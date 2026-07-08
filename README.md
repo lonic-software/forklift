@@ -54,6 +54,16 @@ forklift stack "first parcel"             # commit
 forklift history                           # see it
 ```
 
+## GUIs
+
+Prefer a graphical client? Community-built GUIs for Forklift:
+
+- **[forklift_ui](https://github.com/r4nd0mth1ngs/forklift_ui)** by [r4nd0mth1ngs](https://github.com/r4nd0mth1ngs) — a cross-platform desktop app built with Tauri and Rust.
+
+Built one? Open a PR to add it here. GUIs should drive Forklift through the
+[machine & agent interface](docs/MACHINE_INTERFACE.md) (`--json`, stable errors) rather than
+scraping CLI output.
+
 ## The name
 Why is it called Forklift, you ask? Well, it's easy.. Forklifts are used in warehouses to move and organize packages.\
 This tool does exactly that, but with files on a computer.
