@@ -103,6 +103,7 @@ async fn forklift(cli: Cli) -> Result<(), ForkliftError> {
 /// plain `Result<(), String>`; the generic error is classified by the caller.
 async fn dispatch(cli: Cli) -> Result<(), String> {
     match cli.command {
+        Command::Alias { action } => commands::alias::handle_command(action),
         Command::Audit { pallet } => commands::audit::handle_command(pallet),
         Command::Blame { path, rev } => commands::blame::handle_command(&path, rev).await,
         Command::Config { global, unset, key, value } =>

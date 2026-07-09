@@ -11,6 +11,7 @@
 #   FORKLIFT_VERSION      install a specific tag, e.g. v0.1.0 (default: latest release)
 #   FORKLIFT_INSTALL_DIR  where to put the binaries (default: %LOCALAPPDATA%\Programs\forklift)
 #   FORKLIFT_REPO         GitHub repo slug          (default: lonic-software/forklift)
+#   FORKLIFT_NO_ALIAS     skip creating the `fl` short alias next to the forklift binary
 param([string]$Component = $env:FORKLIFT_COMPONENT)
 
 $ErrorActionPreference = "Stop"
@@ -69,6 +70,24 @@ try {
         Expand-Archive (Join-Path $Tmp $Asset) -DestinationPath $Tmp -Force
         Copy-Item (Join-Path $Tmp "$Name.exe") (Join-Path $InstallDir "$Name.exe") -Force
         Write-Host "installed $InstallDir\$Name.exe"
+
+        # The `fl` short alias (DESIGN.html §5.0 F): every install method converges on the
+        # same `forklift alias install`, so this is the one place the behavior lives. Default
+        # on, opt out with FORKLIFT_NO_ALIAS=1; best effort (never fails the install over it).
+        if ($Name -eq "forklift" -and -not $env:FORKLIFT_NO_ALIAS) {
+            # $ErrorActionPreference = "Stop" only turns PowerShell-native errors into
+            # exceptions - it does not touch an external process's exit code, so the
+            # try/catch alone never fires on failure here. Check $LASTEXITCODE ourselves,
+            # and keep both: the catch still covers the process failing to start at all.
+            try {
+                & (Join-Path $InstallDir "forklift.exe") alias install | Out-Null
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Host "warning: could not create the `"fl`" alias (exit code $LASTEXITCODE); `"forklift alias install`" retries it"
+                }
+            } catch {
+                Write-Host "warning: could not create the `"fl`" alias ($_); `"forklift alias install`" retries it"
+            }
+        }
     }
 
     $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")

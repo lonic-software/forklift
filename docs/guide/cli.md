@@ -117,6 +117,34 @@ always ignored. Example entries:
 \.log$             # any .log file
 ```
 
+### `alias` — the `fl` short name
+
+Forklift ships a short `fl` alias (`f` and `l` are both left-hand home row —
+quicker to type than `git`). It is a **shell-agnostic symlink** next to the
+`forklift` binary (a `.cmd` shim on Windows, where a symlink needs elevated
+privilege), not a per-shell alias — it works from scripts, non-interactive
+shells and every shell dialect alike, and one `ls`/`rm` finds or removes it.
+
+Every installer (the curl script, `pult install`, and self-update — see
+[`self-update`](#self-update--check-for-and-apply-a-newer-release)) creates it
+by default, calling the same command under the hood:
+
+```sh
+forklift alias install            # create "fl" next to this binary
+forklift alias install fl2        # create a differently-named alias instead
+forklift alias uninstall          # remove it
+forklift alias                    # (or "alias status") report whether it's installed, and where
+```
+
+`install` is idempotent (an alias that already points at this binary succeeds
+without change) and refuses — deliberately, with no `--force` — to overwrite
+anything it did not create: a real file already named `fl`, or a symlink
+pointing somewhere else. `uninstall` is a no-op if nothing is installed, and
+also refuses a foreign real file, though it does remove a symlink/shim
+pointing elsewhere (deleting a symlink can never lose data). Set
+`FORKLIFT_NO_ALIAS=1` before installing to skip alias creation — there is no
+interactive prompt (`curl … | sh` has no TTY to answer one).
+
 ---
 
 ## 2. Tracking changes
@@ -651,7 +679,9 @@ right upgrade command instead (`cargo install … --force`, `brew upgrade forkli
 can't fight your package manager. `--check` (and `--json`) just reports `{current, latest,
 update_available, install_method, update_command}`. There is **no server self-update** by
 design: a server is redeployed (new container / Lambda version / package), never
-self-mutated.
+self-mutated. If the [`fl` alias](#alias--the-fl-short-name) was already installed, self-update
+keeps it working — the binary is replaced at the same path, and self-update also restores the
+alias if it ever goes missing.
 
 ### `compact` — pack the object store
 
@@ -812,6 +842,7 @@ keep their git names outright. For the review workflow, git's "pull request" is
 | `prepare` | `p` | Create a warehouse here |
 | `import-git` | | Migrate a git repo's history into the warehouse |
 | `export-git` | | Export the warehouse's history back into a git repo |
+| `alias` | | Manage the `fl` short alias next to this binary |
 | `config` | `cfg` | Read/set/unset configuration |
 | `profile` | | Manage named identity profiles |
 | `load` | `l` | Stage changes into the inventory |

@@ -2115,6 +2115,183 @@ fn self_update_check_reports_without_mutating() {
     assert_eq!(json(&none)["data"]["update_available"], false);
 }
 
+/// A scratch directory standing in for "next to the binary" via `FORKLIFT_ALIAS_DIR` (the
+/// same override the `alias` command reads), so these tests never touch the real target/
+/// build output. Cleaned up on drop, like `TestWarehouse`.
+struct AliasScratch {
+    dir: PathBuf,
+}
+
+impl AliasScratch {
+    fn new(name: &str) -> AliasScratch {
+        let dir = std::env::temp_dir()
+            .join(format!("forklift-test-alias-{}-{}", name, std::process::id()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        AliasScratch { dir }
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        Command::new(FORKLIFT)
+            .args(args)
+            .env("FORKLIFT_ALIAS_DIR", &self.dir)
+            .output()
+            .unwrap()
+    }
+
+    /// Mirrors the production `platform_alias_path` logic: a bare name on Unix (a symlink),
+    /// `name.cmd` on Windows (a shim) — so tests that write a "foreign file" or check
+    /// removal are looking at the same path the `alias` command itself would touch.
+    fn alias_path(&self, name: &str) -> PathBuf {
+        #[cfg(windows)]
+        {
+            self.dir.join(format!("{}.cmd", name))
+        }
+        #[cfg(not(windows))]
+        {
+            self.dir.join(name)
+        }
+    }
+}
+
+impl Drop for AliasScratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+#[test]
+fn alias_install_creates_a_symlink_next_to_the_binary_and_is_idempotent() {
+    let scratch = AliasScratch::new("install");
+
+    let created = scratch.run(&["--json", "alias", "install"]);
+    assert_success(&created);
+    assert_eq!(json(&created)["data"]["already_installed"], false);
+    assert_eq!(json(&created)["data"]["name"], "fl");
+
+    #[cfg(unix)]
+    {
+        let target = std::fs::canonicalize(FORKLIFT).unwrap();
+        let resolved = std::fs::canonicalize(scratch.alias_path("fl")).unwrap();
+        assert_eq!(resolved, target, "the alias must resolve to this binary");
+    }
+
+    // Installing again is a no-op success: an alias that already points here is left alone.
+    let again = scratch.run(&["--json", "alias", "install"]);
+    assert_success(&again);
+    assert_eq!(json(&again)["data"]["already_installed"], true);
+}
+
+#[test]
+fn alias_uninstall_removes_it_and_is_a_noop_when_absent() {
+    let scratch = AliasScratch::new("uninstall");
+
+    assert_success(&scratch.run(&["alias", "install"]));
+    assert!(std::fs::symlink_metadata(scratch.alias_path("fl")).is_ok());
+
+    let removed = scratch.run(&["--json", "alias", "uninstall"]);
+    assert_success(&removed);
+    assert_eq!(json(&removed)["data"]["removed"], true);
+    assert!(
+        std::fs::symlink_metadata(scratch.alias_path("fl")).is_err(),
+        "the alias must be gone"
+    );
+
+    // Uninstalling again when nothing is there succeeds without doing anything.
+    let again = scratch.run(&["--json", "alias", "uninstall"]);
+    assert_success(&again);
+    assert_eq!(json(&again)["data"]["removed"], false);
+}
+
+#[test]
+fn alias_install_refuses_a_foreign_file() {
+    let scratch = AliasScratch::new("foreign-install");
+    std::fs::write(scratch.alias_path("fl"), "not a forklift alias\n").unwrap();
+
+    let result = scratch.run(&["--json", "alias", "install"]);
+    assert!(!result.status.success());
+    assert_eq!(json(&result)["error"]["code"], "error");
+    assert!(stdout(&result).contains("Refusing"));
+
+    // The foreign file must be untouched.
+    assert_eq!(
+        std::fs::read_to_string(scratch.alias_path("fl")).unwrap(),
+        "not a forklift alias\n"
+    );
+}
+
+#[test]
+fn alias_uninstall_refuses_a_foreign_file() {
+    let scratch = AliasScratch::new("foreign-uninstall");
+    std::fs::write(scratch.alias_path("fl"), "not a forklift alias\n").unwrap();
+
+    let result = scratch.run(&["--json", "alias", "uninstall"]);
+    assert!(!result.status.success());
+    assert!(stdout(&result).contains("Refusing"));
+    assert!(scratch.alias_path("fl").exists(), "the foreign file must not be removed");
+}
+
+#[cfg(unix)]
+#[test]
+fn alias_install_refuses_when_the_name_points_elsewhere_but_uninstall_may_remove_it() {
+    let scratch = AliasScratch::new("points-elsewhere");
+    let other = scratch.dir.join("something-else");
+    std::fs::write(&other, "x").unwrap();
+    std::os::unix::fs::symlink(&other, scratch.alias_path("fl")).unwrap();
+
+    let install = scratch.run(&["--json", "alias", "install"]);
+    assert!(!install.status.success());
+    assert!(stdout(&install).contains("Refusing"));
+
+    // A symlink pointing elsewhere is still recognized as an alias, so uninstall may remove
+    // it — deleting a symlink can never lose data, unlike a real file.
+    let uninstall = scratch.run(&["--json", "alias", "uninstall"]);
+    assert_success(&uninstall);
+    assert_eq!(json(&uninstall)["data"]["removed"], true);
+}
+
+#[test]
+fn alias_status_reports_installed_state() {
+    let scratch = AliasScratch::new("status");
+
+    let before = scratch.run(&["--json", "alias", "status"]);
+    assert_success(&before);
+    assert_eq!(json(&before)["data"]["installed"], false);
+
+    assert_success(&scratch.run(&["alias", "install"]));
+
+    let after = scratch.run(&["--json", "alias", "status"]);
+    assert_success(&after);
+    assert_eq!(json(&after)["data"]["installed"], true);
+}
+
+#[test]
+fn the_fl_alias_behaves_identically_to_forklift() {
+    let scratch = AliasScratch::new("behaves-identically");
+    assert_success(&scratch.run(&["alias", "install"]));
+
+    // Direct execution of a `.cmd` file via `CreateProcess` is unreliable — Windows needs
+    // the command interpreter to run a batch shim. Unix executes the symlink directly.
+    #[cfg(windows)]
+    let via_alias = Command::new("cmd")
+        .arg("/C")
+        .arg(scratch.alias_path("fl"))
+        .args(["--json", "version"])
+        .output()
+        .unwrap();
+    #[cfg(not(windows))]
+    let via_alias = Command::new(scratch.alias_path("fl"))
+        .args(["--json", "version"])
+        .output()
+        .unwrap();
+    let via_forklift = Command::new(FORKLIFT).args(["--json", "version"]).output().unwrap();
+
+    assert_success(&via_alias);
+    assert_eq!(json(&via_alias), json(&via_forklift), "fl must behave exactly like forklift");
+}
+
 #[test]
 fn git_command_aliases_map_to_forklift_verbs() {
     let warehouse = TestWarehouse::new("git-aliases");

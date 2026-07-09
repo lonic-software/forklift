@@ -15,6 +15,7 @@
 #   FORKLIFT_BASE_URL     full base URL for the assets (mirrors / air-gapped setups);
 #                         overrides FORKLIFT_REPO/FORKLIFT_VERSION entirely
 #   FORKLIFT_FORCE        install forklift-server even if one is running (skips the guard)
+#   FORKLIFT_NO_ALIAS     skip creating the `fl` short alias next to the forklift binary
 set -eu
 
 REPO="${FORKLIFT_REPO:-lonic-software/forklift}"
@@ -144,6 +145,14 @@ install_one() { # $1 = binary base name (forklift / forklift-server)
     mv -f "$staged" "$dest"
 
     say "installed ${dest} — $("$dest" --version 2>/dev/null || echo "$name")"
+
+    # The `fl` short alias (DESIGN.html §5.0 F): every install method converges on the
+    # same `forklift alias install`, so this is the one place the behavior lives. Default
+    # on, opt out with FORKLIFT_NO_ALIAS=1; best effort (never fails the install over it —
+    # e.g. a read-only install dir, or a name collision it correctly refuses to clobber).
+    if [ "$name" = "forklift" ] && [ -z "${FORKLIFT_NO_ALIAS:-}" ]; then
+        "$dest" alias install || say "warning: could not create the \"fl\" alias (see above); \"$dest alias install\" retries it"
+    fi
 }
 
 for b in $binaries; do

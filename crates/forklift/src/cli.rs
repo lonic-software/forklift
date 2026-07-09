@@ -48,6 +48,21 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Command {
 
+    /// Manage the `fl` short alias for this binary
+    #[command(
+        long_about = "Manage the `fl` short alias (§5.0 milestone F): a shell-agnostic symlink \
+                      (a shim on Windows) placed next to this binary, not a per-shell alias — it \
+                      works in scripts, non-interactive shells and every shell dialect alike, and \
+                      is trivially discoverable and removable. This is the one implementation \
+                      every install method (the curl script, pult, `cargo install`) calls, so the \
+                      alias never drifts between install paths. Without a subcommand, reports \
+                      whether the alias is installed and where."
+    )]
+    Alias {
+        #[command(subcommand)]
+        action: Option<AliasAction>,
+    },
+
     /// Verify the warehouse's signed history offline
     #[command(
         visible_alias = "a",
@@ -612,6 +627,41 @@ pub enum Command {
     #[command(visible_alias = "v")]
     Version,
 
+}
+
+#[derive(Subcommand)]
+pub enum AliasAction {
+    /// Create the alias next to this binary (default name: "fl")
+    #[command(
+        long_about = "Create the alias next to this binary: on Unix, a symlink; on Windows \
+                      (where a symlink needs elevated privilege), a `.cmd` shim that forwards to \
+                      this binary. Resolves this binary's own path (`current_exe`), so it always \
+                      points at whichever `forklift` is actually running the command. Idempotent: \
+                      an alias that already points here succeeds without change. Refuses — without \
+                      a --force, there isn't one — if the name is already taken by something else \
+                      (a real file, or a symlink to a different target): removing an unrelated \
+                      file automatically would be a surprise no flag should paper over."
+    )]
+    Install {
+        /// The alias name (default: "fl")
+        name: Option<String>,
+    },
+
+    /// Remove the alias next to this binary (default name: "fl")
+    #[command(
+        long_about = "Remove the alias next to this binary. A no-op (success) if it is not \
+                      installed. Refuses if the name exists but was not created by this command \
+                      (a real file, e.g.). A symlink (Unix) or a recognized shim (Windows) is \
+                      removed even if it points at a different forklift binary — deleting a \
+                      symlink can never lose data, unlike a real file."
+    )]
+    Uninstall {
+        /// The alias name (default: "fl")
+        name: Option<String>,
+    },
+
+    /// Report whether the alias is installed and where it points (the default)
+    Status,
 }
 
 #[derive(Subcommand)]

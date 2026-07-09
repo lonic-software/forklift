@@ -623,6 +623,7 @@ mod tests {
     /// surface. Every other CLI command MUST have a matching tool — the test below enforces
     /// it, so adding a CLI command without an MCP tool (or an allow-list entry) fails CI.
     const HUMAN_ONLY: &[&str] = &[
+        "alias",       // manage the `fl` shell alias next to this binary (host concern)
         "prepare",     // create a warehouse (setup)
         "config",      // read/set configuration (setup)
         "profile",     // manage identity profiles (setup)

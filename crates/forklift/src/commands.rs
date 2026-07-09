@@ -1,3 +1,4 @@
+pub mod alias;
 pub mod audit;
 pub mod bay;
 pub mod blame;

@@ -27,6 +27,10 @@ commands:
     run:
       - "cargo install --path crates/forklift --locked"
       - "cargo install --path crates/forklift-server --locked"
+      # The `fl` short alias (§5.0 F) — same one implementation every install method calls.
+      # Default on; FORKLIFT_NO_ALIAS=1 opts out. Best effort: a refusal (e.g. an unrelated
+      # "fl" already on PATH) must not fail this install step.
+      - "[ -n \"${FORKLIFT_NO_ALIAS:-}\" ] || forklift alias install || true"
 
   - id: serve
     title: Run a throwaway local forklift-server (test lift / lower / franchise)

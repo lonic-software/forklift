@@ -1,5 +1,6 @@
 use std::process::Command;
 use serde::Serialize;
+use crate::commands::alias;
 use crate::output::{self, CommandOutput};
 
 /// The version this binary was built as.
@@ -59,7 +60,18 @@ pub async fn handle_command(check: bool) -> Result<(), String> {
     // A script/manual install: update in place by re-running the install script, pinned to
     // the exact version we resolved. `update_available` guarantees `latest` is set.
     let target = latest.expect("an available update has a latest version");
+
+    // The install script replaces the binary at the same path (atomic rename), so an
+    // existing `fl` alias keeps working without any action. This is defense in depth for
+    // the case it doesn't (e.g. a relocated install dir): if the alias was present before,
+    // make sure it still is after — best-effort, never fails the update over it.
+    let had_alias = alias::exists(alias::DEFAULT_NAME);
+
     perform_update(&target)?;
+
+    if had_alias {
+        alias::reinstall_silently(alias::DEFAULT_NAME);
+    }
 
     output::emit("self-update", &SelfUpdate { applied: true, latest: Some(target), ..report });
 
