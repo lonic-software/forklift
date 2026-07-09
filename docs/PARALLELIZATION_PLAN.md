@@ -147,25 +147,56 @@ contention.** Two things decide almost every row:
 
 - **`export-git` — bound by an external boundary** (a `git` subprocess per object), not CPU.
 
-## The cross-cutting lever (if read-bound ops ever matter)
+## The cross-cutting lever — the object caches now hold their locks pointer-only (shipped)
 
-Every read-bound parallelization is capped by the shared object caches being single `Mutex`es
-(the read cache and the graph cache; the pack registry only briefly hands back an `Arc`, but even
-that lock is taken on *every* read). If a future need makes a *read*-heavy op worth parallelizing,
-the prerequisite is concurrency-friendly caches — per-shard locks, or an `Arc` snapshot grabbed
-once per walk so reads never re-lock. That is a foundational change that would unblock several ops
-at once.
+Every read-bound parallelization used to be capped by the shared object caches holding a single
+`Mutex` **across real work** — the read cache copied the object bytes out under the lock, and the
+graph cache read, parsed, and even fsync'd a shard file under the lock. Both now hold the lock only
+for pointer-sized, in-memory work (milestone D, P1/P2):
 
-**`audit` proved this ceiling is real, not theoretical.** It was picked as "pure CPU," but the
-measured 2.4× (not the near-linear expected) came from its phase-2 loop doing two object reads per
-parcel through those shared caches — the ed25519 CPU was the minority. Almost every candidate loop
-here reads objects, so this cache rework is the highest-leverage *foundational* lever: it is what
-stands between the shipped wins and near-linear. `audit` (~2.4×), `compact` (~2.1×) and the
-read-bound low end of `diff` all sit at the object-cache ceiling — each does per-item object reads
-through the single `Mutex`es, so more cores stop helping. The compute-bound peaks are already taken
-— `diff` reaches 5.7× and `consolidate`'s merge 6.4× when the CPU dominates. What the cache rework
-would *not* help: `checkout`/`materialize` and `import-git` (bound by the *filesystem* metadata
-wall, not the object caches), and `consolidate`'s end-to-end tail (that same filesystem wall when it
-writes the merged files). So the two ceilings are now clearly separated: shared-`Mutex` object
-reads (a cache rework would lift these) versus OS small-file-write metadata (a storage-format change
-— e.g. writing packs directly — is the only lever there).
+- **Read cache (`file_utils`).** Entries were already `Arc`-shared, but a hit `clone`d the *bytes*
+  out under the lock. It now clones the `Arc` (a pointer bump) and returns it —
+  `retrieve_object_by_hash_shared` hands the shared allocation to the borrow-only readers
+  (`object_utils::load_tree`/`load_blob`, the pack delta-base reads in `pack_utils`), and
+  `retrieve_object_by_hash` still returns owned `Vec<u8>` for the callers that keep the bytes (the
+  server's object-GET, bundles) — but that one copy now happens **outside** the lock. So the
+  critical section is a pointer clone regardless of object size.
+- **Graph cache (`graph_utils`).** `with_shard` took the cache lock and then did the shard-file
+  `read`+`parse` inside it; `persist_records` and eviction wrote (fsync included) inside it. Now
+  the lock is taken only to serve a resident shard or to install/mutate one: a cold shard is
+  read+parsed with the lock **released** (re-locked to insert, the double-load race resolved
+  first-insert-wins on immutable content), and the eager flush serializes a snapshot under the lock
+  but writes it off the lock. The on-disk copy is deliberately last-write-wins and the shard stays
+  dirty until re-flushed, so a stale racing write self-heals — the graph is a derived accelerator,
+  never a source of truth.
+- **Pack registry (`pack_utils`).** Already the idiom: a brief lock hands back an `Arc<Vec<LoadedPack>>`
+  and the mmap'd reads run lock-free. Left as-is; it was the reference for the graph-cache rework.
+
+**What it measured (18 cores).** On a 2500-parcel signed warehouse and a large-blob warehouse
+(120 files × 2000 lines, so a cached blob is ~100 KB), before vs after: `audit`, `diff`, and
+`stocktake` are unchanged within noise; `compact` is ~1.03× (1219 → 1186 ms, fsync off) with
+**byte-identical** `.pack`/`.idx` output; no op regressed. So the foundation shipped without a
+speed cost, but the near-linear payoff did **not** materialize on these CLI ops — and the reason is
+worth recording honestly:
+
+- **`audit`'s 2.4× ceiling did not move, because audit no longer reads through the read cache at
+  all.** Its phase-2 loop reads the parcel body *uncached* (`load_parcel` bypasses the cache — a
+  parcel is read about once) and the `.sig` sidecar via a direct `fs::read`; the only shared lock
+  it touches per parcel is the pack registry's brief `Arc` hand-back. The plan's earlier
+  "read-cache ceiling" description of audit is stale relative to the uncached-parcel + direct-sig
+  read path the code actually takes now.
+- **The parallel read-bound loops that *do* use the read cache (`diff`, `compact`) are
+  miss-dominated, not hit-dominated.** A cross-revision `diff` loads each blob about once (a cache
+  *miss*: disk read + zstd decode, identical before and after); `compact`'s path deltas each read a
+  distinct previous version. The pointer-vs-copy difference only bites when many threads read the
+  **same** cached object at once, and these loops rarely do.
+
+So the lever's real beneficiary is **concurrency the single-process CLI cannot reproduce**: a
+multi-warehouse server serving the same hot objects to many clients (its object-GET now copies
+outside the cache lock), or many concurrent ancestry queries on one warehouse (each graph shard
+read/flush is now off the global lock). What the rework still does **not** help is unchanged:
+`checkout`/`materialize` and `import-git` (bound by the *filesystem* metadata wall) and
+`consolidate`'s write tail (that same wall) — a storage-format change (writing packs directly) is
+the only lever there. The two ceilings remain cleanly separated; this change lifted the object-cache
+one to pointer-sized locks, and a genuinely read-*hit*-bound parallel consumer is what would now
+turn that into a measured near-linear win.

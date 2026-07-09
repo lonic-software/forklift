@@ -134,6 +134,11 @@ struct Shard {
     /// O(1) stamp, so a hot walk that hits a shard tens of thousands of times pays nothing per
     /// hit (a `blame` or a `history` frontier lookup would otherwise scan a recency list).
     last_access: u64,
+    /// Bumped on every mutation to `records`. A flush serializes a snapshot under the lock, then
+    /// writes it with the lock released; on re-lock it clears `dirty` only if `version` is
+    /// unchanged, so a record another thread inserted meanwhile (raising `version`) is never
+    /// falsely marked flushed — it stays dirty until its own writer persists it.
+    version: u64,
 }
 
 /// The process-global resident shard cache, keyed by `root\0prefix` so warehouses never mix.
@@ -273,42 +278,92 @@ fn parse_shard(bytes: &[u8]) -> HashMap<String, Record> {
     records
 }
 
-// ---- resident shard access (holds the cache lock only briefly) ---------------------------
+// ---- resident shard access (disk I/O happens outside the cache lock) ---------------------
 
-/// Run `f` with the shard for `prefix` resident (loading it from disk if needed), holding the
-/// cache lock. `f` must not perform parcel I/O — keep the critical section to in-memory work.
+/// Run `f` with the shard for `prefix` resident, holding the cache lock **only** for the
+/// in-memory work. `f` must not perform parcel or shard I/O.
+///
+/// A cold shard is read and parsed from disk with the lock **released** — the disk read (and a
+/// dirty eviction victim's write) never block another thread's graph access. The sequence is:
+/// take the lock and serve the shard if it is resident (the common case, one lock, no I/O);
+/// otherwise release the lock, read+parse the shard file, then re-take the lock to insert it.
+/// Two threads racing the same cold shard is benign — the records are derived from immutable
+/// parcels, so both parses are equal; the first insert wins and the loser's parse is dropped.
+/// The resident copy never loses a record while it stays resident; if it is later evicted and
+/// reloaded from a stale on-disk copy, the reload can transiently omit a racing writer's record —
+/// the same self-heal (object-walk recompute) that covers any other missing record covers this.
 fn with_shard<R>(root: &str, prefix: &str, f: impl FnOnce(&mut Shard) -> R) -> Result<R, String> {
     let key = cache_key(root, prefix);
-    let mut cache = cache().lock().map_err(|_| "The commit-graph cache lock was poisoned.".to_string())?;
 
-    if !cache.shards.contains_key(&key) {
-        let records = match std::fs::read(shard_path(root, prefix)) {
-            Ok(bytes) => parse_shard(&bytes),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
-            Err(e) => return Err(format!("Error while reading commit-graph shard \"{}\": {}", prefix, e)),
-        };
-        evict_if_needed(&mut cache, &key)?;
-        cache.shards.insert(key.clone(), Shard {
-            root: root.to_string(),
-            prefix: prefix.to_string(),
-            records,
-            dirty: false,
-            last_access: 0,
-        });
+    // Fast path: the shard is already resident. One lock acquisition, no I/O.
+    {
+        let mut cache = cache().lock().map_err(poisoned)?;
+        if cache.shards.contains_key(&key) {
+            let stamp = cache.tick();
+            let shard = cache.shards.get_mut(&key).expect("just checked present");
+            shard.last_access = stamp;
+            return Ok(f(shard));
+        }
     }
 
-    // Refresh recency in O(1): stamp the shard with the next clock tick.
-    let stamp = cache.tick();
-    let shard = cache.shards.get_mut(&key).expect("shard just inserted");
-    shard.last_access = stamp;
-    Ok(f(shard))
+    // Miss: read and parse the shard file with the lock released.
+    let records = match std::fs::read(shard_path(root, prefix)) {
+        Ok(bytes) => parse_shard(&bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+        Err(e) => return Err(format!("Error while reading commit-graph shard \"{}\": {}", prefix, e)),
+    };
+
+    // Re-take the lock to install the shard and run `f`. Any dirty eviction victims are removed
+    // here but flushed to disk *after* the lock is released, below.
+    let (result, victim_writes) = {
+        let mut cache = cache().lock().map_err(poisoned)?;
+
+        // Another thread may have loaded the same shard while we read it; if so, keep the
+        // resident copy (it may already carry newer records) and drop our parse.
+        let victim_writes = if cache.shards.contains_key(&key) {
+            Vec::new()
+        } else {
+            let victim_writes = evict_collect(&mut cache, &key);
+            cache.shards.insert(key.clone(), Shard {
+                root: root.to_string(),
+                prefix: prefix.to_string(),
+                records,
+                dirty: false,
+                last_access: 0,
+                version: 0,
+            });
+            victim_writes
+        };
+
+        let stamp = cache.tick();
+        let shard = cache.shards.get_mut(&key).expect("resident or just inserted");
+        shard.last_access = stamp;
+        (f(shard), victim_writes)
+    };
+
+    // Flush the evicted dirty victims with the lock released. They are already out of the cache,
+    // so their bytes are final; a write error is surfaced (a saved write is a saved rebuild).
+    for (root, prefix, bytes) in victim_writes {
+        write_shard_bytes(&root, &prefix, &bytes)?;
+    }
+
+    Ok(result)
 }
 
-/// Evict least-recently-used shards until there is room for one more, flushing any dirty
-/// victim to disk first so its records are not lost (they would only be recomputed, but a
-/// write saved is a walk saved). With a 2-hex fan-out all ≤256 shards fit under the cap, so
-/// this never actually evicts today — it earns its keep only at a deeper fan-out.
-fn evict_if_needed(cache: &mut Cache, incoming: &str) -> Result<(), String> {
+/// The poisoned-lock error message (a panic while holding the graph lock is unexpected, but the
+/// cache is a derived accelerator, so surfacing it as an error beats propagating a panic).
+fn poisoned<T>(_: T) -> String {
+    "The commit-graph cache lock was poisoned.".to_string()
+}
+
+/// Evict least-recently-used shards until there is room for one more, returning the serialized
+/// bytes of any **dirty** victim so the caller can write it to disk *after releasing the lock*
+/// (flushing under the lock would block every other graph access on an fsync). A victim's
+/// records would only be recomputed if dropped, but a write saved is a walk saved. With a 2-hex
+/// fan-out all ≤256 shards of one warehouse fit under the cap, so this only evicts when a single
+/// process (a server) holds shards for many warehouses at once.
+fn evict_collect(cache: &mut Cache, incoming: &str) -> Vec<(String, String, Vec<u8>)> {
+    let mut pending_writes = Vec::new();
     while cache.shards.len() >= MAX_RESIDENT_SHARDS {
         // The least-recently-accessed shard that is not the one we are about to insert.
         let victim = cache.shards.iter()
@@ -321,19 +376,24 @@ fn evict_if_needed(cache: &mut Cache, incoming: &str) -> Result<(), String> {
         };
         if let Some(shard) = cache.shards.remove(&victim) {
             if shard.dirty {
-                write_shard(&shard)?;
+                // Serialize under the lock (in-memory, cheap); the fsyncing write is done by the
+                // caller once the lock is released.
+                pending_writes.push((
+                    shard.root.clone(),
+                    shard.prefix.clone(),
+                    serialize_shard(&shard.records),
+                ));
             }
         }
     }
-    Ok(())
+    pending_writes
 }
 
-/// Write one shard to its file atomically.
-fn write_shard(shard: &Shard) -> Result<(), String> {
-    let root = std::path::Path::new(&shard.root);
-    file_utils::create_folder_if_not_exists(root)?;
-    let bytes = serialize_shard(&shard.records);
-    file_utils::write_file_atomically(&shard_path(&shard.root, &shard.prefix), &bytes)
+/// Write pre-serialized shard bytes to the shard file atomically. Callers serialize under the
+/// cache lock and call this with the lock released, so the fsync never blocks the cache.
+fn write_shard_bytes(root: &str, prefix: &str, bytes: &[u8]) -> Result<(), String> {
+    file_utils::create_folder_if_not_exists(std::path::Path::new(root))?;
+    file_utils::write_file_atomically(&shard_path(root, prefix), bytes)
 }
 
 /// Fetch a parcel's record if it is already stored (in a resident shard or on disk). Does not
@@ -354,21 +414,30 @@ fn persist_records(root: &str, new: &HashMap<String, Record>) -> Result<(), Stri
         by_prefix.entry(shard_prefix(hash)).or_default().push((hash, record));
     }
     for (prefix, records) in by_prefix {
-        with_shard(root, &prefix, |shard| {
+        // Insert the records and snapshot the shard's bytes + version under the lock; the
+        // fsyncing write then happens with the lock released.
+        let (bytes, version) = with_shard(root, &prefix, |shard| {
             for (hash, record) in records {
                 shard.records.insert(hash.clone(), record.clone());
             }
             shard.dirty = true;
+            shard.version = shard.version.wrapping_add(1);
+            (serialize_shard(&shard.records), shard.version)
         })?;
-        // Flush eagerly so the memoization survives the process — a shard held dirty could be
-        // lost to a crash (only a rebuild, but avoidable). Grouped, so this is one write/shard.
+
+        // Flush eagerly so the memoization survives a crash (otherwise only a rebuild, but
+        // avoidable) — off the lock, so a concurrent graph access never waits on this fsync.
+        write_shard_bytes(root, &prefix, &bytes)?;
+
+        // Mark clean only if nothing changed the shard since the snapshot: a record another
+        // thread inserted meanwhile (a higher `version`) is newer than what we just wrote and
+        // stays dirty until that writer flushes it. (If the shard was evicted and reloaded in the
+        // gap, its `version` reset to 0, so this simply no-ops — its records are already on disk.)
         with_shard(root, &prefix, |shard| {
-            if shard.dirty {
-                write_shard(shard).map(|_| shard.dirty = false)
-            } else {
-                Ok(())
+            if shard.version == version {
+                shard.dirty = false;
             }
-        })??;
+        })?;
     }
     Ok(())
 }
@@ -943,5 +1012,61 @@ mod tests {
 
         let order = topo_order(&parents_of).unwrap();
         assert_eq!(order.len(), 2);
+    }
+
+    #[test]
+    fn concurrent_persists_to_one_shard_never_lose_a_record() {
+        // P2 stress: many threads persist distinct records that all hash into the *same* shard,
+        // so they contend on the out-of-lock shard load, the re-lock insert, and the double-load
+        // race. The invariant the restructure must keep is that the resident shard (what every
+        // read consults) never drops a record *while resident*: the first insert of a shard wins,
+        // and a thread that finds the shard already resident *adds* to it rather than replacing
+        // it. (The on-disk copy is deliberately last-write-wins; if the shard is later evicted and
+        // reloaded from a stale on-disk copy, the reloaded resident copy can transiently lack a
+        // racing writer's record — covered by the same self-heal as any other missing record
+        // (object-walk recompute), so this checks the authoritative in-memory copy via
+        // `stored_record` within one residency, not across an evict/reload.)
+        let root = std::env::temp_dir()
+            .join(format!("forklift-graph-conc-{}", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        let _ = std::fs::remove_dir_all(&root);
+
+        const THREADS: u64 = 8;
+        const PER_THREAD: u64 = 64;
+
+        std::thread::scope(|scope| {
+            for t in 0..THREADS {
+                let root = root.clone();
+                scope.spawn(move || {
+                    // Every hash shares the prefix "ab", so all records target the one shard —
+                    // maximal contention on that shard's load/insert/flush path.
+                    let batch: HashMap<String, Record> = (0..PER_THREAD)
+                        .map(|i| {
+                            let n = t * 100_000 + i;
+                            (format!("ab{:062x}", n), Record {
+                                generation: (n + 1) as u32,
+                                parents: vec![],
+                                filter: PathFilter::Unknown,
+                            })
+                        })
+                        .collect();
+                    persist_records(&root, &batch).expect("persist under contention");
+                });
+            }
+        });
+
+        // Every record from every thread must read back with exactly its stored generation.
+        for t in 0..THREADS {
+            for i in 0..PER_THREAD {
+                let n = t * 100_000 + i;
+                let record = stored_record(&root, &format!("ab{:062x}", n))
+                    .expect("read back")
+                    .unwrap_or_else(|| panic!("record {n} was lost under concurrent persists"));
+                assert_eq!(record.generation, (n + 1) as u32, "record {n} corrupted");
+            }
+        }
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }

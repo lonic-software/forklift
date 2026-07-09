@@ -337,13 +337,39 @@ pub fn write_object_to_file(path: &Path, file_name: &str, content: Vec<u8>) -> R
 /// # Returns
 /// * `Ok(Vec<u8>)` - The decompressed bytes of the object.
 /// * `Err(String)` - The error message.
+///
+/// This owns-the-bytes form is for callers that keep the object (a network response body, a
+/// bundle sink, a value stored in a struct). Callers that only *borrow* the bytes to parse them
+/// (`object_utils::load_tree`/`load_blob`, the pack delta-base reads) should use
+/// [`retrieve_object_by_hash_shared`], which hands back the cached `Arc` so a hit is a pointer
+/// clone and the one cached allocation is shared instead of copied.
 pub fn retrieve_object_by_hash(hash: &str) -> Result<Vec<u8>, String> {
+    // The single copy an owned caller needs happens here, *outside* the cache lock — the
+    // critical section is only the pointer-sized `Arc` clone inside `retrieve_object_by_hash_shared`.
+    Ok(retrieve_object_by_hash_shared(hash)?.as_ref().clone())
+}
+
+/// Retrieve the decompressed bytes of the object with the given hash as a shared
+/// [`std::sync::Arc`], through the same content-addressed read cache as [`retrieve_object_by_hash`].
+///
+/// A cache hit clones an `Arc` (a pointer bump) under the lock rather than copying the bytes, so
+/// the critical section is pointer-sized regardless of object size — the lever that keeps a
+/// read-bound parallel loop from serializing on the cache mutex. The caller then borrows the
+/// bytes (`&*arc`) to parse them, sharing the one cached allocation. A caller that needs owned
+/// bytes uses [`retrieve_object_by_hash`], which clones once at that boundary (off the lock).
+///
+/// The returned `Arc` is safe to hold across a storage-scope switch: an object is addressed by
+/// (and verified against) its hash, so its bytes are the same bytes in every warehouse that
+/// holds it — the cache key isolates *presence* per warehouse, never the content.
+pub fn retrieve_object_by_hash_shared(hash: &str) -> Result<std::sync::Arc<Vec<u8>>, String> {
     if let Some(bytes) = read_cache_get(hash) {
         return Ok(bytes);
     }
 
-    let bytes = read_object_uncached(hash)?;
-    read_cache_put(hash, &bytes);
+    // Wrap the freshly read bytes in the `Arc` once and share that same allocation with the
+    // cache — the caller and the cached entry point at one buffer, never two.
+    let bytes = std::sync::Arc::new(read_object_uncached(hash)?);
+    read_cache_put(hash, std::sync::Arc::clone(&bytes));
     Ok(bytes)
 }
 
@@ -411,7 +437,9 @@ const READ_CACHE_BUDGET: usize = 128 * 1024 * 1024;
 const READ_CACHE_MAX_ENTRY: usize = READ_CACHE_BUDGET / 8;
 
 /// A bounded content-addressed object cache (two generations for approximate LRU). Entries are
-/// `Arc`-shared so a hit clones a pointer, then copies out once for the caller.
+/// `Arc`-shared, so a hit clones a pointer under the lock and the caller shares that one
+/// allocation — an owned-bytes caller copies out afterwards, off the lock (see
+/// [`retrieve_object_by_hash`] vs [`retrieve_object_by_hash_shared`]).
 struct ReadCache {
     live: std::collections::HashMap<String, std::sync::Arc<Vec<u8>>>,
     old: std::collections::HashMap<String, std::sync::Arc<Vec<u8>>>,
@@ -434,17 +462,18 @@ fn read_cache_key(hash: &str) -> String {
     format!("{}\u{0}{}", get_path_objects_root(), hash)
 }
 
-fn read_cache_get(hash: &str) -> Option<Vec<u8>> {
+fn read_cache_get(hash: &str) -> Option<std::sync::Arc<Vec<u8>>> {
     let key = read_cache_key(hash);
     let mut cache = read_cache().lock().expect("the read cache lock is poisoned");
 
     if let Some(bytes) = cache.live.get(&key) {
-        return Some(bytes.as_ref().clone());
+        // Clone the `Arc`, not the bytes: the critical section is a pointer bump, not a memcpy.
+        return Some(std::sync::Arc::clone(bytes));
     }
 
     // A hit in the older generation is promoted to the live one (so it survives the next retire).
     if let Some(bytes) = cache.old.remove(&key) {
-        let out = bytes.as_ref().clone();
+        let out = std::sync::Arc::clone(&bytes);
         cache.live_bytes += bytes.len();
         cache.live.insert(key, bytes);
         retire_if_full(&mut cache);
@@ -454,7 +483,7 @@ fn read_cache_get(hash: &str) -> Option<Vec<u8>> {
     None
 }
 
-fn read_cache_put(hash: &str, bytes: &[u8]) {
+fn read_cache_put(hash: &str, bytes: std::sync::Arc<Vec<u8>>) {
     if bytes.len() > READ_CACHE_MAX_ENTRY {
         return;
     }
@@ -466,8 +495,9 @@ fn read_cache_put(hash: &str, bytes: &[u8]) {
         return;
     }
 
+    // Store the caller's `Arc` directly — the fetched allocation is shared, never re-copied.
     cache.live_bytes += bytes.len();
-    cache.live.insert(key, std::sync::Arc::new(bytes.to_vec()));
+    cache.live.insert(key, bytes);
     retire_if_full(&mut cache);
 }
 
@@ -1136,5 +1166,103 @@ mod tests {
         assert!(leftovers.is_empty(), "no temporary file should survive a successful write");
 
         std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn a_cached_object_is_shared_by_arc_not_recopied() {
+        // P1: the whole point of the shared read is that a hit hands back the *same* allocation.
+        let temp = std::env::temp_dir().join(format!("forklift-arc-share-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+
+        let content = vec![9u8; 4000];
+        let hash = blake3::hash(&content).to_hex().to_string();
+        let compressed = zstd::encode_all(content.as_slice(), 0).unwrap();
+        let (folder, file_name) = get_path_for_object(&hash).unwrap();
+        write_object_to_file(Path::new(&folder), &file_name, compressed).unwrap();
+
+        // First read caches the bytes; the second is a hit that must return the same `Arc`
+        // (a pointer clone), not a fresh copy.
+        let first = retrieve_object_by_hash_shared(&hash).unwrap();
+        let second = retrieve_object_by_hash_shared(&hash).unwrap();
+        assert_eq!(*first, content);
+        assert!(std::sync::Arc::ptr_eq(&first, &second),
+                "a cache hit must share the one cached allocation, not copy it");
+
+        // The owned-bytes wrapper still yields correct, independent bytes (copied off the lock).
+        assert_eq!(retrieve_object_by_hash(&hash).unwrap(), content);
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn concurrent_readers_of_one_object_all_get_correct_bytes() {
+        // P1: the pointer-sized critical section must stay correct under contention — many
+        // threads hammering the same cached object all see the exact bytes, never a torn read.
+        let temp = std::env::temp_dir().join(format!("forklift-arc-conc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+
+        let content = vec![0xABu8; 8000];
+        let hash = blake3::hash(&content).to_hex().to_string();
+        let compressed = zstd::encode_all(content.as_slice(), 0).unwrap();
+        let (folder, file_name) = get_path_for_object(&hash).unwrap();
+        write_object_to_file(Path::new(&folder), &file_name, compressed).unwrap();
+
+        let temp_ref: &Path = &temp;
+        let hash_ref: &str = &hash;
+        let content_ref: &Vec<u8> = &content;
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                scope.spawn(move || {
+                    // Storage-root scopes are thread-local, so each worker re-enters it (the read
+                    // cache is keyed by the resolved object root).
+                    let _s = StorageRootScope::enter(temp_ref);
+                    for _ in 0..200 {
+                        let bytes = retrieve_object_by_hash_shared(hash_ref).unwrap();
+                        assert_eq!(*bytes, *content_ref);
+                    }
+                });
+            }
+        });
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn a_cached_object_is_not_served_across_a_scope_switch() {
+        // The multi-warehouse guard: an `Arc` cached for warehouse A must never be handed to
+        // warehouse B. The cache key carries the object root, so B (which does not hold the
+        // object) fails the read rather than being served A's bytes — a held `Arc` cannot leak
+        // across a scope switch.
+        let temp_a = std::env::temp_dir().join(format!("forklift-scope-a-{}", std::process::id()));
+        let temp_b = std::env::temp_dir().join(format!("forklift-scope-b-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_a);
+        let _ = std::fs::remove_dir_all(&temp_b);
+        std::fs::create_dir_all(&temp_a).unwrap();
+        std::fs::create_dir_all(&temp_b).unwrap();
+
+        let content = vec![0x5Au8; 4000];
+        let hash = blake3::hash(&content).to_hex().to_string();
+
+        {
+            let _a = StorageRootScope::enter(&temp_a);
+            let compressed = zstd::encode_all(content.as_slice(), 0).unwrap();
+            let (folder, file_name) = get_path_for_object(&hash).unwrap();
+            write_object_to_file(Path::new(&folder), &file_name, compressed).unwrap();
+            // Cache it under A.
+            assert_eq!(retrieve_object_by_hash(&hash).unwrap(), content);
+        }
+
+        {
+            let _b = StorageRootScope::enter(&temp_b);
+            assert!(retrieve_object_by_hash_shared(&hash).is_err(),
+                    "warehouse B must not be served warehouse A's cached object");
+        }
+
+        std::fs::remove_dir_all(&temp_a).ok();
+        std::fs::remove_dir_all(&temp_b).ok();
     }
 }

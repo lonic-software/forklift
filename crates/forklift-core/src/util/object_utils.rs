@@ -71,7 +71,9 @@ pub fn load_parcel(hash: &str) -> Result<Parcel, String> {
 /// * `Ok(TreeItem)` - The parsed tree.
 /// * `Err(String)`  - If the object does not exist, could not be parsed, or is not a tree.
 pub fn load_tree(hash: &str) -> Result<TreeItem, String> {
-    let bytes = file_utils::retrieve_object_by_hash(hash)?;
+    // Only the parse borrows the bytes, so take the shared `Arc` — a cache hit is a pointer
+    // clone under the lock, not a copy of the whole tree object.
+    let bytes = file_utils::retrieve_object_by_hash_shared(hash)?;
 
     match parser::object::loose_object_parser::parse(&bytes)? {
         ParsedObject::Tree(tree) => Ok(tree),
@@ -88,7 +90,9 @@ pub fn load_tree(hash: &str) -> Result<TreeItem, String> {
 /// * `Ok(Blob)`    - The parsed blob.
 /// * `Err(String)` - If the object does not exist, could not be parsed, or is not a blob.
 pub fn load_blob(hash: &str) -> Result<Blob, String> {
-    let bytes = file_utils::retrieve_object_by_hash(hash)?;
+    // Borrow-only (the parse), so share the cached `Arc` — the win the read cache exists for on a
+    // reconstruction-heavy walk (`blame`/`diff`/`export`) that reloads the same blobs and bases.
+    let bytes = file_utils::retrieve_object_by_hash_shared(hash)?;
 
     match parser::object::loose_object_parser::parse(&bytes)? {
         ParsedObject::Blob(blob) => Ok(blob),

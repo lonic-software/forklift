@@ -650,7 +650,9 @@ fn reconstruct_record(record: &[u8], version: u32, hash: &str) -> Result<Vec<u8>
             let (target_len, read) = byte_utils::number_from_vlq_bytes(HASH_LEN, body)?;
             let payload = &body[HASH_LEN + read..];
 
-            let base = file_utils::retrieve_object_by_hash(&base_hash)?;
+            // Borrow-only: the delta base is only read to reconstruct against, so share the
+            // cached `Arc` instead of copying the base out (hot on packed-delta reads and compact).
+            let base = file_utils::retrieve_object_by_hash_shared(&base_hash)?;
 
             delta_utils::decompress_delta(&base, payload, target_len as usize)
         }
@@ -1111,7 +1113,9 @@ fn prepare_target(target: &PackTarget,
     let mut path_delta = None;
     if deltable {
         if let Some(base_hex) = path_bases.get(&sign_utils::to_hex(&target.hash)) {
-            let base_raw = file_utils::retrieve_object_by_hash(base_hex)?;
+            // Borrow-only (the delta is computed against it): share the cached `Arc` rather than
+            // copy the base blob out under the read-cache lock.
+            let base_raw = file_utils::retrieve_object_by_hash_shared(base_hex)?;
             let payload = delta_utils::compress_delta(&base_raw, &raw)?;
 
             if payload.len() < compressed.len() {
