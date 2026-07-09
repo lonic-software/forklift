@@ -20,12 +20,17 @@
 //! committed, so the mirror is bounded at `old_head` — but only in the one dimension the
 //! audit actually stops walking. Concretely, below the bound the audit still needs:
 //!
-//! * **parcel bodies** — `verify_parcel_closure_with` builds its prune set with
-//!   `collect_reachable(old_head)`, which loads every parcel in `old_head`'s ancestry.
+//! * **parcel bodies** — `verify_parcel_closure_with` now bounds its walk with
+//!   `audit_utils::new_parcels`, a generation-number frontier, not a materialized prune set.
+//!   That frontier is cheap once a warehouse's commit-graph is warm, but computing a
+//!   parcel's generation self-heals by walking its own ancestry when the record is missing
+//!   (`graph_utils::node`), and a freshly created scratch has no commit-graph at all — so the
+//!   first audit against a cold scratch still loads every parcel body in `old_head`'s
+//!   ancestry. A warm shared scratch (see below) pays that cost once per warehouse.
 //!
 //! What it may skip below the bound is the bulk: **trees, their blobs, and signature
-//! sidecars**. Trees are read only for parcels outside the closure check's prune set;
-//! sidecars only for parcels `verify_pallet_history` discovers, and that walk never
+//! sidecars**. Trees are read only for parcels the audit still walks with its `full` flag
+//! set; sidecars only for parcels `verify_pallet_history` discovers, and that walk never
 //! traverses *through* `old_head` — it skips the bound before enqueueing its parents. Both
 //! sets are exactly the parcels this mirror still reaches with its `full` flag set, so a
 //! merge lift whose new segment forks below `old_head` re-expands that older branch (as it

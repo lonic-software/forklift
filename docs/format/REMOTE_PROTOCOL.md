@@ -244,16 +244,17 @@ enforces meta-pallet rules by namespace, so the office lifts to `POST /v1/pallet
      anchor boundary. Failure is `422`.
 
 `forklift-server` audits incrementally: everything reachable from `old_head` was
-verified when `old_head` was committed, so the signature walk stops there — a linear
-lift audits O(new parcels). A creation (`old_head` absent) audits the full history.
+verified when `old_head` was committed, so neither the signature walk nor the closure
+check descends into it. A lift audits O(new parcels) — for a **merge** too, whose second
+parent may fork below `old_head`: the boundary is computed from the commit-graph's
+generation numbers rather than by stopping at a single hash, which is the exact frontier
+of a linear lift but not of a merge (whose frontier is the merge-base set). A creation
+(`old_head` absent) audits the full history.
 
-Two honest caveats, recorded 2026-07-09 (DESIGN.html §5.0 B/R5, "no unnecessary walk"):
-the signature walk stops at the single hash `old_head`, which is the exact frontier of a
-*linear* lift but not of a **merge**, whose frontier is the merge-base set — so a merge
-lift re-verifies signatures below the fork point. And the closure check builds its prune
-set by walking `old_head`'s whole ancestry, so *every* ref update is O(history) parcel
-reads regardless. Both err by doing more work than needed, never less; both are fixed by
-the same generation-number-bounded frontier.
+The consequence, stated plainly: a remote that has *lost* an object behind `old_head` no
+longer fails at ref-update time. It never failed on a lost tree or blob behind it either —
+that ancestry is trusted, by the same induction. The `audit` command is what re-proves a
+whole history.
 
 ### `POST /lift/{session}/commit` (additive; serverless head)
 
@@ -336,8 +337,13 @@ working pallet:
 
 **lower (pull)** — the mirror: `GET /v1/warehouse`, breadth-first fetch of the unknown
 closure from the remote head (parallel `GET`s, skipping objects already present
-locally), fetch parcel signatures, then a local fast-forward. A diverged local pallet is
-an error (consolidate locally, then lift) — protocol v1 has no remote-tracking refs.
+locally), fetch parcel signatures, then a local fast-forward. The walk **stops at any
+parcel already reachable from a local ref head**, whose closure was proven complete when
+that ref moved — so a lower that brings one parcel walks one parcel, and no longer
+re-probes the remote for the signature of every unsigned parcel in history. An interrupted
+earlier sync leaves its ref unmoved, so its half-fetched objects sit above that bound and
+are still re-walked and healed. A diverged local pallet is an error (consolidate locally,
+then lift) — protocol v1 has no remote-tracking refs.
 
 **franchise (clone)** — prepare an empty warehouse, adopt the remote's trust anchor,
 lower the office pallet and the default (or chosen) pallet, materialize the working

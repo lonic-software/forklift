@@ -32,6 +32,11 @@ const BATCH_FETCH_CHUNK: usize = 512;
 pub struct FetchStats {
     pub fetched_objects: usize,
     pub fetched_signatures: usize,
+
+    /// How many parcels the walk actually descended into. The bound makes this the size of
+    /// the gap between the remote head and what is already complete locally, not the length
+    /// of history — the property `fetch_history` exists to keep.
+    pub walked_parcels: usize,
 }
 
 /// What a lift actually transferred.
@@ -380,19 +385,42 @@ impl RemoteClient {
 
 /// Fetch everything reachable from a parcel head that is missing locally: the parcel
 /// graph, every parcel's signature sidecar, and the full tree/blob closure — verified
-/// object by object before storing. The walk always covers the whole history (skipping
-/// the *fetch* of present objects, never the walk), so an interrupted earlier sync is
-/// healed instead of trusted.
+/// object by object before storing.
+///
+/// The walk stops at any parcel already reachable from a **local ref head** — every pallet
+/// and every meta pallet (`@office`, `@haul`, …), since they share one object store and a
+/// ref of either kind is an equally good witness. Their closures are complete by
+/// construction: a ref only moves once its objects are all present (a `stack` writes them
+/// first; a `lower` or `franchise` fetches the whole closure before the fast-forward). So a
+/// lower that brings one new parcel walks one parcel, not the whole history — the
+/// transfer-economics half of R5.
+///
+/// It still heals an interrupted earlier sync. An interruption leaves the ref where it was,
+/// so the objects it half-fetched sit *above* the bound and are re-walked exactly as before.
+/// What is no longer re-walked is history behind a ref, which was proven complete when that
+/// ref moved. (`audit` is what re-proves a whole history; this is a fetch, not an audit.)
+///
+/// The old walk also re-probed the remote for the signature of every unsigned parcel on
+/// every sync, since "no sidecar here" is indistinguishable from "not fetched yet". Behind
+/// the bound, it no longer asks.
 ///
 /// # Arguments
 /// * `client` - The remote.
 /// * `head`   - The parcel hash to fetch from.
 ///
 /// # Returns
-/// * `Ok(FetchStats)` - What was actually transferred.
+/// * `Ok(FetchStats)` - What was actually transferred, and how many parcels were walked.
 /// * `Err(String)`    - If a transfer or verification failed.
 pub async fn fetch_history(client: &RemoteClient, head: &str) -> Result<FetchStats, String> {
     let mut stats = FetchStats::default();
+
+    // Every local ref head — user pallets and meta pallets alike — and therefore every
+    // closure already known complete. Empty for a franchise into a fresh warehouse, which
+    // walks everything, as it must.
+    let complete: Vec<String> = pallet_utils::all_pallet_refs()?
+        .into_iter()
+        .map(|(_, head)| head)
+        .collect();
 
     let mut parcel_frontier: Vec<String> = vec![head.to_string()];
     let mut seen_parcels: HashSet<String> = HashSet::new();
@@ -400,14 +428,23 @@ pub async fn fetch_history(client: &RemoteClient, head: &str) -> Result<FetchSta
     let mut seen_blobs: HashSet<String> = HashSet::new();
 
     while !parcel_frontier.is_empty() {
-        let wave: Vec<String> = parcel_frontier.drain(..)
+        let candidates: Vec<String> = parcel_frontier.drain(..)
             .filter(|hash| seen_parcels.insert(hash.clone()))
             .collect();
+
+        let mut wave: Vec<String> = Vec::new();
+
+        for hash in candidates {
+            if !is_known_complete(&hash, &complete)? {
+                wave.push(hash);
+            }
+        }
 
         if wave.is_empty() {
             continue;
         }
 
+        stats.walked_parcels += wave.len();
         stats.fetched_objects += fetch_missing_objects(client, &wave).await?;
         stats.fetched_signatures += fetch_missing_signatures(client, &wave).await?;
 
@@ -453,6 +490,28 @@ pub async fn fetch_history(client: &RemoteClient, head: &str) -> Result<FetchSta
     }
 
     Ok(stats)
+}
+
+/// Whether a parcel's whole closure is already present, and so needs neither fetching nor
+/// walking: it is here, and it is reachable from a local ref head.
+///
+/// Only locally-present parcels are tested. A parcel we have not fetched yet cannot be
+/// behind a local ref, and asking would force the commit-graph to build records for an
+/// ancestry that is not here.
+fn is_known_complete(hash: &str, complete_heads: &[String]) -> Result<bool, String> {
+    if !file_utils::does_object_exist(hash)? {
+        return Ok(false);
+    }
+
+    for head in complete_heads {
+        // `is_ancestor` prunes on the commit-graph's generation numbers, so this costs the
+        // gap between the two, not the length of history.
+        if hash == head || merge_utils::is_ancestor(hash, head)? {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
 }
 
 /// Fetch (concurrently) the objects of the given hashes that are missing locally.

@@ -262,6 +262,7 @@ impl KeyRecord {
 }
 
 /// The full state of the office: every user and every key ever tracked.
+#[derive(Clone)]
 pub struct OfficeState {
     pub users: Vec<UserRecord>,
     pub keys: Vec<KeyRecord>,

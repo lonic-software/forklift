@@ -1648,3 +1648,78 @@ fn delta_bundle_reconstructs_a_files_many_versions() {
     let history = stdout(&area.forklift("b", &["history"]));
     assert!(history.contains("v1") && history.contains("v8"), "{}", history);
 }
+
+/// R5: a sync walks the *gap* between the heads, not the length of history.
+///
+/// The old walk descended every parcel back to the genesis on every `lower`, skipping only
+/// the *fetch* of objects it already had — and re-probing the remote for the signature of
+/// every unsigned parcel, since "no sidecar here" is indistinguishable from "not fetched
+/// yet". It now stops at any parcel already reachable from a local ref head, whose closure
+/// was proven complete when that ref moved.
+///
+/// Driven through `fetch_history` directly, because the bound is invisible from the CLI:
+/// the wasted work was local walking, not bytes on the wire.
+#[test]
+fn a_sync_walks_the_gap_between_the_heads_not_the_history() {
+    let area = TestArea::new("bounded-lower");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "a", &server.url);
+
+    // A history worth not re-walking.
+    for version in 0..6 {
+        area.write_file("a/code.txt", &format!("v{}\n", version));
+        assert_success(&area.forklift("a", &["load", "."]));
+        assert_success(&area.forklift("a", &["stack", &format!("parcel {}", version)]));
+    }
+
+    assert_success(&area.forklift("a", &["lift"]));
+
+    // B clones the whole history, so its ref head has a complete closure.
+    assert_success(&area.forklift(".", &["franchise", &server.url, "b"]));
+
+    // One more parcel on the remote.
+    area.write_file("a/code.txt", "the new segment\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "the new segment"]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    let remote_head = std::fs::read_to_string(area.path("server-root/.forklift/pallets/main"))
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let sync = |head: &str| -> forklift_core::util::remote_utils::FetchStats {
+        // A current-thread runtime: `fetch_history` spawns its transfers, and the storage
+        // scope is a thread-local, so the tasks must stay on this thread.
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let _scope = forklift_core::globals::StorageRootScope::enter(&area.path("b"));
+        let client = forklift_core::util::remote_utils::RemoteClient::new(&server.url, None).unwrap();
+
+        runtime
+            .block_on(forklift_core::util::remote_utils::fetch_history(&client, head))
+            .expect("fetch")
+    };
+
+    // Seven parcels behind it, and it walks the one that is new.
+    assert_eq!(sync(&remote_head).walked_parcels, 1, "a sync must walk only the gap");
+
+    // An interrupted sync is still healed. B's ref has not moved, so the parcel the fetch
+    // above stored sits *above* the bound: deleting it leaves a gap the next sync re-walks
+    // and re-fetches, exactly as the unbounded walk did.
+    let stored = area.path(&format!(
+        "b/.forklift/objects/{}/{}",
+        &remote_head[0..2],
+        &remote_head[2..]
+    ));
+    assert!(stored.exists(), "the earlier fetch stored the new parcel");
+    std::fs::remove_file(&stored).unwrap();
+
+    let healed = sync(&remote_head);
+    assert_eq!(healed.walked_parcels, 1, "the un-referenced parcel is still walked");
+    assert!(healed.fetched_objects >= 1, "an interrupted sync above the bound is healed");
+
+    // Once the ref has moved, an up-to-date sync walks nothing at all.
+    assert_success(&area.forklift("b", &["lower"]));
+    assert_eq!(sync(&remote_head).walked_parcels, 0, "an up-to-date sync walks nothing");
+}

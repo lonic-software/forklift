@@ -1376,7 +1376,7 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
                 "Establish the trust anchor (PUT /v1/trust) before lifting the office.".to_string()
             ))?;
 
-            let new_office_state = audit_utils::verify_office_chain(&anchor, &request.new_head)
+            let new_office_state = audit_utils::verify_office_chain_memoized(&anchor, &request.new_head)
                 .map_err(unprocessable)?;
 
             // Authentic is not authorized: every new office parcel must stay within
@@ -1421,7 +1421,7 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
                     office first.".to_string()
                 ))?;
 
-            let office_state = audit_utils::verify_office_chain(&anchor, &office_head)
+            let office_state = audit_utils::verify_office_chain_memoized(&anchor, &office_head)
                 .map_err(unprocessable)?;
 
             // Incremental: everything reachable from old_head was verified when

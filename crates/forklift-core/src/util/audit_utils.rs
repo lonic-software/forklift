@@ -4,7 +4,8 @@
 //! verification before committing a ref update, so a remote can never be pushed into a
 //! state a local audit would reject.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::sync::{Mutex, OnceLock};
 use crate::util::office_utils::{OfficeState, TrustAnchor};
 use crate::util::{file_utils, graph_utils, object_utils, sign_utils};
 
@@ -280,11 +281,11 @@ fn chains_to_identity_root(key: &crate::util::office_utils::KeyRecord,
 /// decide a security question.
 ///
 /// `known_verified` makes the walk incremental (the remote's ref update): everything
-/// reachable from a committed head was verified when that head was committed, so the
-/// walk stops at it without loading it. On a linear lift that makes the audit
-/// O(new parcels); a merge whose second parent rejoins below `known_verified` re-walks
-/// the shared ancestry (correct, just slower) — the boundary set is only collected
-/// when an unsigned parcel actually turns up, so the common all-signed lift never
+/// reachable from a committed head was verified when that head was committed, so none of
+/// that ancestry is walked. The audit is O(new parcels) — for a merge too, whose second
+/// parent rejoins below `known_verified`: [`new_parcels`] excludes the shared ancestry by
+/// generation number rather than by stopping at a single hash. The boundary set is only
+/// collected when an unsigned parcel actually turns up, so the common all-signed lift never
 /// pays for it.
 ///
 /// # Arguments
@@ -301,31 +302,16 @@ pub fn verify_pallet_history(head: &str,
                              anchor: &TrustAnchor,
                              office_state: &OfficeState,
                              known_verified: Option<&str>) -> Result<(usize, usize), String> {
-    // Phase 1 — discover the parcels to verify: a breadth-first walk of the pallet's
-    // ancestry, stopping at `known_verified` (everything reachable from it was verified
-    // when it was committed). Parent edges come from the commit-graph, which is content-
-    // addressed (a parcel's hash commits to its parents, so a present record's parents are
-    // exactly the real ones) and falls back to decoding the parcel when its record is not
-    // yet built — so the discovery set is always complete, and on a graph-warm warehouse
-    // it is found without decoding a single parcel body. The bodies are proven present in
-    // phase 2 instead, in parallel.
-    let mut queue: VecDeque<String> = VecDeque::new();
-    let mut visited: HashSet<String> = HashSet::new();
-    let mut parcels: Vec<String> = Vec::new();
-
-    queue.push_back(head.to_string());
-
-    while let Some(hash) = queue.pop_front() {
-        if known_verified == Some(hash.as_str()) || !visited.insert(hash.clone()) {
-            continue;
-        }
-
-        for parent in graph_utils::parents(&hash)? {
-            queue.push_back(parent);
-        }
-
-        parcels.push(hash);
-    }
+    // Phase 1 — discover the parcels to verify: everything reachable from `head` and not
+    // from `known_verified`, whose ancestry was verified when it was committed. The walk is
+    // bounded by the gap between the two heads, including across a merge (see
+    // [`new_parcels`]). Parent edges come from the commit-graph, which is content-addressed
+    // (a parcel's hash commits to its parents, so a present record's parents are exactly the
+    // real ones) and falls back to decoding the parcel when its record is not yet built — so
+    // the discovery set is always complete, and on a graph-warm warehouse it is found
+    // without decoding a single parcel body. The bodies are proven present in phase 2
+    // instead, in parallel.
+    let parcels = new_parcels(head, known_verified)?;
 
     // Phase 2 — verify every parcel's signature. Each check is independent: it runs
     // against the immutable `office_state` key registry, not against any neighbour, so the
@@ -529,7 +515,346 @@ fn classify_signature(hash: &str, office_state: &OfficeState) -> Result<Verdict,
     Ok(verdict)
 }
 
+/// Verified office chains, remembered per `(warehouse, anchor, office head)`.
+static VERIFIED_OFFICE_CHAINS: OnceLock<Mutex<OfficeChainMemo>> = OnceLock::new();
+
+/// How many verified chains to remember before evicting the least-recently-used one to
+/// make room for a new key. A hosting server can carry many more than sixteen tenants, so
+/// this bound is about keeping the memo small, not about how many warehouses are expected.
+const MAX_MEMOIZED_OFFICE_CHAINS: usize = 16;
+
+/// One remembered chain verification, tagged with when it was last touched.
+///
+/// "When" is a logical clock local to the memo, not a wall-clock timestamp: every hit and
+/// every insert draws the next tick from a counter that only ever increases, so entries can
+/// be ordered by recency without depending on the system clock.
+struct MemoEntry {
+    state: OfficeState,
+    last_used: u64,
+}
+
+/// A bounded memo of verified office chains, keyed by `(warehouse, anchor, office head)`
+/// (see [`office_chain_key`]).
+///
+/// At capacity, an insert of a new key evicts the single least-recently-used entry rather
+/// than clearing the whole memo. A server hosts as many warehouses as it has tenants, and
+/// each lands its own key here — clearing everything on the seventeenth distinct key would
+/// evict every other tenant's verified state along with it, degrading past the point of
+/// having no memo at all: constant recompute, plus the lock contention of a map that never
+/// gets to stay warm. Evicting one entry keeps the other tenants' memoized state intact.
+struct OfficeChainMemo {
+    entries: HashMap<String, MemoEntry>,
+    clock: u64,
+}
+
+impl OfficeChainMemo {
+    fn new() -> Self {
+        OfficeChainMemo { entries: HashMap::new(), clock: 0 }
+    }
+
+    // Only the tests below inspect size directly; production code only ever hits, inserts
+    // or clears the memo.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.clock = 0;
+    }
+
+    /// Look up `key`, marking it most-recently-used on a hit.
+    fn get(&mut self, key: &str) -> Option<OfficeState> {
+        let tick = self.next_tick();
+        let entry = self.entries.get_mut(key)?;
+        entry.last_used = tick;
+
+        Some(entry.state.clone())
+    }
+
+    /// Remember `state` under `key`, marking it most-recently-used.
+    ///
+    /// If the memo is already at [`MAX_MEMOIZED_OFFICE_CHAINS`] and `key` is not already
+    /// present, the entry with the smallest `last_used` is evicted first to make room — a
+    /// linear scan over at most sixteen entries, which is cheap enough not to need anything
+    /// fancier (a heap, an intrusive list) at this size.
+    fn insert(&mut self, key: String, state: OfficeState) {
+        if self.entries.len() >= MAX_MEMOIZED_OFFICE_CHAINS && !self.entries.contains_key(&key) {
+            let lru_key = self.entries.iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(k, _)| k.clone());
+
+            if let Some(lru_key) = lru_key {
+                self.entries.remove(&lru_key);
+            }
+        }
+
+        let tick = self.next_tick();
+        self.entries.insert(key, MemoEntry { state, last_used: tick });
+    }
+
+    fn next_tick(&mut self) -> u64 {
+        let tick = self.clock;
+        self.clock += 1;
+
+        tick
+    }
+}
+
+/// [`verify_office_chain`], remembered for the life of the process.
+///
+/// A server head runs the chain verification on *every* trusted ref update — including lifts
+/// of ordinary pallets, which only consume the resulting key registry and do not move the
+/// office head. That work is pure: the office objects are content-addressed and immutable, so
+/// the same head under the same anchor always verifies to the same state. Memoizing it turns
+/// an O(office history) signature walk per lift into one per office head.
+///
+/// **The warehouse root is part of the key on purpose.** Without it a multi-warehouse server
+/// could hand a verified state to a warehouse whose object store does not hold that chain at
+/// all — the same tenant-boundary mistake a scratch shared across warehouses would make. The
+/// whole anchor is folded in too, not just its genesis: a re-genesis changes the boundary.
+///
+/// Use this from a long-lived head. The `audit` command verifies once and exits, so it calls
+/// [`verify_office_chain`] directly and never consults a memo.
+///
+/// The memo (see [`OfficeChainMemo`]) holds at most [`MAX_MEMOIZED_OFFICE_CHAINS`] entries and
+/// evicts the least-recently-used one to make room for a new key, so a busy tenant's state
+/// stays warm and only idle tenants age out.
+pub fn verify_office_chain_memoized(
+    anchor: &TrustAnchor,
+    office_head: &str,
+) -> Result<OfficeState, String> {
+    let key = office_chain_key(anchor, office_head);
+    let memo = VERIFIED_OFFICE_CHAINS.get_or_init(|| Mutex::new(OfficeChainMemo::new()));
+
+    if let Some(state) = lock_memo(memo).get(&key) {
+        return Ok(state);
+    }
+
+    // Verified outside the lock: a slow chain must not block the other warehouses.
+    let state = verify_office_chain(anchor, office_head)?;
+
+    lock_memo(memo).insert(key, state.clone());
+
+    Ok(state)
+}
+
+/// The memo key: which warehouse, under which anchor, at which office head.
+fn office_chain_key(anchor: &TrustAnchor, office_head: &str) -> String {
+    format!(
+        "{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}",
+        crate::globals::forklift_root().to_string_lossy(),
+        anchor.genesis,
+        anchor.enabled_at,
+        anchor.boundary.join(","),
+        anchor.prior_genesis.as_deref().unwrap_or(""),
+        anchor.adopts.as_deref().unwrap_or(""),
+        office_head
+    )
+}
+
+/// Take the memo, recovering from a poisoned lock rather than failing.
+///
+/// A poisoned mutex means some thread panicked while holding it — an internal fault, and
+/// never the caller's doing. Both server heads map a failure of the memoized verification to
+/// `422 Unprocessable`, so returning an error here would tell a client its lift was invalid
+/// because the server had a bug. And there is nothing to protect: this is a cache of results
+/// that can always be recomputed. So the poison is cleared, whatever was in the memo is
+/// dropped, and the next verification simply repopulates it.
+fn lock_memo(
+    memo: &Mutex<OfficeChainMemo>,
+) -> std::sync::MutexGuard<'_, OfficeChainMemo> {
+    match memo.lock() {
+        Ok(chains) => chains,
+        Err(poisoned) => {
+            memo.clear_poison();
+
+            let mut chains = poisoned.into_inner();
+            chains.clear();
+
+            chains
+        }
+    }
+}
+
+/// Reachable from `head`.
+const FRESH: u8 = 1;
+
+/// Reachable from `known_verified` — already audited when that head was committed.
+const KNOWN: u8 = 2;
+
+/// Every parcel reachable from `head` that is **not** reachable from `known_verified`: the
+/// new segment of a lift, in breadth-first order from `head`.
+///
+/// This is the one ancestry walk the audit needs, and its cost is the *gap* between the two
+/// heads — not the length of history. The lever is the commit-graph's generation numbers
+/// (§B): a parcel's generation is one more than its parents' maximum, so a parent's
+/// generation is strictly less than its child's. Visiting parcels in descending generation
+/// order therefore guarantees that when a parcel is reached, every parcel that could reach
+/// *it* has already been visited — so its "reachable from head" / "reachable from the
+/// verified head" marks are final on arrival, and the walk can stop the moment no
+/// unvisited parcel is still marked fresh.
+///
+/// It replaces two walks that were both O(history) on every lift:
+///
+/// * `collect_reachable(known_verified)`, which decoded every parcel body in the verified
+///   head's ancestry just to build a prune set; and
+/// * a breadth-first discovery that stopped only at the *exact* `known_verified` hash. That
+///   is the right frontier for a linear lift, where the verified head is the unique
+///   boundary — but a merge's boundary is the merge-base *set*, which one hash cannot
+///   express, so a merge walked below the fork point and re-verified ancestry that was
+///   audited when `known_verified` was committed.
+///
+/// Excluding that ancestry is sound on exactly the invariant the incremental audit already
+/// rests on: everything reachable from a committed head was verified when it was committed.
+/// A creation (`known_verified: None`) still walks the whole history.
+///
+/// # Arguments
+/// * `head`           - The parcel whose new ancestry to collect.
+/// * `known_verified` - A head already known good (`None` collects everything).
+///
+/// # Returns
+/// * `Ok(Vec<String>)` - The new parcels, breadth-first from `head`.
+/// * `Err(String)`     - If a parcel is in neither the commit-graph nor the object store.
+pub fn new_parcels(head: &str, known_verified: Option<&str>) -> Result<Vec<String>, String> {
+    let fresh: Option<HashSet<String>> = match known_verified {
+        None => None,
+        Some(bound) if bound == head => return Ok(Vec::new()),
+        Some(bound) => Some(fresh_frontier(head, bound)?),
+    };
+
+    // Breadth-first from `head`, so the order — and therefore the first failure an audit
+    // reports — is exactly what the unbounded walk produced.
+    let mut order: Vec<String> = Vec::new();
+    let mut queue: VecDeque<String> = VecDeque::new();
+    let mut visited: HashSet<String> = HashSet::new();
+
+    queue.push_back(head.to_string());
+
+    while let Some(hash) = queue.pop_front() {
+        if fresh.as_ref().is_some_and(|fresh| !fresh.contains(&hash)) {
+            continue;
+        }
+
+        if !visited.insert(hash.clone()) {
+            continue;
+        }
+
+        for parent in graph_utils::parents(&hash)? {
+            queue.push_back(parent);
+        }
+
+        order.push(hash);
+    }
+
+    Ok(order)
+}
+
+/// The set behind [`new_parcels`]: parcels reachable from `head` but not from `bound`.
+///
+/// A max-heap on the generation number drives the walk, so parcels are settled newest-first
+/// and each one's marks are final when it is popped (every parcel that could mark it has a
+/// strictly greater generation, hence was popped earlier). The walk stops as soon as nothing
+/// fresh is left pending: whatever remains is reachable from `bound`, and so is everything
+/// behind it.
+fn fresh_frontier(head: &str, bound: &str) -> Result<HashSet<String>, String> {
+    let mut walk = Frontier::default();
+
+    walk.mark(head, FRESH)?;
+    walk.mark(bound, KNOWN)?;
+
+    // Nothing fresh left pending means nothing new can be discovered: every parcel still on
+    // the heap is reachable from `bound`, and so is all of its ancestry.
+    while walk.fresh_pending > 0 {
+        let Some((_, hash)) = walk.heap.pop() else {
+            break;
+        };
+
+        if !walk.settled.insert(hash.clone()) {
+            continue;
+        }
+
+        let marks = walk.marks[&hash];
+
+        if marks & FRESH != 0 {
+            walk.fresh_pending -= 1;
+        }
+
+        // Reachable from `bound`: none of it is new, and neither is anything behind it.
+        let inherited = if marks & KNOWN != 0 {
+            KNOWN
+        } else {
+            walk.fresh.insert(hash.clone());
+            FRESH
+        };
+
+        for parent in walk.parents_of[&hash].clone() {
+            walk.mark(&parent, inherited)?;
+        }
+    }
+
+    Ok(walk.fresh)
+}
+
+/// The bookkeeping of [`fresh_frontier`].
+#[derive(Default)]
+struct Frontier {
+    /// The `FRESH`/`KNOWN` bits per parcel. Final once the parcel is settled.
+    marks: HashMap<String, u8>,
+
+    /// Parent edges, read from the commit-graph as each parcel is first seen.
+    parents_of: HashMap<String, Vec<String>>,
+
+    /// Unsettled parcels, newest generation first.
+    heap: BinaryHeap<(u32, String)>,
+
+    /// Parcels already popped; their marks will not change again.
+    settled: HashSet<String>,
+
+    /// The answer: fresh and not known.
+    fresh: HashSet<String>,
+
+    /// How many unsettled parcels carry `FRESH` — the walk's reason to keep going.
+    fresh_pending: usize,
+}
+
+impl Frontier {
+    /// Add `flag` to `hash`, enqueueing it under its generation the first time it is seen.
+    fn mark(&mut self, hash: &str, flag: u8) -> Result<(), String> {
+        let before = self.marks.get(hash).copied();
+
+        self.marks.insert(hash.to_string(), before.unwrap_or(0) | flag);
+
+        // Newly fresh: one more parcel worth walking for. A parcel can only gain marks
+        // before it settles, so this never counts a settled parcel.
+        if flag == FRESH && before.unwrap_or(0) & FRESH == 0 {
+            self.fresh_pending += 1;
+        }
+
+        if before.is_none() {
+            let node = graph_utils::node(hash)?;
+
+            self.parents_of.insert(hash.to_string(), node.parents);
+            self.heap.push((node.generation, hash.to_string()));
+        }
+
+        Ok(())
+    }
+}
+
 /// Collect every parcel reachable from the given heads (the heads included).
+///
+/// The audit no longer uses this — see [`new_parcels`], which is bounded. It remains the
+/// right primitive for the callers that genuinely need the whole set (bundle building, pack
+/// reachability, `deliver`), and it decodes parcel bodies on purpose there: those callers go
+/// on to read the objects, so a commit-graph record would not save them the read *and* would
+/// not prove the object is present.
 ///
 /// # Arguments
 /// * `heads` - The starting parcel hashes.
@@ -810,7 +1135,16 @@ pub fn verify_one_signature(parcel_hash: &str,
 /// before committing a ref update.
 ///
 /// Everything reachable from `known_complete` is assumed complete (it was verified when
-/// that head was committed), so only the new slice is walked.
+/// that head was committed), so only the new slice is walked — including across a merge
+/// that rejoins below it. Until 2026-07-09 this held for trees and blobs but not for parcel
+/// bodies: the prune set was built with `collect_reachable(known_complete)`, which decoded
+/// every one of them. It no longer touches them, which is what makes an incremental lift
+/// O(new parcels) instead of O(history).
+///
+/// The consequence, stated plainly: a store that has *lost* a parcel behind
+/// `known_complete` no longer fails here. It never failed on a lost tree or blob behind it
+/// either — that ancestry is trusted, by the same induction the signature audit uses. The
+/// full `audit` command (`known_complete: None`) is what proves the whole history present.
 ///
 /// # Arguments
 /// * `head`           - The head whose history to verify.
@@ -845,30 +1179,20 @@ pub fn verify_parcel_closure_with(
     known_complete: Option<&str>,
     blob_exists: &dyn Fn(&str) -> Result<bool, String>,
 ) -> Result<(), String> {
-    let complete = match known_complete {
-        Some(hash) => collect_reachable(&[hash.to_string()])?,
-        None => HashSet::new(),
-    };
+    // Only the new segment: the closure behind `known_complete` was proven complete when
+    // that head was committed. This walk used to build its prune set with
+    // `collect_reachable(known_complete)`, which decoded every parcel body in the ancestry —
+    // O(history) on every ref update, however little the lift added.
+    let parcels = new_parcels(head, known_complete)
+        .map_err(|e| format!("The history behind {} is incomplete: {}", head, e))?;
 
-    let mut queue: VecDeque<String> = VecDeque::new();
-    let mut visited: HashSet<String> = HashSet::new();
     let mut visited_trees: HashSet<String> = HashSet::new();
 
-    queue.push_back(head.to_string());
-
-    while let Some(hash) = queue.pop_front() {
-        if complete.contains(&hash) || !visited.insert(hash.clone()) {
-            continue;
-        }
-
-        let parcel = object_utils::load_parcel(&hash)
+    for hash in &parcels {
+        let parcel = object_utils::load_parcel(hash)
             .map_err(|e| format!("The history behind {} is incomplete: {}", head, e))?;
 
         verify_tree_closure(&parcel.tree_hash, &mut visited_trees, blob_exists)?;
-
-        for parent in parcel.parents {
-            queue.push_back(parent);
-        }
     }
 
     Ok(())
@@ -1211,5 +1535,90 @@ mod tests {
 
         let error = verify_new_key_endorsements(None, &broken).unwrap_err();
         assert!(error.contains("pins identity root"), "{}", error);
+    }
+
+    /// A poisoned memo is an internal fault, never a client's. Recover from it rather than
+    /// reporting it: both server heads turn a failure of the memoized office verification
+    /// into a `422`, which would tell a client its lift was invalid because the server had
+    /// a bug. Nothing is lost — the memo only holds results that can be recomputed.
+    #[test]
+    fn a_poisoned_office_memo_recovers_instead_of_failing() {
+        let memo = VERIFIED_OFFICE_CHAINS.get_or_init(|| Mutex::new(OfficeChainMemo::new()));
+
+        // Panic while holding the lock, exactly as an internal fault would.
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = memo.lock().unwrap();
+            panic!("a thread died holding the office memo");
+        }));
+
+        assert!(panicked.is_err());
+        assert!(memo.is_poisoned(), "the lock is poisoned");
+
+        // The memo is taken anyway, emptied, and usable again.
+        {
+            let mut chains = lock_memo(memo);
+            assert!(chains.is_empty(), "a recovered memo starts clean");
+            chains.insert("key".to_string(), OfficeState { users: Vec::new(), keys: Vec::new() });
+        }
+
+        assert!(!memo.is_poisoned(), "the poison is cleared, so the memo caches again");
+        assert_eq!(lock_memo(memo).len(), 1, "and the entry survives the next lock");
+
+        lock_memo(memo).clear();
+    }
+
+    /// A blank office state, cheap to construct, for tests that only care about the memo's
+    /// bookkeeping and not about what it stores.
+    fn blank_office_state() -> OfficeState {
+        OfficeState { users: Vec::new(), keys: Vec::new() }
+    }
+
+    /// A server hosting more warehouses than [`MAX_MEMOIZED_OFFICE_CHAINS`] must never grow
+    /// the memo past that bound — this is exercised against a locally constructed memo, not
+    /// the process-global one, so it stays deterministic under parallel test execution.
+    #[test]
+    fn the_office_memo_never_exceeds_its_capacity() {
+        let mut memo = OfficeChainMemo::new();
+
+        for i in 0..(MAX_MEMOIZED_OFFICE_CHAINS * 2) {
+            memo.insert(format!("key-{i}"), blank_office_state());
+            assert!(
+                memo.len() <= MAX_MEMOIZED_OFFICE_CHAINS,
+                "the memo grew past capacity after inserting key-{i}"
+            );
+        }
+
+        assert_eq!(memo.len(), MAX_MEMOIZED_OFFICE_CHAINS);
+    }
+
+    /// At capacity, a new key must evict only the least-recently-used entry — not the whole
+    /// memo — and a recent hit must protect an entry from being that victim.
+    #[test]
+    fn the_office_memo_evicts_only_the_least_recently_used_entry() {
+        let mut memo = OfficeChainMemo::new();
+
+        for i in 0..MAX_MEMOIZED_OFFICE_CHAINS {
+            memo.insert(format!("key-{i}"), blank_office_state());
+        }
+
+        // Touch "key-0" so it is now the most-recently-used; "key-1" becomes the least.
+        assert!(memo.get("key-0").is_some());
+
+        // One more distinct key, at capacity, forces exactly one eviction.
+        memo.insert("key-new".to_string(), blank_office_state());
+
+        assert_eq!(
+            memo.len(),
+            MAX_MEMOIZED_OFFICE_CHAINS,
+            "capacity is preserved, not cleared"
+        );
+        assert!(memo.get("key-0").is_some(), "the recently-hit entry survives");
+        assert!(memo.get("key-1").is_none(), "the least-recently-used entry was evicted");
+        assert!(memo.get("key-new").is_some(), "the new entry was inserted");
+
+        // Every other entry from the original fill is untouched — this was not a clear-all.
+        for i in 2..MAX_MEMOIZED_OFFICE_CHAINS {
+            assert!(memo.get(&format!("key-{i}")).is_some(), "key-{i} should not have been evicted");
+        }
     }
 }

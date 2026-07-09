@@ -426,7 +426,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 if is_office {
                     // The office chain carries the keys; verify it against the anchor, and
                     // that every new parcel stayed within its signer's privileges.
-                    audit_utils::verify_office_chain(anchor, &request.new_head)
+                    audit_utils::verify_office_chain_memoized(anchor, &request.new_head)
                         .map_err(HeadError::unprocessable)?;
 
                     audit_utils::verify_office_privileges(
@@ -445,7 +445,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                         )
                     })?;
 
-                    let office_state = audit_utils::verify_office_chain(anchor, office_head)
+                    let office_state = audit_utils::verify_office_chain_memoized(anchor, office_head)
                         .map_err(HeadError::unprocessable)?;
 
                     audit_utils::verify_pallet_history(
