@@ -14,6 +14,13 @@
 //! roles the server head consults gate *what* they may move). This type enforces the
 //! provider-independent content invariants: hash-verified objects, a fast-forward-only CAS,
 //! and — on a trusted warehouse — the full offline audit before a ref moves.
+//!
+//! **Every method here is synchronous and must be called from a blocking thread**
+//! (`tokio::task::spawn_blocking`), exactly as `forklift-server` runs its handlers' storage
+//! work. It mirrors objects into a thread-local-scoped scratch and runs `forklift_core`'s
+//! audit inside that scope, so the call must never migrate between threads mid-flight; and
+//! tokio refuses to let a runtime worker block on the futures an SDK-backed store bridges.
+//! See `blocking.rs` (R4).
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;

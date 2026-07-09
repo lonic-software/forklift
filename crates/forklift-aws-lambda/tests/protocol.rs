@@ -17,8 +17,10 @@ use forklift_aws_lambda::error::Status;
 use forklift_aws_lambda::head::{ObjectReadResult, ObjectWriteResult, TrustResult};
 use forklift_aws_lambda::memory::{MemoryObjectStore, MemoryRefStore};
 use forklift_aws_lambda::scratch::Scratch;
-use forklift_aws_lambda::store::{ObjectStore, PromoteOutcome, RefStore, SignatureOutcome};
-use forklift_aws_lambda::{BatchResult, Head};
+use forklift_aws_lambda::store::{
+    CasOutcome, ObjectStore, PromoteOutcome, PutOutcome, RefStore, SignatureOutcome, TrustOutcome,
+};
+use forklift_aws_lambda::{AsyncBridge, BatchResult, Head};
 
 use forklift_core::globals::StorageRootScope;
 use forklift_core::model::remote::{RefUpdateRequest, TrustAnchorDto};
@@ -904,4 +906,134 @@ fn upload_targets_negotiates_without_sending_bodies() {
     assert_eq!(answer.present, vec![present_hash]);
     assert_eq!(answer.direct, vec![wanted_hash]);
     assert!(answer.targets.is_empty());
+}
+
+// ---------------------------------------------------------------------------------------
+// R4: the sync/async seam. Stores whose every operation is a future — the AWS SDK's shape —
+// implementing the synchronous traits through `AsyncBridge`.
+// ---------------------------------------------------------------------------------------
+
+/// An [`ObjectStore`] whose every call suspends, as an `aws-sdk-s3` call does. It exists to
+/// prove the seam: `forklift_core`'s synchronous audit, its thread-local storage scope and
+/// the whole `Head` run on one blocking thread, over a backend that is async underneath.
+struct AsyncObjectStore {
+    inner: MemoryObjectStore,
+    bridge: AsyncBridge,
+}
+
+/// Suspend first, *then* do the work — the shape of a real SDK call, whose response is
+/// handled after the await. A future that cannot resolve on its first poll, so the driver
+/// underneath must genuinely be running for the bridged call to return at all.
+async fn suspending<T>(work: impl FnOnce() -> T) -> T {
+    tokio::task::yield_now().await;
+
+    work()
+}
+
+impl ObjectStore for AsyncObjectStore {
+    fn exists(&self, hash: &str) -> Result<bool, String> {
+        self.bridge.block_on(suspending(|| self.inner.exists(hash)))
+    }
+
+    fn get(&self, hash: &str) -> Result<Option<Vec<u8>>, String> {
+        self.bridge.block_on(suspending(|| self.inner.get(hash)))
+    }
+
+    fn put_verified(&self, hash: &str, bytes: &[u8]) -> Result<PutOutcome, String> {
+        self.bridge.block_on(suspending(|| self.inner.put_verified(hash, bytes)))
+    }
+
+    fn get_signature(&self, parcel_hash: &str) -> Result<Option<Vec<u8>>, String> {
+        self.bridge.block_on(suspending(|| self.inner.get_signature(parcel_hash)))
+    }
+
+    fn put_signature(&self, parcel_hash: &str, bytes: &[u8]) -> Result<SignatureOutcome, String> {
+        self.bridge.block_on(suspending(|| self.inner.put_signature(parcel_hash, bytes)))
+    }
+}
+
+/// The same for the consistency point: DynamoDB is async too.
+struct AsyncRefStore {
+    inner: MemoryRefStore,
+    bridge: AsyncBridge,
+}
+
+impl RefStore for AsyncRefStore {
+    fn get_head(&self, namespace: pallet_utils::PalletNamespace, name: &str) -> Result<Option<String>, String> {
+        self.bridge.block_on(suspending(|| self.inner.get_head(namespace, name)))
+    }
+
+    fn compare_and_set_head(
+        &self,
+        namespace: pallet_utils::PalletNamespace,
+        name: &str,
+        expected: Option<&str>,
+        new: &str,
+    ) -> Result<CasOutcome, String> {
+        self.bridge
+            .block_on(suspending(|| self.inner.compare_and_set_head(namespace, name, expected, new)))
+    }
+
+    fn list_refs(&self) -> Result<Vec<(pallet_utils::PalletRef, String)>, String> {
+        self.bridge.block_on(suspending(|| self.inner.list_refs()))
+    }
+
+    fn default_pallet(&self) -> Result<String, String> {
+        self.bridge.block_on(suspending(|| self.inner.default_pallet()))
+    }
+
+    fn get_trust(&self) -> Result<Option<office_utils::TrustAnchor>, String> {
+        self.bridge.block_on(suspending(|| self.inner.get_trust()))
+    }
+
+    fn put_trust_if_absent(&self, anchor: &office_utils::TrustAnchor) -> Result<TrustOutcome, String> {
+        self.bridge.block_on(suspending(|| self.inner.put_trust_if_absent(anchor)))
+    }
+
+    fn replace_trust(&self, anchor: &office_utils::TrustAnchor) -> Result<(), String> {
+        self.bridge.block_on(suspending(|| self.inner.replace_trust(anchor)))
+    }
+}
+
+/// R4: the whole trusted lift — mirror, thread-local storage scope, signature audit, CAS —
+/// runs synchronously on a blocking thread over stores that are async underneath. This is
+/// the shape milestone C's S3 + DynamoDB implementations take, minus AWS.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_trusted_lift_runs_over_async_backed_stores_from_a_blocking_thread() {
+    let area = Area::new("async-seam");
+    prepare(&area, "wh");
+    area.forklift("wh", &["office", "enroll"]);
+    area.write_file("wh/app.txt", "v1\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "signed one"]);
+
+    let harvested = harvest(&area.path("wh"));
+    let office_head = harvested.head_of("@office").expect("office head");
+    let main_head = harvested.head_of("main").expect("main head");
+
+    let bridge = AsyncBridge::current().expect("the test runs on a multi-thread runtime");
+
+    let head = Head::new(
+        AsyncObjectStore { inner: MemoryObjectStore::new(), bridge: bridge.clone() },
+        AsyncRefStore { inner: MemoryRefStore::new(), bridge },
+    );
+
+    let expected = main_head.clone();
+
+    tokio::task::spawn_blocking(move || {
+        upload_all(&head, &harvested);
+        head.put_trust(harvested.trust.as_ref().expect("trust")).expect("plant trust");
+
+        head.ref_update("@office", &RefUpdateRequest { old_head: None, new_head: office_head })
+            .expect("lift the office over an async store");
+        head.ref_update("main", &RefUpdateRequest { old_head: None, new_head: main_head })
+            .expect("lift the pallet over an async store");
+
+        assert_eq!(
+            head.refs.get_head(pallet_utils::PalletNamespace::User, "main").unwrap().as_deref(),
+            Some(expected.as_str())
+        );
+    })
+    .await
+    .expect("the head runs to completion on a blocking thread");
 }

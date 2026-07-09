@@ -12,3 +12,4 @@ license-file = "../../LICENSE-FSL"
 forklift-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tokio = { workspace = true }
