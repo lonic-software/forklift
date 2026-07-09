@@ -33,6 +33,7 @@ contention.** Two things decide almost every row:
 | **diff** (cross-revision) | occasional | histogram diff, per changed file | **independent per file** | output must be path-ordered (collect-then-print); blob reads hit the read-cache | **Done — 1.4–5.7×** (18 cores; scales with per-file diff size — compute-bound at the high end) | — |
 | **consolidate / merge** | occasional | 3-way LCS, per *divergent* file | **independent per file** | walk records deferred jobs; end-to-end diluted by the sequential apply-writes + stack | **Done — 6.4× merge / 2.5× end-to-end** (18 cores; compute-bound; only wide merges) | — |
 | **compact** | occasional (auto) | zstd delta-compress, per object | path-deltas independent; window + `PackWriter` sequential | the sliding delta `window` (each object deltas against just-packed neighbours) and the single-file append stay serial | **Done — ~2.1×** (18 cores; **byte-identical output**; read-cache-bound below the CPU ceiling) | — |
+| **compact --all** (repack) | occasional (auto) | reachability walk + verbatim record copy, per object | one shared reachability pass (D/P3, below); `CopyRecord` targets need no CPU, only a memory copy | the steady-state case (no garbage, no loose) is **not** CPU-bound at all — it is walk-reads and small memcpys | **Done — steady-state repack ~4.5×** (238 ms → 53 ms on a 401-parcel/7442-object corpus; **byte-identical output**; see D/P3 below) | — |
 | **import-git** | rare (once) | read pipe → build → **store loose file** | the store is the bottleneck | *measured*: **71% is writing loose object files** — the same FS-metadata wall as `materialize`; pipe read 21% (serial source), compress 4% | **Not worth it** — parallel stores regress (materialize lesson); pipe is serial | — |
 | **export-git** | rare | spawn a `git` subprocess per object | DAG-ordered; subprocess per unit | one `git` process per commit/tree/blob, invoked serially; `&mut` memo | **Low** — commits are DAG-ordered; only independent blob `hash-object`s could overlap | med |
 | **bundle build** | occasional (server) | write object into one zstd stream | **sequential sink** | a single `zstd::Encoder` — one compression stream, inherently serial | **None** without a reframed multi-frame format | high |
@@ -124,6 +125,133 @@ contention.** Two things decide almost every row:
    `.pack` and `.idx` files** on a 6480-object store; measured **1290 ms → 610 ms (~2.1×)**. The
    window and the append stay serial by nature, and the delta bases are object reads through the
    shared caches, so it lands at the read-cache ceiling rather than near-linear — the expected place.
+
+6. **`compact --all` (repack) — done, milestone D/P3: one shared reachability pass + mmap'd
+   verbatim copies + `[u8; 32]` path-base keys, all byte-identical.** This is *not* a
+   parallelization change (repack's reachability walk is a single-threaded DAG traversal, not a
+   fan-out candidate — see the "sequential-chain" exclusion in `fanout_utils`'s doc comment); it
+   is a redundant-I/O and per-record-copy fix that pays off specifically in the **steady-state**
+   repack, `compact --all`'s common case once a warehouse is compacted and stays garbage-free.
+
+   **What the roadmap assumed vs what the code did.** The roadmap estimated "~5 parcel re-reads"
+   per parcel across the repack phases; instrumenting the actual walk (temporarily, on a
+   401-parcel/7442-object synthetic corpus) confirmed it exactly: **2005 logical parcel reads /
+   401 parcels = 5.0**, when both the garbage-liveness walk (`gc_utils::collect_live_set` →
+   `audit_utils::collect_reachable_present`, then a second read per parcel for its `tree_hash`)
+   and the path-base walk (`compute_path_bases` → `audit_utils::collect_reachable`,
+   `bundle_utils::topo_order_oldest_first`, then a third read per parcel for its `tree_hash`) run
+   — the general case, whenever any loose object or packed garbage is present. In the *pure*
+   steady-state case (no garbage, no loose — every target is a `CopyRecord`), the path-base walk
+   is already skipped by an existing `needs_delta` check, leaving **802 / 401 = 2.0** reads/parcel.
+   Each "read" is a pack lookup + zstd decode + Blake3 verify, so both counts were real,
+   measurable waste, not a rounding artifact.
+
+   Separately, every `CopyRecord` — the fast path that carries an already-good delta or full
+   record from an old pack into the new one verbatim — went through a **fresh `File::open` +
+   `seek` + `read_exact`** per record (`read_pack_slice`), even though the same packs had *just*
+   been mmap'd once by `loaded_packs()` earlier in the same function to enumerate them.
+
+   **The fix, three pieces:**
+   - **One shared reachability pass.** A `ParcelReadMemo` RAII guard (`object_utils.rs`) turns on
+     a thread-local decode cache (parcel *bytes*, not the parsed `Parcel`, so no `Clone` is needed
+     on the model) for exactly the reachability phase in `compact` — `collect_targets` (the
+     liveness walk) and `compute_path_bases` (the path-base walk) — and is dropped before the
+     parallel batch-write loop starts, so no fan-out worker thread ever sees it (it is
+     deliberately `!Send` via `Rc`, not `Arc` — this is single-threaded work, no synchronization
+     needed). A parcel is decoded once; every further logical read in the phase — of which there
+     are up to 5 — is a pointer clone. This does not change *what* any phase decides, only how
+     often the bytes are fetched from the store.
+   - **mmap'd repack copies.** `collect_targets` now returns the `Arc<Vec<LoadedPack>>` it already
+     built (renamed `source_packs`), kept alive for the whole `compact` call. Each `CopyRecord`
+     target carries a `pack_index` into that vector instead of a `PathBuf`, and the copy
+     (`framed_record`) is a `Cow::Borrowed` slice straight out of the pack's `Mmap` — zero-copy,
+     zero-syscall — for the common framed (version ≥ 2) case; only the rare unframed (version-1)
+     record still allocates, to prepend the missing kind byte. The **only** thing proven to
+     matter for the byte-identical-output contract is that the copied bytes are unchanged — a
+     borrow of the same bytes a fresh `read_exact` would have produced is trivially
+     byte-identical, so this is a pure latency win with no risk to the D5 pack-id/idempotent-repack
+     invariant (the id is computed from the *records themselves*, not from how they were sourced).
+   - **`[u8; 32]` path-base keys.** `compute_path_bases`'s `blob hash → base hash` map (and the
+     `latest_at_path` chain-depth map) switched from 64-byte hex `String` keys to raw 32-byte
+     Blake3 digests (`sign_utils::from_hex`/`to_hex` already existed for the boundary conversions
+     needed at the object-store read). This map is purely an in-memory intermediate — never
+     serialized, never crosses a wire format — so the change is invisible outside this function;
+     `prepare_target`'s lookup also got simpler (`path_bases.get(&target.hash)` directly, no
+     re-hexing the target hash to look it up, since `target.hash` was already `[u8; 32]`).
+
+     **A pitfall caught before it shipped, worth recording.** The same code path also touches
+     `seen_blobs`, the `Bloom` filter that deduplicates the walk (§ above, "Bounding the phase-2b
+     walk memory"). It would have been natural to feed the Bloom filter the new raw `[u8; 32]`
+     bytes too, alongside the map key change — same logical value, seemingly free. It is **not**
+     free: a `HashMap` lookup is exact, so any byte encoding of the same key gives the same answer
+     — but a Bloom filter is *probabilistic*, and which bytes it hashes decides its false-positive
+     *pattern*. A false positive on `seen_blobs` is the mechanism that makes a blob fall back to
+     the size window instead of getting a path-base delta (a deliberately safe degrade, per the
+     Bloom section above) — so a different FP pattern means a different object gets that fallback,
+     which means different delta bytes in the pack. The 401-parcel/~7 500-object synthetic corpus
+     used to verify byte-identity here is far below this Bloom filter's sizing floor (4096 elements
+     minimum), so it never actually triggers a false positive either way — meaning this specific
+     regression would have passed every check in this change *and still broken before-vs-after
+     byte-identity on a large enough store* (git.git-scale, where the doc above already establishes
+     false positives are expected and accepted). The fix: `seen_blobs` keeps hashing exactly the
+     same hex-string bytes it always did (`record_path_base` now takes both the raw `[u8; 32]` for
+     the exact maps and the original hex `&str` for the Bloom calls); only the exact-lookup maps
+     changed representation. General lesson for this codebase: an exact structure (`HashMap`,
+     `BTreeMap`, sorted comparison) is safe to re-key to an equivalent encoding; a probabilistic
+     one (`Bloom`, any hash-bucketed sketch) is not — its output depends on the literal bytes
+     hashed, not just their logical value, and that can only be caught by testing at the scale
+     where it actually engages, which a small synthetic corpus will not do.
+
+   **Byte-identity verification.** `repacking_is_byte_reproducible` (`crates/forklift/tests/determinism.rs`)
+   passes unchanged. Additionally verified end-to-end on the synthetic corpus: `compact` then
+   `compact --all` (twice) with the pre-change binary, and again with the post-change binary,
+   comparing SHA-256 of every `.pack`/`.idx` file — **identical hashes, both for the fresh pack
+   and for the steady-state repack.** This is the strongest test available short of a formal
+   proof: real binaries, real files, real hashes, not just the unit test's assertion.
+
+   **Measured (18 cores, 401-parcel/7442-object synthetic corpus, 5 runs each, min/median ms):**
+
+   | Path | Before | After | Change |
+   |------|--------|-------|--------|
+   | `compact` (fresh, loose→pack) | min 2230 / med 2255 | min 2242 / med 2249 | unchanged (expected — untouched path, no `CopyRecord`s, zstd-delta-bound) |
+   | `compact --all` (steady-state repack, all `CopyRecord`) | min 236 / med 238 | min 52 / med 53 | **~4.5× faster** |
+   | `compact --all` (first repack, from all-loose — exercises both walks) | min 2274 / med 2280 | min 2254 / med 2268 | ~0.5% faster (noise-level — this path is zstd-delta-compute-bound, same as fresh `compact`; the reachability-walk savings are real but small next to the delta compression cost) |
+
+   The steady-state win is the headline because it is `compact --all`'s *common* case in
+   practice: a warehouse settles into "already packed, nothing new to delta" between imports, and
+   every repack from there on was paying the 5×-read + per-record-file-open tax for work that
+   produces the exact same bytes as a cheaper path. The all-loose/fresh-compact paths are
+   dominated by zstd delta compression (already parallelized, item 5 above) and were never the
+   target of this change — their near-zero movement is the expected, honest result, not a miss.
+
+   **Memory.** `/usr/bin/time -l` on the same corpus: peak RSS for the steady-state repack was
+   ~17.6 MB before, ~17.0 MB after — no measurable regression from retaining the source packs'
+   mmaps for the run. This corpus's whole pack is ~1 MB (well under the 512 MiB rollover), so it
+   does not stress-test mmap retention at scale; the honest caveat is that a repack consolidating
+   many large packs (git.git scale, hundreds of MB across several pack files) would hold all of
+   them mapped simultaneously for the run, where before only one was file-read at a time. Virtual
+   address space is not a practical constraint on 64-bit, and *resident* memory only grows with
+   pages actually touched (the copy only touches the bytes it copies), so this is not expected to
+   regress kernel-scale RSS materially — but it has not been measured at that scale in this
+   change, and is worth re-checking if `compact --all` is ever profiled on git.git again.
+
+   **Durable-before-destructive, unaffected — with one portability fix caught along the way.**
+   This change touches only *reads* (the reachability walk, the verbatim-copy source), so the
+   fsync-before-delete sequence itself is untouched: new pack data fsynced → index fsynced → pack
+   directory fsynced → loose sources removed → old packs removed, in the same order as before.
+   But holding the source packs' `Mmap`s for the *whole* `compact` call (rather than the old
+   per-record `File::open` that closed the instant each record was read) is a real change to how
+   long an old pack file stays open — and on Windows, `remove_file` on a file that is still open
+   (or mapped) without `FILE_SHARE_DELETE`, the platform default, fails outright. POSIX permits
+   unlinking an open/mapped file unconditionally, so this would not have shown up testing only on
+   macOS/Linux. The fix: `compact` explicitly `drop(source_packs)` right after the write loop's
+   last use of it, *before* `sync_dir` and both removal sweeps — restoring the old code's
+   mmap-lifetime guarantee (gone by the time anything is deleted) despite now holding one shared
+   handle for the whole run instead of one per record. Pinned by a new unit test,
+   `a_repack_physically_removes_old_pack_files_it_supersedes`, which repacks a store with no
+   pallet refs (so every packed object is legitimately unreachable) and asserts the old pack
+   files are actually gone from disk afterward — the outcome the drop exists to protect, even
+   though the specific Windows failure mode can't be exercised from this (POSIX) dev environment.
 
 ## Where parallelism does *not* pay (and why)
 

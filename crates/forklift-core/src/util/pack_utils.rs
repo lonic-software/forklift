@@ -30,7 +30,7 @@
 //! base can only fail a read, never return wrong bytes silently.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -708,30 +708,17 @@ pub fn is_in_packs(hash: &str) -> Result<bool, String> {
     Ok(packs.iter().any(|pack| pack.locate(&hash_bytes).is_some()))
 }
 
-/// Read `length` bytes at `offset` from a pack data file.
-fn read_pack_slice(data_path: &Path, offset: u64, length: u64) -> Result<Vec<u8>, String> {
-    let mut file = std::fs::File::open(data_path)
-        .map_err(|e| format!("Error while opening pack \"{}\": {}", data_path.to_string_lossy(), e))?;
-
-    file.seek(SeekFrom::Start(offset))
-        .map_err(|e| format!("Error while seeking in pack \"{}\": {}", data_path.to_string_lossy(), e))?;
-
-    let mut buffer = vec![0u8; length as usize];
-    file.read_exact(&mut buffer)
-        .map_err(|e| format!("Error while reading from pack \"{}\": {}", data_path.to_string_lossy(), e))?;
-
-    Ok(buffer)
-}
-
 /// Where an object to pack comes from, and how to pack it.
 enum Source {
     /// A loose file: read it, delta it (path-aware / window), and delete it once packed.
     Loose(PathBuf),
     /// A record already in a pack whose delta base survives the repack — **copied verbatim**,
     /// never reconstructed or re-deltated, so the original (good) delta is preserved and the
-    /// repack stays a byte-copy. `framed` is false for a version-1 (unframed) record, which is
-    /// wrapped in a full-record kind byte on the way into the version-2 pack.
-    CopyRecord { data_path: PathBuf, offset: u64, len: u64, framed: bool, is_delta: bool },
+    /// repack stays a byte-copy. `pack_index` indexes the source packs kept mapped for the run
+    /// (`collect_targets` returns them), so the record is a zero-copy slice out of that pack's
+    /// mmap — no per-record `open`/`seek`/`read`. `framed` is false for a version-1 (unframed)
+    /// record, which is wrapped in a full-record kind byte on the way into the version-2 pack.
+    CopyRecord { pack_index: usize, offset: u64, len: u64, framed: bool, is_delta: bool },
     /// A packed object whose delta base is being dropped as garbage: reconstruct it and re-pack
     /// it path-aware, so nothing is left pointing at the dropped base. Rare.
     Reconstruct,
@@ -791,23 +778,35 @@ pub fn compact(all: bool) -> Result<CompactStats, String> {
     // Taken after the folder exists so its parent (`forklift_root`) is present for `create_new`.
     let _store_lock = lock_utils::StoreLock::acquire()?;
 
-    // The objects to pack, and the old pack files a repack supersedes. Largest-first so the
-    // fallback window holds similar-sized neighbours (git's heuristic).
-    let (mut targets, old_packs) = collect_targets(all)?;
-    // Largest first (the delta/window heuristic), with the object hash as a total tie-breaker so
-    // the packing order — and therefore every record's offset — is deterministic. Without it,
-    // equal-size objects kept their filesystem-enumeration order, so two repacks of the *same
-    // already-packed* live set produced different layouts every run; harmless under the old id
-    // (which hashed only the object set) but, now that the pack id folds in offsets/lengths (D5),
-    // this determinism is what stops a steady-state repack from churning the pack onto a fresh
-    // name (rewrite + delete) each run and lets it land on the very same name instead.
-    targets.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.hash.cmp(&b.hash)));
+    // The objects to pack, and the old pack files a repack supersedes.
+    //
+    // One shared reachability pass (D/P3). Both the garbage decision (`collect_live_set`, inside
+    // `collect_targets`) and the path-base selection (`compute_path_bases`) walk the reachable
+    // parcel DAG, reading each parcel several times over — so hold a `ParcelReadMemo` across the
+    // whole reachability phase, which collapses those (~5 per parcel) re-reads to one decode each
+    // and is dropped before the parallel batch loop below. `source_packs` are the existing packs,
+    // kept mapped for the run so a `CopyRecord` copies its bytes straight from the mmap.
+    let (targets, old_packs, source_packs, path_bases) = {
+        let _parcel_memo = object_utils::ParcelReadMemo::activate();
 
-    // Path-aware base selection (phase 2b) is only needed to *build* new deltas — for loose
-    // objects and for the rare object whose base is dropped. A repack that only copies existing
-    // records (the common case) skips the whole DAG walk.
-    let needs_delta = targets.iter().any(|t| !matches!(t.source, Source::CopyRecord { .. }));
-    let path_bases = if needs_delta { compute_path_bases()? } else { HashMap::new() };
+        let CollectedTargets { mut targets, old_packs, source_packs } = collect_targets(all)?;
+        // Largest first (the delta/window heuristic), with the object hash as a total tie-breaker
+        // so the packing order — and therefore every record's offset — is deterministic. Without
+        // it, equal-size objects kept their filesystem-enumeration order, so two repacks of the
+        // *same already-packed* live set produced different layouts every run; harmless under the
+        // old id (which hashed only the object set) but, now that the pack id folds in
+        // offsets/lengths (D5), this determinism is what stops a steady-state repack from churning
+        // the pack onto a fresh name (rewrite + delete) each run and lets it land on the same name.
+        targets.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.hash.cmp(&b.hash)));
+
+        // Path-aware base selection (phase 2b) is only needed to *build* new deltas — for loose
+        // objects and for the rare object whose base is dropped. A repack that only copies existing
+        // records (the common case) skips the whole DAG walk.
+        let needs_delta = targets.iter().any(|t| !matches!(t.source, Source::CopyRecord { .. }));
+        let path_bases = if needs_delta { compute_path_bases()? } else { HashMap::new() };
+
+        (targets, old_packs, source_packs, path_bases)
+    };
 
     let mut stats = CompactStats {
         objects_packed: 0, packs_written: 0, loose_removed: 0, deltas: 0, bytes_packed: 0,
@@ -858,9 +857,10 @@ pub fn compact(all: bool) -> Result<CompactStats, String> {
             };
 
             // Copy an existing record verbatim — a repack's fast path: the original (good) delta
-            // is preserved, nothing is reconstructed or re-deltated.
-            if let Source::CopyRecord { data_path, offset, len, framed, is_delta } = &target.source {
-                let record = read_framed_record(data_path, *offset, *len, *framed)?;
+            // is preserved, nothing is reconstructed or re-deltated. The bytes are a zero-copy
+            // slice out of the source pack's mmap (framed case) rather than a fresh file read.
+            if let Source::CopyRecord { pack_index, offset, len, framed, is_delta } = &target.source {
+                let record = framed_record(&source_packs[*pack_index], *offset, *len, *framed)?;
                 let written = pack.append_raw_record(target.hash, &record)?;
                 stats.bytes_packed += written;
                 if *is_delta {
@@ -949,6 +949,17 @@ pub fn compact(all: bool) -> Result<CompactStats, String> {
         new_pack_files.extend(finalized.files);
         stats.packs_written += 1;
     }
+
+    // Release the source packs' mmaps now — their last use was a `CopyRecord` in the loop just
+    // above. This must happen before the old-pack removal below: on Windows, a file opened (or
+    // mapped) without `FILE_SHARE_DELETE` — the platform default — cannot be deleted while a
+    // handle to it is still open, and `memmap2::Mmap` holds exactly such a handle. Before this
+    // change, the equivalent per-record `File::open` in `read_pack_slice` was closed the instant
+    // each copy finished, so no old pack was ever held open this late; keeping the whole-run
+    // `Arc<Vec<LoadedPack>>` for the mmap'd fast path must not silently change that. (POSIX needs
+    // no such care — unlinking an open-and-mapped file is always safe there — but this drop must
+    // hold on every supported platform, not just the one this was measured on.)
+    drop(source_packs);
 
     // Each pack's data and index bytes were fsynced in `finalize`, but the *directory entries*
     // that the renames created are themselves only durable once the pack folder is fsynced. Do it
@@ -1051,7 +1062,7 @@ struct Prepared {
 /// `CopyRecord` target needs no preparation (it is byte-copied on the write path), so its slot
 /// is `None`. Results are positionally aligned with `batch`.
 fn prepare_batch(batch: &[PackTarget],
-                 path_bases: &HashMap<String, String>) -> Result<Vec<Option<Prepared>>, String> {
+                 path_bases: &HashMap<[u8; HASH_LEN], [u8; HASH_LEN]>) -> Result<Vec<Option<Prepared>>, String> {
     // Below this many objects the threads cost more than the reads/compressions they share.
     const PARALLEL_THRESHOLD: usize = 8;
 
@@ -1077,7 +1088,7 @@ fn prepare_batch(batch: &[PackTarget],
 /// fallback is *not* done here: it depends on the objects written just before, so it stays on
 /// the sequential path.
 fn prepare_target(target: &PackTarget,
-                  path_bases: &HashMap<String, String>) -> Result<Option<Prepared>, String> {
+                  path_bases: &HashMap<[u8; HASH_LEN], [u8; HASH_LEN]>) -> Result<Option<Prepared>, String> {
     if matches!(target.source, Source::CopyRecord { .. }) {
         return Ok(None);
     }
@@ -1092,21 +1103,34 @@ fn prepare_target(target: &PackTarget,
     // delta beats the full blob.
     let mut path_delta = None;
     if deltable {
-        if let Some(base_hex) = path_bases.get(&sign_utils::to_hex(&target.hash)) {
+        if let Some(base) = path_bases.get(&target.hash) {
             // Borrow-only (the delta is computed against it): share the cached `Arc` rather than
-            // copy the base blob out under the read-cache lock.
-            let base_raw = file_utils::retrieve_object_by_hash_shared(base_hex)?;
+            // copy the base blob out under the read-cache lock. The store read still takes hex
+            // (the on-disk/wire address format); the map itself stays binary.
+            let base_hex = sign_utils::to_hex(base);
+            let base_raw = file_utils::retrieve_object_by_hash_shared(&base_hex)?;
             let payload = delta_utils::compress_delta(&base_raw, &raw)?;
 
             if payload.len() < compressed.len() {
-                let base = hash_to_bytes(base_hex)
-                    .ok_or_else(|| format!("Path base {} is not a valid hash.", base_hex))?;
-                path_delta = Some((base, payload));
+                path_delta = Some((*base, payload));
             }
         }
     }
 
     Ok(Some(Prepared { raw, compressed, deltable, path_delta }))
+}
+
+/// The result of [`collect_targets`]: what to pack, what a repack supersedes, and the packs a
+/// `Source::CopyRecord` among `targets` borrows its bytes from.
+struct CollectedTargets {
+    /// The objects to pack (loose files and/or existing packed records).
+    targets: Vec<PackTarget>,
+    /// Old pack files a repack supersedes (empty for an incremental `compact`).
+    old_packs: Vec<PathBuf>,
+    /// The existing packs, kept mapped for the run so every `Source::CopyRecord { pack_index,
+    /// .. }` in `targets` can borrow its record straight from `source_packs[pack_index]`'s mmap
+    /// (empty for an incremental `compact`, which has no `CopyRecord` targets).
+    source_packs: Arc<Vec<LoadedPack>>,
 }
 
 /// The objects to pack and the old pack files a repack supersedes.
@@ -1118,9 +1142,13 @@ fn prepare_target(target: &PackTarget,
 /// dropped is reconstructed and re-deltated instead. Unreachable objects are simply not
 /// carried over, so packed garbage is dropped; unreachable *loose* objects are left for the
 /// grace-period collector.
-fn collect_targets(all: bool) -> Result<(Vec<PackTarget>, Vec<PathBuf>), String> {
+fn collect_targets(all: bool) -> Result<CollectedTargets, String> {
     if !all {
-        return Ok((enumerate_loose_objects()?, Vec::new()));
+        return Ok(CollectedTargets {
+            targets: enumerate_loose_objects()?,
+            old_packs: Vec::new(),
+            source_packs: Arc::new(Vec::new()),
+        });
     }
 
     let live = crate::util::gc_utils::collect_live_set()?;
@@ -1135,11 +1163,14 @@ fn collect_targets(all: bool) -> Result<(Vec<PackTarget>, Vec<PathBuf>), String>
     }
 
     // Live objects in existing packs. Copy each record verbatim when its base survives; the old
-    // packs are removed at the end, which is what drops the garbage that is not carried over.
+    // packs are removed at the end, which is what drops the garbage that is not carried over. The
+    // mapped packs are returned to the caller and held for the whole run, so a `CopyRecord` reads
+    // its bytes as a zero-copy slice out of the mmap (addressed by `pack_index`), never a fresh
+    // per-record file read.
     let packs = loaded_packs()?;
     let mut old_packs = Vec::new();
 
-    for pack in packs.iter() {
+    for (pack_index, pack) in packs.iter().enumerate() {
         old_packs.push(pack.data_path.clone());
         old_packs.push(pack.data_path.with_extension(PACK_INDEX_EXTENSION));
 
@@ -1157,52 +1188,55 @@ fn collect_targets(all: bool) -> Result<(Vec<PackTarget>, Vec<PathBuf>), String>
             let framed = pack.version >= FIRST_FRAMED_VERSION;
 
             // A delta whose base is not itself live cannot be copied (the base is being
-            // dropped); reconstruct and re-delta it. Everything else is copied as-is.
-            let (is_delta, base) = read_record_header(&pack.data_path, offset, framed)?;
+            // dropped); reconstruct and re-delta it. Everything else is copied as-is. The record
+            // header (kind + base hash) is read straight from the pack's mmap, not a fresh file read.
+            let (is_delta, base) = read_record_header(pack, offset, framed)?;
             let source = if is_delta && base.is_some_and(|b| !live.contains(&sign_utils::to_hex(&b))) {
                 Source::Reconstruct
             } else {
-                Source::CopyRecord { data_path: pack.data_path.clone(), offset, len: length, framed, is_delta }
+                Source::CopyRecord { pack_index, offset, len: length, framed, is_delta }
             };
 
             targets.push(PackTarget { hash, size: length, source });
         }
     }
 
-    Ok((targets, old_packs))
+    Ok(CollectedTargets { targets, old_packs, source_packs: packs })
 }
 
 /// Read a record's kind and (for a delta) its base hash, without reconstructing it — just the
 /// leading kind byte and, for a delta, the 32-byte base that follows. A version-1 (unframed)
 /// record is always a full object.
-fn read_record_header(data_path: &Path, offset: u64, framed: bool) -> Result<(bool, Option<[u8; HASH_LEN]>), String> {
+fn read_record_header(pack: &LoadedPack, offset: u64, framed: bool) -> Result<(bool, Option<[u8; HASH_LEN]>), String> {
     if !framed {
         return Ok((false, None));
     }
 
-    let kind = read_pack_slice(data_path, offset, 1)?[0];
+    let kind = pack.slice(offset, 1)?[0];
     if kind != RECORD_DELTA {
         return Ok((false, None));
     }
 
-    let base = read_pack_slice(data_path, offset + 1, HASH_LEN as u64)?;
+    let base = pack.slice(offset + 1, HASH_LEN as u64)?;
     let mut array = [0u8; HASH_LEN];
-    array.copy_from_slice(&base);
+    array.copy_from_slice(base);
     Ok((true, Some(array)))
 }
 
-/// Read a record and return it framed for a version-2 pack: a version-2 record is copied
-/// verbatim (it already carries its kind byte); a version-1 record (a bare zstd blob) is
-/// wrapped in a `RECORD_FULL` kind byte.
-fn read_framed_record(data_path: &Path, offset: u64, len: u64, framed: bool) -> Result<Vec<u8>, String> {
-    let bytes = read_pack_slice(data_path, offset, len)?;
+/// A live record carried verbatim into the new pack, framed for a version-2 pack: a version-2
+/// record is the source pack's mmap slice as-is (it already carries its kind byte); a version-1
+/// record (a bare zstd blob) is wrapped in a `RECORD_FULL` kind byte. Borrows straight from the
+/// source pack's mmap — no `open`/`seek`/`read`, and for the common framed case no copy at all;
+/// the bytes are byte-identical to what a fresh file read produced, so the pack output is unchanged.
+fn framed_record(pack: &LoadedPack, offset: u64, len: u64, framed: bool) -> Result<std::borrow::Cow<'_, [u8]>, String> {
+    let bytes = pack.slice(offset, len)?;
     if framed {
-        Ok(bytes)
+        Ok(std::borrow::Cow::Borrowed(bytes))
     } else {
         let mut record = Vec::with_capacity(1 + bytes.len());
         record.push(RECORD_FULL);
-        record.extend_from_slice(&bytes);
-        Ok(record)
+        record.extend_from_slice(bytes);
+        Ok(std::borrow::Cow::Owned(record))
     }
 }
 
@@ -1260,16 +1294,20 @@ impl Bloom {
 
 /// Path-aware base selection (phase 2b): for every reachable blob, the previous version of
 /// the *same file* (by path) as its delta base — the ideal base git's name-sorted packer
-/// picks, which the size heuristic can only approximate. Returns `blob hash → base hash`
-/// (both hex); an object with no entry (a tree, a parcel, a first version, or an unreachable
-/// blob) has no path base and falls back to the size window.
+/// picks, which the size heuristic can only approximate. Returns `blob hash → base hash`, both
+/// as raw 32-byte Blake3 digests (not hex) — this map is purely an in-memory intermediate
+/// consulted once per blob during packing, never serialized, so a fixed `[u8; HASH_LEN]` key
+/// avoids a 64-byte hex `String` (allocation + `Eq`/`Hash` over 64 bytes) per entry in favour of
+/// a stack-sized array — a real win at the object counts this map is sized for (one entry per
+/// reachable blob). An object with no entry (a tree, a parcel, a first version, or an
+/// unreachable blob) has no path base and falls back to the size window.
 ///
 /// This walks the reachable DAG — all parcels and their trees, but never blob *content* —
 /// mirroring the bundle traversal (`bundle_utils`), and bounds each chain to `MAX_DELTA_CHAIN`
 /// so reconstruction recursion stays bounded. Its "seen trees" and "seen blobs" sets are Bloom
 /// filters, so the walk's memory is bounded (a bit budget) rather than one entry per object —
 /// what keeps it viable at kernel scale (see [`Bloom`]).
-fn compute_path_bases() -> Result<HashMap<String, String>, String> {
+fn compute_path_bases() -> Result<HashMap<[u8; HASH_LEN], [u8; HASH_LEN]>, String> {
     let heads: Vec<String> = pallet_utils::all_pallet_refs()?
         .into_iter().map(|(_, head)| head).collect();
 
@@ -1285,8 +1323,8 @@ fn compute_path_bases() -> Result<HashMap<String, String>, String> {
     let mut seen_blobs = Bloom::new(estimate);
     // Bounded by the number of distinct paths (not by history depth); carries each path's
     // latest blob and that blob's chain depth (so `depth_of` need not be a per-object map).
-    let mut latest_at_path: HashMap<String, (String, u32)> = HashMap::new();
-    let mut base_of: HashMap<String, String> = HashMap::new();
+    let mut latest_at_path: HashMap<String, ([u8; HASH_LEN], u32)> = HashMap::new();
+    let mut base_of: HashMap<[u8; HASH_LEN], [u8; HASH_LEN]> = HashMap::new();
 
     for parcel_hash in &order {
         let tree_hash = object_utils::load_parcel(parcel_hash)?.tree_hash;
@@ -1305,8 +1343,8 @@ fn walk_tree_for_bases(tree_hash: &str,
                        path_prefix: &str,
                        seen_trees: &mut Bloom,
                        seen_blobs: &mut Bloom,
-                       latest_at_path: &mut HashMap<String, (String, u32)>,
-                       base_of: &mut HashMap<String, String>) -> Result<(), String> {
+                       latest_at_path: &mut HashMap<String, ([u8; HASH_LEN], u32)>,
+                       base_of: &mut HashMap<[u8; HASH_LEN], [u8; HASH_LEN]>) -> Result<(), String> {
     if seen_trees.contains(tree_hash.as_bytes()) {
         return Ok(());
     }
@@ -1316,7 +1354,23 @@ fn walk_tree_for_bases(tree_hash: &str,
 
     for (name, file) in tree.get_files() {
         let path = join_path(path_prefix, name);
-        record_path_base(&file.hash, &path, seen_blobs, latest_at_path, base_of);
+        // A tree entry's hash is always a valid content address (it was written as one); the
+        // rare unparseable case (a corrupt tree) simply gets no path base here rather than
+        // aborting the walk — the same fallback a Bloom false positive already causes, and the
+        // object read/verify path is what actually guards against corruption.
+        if let Some(blob_hash) = hash_to_bytes(&file.hash) {
+            // The Bloom filter is keyed on the *hex string* bytes, not the raw digest — pinned
+            // deliberately, not an oversight: a Bloom filter is probabilistic, so which bytes it
+            // hashes decides its false-positive *pattern*, and a false positive here changes
+            // which blob gets a path-base delta vs. falls back to the size window — i.e. it can
+            // change the packed bytes. Switching this encoding would silently change that pattern
+            // (and so, at a scale where a false positive actually fires, the pack's bytes) even
+            // though `base_of`/`latest_at_path` themselves are exact `HashMap`s and safe to key on
+            // `[u8; HASH_LEN]` (see `compute_path_bases`'s doc comment) — an exact lookup gives an
+            // identical answer under any equivalent key encoding, but a hash-bucketed probabilistic
+            // structure does not. So this call keeps hashing exactly what the pre-D/P3 code hashed.
+            record_path_base(blob_hash, &file.hash, &path, seen_blobs, latest_at_path, base_of);
+        }
     }
 
     for (name, subtree) in tree.get_subtrees() {
@@ -1329,33 +1383,39 @@ fn walk_tree_for_bases(tree_hash: &str,
 
 /// Record a blob's path base: the most recent blob seen at this path (if its chain is not yet
 /// at the limit), and update the latest-at-path so the next version chains from this one.
-fn record_path_base(blob_hash: &str,
+///
+/// Takes both `blob_hash` (raw, for the exact `base_of`/`latest_at_path` maps) and
+/// `blob_hash_hex` (for the probabilistic `seen_blobs` Bloom filter) — see the call site's doc
+/// comment for why the Bloom filter deliberately keeps hashing the hex-string bytes rather than
+/// switching to the raw ones the maps now use.
+fn record_path_base(blob_hash: [u8; HASH_LEN],
+                    blob_hash_hex: &str,
                     path: &str,
                     seen_blobs: &mut Bloom,
-                    latest_at_path: &mut HashMap<String, (String, u32)>,
-                    base_of: &mut HashMap<String, String>) {
+                    latest_at_path: &mut HashMap<String, ([u8; HASH_LEN], u32)>,
+                    base_of: &mut HashMap<[u8; HASH_LEN], [u8; HASH_LEN]>) {
     // First time this blob is seen fixes its base; a later appearance (or a Bloom false
     // positive) only advances the path. Its real chain depth is not tracked per object (that
     // would defeat the bounded-memory point), so the recorded depth restarts at 0 here — which
     // makes the `MAX_DELTA_CHAIN` bound approximate (a real chain can run a small multiple of
     // it). That is safe: base pointers stay acyclic so reconstruction always terminates, and
     // `MAX_RECONSTRUCT_DEPTH` is the hard backstop.
-    if seen_blobs.contains(blob_hash.as_bytes()) {
-        latest_at_path.insert(path.to_string(), (blob_hash.to_string(), 0));
+    if seen_blobs.contains(blob_hash_hex.as_bytes()) {
+        latest_at_path.insert(path.to_string(), (blob_hash, 0));
         return;
     }
-    seen_blobs.insert(blob_hash.as_bytes());
+    seen_blobs.insert(blob_hash_hex.as_bytes());
 
     let mut depth = 0;
 
     if let Some((base, base_depth)) = latest_at_path.get(path) {
-        if *base_depth < MAX_DELTA_CHAIN && base != blob_hash {
-            base_of.insert(blob_hash.to_string(), base.clone());
+        if *base_depth < MAX_DELTA_CHAIN && *base != blob_hash {
+            base_of.insert(blob_hash, *base);
             depth = base_depth + 1;
         }
     }
 
-    latest_at_path.insert(path.to_string(), (blob_hash.to_string(), depth));
+    latest_at_path.insert(path.to_string(), (blob_hash, depth));
 }
 
 /// Join a warehouse path prefix and an entry name (`""` prefix yields the bare name).
@@ -2013,6 +2073,61 @@ mod tests {
         assert!(compact(false).is_err(), "compact must refuse while the shared store lock is held");
         drop(held);
         assert!(compact(false).is_ok(), "compact runs once the store lock is free");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn a_repack_physically_removes_old_pack_files_it_supersedes() {
+        // D/P3: `collect_targets` now keeps the old packs mmap'd for the whole `compact` call
+        // (`source_packs`, for the verbatim-copy fast path) rather than the previous per-record
+        // `File::open` that closed the instant each record was read. That mmap must still be
+        // released *before* the old-pack deletion sweep — `compact` drops `source_packs`
+        // explicitly right after the write loop, ahead of `sync_dir`/removal — or deleting a
+        // still-mapped file could fail on a platform that does not allow it (Windows, without
+        // `FILE_SHARE_DELETE`). This is unobservable as a failure on POSIX (unlinking an open or
+        // mapped file always succeeds there), so this test instead pins the *outcome* the drop
+        // exists to protect: the old pack files are actually gone from disk afterward, not
+        // merely superseded in the index. No pallet/parcel scaffolding is reachable here (no
+        // pallet refs exist), so every packed object is legitimately unreachable garbage and a
+        // repack must drop it all — exercising the exact "mmap it, then delete it" sequence.
+        let temp = std::env::temp_dir().join(format!("forklift-repack-removes-old-packs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+
+        // Two separate incremental packs, so the repack has more than one old pack to supersede.
+        let content_a = b"first pack content".to_vec();
+        store_loose(&blake3::hash(&content_a).to_hex().to_string(), &content_a);
+        compact(false).unwrap();
+
+        let content_b = b"second pack content".to_vec();
+        store_loose(&blake3::hash(&content_b).to_hex().to_string(), &content_b);
+        compact(false).unwrap();
+
+        let pack_paths_before: Vec<PathBuf> = std::fs::read_dir(pack_folder()).unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some(PACK_DATA_EXTENSION))
+            .collect();
+        assert_eq!(pack_paths_before.len(), 2, "two incremental packs should exist before the repack");
+
+        // No pallet refs exist in this bare store, so the live set is empty: a repack must drop
+        // every packed object as garbage and remove both old packs entirely.
+        let stats = compact(true).unwrap();
+        assert_eq!(stats.objects_packed, 0, "nothing is reachable, so nothing should be repacked");
+
+        for old_pack in &pack_paths_before {
+            assert!(!old_pack.exists(),
+                "old pack \"{}\" must be physically removed once superseded", old_pack.to_string_lossy());
+            let old_index = old_pack.with_extension(PACK_INDEX_EXTENSION);
+            assert!(!old_index.exists(),
+                "old index \"{}\" must be physically removed once superseded", old_index.to_string_lossy());
+        }
+
+        // And the content is genuinely gone — not just re-pointed at.
+        assert!(!is_in_packs(&blake3::hash(&content_a).to_hex().to_string()).unwrap());
+        assert!(!is_in_packs(&blake3::hash(&content_b).to_hex().to_string()).unwrap());
 
         std::fs::remove_dir_all(&temp).ok();
     }

@@ -40,6 +40,68 @@ pub fn push_null(content: &mut Vec<u8>) {
     content.push(globals::BYTE_NULL);
 }
 
+thread_local! {
+    /// A short-lived, thread-local cache of decoded parcel *bytes*, active only while a
+    /// [`ParcelReadMemo`] guard is held on this thread. See that type for the why.
+    static PARCEL_BYTES_MEMO: std::cell::RefCell<Option<std::collections::HashMap<String, std::rc::Rc<Vec<u8>>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// An RAII guard that memoizes parcel **decodes** on the current thread for its lifetime.
+///
+/// Parcels deliberately bypass the shared read cache (`retrieve_object_by_hash_uncached`),
+/// because a whole-history walk reads each parcel about once, so caching them is pure churn.
+/// `compact --all`'s reachability phase is the one exception: it reads the *same* parcel set
+/// several times over — the live-set walk (`gc_utils::collect_live_set` →
+/// `collect_reachable_present`, then again per parcel for its `tree_hash`) and, when new deltas
+/// must be built, the path-base walk (`compute_path_bases` → `collect_reachable`,
+/// `topo_order_oldest_first`, then again per parcel for its `tree_hash`). Measured on a
+/// 401-parcel synthetic warehouse: 2005 logical parcel reads when both walks run (garbage or
+/// loose objects present) — exactly 5.0 per parcel, matching the roadmap's "~5" estimate — and
+/// 802 (2.0 per parcel) in the steady-state case where only the live-set walk runs. Each read is
+/// a pack lookup + zstd decode + Blake3 verify. This guard scopes a decode cache to exactly that
+/// phase: a parcel is decoded once and every later read in the phase is an `Rc`-shared clone —
+/// collapsing both cases to exactly 1 decode per parcel.
+///
+/// It stores the decoded *bytes* (not the parsed [`Parcel`]) so it needs no `Clone` on the model
+/// and stays cheap on memory; the parse is the small residual. It is thread-local and single-
+/// scoped (`compact` runs its reachability serially under the store lock), and is dropped before
+/// the parallel pack-write batch, so a worker thread never sees or shares it.
+pub struct ParcelReadMemo(());
+
+impl ParcelReadMemo {
+    /// Begin memoizing parcel decodes on this thread until the returned guard drops.
+    pub fn activate() -> ParcelReadMemo {
+        PARCEL_BYTES_MEMO.with(|memo| *memo.borrow_mut() = Some(std::collections::HashMap::new()));
+        ParcelReadMemo(())
+    }
+}
+
+impl Drop for ParcelReadMemo {
+    fn drop(&mut self) {
+        PARCEL_BYTES_MEMO.with(|memo| *memo.borrow_mut() = None);
+    }
+}
+
+/// Read a parcel's decoded bytes, serving and populating the [`ParcelReadMemo`] cache when one is
+/// active on this thread (otherwise a plain uncached read — the memo is never populated when no
+/// guard is held, so this is zero-cost outside `compact`'s reachability phase).
+fn read_parcel_bytes(hash: &str) -> Result<std::rc::Rc<Vec<u8>>, String> {
+    if let Some(hit) = PARCEL_BYTES_MEMO.with(|memo| memo.borrow().as_ref().and_then(|c| c.get(hash).cloned())) {
+        return Ok(hit);
+    }
+
+    let bytes = std::rc::Rc::new(file_utils::retrieve_object_by_hash_uncached(hash)?);
+
+    PARCEL_BYTES_MEMO.with(|memo| {
+        if let Some(cache) = memo.borrow_mut().as_mut() {
+            cache.insert(hash.to_string(), std::rc::Rc::clone(&bytes));
+        }
+    });
+
+    Ok(bytes)
+}
+
 /// Load and parse the parcel object with the given hash from the object store.
 ///
 /// # Arguments
@@ -51,8 +113,10 @@ pub fn push_null(content: &mut Vec<u8>) {
 pub fn load_parcel(hash: &str) -> Result<Parcel, String> {
     // Parcels are stored full (never delta'd) and a walk reads each one about once, so the read
     // cache only taxes them (a per-read key allocation and churn) without ever paying off — read
-    // them straight, and leave the cache to the trees and blobs that actually reuse it.
-    let bytes = file_utils::retrieve_object_by_hash_uncached(hash)?;
+    // them straight, and leave the cache to the trees and blobs that actually reuse it. The one
+    // exception is `compact --all`, which re-reads the same parcel set several times; a
+    // `ParcelReadMemo` guard (held only for that phase) collapses those re-reads to one decode.
+    let bytes = read_parcel_bytes(hash)?;
 
     match parser::object::loose_object_parser::parse(&bytes)? {
         ParsedObject::Parcel(parcel) => Ok(parcel),
