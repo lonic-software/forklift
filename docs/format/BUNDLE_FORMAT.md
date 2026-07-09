@@ -52,16 +52,25 @@ frame     <rest>   a zstd frame compressed with the base object as a dictionary
 ```
 
 To import a `'D'` record the reader loads the base object's raw bytes, decompresses the
-frame against them (`declen` bounds the output — a decompression-bomb guard), then verifies
-`Blake3(result) == hash` exactly like an `'O'` record before storing. A wrong base, a
-corrupt frame, or a missing base therefore **fails the record**, never corrupts the store;
-a missing base means the bundle is corrupt (a correct builder always emits the base first).
+frame against them, then verifies `Blake3(result) == hash` exactly like an `'O'` record
+before storing. A wrong base, a corrupt frame, or a missing base therefore **fails the
+record**, never corrupts the store; a missing base means the bundle is corrupt (a correct
+builder always emits the base first).
+
+`declen` is **not** by itself a decompression-bomb guard: it is a number the sender chooses,
+so a hostile `u64::MAX` would bound nothing. The reader therefore refuses any `'D'` record
+whose `declen` exceeds **16 MiB** (`delta_utils::MAX_DELTA_TARGET_BYTES`) before it reads a
+byte of the frame, decodes as a bounded stream that never pre-allocates `declen`, and
+requires the frame to reconstruct to *exactly* `declen` bytes. The ceiling is sound because
+no builder ever emits a delta above it: objects larger than 16 MiB are always stored in full
+(`'O'`), since deltating huge blobs costs more RAM and CPU than it saves.
 
 The delta is zstd-with-a-dictionary, **not** a bespoke diff format: unchanged regions of the
 target are referenced from the base for near-free, and the entropy coding stays zstd's. The
-builder only emits a `'D'` when the delta is smaller than the full object, deltas each blob
-against the previous version at the same path, and caps delta chains (a version every ~50 is
-stored in full) so reconstruction stays cheap.
+builder only emits a `'D'` when the delta is smaller than the full object and the object is
+at or under the 16 MiB ceiling, deltas each blob against the previous version at the same
+path, and caps delta chains (a version every ~50 is stored in full) so reconstruction stays
+cheap.
 
 ## Building
 

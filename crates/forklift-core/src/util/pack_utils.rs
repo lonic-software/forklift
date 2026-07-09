@@ -82,7 +82,9 @@ const DELTA_WINDOW_MEMORY: usize = 64 * 1024 * 1024;
 
 /// Objects larger than this are always stored full and never used as (or offered a) delta
 /// base — deltating huge blobs costs more RAM/CPU than it saves, and it bounds window memory.
-const MAX_DELTA_OBJECT_SIZE: usize = 16 * 1024 * 1024;
+/// Shared with `bundle_utils` and, crucially, enforced on the *read* side by
+/// `delta_utils::decompress_delta`, where it is the decompression-bomb bound.
+use crate::util::delta_utils::MAX_DELTA_TARGET_BYTES as MAX_DELTA_OBJECT_SIZE;
 
 /// The longest delta chain a base may already carry before a new delta refuses to extend it.
 /// Reconstructing a delta reads its base (recursively), so this bounds that recursion — the

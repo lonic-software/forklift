@@ -243,7 +243,12 @@ fn emit_blob<W: Write>(encoder: &mut zstd::stream::Encoder<'_, W>,
     if let Some(base_hash) = latest_blob_at_path.get(path).cloned() {
         let base_depth = *emitted_depth.get(&base_hash).unwrap_or(&0);
 
-        if base_depth < MAX_DELTA_CHAIN && base_hash != blob_hash {
+        // An over-large object is stored full, never delta'd — the same rule `pack_utils`
+        // applies, and the one that lets `decompress_delta` enforce a real bomb ceiling on
+        // the read side (`delta_utils::MAX_DELTA_TARGET_BYTES`).
+        let deltable = target_bytes.len() <= delta_utils::MAX_DELTA_TARGET_BYTES;
+
+        if deltable && base_depth < MAX_DELTA_CHAIN && base_hash != blob_hash {
             let base_bytes = file_utils::retrieve_object_by_hash(&base_hash)?;
             let delta = delta_utils::compress_delta(&base_bytes, &target_bytes)?;
 

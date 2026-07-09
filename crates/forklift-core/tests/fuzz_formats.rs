@@ -496,21 +496,42 @@ mod regressions {
         std::fs::remove_dir_all(&temp).ok();
     }
 
-    /// A delta record that declares a `u64::MAX` decompressed length must not pre-allocate it
-    /// (a capacity-overflow panic / allocator abort). It now errors cleanly.
+    /// A delta record's declared decompressed length is attacker-controlled. It must neither be
+    /// pre-allocated (a capacity-overflow panic / allocator abort) nor trusted as the output
+    /// bound — a declared `u64::MAX` would be no bound at all, and a small zstd frame could then
+    /// expand until memory ran out.
     #[test]
-    fn a_delta_with_a_huge_declared_length_does_not_allocate_it() {
+    fn a_delta_with_a_dishonest_declared_length_is_refused_without_allocating_it() {
+        use forklift_core::util::delta_utils::{
+            compress_delta, decompress_delta, MAX_DELTA_TARGET_BYTES,
+        };
+
         let base = b"the quick brown fox\n".repeat(8);
         let mut target = base.clone();
         target.extend_from_slice(b"one more line\n");
-        let delta = forklift_core::util::delta_utils::compress_delta(&base, &target).unwrap();
+        let delta = compress_delta(&base, &target).unwrap();
 
-        // A truthful capacity still reconstructs.
-        let ok = forklift_core::util::delta_utils::decompress_delta(&base, &delta, target.len());
-        assert_eq!(ok.unwrap(), target);
+        // A truthful capacity still reconstructs, exactly.
+        assert_eq!(decompress_delta(&base, &delta, target.len()).unwrap(), target);
 
-        // A dishonest, enormous capacity must be refused without trying to allocate it.
-        let guarded = forklift_core::util::delta_utils::decompress_delta(&base, &delta, u64::MAX as usize);
-        assert!(guarded.is_ok() || guarded.is_err()); // the point is it returns rather than aborting
+        // An enormous declared length is refused up front, by the ceiling — never allocated,
+        // never used as the read bound. This is the decompression-bomb guard.
+        let error = decompress_delta(&base, &delta, u64::MAX as usize)
+            .expect_err("a u64::MAX target must be refused by the ceiling");
+        assert!(error.contains("ceiling"), "{}", error);
+
+        let error = decompress_delta(&base, &delta, MAX_DELTA_TARGET_BYTES + 1)
+            .expect_err("one byte over the ceiling is still over it");
+        assert!(error.contains("ceiling"), "{}", error);
+
+        // A lie that stays *under* the ceiling is caught by the exact-length check instead, and
+        // the 16 MiB it declared is never allocated — the buffer grows with the bytes produced.
+        let error = decompress_delta(&base, &delta, MAX_DELTA_TARGET_BYTES)
+            .expect_err("the frame does not reconstruct to the declared length");
+        assert!(error.contains("declared"), "{}", error);
+
+        // And a frame that overruns a small declared length is rejected, not truncated.
+        let error = decompress_delta(&base, &delta, 4).expect_err("an overrunning frame");
+        assert!(error.contains("declared"), "{}", error);
     }
 }
