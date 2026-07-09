@@ -585,7 +585,7 @@ dependencies = [
 
 [[package]]
 name = "forklift"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "chrono",
  "clap",
@@ -600,7 +600,7 @@ dependencies = [
 
 [[package]]
 name = "forklift-aws-lambda"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "forklift-core",
  "serde",
@@ -610,7 +610,7 @@ dependencies = [
 
 [[package]]
 name = "forklift-core"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "argon2",
  "blake3",
@@ -634,7 +634,7 @@ dependencies = [
 
 [[package]]
 name = "forklift-server"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "axum",
  "clap",
