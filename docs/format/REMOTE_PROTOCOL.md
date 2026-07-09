@@ -247,6 +247,14 @@ enforces meta-pallet rules by namespace, so the office lifts to `POST /v1/pallet
 verified when `old_head` was committed, so the signature walk stops there — a linear
 lift audits O(new parcels). A creation (`old_head` absent) audits the full history.
 
+Two honest caveats, recorded 2026-07-09 (DESIGN.html §5.0 B/R5, "no unnecessary walk"):
+the signature walk stops at the single hash `old_head`, which is the exact frontier of a
+*linear* lift but not of a **merge**, whose frontier is the merge-base set — so a merge
+lift re-verifies signatures below the fork point. And the closure check builds its prune
+set by walking `old_head`'s whole ancestry, so *every* ref update is O(history) parcel
+reads regardless. Both err by doing more work than needed, never less; both are fixed by
+the same generation-number-bounded frontier.
+
 ### `POST /lift/{session}/commit` (additive; serverless head)
 
 The **session-commit** step, for a head where object bytes bypass the control plane —
