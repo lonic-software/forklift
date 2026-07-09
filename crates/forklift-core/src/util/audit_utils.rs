@@ -544,14 +544,14 @@ pub fn verify_office_chain_memoized(
     let key = office_chain_key(anchor, office_head);
     let memo = VERIFIED_OFFICE_CHAINS.get_or_init(|| Mutex::new(HashMap::new()));
 
-    if let Some(state) = lock_memo(memo)?.get(&key) {
+    if let Some(state) = lock_memo(memo).get(&key) {
         return Ok(state.clone());
     }
 
     // Verified outside the lock: a slow chain must not block the other warehouses.
     let state = verify_office_chain(anchor, office_head)?;
 
-    let mut chains = lock_memo(memo)?;
+    let mut chains = lock_memo(memo);
 
     if chains.len() >= MAX_MEMOIZED_OFFICE_CHAINS {
         chains.clear();
@@ -576,10 +576,28 @@ fn office_chain_key(anchor: &TrustAnchor, office_head: &str) -> String {
     )
 }
 
+/// Take the memo, recovering from a poisoned lock rather than failing.
+///
+/// A poisoned mutex means some thread panicked while holding it — an internal fault, and
+/// never the caller's doing. Both server heads map a failure of the memoized verification to
+/// `422 Unprocessable`, so returning an error here would tell a client its lift was invalid
+/// because the server had a bug. And there is nothing to protect: this is a cache of results
+/// that can always be recomputed. So the poison is cleared, whatever was in the map is
+/// dropped, and the next verification simply repopulates it.
 fn lock_memo(
     memo: &Mutex<HashMap<String, OfficeState>>,
-) -> Result<std::sync::MutexGuard<'_, HashMap<String, OfficeState>>, String> {
-    memo.lock().map_err(|e| format!("The office-chain memo is poisoned: {}", e))
+) -> std::sync::MutexGuard<'_, HashMap<String, OfficeState>> {
+    match memo.lock() {
+        Ok(chains) => chains,
+        Err(poisoned) => {
+            memo.clear_poison();
+
+            let mut chains = poisoned.into_inner();
+            chains.clear();
+
+            chains
+        }
+    }
 }
 
 /// Reachable from `head`.
@@ -1434,5 +1452,35 @@ mod tests {
 
         let error = verify_new_key_endorsements(None, &broken).unwrap_err();
         assert!(error.contains("pins identity root"), "{}", error);
+    }
+
+    /// A poisoned memo is an internal fault, never a client's. Recover from it rather than
+    /// reporting it: both server heads turn a failure of the memoized office verification
+    /// into a `422`, which would tell a client its lift was invalid because the server had
+    /// a bug. Nothing is lost — the memo only holds results that can be recomputed.
+    #[test]
+    fn a_poisoned_office_memo_recovers_instead_of_failing() {
+        let memo = VERIFIED_OFFICE_CHAINS.get_or_init(|| Mutex::new(HashMap::new()));
+
+        // Panic while holding the lock, exactly as an internal fault would.
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = memo.lock().unwrap();
+            panic!("a thread died holding the office memo");
+        }));
+
+        assert!(panicked.is_err());
+        assert!(memo.is_poisoned(), "the lock is poisoned");
+
+        // The memo is taken anyway, emptied, and usable again.
+        {
+            let mut chains = lock_memo(memo);
+            assert!(chains.is_empty(), "a recovered memo starts clean");
+            chains.insert("key".to_string(), OfficeState { users: Vec::new(), keys: Vec::new() });
+        }
+
+        assert!(!memo.is_poisoned(), "the poison is cleared, so the memo caches again");
+        assert_eq!(lock_memo(memo).len(), 1, "and the entry survives the next lock");
+
+        lock_memo(memo).clear();
     }
 }

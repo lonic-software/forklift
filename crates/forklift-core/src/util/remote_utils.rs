@@ -387,11 +387,13 @@ impl RemoteClient {
 /// graph, every parcel's signature sidecar, and the full tree/blob closure — verified
 /// object by object before storing.
 ///
-/// The walk stops at any parcel already reachable from a **local pallet head**, whose
-/// closure is complete by construction: a ref only moves once its objects are all present
-/// (a `stack` writes them first; a `lower` or `franchise` fetches the whole closure before
-/// the fast-forward). So a lower that brings one new parcel walks one parcel, not the whole
-/// history — the transfer-economics half of R5.
+/// The walk stops at any parcel already reachable from a **local ref head** — every pallet
+/// and every meta pallet (`@office`, `@haul`, …), since they share one object store and a
+/// ref of either kind is an equally good witness. Their closures are complete by
+/// construction: a ref only moves once its objects are all present (a `stack` writes them
+/// first; a `lower` or `franchise` fetches the whole closure before the fast-forward). So a
+/// lower that brings one new parcel walks one parcel, not the whole history — the
+/// transfer-economics half of R5.
 ///
 /// It still heals an interrupted earlier sync. An interruption leaves the ref where it was,
 /// so the objects it half-fetched sit *above* the bound and are re-walked exactly as before.
@@ -412,8 +414,9 @@ impl RemoteClient {
 pub async fn fetch_history(client: &RemoteClient, head: &str) -> Result<FetchStats, String> {
     let mut stats = FetchStats::default();
 
-    // Every local ref head, and therefore every closure already known complete. Empty for a
-    // franchise into a fresh warehouse, which walks everything — as it must.
+    // Every local ref head — user pallets and meta pallets alike — and therefore every
+    // closure already known complete. Empty for a franchise into a fresh warehouse, which
+    // walks everything, as it must.
     let complete: Vec<String> = pallet_utils::all_pallet_refs()?
         .into_iter()
         .map(|(_, head)| head)
