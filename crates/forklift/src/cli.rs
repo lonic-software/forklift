@@ -651,8 +651,9 @@ pub enum AliasAction {
     #[command(
         long_about = "Remove the alias next to this binary. A no-op (success) if it is not \
                       installed. Refuses if the name exists but was not created by this command \
-                      (a real file, or a symlink/shim pointing somewhere else) — same reasoning as \
-                      \"install\": never remove something forklift didn't put there."
+                      (a real file, e.g.). A symlink (Unix) or a recognized shim (Windows) is \
+                      removed even if it points at a different forklift binary — deleting a \
+                      symlink can never lose data, unlike a real file."
     )]
     Uninstall {
         /// The alias name (default: "fl")

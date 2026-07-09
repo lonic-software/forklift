@@ -145,7 +145,10 @@ fn status() -> Result<(), String> {
 /// an in-place update. Best-effort: any resolution failure reads as "not installed".
 pub(crate) fn exists(name: &str) -> bool {
     match (alias_dir(), this_binary()) {
-        (Ok(dir), Ok(target)) => !matches!(inspect(&platform_alias_path(&dir, name), &target), Existing::None),
+        (Ok(dir), Ok(target)) => matches!(
+            inspect(&platform_alias_path(&dir, name), &target),
+            Existing::PointsHere | Existing::PointsElsewhere(_)
+        ),
         _ => false,
     }
 }
@@ -185,7 +188,9 @@ enum Existing {
 /// binary's own directory.
 fn alias_dir() -> Result<PathBuf, String> {
     if let Ok(dir) = env::var(ENV_ALIAS_DIR) {
-        return Ok(PathBuf::from(dir));
+        if !dir.trim().is_empty() {
+            return Ok(PathBuf::from(dir));
+        }
     }
 
     this_binary()?
@@ -295,8 +300,20 @@ fn inspect(alias_path: &Path, target: &Path) -> Existing {
     }
 
     match shim_target(&content) {
-        Some(existing) if existing == target => Existing::PointsHere,
-        Some(existing) => Existing::PointsElsewhere(existing),
+        Some(existing) => {
+            // Canonicalize before comparing: the shim was written with `target.display()`,
+            // but `target` here is already canonical, so a raw comparison misclassifies
+            // PointsHere as PointsElsewhere on case-insensitive filesystems or when short
+            // (8.3) vs. long paths differ. Fall back to the raw path if it no longer
+            // resolves (e.g. a dangling target after the binary moved).
+            let resolved = existing.canonicalize().unwrap_or_else(|_| existing.clone());
+
+            if resolved == *target {
+                Existing::PointsHere
+            } else {
+                Existing::PointsElsewhere(resolved)
+            }
+        }
         None => Existing::PointsElsewhere(PathBuf::new()),
     }
 }

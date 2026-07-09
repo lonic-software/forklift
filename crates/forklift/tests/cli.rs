@@ -2141,8 +2141,18 @@ impl AliasScratch {
             .unwrap()
     }
 
+    /// Mirrors the production `platform_alias_path` logic: a bare name on Unix (a symlink),
+    /// `name.cmd` on Windows (a shim) — so tests that write a "foreign file" or check
+    /// removal are looking at the same path the `alias` command itself would touch.
     fn alias_path(&self, name: &str) -> PathBuf {
-        self.dir.join(name)
+        #[cfg(windows)]
+        {
+            self.dir.join(format!("{}.cmd", name))
+        }
+        #[cfg(not(windows))]
+        {
+            self.dir.join(name)
+        }
     }
 }
 
@@ -2262,6 +2272,16 @@ fn the_fl_alias_behaves_identically_to_forklift() {
     let scratch = AliasScratch::new("behaves-identically");
     assert_success(&scratch.run(&["alias", "install"]));
 
+    // Direct execution of a `.cmd` file via `CreateProcess` is unreliable — Windows needs
+    // the command interpreter to run a batch shim. Unix executes the symlink directly.
+    #[cfg(windows)]
+    let via_alias = Command::new("cmd")
+        .arg("/C")
+        .arg(scratch.alias_path("fl"))
+        .args(["--json", "version"])
+        .output()
+        .unwrap();
+    #[cfg(not(windows))]
     let via_alias = Command::new(scratch.alias_path("fl"))
         .args(["--json", "version"])
         .output()
