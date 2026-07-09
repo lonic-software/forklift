@@ -14,6 +14,7 @@
 //! forbids, so a test cannot accidentally assert it is reachable.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use forklift_core::model::remote::TrustAnchorDto;
@@ -37,6 +38,9 @@ pub struct MemoryObjectStore {
     /// Offloaded response bodies (`batch` bundles), keyed by their content hash — the
     /// stand-in for an ephemeral S3 prefix served by presigned `GET`. Never an object.
     responses: Mutex<HashMap<String, Vec<u8>>>,
+    /// How many object bodies have been read out of the store — each one an S3 `GET` in the
+    /// real backend, so tests can assert what the audit mirror does *not* fetch.
+    reads: AtomicUsize,
     /// When set, `access`/`put_target` answer with a presigned-style URL under this base
     /// instead of serving bytes directly — the AWS deployment's behaviour.
     redirect_base: Option<String>,
@@ -71,6 +75,16 @@ impl MemoryObjectStore {
         self.staged.lock().unwrap().len()
     }
 
+    /// How many object bodies have been read from the store — an S3 `GET` apiece.
+    pub fn reads(&self) -> usize {
+        self.reads.load(Ordering::Relaxed)
+    }
+
+    /// Forget the read count, to measure one operation in isolation.
+    pub fn reset_reads(&self) {
+        self.reads.store(0, Ordering::Relaxed);
+    }
+
     /// The bytes behind an offloaded response URL, as a presigned `GET` would serve them.
     pub fn offloaded_response(&self, url: &str) -> Option<Vec<u8>> {
         let key = url.rsplit('/').next()?;
@@ -85,6 +99,8 @@ impl ObjectStore for MemoryObjectStore {
     }
 
     fn get(&self, hash: &str) -> Result<Option<Vec<u8>>, String> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+
         Ok(self.objects.lock().unwrap().get(hash).cloned())
     }
 

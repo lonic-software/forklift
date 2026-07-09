@@ -16,6 +16,7 @@
 //! and — on a trusted warehouse — the full offline audit before a ref moves.
 
 use std::collections::{BTreeMap, HashSet};
+use std::sync::Arc;
 
 use forklift_core::model::remote::{
     RefUpdateRequest, TrustAnchorDto, UploadTargetsResponse, WarehouseInfo, MAX_MISSING_BATCH,
@@ -23,10 +24,12 @@ use forklift_core::model::remote::{
 };
 use forklift_core::util::office_utils::OFFICE_PALLET_NAME;
 use forklift_core::util::pallet_utils::{PalletNamespace, PalletRef};
-use forklift_core::util::{audit_utils, bundle_utils, merge_utils, object_utils, sign_utils};
+use forklift_core::util::{
+    audit_utils, bundle_utils, file_utils, merge_utils, object_utils, sign_utils,
+};
 
 use crate::error::{HeadError, HeadResult};
-use crate::scratch::{materialize, Scratch};
+use crate::scratch::{materialize, Mirror, Scratch};
 use crate::store::{
     CasOutcome, ObjectAccess, ObjectStore, PromoteOutcome, PutTarget, RefStore, SignatureOutcome,
     TrustOutcome,
@@ -69,16 +72,43 @@ pub enum TrustResult {
     Unchanged,
 }
 
+/// Where a request's scratch warehouse comes from.
+enum ScratchSource {
+    /// A fresh directory per request, removed when the request ends.
+    Ephemeral,
+    /// The process-global scratch for this warehouse, reused across warm invocations.
+    Pooled(String),
+}
+
 /// The serverless protocol handler over an [`ObjectStore`] and a [`RefStore`].
 pub struct Head<O: ObjectStore, R: RefStore> {
     pub objects: O,
     pub refs: R,
+    scratch: ScratchSource,
 }
 
 impl<O: ObjectStore, R: RefStore> Head<O, R> {
-    /// Assemble a head over the two stores.
+    /// Assemble a head over the two stores, mirroring into a fresh scratch per request.
     pub fn new(objects: O, refs: R) -> Head<O, R> {
-        Head { objects, refs }
+        Head { objects, refs, scratch: ScratchSource::Ephemeral }
+    }
+
+    /// Assemble a head that reuses one scratch warehouse across warm invocations, so the
+    /// audit mirror is paid once per container rather than once per request.
+    ///
+    /// `warehouse_id` must identify the warehouse these stores serve, and nothing else: an
+    /// object found in the scratch is treated as present in the object store, and that
+    /// inference is only sound within one warehouse (see [`Scratch::shared`]).
+    pub fn pooled(objects: O, refs: R, warehouse_id: impl Into<String>) -> Head<O, R> {
+        Head { objects, refs, scratch: ScratchSource::Pooled(warehouse_id.into()) }
+    }
+
+    /// The scratch warehouse this request mirrors into.
+    fn scratch(&self) -> Result<Arc<Scratch>, String> {
+        match &self.scratch {
+            ScratchSource::Ephemeral => Scratch::new().map(Arc::new),
+            ScratchSource::Pooled(warehouse_id) => Scratch::shared(warehouse_id),
+        }
     }
 
     /// `GET /v1/warehouse` — the handshake: protocol version, refs and trust.
@@ -331,24 +361,30 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         // Mirror the objects the audit reads into a scratch `.forklift`, then run the exact
         // `forklift_core` audit inside its scope. Working blobs are never mirrored — their
         // presence is answered by the object store (an S3 HEAD).
-        let scratch = Scratch::new().map_err(HeadError::internal)?;
+        let scratch = self.scratch().map_err(HeadError::internal)?;
 
         scratch.scoped(|| -> HeadResult<()> {
-            let mut mirrored: HashSet<String> = HashSet::new();
+            let mut mirror = Mirror::default();
 
             // On a trusted warehouse the office chain must be readable (it carries the keys
             // that verify every other pallet). Its "blobs" are tracked-metadata records the
-            // audit reads, so they are mirrored too.
+            // audit reads, so they are mirrored too — and never bounded, because
+            // `verify_office_chain` walks from the head to the genesis every time.
             if anchor.is_some() {
                 if let Some(office_head) = &office_head {
-                    materialize(&self.objects, office_head, true, &mut mirrored)
+                    materialize(&self.objects, office_head, true, None, &mut mirror)
                         .map_err(HeadError::internal)?;
                 }
             }
 
+            // Everything reachable from the pallet's current head was audited when that head
+            // was committed, so the target mirror stops expanding trees there. The office is
+            // the exception (see above); a creation has no bound at all.
+            let known_complete = if is_office { None } else { request.old_head.as_deref() };
+
             // The target closure: a meta pallet's blobs are records (mirror them); a
             // working pallet's blobs are file content (leave them in the object store).
-            materialize(&self.objects, &request.new_head, is_meta, &mut mirrored)
+            materialize(&self.objects, &request.new_head, is_meta, known_complete, &mut mirror)
                 .map_err(HeadError::internal)?;
 
             // 1. Closure presence. Working blobs are checked via the object store.
@@ -441,7 +477,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     pub fn batch(&self, hashes: &[String]) -> HeadResult<BatchResult> {
         self.reject_oversized_batch(hashes.len())?;
 
-        let scratch = Scratch::new().map_err(HeadError::internal)?;
+        let scratch = self.scratch().map_err(HeadError::internal)?;
 
         let bundle = scratch.scoped(|| -> HeadResult<Vec<u8>> {
             let mut mirrored: HashSet<String> = HashSet::new();
@@ -451,17 +487,27 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                     continue;
                 }
 
-                if let Some(bytes) = self.objects.get(hash).map_err(HeadError::internal)? {
-                    object_utils::store_object_bytes(hash, &bytes).map_err(HeadError::internal)?;
+                // A warm scratch may already hold it, mirrored from this same warehouse.
+                if !file_utils::does_object_exist(hash).map_err(HeadError::internal)? {
+                    if let Some(bytes) = self.objects.get(hash).map_err(HeadError::internal)? {
+                        object_utils::store_object_bytes(hash, &bytes)
+                            .map_err(HeadError::internal)?;
+                    }
                 }
 
-                if let Some(sidecar) = self.objects.get_signature(hash).map_err(HeadError::internal)?
+                if sign_utils::load_raw_parcel_signature(hash).map_err(HeadError::internal)?.is_none()
                 {
-                    sign_utils::store_raw_parcel_signature(hash, &sidecar)
-                        .map_err(HeadError::internal)?;
+                    if let Some(sidecar) =
+                        self.objects.get_signature(hash).map_err(HeadError::internal)?
+                    {
+                        sign_utils::store_raw_parcel_signature(hash, &sidecar)
+                            .map_err(HeadError::internal)?;
+                    }
                 }
             }
 
+            // `build_partial_bundle` skips whatever is absent from the scratch, so a hash the
+            // store lacks is simply not in the bundle — the documented contract.
             bundle_utils::build_partial_bundle(hashes).map_err(HeadError::internal)
         })?;
 

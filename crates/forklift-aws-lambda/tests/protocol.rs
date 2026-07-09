@@ -16,7 +16,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use forklift_aws_lambda::error::Status;
 use forklift_aws_lambda::head::{ObjectReadResult, ObjectWriteResult, TrustResult};
 use forklift_aws_lambda::memory::{MemoryObjectStore, MemoryRefStore};
-use forklift_aws_lambda::store::{ObjectStore, PromoteOutcome, SignatureOutcome};
+use forklift_aws_lambda::scratch::Scratch;
+use forklift_aws_lambda::store::{ObjectStore, PromoteOutcome, RefStore, SignatureOutcome};
 use forklift_aws_lambda::{BatchResult, Head};
 
 use forklift_core::globals::StorageRootScope;
@@ -564,6 +565,232 @@ fn racing_promoters_serialize_and_never_report_missing() {
     assert!(!outcomes.contains(&PromoteOutcome::Missing), "the loser must not see 'missing'");
     assert_eq!(store.object_count(), 1);
     assert_eq!(store.staged_count(), 0);
+}
+
+/// Build a warehouse of `dirs` directories, then `touches` parcels each rewriting the same
+/// file. Every touch supersedes two trees (the root and `d0`), so the history accumulates
+/// tree versions that only an unbounded mirror would ever fetch. The head's own tree closure
+/// stays the same size no matter how many touches came before.
+fn layered_warehouse(area: &Area, dirs: usize, touches: usize) {
+    prepare(area, "wh");
+
+    for dir in 0..dirs {
+        area.write_file(&format!("wh/d{}/f.txt", dir), "v0\n");
+    }
+
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "create"]);
+
+    for touch in 0..touches {
+        area.write_file("wh/d0/f.txt", &format!("v{}\n", touch + 1));
+        area.forklift("wh", &["load", "."]);
+        area.forklift("wh", &["stack", &format!("touch {}", touch)]);
+    }
+}
+
+/// Audit one more parcel on top of a `touches`-long history, both ways, and report how many
+/// object bodies each mirror pulled from the store: `(bounded, unbounded)`. The two differ
+/// only in `old_head` — same graph, same objects.
+fn mirror_reads(touches: usize) -> (usize, usize) {
+    let area = Area::new("bounded-mirror");
+    layered_warehouse(&area, 4, touches);
+
+    let old_head = harvest(&area.path("wh")).head_of("main").expect("main head");
+
+    // The segment the incremental update actually audits.
+    area.write_file("wh/d0/f.txt", "the new segment\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "the new segment"]);
+
+    let latest = harvest(&area.path("wh"));
+    let new_head = latest.head_of("main").expect("main head");
+    assert_ne!(old_head, new_head);
+
+    // Bounded: the pallet already sits at `old_head`, so the audit stops expanding there.
+    let bounded = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    upload_all(&bounded, &latest);
+    bounded
+        .ref_update("main", &RefUpdateRequest { old_head: None, new_head: old_head.clone() })
+        .expect("establish the old head");
+    bounded.objects.reset_reads();
+    bounded
+        .ref_update(
+            "main",
+            &RefUpdateRequest { old_head: Some(old_head), new_head: new_head.clone() },
+        )
+        .expect("the bounded ref update still audits clean");
+
+    // Unbounded: the same head parcel audited as a creation — the whole history expands.
+    let unbounded = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    upload_all(&unbounded, &latest);
+    unbounded.objects.reset_reads();
+    unbounded
+        .ref_update("main", &RefUpdateRequest { old_head: None, new_head })
+        .expect("the unbounded ref update audits clean");
+
+    (bounded.objects.reads(), unbounded.objects.reads())
+}
+
+/// R3: the ref-update mirror is bounded at `old_head` — in the dimension that costs.
+///
+/// Below the bound it still reads one parcel *body* apiece (`collect_reachable` walks
+/// `old_head`'s ancestry to build the closure check's prune set), but **no trees**. So
+/// lengthening the history by `k` parcels costs a bounded mirror exactly `k` more reads,
+/// while an unbounded one also re-fetches every superseded tree version.
+#[test]
+fn the_ref_update_mirror_is_bounded_at_old_head() {
+    let extra = 4;
+    let (bounded_short, unbounded_short) = mirror_reads(2);
+    let (bounded_long, unbounded_long) = mirror_reads(2 + extra);
+
+    assert!(bounded_short < unbounded_short, "the bound saves reads even on a short history");
+
+    assert_eq!(
+        bounded_long - bounded_short,
+        extra,
+        "a bounded mirror pays exactly one parcel body per extra parcel of history and no \
+         trees ({} vs {} reads)",
+        bounded_long,
+        bounded_short
+    );
+
+    assert!(
+        unbounded_long - unbounded_short > extra,
+        "an unbounded mirror also re-reads every superseded tree ({} vs {} reads)",
+        unbounded_long,
+        unbounded_short
+    );
+}
+
+/// The sidecar bound is the subtle half of R3: `verify_pallet_history` never traverses
+/// *through* `old_head`, so a merge lift whose new segment forks below it must re-expand
+/// that older branch — signatures and all — or a trusted audit would see unsigned parcels.
+#[test]
+fn a_trusted_merge_lift_below_the_bound_still_audits() {
+    let area = Area::new("merge-bound");
+    prepare(&area, "wh");
+    area.forklift("wh", &["office", "enroll"]);
+
+    area.write_file("wh/app.txt", "base\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "base"]);
+
+    // A branch forking at `base` — below the bound the lift will later carry.
+    area.forklift("wh", &["palletize", "feature"]);
+    area.write_file("wh/feature.txt", "from the branch\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "on the branch"]);
+
+    // main moves on, and that head becomes the remote's `old_head`.
+    area.forklift("wh", &["shift", "main"]);
+    area.write_file("wh/app.txt", "moved on\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "on main"]);
+
+    let before = harvest(&area.path("wh"));
+    let old_head = before.head_of("main").expect("main head");
+    let office_head = before.head_of("@office").expect("office head");
+
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    upload_all(&head, &before);
+    head.put_trust(before.trust.as_ref().expect("trust")).expect("plant trust");
+    head.ref_update("@office", &RefUpdateRequest { old_head: None, new_head: office_head })
+        .expect("lift the office");
+    head.ref_update("main", &RefUpdateRequest { old_head: None, new_head: old_head.clone() })
+        .expect("establish the old head");
+
+    // The merge parcel: its second parent is the branch tip, whose ancestry forks below
+    // `old_head`. The audit walks into it; the mirror must follow.
+    area.forklift("wh", &["consolidate", "feature"]);
+
+    let after = harvest(&area.path("wh"));
+    let new_head = after.head_of("main").expect("merged main head");
+    assert_ne!(old_head, new_head);
+
+    // Guard the point of the test: a fast-forward would never walk below the bound.
+    let parents = {
+        let _scope = StorageRootScope::enter(&area.path("wh"));
+        object_utils::load_parcel(&new_head).expect("the merge parcel").parents
+    };
+    assert_eq!(parents.len(), 2, "consolidate stacked a real merge parcel");
+
+    upload_all(&head, &after);
+    head.ref_update("main", &RefUpdateRequest { old_head: Some(old_head), new_head })
+        .expect("a merge lift across the bound audits clean");
+}
+
+/// The warm-container scratch: a second ref update against the same warehouse finds the
+/// history already mirrored and re-reads almost nothing from the object store. The pool is
+/// keyed by warehouse, because scratch presence is read as store presence.
+#[test]
+fn a_pooled_scratch_amortizes_the_mirror_and_is_keyed_by_warehouse() {
+    // Unique per run: a shared scratch is keyed by warehouse alone, so a directory left in
+    // /tmp by an earlier run would silently pre-warm the "cold" measurement below.
+    let warehouse = format!("pooled-{}-{}", std::process::id(), unique_suffix());
+
+    let alpha = Scratch::shared(&warehouse).expect("shared scratch");
+    let again = Scratch::shared(&warehouse).expect("shared scratch");
+    let beta = Scratch::shared(&format!("{}-other", warehouse)).expect("shared scratch");
+
+    assert_eq!(alpha.root(), again.root(), "one scratch per warehouse, reused");
+    assert_ne!(alpha.root(), beta.root(), "never shared across warehouses");
+
+    let area = Area::new("pooled-scratch");
+    layered_warehouse(&area, 4, 3);
+
+    let old_head =
+        harvest(&area.path("wh")).head_of("main").expect("main head");
+
+    area.write_file("wh/d0/f.txt", "v2\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "the new segment"]);
+
+    let latest = harvest(&area.path("wh"));
+    let new_head = latest.head_of("main").expect("main head");
+
+    // A warehouse id unique to this test, so the process-global pool stays isolated.
+    let head = Head::pooled(MemoryObjectStore::new(), MemoryRefStore::new(), &warehouse);
+    upload_all(&head, &latest);
+
+    head.objects.reset_reads();
+    head.ref_update("main", &RefUpdateRequest { old_head: None, new_head: old_head.clone() })
+        .expect("cold ref update");
+    let cold = head.objects.reads();
+
+    head.objects.reset_reads();
+    head.ref_update(
+        "main",
+        &RefUpdateRequest { old_head: Some(old_head), new_head: new_head.clone() },
+    )
+    .expect("warm ref update");
+    let warm = head.objects.reads();
+
+    assert!(cold > 0, "the cold mirror reads the history");
+    assert!(
+        warm * 3 < cold,
+        "a warm scratch re-reads almost nothing: {} warm vs {} cold",
+        warm,
+        cold
+    );
+
+    // And it is still correct: the head moved.
+    assert_eq!(
+        head.refs.get_head(pallet_utils::PalletNamespace::User, "main").unwrap().as_deref(),
+        Some(new_head.as_str())
+    );
+
+    // A pooled scratch outlives the request by design; this test owns these two, so it
+    // leaves no directories behind.
+    let _ = std::fs::remove_dir_all(alpha.root());
+    let _ = std::fs::remove_dir_all(beta.root());
+}
+
+/// A monotonically increasing suffix, so a scratch key is unique to this run.
+fn unique_suffix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("a clock after 1970")
+        .as_nanos() as u64
 }
 
 /// `batch` returns a bundle-format stream the negotiation can consume, and the round trip
