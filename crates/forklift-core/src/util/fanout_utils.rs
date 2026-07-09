@@ -63,7 +63,8 @@ use crate::globals::{self, StorageRootScope};
 /// Spawns no threads for an empty `items` (returns `Vec::new()` immediately); a caller
 /// deciding whether the batch is even worth parallelizing should check its own threshold
 /// *before* calling this — `fanout_map` itself always parallelizes when there is more than
-/// one worker to give the batch.
+/// one worker to give the batch (a single-worker batch — one item, or `num_cpus() == 1` — maps
+/// inline on the calling thread instead, since a `thread::scope` with one worker buys nothing).
 pub fn fanout_map<T, R>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R>
 where
     T: Sync,
@@ -74,6 +75,13 @@ where
     }
 
     let workers = num_cpus::get().max(1).min(items.len());
+
+    if workers == 1 {
+        // No thread::scope re-entry needed here: we're still on the caller's own thread, so
+        // its storage-root scope (thread-local) is already active for `f`.
+        return items.iter().map(f).collect();
+    }
+
     let chunk = items.len().div_ceil(workers);
 
     // Storage-root scopes are thread-local and not inherited by spawned threads; capture the
@@ -122,6 +130,18 @@ mod tests {
         let results = fanout_map(&items, |n| n * 2);
 
         assert_eq!(results, vec![14]);
+    }
+
+    #[test]
+    fn single_worker_path_runs_inline_on_the_calling_thread() {
+        // items.len() == 1 forces workers == 1 regardless of num_cpus, which should take the
+        // serial fast path — no thread::scope, no spawned worker. Confirm `f` actually ran on
+        // the calling thread rather than a spawned one.
+        let caller_thread = std::thread::current().id();
+        let items = vec![7u32];
+        let results = fanout_map(&items, |n| (*n * 2, std::thread::current().id()));
+
+        assert_eq!(results, vec![(14, caller_thread)]);
     }
 
     #[test]

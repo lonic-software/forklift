@@ -83,12 +83,38 @@ impl Drop for ParcelReadMemo {
     }
 }
 
+/// A parcel read's decoded bytes: either a plain owned `Vec` (the common, non-memo path) or an
+/// `Rc`-shared clone served from an active [`ParcelReadMemo`]. Both variants deref to `[u8]`, so
+/// callers that only need to borrow the bytes (the parse) don't care which one they got.
+enum ParcelBytes {
+    Owned(Vec<u8>),
+    Shared(std::rc::Rc<Vec<u8>>),
+}
+
+impl std::ops::Deref for ParcelBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            ParcelBytes::Owned(bytes) => bytes,
+            ParcelBytes::Shared(bytes) => bytes,
+        }
+    }
+}
+
 /// Read a parcel's decoded bytes, serving and populating the [`ParcelReadMemo`] cache when one is
-/// active on this thread (otherwise a plain uncached read — the memo is never populated when no
-/// guard is held, so this is zero-cost outside `compact`'s reachability phase).
-fn read_parcel_bytes(hash: &str) -> Result<std::rc::Rc<Vec<u8>>, String> {
+/// active on this thread. When no guard is held (the common case — audit, history, any whole-walk
+/// caller), this takes a plain direct read with no `Rc` allocation at all: zero-cost outside
+/// `compact`'s reachability phase, not just zero *reuse*.
+fn read_parcel_bytes(hash: &str) -> Result<ParcelBytes, String> {
+    let memo_active = PARCEL_BYTES_MEMO.with(|memo| memo.borrow().is_some());
+
+    if !memo_active {
+        return Ok(ParcelBytes::Owned(file_utils::retrieve_object_by_hash_uncached(hash)?));
+    }
+
     if let Some(hit) = PARCEL_BYTES_MEMO.with(|memo| memo.borrow().as_ref().and_then(|c| c.get(hash).cloned())) {
-        return Ok(hit);
+        return Ok(ParcelBytes::Shared(hit));
     }
 
     let bytes = std::rc::Rc::new(file_utils::retrieve_object_by_hash_uncached(hash)?);
@@ -99,7 +125,7 @@ fn read_parcel_bytes(hash: &str) -> Result<std::rc::Rc<Vec<u8>>, String> {
         }
     });
 
-    Ok(bytes)
+    Ok(ParcelBytes::Shared(bytes))
 }
 
 /// Load and parse the parcel object with the given hash from the object store.
