@@ -308,6 +308,28 @@ fn build_args(name: &str, arguments: &Value) -> Result<Vec<String>, String> {
         "lift" => args.push("lift".to_string()),
         "lower" => args.push("lower".to_string()),
         "office_list" => args.push("office".to_string()),
+        "bay_add" => {
+            args.push("bay".to_string());
+            args.push("add".to_string());
+            args.push(require("name")?);
+            if let Some(path) = string_arg("path") {
+                args.push(path);
+            }
+            if let Some(scope) = arguments.get("scope").and_then(Value::as_array) {
+                for prefix in scope {
+                    if let Some(prefix) = prefix.as_str() {
+                        args.push("--scope".to_string());
+                        args.push(prefix.to_string());
+                    }
+                }
+            }
+        }
+        "bay_list" => args.push("bay".to_string()),
+        "bay_remove" => {
+            args.push("bay".to_string());
+            args.push("remove".to_string());
+            args.push(require("name")?);
+        }
         "peek" => {
             args.push("peek".to_string());
             match (string_arg("object"), string_arg("inventory")) {
@@ -541,6 +563,12 @@ fn tool_definitions() -> Value {
             object(json!({}), json!([]))),
         tool("office_list", "List the enrolled operators and their keys.",
             object(json!({}), json!([]))),
+        tool("bay_add", "Open a bay: a new working directory bound to this warehouse, checked out to a new pallet named after it (branched from the current head). Pass scope to open a scoped (sparse, §7.6) bay materializing only those subtree(s) — the tool for an orchestrator to hand a sub-agent a task-scoped sandbox. path defaults to a sibling of the warehouse.",
+            object(json!({ "name": string, "path": string, "scope": { "type": "array", "items": string } }), json!(["name"]))),
+        tool("bay_list", "List the bays: their names, working directories and current pallets.",
+            object(json!({}), json!([]))),
+        tool("bay_remove", "De-register a bay: remove its local bookkeeping (the redirect and bay state forklift created). The bay's pallet and materialized files are kept.",
+            object(json!({ "name": string }), json!(["name"]))),
         tool("peek", "Inspect an object by hash (object), or a folder's inventory (inventory).",
             object(json!({ "object": string, "inventory": string }), json!([]))),
         tool("blame", "Attribute each line of a file to the parcel that last changed it (rev: at a revision, default the current head).",
@@ -625,6 +653,16 @@ mod tests {
     /// host-machine concerns, and meta commands an agent does not drive through the tool
     /// surface. Every other CLI command MUST have a matching tool — the test below enforces
     /// it, so adding a CLI command without an MCP tool (or an allow-list entry) fails CI.
+    ///
+    /// `bay` is deliberately **not** on this list even though it manages a host working
+    /// directory: §7.6's agent story is an orchestrator agent creating task-scoped sandboxes
+    /// for sub-agents over MCP, and `bay` (`bay_add`/`bay_list`/`bay_remove`) is how it does
+    /// that. The scope a bay records is advisory local setup, not the agent's own security
+    /// boundary — enforcement of what an identity may touch lives remote-side (FORK-10), not
+    /// in the client's bay bookkeeping. Every bay operation is non-destructive: `add` refuses
+    /// onto a non-empty directory, and `remove` only deletes forklift's own redirect file and
+    /// bay-state folder, never the materialized working tree or anything the agent didn't
+    /// create — so nothing here needs a tighter gate than the rest of the surface.
     const HUMAN_ONLY: &[&str] = &[
         "alias",       // manage the `fl` shell alias next to this binary (host concern)
         "prepare",     // create a warehouse (setup)
@@ -633,7 +671,6 @@ mod tests {
         "franchise",   // clone a remote (setup)
         "import-git",  // migrate a git repo in (setup)
         "export-git",  // migrate out to git (setup)
-        "bay",         // create host working directories (host concern)
         "self-update", // update the binary (host concern)
         "mcp",         // this server itself
         "help",        // meta

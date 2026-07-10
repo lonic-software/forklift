@@ -590,6 +590,11 @@ Inside a scoped bay:
 Scope is a property of **this checkout**, not the project: it is recorded bay-locally and is
 **never tracked**, so it is never pushed to the remote or imposed on collaborators.
 
+Bay creation is exposed over MCP (`bay_add`, with the same `scope` argument), so an
+orchestrator agent can open task-scoped sandboxes for its sub-agents directly, without
+shelling out. The scope it sets is advisory local setup, not a security boundary — see
+**[`../MACHINE_INTERFACE.md`](../MACHINE_INTERFACE.md)**.
+
 ### `scope` — show the sparse-workspace scope (§7.6)
 
 ```sh

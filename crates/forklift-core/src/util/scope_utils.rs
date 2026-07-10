@@ -296,10 +296,22 @@ pub fn refusal(code: &str, message: impl Into<String>, next_step: impl Into<Stri
         REFUSAL_PREFIX,
         code,
         REFUSAL_FIELD_SEPARATOR,
-        message.into(),
+        sanitize_for_framing(&message.into()),
         REFUSAL_FIELD_SEPARATOR,
-        next_step.into()
+        sanitize_for_framing(&next_step.into())
     )
+}
+
+/// Strip ASCII control characters (including `\u{1f}`, the field separator) out of text
+/// before it is interpolated into a refusal frame. `message`/`next_step` are built by
+/// formatting in caller-supplied text — often a path — and `WarehousePath::from_user_input`'s
+/// control-character guard only covers paths a person typed; a path read back off disk (a
+/// tree or inventory entry) never passes through that constructor and can carry `\u{1f}`
+/// itself. Sanitizing here, at the one place every refusal is framed, keeps the frame
+/// decodable regardless of where the text originated, rather than relying on every call site
+/// to have scrubbed its input first.
+fn sanitize_for_framing(text: &str) -> String {
+    text.chars().map(|c| if c.is_control() { ' ' } else { c }).collect()
 }
 
 /// Decode a scope-refusal string built by [`refusal`] into `(code, message, next_step)`.
@@ -455,5 +467,22 @@ mod tests {
 
         // A plain error is not a scope refusal.
         assert!(decode_refusal("something ordinary went wrong").is_none());
+    }
+
+    #[test]
+    fn refusal_survives_a_control_character_in_interpolated_text() {
+        // A path sourced from disk (a tree/inventory entry), not `WarehousePath::from_user_input`,
+        // can carry the framing separator itself. The frame must still decode cleanly, with the
+        // control character stripped rather than corrupting the field boundaries.
+        let hostile_path = "src/\u{1f}api";
+
+        let refusal = out_of_scope_refusal(hostile_path);
+        let (code, message, next_step) = decode_refusal(&refusal)
+            .expect("a refusal built from a hostile path must still decode");
+
+        assert_eq!(code, CODE_OUT_OF_SCOPE);
+        assert!(!message.contains('\u{1f}'), "message still carries the control char: {:?}", message);
+        assert!(!next_step.contains('\u{1f}'), "next_step still carries the control char: {:?}", next_step);
+        assert!(message.contains("src/ api"), "control char should be replaced, not vanish: {:?}", message);
     }
 }

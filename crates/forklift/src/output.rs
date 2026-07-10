@@ -242,17 +242,25 @@ impl ForkliftError {
 /// `?`-friendly default. Scope refusals (§7.6) are the exception: `forklift-core` cannot
 /// build a `ForkliftError` (it never prints, and the type is CLI-local), so it frames the
 /// refusal as a sentinel-tagged string that this conversion decodes into a classified error
-/// with the matching stable code, exit code and next step. Any other string is generic.
+/// with the matching stable code, exit code and next step.
+///
+/// A frame whose `code` this build does not recognize (e.g. a newer `forklift-core` added a
+/// scope code this CLI predates) still decodes — the frame itself is well-formed — so it
+/// still uses the decoded human message and next step rather than falling through to the
+/// raw framed string, which would leak the `\u{1f}` field separators into human/JSON output.
+/// It just classifies as `Generic` instead of the (unknown) specific code. Only a string that
+/// is not a scope refusal at all — `decode_refusal` returns `None` — is treated as a plain
+/// generic error verbatim.
 impl From<String> for ForkliftError {
     fn from(message: String) -> ForkliftError {
         if let Some((code, human, next_step)) = scope_utils::decode_refusal(&message) {
-            if let Some(code) = ErrorCode::from_scope_code(code) {
-                return ForkliftError {
-                    code,
-                    message: human.to_string(),
-                    next_step: Some(next_step.to_string()),
-                };
-            }
+            let code = ErrorCode::from_scope_code(code).unwrap_or(ErrorCode::Generic);
+
+            return ForkliftError {
+                code,
+                message: human.to_string(),
+                next_step: Some(next_step.to_string()),
+            };
         }
 
         ForkliftError { code: ErrorCode::Generic, message, next_step: None }
@@ -268,4 +276,42 @@ macro_rules! human {
             println!($($arg)*);
         }
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_known_scope_code_classifies_and_keeps_the_next_step() {
+        let refusal = scope_utils::out_of_scope_refusal("src/web");
+        let error: ForkliftError = refusal.into();
+
+        assert_eq!(error.code.as_str(), scope_utils::CODE_OUT_OF_SCOPE);
+        assert!(!error.message.contains('\u{1f}'));
+        assert!(error.next_step.is_some());
+    }
+
+    #[test]
+    fn an_unrecognized_scope_code_still_decodes_instead_of_leaking_the_raw_frame() {
+        // A well-formed frame whose code this build has never heard of — as if a newer
+        // `forklift-core` introduced a scope code this CLI predates.
+        let frame = scope_utils::refusal("some_future_code", "a human explanation", "do this");
+
+        let error: ForkliftError = frame.into();
+
+        assert_eq!(error.code.as_str(), "error"); // ErrorCode::Generic
+        assert_eq!(error.message, "a human explanation");
+        assert_eq!(error.next_step.as_deref(), Some("do this"));
+        assert!(!error.message.contains('\u{1f}'), "the raw frame must never leak into the message");
+    }
+
+    #[test]
+    fn a_plain_string_is_a_generic_error_with_no_next_step() {
+        let error: ForkliftError = "something ordinary went wrong".to_string().into();
+
+        assert_eq!(error.code.as_str(), "error");
+        assert_eq!(error.message, "something ordinary went wrong");
+        assert!(error.next_step.is_none());
+    }
 }
