@@ -1,0 +1,63 @@
+# Benchmark-regression job (design note DESIGN.html §5.0 milestone D, item T5).
+#
+# Builds a small, deterministically-generated corpus fresh in the job (bin/bench.sh —
+# no committed binary blobs) and times the axes the roadmap named: the existing hot ops
+# (stocktake, diff, compact) plus shift, signed stack, audit, cold/warm cache, peak RSS
+# and core-count scaling. See bin/bench.sh's header for the full design, and its
+# "Gating philosophy" comment for what this job does and does not fail on: a handful of
+# same-run ratio checks and generous absolute ceilings, tuned to catch order-of-magnitude
+# regressions on a noisy shared runner, not ordinary variance. The JSON/Markdown report
+# is a trend artifact for humans, not itself a gate.
+#
+# One Linux job is enough for gating (it is the only platform with `taskset`, so it is
+# the only one that exercises core-count scaling). Runs on every push to main so a
+# regression that lands is caught; on pull requests only when the diff touches a
+# perf-sensitive path, to keep PR CI cheap.
+name: bench
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "crates/forklift-core/src/**"
+      - "crates/forklift/src/commands/**"
+      - "crates/forklift/src/cli.rs"
+      - "bin/bench.sh"
+      - ".github/workflows/bench.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bench:
+    name: bench (ubuntu-latest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install GNU time (peak-RSS measurement)
+        run: sudo apt-get update && sudo apt-get install -y time
+
+      - name: Build (release)
+        run: cargo build --release --locked -p forklift
+
+      - name: Run the benchmark harness
+        run: |
+          export PATH="$PWD/target/release:$PATH"
+          bin/bench.sh --out bench-results
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: |
+            bench-results.json
+            bench-results.md
+          if-no-files-found: warn
