@@ -13,10 +13,19 @@
 //! hold at *every* kill point, so the test cannot flake — whether a given kill lands inside the
 //! interesting window only affects coverage, never pass/fail. A crash that genuinely corrupted
 //! the store (a torn object, a partial ref) is the only thing that fails it.
+//!
+//! The kill delays themselves *are* calibrated, though: a fixed millisecond spread that straddles
+//! the write window on a fast dev laptop can land entirely before the first `stack` ever finishes
+//! on a slow/cold CI runner, in which case no kill ever exercises the durable-ref-advance path and
+//! the sanity guard below (rightly) refuses to pass. So before spawning any kills, this test times
+//! a few uninterrupted `stack` runs on the same corpus in the same warehouse and derives the delay
+//! spread from that measurement — proportional to how slow *this* machine actually is. If the
+//! guard still trips (measurement noise, a GC pause, whatever), it retries once with a
+//! re-measured, wider spread before failing for real.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const FORKLIFT: &str = env!("CARGO_BIN_EXE_forklift");
 
@@ -97,6 +106,152 @@ impl Drop for Area {
     }
 }
 
+/// Overwrite the corpus file with a fresh, same-order-of-magnitude payload so each `stack` call
+/// (calibration or real) has real hashing/compression/fsync work to do.
+fn rewrite_corpus(file: &Path, base_line: &str, tag: &str) {
+    std::fs::write(file, format!("{}{}\n", base_line.repeat(90_000), tag)).unwrap();
+}
+
+/// The current pallet head, if one exists yet.
+fn current_head(warehouse: &Path) -> Option<String> {
+    std::fs::read_to_string(warehouse.join(".forklift").join("pallets").join("main"))
+        .ok()
+        .map(|h| h.trim().to_string())
+}
+
+/// Time a few uninterrupted `stack` runs on the same corpus, in the same warehouse the kill loop
+/// will use, and return the slowest of them. Using the max (not the mean/median) biases the
+/// resulting delay spread wide rather than narrow: undershooting the true duration is what causes
+/// every kill to land before the write ever starts, which is exactly the flake this is guarding
+/// against. Each call fully completes and folds into the real history — that's fine, it's the same
+/// warehouse the kill loop continues from, just with a known head established before it starts.
+fn calibrate_stack_duration(area: &Area, file: &Path, base_line: &str, label: &str, samples: usize) -> Duration {
+    // The caller may be re-entering right after a kill spread whose last kill landed mid-write and
+    // left `.forklift/lock` behind (SIGKILL runs no destructor) — `run_kill_spread` only clears the
+    // stale lock at the *start* of its own next iteration, so a caller that jumps straight from a
+    // spread into recalibration (the attempt-1-landed-nothing retry) would otherwise hit a locked
+    // warehouse on the very first `load`/`stack` below. Clear it here too, same as `run_kill_spread`
+    // does, so calibration never fails on a lock left behind by the run it's re-measuring after.
+    area.clear_stale_lock();
+
+    let mut slowest = Duration::ZERO;
+    for i in 0..samples {
+        rewrite_corpus(file, base_line, &format!("{label} {i}"));
+        let load = area.run(&["load", "."]);
+        assert!(load.status.success(), "calibration load failed: {}", String::from_utf8_lossy(&load.stderr));
+
+        let start = Instant::now();
+        let stack = area.run(&["stack", &format!("{label} {i}")]);
+        let elapsed = start.elapsed();
+        assert!(stack.status.success(),
+            "calibration stack failed: {}", String::from_utf8_lossy(&stack.stderr));
+
+        slowest = slowest.max(elapsed);
+    }
+    slowest
+}
+
+/// Derive `count` kill delays spread across at least `[low_frac, high_frac]` of one measured,
+/// uninterrupted `stack` duration, so the spread scales with how slow *this* machine actually is
+/// instead of assuming a fixed millisecond budget. The fractions set a *floor* for the spread, not
+/// an exact bound: consecutive delays are never closer than `MIN_STEP_MS` apart (Windows' ~15ms
+/// timer-tick granularity quantizes finer sleeps away, which would collapse several
+/// nominally-distinct delays onto the same wall-clock kill point), and on a fast measurement that
+/// floor dominates the requested step, stretching the top of the spread well past `high_frac`. That
+/// overshoot is desirable, not a bug to tighten: a fast machine gets extra post-completion coverage
+/// at negligible cost, and the guard needs some kills to land after completion regardless of how
+/// small the measured duration was.
+fn kill_delay_spread(measured: Duration, count: usize, low_frac: f64, high_frac: f64) -> Vec<Duration> {
+    const MIN_STEP_MS: u64 = 15;
+    assert!(count >= 2);
+
+    let measured_ms = (measured.as_millis() as u64).max(1);
+    let low = ((measured_ms as f64) * low_frac).round().max(1.0) as u64;
+    let high = ((measured_ms as f64) * high_frac).round().max(low as f64 + 1.0) as u64;
+    let step = ((high - low) / (count as u64 - 1)).max(MIN_STEP_MS);
+
+    (0..count as u64).map(|i| Duration::from_millis(low + step * i)).collect()
+}
+
+/// The calibration math in isolation, without spawning any processes: a spread derived from a
+/// slow measurement must actually reach further out than one derived from a fast measurement
+/// (the whole point — no more hard-coded 80ms ceiling that a slow runner can't clear), a spread
+/// must never step by less than Windows' timer granularity, and widening the fractions (the
+/// retry) must reach further than the original spread for the same measurement.
+#[test]
+fn kill_delay_spread_scales_with_measured_duration() {
+    let fast = kill_delay_spread(Duration::from_micros(500), 24, 0.02, 1.30);
+    assert_eq!(fast.first(), Some(&Duration::from_millis(1)));
+    assert!(fast.windows(2).all(|w| w[1] - w[0] >= Duration::from_millis(15)),
+        "delays must never step by less than one Windows timer tick: {fast:?}");
+
+    // A slow, 800ms measurement (a loaded/cold CI runner) must spread proportionally further out —
+    // not stay capped at whatever a fast dev laptop's measurement would have produced.
+    let slow = kill_delay_spread(Duration::from_millis(800), 24, 0.02, 1.30);
+    assert!(slow.last().unwrap() > &Duration::from_millis(900),
+        "a slow measurement must produce a proportionally wide spread: {slow:?}");
+    assert!(slow.windows(2).all(|w| w[1] > w[0]), "delays must be strictly increasing: {slow:?}");
+    assert!(slow.last() > fast.last(), "a slower measurement must reach further than a fast one");
+
+    // The bounded retry (wider fractions) must reach further still for the same measurement.
+    let retry = kill_delay_spread(Duration::from_millis(800), 24, 0.0, 2.5);
+    assert!(retry.last() > slow.last(), "the retry spread must widen beyond the first attempt");
+}
+
+/// Run one spread of kills against `area`, asserting consistency after every one. Returns how many
+/// of them landed *after* a stack's ref update had already completed (a distinct new head appeared
+/// between two consecutive checks) — the signal that the durable path, not just the
+/// killed-before-anything path, was actually exercised. `prior_head` carries the last observed head
+/// across calls (including across calibration bursts) so that head established before this spread
+/// ran is never mistaken for one this spread produced.
+fn run_kill_spread(
+    area: &Area,
+    file: &Path,
+    base_line: &str,
+    warehouse: &Path,
+    delays: &[Duration],
+    commit_tag: &str,
+    prior_head: &mut Option<String>,
+) -> usize {
+    let mut advanced = 0usize;
+
+    for (i, delay) in delays.iter().enumerate() {
+        // 1. Recover from the previous kill and check it left the store consistent.
+        area.clear_stale_lock();
+        area.assert_consistent(&format!("after {commit_tag} kill #{i}"));
+
+        // A head that advanced must be a *new* parcel, never a rewritten/rolled-back one.
+        let head_now = current_head(warehouse);
+        if let (Some(now), Some(prev)) = (&head_now, prior_head.as_ref()) {
+            if now != prev {
+                advanced += 1;
+            }
+        } else if head_now.is_some() && prior_head.is_none() {
+            advanced += 1;
+        }
+        *prior_head = head_now;
+
+        // 2. Make a fresh change and stage it.
+        rewrite_corpus(file, base_line, &format!("{commit_tag} {i}"));
+        let load = area.run(&["load", "."]);
+        assert!(load.status.success(), "load failed: {}", String::from_utf8_lossy(&load.stderr));
+
+        // 3. Spawn the stack and SIGKILL it mid-flight.
+        let mut child = area.command(&["stack", &format!("{commit_tag} commit {i}")])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+
+        std::thread::sleep(*delay);
+
+        let _ = child.kill(); // a no-op if it already finished
+        let _ = child.wait();
+    }
+
+    advanced
+}
+
 #[test]
 fn killing_stack_midway_never_corrupts_the_store() {
     let area = Area::new("stack");
@@ -112,49 +267,33 @@ fn killing_stack_midway_never_corrupts_the_store() {
     assert!(area.run(&["config", "operator.name", "crash@forklift"]).status.success());
     assert!(area.run(&["config", "operator.identifier", "crash@forklift"]).status.success());
 
-    // Delays that straddle a single stack's duration: some fire before the objects are written,
-    // some during, some after the ref has advanced.
-    let delays_ms: [u64; 24] = [
-        1, 2, 3, 4, 5, 6, 8, 10, 12, 14, 16, 18, 20, 24, 28, 32, 36, 40, 45, 50, 55, 60, 70, 80,
-    ];
+    const DELAY_COUNT: usize = 24;
 
-    let mut advanced = 0usize;
-    let mut prior_head: Option<String> = None;
+    // Attempt 1: measure how long an uninterrupted `stack` actually takes on this machine, then
+    // spread the kills across ~2%..130% of that — wide enough to straddle the write window whether
+    // it's microseconds (a fast laptop) or hundreds of milliseconds (a cold, loaded CI runner).
+    let measured_1 = calibrate_stack_duration(&area, &file, base_line, "calibration-1", 3);
+    let delays_1 = kill_delay_spread(measured_1, DELAY_COUNT, 0.02, 1.30);
+    let mut prior_head = current_head(&warehouse);
 
-    for (i, delay) in delays_ms.iter().enumerate() {
-        // 1. Recover from the previous kill and check it left the store consistent.
-        area.clear_stale_lock();
-        area.assert_consistent(&format!("after kill #{i}"));
+    let mut advanced = run_kill_spread(&area, &file, base_line, &warehouse, &delays_1, "a", &mut prior_head);
 
-        // A head that advanced must be a *new* parcel, never a rewritten/rolled-back one.
-        let head_now = std::fs::read_to_string(
-            warehouse.join(".forklift").join("pallets").join("main"),
-        ).ok().map(|h| h.trim().to_string());
-        if let (Some(now), Some(prev)) = (&head_now, &prior_head) {
-            if now != prev {
-                advanced += 1;
-            }
-        } else if head_now.is_some() && prior_head.is_none() {
-            advanced += 1;
-        }
-        prior_head = head_now;
-
-        // 2. Make a fresh change and stage it.
-        std::fs::write(&file, format!("{}change {}\n", base_line.repeat(90_000), i)).unwrap();
-        let load = area.run(&["load", "."]);
-        assert!(load.status.success(), "load failed: {}", String::from_utf8_lossy(&load.stderr));
-
-        // 3. Spawn the stack and SIGKILL it mid-flight.
-        let mut child = area.command(&["stack", &format!("commit {i}")])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-
-        std::thread::sleep(Duration::from_millis(*delay));
-
-        let _ = child.kill(); // a no-op if it already finished
-        let _ = child.wait();
+    // The guard below exists so this test can't silently pass by always killing before any real
+    // work started. If the first spread never landed a completed stack, that's most likely
+    // measurement noise (a cold cache on the very first calibration run, a scheduler hiccup) rather
+    // than a structural problem — so re-measure and try a wider spread once, bounded, before
+    // failing for real.
+    let mut measured_2 = None;
+    let mut delays_2 = None;
+    if advanced == 0 {
+        let measured = calibrate_stack_duration(&area, &file, base_line, "calibration-2", 3);
+        let delays = kill_delay_spread(measured, DELAY_COUNT, 0.0, 2.5);
+        // Recalibration itself completes real, uninterrupted stack calls — re-anchor the baseline
+        // so the retry's own writes are never mistaken for a kill's ref update, same as attempt 1.
+        prior_head = current_head(&warehouse);
+        advanced += run_kill_spread(&area, &file, base_line, &warehouse, &delays, "b", &mut prior_head);
+        measured_2 = Some(measured);
+        delays_2 = Some(delays);
     }
 
     // 4. Final recovery: the store must still accept a clean write, and every object reachable from
@@ -180,5 +319,12 @@ fn killing_stack_midway_never_corrupts_the_store() {
 
     // Sanity: across the run at least one kill fell after a completed ref update, so the durable
     // path (not just the "killed before anything" path) was actually exercised.
-    assert!(advanced >= 1, "no stack ever completed — the write window was never exercised");
+    assert!(advanced >= 1,
+        "no stack ever completed across {} attempt(s) — the write window was never exercised. \
+         attempt 1: measured {measured_1:?} uninterrupted, tried delays {delays_1:?}.{}",
+        if measured_2.is_some() { 2 } else { 1 },
+        match (measured_2, delays_2) {
+            (Some(m), Some(d)) => format!(" attempt 2: measured {m:?} uninterrupted, tried delays {d:?}."),
+            _ => String::new(),
+        });
 }
