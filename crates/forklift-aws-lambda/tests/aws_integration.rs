@@ -10,6 +10,7 @@
 //!
 //! ```sh
 //! docker run --rm -d -p 4566:4566 localstack/localstack
+//! cargo build -p forklift  # the suite drives this CLI binary; it must exist first
 //! FORKLIFT_AWS_TEST_ENDPOINT=http://localhost:4566 \
 //!   AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION=us-east-1 \
 //!   cargo test -p forklift-aws-lambda --test aws_integration
