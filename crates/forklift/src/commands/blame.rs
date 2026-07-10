@@ -26,7 +26,7 @@ use crate::output::{self, CommandOutput};
 ///                   an object could not be read.
 pub async fn handle_command(path: &str, revision: Option<String>) -> Result<(), String> {
     // An out-of-scope path is sealed by hash in a scoped bay; blaming it would hit an object
-    // read the bay never materialized — refuse cleanly with a stable code instead (§7.6 D6).
+    // read the bay never materialized — refuse cleanly with a stable code instead (§7.6).
     crate::commands::scope::ensure_path_in_scope(WarehousePath::from_user_input(path)?.as_key())?;
 
     let head = match revision {

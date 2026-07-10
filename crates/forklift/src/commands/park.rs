@@ -55,7 +55,7 @@ pub async fn park_changes() -> Result<(), String> {
     // onto the head's spine exactly like `stack` does (§3.2), so the parked parcel commits the
     // same root a full bay would — `park` is documented to inherit the overlay, and a truncated
     // parked tree would silently break that. The "nothing to park" check below must compare the
-    // *spliced* root against head, or it never fires in a scoped bay (M2).
+    // *spliced* root against head, or it never fires in a scoped bay.
     let scope = scope_utils::current_scope()?;
 
     let root_tree = if scope.is_full() {

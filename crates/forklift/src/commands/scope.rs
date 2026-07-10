@@ -17,7 +17,7 @@ pub fn ensure_path_in_scope(key: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Refuse a whole-tree verb that stage 1 does not yet support in a scoped (sparse) bay
+/// Refuse a whole-tree verb that does not yet support running in a scoped (sparse) bay
 /// (§7.6), with the stable `sparse_workspace` code and a recovery step. A no-op in a full
 /// (unscoped) bay or the main tree.
 ///
@@ -76,7 +76,8 @@ struct ScopeStatus {
     /// The bay's in-scope prefixes (empty = the full tree).
     materialization_scope: Vec<String>,
 
-    /// The warehouse's fetch-scope prefixes (empty = fully fetched; always so in stage 1).
+    /// The warehouse's fetch-scope prefixes (empty = fully fetched; always so today, since
+    /// fetching itself cannot yet be scoped).
     fetch_scope: Vec<String>,
 }
 

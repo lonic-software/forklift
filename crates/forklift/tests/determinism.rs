@@ -1,4 +1,4 @@
-//! T3 — parallel-determinism + real two-process lock behaviour (milestone A, the test spine).
+//! Parallel-determinism + real two-process lock behaviour, part of the hardening test spine.
 //!
 //! Forklift fans out the staging walk, the tree build and hashing over a worker pool sized to the
 //! core count, and packs the object store. Two properties have to survive that:
@@ -6,7 +6,7 @@
 //!  * **Determinism.** Independent, parallel work reassembles into a fixed order (sorted change
 //!    lists, `BTreeMap` trees), so the *content* addresses it produces must not depend on how the
 //!    workers were scheduled. Two identical worktrees must yield the same tree hash, a repeated
-//!    read must be byte-identical, and a steady-state repack (D5's layout-derived pack id) must
+//!    read must be byte-identical, and a steady-state repack (its layout-derived pack id) must
 //!    reproduce the same pack files rather than churn their names.
 //!  * **Mutual exclusion across processes.** The warehouse lock is an on-disk sentinel, so a
 //!    second process that finds it held must be refused — while a read-only command is unaffected.
@@ -243,7 +243,7 @@ fn stocktake_output_is_stable_across_runs() {
 
 #[test]
 fn repacking_is_byte_reproducible() {
-    // D5: the pack id is derived from the pack's byte layout and repacks tie-break deterministically,
+    // The pack id is derived from the pack's byte layout and repacks tie-break deterministically,
     // so consolidating an already-packed store must reproduce the *same* pack files — not rewrite
     // them under new names every run (the churn the layout-derived id fixed).
     let warehouse = Warehouse::new("repack");

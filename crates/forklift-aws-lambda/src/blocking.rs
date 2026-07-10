@@ -1,4 +1,4 @@
-//! The sync/async seam (R4, decided 2026-07-09).
+//! The sync/async seam.
 //!
 //! # The decision
 //!

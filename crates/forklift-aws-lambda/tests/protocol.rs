@@ -633,7 +633,7 @@ fn mirror_reads(touches: usize) -> (usize, usize) {
     (bounded.objects.reads(), unbounded.objects.reads())
 }
 
-/// R3: the ref-update mirror is bounded at `old_head` — in the dimension that costs.
+/// The ref-update mirror is bounded at `old_head` — in the dimension that costs.
 ///
 /// Below the bound it still reads one parcel *body* apiece (`collect_reachable` walks
 /// `old_head`'s ancestry to build the closure check's prune set), but **no trees**. So
@@ -664,7 +664,7 @@ fn the_ref_update_mirror_is_bounded_at_old_head() {
     );
 }
 
-/// The sidecar bound is the subtle half of R3: `verify_pallet_history` never traverses
+/// The sidecar bound is the subtle half of that guarantee: `verify_pallet_history` never traverses
 /// *through* `old_head`, so a merge lift whose new segment forks below it must re-expand
 /// that older branch — signatures and all — or a trusted audit would see unsigned parcels.
 #[test]
@@ -909,7 +909,7 @@ fn upload_targets_negotiates_without_sending_bodies() {
 }
 
 // ---------------------------------------------------------------------------------------
-// R4: the sync/async seam. Stores whose every operation is a future — the AWS SDK's shape —
+// The sync/async seam: stores whose every operation is a future — the AWS SDK's shape —
 // implementing the synchronous traits through `AsyncBridge`.
 // ---------------------------------------------------------------------------------------
 
@@ -995,9 +995,9 @@ impl RefStore for AsyncRefStore {
     }
 }
 
-/// R4: the whole trusted lift — mirror, thread-local storage scope, signature audit, CAS —
+/// The whole trusted lift — mirror, thread-local storage scope, signature audit, CAS —
 /// runs synchronously on a blocking thread over stores that are async underneath. This is
-/// the shape milestone C's S3 + DynamoDB implementations take, minus AWS.
+/// the shape the S3 + DynamoDB implementations take, minus AWS.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_trusted_lift_runs_over_async_backed_stores_from_a_blocking_thread() {
     let area = Area::new("async-seam");

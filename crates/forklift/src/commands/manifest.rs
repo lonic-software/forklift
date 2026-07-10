@@ -6,7 +6,7 @@ use crate::cli::ManifestAction;
 use crate::commands::office;
 use crate::output::{self, CommandOutput};
 
-/// Handle the manifest command: signed post-metadata attached to parcels (FORK-9).
+/// Handle the manifest command: signed post-metadata attached to parcels.
 ///
 /// * `manifest note <rev> -m …`    - attach a signed note to a parcel.
 /// * `manifest approve <rev> [-m]` - record a signed approval of a parcel.

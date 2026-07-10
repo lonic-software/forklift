@@ -9,7 +9,7 @@
 //! with a `307` redirect to a presigned storage URL when the [`ObjectStore`] is S3-backed,
 //! exactly as the protocol's redirect room allows.
 //!
-//! Authentication and the transport-level FORK-10 role/grant checks are the adapter's
+//! Authentication and the transport-level role/grant checks are the adapter's
 //! concern (the API Gateway authorizer decides *who* the caller is, then the same office
 //! roles the server head consults gate *what* they may move). This type enforces the
 //! provider-independent content invariants: hash-verified objects, a fast-forward-only CAS,
@@ -20,7 +20,7 @@
 //! work. It mirrors objects into a thread-local-scoped scratch and runs `forklift_core`'s
 //! audit inside that scope, so the call must never migrate between threads mid-flight; and
 //! tokio refuses to let a runtime worker block on the futures an SDK-backed store bridges.
-//! See `blocking.rs` (R4).
+//! See `blocking.rs`.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;

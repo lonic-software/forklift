@@ -617,7 +617,7 @@ fn multi_warehouse_routing_resolves_the_path_id() {
     assert_eq!(resolved.as_deref(), Some("acme"));
 
     // A well-formed but never-used warehouse simply hands back an empty handshake (the AWS head
-    // does not track existence; that is the hosting registry's job, R6).
+    // does not track existence; that is the hosting registry's job).
     let info: WarehouseInfo = body_json(&response);
     assert!(info.pallets.is_empty());
 

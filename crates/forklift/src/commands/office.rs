@@ -8,7 +8,7 @@ use forklift_core::util::{config_utils, office_utils, pallet_utils, sign_utils};
 use crate::output::{self, CommandOutput};
 
 // The office command — the warehouse office manages the personnel records: users and
-// keys as tracked metadata on the reserved "office" pallet (FORK-14/12). One public
+// keys as tracked metadata on the reserved "office" pallet. One public
 // function per subcommand; the CLI surface itself is defined in `cli.rs`.
 
 /// Enroll the configured operator and establish trust: the genesis office parcel

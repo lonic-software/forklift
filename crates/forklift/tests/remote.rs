@@ -108,7 +108,7 @@ impl Server {
         ], token)
     }
 
-    /// Serve a bare warehouse with a per-operator token file (FORK-10).
+    /// Serve a bare warehouse with a per-operator token file (transport authorization).
     fn start_with_tokens(area: &TestArea, token: Option<&str>, tokens_relative: &str) -> Server {
         let root = area.path("server-root");
         let root_str = root.to_str().unwrap().to_string();
@@ -1185,7 +1185,7 @@ fn gc_is_refused_while_serving_then_sweeps_orphans_once_the_server_stops() {
     let root = area.path("server-root");
     let root_str = root.to_str().unwrap().to_string();
 
-    // R7: gc against the *live* server is refused — it would sweep the server's in-flight objects
+    // gc against the *live* server is refused — it would sweep the server's in-flight objects
     // and make a concurrent lift fail its ref update. It must wait until the server is stopped, and
     // it sweeps nothing when refused.
     let refused = Command::new(server_binary())
@@ -1238,7 +1238,7 @@ fn a_second_server_and_gc_are_refused_while_serving_but_bundle_is_allowed() {
     let server = Server::start(&area, None);
     let root_str = area.path("server-root").to_str().unwrap().to_string();
 
-    // R7: a second server on the same root is refused up front (it would silently break the first
+    // A second server on the same root is refused up front (it would silently break the first
     // server's in-process ref-update CAS). The acquire happens before the serve loop, so this
     // fails fast rather than blocking.
     let second = Command::new(server_binary())
@@ -1259,7 +1259,7 @@ fn a_second_server_and_gc_are_refused_while_serving_but_bundle_is_allowed() {
     assert!(!gc.status.success(), "gc must be refused while serving");
 
     // bundle, by contrast, is deliberately *allowed* against a live server: it never deletes an
-    // object, writes atomically, and a stale bundle is self-healing (R7).
+    // object, writes atomically, and a stale bundle is self-healing.
     let bundle = Command::new(server_binary())
         .args(["bundle", "--root", &root_str])
         .output()
@@ -1732,7 +1732,7 @@ fn delta_bundle_reconstructs_a_files_many_versions() {
     assert!(history.contains("v1") && history.contains("v8"), "{}", history);
 }
 
-/// R5: a sync walks the *gap* between the heads, not the length of history.
+/// A sync walks the *gap* between the heads, not the length of history.
 ///
 /// The old walk descended every parcel back to the genesis on every `lower`, skipping only
 /// the *fetch* of objects it already had — and re-probing the remote for the signature of

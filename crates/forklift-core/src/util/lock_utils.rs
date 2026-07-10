@@ -98,7 +98,7 @@ impl Drop for StoreLock {
 /// server's in-flight objects (a lift slower than the grace period would otherwise lose its
 /// staged objects and then fail its ref update), and a second server accidentally started on the
 /// same root is refused up front instead of silently breaking the first server's in-process
-/// ref-update CAS (R7). `bundle` deliberately does *not* take it — it never deletes an object,
+/// ref-update CAS. `bundle` deliberately does *not* take it — it never deletes an object,
 /// writes atomically, and a stale bundle is self-healing, so it is safe against a live server.
 ///
 /// Distinct from [`StoreLock`], which serializes destructive store *maintenance* against itself

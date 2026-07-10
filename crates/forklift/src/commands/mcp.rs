@@ -543,7 +543,7 @@ fn tool_definitions() -> Value {
             object(json!({ "all": boolean }), json!([]))),
         tool("store", "Report object-store health: loose vs packed object counts, pack files and how delta-dense they are, on-disk sizes, and whether an incremental compaction or a repack is due. Read-only (the counterpart of compact).",
             object(json!({}), json!([]))),
-        tool("scope", "Report the sparse-workspace scope (§7.6): this bay's materialization scope (the subtrees it works on) and the warehouse fetch scope. Read-only.",
+        tool("scope", "Report the sparse-workspace scope: this bay's materialization scope (the subtrees it works on) and the warehouse fetch scope. Read-only.",
             object(json!({}), json!([]))),
         tool("audit", "Verify the warehouse's signed history offline (a pallet, default: the current one).",
             object(json!({ "pallet": string }), json!([]))),
@@ -563,7 +563,7 @@ fn tool_definitions() -> Value {
             object(json!({}), json!([]))),
         tool("office_list", "List the enrolled operators and their keys.",
             object(json!({}), json!([]))),
-        tool("bay_add", "Open a bay: a new working directory bound to this warehouse, checked out to a new pallet named after it (branched from the current head). Pass scope to open a scoped (sparse, §7.6) bay materializing only those subtree(s) — the tool for an orchestrator to hand a sub-agent a task-scoped sandbox. path defaults to a sibling of the warehouse.",
+        tool("bay_add", "Open a bay: a new working directory bound to this warehouse, checked out to a new pallet named after it (branched from the current head). Pass scope to open a scoped (sparse) bay materializing only those subtree(s) — the tool for an orchestrator to hand a sub-agent a task-scoped sandbox. path defaults to a sibling of the warehouse.",
             object(json!({ "name": string, "path": string, "scope": { "type": "array", "items": string } }), json!(["name"]))),
         tool("bay_list", "List the bays: their names, working directories and current pallets.",
             object(json!({}), json!([]))),
@@ -575,7 +575,7 @@ fn tool_definitions() -> Value {
             object(json!({ "path": string, "rev": string }), json!(["path"]))),
         tool("cherry_pick", "Apply a single parcel's change onto the current pallet as a new parcel.",
             object(json!({ "revision": string, "message": string }), json!(["revision"]))),
-        tool("deliver", "Squash the current draft pallet onto a target pallet as one clean signed parcel, keeping the trail (§7.3). Needs an enrolled key.",
+        tool("deliver", "Squash the current draft pallet onto a target pallet as one clean signed parcel, keeping the trail. Needs an enrolled key.",
             object(json!({ "target": string, "message": string }), json!(["target"]))),
         tool("park", "Park the work in progress (tracked staged + unstaged changes) and reset to the pallet head.",
             object(json!({}), json!([]))),
@@ -593,7 +593,7 @@ fn tool_definitions() -> Value {
             object(json!({ "revision": string, "message": string }), json!(["revision", "message"]))),
         tool("manifest_approve", "Record a signed approval (sign-off) of a parcel. Needs an enrolled key.",
             object(json!({ "revision": string, "message": string }), json!(["revision"]))),
-        tool("manifest_provenance", "Record signed machine-authorship provenance for a parcel: which model produced it (§7.2, the AI-traceability record). The tool and session are set by the MCP server from this connection — you cannot self-report them; model is your attestation. Needs an enrolled key.",
+        tool("manifest_provenance", "Record signed machine-authorship provenance for a parcel: which model produced it (the AI-traceability record). The tool and session are set by the MCP server from this connection — you cannot self-report them; model is your attestation. Needs an enrolled key.",
             object(json!({ "revision": string, "model": string, "transcript": string, "message": string }), json!(["revision", "model"]))),
         tool("manifest_show", "Show the manifest entries (approvals, notes, provenance) attached to a parcel.",
             object(json!({ "revision": string }), json!(["revision"]))),
@@ -658,8 +658,9 @@ mod tests {
     /// directory: §7.6's agent story is an orchestrator agent creating task-scoped sandboxes
     /// for sub-agents over MCP, and `bay` (`bay_add`/`bay_list`/`bay_remove`) is how it does
     /// that. The scope a bay records is advisory local setup, not the agent's own security
-    /// boundary — enforcement of what an identity may touch lives remote-side (FORK-10), not
-    /// in the client's bay bookkeeping. Every bay operation is non-destructive: `add` refuses
+    /// boundary — enforcement of what an identity may touch lives remote-side (the server's
+    /// role-and-transport authorization), not in the client's bay bookkeeping. Every bay
+    /// operation is non-destructive: `add` refuses
     /// onto a non-empty directory, and `remove` only deletes forklift's own redirect file and
     /// bay-state folder, never the materialized working tree or anything the agent didn't
     /// create — so nothing here needs a tighter gate than the rest of the surface.

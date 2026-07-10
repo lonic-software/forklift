@@ -1,5 +1,6 @@
-//! Task-scoped sparse workspaces (§7.6), stage 1 — the local scope record and the
-//! three-valued classifier every scope-aware walk branches on.
+//! Task-scoped sparse workspaces (§7.6) — the local scope record and the
+//! three-valued classifier every scope-aware walk branches on. Materialization can be
+//! scoped today; fetching itself cannot yet be, so the fetch scope is always full.
 //!
 //! A scoped bay materializes and operates on only chosen path subtrees of the user
 //! pallet's working tree. Scope is **local only, never tracked** (it is a property of
@@ -9,15 +10,15 @@
 //! * the **bay materialization scope** (`<bay_root>/scope`, bay-local) — what this bay
 //!   materializes and stacks; always a subset (⊆) of the fetch scope, and
 //! * the **warehouse fetch scope** (`config/fetch-scope`, shared) — what the warehouse
-//!   has fetched at all. In stage 1 the store is full, so the fetch scope is unset
-//!   (= full) and only the bay scope restricts behavior.
+//!   has fetched at all. The store is always fully fetched today, so the fetch scope is
+//!   unset (= full) and only the bay scope restricts behavior.
 //!
-//! The classifier is **three-valued, not boolean** (design finding 5): a boolean
+//! The classifier is **three-valued, not boolean**: a boolean
 //! `in_scope` conflates two situations a walk must treat differently — a *spine* directory
 //! (an ancestor of an in-scope path, walked but with its out-of-scope siblings copied by
 //! hash) and a *fully in-scope* directory (descended normally). See [`ScopeClass`].
 //!
-//! **Meta pallets (`@office` and `.forklift/meta/*`) are never scoped** (design D8): this
+//! **Meta pallets (`@office` and `.forklift/meta/*`) are never scoped**: this
 //! module classifies *user-pallet content paths* only; meta-pallet fetch/audit/materialize
 //! code keeps calling the existing, unscoped functions unchanged.
 
@@ -252,7 +253,8 @@ pub fn is_scoped() -> Result<bool, String> {
     Ok(!current_scope()?.is_full())
 }
 
-/// The warehouse fetch scope (full when unset — the stage-1 full-store default).
+/// The warehouse fetch scope (full when unset — always full today, since fetching itself
+/// cannot yet be scoped).
 pub fn read_fetch_scope() -> Result<MaterializationScope, String> {
     read_scope_file(&fetch_scope_path())
 }
@@ -357,8 +359,8 @@ pub fn out_of_scope_refusal(path: &str) -> String {
     )
 }
 
-/// A ready-made `sparse_workspace` refusal for a whole-tree verb that stage 1 does not yet
-/// support in a scoped bay.
+/// A ready-made `sparse_workspace` refusal for a whole-tree verb that does not yet support
+/// running in a scoped bay.
 pub fn sparse_workspace_refusal(verb: &str, next_step: &str) -> String {
     refusal(
         CODE_SPARSE_WORKSPACE,

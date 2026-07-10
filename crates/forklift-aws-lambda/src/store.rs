@@ -27,7 +27,7 @@
 //! [`Head`](crate::Head) turns into a `500`. The verification and CAS *semantics* live in
 //! the head, not the stores — a store only persists and reports.
 //!
-//! Both traits are **synchronous, deliberately** (R4, decided 2026-07-09), even though S3
+//! Both traits are **synchronous, deliberately**, even though S3
 //! and DynamoDB are async: the audit these stores feed *is* `forklift_core`, which is
 //! synchronous to its roots and scoped by a thread-local that must never cross an `.await`.
 //! The async boundary therefore lives in the runtime adapter, which runs the whole `Head`

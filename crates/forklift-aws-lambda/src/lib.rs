@@ -1,4 +1,4 @@
-//! The AWS serverless head (Phase 3): Lambda handlers behind API Gateway — negotiation,
+//! The AWS serverless head: Lambda handlers behind API Gateway — negotiation,
 //! presigned URL issuing, signature & privilege verification, and ref CAS commits
 //! (metadata only; file bytes flow client ↔ S3 directly). See docs/DESIGN.html §4.
 //!

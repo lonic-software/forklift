@@ -9,7 +9,7 @@
 //! (invariant 1), and it is idempotent, so this racing the control plane's `commit_lift` on one
 //! hash is safe.
 //!
-//! Same R4 blocking discipline as the control plane: `verify_and_promote` bridges S3 futures,
+//! Same blocking discipline as the control plane: `verify_and_promote` bridges S3 futures,
 //! so it runs on a blocking thread. It needs only the object store — no ref store, no warehouse
 //! id — because promotion is content-addressed, not warehouse-scoped.
 //!

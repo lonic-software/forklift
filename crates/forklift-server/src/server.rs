@@ -58,7 +58,7 @@ struct WarehouseHandle {
     /// Whether a bundle rebuild is running right now (never two at once).
     bundling: std::sync::atomic::AtomicBool,
 
-    /// The serve lock for this root, held for as long as the handle is served (R7). `None` for
+    /// The serve lock for this root, held for as long as the handle is served. `None` for
     /// transient handles that are not a live served warehouse (e.g. the throwaway handle
     /// `put_warehouse` uses only to run `prepare` in a storage scope). Held in the handle so the
     /// lock releases exactly when the served warehouse stops being served (server shutdown).
@@ -79,7 +79,7 @@ impl WarehouseHandle {
     }
 
     /// A handle for a warehouse this process is about to serve: acquires the serve lock at `root`
-    /// (R7) and holds it in the handle for the handle's lifetime. Errors if the root is already
+    /// and holds it in the handle for the handle's lifetime. Errors if the root is already
     /// served by another process, or a `gc`/`bundle` is running against it — in either case
     /// serving it would be unsafe.
     fn serving(root: PathBuf) -> Result<WarehouseHandle, String> {
@@ -112,7 +112,7 @@ struct AppState {
     /// The static bearer token (full access), when configured.
     token: Option<String>,
 
-    /// Per-operator bearer tokens: token → office identifier (FORK-10). What the
+    /// Per-operator bearer tokens: token → office identifier. What the
     /// operator may do derives from their role in the target warehouse's office —
     /// the tracked, signed metadata — not from the token itself.
     operator_tokens: HashMap<String, String>,
@@ -248,7 +248,7 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
                 ));
             }
 
-            // Hold the serve lock for the served root for the process lifetime (R7): a second
+            // Hold the serve lock for the served root for the process lifetime: a second
             // server on the same root is refused here rather than silently breaking the CAS.
             ServeMode::Single(Arc::new(WarehouseHandle::serving(root)?))
         }
@@ -765,7 +765,7 @@ fn resolve_warehouse(state: &AppState,
     }
 
     // Acquire this warehouse's serve lock as it is first served, and hold it in the cached handle
-    // for the server's lifetime (R7). Refuses (503) if a `gc`/`bundle` is running against this
+    // for the server's lifetime. Refuses (503) if a `gc`/`bundle` is running against this
     // warehouse, or another server already serves it — serving it then would be unsafe.
     let handle = Arc::new(
         WarehouseHandle::serving(root).map_err(|e| (
@@ -891,7 +891,7 @@ async fn get_warehouse(State(state): State<Arc<AppState>>,
         let mut pallets = std::collections::BTreeMap::new();
 
         // Both namespaces travel in one map, keyed by the qualified reference form: user
-        // pallets bare, meta pallets as `@office` — so clients (and FORK-9's future meta
+        // pallets bare, meta pallets as `@office` — so clients (and future meta
         // pallets) route by namespace, never by a hard-coded name.
         for (pallet_ref, head) in pallet_utils::all_pallet_refs().map_err(internal)? {
             pallets.insert(pallet_ref.to_wire(), head);
@@ -1345,7 +1345,7 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
         let is_meta = namespace == pallet_utils::PalletNamespace::Meta;
         let is_office = is_meta && bare == OFFICE_PALLET_NAME;
 
-        // Transport authorization (FORK-10): may this principal move this ref? The
+        // Transport authorization: may this principal move this ref? The
         // role and the pallet grants come from the office — signed, tracked metadata.
         if let Principal::Operator(identifier) = &principal {
             if let Some(user) = office_user_of(identifier)? {
@@ -1472,7 +1472,7 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
         } else if let Some(anchor) = anchor {
             // A trusted warehouse accepts nothing a local audit would reject. This is the
             // user-pallet path (the office took the branch above); a future non-office
-            // meta pallet — FORK-9 — will bring its own verification here.
+            // meta pallet will bring its own verification here.
             let office_head = pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME)
                 .map_err(internal)?
                 .ok_or(unprocessable(
@@ -2157,7 +2157,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------------
-    // office_user_of / require_uploader (FORK-10 transport authorization)
+    // office_user_of / require_uploader (transport authorization)
     // ---------------------------------------------------------------------------------
 
     /// Serializes every test that touches key generation/signing: `sign_utils` resolves
@@ -2347,7 +2347,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------------
-    // post_ref_update — the FORK-10 transport-authorization gate
+    // post_ref_update — the transport-authorization gate
     // ---------------------------------------------------------------------------------
 
     fn ref_update_params(name: &str) -> PathParams {

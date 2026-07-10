@@ -1,4 +1,4 @@
-//! The canonical *flat* fan-out idiom (design note §5.0, milestone D/P4).
+//! The canonical *flat* fan-out idiom.
 //!
 //! Several hot paths — `audit`'s per-parcel signature verify, `consolidate`'s deferred
 //! three-way merges, `compact`'s per-object read+delta-compress, `diff`'s per-file

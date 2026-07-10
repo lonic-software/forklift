@@ -603,8 +603,8 @@ async fn a_head_untrusted_lift_commits_over_s3_and_dynamodb() {
 // ---------------------------------------------------------------------------------------
 
 /// Route one request through `entrypoint::handle` over freshly-built S3 + DynamoDB stores, on a
-/// blocking thread (every `Head` method blocks on its store's futures — the R4 contract this
-/// suite is built around). The clients are cheap to clone, so a per-request store matches how
+/// blocking thread (every `Head` method blocks on its store's futures, the sync/async seam
+/// this suite is built around). The clients are cheap to clone, so a per-request store matches how
 /// the control-plane binary serves each invocation.
 async fn edge(
     s3: aws_sdk_s3::Client,
@@ -1007,7 +1007,7 @@ struct ShimState {
 }
 
 /// One request: buffer it into the `http::Request` the pure router speaks, run `handle` on a
-/// blocking thread (every `Head` method blocks on its store's futures — R4), convert back.
+/// blocking thread (every `Head` method blocks on its store's futures), convert back.
 /// Headers are dropped on purpose: `handle`'s authentication is an open passthrough, so only
 /// the method, path/query and body matter.
 async fn shim_handler(

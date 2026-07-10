@@ -545,7 +545,7 @@ impl RemoteClient {
 /// construction: a ref only moves once its objects are all present (a `stack` writes them
 /// first; a `lower` or `franchise` fetches the whole closure before the fast-forward). So a
 /// lower that brings one new parcel walks one parcel, not the whole history — the
-/// transfer-economics half of R5.
+/// transfer-economics half of the bounded-negotiation guarantee.
 ///
 /// It still heals an interrupted earlier sync. An interruption leaves the ref where it was,
 /// so the objects it half-fetched sit *above* the bound and are re-walked exactly as before.

@@ -1,4 +1,4 @@
-//! The warehouse office: users and keys as tracked metadata (FORK-15/14/12).
+//! The warehouse office: users and keys as tracked metadata.
 //!
 //! Identity records live on a reserved pallet (the "office") as ordinary blobs under a
 //! reserved tree namespace (`.forklift/tracked/…`) — a path normal loads can never
@@ -43,7 +43,7 @@ const RECORD_SUFFIX: &str = ".toml";
 /// required — a one-way door (nothing ever removes it).
 const FILE_NAME_TRUST: &str = "trust";
 
-/// What an operator may do (FORK-10). Recorded in the user's tracked office record, so
+/// What an operator may do. Recorded in the user's tracked office record, so
 /// privileges are signed, audited metadata like everything else in the office.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {

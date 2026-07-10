@@ -20,7 +20,7 @@ tokio = { workspace = true }
 # and the runtime crates stay out of the library entirely (see the `lambda` feature below).
 http = "1"
 
-# The AWS SDK layer (milestone C): real S3 + DynamoDB implementations of the store seams.
+# The AWS SDK layer: real S3 + DynamoDB implementations of the store seams.
 #
 # TLS is deliberately routed through a ring-based rustls connector, built explicitly in
 # `aws::config` and injected via `.http_client(...)`. The SDKs' own default connector
@@ -35,7 +35,7 @@ aws-smithy-http-client = { version = "1.1", default-features = false, features =
 aws-smithy-runtime-api = { version = "1", features = ["client"] }
 aws-smithy-types = "1"
 
-# The Lambda runtime adapters (milestone C, stage 2): only the two binaries need them, so they
+# The Lambda runtime adapters: only the two binaries need them, so they
 # are optional and gated behind `lambda`. A plain `cargo build`/`cargo test` never compiles
 # them, and their default features are trimmed — the Runtime API is plaintext localhost, so no
 # TLS provider is pulled in and `aws-lc` stays out of the tree (the same `ring`-only stance the

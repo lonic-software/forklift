@@ -265,7 +265,7 @@ fn bundle(root: &str) -> Result<(), String> {
     let _scope = forklift_core::globals::StorageRootScope::enter(&resolved);
 
     // Unlike `gc`, `bundle` is safe to run against a live server and is deliberately *not*
-    // serve-locked (R7): it never deletes an object, it writes the bundle atomically (temp +
+    // serve-locked: it never deletes an object, it writes the bundle atomically (temp +
     // rename), and a bundle is "a clone-time optimization, never a source of truth" — a bundle
     // built mid-lift that misses the newest objects is self-healing (clients fetch the rest
     // loose). Refreshing a live server's bundle with this command is a supported workflow (the
@@ -288,7 +288,7 @@ fn gc(root: &str, grace_hours: u64) -> Result<(), String> {
     let resolved = resolve_root(root, false)?;
     let _scope = forklift_core::globals::StorageRootScope::enter(&resolved);
 
-    // Refuse while a server is serving this root (R7): gc would sweep the server's in-flight
+    // Refuse while a server is serving this root: gc would sweep the server's in-flight
     // staged objects, and a lift slower than the grace period then fails its ref update. Held for
     // the whole command so a server cannot start mid-sweep.
     let _serve_lock = forklift_core::util::lock_utils::ServeLock::acquire()

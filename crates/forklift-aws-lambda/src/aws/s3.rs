@@ -164,7 +164,7 @@ fn percent_encode_copy_source_key(key: &str) -> String {
 
 /// The S3-backed [`ObjectStore`]: the byte plane of an AWS serverless head.
 ///
-/// Every method is synchronous (the settled seam, R4) and drives the async SDK through the
+/// Every method is synchronous (the settled sync/async seam) and drives the async SDK through the
 /// [`AsyncBridge`]. It must be built inside a multi-thread runtime and its methods called
 /// from a blocking thread, exactly as the `Head` contract requires.
 pub struct S3ObjectStore {

@@ -795,7 +795,7 @@ pub fn compact(all: bool) -> Result<CompactStats, String> {
         // it, equal-size objects kept their filesystem-enumeration order, so two repacks of the
         // *same already-packed* live set produced different layouts every run; harmless under the
         // old id (which hashed only the object set) but, now that the pack id folds in
-        // offsets/lengths (D5), this determinism is what stops a steady-state repack from churning
+        // offsets/lengths, this determinism is what stops a steady-state repack from churning
         // the pack onto a fresh name (rewrite + delete) each run and lets it land on the same name.
         targets.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.hash.cmp(&b.hash)));
 
@@ -1597,8 +1597,10 @@ impl PackWriter {
     /// both into place. The order is **data first, index last**: readers enumerate `.idx`
     /// files and open the matching `.pack`, so the index is the commit point — it must appear
     /// only *after* its data is fully present (renaming index-before-data would let a reader
-    /// see an index with no data). This is why the D5 fix is the layout-derived id alone and
-    /// not the review's floated index-before-data reorder: a layout-derived id (see
+    /// see an index with no data). A same-named pack rewrite (a differently-laid-out pack of the
+    /// same object set) could otherwise pair a freshly renamed data file with the not-yet-replaced
+    /// index of the old one — the fix for that is a layout-derived id alone, not an
+    /// index-before-data reorder: a layout-derived id (see
     /// `compute_pack_id`) means a differently-laid-out pack of the same object set gets a
     /// *different* name and is written fresh rather than overwriting this pair, so the only
     /// remaining same-name rewrite is a byte-identical idempotent repack — harmless in either
@@ -1659,7 +1661,7 @@ fn build_index_bytes(records: &[([u8; HASH_LEN], u64, u64)]) -> Vec<u8> {
 }
 
 /// A pack's id: the Blake3 over its sorted records — each object hash **and its offset and
-/// length** — so the name is derived from the on-disk *layout*, not just the object set (D5).
+/// length** — so the name is derived from the on-disk *layout*, not just the object set.
 ///
 /// The property the finalize/repack paths lean on: same records at the same offsets ⇒ same
 /// name; any difference in layout ⇒ a different name. So re-packing an already-packed live set
@@ -1747,7 +1749,7 @@ mod tests {
 
     #[test]
     fn pack_id_depends_on_the_layout_not_just_the_object_set() {
-        // D5: the id must fold in each record's offset and length, so two packs holding the
+        // The id must fold in each record's offset and length, so two packs holding the
         // same object *set* but a different byte layout get different names — otherwise the
         // finalize renames overwrite an existing pair in place and a concurrent reader can
         // pair new data with the old index (a torn read).
@@ -1977,7 +1979,7 @@ mod tests {
 
     #[test]
     fn a_pack_record_that_decompresses_to_the_wrong_bytes_fails_the_read() {
-        // The silent-corruption case D1 guards against: a pack whose record decompresses
+        // The silent-corruption case the read-side hash check guards against: a pack whose record decompresses
         // *cleanly* but to bytes that are not the object its index is addressed by (a damaged
         // record, or a delta rebuilt against the wrong base). Without the read-side hash check
         // this returns wrong bytes silently; with it, the read must error.
@@ -2028,7 +2030,7 @@ mod tests {
 
     #[test]
     fn a_read_reloads_the_pack_registry_when_an_external_compact_moved_the_object() {
-        // D3: a long-running process (a live server) whose cached pack registry predates an
+        // A long-running process (a live server) whose cached pack registry predates an
         // *external* compact would miss an object that compact moved into a new pack and whose
         // loose source it swept — both the cached packs and the loose fallback come up empty.
         let temp = std::env::temp_dir().join(format!("forklift-reload-miss-{}", std::process::id()));
@@ -2059,7 +2061,7 @@ mod tests {
 
     #[test]
     fn compact_refuses_to_run_while_the_shared_store_lock_is_held() {
-        // D4: compact serializes on the shared store lock, so a second compaction (another bay or
+        // compact serializes on the shared store lock, so a second compaction (another bay or
         // process) cannot race its deletions.
         let temp = std::env::temp_dir().join(format!("forklift-compact-lock-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp);

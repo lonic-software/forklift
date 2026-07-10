@@ -1,4 +1,4 @@
-//! The manifest: post-metadata about parcels as tracked metadata (FORK-9).
+//! The manifest: post-metadata about parcels as tracked metadata.
 //!
 //! A *manifest entry* is a signed statement attached to a parcel after the fact — an
 //! approval, a review note, and (later, §7.2) machine-authorship provenance. Entries are

@@ -11,7 +11,7 @@
 //! and building the connector are async, and must run inside the tokio runtime during adapter
 //! setup — the same place [`AsyncBridge::current`](crate::AsyncBridge) is captured. The
 //! bridge then rides inside each store so its synchronous trait methods can drive the SDK's
-//! async calls from the blocking thread the `Head` runs on (see `blocking.rs`, R4).
+//! async calls from the blocking thread the `Head` runs on (see `blocking.rs`).
 
 use aws_smithy_http_client::tls;
 
@@ -148,7 +148,7 @@ pub async fn build_clients(
 }
 
 /// Build both stores over freshly configured clients, moving `bridge` into them so their
-/// synchronous trait methods can drive the SDK's async calls (R4). Capture the bridge with
+/// synchronous trait methods can drive the SDK's async calls. Capture the bridge with
 /// [`AsyncBridge::current`](crate::AsyncBridge) on the runtime thread before calling this.
 ///
 /// # Arguments

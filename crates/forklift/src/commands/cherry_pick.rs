@@ -26,11 +26,10 @@ use crate::output::{self, CommandOutput};
 ///                   failed.
 pub async fn handle_command(revision: &str, message: Option<String>) -> Result<(), String> {
     // A pick applies a diff (the merge machinery) into the working directory, which could
-    // touch out-of-scope paths a scoped bay never materialized; that is scoped-merge territory
-    // (§7.6 stage 2), so it refuses here until then.
+    // touch out-of-scope paths a scoped bay never materialized, so it refuses here.
     crate::commands::scope::refuse_in_scoped_bay(
         "cherry-pick",
-        "Cherry-pick in a full workspace; scoped-bay merge lands in a later stage.",
+        "Run it from a full bay.",
     )?;
 
     let current = pallet_utils::get_current_pallet_name()?;

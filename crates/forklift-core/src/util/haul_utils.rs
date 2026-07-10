@@ -1,7 +1,7 @@
 //! Hauls: reviewable merge proposals (pull requests), as tracked metadata.
 //!
 //! A *haul* proposes merging a source pallet into a target pallet, with discussion and
-//! signed reviews. It is built on the exact substrate the manifest (FORK-9) proved out: a
+//! signed reviews. It is built on the exact substrate the manifest proved out: a
 //! dedicated `@haul` meta pallet whose parcels each carry **one signed event**, so a
 //! haul's whole life is an append-only log — Opened, Pushed, Comment, Review, Merged,
 //! Closed, Reopened — and its current state is the *fold* of that log.

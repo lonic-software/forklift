@@ -80,7 +80,7 @@ fn head_of(item: &HashMap<String, AttributeValue>) -> Option<String> {
 /// The DynamoDB-backed [`RefStore`]: pallet heads and the trust anchor, with an atomic head
 /// CAS and a one-way trust door.
 ///
-/// Every method is synchronous (R4) and drives the async SDK through the [`AsyncBridge`]. The
+/// Every method is synchronous and drives the async SDK through the [`AsyncBridge`]. The
 /// default pallet is held here rather than read per call — it is set once when the warehouse
 /// is registered, exactly as the fake holds it — so `default_pallet` costs no round trip.
 pub struct DynamoRefStore {

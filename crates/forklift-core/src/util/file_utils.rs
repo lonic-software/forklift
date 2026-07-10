@@ -409,7 +409,7 @@ fn read_object_uncached(hash: &str) -> Result<Vec<u8>, String> {
             // Neither the cached packs nor a loose file holds it. In a long-running process (a
             // live server) the pack registry can predate an external `compact` that moved this
             // object into a new pack and swept its loose source — so reload the registry once and
-            // retry the packs before concluding the object is gone (D3, reload-on-miss).
+            // retry the packs before concluding the object is gone (reload-on-miss).
             if let Some(bytes) = crate::util::pack_utils::retrieve_from_packs_reloading(hash)? {
                 return Ok(bytes);
             }
@@ -1035,7 +1035,7 @@ mod tests {
 
     #[test]
     fn a_corrupt_loose_object_fails_the_read_instead_of_returning_wrong_bytes() {
-        // The loose half of D1: a loose file whose bytes decompress cleanly but do not hash to
+        // The loose half of the content-hash verification guarantee: a loose file whose bytes decompress cleanly but do not hash to
         // the address they are stored under (a torn or tampered file). The read must error rather
         // than silently hand back the wrong content.
         let temp = std::env::temp_dir().join(format!("forklift-loose-corrupt-{}", std::process::id()));
@@ -1111,7 +1111,7 @@ mod tests {
 
     #[test]
     fn an_interrupted_write_never_becomes_a_readable_object() {
-        // The durability contract's other half (T1): objects are addressed by their hash and the
+        // The durability contract's other half: objects are addressed by their hash and the
         // atomic write stages through a `hash.tmp…` sibling, so a crash *between* the temp write
         // and the rename leaves only that temp file — never a truncated file at the object's real
         // path. A reader keys on the hash, so that debris must be invisible: the object does not

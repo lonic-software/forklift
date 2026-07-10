@@ -30,8 +30,8 @@ pub fn handle_command(action: Option<BayAction>) -> Result<(), String> {
 /// inventory, current pallet and lock.
 ///
 /// When `scope_paths` are given, the bay is **scoped (sparse, §7.6)**: it materializes and
-/// operates on only those subtrees. The object store still holds everything (stage 1 is
-/// materialization-only sparseness); the scope is recorded bay-locally and drives the
+/// operates on only those subtrees. The object store still holds everything (only
+/// materialization is scoped; fetching itself cannot yet be); the scope is recorded bay-locally and drives the
 /// materialize, and every later stack copies the out-of-scope siblings forward by hash.
 fn add(name: &str, path: Option<String>, scope_paths: Vec<String>) -> Result<(), String> {
     pallet_utils::validate_pallet_name(name)?;

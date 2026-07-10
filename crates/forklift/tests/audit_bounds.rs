@@ -1,4 +1,4 @@
-//! The incremental audit reads nothing behind the head it already trusts (R5).
+//! The incremental audit reads nothing behind the head it already trusts.
 //!
 //! These tests do not count reads — they make the reads *impossible*. A real warehouse is
 //! built with the CLI, the commit-graph is warmed, and then the parcel objects behind the

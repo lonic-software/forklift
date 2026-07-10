@@ -1,4 +1,4 @@
-//! The AWS SDK layer (milestone C): real implementations of the two store seams.
+//! The AWS SDK layer: real implementations of the two store seams.
 //!
 //! [`Head`](crate::Head) runs over [`ObjectStore`](crate::store::ObjectStore) and
 //! [`RefStore`](crate::store::RefStore), and the whole protocol suite proves that logic
@@ -21,7 +21,7 @@
 //! the shared helpers in [`sdk`], so the two backends fail exactly as the fakes do for
 //! equivalent inputs.
 //!
-//! Both stores are synchronous over async SDKs by the settled R4 seam: they drive each future
+//! Both stores are synchronous over async SDKs by the settled sync/async seam: they drive each future
 //! with the [`AsyncBridge`](crate::AsyncBridge) from a blocking thread. See `blocking.rs`.
 
 pub mod config;

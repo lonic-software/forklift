@@ -1,6 +1,6 @@
-//! T1 — the crash / interrupted-write harness (milestone A, the test spine).
+//! The crash / interrupted-write harness, part of the hardening test spine.
 //!
-//! D2 makes "durable before destructive" hold across power loss: every object, ref, inventory
+//! "Durable before destructive" holds across power loss: every object, ref, inventory
 //! shard and graph file is written to a temp file, fsynced, renamed, and the directory fsynced,
 //! and a pallet's ref advances only *after* all the objects it names are durable. The claim is
 //! that a crash at any instant leaves the store either at its old state or fully at the new one —
@@ -72,7 +72,7 @@ impl Area {
 
     /// Assert the store is internally consistent right now: any pallet head is a whole 64-hex hash
     /// (an atomic ref write never leaves a partial one), and the commands that read the committed
-    /// tree and history succeed (a torn object would fail D1's verify-on-read).
+    /// tree and history succeed (a torn object would fail the read-side hash check).
     fn assert_consistent(&self, context: &str) {
         let head_path = self.warehouse().join(".forklift").join("pallets").join("main");
         if let Ok(head) = std::fs::read_to_string(&head_path) {
@@ -298,7 +298,7 @@ fn killing_stack_midway_never_corrupts_the_store() {
 
     // 4. Final recovery: the store must still accept a clean write, and every object reachable from
     //    the final head must read back (export-git walks the whole graph — parcels, trees, blobs —
-    //    so a torn object anywhere would fail here via D1's verify-on-read).
+    //    so a torn object anywhere would fail here via the read-side hash check).
     area.clear_stale_lock();
     area.assert_consistent("final");
 

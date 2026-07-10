@@ -1,4 +1,4 @@
-//! T2 — format fuzzing + round-trip properties (milestone A, the test spine).
+//! Format fuzzing + round-trip properties, part of the hardening test spine.
 //!
 //! Two guarantees, one file:
 //!

@@ -42,7 +42,7 @@ your first `stack`), a warehouse config file, and an ignore file. Idempotent —
 running it in an existing warehouse only creates what's missing. `-v` lists each
 piece created.
 
-### `import-git` — migrate a git repository (§7.8)
+### `import-git` — migrate a git repository
 
 ```sh
 cd my-git-repo
@@ -65,12 +65,12 @@ is slowest and largest in — so import **packs the store on the way out** ([`co
 so you never have to remember to). Pass `--no-compact` to skip it and leave the objects
 loose (e.g. to inspect the raw store or benchmark the loose baseline).
 
-Refuses in a scoped (sparse) bay (§7.6, see `bay add --scope` below): importing builds
+Refuses in a scoped (sparse) bay (see `bay add --scope` below): importing builds
 every pallet's history straight from the git tree, bypassing the sparse overlay entirely,
 and materializes the whole imported HEAD — not a sensible operation to scope. Run it from
 a full workspace.
 
-### `export-git` — migrate back to git (§7.8)
+### `export-git` — migrate back to git
 
 ```sh
 forklift export-git ../my-repo-in-git
@@ -238,7 +238,7 @@ where trust is established, `stack` also signs the parcel (see
 
 `stack` requires staged changes — it refuses to create an empty parcel.
 
-### `undo` — reverse the last operation (§7.8)
+### `undo` — reverse the last operation
 
 ```sh
 forklift undo
@@ -285,7 +285,7 @@ forklift history                 # from the current pallet's head, newest first
 forklift history feature         # from another pallet
 forklift history 1a2b3c          # from a parcel (hash prefix, ≥ 4 chars)
 forklift history @office          # the office's audit trail (users & keys — a meta pallet)
-forklift history --class agent    # only parcels an agent authored (§7.1)
+forklift history --class agent    # only parcels an agent authored
 forklift history -n 20            # only the 20 newest parcels (bounded walk)
 forklift history --oneline        # one terse line per parcel: abbreviated hash + subject
 forklift history -n 20 --json                  # a page + a `next` cursor (for agents)
@@ -302,7 +302,7 @@ description's first line (git's `log --oneline`) — and, since it shows no auth
 class, it skips the office read and the display-name resolution the full form does,
 so it is the fastest way to scan history. **Machine authorship is legible:** an author that is an
 agent, bot or service is shown as `[agent, supervised by <human>]`, read from the
-signed office record (§7.1) — so authorship stays forge-proof, and `--class
+signed office record — so authorship stays forge-proof, and `--class
 <human|agent|bot|service>` filters the log to answer "which parcels did agents write,
 under whose supervision".
 
@@ -335,7 +335,7 @@ forklift blame src/main.rs --json     # structured: line → parcel, parcel → 
 ```
 
 Attributes every line of a file to the parcel that last changed it — and, because
-authorship is signed and classed (§7.1), to the author's **identity class and
+authorship is signed and classed, to the author's **identity class and
 supervisor**. That is blame git structurally cannot express: *"was this line written by a
 human or an agent, under whose supervision"*, offline and forge-proof. An agent-authored
 line reads `[agent, supervised by <human>]` in the gutter, exactly like `history`. The walk
@@ -364,15 +364,14 @@ non-zero exit. See [`trust-and-identity.md`](trust-and-identity.md).
 ```sh
 forklift manifest approve 1a2b3c -m "LGTM"   # a signed sign-off on a parcel
 forklift manifest note 1a2b3c -m "add a test" # a signed review note
-forklift manifest provenance 1a2b3c \         # how an AI produced the parcel (§7.2)
+forklift manifest provenance 1a2b3c \         # how an AI produced the parcel
     --model claude-opus-4-8 --tool claude-code --session sess-42
 forklift manifest show 1a2b3c                 # the entries attached to a parcel
 forklift manifest                             # the whole manifest
 ```
 
 The manifest is Forklift's "GitHub layer" living inside the warehouse: approvals, review
-notes, and machine-authorship **provenance** (which model/tool/session produced a parcel,
-§7.2) — recorded as **signed tracked metadata** that *references* a parcel without ever
+notes, and machine-authorship **provenance** (which model/tool/session produced a parcel) — recorded as **signed tracked metadata** that *references* a parcel without ever
 changing it. Because provenance is signed, paired with an agent-class identity (`office
 admit --agent --supervisor …`) it answers *"which model produced this change, under whose
 supervision"* forge-proof and offline — the AI-traceability question git cannot. Entries live on the
@@ -389,7 +388,7 @@ record entries concurrently the manifest diverges, and `lower` **merges it autom
 — entries are independent, so the union is always conflict-free; you then `lift` the
 merge. (The office, whose records interdepend, stays linear and is reconciled by hand.)
 
-### `tag` — signed tags / releases (§9.4d)
+### `tag` — signed tags / releases
 
 ```sh
 forklift tag create v1.2.0 main -m "the second release"   # an admin-signed release tag
@@ -399,7 +398,7 @@ forklift tag show v1.2.0                                  # one tag in full
 
 A tag is a named, signed pointer at a parcel — a release or a milestone. Like the manifest,
 who cut it is the parcel's **signature**, not a self-declared field, so it is verifiable
-offline against the office chain (`forklift audit @tags`). The release convention (§9.4d):
+offline against the office chain (`forklift audit @tags`). The release convention:
 a tag is signed by an **admin** key, so creating one requires an admin — an authoritative
 act. Tag names are **immutable** (a name already in use is refused). Tags live on the
 `@tags` meta pallet, reserving no user pallet name; without a revision, `tag create` tags
@@ -485,7 +484,7 @@ Requires a clean warehouse before it starts.
 forklift deliver main -m "add the feature"   # run from the draft pallet
 ```
 
-The squash agents need without losing the trail (§7.3). Agents checkpoint constantly;
+The squash agents need without losing the trail. Agents checkpoint constantly;
 humans want one reviewed parcel. `deliver` takes the current (draft) pallet's net change
 and lands it on the target as a **single clean signed parcel** — the draft head's tree
 with the target as its *only* parent, so the checkpoints stay out of the target's history.
@@ -506,7 +505,7 @@ forklift cherry-pick feature -m "..."  # pick a pallet's head, with a custom mes
 ```
 
 Applies a parcel's diff — its change against its first parent — onto the current pallet as
-a new parcel (§9.1 #8). Unlike rebase, cherry-pick only **adds**: no rewrite, no
+a new parcel. Unlike rebase, cherry-pick only **adds**: no rewrite, no
 force-push, nothing an audit has to bless twice. The picked parcel's **authors are
 preserved** and you are recorded as the stacker (the same author/stacker split as
 `import-git`/`export-git` and `deliver`), and the new parcel is freshly signed. It is
@@ -532,7 +531,7 @@ is a valid answer (nothing to resolve).
 **Resolving a conflict:** edit each conflicted file to remove the markers,
 `forklift load` it, then `forklift stack` to complete the consolidation or cherry-pick.
 
-### `bay` — parallel working directories (§7.5)
+### `bay` — parallel working directories
 
 ```sh
 forklift bay add feature ../myrepo.feature   # a new working dir on a new pallet "feature"
@@ -551,7 +550,7 @@ all operate on the bay's pallet against the shared object store. The bay's direc
 a `.forklift` *file* (a redirect back to the warehouse), and its local state lives under
 `.forklift/bays/<name>/`.
 
-### `bay add --scope` — a scoped (sparse) bay (§7.6)
+### `bay add --scope` — a scoped (sparse) bay
 
 ```sh
 forklift bay add api ../myrepo.api --scope src/api          # materialize only src/api
@@ -578,8 +577,8 @@ Inside a scoped bay:
   refuses with the `out_of_scope` code rather than doing something surprising.
 - `export-git`, `import-git` and `consolidate`/`cherry-pick` refuse in a scoped bay
   (`sparse_workspace`): the first two bypass the sparse overlay and would export/import a
-  truncated or scope-inconsistent view, and scoped-bay merge is a later stage. Run them from
-  a full workspace.
+  truncated or scope-inconsistent view, and scoped-bay merge is not yet supported. Run them
+  from a full workspace.
 - `park` produces a parcel that stacks over the head's spine exactly like `stack`, so a parked
   parcel from a scoped bay is byte-identical to what parking the same work in progress in a
   full workspace would commit.
@@ -595,7 +594,7 @@ orchestrator agent can open task-scoped sandboxes for its sub-agents directly, w
 shelling out. The scope it sets is advisory local setup, not a security boundary — see
 **[`../MACHINE_INTERFACE.md`](../MACHINE_INTERFACE.md)**.
 
-### `scope` — show the sparse-workspace scope (§7.6)
+### `scope` — show the sparse-workspace scope
 
 ```sh
 forklift scope            # this bay's materialization scope + the warehouse fetch scope
@@ -661,7 +660,7 @@ with a compare-and-swap. When trust is established, the office pallet and trust
 anchor are lifted first (the server verifies every signature before accepting).
 The remote only accepts **fast-forward** updates — no force push.
 
-**Optimistic lift (§7.7):** if the remote moved and the two changes are cleanly
+**Optimistic lift:** if the remote moved and the two changes are cleanly
 mergeable (they touch different files), `lift` **auto-lowers, consolidates and
 retries** on its own — so a fleet of agents stacking to one pallet stops
 serializing through a human. It reports how many times it auto-merged. Only a
@@ -797,9 +796,9 @@ forklift compact          # incremental: pack the loose objects
 forklift compact --all    # full repack: drop garbage, consolidate every pack
 ```
 
-> Phase 1 of object-store scaling: it removes per-file slack and the open-per-object read
-> cost. Delta compression between similar versions (the rest of the size gap vs git) is a
-> later phase — see [`../OBJECT_STORE_SCALING.md`](../OBJECT_STORE_SCALING.md).
+> This step removes per-file slack and the open-per-object read cost. Delta compression
+> between similar versions (the rest of the size gap vs git) is additional work on top —
+> see [`../OBJECT_STORE_SCALING.md`](../OBJECT_STORE_SCALING.md).
 
 ### `store` — object-store health
 
@@ -951,7 +950,7 @@ Errors set a deterministic exit code so scripts branch without parsing prose:
 | 4 | Conflict (working state blocks the operation) |
 | 5 | Diverged (a remote ref moved under a lift) |
 | 6 | Warehouse locked (another forklift process holds it) |
-| 7 | Out of scope (a path argument is outside a scoped bay's scope, §7.6) |
+| 7 | Out of scope (a path argument is outside a scoped bay's scope) |
 | 8 | Scope path type changed (a scoped bay's spine path flipped dir↔file) |
 | 9 | Sparse workspace (a whole-tree verb is not supported in a scoped bay yet) |
 

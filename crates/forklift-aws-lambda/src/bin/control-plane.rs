@@ -3,7 +3,7 @@
 //! A thin runtime adapter and nothing more. It builds the SDK clients once per cold start
 //! (into a process-global [`OnceCell`], so warm invocations reuse them), converts the
 //! `lambda_http` request into the `http` request the pure router speaks, and — because every
-//! `Head` method blocks on its store's futures (R4) — runs [`handle`] on a **blocking thread**
+//! `Head` method blocks on its store's futures — runs [`handle`] on a **blocking thread**
 //! (`spawn_blocking`), never on a runtime worker where tokio refuses to let a thread block.
 //! The router itself is provider-agnostic and tested without any of this; see
 //! `entrypoint.rs`.

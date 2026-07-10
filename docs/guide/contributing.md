@@ -70,12 +70,12 @@ Notes:
   `FORKLIFT_KEYS_DIR` env vars pointed at a scratch directory, so they never
   touch a developer's real config or keys. Use the same pattern for new tests
   (`TestWarehouse` / `TestArea` helpers already do this).
-- The "test spine" (milestone A) is worth knowing when touching the object store,
+- The hardening test spine is worth knowing when touching the object store,
   the parsers, or the parallel walks: `crates/forklift-core/tests/fuzz_formats.rs`
   fuzzes every parse entry point (must never panic) and checks round-trip
   fidelity; `crash_consistency.rs` SIGKILLs `stack` mid-write to prove the store
-  stays consistent (D2); `determinism.rs` pins deterministic tree hashes,
-  byte-reproducible repacks (D5), and the warehouse-lock refusal. A parser or
+  stays consistent across power loss; `determinism.rs` pins deterministic tree hashes,
+  byte-reproducible repacks, and the warehouse-lock refusal. A parser or
   format change should keep the fuzzer green; if you add a length-prefixed field,
   bound it with a `checked_add` (never `start + length` before the bounds check).
 - To install a working binary (e.g. to dogfood): `cargo install --path

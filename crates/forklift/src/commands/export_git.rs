@@ -28,7 +28,7 @@ use crate::output::{self, CommandOutput};
 ///                   or git could not be written.
 pub fn handle_command(path: &str) -> Result<(), String> {
     // export-git walks the whole tree of every parcel; a scoped bay must not silently export a
-    // truncated view (§7.6 D6). Refuse cleanly and point at a full workspace.
+    // truncated view (§7.6). Refuse cleanly and point at a full workspace.
     crate::commands::scope::refuse_in_scoped_bay(
         "export-git",
         "Run export-git from a full workspace (or the main tree), not a scoped bay.",

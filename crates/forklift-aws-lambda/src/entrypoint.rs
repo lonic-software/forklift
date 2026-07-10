@@ -8,7 +8,7 @@
 //! outcome ([`Status`](crate::Status), a redirect URL, or bytes) into an [`http::Response`].
 //! Nothing here says `lambda_http` or `axum`: the runtime adapter that owns those types is
 //! the thin binary in `src/bin/`, which converts its request into this one, runs [`handle`]
-//! on a blocking thread (`spawn_blocking`, the R4 contract — every `Head` method blocks on
+//! on a blocking thread (`spawn_blocking` — every `Head` method blocks on
 //! its store's futures), and converts the response back.
 //!
 //! That split is what makes the control plane testable without AWS: `tests/entrypoint.rs`
@@ -33,7 +33,8 @@
 //! `/warehouses/{id}/v1/…` with the id travelling inside the client's `remote.url`). The id
 //! resolved here becomes the warehouse the per-request [`Head`] is built for — the DynamoDB
 //! ref partition and the warm-scratch pool key, which must agree (see
-//! [`Scratch::shared`](crate::scratch::Scratch::shared) and stage 1's review note).
+//! [`Scratch::shared`](crate::scratch::Scratch::shared) — both must key on the same warehouse
+//! id).
 
 use http::{header, Method, Request, Response, StatusCode};
 use serde::Serialize;
@@ -118,7 +119,8 @@ fn require_env(name: &str) -> Result<String, String> {
         })
 }
 
-/// The transport-authentication seam (R6, tracked privately, out of scope here).
+/// The transport-authentication seam. Multi-tenant policy is tracked privately and is out
+/// of scope here.
 ///
 /// The protocol carries auth as `Authorization: Bearer <token>`; in the hosted deployment the
 /// API Gateway authorizer in front of this function is the gate that decides *who* the caller
@@ -128,7 +130,8 @@ fn require_env(name: &str) -> Result<String, String> {
 /// open passthrough (mirroring `forklift-server`'s `Principal::Open` when no token is
 /// configured). It never invents policy; it only gives the token a defined resting place.
 fn authenticate<B>(_request: &Request<B>) -> HeadResult<()> {
-    // R6 lands here. Until then the control plane trusts its API Gateway front door.
+    // Multi-tenant transport authorization lands here. Until then the control plane trusts
+    // its API Gateway front door.
     Ok(())
 }
 
@@ -142,7 +145,7 @@ fn authenticate<B>(_request: &Request<B>) -> HeadResult<()> {
 ///
 /// # Blocking contract
 ///
-/// Every `Head` method blocks on its store's futures (R4), so on a real deployment this must
+/// Every `Head` method blocks on its store's futures, so on a real deployment this must
 /// run inside `tokio::task::spawn_blocking` — never on a runtime worker, where tokio refuses
 /// to let a thread block. The binary honours that; the fakes never block, so tests call it
 /// directly.
@@ -379,7 +382,7 @@ where
         }
 
         // Resolution is a display-only, server-mediated directory lookup (DESIGN.html §8.12).
-        // The hosted service tiers names behind its own policy (R6); this head runs no
+        // The hosted service tiers names behind its own (privately tracked) policy; this head runs no
         // resolution hook, so — exactly as the protocol prescribes for a head without one — it
         // answers an empty map, and the client shows pseudonyms.
         Route::Resolve => Ok(json_response(

@@ -5,7 +5,7 @@ use serde::Serialize;
 use crate::cli::AliasAction;
 use crate::output::{self, CommandOutput};
 
-/// The alias name every installer creates by default (DESIGN.html §5.0 milestone F):
+/// The alias name every installer creates by default:
 /// home-row-friendly, and short enough that `fl` collisions are rare.
 pub const DEFAULT_NAME: &str = "fl";
 

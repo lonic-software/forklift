@@ -1,4 +1,4 @@
-//! Offline verification of a warehouse's signed history (FORK-12/13/14).
+//! Offline verification of a warehouse's signed history.
 //!
 //! Shared by the `audit` command and by remotes: the server heads run the same
 //! verification before committing a ref update, so a remote can never be pushed into a
@@ -887,7 +887,7 @@ pub fn collect_reachable_present(heads: &[String]) -> Result<HashSet<String>, St
     Ok(reachable)
 }
 
-/// Verify that every new office parcel stays within its signer's privileges (FORK-10).
+/// Verify that every new office parcel stays within its signer's privileges.
 ///
 /// `verify_office_chain` proves the chain is *authentic* (signed by then-active keys);
 /// this proves it is *authorized*: an admin may change anything, everyone else only

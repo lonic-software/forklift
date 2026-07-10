@@ -3820,7 +3820,7 @@ fn a_mutating_command_runs_maintenance_when_due() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Task-scoped sparse workspaces (§7.6), stage 1: scoped bays on a full object store.
+// Task-scoped sparse workspaces (§7.6): scoped bays on a full object store.
 //
 // Materialization-only sparseness — the store holds everything; a scoped bay materializes and
 // operates on only its subtree(s). The load-bearing invariant is that a scoped stack produces a
@@ -4036,12 +4036,12 @@ fn a_scoped_bay_refuses_a_spine_path_type_flip() {
 }
 
 // -------------------------------------------------------------------------------------------
-// §7.6 stage 1 — adversarial review follow-ups (B1 blocker, M2/M3 majors, m6 minor).
+// §7.6 — adversarial review follow-ups for scoped bays.
 // -------------------------------------------------------------------------------------------
 
 #[test]
 fn a_scoped_stack_refuses_when_the_dock_replaces_an_in_scope_directory_with_a_file() {
-    // B1 (blocker): the working tree flips the scoped subtree itself from a directory to a
+    // The working tree flips the scoped subtree itself from a directory to a
     // file. The overlay's dock-side files pass must catch this — without it, the file lands in
     // no branch of the splice and is silently dropped from the signed (!) tree.
     let warehouse = scoped_fixture("scoped-dock-flip");
@@ -4069,7 +4069,7 @@ fn a_scoped_stack_refuses_when_the_dock_replaces_an_in_scope_directory_with_a_fi
 
 #[test]
 fn a_scoped_park_produces_a_byte_identical_tree_and_a_clean_park_refuses() {
-    // M2: park must route through the overlay exactly like stack, and its "nothing to park"
+    // park must route through the overlay exactly like stack, and its "nothing to park"
     // check must compare the spliced root against head (not the truncated sparse partial) or
     // it never fires in a scoped bay.
     let warehouse = scoped_fixture("scoped-park");
@@ -4105,7 +4105,7 @@ fn a_scoped_park_produces_a_byte_identical_tree_and_a_clean_park_refuses() {
 
 #[test]
 fn a_scoped_restore_staged_root_leaves_stocktake_clean_and_the_shards_scope_bounded() {
-    // M3: `restore --staged` must not resurrect out-of-scope shards into a scoped bay's
+    // `restore --staged` must not resurrect out-of-scope shards into a scoped bay's
     // inventory — those paths were never materialized here.
     let warehouse = scoped_fixture("scoped-restore-staged");
 
@@ -4114,7 +4114,7 @@ fn a_scoped_restore_staged_root_leaves_stocktake_clean_and_the_shards_scope_boun
 
     // Stage an in-scope edit, then reset it via `restore --staged .` (the root) — and revert
     // the working file too, so the working tree, inventory and head all agree again
-    // afterwards (isolating the M3 assertion from `restore --staged`'s ordinary "working
+    // afterwards (isolating this assertion from `restore --staged`'s ordinary "working
     // directory untouched" semantics, which would otherwise still show the edited file as
     // unstaged and drown out the out-of-scope-leakage signal this test checks for).
     std::fs::write(scoped_dir.join("src/api/a.txt"), "api a v2\n").unwrap();
@@ -4141,7 +4141,7 @@ fn a_scoped_restore_staged_root_leaves_stocktake_clean_and_the_shards_scope_boun
 
 #[test]
 fn a_multi_path_scoped_stack_produces_a_byte_identical_root_tree() {
-    // m6: pin the multi-path scope case (two independent in-scope subtrees) for the
+    // Pin the multi-path scope case (two independent in-scope subtrees) for the
     // byte-identical invariant, not just the single-scope-path case.
     let warehouse = scoped_fixture("scoped-multi-path");
 

@@ -22,8 +22,8 @@ pub struct Cli {
     #[arg(
         long,
         global = true,
-        long_help = "Emit the command's result as one JSON document on stdout instead of prose \
-                     (DESIGN.html §7.4). The envelope is \
+        long_help = "Emit the command's result as one JSON document on stdout instead of prose. \
+                     The envelope is \
                      { \"forklift_json\": <schema>, \"command\", \"ok\", \"data\" } on success and \
                      { \"forklift_json\", \"ok\": false, \"error\": { \"code\", \"message\", \
                      \"next_step\" } } on failure. Errors also set a deterministic exit code."
@@ -50,7 +50,7 @@ pub enum Command {
 
     /// Manage the `fl` short alias for this binary
     #[command(
-        long_about = "Manage the `fl` short alias (§5.0 milestone F): a shell-agnostic symlink \
+        long_about = "Manage the `fl` short alias: a shell-agnostic symlink \
                       (a shim on Windows) placed next to this binary, not a per-shell alias — it \
                       works in scripts, non-interactive shells and every shell dialect alike, and \
                       is trivially discoverable and removable. This is the one implementation \
@@ -77,7 +77,7 @@ pub enum Command {
 
     /// Manage bays: parallel working directories bound to this warehouse
     #[command(
-        long_about = "Manage bays (§7.5): additional working directories bound to this warehouse. \
+        long_about = "Manage bays: additional working directories bound to this warehouse. \
                       A bay shares the object store, the refs and trust, but keeps its own working \
                       tree, inventory, current pallet and lock — so several agents (or you and an \
                       agent) work one machine without cloning the objects N times or fighting one \
@@ -94,7 +94,7 @@ pub enum Command {
         visible_alias = "bl",
         alias = "annotate",
         long_about = "Attribute every line of a file to the parcel that introduced it — and, \
-                      because authorship is signed and classed (§7.1), to the author's identity \
+                      because authorship is signed and classed, to the author's identity \
                       class and supervisor. That is blame git cannot express: \"was this line \
                       written by a human or an agent, under whose supervision\", offline and \
                       forge-proof. The walk follows the first-parent chain from the revision (the \
@@ -116,7 +116,7 @@ pub enum Command {
         name = "cherry-pick",
         visible_alias = "cp",
         long_about = "Apply a parcel's diff (its change against its first parent) onto the current \
-                      pallet as a new, author-preserving, freshly-signed parcel (§9.1 #8). Unlike \
+                      pallet as a new, author-preserving, freshly-signed parcel. Unlike \
                       rebase, cherry-pick only *adds* — no rewrite, no force-push: the picked \
                       parcel's authors are preserved and this operator is recorded as the stacker. \
                       A clean pick is stacked immediately; a conflicting one leaves markers to \
@@ -205,7 +205,7 @@ pub enum Command {
     #[command(
         visible_alias = "dv",
         long_about = "Deliver the current (draft) pallet's checkpoint trail onto a target pallet \
-                      as a single clean signed parcel (§7.3) — the squash agents need, without \
+                      as a single clean signed parcel — the squash agents need, without \
                       losing the trail. The delivered parcel carries the draft head's tree with \
                       the target as its only parent, so the checkpoints stay out of the target's \
                       history; the full trail is kept (the draft pallet is left intact) and \
@@ -244,7 +244,7 @@ pub enum Command {
 
     /// Export this warehouse's history into a new git repository (one-way, lossy)
     #[command(
-        long_about = "One-way export of this warehouse's history into a new git repository (§7.8): \
+        long_about = "One-way export of this warehouse's history into a new git repository: \
                       parcels become commits, trees become trees, blobs become blobs, and each user \
                       pallet becomes a branch. The escape hatch that makes trying forklift reversible \
                       — but lossy in this direction: git has no home for the signed office, the \
@@ -283,8 +283,8 @@ pub enum Command {
 
     /// Reviewable merge proposals (pull requests) on the @haul meta pallet
     #[command(
-        long_about = "Propose merging one pallet into another, with discussion and signed reviews \
-                      (Phase 4 pull requests). A haul is an append-only log of signed events on the \
+        long_about = "Propose merging one pallet into another, with discussion and signed reviews — \
+                      pull requests, in Forklift's vocabulary. A haul is an append-only log of signed events on the \
                       @haul meta pallet, so authorship — and who approved — is forge-proof and \
                       carries the operator's identity class (a human's approval is distinguishable \
                       from an agent's). Reviews are recorded; merging is not gated on them in this \
@@ -338,7 +338,7 @@ pub enum Command {
 
     /// Import a git repository's history into this warehouse (one-way migration)
     #[command(
-        long_about = "One-way migration of a git repository's history into this warehouse (§7.8): \
+        long_about = "One-way migration of a git repository's history into this warehouse: \
                       git commits become parcels, trees become trees, blobs become blobs, and each \
                       local branch becomes a pallet. The imported history is unsigned (it predates \
                       trust), so import into a fresh warehouse and then run \"office enroll\" to \
@@ -402,7 +402,7 @@ pub enum Command {
 
     /// Serve the command surface to an AI agent as MCP tools (stdio)
     #[command(
-        long_about = "Run a Model Context Protocol server on stdin/stdout (DESIGN.html §7.4), \
+        long_about = "Run a Model Context Protocol server on stdin/stdout, \
                       exposing forklift's commands as schema-typed MCP tools so an agent calls \
                       tools instead of shelling out and scraping prose. Each tool re-runs forklift \
                       with --json, so the tools return the same structured output the CLI does. \
@@ -574,11 +574,12 @@ pub enum Command {
         summary: bool,
     },
 
-    /// Show this bay's sparse materialization scope, and the warehouse fetch scope (§7.6)
+    /// Show this bay's sparse materialization scope, and the warehouse fetch scope
     #[command(
-        long_about = "Show the sparse-workspace scope (§7.6): this bay's materialization scope \
+        long_about = "Show the sparse-workspace scope: this bay's materialization scope \
                       (the subtree path(s) it checks out, stages and stacks) and the warehouse's \
-                      fetch scope (what the store has fetched at all — full in stage 1). An \
+                      fetch scope (what the store has fetched at all — currently always the full \
+                      tree, since fetching itself cannot yet be scoped). An \
                       unscoped bay (or the main tree) reports a full scope: the whole tree. Scope \
                       is local to the checkout and never tracked. Read-only."
     )]
@@ -601,7 +602,7 @@ pub enum Command {
 
     /// Manage signed tags: named, admin-signed pointers at a parcel (releases)
     #[command(
-        long_about = "Manage tags (§9.4d): named, signed pointers at a parcel — releases and \
+        long_about = "Manage tags: named, signed pointers at a parcel — releases and \
                       milestones. A tag is a signed record on the \"@tags\" meta pallet, so who \
                       cut it is the parcel's signature (forge-proof), verifiable offline against \
                       the office chain. The release convention: a tag is signed by an admin key, \
@@ -693,13 +694,14 @@ pub enum BayAction {
         /// Where to create the working directory (default: a sibling of the warehouse)
         path: Option<String>,
 
-        /// Limit the bay to one or more subtree paths — a scoped (sparse) bay (§7.6). Repeatable.
+        /// Limit the bay to one or more subtree paths — a scoped (sparse) bay. Repeatable.
         #[arg(
             long = "scope",
             value_name = "PATH",
-            long_help = "Open a scoped (sparse) bay (§7.6): materialize and operate on only the \
+            long_help = "Open a scoped (sparse) bay: materialize and operate on only the \
                          given subtree path(s) of the working tree, not the whole tree. The object \
-                         store still holds everything (stage 1 is materialization-only sparseness); \
+                         store still holds everything (only materialization is scoped; fetching \
+                         itself cannot yet be scoped); \
                          the bay just checks out, stages and stacks its in-scope subtree(s), copying \
                          every out-of-scope sibling forward by the hash the signed head already \
                          commits. Repeatable to scope several subtrees. Scope is local to this bay \
@@ -732,7 +734,7 @@ pub enum TagAction {
     #[command(
         long_about = "Create a signed tag pointing at a revision — a release marker. The tag is \
                       signed and recorded on the \"@tags\" meta pallet, verifiable offline against \
-                      the office chain. As the release convention (§9.4d), only an admin may cut a \
+                      the office chain. As the release convention, only an admin may cut a \
                       tag. Tag names are immutable; an existing name is refused."
     )]
     Create {
@@ -789,7 +791,7 @@ pub enum ManifestAction {
         message: Option<String>,
     },
 
-    /// Record how a parcel was produced: model, tool, session (AI provenance, §7.2)
+    /// Record how a parcel was produced: model, tool, session (AI provenance)
     #[command(
         long_about = "Record signed machine-authorship provenance for a parcel — which model \
                       produced the change, with which tool, in which session, and (optionally) a \
@@ -975,7 +977,7 @@ pub enum OfficeAction {
                       exactly as printed by their \"forklift office keygen\" run. The key becomes \
                       their identity root, endorsed by your admin key. Office records are \
                       pseudonymous — no names or emails ever go on-chain. Mark automated \
-                      principals with --agent / --bot / --service (§7.1): the class rides in the \
+                      principals with --agent / --bot / --service: the class rides in the \
                       signed record, so \"an agent wrote this, supervised by <human>\" is \
                       forge-proof. An agent requires a --supervisor; a supervisor must be an \
                       enrolled human. Automated identities should hold passphraseless keys (they \
@@ -1041,7 +1043,7 @@ pub enum OfficeAction {
     /// Authorize a new key for an already-enrolled operator — admins only
     #[command(
         long_about = "Authorize a new key for an already-enrolled operator: the recovery path for \
-                      someone who lost every device (§8.6 — the scope of a key-authorization \
+                      someone who lost every device (the scope of a key-authorization \
                       equals the scope of the authorizer's authority, so an admin's endorsement \
                       is valid exactly here, in the office they administer). The operator runs \
                       \"forklift office keygen\" on their new machine and hands you the printed \
