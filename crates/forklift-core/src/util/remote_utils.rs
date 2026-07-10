@@ -31,8 +31,8 @@ const BATCH_FETCH_CHUNK: usize = 512;
 /// How many times a staged lift retries its session commit while the staging verifier catches
 /// up, and the backoff between attempts. A storage-backed head promotes a blob within seconds
 /// of its staging `PUT` in the hosted deployment; the schedule (~0.2s doubling to a 3s cap)
-/// spans well over a minute, so a slow verifier still commits, while a genuinely stuck one
-/// surfaces as an error rather than hanging the lift forever. Only the transient
+/// spans about 24s of sleep (0.2+0.4+0.8+1.6+3×7), so a slow verifier still commits, while a
+/// genuinely stuck one surfaces as an error rather than hanging the lift forever. Only the transient
 /// blob-not-ready case is retried — a corrupt or missing object fails at once.
 const MAX_COMMIT_ATTEMPTS: usize = 12;
 const COMMIT_BACKOFF_START: std::time::Duration = std::time::Duration::from_millis(200);

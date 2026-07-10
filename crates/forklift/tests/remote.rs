@@ -369,6 +369,20 @@ fn the_direct_head_answers_upload_targets_all_direct() {
 }
 
 #[test]
+fn upload_targets_rejects_an_invalid_hash_as_client_error() {
+    // An invalid hash (non-hex, too short) is a client mistake, not a server fault: `upload-
+    // targets` must map it to 422, the same idiom `GET /v1/objects/{hash}` uses, not a 500.
+    let area = TestArea::new("upload-targets-invalid-hash");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "a", &server.url);
+
+    let request = "{\"session\":\"lift-x\",\"hashes\":[\"not-a-valid-hash\"]}";
+    let (status, body) = http_post_json(&server.url, "/v1/objects/upload-targets", request);
+    assert!(status.starts_with("HTTP/1.1 422"), "{} / {}", status, body);
+}
+
+#[test]
 fn diverged_pallets_are_refused_not_merged() {
     let area = TestArea::new("diverged");
     let server = Server::start(&area, None);

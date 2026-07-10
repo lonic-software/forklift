@@ -992,7 +992,7 @@ async fn post_upload_targets(State(state): State<Arc<AppState>>,
                 continue;
             }
 
-            if file_utils::does_object_exist(&hash).map_err(internal)? {
+            if file_utils::does_object_exist(&hash).map_err(unprocessable)? {
                 response.present.push(hash);
             } else {
                 // No staging prefix here — the client PUTs the body and the head verifies it
