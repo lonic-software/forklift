@@ -1169,6 +1169,7 @@ dependencies = [
  "aws-smithy-http-client",
  "aws-smithy-runtime-api",
  "aws-smithy-types",
+ "blake3",
  "forklift-core",
  "serde",
  "serde_json",

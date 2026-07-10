@@ -112,7 +112,26 @@ impl DynamoRefStore {
         ])
     }
 
-    /// Read one item by its sort key.
+    /// Read one item by its sort key, strongly consistent.
+    ///
+    /// DynamoDB's default eventually-consistent read can serve a replica that has not yet
+    /// absorbed the last write; `consistent_read(true)` pins this read to the same partition
+    /// the CAS writes land on, at roughly double the read cost. That closes the *read* half of
+    /// a staleness window that otherwise exists wherever `get_head`/`get_trust` feed a
+    /// decision: `ref_update` reads the office head and the trust anchor once per request to
+    /// decide what to audit against, and an eventually-consistent read could hand back an
+    /// office head DynamoDB had already moved past.
+    ///
+    /// It does **not** close the other half. `ref_update`'s audit-then-CAS shape reads the
+    /// office head, audits against it, and only *afterwards* CASes the target pallet's own
+    /// head — the CAS is conditioned on the target pallet's `old_head`, not on the office head
+    /// staying put across those two round trips. A concurrent office re-key between the read
+    /// and the CAS is still possible, consistent read or not; closing that would mean
+    /// conditioning the pallet CAS on the office head too (a DynamoDB transaction across both
+    /// items), which changes what the CAS commits and is a design question for `Head`
+    /// (`head.rs`), not something this store can decide unilaterally. This is pre-existing —
+    /// [`crate::memory::MemoryRefStore`] has the identical property, since nothing in the
+    /// trait ties the two reads to the CAS either.
     async fn get_item(
         &self,
         entity: &str,
@@ -122,6 +141,7 @@ impl DynamoRefStore {
             .get_item()
             .table_name(&self.table)
             .set_key(Some(self.key(entity)))
+            .consistent_read(true)
             .send()
             .await
             .map_err(|err| describe("DynamoDB get_item", err))?;

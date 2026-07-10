@@ -316,6 +316,86 @@ async fn s3_verify_and_promote_gates_the_canonical_namespace() {
     .expect("the blocking assertions");
 }
 
+/// The DoS-hardening review finding (C1): a staged object at or above
+/// [`forklift_aws_lambda::aws::STREAMING_THRESHOLD_BYTES`] is never buffered whole —
+/// `verify_and_promote` stream-hashes it through an incremental Blake3 hasher and promotes it
+/// with a server-side `CopyObject` pinned to the exact bytes it hashed. This is the first time
+/// that code path runs against real S3 (the unit tests in `s3.rs` exercise the pure
+/// stream-hashing logic without AWS); it proves, over the real service: a corrupted large
+/// object is discarded exactly as the small-object path discards one, a valid large object
+/// promotes and reads back byte-identical (proof the `CopyObject`, not a buffered re-upload,
+/// is what moved the bytes), and promotion stays idempotent.
+#[tokio::test(flavor = "multi_thread")]
+async fn s3_verify_and_promote_streams_large_staged_objects() {
+    let Some(endpoint) = endpoint() else {
+        eprintln!("skipping: FORKLIFT_AWS_TEST_ENDPOINT is unset");
+        return;
+    };
+
+    let config = test_config(&endpoint);
+    provision(&config).await;
+
+    let bridge = AsyncBridge::current().expect("a multi-thread runtime");
+    let (s3, _dynamodb) = build_clients(&config).await.expect("clients");
+    let (objects, _refs) = build_stores(&config, bridge).await.expect("stores");
+    let bucket = config.bucket.clone();
+
+    // One byte over the streaming threshold: large enough to force the stream-hash +
+    // CopyObject path this test exists to exercise, small enough (a few MiB) to keep the
+    // test fast — the point is the code path, not the byte count.
+    let size = (forklift_aws_lambda::aws::STREAMING_THRESHOLD_BYTES as usize) + 1;
+    let good: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+    let good_hash = object_utils::hash_object_bytes(&good);
+
+    // Bytes that do NOT match the hash they are declared (staged) under — the large-object
+    // analogue of `s3_verify_and_promote_gates_the_canonical_namespace`'s corrupt case.
+    let mut wrong_content = good.clone();
+    wrong_content[0] ^= 0xFF;
+    let declared_hash = object_utils::hash_object_bytes(b"a declared hash the bytes will not match");
+
+    let stage = |key: String, body: Vec<u8>| {
+        let s3 = s3.clone();
+        let bucket = bucket.clone();
+        async move {
+            s3.put_object()
+                .bucket(bucket)
+                .key(key)
+                .body(body.into())
+                .send()
+                .await
+                .expect("stage bytes");
+        }
+    };
+    stage(format!("staging/lift-big/{}", good_hash), good.clone()).await;
+    stage(format!("staging/lift-big/{}", declared_hash), wrong_content).await;
+
+    tokio::task::spawn_blocking(move || {
+        // The corrupt large object is discarded, never promoted, over the streaming path.
+        match objects.verify_and_promote("lift-big", &declared_hash).expect("corrupt large") {
+            PromoteOutcome::Corrupt { actual } => assert_ne!(actual, declared_hash),
+            other => panic!("expected Corrupt, got {:?}", other),
+        }
+        assert!(!objects.exists(&declared_hash).expect("never canonical"));
+
+        // The valid large object promotes via stream-hash + CopyObject, and the bytes at the
+        // canonical key are exactly the ones staged.
+        assert_eq!(
+            objects.verify_and_promote("lift-big", &good_hash).expect("promote large"),
+            PromoteOutcome::Promoted
+        );
+        assert!(objects.exists(&good_hash).expect("now canonical"));
+        assert_eq!(objects.get(&good_hash).expect("read back").as_deref(), Some(good.as_slice()));
+
+        // Idempotent, exactly like the small-object path.
+        assert_eq!(
+            objects.verify_and_promote("lift-big", &good_hash).expect("retry"),
+            PromoteOutcome::AlreadyPresent
+        );
+    })
+    .await
+    .expect("the blocking assertions");
+}
+
 /// The full [`RefStore`] contract against real DynamoDB: the head CAS (committed / conflict
 /// with the current head reported), enumeration, and the one-way trust door.
 #[tokio::test(flavor = "multi_thread")]
@@ -338,6 +418,17 @@ async fn dynamo_ref_store_upholds_the_cas_and_the_trust_door() {
         // Unborn.
         assert!(refs.get_head(PalletNamespace::User, "main").expect("get").is_none());
         assert_eq!(refs.default_pallet().expect("default"), "main");
+
+        // A CAS naming a *non-None* `expected` head against a pallet that does not exist yet
+        // (no item at all, not merely a different head) is a conflict reporting no current
+        // head — not a special "missing item" case distinct from an ordinary CAS mismatch, and
+        // never an error (the `UpdateItem` condition `#h = :old` simply cannot hold against an
+        // item with no `head` attribute).
+        assert_eq!(
+            refs.compare_and_set_head(PalletNamespace::User, "main", Some(&one), &two)
+                .expect("cas against a genuinely missing item"),
+            CasOutcome::Conflict { current: None }
+        );
 
         // Create with expected None.
         assert_eq!(

@@ -32,4 +32,4 @@ mod sdk;
 
 pub use config::{build_clients, build_stores, AwsConfig};
 pub use dynamo::DynamoRefStore;
-pub use s3::{S3ObjectStore, PRESIGN_TTL};
+pub use s3::{S3ObjectStore, PRESIGN_TTL, STREAMING_THRESHOLD_BYTES};

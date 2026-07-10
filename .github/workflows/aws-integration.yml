@@ -1,0 +1,78 @@
+# The AWS SDK store implementations (forklift-aws-lambda) against real S3 + DynamoDB APIs,
+# via a LocalStack service container. This is the sibling of the in-memory protocol suite
+# (which `ci.yml` already runs on every push/PR, no AWS needed): `tests/aws_integration.rs`
+# is gated on `FORKLIFT_AWS_TEST_ENDPOINT` and skips cleanly everywhere that variable is
+# unset, so it needs its own job with that endpoint actually wired up.
+#
+# A separate workflow (not a job bolted onto `ci.yml`) because path filtering is a
+# workflow-level `on:` concept in GitHub Actions: this must only run when the aws-lambda
+# crate (or this file) changes, without touching what gates the OS matrix in `ci.yml`.
+name: AWS integration (LocalStack)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/forklift-aws-lambda/**"
+      - ".github/workflows/aws-integration.yml"
+  pull_request:
+    paths:
+      - "crates/forklift-aws-lambda/**"
+      - ".github/workflows/aws-integration.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+  # LocalStack accepts any values; the SDKs' default provider chain still requires something
+  # present, so these are just placeholders, never real credentials.
+  AWS_ACCESS_KEY_ID: test
+  AWS_SECRET_ACCESS_KEY: test
+  AWS_REGION: us-east-1
+  FORKLIFT_AWS_TEST_ENDPOINT: http://localhost:4566
+
+jobs:
+  aws-integration:
+    name: aws-integration (localstack)
+    runs-on: ubuntu-latest
+    services:
+      localstack:
+        image: localstack/localstack:3
+        ports:
+          - 4566:4566
+        env:
+          SERVICES: s3,dynamodb
+        options: >-
+          --health-cmd "curl -sf http://localhost:4566/_localstack/health"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The suite drives the `forklift` CLI to build a real warehouse to harvest objects
+      # from (`tests/aws_integration.rs` locates it next to the test binary in `target/`),
+      # so it must be built first — `cargo test -p forklift-aws-lambda` alone would not
+      # build the CLI's own crate.
+      - name: Build the forklift CLI
+        run: cargo build -p forklift
+
+      # Actions already waits on the service container's own health check before running
+      # steps, but LocalStack's first health-check pass can lag its actual readiness by a
+      # beat; a short, bounded extra wait here is cheap insurance against that flake.
+      - name: Wait for LocalStack
+        run: |
+          for _ in $(seq 1 30); do
+            curl -sf http://localhost:4566/_localstack/health > /dev/null && exit 0
+            sleep 2
+          done
+          echo "LocalStack did not become healthy in time" >&2
+          exit 1
+
+      # This is the real first execution of this suite (no local Docker was available while
+      # writing it) — treat a failure here as expected first-run iteration, not a red flag.
+      - name: Run the AWS integration suite
+        run: cargo test -p forklift-aws-lambda --test aws_integration --verbose
