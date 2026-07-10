@@ -30,6 +30,7 @@ use forklift_core::globals::StorageRootScope;
 use forklift_core::model::remote::{
     CommitLiftRequest, MissingObjectsRequest, MissingObjectsResponse, RefUpdateRequest,
     ResolveResponse, TrustAnchorDto, UploadTargetsRequest, UploadTargetsResponse, WarehouseInfo,
+    MAX_MISSING_BATCH,
 };
 use forklift_core::util::office_utils::{self, OFFICE_PALLET_NAME};
 use forklift_core::util::pallet_utils::{self, PalletNamespace};
@@ -355,6 +356,30 @@ fn the_staging_byte_plane_answers_307_and_refuses_a_session_less_put() {
     assert_eq!(status(&fixture.call(get(&format!("/v1/objects/{}", "c".repeat(64))))), 404);
 }
 
+/// Review fix: `?session=` with an empty value must not be treated as a real session — that
+/// would presign a `staging//{hash}` key `commit_lift` could never promote, stranding the
+/// object. It is routed exactly like a request with no `session` parameter: `422
+/// SessionRequired`, never a `307` to a doubled-slash staging key.
+#[test]
+fn an_empty_session_query_value_is_treated_as_absent() {
+    let fixture = Fixture::staging();
+
+    let hash = object_utils::hash_object_bytes(b"an object");
+
+    let response =
+        fixture.call(put_bytes(&format!("/v1/objects/{}?session=", hash), b"ignored".to_vec()));
+    assert_eq!(status(&response), 422, "an empty session is treated as absent, not a real one");
+
+    // Confirm it is genuinely the "no session" path, not some other 422: the identical request
+    // with a real session redirects, and one with no `?session` at all fails the same way.
+    let with_real_session =
+        fixture.call(put_bytes(&format!("/v1/objects/{}?session=lift-1", hash), b"ignored".to_vec()));
+    assert_eq!(status(&with_real_session), 307);
+
+    let with_no_session = fixture.call(put_bytes(&format!("/v1/objects/{}", hash), b"ignored".to_vec()));
+    assert_eq!(status(&with_no_session), status(&response), "empty and absent answer identically");
+}
+
 /// The body-less upload negotiation sorts hashes into present/targets/direct.
 #[test]
 fn upload_targets_negotiates_over_http() {
@@ -367,7 +392,7 @@ fn upload_targets_negotiates_over_http() {
 
     let request = UploadTargetsRequest {
         session: "lift-1".to_string(),
-        hashes: vec![present_hash.clone(), wanted_hash.clone(), present_hash.clone()],
+        hashes: vec![present_hash.clone(), wanted_hash.clone()],
     };
     let response = fixture.call(post_json("/v1/objects/upload-targets", &request));
     assert_eq!(status(&response), 200);
@@ -379,6 +404,33 @@ fn upload_targets_negotiates_over_http() {
         answer.targets.get(&wanted_hash).map(String::as_str),
         Some(format!("https://s3.example/bucket/staging/lift-1/{}", wanted_hash).as_str())
     );
+}
+
+/// Review fix: `upload-targets` has its own, smaller batch cap than the protocol's shared
+/// `MAX_MISSING_BATCH` (10 000) — each response entry carries a presigned URL, not a bare hash,
+/// so a `MAX_MISSING_BATCH`-sized request would answer with several megabytes of JSON, at or
+/// over a Lambda synchronous response's limit. A request over the router's cap is refused
+/// before `Head::upload_targets` ever runs, and the error names the cap.
+#[test]
+fn upload_targets_over_the_router_cap_is_a_422_naming_the_cap() {
+    let fixture = Fixture::staging();
+
+    // One over the documented cap (1000; see `entrypoint::MAX_UPLOAD_TARGETS_BATCH`).
+    let hashes: Vec<String> = (0..1001).map(|i| format!("{:064x}", i)).collect();
+    let request = UploadTargetsRequest { session: "lift-1".to_string(), hashes };
+
+    let response = fixture.call(post_json("/v1/objects/upload-targets", &request));
+    assert_eq!(status(&response), 422);
+
+    let error: serde_json::Value = body_json(&response);
+    let message = error["error"].as_str().expect("a JSON error body");
+    assert!(message.contains("1000"), "the error should name the cap: {}", message);
+
+    // Exactly at the cap still succeeds.
+    let hashes: Vec<String> = (0..1000).map(|i| format!("{:064x}", i)).collect();
+    let request = UploadTargetsRequest { session: "lift-1".to_string(), hashes };
+    let response = fixture.call(post_json("/v1/objects/upload-targets", &request));
+    assert_eq!(status(&response), 200, "exactly at the cap is still accepted");
 }
 
 /// The full staged-commit path over HTTP: a corrupt object refuses the commit (422), a clean
@@ -415,6 +467,31 @@ fn commit_lift_verifies_and_promotes_over_http() {
     let response = fixture.call(get(&format!("/v1/objects/{}", good_hash)));
     assert_eq!(status(&response), 307);
     assert_eq!(location(&response), format!("https://s3.example/bucket/objects/{}", good_hash));
+}
+
+/// Review fix: `commit_lift` had no batch cap at all (every other list-taking route enforces the
+/// protocol's shared `MAX_MISSING_BATCH` inside `Head`). A request whose `control_plane` and
+/// `blobs` lists together exceed the cap is refused with a 422 before `Head::commit_lift` runs.
+#[test]
+fn commit_lift_over_the_shared_cap_is_a_422() {
+    let fixture = Fixture::staging();
+
+    // The combined length is one over `MAX_MISSING_BATCH`; the two lists individually stay
+    // under it, proving the cap applies to their sum, not either list alone.
+    let control_plane: Vec<String> =
+        (0..MAX_MISSING_BATCH / 2).map(|i| format!("{:064x}", i)).collect();
+    let blobs: Vec<String> = (0..(MAX_MISSING_BATCH / 2 + 1))
+        .map(|i| format!("{:064x}", i + MAX_MISSING_BATCH))
+        .collect();
+    assert!(control_plane.len() + blobs.len() > MAX_MISSING_BATCH);
+
+    let commit = CommitLiftRequest { control_plane, blobs };
+    let response = fixture.call(post_json("/v1/lift/lift-1/commit", &commit));
+    assert_eq!(status(&response), 422);
+
+    let error: serde_json::Value = body_json(&response);
+    let message = error["error"].as_str().expect("a JSON error body");
+    assert!(message.contains(&MAX_MISSING_BATCH.to_string()), "{}", message);
 }
 
 /// A `batch` over a store that offloads answers 307 to a presigned response URL, outside the
@@ -566,6 +643,38 @@ fn unknown_routes_are_404() {
     assert_eq!(status(&fixture.call(post_json("/v1/warehouse", &serde_json::json!({})))), 404);
     // The version prefix is mandatory for the versioned endpoints.
     assert_eq!(status(&fixture.call(get("/warehouse"))), 404);
+}
+
+/// Review fix: a `500` must not forward `Head`'s internal message verbatim — that message can
+/// wrap a raw SDK failure carrying a request id, a bucket or table name, which this hosted,
+/// multi-tenant edge must not hand to whoever is asking (unlike `forklift-server`, which
+/// forwards its `500`s because that self-host head only ever runs on the operator's own
+/// infrastructure). Force one via a failing `build_head` (the same path a real client-building
+/// failure takes) and assert the body is generic, not the detailed message.
+#[test]
+fn an_internal_error_is_redacted_at_the_edge_not_forwarded_verbatim() {
+    let routing = Routing::Single("wh".to_string());
+    let request = get("/v1/warehouse");
+
+    let sensitive = "S3 bucket forklift-prod-customer-42 (request-id 8f1c2b, role AKIAEXAMPLE) \
+        denied HeadObject";
+
+    let response = handle(
+        &routing,
+        |_warehouse_id: &str| -> Result<Head<SharedObjects, SharedRefs>, String> {
+            Err(sensitive.to_string())
+        },
+        request,
+    );
+
+    assert_eq!(status(&response), 500);
+
+    let body: serde_json::Value = body_json(&response);
+    let message = body["error"].as_str().expect("a JSON error body");
+    assert_ne!(message, sensitive, "the detailed message must not be forwarded verbatim");
+    assert!(!message.contains("forklift-prod-customer-42"), "{}", message);
+    assert!(!message.contains("AKIAEXAMPLE"), "{}", message);
+    assert!(!message.contains("8f1c2b"), "{}", message);
 }
 
 // -------------------------------------------------------------------------------------------

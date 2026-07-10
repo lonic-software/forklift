@@ -43,9 +43,19 @@ async fn handler(event: LambdaEvent<S3Event>) -> Result<(), Error> {
     let objects = objects().await?;
 
     for record in event.payload.records {
-        let Some(key) = record.s3.object.key else {
+        let Some(raw_key) = record.s3.object.key else {
             continue;
         };
+
+        // S3 event notifications URL-encode the key the way a query string is (space → `+`,
+        // everything else percent-escaped): "red flower.jpg" arrives as "red+flower.jpg". A
+        // session id or hash cannot contain either character, but the key is split on `/`
+        // first — an unrelated, encoded key (or a stray notification) must decode cleanly
+        // before `parse_staging_key` judges its shape, or a corrupted split could misroute it.
+        // Newer event payloads carry the already-decoded form in `url_decoded_key`; prefer it
+        // when present, and fall back to a small inline decoder for payloads that predate it,
+        // rather than pulling in a URL-decoding dependency for one string.
+        let key = record.s3.object.url_decoded_key.unwrap_or_else(|| decode_s3_key(&raw_key));
 
         let Some((session, hash)) = parse_staging_key(&key) else {
             // The trigger should be scoped to the `staging/` prefix, but a stray event is
@@ -79,6 +89,48 @@ async fn handler(event: LambdaEvent<S3Event>) -> Result<(), Error> {
     Ok(())
 }
 
+/// Percent-decode an S3 event notification key: S3 encodes it the way a URL query string is
+/// (`+` for space, `%XX` for everything else outside the unreserved set), so an object whose
+/// name has a space or a non-ASCII character arrives encoded. A tiny inline decoder rather than
+/// a new dependency — the alphabet is fixed and the input is one path string, not a query
+/// string — used only as the fallback for event payloads that predate `url_decoded_key`.
+/// A malformed or truncated `%` escape is left as a literal `%` rather than rejected: this feeds
+/// `parse_staging_key`, which already treats anything that does not split into
+/// `staging/{session}/{hash}` as "not a staging object".
+fn decode_s3_key(key: &str) -> String {
+    let bytes = key.as_bytes();
+    let mut decoded: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                decoded.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 3 <= bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok();
+                match hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                    Some(byte) => {
+                        decoded.push(byte);
+                        i += 3;
+                    }
+                    None => {
+                        decoded.push(bytes[i]);
+                        i += 1;
+                    }
+                }
+            }
+            byte => {
+                decoded.push(byte);
+                i += 1;
+            }
+        }
+    }
+
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
 /// Parse a `staging/{session}/{hash}` key into its parts. `None` for any other key shape.
 fn parse_staging_key(key: &str) -> Option<(&str, &str)> {
     let rest = key.strip_prefix("staging/")?;
@@ -101,7 +153,7 @@ async fn main() -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_staging_key;
+    use super::{decode_s3_key, parse_staging_key};
 
     #[test]
     fn a_staging_key_splits_into_session_and_hash() {
@@ -115,5 +167,33 @@ mod tests {
         assert_eq!(parse_staging_key("staging//abc"), None, "empty session");
         assert_eq!(parse_staging_key("staging/lift-1/"), None, "empty hash");
         assert_eq!(parse_staging_key("staging/lift-1/a/b"), None, "extra segment");
+    }
+
+    #[test]
+    fn decode_s3_key_handles_plus_as_space_and_percent_escapes() {
+        assert_eq!(decode_s3_key("a+b"), "a b");
+        assert_eq!(decode_s3_key("a%2Bb"), "a+b");
+        assert_eq!(decode_s3_key("Happy%20Face.jpg"), "Happy Face.jpg");
+        assert_eq!(decode_s3_key("staging/lift+session/de%2Dad"), "staging/lift session/de-ad");
+    }
+
+    #[test]
+    fn decode_s3_key_leaves_a_malformed_escape_as_a_literal_percent() {
+        // A truncated or non-hex escape at the end of the string is not a valid encoding; it is
+        // left as-is rather than dropped or panicking. `parse_staging_key` still judges the
+        // result as not a staging key, which is the behaviour that matters.
+        assert_eq!(decode_s3_key("abc%"), "abc%");
+        assert_eq!(decode_s3_key("abc%2"), "abc%2");
+        assert_eq!(decode_s3_key("abc%zz"), "abc%zz");
+    }
+
+    /// The regression this fix is for: an S3-notification-encoded staging key still parses into
+    /// the right `(session, hash)` once decoded — encoding it first the way S3 would, then
+    /// running it through the same `decode_s3_key` → `parse_staging_key` pipeline `handler` uses.
+    #[test]
+    fn a_url_encoded_staging_key_still_parses_after_decoding() {
+        let key = "staging/lift+session-1/deadbeef";
+        let decoded = decode_s3_key(key);
+        assert_eq!(parse_staging_key(&decoded), Some(("lift session-1", "deadbeef")));
     }
 }

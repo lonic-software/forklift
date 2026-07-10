@@ -40,7 +40,7 @@ use serde::Serialize;
 
 use forklift_core::model::remote::{
     CommitLiftRequest, ErrorResponse, MissingObjectsRequest, MissingObjectsResponse,
-    RefUpdateRequest, ResolveResponse, TrustAnchorDto, UploadTargetsRequest,
+    RefUpdateRequest, ResolveResponse, TrustAnchorDto, UploadTargetsRequest, MAX_MISSING_BATCH,
 };
 use forklift_core::util::pallet_utils::DEFAULT_PALLET_NAME;
 
@@ -261,6 +261,64 @@ fn match_endpoint(method: &Method, segments: &[&str], query: Option<&str>) -> Op
     }
 }
 
+/// `POST /v1/objects/upload-targets`'s own response-size cap — smaller than the protocol's
+/// shared `MAX_MISSING_BATCH` (10 000). Unlike `missing`'s bare-hash response, this endpoint
+/// answers with a presigned URL per requested hash: a `MAX_MISSING_BATCH`-sized request would
+/// answer with several megabytes of JSON (~500-byte presigned URLs × 10 000 hash keys) — at or
+/// over a Lambda synchronous response's ~6 MB limit. 1 000 keeps a max-size response
+/// comfortably under 1 MB (1 000 × ~700 bytes per hash-key-plus-URL entry ≈ 700 KB) while
+/// staying well above what one lift session's negotiation needs in practice.
+const MAX_UPLOAD_TARGETS_BATCH: usize = 1000;
+
+/// The `422` for an `upload-targets` request over [`MAX_UPLOAD_TARGETS_BATCH`] — reads exactly
+/// like `Head::reject_oversized_batch`, just against the smaller, response-shaped ceiling this
+/// endpoint needs (see the constant's docs).
+fn reject_oversized_upload_targets(count: usize) -> HeadResult<()> {
+    if count > MAX_UPLOAD_TARGETS_BATCH {
+        return Err(HeadError::unprocessable(format!(
+            "At most {} hashes per upload-targets request (each answer carries a presigned URL, \
+            not just a hash); batch larger sets.",
+            MAX_UPLOAD_TARGETS_BATCH
+        )));
+    }
+
+    Ok(())
+}
+
+/// The `422` for a `commit_lift` request whose `control_plane` and `blobs` lists together
+/// exceed the protocol's shared batch cap. `Head::commit_lift` carries no such guard itself
+/// (unlike `missing`/`upload_targets`/`batch`, each capped inside `Head` via its own
+/// `reject_oversized_batch`), so the router enforces it here — combined across both lists,
+/// since a request naming this many hashes at all is the failure mode worth capping, not
+/// either list in isolation.
+fn reject_oversized_commit(control_plane: usize, blobs: usize) -> HeadResult<()> {
+    let total = control_plane + blobs;
+
+    if total > MAX_MISSING_BATCH {
+        return Err(HeadError::unprocessable(format!(
+            "At most {} hashes per commit (control-plane objects plus blobs combined); commit \
+            the lift session in smaller groups.",
+            MAX_MISSING_BATCH
+        )));
+    }
+
+    Ok(())
+}
+
+/// Map a signature-store outcome to its response status — split out from the `SignaturePut`
+/// dispatch arm so the mapping is directly unit-testable: `Head::signature_put` currently turns
+/// a conflicting sidecar into `Err(HeadError::conflict(..))` before this function ever sees
+/// `SignatureOutcome::Conflict` (the `?` at the call site returns early there), so that arm is
+/// unreachable through `Head` today. It still maps to `409`, not `200` — an invariant enforced
+/// here rather than left to fall out of whichever variants happen to reach this match.
+fn signature_put_status(outcome: SignatureOutcome) -> StatusCode {
+    match outcome {
+        SignatureOutcome::Created => StatusCode::CREATED,
+        SignatureOutcome::AlreadyPresent => StatusCode::OK,
+        SignatureOutcome::Conflict => StatusCode::CONFLICT,
+    }
+}
+
 /// Call the `Head` method a route names and shape its outcome into a response. Returning a
 /// [`HeadError`] here funnels every failure through the one status/JSON-body mapping.
 fn dispatch<O, R>(head: &Head<O, R>, route: Route, body: Vec<u8>) -> HeadResult<Response<Vec<u8>>>
@@ -279,6 +337,7 @@ where
 
         Route::UploadTargets => {
             let request: UploadTargetsRequest = parse_json(&body)?;
+            reject_oversized_upload_targets(request.hashes.len())?;
             let response = head.upload_targets(&request.session, &request.hashes)?;
             Ok(json_response(StatusCode::OK, &response))
         }
@@ -309,12 +368,9 @@ where
             Ok(octet_stream(StatusCode::OK, head.signature_get(&hash)?, false))
         }
 
-        Route::SignaturePut(hash) => match head.signature_put(&hash, &body)? {
-            SignatureOutcome::Created => Ok(empty(StatusCode::CREATED)),
-            // `signature_put` returns `Conflict` as a `409` error, so only these two land here.
-            SignatureOutcome::AlreadyPresent => Ok(empty(StatusCode::OK)),
-            SignatureOutcome::Conflict => Ok(empty(StatusCode::OK)),
-        },
+        Route::SignaturePut(hash) => {
+            Ok(empty(signature_put_status(head.signature_put(&hash, &body)?)))
+        }
 
         Route::PutTrust => {
             let anchor: TrustAnchorDto = parse_json(&body)?;
@@ -347,6 +403,7 @@ where
 
         Route::CommitLift(session) => {
             let request: CommitLiftRequest = parse_json(&body)?;
+            reject_oversized_commit(request.control_plane.len(), request.blobs.len())?;
             head.commit_lift(&session, &request.control_plane, &request.blobs)?;
             Ok(empty(StatusCode::OK))
         }
@@ -382,11 +439,23 @@ fn validate_warehouse_id(id: &str) -> HeadResult<()> {
 
 /// Pull one `key=value` out of a raw query string. Values are simple (a lift session id, a
 /// hex hash) so no percent-decoding is needed — the client never encodes them.
+///
+/// An empty or whitespace-only value (`?session=`) is treated the same as the parameter being
+/// absent entirely, rather than as a real, empty session id: a blank session could never be
+/// committed against (`staging//{hash}` is not a key `commit_lift` can promote), so a client
+/// that sends one is routed to the same `422 SessionRequired` a missing parameter gets, instead
+/// of a `307` that stages the upload somewhere it can never be promoted from.
 fn query_param(query: Option<&str>, key: &str) -> Option<String> {
-    query?.split('&').find_map(|pair| {
+    let value = query?.split('&').find_map(|pair| {
         let (name, value) = pair.split_once('=')?;
-        (name == key).then(|| value.to_string())
-    })
+        (name == key).then_some(value)
+    })?;
+
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
 }
 
 /// The `404` for a path this head does not serve (an unknown route, a wrong method, or a
@@ -454,13 +523,30 @@ fn empty(status: StatusCode) -> Response<Vec<u8>> {
 }
 
 /// A failed request as the protocol's JSON error body, at the status the head chose.
+///
+/// A `500`'s message is the one the client never sees as written. `Head`'s internal errors wrap
+/// raw storage failures (an SDK `DisplayErrorContext` can carry a request id, a bucket or table
+/// name), and this router sits behind the hosted service's public edge. `forklift-server`
+/// forwards its `500` messages verbatim, and that is fine there — a self-host head only ever
+/// runs on the operator's own infrastructure — but this head must not hand a stranger's bucket
+/// name to whoever happens to be asking. The detail is logged instead (Lambda ships stderr to
+/// CloudWatch) and the client gets a generic message. Every other status is the protocol's own
+/// diagnostic (a bad hash, a stale ref, a malformed body) and stays as-is — it is meant to be
+/// read.
 fn error_response(error: HeadError) -> Response<Vec<u8>> {
     // The head's [`Status`] numeric values *are* the protocol's HTTP status codes, so this is
     // the single point its taxonomy meets `http`.
     let status = StatusCode::from_u16(error.status.as_u16())
         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
-    let body = serde_json::to_vec(&ErrorResponse { error: error.message })
+    let message = if status == StatusCode::INTERNAL_SERVER_ERROR {
+        eprintln!("forklift-aws-lambda: internal error: {}", error.message);
+        "An internal error occurred.".to_string()
+    } else {
+        error.message
+    };
+
+    let body = serde_json::to_vec(&ErrorResponse { error: message })
         .unwrap_or_else(|_| b"{\"error\":\"internal error\"}".to_vec());
 
     Response::builder()
@@ -468,4 +554,59 @@ fn error_response(error: HeadError) -> Response<Vec<u8>> {
         .header(header::CONTENT_TYPE, "application/json")
         .body(body)
         .expect("a valid error response")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `query_param` treats a missing, empty, or whitespace-only value as absent — the fix for
+    /// the review finding that `?session=` presigned a `staging//{hash}` key nothing could ever
+    /// commit against. A non-empty value (including one with embedded whitespace) still round
+    /// trips untouched, and no percent-decoding happens (the client never encodes these values).
+    #[test]
+    fn query_param_treats_empty_and_whitespace_values_as_absent() {
+        assert_eq!(query_param(Some("session=abc"), "session"), Some("abc".to_string()));
+        assert_eq!(query_param(Some("session="), "session"), None, "an empty value is absent");
+        assert_eq!(
+            query_param(Some("session=   "), "session"),
+            None,
+            "a whitespace-only value is absent"
+        );
+        assert_eq!(
+            query_param(Some("session=%20"), "session"),
+            Some("%20".to_string()),
+            "no percent-decoding: a literal three-character value is not empty"
+        );
+        assert_eq!(query_param(Some("other=abc"), "session"), None, "a different key");
+        assert_eq!(query_param(Some("session=abc&other=x"), "session"), Some("abc".to_string()));
+        assert_eq!(query_param(None, "session"), None, "no query string at all");
+    }
+
+    /// The status mapping stays a `409` for a conflicting signature even though `Head` never
+    /// actually returns `Ok(SignatureOutcome::Conflict)` today (see the function's own doc) —
+    /// tested directly since the router can never observe that variant through `Head`.
+    #[test]
+    fn signature_put_status_maps_conflict_to_409_even_though_head_never_returns_it() {
+        assert_eq!(signature_put_status(SignatureOutcome::Created), StatusCode::CREATED);
+        assert_eq!(signature_put_status(SignatureOutcome::AlreadyPresent), StatusCode::OK);
+        assert_eq!(signature_put_status(SignatureOutcome::Conflict), StatusCode::CONFLICT);
+    }
+
+    /// The router-level caps reject at the documented ceilings and accept exactly at them.
+    #[test]
+    fn the_router_level_batch_caps_are_enforced_at_their_documented_ceilings() {
+        assert!(reject_oversized_upload_targets(MAX_UPLOAD_TARGETS_BATCH).is_ok());
+        let error = reject_oversized_upload_targets(MAX_UPLOAD_TARGETS_BATCH + 1)
+            .expect_err("over the cap");
+        assert_eq!(error.status, crate::error::Status::Unprocessable);
+        assert!(error.message.contains(&MAX_UPLOAD_TARGETS_BATCH.to_string()), "{}", error.message);
+
+        assert!(reject_oversized_commit(MAX_MISSING_BATCH, 0).is_ok());
+        assert!(reject_oversized_commit(MAX_MISSING_BATCH / 2, MAX_MISSING_BATCH / 2).is_ok());
+        let error =
+            reject_oversized_commit(MAX_MISSING_BATCH, 1).expect_err("over the combined cap");
+        assert_eq!(error.status, crate::error::Status::Unprocessable);
+        assert!(error.message.contains(&MAX_MISSING_BATCH.to_string()), "{}", error.message);
+    }
 }
