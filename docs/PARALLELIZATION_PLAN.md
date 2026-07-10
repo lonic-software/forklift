@@ -363,3 +363,34 @@ read/flush is now off the global lock). What the rework still does **not** help 
 the only lever there. The two ceilings remain cleanly separated; this change lifted the object-cache
 one to pointer-sized locks, and a genuinely read-*hit*-bound parallel consumer is what would now
 turn that into a measured near-linear win.
+
+## CI benchmark-regression job (milestone D, T5)
+
+Every number above was a one-off, hand-run measurement (`min`/`median` of N, release build, a
+synthetic corpus built for that change). T5 turns that into a standing CI job so a future
+regression on any of these hot paths gets caught automatically, not only when someone happens to
+re-run a benchmark by hand.
+
+- **Harness:** `bin/bench.sh` — builds a small, deterministically-generated warehouse fresh in the
+  job (a seeded, index-derived corpus, not a committed binary blob: a few hundred files, a few
+  hundred signed parcels, two diverging pallets), then times the hot ops already covered above
+  (`stocktake`, `diff`, `compact`/`compact --all`) plus the axes this plan never measured in CI:
+  `shift` (checkout), a signed `stack` + `audit` (after `office enroll` — every parcel from there
+  on is signed), cold vs warm cache (first invocation vs. the mean of later ones — a CLI process
+  never carries its object caches across invocations, so "cold" here is real: the first touch of a
+  given file after the corpus is built), peak RSS (`/usr/bin/time -l`/`-v`), and core-count scaling
+  (`audit` — which crosses `audit_utils::PARALLEL_THRESHOLD` at this corpus size — pinned to one
+  core via `taskset` vs. unrestricted; Linux-only, since there is no worker-count env/flag to pass
+  instead and macOS has no affinity equivalent `num_cpus` honors).
+- **CI job:** `.github/workflows/bench.yml` — one `ubuntu-latest` job, runs on every push to `main`
+  and on pull requests that touch a perf-sensitive path (`crates/forklift-core/src/**`,
+  `crates/forklift/src/commands/**`, `bin/bench.sh`). Uploads `bench-results.json`/`.md` as a build
+  artifact — **that is where the numbers live**; they are not committed to the repo (a fixed corpus
+  regenerated every run keeps them comparable run-to-run without needing a tracked baseline file).
+- **Gating philosophy — deliberately narrow.** A CI runner is noisy and shared; an absolute-ms
+  baseline gate on it is flake theater. The job gates only on a handful of *same-run ratio* checks
+  (repack ≤ 1.5× a fresh `compact`, per D/P3 above; unrestricted `audit` ≤ 2× `audit` pinned to one
+  core) plus generous absolute ceilings sized to catch an order-of-magnitude regression (an
+  accidental O(n²), a broken fan-out) and nothing tighter. Absolute-time trend-watching is left to
+  a human reading the uploaded report over time, exactly as this plan's hand-run numbers have been
+  — the gate's job is only to catch the kind of regression a noisy runner cannot hide.
