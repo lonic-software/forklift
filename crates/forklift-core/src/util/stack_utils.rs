@@ -79,6 +79,16 @@ pub async fn stack_parcel(description: Option<String>) -> Result<(String, String
 
     let consolidation = merge_utils::read_consolidation_state()?;
 
+    // An orphaned skeleton (left behind when a merge is aborted by removing
+    // ".forklift/consolidation" directly, instead of resolving it) is harmless on its own — a
+    // plain stack never reads it — but stale disk state is untidy and could confuse a future
+    // reader. Clean it up opportunistically whenever there is no consolidation in progress to
+    // own it; best-effort, since this is hygiene, not correctness, so it must never fail the
+    // stack.
+    if consolidation.is_none() {
+        let _ = merge_utils::OutOfScopeSkeleton::clear();
+    }
+
     // A cherry-pick in progress (§9.1 #8) completes here, single-parent: the picked
     // parcel's authors are preserved and this operator is recorded as the stacker.
     let cherry_pick = cherry_pick_utils::read_state()?;
@@ -103,7 +113,20 @@ pub async fn stack_parcel(description: Option<String>) -> Result<(String, String
             None => None,
         };
 
-        tree_utils::build_scoped_root_tree(head_root_hash.as_deref(), &partial_root, &scope)?
+        // A completing merge splices its out-of-scope skeleton (§7.6) into the merge parcel's
+        // tree: the out-of-scope siblings theirs changed one-sided, adopted by hash. A plain
+        // stack has no skeleton, so the overlay copies every out-of-scope sibling verbatim.
+        // `read_required` (not `read`) is deliberate here: a consolidation in progress with no
+        // skeleton file is a broken invariant (an interrupted write), not "no resolutions" — see
+        // its doc comment.
+        let skeleton = match &consolidation {
+            Some(_) => merge_utils::OutOfScopeSkeleton::read_required()?,
+            None => merge_utils::OutOfScopeSkeleton::default(),
+        };
+
+        tree_utils::build_scoped_root_tree(
+            head_root_hash.as_deref(), &partial_root, &scope, skeleton.entries()
+        )?
     };
 
     let root_is_empty = root_tree.get_files().len() == 0 && root_tree.get_subtrees().len() == 0;
@@ -213,6 +236,7 @@ pub async fn stack_parcel(description: Option<String>) -> Result<(String, String
     // The parcel consumed the staged removals (and the consolidation or cherry-pick, if any).
     inventory_utils::cleanup_after_stack()?;
     merge_utils::clear_consolidation_state()?;
+    merge_utils::OutOfScopeSkeleton::clear()?;
     cherry_pick_utils::clear_state()?;
 
     Ok((object.hash, pallet))

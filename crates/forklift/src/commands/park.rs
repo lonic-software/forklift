@@ -61,7 +61,11 @@ pub async fn park_changes() -> Result<(), String> {
     let root_tree = if scope.is_full() {
         partial_root
     } else {
-        tree_utils::build_scoped_root_tree(Some(&head_tree_hash), &partial_root, &scope)?
+        // A park is a WIP snapshot, never a merge completion, so it has no out-of-scope skeleton:
+        // every out-of-scope sibling is copied verbatim from the head.
+        let overrides = std::collections::BTreeMap::new();
+
+        tree_utils::build_scoped_root_tree(Some(&head_tree_hash), &partial_root, &scope, &overrides)?
     };
 
     if root_tree.hash == head_tree_hash {

@@ -6,7 +6,7 @@ const CODE_TYPE_SYMBOLIC_LINK: u64 = 3;
 const CODE_TYPE_TREE: u64 = 4;
 
 /// Directory entry type (i.e. type of file or directory).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DirEntryType {
     /// A normal (non-executable) file.
     Normal,

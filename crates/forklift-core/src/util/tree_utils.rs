@@ -227,11 +227,20 @@ fn build_tree_for_inventory_key(context: Arc<TreeBuilderContext>,
 /// (`:173-178`), bottom-up, so a scoped stack's tree hash is **byte-identical** to what a full
 /// workspace stacking the same content would produce — the stage-1 invariant.
 ///
+/// When the stack completes a merge, `overrides` carries the out-of-scope skeleton (§3.3):
+/// out-of-scope siblings theirs changed one-sided, adopted by hash. The overlay applies them on
+/// top of the head's verbatim siblings — `Some((hash, type))` sets an entry (a subtree, file or
+/// symlink adopted from theirs), `None` deletes it, and an override for a name the head lacks
+/// adds it — so the committed merge tree is byte-identical to a full workspace merging the same
+/// two heads. For a plain stack the map is empty and every out-of-scope sibling is copied
+/// verbatim from the head.
+///
 /// # Arguments
 /// * `head_root_hash` - The current head parcel's root tree hash (`None` for an unborn pallet).
 /// * `partial_root`   - The freshly built (sparse) root from [`build_tree_from_inventory`]: its
 ///                      in-scope subtree objects are already stored with correct hashes.
 /// * `scope`          - The bay's materialization scope (the caller gates on it not being full).
+/// * `overrides`      - The out-of-scope skeleton for a completing merge (empty for a plain stack).
 ///
 /// # Returns
 /// * `Ok(TreeItem)` - The spliced root tree (its hash set, every new spine tree object stored).
@@ -239,7 +248,9 @@ fn build_tree_for_inventory_key(context: Arc<TreeBuilderContext>,
 ///                    or store.
 pub fn build_scoped_root_tree(head_root_hash: Option<&str>,
                               partial_root: &TreeItem,
-                              scope: &MaterializationScope) -> Result<TreeItem, String> {
+                              scope: &MaterializationScope,
+                              overrides: &BTreeMap<String, Option<(String, DirEntryType)>>)
+                              -> Result<TreeItem, String> {
     let head_root = match head_root_hash {
         Some(hash) => Some(object_utils::load_tree(hash)?),
         None => None,
@@ -247,7 +258,7 @@ pub fn build_scoped_root_tree(head_root_hash: Option<&str>,
 
     // The root is never pruned, even when empty — matching build_tree_from_inventory, which
     // always keeps (and stores) the root tree object.
-    match splice_spine_level(head_root.as_ref(), Some(partial_root), "", scope)? {
+    match splice_spine_level(head_root.as_ref(), Some(partial_root), "", scope, overrides)? {
         Some(tree) => Ok(tree),
         None => {
             let mut tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
@@ -269,7 +280,9 @@ pub fn build_scoped_root_tree(head_root_hash: Option<&str>,
 fn splice_spine_level(head: Option<&TreeItem>,
                       dock: Option<&TreeItem>,
                       key: &str,
-                      scope: &MaterializationScope) -> Result<Option<TreeItem>, String> {
+                      scope: &MaterializationScope,
+                      overrides: &BTreeMap<String, Option<(String, DirEntryType)>>)
+                      -> Result<Option<TreeItem>, String> {
     let mut tree = TreeItem::new(last_component(key).to_string(), String::new(), DirEntryType::Tree);
 
     let head_files: BTreeMap<&String, &TreeItem> = head
@@ -285,14 +298,25 @@ fn splice_spine_level(head: Option<&TreeItem>,
         .map(|tree| tree.get_subtrees().collect())
         .unwrap_or_default();
 
+    // Every entry name the head already holds at this level (file or subtree) — the newly-added
+    // merge-skeleton pass below only emits names the head lacks, so it never double-emits one an
+    // inline branch already handled.
+    let head_names: BTreeSet<&str> = head
+        .map(|tree| tree.get_files().map(|(name, _)| name.as_str())
+            .chain(tree.get_subtrees().map(|(name, _)| name.as_str()))
+            .collect())
+        .unwrap_or_default();
+
     // A spine level's own files are all out-of-scope (an in-scope path is a directory prefix),
-    // so they are copied verbatim — unless the path is where an in-scope directory is expected,
-    // i.e. the entry flipped from a directory to a file at this revision (§3.1 type-change).
+    // so they are copied verbatim — or resolved by the merge skeleton (§3.3) where it changed
+    // them — unless the path is where an in-scope directory is expected, i.e. the entry flipped
+    // from a directory to a file at this revision (§3.1 type-change).
     for (name, item) in &head_files {
         let child_key = join_key(key, name);
 
         match scope.classify(&child_key) {
-            ScopeClass::OutOfScope => tree.add_child(shallow_entry(item)),
+            ScopeClass::OutOfScope =>
+                splice_out_of_scope_entry(&mut tree, name, item, overrides.get(&child_key)),
             ScopeClass::InScope | ScopeClass::Spine =>
                 return Err(scope_utils::type_changed_refusal(&child_key)),
         }
@@ -318,13 +342,15 @@ fn splice_spine_level(head: Option<&TreeItem>,
         });
     }
 
-    // Head subtrees: out-of-scope ones are copied verbatim; the in-scope subtree is taken fresh
-    // from the dock (pruned when empty or deleted); a deeper spine recurses.
+    // Head subtrees: out-of-scope ones are copied verbatim (or resolved by the merge skeleton);
+    // the in-scope subtree is taken fresh from the dock (pruned when empty or deleted); a deeper
+    // spine recurses.
     for (name, item) in &head_subtrees {
         let child_key = join_key(key, name);
 
         match scope.classify(&child_key) {
-            ScopeClass::OutOfScope => tree.add_child(shallow_entry(item)),
+            ScopeClass::OutOfScope =>
+                splice_out_of_scope_entry(&mut tree, name, item, overrides.get(&child_key)),
             ScopeClass::InScope => {
                 if let Some(dock_subtree) = dock_subtrees.get(name) {
                     if !is_tree_empty(dock_subtree) {
@@ -337,7 +363,7 @@ fn splice_spine_level(head: Option<&TreeItem>,
                 let dock_subtree = dock_subtrees.get(name).copied();
 
                 if let Some(spliced) =
-                    splice_spine_level(Some(&head_subtree), dock_subtree, &child_key, scope)?
+                    splice_spine_level(Some(&head_subtree), dock_subtree, &child_key, scope, overrides)?
                 {
                     tree.add_child(spliced);
                 }
@@ -363,13 +389,37 @@ fn splice_spine_level(head: Option<&TreeItem>,
             }
             ScopeClass::Spine => {
                 if let Some(spliced) =
-                    splice_spine_level(None, Some(dock_subtree), &child_key, scope)?
+                    splice_spine_level(None, Some(dock_subtree), &child_key, scope, overrides)?
                 {
                     tree.add_child(spliced);
                 }
             }
             // The dock never holds an out-of-scope subtree; ignore defensively.
             ScopeClass::OutOfScope => {}
+        }
+    }
+
+    // Merge-skeleton entries theirs *added* out of scope at this level: an out-of-scope subtree,
+    // file or symlink the head does not carry (so no inline branch above emitted it). A deletion
+    // of a non-existent entry is a no-op, so only `Some` resolutions add anything. By construction
+    // every skeleton path's parent is a spine directory the overlay walks, so each is applied at
+    // exactly one level.
+    for (path, resolution) in overrides {
+        let Some((hash, item_type)) = resolution else { continue };
+
+        let (parent, name) = match path.rsplit_once('/') {
+            Some((parent, name)) => (parent, name),
+            None => ("", path.as_str()),
+        };
+
+        if parent != key || head_names.contains(name) {
+            continue;
+        }
+
+        // Skeleton paths are out-of-scope by construction; guard defensively so a malformed one
+        // can never be spliced into a signed tree at an in-scope or spine path.
+        if scope.classify(path) == ScopeClass::OutOfScope {
+            tree.add_child(TreeItem::new(name.to_string(), hash.clone(), *item_type));
         }
     }
 
@@ -380,6 +430,21 @@ fn splice_spine_level(head: Option<&TreeItem>,
     store_tree(&mut tree)?;
 
     Ok(Some(tree))
+}
+
+/// Emit one out-of-scope sibling into the spliced spine level: the merge skeleton's resolution
+/// wins when present (`Some((hash, type))` sets it to theirs' entry, `None` deletes it — omit),
+/// otherwise the head's entry is copied verbatim by hash. Never loads or descends the object.
+fn splice_out_of_scope_entry(tree: &mut TreeItem,
+                             name: &str,
+                             head_entry: &TreeItem,
+                             resolution: Option<&Option<(String, DirEntryType)>>) {
+    match resolution {
+        Some(Some((hash, item_type))) =>
+            tree.add_child(TreeItem::new(name.to_string(), hash.clone(), *item_type)),
+        Some(None) => {} // theirs deleted this out-of-scope entry — omit it
+        None => tree.add_child(shallow_entry(head_entry)),
+    }
 }
 
 /// A shallow copy of a tree entry — its `(name, hash, item_type)` with no children. The tree

@@ -169,6 +169,10 @@ pub enum ErrorCode {
     /// A path argument is outside the bay's materialization scope (§7.6).
     OutOfScope,
 
+    /// A merge in a scoped bay hit an out-of-scope entry that changed on both sides (§7.6):
+    /// there is no content to reconcile, so it refuses rather than guess.
+    OutOfScopeConflict,
+
     /// A scoped bay's spine path flipped between a directory and a file (§7.6): the scope
     /// is no longer valid there and the operation refuses rather than guess.
     ScopePathTypeChanged,
@@ -187,6 +191,7 @@ impl ErrorCode {
             ErrorCode::Conflict             => "conflict",
             ErrorCode::Diverged             => "diverged",
             ErrorCode::OutOfScope           => scope_utils::CODE_OUT_OF_SCOPE,
+            ErrorCode::OutOfScopeConflict   => scope_utils::CODE_OUT_OF_SCOPE_CONFLICT,
             ErrorCode::ScopePathTypeChanged => scope_utils::CODE_SCOPE_PATH_TYPE_CHANGED,
             ErrorCode::SparseWorkspace      => scope_utils::CODE_SPARSE_WORKSPACE,
         }
@@ -204,6 +209,7 @@ impl ErrorCode {
             ErrorCode::OutOfScope           => 7,
             ErrorCode::ScopePathTypeChanged => 8,
             ErrorCode::SparseWorkspace      => 9,
+            ErrorCode::OutOfScopeConflict   => 10,
         }
     }
 
@@ -211,6 +217,7 @@ impl ErrorCode {
     fn from_scope_code(code: &str) -> Option<ErrorCode> {
         match code {
             _ if code == scope_utils::CODE_OUT_OF_SCOPE           => Some(ErrorCode::OutOfScope),
+            _ if code == scope_utils::CODE_OUT_OF_SCOPE_CONFLICT  => Some(ErrorCode::OutOfScopeConflict),
             _ if code == scope_utils::CODE_SCOPE_PATH_TYPE_CHANGED => Some(ErrorCode::ScopePathTypeChanged),
             _ if code == scope_utils::CODE_SPARSE_WORKSPACE       => Some(ErrorCode::SparseWorkspace),
             _ => None,

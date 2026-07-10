@@ -3885,6 +3885,34 @@ fn a_scoped_bay_materializes_only_its_subtree_and_reports_the_scope() {
 }
 
 #[test]
+fn bay_add_scope_rejects_a_path_that_is_a_file_not_a_directory_in_the_head() {
+    // `scoped_fixture` stacks "README.md" as a plain file at the head. A `--scope` naming it (or
+    // a path through it) is not a subtree the overlay can materialize — refuse up front rather
+    // than let it silently misbehave later (a Spine walk that expects a directory there).
+    let warehouse = scoped_fixture("scoped-add-rejects-file");
+
+    let scoped_dir = warehouse.home.join("bay-file-scope");
+    let rejected = warehouse.run(&["bay", "add", "scoped", scoped_dir.to_str().unwrap(), "--scope", "README.md"]);
+
+    assert!(!rejected.status.success(), "a file path must not be accepted as a bay scope");
+    assert!(
+        stderr(&rejected).contains("is not a directory in the current head"),
+        "{}", stderr(&rejected)
+    );
+    assert!(!scoped_dir.exists(), "a rejected bay add must not create the bay directory");
+
+    // A path through the file (as if it were a directory) is rejected the same way.
+    let rejected_nested = warehouse.run(&[
+        "bay", "add", "scoped2", scoped_dir.to_str().unwrap(), "--scope", "README.md/nested"
+    ]);
+    assert!(!rejected_nested.status.success());
+    assert!(
+        stderr(&rejected_nested).contains("is not a directory in the current head"),
+        "{}", stderr(&rejected_nested)
+    );
+}
+
+#[test]
 fn a_scoped_stack_produces_a_byte_identical_root_tree_to_a_full_stack() {
     let warehouse = scoped_fixture("scoped-identical");
 
@@ -4002,12 +4030,9 @@ fn a_scoped_bay_refuses_whole_tree_verbs_with_a_stable_code() {
     let scoped_dir = warehouse.home.join("bay-scoped");
     assert_success(&warehouse.run(&["bay", "add", "scoped", scoped_dir.to_str().unwrap(), "--scope", "src/api"]));
 
-    // consolidate (scoped-bay merge is a later stage) and export-git (would silently truncate)
-    // refuse with the sparse_workspace code + exit 9.
-    let consolidate = warehouse.run_at(&scoped_dir, &["--json", "consolidate", "main"]);
-    assert_eq!(consolidate.status.code(), Some(9));
-    assert_eq!(json(&consolidate)["error"]["code"], "sparse_workspace");
-
+    // export-git (would silently truncate the out-of-scope content) refuses with the
+    // sparse_workspace code + exit 9. (consolidate no longer refuses — a scoped bay resolves
+    // out-of-scope siblings by hash; see the scoped-merge tests below.)
     let export_dir = warehouse.home.join("export-git-out");
     let export = warehouse.run_at(&scoped_dir, &["--json", "export-git", export_dir.to_str().unwrap()]);
     assert_eq!(export.status.code(), Some(9));
@@ -4182,4 +4207,384 @@ fn a_scoped_bay_refuses_import_git() {
     let import = warehouse.run_at(&scoped_dir, &["--json", "import-git", "."]);
     assert_eq!(import.status.code(), Some(9), "stdout/err: {}", stdout(&import));
     assert_eq!(json(&import)["error"]["code"], "sparse_workspace");
+}
+
+// -------------------------------------------------------------------------------------------
+// §7.6 stage 2 — hash-only three-way merge resolution in a scoped bay.
+//
+// A scoped merge resolves out-of-scope siblings (subtrees, files, symlinks) by hash alone: a
+// one-sided change is adopted from theirs, a two-sided one refuses. The committed merge tree is
+// byte-identical to a full workspace merging the same two heads — and, to prove the resolution
+// never depends on out-of-scope content being present (so it still holds once stage 4 makes
+// stores sparse), the out-of-scope objects are deleted before the scoped merge runs.
+// -------------------------------------------------------------------------------------------
+
+/// The object-store path of a loose object (matches the on-disk sharding the store uses).
+fn object_store_path(warehouse: &TestWarehouse, hash: &str) -> PathBuf {
+    warehouse.root.join(".forklift").join("objects").join(&hash[0..2]).join(&hash[2..])
+}
+
+/// Resolve the object hash a parcel commits at a warehouse path by walking tree objects through
+/// `peek`, so a test can then delete that object and prove a later walk never reads it.
+fn path_object_hash(warehouse: &TestWarehouse, parcel: &str, path: &str) -> String {
+    let mut hash = parcel_tree_hash(warehouse, parcel);
+
+    for component in path.split('/') {
+        let peeked = warehouse.run(&["--json", "peek", &hash]);
+        assert_success(&peeked);
+
+        let entries = json(&peeked)["data"]["entries"].as_array().unwrap().clone();
+        hash = entries.iter()
+            .find(|entry| entry["name"] == component)
+            .unwrap_or_else(|| panic!("no tree entry \"{}\" under {}", component, hash))
+            ["hash"].as_str().unwrap().to_string();
+    }
+
+    hash
+}
+
+#[test]
+fn a_scoped_merge_resolves_one_sided_out_of_scope_changes_by_hash_without_reading_them() {
+    let warehouse = TestWarehouse::new("scoped-merge-oneside");
+    warehouse.write_file("src/api/a.txt", "api a v1\n");
+    warehouse.write_file("src/web/w.txt", "web v1\n");
+    warehouse.write_file("README.md", "readme v1\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base"]));
+
+    // "theirs" changes only out-of-scope content: a subtree (src/web) and a root file (README).
+    assert_success(&warehouse.run(&["palletize", "theirs"]));
+    warehouse.write_file("src/web/w.txt", "web v2 from theirs\n");
+    warehouse.write_file("README.md", "readme v2 from theirs\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "theirs edits out-of-scope content"]));
+    let theirs_head = pallet_head_hash(&warehouse, "theirs");
+    assert_success(&warehouse.run(&["shift", "main"]));
+
+    // A full bay and a scoped bay, both branched from the base.
+    let full_dir = warehouse.home.join("bay-full");
+    let scoped_dir = warehouse.home.join("bay-scoped");
+    assert_success(&warehouse.run(&["bay", "add", "full", full_dir.to_str().unwrap()]));
+    assert_success(&warehouse.run(&["bay", "add", "scoped", scoped_dir.to_str().unwrap(), "--scope", "src/api"]));
+
+    // The full bay makes an in-scope edit and consolidates theirs with every object present; that
+    // merge tree is the reference the scoped merge must reproduce byte-for-byte.
+    std::fs::write(full_dir.join("src/api/a.txt"), "api a v2\n").unwrap();
+    assert_success(&warehouse.run_at(&full_dir, &["load", "."]));
+    assert_success(&warehouse.run_at(&full_dir, &["stack", "edit api (full)"]));
+    assert_success(&warehouse.run_at(&full_dir, &["consolidate", "theirs"]));
+    let full_tree = parcel_tree_hash(&warehouse, &pallet_head_hash(&warehouse, "full"));
+
+    // Make the out-of-scope objects theirs changed impossible to read: a store fetched sparsely
+    // would never hold them. Deleting them here proves the scoped merge resolves them by hash
+    // alone — never loading or materializing one.
+    let web_tree = path_object_hash(&warehouse, &theirs_head, "src/web");
+    let web_blob = path_object_hash(&warehouse, &theirs_head, "src/web/w.txt");
+    let readme_blob = path_object_hash(&warehouse, &theirs_head, "README.md");
+    for hash in [&web_tree, &web_blob, &readme_blob] {
+        std::fs::remove_file(object_store_path(&warehouse, hash)).expect("the out-of-scope object existed");
+    }
+
+    // The scoped bay makes the same in-scope edit and consolidates theirs. It must succeed...
+    std::fs::write(scoped_dir.join("src/api/a.txt"), "api a v2\n").unwrap();
+    assert_success(&warehouse.run_at(&scoped_dir, &["load", "."]));
+    assert_success(&warehouse.run_at(&scoped_dir, &["stack", "edit api (scoped)"]));
+    let consolidated = warehouse.run_at(&scoped_dir, &["consolidate", "theirs"]);
+    assert_success(&consolidated);
+
+    // ...committing a byte-identical merge tree, and never materializing the out-of-scope content.
+    let scoped_tree = parcel_tree_hash(&warehouse, &pallet_head_hash(&warehouse, "scoped"));
+    assert_eq!(full_tree, scoped_tree,
+        "a scoped merge must commit the same tree a full merge does, resolving out-of-scope siblings by hash");
+    assert!(!scoped_dir.join("src/web").exists(), "an out-of-scope subtree must not materialize in a scoped merge");
+    assert!(!scoped_dir.join("README.md").exists(), "an out-of-scope file must not materialize in a scoped merge");
+}
+
+#[test]
+fn a_scoped_merge_refuses_a_two_sided_out_of_scope_conflict() {
+    let warehouse = TestWarehouse::new("scoped-merge-conflict");
+    warehouse.write_file("src/api/a.txt", "api a v1\n");
+    warehouse.write_file("src/web/w.txt", "web v1\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base"]));
+
+    // theirs branches from the base and changes src/web one way...
+    assert_success(&warehouse.run(&["palletize", "theirs"]));
+    warehouse.write_file("src/web/w.txt", "web from theirs\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "theirs edits web"]));
+    assert_success(&warehouse.run(&["shift", "main"]));
+
+    // ...and main changes the same out-of-scope file differently, so the scoped bay's head carries
+    // an out-of-scope change of its own — a genuine two-sided out-of-scope divergence.
+    warehouse.write_file("src/web/w.txt", "web from main\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "main edits web"]));
+
+    let scoped_dir = warehouse.home.join("bay-scoped");
+    assert_success(&warehouse.run(&["bay", "add", "scoped", scoped_dir.to_str().unwrap(), "--scope", "src/api"]));
+    let head_before = pallet_head_hash(&warehouse, "scoped");
+
+    // The scoped bay has no content to reconcile src/web with, so it refuses cleanly with the
+    // stable code + exit 10, and stacks nothing.
+    let refused = warehouse.run_at(&scoped_dir, &["--json", "consolidate", "theirs"]);
+    assert_eq!(refused.status.code(), Some(10), "stdout: {}", stdout(&refused));
+    assert_eq!(json(&refused)["error"]["code"], "out_of_scope_conflict");
+    assert!(json(&refused)["error"]["next_step"].is_string());
+
+    assert_eq!(pallet_head_hash(&warehouse, "scoped"), head_before, "a refused merge must stack nothing");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_scoped_merge_resolves_a_one_sided_out_of_scope_symlink_by_hash() {
+    use std::os::unix::fs::symlink;
+
+    let warehouse = TestWarehouse::new("scoped-merge-symlink");
+    warehouse.write_file("src/api/a.txt", "api a v1\n");
+    warehouse.write_file("src/web/w.txt", "web v1\n");
+    // An out-of-scope symlink at the root (a plain file entry of type symlink in the tree).
+    symlink("src/web/w.txt", warehouse.root.join("shortcut")).unwrap();
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base"]));
+
+    // theirs re-points the out-of-scope symlink one-sided.
+    assert_success(&warehouse.run(&["palletize", "theirs"]));
+    std::fs::remove_file(warehouse.root.join("shortcut")).unwrap();
+    symlink("src/api/a.txt", warehouse.root.join("shortcut")).unwrap();
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "theirs re-points the symlink"]));
+    assert_success(&warehouse.run(&["shift", "main"]));
+
+    let full_dir = warehouse.home.join("bay-full");
+    let scoped_dir = warehouse.home.join("bay-scoped");
+    assert_success(&warehouse.run(&["bay", "add", "full", full_dir.to_str().unwrap()]));
+    assert_success(&warehouse.run(&["bay", "add", "scoped", scoped_dir.to_str().unwrap(), "--scope", "src/api"]));
+
+    std::fs::write(full_dir.join("src/api/a.txt"), "api a v2\n").unwrap();
+    assert_success(&warehouse.run_at(&full_dir, &["load", "."]));
+    assert_success(&warehouse.run_at(&full_dir, &["stack", "edit api (full)"]));
+    assert_success(&warehouse.run_at(&full_dir, &["consolidate", "theirs"]));
+    let full_tree = parcel_tree_hash(&warehouse, &pallet_head_hash(&warehouse, "full"));
+
+    std::fs::write(scoped_dir.join("src/api/a.txt"), "api a v2\n").unwrap();
+    assert_success(&warehouse.run_at(&scoped_dir, &["load", "."]));
+    assert_success(&warehouse.run_at(&scoped_dir, &["stack", "edit api (scoped)"]));
+    assert_success(&warehouse.run_at(&scoped_dir, &["consolidate", "theirs"]));
+    let scoped_tree = parcel_tree_hash(&warehouse, &pallet_head_hash(&warehouse, "scoped"));
+
+    assert_eq!(full_tree, scoped_tree,
+        "a scoped merge must adopt a one-sided out-of-scope symlink by hash, identically to a full merge");
+    assert!(std::fs::symlink_metadata(scoped_dir.join("shortcut")).is_err(),
+        "the out-of-scope symlink must not materialize in the scoped bay");
+}
+
+// -------------------------------------------------------------------------------------------
+// §7.6 stage 2 — review follow-up: a one-sided out-of-scope directory↔file type flip.
+//
+// The merge walk classifies a changed name in two separate loops (files, then subtrees) at
+// each directory level. A type flip makes exactly one of those loops see theirs' real entry (a
+// "set") and the other see none of its own type there (a "delete") — both for the *same* path.
+// Which loop runs second depends on the flip's direction, so the skeleton must combine the two
+// resolutions correctly regardless of order: a "set" must always win over a "delete".
+// -------------------------------------------------------------------------------------------
+
+/// Resolve the `(hash, item_type)` of the tree entry a parcel commits at a warehouse path, by
+/// walking tree objects through `peek` and reading the LAST component's own entry (not
+/// descending into it) — so a test can assert both its content address and its type (file vs.
+/// directory) directly, without loading the entry itself. `item_type` is the trimmed
+/// `get_name_for_peek()` string ("normal", "tree", …).
+fn path_object_entry(warehouse: &TestWarehouse, parcel: &str, path: &str) -> (String, String) {
+    let mut hash = parcel_tree_hash(warehouse, parcel);
+    let components: Vec<&str> = path.split('/').collect();
+    let mut item_type = String::new();
+
+    for component in &components {
+        let peeked = warehouse.run(&["--json", "peek", &hash]);
+        assert_success(&peeked);
+        let entries = json(&peeked)["data"]["entries"].as_array().unwrap().clone();
+        let entry = entries.iter()
+            .find(|entry| entry["name"] == *component)
+            .unwrap_or_else(|| panic!("no tree entry \"{}\" under {}", component, hash));
+
+        hash = entry["hash"].as_str().unwrap().to_string();
+        item_type = entry["item_type"].as_str().unwrap().trim().to_string();
+    }
+
+    (hash, item_type)
+}
+
+#[test]
+fn a_scoped_merge_resolves_an_out_of_scope_directory_to_file_flip_by_hash() {
+    // NOTE on verification strategy: this direction cannot be checked against an actual
+    // full-bay `consolidate` run — doing so hits a *separate, pre-existing* bug in
+    // `ensure_no_untracked_collisions` (confirmed reproducible on a plain, unscoped warehouse
+    // with none of §7.6's code involved: `inventory_lookup` only recognizes a tracked *file*
+    // entry, so a one-sided merge that replaces a tracked *directory* with a file is misread as
+    // colliding with an "untracked" file and refused). That bug is out of this review's scope
+    // and is reported separately, not fixed here. Verification instead checks the scoped merge's
+    // own committed tree directly: the out-of-scope path must carry theirs' exact post-flip
+    // hash and type — never omitted (the BLOCKER) and never the stale pre-flip directory.
+    let warehouse = TestWarehouse::new("scoped-merge-dir-to-file");
+    warehouse.write_file("src/api/a.txt", "api a v1\n");
+    warehouse.write_file("src/web/w.txt", "web v1\n"); // src/web starts as a DIRECTORY
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base"]));
+
+    // theirs one-sidedly replaces the out-of-scope directory src/web with a FILE. This is the
+    // exact construction that emits a "set" (file loop) then a "delete" (subtree loop) for the
+    // same path, in that order — the direction a plain last-write-wins insert gets wrong.
+    assert_success(&warehouse.run(&["palletize", "theirs"]));
+    std::fs::remove_dir_all(warehouse.root.join("src/web")).unwrap();
+    warehouse.write_file("src/web", "web is a file now\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "theirs turns src/web into a file"]));
+    let theirs_head = pallet_head_hash(&warehouse, "theirs");
+    let (theirs_web_hash, theirs_web_type) = path_object_entry(&warehouse, &theirs_head, "src/web");
+    assert_eq!(theirs_web_type, "normal", "sanity: theirs' src/web really is a file");
+
+    assert_success(&warehouse.run(&["shift", "main"]));
+
+    let scoped_dir = warehouse.home.join("bay-scoped");
+    assert_success(&warehouse.run(&["bay", "add", "scoped", scoped_dir.to_str().unwrap(), "--scope", "src/api"]));
+
+    std::fs::write(scoped_dir.join("src/api/a.txt"), "api a v2\n").unwrap();
+    assert_success(&warehouse.run_at(&scoped_dir, &["load", "."]));
+    assert_success(&warehouse.run_at(&scoped_dir, &["stack", "edit api (scoped)"]));
+    assert_success(&warehouse.run_at(&scoped_dir, &["consolidate", "theirs"]));
+
+    let scoped_head = pallet_head_hash(&warehouse, "scoped");
+    let (merged_web_hash, merged_web_type) = path_object_entry(&warehouse, &scoped_head, "src/web");
+
+    assert_eq!(merged_web_type, "normal",
+        "the merge must resolve src/web to theirs' FILE, not omit it or keep the stale directory");
+    assert_eq!(merged_web_hash, theirs_web_hash,
+        "the merge must adopt theirs' exact file content by hash");
+}
+
+#[test]
+fn a_scoped_merge_resolves_an_out_of_scope_file_to_directory_flip_by_hash() {
+    // This direction CAN be verified against a real full-bay `consolidate` (unlike the mirror
+    // test above), provided "theirs" is authored in a freshly materialized bay rather than by
+    // switching the warehouse root's own working directory from "theirs" back to "main" via
+    // `shift` — reverting a *directory* left on disk back to a *file* via `shift` hits the same
+    // untracked-collision false positive from the other side. Authoring "theirs" in its own bay
+    // means the warehouse root never leaves "main", so no reverse-direction shift ever happens.
+    let warehouse = TestWarehouse::new("scoped-merge-file-to-dir");
+    warehouse.write_file("src/api/a.txt", "api a v1\n");
+    warehouse.write_file("src/web", "web is a file v1\n"); // src/web starts as a FILE
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base"]));
+
+    // Author "theirs" in its own bay (branched from main's current head) rather than switching
+    // the warehouse root onto it — the warehouse root stays on "main" throughout.
+    let theirs_dir = warehouse.home.join("bay-theirs");
+    assert_success(&warehouse.run(&["bay", "add", "theirs", theirs_dir.to_str().unwrap()]));
+    std::fs::remove_file(theirs_dir.join("src/web")).unwrap();
+    std::fs::create_dir_all(theirs_dir.join("src/web")).unwrap();
+    std::fs::write(theirs_dir.join("src/web/inner.txt"), "inner v1\n").unwrap();
+    assert_success(&warehouse.run_at(&theirs_dir, &["load", "."]));
+    assert_success(&warehouse.run_at(&theirs_dir, &["stack", "theirs turns src/web into a directory"]));
+
+    let full_dir = warehouse.home.join("bay-full");
+    let scoped_dir = warehouse.home.join("bay-scoped");
+    assert_success(&warehouse.run(&["bay", "add", "full", full_dir.to_str().unwrap()]));
+    assert_success(&warehouse.run(&["bay", "add", "scoped", scoped_dir.to_str().unwrap(), "--scope", "src/api"]));
+
+    std::fs::write(full_dir.join("src/api/a.txt"), "api a v2\n").unwrap();
+    assert_success(&warehouse.run_at(&full_dir, &["load", "."]));
+    assert_success(&warehouse.run_at(&full_dir, &["stack", "edit api (full)"]));
+    assert_success(&warehouse.run_at(&full_dir, &["consolidate", "theirs"]));
+    let full_tree = parcel_tree_hash(&warehouse, &pallet_head_hash(&warehouse, "full"));
+
+    std::fs::write(scoped_dir.join("src/api/a.txt"), "api a v2\n").unwrap();
+    assert_success(&warehouse.run_at(&scoped_dir, &["load", "."]));
+    assert_success(&warehouse.run_at(&scoped_dir, &["stack", "edit api (scoped)"]));
+    assert_success(&warehouse.run_at(&scoped_dir, &["consolidate", "theirs"]));
+    let scoped_tree = parcel_tree_hash(&warehouse, &pallet_head_hash(&warehouse, "scoped"));
+
+    assert_eq!(full_tree, scoped_tree,
+        "a scoped merge must resolve a one-sided out-of-scope file-to-directory flip \
+        identically to a full merge");
+}
+
+// -------------------------------------------------------------------------------------------
+// §7.6 stage 2 — review follow-up: the skeleton-durability invariant.
+// -------------------------------------------------------------------------------------------
+
+#[test]
+fn a_stack_refuses_when_consolidation_state_exists_but_the_skeleton_file_is_gone() {
+    // Simulates an interrupted write between the skeleton and the consolidation-state file (a
+    // crash mid-merge): the consolidation state is present, but its skeleton is not. The
+    // completing stack must refuse rather than silently treat the missing skeleton as "no
+    // out-of-scope resolutions" and commit a tree that dropped them.
+    //
+    // A clean (conflict-free) merge auto-stacks immediately and consumes the consolidation state
+    // right away, so there would be no window to interfere. The merge here also carries a genuine
+    // *in-scope* conflict (both sides edit "src/api/a.txt" differently), so the consolidation
+    // stays in progress — state and skeleton both on disk — until the operator resolves, loads,
+    // and stacks.
+    let warehouse = TestWarehouse::new("scoped-skeleton-durability");
+    warehouse.write_file("src/api/a.txt", "api a v1\n");
+    warehouse.write_file("src/web/w.txt", "web v1\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base"]));
+
+    // theirs changes both the out-of-scope subtree one-sidedly (so the merge produces a
+    // skeleton) and the in-scope file (so the scoped bay's own edit below conflicts with it).
+    assert_success(&warehouse.run(&["palletize", "theirs"]));
+    warehouse.write_file("src/web/w.txt", "web v2 from theirs\n");
+    warehouse.write_file("src/api/a.txt", "api a v2 from theirs\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "theirs edits web and api"]));
+    assert_success(&warehouse.run(&["shift", "main"]));
+
+    let scoped_dir = warehouse.home.join("bay-scoped");
+    assert_success(&warehouse.run(&["bay", "add", "scoped", scoped_dir.to_str().unwrap(), "--scope", "src/api"]));
+
+    // A conflicting in-scope edit: the scoped bay changes a.txt differently than theirs did.
+    std::fs::write(scoped_dir.join("src/api/a.txt"), "api a v2 from scoped\n").unwrap();
+    assert_success(&warehouse.run_at(&scoped_dir, &["load", "."]));
+    assert_success(&warehouse.run_at(&scoped_dir, &["stack", "edit api"]));
+
+    let consolidated = warehouse.run_at(&scoped_dir, &["--json", "consolidate", "theirs"]);
+    assert_success(&consolidated);
+    assert_eq!(json(&consolidated)["data"]["outcome"], "conflicts",
+        "the in-scope edit must conflict, keeping the consolidation in progress: {}", stdout(&consolidated));
+
+    // Both files exist after the conflicting consolidate — the merge is not yet complete.
+    let bay_data_dir = warehouse.root.join(".forklift").join("bays").join("scoped");
+    let state_path = bay_data_dir.join("consolidation");
+    let skeleton_path = bay_data_dir.join("consolidation-skeleton");
+    assert!(state_path.exists(), "consolidation state must exist while conflicts are unresolved");
+    assert!(skeleton_path.exists(), "the skeleton file must exist too, even before the conflict is resolved");
+
+    // Simulate the interrupted write: the skeleton vanishes, the state does not.
+    std::fs::remove_file(&skeleton_path).unwrap();
+
+    // Resolve the in-scope conflict so only the skeleton-durability gate stands in the way.
+    std::fs::write(scoped_dir.join("src/api/a.txt"), "api a resolved\n").unwrap();
+    assert_success(&warehouse.run_at(&scoped_dir, &["load", "."]));
+
+    let head_before = pallet_head_hash(&warehouse, "scoped");
+    let refused = warehouse.run_at(&scoped_dir, &["--json", "stack", "complete the merge"]);
+
+    assert!(!refused.status.success(), "a stack with state-present/skeleton-absent must refuse");
+    assert!(
+        stdout(&refused).to_lowercase().contains("skeleton") || stderr(&refused).to_lowercase().contains("skeleton"),
+        "the refusal must name the broken invariant: stdout={} stderr={}", stdout(&refused), stderr(&refused)
+    );
+    assert_eq!(pallet_head_hash(&warehouse, "scoped"), head_before, "a refused stack must commit nothing");
 }

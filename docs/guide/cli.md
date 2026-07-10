@@ -575,10 +575,17 @@ Inside a scoped bay:
   history is *sealed by hash*, not shown as removed.
 - A path argument outside the scope (`load src/web`, `blame src/web/x.rs`, `diff a b src/web`)
   refuses with the `out_of_scope` code rather than doing something surprising.
-- `export-git`, `import-git` and `consolidate`/`cherry-pick` refuse in a scoped bay
-  (`sparse_workspace`): the first two bypass the sparse overlay and would export/import a
-  truncated or scope-inconsistent view, and scoped-bay merge is not yet supported. Run them
-  from a full workspace.
+- `consolidate` merges in a scoped bay. In-scope content merges normally; an out-of-scope
+  sibling (a subtree, file or symlink) that changed on only one side is adopted **by hash** —
+  never materialized, never fetched — so the merge parcel is byte-identical to what a full
+  workspace merging the same two heads would commit. An out-of-scope entry that changed on
+  **both** sides has no content here to reconcile, so the merge refuses with
+  `out_of_scope_conflict`; widen the scope to include that path and retry, or resolve the merge
+  in a full workspace.
+- `export-git`, `import-git` and `cherry-pick` refuse in a scoped bay (`sparse_workspace`): the
+  first two bypass the sparse overlay and would export/import a truncated or scope-inconsistent
+  view, and a cherry-pick materializes a diff that may touch paths this bay never fetched. Run
+  them from a full workspace.
 - `park` produces a parcel that stacks over the head's spine exactly like `stack`, so a parked
   parcel from a scoped bay is byte-identical to what parking the same work in progress in a
   full workspace would commit.
@@ -953,6 +960,7 @@ Errors set a deterministic exit code so scripts branch without parsing prose:
 | 7 | Out of scope (a path argument is outside a scoped bay's scope) |
 | 8 | Scope path type changed (a scoped bay's spine path flipped dir↔file) |
 | 9 | Sparse workspace (a whole-tree verb is not supported in a scoped bay yet) |
+| 10 | Out of scope conflict (a scoped bay merge hit an out-of-scope entry changed on both sides) |
 
 With `--json`, the same classification appears as `error.code` in the output
 envelope. See [`../MACHINE_INTERFACE.md`](../MACHINE_INTERFACE.md).

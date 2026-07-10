@@ -1,6 +1,8 @@
-use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
+use crate::enums::dir_entry_type::DirEntryType;
 use crate::globals::bay_root;
+use crate::util::scope_utils::{self, MaterializationScope, ScopeClass};
 use crate::util::{fanout_utils, file_utils, graph_utils, lcs, object_utils};
 
 /// The name of the consolidation-state file (inside the forklift root folder). While a
@@ -62,8 +64,8 @@ pub fn read_consolidation_state() -> Result<Option<ConsolidationState>, String> 
 
     if !is_valid_hash || their_pallet.is_empty() {
         return Err(format!(
-            "The consolidation state file \"{}\" is malformed; remove it to abort the \
-            consolidation.",
+            "The consolidation state file \"{}\" is malformed; remove it (and \
+            \".forklift/consolidation-skeleton\", if present) to abort the consolidation.",
             path.to_string_lossy()
         ));
     }
@@ -98,6 +100,199 @@ pub fn clear_consolidation_state() -> Result<(), String> {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(format!("Error while removing \"{}\": {}", path.to_string_lossy(), e)),
+    }
+}
+
+/// The name of the out-of-scope skeleton file (beside the consolidation-state file, bay-local).
+const FILE_NAME_SKELETON: &str = "consolidation-skeleton";
+
+/// The out-of-scope resolution skeleton a scoped-bay merge produces (design §3.3): every
+/// out-of-scope subtree/file/symlink adopted from *theirs* by hash, keyed by warehouse path.
+/// It carries no content — only the resolved `(hash, type)` (or a deletion) — and is consumed
+/// by the *next* `stack`, whose overlay splices these entries into the merge parcel's root tree
+/// so the committed tree is byte-identical to a full workspace merging the same two heads
+/// (§3.2). A one-sided out-of-scope change never touches the working directory or the inventory;
+/// a two-sided one refuses (`out_of_scope_conflict`) before any skeleton or parcel exists.
+///
+/// Entries are keyed on the full warehouse path: `Some((hash, type))` sets the entry (a subtree,
+/// file or symlink adopted from theirs), `None` deletes it (theirs removed it). A [`BTreeMap`]
+/// gives a deterministic on-disk order regardless of the walk order that produced the entries.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct OutOfScopeSkeleton {
+    entries: BTreeMap<String, Option<(String, DirEntryType)>>,
+}
+
+impl OutOfScopeSkeleton {
+    /// Collect the out-of-scope resolutions out of a merge's action list.
+    ///
+    /// At a directory↔file type flip, the walk emits **two** `ResolveOutOfScope` actions for the
+    /// same path: the file loop and the subtree loop each see the name in their own map, and
+    /// exactly one of them matches theirs' actual (post-flip) entry — a `Set` — while the other
+    /// sees no entry of its own type there — a `Delete`. Which loop produces the `Set` and which
+    /// produces the `Delete` depends on the flip's direction (file loop runs before the subtree
+    /// loop at each level), so plain last-write-wins insertion is **not** safe: it happens to keep
+    /// the right answer when the `Set` is emitted second (file → directory), but silently drops it
+    /// when the `Set` is emitted first (directory → file, clobbered by the `Delete` that follows).
+    ///
+    /// A tree level cannot hold both a file and a subtree of the same name, so at most one of the
+    /// two actions for a given path is ever a `Set` — "keep whichever resolution is `Some`" is
+    /// therefore unconditionally correct, independent of which one arrives first.
+    pub fn from_actions(actions: &[MergeAction]) -> OutOfScopeSkeleton {
+        let mut entries: BTreeMap<String, Option<(String, DirEntryType)>> = BTreeMap::new();
+
+        for action in actions {
+            if let MergeAction::ResolveOutOfScope { path, resolution } = action {
+                entries.entry(path.clone())
+                    .and_modify(|existing| {
+                        // Never let a later `None` (delete) overwrite an already-recorded `Some`
+                        // (set) — only a `Some` may ever replace what is there.
+                        if resolution.is_some() {
+                            *existing = resolution.clone();
+                        }
+                    })
+                    .or_insert_with(|| resolution.clone());
+            }
+        }
+
+        OutOfScopeSkeleton { entries }
+    }
+
+    /// Whether the skeleton has no entries (the common case: a merge whose out-of-scope siblings
+    /// were all unchanged, or a full-bay merge, which produces none).
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The resolved entries (warehouse path → `Some((hash, type))` to set, `None` to delete),
+    /// consumed by the stack overlay (`tree_utils::build_scoped_root_tree`).
+    pub fn entries(&self) -> &BTreeMap<String, Option<(String, DirEntryType)>> {
+        &self.entries
+    }
+
+    /// The bay-local path of the skeleton file.
+    fn path() -> PathBuf {
+        bay_root().join(FILE_NAME_SKELETON)
+    }
+
+    /// Read the skeleton beside the in-progress consolidation, returning an empty skeleton when
+    /// the file is absent (a merge with no out-of-scope resolutions). Used outside a completing
+    /// stack (e.g. inspection); the completing stack itself uses [`OutOfScopeSkeleton::read_required`]
+    /// instead, since *there* an absent file is not "no resolutions" but a broken invariant.
+    pub fn read() -> Result<OutOfScopeSkeleton, String> {
+        let path = OutOfScopeSkeleton::path();
+
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(OutOfScopeSkeleton::default()),
+            Err(e) => return Err(format!("Error while reading \"{}\": {}", path.to_string_lossy(), e)),
+        };
+
+        OutOfScopeSkeleton::from_bytes(&bytes)
+    }
+
+    /// Read the skeleton beside an in-progress consolidation, **requiring the file to exist**.
+    ///
+    /// `consolidate` always writes the skeleton — even an empty one — strictly *before* it writes
+    /// the consolidation state (see `merge_head_into_current`), so once a consolidation state file
+    /// exists, its skeleton is guaranteed to exist too, unless the write between the two was
+    /// interrupted (a crash, or a failed write). Defaulting to empty in that case would silently
+    /// drop every adopted-by-hash out-of-scope entry from the committing merge tree — the exact
+    /// wrong-but-complete-tree failure the skeleton exists to prevent, just relocated to a rarer
+    /// window. Refusing instead makes the invariant checkable rather than merely assumed.
+    ///
+    /// # Returns
+    /// * `Ok(OutOfScopeSkeleton)` - The skeleton (possibly empty).
+    /// * `Err(String)` - The skeleton file is missing or unreadable; names the recovery.
+    pub fn read_required() -> Result<OutOfScopeSkeleton, String> {
+        let path = OutOfScopeSkeleton::path();
+
+        let bytes = std::fs::read(&path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "A consolidation is in progress but its out-of-scope skeleton \
+                (\".forklift/consolidation-skeleton\") is missing — most likely an interrupted \
+                write (a crash mid-merge). The completing stack cannot tell what out-of-scope \
+                entries the merge resolved, so it refuses rather than silently drop them. Abort \
+                the consolidation (remove \".forklift/consolidation\" and \
+                \".forklift/consolidation-skeleton\") and consolidate again.".to_string()
+            } else {
+                format!("Error while reading \"{}\": {}", path.to_string_lossy(), e)
+            }
+        })?;
+
+        OutOfScopeSkeleton::from_bytes(&bytes)
+    }
+
+    /// Write the skeleton (atomically) beside the consolidation-state file.
+    pub fn write(&self) -> Result<(), String> {
+        file_utils::write_file_atomically(&OutOfScopeSkeleton::path(), &self.to_bytes())
+    }
+
+    /// Remove the skeleton file (a no-op when none exists), consumed alongside the consolidation.
+    pub fn clear() -> Result<(), String> {
+        let path = OutOfScopeSkeleton::path();
+
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("Error while removing \"{}\": {}", path.to_string_lossy(), e)),
+        }
+    }
+
+    /// Serialize to the on-disk form: one entry per line. A set is `S <type-code> <hash> <path>`
+    /// (path last, so a path with spaces survives); a deletion is `D <path>`. Tree entry names
+    /// never contain a newline (the tree object format is newline-delimited), so a line per entry
+    /// is unambiguous.
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut text = String::new();
+
+        for (path, resolution) in &self.entries {
+            match resolution {
+                Some((hash, item_type)) => {
+                    text.push_str(&format!("S {} {} {}\n", item_type.get_code(), hash, path));
+                }
+                None => {
+                    text.push_str(&format!("D {}\n", path));
+                }
+            }
+        }
+
+        text.into_bytes()
+    }
+
+    /// Parse the on-disk form produced by [`OutOfScopeSkeleton::to_bytes`].
+    fn from_bytes(bytes: &[u8]) -> Result<OutOfScopeSkeleton, String> {
+        let text = std::str::from_utf8(bytes)
+            .map_err(|_| "The consolidation skeleton file is not valid UTF-8.".to_string())?;
+
+        let mut entries: BTreeMap<String, Option<(String, DirEntryType)>> = BTreeMap::new();
+
+        for line in text.lines() {
+            if line.is_empty() {
+                continue;
+            }
+
+            let malformed = || format!("The consolidation skeleton line \"{}\" is malformed.", line);
+
+            match line.split_once(' ') {
+                Some(("D", path)) => {
+                    entries.insert(path.to_string(), None);
+                }
+                Some(("S", rest)) => {
+                    let mut parts = rest.splitn(3, ' ');
+                    let code = parts.next().ok_or_else(malformed)?;
+                    let hash = parts.next().ok_or_else(malformed)?;
+                    let path = parts.next().ok_or_else(malformed)?;
+
+                    let code: u64 = code.parse().map_err(|_| malformed())?;
+                    let item_type = DirEntryType::from_code(code)?;
+
+                    entries.insert(path.to_string(), Some((hash.to_string(), item_type)));
+                }
+                _ => return Err(malformed()),
+            }
+        }
+
+        Ok(OutOfScopeSkeleton { entries })
     }
 }
 
@@ -447,6 +642,17 @@ pub enum MergeAction {
         entry_hash: String,
         item_type: crate::enums::dir_entry_type::DirEntryType,
     },
+
+    /// An out-of-scope entry (a subtree, file or symlink this bay never materialized) that
+    /// theirs changed one-sided, resolved **by hash alone** — no content is loaded (design
+    /// §3.3). It never touches the working directory or the inventory; it is recorded in the
+    /// out-of-scope skeleton and spliced into the merge parcel's root tree by the next stack's
+    /// overlay (§3.2). `resolution` is the adopted `(hash, type)`, or `None` when theirs
+    /// deleted the entry. Only ever produced in a scoped (sparse) bay.
+    ResolveOutOfScope {
+        path: String,
+        resolution: Option<(String, crate::enums::dir_entry_type::DirEntryType)>,
+    },
 }
 
 /// One entry of the merge walk before its heavy work is run. The walk is a cheap tree
@@ -484,21 +690,29 @@ struct MergeJob {
 /// The three-way line merges of files both sides changed (the expensive part) fan out
 /// across the cores; the result is identical to a single-threaded merge, in the same order.
 ///
+/// In a scoped (sparse) bay, out-of-scope entries (subtrees, files and symlinks the bay never
+/// materialized) are resolved by hash alone (design §3.3): a one-sided change is adopted into a
+/// [`MergeAction::ResolveOutOfScope`] without loading its content; a two-sided out-of-scope
+/// conflict refuses with `out_of_scope_conflict` before any object is dereferenced. A full
+/// (unscoped) `scope` classifies everything `InScope`, so the walk is exactly today's behavior.
+///
 /// # Arguments
 /// * `base_hash`    - The root tree hash of the merge base.
 /// * `ours_hash`    - The root tree hash of our head.
 /// * `theirs_hash`  - The root tree hash of their head.
 /// * `ours_label`   - The conflict-marker label for our side (the current pallet name).
 /// * `theirs_label` - The conflict-marker label for their side.
+/// * `scope`        - The bay's materialization scope (full = today's behavior everywhere).
 ///
 /// # Returns
 /// * `Ok(Vec<MergeAction>)` - The actions to perform.
-/// * `Err(String)`          - If an object could not be loaded.
+/// * `Err(String)`          - A load failed, or a genuine out-of-scope conflict / type flip refuses.
 pub fn compute_merge_actions(base_hash: &str,
                              ours_hash: &str,
                              theirs_hash: &str,
                              ours_label: &str,
-                             theirs_label: &str) -> Result<Vec<MergeAction>, String> {
+                             theirs_label: &str,
+                             scope: &MaterializationScope) -> Result<Vec<MergeAction>, String> {
     let base_tree = object_utils::load_tree(base_hash)?;
     let ours_tree = object_utils::load_tree(ours_hash)?;
     let theirs_tree = object_utils::load_tree(theirs_hash)?;
@@ -512,6 +726,7 @@ pub fn compute_merge_actions(base_hash: &str,
         Some(&ours_tree),
         Some(&theirs_tree),
         "",
+        scope,
         &mut pending
     )?;
 
@@ -640,10 +855,18 @@ fn resolve_merge_job(job: &MergeJob,
 }
 
 /// Merge one directory level of the three trees (recursively).
+///
+/// In a scoped bay the `scope` classifier gates every entry **before** any content is loaded:
+/// an out-of-scope entry (a subtree, file or symlink) is resolved by hash into a
+/// [`MergeAction::ResolveOutOfScope`] (one-sided) or refuses (`out_of_scope_conflict`, two-sided),
+/// never dereferencing the absent object; a file where the scope needs a directory refuses
+/// (`scope_path_type_changed`); everything in scope merges exactly as today. A full scope
+/// classifies every path `InScope`, so a full-bay merge is unchanged.
 fn merge_directory(base: Option<&crate::model::tree_item::TreeItem>,
                    ours: Option<&crate::model::tree_item::TreeItem>,
                    theirs: Option<&crate::model::tree_item::TreeItem>,
                    key: &str,
+                   scope: &MaterializationScope,
                    pending: &mut Vec<PendingAction>) -> Result<(), String> {
     use std::collections::BTreeMap;
     use crate::enums::dir_entry_type::DirEntryType;
@@ -672,23 +895,55 @@ fn merge_directory(base: Option<&crate::model::tree_item::TreeItem>,
 
         let path = if key.is_empty() { name.clone() } else { format!("{}/{}", key, name) };
 
+        // A file where the scope needs a directory (an in-scope prefix itself, or a spine
+        // ancestor of one) is a directory→file flip the sparse scope cannot reason about —
+        // refuse rather than guess, before touching content (§3.1). Never fires in a full bay
+        // or a valid scoped bay (a spine path is always a directory there).
+        if scope.requires_directory(&path) {
+            return Err(scope_utils::type_changed_refusal(&path));
+        }
+
         // Nothing to do when both sides agree, or their side is unchanged since the base.
         if o == t || t == b {
             continue;
         }
 
+        let out_of_scope = scope.classify(&path) == ScopeClass::OutOfScope;
+
         // Our side is unchanged since the base: take their side.
         if o == b {
-            match t {
-                Some((hash, item_type)) => pending.push(PendingAction::Ready(MergeAction::TakeTheirs {
-                    path,
-                    hash: hash.clone(),
-                    item_type: *item_type,
-                    is_new: o.is_none(),
-                })),
-                None => pending.push(PendingAction::Ready(MergeAction::Delete { path })),
+            match (out_of_scope, t) {
+                // Out of scope: adopt theirs by hash into the skeleton (§3.3) — no blob load,
+                // never the working directory. `None` = theirs deleted the entry.
+                (true, Some((hash, item_type))) =>
+                    pending.push(PendingAction::Ready(MergeAction::ResolveOutOfScope {
+                        path,
+                        resolution: Some((hash.clone(), *item_type)),
+                    })),
+                (true, None) =>
+                    pending.push(PendingAction::Ready(MergeAction::ResolveOutOfScope {
+                        path,
+                        resolution: None,
+                    })),
+                // In scope: today's behavior — the blob is present and later applied to the
+                // working directory by `apply_merge_action`.
+                (false, Some((hash, item_type))) =>
+                    pending.push(PendingAction::Ready(MergeAction::TakeTheirs {
+                        path,
+                        hash: hash.clone(),
+                        item_type: *item_type,
+                        is_new: o.is_none(),
+                    })),
+                (false, None) => pending.push(PendingAction::Ready(MergeAction::Delete { path })),
             }
             continue;
+        }
+
+        // Both sides changed the file (relative to the base) in different ways. Out of scope,
+        // that is a genuine conflict the bay has no content to reconcile — refuse before any
+        // blob load (§3.3), so no absent out-of-scope object is ever dereferenced.
+        if out_of_scope {
+            return Err(scope_utils::out_of_scope_conflict_refusal(&path));
         }
 
         // Both sides changed the file (relative to the base) in different ways.
@@ -776,6 +1031,28 @@ fn merge_directory(base: Option<&crate::model::tree_item::TreeItem>,
 
         let child_key = if key.is_empty() { name.clone() } else { format!("{}/{}", key, name) };
 
+        // Out-of-scope subtree: resolve by hash without loading it (§3.3). A one-sided change is
+        // adopted from theirs into the skeleton; a two-sided one is a genuine conflict. A subtree
+        // is a directory, so no `scope_path_type_changed` check applies here.
+        if scope.classify(&child_key) == ScopeClass::OutOfScope {
+            if o == b {
+                // Our side is unchanged since the base: adopt theirs by hash. `None` = theirs
+                // deleted the subtree.
+                pending.push(PendingAction::Ready(MergeAction::ResolveOutOfScope {
+                    path: child_key,
+                    resolution: t.map(|hash| (hash.clone(), DirEntryType::Tree)),
+                }));
+            } else {
+                // Both sides changed it (o != b, t != b, o != t) — refuse before any load.
+                return Err(scope_utils::out_of_scope_conflict_refusal(&child_key));
+            }
+
+            continue;
+        }
+
+        // In scope, or on the spine to an in-scope leaf: descend exactly as today. The subtree
+        // objects at a spine/in-scope path are always present (never sealed), so the loads are
+        // safe even in a sparse store; the recursion re-classifies each child by its own path.
         let load = |hash: Option<&String>| -> Result<Option<TreeItem>, String> {
             match hash {
                 Some(hash) => object_utils::load_tree(hash).map(Some),
@@ -792,6 +1069,7 @@ fn merge_directory(base: Option<&crate::model::tree_item::TreeItem>,
             ours_loaded.as_ref(),
             theirs_loaded.as_ref(),
             &child_key,
+            scope,
             pending
         )?;
     }
@@ -1016,5 +1294,106 @@ mod tests {
     fn binary_content_is_not_mergeable() {
         assert!(is_mergeable_text(b"plain text\n"));
         assert!(!is_mergeable_text(b"bin\0ary"));
+    }
+
+    /// The review's BLOCKER, pinned directly: at an out-of-scope directory↔file flip, the merge
+    /// walk emits **two** `ResolveOutOfScope` actions for the same path — a "set" from whichever
+    /// loop (file or subtree) matches theirs' real, post-flip entry, and a "delete" from the
+    /// other loop, which sees no entry of its own kind there. The file loop always runs before
+    /// the subtree loop at a given level, so which action is emitted *second* — and would
+    /// clobber the other under plain last-write-wins insertion — flips with the direction of the
+    /// change. `OutOfScopeSkeleton::from_actions` must keep the "set" either way.
+    ///
+    /// This is a direct, CLI-independent proof of the exact defect and fix: it exercises
+    /// `compute_merge_actions` + `from_actions` in isolation, with no materialization, no
+    /// `apply_merge_action`, and no `stack` overlay involved.
+    #[test]
+    fn the_out_of_scope_skeleton_keeps_a_set_over_a_delete_regardless_of_flip_direction() {
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+        use crate::enums::dir_entry_type::DirEntryType::{Normal, Tree};
+        use crate::globals::StorageRootScope;
+        use crate::model::blob::Blob;
+        use crate::model::tree_item::TreeItem;
+
+        let temp = std::env::temp_dir()
+            .join(format!("forklift-skeleton-flip-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope_guard = StorageRootScope::enter(&temp);
+
+        let store_blob = |content: &str| -> String {
+            let mut object = LooseObjectBuilder::build_blob(&Blob { content: content.as_bytes().to_vec() });
+            object.store().unwrap();
+            object.hash
+        };
+
+        let store_tree = |entries: &[(&str, &str, crate::enums::dir_entry_type::DirEntryType)]| -> String {
+            let mut tree = TreeItem::new(String::new(), String::new(), Tree);
+            for (name, hash, item_type) in entries {
+                tree.add_child(TreeItem::new(name.to_string(), hash.to_string(), *item_type));
+            }
+            let mut object = LooseObjectBuilder::build_tree(&tree);
+            object.store().unwrap();
+            object.hash
+        };
+
+        // "src/web" is out of scope throughout (only "src/api" is in scope); "src/api" never
+        // needs to exist in these trees at all — the classifier is a pure path-prefix test.
+        let scope = MaterializationScope::from_prefixes(["src/api"]);
+
+        // Direction A: base has "src/web" as a DIRECTORY; theirs replaces it with a FILE (ours
+        // unchanged). The file loop's "set" is emitted BEFORE the subtree loop's "delete" —
+        // exactly the order a plain last-write-wins insert gets wrong.
+        {
+            let inner_content = store_blob("web v1");
+            let web_dir = store_tree(&[("w.txt", &inner_content, Normal)]);
+            let web_file = store_blob("web is a file now");
+
+            let src_base = store_tree(&[("web", &web_dir, Tree)]);
+            let root_base = store_tree(&[("src", &src_base, Tree)]);
+            let root_ours = root_base.clone(); // ours == base: unchanged.
+
+            let src_theirs = store_tree(&[("web", &web_file, Normal)]);
+            let root_theirs = store_tree(&[("src", &src_theirs, Tree)]);
+
+            let actions = compute_merge_actions(&root_base, &root_ours, &root_theirs, "ours", "theirs", &scope)
+                .expect("a one-sided out-of-scope flip must resolve, not error");
+            let skeleton = OutOfScopeSkeleton::from_actions(&actions);
+
+            assert_eq!(
+                skeleton.entries().get("src/web"),
+                Some(&Some((web_file, Normal))),
+                "directory-to-file: the skeleton must keep the 'set' (theirs' file), not the \
+                'delete' the subtree loop emits right after it"
+            );
+        }
+
+        // Direction B (the mirror): base has "src/web" as a FILE; theirs replaces it with a
+        // DIRECTORY. The file loop's "delete" is emitted BEFORE the subtree loop's "set" — the
+        // direction that happened to already work under plain last-write-wins, now guaranteed.
+        {
+            let file_content = store_blob("web is a file v1");
+            let inner_content = store_blob("inner v1");
+            let web_dir = store_tree(&[("inner.txt", &inner_content, Normal)]);
+
+            let src_base = store_tree(&[("web", &file_content, Normal)]);
+            let root_base = store_tree(&[("src", &src_base, Tree)]);
+            let root_ours = root_base.clone();
+
+            let src_theirs = store_tree(&[("web", &web_dir, Tree)]);
+            let root_theirs = store_tree(&[("src", &src_theirs, Tree)]);
+
+            let actions = compute_merge_actions(&root_base, &root_ours, &root_theirs, "ours", "theirs", &scope)
+                .expect("a one-sided out-of-scope flip must resolve, not error");
+            let skeleton = OutOfScopeSkeleton::from_actions(&actions);
+
+            assert_eq!(
+                skeleton.entries().get("src/web"),
+                Some(&Some((web_dir, Tree))),
+                "file-to-directory: the skeleton must keep the 'set' (theirs' directory)"
+            );
+        }
+
+        std::fs::remove_dir_all(&temp).ok();
     }
 }

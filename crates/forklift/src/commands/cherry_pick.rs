@@ -94,8 +94,11 @@ pub async fn handle_command(revision: &str, message: Option<String>) -> Result<(
 
     let source_label = format!("cherry-pick {}", &source[..source.len().min(10)]);
 
+    // A cherry-pick refuses in a scoped bay (above), so the merge always runs at full scope —
+    // every path is in scope and materialized, exactly today's behavior.
     let actions = merge_utils::compute_merge_actions(
-        &base_tree, &our_tree, &theirs_tree, &current, &source_label
+        &base_tree, &our_tree, &theirs_tree, &current, &source_label,
+        &forklift_core::util::scope_utils::MaterializationScope::full(),
     )?;
 
     // Every change the source made is already present here: an empty pick.

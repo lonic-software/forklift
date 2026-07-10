@@ -38,6 +38,7 @@ const FILE_NAME_FETCH_SCOPE: &str = "fetch-scope";
 /// never prints and cannot build the CLI's `ForkliftError`) to the CLI as a sentinel-framed
 /// string; the CLI decodes it into a classified error + exit code. See [`refusal`].
 pub const CODE_OUT_OF_SCOPE: &str = "out_of_scope";
+pub const CODE_OUT_OF_SCOPE_CONFLICT: &str = "out_of_scope_conflict";
 pub const CODE_SCOPE_PATH_TYPE_CHANGED: &str = "scope_path_type_changed";
 pub const CODE_SPARSE_WORKSPACE: &str = "sparse_workspace";
 
@@ -355,6 +356,25 @@ pub fn out_of_scope_refusal(path: &str) -> String {
     refusal(
         CODE_OUT_OF_SCOPE,
         format!("The path \"{}\" is outside this bay's materialization scope. {}", path, next_step),
+        next_step,
+    )
+}
+
+/// A ready-made `out_of_scope_conflict` refusal for a merge where an out-of-scope entry (a
+/// subtree, file or symlink this bay never materialized) changed on *both* sides against the
+/// merge base (design §3.3). A one-sided out-of-scope change is resolved by hash without the
+/// content; a genuine two-sided conflict cannot be — the bay has no content to reconcile — so
+/// it refuses rather than guess.
+pub fn out_of_scope_conflict_refusal(path: &str) -> String {
+    let next_step = "Widen the bay's scope to include the path and retry, or resolve the merge in a full workspace.";
+
+    refusal(
+        CODE_OUT_OF_SCOPE_CONFLICT,
+        format!(
+            "The path \"{}\" changed on both sides outside this bay's materialization scope; a \
+            scoped bay cannot merge it without the content. {}",
+            path, next_step
+        ),
         next_step,
     )
 }

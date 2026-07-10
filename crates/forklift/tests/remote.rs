@@ -252,6 +252,33 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).to_string()
 }
 
+/// Walk a parcel's tree to the object at a warehouse path via `peek --json`, run in a directory
+/// of the area — so a test can find (then delete) an object and prove a later walk skips it.
+fn path_object_hash(area: &TestArea, dir: &str, parcel: &str, path: &str) -> String {
+    let peeked = area.forklift(dir, &["--json", "peek", parcel]);
+    assert_success(&peeked);
+    let value: serde_json::Value = serde_json::from_str(&stdout(&peeked)).unwrap();
+    let mut hash = value["data"]["tree"].as_str().unwrap().to_string();
+
+    for component in path.split('/') {
+        let peeked = area.forklift(dir, &["--json", "peek", &hash]);
+        assert_success(&peeked);
+        let value: serde_json::Value = serde_json::from_str(&stdout(&peeked)).unwrap();
+        hash = value["data"]["entries"].as_array().unwrap().iter()
+            .find(|entry| entry["name"] == component)
+            .unwrap_or_else(|| panic!("no tree entry \"{}\" under {}", component, hash))
+            ["hash"].as_str().unwrap().to_string();
+    }
+
+    hash
+}
+
+/// The object-store path of a loose object in a warehouse under the area (bays share it).
+fn object_store_path(area: &TestArea, warehouse_dir: &str, hash: &str) -> PathBuf {
+    area.path(warehouse_dir)
+        .join(".forklift").join("objects").join(&hash[0..2]).join(&hash[2..])
+}
+
 /// Create a warehouse under the area with the operator configured and the remote set.
 fn prepare_warehouse(area: &TestArea, name: &str, remote_url: &str) {
     std::fs::create_dir_all(area.path(name)).unwrap();
@@ -414,6 +441,68 @@ fn diverged_pallets_are_refused_not_merged() {
     let diverged = area.forklift("b", &["lower"]);
     assert!(!diverged.status.success());
     assert!(stderr(&diverged).contains("diverged"), "{}", stderr(&diverged));
+}
+
+#[test]
+fn a_scoped_merge_lifts_without_reading_the_out_of_scope_object() {
+    // The §7.6 review construction, end to end: a scoped bay consolidates a diverged remote "work"
+    // head that changed an out-of-scope subtree (adopting it by hash into the merge), then lifts.
+    // The lift's negotiation walk must prune that subtree against the merge's second parent — the
+    // remote head it is lifting against — and never load it. To prove that, the out-of-scope
+    // object is deleted from the local store before the lift; the remote already holds it, so the
+    // ref update still goes through and the server's closure check passes.
+    let area = TestArea::new("scoped-merge-lift");
+    let server = Server::start(&area, None);
+
+    // dev seeds the base on main, then registers a scoped "work" pallet on the server.
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/src/api/a.txt", "api v1\n");
+    area.write_file("dev/src/web/w.txt", "web v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    let work_dir = area.path("dev-work");
+    assert_success(&area.forklift("dev",
+        &["bay", "add", "work", work_dir.to_str().unwrap(), "--scope", "src/api"]));
+    assert_success(&area.forklift("dev-work", &["lift"])); // server "work" = base
+
+    // A second machine clones the scoped "work" pallet (full), changes the out-of-scope subtree,
+    // and lifts it — so the server's "work" head now carries an out-of-scope change dev never made.
+    assert_success(&area.forklift(".", &["franchise", &server.url, "up", "--pallet", "work"]));
+    area.write_file("up/src/web/w.txt", "web v2 from up\n");
+    assert_success(&area.forklift("up", &["load", "."]));
+    assert_success(&area.forklift("up", &["stack", "up edits web (out of scope for dev)"]));
+    assert_success(&area.forklift("up", &["lift"]));
+    let remote_web_head = area.read_file("up/.forklift/pallets/work").trim().to_string();
+
+    // dev's scoped bay makes an in-scope edit, diverging its "work" head from the server's.
+    std::fs::write(work_dir.join("src/api/a.txt"), "api v2 from dev\n").unwrap();
+    assert_success(&area.forklift("dev-work", &["load", "."]));
+    assert_success(&area.forklift("dev-work", &["stack", "dev edits api"]));
+
+    // Lower fetches the diverged remote head (with its out-of-scope object) and reports the
+    // divergence; palletize that head and consolidate it into work — the scoped bay adopts the
+    // out-of-scope subtree by hash into the stacked merge parcel.
+    let lowered = area.forklift("dev-work", &["lower"]);
+    assert!(!lowered.status.success(), "the divergence must be reported: {}", stdout(&lowered));
+
+    assert_success(&area.forklift("dev-work", &["palletize", "incoming", &remote_web_head]));
+    assert_success(&area.forklift("dev-work", &["shift", "work"]));
+    assert_success(&area.forklift("dev-work", &["consolidate", "incoming"]));
+
+    // Make the out-of-scope object impossible to read (a sparse store would never have fetched it):
+    // the merge already committed its hash, so the lift must not need its bytes.
+    let web_tree = path_object_hash(&area, "dev-work", &remote_web_head, "src/web");
+    std::fs::remove_file(object_store_path(&area, "dev", &web_tree))
+        .expect("the out-of-scope object existed");
+
+    // The lift succeeds: its closure walk prunes the out-of-scope subtree against the merge's
+    // second parent (the remote "work" head) and never loads it; the remote already holds it.
+    let lifted = area.forklift("dev-work", &["lift"]);
+    assert_success(&lifted);
+    assert!(stdout(&lifted).contains("Lifted") || stdout(&lifted).contains("up to date"),
+        "the scoped merge must lift: {}", stdout(&lifted));
 }
 
 #[test]

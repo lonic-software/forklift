@@ -7,8 +7,8 @@ use forklift_core::model::inventory::InventoryItem;
 use forklift_core::util::merge_utils::{ConsolidationState, MergeAction};
 use forklift_core::util::stocktake_utils::ChangeKind;
 use forklift_core::util::{
-    inventory_utils, merge_utils, object_utils, office_utils, pallet_utils, shift_utils,
-    stack_utils, stocktake_utils,
+    inventory_utils, merge_utils, object_utils, office_utils, pallet_utils, scope_utils,
+    shift_utils, stack_utils, stocktake_utils,
 };
 use crate::output::{self, CommandOutput};
 
@@ -30,13 +30,9 @@ use crate::output::{self, CommandOutput};
 /// * `Ok(())`      - If the consolidation completed (or was cleanly a no-op).
 /// * `Err(String)` - If there was an error while handling the command.
 pub async fn handle_command(target: &str) -> Result<(), String> {
-    // A merge in a scoped bay would need to materialize out-of-scope content to reason about
-    // the three-way merge and would break the scope invariant, so it refuses cleanly here.
-    crate::commands::scope::refuse_in_scoped_bay(
-        "consolidate",
-        "Run it from a full bay.",
-    )?;
-
+    // A merge in a scoped bay resolves out-of-scope siblings by hash (§7.6): a one-sided change
+    // is adopted from theirs into the merge parcel's tree without materializing it; a genuine
+    // out-of-scope conflict refuses (`out_of_scope_conflict`). In-scope content merges as usual.
     pallet_utils::validate_pallet_name(target)?;
 
     let current = pallet_utils::get_current_pallet_name()?;
@@ -48,7 +44,8 @@ pub async fn handle_command(target: &str) -> Result<(), String> {
     if merge_utils::read_consolidation_state()?.is_some() {
         return Err(
             "A consolidation is already in progress. Resolve its conflicts and \"stack\", \
-            or remove \".forklift/consolidation\" to abort it.".to_string()
+            or remove \".forklift/consolidation\" (and \".forklift/consolidation-skeleton\", \
+            if present) to abort it.".to_string()
         );
     }
 
@@ -255,8 +252,13 @@ pub(crate) async fn merge_head_into_current(current: &str,
         .ok_or(format!("\"{}\" and \"{}\" share no history; they cannot be merged.", current, their_label))?;
     let base_tree_hash = object_utils::load_parcel(&base)?.tree_hash;
 
+    // In a scoped (sparse) bay the classifier resolves out-of-scope siblings by hash and refuses
+    // genuine out-of-scope conflicts before any object is loaded; a full scope leaves the merge
+    // exactly as before.
+    let scope = scope_utils::current_scope()?;
+
     let actions = merge_utils::compute_merge_actions(
-        &base_tree_hash, &our_tree_hash, &their_tree_hash, current, their_label
+        &base_tree_hash, &our_tree_hash, &their_tree_hash, current, their_label, &scope
     )?;
 
     // The optimistic path (apply_conflicts = false) refuses to touch the working directory
@@ -282,6 +284,17 @@ pub(crate) async fn merge_head_into_current(current: &str,
     for action in &actions {
         apply_merge_action(action, &mut conflict_paths)?;
     }
+
+    // Record the out-of-scope skeleton (§7.6) BEFORE the consolidation state, and unconditionally
+    // — even when it is empty (a full-bay merge, or one that resolved nothing out of scope): the
+    // completing `stack` (`stack_utils::stack_parcel`) requires the skeleton file to exist
+    // whenever a consolidation is in progress, so this ordering guarantees a crash or a failed
+    // write between the two can never leave consolidation state whose skeleton is silently
+    // treated as empty — which would drop every adopted-by-hash entry from the committed tree.
+    // Clearing first guards against a stale skeleton left behind by an aborted earlier merge in
+    // this bay.
+    merge_utils::OutOfScopeSkeleton::clear()?;
+    merge_utils::OutOfScopeSkeleton::from_actions(&actions).write()?;
 
     merge_utils::write_consolidation_state(&ConsolidationState {
         their_head: their_head.to_string(),
@@ -493,6 +506,11 @@ pub(crate) fn apply_merge_action(action: &MergeAction, conflict_paths: &mut Vec<
 
             Ok(())
         }
+
+        // An out-of-scope entry resolved by hash never touches the working directory or the
+        // inventory (§7.6): it is carried in the out-of-scope skeleton and spliced into the merge
+        // parcel's tree by the completing stack's overlay. Nothing to apply here.
+        MergeAction::ResolveOutOfScope { .. } => Ok(()),
     }
 }
 

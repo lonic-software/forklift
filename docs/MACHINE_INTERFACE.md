@@ -59,6 +59,7 @@ is reserved for argument/usage errors (clap); `0` is success.
 | `out_of_scope`            | 7    | A path argument is outside a scoped (sparse) bay's scope          |
 | `scope_path_type_changed` | 8    | A scoped bay's spine path flipped dir↔file; scope no longer valid |
 | `sparse_workspace`        | 9    | A whole-tree verb is not supported in a scoped (sparse) bay yet   |
+| `out_of_scope_conflict`   | 10   | A scoped bay merge hit an out-of-scope entry changed on both sides |
 
 The codes and exit numbers are a contract: they get added to, never repurposed.
 
