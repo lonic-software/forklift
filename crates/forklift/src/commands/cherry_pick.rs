@@ -111,11 +111,7 @@ pub async fn handle_command(revision: &str, message: Option<String>) -> Result<(
 
     consolidate::ensure_no_untracked_collisions(&actions, &source_label)?;
 
-    let mut conflicts: Vec<String> = Vec::new();
-
-    for action in &actions {
-        consolidate::apply_merge_action(action, &mut conflicts)?;
-    }
+    let mut conflicts = consolidate::apply_merge_actions(&actions)?;
 
     // The completing parcel's message: the -m override, else the source's own message.
     let description = message.or_else(|| source_parcel.description.clone());

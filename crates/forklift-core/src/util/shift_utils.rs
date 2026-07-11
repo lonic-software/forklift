@@ -199,6 +199,75 @@ fn diff_directory(from: Option<&TreeItem>,
     Ok(())
 }
 
+/// Find the new-file writes in `ops` that would overwrite something already on disk: used
+/// up front by `shift` and consolidate's fast-forward path, before anything is touched.
+///
+/// A path that exists on disk is not a collision when it is a tracked, fully clean
+/// directory (every entry beneath it tracked) — that is a tracked directory the diff is
+/// legitimately replacing with a file (a dir→file flip). Applying the diff must then delete
+/// the directory's contents before writing the file (see `apply_ops`); a directory with any
+/// untracked content beneath it is a genuine collision and still refuses.
+///
+/// # Arguments
+/// * `ops` - The file operations a diff produced.
+///
+/// # Returns
+/// * `Ok(Vec<String>)` - The colliding paths (empty when there are none).
+/// * `Err(String)`      - If a directory or a shard could not be read or parsed.
+pub fn collect_untracked_collisions(ops: &[FileOp]) -> Result<Vec<String>, String> {
+    let mut collisions = Vec::new();
+
+    for op in ops {
+        let FileOp::Write { path, is_new: true, .. } = op else { continue };
+
+        let fs_path = Path::new(path);
+
+        if !fs_path.exists() {
+            continue;
+        }
+
+        if fs_path.is_dir() && inventory_utils::directory_is_safe_to_replace(path)? {
+            continue;
+        }
+
+        collisions.push(path.clone());
+    }
+
+    Ok(collisions)
+}
+
+/// Apply a diff's file operations to the working directory: every removal first (so a
+/// directory a new file is about to replace is emptied), then `remove_empty_directories`
+/// clears the now-empty source-only directories (deepest first) — the removals themselves
+/// only unlink files and never touch a directory — then every write lands. Writing before a
+/// same-path removal would otherwise fail (`EISDIR`/`EEXIST`) for a type flip in either
+/// direction.
+///
+/// # Arguments
+/// * `ops`          - The file operations to apply.
+/// * `removed_dirs` - The directories a diff found source-only (deepest first).
+///
+/// # Returns
+/// * `Ok(())`      - If every operation applied.
+/// * `Err(String)` - If a file system operation failed.
+pub fn apply_ops(ops: &[FileOp], removed_dirs: &[String]) -> Result<(), String> {
+    for op in ops {
+        if matches!(op, FileOp::Remove { .. }) {
+            apply_file_op(op)?;
+        }
+    }
+
+    remove_empty_directories(removed_dirs);
+
+    for op in ops {
+        if matches!(op, FileOp::Write { .. }) {
+            apply_file_op(op)?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Apply a file operation to the working directory.
 ///
 /// # Arguments
