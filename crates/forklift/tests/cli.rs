@@ -3574,6 +3574,278 @@ fn cherry_pick_conflicts_are_marked_and_completed_by_stacking() {
     assert!(!warehouse.root.join(".forklift/cherry-pick").exists(), "the cherry-pick state must be cleared");
 }
 
+// -------------------------------------------------------------------------------------------
+// Tracked directory <-> file flips: a merge or shift that replaces a tracked directory with a
+// file (or vice versa) must not misread the directory as untracked content, and must apply the
+// deletes before the write so the flip actually lands on disk in either direction.
+// -------------------------------------------------------------------------------------------
+
+#[test]
+fn shift_flips_a_tracked_directory_into_a_file_and_back() {
+    let warehouse = TestWarehouse::new("shift-dir-file-flip");
+    warehouse.write_file("foo/a.txt", "a\n");
+    warehouse.write_file("foo/b.txt", "b\n");
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base"]));
+
+    // "flipped" replaces the tracked directory "foo" with a plain file.
+    assert_success(&warehouse.run(&["palletize", "flipped"]));
+    std::fs::remove_dir_all(warehouse.root.join("foo")).unwrap();
+    warehouse.write_file("foo", "foo is a file now\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "flip foo to a file"]));
+
+    // Shifting to "flipped" from "main" (where "foo" is still a tracked, clean directory) must
+    // not refuse: it is exactly the tracked dir->file flip, not an untracked collision.
+    assert_success(&warehouse.run(&["shift", "main"]));
+    let shift_to_flipped = warehouse.run(&["shift", "flipped"]);
+    assert_success(&shift_to_flipped);
+
+    assert!(!warehouse.root.join("foo").is_dir(), "\"foo\" must now be a file, not a directory");
+    assert_eq!(
+        std::fs::read_to_string(warehouse.root.join("foo")).unwrap(),
+        "foo is a file now\n"
+    );
+
+    let status = stdout(&warehouse.run(&["stocktake"]));
+    assert!(status.contains("The inventory matches the pallet head"), "status: {}", status);
+    assert!(status.contains("The working directory matches the inventory"), "status: {}", status);
+
+    // Pin: the reverse flip (file -> directory) already works; shifting back must restore the
+    // directory and its tracked files exactly.
+    assert_success(&warehouse.run(&["shift", "main"]));
+    assert!(warehouse.root.join("foo").is_dir(), "\"foo\" must be a directory again");
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("foo/a.txt")).unwrap(), "a\n");
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("foo/b.txt")).unwrap(), "b\n");
+
+    let status_back = stdout(&warehouse.run(&["stocktake"]));
+    assert!(status_back.contains("The inventory matches the pallet head"), "status: {}", status_back);
+    assert!(status_back.contains("The working directory matches the inventory"), "status: {}", status_back);
+}
+
+#[test]
+fn shift_still_refuses_a_directory_to_file_flip_when_untracked_content_is_beneath_it() {
+    let warehouse = TestWarehouse::new("shift-dir-file-flip-guard");
+    warehouse.write_file("foo/a.txt", "a\n");
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base"]));
+
+    assert_success(&warehouse.run(&["palletize", "flipped"]));
+    std::fs::remove_dir_all(warehouse.root.join("foo")).unwrap();
+    warehouse.write_file("foo", "foo is a file now\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "flip foo to a file"]));
+
+    assert_success(&warehouse.run(&["shift", "main"]));
+
+    // An untracked file left inside "foo" must still block the flip: replacing the directory
+    // would silently destroy it.
+    warehouse.write_file("foo/untracked.txt", "never loaded\n");
+
+    let refused = warehouse.run(&["shift", "flipped"]);
+    assert!(!refused.status.success());
+    assert!(stderr(&refused).contains("would overwrite these untracked files"), "{}", stderr(&refused));
+
+    // Nothing was touched: the untracked file survives and the pallet did not change.
+    assert_eq!(
+        std::fs::read_to_string(warehouse.root.join("foo/untracked.txt")).unwrap(),
+        "never loaded\n"
+    );
+    assert!(warehouse.root.join("foo").is_dir());
+    assert!(stdout(&warehouse.run(&["stocktake"])).contains("On pallet \"main\""));
+}
+
+#[test]
+fn consolidate_flips_a_tracked_directory_into_a_file_and_back() {
+    let warehouse = TestWarehouse::new("consolidate-dir-file-flip");
+    warehouse.write_file("foo/a.txt", "a\n");
+    warehouse.write_file("root.txt", "root v1\n");
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base"]));
+
+    // "feature" one-sidedly replaces the tracked directory "foo" with a file.
+    assert_success(&warehouse.run(&["palletize", "feature"]));
+    std::fs::remove_dir_all(warehouse.root.join("foo")).unwrap();
+    warehouse.write_file("foo", "foo is a file now\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "feature flips foo to a file"]));
+
+    // "main" diverges the other way (an unrelated, non-overlapping change), so the merge is a
+    // genuine three-way merge — not a fast-forward.
+    assert_success(&warehouse.run(&["shift", "main"]));
+    warehouse.write_file("root.txt", "root v2\n");
+    assert_success(&warehouse.run(&["load", "root.txt"]));
+    assert_success(&warehouse.run(&["stack", "main edits root"]));
+
+    let merge = warehouse.run(&["consolidate", "feature"]);
+    assert_success(&merge);
+    assert!(stdout(&merge).contains("stacked merge parcel"), "output: {}", stdout(&merge));
+
+    assert!(!warehouse.root.join("foo").is_dir(), "\"foo\" must now be a file, not a directory");
+    assert_eq!(
+        std::fs::read_to_string(warehouse.root.join("foo")).unwrap(),
+        "foo is a file now\n"
+    );
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("root.txt")).unwrap(), "root v2\n");
+
+    let status = stdout(&warehouse.run(&["stocktake"]));
+    assert!(status.contains("The inventory matches the pallet head"), "status: {}", status);
+    assert!(status.contains("The working directory matches the inventory"), "status: {}", status);
+}
+
+#[test]
+fn consolidate_flips_a_tracked_file_into_a_directory() {
+    // Pin for the reverse flip (file -> directory): the merge machinery already ordered this
+    // direction correctly on its own (the delete of the file was already walked before the
+    // writes under the new directory); returning the warehouse root to "main" below still
+    // exercises the dir->file shift the fix above covers, since "main" still has "foo" as a file.
+    let warehouse = TestWarehouse::new("consolidate-file-dir-flip");
+    warehouse.write_file("foo", "foo is a file v1\n");
+    warehouse.write_file("root.txt", "root v1\n");
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base"]));
+
+    assert_success(&warehouse.run(&["palletize", "feature"]));
+    std::fs::remove_file(warehouse.root.join("foo")).unwrap();
+    warehouse.write_file("foo/inner.txt", "inner v1\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "feature flips foo to a directory"]));
+
+    assert_success(&warehouse.run(&["shift", "main"]));
+    warehouse.write_file("root.txt", "root v2\n");
+    assert_success(&warehouse.run(&["load", "root.txt"]));
+    assert_success(&warehouse.run(&["stack", "main edits root"]));
+
+    let merge = warehouse.run(&["consolidate", "feature"]);
+    assert_success(&merge);
+
+    assert!(warehouse.root.join("foo").is_dir(), "\"foo\" must now be a directory");
+    assert_eq!(
+        std::fs::read_to_string(warehouse.root.join("foo/inner.txt")).unwrap(),
+        "inner v1\n"
+    );
+
+    let status = stdout(&warehouse.run(&["stocktake"]));
+    assert!(status.contains("The inventory matches the pallet head"), "status: {}", status);
+    assert!(status.contains("The working directory matches the inventory"), "status: {}", status);
+}
+
+#[test]
+fn consolidate_still_refuses_a_directory_to_file_flip_when_untracked_content_is_beneath_it() {
+    let warehouse = TestWarehouse::new("consolidate-dir-file-flip-guard");
+    warehouse.write_file("foo/a.txt", "a\n");
+    warehouse.write_file("root.txt", "root v1\n");
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base"]));
+
+    assert_success(&warehouse.run(&["palletize", "feature"]));
+    std::fs::remove_dir_all(warehouse.root.join("foo")).unwrap();
+    warehouse.write_file("foo", "foo is a file now\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "feature flips foo to a file"]));
+
+    assert_success(&warehouse.run(&["shift", "main"]));
+    warehouse.write_file("root.txt", "root v2\n");
+    assert_success(&warehouse.run(&["load", "root.txt"]));
+    assert_success(&warehouse.run(&["stack", "main edits root"]));
+
+    // An untracked file left inside "foo" must still block the merge.
+    warehouse.write_file("foo/untracked.txt", "never loaded\n");
+
+    let refused = warehouse.run(&["consolidate", "feature"]);
+    assert!(!refused.status.success());
+    assert!(stderr(&refused).contains("would overwrite these untracked files"), "{}", stderr(&refused));
+
+    assert_eq!(
+        std::fs::read_to_string(warehouse.root.join("foo/untracked.txt")).unwrap(),
+        "never loaded\n"
+    );
+    assert!(warehouse.root.join("foo").is_dir());
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("root.txt")).unwrap(), "root v2\n");
+}
+
+#[test]
+fn cherry_pick_flips_a_tracked_directory_into_a_file_and_back() {
+    let warehouse = TestWarehouse::new("cherry-pick-dir-file-flip");
+    warehouse.write_file("foo/a.txt", "a\n");
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base"]));
+
+    // "feature" replaces the tracked directory "foo" with a file, in a single parcel.
+    assert_success(&warehouse.run(&["palletize", "feature"]));
+    std::fs::remove_dir_all(warehouse.root.join("foo")).unwrap();
+    warehouse.write_file("foo", "foo is a file now\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    let source = extract_parcel_hash(&warehouse.run(&["stack", "flip foo to a file"]));
+
+    // Cherry-pick that parcel onto "main", where "foo" is still a tracked, clean directory.
+    assert_success(&warehouse.run(&["shift", "main"]));
+    let picked = json(&warehouse.run(&["--json", "cherry-pick", &source]));
+    assert_eq!(picked["data"]["outcome"], "applied", "{:?}", picked);
+
+    assert!(!warehouse.root.join("foo").is_dir(), "\"foo\" must now be a file, not a directory");
+    assert_eq!(
+        std::fs::read_to_string(warehouse.root.join("foo")).unwrap(),
+        "foo is a file now\n"
+    );
+
+    let status = stdout(&warehouse.run(&["stocktake"]));
+    assert!(status.contains("The inventory matches the pallet head"), "status: {}", status);
+    assert!(status.contains("The working directory matches the inventory"), "status: {}", status);
+}
+
+#[test]
+fn cherry_pick_flips_a_tracked_file_into_a_directory() {
+    // Pin for the reverse flip (file -> directory): the pick's merge machinery already ordered
+    // this direction correctly on its own; shifting to "main" below still exercises the
+    // dir->file shift the fix above covers, since "main" still has "foo" as a file.
+    let warehouse = TestWarehouse::new("cherry-pick-file-dir-flip");
+    warehouse.write_file("foo", "foo is a file v1\n");
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base"]));
+
+    assert_success(&warehouse.run(&["palletize", "feature"]));
+    std::fs::remove_file(warehouse.root.join("foo")).unwrap();
+    warehouse.write_file("foo/inner.txt", "inner v1\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    let source = extract_parcel_hash(&warehouse.run(&["stack", "flip foo to a directory"]));
+
+    assert_success(&warehouse.run(&["shift", "main"]));
+    let picked = json(&warehouse.run(&["--json", "cherry-pick", &source]));
+    assert_eq!(picked["data"]["outcome"], "applied", "{:?}", picked);
+
+    assert!(warehouse.root.join("foo").is_dir(), "\"foo\" must now be a directory");
+    assert_eq!(
+        std::fs::read_to_string(warehouse.root.join("foo/inner.txt")).unwrap(),
+        "inner v1\n"
+    );
+
+    let status = stdout(&warehouse.run(&["stocktake"]));
+    assert!(status.contains("The inventory matches the pallet head"), "status: {}", status);
+    assert!(status.contains("The working directory matches the inventory"), "status: {}", status);
+}
+
 /// Count the `.pack` data files under an object store's pack folder.
 fn count_packs(objects_root: &Path) -> usize {
     let pack_dir = objects_root.join("pack");
@@ -4424,15 +4696,13 @@ fn path_object_entry(warehouse: &TestWarehouse, parcel: &str, path: &str) -> (St
 
 #[test]
 fn a_scoped_merge_resolves_an_out_of_scope_directory_to_file_flip_by_hash() {
-    // NOTE on verification strategy: this direction cannot be checked against an actual
-    // full-bay `consolidate` run — doing so hits a *separate, pre-existing* bug in
-    // `ensure_no_untracked_collisions` (confirmed reproducible on a plain, unscoped warehouse
-    // with none of the scoped-bay merge code involved: `inventory_lookup` only recognizes a
-    // tracked *file* entry, so a one-sided merge that replaces a tracked *directory* with a file
-    // is misread as colliding with an "untracked" file and refused). That bug is unrelated to
-    // scoped bays and is reported separately, not fixed here. Verification instead checks the
-    // scoped merge's own committed tree directly: the out-of-scope path must carry theirs' exact
-    // post-flip hash and type — never omitted and never the stale pre-flip directory.
+    // NOTE on verification strategy: verification checks the scoped merge's own committed tree
+    // directly (rather than diffing a full-bay `consolidate` run against it): the out-of-scope
+    // path must carry theirs' exact post-flip hash and type — never omitted and never the stale
+    // pre-flip directory. (A separate, now-fixed bug once misread a tracked directory a one-sided
+    // merge replaced with a file as an untracked collision — see `ensure_no_untracked_collisions`
+    // and `inventory_utils::directory_is_safe_to_replace` — but this test's verification does not
+    // depend on that fix; it never runs an unscoped `consolidate` at all.)
     let warehouse = TestWarehouse::new("scoped-merge-dir-to-file");
     warehouse.write_file("src/api/a.txt", "api a v1\n");
     warehouse.write_file("src/web/w.txt", "web v1\n"); // src/web starts as a DIRECTORY
@@ -4474,12 +4744,13 @@ fn a_scoped_merge_resolves_an_out_of_scope_directory_to_file_flip_by_hash() {
 
 #[test]
 fn a_scoped_merge_resolves_an_out_of_scope_file_to_directory_flip_by_hash() {
-    // This direction CAN be verified against a real full-bay `consolidate` (unlike the mirror
-    // test above), provided "theirs" is authored in a freshly materialized bay rather than by
-    // switching the warehouse root's own working directory from "theirs" back to "main" via
-    // `shift` — reverting a *directory* left on disk back to a *file* via `shift` hits the same
-    // untracked-collision false positive from the other side. Authoring "theirs" in its own bay
-    // means the warehouse root never leaves "main", so no reverse-direction shift ever happens.
+    // This direction is verified against a real full-bay `consolidate`, with "theirs" authored
+    // in a freshly materialized bay rather than by switching the warehouse root's own working
+    // directory from "theirs" back to "main" via `shift` — that would revert a directory left on
+    // disk back to a file, a dir->file shift, which is exactly what this suite's
+    // `shift_flips_a_tracked_directory_into_a_file_and_back` covers directly; there is no need
+    // to exercise it incidentally here too. Authoring "theirs" in its own bay means the warehouse
+    // root never leaves "main", so no reverse-direction shift happens in this test at all.
     let warehouse = TestWarehouse::new("scoped-merge-file-to-dir");
     warehouse.write_file("src/api/a.txt", "api a v1\n");
     warehouse.write_file("src/web", "web is a file v1\n"); // src/web starts as a FILE

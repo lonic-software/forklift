@@ -279,11 +279,7 @@ pub(crate) async fn merge_head_into_current(current: &str,
 
     ensure_no_untracked_collisions(&actions, their_label)?;
 
-    let mut conflict_paths: Vec<String> = Vec::new();
-
-    for action in &actions {
-        apply_merge_action(action, &mut conflict_paths)?;
-    }
+    let mut conflict_paths = apply_merge_actions(&actions)?;
 
     // Record the out-of-scope skeleton BEFORE the consolidation state, and unconditionally
     // — even when it is empty (a full-bay merge, or one that resolved nothing out of scope): the
@@ -329,28 +325,18 @@ fn fast_forward(current: &str,
                 their_tree_hash: &str) -> Result<String, String> {
     let (ops, removed_dirs) = shift_utils::diff_trees(Some(our_tree_hash), their_tree_hash)?;
 
-    let conflicts: Vec<&String> = ops.iter()
-        .filter_map(|op| match op {
-            shift_utils::FileOp::Write { path, is_new: true, .. }
-                if std::path::Path::new(path).exists() => Some(path),
-            _ => None,
-        })
-        .collect();
+    let conflicts = shift_utils::collect_untracked_collisions(&ops)?;
 
     if !conflicts.is_empty() {
         return Err(format!(
             "Consolidating \"{}\" would overwrite these untracked files:\n  {}\n\
             Move them out of the way (or load and stack them) first.",
             target,
-            conflicts.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("\n  ")
+            conflicts.join("\n  ")
         ));
     }
 
-    for op in &ops {
-        shift_utils::apply_file_op(op)?;
-    }
-
-    shift_utils::remove_empty_directories(&removed_dirs);
+    shift_utils::apply_ops(&ops, &removed_dirs)?;
 
     let shards = shift_utils::build_inventories_for_tree(their_tree_hash)?;
     inventory_utils::replace_all_inventories(&shards)?;
@@ -396,10 +382,17 @@ pub(crate) fn ensure_no_untracked_collisions(actions: &[MergeAction], target: &s
         };
 
         if let Some(path) = new_path {
-            // Only paths we do not track can collide; tracked paths were verified clean.
-            let is_tracked = inventory_lookup(path)?.is_some();
+            // A tracked file cannot collide (tracked paths were verified clean). A tracked
+            // directory with no untracked content beneath it cannot collide either — the merge
+            // legitimately replaces it with the new entry (see `apply_merge_action`'s
+            // deletes-before-writes ordering); a directory is tracked by its own inventory
+            // shard, not as an item in its parent's inventory, so it is checked separately.
+            let is_tracked_file = inventory_lookup(path)?.is_some();
+            let fs_path = std::path::Path::new(path);
+            let is_replaceable_dir = fs_path.is_dir()
+                && inventory_utils::directory_is_safe_to_replace(path)?;
 
-            if !is_tracked && std::path::Path::new(path).exists() {
+            if !is_tracked_file && !is_replaceable_dir && fs_path.exists() {
                 collisions.push(path);
             }
         }
@@ -434,6 +427,32 @@ fn inventory_lookup(path: &str) -> Result<Option<InventoryItem>, String> {
         .map_err(|e| format!("Error while parsing the inventory of folder \"{}\": {}", parent_key, e))?;
 
     Ok(inventory.get_item_by_name(name).map(|item| (*item).clone()))
+}
+
+/// Apply every merge action to the working directory and the inventory, and return the
+/// paths left in conflict. Shared with `cherry-pick`, which applies a parcel's diff through
+/// the same `MergeAction`s.
+///
+/// Every deletion is applied first, so a directory a write is about to replace (or a file a
+/// write is about to turn into a directory) is emptied — and, via `apply_merge_action`'s
+/// parent-chain cleanup, itself removed — before that write lands. Writing first would
+/// otherwise fail (`EISDIR`/`EEXIST`) for a tracked type flip in either direction.
+pub(crate) fn apply_merge_actions(actions: &[MergeAction]) -> Result<Vec<String>, String> {
+    let mut conflict_paths: Vec<String> = Vec::new();
+
+    for action in actions {
+        if matches!(action, MergeAction::Delete { .. }) {
+            apply_merge_action(action, &mut conflict_paths)?;
+        }
+    }
+
+    for action in actions {
+        if !matches!(action, MergeAction::Delete { .. }) {
+            apply_merge_action(action, &mut conflict_paths)?;
+        }
+    }
+
+    Ok(conflict_paths)
 }
 
 /// Apply one merge action to the working directory and the inventory. Shared with

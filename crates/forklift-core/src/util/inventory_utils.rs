@@ -458,6 +458,74 @@ pub fn stage_file_entry_from_stat(path: &str, hash: String) -> Result<(), String
     })
 }
 
+/// Whether the directory at `path` may be safely replaced (by a file, or cleared to make
+/// way for one) without losing data: it is tracked — represented by its own inventory
+/// shard, the sharded-inventory way a directory is recognized (see `stage_removal`) — and
+/// every entry beneath it, recursively, is tracked too. Called for a path a merge or shift
+/// wants to write a new file to that already exists as a directory on disk (a tracked
+/// dir→file flip); the caller still refuses when this returns `false`, exactly as it does
+/// for a plain untracked file at the path.
+///
+/// # Arguments
+/// * `path` - The warehouse path of the directory (assumed to exist on disk).
+///
+/// # Returns
+/// * `Ok(true)`    - The directory is tracked and has no untracked content beneath it.
+/// * `Ok(false)`   - The directory is untracked, or has untracked content beneath it.
+/// * `Err(String)` - If a directory entry or a shard could not be read or parsed.
+pub fn directory_is_safe_to_replace(path: &str) -> Result<bool, String> {
+    if !file_utils::get_inventory_data_path_for_key(path).exists() {
+        return Ok(false);
+    }
+
+    directory_has_no_untracked_content(path)
+}
+
+/// Recursively check a tracked directory for untracked content (the body of
+/// `directory_is_safe_to_replace`). Ignored entries are skipped, matching the rest of the
+/// inventory machinery (`walk_directory_unstaged` in `stocktake_utils`): they are invisible
+/// to tracking, not a collision.
+fn directory_has_no_untracked_content(key: &str) -> Result<bool, String> {
+    let ignored_paths = file_utils::get_ignored_paths()?;
+    let fs_path = if key.is_empty() { std::path::PathBuf::from(".") } else { std::path::PathBuf::from(key) };
+
+    let (_, bytes_opt) = file_utils::retrieve_inventory_or_none_by_key(key)?;
+    let inventory = match bytes_opt {
+        Some(bytes) => parser::inventory::inventory_parser::parse_inventory(&bytes)
+            .map_err(|e| format!("Error while parsing the inventory of folder \"{}\": {}", key, e))?,
+        None => Inventory::new(),
+    };
+
+    for entry_result in file_utils::read_directory(&fs_path)? {
+        let entry = entry_result.map_err(|e| format!("Error while reading directory entry: {}", e))?;
+        let name = file_utils::get_name_for_file_or_directory(&entry)?;
+        let entry_key = if key.is_empty() { name.clone() } else { format!("{}/{}", key, name) };
+
+        if file_utils::is_path_ignored(&entry_key, &ignored_paths) {
+            continue;
+        }
+
+        let metadata = file_utils::get_symlink_metadata_for_path(&entry.path())?;
+        let item_type = file_utils::get_type_of_dir_entry(&metadata);
+
+        let is_tracked = if item_type.is_file() {
+            matches!(
+                inventory.get_item_by_name(&name),
+                Some(item) if item.state != InventoryItemState::Deleted
+            )
+        } else {
+            file_utils::get_inventory_data_path_for_key(&entry_key).exists()
+                && directory_has_no_untracked_content(&entry_key)?
+        };
+
+        if !is_tracked {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
+}
+
 /// Refresh every *tracked* entry of the inventory from the working directory: modified
 /// files are re-hashed (their blobs stored) and re-staged, files gone from disk become
 /// staged removals. Untracked files are deliberately left alone — this is `park`'s way of

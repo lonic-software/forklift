@@ -1,5 +1,4 @@
 use serde::Serialize;
-use forklift_core::util::shift_utils::FileOp;
 use forklift_core::util::stocktake_utils::ChangeKind;
 use forklift_core::util::{inventory_utils, object_utils, office_utils, pallet_utils, shift_utils, stocktake_utils};
 use crate::output::{self, CommandOutput};
@@ -90,27 +89,18 @@ pub async fn shift_to(target: &str) -> Result<String, String> {
 
     // New files must never overwrite untracked content. This is checked up front, before
     // anything is touched, so a conflict aborts the shift with the warehouse unchanged.
-    let conflicts: Vec<&String> = ops.iter()
-        .filter_map(|op| match op {
-            FileOp::Write { path, is_new: true, .. } if std::path::Path::new(path).exists() => Some(path),
-            _ => None,
-        })
-        .collect();
+    let conflicts = shift_utils::collect_untracked_collisions(&ops)?;
 
     if !conflicts.is_empty() {
         return Err(format!(
             "Shifting to \"{}\" would overwrite these untracked files:\n  {}\n\
             Move them out of the way (or load and stack them) first.",
             target,
-            conflicts.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("\n  ")
+            conflicts.join("\n  ")
         ));
     }
 
-    for op in &ops {
-        shift_utils::apply_file_op(op)?;
-    }
-
-    shift_utils::remove_empty_directories(&removed_dirs);
+    shift_utils::apply_ops(&ops, &removed_dirs)?;
 
     // Repopulate the staging area from the target tree ("repopulate on shift"): entries
     // carry the just-materialized files' stat data and the hashes from the tree, so the
