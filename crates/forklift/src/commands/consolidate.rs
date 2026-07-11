@@ -442,7 +442,7 @@ pub(crate) fn apply_merge_action(action: &MergeAction, conflict_paths: &mut Vec<
     match action {
         MergeAction::TakeTheirs { path, hash, item_type, .. } => {
             shift_utils::write_tracked_file(path, hash, *item_type)?;
-            inventory_utils::stage_file_entry_from_stat(path, hash.clone())
+            inventory_utils::stage_file_entry_from_stat(path, hash.clone(), *item_type)
         }
 
         MergeAction::Delete { path } => {
@@ -476,16 +476,23 @@ pub(crate) fn apply_merge_action(action: &MergeAction, conflict_paths: &mut Vec<
         MergeAction::Merged { path, content, item_type } => {
             write_merged_file(path, content, *item_type)?;
 
-            // The merged content is new — store its blob so the next stack can point at it.
+            // The merged content is new — store its blob so the next stack can point at it. A
+            // three-way merge only ever runs on plain text files, so a `Merged` result is always
+            // a plain blob, never chunked.
             let mut object = LooseObjectBuilder::build_blob(&Blob { content: content.clone() });
             object.store()?;
 
-            inventory_utils::stage_file_entry_from_stat(path, object.hash)
+            inventory_utils::stage_file_entry_from_stat(path, object.hash, *item_type)
         }
 
         MergeAction::Conflict { path, content, entry_hash, item_type } => {
             if let Some(content) = content {
                 write_merged_file(path, content, *item_type)?;
+            } else if item_type.is_chunked() {
+                // A chunked (binary) conflict carries no inline content: materialize the
+                // should-be-on-disk version from its recipe (`entry_hash` is ours when we keep
+                // ours, theirs when theirs is put back). Bounded, verified stream-assembly.
+                shift_utils::write_tracked_file(path, entry_hash, *item_type)?;
             }
 
             let (parent_key, name) = split_path(path);

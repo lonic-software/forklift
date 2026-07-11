@@ -63,6 +63,7 @@ is reserved for argument/usage errors (clap); `0` is success.
 | `non_origin_lift`         | 11   | A sparse workspace tried to lift to a remote other than its origin |
 | `narrow_unclean`          | 12   | `narrow` would delete a subtree that still holds uncommitted work  |
 | `scope_prune_blocked`     | 13   | `scope-prune` would free a path a checkout still materializes       |
+| `chunked_transport_unsupported` | 14   | A large chunked file can't be sent to a remote or bundle yet |
 
 The codes and exit numbers are a contract: they get added to, never repurposed.
 

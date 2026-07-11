@@ -17,7 +17,7 @@ use crate::model::remote::{
     MAX_UPLOAD_TARGETS_BATCH, PROTOCOL_VERSION,
 };
 use crate::util::office_utils::OFFICE_PALLET_NAME;
-use crate::util::scope_utils::{MaterializationScope, ScopeClass};
+use crate::util::scope_utils::{self, MaterializationScope, ScopeClass};
 use crate::util::{
     bundle_utils, config_utils, file_utils, merge_utils, object_utils, office_utils,
     pallet_utils, sign_utils,
@@ -1163,7 +1163,7 @@ async fn lift_pallet_inner(client: &RemoteClient,
             .map(|parent| object_utils::load_parcel(parent).map(|p| p.tree_hash))
             .collect::<Result<_, _>>()?;
 
-        collect_changed_closure(&parcel.tree_hash, &base_trees,
+        collect_changed_closure(&parcel.tree_hash, "", &base_trees,
                                 &mut seen_trees, &mut seen_blobs, &mut candidates)?;
     }
 
@@ -1212,6 +1212,7 @@ async fn lift_pallet_inner(client: &RemoteClient,
 /// parent is provably on the remote (that parent is already there or is uploaded in this session),
 /// exactly the guarantee the first-parent-only walk gave for linear history.
 fn collect_changed_closure(tree_hash: &str,
+                           path_prefix: &str,
                            base_tree_hashes: &[String],
                            seen_trees: &mut HashSet<String>,
                            seen_blobs: &mut HashSet<String>,
@@ -1255,6 +1256,17 @@ fn collect_changed_closure(tree_hash: &str,
     }
 
     for (name, file) in tree.get_files() {
+        // Chunk transport (negotiating/uploading the chunk objects a recipe references) is not
+        // wired up yet: nothing here descends into a recipe to add its chunk hashes to
+        // `candidates`, so lifting a chunked file would advance the remote's ref over a recipe
+        // whose chunks never arrive — a signed ref over content that can never be materialized
+        // there. Refuse client-side, before any negotiation or upload, naming the path. Checked
+        // for every file this walk visits (explained or not), so it also catches a chunked file
+        // that is unchanged-but-newly-reachable in this lift. Remove once chunk transport ships.
+        if file.item_type.is_chunked() {
+            return Err(scope_utils::chunked_transport_refusal(&join_path(path_prefix, name)));
+        }
+
         let explained = base_file_hashes.get(name.as_str())
             .is_some_and(|hashes| hashes.contains(&file.hash.as_str()));
 
@@ -1272,10 +1284,21 @@ fn collect_changed_closure(tree_hash: &str,
             .map(|hashes| hashes.iter().map(|hash| hash.to_string()).collect())
             .unwrap_or_default();
 
-        collect_changed_closure(&subtree.hash, &child_bases, seen_trees, seen_blobs, candidates)?;
+        collect_changed_closure(&subtree.hash, &join_path(path_prefix, name), &child_bases,
+                                seen_trees, seen_blobs, candidates)?;
     }
 
     Ok(())
+}
+
+/// Join a directory path prefix and an entry name into the entry's warehouse path (`""` prefix
+/// yields the bare name) — used only to name a path in an error message, never for lookups.
+fn join_path(prefix: &str, name: &str) -> String {
+    if prefix.is_empty() {
+        name.to_string()
+    } else {
+        format!("{}/{}", prefix, name)
+    }
 }
 
 /// Upload (concurrently) the objects of the given hashes.
@@ -2076,7 +2099,7 @@ mod tests {
             let mut seen_trees = HashSet::new();
             let mut seen_blobs = HashSet::new();
             let mut candidates = Vec::new();
-            collect_changed_closure(&root_merge, bases, &mut seen_trees, &mut seen_blobs, &mut candidates)
+            collect_changed_closure(&root_merge, "", bases, &mut seen_trees, &mut seen_blobs, &mut candidates)
                 .expect("the closure walk must not load a pruned object");
             candidates
         };
@@ -2131,12 +2154,47 @@ mod tests {
         let mut seen_trees = HashSet::new();
         let mut seen_blobs = HashSet::new();
         let mut candidates = Vec::new();
-        collect_changed_closure(&new_root, &[base_root], &mut seen_trees, &mut seen_blobs, &mut candidates)
+        collect_changed_closure(&new_root, "", &[base_root], &mut seen_trees, &mut seen_blobs, &mut candidates)
             .expect("the second path must be recognized as already-seen, not re-loaded");
 
         assert!(!candidates.contains(&shared),
             "the base-explained subtree must not be re-collected at the second path");
         assert!(seen_trees.contains(&shared),
             "the base-explained subtree must be marked seen so a second path skips it too");
+    }
+
+    /// The lift closure walk refuses a chunked file entry before any negotiation or upload:
+    /// chunk transport has not shipped, so lifting one would advance the remote's ref over a
+    /// recipe whose chunks never arrive. Named by its full path; a plain sibling in the same
+    /// tree is unaffected (proving the guard is scoped to the one chunked entry, not the walk).
+    #[test]
+    fn the_closure_walk_refuses_a_chunked_file() {
+        use crate::enums::dir_entry_type::DirEntryType::{Normal, NormalChunked, Tree};
+
+        let _scratch = Scratch::new("closure-chunked-refuses");
+
+        let plain = store_blob("small file");
+        // The walk refuses before ever loading the file's own object, so a placeholder hash
+        // (never stored) is enough to prove it — this is a load-order guarantee, not incidental.
+        let fake_recipe_hash = "a".repeat(64);
+
+        let src = store_tree(&[
+            ("plain.txt", &plain, Normal),
+            ("big.bin", &fake_recipe_hash, NormalChunked),
+        ]);
+        let root = store_tree(&[("src", &src, Tree)]);
+
+        let mut seen_trees = HashSet::new();
+        let mut seen_blobs = HashSet::new();
+        let mut candidates = Vec::new();
+
+        let error = collect_changed_closure(&root, "", &[], &mut seen_trees, &mut seen_blobs, &mut candidates)
+            .expect_err("a chunked file entry must refuse the closure walk");
+
+        let (code, message, _) = scope_utils::decode_refusal(&error)
+            .expect("the refusal must decode via the shared sentinel framing");
+
+        assert_eq!(code, scope_utils::CODE_CHUNKED_TRANSPORT_UNSUPPORTED);
+        assert!(message.contains("src/big.bin"), "the refusal names the full path: {}", message);
     }
 }

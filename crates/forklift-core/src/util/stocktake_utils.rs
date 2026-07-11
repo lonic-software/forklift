@@ -5,7 +5,6 @@ use std::path::Path;
 use std::sync::Arc;
 use file_id::FileId;
 use regex::Regex;
-use crate::builder::object::loose_object_builder::LooseObjectBuilder;
 use crate::enums::inventory_item_state::InventoryItemState;
 use crate::model::inventory::Inventory;
 use crate::model::task::change_walk::change_walk_context::ChangeWalkContext;
@@ -381,10 +380,12 @@ fn walk_directory_unstaged(context: Arc<ChangeWalkContext>,
                     }
                     Some(item) => {
                         // The shared classifier `load` also uses: stat cache first, hash
-                        // on a miss. Nothing is stored — the blob object of a modified
-                        // file is dropped here.
+                        // on a miss. `ComputeOnly` keeps this read-only — nothing is written
+                        // to the object store, not even a re-chunked giant's chunks (the blob
+                        // object of a modified small file is likewise dropped here).
                         let verdict = inventory_utils::classify_file_against_entry(
-                            &item, &metadata, item_type, &entry.path(), &name, shard_mtime
+                            &item, &metadata, item_type, &entry.path(), &name, shard_mtime,
+                            object_utils::IngestMode::ComputeOnly,
                         )?;
 
                         if let inventory_utils::FileVerdict::Modified(..) = verdict {
@@ -661,9 +662,11 @@ fn hash_worktree_file(path: &str) -> Result<String, String> {
     let item_type = file_utils::get_type_of_dir_entry(&metadata);
     let name = last_component(path);
 
-    let blob = object_utils::get_blob_for_file(name, fs_path, &item_type)?;
-
-    Ok(LooseObjectBuilder::build_blob(&blob).hash)
+    // Compute the identity `load` would record — the recipe hash for a giant, the blob hash for a
+    // small file — without storing anything (`ComputeOnly`). This keeps move detection comparing
+    // like with like: the inventory holds a recipe hash for a chunked file, so the untracked
+    // candidate must be hashed the same way (and never read whole into memory).
+    Ok(object_utils::ingest_file(name, fs_path, item_type, object_utils::IngestMode::ComputeOnly)?.hash)
 }
 
 /// Split a warehouse path into its parent directory key and its entry name.

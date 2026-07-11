@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use crate::globals::forklift_root;
-use crate::util::{audit_utils, delta_utils, file_utils, object_utils, pallet_utils, sign_utils};
+use crate::util::{audit_utils, delta_utils, file_utils, object_utils, pallet_utils, scope_utils, sign_utils};
 
 /// The uncompressed ASCII header line (without the newline) that opens every bundle this
 /// build *writes*. Version 2 (2026-07-06, §9.1 #1) added delta records (`KIND_DELTA`).
@@ -207,6 +207,18 @@ fn write_tree_closure<W: Write>(encoder: &mut zstd::stream::Encoder<'_, W>,
 
     for (name, file) in tree.get_files() {
         let path = join_path(path_prefix, name);
+
+        // Chunk transport (uploading/fetching the chunk objects a recipe references) is not
+        // wired up yet: a bundle can carry a chunked file's *recipe* just like any other small
+        // object (`emit_blob` below would happily do it — a recipe is not decoded here, just
+        // moved as bytes), but its chunks are excluded from bundles structurally (this walk
+        // never descends into a recipe), so the result would be a bundle over a file that can
+        // never be materialized wherever it lands. Refuse loudly rather than ship it silently
+        // incomplete. Remove this check once chunk transport ships.
+        if file.item_type.is_chunked() {
+            return Err(scope_utils::chunked_transport_refusal(&path));
+        }
+
         emit_blob(encoder, &file.hash, &path, emitted_depth, latest_blob_at_path, stats)?;
     }
 
@@ -535,7 +547,9 @@ mod tests {
     use crate::enums::dir_entry_type::DirEntryType;
     use crate::globals::StorageRootScope;
     use crate::model::blob::Blob;
+    use crate::model::chunk::Chunk;
     use crate::model::parcel::Parcel;
+    use crate::model::recipe::{Recipe, RecipeChunk};
     use crate::model::tree_item::TreeItem;
     use crate::util::byte_utils::number_to_vlq_bytes;
 
@@ -794,5 +808,54 @@ mod tests {
         let reimport_stats = import_bundle_bytes(&bundle_bytes).unwrap();
         assert_eq!(reimport_stats.stored_objects, 0);
         assert_eq!(reimport_stats.skipped_records, 3);
+    }
+
+    /// A warehouse with a chunked file anywhere in reachable history refuses to bundle: chunk
+    /// transport has not shipped, so a bundle carrying only the recipe (never its chunks,
+    /// structurally) would be silently incomplete. The refusal carries the stable code and
+    /// names the file's path. This check lifts the moment chunk transport ships.
+    #[test]
+    fn build_bundle_refuses_a_warehouse_with_a_chunked_file() {
+        let _scratch = Scratch::new("bundle-chunked-refuses");
+
+        let chunk = Chunk { content: b"a chunk of a large file".to_vec() };
+        let mut chunk_object = LooseObjectBuilder::build_chunk(&chunk);
+        chunk_object.store().unwrap();
+
+        let recipe = Recipe {
+            content_hash: object_utils::hash_object_bytes(&chunk.content),
+            total_size: chunk.content.len() as u64,
+            chunks: vec![RecipeChunk { hash: chunk_object.hash.clone(), size: chunk.content.len() as u64 }],
+        };
+        let mut recipe_object = LooseObjectBuilder::build_recipe(&recipe);
+        recipe_object.store().unwrap();
+
+        let mut root_tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        root_tree.add_child(TreeItem::new(
+            "big.bin".to_string(), recipe_object.hash.clone(), DirEntryType::NormalChunked
+        ));
+        let mut tree_object = LooseObjectBuilder::build_tree(&root_tree);
+        tree_object.store().unwrap();
+
+        let parcel = Parcel {
+            tree_hash: tree_object.hash.clone(),
+            parents: Vec::new(),
+            actions: Vec::new(),
+            description: Some("a chunked file".to_string()),
+        };
+        let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
+        parcel_object.store().unwrap();
+
+        pallet_utils::set_pallet_head("main", &parcel_object.hash).unwrap();
+
+        let error = build_bundle().err().expect("a chunked file must refuse the bundle");
+        let (code, message, _) = scope_utils::decode_refusal(&error)
+            .expect("the refusal must decode via the shared sentinel framing");
+
+        assert_eq!(code, scope_utils::CODE_CHUNKED_TRANSPORT_UNSUPPORTED);
+        assert!(message.contains("big.bin"), "the refusal names the path: {}", message);
+
+        // Nothing was left behind: the bundle file is never renamed into place on failure.
+        assert!(!get_latest_bundle_path().exists(), "a refused bundle must not be written");
     }
 }

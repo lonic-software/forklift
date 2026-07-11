@@ -200,8 +200,8 @@ pub fn pop_parked() -> Result<(), String> {
         shift_utils::apply_file_op(op)?;
 
         match op {
-            FileOp::Write { path, hash, .. } => {
-                inventory_utils::stage_file_entry_from_stat(path, hash.clone())?;
+            FileOp::Write { path, hash, item_type, .. } => {
+                inventory_utils::stage_file_entry_from_stat(path, hash.clone(), *item_type)?;
             }
             FileOp::Remove { path } => {
                 let (parent_key, name) = match path.rsplit_once('/') {

@@ -211,6 +211,10 @@ Binary files are reported, not printed. Whitespace-only changes are shown faint
 (they're still real changes — the object store hashes them). With `--json`, diff
 reports the changed-file set (path + kind) rather than every line.
 
+A large file (stored in chunks — see below) is a binary as far as diff is concerned:
+a changed one reports as `(binary contents; not shown line by line)`, never assembled
+or line-diffed.
+
 ### `restore` — discard changes (`r`)
 
 ```sh
@@ -237,6 +241,21 @@ where trust is established, `stack` also signs the parcel (see
 [Identity, signing, and agents](#7-identity-signing-and-agents)).
 
 `stack` requires staged changes — it refuses to create an empty parcel.
+
+### Large files
+
+Large files are handled natively — no separate tool, no pointer files. A file at or above
+8 MiB is split into content-defined chunks and stored as a small **recipe** (the ordered list
+of chunk hashes) plus the chunks themselves; everything below stays a single object. This is
+transparent: you `load`, `stack`, `shift`, `park` and `restore` large files exactly like any
+other, and they round-trip byte-for-byte. The wins are streaming (a multi-GB file is never held
+whole in memory), resumable transfer, and deduplication — an edit re-stores only the chunks it
+actually touched, and two files (or two revisions) that share content share their chunks.
+
+Chunking is content-addressed like everything else, so a chunked file's authorship is signed and
+offline-verifiable down to every byte. Two commands treat a chunked file as the opaque binary it
+is: [`diff`](#diff--line-by-line-changes-d) reports it changed without a line diff, and
+[`blame`](#blame--who-wrote-each-line-bl-annotate) refuses it (there are no lines to attribute).
 
 ### `undo` — reverse the last operation
 
@@ -343,6 +362,9 @@ follows the first-parent chain from the revision (git's `blame --first-parent`);
 merge brought in from a side line is attributed to the merge parcel. On a long history the walk
 uses the commit-graph's **changed-path filters** (built by [`compact`](#compact--pack-the-object-store))
 to skip the parcels that never touched the file, so it stays fast as history grows.
+
+blame refuses a large binary file (one stored in chunks — see below): there are no lines to
+attribute, so it fails with a clear message rather than assembling gigabytes to guess.
 
 ### `audit` — verify signed history offline (`a`)
 

@@ -2,9 +2,11 @@ use serde::Serialize;
 use forklift_core::enums::object::parsed_object::ParsedObject;
 use forklift_core::enums::object_type::ObjectType;
 use forklift_core::model::blob::Blob;
+use forklift_core::model::chunk::Chunk;
 use forklift_core::util::path_utils::WarehousePath;
 use forklift_core::model::parcel::Parcel;
 use forklift_core::model::parcel_action::ParcelAction;
+use forklift_core::model::recipe::Recipe;
 use forklift_core::model::tree_item::TreeItem;
 use forklift_core::parser;
 use forklift_core::parser::inventory::inventory_parser;
@@ -119,6 +121,8 @@ fn peek_object(hash: &str) -> Result<(), String> {
         ParsedObject::Blob(blob) => peek_blob(blob),
         ParsedObject::Tree(tree) => peek_tree(tree),
         ParsedObject::Parcel(parcel) => peek_parcel(parcel),
+        ParsedObject::Recipe(recipe) => peek_recipe(recipe),
+        ParsedObject::Chunk(chunk) => peek_chunk(chunk),
     }?;
 
     Ok(())
@@ -130,13 +134,8 @@ fn peek_object_json(object: ParsedObject) -> Result<(), String> {
 
     let peeked = match object {
         ParsedObject::Blob(blob) => PeekObject {
-            object_type,
             content: Some(String::from_utf8_lossy(&blob.content).to_string()),
-            entries: Vec::new(),
-            tree: None,
-            parents: Vec::new(),
-            actions: Vec::new(),
-            description: None,
+            ..PeekObject::empty(object_type)
         },
         ParsedObject::Tree(tree) => {
             let entries = tree.get_files().chain(tree.get_subtrees())
@@ -147,15 +146,7 @@ fn peek_object_json(object: ParsedObject) -> Result<(), String> {
                 })
                 .collect();
 
-            PeekObject {
-                object_type,
-                content: None,
-                entries,
-                tree: None,
-                parents: Vec::new(),
-                actions: Vec::new(),
-                description: None,
-            }
+            PeekObject { entries, ..PeekObject::empty(object_type) }
         }
         ParsedObject::Parcel(parcel) => {
             let actions = parcel.actions.iter().map(|action| PeekAction {
@@ -166,15 +157,29 @@ fn peek_object_json(object: ParsedObject) -> Result<(), String> {
             }).collect();
 
             PeekObject {
-                object_type,
-                content: None,
-                entries: Vec::new(),
                 tree: Some(parcel.tree_hash.clone()),
                 parents: parcel.parents.clone(),
                 actions,
                 description: parcel.description.clone(),
+                ..PeekObject::empty(object_type)
             }
         }
+        ParsedObject::Recipe(recipe) => {
+            let chunks = recipe.chunks.iter()
+                .map(|chunk| PeekChunk { hash: chunk.hash.clone(), size: chunk.size })
+                .collect();
+
+            PeekObject {
+                content_hash: Some(recipe.content_hash.clone()),
+                total_size: Some(recipe.total_size),
+                chunks,
+                ..PeekObject::empty(object_type)
+            }
+        }
+        ParsedObject::Chunk(chunk) => PeekObject {
+            total_size: Some(chunk.content.len() as u64),
+            ..PeekObject::empty(object_type)
+        },
     };
 
     output::emit("peek", &peeked);
@@ -210,6 +215,37 @@ struct PeekObject {
     /// A parcel's description.
     #[serde(skip_serializing_if = "Option::is_none")]
     description: Option<String>,
+
+    /// A recipe's whole-file content hash.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content_hash: Option<String>,
+
+    /// A recipe's total assembled size, or a chunk's payload size.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_size: Option<u64>,
+
+    /// A recipe's ordered chunk list.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    chunks: Vec<PeekChunk>,
+}
+
+impl PeekObject {
+    /// An otherwise-empty peek of the given type — every type-specific field defaulted, so each
+    /// arm sets only the fields relevant to its object type via struct update.
+    fn empty(object_type: String) -> PeekObject {
+        PeekObject {
+            object_type,
+            content: None,
+            entries: Vec::new(),
+            tree: None,
+            parents: Vec::new(),
+            actions: Vec::new(),
+            description: None,
+            content_hash: None,
+            total_size: None,
+            chunks: Vec::new(),
+        }
+    }
 }
 
 /// One entry of a tree object.
@@ -218,6 +254,13 @@ struct PeekTreeEntry {
     item_type: String,
     hash: String,
     name: String,
+}
+
+/// One chunk of a recipe object.
+#[derive(Serialize)]
+struct PeekChunk {
+    hash: String,
+    size: u64,
 }
 
 /// One action of a parcel object.
@@ -256,6 +299,39 @@ fn peek_blob(object: Blob) -> Result<(), String> {
         .map_err(|_| "Failed to convert blob content to string.".to_string())?;
 
     println!("{}", content);
+
+    Ok(())
+}
+
+/// Print details of the given recipe (a chunked file's chunk index) to stdout.
+///
+/// # Arguments
+/// * `recipe` - The recipe to print.
+///
+/// # Returns
+/// * `Ok(())` - Always (nothing here can fail).
+fn peek_recipe(recipe: Recipe) -> Result<(), String> {
+    println!("content-hash {}", recipe.content_hash);
+    println!("total-size   {}", recipe.total_size);
+    println!("chunks       {}", recipe.chunks.len());
+
+    for (index, chunk) in recipe.chunks.iter().enumerate() {
+        println!("  {:>6} {} {}", index, chunk.hash, chunk.size);
+    }
+
+    Ok(())
+}
+
+/// Print details of the given chunk (a leaf byte-range of a chunked file) to stdout. The raw
+/// bytes are not printed — a chunk is binary — only its size.
+///
+/// # Arguments
+/// * `chunk` - The chunk to print.
+///
+/// # Returns
+/// * `Ok(())` - Always.
+fn peek_chunk(chunk: Chunk) -> Result<(), String> {
+    println!("(binary chunk, {} bytes)", chunk.content.len());
 
     Ok(())
 }

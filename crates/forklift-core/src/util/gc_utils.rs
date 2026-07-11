@@ -209,6 +209,16 @@ pub(crate) fn collect_live_set() -> Result<HashSet<String>, String> {
             // and its bytes are never loaded by this walk, so an absent (sealed-but-unfetched)
             // blob is tolerated with no check at all — marked, and skipped by never being read.
             live.insert(file.hash.clone());
+
+            // A chunked file's hash names a recipe; its chunks are reachable **only** through the
+            // recipe (they are never referenced by a tree directly), so a walk that stopped at the
+            // recipe hash would leave every chunk unmarked — and a later loose-object sweep would
+            // collect them all, silently making the file unmaterializable (the B1 data-loss bug).
+            // The `*Chunked` tree entry type is what lets this walk decide to descend here with no
+            // speculative load on a plain entry: dispatch on the type, then mark the chunks live.
+            if file.item_type.is_chunked() {
+                mark_recipe_chunks_live(&file.hash, &mut live)?;
+            }
         }
 
         for (_, subtree) in tree.get_subtrees() {
@@ -217,6 +227,37 @@ pub(crate) fn collect_live_set() -> Result<HashSet<String>, String> {
     }
 
     Ok(live)
+}
+
+/// Mark every chunk of a chunked file's recipe live, presence-tolerantly.
+///
+/// The recipe hash itself is already marked live by the caller; this descends it to reach the
+/// chunk hashes. Tolerance mirrors the subtree descent exactly, one level deeper: an **absent**
+/// recipe (out of scope in a sparse warehouse, never fetched — and by the store invariant its
+/// chunks are absent too) is skipped, since we cannot descend bytes we do not hold, and its
+/// already-live hash is never collected. A **present** recipe is loaded (which re-hashes it on the
+/// content-addressed read, so a corrupt one fails here and `collect_garbage` then deletes nothing
+/// — safe and loud) and each chunk hash is marked live, tolerating an absent chunk with no read.
+///
+/// # Arguments
+/// * `recipe_hash` - The hash of the recipe (a chunked file's tree-entry hash).
+/// * `live`        - The live set to mark chunk hashes into.
+///
+/// # Returns
+/// * `Ok(())`      - The chunks were marked (or the recipe was absent and tolerated).
+/// * `Err(String)` - If a present recipe could not be loaded (corrupt/unreadable).
+fn mark_recipe_chunks_live(recipe_hash: &str, live: &mut HashSet<String>) -> Result<(), String> {
+    if !file_utils::does_object_exist(recipe_hash)? {
+        return Ok(());
+    }
+
+    let recipe = object_utils::load_recipe(recipe_hash)?;
+
+    for chunk in &recipe.chunks {
+        live.insert(chunk.hash.clone());
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -263,6 +304,30 @@ mod tests {
     /// Store a blob and return its hash.
     fn store_blob(content: &str) -> String {
         let mut object = LooseObjectBuilder::build_blob(&Blob { content: content.as_bytes().to_vec() });
+        object.store().unwrap();
+        object.hash
+    }
+
+    /// Store a chunk object and return its hash.
+    fn store_chunk(content: &[u8]) -> String {
+        use crate::model::chunk::Chunk;
+        let mut object = LooseObjectBuilder::build_chunk(&Chunk { content: content.to_vec() });
+        object.store().unwrap();
+        object.hash
+    }
+
+    /// Store a recipe over the given chunks (its `total_size` is the sum of the sizes, so it
+    /// passes the structural check at load) and return its hash.
+    fn store_recipe(chunks: &[(String, u64)]) -> String {
+        use crate::model::recipe::{Recipe, RecipeChunk};
+        let total_size = chunks.iter().map(|(_, size)| *size).sum();
+        let recipe = Recipe {
+            // gc never verifies `content_hash`; any valid 64-hex value is fine here.
+            content_hash: "0".repeat(64),
+            total_size,
+            chunks: chunks.iter().map(|(hash, size)| RecipeChunk { hash: hash.clone(), size: *size }).collect(),
+        };
+        let mut object = LooseObjectBuilder::build_recipe(&recipe);
         object.store().unwrap();
         object.hash
     }
@@ -409,6 +474,60 @@ mod tests {
         assert!(live.contains(&f.root_tree));
         object_utils::load_tree(&f.root_tree).expect("the root spine tree still loads after gc");
         object_utils::load_tree(&f.api_tree).expect("the in-scope subtree still loads after gc");
+    }
+
+    #[test]
+    fn gc_keeps_live_chunks_and_collects_orphan_chunks() {
+        // The B1 fix: a chunk-aware gc descends a live recipe and marks every chunk live, so a
+        // live chunked file's chunks survive; a chunk reachable through no recipe is ordinary
+        // garbage and is collected.
+        let _scratch = Scratch::new("gc-chunks");
+
+        let chunk_a = store_chunk(b"chunk a content");
+        let chunk_b = store_chunk(b"chunk b content");
+        let recipe = store_recipe(&[(chunk_a.clone(), 15), (chunk_b.clone(), 15)]);
+
+        // A tree entry of the chunked type points at the recipe; a parcel commits it on `main`.
+        let root_tree = store_tree(&[("big.bin", &recipe, DirEntryType::NormalChunked)]);
+        let parcel = store_root_parcel(&root_tree);
+
+        // An orphan chunk: a valid chunk object no recipe references.
+        let orphan = store_chunk(b"orphan chunk no recipe reaches me");
+
+        let stats = collect_garbage(0).expect("gc runs");
+
+        // The orphan chunk (and nothing live) is collected.
+        assert_eq!(stats.deleted, 1, "exactly the orphan chunk is collected");
+        assert!(!loose_path(&orphan).exists(), "the orphan chunk must be gone");
+
+        // Every object reachable through the recipe survives.
+        for hash in [&parcel, &root_tree, &recipe, &chunk_a, &chunk_b] {
+            assert!(loose_path(hash).exists(), "a live object must survive gc: {}", hash);
+        }
+    }
+
+    #[test]
+    fn gc_tolerates_an_absent_recipe_the_way_it_tolerates_an_absent_subtree() {
+        // Presence tolerance one level deeper: an out-of-scope (sparse) recipe is absent, and by
+        // the store invariant its chunks are absent too. The walk marks the recipe hash live and
+        // stops, never erroring — exactly like the sealed-subtree tolerance.
+        let _scratch = Scratch::new("gc-absent-recipe");
+
+        let chunk_a = store_chunk(b"a");
+        let chunk_b = store_chunk(b"bb");
+        let recipe = store_recipe(&[(chunk_a.clone(), 1), (chunk_b.clone(), 2)]);
+        let root_tree = store_tree(&[("big.bin", &recipe, DirEntryType::NormalChunked)]);
+        let _parcel = store_root_parcel(&root_tree);
+
+        // Simulate the sparse store: the recipe and its chunks were never fetched.
+        delete_object(&recipe);
+        delete_object(&chunk_a);
+        delete_object(&chunk_b);
+
+        // The walk completes (no error) and the sealed recipe hash stays live.
+        let live = collect_live_set().expect("an absent recipe must be tolerated, not error");
+        assert!(live.contains(&recipe), "the sealed recipe hash must stay live");
+        assert!(!live.contains(&chunk_a), "nothing beneath an absent recipe is individually marked");
     }
 
     #[test]

@@ -178,7 +178,8 @@ fn restore_file_and_refresh_entry(parent_key: &str,
     let refreshed = inventory_utils::build_inventory_item_from_stat(
         std::path::Path::new(&file_path),
         name,
-        hash.to_string()
+        hash.to_string(),
+        item_type,
     )?;
 
     inventory_utils::update_shard(parent_key, |inventory| {

@@ -166,11 +166,17 @@ impl<'a> Exporter<'a> {
 
         for (name, item) in tree.get_files() {
             let (mode, kind) = match item.item_type {
-                DirEntryType::Executable => ("100755", "blob"),
+                DirEntryType::Executable | DirEntryType::ExecutableChunked => ("100755", "blob"),
                 DirEntryType::SymbolicLink => ("120000", "blob"),
                 _ => ("100644", "blob"),
             };
-            let blob = self.convert_blob(&item.hash)?;
+            // A chunked file's hash is a recipe: stream-assemble it into the git blob rather than
+            // loading it as a blob (which would fail) or reading it whole into memory.
+            let blob = if item.item_type.is_chunked() {
+                self.convert_chunked_blob(&item.hash)?
+            } else {
+                self.convert_blob(&item.hash)?
+            };
             entries.push_str(&format!("{} {} {}\t{}\n", mode, kind, blob, name));
         }
 
@@ -196,6 +202,43 @@ impl<'a> Exporter<'a> {
         let git_hash = git_stdin(self.path, &["hash-object", "-w", "--stdin"], &content)?.trim().to_string();
 
         self.blobs.insert(forklift_hash.to_string(), git_hash.clone());
+
+        Ok(git_hash)
+    }
+
+    /// Write one chunked forklift file as a git blob by stream-assembling its recipe to a temp
+    /// file (bounded to one chunk in memory at a time, integrity-verified), then hashing that file
+    /// into the git object store. The assembled bytes round-trip exactly.
+    fn convert_chunked_blob(&mut self, recipe_hash: &str) -> Result<String, String> {
+        if let Some(hash) = self.blobs.get(recipe_hash) {
+            return Ok(hash.clone());
+        }
+
+        let temp_path = std::env::temp_dir().join(format!(
+            "forklift-export-{}-{}.tmp", std::process::id(), recipe_hash
+        ));
+
+        let assemble = || -> Result<(), String> {
+            let file = std::fs::File::create(&temp_path)
+                .map_err(|e| format!("Error while creating a temp file for git export: {}", e))?;
+            let mut writer = std::io::BufWriter::new(file);
+            object_utils::assemble_chunked_file(recipe_hash, &mut writer)?;
+            std::io::Write::flush(&mut writer)
+                .map_err(|e| format!("Error while flushing a temp file for git export: {}", e))
+        };
+
+        if let Err(e) = assemble() {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(e);
+        }
+
+        let temp_str = temp_path.to_string_lossy().into_owned();
+        let git_hash = git(self.path, &["hash-object", "-w", "--", &temp_str])
+            .map(|h| h.trim().to_string());
+        let _ = std::fs::remove_file(&temp_path);
+        let git_hash = git_hash?;
+
+        self.blobs.insert(recipe_hash.to_string(), git_hash.clone());
 
         Ok(git_hash)
     }

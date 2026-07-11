@@ -120,6 +120,16 @@ pub fn parse(offset: usize, content: &[u8]) -> Result<ParsedObject, String> {
                 offset + cursor,
                 content
             ).map(ParsedObject::Tree),
+        ObjectType::Recipe =>
+            parser::object::recipe::recipe_parser::parse_recipe(
+                offset + cursor,
+                content
+            ).map(ParsedObject::Recipe),
+        ObjectType::Chunk =>
+            parser::object::chunk::chunk_parser::parse_chunk(
+                offset + cursor,
+                content
+            ).map(ParsedObject::Chunk),
     };
 
     parsed_object

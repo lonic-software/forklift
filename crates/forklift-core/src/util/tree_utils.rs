@@ -581,12 +581,16 @@ fn build_tree(path: &PathBuf,
 fn build_tree_item_from_file(entry: &std::fs::DirEntry,
                              name: String,
                              item_type: DirEntryType) -> Result<TreeItem, String> {
-    let blob = object_utils::get_blob_for_file(&name, &entry.path(), &item_type)?;
+    // Chunk-aware ingest: a giant becomes a recipe + chunks (its entry type upgraded to a
+    // `*Chunked` variant), a small file an ordinary blob. Store mode persists whatever it built.
+    let ingested = object_utils::ingest_file(&name, &entry.path(), item_type,
+                                             object_utils::IngestMode::Store)?;
 
-    let mut object = LooseObjectBuilder::build_blob(&blob);
-    object.store()?;
+    if let Some(mut object) = ingested.deferred {
+        object.store()?;
+    }
 
-    Ok(TreeItem::new(name, object.hash, item_type))
+    Ok(TreeItem::new(name, ingested.hash, ingested.item_type))
 }
 
 /// Create (and save) a tree metadata file.

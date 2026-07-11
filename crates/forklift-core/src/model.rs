@@ -4,6 +4,8 @@ pub mod parcel_action;
 pub mod object;
 pub mod diff;
 pub mod blob;
+pub mod recipe;
+pub mod chunk;
 pub mod tree_item;
 pub mod inventory;
 pub mod task;

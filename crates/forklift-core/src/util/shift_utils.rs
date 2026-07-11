@@ -233,7 +233,6 @@ pub fn apply_file_op(op: &FileOp) -> Result<(), String> {
 /// * `Ok(())`      - If the file was written.
 /// * `Err(String)` - If the blob could not be loaded or a file system operation failed.
 pub fn write_tracked_file(path: &str, hash: &str, item_type: DirEntryType) -> Result<(), String> {
-    let blob = object_utils::load_blob(hash)?;
     let fs_path = Path::new(path);
 
     if let Some(parent) = fs_path.parent() {
@@ -241,6 +240,16 @@ pub fn write_tracked_file(path: &str, hash: &str, item_type: DirEntryType) -> Re
             file_utils::create_folder_if_not_exists(parent)?;
         }
     }
+
+    // A chunked file's hash names a recipe, not a blob: stream its chunks to the target file in
+    // order, verifying `Blake3(assembled) == recipe.content_hash` during assembly (bounded to one
+    // chunk in memory at a time, never the whole file). Dispatched on the tree entry type with no
+    // extra object load to discover the path.
+    if item_type.is_chunked() {
+        return write_chunked_file(path, fs_path, hash, item_type);
+    }
+
+    let blob = object_utils::load_blob(hash)?;
 
     if item_type == DirEntryType::SymbolicLink {
         let target = String::from_utf8(blob.content)
@@ -267,14 +276,85 @@ pub fn write_tracked_file(path: &str, hash: &str, item_type: DirEntryType) -> Re
     std::fs::write(fs_path, &blob.content)
         .map_err(|e| format!("Error while writing \"{}\": {}", path, e))?;
 
+    set_file_mode(fs_path, path, item_type)?;
+
+    Ok(())
+}
+
+/// Materialize a chunked file by streaming its recipe's chunks to `fs_path` in order, verifying
+/// the assembled content hash as it goes. The file is created/truncated first (bounded memory:
+/// one chunk at a time), then the executable bit is set for an `ExecutableChunked` entry.
+///
+/// # Arguments
+/// * `path`        - The warehouse path (for error messages).
+/// * `fs_path`     - The filesystem path to write to.
+/// * `recipe_hash` - The recipe hash from the tree entry.
+/// * `item_type`   - The chunked entry type (`NormalChunked` or `ExecutableChunked`).
+///
+/// # Returns
+/// * `Ok(())`      - If the file was assembled and verified.
+/// * `Err(String)` - If a chunk is missing/corrupt, the assembled hash mismatches, or a write fails.
+fn write_chunked_file(path: &str,
+                      fs_path: &Path,
+                      recipe_hash: &str,
+                      item_type: DirEntryType) -> Result<(), String> {
+    // Assembly can fail its integrity check partway; assemble into a temp file and only then
+    // rename it into place (durable-before-destructive). The original at `fs_path` — an existing
+    // file or symlink — survives untouched until the temp is proven good: a failed materialization
+    // (a corrupt/missing chunk) never destroys the working copy or leaves a half-written file. The
+    // atomic rename replaces a regular file or a symlink in one step (it does not follow the
+    // symlink); replacing a directory is the shift command's deletes-before-writes concern, not
+    // this one.
+    let temp_path = fs_path.with_file_name(format!(
+        ".{}.forklift-assemble.tmp",
+        fs_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+    ));
+
+    let assemble = || -> Result<(), String> {
+        let file = std::fs::File::create(&temp_path)
+            .map_err(|e| format!("Error while creating \"{}\": {}", path, e))?;
+        let mut writer = std::io::BufWriter::new(file);
+
+        object_utils::assemble_chunked_file(recipe_hash, &mut writer)?;
+
+        std::io::Write::flush(&mut writer)
+            .map_err(|e| format!("Error while flushing \"{}\": {}", path, e))?;
+        Ok(())
+    };
+
+    if let Err(e) = assemble() {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(e);
+    }
+
+    set_file_mode(&temp_path, path, item_type)?;
+
+    std::fs::rename(&temp_path, fs_path)
+        .map_err(|e| format!("Error while finalizing \"{}\": {}", path, e))?;
+
+    Ok(())
+}
+
+/// Set a materialized file's mode: executable (`0o755`) for an executable (chunked or plain)
+/// entry, otherwise `0o644`. A no-op on non-Unix.
+fn set_file_mode(fs_path: &Path, path: &str, item_type: DirEntryType) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
 
-        let mode = if item_type == DirEntryType::Executable { 0o755 } else { 0o644 };
+        let is_executable = matches!(
+            item_type.on_disk_kind(),
+            DirEntryType::Executable
+        );
+        let mode = if is_executable { 0o755 } else { 0o644 };
 
         std::fs::set_permissions(fs_path, std::fs::Permissions::from_mode(mode))
             .map_err(|e| format!("Error while setting the permissions of \"{}\": {}", path, e))?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (fs_path, path, item_type);
     }
 
     Ok(())
@@ -352,7 +432,8 @@ fn build_inventory_for_tree_directory(tree: &TreeItem,
         inventory.add_item(inventory_utils::build_inventory_item_from_stat(
             &file_path,
             name,
-            item.hash.clone()
+            item.hash.clone(),
+            item.item_type,
         )?);
     }
 

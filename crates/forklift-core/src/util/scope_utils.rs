@@ -47,6 +47,13 @@ pub const CODE_NON_ORIGIN_LIFT: &str = "non_origin_lift";
 pub const CODE_NARROW_UNCLEAN: &str = "narrow_unclean";
 pub const CODE_SCOPE_PRUNE_BLOCKED: &str = "scope_prune_blocked";
 
+/// Not a scope/sparse-workspace code — large-file chunk transport (§9.4b) has no home of its
+/// own for a `forklift-core` → CLI classified refusal, and this module's sentinel-framing
+/// ([`refusal`]/[`decode_refusal`]) is the only such facility in the codebase (the same
+/// piggy-backing precedent `CODE_NON_ORIGIN_LIFT` already set). Reused here rather than
+/// duplicated.
+pub const CODE_CHUNKED_TRANSPORT_UNSUPPORTED: &str = "chunked_transport_unsupported";
+
 /// The framing that marks a scope refusal string so the CLI can classify it without
 /// parsing prose. `\u{1f}` (ASCII Unit Separator) never appears in a message or a
 /// warehouse path, so the framing is unambiguous; a plain error the CLI does not recognize
@@ -516,6 +523,32 @@ pub fn non_origin_lift_refusal(origin: &str, other: &str) -> String {
     )
 }
 
+/// A ready-made `chunked_transport_unsupported` refusal for sending a large file stored in
+/// chunks to a remote or into a bundle. Chunk transport (the wire-level upload/download of the
+/// chunk objects themselves) has not shipped yet: a bundle or a lift can walk the tree closure
+/// and carry a chunked file's *recipe* just like any other small object, but nothing today
+/// negotiates or transfers the chunks a recipe references, so shipping one would silently
+/// produce a signed ref (or a bundle) over content that can never be materialized elsewhere.
+/// Refusing up front — client-side, before anything is sent — is the honest failure. This is a
+/// transport gap, not a format one; the check is removed the moment chunk transport ships.
+///
+/// # Arguments
+/// * `path` - The warehouse path of the chunked file that blocked the operation.
+pub fn chunked_transport_refusal(path: &str) -> String {
+    let next_step = "Keep this file under the chunking threshold, or wait for chunked \
+        large-file transport support.".to_string();
+
+    refusal(
+        CODE_CHUNKED_TRANSPORT_UNSUPPORTED,
+        format!(
+            "\"{}\" is a large file stored in chunks, and sending chunked files to a remote \
+            or into a bundle is not supported yet. {}",
+            path, next_step
+        ),
+        next_step,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -638,6 +671,17 @@ mod tests {
         assert!(message.contains("http://origin.example"), "the origin is named: {}", message);
         assert!(message.contains("http://other.example"), "the target is named: {}", message);
         assert!(next_step.contains("http://origin.example"), "the recovery names the origin: {}", next_step);
+    }
+
+    #[test]
+    fn a_chunked_transport_refusal_carries_the_stable_code_and_names_the_path() {
+        let refusal = chunked_transport_refusal("big.bin");
+        let (code, message, next_step) = decode_refusal(&refusal).unwrap();
+
+        assert_eq!(code, CODE_CHUNKED_TRANSPORT_UNSUPPORTED);
+        assert!(message.contains("big.bin"), "the path is named: {}", message);
+        assert!(message.contains("chunks"), "the message explains why: {}", message);
+        assert!(!next_step.is_empty());
     }
 
     #[test]
