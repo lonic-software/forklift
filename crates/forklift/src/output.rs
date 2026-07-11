@@ -169,7 +169,7 @@ pub enum ErrorCode {
     /// A path argument is outside the bay's materialization scope (§7.6).
     OutOfScope,
 
-    /// A merge in a scoped bay hit an out-of-scope entry that changed on both sides (§7.6):
+    /// A merge in a scoped bay hit an out-of-scope entry that changed on both sides:
     /// there is no content to reconcile, so it refuses rather than guess.
     OutOfScopeConflict,
 

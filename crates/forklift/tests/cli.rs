@@ -3820,7 +3820,7 @@ fn a_mutating_command_runs_maintenance_when_due() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Task-scoped sparse workspaces (§7.6): scoped bays on a full object store.
+// Task-scoped sparse workspaces: scoped bays on a full object store.
 //
 // Materialization-only sparseness — the store holds everything; a scoped bay materializes and
 // operates on only its subtree(s). The load-bearing invariant is that a scoped stack produces a
@@ -4061,7 +4061,8 @@ fn a_scoped_bay_refuses_a_spine_path_type_flip() {
 }
 
 // -------------------------------------------------------------------------------------------
-// §7.6 — adversarial review follow-ups for scoped bays.
+// Scoped bays: hostile inputs at the scope boundary (a spine path flipping type, an
+// out-of-scope entry a merge can't reconcile, and similar edge cases).
 // -------------------------------------------------------------------------------------------
 
 #[test]
@@ -4210,13 +4211,14 @@ fn a_scoped_bay_refuses_import_git() {
 }
 
 // -------------------------------------------------------------------------------------------
-// §7.6 stage 2 — hash-only three-way merge resolution in a scoped bay.
+// Hash-only three-way merge resolution in a scoped bay.
 //
 // A scoped merge resolves out-of-scope siblings (subtrees, files, symlinks) by hash alone: a
 // one-sided change is adopted from theirs, a two-sided one refuses. The committed merge tree is
 // byte-identical to a full workspace merging the same two heads — and, to prove the resolution
-// never depends on out-of-scope content being present (so it still holds once stage 4 makes
-// stores sparse), the out-of-scope objects are deleted before the scoped merge runs.
+// never depends on out-of-scope content being present (so it will still hold once fetching
+// itself can be scoped, not just materialization), the out-of-scope objects are deleted before
+// the scoped merge runs.
 // -------------------------------------------------------------------------------------------
 
 /// The object-store path of a loose object (matches the on-disk sharding the store uses).
@@ -4386,7 +4388,7 @@ fn a_scoped_merge_resolves_a_one_sided_out_of_scope_symlink_by_hash() {
 }
 
 // -------------------------------------------------------------------------------------------
-// §7.6 stage 2 — review follow-up: a one-sided out-of-scope directory↔file type flip.
+// A one-sided out-of-scope directory↔file type flip.
 //
 // The merge walk classifies a changed name in two separate loops (files, then subtrees) at
 // each directory level. A type flip makes exactly one of those loops see theirs' real entry (a
@@ -4425,12 +4427,12 @@ fn a_scoped_merge_resolves_an_out_of_scope_directory_to_file_flip_by_hash() {
     // NOTE on verification strategy: this direction cannot be checked against an actual
     // full-bay `consolidate` run — doing so hits a *separate, pre-existing* bug in
     // `ensure_no_untracked_collisions` (confirmed reproducible on a plain, unscoped warehouse
-    // with none of §7.6's code involved: `inventory_lookup` only recognizes a tracked *file*
-    // entry, so a one-sided merge that replaces a tracked *directory* with a file is misread as
-    // colliding with an "untracked" file and refused). That bug is out of this review's scope
-    // and is reported separately, not fixed here. Verification instead checks the scoped merge's
-    // own committed tree directly: the out-of-scope path must carry theirs' exact post-flip
-    // hash and type — never omitted (the BLOCKER) and never the stale pre-flip directory.
+    // with none of the scoped-bay merge code involved: `inventory_lookup` only recognizes a
+    // tracked *file* entry, so a one-sided merge that replaces a tracked *directory* with a file
+    // is misread as colliding with an "untracked" file and refused). That bug is unrelated to
+    // scoped bays and is reported separately, not fixed here. Verification instead checks the
+    // scoped merge's own committed tree directly: the out-of-scope path must carry theirs' exact
+    // post-flip hash and type — never omitted and never the stale pre-flip directory.
     let warehouse = TestWarehouse::new("scoped-merge-dir-to-file");
     warehouse.write_file("src/api/a.txt", "api a v1\n");
     warehouse.write_file("src/web/w.txt", "web v1\n"); // src/web starts as a DIRECTORY
@@ -4519,7 +4521,8 @@ fn a_scoped_merge_resolves_an_out_of_scope_file_to_directory_flip_by_hash() {
 }
 
 // -------------------------------------------------------------------------------------------
-// §7.6 stage 2 — review follow-up: the skeleton-durability invariant.
+// The out-of-scope skeleton's durability invariant: a crash between writing it and the
+// consolidation state must never be silently read back as "no out-of-scope resolutions".
 // -------------------------------------------------------------------------------------------
 
 #[test]

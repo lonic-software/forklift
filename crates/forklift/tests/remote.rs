@@ -445,7 +445,7 @@ fn diverged_pallets_are_refused_not_merged() {
 
 #[test]
 fn a_scoped_merge_lifts_without_reading_the_out_of_scope_object() {
-    // The §7.6 review construction, end to end: a scoped bay consolidates a diverged remote "work"
+    // A scoped bay's merge-then-lift, end to end: a scoped bay consolidates a diverged remote "work"
     // head that changed an out-of-scope subtree (adopting it by hash into the merge), then lifts.
     // The lift's negotiation walk must prune that subtree against the merge's second parent — the
     // remote head it is lifting against — and never load it. To prove that, the out-of-scope

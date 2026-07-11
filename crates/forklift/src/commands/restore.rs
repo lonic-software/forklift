@@ -37,7 +37,7 @@ pub fn handle_command(staged: bool, target: &str) -> Result<(), String> {
 
     // An out-of-scope path is sealed by hash in a scoped bay and was never materialized;
     // restoring it (worktree or staged) would have nothing to restore from/to and, for
-    // `--staged`, would smuggle out-of-scope content into the inventory (§7.6). Refuse
+    // `--staged`, would smuggle out-of-scope content into the inventory. Refuse
     // cleanly rather than let the walk below silently do the wrong thing.
     crate::commands::scope::ensure_path_in_scope(path.as_key())?;
 
@@ -225,7 +225,7 @@ fn restore_staged(path: &WarehousePath) -> Result<(), String> {
         if let Some(HeadEntry::Tree(tree)) = &head_entry {
             // In a scoped bay, only in-scope directories were ever materialized — the walk
             // must not resurrect out-of-scope shards for content that was never actually
-            // written to this bay's working directory (§7.6).
+            // written to this bay's working directory.
             let scope = scope_utils::current_scope()?;
 
             build_stale_shards(tree, path.as_key(), &mut shards, &scope)?;
@@ -278,7 +278,7 @@ fn restore_staged(path: &WarehousePath) -> Result<(), String> {
 
 /// Build stale-stat inventory shards for a head subtree (see `build_stale_inventory_item`).
 ///
-/// Scope-aware (§7.6): only in-scope content is ever written to a scoped bay's working
+/// Scope-aware: only in-scope content is ever written to a scoped bay's working
 /// directory, so restoring "to head" must not resurrect shards for out-of-scope files or
 /// subtrees — those are sealed by hash and were never materialized here. A head file where
 /// the scope expects a directory (a spine ancestor, or an in-scope prefix itself) is the

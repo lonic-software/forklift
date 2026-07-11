@@ -30,7 +30,7 @@ use crate::output::{self, CommandOutput};
 /// * `Ok(())`      - If the consolidation completed (or was cleanly a no-op).
 /// * `Err(String)` - If there was an error while handling the command.
 pub async fn handle_command(target: &str) -> Result<(), String> {
-    // A merge in a scoped bay resolves out-of-scope siblings by hash (§7.6): a one-sided change
+    // A merge in a scoped bay resolves out-of-scope siblings by hash: a one-sided change
     // is adopted from theirs into the merge parcel's tree without materializing it; a genuine
     // out-of-scope conflict refuses (`out_of_scope_conflict`). In-scope content merges as usual.
     pallet_utils::validate_pallet_name(target)?;
@@ -285,7 +285,7 @@ pub(crate) async fn merge_head_into_current(current: &str,
         apply_merge_action(action, &mut conflict_paths)?;
     }
 
-    // Record the out-of-scope skeleton (§7.6) BEFORE the consolidation state, and unconditionally
+    // Record the out-of-scope skeleton BEFORE the consolidation state, and unconditionally
     // — even when it is empty (a full-bay merge, or one that resolved nothing out of scope): the
     // completing `stack` (`stack_utils::stack_parcel`) requires the skeleton file to exist
     // whenever a consolidation is in progress, so this ordering guarantees a crash or a failed
@@ -508,7 +508,7 @@ pub(crate) fn apply_merge_action(action: &MergeAction, conflict_paths: &mut Vec<
         }
 
         // An out-of-scope entry resolved by hash never touches the working directory or the
-        // inventory (§7.6): it is carried in the out-of-scope skeleton and spliced into the merge
+        // inventory: it is carried in the out-of-scope skeleton and spliced into the merge
         // parcel's tree by the completing stack's overlay. Nothing to apply here.
         MergeAction::ResolveOutOfScope { .. } => Ok(()),
     }

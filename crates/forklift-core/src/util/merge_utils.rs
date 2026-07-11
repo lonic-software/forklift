@@ -106,13 +106,13 @@ pub fn clear_consolidation_state() -> Result<(), String> {
 /// The name of the out-of-scope skeleton file (beside the consolidation-state file, bay-local).
 const FILE_NAME_SKELETON: &str = "consolidation-skeleton";
 
-/// The out-of-scope resolution skeleton a scoped-bay merge produces (design §3.3): every
-/// out-of-scope subtree/file/symlink adopted from *theirs* by hash, keyed by warehouse path.
-/// It carries no content — only the resolved `(hash, type)` (or a deletion) — and is consumed
-/// by the *next* `stack`, whose overlay splices these entries into the merge parcel's root tree
-/// so the committed tree is byte-identical to a full workspace merging the same two heads
-/// (§3.2). A one-sided out-of-scope change never touches the working directory or the inventory;
-/// a two-sided one refuses (`out_of_scope_conflict`) before any skeleton or parcel exists.
+/// The out-of-scope resolution skeleton a scoped-bay merge produces: every out-of-scope
+/// subtree/file/symlink adopted from *theirs* by hash, keyed by warehouse path. It carries
+/// no content — only the resolved `(hash, type)` (or a deletion) — and is consumed by the
+/// *next* `stack`, whose overlay splices these entries into the merge parcel's root tree so
+/// the committed tree is byte-identical to a full workspace merging the same two heads. A
+/// one-sided out-of-scope change never touches the working directory or the inventory; a
+/// two-sided one refuses (`out_of_scope_conflict`) before any skeleton or parcel exists.
 ///
 /// Entries are keyed on the full warehouse path: `Some((hash, type))` sets the entry (a subtree,
 /// file or symlink adopted from theirs), `None` deletes it (theirs removed it). A [`BTreeMap`]
@@ -644,11 +644,11 @@ pub enum MergeAction {
     },
 
     /// An out-of-scope entry (a subtree, file or symlink this bay never materialized) that
-    /// theirs changed one-sided, resolved **by hash alone** — no content is loaded (design
-    /// §3.3). It never touches the working directory or the inventory; it is recorded in the
-    /// out-of-scope skeleton and spliced into the merge parcel's root tree by the next stack's
-    /// overlay (§3.2). `resolution` is the adopted `(hash, type)`, or `None` when theirs
-    /// deleted the entry. Only ever produced in a scoped (sparse) bay.
+    /// theirs changed one-sided, resolved **by hash alone** — no content is loaded. It never
+    /// touches the working directory or the inventory; it is recorded in the out-of-scope
+    /// skeleton and spliced into the merge parcel's root tree by the next stack's overlay.
+    /// `resolution` is the adopted `(hash, type)`, or `None` when theirs deleted the entry.
+    /// Only ever produced in a scoped (sparse) bay.
     ResolveOutOfScope {
         path: String,
         resolution: Option<(String, crate::enums::dir_entry_type::DirEntryType)>,
@@ -691,7 +691,7 @@ struct MergeJob {
 /// across the cores; the result is identical to a single-threaded merge, in the same order.
 ///
 /// In a scoped (sparse) bay, out-of-scope entries (subtrees, files and symlinks the bay never
-/// materialized) are resolved by hash alone (design §3.3): a one-sided change is adopted into a
+/// materialized) are resolved by hash alone: a one-sided change is adopted into a
 /// [`MergeAction::ResolveOutOfScope`] without loading its content; a two-sided out-of-scope
 /// conflict refuses with `out_of_scope_conflict` before any object is dereferenced. A full
 /// (unscoped) `scope` classifies everything `InScope`, so the walk is exactly today's behavior.
@@ -897,7 +897,7 @@ fn merge_directory(base: Option<&crate::model::tree_item::TreeItem>,
 
         // A file where the scope needs a directory (an in-scope prefix itself, or a spine
         // ancestor of one) is a directory→file flip the sparse scope cannot reason about —
-        // refuse rather than guess, before touching content (§3.1). Never fires in a full bay
+        // refuse rather than guess, before touching content. Never fires in a full bay
         // or a valid scoped bay (a spine path is always a directory there).
         if scope.requires_directory(&path) {
             return Err(scope_utils::type_changed_refusal(&path));
@@ -913,7 +913,7 @@ fn merge_directory(base: Option<&crate::model::tree_item::TreeItem>,
         // Our side is unchanged since the base: take their side.
         if o == b {
             match (out_of_scope, t) {
-                // Out of scope: adopt theirs by hash into the skeleton (§3.3) — no blob load,
+                // Out of scope: adopt theirs by hash into the skeleton — no blob load,
                 // never the working directory. `None` = theirs deleted the entry.
                 (true, Some((hash, item_type))) =>
                     pending.push(PendingAction::Ready(MergeAction::ResolveOutOfScope {
@@ -941,7 +941,7 @@ fn merge_directory(base: Option<&crate::model::tree_item::TreeItem>,
 
         // Both sides changed the file (relative to the base) in different ways. Out of scope,
         // that is a genuine conflict the bay has no content to reconcile — refuse before any
-        // blob load (§3.3), so no absent out-of-scope object is ever dereferenced.
+        // blob load, so no absent out-of-scope object is ever dereferenced.
         if out_of_scope {
             return Err(scope_utils::out_of_scope_conflict_refusal(&path));
         }
@@ -1031,7 +1031,7 @@ fn merge_directory(base: Option<&crate::model::tree_item::TreeItem>,
 
         let child_key = if key.is_empty() { name.clone() } else { format!("{}/{}", key, name) };
 
-        // Out-of-scope subtree: resolve by hash without loading it (§3.3). A one-sided change is
+        // Out-of-scope subtree: resolve by hash without loading it. A one-sided change is
         // adopted from theirs into the skeleton; a two-sided one is a genuine conflict. A subtree
         // is a directory, so no `scope_path_type_changed` check applies here.
         if scope.classify(&child_key) == ScopeClass::OutOfScope {

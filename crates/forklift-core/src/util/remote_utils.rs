@@ -869,7 +869,7 @@ async fn lift_pallet_inner(client: &RemoteClient,
     // its parents' trees — a subtree identical to *any* parent's at the same path is
     // skipped whole, the same skip the merge walk and the pallet diff use. A one-line
     // change on a 100k-file warehouse thus negotiates the changed path, not the full
-    // closure (DESIGN.html §4.5, data-plane item 1).
+    // closure.
     let mut candidates: Vec<String> = new_parcels.clone();
     let mut seen_trees: HashSet<String> = HashSet::new();
     let mut seen_blobs: HashSet<String> = HashSet::new();
@@ -879,7 +879,7 @@ async fn lift_pallet_inner(client: &RemoteClient,
     for parcel_hash in new_parcels.iter().rev() {
         let parcel = object_utils::load_parcel(parcel_hash)?;
 
-        // Every parent's tree, not just the first (DESIGN.html §7.6/§3.4). A merge parcel that
+        // Every parent's tree, not just the first. A merge parcel that
         // adopted an out-of-scope sibling by hash from its *second* parent is explained by that
         // parent — which the remote already has, or which is uploaded in this same session — so
         // treating a subtree as base-explained when it matches ANY parent stops the walk from
@@ -931,7 +931,7 @@ async fn lift_pallet_inner(client: &RemoteClient,
 /// changed subtree is descended with each parent's matching child as a base. An empty base set
 /// collects the full closure (a root parcel has no parents).
 ///
-/// The multi-parent base set (DESIGN.html §7.6/§3.4) is a straight generalization of the
+/// The multi-parent base set is a straight generalization of the
 /// single-parent walk: a merge parcel's subtree adopted by hash from its second parent matches
 /// that parent here and is pruned, so the walk never loads an object a sparse workspace holds
 /// only by seal. It is scope-agnostic and correct in full stores too — an object pruned against a
@@ -1748,7 +1748,7 @@ mod tests {
         object.hash
     }
 
-    /// The lift closure walk (§7.6/§3.4) prunes a subtree against **every** parent, not just the
+    /// The lift closure walk prunes a subtree against **every** parent, not just the
     /// first — so a merge parcel that adopted an out-of-scope sibling by hash from its *second*
     /// parent treats that subtree as base-explained and never loads it. This is what makes a
     /// sparse-workspace merge liftable; it is also a strictly-not-larger candidate set in a full

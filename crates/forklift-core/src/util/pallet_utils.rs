@@ -10,7 +10,7 @@ const FOLDER_NAME_PALLETS_ROOT: &str = "pallets";
 /// The folder inside the forklift root that holds the *meta* pallet ref files: real
 /// pallets (they hash, sign and transport like any other) that carry tracked metadata
 /// rather than working-directory content — the office (users + keys) today, post-metadata
-/// and provenance (§7.2) later. Kept in their own namespace so no user pallet
+/// and provenance later. Kept in their own namespace so no user pallet
 /// name is ever reserved (DESIGN.html §3.3). Mirrors git's `refs/heads/*` vs `refs/notes/*`.
 const FOLDER_NAME_META_ROOT: &str = "meta";
 

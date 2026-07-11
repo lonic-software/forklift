@@ -113,7 +113,7 @@ pub async fn stack_parcel(description: Option<String>) -> Result<(String, String
             None => None,
         };
 
-        // A completing merge splices its out-of-scope skeleton (§7.6) into the merge parcel's
+        // A completing merge splices its out-of-scope skeleton into the merge parcel's
         // tree: the out-of-scope siblings theirs changed one-sided, adopted by hash. A plain
         // stack has no skeleton, so the overlay copies every out-of-scope sibling verbatim.
         // `read_required` (not `read`) is deliberate here: a consolidation in progress with no

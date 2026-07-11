@@ -1,4 +1,4 @@
-//! Task-scoped sparse workspaces (§7.6) — the local scope record and the
+//! Task-scoped sparse workspaces (DESIGN.html §7.6) — the local scope record and the
 //! three-valued classifier every scope-aware walk branches on. Materialization can be
 //! scoped today; fetching itself cannot yet be, so the fetch scope is always full.
 //!
@@ -362,7 +362,7 @@ pub fn out_of_scope_refusal(path: &str) -> String {
 
 /// A ready-made `out_of_scope_conflict` refusal for a merge where an out-of-scope entry (a
 /// subtree, file or symlink this bay never materialized) changed on *both* sides against the
-/// merge base (design §3.3). A one-sided out-of-scope change is resolved by hash without the
+/// merge base. A one-sided out-of-scope change is resolved by hash without the
 /// content; a genuine two-sided conflict cannot be — the bay has no content to reconcile — so
 /// it refuses rather than guess.
 pub fn out_of_scope_conflict_refusal(path: &str) -> String {

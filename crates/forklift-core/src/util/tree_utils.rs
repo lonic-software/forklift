@@ -227,7 +227,7 @@ fn build_tree_for_inventory_key(context: Arc<TreeBuilderContext>,
 /// (`:173-178`), bottom-up, so a scoped stack's tree hash is **byte-identical** to what a full
 /// workspace stacking the same content would produce — the stage-1 invariant.
 ///
-/// When the stack completes a merge, `overrides` carries the out-of-scope skeleton (§3.3):
+/// When the stack completes a merge, `overrides` carries the out-of-scope skeleton:
 /// out-of-scope siblings theirs changed one-sided, adopted by hash. The overlay applies them on
 /// top of the head's verbatim siblings — `Some((hash, type))` sets an entry (a subtree, file or
 /// symlink adopted from theirs), `None` deletes it, and an override for a name the head lacks
@@ -308,9 +308,9 @@ fn splice_spine_level(head: Option<&TreeItem>,
         .unwrap_or_default();
 
     // A spine level's own files are all out-of-scope (an in-scope path is a directory prefix),
-    // so they are copied verbatim — or resolved by the merge skeleton (§3.3) where it changed
+    // so they are copied verbatim — or resolved by the merge skeleton where it changed
     // them — unless the path is where an in-scope directory is expected, i.e. the entry flipped
-    // from a directory to a file at this revision (§3.1 type-change).
+    // from a directory to a file at this revision (a spine-path type change).
     for (name, item) in &head_files {
         let child_key = join_key(key, name);
 
