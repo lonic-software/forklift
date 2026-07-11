@@ -60,6 +60,7 @@ is reserved for argument/usage errors (clap); `0` is success.
 | `scope_path_type_changed` | 8    | A scoped bay's spine path flipped dir↔file; scope no longer valid |
 | `sparse_workspace`        | 9    | A whole-tree verb is not supported in a scoped (sparse) bay yet   |
 | `out_of_scope_conflict`   | 10   | A scoped bay merge hit an out-of-scope entry changed on both sides |
+| `non_origin_lift`         | 11   | A sparse workspace tried to lift to a remote other than its origin |
 
 The codes and exit numbers are a contract: they get added to, never repurposed.
 

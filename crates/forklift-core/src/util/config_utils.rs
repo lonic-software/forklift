@@ -42,6 +42,12 @@ pub const KEY_REMOTE_URL: &str = "remote.url";
 /// The bearer token for remotes that require one.
 pub const KEY_REMOTE_TOKEN: &str = "remote.token";
 
+/// The remote a sparse (scoped) franchise fetched against — its origin. A sparse warehouse
+/// only proved its out-of-scope closure present on this remote, so `lift` refuses to publish
+/// to a different one (it would fail late at that remote's closure check). Unset for a full
+/// franchise, which has the whole closure and can lift anywhere.
+pub const KEY_REMOTE_ORIGIN: &str = "remote.origin";
+
 /// Whether background object-store maintenance (auto-compaction) runs after mutating
 /// commands. Anything falsey (`false`/`0`/`off`/`no`) turns it off; default is on.
 pub const KEY_MAINTENANCE_AUTO: &str = "maintenance.auto";
@@ -54,9 +60,9 @@ pub const KEY_MAINTENANCE_PACKS: &str = "maintenance.packs";
 
 /// The configuration keys Forklift understands, in `section.key` form.
 /// Setting a key outside this list is rejected (it would silently do nothing).
-pub const KNOWN_KEYS: [&str; 8] = [
+pub const KNOWN_KEYS: [&str; 9] = [
     KEY_OPERATOR_NAME, KEY_OPERATOR_IDENTIFIER, KEY_OPERATOR_PROFILE, KEY_REMOTE_URL, KEY_REMOTE_TOKEN,
-    KEY_MAINTENANCE_AUTO, KEY_MAINTENANCE_LOOSE, KEY_MAINTENANCE_PACKS,
+    KEY_REMOTE_ORIGIN, KEY_MAINTENANCE_AUTO, KEY_MAINTENANCE_LOOSE, KEY_MAINTENANCE_PACKS,
 ];
 
 /// The global-config section that holds the named profiles (`[profile.<name>]`).

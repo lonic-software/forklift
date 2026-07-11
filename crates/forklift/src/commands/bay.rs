@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use serde::Serialize;
 use forklift_core::globals;
 use forklift_core::util::path_utils::WarehousePath;
-use forklift_core::util::scope_utils::MaterializationScope;
+use forklift_core::util::scope_utils::{MaterializationScope, ScopeClass};
 use forklift_core::util::{
     bay_utils, file_utils, object_utils, pallet_utils, scope_utils, shift_utils, warehouse_utils,
 };
@@ -30,9 +30,10 @@ pub fn handle_command(action: Option<BayAction>) -> Result<(), String> {
 /// inventory, current pallet and lock.
 ///
 /// When `scope_paths` are given, the bay is **scoped (sparse, §7.6)**: it materializes and
-/// operates on only those subtrees. The object store still holds everything (only
-/// materialization is scoped; fetching itself cannot yet be); the scope is recorded bay-locally and drives the
-/// materialize, and every later stack copies the out-of-scope siblings forward by hash.
+/// operates on only those subtrees. On a full warehouse the object store still holds everything
+/// (only materialization is scoped); on a sparse one the bay scope must stay within the
+/// warehouse fetch scope. The scope is recorded bay-locally and drives the materialize, and
+/// every later stack copies the out-of-scope siblings forward by hash.
 fn add(name: &str, path: Option<String>, scope_paths: Vec<String>) -> Result<(), String> {
     pallet_utils::validate_pallet_name(name)?;
 
@@ -113,11 +114,21 @@ fn add(name: &str, path: Option<String>, scope_paths: Vec<String>) -> Result<(),
 
 /// Normalize the `--scope` prefixes into a [`MaterializationScope`] and verify each names a
 /// directory (subtree) in the head tree. An empty list yields the full (unscoped) scope.
+///
+/// On a sparse warehouse, every requested prefix is checked against the warehouse fetch scope
+/// **before** it is ever used to load a tree object: a prefix outside the fetch scope may name
+/// an object that was never downloaded (a spine ancestor like `src` when only `src/api` was
+/// fetched, or a sealed sibling like `src/web` itself), and `is_directory_in_tree` below would
+/// otherwise hard-error on that absent object instead of refusing cleanly. Checking here, before
+/// `add` creates any bay state, also keeps a rejected `--scope` from leaving a half-created bay
+/// behind — `scope_utils::set_bay_scope` re-checks the same ⊆ invariant later, but only after
+/// the pallet ref, directory and redirect already exist.
 fn resolve_scope(scope_paths: &[String], head_tree_hash: &str) -> Result<MaterializationScope, String> {
     if scope_paths.is_empty() {
         return Ok(MaterializationScope::full());
     }
 
+    let fetch_scope = scope_utils::read_fetch_scope()?;
     let mut keys: Vec<String> = Vec::new();
 
     for raw in scope_paths {
@@ -130,14 +141,24 @@ fn resolve_scope(scope_paths: &[String], head_tree_hash: &str) -> Result<Materia
             );
         }
 
-        if !is_directory_in_tree(head_tree_hash, path.as_key())? {
+        let key = path.as_key().to_string();
+
+        if !fetch_scope.is_full() && fetch_scope.classify(&key) != ScopeClass::InScope {
+            return Err(format!(
+                "\"{}\" is outside the warehouse's fetch scope ({}), so it cannot be a bay \
+                scope. Fetch it first with \"expand {}\".",
+                raw, fetch_scope.prefixes().join(", "), raw
+            ));
+        }
+
+        if !is_directory_in_tree(head_tree_hash, &key)? {
             return Err(format!(
                 "\"{}\" is not a directory in the current head, so it cannot be a bay scope.",
                 raw
             ));
         }
 
-        keys.push(path.as_key().to_string());
+        keys.push(key);
     }
 
     Ok(MaterializationScope::from_prefixes(keys))

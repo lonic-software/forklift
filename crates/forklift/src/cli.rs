@@ -263,7 +263,9 @@ pub enum Command {
         long_about = "Open a local franchise of a remote warehouse: prepare a fresh warehouse in \
                       the target directory, remember the remote, adopt its trust anchor, download \
                       the history (using the remote's bundle when it has one) and materialize the \
-                      chosen pallet in the working directory."
+                      chosen pallet in the working directory. With --only, franchise sparsely: \
+                      fetch the full signed history but only the named subtree(s) of content, \
+                      leaving the rest sealed by hash."
     )]
     Franchise {
         /// The URL of the remote warehouse (e.g. http://forklift.example.com:9418)
@@ -279,6 +281,21 @@ pub enum Command {
         /// The bearer token, when the remote requires one (remembered as "remote.token")
         #[arg(short, long)]
         token: Option<String>,
+
+        /// Franchise sparsely: fetch only the named subtree path(s) of content. Repeatable.
+        #[arg(
+            long = "only",
+            value_name = "PATH",
+            long_help = "Franchise sparsely: fetch the whole signed history — every parcel, \
+                         signature and the tree spine — but only the content under the named \
+                         subtree path(s). Out-of-scope subtrees and blobs are never downloaded; \
+                         they stay pinned by the exact hash a signed parcel already commits, so \
+                         nothing can be forged, it is simply not fetched. The working tree \
+                         materializes only the in-scope subtree(s). The remote's whole-store \
+                         bundle is skipped (it would defeat the point). Repeatable to fetch \
+                         several subtrees. Widen later with \"expand\"."
+        )]
+        only: Vec<String>,
     },
 
     /// Reviewable merge proposals (pull requests) on the @haul meta pallet
@@ -574,12 +591,41 @@ pub enum Command {
         summary: bool,
     },
 
+    /// Widen a sparse warehouse's fetch scope and download the newly in-scope subtree(s)
+    #[command(
+        long_about = "Widen a sparse warehouse's fetch scope: add subtree path(s) to what the \
+                      store fetches, then download their content across the whole history from the \
+                      remote. Cheap and incremental — only the newly in-scope objects are fetched; \
+                      what is already present is skipped. After expanding, a bay can be scoped to \
+                      the new path (\"bay add --scope\"). A full (non-sparse) warehouse already \
+                      holds everything, so there is nothing to expand."
+    )]
+    Expand {
+        /// The subtree path(s) to add to the fetch scope. Repeatable.
+        #[arg(value_name = "PATH", required = true)]
+        paths: Vec<String>,
+    },
+
+    /// Narrow this checkout's materialization scope and de-materialize the dropped subtree(s)
+    #[command(
+        long_about = "Narrow this checkout's materialization scope: drop subtree path(s) from what \
+                      this bay (or the main tree) materializes, and remove the now out-of-scope \
+                      files from the working directory. This frees nothing in the shared object \
+                      store — the dropped content is still ordinary reachable history, not garbage \
+                      — it only shrinks what this checkout shows. A checkout must keep at least one \
+                      in-scope path; to stop scoping entirely, open a fresh full checkout."
+    )]
+    Narrow {
+        /// The in-scope subtree path(s) to drop. Repeatable.
+        #[arg(value_name = "PATH", required = true)]
+        paths: Vec<String>,
+    },
+
     /// Show this bay's sparse materialization scope, and the warehouse fetch scope
     #[command(
         long_about = "Show the sparse-workspace scope: this bay's materialization scope \
                       (the subtree path(s) it checks out, stages and stacks) and the warehouse's \
-                      fetch scope (what the store has fetched at all — currently always the full \
-                      tree, since fetching itself cannot yet be scoped). An \
+                      fetch scope (what the store has fetched at all). An \
                       unscoped bay (or the main tree) reports a full scope: the whole tree. Scope \
                       is local to the checkout and never tracked. Read-only."
     )]
@@ -699,13 +745,13 @@ pub enum BayAction {
             long = "scope",
             value_name = "PATH",
             long_help = "Open a scoped (sparse) bay: materialize and operate on only the \
-                         given subtree path(s) of the working tree, not the whole tree. The object \
-                         store still holds everything (only materialization is scoped; fetching \
-                         itself cannot yet be scoped); \
-                         the bay just checks out, stages and stacks its in-scope subtree(s), copying \
-                         every out-of-scope sibling forward by the hash the signed head already \
-                         commits. Repeatable to scope several subtrees. Scope is local to this bay \
-                         and never tracked."
+                         given subtree path(s) of the working tree, not the whole tree. On a full \
+                         warehouse the object store still holds everything (only materialization is \
+                         scoped); the bay just checks out, stages and stacks its in-scope \
+                         subtree(s), copying every out-of-scope sibling forward by the hash the \
+                         signed head already commits. A bay's scope must be within what the \
+                         warehouse fetched (see \"franchise --only\" and \"expand\"). Repeatable to \
+                         scope several subtrees. Scope is local to this bay and never tracked."
         )]
         scope: Vec<String>,
     },
@@ -1219,6 +1265,7 @@ impl Command {
                 | Command::Consolidate { .. }
                 | Command::Deliver { .. }
                 | Command::Diff { .. }
+                | Command::Expand { .. }
                 | Command::ExportGit { .. }
                 | Command::History { .. }
                 | Command::ImportGit { .. }
@@ -1227,6 +1274,7 @@ impl Command {
                 | Command::Lower
                 | Command::Haul { .. }
                 | Command::Manifest { .. }
+                | Command::Narrow { .. }
                 | Command::Office { .. }
                 | Command::Palletize { .. }
                 | Command::Park { .. }
@@ -1257,11 +1305,13 @@ impl Command {
                 | Command::Compact { .. }
                 | Command::Consolidate { .. }
                 | Command::Deliver { .. }
+                | Command::Expand { .. }
                 | Command::ImportGit { .. }
                 | Command::Load { .. }
                 | Command::Lower
                 | Command::Haul { .. }
                 | Command::Manifest { .. }
+                | Command::Narrow { .. }
                 | Command::Office { .. }
                 | Command::Palletize { .. }
                 | Command::Park { .. }

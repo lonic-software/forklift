@@ -264,6 +264,26 @@ fn build_args(name: &str, arguments: &Value) -> Result<Vec<String>, String> {
         }
         "conflicts" => args.push("conflicts".to_string()),
         "scope" => args.push("scope".to_string()),
+        "expand" => {
+            args.push("expand".to_string());
+            let paths = arguments.get("paths").and_then(Value::as_array)
+                .ok_or("the \"paths\" argument is required")?;
+            for path in paths {
+                if let Some(path) = path.as_str() {
+                    args.push(path.to_string());
+                }
+            }
+        }
+        "narrow" => {
+            args.push("narrow".to_string());
+            let paths = arguments.get("paths").and_then(Value::as_array)
+                .ok_or("the \"paths\" argument is required")?;
+            for path in paths {
+                if let Some(path) = path.as_str() {
+                    args.push(path.to_string());
+                }
+            }
+        }
         "store" => args.push("store".to_string()),
         "compact" => {
             args.push("compact".to_string());
@@ -545,6 +565,10 @@ fn tool_definitions() -> Value {
             object(json!({}), json!([]))),
         tool("scope", "Report the sparse-workspace scope: this bay's materialization scope (the subtrees it works on) and the warehouse fetch scope. Read-only.",
             object(json!({}), json!([]))),
+        tool("expand", "Widen a sparse warehouse's fetch scope and download the newly in-scope subtree(s) across history from the remote. A full warehouse already holds everything.",
+            object(json!({ "paths": { "type": "array", "items": string } }), json!(["paths"]))),
+        tool("narrow", "Shrink this checkout's materialization scope: drop subtree path(s) and de-materialize their files. Frees nothing in the object store — the content stays reachable history.",
+            object(json!({ "paths": { "type": "array", "items": string } }), json!(["paths"]))),
         tool("audit", "Verify the warehouse's signed history offline (a pallet, default: the current one).",
             object(json!({ "pallet": string }), json!([]))),
         tool("shift", "Switch the working directory to another pallet (checkout).",

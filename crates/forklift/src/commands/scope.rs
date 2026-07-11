@@ -76,8 +76,8 @@ struct ScopeStatus {
     /// The bay's in-scope prefixes (empty = the full tree).
     materialization_scope: Vec<String>,
 
-    /// The warehouse's fetch-scope prefixes (empty = fully fetched; always so today, since
-    /// fetching itself cannot yet be scoped).
+    /// The warehouse's fetch-scope prefixes (empty = fully fetched; a sparse franchise records
+    /// its fetched prefixes here).
     fetch_scope: Vec<String>,
 }
 

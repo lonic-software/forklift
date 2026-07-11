@@ -1,6 +1,9 @@
 use serde::Serialize;
+use forklift_core::enums::config_scope::ConfigScope;
 use forklift_core::util::remote_utils::{LiftResult, RemoteClient};
-use forklift_core::util::{file_utils, merge_utils, object_utils, pallet_utils, remote_utils};
+use forklift_core::util::{
+    config_utils, file_utils, merge_utils, object_utils, pallet_utils, remote_utils, scope_utils,
+};
 use crate::commands::consolidate::{self, MergeStatus};
 use crate::output::{self, CommandOutput};
 
@@ -20,6 +23,8 @@ const MAX_AUTO_MERGES: usize = 5;
 /// * `Err(String)` - If no remote is configured, the remote is ahead, or a transfer
 ///                   failed.
 pub async fn handle_command() -> Result<(), String> {
+    ensure_origin_remote()?;
+
     let mut auto_merged = 0usize;
 
     // Optimistic lift (§7.7): a diverged push whose merge is clean auto-lowers,
@@ -89,6 +94,34 @@ pub async fn handle_command() -> Result<(), String> {
     }
 }
 
+/// Refuse a lift from a sparse workspace to a remote other than the one it fetched against.
+/// A sparse warehouse only ever proved its out-of-scope closure present on its origin; a
+/// different remote may lack objects it never verified there, so the lift's closure check would
+/// fail late and confusingly. Refusing up front, with the origin named, is the clearer failure.
+/// A no-op for a full (non-sparse) warehouse, which holds the whole closure and can lift
+/// anywhere, and for a sparse warehouse still pointed at its origin.
+fn ensure_origin_remote() -> Result<(), String> {
+    if !scope_utils::is_warehouse_sparse()? {
+        return Ok(());
+    }
+
+    let Some(origin) = config_utils::get_scoped_value(config_utils::KEY_REMOTE_ORIGIN, ConfigScope::Warehouse)? else {
+        // A sparse warehouse with no recorded origin predates this guard; leave it to the remote's
+        // closure check rather than invent an origin.
+        return Ok(());
+    };
+
+    let configured = config_utils::get_effective_value(config_utils::KEY_REMOTE_URL)?
+        .map(|(url, _scope)| url)
+        .unwrap_or_default();
+
+    if configured != origin {
+        return Err(scope_utils::non_origin_lift_refusal(&origin, &configured));
+    }
+
+    Ok(())
+}
+
 /// If the remote head has genuinely diverged from ours and a clean auto-merge is possible,
 /// perform it (fetch their work, consolidate, stack the merge parcel) and report `true` so
 /// the caller retries the lift. Report `false` when the remote is not diverged (it is our
@@ -99,9 +132,12 @@ async fn try_auto_merge(client: &RemoteClient,
                         pallet: &str,
                         head: &str,
                         remote_head: &str) -> Result<bool, String> {
-    // Their work must be local before we can compare ancestry or merge it.
+    // Their work must be local before we can compare ancestry or merge it. Path-pruned in a
+    // sparse workspace (a full fetch scope makes this the whole closure, as before), so an
+    // optimistic auto-merge stays as sparse as the workspace it runs in.
     if !file_utils::does_object_exist(remote_head)? {
-        remote_utils::fetch_history(client, remote_head).await?;
+        let fetch_scope = scope_utils::read_fetch_scope()?;
+        remote_utils::fetch_history_scoped(client, remote_head, &fetch_scope).await?;
     }
 
     let diverged = !merge_utils::is_ancestor(remote_head, head)?   // we do not already contain them

@@ -16,6 +16,7 @@ use crate::model::remote::{
     MAX_UPLOAD_TARGETS_BATCH, PROTOCOL_VERSION,
 };
 use crate::util::office_utils::OFFICE_PALLET_NAME;
+use crate::util::scope_utils::{MaterializationScope, ScopeClass};
 use crate::util::{
     bundle_utils, config_utils, file_utils, merge_utils, object_utils, office_utils,
     pallet_utils, sign_utils,
@@ -644,6 +645,209 @@ pub async fn fetch_history(client: &RemoteClient, head: &str) -> Result<FetchSta
     Ok(stats)
 }
 
+/// Fetch a parcel head's history like [`fetch_history`], but path-prune the **content** walk
+/// to a fetch `scope`: the full parcel graph, every signature, and the tree spine down to each
+/// in-scope prefix are fetched, along with the in-scope subtrees and blobs in full; out-of-scope
+/// subtree objects and blobs are skipped — they stay sealed by the hash the spine tree already
+/// carries. Only the user pallet's content is fetched this way; office and other meta pallets
+/// keep routing through the unscoped [`fetch_history`], because their audit reads full content.
+///
+/// A full (empty) scope is the whole store, so this delegates to [`fetch_history`] verbatim —
+/// a full franchise or lower stays byte-for-byte identical, and the pruning below runs only for
+/// a genuinely sparse warehouse.
+///
+/// Like [`fetch_history`], it heals an interrupted earlier sync: the ref is unmoved until the
+/// whole scoped closure is present, so re-running re-walks only what is still missing (the
+/// fetch primitives skip objects already on disk).
+///
+/// # Arguments
+/// * `client` - The remote.
+/// * `head`   - The parcel hash to fetch from.
+/// * `scope`  - The warehouse fetch scope (the in-scope path prefixes).
+///
+/// # Returns
+/// * `Ok(FetchStats)` - What was actually transferred, and how many parcels were walked.
+/// * `Err(String)`    - If a transfer or verification failed.
+pub async fn fetch_history_scoped(client: &RemoteClient,
+                                  head: &str,
+                                  scope: &MaterializationScope) -> Result<FetchStats, String> {
+    if scope.is_full() {
+        return fetch_history(client, head).await;
+    }
+
+    // Bound the walk at local ref heads, exactly like `fetch_history`: a closure already known
+    // complete at this scope needs neither fetching nor walking.
+    let complete: Vec<String> = pallet_utils::all_pallet_refs()?
+        .into_iter()
+        .map(|(_, head)| head)
+        .collect();
+
+    fetch_scoped_from(client, head, scope, &complete).await
+}
+
+/// Fetch the content newly brought into `scope` across a head's whole history — the walk behind
+/// `expand`. Unlike [`fetch_history_scoped`], it is **not** bounded at local ref heads: widening
+/// the scope invalidates the "reachable from a ref ⟹ closure complete" invariant for the
+/// newly in-scope paths (that content was sealed, not fetched, behind those very refs), so the
+/// history is re-walked in full. The fetch primitives still skip every object already on disk, so
+/// only the genuinely newly in-scope objects transfer.
+///
+/// # Arguments
+/// * `client` - The remote.
+/// * `head`   - The parcel hash to widen from.
+/// * `scope`  - The widened fetch scope.
+///
+/// # Returns
+/// * `Ok(FetchStats)` - What was actually transferred.
+/// * `Err(String)`    - If a transfer or verification failed.
+pub async fn fetch_expanded(client: &RemoteClient,
+                            head: &str,
+                            scope: &MaterializationScope) -> Result<FetchStats, String> {
+    if scope.is_full() {
+        return fetch_history(client, head).await;
+    }
+
+    fetch_scoped_from(client, head, scope, &[]).await
+}
+
+/// The shared path-pruned walk behind [`fetch_history_scoped`] and [`fetch_expanded`]: fetch the
+/// full parcel graph and signatures, the tree spine to each in-scope prefix, and the in-scope
+/// subtrees and blobs in full, sealing out-of-scope objects by hash. `complete` bounds the
+/// parcel walk at closures already known complete at this scope (empty for a full re-walk).
+async fn fetch_scoped_from(client: &RemoteClient,
+                           head: &str,
+                           scope: &MaterializationScope,
+                           complete: &[String]) -> Result<FetchStats, String> {
+    let mut stats = FetchStats::default();
+
+    let mut parcel_frontier: Vec<String> = vec![head.to_string()];
+    let mut seen_parcels: HashSet<String> = HashSet::new();
+
+    // Two dedup ledgers, kept apart on purpose. A spine node's classification depends on its
+    // *path* (the same tree hash at two paths seals different siblings), so spine visits are keyed
+    // by (hash, path). An in-scope subtree's whole closure is fetched regardless of where it
+    // sits, so it is keyed by hash alone.
+    let mut walked_spine: HashSet<(String, String)> = HashSet::new();
+    let mut walked_full: HashSet<String> = HashSet::new();
+    let mut seen_blobs: HashSet<String> = HashSet::new();
+
+    while !parcel_frontier.is_empty() {
+        let candidates: Vec<String> = parcel_frontier.drain(..)
+            .filter(|hash| seen_parcels.insert(hash.clone()))
+            .collect();
+
+        let mut wave: Vec<String> = Vec::new();
+
+        for hash in candidates {
+            if !is_known_complete(&hash, complete)? {
+                wave.push(hash);
+            }
+        }
+
+        if wave.is_empty() {
+            continue;
+        }
+
+        stats.walked_parcels += wave.len();
+        stats.fetched_objects += fetch_missing_objects(client, &wave).await?;
+        stats.fetched_signatures += fetch_missing_signatures(client, &wave).await?;
+
+        // Each parcel's root tree is a spine node (path ""); descend the spine, collecting the
+        // in-scope subtree roots whose full closure the batched walk below fetches.
+        let mut spine_frontier: Vec<(String, String)> = Vec::new();
+        let mut in_scope_roots: Vec<String> = Vec::new();
+
+        for hash in &wave {
+            let parcel = object_utils::load_parcel(hash)?;
+            spine_frontier.push((parcel.tree_hash.clone(), String::new()));
+            parcel_frontier.extend(parcel.parents);
+        }
+
+        // The spine is narrow (the depth to each in-scope prefix), so this sequential descent is
+        // cheap; the parallel bulk is the in-scope closure walk that follows.
+        while let Some((tree_hash, path)) = spine_frontier.pop() {
+            if !walked_spine.insert((tree_hash.clone(), path.clone())) {
+                continue;
+            }
+
+            stats.fetched_objects += fetch_missing_objects(client, std::slice::from_ref(&tree_hash)).await?;
+
+            let tree = object_utils::load_tree(&tree_hash)?;
+            let mut spine_blobs: Vec<String> = Vec::new();
+
+            for (name, subtree) in tree.get_subtrees() {
+                let child = scope_join(&path, name);
+
+                match scope.classify(&child) {
+                    ScopeClass::InScope => in_scope_roots.push(subtree.hash.clone()),
+                    ScopeClass::Spine => spine_frontier.push((subtree.hash.clone(), child)),
+                    ScopeClass::OutOfScope => {}
+                }
+            }
+
+            for (name, file) in tree.get_files() {
+                // A file entry on the spine is a sibling of the in-scope path — out of scope — so
+                // it is sealed, unless the scope names this exact path in scope (a scope prefix
+                // names a directory, so this stays classifier-driven rather than assumed).
+                if scope.classify(&scope_join(&path, name)) == ScopeClass::InScope
+                    && seen_blobs.insert(file.hash.clone())
+                {
+                    spine_blobs.push(file.hash.clone());
+                }
+            }
+
+            stats.fetched_objects += fetch_missing_objects(client, &spine_blobs).await?;
+        }
+
+        // The in-scope subtree closures — the parallel bulk, fetched in batched waves exactly as
+        // the unscoped walk does. Everything under an in-scope prefix is in scope, so no further
+        // classification is needed here.
+        let mut tree_frontier = in_scope_roots;
+
+        while !tree_frontier.is_empty() {
+            let tree_wave: Vec<String> = tree_frontier.drain(..)
+                .filter(|hash| walked_full.insert(hash.clone()))
+                .collect();
+
+            if tree_wave.is_empty() {
+                continue;
+            }
+
+            stats.fetched_objects += fetch_missing_objects(client, &tree_wave).await?;
+
+            let mut blob_wave: Vec<String> = Vec::new();
+
+            for tree_hash in &tree_wave {
+                let tree = object_utils::load_tree(tree_hash)?;
+
+                for (_, file) in tree.get_files() {
+                    if seen_blobs.insert(file.hash.clone()) {
+                        blob_wave.push(file.hash.clone());
+                    }
+                }
+
+                for (_, subtree) in tree.get_subtrees() {
+                    tree_frontier.push(subtree.hash.clone());
+                }
+            }
+
+            stats.fetched_objects += fetch_missing_objects(client, &blob_wave).await?;
+        }
+    }
+
+    Ok(stats)
+}
+
+/// Join a warehouse path key with a child name (root key is the empty string). A local copy of
+/// the same rule the tree walks elsewhere use, kept here so the fetch has no cross-module dep.
+fn scope_join(key: &str, name: &str) -> String {
+    if key.is_empty() {
+        name.to_string()
+    } else {
+        format!("{}/{}", key, name)
+    }
+}
+
 /// Whether a parcel's whole closure is already present, and so needs neither fetching nor
 /// walking: it is here, and it is reachable from a local ref head.
 ///
@@ -846,10 +1050,15 @@ async fn lift_pallet_inner(client: &RemoteClient,
         }
     }
 
-    // The new parcels: everything from the local head down to the remote head. The
-    // walk stops at the remote head itself — no pre-walk of the shared history — so a
-    // linear lift touches O(new parcels). A merge that rejoins below the remote head
-    // re-walks the shared slice; the negotiation drops it.
+    // The new parcels: everything reachable from the local head that the remote does not
+    // already have — the remote head, and every ancestor of it. The walk stops at the remote
+    // head and at any ancestor of it (a merge's other side rejoins below the remote head), so a
+    // linear lift touches O(new parcels) and a merge never re-walks the shared slice. Pruning at
+    // every ancestor — not just the remote head hash — is also what keeps a sparse workspace
+    // liftable: an interior parcel the remote already has may carry an out-of-scope change whose
+    // object this workspace never fetched, and re-walking it would try to load that sealed object.
+    // The remote provably has it (it is an ancestor of the remote head, whose closure is
+    // complete there), so it is correctly never uploaded and never walked.
     let mut new_parcels: Vec<String> = Vec::new();
     let mut queue: Vec<String> = vec![local_head.to_string()];
     let mut visited: HashSet<String> = HashSet::new();
@@ -857,6 +1066,12 @@ async fn lift_pallet_inner(client: &RemoteClient,
     while let Some(hash) = queue.pop() {
         if Some(hash.as_str()) == remote_head || !visited.insert(hash.clone()) {
             continue;
+        }
+
+        if let Some(remote_head) = remote_head {
+            if merge_utils::is_ancestor(&hash, remote_head)? {
+                continue;
+            }
         }
 
         let parcel = object_utils::load_parcel(&hash)?;

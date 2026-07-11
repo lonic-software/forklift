@@ -179,6 +179,14 @@ pub enum ErrorCode {
 
     /// A whole-tree verb is not (yet) supported in a scoped (sparse) bay (§7.6).
     SparseWorkspace,
+
+    /// A lift from a sparse warehouse was aimed at a remote other than its origin: the
+    /// out-of-scope closure was only ever proved present on the origin, so it refuses up front.
+    NonOriginLift,
+
+    /// `narrow` was asked to drop a subtree that still holds uncommitted work (staged,
+    /// unstaged or untracked): it refuses rather than silently discard it.
+    NarrowUnclean,
 }
 
 impl ErrorCode {
@@ -194,6 +202,8 @@ impl ErrorCode {
             ErrorCode::OutOfScopeConflict   => scope_utils::CODE_OUT_OF_SCOPE_CONFLICT,
             ErrorCode::ScopePathTypeChanged => scope_utils::CODE_SCOPE_PATH_TYPE_CHANGED,
             ErrorCode::SparseWorkspace      => scope_utils::CODE_SPARSE_WORKSPACE,
+            ErrorCode::NonOriginLift        => scope_utils::CODE_NON_ORIGIN_LIFT,
+            ErrorCode::NarrowUnclean        => scope_utils::CODE_NARROW_UNCLEAN,
         }
     }
 
@@ -210,6 +220,8 @@ impl ErrorCode {
             ErrorCode::ScopePathTypeChanged => 8,
             ErrorCode::SparseWorkspace      => 9,
             ErrorCode::OutOfScopeConflict   => 10,
+            ErrorCode::NonOriginLift        => 11,
+            ErrorCode::NarrowUnclean        => 12,
         }
     }
 
@@ -220,6 +232,8 @@ impl ErrorCode {
             _ if code == scope_utils::CODE_OUT_OF_SCOPE_CONFLICT  => Some(ErrorCode::OutOfScopeConflict),
             _ if code == scope_utils::CODE_SCOPE_PATH_TYPE_CHANGED => Some(ErrorCode::ScopePathTypeChanged),
             _ if code == scope_utils::CODE_SPARSE_WORKSPACE       => Some(ErrorCode::SparseWorkspace),
+            _ if code == scope_utils::CODE_NON_ORIGIN_LIFT        => Some(ErrorCode::NonOriginLift),
+            _ if code == scope_utils::CODE_NARROW_UNCLEAN         => Some(ErrorCode::NarrowUnclean),
             _ => None,
         }
     }

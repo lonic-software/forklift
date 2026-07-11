@@ -1,6 +1,7 @@
 //! Task-scoped sparse workspaces (DESIGN.html §7.6) — the local scope record and the
-//! three-valued classifier every scope-aware walk branches on. Materialization can be
-//! scoped today; fetching itself cannot yet be, so the fetch scope is always full.
+//! three-valued classifier every scope-aware walk branches on. Both layers are live: a bay's
+//! materialization scope, and the warehouse fetch scope a sparse franchise records (empty = the
+//! store holds everything).
 //!
 //! A scoped bay materializes and operates on only chosen path subtrees of the user
 //! pallet's working tree. Scope is **local only, never tracked** (it is a property of
@@ -10,8 +11,9 @@
 //! * the **bay materialization scope** (`<bay_root>/scope`, bay-local) — what this bay
 //!   materializes and stacks; always a subset (⊆) of the fetch scope, and
 //! * the **warehouse fetch scope** (`config/fetch-scope`, shared) — what the warehouse
-//!   has fetched at all. The store is always fully fetched today, so the fetch scope is
-//!   unset (= full) and only the bay scope restricts behavior.
+//!   has fetched at all. A full franchise leaves it unset (= full) and only the bay scope
+//!   restricts behavior; a sparse (`franchise --only`) warehouse records the fetched prefixes
+//!   here, and `expand` widens them.
 //!
 //! The classifier is **three-valued, not boolean**: a boolean
 //! `in_scope` conflates two situations a walk must treat differently — a *spine* directory
@@ -41,6 +43,8 @@ pub const CODE_OUT_OF_SCOPE: &str = "out_of_scope";
 pub const CODE_OUT_OF_SCOPE_CONFLICT: &str = "out_of_scope_conflict";
 pub const CODE_SCOPE_PATH_TYPE_CHANGED: &str = "scope_path_type_changed";
 pub const CODE_SPARSE_WORKSPACE: &str = "sparse_workspace";
+pub const CODE_NON_ORIGIN_LIFT: &str = "non_origin_lift";
+pub const CODE_NARROW_UNCLEAN: &str = "narrow_unclean";
 
 /// The framing that marks a scope refusal string so the CLI can classify it without
 /// parsing prose. `\u{1f}` (ASCII Unit Separator) never appears in a message or a
@@ -254,8 +258,8 @@ pub fn is_scoped() -> Result<bool, String> {
     Ok(!current_scope()?.is_full())
 }
 
-/// The warehouse fetch scope (full when unset — always full today, since fetching itself
-/// cannot yet be scoped).
+/// The warehouse fetch scope (full when unset — a full franchise; a sparse one records its
+/// fetched prefixes here).
 pub fn read_fetch_scope() -> Result<MaterializationScope, String> {
     read_scope_file(&fetch_scope_path())
 }
@@ -282,6 +286,29 @@ pub fn set_bay_scope(scope: &MaterializationScope) -> Result<(), String> {
     }
 
     write_scope_file(&path, scope)
+}
+
+/// Set the warehouse fetch scope (shared across bays). A sparse franchise records the paths it
+/// fetched here; `expand` unions new prefixes into it. A full (empty) scope means the store
+/// holds everything, so every scope-aware fetch and walk collapses to today's behavior.
+///
+/// # Arguments
+/// * `scope` - The fetch scope to record for the warehouse.
+pub fn set_fetch_scope(scope: &MaterializationScope) -> Result<(), String> {
+    let path = fetch_scope_path();
+
+    if let Some(parent) = path.parent() {
+        crate::util::file_utils::create_folder_if_not_exists(parent)?;
+    }
+
+    write_scope_file(&path, scope)
+}
+
+/// Whether the warehouse itself is sparse — its fetch scope is restricted, so some content is
+/// sealed-but-unfetched. A quick gate for the operations that behave differently on a store
+/// that was never fully fetched (the origin-only lift guard, franchise's bundle skip).
+pub fn is_warehouse_sparse() -> Result<bool, String> {
+    Ok(!read_fetch_scope()?.is_full())
 }
 
 /// Build a classified scope-refusal string (design §7.4 taxonomy). It carries the stable
@@ -389,6 +416,62 @@ pub fn sparse_workspace_refusal(verb: &str, next_step: &str) -> String {
     )
 }
 
+/// A ready-made `narrow_unclean` refusal: the subtree `narrow` was asked to drop still holds
+/// uncommitted work. `narrow` de-materializes files unconditionally once it decides to act — it
+/// has no working-directory-preserving path the way `shift`'s target-tree walk does — so it
+/// refuses up front rather than silently discard staged, unstaged or untracked content. This
+/// matches `shift`'s own precedent for untracked collisions: never delete something the
+/// operator has not committed anywhere. No override in this round — stack, restore, park or
+/// move the blocking paths out of the way, then narrow again.
+///
+/// # Arguments
+/// * `path`      - The subtree that was asked to be narrowed away.
+/// * `blocked_by` - What kind of uncommitted work is blocking it (for the message).
+pub fn narrow_unclean_refusal(path: &str, blocked_by: &str) -> String {
+    let next_step = format!(
+        "Stack or restore the changes under \"{}\" (or move untracked files out of the way), \
+        then narrow again.",
+        path
+    );
+
+    refusal(
+        CODE_NARROW_UNCLEAN,
+        format!(
+            "\"{}\" has {} that narrow would otherwise delete; narrow refuses to discard \
+            uncommitted work. {}",
+            path, blocked_by, next_step
+        ),
+        next_step,
+    )
+}
+
+/// A ready-made `non_origin_lift` refusal for a lift from a sparse warehouse to a remote other
+/// than the one it fetched against. A sparse warehouse only ever proved its out-of-scope
+/// closure present on its origin; a different remote may lack objects it never verified there,
+/// so the lift would fail late at the remote's closure check. Refusing up front is the clearer
+/// failure.
+///
+/// # Arguments
+/// * `origin` - The remote this warehouse was fetched (scoped) against.
+/// * `other`  - The currently configured remote it is trying to lift to.
+pub fn non_origin_lift_refusal(origin: &str, other: &str) -> String {
+    let next_step = format!(
+        "Point \"remote.url\" back at \"{}\", or run a full (unscoped) franchise against \"{}\".",
+        origin, other
+    );
+
+    refusal(
+        CODE_NON_ORIGIN_LIFT,
+        format!(
+            "This is a sparse workspace, fetched against \"{}\"; lifting to \"{}\" may fail \
+            because that remote may lack out-of-scope objects this workspace never verified \
+            there. {}",
+            origin, other, next_step
+        ),
+        next_step,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -489,6 +572,28 @@ mod tests {
 
         // A plain error is not a scope refusal.
         assert!(decode_refusal("something ordinary went wrong").is_none());
+    }
+
+    #[test]
+    fn a_narrow_unclean_refusal_carries_the_stable_code_and_names_the_path() {
+        let refusal = narrow_unclean_refusal("docs", "untracked file(s) (docs/draft.md)");
+        let (code, message, next_step) = decode_refusal(&refusal).unwrap();
+
+        assert_eq!(code, CODE_NARROW_UNCLEAN);
+        assert!(message.contains("docs"), "the path is named: {}", message);
+        assert!(message.contains("untracked file(s)"), "the blocker is named: {}", message);
+        assert!(next_step.contains("docs"), "the recovery names the path: {}", next_step);
+    }
+
+    #[test]
+    fn a_non_origin_lift_refusal_carries_the_stable_code_and_names_both_remotes() {
+        let refusal = non_origin_lift_refusal("http://origin.example", "http://other.example");
+        let (code, message, next_step) = decode_refusal(&refusal).unwrap();
+
+        assert_eq!(code, CODE_NON_ORIGIN_LIFT);
+        assert!(message.contains("http://origin.example"), "the origin is named: {}", message);
+        assert!(message.contains("http://other.example"), "the target is named: {}", message);
+        assert!(next_step.contains("http://origin.example"), "the recovery names the origin: {}", next_step);
     }
 
     #[test]

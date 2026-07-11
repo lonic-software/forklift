@@ -123,8 +123,10 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
         Command::Deliver { target, message } => commands::deliver::handle_command(&target, message),
         Command::Diff { staged, targets } => commands::diff::handle_command(staged, &targets, cli.verbose).await,
         Command::Help { command } => commands::help::handle_command(&command),
-        Command::Franchise { url, directory, pallet, token } =>
-            commands::franchise::handle_command(&url, &directory, pallet, token).await,
+        Command::Expand { paths } => commands::expand::handle_command(paths).await,
+        Command::Narrow { paths } => commands::narrow::handle_command(paths).await,
+        Command::Franchise { url, directory, pallet, token, only } =>
+            commands::franchise::handle_command(&url, &directory, pallet, token, only).await,
         Command::History { revision, class, limit, after, oneline } => commands::history::handle_command(revision, class, limit, after, oneline).await,
         Command::ImportGit { path, no_compact } => commands::import_git::handle_command(&path, no_compact),
         Command::ExportGit { path } => commands::export_git::handle_command(&path),

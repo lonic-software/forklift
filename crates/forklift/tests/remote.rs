@@ -129,6 +129,27 @@ impl Server {
         ], token)
     }
 
+    /// Prepare and serve a bare warehouse under a named root of the area — a second,
+    /// independent remote alongside `start`'s `server-root`.
+    fn start_at(area: &TestArea, root_relative: &str, token: Option<&str>) -> Server {
+        let root = area.path(root_relative);
+        let root_str = root.to_str().unwrap().to_string();
+
+        let prepared = Command::new(server_binary())
+            .args(["prepare", "--root", &root_str])
+            .output()
+            .unwrap();
+
+        assert!(prepared.status.success(), "server prepare failed: {}",
+                String::from_utf8_lossy(&prepared.stderr));
+
+        Server::spawn(vec![
+            "serve".to_string(),
+            "--root".to_string(), root_str,
+            "--addr".to_string(), "127.0.0.1:0".to_string(),
+        ], token)
+    }
+
     /// Serve a folder of warehouses (multi-warehouse mode) on an ephemeral port.
     fn start_multi(area: &TestArea, token: Option<&str>) -> Server {
         let base = area.path("warehouses-base");
@@ -1894,4 +1915,560 @@ fn a_sync_walks_the_gap_between_the_heads_not_the_history() {
     // Once the ref has moved, an up-to-date sync walks nothing at all.
     assert_success(&area.forklift("b", &["lower"]));
     assert_eq!(sync(&remote_head).walked_parcels, 0, "an up-to-date sync walks nothing");
+}
+
+/// The head parcel hash of a pallet in a warehouse under the area.
+fn pallet_head(area: &TestArea, dir: &str, pallet: &str) -> String {
+    area.read_file(&format!("{}/.forklift/pallets/{}", dir, pallet)).trim().to_string()
+}
+
+/// Whether a loose object is present in a warehouse's store (bays share it).
+fn object_present(area: &TestArea, dir: &str, hash: &str) -> bool {
+    object_store_path(area, dir, hash).exists()
+}
+
+#[test]
+fn a_sparse_franchise_fetches_only_the_scoped_subtree() {
+    // The headline: `franchise --only src/api` fetches the whole signed history but only the
+    // content under src/api. The in-scope subtree and blob land; the out-of-scope subtree and a
+    // top-level out-of-scope file are never downloaded — sealed by the hash the spine commits.
+    let area = TestArea::new("sparse-franchise");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/src/api/a.txt", "api v1\n");
+    area.write_file("dev/src/web/w.txt", "web v1\n");
+    area.write_file("dev/top.txt", "top v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    let head = pallet_head(&area, "dev", "main");
+    let api_tree = path_object_hash(&area, "dev", &head, "src/api");
+    let api_blob = path_object_hash(&area, "dev", &head, "src/api/a.txt");
+    let web_tree = path_object_hash(&area, "dev", &head, "src/web");
+    let web_blob = path_object_hash(&area, "dev", &head, "src/web/w.txt");
+    let top_blob = path_object_hash(&area, "dev", &head, "top.txt");
+
+    let franchised = area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src/api"]);
+    assert_success(&franchised);
+    assert!(stdout(&franchised).contains("Sparse"), "{}", stdout(&franchised));
+
+    // The working tree materializes only the in-scope subtree.
+    assert_eq!(area.read_file("sparse/src/api/a.txt"), "api v1\n");
+    assert!(!area.path("sparse/src/web").exists(), "out-of-scope subtree must not materialize");
+    assert!(!area.path("sparse/top.txt").exists(), "out-of-scope file must not materialize");
+
+    // The in-scope objects are present; the out-of-scope objects were never fetched.
+    assert!(object_present(&area, "sparse", &api_tree), "the in-scope subtree object must be present");
+    assert!(object_present(&area, "sparse", &api_blob), "the in-scope blob must be present");
+    assert!(!object_present(&area, "sparse", &web_tree), "the out-of-scope subtree object must be sealed, not fetched");
+    assert!(!object_present(&area, "sparse", &web_blob), "the out-of-scope blob must be sealed, not fetched");
+    assert!(!object_present(&area, "sparse", &top_blob), "the out-of-scope top-level file must be sealed, not fetched");
+
+    // The full signed history is present regardless of content scope.
+    let history = area.forklift("sparse", &["history"]);
+    assert_success(&history);
+    assert!(stdout(&history).contains("base"), "{}", stdout(&history));
+
+    // The store reports itself sparse; the checkout is clean.
+    let scope = area.forklift("sparse", &["--json", "scope"]);
+    assert_success(&scope);
+    let scope_json: serde_json::Value = serde_json::from_str(&stdout(&scope)).unwrap();
+    assert_eq!(scope_json["data"]["fetch_scope"], serde_json::json!(["src/api"]), "{}", stdout(&scope));
+    assert_eq!(scope_json["data"]["materialization_scope"], serde_json::json!(["src/api"]), "{}", stdout(&scope));
+
+    let stocktake = area.forklift("sparse", &["stocktake"]);
+    assert_success(&stocktake);
+    assert!(stdout(&stocktake).contains("matches the inventory"), "{}", stdout(&stocktake));
+
+    // In-scope work stacks and lifts back to the origin, without ever needing the sealed content.
+    std::fs::write(area.path("sparse/src/api/a.txt"), "api v2 from sparse\n").unwrap();
+    let diff = area.forklift("sparse", &["diff"]);
+    assert_success(&diff);
+    assert!(stdout(&diff).contains("api v2"), "{}", stdout(&diff));
+
+    assert_success(&area.forklift("sparse", &["load", "."]));
+    assert_success(&area.forklift("sparse", &["stack", "sparse edits api"]));
+
+    let lifted = area.forklift("sparse", &["lift"]);
+    assert_success(&lifted);
+    assert!(stdout(&lifted).contains("Lifted"), "{}", stdout(&lifted));
+
+    // The origin now serves the in-scope edit to a full clone.
+    assert_success(&area.forklift(".", &["franchise", &server.url, "full"]));
+    assert_eq!(area.read_file("full/src/api/a.txt"), "api v2 from sparse\n");
+    assert_eq!(area.read_file("full/src/web/w.txt"), "web v1\n", "the sealed sibling is intact on the origin");
+}
+
+#[test]
+fn a_sparse_franchise_still_audits() {
+    // The meta/office carve-out: a sparse franchise fetches office and every meta pallet at full
+    // scope, so a trusted warehouse's offline audit still passes — the office chain is verified
+    // with full content, exactly as a full clone would.
+    let area = TestArea::new("sparse-audit");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/src/api/a.txt", "api v1\n");
+    area.write_file("dev/src/web/w.txt", "web v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "pre-trust base"]));
+
+    // Establish trust: every parcel from here is signed, and the office pallet carries the keys.
+    assert_success(&area.forklift("dev", &["office", "enroll"]));
+    area.write_file("dev/src/api/a.txt", "api v2 signed\n");
+    assert_success(&area.forklift("dev", &["load", "src/api/a.txt"]));
+    assert_success(&area.forklift("dev", &["stack", "signed parcel"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    let franchised = area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src/api"]);
+    assert_success(&franchised);
+    assert!(stdout(&franchised).contains("Adopted the remote's trust anchor"), "{}", stdout(&franchised));
+
+    // The audit reads the office chain's full content (present via the carve-out) and the user
+    // pallet's signatures (parcels are always fully present) — it passes on the sparse store.
+    let audit = area.forklift("sparse", &["audit"]);
+    assert_success(&audit);
+    assert!(stdout(&audit).contains("Office chain verified"), "{}", stdout(&audit));
+    assert!(stdout(&audit).contains("verified"), "{}", stdout(&audit));
+}
+
+#[test]
+fn lower_into_a_sparse_store_stays_pruned() {
+    // A lower into a sparse store fetches new in-scope content and stays pruned on the rest: an
+    // out-of-scope change made upstream is never downloaded.
+    let area = TestArea::new("sparse-lower");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/src/api/a.txt", "api v1\n");
+    area.write_file("dev/src/web/w.txt", "web v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src/api"]));
+
+    // A full clone changes both an in-scope and an out-of-scope file, and lifts.
+    assert_success(&area.forklift(".", &["franchise", &server.url, "up"]));
+    area.write_file("up/src/api/a.txt", "api v2 from up\n");
+    area.write_file("up/src/web/w.txt", "web v2 from up\n");
+    assert_success(&area.forklift("up", &["load", "."]));
+    assert_success(&area.forklift("up", &["stack", "up edits both"]));
+    assert_success(&area.forklift("up", &["lift"]));
+
+    let up_head = pallet_head(&area, "up", "main");
+    let new_web_tree = path_object_hash(&area, "up", &up_head, "src/web");
+
+    // The sparse store lowers the in-scope change and stays pruned on the out-of-scope one.
+    let lowered = area.forklift("sparse", &["lower"]);
+    assert_success(&lowered);
+    assert!(stdout(&lowered).contains("Lowered"), "{}", stdout(&lowered));
+
+    assert_eq!(area.read_file("sparse/src/api/a.txt"), "api v2 from up\n");
+    assert!(!area.path("sparse/src/web").exists(), "out-of-scope subtree still not materialized");
+    assert!(!object_present(&area, "sparse", &new_web_tree),
+        "the upstream out-of-scope change must stay sealed, not fetched");
+}
+
+#[test]
+fn expand_fetches_the_widened_subtree_and_a_bay_can_scope_to_it() {
+    // `expand` widens a sparse warehouse's fetch scope and downloads the newly in-scope subtree
+    // across history; a bay can then be scoped to the newly available path.
+    let area = TestArea::new("sparse-expand");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/src/api/a.txt", "api v1\n");
+    area.write_file("dev/src/web/w.txt", "web v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    let head = pallet_head(&area, "dev", "main");
+    let web_tree = path_object_hash(&area, "dev", &head, "src/web");
+    let web_blob = path_object_hash(&area, "dev", &head, "src/web/w.txt");
+
+    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src/api"]));
+    assert!(!object_present(&area, "sparse", &web_tree), "src/web is sealed after the sparse franchise");
+
+    // Expand fetches the newly in-scope subtree.
+    let expanded = area.forklift("sparse", &["expand", "src/web"]);
+    assert_success(&expanded);
+    assert!(stdout(&expanded).contains("Expanded"), "{}", stdout(&expanded));
+    assert!(object_present(&area, "sparse", &web_tree), "expand must fetch the widened subtree object");
+    assert!(object_present(&area, "sparse", &web_blob), "expand must fetch the widened subtree's blob");
+
+    let scope = area.forklift("sparse", &["--json", "scope"]);
+    let scope_json: serde_json::Value = serde_json::from_str(&stdout(&scope)).unwrap();
+    assert_eq!(scope_json["data"]["fetch_scope"], serde_json::json!(["src/api", "src/web"]), "{}", stdout(&scope));
+
+    // A bay can now be scoped to the newly fetched path, and it materializes it.
+    let bay_dir = area.path("sparse-web");
+    assert_success(&area.forklift("sparse",
+        &["bay", "add", "web", bay_dir.to_str().unwrap(), "--scope", "src/web"]));
+    assert_eq!(std::fs::read_to_string(bay_dir.join("src/web/w.txt")).unwrap(), "web v1\n");
+}
+
+#[test]
+fn narrow_shrinks_the_scope_and_frees_nothing() {
+    // `narrow` drops a subtree from this checkout's materialization scope and de-materializes its
+    // files, but frees nothing in the object store — the content is still reachable history.
+    let area = TestArea::new("sparse-narrow");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/src/api/a.txt", "api v1\n");
+    area.write_file("dev/docs/guide.md", "guide v1\n");
+    area.write_file("dev/src/web/w.txt", "web v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    let head = pallet_head(&area, "dev", "main");
+    let docs_tree = path_object_hash(&area, "dev", &head, "docs");
+    let docs_blob = path_object_hash(&area, "dev", &head, "docs/guide.md");
+
+    assert_success(&area.forklift(".",
+        &["franchise", &server.url, "sparse", "--only", "src/api", "--only", "docs"]));
+    assert_eq!(area.read_file("sparse/docs/guide.md"), "guide v1\n");
+
+    // Narrow away docs.
+    let narrowed = area.forklift("sparse", &["narrow", "docs"]);
+    assert_success(&narrowed);
+    assert!(stdout(&narrowed).contains("Narrowed away docs"), "{}", stdout(&narrowed));
+
+    // The files are de-materialized, the in-scope ones stay, and nothing is freed.
+    assert!(!area.path("sparse/docs").exists(), "narrow de-materializes the dropped subtree");
+    assert_eq!(area.read_file("sparse/src/api/a.txt"), "api v1\n");
+    assert!(object_present(&area, "sparse", &docs_tree), "narrow frees nothing: the subtree object stays");
+    assert!(object_present(&area, "sparse", &docs_blob), "narrow frees nothing: the blob stays");
+
+    // The materialization scope shrank; a clean stocktake proves the dropped subtree is not
+    // reported as a removal.
+    let scope = area.forklift("sparse", &["--json", "scope"]);
+    let scope_json: serde_json::Value = serde_json::from_str(&stdout(&scope)).unwrap();
+    assert_eq!(scope_json["data"]["materialization_scope"], serde_json::json!(["src/api"]), "{}", stdout(&scope));
+
+    let stocktake = area.forklift("sparse", &["stocktake"]);
+    assert_success(&stocktake);
+    assert!(stdout(&stocktake).contains("matches the inventory"), "{}", stdout(&stocktake));
+}
+
+#[test]
+fn a_sparse_workspace_refuses_to_lift_to_a_non_origin_remote() {
+    // A sparse workspace only ever proved its out-of-scope closure present on its origin, so it
+    // refuses to lift to a different remote up front, with a stable code — and even if forced
+    // (origin unset), the lift fails loudly rather than silently corrupting the other remote.
+    let origin = TestArea::new("non-origin");
+    let server1 = Server::start(&origin, None);
+
+    prepare_warehouse(&origin, "dev", &server1.url);
+    origin.write_file("dev/src/api/a.txt", "api v1\n");
+    origin.write_file("dev/src/web/w.txt", "web v1\n");
+    assert_success(&origin.forklift("dev", &["load", "."]));
+    assert_success(&origin.forklift("dev", &["stack", "base"]));
+    assert_success(&origin.forklift("dev", &["lift"]));
+
+    assert_success(&origin.forklift(".", &["franchise", &server1.url, "sparse", "--only", "src/api"]));
+
+    // A second, independent remote (empty).
+    let server2 = Server::start_at(&origin, "server-root-2", None);
+    assert_success(&origin.forklift("sparse", &["config", "remote.url", &server2.url]));
+
+    // The client refuses before touching the wire, with the stable code and exit 11.
+    let refused = origin.forklift("sparse", &["--json", "lift"]);
+    assert_eq!(refused.status.code(), Some(11), "non-origin lift exits 11: {}", stderr(&refused));
+    let json: serde_json::Value = serde_json::from_str(&stdout(&refused)).unwrap();
+    assert_eq!(json["error"]["code"], "non_origin_lift", "{}", stdout(&refused));
+    assert!(json["error"]["message"].as_str().unwrap().contains(&server1.url),
+        "the refusal names the origin: {}", stdout(&refused));
+
+    // Defense in depth: forcing it (origin unset) does not silently succeed — the sparse history
+    // cannot be closed against the empty remote, so it fails loudly.
+    assert_success(&origin.forklift("sparse", &["config", "--unset", "remote.origin"]));
+    let forced = origin.forklift("sparse", &["lift"]);
+    assert!(!forced.status.success(), "a forced non-origin sparse lift must fail loudly: {}", stdout(&forced));
+}
+
+#[test]
+fn a_merge_second_parent_below_the_remote_head_lifts_from_a_sparse_store() {
+    // The residual from the merge stage's review: a merge whose second parent is an interior
+    // ancestor of the remote head (reached via the merge's other side) carries an out-of-scope
+    // change a sparse store never fetched. The lift's parcel walk must prune every parcel the
+    // remote already has — not just the remote head hash — or it would try to load that sealed
+    // object. Two sequential merges build exactly that shape; the lift must still succeed.
+    let area = TestArea::new("sparse-second-parent");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/src/api/a.txt", "api v1\n");
+    area.write_file("dev/src/web/w.txt", "web v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    // The sparse workspace under test.
+    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src/api"]));
+
+    // A full clone drives the remote forward twice, each time changing the out-of-scope subtree.
+    assert_success(&area.forklift(".", &["franchise", &server.url, "up"]));
+    area.write_file("up/src/web/w.txt", "web v2 (out of scope)\n");
+    assert_success(&area.forklift("up", &["load", "."]));
+    assert_success(&area.forklift("up", &["stack", "up edits web (1)"]));
+    assert_success(&area.forklift("up", &["lift"]));
+    let p2 = pallet_head(&area, "up", "main");
+    let sealed_web = path_object_hash(&area, "up", &p2, "src/web");
+
+    // The sparse workspace makes an in-scope edit, then merges the diverged remote head p2.
+    std::fs::write(area.path("sparse/src/api/a.txt"), "api v2 from sparse\n").unwrap();
+    assert_success(&area.forklift("sparse", &["load", "."]));
+    assert_success(&area.forklift("sparse", &["stack", "sparse edits api (1)"]));
+
+    let lowered = area.forklift("sparse", &["lower"]);
+    assert!(!lowered.status.success(), "the first divergence must be reported");
+    assert_success(&area.forklift("sparse", &["palletize", "incoming1", &p2]));
+    assert_success(&area.forklift("sparse", &["shift", "main"]));
+    assert_success(&area.forklift("sparse", &["consolidate", "incoming1"]));
+
+    // The remote moves forward again, on top of p2 — so p2 becomes an interior ancestor of the
+    // new remote head, reachable in the sparse workspace only through the first merge's parent.
+    assert_success(&area.forklift("up", &["lower"]));
+    area.write_file("up/src/web/w.txt", "web v3 (out of scope)\n");
+    assert_success(&area.forklift("up", &["load", "."]));
+    assert_success(&area.forklift("up", &["stack", "up edits web (2)"]));
+    assert_success(&area.forklift("up", &["lift"]));
+    let p3 = pallet_head(&area, "up", "main");
+
+    // The sparse workspace merges p3 too — building the second merge whose ancestry re-reaches p2.
+    let lowered = area.forklift("sparse", &["lower"]);
+    assert!(!lowered.status.success(), "the second divergence must be reported");
+    assert_success(&area.forklift("sparse", &["palletize", "incoming2", &p3]));
+    assert_success(&area.forklift("sparse", &["shift", "main"]));
+    assert_success(&area.forklift("sparse", &["consolidate", "incoming2"]));
+
+    // p2's out-of-scope subtree was never fetched into the sparse store.
+    assert!(!object_present(&area, "sparse", &sealed_web),
+        "the interior merge parent's out-of-scope object must be sealed, not fetched");
+
+    // The lift must succeed: the parcel walk prunes p2 (and everything the remote already has),
+    // never loading the sealed object; the remote holds p2's whole closure.
+    let lifted = area.forklift("sparse", &["lift"]);
+    assert_success(&lifted);
+    assert!(stdout(&lifted).contains("Lifted") || stdout(&lifted).contains("up to date"),
+        "the two-merge sparse lift must go through: {}", stdout(&lifted));
+}
+
+#[test]
+fn narrow_refuses_to_delete_dirty_tracked_changes() {
+    // narrow has no working-directory-preserving path the way shift does — its delete is
+    // unconditional once it decides to act. An unstaged edit and a staged (loaded) edit under
+    // the narrowed prefix must both block it, naming the stable code, rather than be silently
+    // discarded.
+    let area = TestArea::new("sparse-narrow-dirty-tracked");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/src/api/a.txt", "api v1\n");
+    area.write_file("dev/docs/guide.md", "guide v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    assert_success(&area.forklift(".",
+        &["franchise", &server.url, "sparse", "--only", "src/api", "--only", "docs"]));
+
+    // An unstaged edit blocks narrowing "docs".
+    std::fs::write(area.path("sparse/docs/guide.md"), "guide v2 (unsaved)\n").unwrap();
+
+    let refused = area.forklift("sparse", &["--json", "narrow", "docs"]);
+    assert_eq!(refused.status.code(), Some(12), "narrow_unclean exits 12: {}", stderr(&refused));
+    let json: serde_json::Value = serde_json::from_str(&stdout(&refused)).unwrap();
+    assert_eq!(json["error"]["code"], "narrow_unclean", "{}", stdout(&refused));
+    assert_eq!(area.read_file("sparse/docs/guide.md"), "guide v2 (unsaved)\n",
+        "the unstaged edit must survive a refused narrow");
+
+    // A staged (loaded) edit blocks narrowing "src/api" too.
+    std::fs::write(area.path("sparse/src/api/a.txt"), "api v2 staged\n").unwrap();
+    assert_success(&area.forklift("sparse", &["load", "src/api/a.txt"]));
+
+    let refused2 = area.forklift("sparse", &["--json", "narrow", "src/api"]);
+    assert_eq!(refused2.status.code(), Some(12), "narrow_unclean exits 12: {}", stderr(&refused2));
+    assert_eq!(area.read_file("sparse/src/api/a.txt"), "api v2 staged\n",
+        "the staged edit must survive a refused narrow");
+
+    // Neither prefix was dropped: the materialization scope is unchanged.
+    let scope = area.forklift("sparse", &["--json", "scope"]);
+    let scope_json: serde_json::Value = serde_json::from_str(&stdout(&scope)).unwrap();
+    assert_eq!(scope_json["data"]["materialization_scope"], serde_json::json!(["docs", "src/api"]),
+        "{}", stdout(&scope));
+}
+
+#[test]
+fn narrow_refuses_to_delete_untracked_files() {
+    // An untracked file under the narrowed prefix — never loaded, never stacked — must also
+    // block narrow: it is uncommitted work, even though it was never tracked.
+    let area = TestArea::new("sparse-narrow-untracked");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/src/api/a.txt", "api v1\n");
+    area.write_file("dev/docs/guide.md", "guide v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    assert_success(&area.forklift(".",
+        &["franchise", &server.url, "sparse", "--only", "src/api", "--only", "docs"]));
+
+    area.write_file("sparse/docs/scratch.md", "not tracked\n");
+
+    let refused = area.forklift("sparse", &["--json", "narrow", "docs"]);
+    assert_eq!(refused.status.code(), Some(12), "narrow_unclean exits 12: {}", stderr(&refused));
+    let json: serde_json::Value = serde_json::from_str(&stdout(&refused)).unwrap();
+    assert_eq!(json["error"]["code"], "narrow_unclean", "{}", stdout(&refused));
+    assert!(json["error"]["message"].as_str().unwrap().contains("scratch.md"),
+        "the refusal names the untracked file: {}", stdout(&refused));
+
+    assert_eq!(area.read_file("sparse/docs/scratch.md"), "not tracked\n",
+        "the untracked file must survive a refused narrow");
+    assert!(area.path("sparse/docs/guide.md").exists(), "tracked content must survive too");
+}
+
+#[test]
+fn bay_add_scope_refuses_a_spine_ancestor_outside_the_fetch_scope() {
+    // A bay scope wider than the warehouse fetch scope (here, a spine ancestor whose sibling was
+    // never fetched) must be refused cleanly and up front — never half-create the bay (a
+    // registered pallet ref, a working directory, a redirect) before materialize discovers the
+    // problem.
+    let area = TestArea::new("sparse-bay-scope-spine");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/src/api/a.txt", "api v1\n");
+    area.write_file("dev/src/web/w.txt", "web v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src/api"]));
+
+    let bay_dir = area.path("sparse-src");
+    let refused = area.forklift("sparse",
+        &["bay", "add", "work", bay_dir.to_str().unwrap(), "--scope", "src"]);
+    assert!(!refused.status.success(), "a bay scope wider than the fetch scope must be refused");
+    assert!(stderr(&refused).contains("fetch scope"), "{}", stderr(&refused));
+    assert!(stderr(&refused).contains("expand"), "the refusal names expand: {}", stderr(&refused));
+
+    // Nothing was left behind: no working directory, no bay registered, no pallet ref.
+    assert!(!bay_dir.exists(), "a refused bay add must not create the working directory");
+    let list = area.forklift("sparse", &["bay"]);
+    assert_success(&list);
+    assert!(!stdout(&list).contains("work"), "a refused bay add must not register the bay: {}", stdout(&list));
+    assert!(!area.path("sparse/.forklift/pallets/work").exists(),
+        "a refused bay add must not create a pallet ref");
+}
+
+#[test]
+fn bay_add_scope_refuses_a_sealed_sibling_outside_the_fetch_scope() {
+    // A bay scope naming an out-of-scope path directly (the sealed sibling itself, not a spine
+    // ancestor) must also refuse cleanly — never a raw "object not found" from trying to load an
+    // object that was never fetched.
+    let area = TestArea::new("sparse-bay-scope-sealed");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/src/api/a.txt", "api v1\n");
+    area.write_file("dev/src/web/w.txt", "web v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src/api"]));
+
+    let bay_dir = area.path("sparse-web");
+    let refused = area.forklift("sparse",
+        &["bay", "add", "work", bay_dir.to_str().unwrap(), "--scope", "src/web"]);
+    assert!(!refused.status.success(), "a bay scope outside the fetch scope must be refused");
+    assert!(stderr(&refused).contains("fetch scope"), "a clean scope refusal, not a raw object error: {}", stderr(&refused));
+    assert!(stderr(&refused).contains("expand"), "the refusal names expand: {}", stderr(&refused));
+
+    assert!(!bay_dir.exists(), "a refused bay add must not create the working directory");
+}
+
+#[test]
+fn expand_recovers_after_an_unreachable_remote_leaves_the_scope_unchanged() {
+    // The crash-consistency property: expand must not persist the widened fetch scope until the
+    // content actually landed. Simulated deterministically by pointing at an unreachable remote
+    // (the same failure shape as a fetch that never completes) — the fetch scope must come back
+    // unchanged, and a plain re-run against the real remote must then complete on its own,
+    // proving the self-heal a premature scope write would have defeated.
+    let area = TestArea::new("sparse-expand-interrupt");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/src/api/a.txt", "api v1\n");
+    area.write_file("dev/src/web/w.txt", "web v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    let head = pallet_head(&area, "dev", "main");
+    let web_tree = path_object_hash(&area, "dev", &head, "src/web");
+
+    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src/api"]));
+
+    // Point at an unreachable remote and attempt to expand.
+    assert_success(&area.forklift("sparse", &["config", "remote.url", "http://127.0.0.1:9"]));
+    let failed = area.forklift("sparse", &["expand", "src/web"]);
+    assert!(!failed.status.success(), "expand against an unreachable remote must fail");
+
+    // The fetch scope must be unchanged — not left claiming "src/web" is in scope while nothing
+    // was actually fetched (that would make the next expand see it as already-in-scope and
+    // no-op, defeating self-heal).
+    let scope = area.forklift("sparse", &["--json", "scope"]);
+    let scope_json: serde_json::Value = serde_json::from_str(&stdout(&scope)).unwrap();
+    assert_eq!(scope_json["data"]["fetch_scope"], serde_json::json!(["src/api"]),
+        "a failed expand must not persist the widened scope: {}", stdout(&scope));
+    assert!(!object_present(&area, "sparse", &web_tree), "nothing was fetched by the failed attempt");
+
+    // Point back at the real remote: a plain re-run completes the fetch.
+    assert_success(&area.forklift("sparse", &["config", "remote.url", &server.url]));
+    let recovered = area.forklift("sparse", &["expand", "src/web"]);
+    assert_success(&recovered);
+    assert!(stdout(&recovered).contains("Expanded"), "{}", stdout(&recovered));
+    assert!(object_present(&area, "sparse", &web_tree), "the re-run must complete the fetch");
+
+    let scope2 = area.forklift("sparse", &["--json", "scope"]);
+    let scope2_json: serde_json::Value = serde_json::from_str(&stdout(&scope2)).unwrap();
+    assert_eq!(scope2_json["data"]["fetch_scope"], serde_json::json!(["src/api", "src/web"]),
+        "{}", stdout(&scope2));
+}
+
+#[test]
+fn a_sparse_franchise_with_a_typo_d_only_path_leaves_no_state_behind() {
+    // A typo'd --only path (naming nothing in the head) must be rejected before the fetch scope,
+    // origin or pallet head are ever written — a fresh, discarded directory should not also be a
+    // scope-inconsistent warehouse an operator has to notice.
+    let area = TestArea::new("sparse-franchise-typo");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/src/api/a.txt", "api v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    // "src/ap" (missing the final "i") names nothing in the head.
+    let failed = area.forklift(".", &["franchise", &server.url, "typo", "--only", "src/ap"]);
+    assert!(!failed.status.success(), "a typo'd --only path must be refused");
+    assert!(stderr(&failed).contains("Nothing was recorded"), "{}", stderr(&failed));
+
+    let dir = area.path("typo");
+    assert!(!dir.join(".forklift/config/fetch-scope").exists(), "no fetch scope was persisted");
+    assert!(!dir.join(".forklift/pallets/main").exists(), "no pallet head was recorded");
+
+    let origin = std::fs::read_to_string(dir.join(".forklift/config/warehouse.toml")).unwrap_or_default();
+    assert!(!origin.contains("origin"), "no remote origin was recorded: {}", origin);
 }

@@ -609,8 +609,10 @@ forklift scope --json     # the same, as a machine envelope
 ```
 
 Read-only. In a plain bay or the main tree it reports the full tree; in a scoped bay it lists
-the in-scope subtree prefixes. The warehouse fetch scope is reported too (it is *full* in this
-release — the store holds everything).
+the in-scope subtree prefixes. The warehouse fetch scope is reported too — *full* for an
+ordinary warehouse (the store holds everything), or the fetched prefixes for a sparse
+(`franchise --only`) one. Widen the fetch scope with `expand`; shrink a checkout's
+materialization scope with `narrow`.
 
 ---
 
@@ -642,12 +644,24 @@ once, then push and pull.
 ```sh
 forklift franchise http://forklift.example.com:9418 my-project
 forklift franchise <url> <dir> --pallet main --token <secret>
+forklift franchise <url> <dir> --only src/api            # sparse: fetch one subtree
+forklift franchise <url> <dir> --only src/api --only docs # several subtrees
 ```
 
 Prepares a fresh warehouse in the target directory, remembers the remote, adopts
 its trust anchor, downloads the history (using the remote's bundle when it has
 one, then loose objects for the rest), and materializes the chosen pallet
 (default: the remote's default pallet). The directory must be new or empty.
+
+**Sparse franchise (`--only`).** With one or more `--only <path>`, franchise fetches the
+whole signed history — every parcel, signature and the tree spine — but only the **content**
+under the named subtree(s). Out-of-scope subtrees and files are never downloaded; they stay
+pinned by the exact hash a signed parcel already commits, so nothing can be forged, it is
+simply not fetched. The working tree materializes only the in-scope subtree(s), and the
+remote's whole-store bundle is skipped. History, `audit`, `blame` and `diff` on in-scope paths
+all work; office and every meta pallet are always fetched in full, so a sparse franchise of a
+trusted warehouse still audits offline exactly as a full clone does. Widen later with `expand`.
+A sparse franchise records its origin — see the origin-only lift rule under `lift`.
 
 ### Configuring a remote on an existing warehouse
 
@@ -675,6 +689,13 @@ clean warehouse qualifies (the merge materializes), and a **true overlap** (both
 sides edited the same file) still stops with the diverged error, leaving the
 warehouse untouched — resolve it with `lower` + `consolidate`.
 
+**Origin-only lift from a sparse workspace.** A sparse (`franchise --only`) warehouse only
+ever proved its out-of-scope content present on the remote it fetched from — its origin. Lifting
+to a *different* remote could fail late at that remote's closure check, so `lift` refuses up
+front with the `non_origin_lift` code, naming the origin. Point `remote.url` back at the origin,
+or run a full (unscoped) franchise against the new remote. A full warehouse holds the whole
+closure and can lift anywhere.
+
 ### `lower` — pull (`lo`)
 
 ```sh
@@ -687,7 +708,35 @@ remote, its trust anchor is adopted (a one-way door, like enrolling). A diverged
 pallet is never merged implicitly: `lower` fetches the parcels and reports the
 divergence, and you consolidate deliberately (`palletize` the remote head into
 its own pallet, `consolidate` it, then `lift` the merge). Requires a clean
-warehouse.
+warehouse. In a sparse warehouse, `lower` stays pruned — it fetches new in-scope
+content and leaves out-of-scope changes sealed by hash, exactly as the franchise did.
+
+### `expand` — widen a sparse warehouse's fetch scope
+
+```sh
+forklift expand src/web            # fetch a subtree the sparse franchise left sealed
+forklift expand src/web docs       # several at once
+```
+
+Adds subtree path(s) to what the warehouse has fetched, and downloads their content across the
+whole history from the remote. Incremental and precise — only the newly in-scope objects are
+fetched; what is already present is skipped, and the content is hash-verified against the seals
+the history commits (so widening is safe from any remote — only publishing is origin-bound).
+After expanding, a bay can be scoped to the new path (`bay add --scope`). A full warehouse
+already holds everything, so there is nothing to expand.
+
+### `narrow` — shrink this checkout's materialization scope
+
+```sh
+forklift narrow docs               # stop materializing a subtree here
+```
+
+Drops subtree path(s) from what **this** checkout (a bay, or a sparse main tree) materializes,
+and removes those files from the working directory. This **frees nothing** in the shared object
+store — the dropped content is ordinary reachable history, not garbage — it only shrinks what
+this checkout shows. A checkout must keep at least one in-scope path; to stop scoping entirely,
+open a fresh full checkout. `narrow` is the counterpart of a bay's `--scope`, not of `expand`:
+`expand` widens what the *warehouse* fetched, `narrow` shrinks what *this checkout* materializes.
 
 ---
 
@@ -932,9 +981,11 @@ keep their git names outright. For the review workflow, git's "pull request" is
 | `store` | | Report object-store health (loose vs packed, sizes, maintenance due) |
 | `conflicts` | | List unresolved conflicts |
 | `park` | `pa` | Stash / list / pop work in progress |
-| `franchise` | `fr` | Clone a remote warehouse |
+| `franchise` | `fr` | Clone a remote warehouse (`--only` for a sparse clone) |
 | `lift` | `li` | Push to a remote |
 | `lower` | `lo` | Pull from a remote |
+| `expand` | | Widen a sparse warehouse's fetch scope and fetch the new subtree(s) |
+| `narrow` | | Shrink this checkout's materialization scope (frees nothing) |
 | `office` | `o` | Manage users, keys, roles, agents, trust |
 | `manifest` | `mf` | Record/read signed post-metadata on parcels |
 | `tag` | | Signed tags / releases (admin-signed, offline-verifiable) |
@@ -961,6 +1012,7 @@ Errors set a deterministic exit code so scripts branch without parsing prose:
 | 8 | Scope path type changed (a scoped bay's spine path flipped dir↔file) |
 | 9 | Sparse workspace (a whole-tree verb is not supported in a scoped bay yet) |
 | 10 | Out of scope conflict (a scoped bay merge hit an out-of-scope entry changed on both sides) |
+| 11 | Non-origin lift (a sparse workspace tried to lift to a remote other than its origin) |
 
 With `--json`, the same classification appears as `error.code` in the output
 envelope. See [`../MACHINE_INTERFACE.md`](../MACHINE_INTERFACE.md).

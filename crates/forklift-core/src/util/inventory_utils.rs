@@ -820,6 +820,55 @@ pub fn cleanup_after_stack() -> Result<(), String> {
     update_inventory_metadata(&BTreeSet::new(), &removed_keys)
 }
 
+/// Remove every inventory shard at or under a warehouse path prefix, dropping those keys from
+/// the metadata too. Unlike [`stage_removal_for_directory`], this leaves no `Deleted` record —
+/// the entries vanish, as if the subtree had never been inventoried. Used by `narrow` when a
+/// subtree leaves the checkout's materialization scope: it should stop being reported entirely,
+/// not appear as a staged removal to be committed.
+///
+/// # Arguments
+/// * `prefix` - The warehouse path key of the subtree leaving scope (never the root).
+///
+/// # Returns
+/// * `Ok(())`      - If the shards under the prefix were removed.
+/// * `Err(String)` - If a shard folder or the metadata could not be updated.
+pub fn remove_inventories_under(prefix: &str) -> Result<(), String> {
+    let (_, metadata_opt) = file_utils::retrieve_inventory_metadata_or_none()?;
+
+    let Some(metadata) = metadata_opt else {
+        return Ok(());
+    };
+
+    let mut removed_keys: BTreeSet<String> = BTreeSet::new();
+
+    for entry in &metadata {
+        let key = metadata_entry_to_key(entry);
+
+        // The prefix directory itself, or a directory strictly under it.
+        let under = key == prefix
+            || (key.len() > prefix.len()
+                && key.as_bytes()[prefix.len()] == b'/'
+                && key.starts_with(prefix));
+
+        if !under {
+            continue;
+        }
+
+        let folder = file_utils::get_inventory_folder_for_key(key);
+
+        // A parent shard folder earlier in the (sorted) set may have removed this one already.
+        if folder.exists() {
+            std::fs::remove_dir_all(&folder).map_err(|e|
+                format!("Error while removing the inventory of folder \"{}\": {}", key, e)
+            )?;
+        }
+
+        removed_keys.insert(key.to_string());
+    }
+
+    update_inventory_metadata(&BTreeSet::new(), &removed_keys)
+}
+
 /// Carry over the entries of the previous inventory that were not re-added by the directory
 /// walk (their file was deleted, renamed, newly ignored, or replaced by a directory),
 /// marking them as staged removals.
