@@ -4591,3 +4591,79 @@ fn a_stack_refuses_when_consolidation_state_exists_but_the_skeleton_file_is_gone
     );
     assert_eq!(pallet_head_hash(&warehouse, "scoped"), head_before, "a refused stack must commit nothing");
 }
+
+// -------------------------------------------------------------------------------------------
+// Presence-tolerant maintenance: `compact --all` on a store that legitimately lacks its
+// out-of-scope objects.
+//
+// The object store is FULL today (fetching cannot yet be scoped), so — like the scoped-merge
+// tests — absence is simulated by deleting the out-of-scope objects before maintenance runs.
+// That proves the repack's reachability pass tolerates a sparsely-fetched store in advance: it
+// packs what is present and never errors on a subtree object it does not hold. gc shares the same
+// reachability walk (`collect_live_set`), unit-tested directly in `gc_utils` where its collecting
+// side has a warehouse to sweep; here the end-to-end shape is pinned through the client.
+// -------------------------------------------------------------------------------------------
+
+#[test]
+fn compact_all_tolerates_a_sparse_store_and_a_later_scoped_stack_still_works() {
+    let warehouse = TestWarehouse::new("compact-all-sparse");
+    warehouse.write_file("src/api/a.txt", "api a v1\n");
+    warehouse.write_file("src/api/b.txt", "api b v1\n");
+    warehouse.write_file("src/web/w.txt", "web v1\n");
+    warehouse.write_file("README.md", "readme v1\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base"]));
+
+    let head = pallet_head_hash(&warehouse, "main");
+
+    // Resolve every out-of-scope object's hash *before* deleting any (walking one requires the
+    // ones above it to still be present): the sibling subtree, its blob, and the root file's blob.
+    let web_tree = path_object_hash(&warehouse, &head, "src/web");
+    let web_blob = path_object_hash(&warehouse, &head, "src/web/w.txt");
+    let readme_blob = path_object_hash(&warehouse, &head, "README.md");
+
+    // Make them unreadable, the way a sparsely-fetched store holds them: sealed by hash in the
+    // signed head, never downloaded.
+    for hash in [&web_tree, &web_blob, &readme_blob] {
+        std::fs::remove_file(object_store_path(&warehouse, hash)).expect("the out-of-scope object existed");
+    }
+
+    // The repack must not error on the absent-but-reachable subtree: it packs the present live set.
+    let objects = warehouse.root.join(".forklift/objects");
+    let repack = warehouse.run(&["--json", "compact", "--all"]);
+    assert_success(&repack);
+    assert_eq!(json(&repack)["data"]["all"], true);
+    assert_eq!(count_packs(&objects), 1, "the present live set consolidates into a single pack");
+
+    // Byte-reproducible on the sparse store: a second repack lands on the same single pack (the
+    // pack id is content-derived, so an unchanged repack neither churns the name nor loses an
+    // object) — the determinism contract, holding with objects legitimately missing.
+    assert_success(&warehouse.run(&["compact", "--all"]));
+    assert_eq!(count_packs(&objects), 1, "an idempotent repack on a sparse store keeps the one pack");
+
+    // The live, present history still reads back after the repack; the deleted objects stay gone
+    // (the repack neither collected the sealed spine nor resurrected the unfetched objects).
+    assert_success(&warehouse.run(&["peek", &head]));
+    assert_eq!(
+        json(&warehouse.run(&["--json", "history"]))["data"]["entries"].as_array().unwrap().len(),
+        1, "the one live parcel survives the sparse repack"
+    );
+    assert!(!object_store_path(&warehouse, &web_tree).exists(), "the repack must not recreate an unfetched object");
+
+    // A subsequent scoped stack still works on the compacted sparse store: the overlay reads the
+    // out-of-scope sibling's hash off the (now packed) spine tree and carries it forward by hash,
+    // never touching the absent object.
+    let scoped_dir = warehouse.home.join("bay-scoped");
+    assert_success(&warehouse.run(&["bay", "add", "scoped", scoped_dir.to_str().unwrap(), "--scope", "src/api"]));
+    std::fs::write(scoped_dir.join("src/api/a.txt"), "api a v2\n").unwrap();
+    assert_success(&warehouse.run_at(&scoped_dir, &["load", "."]));
+    assert_success(&warehouse.run_at(&scoped_dir, &["stack", "edit api after a sparse repack"]));
+
+    // The new head still commits the out-of-scope sibling at its original, never-fetched hash — the
+    // seal survived both the compaction and the scoped stack, with the object absent throughout.
+    let scoped_head = pallet_head_hash(&warehouse, "scoped");
+    assert_eq!(path_object_hash(&warehouse, &scoped_head, "src/web"), web_tree,
+        "the sealed out-of-scope subtree hash must carry forward unchanged");
+}

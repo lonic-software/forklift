@@ -1350,6 +1350,19 @@ fn walk_tree_for_bases(tree_hash: &str,
     }
     seen_trees.insert(tree_hash.as_bytes());
 
+    // Presence-tolerant descent, matching the live-set walk (`gc_utils::collect_live_set`). A
+    // subtree object can be legitimately absent — sealed by hash in a signed parcel but never
+    // fetched into this warehouse. There is no path base to compute for content we do not hold,
+    // and by the store invariant nothing beneath an absent subtree is present here either, so
+    // stopping loses no base for any object that will actually be packed (every pack target is a
+    // present object). For a full store `does_object_exist` is always true, so this guard never
+    // fires and the pack bytes are byte-for-byte what they were before — the determinism contract
+    // the repack suite pins. For a store missing some paths the output is deterministic given the
+    // same present set: the same objects are present, so the same bases are computed.
+    if !file_utils::does_object_exist(tree_hash)? {
+        return Ok(());
+    }
+
     let tree = object_utils::load_tree(tree_hash)?;
 
     for (name, file) in tree.get_files() {
