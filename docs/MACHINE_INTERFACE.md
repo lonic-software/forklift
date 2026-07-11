@@ -61,6 +61,7 @@ is reserved for argument/usage errors (clap); `0` is success.
 | `sparse_workspace`        | 9    | A whole-tree verb is not supported in a scoped (sparse) bay yet   |
 | `out_of_scope_conflict`   | 10   | A scoped bay merge hit an out-of-scope entry changed on both sides |
 | `non_origin_lift`         | 11   | A sparse workspace tried to lift to a remote other than its origin |
+| `narrow_unclean`          | 12   | `narrow` would delete a subtree that still holds uncommitted work  |
 
 The codes and exit numbers are a contract: they get added to, never repurposed.
 

@@ -2472,3 +2472,31 @@ fn a_sparse_franchise_with_a_typo_d_only_path_leaves_no_state_behind() {
     let origin = std::fs::read_to_string(dir.join(".forklift/config/warehouse.toml")).unwrap_or_default();
     assert!(!origin.contains("origin"), "no remote origin was recorded: {}", origin);
 }
+
+#[test]
+fn lift_from_a_sparse_workspace_with_no_remote_configured_reports_the_plain_error() {
+    // The origin guard must not fire when remote.url is simply unset: that is a different, plain
+    // "no remote configured" problem. Treating "unset" as "configured to the empty string" would
+    // wrongly compare it against the recorded origin and mask the real error behind a confusing
+    // "lifting to \"\"" non-origin refusal.
+    let area = TestArea::new("sparse-no-remote");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/src/api/a.txt", "api v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src/api"]));
+    assert_success(&area.forklift("sparse", &["config", "--unset", "remote.url"]));
+
+    let failed = area.forklift("sparse", &["--json", "lift"]);
+    assert!(!failed.status.success(), "lift with no remote configured must fail");
+    assert_ne!(failed.status.code(), Some(11), "must not be misclassified as non_origin_lift: {}", stdout(&failed));
+
+    let json: serde_json::Value = serde_json::from_str(&stdout(&failed)).unwrap();
+    assert_ne!(json["error"]["code"], serde_json::json!("non_origin_lift"), "{}", stdout(&failed));
+    assert!(json["error"]["message"].as_str().unwrap().contains("No remote is configured"),
+        "{}", stdout(&failed));
+}

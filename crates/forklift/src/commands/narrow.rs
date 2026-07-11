@@ -100,9 +100,11 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
 /// precedent (`shift` refuses rather than overwrite untracked content) — narrow's delete is
 /// unconditional once it decides to act, so the decision itself must be conservative.
 async fn ensure_narrow_target_is_clean(prefix: &str) -> Result<(), String> {
-    // Reuses the classifier to test "at or under `prefix`" — a scope of exactly this one
-    // prefix classifies everything at or under it as `InScope`, everything else as
-    // `OutOfScope` (there is nothing else to be `Spine` for, since it is the whole scope).
+    // Reuses the classifier to test "at or under `prefix`": a scope of exactly this one prefix
+    // classifies a path at or under it as `InScope` — the only case this check acts on. An
+    // ancestor of `prefix` (e.g. "src" for "src/api") classifies `Spine`, not `InScope`, exactly
+    // as it would in the bay's real scope — correctly excluded here too, since a change to
+    // something merely on the path to `prefix` is not a change inside the subtree being narrowed.
     let under = MaterializationScope::from_prefixes([prefix.to_string()]);
 
     let pallet = pallet_utils::get_current_pallet_name()?;

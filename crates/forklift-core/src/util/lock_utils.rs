@@ -132,38 +132,62 @@ impl Drop for ServeLock {
     }
 }
 
+/// How many times `acquire_lock_file` retries a transient permission-denied create, and the
+/// delay between attempts (see the function doc for what this absorbs).
+const LOCK_CREATE_MAX_ATTEMPTS: u32 = 6;
+const LOCK_CREATE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(20);
+
 /// Create an exclusive lock file at `path`, atomically (`create_new`, atomic on every platform).
 /// `subject` names what is being locked, for the contention message. Shared by every lock scope.
+///
+/// Retries a narrow, Windows-only failure a few times before giving up: NTFS can leave a
+/// just-deleted file in a brief "pending delete" state — e.g. while an antivirus scanner still
+/// holds a handle open on it — during which `CREATE_NEW` against the same path reports
+/// access-denied rather than a clean create. POSIX `unlink` has no such state (the directory
+/// entry is gone immediately, regardless of any other open handle), so this path is never taken
+/// on Unix. The retry is bounded (at most ~120ms total) and scoped to exactly this error kind —
+/// the moment a create instead reports `AlreadyExists`, that is the genuine "another process
+/// holds it" signal and returns immediately, no retry.
 fn acquire_lock_file(path: &Path, subject: &str) -> Result<(), String> {
-    match std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
-        Ok(mut file) => {
-            // The PID is informational only (it helps the user identify a stale lock);
-            // failing to write it must not fail the command.
-            let _ = writeln!(file, "{}", std::process::id());
-            Ok(())
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            let owner = std::fs::read_to_string(path).unwrap_or_default();
-            let owner = owner.trim();
-            let owner_info = if owner.is_empty() {
-                String::new()
-            } else {
-                format!(" (held by process {})", owner)
-            };
+    let mut attempts = 0;
 
-            Err(format!(
-                "The {} is locked by another forklift process{}. If that process \
-                is no longer running, remove \"{}\" and try again.",
-                subject,
-                owner_info,
-                path.to_string_lossy()
-            ))
+    loop {
+        attempts += 1;
+
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
+            Ok(mut file) => {
+                // The PID is informational only (it helps the user identify a stale lock);
+                // failing to write it must not fail the command.
+                let _ = writeln!(file, "{}", std::process::id());
+                return Ok(());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let owner = std::fs::read_to_string(path).unwrap_or_default();
+                let owner = owner.trim();
+                let owner_info = if owner.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (held by process {})", owner)
+                };
+
+                return Err(format!(
+                    "The {} is locked by another forklift process{}. If that process \
+                    is no longer running, remove \"{}\" and try again.",
+                    subject,
+                    owner_info,
+                    path.to_string_lossy()
+                ));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied
+                && attempts < LOCK_CREATE_MAX_ATTEMPTS => {
+                std::thread::sleep(LOCK_CREATE_RETRY_DELAY);
+            }
+            Err(e) => return Err(format!(
+                "Error while creating the lock file \"{}\": {}",
+                path.to_string_lossy(),
+                e
+            )),
         }
-        Err(e) => Err(format!(
-            "Error while creating the lock file \"{}\": {}",
-            path.to_string_lossy(),
-            e
-        )),
     }
 }
 

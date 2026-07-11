@@ -1013,6 +1013,7 @@ Errors set a deterministic exit code so scripts branch without parsing prose:
 | 9 | Sparse workspace (a whole-tree verb is not supported in a scoped bay yet) |
 | 10 | Out of scope conflict (a scoped bay merge hit an out-of-scope entry changed on both sides) |
 | 11 | Non-origin lift (a sparse workspace tried to lift to a remote other than its origin) |
+| 12 | Narrow unclean (`narrow` would delete a subtree that still holds uncommitted work) |
 
 With `--json`, the same classification appears as `error.code` in the output
 envelope. See [`../MACHINE_INTERFACE.md`](../MACHINE_INTERFACE.md).

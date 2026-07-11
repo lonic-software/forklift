@@ -111,9 +111,13 @@ fn ensure_origin_remote() -> Result<(), String> {
         return Ok(());
     };
 
-    let configured = config_utils::get_effective_value(config_utils::KEY_REMOTE_URL)?
-        .map(|(url, _scope)| url)
-        .unwrap_or_default();
+    let Some((configured, _scope)) = config_utils::get_effective_value(config_utils::KEY_REMOTE_URL)? else {
+        // No remote is configured at all — a different, unrelated problem. Leave it to
+        // `RemoteClient::from_config` (called right after this guard) to report that plainly,
+        // rather than treating "unset" as "configured to the empty string" and masking it
+        // behind a confusing "lifting to \"\"" origin refusal.
+        return Ok(());
+    };
 
     if configured != origin {
         return Err(scope_utils::non_origin_lift_refusal(&origin, &configured));
