@@ -62,6 +62,7 @@ is reserved for argument/usage errors (clap); `0` is success.
 | `out_of_scope_conflict`   | 10   | A scoped bay merge hit an out-of-scope entry changed on both sides |
 | `non_origin_lift`         | 11   | A sparse workspace tried to lift to a remote other than its origin |
 | `narrow_unclean`          | 12   | `narrow` would delete a subtree that still holds uncommitted work  |
+| `scope_prune_blocked`     | 13   | `scope-prune` would free a path a checkout still materializes       |
 
 The codes and exit numbers are a contract: they get added to, never repurposed.
 

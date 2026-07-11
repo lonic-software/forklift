@@ -697,6 +697,7 @@ mod tests {
         "import-git",  // migrate a git repo in (setup)
         "export-git",  // migrate out to git (setup)
         "self-update", // update the binary (host concern)
+        "scope-prune", // destructive, warehouse-wide disk reclamation — an admin verb, never a sub-agent's
         "mcp",         // this server itself
         "help",        // meta
         "version",     // meta

@@ -45,6 +45,7 @@ pub const CODE_SCOPE_PATH_TYPE_CHANGED: &str = "scope_path_type_changed";
 pub const CODE_SPARSE_WORKSPACE: &str = "sparse_workspace";
 pub const CODE_NON_ORIGIN_LIFT: &str = "non_origin_lift";
 pub const CODE_NARROW_UNCLEAN: &str = "narrow_unclean";
+pub const CODE_SCOPE_PRUNE_BLOCKED: &str = "scope_prune_blocked";
 
 /// The framing that marks a scope refusal string so the CLI can classify it without
 /// parsing prose. `\u{1f}` (ASCII Unit Separator) never appears in a message or a
@@ -264,6 +265,24 @@ pub fn read_fetch_scope() -> Result<MaterializationScope, String> {
     read_scope_file(&fetch_scope_path())
 }
 
+/// The materialization scope of a named bay (full when the bay has no scope file). Read from
+/// any checkout so a warehouse-level operation — scope-prune — can intersect every bay's scope
+/// before freeing anything, not only the invoking bay's.
+///
+/// # Arguments
+/// * `name` - The bay's name (as listed by `bay_utils::list_bays`).
+pub fn read_bay_scope(name: &str) -> Result<MaterializationScope, String> {
+    read_scope_file(&crate::util::bay_utils::bay_state_dir(name).join(FILE_NAME_BAY_SCOPE))
+}
+
+/// The materialization scope of the warehouse's main working tree (full when it has none).
+/// The main tree keeps its bay-local state directly under the shared root, so its scope file
+/// is at a fixed location every checkout can read — needed by scope-prune, which must intersect
+/// the main tree's scope too, not only the invoking checkout's and the named bays'.
+pub fn read_main_tree_scope() -> Result<MaterializationScope, String> {
+    read_scope_file(&globals::forklift_root().join(FILE_NAME_BAY_SCOPE))
+}
+
 /// Set the active bay's materialization scope, refusing a scope that is not ⊆ the warehouse
 /// fetch scope (a bay can never materialize what the warehouse never fetched, design §3.1).
 ///
@@ -445,6 +464,31 @@ pub fn narrow_unclean_refusal(path: &str, blocked_by: &str) -> String {
     )
 }
 
+/// A ready-made `scope_prune_blocked` refusal: scope-prune would free content that a checkout
+/// still materializes. A prune narrows the shared warehouse fetch scope and deletes the freed
+/// objects, so it can never leave a checkout materializing a path the warehouse no longer
+/// fetches — that would break the checkout the next time it read the now-absent content. It
+/// refuses up front, naming the blocking checkout(s), rather than corrupt them.
+///
+/// # Arguments
+/// * `path`      - The path the prune was asked to free.
+/// * `blockers`  - The checkout(s) still materializing it (for the message).
+pub fn scope_prune_blocked_refusal(path: &str, blockers: &str) -> String {
+    let next_step = format!(
+        "Narrow {} off \"{}\" first (that is bay-local and frees nothing), then prune.",
+        blockers, path
+    );
+
+    refusal(
+        CODE_SCOPE_PRUNE_BLOCKED,
+        format!(
+            "\"{}\" is still materialized by {}; pruning it would break that checkout. {}",
+            path, blockers, next_step
+        ),
+        next_step,
+    )
+}
+
 /// A ready-made `non_origin_lift` refusal for a lift from a sparse warehouse to a remote other
 /// than the one it fetched against. A sparse warehouse only ever proved its out-of-scope
 /// closure present on its origin; a different remote may lack objects it never verified there,
@@ -611,5 +655,16 @@ mod tests {
         assert!(!message.contains('\u{1f}'), "message still carries the control char: {:?}", message);
         assert!(!next_step.contains('\u{1f}'), "next_step still carries the control char: {:?}", next_step);
         assert!(message.contains("src/ api"), "control char should be replaced, not vanish: {:?}", message);
+    }
+
+    #[test]
+    fn a_scope_prune_blocked_refusal_carries_the_stable_code_and_names_the_blocker() {
+        let refusal = scope_prune_blocked_refusal("docs", "bay \"reviewer\"");
+        let (code, message, next_step) = decode_refusal(&refusal).unwrap();
+
+        assert_eq!(code, CODE_SCOPE_PRUNE_BLOCKED);
+        assert!(message.contains("docs"), "the path is named: {}", message);
+        assert!(message.contains("bay \"reviewer\""), "the blocker is named: {}", message);
+        assert!(next_step.contains("Narrow"), "the recovery says how to unblock: {}", next_step);
     }
 }

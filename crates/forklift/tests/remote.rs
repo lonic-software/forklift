@@ -2500,3 +2500,669 @@ fn lift_from_a_sparse_workspace_with_no_remote_configured_reports_the_plain_erro
     assert!(json["error"]["message"].as_str().unwrap().contains("No remote is configured"),
         "{}", stdout(&failed));
 }
+
+#[test]
+fn a_sparse_audit_names_its_scope_boundary() {
+    // Sparse-audit honesty: signatures are verified in full and in-scope content is verified by
+    // re-hash, but the rest is sealed by hash — and the audit says so in a distinct statement a
+    // full-clone audit never prints. A sealed out-of-scope subtree does not fail the audit; the
+    // human output and the --json envelope both carry the scope boundary.
+    let area = TestArea::new("sparse-audit-boundary");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/src/api/a.txt", "api v1\n");
+    area.write_file("dev/src/web/w.txt", "web v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "pre-trust base"]));
+    assert_success(&area.forklift("dev", &["office", "enroll"]));
+    area.write_file("dev/src/api/a.txt", "api v2 signed\n");
+    assert_success(&area.forklift("dev", &["load", "src/api/a.txt"]));
+    assert_success(&area.forklift("dev", &["stack", "signed parcel"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    let head = pallet_head(&area, "dev", "main");
+    let web_tree = path_object_hash(&area, "dev", &head, "src/web");
+
+    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src/api"]));
+
+    // The out-of-scope subtree was sealed, not fetched — yet the audit passes over it.
+    assert!(!object_present(&area, "sparse", &web_tree),
+        "the out-of-scope subtree must be sealed, not fetched");
+
+    let audit = area.forklift("sparse", &["audit"]);
+    assert_success(&audit);
+    let report = stdout(&audit);
+    assert!(report.contains("Office chain verified"), "the office chain is verified in full: {}", report);
+    assert!(report.contains("sparse"), "the boundary names the store as sparse: {}", report);
+    assert!(report.contains("src/api"), "the boundary names the fetched scope: {}", report);
+    assert!(report.contains("sealed by hash"), "out-of-scope content is stated sealed: {}", report);
+    assert!(report.contains("advisory"), "the boundary states enforcement is advisory: {}", report);
+
+    // --json carries the scope object only on a sparse run.
+    let audit_json = area.forklift("sparse", &["--json", "audit"]);
+    assert_success(&audit_json);
+    let json: serde_json::Value = serde_json::from_str(&stdout(&audit_json)).unwrap();
+    let scope = &json["data"]["scope"];
+    assert_eq!(scope["fetch_scope"], serde_json::json!(["src/api"]), "{}", stdout(&audit_json));
+    assert_eq!(scope["signatures"], serde_json::json!("verified"), "{}", stdout(&audit_json));
+    assert_eq!(scope["in_scope_content"], serde_json::json!("verified"), "{}", stdout(&audit_json));
+    assert_eq!(scope["out_of_scope_content"], serde_json::json!("sealed"), "{}", stdout(&audit_json));
+    assert_eq!(scope["enforcement"], serde_json::json!("advisory"), "{}", stdout(&audit_json));
+}
+
+#[test]
+fn a_sparse_audit_fails_on_a_tampered_in_scope_tree() {
+    // The scoped closure loads every in-scope tree, and a content-addressed read re-hashes it,
+    // so a corrupted in-scope subtree object is caught — the seal covers only what was never
+    // fetched, never the in-scope content the audit re-verifies.
+    let area = TestArea::new("sparse-audit-tamper");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/src/api/a.txt", "api v1\n");
+    area.write_file("dev/src/web/w.txt", "web v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "pre-trust base"]));
+    assert_success(&area.forklift("dev", &["office", "enroll"]));
+    area.write_file("dev/src/api/a.txt", "api v2 signed\n");
+    assert_success(&area.forklift("dev", &["load", "src/api/a.txt"]));
+    assert_success(&area.forklift("dev", &["stack", "signed parcel"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    let head = pallet_head(&area, "dev", "main");
+    let api_tree = path_object_hash(&area, "dev", &head, "src/api");
+    let api_blob = path_object_hash(&area, "dev", &head, "src/api/a.txt");
+
+    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src/api"]));
+
+    // A healthy sparse audit first — the store is valid.
+    assert_success(&area.forklift("sparse", &["audit"]));
+
+    // Overwrite the in-scope subtree object with another valid object's bytes: the read
+    // decompresses cleanly, but the re-hash no longer matches the name it was fetched under.
+    let blob_bytes = std::fs::read(object_store_path(&area, "sparse", &api_blob)).unwrap();
+    std::fs::write(object_store_path(&area, "sparse", &api_tree), &blob_bytes).unwrap();
+
+    let tampered = area.forklift("sparse", &["audit"]);
+    assert!(!tampered.status.success(),
+        "a corrupted in-scope tree must fail the sparse audit: {}", stdout(&tampered));
+}
+
+#[test]
+fn a_content_corrupted_in_scope_blob_passes_closure_but_fails_on_read() {
+    // The limitation, stated honestly: audit presence-checks blobs, it does not re-read their
+    // content — so a present-but-corrupted in-scope blob passes the closure check (true of a
+    // full-store audit too) and is caught only when it is next actually read.
+    let area = TestArea::new("sparse-audit-blob");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/src/api/a.txt", "api v1\n");
+    area.write_file("dev/src/web/w.txt", "web v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "pre-trust base"]));
+    assert_success(&area.forklift("dev", &["office", "enroll"]));
+    area.write_file("dev/src/api/a.txt", "api v2 signed\n");
+    assert_success(&area.forklift("dev", &["load", "src/api/a.txt"]));
+    assert_success(&area.forklift("dev", &["stack", "signed parcel"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    let head = pallet_head(&area, "dev", "main");
+    let api_blob = path_object_hash(&area, "dev", &head, "src/api/a.txt");
+
+    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src/api"]));
+    let sparse_head = pallet_head(&area, "sparse", "main");
+
+    // Corrupt the blob's bytes but leave the file present — a degraded-on-disk in-scope blob.
+    std::fs::write(object_store_path(&area, "sparse", &api_blob), b"corrupted-not-valid-zstd").unwrap();
+
+    let _scope = forklift_core::globals::StorageRootScope::enter(&area.path("sparse"));
+    let fetch_scope = forklift_core::util::scope_utils::read_fetch_scope().unwrap();
+
+    // Closure passes: the blob is present, and audit only presence-checks blobs.
+    forklift_core::util::audit_utils::verify_parcel_closure_scoped(&sparse_head, None, &fetch_scope)
+        .expect("a present (if content-corrupted) in-scope blob passes the presence-only closure check");
+
+    // Reading it does catch the corruption — the content-addressed read re-hashes.
+    assert!(forklift_core::util::object_utils::load_blob(&api_blob).is_err(),
+        "the corrupted blob must fail when it is actually read");
+}
+
+#[test]
+fn path_maybe_changed_absorbs_an_absent_out_of_scope_object() {
+    // The cold-path hardening: computing a parcel's changed-path filter diffs its tree against
+    // its parent's, which in a sparse store descends toward a sealed out-of-scope subtree the
+    // store never fetched. path_maybe_changed absorbs that absence into the honest "maybe"
+    // answer itself — every caller is safe by construction, not only blame's defensive wrapper.
+    let area = TestArea::new("sparse-maybe-changed");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/src/api/a.txt", "api v1\n");
+    area.write_file("dev/src/web/w.txt", "web v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    // A second parcel changes ONLY the out-of-scope subtree, so a filter diff must descend into
+    // it to be computed at all.
+    area.write_file("dev/src/web/w.txt", "web v2\n");
+    assert_success(&area.forklift("dev", &["load", "src/web/w.txt"]));
+    assert_success(&area.forklift("dev", &["stack", "web only"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    let head = pallet_head(&area, "dev", "main");
+    let web_tree = path_object_hash(&area, "dev", &head, "src/web");
+
+    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src/api"]));
+    let sparse_head = pallet_head(&area, "sparse", "main");
+
+    // The changed out-of-scope subtree the filter computation must descend into was never fetched.
+    assert!(!object_present(&area, "sparse", &web_tree), "the changed out-of-scope subtree must be sealed");
+
+    // Force the cold path: drop any precomputed filter so the head parcel's filter is recomputed.
+    let _ = std::fs::remove_dir_all(area.path("sparse/.forklift/graph"));
+
+    let _scope = forklift_core::globals::StorageRootScope::enter(&area.path("sparse"));
+    // Called directly — no `.unwrap_or(true)` — the function itself must degrade to Ok(true)
+    // rather than propagate the absent-object read error out of a total query.
+    let answer = forklift_core::util::graph_utils::path_maybe_changed(&sparse_head, "src/api/a.txt");
+    assert_eq!(answer, Ok(true),
+        "the cold path must absorb the absent out-of-scope object into a total \"maybe\", not an Err");
+}
+
+#[test]
+fn a_full_store_audit_omits_the_sparse_boundary() {
+    // The referee: a full (unscoped) store's audit is byte-for-byte what it always was — no
+    // scope boundary line, no scope field — so a sparse pass can never be confused for one.
+    let area = TestArea::new("full-audit-referee");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/src/api/a.txt", "api v1\n");
+    area.write_file("dev/src/web/w.txt", "web v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "pre-trust base"]));
+    assert_success(&area.forklift("dev", &["office", "enroll"]));
+    area.write_file("dev/src/api/a.txt", "api v2 signed\n");
+    assert_success(&area.forklift("dev", &["load", "src/api/a.txt"]));
+    assert_success(&area.forklift("dev", &["stack", "signed parcel"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    assert_success(&area.forklift(".", &["franchise", &server.url, "full"]));
+
+    let audit = area.forklift("full", &["audit"]);
+    assert_success(&audit);
+    let report = stdout(&audit);
+    assert!(report.contains("Office chain verified"), "{}", report);
+    assert!(!report.contains("sparse"), "a full-store audit must not print the sparse boundary: {}", report);
+    assert!(!report.contains("sealed by hash"), "{}", report);
+
+    let audit_json = area.forklift("full", &["--json", "audit"]);
+    assert_success(&audit_json);
+    let json: serde_json::Value = serde_json::from_str(&stdout(&audit_json)).unwrap();
+    assert!(json["data"]["scope"].is_null(),
+        "a full-store audit --json carries no scope field: {}", stdout(&audit_json));
+}
+
+#[test]
+fn scope_prune_frees_a_path_no_checkout_needs_and_leaves_the_rest_intact() {
+    // The scope-prune headline: on a sparse warehouse with two bays of different scopes, prune a
+    // fetched path no checkout materializes. Its content is freed; every other scope's content
+    // survives; the store still audits (the pruned path re-enters the sealed-but-unfetched
+    // state, never "missing"); and the path is re-fetchable with expand.
+    let area = TestArea::new("scope-prune-two-bays");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/src/api/a.txt", "api v1\n");
+    area.write_file("dev/src/web/w.txt", "web v1\n");
+    area.write_file("dev/docs/guide.md", "guide v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+
+    // Establish trust so a later audit verifies a real office chain — and so the office/meta
+    // carve-out (never scoped, never pruned) is exercised end to end.
+    assert_success(&area.forklift("dev", &["office", "enroll"]));
+    area.write_file("dev/src/api/a.txt", "api v2 signed\n");
+    assert_success(&area.forklift("dev", &["load", "src/api/a.txt"]));
+    assert_success(&area.forklift("dev", &["stack", "signed"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    let head = pallet_head(&area, "dev", "main");
+    let docs_tree = path_object_hash(&area, "dev", &head, "docs");
+    let docs_blob = path_object_hash(&area, "dev", &head, "docs/guide.md");
+    let api_tree = path_object_hash(&area, "dev", &head, "src/api");
+    let web_tree = path_object_hash(&area, "dev", &head, "src/web");
+    let web_blob = path_object_hash(&area, "dev", &head, "src/web/w.txt");
+
+    // A sparse franchise of all three paths, then two bays of different scopes on the one store.
+    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse",
+        "--only", "src/api", "--only", "src/web", "--only", "docs"]));
+
+    let apibay = area.path("bay-api");
+    assert_success(&area.forklift("sparse",
+        &["bay", "add", "apibay", apibay.to_str().unwrap(), "--scope", "src/api"]));
+    let webbay = area.path("bay-web");
+    assert_success(&area.forklift("sparse",
+        &["bay", "add", "webbay", webbay.to_str().unwrap(), "--scope", "src/web"]));
+
+    // The main checkout still materializes docs, so a prune of docs refuses until it narrows.
+    let blocked = area.forklift("sparse", &["--json", "scope-prune", "docs"]);
+    assert_eq!(blocked.status.code(), Some(13),
+        "a materialized path blocks the prune: {}", stderr(&blocked));
+
+    // Narrow docs away (the main checkout is the only one that had it), then prune it.
+    assert_success(&area.forklift("sparse", &["narrow", "docs"]));
+
+    let pruned = area.forklift("sparse", &["scope-prune", "docs"]);
+    assert_success(&pruned);
+    assert!(stdout(&pruned).contains("Pruned docs"), "{}", stdout(&pruned));
+    assert!(stdout(&pruned).contains("freed 2"),
+        "docs' subtree object and blob are freed: {}", stdout(&pruned));
+
+    // docs' content is gone; every other scope's content — and the office/meta chain — survives.
+    assert!(!object_present(&area, "sparse", &docs_tree), "the pruned subtree object is freed");
+    assert!(!object_present(&area, "sparse", &docs_blob), "the pruned blob is freed");
+    assert!(object_present(&area, "sparse", &api_tree), "bay apibay's content survives");
+    assert!(object_present(&area, "sparse", &web_tree), "bay webbay's content survives");
+    assert!(object_present(&area, "sparse", &web_blob), "bay webbay's content survives");
+
+    // The fetch scope was narrowed — docs is sealed, not missing — so the store still audits...
+    let scope = area.forklift("sparse", &["--json", "scope"]);
+    let scope_json: serde_json::Value = serde_json::from_str(&stdout(&scope)).unwrap();
+    assert_eq!(scope_json["data"]["fetch_scope"], serde_json::json!(["src/api", "src/web"]),
+        "{}", stdout(&scope));
+
+    let audit = area.forklift("sparse", &["audit"]);
+    assert_success(&audit);
+
+    // ...stocktake is clean...
+    let stocktake = area.forklift("sparse", &["stocktake"]);
+    assert_success(&stocktake);
+    assert!(stdout(&stocktake).contains("matches the inventory"), "{}", stdout(&stocktake));
+
+    // ...an in-scope edit still stacks and lifts (the sealed docs are never needed)...
+    std::fs::write(area.path("sparse/src/api/a.txt"), "api v3 after prune\n").unwrap();
+    assert_success(&area.forklift("sparse", &["load", "."]));
+    assert_success(&area.forklift("sparse", &["stack", "edit after prune"]));
+    assert_success(&area.forklift("sparse", &["lift"]));
+
+    // ...and the pruned path is re-fetchable from the origin, proving it was only sealed.
+    let expanded = area.forklift("sparse", &["expand", "docs"]);
+    assert_success(&expanded);
+    assert!(object_present(&area, "sparse", &docs_tree), "expand re-fetches the pruned subtree object");
+    assert!(object_present(&area, "sparse", &docs_blob), "expand re-fetches the pruned blob");
+}
+
+#[test]
+fn scope_prune_refuses_while_a_bay_still_materializes_the_path() {
+    // The multi-bay hazard: one object store is shared across checkouts, so pruning a path a bay
+    // still materializes would break that bay. The prune refuses, naming the bay, and the bay's
+    // objects are untouched — the bay's scope protects them from the prune.
+    let area = TestArea::new("scope-prune-hazard");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/src/api/a.txt", "api v1\n");
+    area.write_file("dev/src/web/w.txt", "web v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    let head = pallet_head(&area, "dev", "main");
+    let web_tree = path_object_hash(&area, "dev", &head, "src/web");
+    let web_blob = path_object_hash(&area, "dev", &head, "src/web/w.txt");
+
+    assert_success(&area.forklift(".",
+        &["franchise", &server.url, "sparse", "--only", "src/api", "--only", "src/web"]));
+
+    // A bay scopes src/web; the main checkout narrows it away — so only the bay still needs it.
+    let webbay = area.path("bay-web");
+    assert_success(&area.forklift("sparse",
+        &["bay", "add", "webbay", webbay.to_str().unwrap(), "--scope", "src/web"]));
+    assert_success(&area.forklift("sparse", &["narrow", "src/web"]));
+
+    // The prune refuses: the bay still materializes src/web. Exit 13, stable code, names the bay.
+    let refused = area.forklift("sparse", &["--json", "scope-prune", "src/web"]);
+    assert_eq!(refused.status.code(), Some(13), "the bay blocks the prune: {}", stderr(&refused));
+    let json: serde_json::Value = serde_json::from_str(&stdout(&refused)).unwrap();
+    assert_eq!(json["error"]["code"], "scope_prune_blocked", "{}", stdout(&refused));
+    assert!(json["error"]["message"].as_str().unwrap().contains("webbay"),
+        "the refusal names the blocking bay: {}", stdout(&refused));
+
+    // The bay's objects — and the fetch scope — are untouched: the refusal protected them.
+    assert!(object_present(&area, "sparse", &web_tree), "the bay's subtree object survives the refused prune");
+    assert!(object_present(&area, "sparse", &web_blob), "the bay's blob survives the refused prune");
+
+    let scope = area.forklift("sparse", &["--json", "scope"]);
+    let scope_json: serde_json::Value = serde_json::from_str(&stdout(&scope)).unwrap();
+    assert_eq!(scope_json["data"]["fetch_scope"], serde_json::json!(["src/api", "src/web"]),
+        "the refused prune left the fetch scope unchanged: {}", stdout(&scope));
+}
+
+#[test]
+fn scope_prune_refuses_on_a_full_warehouse() {
+    // A full (non-sparse) warehouse holds the whole tree by design; there is nothing to prune.
+    let area = TestArea::new("scope-prune-full");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/src/api/a.txt", "api v1\n");
+    area.write_file("dev/src/web/w.txt", "web v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    assert_success(&area.forklift(".", &["franchise", &server.url, "full"]));
+    let head = pallet_head(&area, "full", "main");
+    let web_tree = path_object_hash(&area, "full", &head, "src/web");
+
+    let refused = area.forklift("full", &["--json", "scope-prune", "src/web"]);
+    assert!(!refused.status.success(), "a full warehouse has nothing to prune: {}", stdout(&refused));
+    let json: serde_json::Value = serde_json::from_str(&stdout(&refused)).unwrap();
+    assert!(json["error"]["message"].as_str().unwrap().contains("full tree"),
+        "the refusal explains the warehouse is full: {}", stdout(&refused));
+
+    assert!(object_present(&area, "full", &web_tree), "nothing is freed on a full warehouse");
+}
+
+#[test]
+fn scope_prune_dry_run_reports_and_frees_nothing() {
+    // A dry run states what it would free and changes nothing — no object deleted, no fetch scope
+    // narrowed. A destructive verb must let the operator look before it leaps.
+    let area = TestArea::new("scope-prune-dry-run");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/src/api/a.txt", "api v1\n");
+    area.write_file("dev/src/web/w.txt", "web v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    let head = pallet_head(&area, "dev", "main");
+    let web_tree = path_object_hash(&area, "dev", &head, "src/web");
+    let web_blob = path_object_hash(&area, "dev", &head, "src/web/w.txt");
+
+    assert_success(&area.forklift(".",
+        &["franchise", &server.url, "sparse", "--only", "src/api", "--only", "src/web"]));
+    assert_success(&area.forklift("sparse", &["narrow", "src/web"]));
+
+    let dry = area.forklift("sparse", &["--json", "scope-prune", "src/web", "--dry-run"]);
+    assert_success(&dry);
+    let json: serde_json::Value = serde_json::from_str(&stdout(&dry)).unwrap();
+    assert_eq!(json["data"]["dry_run"], serde_json::json!(true), "{}", stdout(&dry));
+    assert_eq!(json["data"]["would_free"], serde_json::json!(2),
+        "the dry run counts the freeable objects: {}", stdout(&dry));
+    assert_eq!(json["data"]["freed"], serde_json::json!(0), "a dry run frees nothing: {}", stdout(&dry));
+
+    // Nothing changed: the objects are present and the fetch scope is unchanged.
+    assert!(object_present(&area, "sparse", &web_tree), "a dry run frees no object");
+    assert!(object_present(&area, "sparse", &web_blob), "a dry run frees no object");
+    let scope = area.forklift("sparse", &["--json", "scope"]);
+    let scope_json: serde_json::Value = serde_json::from_str(&stdout(&scope)).unwrap();
+    assert_eq!(scope_json["data"]["fetch_scope"], serde_json::json!(["src/api", "src/web"]),
+        "a dry run leaves the fetch scope unchanged: {}", stdout(&scope));
+}
+
+#[test]
+fn scope_prune_resumes_after_an_interrupted_free_and_completes() {
+    // Simulate a crash mid-prune: the fetch scope was already narrowed (the durable half of a
+    // prune) but freeing the objects (the destructive half) was interrupted before it finished.
+    // A bare re-run of the SAME path must not refuse "not a fetched path" — it must detect the
+    // already-pruned case, re-derive the closure against the now-narrowed scope, and finish
+    // freeing whatever the interrupted run left behind. The store stays healthy throughout.
+    let area = TestArea::new("scope-prune-resume");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/src/api/a.txt", "api v1\n");
+    area.write_file("dev/src/web/w.txt", "web v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+
+    // Trust, so the audit at the end verifies something real, not just "nothing to check."
+    assert_success(&area.forklift("dev", &["office", "enroll"]));
+    area.write_file("dev/src/api/a.txt", "api v2 signed\n");
+    assert_success(&area.forklift("dev", &["load", "src/api/a.txt"]));
+    assert_success(&area.forklift("dev", &["stack", "signed"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    let head = pallet_head(&area, "dev", "main");
+    let web_tree = path_object_hash(&area, "dev", &head, "src/web");
+    let web_blob = path_object_hash(&area, "dev", &head, "src/web/w.txt");
+
+    assert_success(&area.forklift(".",
+        &["franchise", &server.url, "sparse", "--only", "src/api", "--only", "src/web"]));
+    assert_success(&area.forklift("sparse", &["narrow", "src/web"]));
+
+    // Simulate an interrupted prune by hand: narrow the shared fetch scope directly (step one of
+    // a real prune, already durable) and delete only the blob — the child, freed before its
+    // parent tree in a real run's order — leaving the parent tree behind (step two, interrupted).
+    std::fs::write(area.path("sparse/.forklift/config/fetch-scope"), "src/api\n").unwrap();
+    std::fs::remove_file(object_store_path(&area, "sparse", &web_blob)).unwrap();
+    assert!(object_present(&area, "sparse", &web_tree),
+        "the simulated interruption leaves the parent tree behind");
+
+    // A bare re-run of "src/web" — no longer a fetch-scope prefix — resumes instead of refusing.
+    let resumed = area.forklift("sparse", &["--json", "scope-prune", "src/web"]);
+    assert_success(&resumed);
+    let json: serde_json::Value = serde_json::from_str(&stdout(&resumed)).unwrap();
+    assert!(json["ok"].as_bool().unwrap(), "a resumed prune must not error: {}", stdout(&resumed));
+    assert_eq!(json["data"]["freed"], serde_json::json!(1),
+        "the resumed prune frees exactly what the interruption left: {}", stdout(&resumed));
+
+    // The rest of the plan is now gone, and the store is still healthy.
+    assert!(!object_present(&area, "sparse", &web_tree), "the resumed prune frees the rest of the plan");
+    assert_success(&area.forklift("sparse", &["audit"]));
+    let stocktake = area.forklift("sparse", &["stocktake"]);
+    assert_success(&stocktake);
+    assert!(stdout(&stocktake).contains("matches the inventory"), "{}", stdout(&stocktake));
+
+    // Running it again, now that nothing is left, is a clean no-op, not an error.
+    let again = area.forklift("sparse", &["--json", "scope-prune", "src/web"]);
+    assert_success(&again);
+    let again_json: serde_json::Value = serde_json::from_str(&stdout(&again)).unwrap();
+    assert_eq!(again_json["data"]["freed"], serde_json::json!(0),
+        "a second resume finds nothing left to free: {}", stdout(&again));
+}
+
+#[test]
+fn scope_prune_retains_a_user_blob_that_collides_with_an_office_blob() {
+    // The mechanism the multi-bay/meta-carve-out retention depends on, pinned directly: prune's
+    // retained set is a hash SET spanning meta (full closure) and in-scope user content, so a
+    // pruned user blob that happens to share its hash with an office record (identical bytes,
+    // content-addressing) must survive — and the office chain, which needs that exact content,
+    // must still verify afterward. Content-addressing makes the collision easy to force
+    // deliberately: copy the office's own known content into a path this test then prunes.
+    let area = TestArea::new("scope-prune-office-collision");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/src/api/a.txt", "api v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+
+    // Establish trust, which writes at least one tracked-key record under the office pallet.
+    assert_success(&area.forklift("dev", &["office", "enroll"]));
+
+    let office_head = area.read_file("dev/.forklift/meta/office").trim().to_string();
+    let keys_tree = path_object_hash(&area, "dev", &office_head, ".forklift/tracked/keys");
+
+    // Find one key record's blob hash and content via peek (never guessing the on-disk layout).
+    let listing = area.forklift("dev", &["--json", "peek", &keys_tree]);
+    assert_success(&listing);
+    let listing_json: serde_json::Value = serde_json::from_str(&stdout(&listing)).unwrap();
+    let key_blob_hash = listing_json["data"]["entries"].as_array().unwrap().iter()
+        .find(|entry| entry["item_type"].as_str().unwrap().trim() != "tree")
+        .expect("the office keys tree has at least one record")
+        ["hash"].as_str().unwrap().to_string();
+
+    let blob_peek = area.forklift("dev", &["--json", "peek", &key_blob_hash]);
+    assert_success(&blob_peek);
+    let blob_json: serde_json::Value = serde_json::from_str(&stdout(&blob_peek)).unwrap();
+    let key_blob_content = blob_json["data"]["content"].as_str().unwrap().to_string();
+
+    // Write the office record's EXACT content at a user-pallet path, so the stored blob hash
+    // collides with the office's — proving retention is keyed by hash, not by pallet or path.
+    area.write_file("dev/src/web/w.txt", &key_blob_content);
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "web collides with an office key record"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    let head = pallet_head(&area, "dev", "main");
+    let web_blob = path_object_hash(&area, "dev", &head, "src/web/w.txt");
+    assert_eq!(web_blob, key_blob_hash, "the forced collision landed on the same hash");
+
+    assert_success(&area.forklift(".",
+        &["franchise", &server.url, "sparse", "--only", "src/api", "--only", "src/web"]));
+    assert_success(&area.forklift("sparse", &["narrow", "src/web"]));
+
+    let pruned = area.forklift("sparse", &["scope-prune", "src/web"]);
+    assert_success(&pruned);
+
+    // The colliding object SURVIVES the prune: the office's full-closure retention protects it,
+    // even though the only *user-pallet* path that named it was just pruned.
+    assert!(object_present(&area, "sparse", &web_blob),
+        "a user blob colliding with an office record must survive a prune of its user path");
+
+    // The office chain still verifies — proving the survival is real, not a coincidence: had the
+    // object actually been freed, the office audit (which needs this exact blob's content) would
+    // fail, not merely read as "missing" in some unrelated sense.
+    let audit = area.forklift("sparse", &["audit"]);
+    assert_success(&audit);
+    assert!(stdout(&audit).contains("Office chain verified"), "{}", stdout(&audit));
+}
+
+#[test]
+fn the_path_addressed_subtree_endpoint_serves_a_subtree_and_signals_fallback_on_404() {
+    // The FORK-10 enforcement seam: a path-addressed fetch. The remote resolves a path to a
+    // subtree and serves its closure — the wire surface a per-path authorizer will gate (a
+    // hash-addressed object GET is path-blind and cannot). The endpoint is additive: the client
+    // treats a 404 — an older remote without the route, or a path that does not resolve — as the
+    // signal to fall back to the shipped hash-addressed walk, so shipping it needs no version bump.
+    let area = TestArea::new("subtree-endpoint");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/src/api/a.txt", "api v1\n");
+    area.write_file("dev/src/web/w.txt", "web v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    let head = pallet_head(&area, "dev", "main");
+    let web_tree = path_object_hash(&area, "dev", &head, "src/web");
+    let web_blob = path_object_hash(&area, "dev", &head, "src/web/w.txt");
+
+    // A sparse franchise: src/web is sealed by hash, its objects never fetched.
+    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src/api"]));
+    assert!(!object_present(&area, "sparse", &web_tree), "src/web starts sealed, not fetched");
+
+    // Drive the client straight against the endpoint (a current-thread runtime: the storage scope
+    // is thread-local, so the import must stay on this thread).
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let _scope = forklift_core::globals::StorageRootScope::enter(&area.path("sparse"));
+    let client = forklift_core::util::remote_utils::RemoteClient::new(&server.url, None).unwrap();
+
+    // The endpoint resolves src/web to its subtree and serves the closure; importing it lands the
+    // sealed objects, hash-verified like any bundle.
+    let bundle = runtime
+        .block_on(client.fetch_subtree(&head, "src/web"))
+        .expect("the subtree fetch must not error")
+        .expect("a present remote serves the subtree, not a 404");
+    forklift_core::util::bundle_utils::import_bundle_bytes(&bundle).expect("the served subtree imports");
+
+    assert!(object_present(&area, "sparse", &web_tree), "the endpoint delivered the subtree object");
+    assert!(object_present(&area, "sparse", &web_blob), "the endpoint delivered the subtree's blob");
+
+    // A path the remote cannot resolve answers 404, which the client returns as `None` — the
+    // signal to fall back to the hash-addressed walk. An older remote without the route 404s
+    // identically, so the fallback path is the same one this returns.
+    let missing = runtime
+        .block_on(client.fetch_subtree(&head, "does/not/exist"))
+        .expect("a 404 is not an error");
+    assert!(missing.is_none(), "an unresolved path signals the client to fall back");
+}
+
+/// Build a subtree of `count` uniquely-named, uniquely-hashed blobs directly under one
+/// directory `name`, and set the warehouse's `main` head to a parcel rooted over it. Used to
+/// exceed the subtree endpoint's per-response object cap without paying for thousands of real
+/// `forklift` process calls.
+///
+/// Stores objects with a plain, non-atomic write rather than the real (fsync'd) write path:
+/// safe only because this is a disposable fixture built and consumed within one test process,
+/// never exercising crash-recovery. The real path (`LooseObject::store`) fsyncs deliberately —
+/// durable-before-destructive — which is exactly why it is too slow to call ten thousand times
+/// in one test (empirically, over a minute; this fixture needs milliseconds).
+fn build_wide_subtree(warehouse_root: &Path, name: &str, count: usize) -> String {
+    use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
+    use forklift_core::enums::dir_entry_type::DirEntryType;
+    use forklift_core::globals::StorageRootScope;
+    use forklift_core::model::blob::Blob;
+    use forklift_core::model::object::loose_object::LooseObject;
+    use forklift_core::model::parcel::Parcel;
+    use forklift_core::model::tree_item::TreeItem;
+    use forklift_core::util::{file_utils, pallet_utils};
+
+    let _scope = StorageRootScope::enter(warehouse_root);
+
+    fn store_fast(mut object: LooseObject) -> String {
+        let compressed = object.compress().unwrap();
+        let (path, file_name) = file_utils::get_path_for_object(&object.hash).unwrap();
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(std::path::Path::new(&path).join(&file_name), compressed).unwrap();
+        object.hash
+    }
+
+    let mut wide = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+    for i in 0..count {
+        let hash = store_fast(LooseObjectBuilder::build_blob(&Blob { content: i.to_string().into_bytes() }));
+        wide.add_child(TreeItem::new(format!("f{}", i), hash, DirEntryType::Normal));
+    }
+    let wide_hash = store_fast(LooseObjectBuilder::build_tree(&wide));
+
+    let mut top = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+    top.add_child(TreeItem::new(name.to_string(), wide_hash, DirEntryType::Tree));
+    let top_hash = store_fast(LooseObjectBuilder::build_tree(&top));
+
+    let parcel = Parcel {
+        tree_hash: top_hash,
+        parents: Vec::new(),
+        actions: Vec::new(),
+        description: Some("wide subtree fixture".to_string()),
+    };
+    let parcel_hash = store_fast(LooseObjectBuilder::build_parcel(&parcel));
+    pallet_utils::set_pallet_head("main", &parcel_hash).unwrap();
+
+    parcel_hash
+}
+
+#[test]
+fn the_subtree_endpoint_refuses_an_oversized_closure_and_the_client_falls_back() {
+    // Parity with objects/batch's MAX_MISSING_BATCH cap: an uncapped subtree response would
+    // buffer an arbitrarily large bundle in memory before it could even check the size. A
+    // subtree whose closure exceeds the cap must be refused (422, naming the cap) rather than
+    // streamed — and the client must treat that refusal exactly like a 404: fall back to the
+    // hash-addressed scoped walk, which has no such single-response limit.
+    let area = TestArea::new("subtree-cap");
+    let server = Server::start(&area, None);
+
+    // MAX_MISSING_BATCH is 10_000; 10_000 blobs plus their one parent tree is 10_001 objects —
+    // one over the cap.
+    let head = build_wide_subtree(&area.path("server-root"), "big", 10_000);
+
+    // The server refuses with 422, not a streamed bundle.
+    let status = http_status(&server.url, "GET", &format!("/v1/parcels/{}/subtree/big", head), None);
+    assert_eq!(status, "HTTP/1.1 422 Unprocessable Entity",
+        "an oversized subtree closure is refused, not streamed");
+
+    // The client treats that 422 exactly like a 404: `Ok(None)`, the fallback signal.
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let client = forklift_core::util::remote_utils::RemoteClient::new(&server.url, None).unwrap();
+    let result = runtime.block_on(client.fetch_subtree(&head, "big"));
+    assert!(result.is_ok(), "an over-cap subtree must not be a client error: {:?}", result.err());
+    assert!(result.unwrap().is_none(), "an over-cap subtree signals fallback, exactly like a 404");
+}

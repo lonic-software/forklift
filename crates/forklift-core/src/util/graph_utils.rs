@@ -692,13 +692,19 @@ fn topo_order(parents_of: &HashMap<String, Vec<String>>) -> Result<Vec<String>, 
 /// has not been computed yet it is computed now and stored, so the first query pays and every
 /// later one (for any file) is free.
 ///
+/// Computing the filter diffs the parcel's tree against its parent's, which in a sparse store can
+/// descend toward a sealed out-of-scope subtree the store never fetched. An object that is absent
+/// (or otherwise unreadable) during that computation is absorbed into the honest "maybe changed"
+/// answer here — the function is safe by construction for every caller, not only for `blame`,
+/// which is why callers do not need to wrap it defensively.
+///
 /// # Arguments
 /// * `parcel_hash` - The parcel to test.
 /// * `path`        - The warehouse path of the file.
 ///
 /// # Returns
-/// * `Ok(bool)`    - `true` if the path may have changed at the parcel, `false` if it did not.
-/// * `Err(String)` - If the parcel or a tree it needs could not be read.
+/// * `Ok(bool)`    - `true` if the path may have changed (or the filter is uncomputable), else `false`.
+/// * `Err(String)` - If the parcel record could not be resolved or the computed filter not stored.
 pub fn path_maybe_changed(parcel_hash: &str, path: &str) -> Result<bool, String> {
     let root = file_utils::get_path_graph_root();
     let prefix = shard_prefix(parcel_hash);
@@ -729,7 +735,12 @@ pub fn path_maybe_changed(parcel_hash: &str, path: &str) -> Result<bool, String>
         }
     };
 
-    let filter = compute_filter(parcel_hash, record.parents.first().map(String::as_str))?;
+    // Absorb an absent/unreadable object during the diff into `Unknown` — exactly as
+    // `build_from_heads` does for the bulk path (`.unwrap_or(PathFilter::Unknown)`) — so a sparse
+    // store's sealed out-of-scope subtree degrades this cold path to the honest "maybe" answer
+    // rather than propagating the read error out of a query the caller expects to be total.
+    let filter = compute_filter(parcel_hash, record.parents.first().map(String::as_str))
+        .unwrap_or(PathFilter::Unknown);
     let updated = Record {
         generation: record.generation,
         parents: record.parents,
@@ -739,7 +750,7 @@ pub fn path_maybe_changed(parcel_hash: &str, path: &str) -> Result<bool, String>
 
     Ok(match filter {
         PathFilter::Bloom(bytes) => bloom_contains(&bytes, path),
-        _ => true, // TooLarge (a root or a sweeping change) → maybe
+        _ => true, // TooLarge (a root or a sweeping change) or Unknown (uncomputable) → maybe
     })
 }
 

@@ -622,3 +622,73 @@ fn build_tree_metadata(root_hash: &str, tree_hashes: &BTreeMap<String, String>) 
 
     Ok(())
 }
+
+/// Resolve a warehouse path key to its subtree object hash inside a tree, or `None` when the key
+/// names nothing (or names a file, not a directory). The empty key resolves to the root itself.
+/// The trees on the path must be present to descend — which they are for an in-scope key.
+///
+/// # Arguments
+/// * `root_tree_hash` - The tree to resolve the key in.
+/// * `key`            - The warehouse path key (`/`-separated, e.g. `src/api`).
+pub fn resolve_subtree_hash(root_tree_hash: &str, key: &str) -> Result<Option<String>, String> {
+    if key.is_empty() {
+        return Ok(Some(root_tree_hash.to_string()));
+    }
+
+    let mut current = root_tree_hash.to_string();
+
+    for component in key.split('/') {
+        let tree = object_utils::load_tree(&current)?;
+
+        match tree.get_subtrees().find(|(name, _)| name.as_str() == component) {
+            Some((_, item)) => current = item.hash.clone(),
+            None => return Ok(None),
+        }
+    }
+
+    Ok(Some(current))
+}
+
+/// The object closure of the subtree at a warehouse path key inside a parcel's tree: the subtree
+/// root object and every tree and blob beneath it, de-duplicated. `Ok(None)` when the key names
+/// nothing (or a file) in this tree.
+///
+/// The path-addressed subtree fetch endpoint (`docs/format/REMOTE_PROTOCOL.md`) serves exactly
+/// this set, so a remote can resolve — and, when file-level path enforcement ships, authorize —
+/// a fetch by path rather than by an opaque hash a path-blind object endpoint cannot gate.
+///
+/// # Arguments
+/// * `root_tree_hash` - The parcel's root tree hash.
+/// * `key`            - The warehouse path key of the subtree.
+pub fn collect_subtree_closure(root_tree_hash: &str, key: &str) -> Result<Option<Vec<String>>, String> {
+    let subtree = match resolve_subtree_hash(root_tree_hash, key)? {
+        Some(hash) => hash,
+        None => return Ok(None),
+    };
+
+    let mut closure: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut frontier: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    frontier.push_back(subtree);
+
+    while let Some(tree_hash) = frontier.pop_front() {
+        if !seen.insert(tree_hash.clone()) {
+            continue;
+        }
+
+        closure.push(tree_hash.clone());
+        let tree = object_utils::load_tree(&tree_hash)?;
+
+        for (_, file) in tree.get_files() {
+            if seen.insert(file.hash.clone()) {
+                closure.push(file.hash.clone());
+            }
+        }
+
+        for (_, subtree) in tree.get_subtrees() {
+            frontier.push_back(subtree.hash.clone());
+        }
+    }
+
+    Ok(Some(closure))
+}

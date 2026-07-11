@@ -738,6 +738,29 @@ this checkout shows. A checkout must keep at least one in-scope path; to stop sc
 open a fresh full checkout. `narrow` is the counterpart of a bay's `--scope`, not of `expand`:
 `expand` widens what the *warehouse* fetched, `narrow` shrinks what *this checkout* materializes.
 
+### `scope-prune` — reclaim disk from a sparse warehouse
+
+```sh
+forklift scope-prune docs            # forget a fetched path and free its content
+forklift scope-prune docs --dry-run  # show what it would free, change nothing
+```
+
+The deliberate, **destructive** counterpart of `narrow`. Where `narrow` is bay-local and frees
+nothing, `scope-prune` forgets a path **warehouse-wide**: it drops the path from the shared
+warehouse fetch scope and deletes the objects under it from the object store, reclaiming disk
+reachability-`gc` never could (narrowed-away content is still reachable history, so `gc`
+correctly keeps it). It is **multi-bay-aware** — it refuses (`scope_prune_blocked`, exit 13) to
+free a path any checkout (the main tree or a bay) still materializes, so narrow that path away
+everywhere first. Nothing is lost: the pruned content is sealed by hash, re-fetchable from the
+origin with `expand`. A full (non-sparse) warehouse has nothing to prune. Use `--dry-run` before
+you leap. (Objects already inside a pack are reported but not reclaimed yet — a scope-aware
+repack is future work.)
+
+If a prune gets interrupted (killed, crashed) before it finishes freeing everything, the fetch
+scope has already narrowed but some objects are left behind. Running `scope-prune` again on the
+*same* path resumes rather than refusing "not a fetched path" — it finishes freeing whatever is
+left, or reports there is nothing left to free.
+
 ---
 
 ## 7. Identity, signing, and agents

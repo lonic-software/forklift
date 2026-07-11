@@ -161,6 +161,38 @@ content-addressed response prefix**, never the `objects/` namespace, so nothing 
 reachable as an object at a hash key and invariant 1 is not in play — and the client
 hash-verifies every record on import regardless.
 
+### `GET /v1/parcels/{parcel}/subtree/{path}` (additive; the path-addressed fetch)
+
+The object closure of the subtree at `path` in `parcel` — the subtree root object and every
+tree and blob beneath it — as a **bundle-format stream** (`BUNDLE_FORMAT.md`), served with
+`Content-Encoding: identity`. `{path}` is a warehouse path key (`/`-separated, e.g. `src/api`);
+the empty path is the whole tree. A parcel or path that does not resolve to a subtree is `404`.
+Every record is hash-verified on import, exactly like a bundle.
+
+This is the **path-addressed** counterpart of hash-addressed fetch. A sparse client already
+fetches exactly a subtree by pruning its hash-addressed walk by path (the MVP, which needs no
+new endpoint); this endpoint moves that resolution to the **remote**, which is what lets the
+remote *authorize a fetch by path*. A hash-addressed `GET /v1/objects/{hash}` is path-blind — it
+cannot enforce a per-path grant without a hash→path index — so this endpoint is the wire surface
+**file-level path enforcement** (FORK-10) is designed to gate: the remote resolves the subtree,
+checks the operator's path grants, and `403`s an out-of-scope path. The authorizer is a distinct
+seam in the head, wired when file-level FORK-10 ships; **today the read is open to every
+authenticated principal**, exactly as an object fetch already is, so the endpoint adds no
+enforcement yet — it only positions the surface. Task-scoped sparse workspaces are not
+confidentiality (hiding content): that is a separate feature (the private-tier locker), and this
+endpoint must not be sold as it.
+
+The endpoint is **additive**: a client whose remote predates the route gets a `404` and falls
+back to the shipped hash-addressed scoped walk, so it needs no protocol bump. A storage-backed
+head may answer `307` with a presigned `GET` of the bundle under the ephemeral response prefix,
+the same medicine the batch endpoint uses for large responses.
+
+Two further additive endpoints are **designed but deferred**, both pure optimizations behind the
+same `404`-fallback discipline (a client falls back to the hash walk / to recomputing locally):
+a **scoped-bundle** endpoint for sparse cold-start bundle speed, and **served commit-graph
+shards** so a sparse clone gets full changed-path filters without recomputing them. Neither
+changes what is fetchable, only how fast.
+
 ### `GET /v1/objects/{hash}`
 
 The raw (uncompressed) object bytes, or `404`. The client verifies the hash before

@@ -634,6 +634,34 @@ pub enum Command {
         action: Option<ScopeAction>,
     },
 
+    /// Reclaim disk from a sparse warehouse: forget a fetched path and free its content
+    #[command(
+        name = "scope-prune",
+        long_about = "Reclaim disk from a sparse warehouse: drop a fetched path from the shared \
+                      warehouse fetch scope and free the objects under it from the object store. \
+                      This is the deliberate, destructive counterpart of \"narrow\" — narrow is \
+                      bay-local and frees nothing, because narrowed-away content is still \
+                      reachable history that garbage collection correctly keeps; scope-prune \
+                      forgets a path warehouse-wide and reclaims its disk. It is multi-bay-aware: \
+                      it refuses to free a path any checkout (the main tree or a bay) still \
+                      materializes. The pruned content is sealed by hash afterwards — re-fetchable \
+                      from the origin with \"expand\". A full (non-sparse) warehouse has nothing to \
+                      prune. If an earlier prune was interrupted before it finished freeing \
+                      everything, running it again on the same path resumes and finishes the job \
+                      rather than refusing. Use --dry-run to see what it would free without \
+                      changing anything."
+    )]
+    ScopePrune {
+        /// The fetched path(s) to prune. Repeatable; also accepts a path an earlier, interrupted
+        /// prune already dropped from the fetch scope, to resume and finish freeing it.
+        #[arg(value_name = "PATH", required = true)]
+        paths: Vec<String>,
+
+        /// Report what would be freed and change nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Report object-store health: loose vs packed objects, packs, and whether compaction is due
     #[command(
         long_about = "Report the health of the object store — the counterpart of \"stocktake\" \
@@ -1281,6 +1309,7 @@ impl Command {
                 | Command::Peek { .. }
                 | Command::Restore { .. }
                 | Command::Scope { .. }
+                | Command::ScopePrune { .. }
                 | Command::Shift { .. }
                 | Command::Stack { .. }
                 | Command::Stocktake { .. }
@@ -1316,6 +1345,7 @@ impl Command {
                 | Command::Palletize { .. }
                 | Command::Park { .. }
                 | Command::Restore { .. }
+                | Command::ScopePrune { .. }
                 | Command::Shift { .. }
                 | Command::Stack { .. }
                 | Command::Tag { .. }

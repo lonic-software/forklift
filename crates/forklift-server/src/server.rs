@@ -37,7 +37,7 @@ use forklift_core::util::office_utils::OFFICE_PALLET_NAME;
 use forklift_core::util::lock_utils::ServeLock;
 use forklift_core::util::{
     audit_utils, bundle_utils, file_utils, hook_utils, merge_utils, object_utils,
-    office_utils, pallet_utils, sign_utils, warehouse_utils,
+    office_utils, pallet_utils, sign_utils, tree_utils, warehouse_utils,
 };
 
 /// One served warehouse: its storage root and its write mutex.
@@ -311,6 +311,7 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
         .route("/objects/missing", post(post_missing))
         .route("/objects/upload-targets", post(post_upload_targets))
         .route("/objects/batch", post(post_objects_batch))
+        .route("/parcels/{parcel}/subtree/{*path}", get(get_subtree))
         .route("/objects/{hash}", get(get_object).put(put_object))
         .route("/signatures/{hash}", get(get_signature).put(put_signature))
         .route("/trust", put(put_trust))
@@ -1050,6 +1051,96 @@ async fn post_objects_batch(State(state): State<Arc<AppState>>,
         ).into_response(),
         Err(error) => error_response(error),
     }
+}
+
+/// `GET /v1/parcels/{parcel}/subtree/{path}` — the object closure of the subtree at `path` in
+/// `parcel`, as a bundle-format stream.
+///
+/// This is the **path-addressed** fetch (the client's `RemoteClient::fetch_subtree`): the
+/// remote resolves `path` to a subtree itself, which is what lets it authorize a fetch by path.
+/// A hash-addressed `GET /v1/objects/{hash}` is path-blind — it cannot enforce a per-path grant
+/// without a hash→path index — so this endpoint is the wire surface file-level path enforcement
+/// (FORK-10) is designed to gate; see [`authorize_subtree`]. The endpoint is additive: a client
+/// whose remote predates the route gets a `404` and falls back to the hash-addressed scoped
+/// walk, so shipping it needs no protocol bump.
+async fn get_subtree(State(state): State<Arc<AppState>>,
+                     headers: HeaderMap,
+                     Path(params): Path<PathParams>) -> Response {
+    let principal = match check_auth(&state, &headers).await {
+        Ok(principal) => principal,
+        Err(error) => return error_response(error),
+    };
+
+    let warehouse = match resolve_warehouse(&state, &params) {
+        Ok(warehouse) => warehouse,
+        Err(error) => return error_response(error),
+    };
+
+    let parcel = match param(&params, "parcel") {
+        Ok(parcel) => parcel,
+        Err(error) => return error_response(error),
+    };
+
+    let path = match param(&params, "path") {
+        Ok(path) => path,
+        Err(error) => return error_response(error),
+    };
+
+    if let Err(error) = authorize_subtree(&state, &params, &principal, &path).await {
+        return error_response(error);
+    }
+
+    let result = blocking(warehouse, move || {
+        let root = object_utils::load_parcel(&parcel)
+            .map_err(|_| (StatusCode::NOT_FOUND, format!("No parcel {} exists.", parcel)))?
+            .tree_hash;
+
+        let closure = tree_utils::collect_subtree_closure(&root, &path)
+            .map_err(internal)?
+            .ok_or_else(|| (StatusCode::NOT_FOUND, format!("No subtree at \"{}\" in {}.", path, parcel)))?;
+
+        // The same cap `objects/batch` enforces, for the same reason: an uncapped subtree would
+        // buffer an arbitrarily large bundle in memory before it can even check the size. The
+        // empty path (the whole tree) is exactly the request expected to blow this cap on a big
+        // repo — that is the correct outcome: the client falls back to the hash-addressed walk,
+        // the same fallback a 404 already triggers, so a 422 here reuses that exact path.
+        if closure.len() > MAX_MISSING_BATCH {
+            return Err(unprocessable(format!(
+                "The subtree at \"{}\" has more than {} objects; fetch it with the hash-addressed \
+                walk instead.",
+                path, MAX_MISSING_BATCH
+            )));
+        }
+
+        bundle_utils::build_partial_bundle(&closure).map_err(internal)
+    }).await;
+
+    match result {
+        Ok(bytes) => (
+            [
+                (axum::http::header::CONTENT_TYPE, "application/octet-stream"),
+                // Already a zstd stream; the compression layer must not wrap it again.
+                (axum::http::header::CONTENT_ENCODING, "identity"),
+            ],
+            bytes,
+        ).into_response(),
+        Err(error) => error_response(error),
+    }
+}
+
+/// The file-level path-authorization seam (FORK-10) for the path-addressed subtree fetch.
+///
+/// Today a read is open to every authenticated principal — exactly what a hash-addressed object
+/// `GET` already allows — so this admits everything and adds no enforcement: the endpoint
+/// exposes nothing a path-blind object fetch does not. It is kept as a distinct function because
+/// the request names a *path*: once file-level grants land, the office resolves the principal's
+/// granted paths here and refuses (`403`) a subtree outside them — the one enforcement point,
+/// wired in one place rather than scattered across the read handlers.
+async fn authorize_subtree(_state: &AppState,
+                           _params: &PathParams,
+                           _principal: &Principal,
+                           _path: &str) -> Result<(), HandlerError> {
+    Ok(())
 }
 
 /// `GET /v1/objects/{hash}` — the raw object bytes.

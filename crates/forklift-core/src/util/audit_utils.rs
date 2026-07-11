@@ -7,6 +7,7 @@
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::sync::{Mutex, OnceLock};
 use crate::util::office_utils::{OfficeState, TrustAnchor};
+use crate::util::scope_utils::{MaterializationScope, ScopeClass};
 use crate::util::{fanout_utils, file_utils, graph_utils, object_utils, sign_utils};
 
 /// Verify the office chain from the genesis forward and return the final office state.
@@ -1172,6 +1173,129 @@ pub fn verify_parcel_closure_with(
     }
 
     Ok(())
+}
+
+/// [`verify_parcel_closure`], scoped to a sparse warehouse's fetch scope.
+///
+/// A sparse warehouse holds the full tree/blob closure only *within* its fetch scope; every
+/// out-of-scope subtree, file and symlink is sealed by the hash a signed parcel commits, not
+/// downloaded. This walk verifies exactly what is present — in-scope trees are loaded (and so
+/// re-hashed on the content-addressed read) and their blobs presence-checked, exactly as a full
+/// closure does — and stops at each out-of-scope boundary rather than erroring on the object it
+/// deliberately never fetched. Passing a full (unrestricted) `scope` makes it identical to
+/// [`verify_parcel_closure`].
+///
+/// Object presence is a warehouse property (what was fetched at all), so the walk is bounded by
+/// the warehouse fetch scope, never a narrower bay materialization scope: an object fetched but
+/// not materialized in *this* bay is still present in the shared store and is verified here.
+///
+/// # Arguments
+/// * `head`           - The head parcel whose closure is verified.
+/// * `known_complete` - A head already known complete (`None` verifies down to the genesis).
+/// * `scope`          - The warehouse fetch scope the store was fetched against.
+///
+/// # Returns
+/// * `Ok(())`      - If everything in the fetch scope is present (out-of-scope content stays sealed).
+/// * `Err(String)` - If an in-scope parcel, tree or blob is missing (or a tree is corrupt).
+pub fn verify_parcel_closure_scoped(
+    head: &str,
+    known_complete: Option<&str>,
+    scope: &MaterializationScope,
+) -> Result<(), String> {
+    let parcels = new_parcels(head, known_complete)
+        .map_err(|e| format!("The history behind {} is incomplete: {}", head, e))?;
+
+    let blob_exists = |hash: &str| file_utils::does_object_exist(hash);
+
+    // `verified` holds trees whose *entire* closure is proven present; it is populated only by
+    // the full walk below and never by a spine walk, so an in-scope encounter of a subtree is
+    // never wrongly skipped because the same hash was earlier reached, only partially, on the
+    // spine. `spine_seen` deduplicates the (few, path-shaped) spine trees for its own sake.
+    let mut verified: HashSet<String> = HashSet::new();
+    let mut spine_seen: HashSet<String> = HashSet::new();
+
+    for hash in &parcels {
+        let parcel = object_utils::load_parcel(hash)
+            .map_err(|e| format!("The history behind {} is incomplete: {}", head, e))?;
+
+        verify_tree_closure_scoped(
+            &parcel.tree_hash, "", &mut verified, &mut spine_seen, &blob_exists, scope,
+        )?;
+    }
+
+    Ok(())
+}
+
+/// [`verify_tree_closure`], threaded with the three-valued sparse classifier so an out-of-scope
+/// boundary is sealed (skipped) rather than loaded.
+///
+/// * **InScope** `prefix` — everything below is in scope too, so the whole closure is present:
+///   verify it fully via [`verify_tree_closure`], sharing (and populating) the fully-verified
+///   `verified` memo.
+/// * **OutOfScope** `prefix` — sealed by the hash the parent spine tree already commits; never
+///   loaded, never descended.
+/// * **Spine** `prefix` — an ancestor of an in-scope path: walk it, descending only the entries
+///   that lead to an in-scope leaf and carrying the out-of-scope siblings forward by their
+///   sealed hash. A spine walk verifies only part of the tree, so it must never record the tree
+///   in `verified` — that memo means "entire closure present", which a spine walk cannot claim.
+///
+/// # Arguments
+/// * `prefix`      - The warehouse path of `tree_hash` (`""` at the root), classified by `scope`.
+/// * `verified`    - Trees whose full closure is already proven present (populated by the full walk).
+/// * `spine_seen`  - Spine trees already walked in this pass (perf-only dedup).
+fn verify_tree_closure_scoped(tree_hash: &str,
+                              prefix: &str,
+                              verified: &mut HashSet<String>,
+                              spine_seen: &mut HashSet<String>,
+                              blob_exists: &dyn Fn(&str) -> Result<bool, String>,
+                              scope: &MaterializationScope) -> Result<(), String> {
+    match scope.classify(prefix) {
+        ScopeClass::InScope => return verify_tree_closure(tree_hash, verified, blob_exists),
+        ScopeClass::OutOfScope => return Ok(()),
+        ScopeClass::Spine => {}
+    }
+
+    // A spine tree already proven fully present in scope elsewhere, or already walked as a spine
+    // on this pass, needs no re-walk.
+    if verified.contains(tree_hash) || !spine_seen.insert(tree_hash.to_string()) {
+        return Ok(());
+    }
+
+    // Loading re-hashes the object (content-addressed read), so a corrupted spine tree fails here.
+    let tree = object_utils::load_tree(tree_hash)
+        .map_err(|e| format!("Tree {} is missing or unreadable: {}", tree_hash, e))?;
+
+    for (_, file) in tree.get_files() {
+        let path = child_path(prefix, &file.name);
+        if scope.classify(&path) == ScopeClass::OutOfScope {
+            continue; // sealed by hash, never fetched
+        }
+        if !blob_exists(&file.hash)? {
+            return Err(format!(
+                "Blob {} (\"{}\" in tree {}) is missing.",
+                file.hash, file.name, tree_hash
+            ));
+        }
+    }
+
+    for (_, subtree) in tree.get_subtrees() {
+        let path = child_path(prefix, &subtree.name);
+        if scope.classify(&path) == ScopeClass::OutOfScope {
+            continue; // sealed by hash, never descended
+        }
+        verify_tree_closure_scoped(&subtree.hash, &path, verified, spine_seen, blob_exists, scope)?;
+    }
+
+    Ok(())
+}
+
+/// The warehouse path of a tree entry named `name` under directory `prefix` (`""` = the root).
+fn child_path(prefix: &str, name: &str) -> String {
+    if prefix.is_empty() {
+        name.to_string()
+    } else {
+        format!("{}/{}", prefix, name)
+    }
 }
 
 /// Verify that a tree and everything below it is present in the object store.

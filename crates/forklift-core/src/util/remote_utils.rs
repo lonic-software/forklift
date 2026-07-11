@@ -288,6 +288,40 @@ impl RemoteClient {
             .map_err(|e| format!("Error while reading the batch response: {}", e))
     }
 
+    /// Fetch the object closure of a subtree at a path of a parcel, as a bundle-format stream
+    /// (`GET /v1/parcels/{parcel}/subtree/{path}`). This is the **path-addressed** fetch: the
+    /// remote resolves the path to a subtree itself, so it can authorize the request by path —
+    /// the wire surface file-level path enforcement (FORK-10) is designed to gate, which a
+    /// hash-addressed `GET /v1/objects/{hash}` cannot, being path-blind. `Ok(None)` when the
+    /// remote predates the endpoint (a `404`/`405`) or refused because the resolved subtree
+    /// exceeds the remote's per-response object cap (`422`, the same cap `objects/batch`
+    /// enforces) — both cases share one fallback: the caller walks the shipped hash-addressed
+    /// scoped fetch instead, which has no such single-response limit. That fallback is why
+    /// shipping this endpoint needs no protocol bump.
+    ///
+    /// # Arguments
+    /// * `parcel` - The parcel whose tree the path is resolved in.
+    /// * `path`   - The warehouse path key of the subtree (`/`-separated, e.g. `src/api`).
+    pub async fn fetch_subtree(&self, parcel: &str, path: &str) -> Result<Option<Vec<u8>>, String> {
+        let response = self.request(reqwest::Method::GET, &format!("/v1/parcels/{}/subtree/{}", parcel, path))
+            .send()
+            .await
+            .map_err(|e| format!("Error while fetching subtree \"{}\" from the remote: {}", path, e))?;
+
+        if endpoint_absent(response.status()) || response.status() == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+            return Ok(None);
+        }
+
+        if !response.status().is_success() {
+            return Err(Self::error_of(response, &format!("the subtree fetch for \"{}\"", path)).await);
+        }
+
+        response.bytes()
+            .await
+            .map(|bytes| Some(bytes.to_vec()))
+            .map_err(|e| format!("Error while reading the subtree response: {}", e))
+    }
+
     /// Fetch one object's raw bytes.
     pub async fn fetch_object(&self, hash: &str) -> Result<Vec<u8>, String> {
         let response = self.request(reqwest::Method::GET, &format!("/v1/objects/{}", hash))

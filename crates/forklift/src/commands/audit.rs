@@ -1,5 +1,5 @@
 use serde::Serialize;
-use forklift_core::util::{audit_utils, office_utils, pallet_utils};
+use forklift_core::util::{audit_utils, office_utils, pallet_utils, scope_utils};
 use forklift_core::util::pallet_utils::{PalletNamespace, PalletRef};
 use crate::output::{self, CommandOutput};
 
@@ -47,6 +47,7 @@ pub fn handle_command(pallet: Option<String>) -> Result<(), String> {
         pallet_verified: None,
         verified_parcels: 0,
         legacy_parcels: 0,
+        scope: None,
     };
 
     // Auditing the office pallet is just the office-chain verification above; any other
@@ -64,6 +65,17 @@ pub fn handle_command(pallet: Option<String>) -> Result<(), String> {
         report.pallet_verified = Some(true);
         report.verified_parcels = verified;
         report.legacy_parcels = legacy;
+
+        // A sparse warehouse holds only its in-scope content, so signatures alone cannot speak
+        // for what is on disk. Prove the fetched content present and re-hashed (sealing the rest
+        // by the hash a signed parcel commits), and report the boundary so a sparse pass can
+        // never read as a full-clone pass. A full store keeps today's signature-only audit
+        // unchanged — object presence is a warehouse property, so the fetch scope is the seam.
+        let fetch_scope = scope_utils::read_fetch_scope()?;
+        if !fetch_scope.is_full() {
+            audit_utils::verify_parcel_closure_scoped(&head, None, &fetch_scope)?;
+            report.scope = Some(AuditScope::new(fetch_scope.prefixes().to_vec()));
+        }
     }
 
     output::emit("audit", &report);
@@ -91,6 +103,47 @@ struct AuditReport {
 
     /// How many legacy (pre-trust, unsigned) parcels were tolerated.
     legacy_parcels: usize,
+
+    /// Present only when the warehouse is sparse: the fetch-scope boundary the content audit
+    /// ran against. A full clone omits it entirely, so a sparse pass is never mistaken for one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<AuditScope>,
+}
+
+/// The scope boundary of a sparse warehouse's audit. Emitted only on a sparse run so that a
+/// skimming reader (or agent) can never mistake a sparse pass — which verified content only
+/// within the fetch scope — for a full-clone pass that verified all of it.
+#[derive(Serialize)]
+struct AuditScope {
+    /// The warehouse fetch scope: the path prefixes whose content was fetched. Everything
+    /// outside is sealed by hash, not downloaded.
+    fetch_scope: Vec<String>,
+
+    /// Signatures — the office chain and every parcel — are verified in full regardless of
+    /// scope (parcels and their sidecars are always fully present).
+    signatures: &'static str,
+
+    /// In-scope content: every tree was re-hashed on read and every blob confirmed present.
+    in_scope_content: &'static str,
+
+    /// Out-of-scope content: sealed by the hash a signed parcel commits (unforgeable), verified
+    /// when it is fetched.
+    out_of_scope_content: &'static str,
+
+    /// The scope boundary is advisory — a client choice, not enforced by the remote.
+    enforcement: &'static str,
+}
+
+impl AuditScope {
+    fn new(fetch_scope: Vec<String>) -> AuditScope {
+        AuditScope {
+            fetch_scope,
+            signatures: "verified",
+            in_scope_content: "verified",
+            out_of_scope_content: "sealed",
+            enforcement: "advisory",
+        }
+    }
 }
 
 impl CommandOutput for AuditReport {
@@ -111,5 +164,25 @@ impl CommandOutput for AuditReport {
                 String::new()
             }
         );
+
+        // A distinct, self-contained boundary statement whenever the store is sparse — the one
+        // line a full-clone audit never prints, so a partial verification is never read as a
+        // complete one.
+        if let Some(scope) = &self.scope {
+            println!(
+                "This warehouse is sparse; content outside the fetched scope ({}) is sealed by \
+                hash, not downloaded.",
+                scope.fetch_scope.join(", ")
+            );
+            println!(
+                "Signatures are verified in full; within the fetched scope every tree was \
+                re-hashed and every blob confirmed present."
+            );
+            println!(
+                "Out-of-scope content is pinned to the hash a signed parcel commits — it cannot \
+                be forged or substituted, only fetched. The boundary is advisory, not enforced \
+                by the remote."
+            );
+        }
     }
 }

@@ -187,6 +187,10 @@ pub enum ErrorCode {
     /// `narrow` was asked to drop a subtree that still holds uncommitted work (staged,
     /// unstaged or untracked): it refuses rather than silently discard it.
     NarrowUnclean,
+
+    /// `scope-prune` was asked to free a path a checkout still materializes: freeing it would
+    /// break that checkout, so it refuses until the checkout narrows the path away.
+    ScopePruneBlocked,
 }
 
 impl ErrorCode {
@@ -204,6 +208,7 @@ impl ErrorCode {
             ErrorCode::SparseWorkspace      => scope_utils::CODE_SPARSE_WORKSPACE,
             ErrorCode::NonOriginLift        => scope_utils::CODE_NON_ORIGIN_LIFT,
             ErrorCode::NarrowUnclean        => scope_utils::CODE_NARROW_UNCLEAN,
+            ErrorCode::ScopePruneBlocked    => scope_utils::CODE_SCOPE_PRUNE_BLOCKED,
         }
     }
 
@@ -222,6 +227,7 @@ impl ErrorCode {
             ErrorCode::OutOfScopeConflict   => 10,
             ErrorCode::NonOriginLift        => 11,
             ErrorCode::NarrowUnclean        => 12,
+            ErrorCode::ScopePruneBlocked    => 13,
         }
     }
 
@@ -234,6 +240,7 @@ impl ErrorCode {
             _ if code == scope_utils::CODE_SPARSE_WORKSPACE       => Some(ErrorCode::SparseWorkspace),
             _ if code == scope_utils::CODE_NON_ORIGIN_LIFT        => Some(ErrorCode::NonOriginLift),
             _ if code == scope_utils::CODE_NARROW_UNCLEAN         => Some(ErrorCode::NarrowUnclean),
+            _ if code == scope_utils::CODE_SCOPE_PRUNE_BLOCKED    => Some(ErrorCode::ScopePruneBlocked),
             _ => None,
         }
     }
