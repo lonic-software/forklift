@@ -33,19 +33,40 @@ enum HeadEntry {
 /// * `Ok(())`      - If the restore completed successfully.
 /// * `Err(String)` - If there was an error while handling the command.
 pub fn handle_command(staged: bool, target: &str) -> Result<(), String> {
+    if staged {
+        return handle_unstage(target, "restore");
+    }
+
     let path = WarehousePath::from_user_input(target)?;
 
     // An out-of-scope path is sealed by hash in a scoped bay and was never materialized;
-    // restoring it (worktree or staged) would have nothing to restore from/to and, for
-    // `--staged`, would smuggle out-of-scope content into the inventory. Refuse
-    // cleanly rather than let the walk below silently do the wrong thing.
+    // restoring it would have nothing to restore from. Refuse cleanly rather than let the
+    // walk below silently do the wrong thing.
     crate::commands::scope::ensure_path_in_scope(path.as_key())?;
 
-    if staged {
-        restore_staged(&path)
-    } else {
-        restore_worktree(&path)
-    }
+    restore_worktree(&path)
+}
+
+/// Unstage a file or directory: reset its inventory entries to the pallet head, leaving
+/// the working directory untouched. Shared by `restore --staged` and `unload`; `command`
+/// labels the output envelope with the verb the user actually ran.
+///
+/// # Arguments
+/// * `target`  - The path of the file or directory to unstage.
+/// * `command` - The invoked command's name, for the output envelope.
+///
+/// # Returns
+/// * `Ok(())`      - If the unstage completed successfully.
+/// * `Err(String)` - If there was an error while handling the command.
+pub fn handle_unstage(target: &str, command: &str) -> Result<(), String> {
+    let path = WarehousePath::from_user_input(target)?;
+
+    // An out-of-scope path is sealed by hash in a scoped bay and was never materialized;
+    // unstaging it would smuggle out-of-scope content into the inventory. Refuse cleanly
+    // rather than let the walk below silently do the wrong thing.
+    crate::commands::scope::ensure_path_in_scope(path.as_key())?;
+
+    restore_staged(&path, command)
 }
 
 /// Restore the working directory from the inventory: rewrite the file (or, for a
@@ -78,7 +99,7 @@ fn restore_worktree(path: &WarehousePath) -> Result<(), String> {
 
     if item.state == InventoryItemState::Deleted {
         return Err(format!(
-            "The removal of \"{}\" is staged; use \"restore --staged {}\" to unstage it first.",
+            "The removal of \"{}\" is staged; use \"unload {}\" to unstage it first.",
             path.as_key(),
             path.as_key()
         ));
@@ -193,12 +214,13 @@ fn restore_file_and_refresh_entry(parent_key: &str,
 /// next comparison against the working directory rehashes them.
 ///
 /// # Arguments
-/// * `path` - The path to unstage.
+/// * `path`    - The path to unstage.
+/// * `command` - The invoked command's name, for the output envelope.
 ///
 /// # Returns
 /// * `Ok(())`      - If the unstage completed.
 /// * `Err(String)` - If the path exists neither in the inventory nor in the head.
-fn restore_staged(path: &WarehousePath) -> Result<(), String> {
+fn restore_staged(path: &WarehousePath, command: &str) -> Result<(), String> {
     let pallet = pallet_utils::get_current_pallet_name()?;
     let head = pallet_utils::get_pallet_head(&pallet)?;
 
@@ -234,7 +256,7 @@ fn restore_staged(path: &WarehousePath) -> Result<(), String> {
 
         inventory_utils::replace_subtree_inventories(path.as_key(), &shards)?;
 
-        output::message("restore", format!(
+        output::message(command, format!(
             "Unstaged \"{}\" (inventory reset to the pallet head).",
             if path.is_root() { "./" } else { path.as_key() }
         ));
@@ -272,7 +294,7 @@ fn restore_staged(path: &WarehousePath) -> Result<(), String> {
         }
     }
 
-    output::message("restore", format!("Unstaged \"{}\".", path.as_key()));
+    output::message(command, format!("Unstaged \"{}\".", path.as_key()));
 
     Ok(())
 }

@@ -177,7 +177,7 @@ fn extract_parcel_hash(stack_output: &Output) -> String {
 }
 
 #[test]
-fn prepare_load_peek_unload_flow() {
+fn prepare_load_peek_remove_flow() {
     let warehouse = TestWarehouse::new("flow");
     warehouse.write_file("readme.txt", "root file\n");
     warehouse.write_file("src/main.txt", "hello\n");
@@ -195,35 +195,35 @@ fn prepare_load_peek_unload_flow() {
     assert_success(&peek_nested);
     assert!(stdout(&peek_nested).contains("nested.txt"));
 
-    assert_success(&warehouse.run(&["unload", "."]));
+    assert_success(&warehouse.run(&["remove", "."]));
 
-    // Unloading stages removals instead of erasing the inventory: the entries survive,
+    // Removing stages removals instead of erasing the inventory: the entries survive,
     // marked as staged for removal.
-    let peek_after_unload = warehouse.run(&["peek", "--inventory", "."]);
-    assert_success(&peek_after_unload);
-    let root_listing = stdout(&peek_after_unload);
+    let peek_after_remove = warehouse.run(&["peek", "--inventory", "."]);
+    assert_success(&peek_after_remove);
+    let root_listing = stdout(&peek_after_remove);
     assert!(root_listing.contains("readme.txt"));
     assert!(root_listing.contains("Staged for removal"));
 
-    let nested_after_unload = stdout(&warehouse.run(&["peek", "--inventory", "src/data"]));
-    assert!(nested_after_unload.contains("nested.txt"));
-    assert!(nested_after_unload.contains("Staged for removal"));
+    let nested_after_remove = stdout(&warehouse.run(&["peek", "--inventory", "src/data"]));
+    assert!(nested_after_remove.contains("nested.txt"));
+    assert!(nested_after_remove.contains("Staged for removal"));
 }
 
 #[test]
-fn unloading_a_file_stages_its_removal_and_reloading_restores_it() {
+fn removing_a_file_stages_its_removal_and_reloading_restores_it() {
     let warehouse = TestWarehouse::new("stage-removal");
     warehouse.write_file("file.txt", "content\n");
 
     assert_success(&warehouse.run(&["prepare"]));
     assert_success(&warehouse.run(&["load", "file.txt"]));
-    assert_success(&warehouse.run(&["unload", "file.txt"]));
+    assert_success(&warehouse.run(&["remove", "file.txt"]));
 
     let staged = stdout(&warehouse.run(&["peek", "--inventory", "."]));
-    assert!(staged.contains("Staged for removal"), "unload must mark the entry, not erase it");
+    assert!(staged.contains("Staged for removal"), "remove must mark the entry, not erase it");
 
-    // Unloading an untracked path is still an error.
-    let unknown = warehouse.run(&["unload", "missing.txt"]);
+    // Removing an untracked path is still an error.
+    let unknown = warehouse.run(&["remove", "missing.txt"]);
     assert!(!unknown.status.success());
     assert!(stderr(&unknown).contains("not in the inventory"));
 
@@ -271,7 +271,7 @@ fn commands_work_from_a_subdirectory_of_the_warehouse() {
 }
 
 #[test]
-fn unloading_a_directory_keeps_sibling_directories_with_the_same_prefix() {
+fn removing_a_directory_keeps_sibling_directories_with_the_same_prefix() {
     let warehouse = TestWarehouse::new("sibling");
     warehouse.write_file("src/a.txt", "a\n");
     warehouse.write_file("src2/b.txt", "b\n");
@@ -279,9 +279,9 @@ fn unloading_a_directory_keeps_sibling_directories_with_the_same_prefix() {
     assert_success(&warehouse.run(&["prepare"]));
     assert_success(&warehouse.run(&["load", "src"]));
     assert_success(&warehouse.run(&["load", "src2"]));
-    assert_success(&warehouse.run(&["unload", "src"]));
+    assert_success(&warehouse.run(&["remove", "src"]));
 
-    // "src2" shares a string prefix with "src" but must survive the unload.
+    // "src2" shares a string prefix with "src" but must survive the removal.
     let peek = warehouse.run(&["peek", "--inventory", "src2"]);
     assert_success(&peek);
     assert!(stdout(&peek).contains("b.txt"));
@@ -631,7 +631,7 @@ fn stack_consumes_staged_removals() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["unload", "remove.txt"]));
+    assert_success(&warehouse.run(&["remove", "remove.txt"]));
 
     let stack = warehouse.run(&["stack", "Drop remove.txt"]);
     assert_success(&stack);
@@ -764,7 +764,7 @@ fn stocktake_reports_staged_and_unstaged_changes() {
     assert!(staged.contains("modified:"));
 
     // A staged removal is reported as removed; the file (still on disk) as untracked.
-    assert_success(&warehouse.run(&["unload", "dir/b.txt"]));
+    assert_success(&warehouse.run(&["remove", "dir/b.txt"]));
     let removal = stdout(&warehouse.run(&["stocktake"]));
     assert!(removal.contains("removed:"));
     assert!(removal.contains("dir/b.txt"));
@@ -994,7 +994,7 @@ fn restore_staged_resets_the_inventory_to_the_head() {
     assert!(after_add.contains("untracked: new.txt"), "status: {}", after_add);
 
     // Unstage a staged removal: the entry comes back from the head.
-    assert_success(&warehouse.run(&["unload", "a.txt"]));
+    assert_success(&warehouse.run(&["remove", "a.txt"]));
     let with_removal = stdout(&warehouse.run(&["stocktake"]));
     assert!(with_removal.contains("removed:"), "status: {}", with_removal);
 
@@ -1006,6 +1006,56 @@ fn restore_staged_resets_the_inventory_to_the_head() {
     let unknown = warehouse.run(&["restore", "--staged", "ghost.txt"]);
     assert!(!unknown.status.success());
     assert!(stderr(&unknown).contains("neither in the inventory nor in the pallet head"));
+}
+
+#[test]
+fn unload_unstages_instead_of_staging_a_removal() {
+    let warehouse = TestWarehouse::new("unload-unstages");
+    warehouse.write_file("a.txt", "original\n");
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "baseline"]));
+
+    // unload is the inverse of load: the staged modification is unstaged (back to the
+    // head), the worktree keeps the change — and crucially no removal is staged.
+    warehouse.write_file("a.txt", "modified\n");
+    assert_success(&warehouse.run(&["load", "a.txt"]));
+    assert_success(&warehouse.run(&["unload", "a.txt"]));
+
+    let status = stdout(&warehouse.run(&["stocktake"]));
+    assert!(status.contains("The inventory matches the pallet head"), "status: {}", status);
+    assert!(status.contains("modified:"), "status: {}", status);
+    assert!(!status.contains("removed:"), "unload must never stage a removal: {}", status);
+    assert_eq!(
+        std::fs::read_to_string(warehouse.root.join("a.txt")).unwrap(),
+        "modified\n"
+    );
+
+    // Stacking now records no change to the file: a mistaken load undone by unload can
+    // never turn into a deletion in the next parcel.
+    let nothing = warehouse.run(&["stack", "empty"]);
+    assert!(!nothing.status.success(), "nothing must be staged after unload");
+
+    // The JSON envelope carries the verb the user ran, not the shared implementation's.
+    warehouse.write_file("a.txt", "modified again\n");
+    assert_success(&warehouse.run(&["load", "a.txt"]));
+    let unloaded = warehouse.run(&["--json", "unload", "a.txt"]);
+    assert_success(&unloaded);
+    assert_eq!(json(&unloaded)["command"], "unload");
+
+    // The `ul` alias follows the verb.
+    warehouse.write_file("a.txt", "modified once more\n");
+    assert_success(&warehouse.run(&["load", "a.txt"]));
+    assert_success(&warehouse.run(&["ul", "a.txt"]));
+    let after_alias = stdout(&warehouse.run(&["stocktake"]));
+    assert!(after_alias.contains("The inventory matches the pallet head"), "status: {}", after_alias);
+
+    // And `rm` is the alias for staging a removal.
+    assert_success(&warehouse.run(&["rm", "a.txt"]));
+    let removal = stdout(&warehouse.run(&["stocktake"]));
+    assert!(removal.contains("removed:"), "status: {}", removal);
 }
 
 #[test]
@@ -4278,9 +4328,11 @@ fn a_scoped_bay_refuses_out_of_scope_path_arguments() {
     let scoped_dir = warehouse.home.join("bay-scoped");
     assert_success(&warehouse.run(&["bay", "add", "scoped", scoped_dir.to_str().unwrap(), "--scope", "src/api"]));
 
-    // load / unload / blame / diff on an out-of-scope path refuse with the stable code + exit 7.
+    // load / remove / unload / blame / diff on an out-of-scope path refuse with the stable
+    // code + exit 7.
     for args in [
         vec!["--json", "load", "src/web/w.txt"],
+        vec!["--json", "remove", "src/web/w.txt"],
         vec!["--json", "unload", "src/web/w.txt"],
         vec!["--json", "blame", "src/web/w.txt"],
         vec!["--json", "diff", "main", "scoped", "src/web"],

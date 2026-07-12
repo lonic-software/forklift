@@ -210,6 +210,7 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
         },
         Command::Peek { inventory, object } => commands::peek::handle_command(inventory, object, cli.verbose),
         Command::Prepare => commands::prepare::handle_command(cli.verbose),
+        Command::Remove { path } => commands::remove::handle_command(&path),
         Command::Restore { staged, path } => commands::restore::handle_command(staged, &path),
         Command::Scope { action } => commands::scope::handle_command(action),
         Command::ScopePrune { paths, dry_run } => commands::scope_prune::handle_command(paths, dry_run),

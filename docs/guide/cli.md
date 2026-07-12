@@ -172,16 +172,28 @@ is incremental — unchanged files are recognized by their stat data and never
 re-read. `load` (like every mutating command) holds the warehouse lock while it
 runs, so two forklift processes never interleave.
 
-### `unload` — stage a removal (`ul`)
+### `unload` — unstage (`ul`)
 
 ```sh
-forklift unload old.txt
+forklift unload src/main.rs
+```
+
+The inverse of `load`: resets the path's inventory entries to the pallet head,
+so the next parcel won't record the staged change. The working directory is
+**not** touched — your edits stay, they're just no longer staged. (`restore
+--staged` does the same thing; `unload` is its natural name.) To stage a
+removal instead, use `remove`.
+
+### `remove` — stage a removal (`rm`)
+
+```sh
+forklift remove old.txt
 ```
 
 Marks the path's inventory entries as deleted so the next parcel won't contain
 them. The working directory is **not** touched (the file stays on disk). To
 un-stage the removal, `load` the file again (if it's still there) or use
-`restore --staged`.
+`unload`.
 
 ### `stocktake` — status (`st`)
 
@@ -224,7 +236,8 @@ forklift restore --staged path   # reset the inventory entry to the pallet head 
 
 `restore path` overwrites the working file(s) from what's staged — it throws away
 unstaged edits, so use it deliberately. `restore --staged path` leaves the
-working directory alone and only un-stages (the inverse of `load`).
+working directory alone and only un-stages (the inverse of `load`) — the same
+operation as `unload`.
 
 ### `stack` — commit (`s`)
 
@@ -288,8 +301,8 @@ time:
 
 Re-`stack` to redo (e.g. with a corrected message). When the journal is empty (a stack made
 before this feature), `undo` falls back to soft-resetting the current pallet's head to its
-first parent. Undoing a pallet's *very first* parcel, pure-staging (`load`/`unload`) and
-trust/remote commands are out of scope; `park` is reversed with `park pop`.
+first parent. Undoing a pallet's *very first* parcel, pure-staging (`load`/`remove`/`unload`)
+and trust/remote commands are out of scope; `park` is reversed with `park pop`.
 
 ### `peek` — inspect an object (`pk`)
 
@@ -1032,7 +1045,8 @@ nudge you toward the real names as you go):
 | `status` | `stocktake` | | `push` | `lift` |
 | `log` | `history` | | `pull` | `lower` |
 | `branch` | `palletize` | | `stash` | `park` |
-| `annotate` | `blame` | | | |
+| `annotate` | `blame` | | `rm --cached` | `remove` |
+| `restore --staged` | `unload` | | | |
 
 The mapping isn't always one-to-one in *behavior* (e.g. `commit` runs `stack`, which commits
 what you've `load`ed — it doesn't stage for you). `diff`, `restore`, `tag` and `cherry-pick`
@@ -1048,7 +1062,8 @@ keep their git names outright. For the review workflow, git's "pull request" is
 | `config` | `cfg` | Read/set/unset configuration |
 | `profile` | | Manage named identity profiles |
 | `load` | `l` | Stage changes into the inventory |
-| `unload` | `ul` | Stage a removal |
+| `unload` | `ul` | Unstage (undo a `load`) |
+| `remove` | `rm` | Stage a removal |
 | `restore` | `r` | Restore from the inventory (discard changes) |
 | `stocktake` | `st` | Show staged and unstaged changes |
 | `diff` | `d` | Show line-by-line changes |

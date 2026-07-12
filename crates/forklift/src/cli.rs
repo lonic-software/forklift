@@ -529,6 +529,19 @@ pub enum Command {
         action: Option<ProfileAction>,
     },
 
+    /// Stage a file or directory for removal
+    #[command(
+        visible_alias = "rm",
+        long_about = "Stage a file or directory for removal: its inventory entries are marked as \
+                      deleted, so they will not be part of the next parcel. The working directory \
+                      is not touched. To unstage changes instead (undo a \"load\"), use \
+                      \"unload\"."
+    )]
+    Remove {
+        /// The file or directory to stage for removal
+        path: String,
+    },
+
     /// Restore a file or directory from the inventory (discard unstaged changes)
     #[command(
         visible_alias = "r",
@@ -708,15 +721,16 @@ pub enum Command {
     )]
     Undo,
 
-    /// Stage a file or directory for removal
+    /// Unstage a file or directory (keep your changes)
     #[command(
         visible_alias = "ul",
-        long_about = "Stage a file or directory for removal: its inventory entries are marked as \
-                      deleted, so they will not be part of the next parcel. The working directory \
-                      is not touched."
+        long_about = "Unstage a file or directory: reset its inventory entries to the pallet \
+                      head, leaving the working directory untouched — the inverse of \"load\", \
+                      and the same as \"restore --staged\". To stage a removal instead, use \
+                      \"remove\"."
     )]
     Unload {
-        /// The file or directory to unload
+        /// The file or directory to unstage
         path: String,
     },
 
@@ -1316,6 +1330,7 @@ impl Command {
                 | Command::Palletize { .. }
                 | Command::Park { .. }
                 | Command::Peek { .. }
+                | Command::Remove { .. }
                 | Command::Restore { .. }
                 | Command::Scope { .. }
                 | Command::ScopePrune { .. }
@@ -1353,6 +1368,7 @@ impl Command {
                 | Command::Office { .. }
                 | Command::Palletize { .. }
                 | Command::Park { .. }
+                | Command::Remove { .. }
                 | Command::Restore { .. }
                 | Command::ScopePrune { .. }
                 | Command::Shift { .. }
@@ -1399,7 +1415,7 @@ impl Command {
     /// The name this command records in the undo journal (§7.8), or `None` if it is not
     /// journaled. Only state-changing operations `undo` knows how to reverse are listed;
     /// their pre-operation state is snapshotted so `undo` can restore it. Pure-staging
-    /// (`load`/`unload`/`restore`), trust and remote commands are intentionally excluded.
+    /// (`load`/`remove`/`unload`/`restore`), trust and remote commands are intentionally excluded.
     pub fn journal_op(&self) -> Option<&'static str> {
         match self {
             Command::Stack { .. } => Some("stack"),

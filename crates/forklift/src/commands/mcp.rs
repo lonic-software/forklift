@@ -224,6 +224,10 @@ fn build_args(name: &str, arguments: &Value) -> Result<Vec<String>, String> {
             args.push("load".to_string());
             args.push(require("path")?);
         }
+        "remove" => {
+            args.push("remove".to_string());
+            args.push(require("path")?);
+        }
         "unload" => {
             args.push("unload".to_string());
             args.push(require("path")?);
@@ -551,7 +555,9 @@ fn tool_definitions() -> Value {
             object(json!({ "description": string }), json!([]))),
         tool("load", "Stage a file or directory (its changes) into the inventory.",
             object(json!({ "path": string }), json!(["path"]))),
-        tool("unload", "Stage a file or directory for removal.",
+        tool("remove", "Stage a file or directory for removal (the working directory is not touched).",
+            object(json!({ "path": string }), json!(["path"]))),
+        tool("unload", "Unstage a file or directory: reset it to the pallet head, keeping the working directory as it is (the inverse of load).",
             object(json!({ "path": string }), json!(["path"]))),
         tool("diff", "Show changed files. Default: working directory vs inventory. staged=true: inventory vs head. targets: two revisions to compare, optionally plus a path.",
             object(json!({ "staged": boolean, "targets": { "type": "array", "items": string } }), json!([]))),

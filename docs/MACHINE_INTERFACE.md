@@ -116,7 +116,8 @@ fails CI if that ever drifts. Tools (arguments in parentheses):
 - **Inspect:** `stocktake` (summary?), `history` (revision?, class?, limit?, after?),
   `diff` (staged?, targets?), `peek` (object | inventory), `blame` (path, rev?),
   `audit` (pallet?), `conflicts`.
-- **Change:** `load` (path), `unload` (path), `stack` (description?), `restore` (path,
+- **Change:** `load` (path), `remove` (path — stage a removal), `unload` (path — unstage),
+  `stack` (description?), `restore` (path,
   staged?), `undo`, `park` / `park_list` / `park_pop`, `cherry_pick` (revision, message?),
   `deliver` (target, message?).
 - **Maintain:** `compact` (all?) — pack the loose object store into a few dense pack files
