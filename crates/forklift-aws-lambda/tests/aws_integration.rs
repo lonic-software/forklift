@@ -37,7 +37,7 @@ use forklift_aws_lambda::store::{
     CasOutcome, ObjectAccess, ObjectStore, PromoteOutcome, PutOutcome, PutTarget, RefStore,
     SignatureOutcome, TrustOutcome,
 };
-use forklift_aws_lambda::{handle, AsyncBridge, DynamoRefStore, Head, Routing, S3ObjectStore};
+use forklift_aws_lambda::{handle, AsyncBridge, DynamoRefStore, Head, HeadResult, Routing, S3ObjectStore};
 
 use forklift_core::globals::StorageRootScope;
 use forklift_core::model::remote::{CommitLiftRequest, RefUpdateRequest, TrustAnchorDto};
@@ -1136,5 +1136,467 @@ async fn the_cli_lifts_and_lowers_through_the_staging_flow_over_s3_and_dynamodb(
     assert_eq!(
         std::fs::read_to_string(area.path("clone/readme.txt")).expect("clone readme v2"),
         "hello staging, twice\n"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// Chunk transport (§9.4b): the real-S3/DynamoDB verification the Stage 3 review flagged as
+// the remaining gap. `protocol.rs` already proves this logic against the in-memory fakes
+// (`a_ref_update_with_a_missing_chunk_is_refused`,
+// `an_intermediate_commit_batch_does_not_sweep_a_later_batchs_staged_objects`); everything below
+// re-proves the same invariants against real S3 + DynamoDB semantics, plus a full CLI round trip.
+//
+// A chunk is not a special case anywhere on the wire (`head.rs`/`aws/s3.rs` are type-blind by
+// construction — see their module docs) — every test here drives a *real* `Recipe`/`Chunk` pair
+// built through `object_utils::ingest_file`'s CDC path, the same code `forklift load` calls.
+// ---------------------------------------------------------------------------------------
+
+/// The chunk threshold (bytes): content at or above this is stored chunked. Mirrors
+/// `chunk_utils::CHUNK_THRESHOLD_BYTES` (a frozen format constant) — kept as a local literal
+/// exactly like `protocol.rs`'s copy of this harness, since the two test binaries cannot share one.
+const CHUNK_THRESHOLD: usize = 8 * 1024 * 1024;
+
+impl Area {
+    /// Write a large (chunk-threshold-crossing) file of deterministic, RNG-free bytes so it is
+    /// stored chunked and chunks reproducibly. A straight copy of `protocol.rs`'s helper of the
+    /// same name.
+    fn write_large_file(&self, relative: &str, seed: u64, size: usize) {
+        let path = self.path(relative);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create parent dirs");
+        }
+
+        let mut bytes = Vec::with_capacity(size);
+        let mut state = seed;
+        while bytes.len() < size {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            bytes.extend_from_slice(&(z ^ (z >> 31)).to_le_bytes());
+        }
+        bytes.truncate(size);
+        std::fs::write(path, bytes).expect("write large file");
+    }
+}
+
+/// A chunked file's identity, resolved from the *source* warehouse before it is harvested: the
+/// recipe hash and its ordered chunk hashes. Resolved exactly the way `protocol.rs`'s
+/// `a_ref_update_with_a_missing_chunk_is_refused` resolves them.
+struct ChunkedFileIdentity {
+    recipe_hash: String,
+    chunk_hashes: Vec<String>,
+}
+
+/// Build a warehouse with one file at/above [`CHUNK_THRESHOLD`] (so `forklift load` stores it as
+/// a recipe plus chunks), lift-stack it, and harvest every object/signature/ref plus the chunked
+/// file's own identity. Deterministic bytes (no RNG), so the chunk boundaries — and therefore the
+/// chunk count — are reproducible from one run to the next.
+fn build_chunked_warehouse(
+    name: &str,
+    size: usize,
+) -> (Area, Harvest, String, ChunkedFileIdentity) {
+    let area = Area::new(name);
+    prepare(&area, "wh");
+    area.write_large_file("wh/big.bin", 0xC0FFEE, size);
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "a giant"]);
+
+    let harvest = harvest(&area.path("wh"));
+    let main_head = harvest.head_of("main").expect("main has a head");
+
+    let identity = {
+        let _scope = StorageRootScope::enter(&area.path("wh"));
+        let tree = object_utils::load_parcel(&main_head).expect("head parcel").tree_hash;
+        let (recipe_hash, item_type) = object_utils::resolve_tree_file(&tree, "big.bin")
+            .expect("resolve big.bin")
+            .expect("big.bin is tracked");
+        assert!(item_type.is_chunked(), "the giant is stored chunked");
+        let chunk_hashes = object_utils::recipe_chunk_hashes(&recipe_hash).expect("chunk hashes");
+
+        ChunkedFileIdentity { recipe_hash, chunk_hashes }
+    };
+
+    (area, harvest, main_head, identity)
+}
+
+/// Take a [`S3ObjectStore`] by value, run one blocking `ObjectStore` call on it, and hand it back
+/// alongside the result — `S3ObjectStore` is not `Clone`, so ownership threads through a chain of
+/// blocking calls instead of being rebuilt or shared. Used only by the chunk-transport tests
+/// below, which (unlike the tests above) need real `reqwest` calls interleaved between blocking
+/// store calls.
+async fn chunk_stage_target(objects: S3ObjectStore, session: &str, hash: &str) -> (S3ObjectStore, String) {
+    let (session, hash) = (session.to_string(), hash.to_string());
+
+    tokio::task::spawn_blocking(move || {
+        let url = match objects.put_target(Some(&session), &hash).expect("put target") {
+            PutTarget::Staged(url) => url,
+            _ => panic!("expected a staged target"),
+        };
+        (objects, url)
+    })
+    .await
+    .expect("blocking put_target")
+}
+
+async fn chunk_promote(
+    objects: S3ObjectStore,
+    session: &str,
+    hash: &str,
+) -> (S3ObjectStore, PromoteOutcome) {
+    let (session, hash) = (session.to_string(), hash.to_string());
+
+    tokio::task::spawn_blocking(move || {
+        let outcome = objects.verify_and_promote(&session, &hash).expect("verify_and_promote");
+        (objects, outcome)
+    })
+    .await
+    .expect("blocking verify_and_promote")
+}
+
+async fn chunk_object_exists(objects: S3ObjectStore, hash: &str) -> (S3ObjectStore, bool) {
+    let hash = hash.to_string();
+
+    tokio::task::spawn_blocking(move || {
+        let found = objects.exists(&hash).expect("exists");
+        (objects, found)
+    })
+    .await
+    .expect("blocking exists")
+}
+
+async fn chunk_object_get(objects: S3ObjectStore, hash: &str) -> (S3ObjectStore, Option<Vec<u8>>) {
+    let hash = hash.to_string();
+
+    tokio::task::spawn_blocking(move || {
+        let bytes = objects.get(&hash).expect("get");
+        (objects, bytes)
+    })
+    .await
+    .expect("blocking get")
+}
+
+/// Stage bytes straight to `staging/{session}/{hash}` via the real client — the same shortcut
+/// `s3_verify_and_promote_gates_the_canonical_namespace` takes above, standing in for a client's
+/// presigned staging `PUT` (proven end to end, for a chunk specifically, by
+/// `a_chunked_files_chunks_stage_and_promote_over_real_s3` below).
+async fn chunk_stage_raw(s3: &aws_sdk_s3::Client, bucket: &str, session: &str, hash: &str, bytes: Vec<u8>) {
+    s3.put_object()
+        .bucket(bucket)
+        .key(format!("staging/{}/{}", session, hash))
+        .body(bytes.into())
+        .send()
+        .await
+        .expect("stage bytes");
+}
+
+/// List every key currently under `session`'s staging prefix in real S3 — the ground truth this
+/// suite's in-memory-fake counterpart (`protocol.rs`'s `MemoryObjectStore::staged_count`) has no
+/// equivalent for, and the direct proof a sweep did or did not run.
+async fn chunk_list_staging_keys(s3: &aws_sdk_s3::Client, bucket: &str, session: &str) -> Vec<String> {
+    let listed = s3
+        .list_objects_v2()
+        .bucket(bucket)
+        .prefix(format!("staging/{}/", session))
+        .send()
+        .await
+        .expect("list staging keys");
+
+    listed.contents().iter().filter_map(|object| object.key().map(str::to_string)).collect()
+}
+
+/// Take a [`Head`] over the real stores by value, run one blocking `commit_lift` call, and hand
+/// it back alongside the result — the same ownership-threading `chunk_stage_target` and its
+/// siblings use, since `Head` is not `Clone` either.
+async fn chunk_commit_lift(
+    objects: S3ObjectStore,
+    refs: DynamoRefStore,
+    session: &str,
+    control_plane: Vec<String>,
+    blobs: Vec<String>,
+    more: bool,
+) -> (S3ObjectStore, DynamoRefStore, HeadResult<()>) {
+    let session = session.to_string();
+
+    tokio::task::spawn_blocking(move || {
+        let head = Head::new(objects, refs);
+        let result = head.commit_lift(&session, &control_plane, &blobs, more);
+        (head.objects, head.refs, result)
+    })
+    .await
+    .expect("blocking commit_lift")
+}
+
+/// PROOF 1 — a chunked file's lift, chunk by chunk, over real S3: each chunk stages via its own
+/// presigned `PUT` (the same `put_target`/`staging/{session}/{hash}` scheme as any other object —
+/// a chunk is not a special case anywhere on the wire, see `head.rs::commit_lift`'s doc comment),
+/// and lands canonical only once `verify_and_promote` runs on the staged key.
+///
+/// LocalStack's community edition does not deliver S3 bucket-notification events to a Lambda the
+/// way production does (that is what `verifier.rs`'s `S3Event` handler reacts to), so — exactly
+/// like this suite's `run_staging_verifier` stand-in and `s3_verify_and_promote_gates_the_canonical_namespace`
+/// above — this test drives the verifier by calling `verify_and_promote` directly on each staged
+/// key, rather than waiting for a bucket notification that never arrives here.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_chunked_files_chunks_stage_and_promote_over_real_s3() {
+    let Some(endpoint) = endpoint() else {
+        eprintln!("skipping: FORKLIFT_AWS_TEST_ENDPOINT is unset");
+        return;
+    };
+
+    let (_area, harvest, _main_head, identity) =
+        build_chunked_warehouse("chunk-lift", CHUNK_THRESHOLD + 3 * 1024 * 1024);
+    assert!(identity.chunk_hashes.len() >= 2, "a chunked file always has at least two chunks");
+
+    let config = test_config(&endpoint);
+    provision(&config).await;
+    let bridge = AsyncBridge::current().expect("a multi-thread runtime");
+    let (objects, _refs) = build_stores(&config, bridge).await.expect("stores");
+
+    let session = "lift-chunks";
+
+    // The recipe itself travels the identical staging path — it is just another hash-addressed
+    // object (the wire has no separate "chunks" field; see `remote_utils.rs`'s classification).
+    let recipe_bytes = harvest.objects[&identity.recipe_hash].clone();
+    let (objects, staging_url) = chunk_stage_target(objects, session, &identity.recipe_hash).await;
+    let put =
+        reqwest::Client::new().put(&staging_url).body(recipe_bytes.clone()).send().await.expect("PUT");
+    assert!(put.status().is_success(), "the presigned staging PUT failed: {}", put.status());
+
+    let (objects, outcome) = chunk_promote(objects, session, &identity.recipe_hash).await;
+    assert_eq!(outcome, PromoteOutcome::Promoted);
+
+    let (objects, exists) = chunk_object_exists(objects, &identity.recipe_hash).await;
+    assert!(exists, "the recipe is canonical after promotion");
+    let (mut objects, got) = chunk_object_get(objects, &identity.recipe_hash).await;
+    assert_eq!(got.as_deref(), Some(recipe_bytes.as_slice()));
+
+    // A promoted recipe reads back and parses — the store-backed `load_recipe_chunks` path
+    // `Head::ref_update` uses for the W4 gate (proven end to end again, through a real head, by
+    // `ref_update_refuses_a_missing_chunk_and_commits_once_complete_over_s3_and_dynamodb` below).
+    let reparsed = object_utils::parse_recipe_bytes(&identity.recipe_hash, &recipe_bytes)
+        .expect("a promoted recipe parses");
+    let reparsed_chunk_hashes: Vec<String> =
+        reparsed.chunks.into_iter().map(|chunk| chunk.hash).collect();
+    assert_eq!(reparsed_chunk_hashes, identity.chunk_hashes);
+
+    // Every chunk: absent while staged, `Promoted` once verified, and its bytes read back
+    // byte-identical — real S3 semantics for the exact object type the W4 gate cares about.
+    for chunk_hash in &identity.chunk_hashes {
+        let bytes = harvest.objects[chunk_hash].clone();
+
+        let (o, existed_before) = chunk_object_exists(objects, chunk_hash).await;
+        assert!(!existed_before, "a chunk is not fetchable while merely staged");
+
+        let (o, staging_url) = chunk_stage_target(o, session, chunk_hash).await;
+        let put = reqwest::Client::new().put(&staging_url).body(bytes.clone()).send().await.expect("PUT");
+        assert!(put.status().is_success(), "the presigned staging PUT failed: {}", put.status());
+
+        let (o, outcome) = chunk_promote(o, session, chunk_hash).await;
+        assert_eq!(outcome, PromoteOutcome::Promoted, "chunk {} did not promote", chunk_hash);
+
+        let (o, existed_after) = chunk_object_exists(o, chunk_hash).await;
+        assert!(existed_after, "chunk {} is canonical after promotion", chunk_hash);
+
+        let (o, got) = chunk_object_get(o, chunk_hash).await;
+        assert_eq!(got.as_deref(), Some(bytes.as_slice()));
+
+        objects = o;
+    }
+
+    // Promotion is idempotent for a chunk exactly as for any other object: nothing is staged the
+    // second time (the first promotion already dropped the staged copy), so the store simply
+    // finds the hash already canonical.
+    let repeat_hash = identity.chunk_hashes[0].clone();
+    let (_objects, outcome) = chunk_promote(objects, session, &repeat_hash).await;
+    assert_eq!(outcome, PromoteOutcome::AlreadyPresent);
+}
+
+/// PROOF 2 — a multi-batch `commit_lift` over real S3: an intermediate batch (`more: true`) must
+/// never sweep the session's staging prefix (a later batch's still-staged chunks would be
+/// discarded before they can be promoted), and only the final batch (`more: false`) sweeps —
+/// verified here by re-`list_objects_v2`-ing the staging prefix in between, over real S3, rather
+/// than the in-memory fake's `staged_count()` (`protocol.rs`'s
+/// `an_intermediate_commit_batch_does_not_sweep_a_later_batchs_staged_objects`). A third, never
+/// referenced chunk stands in for an unrelated straggler still sitting in the session's staging
+/// prefix, proving the final sweep is session-wide, not scoped to the hashes the last batch named.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_multi_batch_commit_lift_does_not_sweep_staging_until_the_final_batch_over_s3() {
+    let Some(endpoint) = endpoint() else {
+        eprintln!("skipping: FORKLIFT_AWS_TEST_ENDPOINT is unset");
+        return;
+    };
+
+    let (_area, harvest, _main_head, identity) =
+        build_chunked_warehouse("chunk-batches", CHUNK_THRESHOLD + 6 * 1024 * 1024);
+    assert!(
+        identity.chunk_hashes.len() >= 3,
+        "need at least three chunks: one per batch plus a never-referenced straggler"
+    );
+
+    let config = test_config(&endpoint);
+    provision(&config).await;
+    let bridge = AsyncBridge::current().expect("a multi-thread runtime");
+    let (s3, _dynamodb) = build_clients(&config).await.expect("clients");
+    let bucket = config.bucket.clone();
+    let (objects, refs) = build_stores(&config, bridge).await.expect("stores");
+
+    let session = "lift-batches";
+    let first_chunk = identity.chunk_hashes[0].clone();
+    let second_chunk = identity.chunk_hashes[1].clone();
+    let straggler = identity.chunk_hashes[2].clone();
+
+    // Stage every chunk this test touches straight via the real client (the presigned-PUT path
+    // itself is proven end to end above; this test is about the sweep, not the upload).
+    for hash in [&first_chunk, &second_chunk, &straggler] {
+        let bytes = harvest.objects[hash].clone();
+        chunk_stage_raw(&s3, &bucket, session, hash, bytes).await;
+    }
+
+    // The background staging verifier has caught up on batch 1's chunk only.
+    let (objects, outcome) = chunk_promote(objects, session, &first_chunk).await;
+    assert_eq!(outcome, PromoteOutcome::Promoted);
+
+    // Intermediate batch (`more: true`): presence-checks the promoted chunk, must not sweep.
+    let (objects, refs, result) =
+        chunk_commit_lift(objects, refs, session, vec![], vec![first_chunk.clone()], true).await;
+    result.expect("the intermediate batch commits");
+
+    let staged = chunk_list_staging_keys(&s3, &bucket, session).await;
+    assert!(
+        staged.iter().any(|key| key.ends_with(&second_chunk)),
+        "batch 2's staged chunk must survive an intermediate (more) batch: {:?}",
+        staged
+    );
+    assert!(
+        staged.iter().any(|key| key.ends_with(&straggler)),
+        "an object no batch names must also survive an intermediate batch: {:?}",
+        staged
+    );
+
+    // The verifier catches up on batch 2's chunk before the final batch commits.
+    let (objects, outcome) = chunk_promote(objects, session, &second_chunk).await;
+    assert_eq!(outcome, PromoteOutcome::Promoted);
+
+    // Final batch (`more: false`): presence-checks batch 2's chunk and sweeps the whole
+    // session — including the straggler, which no batch ever named.
+    let (_objects, _refs, result) =
+        chunk_commit_lift(objects, refs, session, vec![], vec![second_chunk.clone()], false).await;
+    result.expect("the final batch commits");
+
+    let staged_after = chunk_list_staging_keys(&s3, &bucket, session).await;
+    assert!(
+        staged_after.is_empty(),
+        "the final (more: false) batch sweeps the whole session, straggler included: {:?}",
+        staged_after
+    );
+}
+
+/// PROOF 3 — the commit-gate closure audit's chunk descent (§9.4b W4), over real S3 + DynamoDB:
+/// `Head::ref_update` refuses a ref whose chunked file is missing even one chunk (the recipe
+/// itself, and every other chunk, is present — a walk that stopped at the recipe would wrongly
+/// pass), then commits once the withheld chunk is uploaded. The real-backend analogue of
+/// `protocol.rs`'s `a_ref_update_with_a_missing_chunk_is_refused`, plus the store-backed
+/// `load_recipe_chunks` read (`Head::ref_update`'s local closure over
+/// `object_utils::parse_recipe_bytes`) against a recipe actually sitting in S3, not a fake.
+#[tokio::test(flavor = "multi_thread")]
+async fn ref_update_refuses_a_missing_chunk_and_commits_once_complete_over_s3_and_dynamodb() {
+    let Some(endpoint) = endpoint() else {
+        eprintln!("skipping: FORKLIFT_AWS_TEST_ENDPOINT is unset");
+        return;
+    };
+
+    let (_area, harvest, main_head, identity) =
+        build_chunked_warehouse("chunk-w4", CHUNK_THRESHOLD + 2 * 1024 * 1024);
+
+    let config = test_config(&endpoint);
+    provision(&config).await;
+    let bridge = AsyncBridge::current().expect("a multi-thread runtime");
+    let (objects, refs) = build_stores(&config, bridge).await.expect("stores");
+    let head = Head::new(objects, refs);
+
+    let victim = identity.chunk_hashes[0].clone();
+    let expected_chunks = identity.chunk_hashes.clone();
+    let recipe_hash = identity.recipe_hash.clone();
+
+    tokio::task::spawn_blocking(move || {
+        // Seed everything except one chunk directly into the canonical namespace (mirrors how
+        // `a_head_untrusted_lift_commits_over_s3_and_dynamodb` above seeds a closure).
+        for (hash, bytes) in &harvest.objects {
+            if *hash == victim {
+                continue;
+            }
+            head.objects.put_verified(hash, bytes).expect("seed object");
+        }
+        for (hash, sidecar) in &harvest.signatures {
+            head.objects.put_signature(hash, sidecar).expect("seed signature");
+        }
+        assert!(
+            head.objects.exists(&recipe_hash).expect("exists"),
+            "the recipe itself is present on the head"
+        );
+
+        let request = RefUpdateRequest { old_head: None, new_head: main_head.clone() };
+        let err = head.ref_update("main", &request).expect_err("a missing chunk fails the closure");
+        assert_eq!(err.status, forklift_aws_lambda::Status::Unprocessable);
+
+        // The control: upload the withheld chunk, and the identical update now commits.
+        let victim_bytes = harvest.objects[&victim].clone();
+        head.objects.put_verified(&victim, &victim_bytes).expect("upload the last chunk");
+        head.ref_update("main", &request).expect("complete once every chunk is present");
+
+        assert_eq!(head.handshake().expect("handshake").pallets.get("main"), Some(&main_head));
+
+        // The store-backed `load_recipe_chunks` path: read the promoted recipe back from real S3
+        // and parse it — exactly as `Head::ref_update`'s closure does for the gate above.
+        let bytes = head.objects.get(&recipe_hash).expect("get").expect("recipe present");
+        let recipe = object_utils::parse_recipe_bytes(&recipe_hash, &bytes).expect("parses");
+        let chunk_hashes: Vec<String> = recipe.chunks.into_iter().map(|chunk| chunk.hash).collect();
+        assert_eq!(chunk_hashes, expected_chunks);
+    })
+    .await
+    .expect("the blocking closure audit");
+}
+
+/// PROOF 4 — a full franchise of a chunked file from the AWS head, end to end through the real
+/// CLI: presigned chunk `GET`s (redirects) hash-verify (`assemble_chunked_file`'s incremental
+/// `Blake3`) and the file materializes byte-identical. Reuses [`StagingHead`] unmodified — the
+/// staging verifier, the presigned PUT/GET machinery and `commit_lift` pagination are all
+/// type-blind (see `head.rs`/`aws/s3.rs`'s module docs), so a chunked file needs no special
+/// handling anywhere in this harness; it only needs to be big enough to be stored chunked.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_cli_lifts_and_franchises_a_chunked_file_over_s3_and_dynamodb() {
+    let Some(endpoint) = endpoint() else {
+        eprintln!("skipping: FORKLIFT_AWS_TEST_ENDPOINT is unset");
+        return;
+    };
+
+    let config = test_config(&endpoint);
+    provision(&config).await;
+
+    let bridge = AsyncBridge::current().expect("a multi-thread runtime");
+    let head = StagingHead::start(&config, bridge).await;
+
+    let area = Area::new("cli-staging-chunked");
+    prepare(&area, "wh");
+    area.write_large_file("wh/big.bin", 0xBADA55, CHUNK_THRESHOLD + 5 * 1024 * 1024);
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "a giant"]);
+    area.forklift("wh", &["config", "remote.url", &head.url]);
+
+    // The money shot: lift a chunked file through the staging flow (a failed staging PUT, a
+    // rejected commit, or a refused ref update would make `forklift lift` exit non-zero, which
+    // `Area::forklift` turns into a panic).
+    area.forklift("wh", &["lift"]);
+
+    // Franchise a fresh copy back down through the same head — every chunk travels a presigned
+    // `GET` redirect, and `assemble_chunked_file` re-verifies the whole content hash as it writes.
+    area.forklift(".", &["franchise", &head.url, "clone"]);
+
+    let original = std::fs::read(area.path("wh/big.bin")).expect("read the source giant");
+    let materialized = std::fs::read(area.path("clone/big.bin")).expect("read the franchised giant");
+    assert_eq!(
+        materialized, original,
+        "the franchised chunked file must be byte-identical to the source"
     );
 }
