@@ -45,7 +45,7 @@ pub mod head;
 
 pub use aws::{AwsConfig, DynamoRefStore, S3ObjectStore};
 pub use blocking::AsyncBridge;
-pub use entrypoint::{config_from_env, handle, Routing};
+pub use entrypoint::{auth_from_env, config_from_env, handle, AuthConfig, Routing};
 pub use error::{HeadError, HeadResult, Status};
 pub use head::{BatchResult, Head};
 pub use store::{

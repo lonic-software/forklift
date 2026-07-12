@@ -42,3 +42,7 @@ toml_edit = "0.23"
 argon2 = "0.5"
 chacha20poly1305 = "0.10"
 rpassword = "7"
+# Constant-time secret comparison (bearer tokens): already in the tree transitively via
+# ed25519-dalek, promoted to a direct dependency for the two server heads' auth checks so a
+# byte-wise `==` never regresses back in. Zero dependencies of its own — pins no new crate.
+subtle = "2.6"

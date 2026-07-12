@@ -42,6 +42,7 @@
 
 use http::{header, Method, Request, Response, StatusCode};
 use serde::Serialize;
+use subtle::ConstantTimeEq;
 
 use forklift_core::model::remote::{
     CommitLiftRequest, ErrorResponse, MissingObjectsRequest, MissingObjectsResponse,
@@ -123,20 +124,111 @@ fn require_env(name: &str) -> Result<String, String> {
         })
 }
 
+/// The transport-authentication configuration, resolved once at cold start ([`auth_from_env`])
+/// and threaded into every request by [`handle`]. Full multi-tenant policy (resolving a bearer
+/// to a principal, per-warehouse admission) is tracked privately and stays out of scope here —
+/// this is the single-tenant seam: is *a* configured token present and correct at all.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AuthConfig {
+    /// A configured bearer token; every request must present it via
+    /// `Authorization: Bearer <token>`.
+    Token(String),
+
+    /// No token is configured and the operator has explicitly opted out
+    /// (`FORKLIFT_OPEN_ACCESS=1`): every request passes untouched, mirroring
+    /// `forklift-server`'s `Principal::Open`. Meant for LocalStack and local development —
+    /// a real deployment sets `FORKLIFT_TOKEN` instead.
+    Open,
+
+    /// No token is configured and there is no explicit opt-out: the safe default. Every
+    /// request is refused (`401`) — a forgotten `FORKLIFT_TOKEN` fails closed instead of
+    /// silently serving the world from a public endpoint.
+    Closed,
+}
+
+/// Read the auth configuration from the environment:
+/// * `FORKLIFT_TOKEN` (optional) — the bearer token every request must present. An empty
+///   value is treated exactly like an unset one (refuse), never as a valid empty token.
+/// * `FORKLIFT_OPEN_ACCESS` (optional) — set to `1` to run with no token at all. Only takes
+///   effect when `FORKLIFT_TOKEN` is unset; LocalStack and local dev use this, a real
+///   deployment never should.
+pub fn auth_from_env() -> AuthConfig {
+    auth_from(std::env::var("FORKLIFT_TOKEN").ok(), std::env::var("FORKLIFT_OPEN_ACCESS").ok())
+}
+
+/// The pure decision behind [`auth_from_env`], split out so the matrix (empty-is-unset, the
+/// opt-out, and token-takes-precedence-over-the-opt-out) is testable without touching real
+/// process environment state.
+fn auth_from(token: Option<String>, open_access: Option<String>) -> AuthConfig {
+    match token.filter(|value| !value.is_empty()) {
+        Some(token) => AuthConfig::Token(token),
+        None if open_access.as_deref() == Some("1") => AuthConfig::Open,
+        None => AuthConfig::Closed,
+    }
+}
+
+/// Compare two bearer tokens without leaking which byte differs first: a naive `==` on `str`
+/// short-circuits at the first mismatch, which is exactly the timing side channel a bearer
+/// check must not have. The slice lengths are still compared up front (`subtle`'s own
+/// short-circuit) — a token's length is not the secret, only its bytes are.
+fn tokens_match(provided: &str, expected: &str) -> bool {
+    bool::from(provided.as_bytes().ct_eq(expected.as_bytes()))
+}
+
+/// Strip the `Bearer` auth-scheme token case-insensitively (RFC 7235 §2.1: `auth-scheme` is a
+/// `token`, and the scheme name itself is case-insensitive — `bearer`, `Bearer`, `BEARER` all
+/// name the same scheme), leaving the credentials (the token after the scheme and its one
+/// separating space) untouched: still compared case-sensitively, in constant time, by
+/// [`tokens_match`]. Only the 7-byte scheme prefix is matched loosely; a non-`Bearer` scheme
+/// (`Basic …`) still fails to match at all.
+fn strip_bearer_prefix(value: &str) -> Option<&str> {
+    const SCHEME_LEN: usize = "bearer ".len();
+
+    let prefix = value.get(..SCHEME_LEN)?;
+
+    if prefix.eq_ignore_ascii_case("bearer ") {
+        value.get(SCHEME_LEN..)
+    } else {
+        None
+    }
+}
+
+/// The `401` this seam answers on any failure — a missing header, a non-`Bearer` scheme, a
+/// wrong token, or no token configured at all. The message is identical in every case: a
+/// probing client must not be able to tell "you sent nothing" from "you sent the wrong thing"
+/// from "this deployment isn't configured for auth", the same information a timing side
+/// channel would otherwise leak by a different route.
+fn unauthorized() -> HeadError {
+    HeadError::unauthorized("A valid bearer token is required.")
+}
+
 /// The transport-authentication seam. Multi-tenant policy is tracked privately and is out
 /// of scope here.
 ///
 /// The protocol carries auth as `Authorization: Bearer <token>`; in the hosted deployment the
-/// API Gateway authorizer in front of this function is the gate that decides *who* the caller
-/// is, and the office roles the ref-update handler already consults decide *what* they may
-/// move. This function is the one place multi-tenant policy will land — resolve the bearer to
-/// a principal, apply per-warehouse admission — so it exists now as a marked, deliberately
-/// open passthrough (mirroring `forklift-server`'s `Principal::Open` when no token is
-/// configured). It never invents policy; it only gives the token a defined resting place.
-fn authenticate<B>(_request: &Request<B>) -> HeadResult<()> {
-    // Multi-tenant transport authorization lands here. Until then the control plane trusts
-    // its API Gateway front door.
-    Ok(())
+/// API Gateway authorizer in front of this function is an additional gate, and the office
+/// roles the ref-update handler already consults decide *what* an authenticated caller may
+/// move. This function decides the one thing prior to both: does the request carry the
+/// configured bearer at all. [`AuthConfig::Open`] passes everything (the explicit local/
+/// LocalStack opt-out); [`AuthConfig::Closed`] (no token configured, no opt-out) refuses
+/// everything; [`AuthConfig::Token`] requires an exact, constant-time match.
+fn authenticate<B>(auth: &AuthConfig, request: &Request<B>) -> HeadResult<()> {
+    let expected = match auth {
+        AuthConfig::Open => return Ok(()),
+        AuthConfig::Closed => return Err(unauthorized()),
+        AuthConfig::Token(expected) => expected,
+    };
+
+    let provided = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(strip_bearer_prefix);
+
+    match provided {
+        Some(token) if tokens_match(token, expected) => Ok(()),
+        _ => Err(unauthorized()),
+    }
 }
 
 /// Route and answer one request. The whole control plane: pure, synchronous, and generic over
@@ -155,6 +247,7 @@ fn authenticate<B>(_request: &Request<B>) -> HeadResult<()> {
 /// directly.
 pub fn handle<O, R>(
     routing: &Routing,
+    auth: &AuthConfig,
     build_head: impl FnOnce(&str) -> Result<Head<O, R>, String>,
     request: Request<Vec<u8>>,
 ) -> Response<Vec<u8>>
@@ -162,7 +255,7 @@ where
     O: ObjectStore,
     R: RefStore,
 {
-    if let Err(error) = authenticate(&request) {
+    if let Err(error) = authenticate(auth, &request) {
         return error_response(error);
     }
 
@@ -564,11 +657,16 @@ fn error_response(error: HeadError) -> Response<Vec<u8>> {
     let body = serde_json::to_vec(&ErrorResponse { error: message })
         .unwrap_or_else(|_| b"{\"error\":\"internal error\"}".to_vec());
 
-    Response::builder()
-        .status(status)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(body)
-        .expect("a valid error response")
+    let mut builder =
+        Response::builder().status(status).header(header::CONTENT_TYPE, "application/json");
+
+    if status == StatusCode::UNAUTHORIZED {
+        // RFC 6750 §3: a resource server refusing a bearer-authenticated request challenges
+        // with this header so a well-behaved client knows which scheme to retry.
+        builder = builder.header(header::WWW_AUTHENTICATE, "Bearer");
+    }
+
+    builder.body(body).expect("a valid error response")
 }
 
 #[cfg(test)]
@@ -623,5 +721,143 @@ mod tests {
             reject_oversized_commit(MAX_MISSING_BATCH, 1).expect_err("over the combined cap");
         assert_eq!(error.status, crate::error::Status::Unprocessable);
         assert!(error.message.contains(&MAX_MISSING_BATCH.to_string()), "{}", error.message);
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Auth: AuthConfig resolution, constant-time token comparison, the authenticate() seam.
+    // ---------------------------------------------------------------------------------
+
+    fn request_with_bearer(token: &str) -> Request<()> {
+        Request::builder()
+            .header(header::AUTHORIZATION, format!("Bearer {}", token))
+            .body(())
+            .unwrap()
+    }
+
+    fn request_with_no_header() -> Request<()> {
+        Request::builder().body(()).unwrap()
+    }
+
+    /// An empty `FORKLIFT_TOKEN` is treated exactly like an unset one — never a valid empty
+    /// token — and the opt-out only takes effect (and only for the literal `"1"`) when there
+    /// is no real token at all: a token, once configured, always wins.
+    #[test]
+    fn auth_from_env_treats_an_empty_token_as_unset_and_only_the_opt_out_falls_back_to_open() {
+        assert_eq!(
+            auth_from(Some("secret".to_string()), None),
+            AuthConfig::Token("secret".to_string())
+        );
+        assert_eq!(
+            auth_from(Some("".to_string()), None),
+            AuthConfig::Closed,
+            "an empty token with no opt-out is closed, not a valid empty token"
+        );
+        assert_eq!(auth_from(None, None), AuthConfig::Closed, "no token, no opt-out: closed by default");
+        assert_eq!(auth_from(None, Some("1".to_string())), AuthConfig::Open, "the explicit opt-out");
+        assert_eq!(
+            auth_from(Some("".to_string()), Some("1".to_string())),
+            AuthConfig::Open,
+            "an empty token is unset, so the opt-out still applies"
+        );
+        assert_eq!(
+            auth_from(Some("secret".to_string()), Some("1".to_string())),
+            AuthConfig::Token("secret".to_string()),
+            "a real token always wins over the opt-out"
+        );
+        assert_eq!(
+            auth_from(None, Some("yes".to_string())),
+            AuthConfig::Closed,
+            "only the literal \"1\" opts out"
+        );
+    }
+
+    /// Pins the equality semantics a timing side channel can't be asserted in a unit test:
+    /// an exact match passes, and near-misses of every length relationship (equal, shorter,
+    /// longer) refuse — including the equal-length case, which is exactly what would slip
+    /// through a broken constant-time comparison that always agreed on length.
+    #[test]
+    fn tokens_match_requires_an_exact_byte_for_byte_match() {
+        assert!(tokens_match("secret", "secret"));
+        assert!(!tokens_match("secret", "secrft"), "a same-length near-miss must refuse");
+        assert!(!tokens_match("secret", "secre"), "a shorter guess must refuse");
+        assert!(!tokens_match("secret", "secrets"), "a longer guess must refuse");
+        assert!(!tokens_match("", "secret"));
+        assert!(tokens_match("", ""));
+    }
+
+    #[test]
+    fn authenticate_closed_refuses_every_request() {
+        let auth = AuthConfig::Closed;
+        assert_eq!(
+            authenticate(&auth, &request_with_no_header()).unwrap_err().status,
+            crate::error::Status::Unauthorized
+        );
+        assert_eq!(
+            authenticate(&auth, &request_with_bearer("anything")).unwrap_err().status,
+            crate::error::Status::Unauthorized
+        );
+    }
+
+    #[test]
+    fn authenticate_open_passes_every_request() {
+        let auth = AuthConfig::Open;
+        assert!(authenticate(&auth, &request_with_no_header()).is_ok());
+        assert!(authenticate(&auth, &request_with_bearer("anything")).is_ok());
+    }
+
+    #[test]
+    fn authenticate_token_requires_the_exact_bearer() {
+        let auth = AuthConfig::Token("secret".to_string());
+
+        assert!(authenticate(&auth, &request_with_bearer("secret")).is_ok());
+        assert!(authenticate(&auth, &request_with_no_header()).is_err());
+        assert!(authenticate(&auth, &request_with_bearer("wrong")).is_err());
+        assert!(
+            authenticate(&auth, &request_with_bearer("secrft")).is_err(),
+            "an equal-length near miss must refuse"
+        );
+
+        let non_bearer =
+            Request::builder().header(header::AUTHORIZATION, "Basic secret").body(()).unwrap();
+        assert!(authenticate(&auth, &non_bearer).is_err(), "a non-Bearer scheme must refuse");
+    }
+
+    /// RFC 7235 §2.1: `auth-scheme` is case-insensitive, so `bearer`/`BEARER`/mixed-case must
+    /// authenticate exactly like `Bearer`. The credential (token) half of the header is a
+    /// different story — it stays case-sensitive, so a same-length, wrong-case token must still
+    /// refuse.
+    #[test]
+    fn authenticate_accepts_the_bearer_scheme_case_insensitively() {
+        let auth = AuthConfig::Token("secret".to_string());
+
+        for scheme in ["bearer", "Bearer", "BEARER", "BeArEr"] {
+            let request = Request::builder()
+                .header(header::AUTHORIZATION, format!("{scheme} secret"))
+                .body(())
+                .unwrap();
+            assert!(authenticate(&auth, &request).is_ok(), "scheme {} must authenticate", scheme);
+        }
+
+        // The token itself is still case-sensitive.
+        let wrong_case_token =
+            Request::builder().header(header::AUTHORIZATION, "Bearer SECRET").body(()).unwrap();
+        assert!(
+            authenticate(&auth, &wrong_case_token).is_err(),
+            "the token's case must still matter"
+        );
+    }
+
+    /// The seam never distinguishes "no token configured" from "wrong token" — same status,
+    /// same message — so a client probing a deployment learns nothing either way.
+    #[test]
+    fn closed_and_a_wrong_token_answer_the_identical_401() {
+        let closed_error = authenticate(&AuthConfig::Closed, &request_with_no_header()).unwrap_err();
+        let wrong_token_error = authenticate(
+            &AuthConfig::Token("secret".to_string()),
+            &request_with_bearer("wrong"),
+        ).unwrap_err();
+
+        assert_eq!(closed_error.status, wrong_token_error.status);
+        assert_eq!(closed_error.message, wrong_token_error.message);
     }
 }

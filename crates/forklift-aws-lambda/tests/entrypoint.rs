@@ -24,7 +24,7 @@ use forklift_aws_lambda::store::{
     CasOutcome, ObjectAccess, ObjectStore, PromoteOutcome, PutOutcome, PutTarget, RefStore,
     SignatureOutcome, TrustOutcome,
 };
-use forklift_aws_lambda::{handle, Head, Routing};
+use forklift_aws_lambda::{handle, AuthConfig, Head, Routing};
 
 use forklift_core::globals::StorageRootScope;
 use forklift_core::model::remote::{
@@ -116,10 +116,15 @@ impl RefStore for SharedRefs {
 }
 
 /// A head over one shared warehouse, driven through `handle` request by request.
+///
+/// `auth` defaults to [`AuthConfig::Open`] in every constructor below — this suite drives the
+/// protocol walk, not the auth seam (which has its own dedicated tests further down), so every
+/// call site is deliberately pre-authenticated in this one place rather than per test.
 struct Fixture {
     objects: Arc<MemoryObjectStore>,
     refs: Arc<MemoryRefStore>,
     routing: Routing,
+    auth: AuthConfig,
 }
 
 impl Fixture {
@@ -129,6 +134,7 @@ impl Fixture {
             objects: Arc::new(MemoryObjectStore::new()),
             refs: Arc::new(MemoryRefStore::new()),
             routing: Routing::Single("wh".to_string()),
+            auth: AuthConfig::Open,
         }
     }
 
@@ -138,6 +144,7 @@ impl Fixture {
             objects: Arc::new(MemoryObjectStore::with_redirect("https://s3.example/bucket")),
             refs: Arc::new(MemoryRefStore::new()),
             routing: Routing::Single("wh".to_string()),
+            auth: AuthConfig::Open,
         }
     }
 
@@ -147,6 +154,7 @@ impl Fixture {
             objects: Arc::new(MemoryObjectStore::new()),
             refs: Arc::new(MemoryRefStore::new()),
             routing: Routing::Multi,
+            auth: AuthConfig::Open,
         }
     }
 
@@ -156,6 +164,7 @@ impl Fixture {
 
         handle(
             &self.routing,
+            &self.auth,
             move |_warehouse| Ok(Head::new(SharedObjects(objects), SharedRefs(refs))),
             request,
         )
@@ -169,6 +178,7 @@ impl Fixture {
 
         let response = handle(
             &self.routing,
+            &self.auth,
             move |warehouse| {
                 *sink.borrow_mut() = Some(warehouse.to_string());
                 Ok(Head::new(SharedObjects(objects), SharedRefs(refs)))
@@ -665,6 +675,7 @@ fn an_internal_error_is_redacted_at_the_edge_not_forwarded_verbatim() {
 
     let response = handle(
         &routing,
+        &AuthConfig::Open,
         |_warehouse_id: &str| -> Result<Head<SharedObjects, SharedRefs>, String> {
             Err(sensitive.to_string())
         },
@@ -679,6 +690,83 @@ fn an_internal_error_is_redacted_at_the_edge_not_forwarded_verbatim() {
     assert!(!message.contains("forklift-prod-customer-42"), "{}", message);
     assert!(!message.contains("AKIAEXAMPLE"), "{}", message);
     assert!(!message.contains("8f1c2b"), "{}", message);
+}
+
+// -------------------------------------------------------------------------------------------
+// Auth: the fail-closed default, the explicit opt-out, and a configured bearer token — the
+// seam every other test in this file bypasses via `Fixture`'s `AuthConfig::Open` default.
+// -------------------------------------------------------------------------------------------
+
+/// Route one request through `handle` with an explicit `AuthConfig`, over a fresh empty store.
+/// Every case here is decided by `authenticate` before the route even resolves, so which store
+/// backs it is irrelevant.
+fn call_with_auth(auth: &AuthConfig, request: Request<Vec<u8>>) -> Response<Vec<u8>> {
+    let routing = Routing::Single("wh".to_string());
+
+    handle(
+        &routing,
+        auth,
+        |_warehouse| {
+            Ok(Head::new(
+                SharedObjects(Arc::new(MemoryObjectStore::new())),
+                SharedRefs(Arc::new(MemoryRefStore::new())),
+            ))
+        },
+        request,
+    )
+}
+
+/// The safe default: no token configured, no opt-out — every request is refused, and the
+/// answer carries the `WWW-Authenticate` challenge RFC 6750 prescribes.
+#[test]
+fn closed_by_default_refuses_every_request_with_a_challenge() {
+    let response = call_with_auth(&AuthConfig::Closed, get("/v1/warehouse"));
+
+    assert_eq!(status(&response), 401);
+    assert_eq!(
+        response.headers().get(http::header::WWW_AUTHENTICATE).map(|v| v.to_str().unwrap()),
+        Some("Bearer")
+    );
+
+    let body: serde_json::Value = body_json(&response);
+    assert!(body.get("error").and_then(|v| v.as_str()).is_some(), "a JSON error body");
+}
+
+/// The explicit opt-out: no token, but `AuthConfig::Open` — everything passes untouched.
+#[test]
+fn the_open_opt_out_passes_every_request() {
+    let response = call_with_auth(&AuthConfig::Open, get("/v1/warehouse"));
+    assert_eq!(status(&response), 200);
+}
+
+/// A configured token: the correct bearer passes; a missing header, a wrong token, and an
+/// equal-length near-miss all refuse identically.
+#[test]
+fn a_configured_token_gates_every_request() {
+    let auth = AuthConfig::Token("secret".to_string());
+
+    assert_eq!(
+        status(&call_with_auth(&auth, get("/v1/warehouse"))),
+        401,
+        "no Authorization header at all"
+    );
+
+    let bearer = |token: &str| {
+        Request::builder()
+            .method("GET")
+            .uri("/v1/warehouse")
+            .header(http::header::AUTHORIZATION, format!("Bearer {}", token))
+            .body(Vec::new())
+            .unwrap()
+    };
+
+    assert_eq!(status(&call_with_auth(&auth, bearer("wrong"))), 401);
+    assert_eq!(
+        status(&call_with_auth(&auth, bearer("secrft"))),
+        401,
+        "an equal-length near miss must refuse"
+    );
+    assert_eq!(status(&call_with_auth(&auth, bearer("secret"))), 200);
 }
 
 // -------------------------------------------------------------------------------------------

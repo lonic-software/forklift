@@ -37,7 +37,9 @@ use forklift_aws_lambda::store::{
     CasOutcome, ObjectAccess, ObjectStore, PromoteOutcome, PutOutcome, PutTarget, RefStore,
     SignatureOutcome, TrustOutcome,
 };
-use forklift_aws_lambda::{handle, AsyncBridge, DynamoRefStore, Head, HeadResult, Routing, S3ObjectStore};
+use forklift_aws_lambda::{
+    handle, AsyncBridge, AuthConfig, DynamoRefStore, Head, HeadResult, Routing, S3ObjectStore,
+};
 
 use forklift_core::globals::StorageRootScope;
 use forklift_core::model::remote::{CommitLiftRequest, RefUpdateRequest, TrustAnchorDto};
@@ -618,6 +620,11 @@ async fn edge(
     tokio::task::spawn_blocking(move || {
         handle(
             &routing,
+            // This suite drives the protocol walk over real S3 + DynamoDB, not the auth seam
+            // (which has its own dedicated, store-free tests in `entrypoint.rs`) — every call
+            // here is explicitly pre-authenticated rather than depending on the fail-closed
+            // default.
+            &AuthConfig::Open,
             move |warehouse_id| {
                 let objects = S3ObjectStore::new(s3, config.bucket.clone(), bridge.clone());
                 let refs = DynamoRefStore::new(
@@ -1008,8 +1015,9 @@ struct ShimState {
 
 /// One request: buffer it into the `http::Request` the pure router speaks, run `handle` on a
 /// blocking thread (every `Head` method blocks on its store's futures), convert back.
-/// Headers are dropped on purpose: `handle`'s authentication is an open passthrough, so only
-/// the method, path/query and body matter.
+/// Headers are dropped on purpose: the shim always calls `handle` with `AuthConfig::Open` (see
+/// below), so only the method, path/query and body matter — a real deployment configures
+/// `AuthConfig::Token` instead and this shim would need to forward the header.
 async fn shim_handler(
     axum::extract::State(state): axum::extract::State<Arc<ShimState>>,
     method: http::Method,
@@ -1028,6 +1036,7 @@ async fn shim_handler(
     let response = tokio::task::spawn_blocking(move || {
         handle(
             &routing,
+            &AuthConfig::Open,
             move |warehouse_id| {
                 let objects = S3ObjectStore::new(s3, config.bucket.clone(), bridge.clone());
                 let refs = DynamoRefStore::new(

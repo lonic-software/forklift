@@ -1224,12 +1224,14 @@ dependencies = [
  "axum",
  "blake3",
  "forklift-core",
+ "futures",
  "http 1.4.2",
  "lambda_http",
  "lambda_runtime",
  "reqwest",
  "serde",
  "serde_json",
+ "subtle",
  "tokio",
 ]
 
@@ -1268,6 +1270,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "subtle",
  "tokio",
  "tokio-util",
  "toml_edit",

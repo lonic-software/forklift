@@ -12,7 +12,8 @@
 
 use forklift_aws_lambda::aws::build_clients;
 use forklift_aws_lambda::{
-    config_from_env, handle, AsyncBridge, AwsConfig, DynamoRefStore, Head, Routing, S3ObjectStore,
+    auth_from_env, config_from_env, handle, AsyncBridge, AuthConfig, AwsConfig, DynamoRefStore,
+    Head, Routing, S3ObjectStore,
 };
 use lambda_http::{run, service_fn, Body, Error, Request, Response};
 use tokio::sync::OnceCell;
@@ -27,6 +28,7 @@ struct Context {
     bridge: AsyncBridge,
     config: AwsConfig,
     routing: Routing,
+    auth: AuthConfig,
 }
 
 impl Context {
@@ -59,10 +61,11 @@ async fn context() -> Result<&'static Context, Error> {
     CONTEXT
         .get_or_try_init(|| async {
             let (config, routing) = config_from_env().map_err(Error::from)?;
+            let auth = auth_from_env();
             let (s3, dynamodb) = build_clients(&config).await.map_err(Error::from)?;
             let bridge = AsyncBridge::current().map_err(Error::from)?;
 
-            Ok(Context { s3, dynamodb, bridge, config, routing })
+            Ok(Context { s3, dynamodb, bridge, config, routing, auth })
         })
         .await
 }
@@ -76,7 +79,7 @@ async fn handler(event: Request) -> Result<Response<Body>, Error> {
     let request = http::Request::from_parts(parts, body_to_vec(body));
 
     let response = tokio::task::spawn_blocking(move || {
-        handle(&ctx.routing, |warehouse_id| ctx.build_head(warehouse_id), request)
+        handle(&ctx.routing, &ctx.auth, |warehouse_id| ctx.build_head(warehouse_id), request)
     })
     .await
     .map_err(|e| Error::from(format!("The request handler panicked: {}", e)))?;

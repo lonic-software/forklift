@@ -14,6 +14,7 @@ blake3 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+subtle = { workspace = true }
 
 # The HTTP edge speaks the lightweight `http` crate (already in the tree via the AWS SDK), not
 # `lambda_http`, so the pure router `entrypoint::handle` is testable without any Lambda runtime
@@ -34,6 +35,14 @@ aws-sdk-dynamodb = { version = "1.110", default-features = false, features = ["r
 aws-smithy-http-client = { version = "1.1", default-features = false, features = ["rustls-ring"] }
 aws-smithy-runtime-api = { version = "1", features = ["client"] }
 aws-smithy-types = "1"
+
+# Stream combinators (`buffer_unordered`) for the S3 store's bulk presence probe: the ref-update
+# chunk-presence gate fans its `HeadObject`s out with bounded concurrency instead of walking a large
+# recipe's thousands of chunks one round trip at a time (which API Gateway's 29 s ceiling forbids).
+# Only the stream utilities are needed, not the bundled executor; `futures` is already in the tree
+# transitively via the AWS SDK, so this promotes it to a direct dependency without pinning anything
+# new.
+futures = { version = "0.3", default-features = false, features = ["std"] }
 
 # The Lambda runtime adapters: only the two binaries need them, so they
 # are optional and gated behind `lambda`. A plain `cargo build`/`cargo test` never compiles

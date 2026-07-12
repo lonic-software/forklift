@@ -39,6 +39,7 @@ use forklift_core::util::{
     audit_utils, bundle_utils, file_utils, hook_utils, merge_utils, object_utils,
     office_utils, pallet_utils, sign_utils, tree_utils, warehouse_utils,
 };
+use subtle::ConstantTimeEq;
 
 /// One served warehouse: its storage root and its write mutex.
 struct WarehouseHandle {
@@ -306,6 +307,11 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
         ),
     });
 
+    // Captured before `state` moves into the router below — used only for the startup-bind
+    // warning once the address is actually bound.
+    let auth_configured =
+        state.token.is_some() || !state.operator_tokens.is_empty() || state.authentication_hook.is_some();
+
     let protocol = Router::new()
         .route("/warehouse", get(get_warehouse))
         .route("/objects/missing", post(post_missing))
@@ -357,6 +363,10 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
     let bound = listener.local_addr()
         .map_err(|e| format!("Error while reading the bound address: {}", e))?;
 
+    if let Some(message) = startup_bind_warning(&bound, auth_configured) {
+        tracing::warn!(%bound, "{}", message);
+    }
+
     // The single startup line is machine-readable on purpose: tools (and the tests)
     // parse the port out of it, which is what makes `--addr 127.0.0.1:0` usable.
     println!("forklift-server listening on http://{}", bound);
@@ -368,6 +378,31 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .map_err(|e| format!("The server failed: {}", e))
+}
+
+/// The startup-log risk to warn about for a bound address, or `None` when there is nothing to
+/// say. A loopback bind is never warned about regardless of auth (that is the ordinary
+/// single-team self-host case this head is designed for); a non-loopback bind always is, on
+/// either side of the auth question: with a token configured, requests — including the bearer
+/// itself — still travel as plaintext HTTP unless the operator puts a TLS-terminating proxy in
+/// front of this process; with none configured, every request is served as `Principal::Open` to
+/// whoever can reach the address at all.
+fn startup_bind_warning(bound: &std::net::SocketAddr, auth_configured: bool) -> Option<&'static str> {
+    if bound.ip().is_loopback() {
+        return None;
+    }
+
+    if auth_configured {
+        Some(
+            "serving a non-loopback address: the bearer token still travels as plaintext HTTP \
+            unless a TLS-terminating proxy sits in front of this process"
+        )
+    } else {
+        Some(
+            "serving a non-loopback address with no token, operator tokens, or authentication \
+            hook configured: every request is served as Principal::Open"
+        )
+    }
 }
 
 /// Resolve when the process should shut down (SIGINT/ctrl-c, or SIGTERM on Unix), so
@@ -439,6 +474,32 @@ fn unprocessable(message: String) -> HandlerError {
     (StatusCode::UNPROCESSABLE_ENTITY, message)
 }
 
+/// Compare two bearer tokens without leaking which byte differs first: a naive `==` on `str`
+/// short-circuits at the first mismatch, which is exactly the timing side channel a bearer
+/// check must not have. The slice lengths are still compared up front (`subtle`'s own
+/// short-circuit) — a token's length is not the secret, only its bytes are.
+fn tokens_match(provided: &str, expected: &str) -> bool {
+    bool::from(provided.as_bytes().ct_eq(expected.as_bytes()))
+}
+
+/// Strip the `Bearer` auth-scheme token case-insensitively (RFC 7235 §2.1: `auth-scheme` is a
+/// `token`, and the scheme name itself is case-insensitive — `bearer`, `Bearer`, `BEARER` all
+/// name the same scheme), leaving the credentials (the token after the scheme and its one
+/// separating space) untouched: still compared case-sensitively, in constant time, by
+/// [`tokens_match`]. Only the 7-byte scheme prefix is matched loosely; a non-`Bearer` scheme
+/// (`Basic …`) still fails to match at all.
+fn strip_bearer_prefix(value: &str) -> Option<&str> {
+    const SCHEME_LEN: usize = "bearer ".len();
+
+    let prefix = value.get(..SCHEME_LEN)?;
+
+    if prefix.eq_ignore_ascii_case("bearer ") {
+        value.get(SCHEME_LEN..)
+    } else {
+        None
+    }
+}
+
 /// Authenticate a request: who is this? Reads are open to every authenticated
 /// principal; writes are further authorized against the office (see
 /// `require_uploader` and the ref-update handler). Tokens unknown locally are asked
@@ -453,7 +514,7 @@ async fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<Principal, 
 
     let provided = headers.get("authorization")
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "));
+        .and_then(strip_bearer_prefix);
 
     let unauthorized = || (
         StatusCode::UNAUTHORIZED,
@@ -461,7 +522,8 @@ async fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<Principal, 
     );
 
     match provided {
-        Some(token) if state.token.as_deref() == Some(token) => Ok(Principal::Static),
+        Some(token) if state.token.as_deref().is_some_and(|expected| tokens_match(token, expected)) =>
+            Ok(Principal::Static),
         Some(token) => {
             if let Some(identifier) = state.operator_tokens.get(token) {
                 return Ok(Principal::Operator(identifier.clone()));
@@ -1900,6 +1962,27 @@ mod tests {
         assert!(principal == Principal::Static);
     }
 
+    /// Pins the equality semantics the constant-time compare must preserve: a same-length
+    /// near-miss still refuses. This is the regression test for the review finding that the
+    /// static-token compare was a naive (timing-leaky) `==`; a constant-time comparator that
+    /// were subtly wrong (e.g. always agreeing once lengths match) would slip through every
+    /// other test here, since they all use tokens of different lengths.
+    #[tokio::test]
+    async fn an_equal_length_near_miss_token_is_unauthorized() {
+        let state = AppState { token: Some("secret".to_string()), ..single_mode_state(PathBuf::from("/unused")) };
+        let error = check_auth(&state, &headers_with_bearer("secrft")).await.err().unwrap();
+        assert_eq!(error.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn tokens_match_requires_an_exact_byte_for_byte_match() {
+        assert!(tokens_match("secret", "secret"));
+        assert!(!tokens_match("secret", "secrft"), "a same-length near-miss must refuse");
+        assert!(!tokens_match("secret", "secre"), "a shorter guess must refuse");
+        assert!(!tokens_match("secret", "secrets"), "a longer guess must refuse");
+        assert!(tokens_match("", ""));
+    }
+
     #[tokio::test]
     async fn a_known_operator_token_authenticates_as_that_operator() {
         let mut operator_tokens = HashMap::new();
@@ -1929,6 +2012,24 @@ mod tests {
         let state = AppState { token: Some("secret".to_string()), ..single_mode_state(PathBuf::from("/unused")) };
         let error = check_auth(&state, &headers_with_raw("Basic secret")).await.err().unwrap();
         assert_eq!(error.0, StatusCode::UNAUTHORIZED);
+    }
+
+    /// RFC 7235 §2.1: `auth-scheme` is case-insensitive, so `bearer`/`BEARER`/mixed-case must
+    /// authenticate exactly like `Bearer`. The credential (token) half stays case-sensitive — a
+    /// same-length, wrong-case token must still refuse.
+    #[tokio::test]
+    async fn the_bearer_scheme_is_accepted_case_insensitively_but_the_token_stays_case_sensitive() {
+        let state = AppState { token: Some("secret".to_string()), ..single_mode_state(PathBuf::from("/unused")) };
+
+        for scheme in ["bearer", "Bearer", "BEARER", "BeArEr"] {
+            let principal = check_auth(&state, &headers_with_raw(&format!("{scheme} secret")))
+                .await
+                .unwrap_or_else(|_| panic!("scheme {} must authenticate", scheme));
+            assert!(principal == Principal::Static);
+        }
+
+        let error = check_auth(&state, &headers_with_raw("Bearer SECRET")).await.err().unwrap();
+        assert_eq!(error.0, StatusCode::UNAUTHORIZED, "the token's case must still matter");
     }
 
     #[tokio::test]
@@ -2544,5 +2645,31 @@ mod tests {
         let status = response.into_response().status();
         assert_ne!(status, StatusCode::FORBIDDEN, "an in-grant writer must clear the auth gate");
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "it must instead fail on the missing object");
+    }
+
+    // ---------------------------------------------------------------------------------
+    // startup_bind_warning
+    // ---------------------------------------------------------------------------------
+
+    #[test]
+    fn a_loopback_bind_never_warns_regardless_of_auth() {
+        let v4: std::net::SocketAddr = "127.0.0.1:9418".parse().unwrap();
+        let v6: std::net::SocketAddr = "[::1]:9418".parse().unwrap();
+
+        assert!(startup_bind_warning(&v4, true).is_none());
+        assert!(startup_bind_warning(&v4, false).is_none());
+        assert!(startup_bind_warning(&v6, true).is_none());
+        assert!(startup_bind_warning(&v6, false).is_none());
+    }
+
+    #[test]
+    fn a_non_loopback_bind_warns_whether_or_not_a_token_is_configured() {
+        let bound: std::net::SocketAddr = "0.0.0.0:9418".parse().unwrap();
+
+        let with_auth = startup_bind_warning(&bound, true).expect("a warning with auth configured");
+        assert!(with_auth.contains("plaintext"), "{}", with_auth);
+
+        let without_auth = startup_bind_warning(&bound, false).expect("a warning with no auth");
+        assert!(without_auth.contains("Principal::Open"), "{}", without_auth);
     }
 }

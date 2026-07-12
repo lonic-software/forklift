@@ -16,6 +16,8 @@ pub enum Status {
     Created,
     /// `307` — follow the `Location` to a presigned storage URL for the bytes.
     TemporaryRedirect,
+    /// `401` — no valid bearer token was presented (the transport-authentication seam).
+    Unauthorized,
     /// `403` — authenticated but not authorized (a role or grant refuses it).
     Forbidden,
     /// `404` — no such warehouse, object, signature or bundle.
@@ -35,6 +37,7 @@ impl Status {
             Status::Ok => 200,
             Status::Created => 201,
             Status::TemporaryRedirect => 307,
+            Status::Unauthorized => 401,
             Status::Forbidden => 403,
             Status::NotFound => 404,
             Status::Conflict => 409,
@@ -64,6 +67,13 @@ impl HeadError {
     /// A `409 Conflict` — a CAS race or a one-way-door violation.
     pub fn conflict(message: impl Into<String>) -> HeadError {
         HeadError { status: Status::Conflict, message: message.into() }
+    }
+
+    /// A `401 Unauthorized` — no valid bearer token was presented. The message is the same
+    /// whether the header was missing, malformed, or simply wrong: the seam that emits this
+    /// must never let a caller distinguish "no token configured" from "wrong token".
+    pub fn unauthorized(message: impl Into<String>) -> HeadError {
+        HeadError { status: Status::Unauthorized, message: message.into() }
     }
 
     /// A `422 Unprocessable Entity` — a verification failure.
