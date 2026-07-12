@@ -79,7 +79,7 @@ pub async fn handle_command() -> Result<(), String> {
             uploaded_signatures: 0,
         };
 
-        match remote_utils::lift_pallet(&client, &pallet, &head, remote_head.as_deref()).await? {
+        match remote_utils::lift_pallet(&client, &pallet, &head, remote_head.as_deref(), info.chunking).await? {
             LiftResult::UpToDate => report.up_to_date = true,
             LiftResult::Lifted(stats) => {
                 report.new_parcels = stats.new_parcels;

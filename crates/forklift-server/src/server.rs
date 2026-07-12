@@ -327,10 +327,15 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
         Router::new().nest("/v1", protocol)
     };
 
-    // The hash check gates correctness; the (optional) body cap gates disk-fill abuse.
+    // The hash check gates correctness; the body cap gates disk-fill abuse (§9.4b R9/D7). It now
+    // defaults **on** at the whole-object ceiling: after chunking, the largest legitimate object a
+    // client ever PUTs is a `MAX_OBJECT_BYTES` recipe or tree (a blob is below the chunk threshold,
+    // a chunk is at most `MAX_CHUNK_BYTES`), so this is a principled default value rather than the
+    // old "unlimited unless an operator remembers to cap it". An operator may still raise it for a
+    // grandfathered-giant read path or lower it, via `max_body_mb`.
     let body_limit = match options.max_body_mb {
         Some(mb) => DefaultBodyLimit::max((mb as usize) * 1024 * 1024),
-        None => DefaultBodyLimit::disable(),
+        None => DefaultBodyLimit::max(object_utils::MAX_OBJECT_BYTES),
     };
 
     let app = app
@@ -905,6 +910,12 @@ async fn get_warehouse(State(state): State<Arc<AppState>>,
             trust: office_utils::read_trust_anchor()
                 .map_err(internal)?
                 .map(|anchor| TrustAnchorDto::from(&anchor)),
+            // This head serves and stores chunked large files as ordinary content-addressed
+            // objects, and its ref-update closure audit descends recipes to presence-check chunks
+            // before a ref moves. A chunk-aware client reads this to know it may lift chunked
+            // content here (the byte plane is the local object store, so a chunk GET/PUT is served
+            // whole like any other loose object).
+            chunking: true,
         })
     }).await;
 

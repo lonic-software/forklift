@@ -63,8 +63,9 @@ is reserved for argument/usage errors (clap); `0` is success.
 | `non_origin_lift`         | 11   | A sparse workspace tried to lift to a remote other than its origin |
 | `narrow_unclean`          | 12   | `narrow` would delete a subtree that still holds uncommitted work  |
 | `scope_prune_blocked`     | 13   | `scope-prune` would free a path a checkout still materializes       |
-| `chunked_transport_unsupported` | 14   | A large chunked file can't be sent to a remote or bundle yet |
+| `chunked_transport_unsupported` | 14   | A chunked large file can't go into a bundle, or is being lifted to a remote that doesn't support chunking |
 | `oversized_transport_unsupported` | 15 | An object predates the size limit and can't be sent to a remote or bundle |
+| `commit_pagination_unsupported` | 16 | A lift needs a paginated commit (many objects) and the remote doesn't support it yet |
 
 The codes and exit numbers are a contract: they get added to, never repurposed.
 

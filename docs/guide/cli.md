@@ -257,6 +257,16 @@ offline-verifiable down to every byte. Two commands treat a chunked file as the 
 is: [`diff`](#diff--line-by-line-changes-d) reports it changed without a line diff, and
 [`blame`](#blame--who-wrote-each-line-bl-annotate) refuses it (there are no lines to attribute).
 
+Over the wire, chunked files travel **per object**: a `lift` uploads the recipe and every chunk
+(re-uploading only the chunks that changed — an appended-to file re-sends its new chunks and
+nothing else), and a `franchise`/`lower`/`expand` fetches each in-scope chunk it doesn't already
+have. A lift only advances the remote's ref once every chunk is confirmed present, so a chunked
+file is never left half-transferred. Two limits are worth knowing: a `bundle` never carries a
+chunked file (its chunks are reachable only through the recipe, which a bundle doesn't descend —
+move that history over the wire instead), and lifting a chunked file to a remote that predates
+chunking support is refused up front, naming the file (`chunked_transport_unsupported`, exit 14) —
+upgrade the remote, or keep the file under the 8 MiB threshold.
+
 ### `undo` — reverse the last operation
 
 ```sh
@@ -717,6 +727,12 @@ to a *different* remote could fail late at that remote's closure check, so `lift
 front with the `non_origin_lift` code, naming the origin. Point `remote.url` back at the origin,
 or run a full (unscoped) franchise against the new remote. A full warehouse holds the whole
 closure and can lift anywhere.
+
+**Very large lifts and old remotes.** A lift touching more objects than fit in one commit batch
+(tens of thousands of distinct objects — realistic for a single maximal chunked file, or simply a
+lot of small tracked files at once) needs a remote that understands paginated commits. Against a
+remote that doesn't, `lift` refuses up front, before uploading anything
+(`commit_pagination_unsupported`, exit 16) — upgrade the remote, or lift in smaller stages.
 
 ### `lower` — pull (`lo`)
 

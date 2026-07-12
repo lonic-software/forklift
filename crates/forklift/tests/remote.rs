@@ -1952,6 +1952,19 @@ fn object_present(area: &TestArea, dir: &str, hash: &str) -> bool {
     object_store_path(area, dir, hash).exists()
 }
 
+/// The hash of a recipe's first chunk, read from a warehouse's own store (for asserting a chunk's
+/// presence/absence over the wire).
+fn recipe_first_chunk(area: &TestArea, dir: &str, recipe_hash: &str) -> String {
+    let _scope = forklift_core::globals::StorageRootScope::enter(&area.path(dir));
+    forklift_core::util::object_utils::load_recipe(recipe_hash)
+        .expect("load the recipe")
+        .chunks
+        .first()
+        .expect("the recipe has at least one chunk")
+        .hash
+        .clone()
+}
+
 #[test]
 fn a_sparse_franchise_fetches_only_the_scoped_subtree() {
     // The headline: `franchise --only src/api` fetches the whole signed history but only the
@@ -2137,6 +2150,49 @@ fn expand_fetches_the_widened_subtree_and_a_bay_can_scope_to_it() {
 }
 
 #[test]
+fn a_sparse_franchise_seals_an_out_of_scope_chunked_file_and_expand_fetches_it() {
+    // Sparse × chunked (§9.4b Stage 3): an out-of-scope chunked file fetches NOTHING — its recipe
+    // is sealed by hash and, by the store invariant "recipe absent ⟹ chunks absent", none of its
+    // chunks are ever named or fetched. `expand` into its scope then fetches the recipe AND every
+    // chunk, and a bay scoped to it materializes the file byte-for-byte.
+    let area = TestArea::new("sparse-chunked");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/src/api/a.txt", "api v1\n");
+    area.write_large_file("dev/big/giant.bin", 0xBEEF, CHUNK_THRESHOLD + 50_000);
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    let head = pallet_head(&area, "dev", "main");
+    let recipe = path_object_hash(&area, "dev", &head, "big/giant.bin");
+    let chunk = recipe_first_chunk(&area, "dev", &recipe);
+
+    // Sparse franchise excluding the chunked file's subtree.
+    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src/api"]));
+
+    // Out of scope: neither the recipe nor its chunks were fetched.
+    assert!(!object_present(&area, "sparse", &recipe), "the out-of-scope recipe is sealed, not fetched");
+    assert!(!object_present(&area, "sparse", &chunk), "an out-of-scope chunk is never fetched");
+    assert!(!area.path("sparse/big/giant.bin").exists(), "the out-of-scope giant is not materialized");
+
+    // Expand into the chunked file's scope: the recipe AND its chunks arrive.
+    let expanded = area.forklift("sparse", &["expand", "big"]);
+    assert_success(&expanded);
+    assert!(object_present(&area, "sparse", &recipe), "expand fetches the recipe");
+    assert!(object_present(&area, "sparse", &chunk), "expand fetches the recipe's chunks");
+
+    // A bay scoped to the newly-fetched path materializes the giant byte-for-byte.
+    let bay_dir = area.path("sparse-big");
+    assert_success(&area.forklift("sparse",
+        &["bay", "add", "big", bay_dir.to_str().unwrap(), "--scope", "big"]));
+    let original = std::fs::read(area.path("dev/big/giant.bin")).unwrap();
+    let restored = std::fs::read(bay_dir.join("big/giant.bin")).unwrap();
+    assert_eq!(restored, original, "the expanded chunked file materializes byte-for-byte");
+}
+
+#[test]
 fn narrow_shrinks_the_scope_and_frees_nothing() {
     // `narrow` drops a subtree from this checkout's materialization scope and de-materializes its
     // files, but frees nothing in the object store — the content is still reachable history.
@@ -2218,14 +2274,14 @@ fn a_sparse_workspace_refuses_to_lift_to_a_non_origin_remote() {
 }
 
 #[test]
-fn lift_refuses_a_chunked_file_but_earlier_plain_work_stays_liftable() {
-    // Chunk transport (uploading/negotiating the chunk objects a recipe references) has not
-    // shipped: a lift can walk the tree closure and carry a chunked file's recipe like any other
-    // small object, but nothing negotiates or transfers its chunks, so pushing one would silently
-    // advance the remote's ref over content that can never be materialized there. The client
-    // refuses before touching the wire, with the stable code — and earlier plain work already on
-    // the remote is completely unaffected.
-    let area = TestArea::new("chunked-lift-refuses");
+fn lift_and_franchise_round_trip_a_chunked_file() {
+    // Chunk transport, end to end (§9.4b Stage 3). A chunk-aware server advertises `chunking` on
+    // its handshake, so a chunked file lifts like any other content: the recipe rides the control
+    // plane, its chunks ride the blob plane (per-object negotiation + upload), and the ref advances
+    // only after the commit-gate closure audit confirms every chunk is present. A fresh franchise
+    // then imports the tree+recipe closure (bundles never carry chunks) and fetches each chunk per
+    // object, re-assembling the file byte-for-byte — proving both directions of the wire.
+    let area = TestArea::new("chunked-round-trip");
     let server = Server::start(&area, None);
 
     prepare_warehouse(&area, "dev", &server.url);
@@ -2233,30 +2289,30 @@ fn lift_refuses_a_chunked_file_but_earlier_plain_work_stays_liftable() {
     assert_success(&area.forklift("dev", &["load", "."]));
     assert_success(&area.forklift("dev", &["stack", "plain work"]));
 
-    // The plain work lifts fine — the guard must not touch an ordinary lift.
+    // The plain work lifts fine — the chunk path must not touch an ordinary lift.
     let lifted = area.forklift("dev", &["lift"]);
     assert_success(&lifted);
     assert!(stdout(&lifted).contains("Lifted pallet"), "{}", stdout(&lifted));
 
-    // Now add a chunked giant and try to lift it.
+    // A chunked giant now lifts too — no refusal against a chunk-aware remote.
     area.write_large_file("dev/big.bin", 0xC0FFEE, CHUNK_THRESHOLD + 50_000);
     assert_success(&area.forklift("dev", &["load", "."]));
     assert_success(&area.forklift("dev", &["stack", "with a giant"]));
 
-    let refused = area.forklift("dev", &["--json", "lift"]);
-    assert!(!refused.status.success(), "a chunked file must refuse the lift: {}", stdout(&refused));
-    assert_eq!(refused.status.code(), Some(14), "chunked transport exits 14: {}", stderr(&refused));
+    let lifted_giant = area.forklift("dev", &["lift"]);
+    assert_success(&lifted_giant);
+    assert!(stdout(&lifted_giant).contains("Lifted pallet"),
+        "a chunked file lifts to a chunk-aware remote: {}", stdout(&lifted_giant));
 
-    let json: serde_json::Value = serde_json::from_str(&stdout(&refused)).unwrap();
-    assert_eq!(json["error"]["code"], "chunked_transport_unsupported", "{}", stdout(&refused));
-    assert!(json["error"]["message"].as_str().unwrap().contains("big.bin"),
-        "the refusal names the chunked file: {}", stdout(&refused));
-
-    // Nothing new reached the remote: a fresh franchise only ever sees the earlier plain work.
+    // A fresh franchise re-materializes the chunked file byte-for-byte (chunks fetched per object).
     let franchised = area.forklift(".", &["franchise", &server.url, "check"]);
     assert_success(&franchised);
     assert_eq!(area.read_file("check/small.txt"), "a normal file\n");
-    assert!(!area.path("check/big.bin").exists(), "the chunked file must never have reached the remote");
+
+    let original = std::fs::read(area.path("dev/big.bin")).unwrap();
+    let restored = std::fs::read(area.path("check/big.bin")).unwrap();
+    assert_eq!(restored.len(), CHUNK_THRESHOLD + 50_000, "the restored giant is the full size");
+    assert_eq!(restored, original, "the chunked file round-trips byte-for-byte");
 }
 
 #[test]

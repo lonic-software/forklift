@@ -74,6 +74,29 @@
 //! be, enforced by the URL; it is enforced where it actually can be — the streaming read
 //! above — which is a stronger guarantee anyway: it bounds every staged object regardless of
 //! how or whether the client's `Content-Length` header matched anything.
+//!
+//! # Operational requirement: expire abandoned staging objects (§9.4b Stage 3, W2)
+//!
+//! [`discard_session`](S3ObjectStore::discard_session) sweeps a lift session's `staging/{session}/`
+//! prefix, but only ever runs when a client actually calls `commit_lift` with the session's *final*
+//! batch (`more: false`) — see `Head::commit_lift`. A client that dies mid-lift (crash, killed
+//! process, a bay that is simply abandoned) never issues that final call, so its staged objects are
+//! never swept by any code path here: nothing in this store, or in the head, ever revisits a
+//! session it was not explicitly told is done. Paginated commits (`more: true` batches) widen the
+//! pre-existing window — the more batches a lift needs, the longer it stays "in flight" and
+//! abandonable before the final sweep — but the underlying gap (an unswept `staging/` key with no
+//! code path back to it) predates pagination and would exist even for a single-shot lift that never
+//! reaches its one and only commit call.
+//!
+//! **This is not closed in code.** The fix is operational, not a store method: the deploying
+//! operator **must** configure an S3 bucket lifecycle rule that expires objects under the
+//! `staging/` prefix after a fixed age (a week — comfortably longer than any legitimate lift is
+//! expected to take, including a paginated one, and short enough that abandoned sessions do not
+//! accumulate indefinitely). Without such a rule, an abandoned session — or a client that sets
+//! `more: true` forever and never sends a final batch, maliciously or by a bug — grows the
+//! `staging/` prefix without bound. This is deliberately out of scope for Stage 3: no code change
+//! closes it here, and it must be re-verified whenever the deployment/infrastructure story for this
+//! head is documented or automated (Terraform/CDK, a setup script, an operator runbook).
 
 use std::time::Duration;
 
@@ -107,6 +130,19 @@ pub const STREAMING_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
 /// docs). 5 GiB is S3's own single-`PUT` maximum — generous enough that no legitimate blob
 /// ever hits it, since anything larger would not have fit through a single presigned `PUT` in
 /// the first place.
+///
+/// This cap is deliberately **size-only, not per-type** — larger than either the whole-object
+/// ceiling (`MAX_OBJECT_BYTES`, 64 MiB) or the chunk ceiling (`MAX_CHUNK_BYTES`, 4 MiB) the format
+/// enforces (§9.4b). `verify_and_promote` is type-blind by construction: it hashes staged bytes and
+/// promotes them with a server-side `CopyObject`, never parsing the object header, so it *cannot*
+/// cheaply tell a chunk from a recipe from a tree to apply a per-type cap here. It does not need
+/// to. Every per-type ceiling is enforced where the type *is* known: a chunk is capped at
+/// `MAX_CHUNK_BYTES` and a whole object at `MAX_OBJECT_BYTES` by `object_utils::store_object_bytes`
+/// / `store_object_stream` on the **client** that authors it, on **every peer** that reads it back
+/// loose (a hand-crafted over-size chunk uploaded here is refused the moment any client fetches and
+/// stores it), and — for a recipe the commit-gate audit must read — by `parse_recipe_bytes`. So the
+/// staging cap is only the coarse S3-single-PUT backstop; the fine, format-defined ceilings live at
+/// the store boundary, not the staging promoter.
 const MAX_STAGED_OBJECT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
 /// How many times [`ObjectStore::verify_and_promote`] retries the streaming path when a

@@ -457,10 +457,12 @@ impl RemoteClient {
     async fn commit_lift(&self,
                          session: &str,
                          control_plane: &[String],
-                         blobs: &[String]) -> Result<CommitOutcome, String> {
+                         blobs: &[String],
+                         more: bool) -> Result<CommitOutcome, String> {
         let body = CommitLiftRequest {
             control_plane: control_plane.to_vec(),
             blobs: blobs.to_vec(),
+            more,
         };
 
         let response = self.request(reqwest::Method::POST, &format!("/v1/lift/{}/commit", session))
@@ -682,6 +684,7 @@ pub async fn fetch_history(client: &RemoteClient, head: &str) -> Result<FetchSta
             stats.fetched_objects += fetch_missing_objects(client, &tree_wave).await?;
 
             let mut blob_wave: Vec<String> = Vec::new();
+            let mut recipe_wave: Vec<String> = Vec::new();
 
             for tree_hash in &tree_wave {
                 let tree = object_utils::load_tree(tree_hash)?;
@@ -689,6 +692,12 @@ pub async fn fetch_history(client: &RemoteClient, head: &str) -> Result<FetchSta
                 for (_, file) in tree.get_files() {
                     if seen_blobs.insert(file.hash.clone()) {
                         blob_wave.push(file.hash.clone());
+
+                        // A chunked file's entry names a recipe: fetch it with the blob wave, then
+                        // descend it below for its chunks (which no bundle or blob wave carries).
+                        if file.item_type.is_chunked() {
+                            recipe_wave.push(file.hash.clone());
+                        }
                     }
                 }
 
@@ -698,6 +707,7 @@ pub async fn fetch_history(client: &RemoteClient, head: &str) -> Result<FetchSta
             }
 
             stats.fetched_objects += fetch_missing_objects(client, &blob_wave).await?;
+            stats.fetched_objects += fetch_recipe_chunks(client, &recipe_wave).await?;
         }
     }
 
@@ -833,6 +843,7 @@ async fn fetch_scoped_from(client: &RemoteClient,
 
             let tree = object_utils::load_tree(&tree_hash)?;
             let mut spine_blobs: Vec<String> = Vec::new();
+            let mut spine_recipes: Vec<String> = Vec::new();
 
             for (name, subtree) in tree.get_subtrees() {
                 let child = scope_join(&path, name);
@@ -852,10 +863,18 @@ async fn fetch_scoped_from(client: &RemoteClient,
                     && seen_blobs.insert(file.hash.clone())
                 {
                     spine_blobs.push(file.hash.clone());
+
+                    // An in-scope chunked file named on the spine: fetch its chunks too. An
+                    // out-of-scope one is sealed above (never added), so its recipe never lands and
+                    // its chunks are never named — sparse fetches nothing out of scope.
+                    if file.item_type.is_chunked() {
+                        spine_recipes.push(file.hash.clone());
+                    }
                 }
             }
 
             stats.fetched_objects += fetch_missing_objects(client, &spine_blobs).await?;
+            stats.fetched_objects += fetch_recipe_chunks(client, &spine_recipes).await?;
         }
 
         // The in-scope subtree closures — the parallel bulk, fetched in batched waves exactly as
@@ -875,6 +894,7 @@ async fn fetch_scoped_from(client: &RemoteClient,
             stats.fetched_objects += fetch_missing_objects(client, &tree_wave).await?;
 
             let mut blob_wave: Vec<String> = Vec::new();
+            let mut recipe_wave: Vec<String> = Vec::new();
 
             for tree_hash in &tree_wave {
                 let tree = object_utils::load_tree(tree_hash)?;
@@ -882,6 +902,12 @@ async fn fetch_scoped_from(client: &RemoteClient,
                 for (_, file) in tree.get_files() {
                     if seen_blobs.insert(file.hash.clone()) {
                         blob_wave.push(file.hash.clone());
+
+                        // Everything under an in-scope prefix is in scope, so every chunked file
+                        // here has its chunks fetched (via the recipe just fetched in the blob wave).
+                        if file.item_type.is_chunked() {
+                            recipe_wave.push(file.hash.clone());
+                        }
                     }
                 }
 
@@ -891,6 +917,7 @@ async fn fetch_scoped_from(client: &RemoteClient,
             }
 
             stats.fetched_objects += fetch_missing_objects(client, &blob_wave).await?;
+            stats.fetched_objects += fetch_recipe_chunks(client, &recipe_wave).await?;
         }
     }
 
@@ -979,6 +1006,46 @@ async fn fetch_missing_objects(client: &RemoteClient, hashes: &[String]) -> Resu
     }
 
     fetch_loose_objects(client, &missing).await
+}
+
+/// Fetch every chunk of the given recipes that is missing locally — the second half of fetching a
+/// chunked file, run *after* the recipes themselves have landed (they ride the ordinary blob wave,
+/// since a tree entry names the recipe like any other file object). Bundles never carry chunks
+/// (trees don't reference them, so no closure walk ever emits one), so a franchise/lower/expand
+/// imports the tree+recipe closure and then fetches the in-scope chunks per object here, exactly
+/// the "a bundle is an optimization; missing objects fall back to loose GET" contract.
+///
+/// Each recipe is loaded from the now-present local object (which re-hashes it and runs the
+/// `sum(sizes) == total` structural check) and its chunk hashes are collected — deduplicated across
+/// recipes so a chunk shared by two files is fetched once. `store_object_bytes` hash-verifies every
+/// fetched chunk and enforces the per-chunk ceiling on the way in. Only in-scope recipes are ever
+/// passed here: an out-of-scope recipe is sealed, never fetched, so its chunks are never named
+/// (the store invariant "recipe absent ⟹ chunks absent" holds under sparse fetch).
+///
+/// # Arguments
+/// * `client`        - The remote.
+/// * `recipe_hashes` - Recipe hashes whose chunks to fetch (already present locally).
+///
+/// # Returns
+/// * `Ok(usize)`   - How many chunk objects were fetched.
+/// * `Err(String)` - If a recipe is unreadable, or a chunk transfer/verification failed.
+async fn fetch_recipe_chunks(client: &RemoteClient, recipe_hashes: &[String]) -> Result<usize, String> {
+    if recipe_hashes.is_empty() {
+        return Ok(0);
+    }
+
+    let mut chunk_hashes: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    for recipe_hash in recipe_hashes {
+        for chunk_hash in object_utils::recipe_chunk_hashes(recipe_hash)? {
+            if seen.insert(chunk_hash.clone()) {
+                chunk_hashes.push(chunk_hash);
+            }
+        }
+    }
+
+    fetch_missing_objects(client, &chunk_hashes).await
 }
 
 /// Fetch (concurrently) the given objects one GET each. All of them are assumed
@@ -1074,8 +1141,9 @@ async fn fetch_missing_signatures(client: &RemoteClient,
 pub async fn lift_pallet(client: &RemoteClient,
                          pallet: &str,
                          local_head: &str,
-                         remote_head: Option<&str>) -> Result<LiftResult, String> {
-    lift_pallet_inner(client, pallet, local_head, remote_head, false).await
+                         remote_head: Option<&str>,
+                         chunking_supported: bool) -> Result<LiftResult, String> {
+    lift_pallet_inner(client, pallet, local_head, remote_head, false, chunking_supported).await
 }
 
 /// `lift_pallet`, allowing one sanctioned non-descendant update: the office lift right
@@ -1086,7 +1154,8 @@ async fn lift_pallet_inner(client: &RemoteClient,
                            pallet: &str,
                            local_head: &str,
                            remote_head: Option<&str>,
-                           adopted_reset: bool) -> Result<LiftResult, String> {
+                           adopted_reset: bool,
+                           chunking_supported: bool) -> Result<LiftResult, String> {
     if remote_head == Some(local_head) {
         return Ok(LiftResult::UpToDate);
     }
@@ -1147,6 +1216,7 @@ async fn lift_pallet_inner(client: &RemoteClient,
     let mut candidates: Vec<String> = new_parcels.clone();
     let mut seen_trees: HashSet<String> = HashSet::new();
     let mut seen_blobs: HashSet<String> = HashSet::new();
+    let mut seen_recipes: HashSet<String> = HashSet::new();
 
     // Oldest first: a parcel's parents are remote-known or already processed, so
     // everything a base "explains" is on the remote or in the candidates already.
@@ -1164,21 +1234,27 @@ async fn lift_pallet_inner(client: &RemoteClient,
             .collect::<Result<_, _>>()?;
 
         collect_changed_closure(&parcel.tree_hash, "", &base_trees,
-                                &mut seen_trees, &mut seen_blobs, &mut candidates)?;
+                                &mut seen_trees, &mut seen_blobs, &mut seen_recipes,
+                                &mut candidates, chunking_supported)?;
     }
 
-    // Control-plane objects — parcels and trees — are promoted synchronously when a storage-
-    // backed head commits the session; working blobs are promoted out of band by the staging
-    // verifier and only presence-checked. Classify from the sets the closure walk already built
-    // (`new_parcels` and `seen_trees`), rather than re-deriving each object's type on the wire.
+    // Control-plane objects — parcels, trees, and recipes — are promoted synchronously when a
+    // storage-backed head commits the session; working blobs and chunks are promoted out of band
+    // by the staging verifier and only presence-checked. Classify from the sets the closure walk
+    // already built (`new_parcels`, `seen_trees` and `seen_recipes`), rather than re-deriving each
+    // object's type on the wire. A recipe is small and structural (like a tree), so it belongs in
+    // the synchronous half; its chunks are the large, many, out-of-band half.
     let mut control_plane: HashSet<String> = new_parcels.iter().cloned().collect();
     control_plane.extend(seen_trees.iter().cloned());
+    control_plane.extend(seen_recipes.iter().cloned());
 
     // One flow serves both heads: negotiate upload targets, PUT the missing objects straight to
     // presigned staging URLs and/or to the control plane, and commit the staged session. Falls
     // back to `missing` + per-object `PUT` against a remote that predates `upload-targets`.
     let session = new_lift_session();
-    let uploaded_objects = negotiate_and_upload(client, &session, &candidates, &control_plane).await?;
+    let uploaded_objects = negotiate_and_upload(
+        client, &session, &candidates, &control_plane, chunking_supported,
+    ).await?;
 
     // The signatures of the new parcels travel with them.
     let mut uploaded_signatures = 0usize;
@@ -1211,12 +1287,18 @@ async fn lift_pallet_inner(client: &RemoteClient,
 /// only by seal. It is scope-agnostic and correct in full stores too — an object pruned against a
 /// parent is provably on the remote (that parent is already there or is uploaded in this session),
 /// exactly the guarantee the first-parent-only walk gave for linear history.
+// Three dedup ledgers (trees, blobs/chunks, recipes) plus the candidate accumulator, the path
+// prefix for error naming, the base set, and the chunking capability — each meaningfully distinct
+// and threaded through the recursion, so a parameter object would only obscure them.
+#[allow(clippy::too_many_arguments)]
 fn collect_changed_closure(tree_hash: &str,
                            path_prefix: &str,
                            base_tree_hashes: &[String],
                            seen_trees: &mut HashSet<String>,
                            seen_blobs: &mut HashSet<String>,
-                           candidates: &mut Vec<String>) -> Result<(), String> {
+                           seen_recipes: &mut HashSet<String>,
+                           candidates: &mut Vec<String>,
+                           chunking_supported: bool) -> Result<(), String> {
     // Record the visit before checking base-explained, not after: content-addressing means the
     // same subtree hash can recur at another path in the same walk (e.g. a merge adopting one
     // side's out-of-scope subtree under two names), and that recurrence must be recognized even
@@ -1256,19 +1338,46 @@ fn collect_changed_closure(tree_hash: &str,
     }
 
     for (name, file) in tree.get_files() {
-        // Chunk transport (negotiating/uploading the chunk objects a recipe references) is not
-        // wired up yet: nothing here descends into a recipe to add its chunk hashes to
-        // `candidates`, so lifting a chunked file would advance the remote's ref over a recipe
-        // whose chunks never arrive — a signed ref over content that can never be materialized
-        // there. Refuse client-side, before any negotiation or upload, naming the path. Checked
-        // for every file this walk visits (explained or not), so it also catches a chunked file
-        // that is unchanged-but-newly-reachable in this lift. Remove once chunk transport ships.
-        if file.item_type.is_chunked() {
-            return Err(scope_utils::chunked_transport_refusal(&join_path(path_prefix, name)));
-        }
-
         let explained = base_file_hashes.get(name.as_str())
             .is_some_and(|hashes| hashes.contains(&file.hash.as_str()));
+
+        // A chunked file's entry hash names a recipe, whose chunks ride the byte plane as
+        // ordinary objects. Two independent guards apply, in this order:
+        if file.item_type.is_chunked() {
+            // 1. The remote must support chunked files at all. Absent the handshake capability
+            //    (an old head), refuse client-side, before any negotiation or upload, naming the
+            //    path — an old head's `gc` would silently collect a recipe's chunks (B1), so a
+            //    chunk-aware client never lifts chunked content there. Checked for every chunked
+            //    entry this walk visits (explained or not), so it also catches one that is
+            //    unchanged-but-newly-reachable in this lift.
+            if !chunking_supported {
+                return Err(scope_utils::chunked_remote_refusal(&join_path(path_prefix, name)));
+            }
+
+            // 2. An identical recipe on a parent at this name ⟹ the remote already has that
+            //    recipe and its whole chunk closure (a base's closure is complete on the remote).
+            if explained {
+                continue;
+            }
+
+            // First encounter of this recipe: negotiate the recipe (control plane) and descend it
+            // to enumerate every chunk (blobs). Without the chunks in `candidates`, the upload
+            // negotiation never learns to send them, and the remote's ref would advance over a
+            // recipe whose chunks never arrived — the client half of §9.4b W4. Per-chunk dedup is
+            // free from the negotiation: an appended-to file re-lists all its chunk hashes here,
+            // and `upload-targets` reports the unchanged ones `present`.
+            if seen_recipes.insert(file.hash.clone()) {
+                candidates.push(file.hash.clone());
+
+                for chunk_hash in object_utils::recipe_chunk_hashes(&file.hash)? {
+                    if seen_blobs.insert(chunk_hash.clone()) {
+                        candidates.push(chunk_hash);
+                    }
+                }
+            }
+
+            continue;
+        }
 
         if explained {
             continue;
@@ -1285,7 +1394,8 @@ fn collect_changed_closure(tree_hash: &str,
             .unwrap_or_default();
 
         collect_changed_closure(&subtree.hash, &join_path(path_prefix, name), &child_bases,
-                                seen_trees, seen_blobs, candidates)?;
+                                seen_trees, seen_blobs, seen_recipes, candidates,
+                                chunking_supported)?;
     }
 
     Ok(())
@@ -1340,6 +1450,27 @@ async fn upload_objects(client: &RemoteClient, hashes: &[String]) -> Result<(), 
     join_all(tasks).await
 }
 
+/// Refuse a lift whose commit would need more than one paginated batch (§9.4b Stage 3, W3) when
+/// the remote does not advertise chunking support. See [`negotiate_and_upload`] for why: the
+/// additive `more` field that makes pagination safe shipped *with* chunking, not before it, and a
+/// remote that ignores it would silently sweep away a later batch's still-staged objects.
+///
+/// # Arguments
+/// * `staged_count`       - How many distinct objects `upload-targets` staged for this lift.
+/// * `chunking_supported` - Whether the remote's handshake advertised chunking support.
+///
+/// # Returns
+/// * `Ok(())`      - One batch suffices, or the remote understands pagination either way.
+/// * `Err(String)` - The `commit_pagination_unsupported` refusal.
+fn refuse_if_commit_pagination_unsupported(staged_count: usize,
+                                           chunking_supported: bool) -> Result<(), String> {
+    if staged_count <= MAX_MISSING_BATCH || chunking_supported {
+        return Ok(());
+    }
+
+    Err(scope_utils::commit_pagination_unsupported_refusal(staged_count))
+}
+
 /// The one upload flow that serves both a storage-backed (staging) head and a direct head.
 /// Negotiates targets, uploads the missing objects — straight to presigned staging URLs and/or
 /// to the control plane — commits the staged session when there is one, and returns how many
@@ -1349,17 +1480,34 @@ async fn upload_objects(client: &RemoteClient, hashes: &[String]) -> Result<(), 
 /// `control_plane` names the hashes that are parcels or trees — small objects the commit
 /// verifies and promotes synchronously; every other staged hash is a working blob, promoted out
 /// of band by the staging verifier and only presence-checked at commit.
+///
+/// `chunking_supported` gates nothing about chunked files here (that refusal already fired
+/// earlier, in the closure walk) — it gates whether *this* remote understands paginated commits at
+/// all (§9.4b W3), which matters for *any* large lift, chunked or not.
 async fn negotiate_and_upload(client: &RemoteClient,
                               session: &str,
                               candidates: &[String],
-                              control_plane: &HashSet<String>) -> Result<usize, String> {
+                              control_plane: &HashSet<String>,
+                              chunking_supported: bool) -> Result<usize, String> {
     let Some(negotiation) = client.upload_targets(session, candidates).await? else {
         // An older remote with no `upload-targets`: negotiate the missing set and PUT each body
-        // to the control plane, exactly as before.
+        // to the control plane, exactly as before. No staging, no commit batching — each object is
+        // verified inline on its own PUT, so the pagination gate below does not apply here.
         let missing = client.missing_objects(candidates).await?;
         upload_objects(client, &missing).await?;
         return Ok(missing.len());
     };
+
+    // Before a single byte is uploaded: a commit that will need more than one paginated batch
+    // requires a remote that understands the additive `more` field (§9.4b W3), which shipped with
+    // chunking support. A pre-chunking staging head ignores an unrecognized `more` (defaults to
+    // `false`) and sweeps its staging prefix after the very first batch — silently stranding
+    // whatever a later batch still needed staged, so the lift would fail non-deterministically at
+    // commit time with a misleading "blob not ready", *after* the whole (potentially enormous)
+    // upload already ran. Refusing here, right after negotiation (which already knows the exact
+    // staged count and cost nothing but a cheap, already-paginated round trip), is the honest
+    // failure before any bytes move.
+    refuse_if_commit_pagination_unsupported(negotiation.targets.len(), chunking_supported)?;
 
     // `present` is already on the remote (skip). `direct` goes to the control plane for inline
     // verification; `targets` go straight to storage under the session's staging prefix.
@@ -1418,18 +1566,45 @@ async fn upload_to_targets(client: &RemoteClient,
     join_all(tasks).await
 }
 
-/// Commit a staged lift session, retrying with bounded backoff while a blob is still being
-/// promoted out of band by the staging verifier (the one transient failure — every other
-/// commit failure surfaces at once). Gives up with a clear, safe-to-retry error rather than
-/// hanging on a stuck verifier.
+/// Commit a staged lift session, paginating the hash lists and retrying each batch with bounded
+/// backoff while a blob is still being promoted out of band by the staging verifier (the one
+/// transient failure — every other commit failure surfaces at once). Gives up with a clear,
+/// safe-to-retry error rather than hanging on a stuck verifier.
+///
+/// A lift touching a maximal chunked file lists too many chunk hashes for one request (Lambda's
+/// ~6 MB synchronous body), so `control_plane`/`blobs` are paginated at [`MAX_MISSING_BATCH`] and
+/// every batch but the last carries `more: true`. The head verifies/presence-checks each batch but
+/// gates its session-wide staging sweep on the final (`more: false`) batch, so an early batch never
+/// discards chunks a later batch still needs. A small lift is one batch (`more: false`), byte-for-
+/// byte the pre-pagination behaviour.
 async fn commit_staged_session(client: &RemoteClient,
                                session: &str,
                                control_plane: &[String],
                                blobs: &[String]) -> Result<(), String> {
+    let batches = build_commit_batches(control_plane, blobs, MAX_MISSING_BATCH);
+    let last = batches.len() - 1; // `build_commit_batches` never returns an empty vec.
+
+    for (index, (control, working)) in batches.iter().enumerate() {
+        // `more` on every batch but the last: the head skips its staging sweep until the final
+        // batch, so intermediate batches never discard a later batch's still-staged objects.
+        let more = index < last;
+        commit_one_batch(client, session, control, working, more).await?;
+    }
+
+    Ok(())
+}
+
+/// Commit one paginated batch, retrying with bounded backoff while a blob (or chunk) is still
+/// being promoted out of band. A `more` batch re-verifies idempotently on retry and never sweeps.
+async fn commit_one_batch(client: &RemoteClient,
+                          session: &str,
+                          control_plane: &[String],
+                          blobs: &[String],
+                          more: bool) -> Result<(), String> {
     let mut delay = COMMIT_BACKOFF_START;
 
     for attempt in 1..=MAX_COMMIT_ATTEMPTS {
-        match client.commit_lift(session, control_plane, blobs).await? {
+        match client.commit_lift(session, control_plane, blobs, more).await? {
             CommitOutcome::Committed => return Ok(()),
             CommitOutcome::BlobNotReady => {}
         }
@@ -1445,6 +1620,54 @@ async fn commit_staged_session(client: &RemoteClient,
         attempts. The upload is safe — retry the lift once the remote has caught up.",
         MAX_COMMIT_ATTEMPTS
     ))
+}
+
+/// Partition a session's `control_plane` and `blobs` hash lists into commit batches, each with at
+/// most `cap` hashes *combined* (the head caps `control_plane.len() + blobs.len()` per request).
+/// Control-plane hashes fill first (they carry the recipes/trees a later batch's chunks belong to),
+/// then blobs; a batch is never split across the two lists' boundary in a way that reorders either.
+/// Always returns at least one batch — even for two empty lists — so the caller's final-batch
+/// staging sweep always runs.
+fn build_commit_batches(control_plane: &[String],
+                        blobs: &[String],
+                        cap: usize) -> Vec<(Vec<String>, Vec<String>)> {
+    let cap = cap.max(1);
+    let mut batches: Vec<(Vec<String>, Vec<String>)> = Vec::new();
+    let mut control = control_plane.iter();
+    let mut working = blobs.iter();
+
+    loop {
+        let mut control_batch: Vec<String> = Vec::new();
+        let mut working_batch: Vec<String> = Vec::new();
+        let mut room = cap;
+
+        while room > 0 {
+            match control.next() {
+                Some(hash) => { control_batch.push(hash.clone()); room -= 1; }
+                None => break,
+            }
+        }
+        while room > 0 {
+            match working.next() {
+                Some(hash) => { working_batch.push(hash.clone()); room -= 1; }
+                None => break,
+            }
+        }
+
+        if control_batch.is_empty() && working_batch.is_empty() {
+            break;
+        }
+
+        batches.push((control_batch, working_batch));
+    }
+
+    if batches.is_empty() {
+        // Nothing staged (both lists empty): still one final-batch commit so the sweep runs, the
+        // exact single-shot behaviour of the pre-pagination path when it was handed empty lists.
+        batches.push((Vec::new(), Vec::new()));
+    }
+
+    batches
 }
 
 /// Await every task of a set, surfacing the first failure.
@@ -1673,7 +1896,10 @@ pub async fn push_local_trust(client: &RemoteClient,
         &office_key,
         &office_head,
         remote_office_head,
-        adopted_reset
+        adopted_reset,
+        // The office pallet carries only structural, tracked-metadata objects — never a chunked
+        // file — so the capability never actually gates it; threaded honestly all the same.
+        info.chunking,
     ).await?;
 
     Ok(Some(result))
@@ -1717,7 +1943,8 @@ pub async fn lift_meta_pallets(client: &RemoteClient,
         let wire = pallet_utils::PalletRef::meta(&name).to_wire();
         let remote_head = info.pallets.get(&wire).map(String::as_str);
 
-        let result = lift_pallet(client, &wire, &local_head, remote_head).await?;
+        // Meta pallets never carry a chunked file; the capability is threaded for uniformity.
+        let result = lift_pallet(client, &wire, &local_head, remote_head, info.chunking).await?;
         lifts.push(MetaPalletLift { pallet: wire, result });
     }
 
@@ -1986,6 +2213,85 @@ mod tests {
         assert!(blobs.is_empty());
     }
 
+    /// A small lift fits in one batch, which carries both lists intact and, being the last (only)
+    /// batch, is committed with `more: false` (the caller's sweep runs) — the pre-pagination path.
+    #[test]
+    fn a_small_commit_is_a_single_batch() {
+        let control: Vec<String> = vec!["a".repeat(64), "b".repeat(64)];
+        let blobs: Vec<String> = vec!["c".repeat(64)];
+
+        let batches = build_commit_batches(&control, &blobs, MAX_MISSING_BATCH);
+
+        assert_eq!(batches.len(), 1, "a small lift is one batch");
+        assert_eq!(batches[0].0, control, "the control plane rides intact");
+        assert_eq!(batches[0].1, blobs, "the blobs ride intact");
+    }
+
+    /// Two empty lists still yield one (empty) batch, so the final-batch staging sweep always runs.
+    #[test]
+    fn an_empty_commit_still_yields_one_batch_so_the_sweep_runs() {
+        let batches = build_commit_batches(&[], &[], MAX_MISSING_BATCH);
+        assert_eq!(batches.len(), 1);
+        assert!(batches[0].0.is_empty() && batches[0].1.is_empty());
+    }
+
+    /// The cap applies to the two lists *combined*: control-plane hashes fill each batch first,
+    /// then blobs, and neither list is reordered across the batch boundary. Every batch but the
+    /// last is exactly `cap` hashes; the last carries the remainder.
+    #[test]
+    fn batches_respect_the_combined_cap_and_preserve_order() {
+        let control: Vec<String> = (0..3).map(|i| format!("c{}", i)).collect();
+        let blobs: Vec<String> = (0..3).map(|i| format!("b{}", i)).collect();
+
+        // cap = 4: batch 1 takes all 3 control + 1 blob; batch 2 takes the remaining 2 blobs.
+        let batches = build_commit_batches(&control, &blobs, 4);
+
+        assert_eq!(batches.len(), 2, "6 hashes at cap 4 is two batches");
+        assert_eq!(batches[0].0, vec!["c0", "c1", "c2"], "control fills first, in order");
+        assert_eq!(batches[0].1, vec!["b0"], "then blobs, in order");
+        assert_eq!(batches[0].0.len() + batches[0].1.len(), 4, "the first batch is exactly the cap");
+        assert_eq!(batches[1].0, Vec::<String>::new(), "control is exhausted");
+        assert_eq!(batches[1].1, vec!["b1", "b2"], "the last batch carries the blob remainder");
+
+        // Reassembling the batches recovers the inputs exactly (nothing dropped or duplicated).
+        let seen_control: Vec<String> = batches.iter().flat_map(|(c, _)| c.clone()).collect();
+        let seen_blobs: Vec<String> = batches.iter().flat_map(|(_, b)| b.clone()).collect();
+        assert_eq!(seen_control, control);
+        assert_eq!(seen_blobs, blobs);
+    }
+
+    /// The commit-pagination gate (§9.4b W3, the pure boundary): a staged count at or under the
+    /// per-batch cap is fine regardless of remote support (one batch either way); over the cap,
+    /// only a chunking-capable remote (which understands the additive `more` field) may proceed —
+    /// a non-chunking remote is refused, naming the exact staged count.
+    #[test]
+    fn commit_pagination_gate_refuses_only_when_over_cap_and_unsupported() {
+        assert!(
+            refuse_if_commit_pagination_unsupported(MAX_MISSING_BATCH, false).is_ok(),
+            "exactly the cap needs only one batch, even against a non-chunking remote"
+        );
+        assert!(
+            refuse_if_commit_pagination_unsupported(MAX_MISSING_BATCH + 1, true).is_ok(),
+            "a chunking-capable remote may paginate past the cap"
+        );
+        assert!(
+            refuse_if_commit_pagination_unsupported(1, false).is_ok(),
+            "a tiny lift is never gated"
+        );
+
+        let error = refuse_if_commit_pagination_unsupported(MAX_MISSING_BATCH + 1, false)
+            .expect_err("over the cap, against a non-chunking remote, must refuse");
+        let (code, message, next_step) = scope_utils::decode_refusal(&error)
+            .expect("the refusal must decode via the shared sentinel framing");
+
+        assert_eq!(code, scope_utils::CODE_COMMIT_PAGINATION_UNSUPPORTED);
+        assert!(
+            message.contains(&(MAX_MISSING_BATCH + 1).to_string()),
+            "the refusal names the staged count: {}", message
+        );
+        assert!(next_step.contains("Upgrade the remote"), "{}", next_step);
+    }
+
     /// The fallback decision: only a `404`/`405` means the remote lacks the endpoint; every
     /// other non-success status is a real error the caller must surface, not silently fall back
     /// on (falling back on, say, a `500` would mask it).
@@ -2111,8 +2417,10 @@ mod tests {
         let walk = |bases: &[String]| -> Vec<String> {
             let mut seen_trees = HashSet::new();
             let mut seen_blobs = HashSet::new();
+            let mut seen_recipes = HashSet::new();
             let mut candidates = Vec::new();
-            collect_changed_closure(&root_merge, "", bases, &mut seen_trees, &mut seen_blobs, &mut candidates)
+            collect_changed_closure(&root_merge, "", bases, &mut seen_trees, &mut seen_blobs,
+                                    &mut seen_recipes, &mut candidates, true)
                 .expect("the closure walk must not load a pruned object");
             candidates
         };
@@ -2166,8 +2474,10 @@ mod tests {
 
         let mut seen_trees = HashSet::new();
         let mut seen_blobs = HashSet::new();
+        let mut seen_recipes = HashSet::new();
         let mut candidates = Vec::new();
-        collect_changed_closure(&new_root, "", &[base_root], &mut seen_trees, &mut seen_blobs, &mut candidates)
+        collect_changed_closure(&new_root, "", &[base_root], &mut seen_trees, &mut seen_blobs,
+                                &mut seen_recipes, &mut candidates, true)
             .expect("the second path must be recognized as already-seen, not re-loaded");
 
         assert!(!candidates.contains(&shared),
@@ -2176,19 +2486,51 @@ mod tests {
             "the base-explained subtree must be marked seen so a second path skips it too");
     }
 
-    /// The lift closure walk refuses a chunked file entry before any negotiation or upload:
-    /// chunk transport has not shipped, so lifting one would advance the remote's ref over a
-    /// recipe whose chunks never arrive. Named by its full path; a plain sibling in the same
-    /// tree is unaffected (proving the guard is scoped to the one chunked entry, not the walk).
+    /// Build and store a recipe from the given chunk contents (each a real, stored `Chunk`
+    /// object), returning `(recipe_hash, chunk_hashes)`. The recipe's `content_hash` and sizes are
+    /// consistent, so it passes the structural load check the closure descent runs.
+    fn store_recipe(chunk_contents: &[&str]) -> (String, Vec<String>) {
+        use crate::model::chunk::Chunk;
+        use crate::model::recipe::{Recipe, RecipeChunk};
+
+        let mut chunk_hashes: Vec<String> = Vec::new();
+        let mut recipe_chunks: Vec<RecipeChunk> = Vec::new();
+        let mut hasher = blake3::Hasher::new();
+
+        for content in chunk_contents {
+            let bytes = content.as_bytes().to_vec();
+            hasher.update(&bytes);
+
+            let mut object = LooseObjectBuilder::build_chunk(&Chunk { content: bytes.clone() });
+            object.store().unwrap();
+            recipe_chunks.push(RecipeChunk { hash: object.hash.clone(), size: bytes.len() as u64 });
+            chunk_hashes.push(object.hash);
+        }
+
+        let total_size = recipe_chunks.iter().map(|chunk| chunk.size).sum();
+        let recipe = Recipe {
+            content_hash: hasher.finalize().to_hex().to_string(),
+            total_size,
+            chunks: recipe_chunks,
+        };
+
+        let mut object = LooseObjectBuilder::build_recipe(&recipe);
+        object.store().unwrap();
+        (object.hash, chunk_hashes)
+    }
+
+    /// Against a remote that does **not** advertise chunking, the lift closure walk refuses a
+    /// chunked file entry before any negotiation or upload: an old head's `gc` would silently
+    /// collect a recipe's chunks (B1). Named by its full path; a plain sibling in the same tree is
+    /// unaffected (proving the guard is scoped to the one chunked entry, not the walk). The walk
+    /// refuses before loading the recipe, so a placeholder hash is enough — a load-order guarantee.
     #[test]
-    fn the_closure_walk_refuses_a_chunked_file() {
+    fn the_lift_refuses_a_chunked_file_to_a_non_chunking_remote() {
         use crate::enums::dir_entry_type::DirEntryType::{Normal, NormalChunked, Tree};
 
-        let _scratch = Scratch::new("closure-chunked-refuses");
+        let _scratch = Scratch::new("closure-chunked-refuses-old-remote");
 
         let plain = store_blob("small file");
-        // The walk refuses before ever loading the file's own object, so a placeholder hash
-        // (never stored) is enough to prove it — this is a load-order guarantee, not incidental.
         let fake_recipe_hash = "a".repeat(64);
 
         let src = store_tree(&[
@@ -2199,16 +2541,61 @@ mod tests {
 
         let mut seen_trees = HashSet::new();
         let mut seen_blobs = HashSet::new();
+        let mut seen_recipes = HashSet::new();
         let mut candidates = Vec::new();
 
-        let error = collect_changed_closure(&root, "", &[], &mut seen_trees, &mut seen_blobs, &mut candidates)
-            .expect_err("a chunked file entry must refuse the closure walk");
+        // `false` = the remote's handshake omitted the chunking capability.
+        let error = collect_changed_closure(&root, "", &[], &mut seen_trees, &mut seen_blobs,
+                                            &mut seen_recipes, &mut candidates, false)
+            .expect_err("a chunked file entry must refuse a lift to a non-chunking remote");
 
-        let (code, message, _) = scope_utils::decode_refusal(&error)
+        let (code, message, next_step) = scope_utils::decode_refusal(&error)
             .expect("the refusal must decode via the shared sentinel framing");
 
         assert_eq!(code, scope_utils::CODE_CHUNKED_TRANSPORT_UNSUPPORTED);
         assert!(message.contains("src/big.bin"), "the refusal names the full path: {}", message);
+        assert!(next_step.contains("Upgrade the remote"), "it points at the remote: {}", next_step);
+    }
+
+    /// Against a chunk-aware remote, the lift closure walk descends a chunked file's recipe: the
+    /// recipe rides the control plane (`seen_recipes`) and every chunk rides the blob plane
+    /// (`seen_blobs`), so the negotiation learns to upload all of them. A plain sibling still
+    /// negotiates as an ordinary blob. This is the client half of §9.4b W4 — without the chunk
+    /// hashes in `candidates`, the remote's ref would advance over a recipe whose chunks never came.
+    #[test]
+    fn the_lift_negotiates_a_chunked_files_recipe_and_chunks_to_a_chunking_remote() {
+        use crate::enums::dir_entry_type::DirEntryType::{Normal, NormalChunked, Tree};
+
+        let _scratch = Scratch::new("closure-chunked-descends");
+
+        let plain = store_blob("small file");
+        let (recipe_hash, chunk_hashes) = store_recipe(&["chunk-a", "chunk-b", "chunk-c"]);
+
+        let src = store_tree(&[
+            ("plain.txt", &plain, Normal),
+            ("big.bin", &recipe_hash, NormalChunked),
+        ]);
+        let root = store_tree(&[("src", &src, Tree)]);
+
+        let mut seen_trees = HashSet::new();
+        let mut seen_blobs = HashSet::new();
+        let mut seen_recipes = HashSet::new();
+        let mut candidates = Vec::new();
+
+        collect_changed_closure(&root, "", &[], &mut seen_trees, &mut seen_blobs,
+                                &mut seen_recipes, &mut candidates, true)
+            .expect("a chunked file must negotiate, not refuse, against a chunking remote");
+
+        // The recipe is a control-plane candidate; every chunk is a blob candidate.
+        assert!(candidates.contains(&recipe_hash), "the recipe is negotiated");
+        assert!(seen_recipes.contains(&recipe_hash), "the recipe is classified control-plane");
+        for chunk in &chunk_hashes {
+            assert!(candidates.contains(chunk), "every chunk is negotiated: {}", chunk);
+            assert!(seen_blobs.contains(chunk), "every chunk is classified as a blob: {}", chunk);
+        }
+        // The recipe is not double-classified as a blob.
+        assert!(!seen_blobs.contains(&recipe_hash), "the recipe is not a blob");
+        assert!(candidates.contains(&plain), "the plain sibling still negotiates as a blob");
     }
 
     /// Plant a blob above the whole-object ceiling directly, bypassing `LooseObject::store`'s
@@ -2273,5 +2660,235 @@ mod tests {
 
         assert_eq!(code, scope_utils::CODE_OVERSIZED_TRANSPORT_UNSUPPORTED);
         assert!(message.contains(&hash), "the refusal names the object: {}", message);
+    }
+
+    // -----------------------------------------------------------------------------------
+    // The commit-pagination gate, end to end (§9.4b Stage 3, W3): a hand-rolled remote so a
+    // non-chunking head can be simulated at all (both shipped heads always advertise chunking
+    // now). Mirrors the raw-TCP mock pattern `forklift/tests/remote.rs`'s `HookServer` already
+    // uses for the hook protocol — proven compatible with `reqwest` as the client.
+    // -----------------------------------------------------------------------------------
+
+    /// A minimal HTTP endpoint standing in for a storage-backed remote head, answering only the
+    /// two things `negotiate_and_upload` needs to reach its pagination gate: the handshake (with a
+    /// caller-chosen `chunking` flag) and `upload-targets` (every requested hash comes back staged,
+    /// at a URL on this same server, so an actual upload attempt is directly observable). Anything
+    /// else hit (a staging `PUT`, or a commit call) increments `upload_or_commit_hits` — the signal
+    /// that the client proceeded past the gate.
+    struct FakeStagingRemote {
+        url: String,
+        upload_or_commit_hits: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl FakeStagingRemote {
+        /// One request handled per spawned thread — `CONCURRENT_TRANSFERS` (24) client-side
+        /// uploads run in parallel, and a large-lift test staging 10,000+ objects (one connection
+        /// each, `Connection: close`) needs that concurrency to run in seconds rather than minutes:
+        /// a single-threaded accept loop serializes every round trip.
+        fn start(chunking: bool) -> FakeStagingRemote {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let accepted_hits = Arc::clone(&hits);
+            let base = url.clone();
+
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(stream) = stream else { continue };
+                    let counted = Arc::clone(&accepted_hits);
+                    let base = base.clone();
+
+                    std::thread::spawn(move || {
+                        handle_fake_remote_request(stream, chunking, &base, &counted);
+                    });
+                }
+            });
+
+            FakeStagingRemote { url, upload_or_commit_hits: hits }
+        }
+
+        fn upload_or_commit_hits(&self) -> usize {
+            self.upload_or_commit_hits.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// Handle exactly one connection/request for [`FakeStagingRemote`].
+    fn handle_fake_remote_request(
+        mut stream: std::net::TcpStream,
+        chunking: bool,
+        base: &str,
+        hits: &std::sync::atomic::AtomicUsize,
+    ) {
+        use std::io::Write;
+
+        let Some((path, body)) = read_test_request(&mut stream) else { return };
+
+        let (status, response_body): (&str, String) = if path == "/v1/warehouse" {
+            (
+                "200 OK",
+                format!(
+                    r#"{{"protocol":"{}","default_pallet":"main","pallets":{{}},"trust":null,"chunking":{}}}"#,
+                    PROTOCOL_VERSION, chunking
+                ),
+            )
+        } else if path == "/v1/objects/upload-targets" {
+            // Every requested hash comes back staged, at a URL under this same server — so a
+            // client that proceeds to upload is directly observable below.
+            let request: UploadTargetsRequest = serde_json::from_slice(&body).unwrap();
+            let targets: BTreeMap<String, String> = request.hashes.into_iter()
+                .map(|hash| {
+                    let target = format!("{}/staging/{}", base, hash);
+                    (hash, target)
+                })
+                .collect();
+            let response = UploadTargetsResponse { present: Vec::new(), targets, direct: Vec::new() };
+            ("200 OK", serde_json::to_string(&response).unwrap())
+        } else {
+            // A staging PUT or a commit call: exactly the upload/commit phase the gate exists to
+            // prevent from ever running when it refuses.
+            hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            ("200 OK", "{}".to_string())
+        };
+
+        let _ = write!(
+            stream,
+            "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            status, response_body.len(), response_body
+        );
+        let _ = stream.flush();
+    }
+
+    /// Read one HTTP/1.1 request (start line + content-length body only; no header inspection is
+    /// needed by this fake). Returns `(path, body)`.
+    fn read_test_request(stream: &mut std::net::TcpStream) -> Option<(String, Vec<u8>)> {
+        use std::io::Read;
+
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 4096];
+
+        let header_end = loop {
+            if let Some(position) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                break position + 4;
+            }
+
+            match stream.read(&mut chunk) {
+                Ok(0) => return None,
+                Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+                Err(_) => return None,
+            }
+        };
+
+        let head = String::from_utf8_lossy(&buffer[..header_end]).to_string();
+        let path = head.lines().next()?.split_whitespace().nth(1)?.to_string();
+
+        let content_length: usize = head.lines()
+            .find(|line| line.to_ascii_lowercase().starts_with("content-length:"))
+            .and_then(|line| line.split_once(':'))
+            .and_then(|(_, value)| value.trim().parse().ok())
+            .unwrap_or(0);
+
+        let mut body = buffer[header_end..].to_vec();
+
+        while body.len() < content_length {
+            match stream.read(&mut chunk) {
+                Ok(0) => return None,
+                Ok(n) => body.extend_from_slice(&chunk[..n]),
+                Err(_) => return None,
+            }
+        }
+
+        body.truncate(content_length);
+
+        Some((path, body))
+    }
+
+    /// A synthetic candidate set larger than `MAX_MISSING_BATCH` — hashes that name no real
+    /// object. Fine for a test proving the gate refuses *before* anything is read or uploaded (the
+    /// only path that ever touches local storage is downstream of the refusal), but not for a test
+    /// that lets negotiation proceed to an actual upload — use [`store_many_blobs`] for those.
+    fn oversized_candidate_set() -> Vec<String> {
+        (0..MAX_MISSING_BATCH + 1).map(|i| format!("{:064x}", i)).collect()
+    }
+
+    /// Store `count` distinct, real (tiny) blob objects and return their hashes — for a test whose
+    /// candidates must survive an actual `retrieve_object_by_hash` + upload attempt, unlike
+    /// [`oversized_candidate_set`]'s placeholder hashes.
+    fn store_many_blobs(tag: &str, count: usize) -> Vec<String> {
+        (0..count).map(|i| store_blob(&format!("{}-{}", tag, i))).collect()
+    }
+
+    /// The reviewer's exact scenario: against a remote whose handshake omits chunking, a lift
+    /// needing more than one commit batch refuses **before any upload** — proven by asserting the
+    /// fake server's staging/commit endpoints were never hit at all.
+    #[test]
+    fn a_large_lift_to_a_non_chunking_remote_refuses_before_any_upload() {
+        let remote = FakeStagingRemote::start(false);
+        let client = RemoteClient::new(&remote.url, None).unwrap();
+        let candidates = oversized_candidate_set();
+        let control_plane: HashSet<String> = HashSet::new();
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let error = runtime.block_on(negotiate_and_upload(
+            &client, "session-1", &candidates, &control_plane, false,
+        )).expect_err("a commit needing multiple batches must refuse a non-chunking remote");
+
+        let (code, message, _) = scope_utils::decode_refusal(&error)
+            .expect("the refusal must decode via the shared sentinel framing");
+        assert_eq!(code, scope_utils::CODE_COMMIT_PAGINATION_UNSUPPORTED);
+        assert!(message.contains(&candidates.len().to_string()), "{}", message);
+
+        assert_eq!(
+            remote.upload_or_commit_hits(), 0,
+            "nothing was uploaded or committed: the whole upload was never wasted"
+        );
+    }
+
+    /// The same oversized negotiation against a remote that DOES advertise chunking never triggers
+    /// the pagination gate — proven by the *kind* of failure, not by completing a real 10,000+
+    /// object upload (too slow for a unit test; the pure boundary test above already nails the
+    /// exact cap arithmetic with zero cost). The candidates are placeholder hashes naming no real
+    /// object, so `upload_to_targets`'s per-object read fails downstream — but that failure is an
+    /// ordinary read error, not a scope refusal at all, which is exactly the proof: had the gate
+    /// fired, the error would decode as `CODE_COMMIT_PAGINATION_UNSUPPORTED` before a single object
+    /// read was even attempted (as the sibling refusal test demonstrates). Its absence here means
+    /// execution passed the gate and reached the real upload attempt.
+    #[test]
+    fn a_large_lift_to_a_chunking_remote_does_not_trigger_the_pagination_gate() {
+        let remote = FakeStagingRemote::start(true);
+        let client = RemoteClient::new(&remote.url, None).unwrap();
+        let candidates = oversized_candidate_set();
+        let control_plane: HashSet<String> = HashSet::new();
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let error = runtime.block_on(negotiate_and_upload(
+            &client, "session-2", &candidates, &control_plane, true,
+        )).expect_err("the placeholder hashes name no real object, so the upload attempt fails");
+
+        assert!(
+            scope_utils::decode_refusal(&error).is_none(),
+            "a chunking-capable remote must never see the pagination refusal, only the (expected, \
+            unrelated) downstream read failure: {}", error
+        );
+    }
+
+    /// A small (single-batch) lift to a non-chunking remote is completely unaffected: the gate
+    /// only ever fires when pagination would actually be needed.
+    #[test]
+    fn a_small_lift_to_a_non_chunking_remote_is_unaffected() {
+        let _scratch = Scratch::new("small-lift-non-chunking-remote");
+        let remote = FakeStagingRemote::start(false);
+        let client = RemoteClient::new(&remote.url, None).unwrap();
+        let candidates = store_many_blobs("small", 5);
+        let control_plane: HashSet<String> = HashSet::new();
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(negotiate_and_upload(
+            &client, "session-3", &candidates, &control_plane, false,
+        )).expect("a single-batch lift to an old server is unaffected by the pagination gate");
+
+        assert!(
+            remote.upload_or_commit_hits() > 0,
+            "the small lift's upload/commit phase ran normally"
+        );
     }
 }

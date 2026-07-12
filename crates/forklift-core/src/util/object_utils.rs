@@ -245,6 +245,45 @@ pub fn load_recipe(hash: &str) -> Result<Recipe, String> {
     }
 }
 
+/// The ordered chunk hashes of a recipe named by `hash`, loaded from the local object store.
+/// The convenience the closure-audit and download descents both want: they never need the sizes
+/// or the content hash, only which chunk objects a recipe references.
+///
+/// # Arguments
+/// * `hash` - The hash of the recipe object (a chunked file's tree-entry hash).
+///
+/// # Returns
+/// * `Ok(Vec<String>)` - The recipe's chunk hashes, in order.
+/// * `Err(String)`     - If the recipe is absent, not a recipe, or structurally invalid.
+pub fn recipe_chunk_hashes(hash: &str) -> Result<Vec<String>, String> {
+    Ok(load_recipe(hash)?.chunks.into_iter().map(|chunk| chunk.hash).collect())
+}
+
+/// Parse a recipe from raw object bytes the caller already holds (rather than reading it from the
+/// local object store), enforcing the whole-object ceiling first. This is the store-backed
+/// recipe-load path the AWS head needs for the commit-gate chunk descent (§9.4b W4): a working
+/// pallet's recipe is a file-entry object, so it is *not* mirrored into the audit scratch — the
+/// head fetches its bytes from object storage and parses them here, without ever persisting a
+/// (potentially large) recipe in the scratch. The ceiling check bounds a hand-crafted over-size
+/// recipe the same way [`store_object_bytes`] would on any other import path.
+///
+/// # Arguments
+/// * `hash`  - The hash the bytes are addressed by (for the error message; not re-verified here —
+///             the caller reads it from a content-addressed store that already verified it).
+/// * `bytes` - The full (uncompressed) recipe object bytes.
+///
+/// # Returns
+/// * `Ok(Recipe)`  - The parsed, structurally valid recipe.
+/// * `Err(String)` - If the bytes exceed the ceiling, are not a recipe, or are structurally invalid.
+pub fn parse_recipe_bytes(hash: &str, bytes: &[u8]) -> Result<Recipe, String> {
+    enforce_object_ceiling(bytes)?;
+
+    match parser::object::loose_object_parser::parse(bytes)? {
+        ParsedObject::Recipe(recipe) => Ok(recipe),
+        other => Err(format!("Object {} is a {}, not a recipe.", hash, other.get_type())),
+    }
+}
+
 /// Load and parse the chunk object with the given hash from the object store. The per-chunk
 /// ceiling is enforced on read by the parser.
 ///

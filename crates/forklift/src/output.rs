@@ -192,9 +192,11 @@ pub enum ErrorCode {
     /// break that checkout, so it refuses until the checkout narrows the path away.
     ScopePruneBlocked,
 
-    /// A bundle or lift was asked to send a large file stored in chunks: chunk transport has
-    /// not shipped yet, so it refuses client-side rather than ship a recipe whose chunks can
-    /// never arrive. Removed once chunk transport ships (§9.4b).
+    /// A large chunked file was asked to go into a bundle (chunks are structurally excluded from
+    /// every bundle — a bundle never carries them), or a lift was asked to send one to a remote
+    /// whose handshake did not advertise chunking support (an old head's `gc` would silently
+    /// collect a recipe's chunks). Either case refuses client-side rather than ship content that
+    /// can never be materialized where it lands.
     ChunkedTransportUnsupported,
 
     /// A bundle or lift was asked to send an object above the whole-object ceiling: a
@@ -203,6 +205,14 @@ pub enum ErrorCode {
     /// signed identity, so nothing accepts it in transport. Refuses client-side (or at the
     /// bundle-building source) rather than ship something no reader could finish importing.
     OversizedTransportUnsupported,
+
+    /// A lift's commit would need more than one paginated batch (more than `MAX_MISSING_BATCH`
+    /// distinct staged objects), and the remote does not advertise support for the pagination
+    /// (§9.4b Stage 3, W3 — the additive `more` field shipped with chunking support, so a
+    /// pre-chunking remote silently mishandles it). Refused right after negotiation, before a
+    /// single byte is uploaded, rather than wasting the whole upload and failing confusingly at
+    /// commit time.
+    CommitPaginationUnsupported,
 }
 
 impl ErrorCode {
@@ -223,6 +233,7 @@ impl ErrorCode {
             ErrorCode::ScopePruneBlocked    => scope_utils::CODE_SCOPE_PRUNE_BLOCKED,
             ErrorCode::ChunkedTransportUnsupported => scope_utils::CODE_CHUNKED_TRANSPORT_UNSUPPORTED,
             ErrorCode::OversizedTransportUnsupported => scope_utils::CODE_OVERSIZED_TRANSPORT_UNSUPPORTED,
+            ErrorCode::CommitPaginationUnsupported => scope_utils::CODE_COMMIT_PAGINATION_UNSUPPORTED,
         }
     }
 
@@ -244,6 +255,7 @@ impl ErrorCode {
             ErrorCode::ScopePruneBlocked    => 13,
             ErrorCode::ChunkedTransportUnsupported => 14,
             ErrorCode::OversizedTransportUnsupported => 15,
+            ErrorCode::CommitPaginationUnsupported => 16,
         }
     }
 
@@ -259,6 +271,7 @@ impl ErrorCode {
             _ if code == scope_utils::CODE_SCOPE_PRUNE_BLOCKED    => Some(ErrorCode::ScopePruneBlocked),
             _ if code == scope_utils::CODE_CHUNKED_TRANSPORT_UNSUPPORTED => Some(ErrorCode::ChunkedTransportUnsupported),
             _ if code == scope_utils::CODE_OVERSIZED_TRANSPORT_UNSUPPORTED => Some(ErrorCode::OversizedTransportUnsupported),
+            _ if code == scope_utils::CODE_COMMIT_PAGINATION_UNSUPPORTED => Some(ErrorCode::CommitPaginationUnsupported),
             _ => None,
         }
     }

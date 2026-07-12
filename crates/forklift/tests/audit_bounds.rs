@@ -17,9 +17,15 @@ use std::path::PathBuf;
 use std::process::{Command, Output};
 
 use forklift_core::globals::StorageRootScope;
-use forklift_core::util::{audit_utils, graph_utils, office_utils, pallet_utils};
+use forklift_core::util::{
+    audit_utils, file_utils, graph_utils, object_utils, office_utils, pallet_utils,
+};
 
 const FORKLIFT: &str = env!("CARGO_BIN_EXE_forklift");
+
+/// The chunk threshold (bytes): content at or above this is stored chunked. Mirrors
+/// `chunk_utils::CHUNK_THRESHOLD_BYTES` (a frozen format constant).
+const CHUNK_THRESHOLD: usize = 8 * 1024 * 1024;
 
 /// One isolated, signed warehouse with its own home for global config + keys.
 struct Warehouse {
@@ -77,6 +83,36 @@ impl Warehouse {
         self.run_ok(&["stack", message]);
 
         self.head(&self.current_pallet())
+    }
+
+    /// Write a large (chunk-threshold-crossing) file of deterministic bytes and stack it as a
+    /// signed parcel; return the new head. The bytes are seeded and RNG-free, so the file chunks
+    /// reproducibly.
+    fn stack_large(&self, file: &str, seed: u64, size: usize, message: &str) -> String {
+        let path = self.root.join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        let mut bytes = Vec::with_capacity(size);
+        let mut state = seed;
+        while bytes.len() < size {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            bytes.extend_from_slice(&(z ^ (z >> 31)).to_le_bytes());
+        }
+        bytes.truncate(size);
+        std::fs::write(path, bytes).unwrap();
+
+        self.run_ok(&["load", "."]);
+        self.run_ok(&["stack", message]);
+        self.head(&self.current_pallet())
+    }
+
+    /// Delete an arbitrary object (not a parcel — no signature sidecar) from the store.
+    fn delete_object(&self, hash: &str) {
+        let objects = self.root.join(".forklift").join("objects").join(&hash[0..2]);
+        std::fs::remove_file(objects.join(&hash[2..])).expect("the object existed");
     }
 
     fn current_pallet(&self) -> String {
@@ -212,6 +248,51 @@ fn a_merge_lift_reads_nothing_below_the_fork_point() {
         // The control.
         audit_utils::verify_parcel_closure(&new_head, None)
             .expect_err("a full audit must still find the missing parcels");
+    });
+}
+
+/// The commit-gate closure audit descends a chunked file's recipe and presence-checks every
+/// chunk **non-tolerantly** (§9.4b W4): a ref must never advance over a chunked file whose chunks
+/// never reached the store, or the file is silently unmaterializable forever. Deleting one chunk —
+/// while the recipe itself stays present — makes the closure check fail, exactly the failure mode a
+/// walk that stopped at the recipe hash would have missed.
+#[test]
+fn the_closure_check_fails_when_a_chunk_of_a_chunked_file_is_missing() {
+    let warehouse = Warehouse::new("chunk-missing");
+
+    warehouse.stack("small.txt", "a small file\n", "first");
+    let head = warehouse.stack_large("big.bin", 0xABCD, CHUNK_THRESHOLD + 50_000, "a giant");
+
+    warehouse.scoped(|| {
+        graph_utils::build_from_heads(std::slice::from_ref(&head)).expect("warm the commit-graph");
+
+        // The whole closure — recipe and every chunk — is present, so the check passes.
+        audit_utils::verify_parcel_closure(&head, None).expect("all chunks present");
+
+        // Resolve the chunked file's recipe and pick one of its chunks to delete.
+        let tree = object_utils::load_parcel(&head).expect("the head parcel").tree_hash;
+        let (recipe_hash, item_type) = object_utils::resolve_tree_file(&tree, "big.bin")
+            .expect("resolve")
+            .expect("big.bin is tracked");
+        assert!(item_type.is_chunked(), "the giant is stored chunked");
+
+        let recipe = object_utils::load_recipe(&recipe_hash).expect("the recipe");
+        let victim = recipe.chunks[0].hash.clone();
+
+        // The recipe stays; only a chunk is gone — a walk stopping at the recipe hash would pass.
+        warehouse.delete_object(&victim);
+        assert!(
+            file_utils::does_object_exist(&recipe_hash).unwrap(),
+            "the recipe itself is still present"
+        );
+
+        let err = audit_utils::verify_parcel_closure(&head, None)
+            .expect_err("a missing chunk must fail the closure check");
+        assert!(
+            err.contains(&victim) && err.contains("missing"),
+            "the error names the missing chunk: {}",
+            err
+        );
     });
 }
 

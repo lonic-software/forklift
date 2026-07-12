@@ -47,6 +47,18 @@ pub struct WarehouseInfo {
 
     /// The trust anchor, when signing is established on the remote.
     pub trust: Option<TrustAnchorDto>,
+
+    /// Whether this head supports chunked large files (§9.4b): it serves and stores the
+    /// per-object recipe/chunk closure of a chunked file, and a `gc` that will not silently
+    /// collect a chunked file's recipe-only-reachable chunks. An **additive** capability field,
+    /// deliberately *not* a [`PROTOCOL_VERSION`] bump — the version check is exact-string
+    /// equality, so bumping it would refuse every old×new pairing outright (a flag day), whereas
+    /// a chunk-aware client reads this field to refuse only the one thing an old head cannot
+    /// safely hold: a chunked file's lift. Absent (an old head that never wrote the field) reads
+    /// as `false` via `#[serde(default)]`, so a new client refuses to lift chunked content there;
+    /// an old client ignores the unknown field and is wholly unaffected.
+    #[serde(default)]
+    pub chunking: bool,
 }
 
 /// The trust anchor on the wire (the TOML file's fields as JSON). The re-genesis
@@ -152,15 +164,26 @@ pub struct RefUpdateRequest {
 /// inline and never needs this call.
 #[derive(Serialize, Deserialize)]
 pub struct CommitLiftRequest {
-    /// Small objects — parcels, trees, signature sidecars — the head verifies and promotes
-    /// synchronously: it reads the staged bytes, checks `Blake3(bytes) == hash`, and only
-    /// then copies them to the canonical hash key. A corrupt one refuses the commit.
+    /// Small objects — parcels, trees, recipes, signature sidecars — the head verifies and
+    /// promotes synchronously: it reads the staged bytes, checks `Blake3(bytes) == hash`, and
+    /// only then copies them to the canonical hash key. A corrupt one refuses the commit.
     pub control_plane: Vec<String>,
 
-    /// Large working blobs, checked for presence at their canonical key only — which is the
-    /// proof the staging verifier already hash-checked them. One still in staging simply
-    /// reads as not-yet-ready, and the client retries.
+    /// Large working blobs and a chunked file's chunks, checked for presence at their canonical
+    /// key only — which is the proof the staging verifier already hash-checked them. One still in
+    /// staging simply reads as not-yet-ready, and the client retries.
     pub blobs: Vec<String>,
+
+    /// Whether more commit batches follow for this same lift session. A lift touching a maximal
+    /// chunked file lists too many chunk hashes for one request (Lambda's ~6 MB synchronous body),
+    /// so the client paginates `control_plane`/`blobs` at [`MAX_MISSING_BATCH`] and sends
+    /// `more: true` on every batch but the last. The head verifies/presence-checks each batch, but
+    /// gates its end-of-session staging sweep (`discard_session`) on the **final** batch only
+    /// (`more: false`) — otherwise an early batch's sweep would delete chunks a later batch still
+    /// needs staged. Additive: an old client omits it (`#[serde(default)]` → `false`), which is
+    /// exactly today's single-shot "verify, presence-check, then sweep" behaviour.
+    #[serde(default)]
+    pub more: bool,
 }
 
 /// The body of `POST /v1/resolve` — operator identifiers to resolve to display
@@ -185,4 +208,89 @@ pub struct ResolveResponse {
 #[derive(Serialize, Deserialize)]
 pub struct ErrorResponse {
     pub error: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// New client × **old** server: an old head's handshake has no `chunking` field, so a
+    /// chunk-aware client must read it as `false` (and then refuse to lift chunked content there).
+    #[test]
+    fn warehouse_info_without_chunking_reads_as_false() {
+        let json = r#"{
+            "protocol": "x",
+            "default_pallet": "main",
+            "pallets": {},
+            "trust": null
+        }"#;
+
+        let info: WarehouseInfo = serde_json::from_str(json).expect("old-server handshake parses");
+        assert!(!info.chunking, "an absent chunking field defaults to false");
+    }
+
+    /// A new head advertises `chunking: true`, and a chunk-aware client reads it.
+    #[test]
+    fn warehouse_info_with_chunking_reads_true_and_round_trips() {
+        let info = WarehouseInfo {
+            protocol: "x".to_string(),
+            default_pallet: "main".to_string(),
+            pallets: BTreeMap::new(),
+            trust: None,
+            chunking: true,
+        };
+
+        let wire = serde_json::to_string(&info).expect("serialize");
+        assert!(wire.contains("\"chunking\":true"), "the field is on the wire: {}", wire);
+
+        let back: WarehouseInfo = serde_json::from_str(&wire).expect("round trip");
+        assert!(back.chunking);
+    }
+
+    /// **Old** client × new server: an old client's `WarehouseInfo` has fewer fields than a new
+    /// server sends, so deserialization must ignore unknown fields (no `deny_unknown_fields`) —
+    /// otherwise a new server's handshake would break every old client. A future extra field
+    /// stands in for exactly that "server is newer than client" direction.
+    #[test]
+    fn warehouse_info_tolerates_an_unknown_field() {
+        let json = r#"{
+            "protocol": "x",
+            "default_pallet": "main",
+            "pallets": {},
+            "trust": null,
+            "chunking": true,
+            "some_future_capability": ["v9"]
+        }"#;
+
+        let info: WarehouseInfo = serde_json::from_str(json).expect("unknown fields are ignored");
+        assert!(info.chunking);
+    }
+
+    /// **Old** client → new server, or the single-shot path: a commit request with no `more` field
+    /// must read as `false` (verify, presence-check, then sweep — today's exact behaviour).
+    #[test]
+    fn commit_lift_request_without_more_reads_as_false() {
+        let json = r#"{ "control_plane": [], "blobs": [] }"#;
+
+        let request: CommitLiftRequest = serde_json::from_str(json).expect("old-client commit parses");
+        assert!(!request.more, "an absent more field defaults to false (single-shot, sweeps)");
+    }
+
+    /// A paginating client sets `more: true`; it round-trips, and an unknown extra field (a newer
+    /// client than this server) is tolerated.
+    #[test]
+    fn commit_lift_request_more_round_trips_and_tolerates_unknown_fields() {
+        let request = CommitLiftRequest {
+            control_plane: vec!["a".repeat(64)],
+            blobs: vec!["b".repeat(64)],
+            more: true,
+        };
+
+        let wire = serde_json::to_string(&request).expect("serialize");
+        assert!(wire.contains("\"more\":true"), "the field is on the wire: {}", wire);
+
+        let json = r#"{ "control_plane": [], "blobs": [], "more": true, "future": 1 }"#;
+        let back: CommitLiftRequest = serde_json::from_str(json).expect("unknown fields ignored");
+        assert!(back.more);
+    }
 }

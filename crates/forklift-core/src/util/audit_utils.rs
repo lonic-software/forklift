@@ -1132,9 +1132,15 @@ pub fn verify_one_signature(parcel_hash: &str,
 /// * `Ok(())`      - If everything is present.
 /// * `Err(String)` - If a parcel, tree or blob is missing (or unreadable).
 pub fn verify_parcel_closure(head: &str, known_complete: Option<&str>) -> Result<(), String> {
-    // The default check reads blob presence straight from the local object store; the
-    // serverless head passes an S3 HEAD instead (see `verify_parcel_closure_with`).
-    verify_parcel_closure_with(head, known_complete, &|hash| file_utils::does_object_exist(hash))
+    // The default checks read straight from the local object store; the serverless head passes an
+    // S3 HEAD for blob/chunk presence and a store-backed recipe read for the chunk descent (see
+    // `verify_parcel_closure_with`).
+    verify_parcel_closure_with(
+        head,
+        known_complete,
+        &|hash| file_utils::does_object_exist(hash),
+        &|hash| object_utils::recipe_chunk_hashes(hash),
+    )
 }
 
 /// [`verify_parcel_closure`], with the leaf-blob presence check made pluggable.
@@ -1147,14 +1153,23 @@ pub fn verify_parcel_closure(head: &str, known_complete: Option<&str>) -> Result
 /// and answers this check with an S3 `HEAD` (DESIGN.html §4.6).
 ///
 /// # Arguments
-/// * `head`           - The head parcel whose closure is verified.
-/// * `known_complete` - A head whose history is already known complete (`None` verifies
-///                      all the way down).
-/// * `blob_exists`    - Returns whether a file-content blob is present at a hash.
+/// * `head`               - The head parcel whose closure is verified.
+/// * `known_complete`     - A head whose history is already known complete (`None` verifies
+///                          all the way down).
+/// * `blob_exists`        - Returns whether a file-content blob (or a chunk) is present at a hash.
+/// * `load_recipe_chunks` - Returns the ordered chunk hashes of a recipe. The commit-gate descent
+///                          (§9.4b W4): a `*Chunked` file entry names a recipe whose chunks are
+///                          reachable only *through* it, so the closure walk loads the recipe and
+///                          presence-checks every chunk **non-tolerantly** — a ref must never
+///                          advance over a chunked file whose chunks never reached the store. The
+///                          local path reads the recipe from the object store; the AWS head reads
+///                          it from object storage (its recipes are not mirrored into the audit
+///                          scratch), which is why the read is a parameter, not a hard-coded load.
 pub fn verify_parcel_closure_with(
     head: &str,
     known_complete: Option<&str>,
     blob_exists: &dyn Fn(&str) -> Result<bool, String>,
+    load_recipe_chunks: &dyn Fn(&str) -> Result<Vec<String>, String>,
 ) -> Result<(), String> {
     // Only the new segment: the closure behind `known_complete` was proven complete when
     // that head was committed. This walk used to build its prune set with
@@ -1169,7 +1184,7 @@ pub fn verify_parcel_closure_with(
         let parcel = object_utils::load_parcel(hash)
             .map_err(|e| format!("The history behind {} is incomplete: {}", head, e))?;
 
-        verify_tree_closure(&parcel.tree_hash, &mut visited_trees, blob_exists)?;
+        verify_tree_closure(&parcel.tree_hash, &mut visited_trees, blob_exists, load_recipe_chunks)?;
     }
 
     Ok(())
@@ -1206,6 +1221,11 @@ pub fn verify_parcel_closure_scoped(
         .map_err(|e| format!("The history behind {} is incomplete: {}", head, e))?;
 
     let blob_exists = |hash: &str| file_utils::does_object_exist(hash);
+    // A local audit reads its recipes from the same local store as everything else; the chunk
+    // descent presence-checks an in-scope chunked file's chunks (an out-of-scope recipe is sealed,
+    // never loaded, so its chunks are never even named — the store invariant "recipe absent ⟹
+    // chunks absent" holds).
+    let load_recipe_chunks = |hash: &str| object_utils::recipe_chunk_hashes(hash);
 
     // `verified` holds trees whose *entire* closure is proven present; it is populated only by
     // the full walk below and never by a spine walk, so an in-scope encounter of a subtree is
@@ -1219,7 +1239,8 @@ pub fn verify_parcel_closure_scoped(
             .map_err(|e| format!("The history behind {} is incomplete: {}", head, e))?;
 
         verify_tree_closure_scoped(
-            &parcel.tree_hash, "", &mut verified, &mut spine_seen, &blob_exists, scope,
+            &parcel.tree_hash, "", &mut verified, &mut spine_seen, &blob_exists,
+            &load_recipe_chunks, scope,
         )?;
     }
 
@@ -1248,9 +1269,12 @@ fn verify_tree_closure_scoped(tree_hash: &str,
                               verified: &mut HashSet<String>,
                               spine_seen: &mut HashSet<String>,
                               blob_exists: &dyn Fn(&str) -> Result<bool, String>,
+                              load_recipe_chunks: &dyn Fn(&str) -> Result<Vec<String>, String>,
                               scope: &MaterializationScope) -> Result<(), String> {
     match scope.classify(prefix) {
-        ScopeClass::InScope => return verify_tree_closure(tree_hash, verified, blob_exists),
+        ScopeClass::InScope => {
+            return verify_tree_closure(tree_hash, verified, blob_exists, load_recipe_chunks)
+        }
         ScopeClass::OutOfScope => return Ok(()),
         ScopeClass::Spine => {}
     }
@@ -1276,6 +1300,12 @@ fn verify_tree_closure_scoped(tree_hash: &str,
                 file.hash, file.name, tree_hash
             ));
         }
+
+        // An in-scope chunked file on the spine: its recipe is present (checked just above), so
+        // descend it and presence-check every chunk, exactly as the fully-in-scope walk does.
+        if file.item_type.is_chunked() {
+            verify_recipe_chunks_present(&file.hash, load_recipe_chunks, blob_exists)?;
+        }
     }
 
     for (_, subtree) in tree.get_subtrees() {
@@ -1283,7 +1313,9 @@ fn verify_tree_closure_scoped(tree_hash: &str,
         if scope.classify(&path) == ScopeClass::OutOfScope {
             continue; // sealed by hash, never descended
         }
-        verify_tree_closure_scoped(&subtree.hash, &path, verified, spine_seen, blob_exists, scope)?;
+        verify_tree_closure_scoped(
+            &subtree.hash, &path, verified, spine_seen, blob_exists, load_recipe_chunks, scope,
+        )?;
     }
 
     Ok(())
@@ -1300,6 +1332,21 @@ fn child_path(prefix: &str, name: &str) -> String {
 
 /// Verify that a tree and everything below it is present in the object store.
 ///
+/// **Cost, stated honestly (§9.4b Stage 3, W1).** [`verify_parcel_closure_with`] bounds *which
+/// parcels* this runs for (only the new segment behind `known_complete`), but for each new parcel
+/// it walks that parcel's tree **in full** — every file and subtree, not diffed against the prior
+/// (already-verified) head's tree. So every push already re-presence-checks every blob in the
+/// entire tree, not just the changed ones — a pre-existing characteristic, not introduced here.
+/// The recipe→chunk descent below (W4) multiplies this by a chunked file's chunk count: a maximal
+/// 64 MiB recipe lists ~987,000 chunks, so one push touching a directory that merely *contains*
+/// such a file — even if that file itself did not change in this push — costs on the order of a
+/// million synchronous presence checks (an S3 `HEAD` apiece on the AWS head) inside the commit
+/// Lambda's own invocation, a real latency/timeout-budget cost, not just a correctness one. The
+/// correct fix is pruning unchanged subtrees against a base tree here, mirroring
+/// `collect_changed_closure`'s client-side prune against parent trees (only descend a subtree
+/// whose hash differs from the corresponding subtree at the prior head) — deliberately **not**
+/// done in this stage; named here so it is not lost, not silently accepted as free.
+///
 /// # Arguments
 /// * `tree_hash`     - The root of the subtree to verify.
 /// * `visited_trees` - Trees already verified (shared across parcels of one walk, so
@@ -1310,7 +1357,9 @@ fn child_path(prefix: &str, name: &str) -> String {
 /// * `Err(String)` - If a tree or blob is missing (or unreadable).
 fn verify_tree_closure(tree_hash: &str,
                        visited_trees: &mut HashSet<String>,
-                       blob_exists: &dyn Fn(&str) -> Result<bool, String>) -> Result<(), String> {
+                       blob_exists: &dyn Fn(&str) -> Result<bool, String>,
+                       load_recipe_chunks: &dyn Fn(&str) -> Result<Vec<String>, String>)
+                       -> Result<(), String> {
     if !visited_trees.insert(tree_hash.to_string()) {
         return Ok(());
     }
@@ -1325,10 +1374,53 @@ fn verify_tree_closure(tree_hash: &str,
                 file.hash, file.name, tree_hash
             ));
         }
+
+        // A chunked file's tree-entry hash names a recipe; its chunks are reachable only through
+        // the recipe. The recipe's own presence is checked just above; this descends it and
+        // presence-checks every chunk. Non-tolerant on purpose — this is the commit-gate closure
+        // audit (§9.4b W4): a signed ref must never advance over a chunked file whose chunks are
+        // not all present, or the file becomes silently unmaterializable the moment someone
+        // fetches it. (gc's own descent is presence-*tolerant*; this one is the opposite, exactly
+        // because a ref move is a durability promise a fetch is not.)
+        if file.item_type.is_chunked() {
+            verify_recipe_chunks_present(&file.hash, load_recipe_chunks, blob_exists)?;
+        }
     }
 
     for (_, subtree) in tree.get_subtrees() {
-        verify_tree_closure(&subtree.hash, visited_trees, blob_exists)?;
+        verify_tree_closure(&subtree.hash, visited_trees, blob_exists, load_recipe_chunks)?;
+    }
+
+    Ok(())
+}
+
+/// Presence-check every chunk of a recipe non-tolerantly: load the recipe's chunk list (via the
+/// caller's store-appropriate reader) and fail if any chunk is absent. The recipe's own presence
+/// is the caller's responsibility (it is checked as an ordinary file-entry object before this).
+///
+/// Called from every walk that reaches this recipe's tree entry, whether or not the recipe changed
+/// in the parcel being verified — see [`verify_tree_closure`]'s doc comment (W1) for the resulting
+/// per-push cost this implies for a large chunked file, and the pruning fix deliberately deferred.
+///
+/// # Arguments
+/// * `recipe_hash`        - The recipe (a chunked file's tree-entry hash) whose chunks are checked.
+/// * `load_recipe_chunks` - Reads the recipe's ordered chunk hashes (local store, or object store).
+/// * `blob_exists`        - Presence check for one chunk hash.
+fn verify_recipe_chunks_present(
+    recipe_hash: &str,
+    load_recipe_chunks: &dyn Fn(&str) -> Result<Vec<String>, String>,
+    blob_exists: &dyn Fn(&str) -> Result<bool, String>,
+) -> Result<(), String> {
+    let chunks = load_recipe_chunks(recipe_hash)
+        .map_err(|e| format!("Recipe {} is missing or unreadable: {}", recipe_hash, e))?;
+
+    for chunk in &chunks {
+        if !blob_exists(chunk)? {
+            return Err(format!(
+                "Chunk {} of recipe {} is missing; the chunked file cannot be materialized.",
+                chunk, recipe_hash
+            ));
+        }
     }
 
     Ok(())

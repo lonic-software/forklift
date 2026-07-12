@@ -709,7 +709,7 @@ async fn the_http_edge_drives_a_staged_lift_over_s3_and_dynamodb_following_307s(
     assert_eq!(response.status().as_u16(), 404, "a staged object is not fetchable before commit");
 
     // 3. `commit_lift`: the head verifies and promotes the staged object to its canonical key.
-    let commit = CommitLiftRequest { control_plane: vec![staged_hash.clone()], blobs: vec![] };
+    let commit = CommitLiftRequest { control_plane: vec![staged_hash.clone()], blobs: vec![], more: false };
     let response = edge(
         s3.clone(),
         dynamodb.clone(),

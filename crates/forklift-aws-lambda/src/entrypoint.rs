@@ -399,7 +399,7 @@ where
         Route::CommitLift(session) => {
             let request: CommitLiftRequest = parse_json(&body)?;
             reject_oversized_commit(request.control_plane.len(), request.blobs.len())?;
-            head.commit_lift(&session, &request.control_plane, &request.blobs)?;
+            head.commit_lift(&session, &request.control_plane, &request.blobs, request.more)?;
             Ok(empty(StatusCode::OK))
         }
     }

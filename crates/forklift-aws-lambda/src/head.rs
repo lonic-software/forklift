@@ -135,6 +135,11 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 .get_trust()
                 .map_err(HeadError::internal)?
                 .map(|anchor| TrustAnchorDto::from(&anchor)),
+            // This head serves and stores chunked large files: chunks and recipes ride the byte
+            // plane as ordinary content-addressed objects, and the commit-gate closure audit
+            // (`ref_update`) descends a recipe to presence-check its chunks before a ref moves. A
+            // chunk-aware client reads this to know it may lift chunked content here.
+            chunking: true,
         })
     }
 
@@ -394,12 +399,29 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             materialize(&self.objects, &request.new_head, is_meta, known_complete, &mut mirror)
                 .map_err(HeadError::internal)?;
 
-            // 1. Closure presence. Working blobs are checked via the object store.
+            // 1. Closure presence. Working blobs and a chunked file's chunks are checked via the
+            // object store; a chunked file's recipe is read from the object store too (it is a
+            // file-entry object, so `materialize` above never mirrored it into the scratch) and
+            // its chunks are presence-checked non-tolerantly — a ref must never advance over a
+            // chunked file whose chunks never reached storage (§9.4b W4).
             let blob_exists = |hash: &str| self.objects.exists(hash);
+            let load_recipe_chunks = |hash: &str| -> Result<Vec<String>, String> {
+                let bytes = self
+                    .objects
+                    .get(hash)?
+                    .ok_or_else(|| format!("Recipe {} is missing.", hash))?;
+
+                Ok(object_utils::parse_recipe_bytes(hash, &bytes)?
+                    .chunks
+                    .into_iter()
+                    .map(|chunk| chunk.hash)
+                    .collect())
+            };
             audit_utils::verify_parcel_closure_with(
                 &request.new_head,
                 request.old_head.as_deref(),
                 &blob_exists,
+                &load_recipe_chunks,
             )
             .map_err(HeadError::unprocessable)?;
 
@@ -545,12 +567,19 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// absent, and the client retries once the verifier has caught up.
     ///
     /// Promotion is idempotent, so a retried commit is safe. Once everything is promoted the
-    /// session's staging prefix is swept.
+    /// session's staging prefix is swept — but only on the **final** batch (`more == false`). A
+    /// lift touching a maximal chunked file lists too many chunk hashes for one request, so the
+    /// client paginates and sets `more: true` on every batch but the last; an early batch verifies
+    /// and presence-checks its slice without sweeping, because the sweep is session-wide and would
+    /// otherwise discard chunks a later batch still needs staged. An old client never sets `more`
+    /// (it defaults to `false`), so a single-shot lift verifies, presence-checks, and sweeps
+    /// exactly as before.
     pub fn commit_lift(
         &self,
         session: &str,
         control_plane: &[String],
         blobs: &[String],
+        more: bool,
     ) -> HeadResult<()> {
         for hash in control_plane {
             let outcome =
@@ -587,7 +616,20 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             }
         }
 
-        self.objects.discard_session(session).map_err(HeadError::internal)?;
+        // Sweep the session's staging prefix only when this is the final batch. An intermediate
+        // batch (`more`) leaves staging intact so a later batch's still-staged chunks survive to
+        // be presence-checked; the final batch (or the only batch of a single-shot lift) sweeps.
+        //
+        // A client that never sends a final (`more: false`) batch — crashed, killed, or simply
+        // abandoned mid-lift — leaves its staged objects unswept forever: no code path here ever
+        // revisits a session it was not explicitly told is done, and paginating widens the window
+        // (§9.4b Stage 3, W2). This is an operational gap, not a code one: the deploying operator
+        // MUST configure an S3 lifecycle rule expiring the `staging/` prefix (see the "Operational
+        // requirement" section of `aws::s3`'s module docs for the full reasoning and the suggested
+        // age).
+        if !more {
+            self.objects.discard_session(session).map_err(HeadError::internal)?;
+        }
 
         Ok(())
     }

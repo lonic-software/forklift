@@ -64,6 +64,18 @@ pub const CODE_CHUNKED_TRANSPORT_UNSUPPORTED: &str = "chunked_transport_unsuppor
 /// a bundle or sent over a lift, is the honest failure at the source.
 pub const CODE_OVERSIZED_TRANSPORT_UNSUPPORTED: &str = "oversized_transport_unsupported";
 
+/// Not a scope/sparse-workspace code either — same piggy-backing precedent as the two codes
+/// above. A lift whose commit needs more than one paginated batch (§9.4b Stage 3, W3) — more than
+/// `MAX_MISSING_BATCH` distinct staged objects — requires a remote that understands the additive
+/// `more` field, which shipped *with* chunking support, not before it: a pre-chunking staging head
+/// has no such field and ignores an unrecognized one (`#[serde(default)]` reads it as `false`), so
+/// it sweeps its staging prefix after the very first batch, silently discarding whatever a later
+/// batch still needed staged. This is not specific to any chunked file — a plain lift touching
+/// enough distinct small tracked files hits the identical cap — so the check (and this code) is
+/// keyed on the staged object count alone, checked right after negotiation and before a single
+/// byte is uploaded (a naive commit-time check would waste the whole upload first).
+pub const CODE_COMMIT_PAGINATION_UNSUPPORTED: &str = "commit_pagination_unsupported";
+
 /// The framing that marks a scope refusal string so the CLI can classify it without
 /// parsing prose. `\u{1f}` (ASCII Unit Separator) never appears in a message or a
 /// warehouse path, so the framing is unambiguous; a plain error the CLI does not recognize
@@ -533,27 +545,77 @@ pub fn non_origin_lift_refusal(origin: &str, other: &str) -> String {
     )
 }
 
-/// A ready-made `chunked_transport_unsupported` refusal for sending a large file stored in
-/// chunks to a remote or into a bundle. Chunk transport (the wire-level upload/download of the
-/// chunk objects themselves) has not shipped yet: a bundle or a lift can walk the tree closure
-/// and carry a chunked file's *recipe* just like any other small object, but nothing today
-/// negotiates or transfers the chunks a recipe references, so shipping one would silently
-/// produce a signed ref (or a bundle) over content that can never be materialized elsewhere.
-/// Refusing up front — client-side, before anything is sent — is the honest failure. This is a
-/// transport gap, not a format one; the check is removed the moment chunk transport ships.
+/// A ready-made `chunked_transport_unsupported` refusal for writing a large file stored in chunks
+/// **into a bundle**. Chunk transport ships per object (a chunked file's chunks ride the loose
+/// GET/PUT byte plane, negotiated one hash at a time), but **no bundle ever carries a chunk** by
+/// design: trees reference only recipes, so a bundle's closure walk never descends into a recipe,
+/// and a chunk is structurally absent from every bundle. A bundle could still move a chunked
+/// file's recipe as bytes, but the result would be a bundle over a file whose chunks it cannot
+/// contain — unmaterializable wherever it lands. Refusing up front, naming the path, is the honest
+/// failure; a chunked file reaches a peer over the wire per object (franchise/lower/expand fetch
+/// the recipe, then the chunks loose), never inside a bundle.
 ///
 /// # Arguments
-/// * `path` - The warehouse path of the chunked file that blocked the operation.
+/// * `path` - The warehouse path of the chunked file that blocked the bundle.
 pub fn chunked_transport_refusal(path: &str) -> String {
-    let next_step = "Keep this file under the chunking threshold, or wait for chunked \
-        large-file transport support.".to_string();
+    let next_step = "Move this warehouse's history to the peer over the wire (lower/franchise/lift \
+        to a chunk-aware remote), which carries chunked files per object; a bundle cannot.".to_string();
 
     refusal(
         CODE_CHUNKED_TRANSPORT_UNSUPPORTED,
         format!(
-            "\"{}\" is a large file stored in chunks, and sending chunked files to a remote \
-            or into a bundle is not supported yet. {}",
+            "\"{}\" is a large file stored in chunks, and a bundle never carries a chunked file's \
+            chunks. {}",
             path, next_step
+        ),
+        next_step,
+    )
+}
+
+/// A ready-made `chunked_transport_unsupported` refusal for lifting a chunked file to a remote
+/// **that does not support chunked large files** (its handshake omits the `chunking` capability —
+/// an older head). Such a head serves and stores the recipe like any other object, but its `gc`
+/// cannot see that a recipe's chunks are reachable only through it and would silently collect them
+/// (the §9.4b B1 data-loss bug), so a chunk-aware client refuses to lift chunked content there —
+/// client-side, before any negotiation or upload, naming the path. Checked for every chunked entry
+/// the lift closure visits, so it also catches one that is unchanged-but-newly-reachable. Plain
+/// (non-chunked) content lifts to such a head unaffected.
+///
+/// # Arguments
+/// * `path` - The warehouse path of the chunked file that blocked the lift.
+pub fn chunked_remote_refusal(path: &str) -> String {
+    let next_step = "Upgrade the remote to a version that supports chunked large files, or keep \
+        this file under the chunking threshold.".to_string();
+
+    refusal(
+        CODE_CHUNKED_TRANSPORT_UNSUPPORTED,
+        format!(
+            "\"{}\" is a large file stored in chunks, and this remote does not support chunked \
+            large files. {}",
+            path, next_step
+        ),
+        next_step,
+    )
+}
+
+/// A ready-made `commit_pagination_unsupported` refusal for a lift whose commit would need more
+/// than one paginated batch against a remote that does not advertise chunking support (the
+/// capability the additive `more` field shipped alongside — see
+/// [`CODE_COMMIT_PAGINATION_UNSUPPORTED`]). Checked right after upload-target negotiation, which
+/// already knows the exact staged count, and before a single byte is uploaded — a refused lift
+/// never wastes the (potentially enormous) upload only to fail confusingly at commit time.
+///
+/// # Arguments
+/// * `staged_count` - How many distinct objects `upload-targets` staged for this lift.
+pub fn commit_pagination_unsupported_refusal(staged_count: usize) -> String {
+    let next_step = "Upgrade the remote to a version that supports paginated commits.".to_string();
+
+    refusal(
+        CODE_COMMIT_PAGINATION_UNSUPPORTED,
+        format!(
+            "This lift needs to stage {} objects, above the {}-object cap a single commit batch \
+            supports, and this remote does not advertise support for paginated commits. {}",
+            staged_count, crate::model::remote::MAX_MISSING_BATCH, next_step
         ),
         next_step,
     )

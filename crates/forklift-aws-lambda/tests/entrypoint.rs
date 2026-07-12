@@ -456,11 +456,12 @@ fn commit_lift_verifies_and_promotes_over_http() {
     let commit = CommitLiftRequest {
         control_plane: vec![good_hash.clone(), corrupt_hash.clone()],
         blobs: vec![],
+        more: false,
     };
     assert_eq!(status(&fixture.call(post_json("/v1/lift/lift-1/commit", &commit))), 422);
 
     // A commit over only the good object promotes it — via the un-versioned spelling.
-    let commit = CommitLiftRequest { control_plane: vec![good_hash.clone()], blobs: vec![] };
+    let commit = CommitLiftRequest { control_plane: vec![good_hash.clone()], blobs: vec![], more: false };
     assert_eq!(status(&fixture.call(post_json("/lift/lift-1/commit", &commit))), 200);
 
     // Now — and only now — it is fetchable (as a redirect to the canonical key).
@@ -485,7 +486,7 @@ fn commit_lift_over_the_shared_cap_is_a_422() {
         .collect();
     assert!(control_plane.len() + blobs.len() > MAX_MISSING_BATCH);
 
-    let commit = CommitLiftRequest { control_plane, blobs };
+    let commit = CommitLiftRequest { control_plane, blobs, more: false };
     let response = fixture.call(post_json("/v1/lift/lift-1/commit", &commit));
     assert_eq!(status(&response), 422);
 

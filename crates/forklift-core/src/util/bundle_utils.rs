@@ -238,13 +238,16 @@ fn write_tree_closure<W: Write>(encoder: &mut zstd::stream::Encoder<'_, W>,
     for (name, file) in tree.get_files() {
         let path = join_path(path_prefix, name);
 
-        // Chunk transport (uploading/fetching the chunk objects a recipe references) is not
-        // wired up yet: a bundle can carry a chunked file's *recipe* just like any other small
-        // object (`emit_blob` below would happily do it — a recipe is not decoded here, just
-        // moved as bytes), but its chunks are excluded from bundles structurally (this walk
-        // never descends into a recipe), so the result would be a bundle over a file that can
-        // never be materialized wherever it lands. Refuse loudly rather than ship it silently
-        // incomplete. Remove this check once chunk transport ships.
+        // Chunk transport is **per-object** (a chunked file's chunks ride the loose GET/PUT byte
+        // plane, negotiated one hash at a time), and by design **no bundle ever carries a chunk**:
+        // trees reference only recipes, so this closure walk never descends into a recipe, and a
+        // chunk is therefore structurally absent from every bundle. A bundle could still carry a
+        // chunked file's *recipe* as bytes (`emit_blob` moves it undecoded), but the result would
+        // be a bundle over a file whose chunks it cannot contain — unmaterializable wherever it
+        // lands. So this guard stays even now that chunk transport has shipped: a chunked file
+        // reaches a peer over the wire per object (franchise/lower/expand fetch the recipe from the
+        // bundle, then the chunks loose), never inside a bundle. Refuse loudly rather than ship one
+        // silently incomplete.
         if file.item_type.is_chunked() {
             return Err(scope_utils::chunked_transport_refusal(&path));
         }

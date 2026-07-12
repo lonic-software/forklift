@@ -108,7 +108,32 @@ impl Area {
         }
         std::fs::write(path, content).expect("write file");
     }
+
+    /// Write a large (chunk-threshold-crossing) file of deterministic, RNG-free bytes so it is
+    /// stored chunked and chunks reproducibly.
+    fn write_large_file(&self, relative: &str, seed: u64, size: usize) {
+        let path = self.path(relative);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create parent dirs");
+        }
+
+        let mut bytes = Vec::with_capacity(size);
+        let mut state = seed;
+        while bytes.len() < size {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            bytes.extend_from_slice(&(z ^ (z >> 31)).to_le_bytes());
+        }
+        bytes.truncate(size);
+        std::fs::write(path, bytes).expect("write large file");
+    }
 }
+
+/// The chunk threshold (bytes): content at or above this is stored chunked. Mirrors
+/// `chunk_utils::CHUNK_THRESHOLD_BYTES` (a frozen format constant).
+const CHUNK_THRESHOLD: usize = 8 * 1024 * 1024;
 
 impl Drop for Area {
     fn drop(&mut self) {
@@ -309,6 +334,64 @@ fn is_probably_blob(warehouse: &Path, hash: &str) -> bool {
     object_utils::load_parcel(hash).is_err() && object_utils::load_tree(hash).is_err()
 }
 
+/// The commit-gate closure audit on the AWS head descends a chunked file's recipe and
+/// presence-checks every chunk **non-tolerantly** (§9.4b W4), reading the recipe from the object
+/// store (its recipes are never mirrored into the audit scratch). A ref update whose chunked file
+/// is missing even one chunk — while the recipe itself is present, so a walk that stopped at the
+/// recipe hash would wrongly pass — is refused (`422`). Uploading the last chunk lets the same
+/// update commit, proving the check gates on exactly the chunk closure.
+#[test]
+fn a_ref_update_with_a_missing_chunk_is_refused() {
+    let area = Area::new("missing-chunk");
+    prepare(&area, "wh");
+    area.write_large_file("wh/big.bin", 0xD00D, CHUNK_THRESHOLD + 50_000);
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "a giant"]);
+
+    let harvest = harvest(&area.path("wh"));
+    let main_head = harvest.head_of("main").expect("main head");
+
+    // Resolve the chunked file's recipe and its chunk hashes from the source warehouse.
+    let (recipe_hash, chunk_hashes) = {
+        let _scope = StorageRootScope::enter(&area.path("wh"));
+        let tree = object_utils::load_parcel(&main_head).expect("head parcel").tree_hash;
+        let (recipe, item_type) = object_utils::resolve_tree_file(&tree, "big.bin")
+            .expect("resolve")
+            .expect("big.bin tracked");
+        assert!(item_type.is_chunked(), "the giant is stored chunked");
+        (recipe.clone(), object_utils::recipe_chunk_hashes(&recipe).expect("chunks"))
+    };
+    let victim = chunk_hashes[0].clone();
+
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+
+    // Upload everything except one chunk. The recipe itself is uploaded.
+    for (hash, bytes) in &harvest.objects {
+        if *hash == victim {
+            continue;
+        }
+        head.object_put(None, hash, bytes).expect("upload object");
+    }
+    for (hash, sidecar) in &harvest.signatures {
+        head.signature_put(hash, sidecar).expect("upload signature");
+    }
+    assert!(head.object_get(&recipe_hash).is_ok(), "the recipe itself is present on the head");
+
+    let request = RefUpdateRequest { old_head: None, new_head: main_head.clone() };
+    let err = head.ref_update("main", &request).expect_err("a missing chunk fails the closure");
+    assert_eq!(err.status, Status::Unprocessable);
+
+    // The control: upload the withheld chunk, and the identical update now commits.
+    head.object_put(None, &victim, &harvest.objects[&victim]).expect("upload the last chunk");
+    // A chunk is served as an ordinary content-addressed object (`GET /v1/objects/{hash}`).
+    assert!(head.object_get(&victim).is_ok(), "the head serves a chunk like any other object");
+    head.ref_update("main", &request).expect("the closure is complete once every chunk is present");
+    assert_eq!(head.handshake().expect("handshake").pallets.get("main"), Some(&main_head));
+
+    // The handshake advertises chunking, so a chunk-aware client knows it may lift here.
+    assert!(head.handshake().expect("handshake").chunking, "the head advertises chunking");
+}
+
 /// A wrong-hash upload is rejected — nothing unverified enters the store.
 #[test]
 fn a_tampered_object_upload_is_rejected() {
@@ -483,7 +566,7 @@ fn a_staged_object_is_not_fetchable_until_it_is_verified_and_promoted() {
 
     // A commit naming the corrupt object is refused...
     let err = head
-        .commit_lift("lift-1", &[good_hash.clone(), corrupt_hash.clone()], &[])
+        .commit_lift("lift-1", &[good_hash.clone(), corrupt_hash.clone()], &[], false)
         .expect_err("corrupt control-plane object");
     assert_eq!(err.status, Status::Unprocessable);
 
@@ -492,7 +575,7 @@ fn a_staged_object_is_not_fetchable_until_it_is_verified_and_promoted() {
     assert_eq!(err.status, Status::NotFound);
 
     // A commit over only the good object promotes it: now — and only now — it is fetchable.
-    head.commit_lift("lift-1", std::slice::from_ref(&good_hash), &[]).expect("clean commit");
+    head.commit_lift("lift-1", std::slice::from_ref(&good_hash), &[], false).expect("clean commit");
 
     match head.object_get(&good_hash).expect("the promoted object") {
         ObjectReadResult::Redirect(url) => {
@@ -503,10 +586,10 @@ fn a_staged_object_is_not_fetchable_until_it_is_verified_and_promoted() {
 
     // The commit swept the session's staging prefix, and promotion is idempotent.
     assert_eq!(head.objects.staged_count(), 0, "staging is swept after a commit");
-    head.commit_lift("lift-1", std::slice::from_ref(&good_hash), &[]).expect("retried commit");
+    head.commit_lift("lift-1", std::slice::from_ref(&good_hash), &[], false).expect("retried commit");
 
     // A commit naming an object that was never staged is "not ready".
-    let err = head.commit_lift("lift-1", &["f".repeat(64)], &[]).expect_err("missing object");
+    let err = head.commit_lift("lift-1", &["f".repeat(64)], &[], false).expect_err("missing object");
     assert_eq!(err.status, Status::Unprocessable);
 }
 
@@ -523,7 +606,7 @@ fn a_blob_still_in_staging_is_not_ready_to_commit() {
     let head = Head::new(store, MemoryRefStore::new());
 
     let err = head
-        .commit_lift("lift-1", &[], std::slice::from_ref(&blob_hash))
+        .commit_lift("lift-1", &[], std::slice::from_ref(&blob_hash), false)
         .expect_err("unpromoted blob");
     assert_eq!(err.status, Status::Unprocessable);
 
@@ -532,7 +615,50 @@ fn a_blob_still_in_staging_is_not_ready_to_commit() {
     let outcome = head.objects.verify_and_promote("lift-1", &blob_hash).expect("promote");
     assert_eq!(outcome, PromoteOutcome::Promoted);
 
-    head.commit_lift("lift-1", &[], &[blob_hash]).expect("the blob is verified and present");
+    head.commit_lift("lift-1", &[], &[blob_hash], false).expect("the blob is verified and present");
+}
+
+/// The commit-pagination sweep-ordering fix (§9.4b Stage 3): an intermediate commit batch
+/// (`more: true`) verifies and presence-checks its own slice but **must not** sweep the session's
+/// staging prefix, or it would discard a later batch's chunks that are still staged (not yet
+/// promoted). Only the final batch (`more: false`) sweeps. The orphan here stands in for exactly
+/// such a later-batch chunk: it survives the intermediate batch and is swept only by the final one.
+#[test]
+fn an_intermediate_commit_batch_does_not_sweep_a_later_batchs_staged_objects() {
+    let store = MemoryObjectStore::with_redirect("https://s3.example/bucket");
+
+    let committed = b"a blob in this batch".to_vec();
+    let committed_hash = object_utils::hash_object_bytes(&committed);
+    let orphan = b"a chunk for a later batch, still staging".to_vec();
+    let orphan_hash = object_utils::hash_object_bytes(&orphan);
+
+    store.stage("lift-1", &committed_hash, committed);
+    store.stage("lift-1", &orphan_hash, orphan);
+
+    // This batch's blob is promoted (present at canonical); the orphan is not — it is a later
+    // batch's still-staged object.
+    store.verify_and_promote("lift-1", &committed_hash).expect("promote this batch's blob");
+    assert_eq!(store.staged_count(), 1, "only the orphan remains staged");
+
+    let head = Head::new(store, MemoryRefStore::new());
+
+    // Intermediate batch: presence-check the promoted blob, but do NOT sweep — the orphan survives.
+    head.commit_lift("lift-1", &[], std::slice::from_ref(&committed_hash), true)
+        .expect("the intermediate batch commits");
+    assert_eq!(
+        head.objects.staged_count(),
+        1,
+        "an intermediate (more) batch never sweeps: the later batch's staged object survives"
+    );
+
+    // Final batch (idempotent presence-check of the same blob): now the session is swept.
+    head.commit_lift("lift-1", &[], std::slice::from_ref(&committed_hash), false)
+        .expect("the final batch commits");
+    assert_eq!(
+        head.objects.staged_count(),
+        0,
+        "the final (more: false) batch sweeps the whole session's staging prefix"
+    );
 }
 
 /// The control plane and the staging verifier can promote the same hash at the same time.
