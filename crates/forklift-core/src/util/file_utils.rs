@@ -275,7 +275,11 @@ fn write_and_sync_file(path: &Path, content: &[u8]) -> Result<(), String> {
 pub fn write_file_atomically(file_path: &Path, content: &[u8]) -> Result<(), String> {
     // The temporary name must be unique per *write*, not just per process: two parallel
     // tasks writing the same path (e.g. storing identical object content) would otherwise
-    // share a temporary file and race each other's rename.
+    // share a temporary file and race each other's rename. `object_utils::store_object_stream`
+    // writes its own temp files the same way, off its own independent counter — its `.stream.tmp`
+    // infix (vs. this function's plain `.tmp`) is deliberately different so the two paths can
+    // never collide on the same temp name even if both counters reach the same numeric value at
+    // the same moment (two independent counters offer no such guarantee on their own).
     static TEMP_FILE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let write_id = TEMP_FILE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 

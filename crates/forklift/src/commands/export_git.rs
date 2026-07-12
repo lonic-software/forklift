@@ -166,11 +166,17 @@ impl<'a> Exporter<'a> {
 
         for (name, item) in tree.get_files() {
             let (mode, kind) = match item.item_type {
-                DirEntryType::Executable => ("100755", "blob"),
+                DirEntryType::Executable | DirEntryType::ExecutableChunked => ("100755", "blob"),
                 DirEntryType::SymbolicLink => ("120000", "blob"),
                 _ => ("100644", "blob"),
             };
-            let blob = self.convert_blob(&item.hash)?;
+            // A chunked file's hash is a recipe: stream-assemble it into the git blob rather than
+            // loading it as a blob (which would fail) or reading it whole into memory.
+            let blob = if item.item_type.is_chunked() {
+                self.convert_chunked_blob(&item.hash)?
+            } else {
+                self.convert_blob(&item.hash)?
+            };
             entries.push_str(&format!("{} {} {}\t{}\n", mode, kind, blob, name));
         }
 
@@ -196,6 +202,52 @@ impl<'a> Exporter<'a> {
         let git_hash = git_stdin(self.path, &["hash-object", "-w", "--stdin"], &content)?.trim().to_string();
 
         self.blobs.insert(forklift_hash.to_string(), git_hash.clone());
+
+        Ok(git_hash)
+    }
+
+    /// Write one chunked forklift file as a git blob by stream-assembling its recipe to a temp
+    /// file (bounded to one chunk in memory at a time, integrity-verified), then hashing that file
+    /// into the git object store. The assembled bytes round-trip exactly.
+    fn convert_chunked_blob(&mut self, recipe_hash: &str) -> Result<String, String> {
+        if let Some(hash) = self.blobs.get(recipe_hash) {
+            return Ok(hash.clone());
+        }
+
+        // A per-process atomic counter, not just the pid, is part of the temp name: two calls to
+        // `convert_chunked_blob` in the same process (even sequentially, since the previous temp
+        // is removed before this one is created) must never share a name, and this matches the
+        // naming convention `object_utils`/`file_utils` use for their own temp files.
+        static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let write_id = TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let temp_path = std::env::temp_dir().join(format!(
+            "forklift-export-{}-{}-{}.tmp", std::process::id(), write_id, recipe_hash
+        ));
+
+        let assemble = || -> Result<(), String> {
+            // `create_new` refuses to open an existing path (including a planted symlink) rather
+            // than following/truncating it — a shared, world-writable /tmp is not a safe place to
+            // open-by-name-and-truncate.
+            let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&temp_path)
+                .map_err(|e| format!("Error while creating a temp file for git export: {}", e))?;
+            let mut writer = std::io::BufWriter::new(file);
+            object_utils::assemble_chunked_file(recipe_hash, &mut writer)?;
+            std::io::Write::flush(&mut writer)
+                .map_err(|e| format!("Error while flushing a temp file for git export: {}", e))
+        };
+
+        if let Err(e) = assemble() {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(e);
+        }
+
+        let temp_str = temp_path.to_string_lossy().into_owned();
+        let git_hash = git(self.path, &["hash-object", "-w", "--", &temp_str])
+            .map(|h| h.trim().to_string());
+        let _ = std::fs::remove_file(&temp_path);
+        let git_hash = git_hash?;
+
+        self.blobs.insert(recipe_hash.to_string(), git_hash.clone());
 
         Ok(git_hash)
     }

@@ -949,13 +949,19 @@ fn merge_directory(base: Option<&crate::model::tree_item::TreeItem>,
         // Both sides changed the file (relative to the base) in different ways.
         match (o, t) {
             // Delete/modify: they changed it, we deleted it. Their version is put back
-            // in the working directory, in conflict.
+            // in the working directory, in conflict. A chunked (binary) file is never loaded
+            // whole into memory here — it carries no inline content; the apply path
+            // re-materializes it from its recipe hash (which `entry_hash` holds).
             (None, Some((their_hash, their_type))) => {
-                let their_blob = object_utils::load_blob(their_hash)?;
+                let content = if their_type.is_chunked() {
+                    None
+                } else {
+                    Some(object_utils::load_blob(their_hash)?.content)
+                };
 
                 pending.push(PendingAction::Ready(MergeAction::Conflict {
                     path,
-                    content: Some(their_blob.content),
+                    content,
                     entry_hash: their_hash.clone(),
                     item_type: *their_type,
                 }));

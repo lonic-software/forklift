@@ -851,6 +851,17 @@ pub fn compact(all: bool) -> Result<CompactStats, String> {
         start = end;
 
         for (i, target) in batch.iter().enumerate() {
+            // Chunks are never packed or delta'd: leave the loose chunk file exactly where it is
+            // (do not write it into a pack, do not mark it for deletion, do not seed the delta
+            // window with it). Detected from the decompressed bytes already prepared for this
+            // target, so no extra read; only a loose target can be a chunk (a chunk is never in an
+            // existing pack, so a `CopyRecord` never is one). This is checked before the writer is
+            // fetched so an all-chunk batch never creates an empty pack.
+            if matches!(target.source, Source::Loose(_))
+                && prepared[i].as_ref().is_some_and(|prep| is_chunk(&prep.raw)) {
+                continue;
+            }
+
             let pack = match writer.as_mut() {
                 Some(pack) => pack,
                 None => writer.insert(PackWriter::new(&pack_folder)?),
@@ -1727,6 +1738,21 @@ fn is_parcel(raw: &[u8]) -> bool {
     matches!(
         byte_utils::number_from_vlq_bytes(after_version, raw),
         Ok((code, _)) if code == crate::enums::object_type::ObjectType::Parcel.get_code()
+    )
+}
+
+/// Whether an object's raw bytes are a chunk, read from the type in its header without a full
+/// parse. Chunks are **never** packed or delta'd: each must stay an individually addressable
+/// loose object (a hosted head serves each chunk as its own presigned GET, and loose chunks give
+/// O(1) ranged reads); a chunk also has no "path" for the path-base delta grouping, and CDC
+/// already captured the dedup a delta would chase. So a chunk is left loose by compaction.
+fn is_chunk(raw: &[u8]) -> bool {
+    let Ok((_version, after_version)) = byte_utils::number_from_vlq_bytes(0, raw) else {
+        return false;
+    };
+    matches!(
+        byte_utils::number_from_vlq_bytes(after_version, raw),
+        Ok((code, _)) if code == crate::enums::object_type::ObjectType::Chunk.get_code()
     )
 }
 

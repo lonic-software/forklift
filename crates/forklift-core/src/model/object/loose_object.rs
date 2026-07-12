@@ -1,7 +1,7 @@
 use std::ops::Add;
 use std::path::Path;
 use crate::enums::object_type::ObjectType;
-use crate::util::file_utils;
+use crate::util::{file_utils, object_utils};
 
 /// A loose object.
 /// Compress it before saving it to the object store.
@@ -31,6 +31,12 @@ impl LooseObject {
     ///    * `bool`: True if a new object was stored, false if the object already existed.
     /// * `Err(String)`- The error message, if the operation failed.
     pub fn store(&mut self) -> Result<(String, bool), String> {
+        // The whole-object ceiling, on the way in from local authorship (`stack`, `import-git`, a
+        // meta write). Only a tree or a recipe can legitimately approach it; blobs and chunks are
+        // bounded well below it by construction. Reads never re-store an object, so a grandfathered
+        // giant authored before this policy stays readable — this gates new authorship only.
+        object_utils::check_object_ceiling(&self.object_type, self.content.len())?;
+
         let does_exist = file_utils::does_object_exist(&self.hash)?;
         let (path, file_name) = file_utils::get_path_for_object(&self.hash)?;
 

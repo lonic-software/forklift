@@ -70,10 +70,35 @@ impl TestArea {
         std::fs::write(path, content).unwrap();
     }
 
+    /// Write deterministic, seeded pseudo-random raw bytes to a path under the area — for a
+    /// large (chunk-threshold-crossing) file, which `write_file`'s `&str` content cannot express.
+    /// No clock/RNG, so the content (and thus its chunking) is reproducible.
+    fn write_large_file(&self, relative_path: &str, seed: u64, size: usize) {
+        let path = self.path(relative_path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        let mut bytes = Vec::with_capacity(size);
+        let mut state = seed;
+        while bytes.len() < size {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            bytes.extend_from_slice(&(z ^ (z >> 31)).to_le_bytes());
+        }
+        bytes.truncate(size);
+
+        std::fs::write(path, bytes).unwrap();
+    }
+
     fn read_file(&self, relative_path: &str) -> String {
         std::fs::read_to_string(self.path(relative_path)).unwrap()
     }
 }
+
+/// The chunk threshold (bytes): content at or above this is stored chunked. Mirrors
+/// `chunk_utils::CHUNK_THRESHOLD_BYTES` (a frozen format constant).
+const CHUNK_THRESHOLD: usize = 8 * 1024 * 1024;
 
 impl Drop for TestArea {
     fn drop(&mut self) {
@@ -2190,6 +2215,48 @@ fn a_sparse_workspace_refuses_to_lift_to_a_non_origin_remote() {
     assert_success(&origin.forklift("sparse", &["config", "--unset", "remote.origin"]));
     let forced = origin.forklift("sparse", &["lift"]);
     assert!(!forced.status.success(), "a forced non-origin sparse lift must fail loudly: {}", stdout(&forced));
+}
+
+#[test]
+fn lift_refuses_a_chunked_file_but_earlier_plain_work_stays_liftable() {
+    // Chunk transport (uploading/negotiating the chunk objects a recipe references) has not
+    // shipped: a lift can walk the tree closure and carry a chunked file's recipe like any other
+    // small object, but nothing negotiates or transfers its chunks, so pushing one would silently
+    // advance the remote's ref over content that can never be materialized there. The client
+    // refuses before touching the wire, with the stable code — and earlier plain work already on
+    // the remote is completely unaffected.
+    let area = TestArea::new("chunked-lift-refuses");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/small.txt", "a normal file\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "plain work"]));
+
+    // The plain work lifts fine — the guard must not touch an ordinary lift.
+    let lifted = area.forklift("dev", &["lift"]);
+    assert_success(&lifted);
+    assert!(stdout(&lifted).contains("Lifted pallet"), "{}", stdout(&lifted));
+
+    // Now add a chunked giant and try to lift it.
+    area.write_large_file("dev/big.bin", 0xC0FFEE, CHUNK_THRESHOLD + 50_000);
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "with a giant"]));
+
+    let refused = area.forklift("dev", &["--json", "lift"]);
+    assert!(!refused.status.success(), "a chunked file must refuse the lift: {}", stdout(&refused));
+    assert_eq!(refused.status.code(), Some(14), "chunked transport exits 14: {}", stderr(&refused));
+
+    let json: serde_json::Value = serde_json::from_str(&stdout(&refused)).unwrap();
+    assert_eq!(json["error"]["code"], "chunked_transport_unsupported", "{}", stdout(&refused));
+    assert!(json["error"]["message"].as_str().unwrap().contains("big.bin"),
+        "the refusal names the chunked file: {}", stdout(&refused));
+
+    // Nothing new reached the remote: a fresh franchise only ever sees the earlier plain work.
+    let franchised = area.forklift(".", &["franchise", &server.url, "check"]);
+    assert_success(&franchised);
+    assert_eq!(area.read_file("check/small.txt"), "a normal file\n");
+    assert!(!area.path("check/big.bin").exists(), "the chunked file must never have reached the remote");
 }
 
 #[test]

@@ -23,6 +23,21 @@ byte) because file names may legally contain any byte, including new line and EO
 every entry (including the last one). This is safe as a terminator because hashes are
 ASCII hex and can never contain a newline byte.
 
+## Whole-object ceiling
+A tree object, like every object, is subject to the whole-object ceiling of
+`object_utils::MAX_OBJECT_BYTES` (64 MiB), enforced on the way *in* — a locally authored tree
+that would exceed it is refused on write, and one handed over in a bundle or a lift is refused
+on import. Unlike a large file (which is chunked) a tree is never split, so this is a real
+**hard limit** on a single directory: at roughly 88 bytes per entry it caps one directory at
+about **762,000 entries**. Split a larger directory across subdirectories. (Hierarchical trees
+that would lift this cap are a deferred future format version.) The ceiling gates writes and
+imports only; a pre-existing over-ceiling tree authored before this policy stays readable and
+checkout-able locally, forever, so an old store never bricks — but it can never be sent to a
+remote or into a bundle again: `docs/format/BUNDLE_FORMAT.md`'s "Grandfathered giants" section
+explains why no migration exists (a tree's hash is pinned inside its signed parcel, so a smaller
+replacement would mint a different, unsigned history) and how transport refuses it honestly,
+at the source, with the stable `oversized_transport_unsupported` code.
+
 ## Structure (V2024_09_04)
 Below is the structure of the tree object (as of version `V2024_09_04`).
 Each `[...]` represents a byte or a sequence of bytes.

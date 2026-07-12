@@ -59,11 +59,18 @@ pub fn blame(head: &str, path: &str) -> Result<FileBlame, String> {
     // The file must exist at the revision — blame is over a file that is there to read.
     let head_tree = object_utils::load_parcel(head)?.tree_hash;
 
-    if object_utils::resolve_tree_file(&head_tree, path)?.is_none() {
-        return Err(format!(
+    match object_utils::resolve_tree_file(&head_tree, path)? {
+        None => return Err(format!(
             "There is no file \"{}\" at that revision (it may be a directory, or not exist there).",
             path
-        ));
+        )),
+        // A chunked file is an opaque binary — there are no lines to attribute. Refuse loudly
+        // from the tree entry type alone (no object load), the way `diff` reports it as binary.
+        Some((_, item_type)) if item_type.is_chunked() => return Err(format!(
+            "\"{}\" is a large binary file (stored in chunks); blame is only available for text files.",
+            path
+        )),
+        Some(_) => {}
     }
 
     // The first-parent chain, oldest first: the linear history the blame is computed over.
@@ -88,19 +95,30 @@ pub fn blame(head: &str, path: &str) -> Result<FileBlame, String> {
         }
 
         let parcel_tree = object_utils::load_parcel(parcel)?.tree_hash;
-        let blob = object_utils::resolve_tree_file(&parcel_tree, path)?.map(|(hash, _)| hash);
+        let file = object_utils::resolve_tree_file(&parcel_tree, path)?;
+        let blob = file.as_ref().map(|(hash, _)| hash.clone());
 
         // No change to the file at this parcel: the attribution carries forward untouched.
         if blob == prev_blob {
             continue;
         }
 
-        match &blob {
+        match &file {
             // The file does not exist at this parcel (not yet added, or removed). A later
             // re-add is treated as wholly new content there.
             None => current.clear(),
 
-            Some(blob_hash) => {
+            // A chunked (binary) version is an opaque boundary the first-parent walk cannot
+            // see through: there is no text to load or line-match against. Clear the carried
+            // state exactly like the file-absent arm, so lines from before this version drop;
+            // if the file later becomes plain text again, that version's lines have nothing to
+            // inherit from (an empty `current`) and are attributed fresh to the parcel that
+            // (re)introduced them — the same treatment a first version gets. This is what keeps
+            // a plain-at-head file with a chunked ancestor blaming successfully instead of the
+            // internal "is a recipe, not a blob" error a bare `load_blob` would otherwise leak.
+            Some((_, item_type)) if item_type.is_chunked() => current.clear(),
+
+            Some((blob_hash, _)) => {
                 let content = object_utils::load_blob(blob_hash)?.content;
                 current = attribute_version(&current, &content, parcel);
             }

@@ -5,7 +5,6 @@ use std::sync::Arc;
 use file_id::FileId;
 use regex::Regex;
 use crate::builder::inventory::InventoryBuilder;
-use crate::builder::object::loose_object_builder::LooseObjectBuilder;
 use crate::enums::inventory_item_state::InventoryItemState;
 use crate::enums::dir_entry_type::DirEntryType;
 use crate::model::inventory::{Inventory, InventoryItem};
@@ -16,6 +15,7 @@ use crate::model::task::TaskExecutor;
 use crate::parser;
 use crate::traits::task_context::TaskContext;
 use crate::util::{file_utils, object_utils};
+use crate::util::object_utils::IngestMode;
 use crate::util::path_utils::WarehousePath;
 
 /// The metadata entry used for the warehouse root (its key is the empty string,
@@ -328,7 +328,8 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
                 let index_item = match existing_entry {
                     Some((item, shard_mtime)) => {
                         let verdict = classify_file_against_entry(
-                            &item, &metadata, item_type, &entry.path(), &name, shard_mtime
+                            &item, &metadata, item_type, &entry.path(), &name, shard_mtime,
+                            IngestMode::Store,
                         )?;
 
                         match verdict {
@@ -343,10 +344,13 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
                             }
                             // Storing on the unchanged-by-hash path too keeps load
                             // self-healing: a blob that went missing from the object
-                            // store comes back on the next re-load.
-                            FileVerdict::UnchangedByHash(fresh, mut object)
-                                | FileVerdict::Modified(fresh, mut object) => {
-                                object.store()?;
+                            // store comes back on the next re-load. A chunked file's objects
+                            // were already stored during ingest (`object` is `None`).
+                            FileVerdict::UnchangedByHash(fresh, object)
+                                | FileVerdict::Modified(fresh, object) => {
+                                if let Some(mut object) = object {
+                                    object.store()?;
+                                }
                                 fresh
                             }
                         }
@@ -390,18 +394,23 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
 /// hashed. Used when repopulating the inventory after materializing a tree.
 ///
 /// # Arguments
-/// * `path` - The path of the file.
-/// * `name` - The name of the file.
-/// * `hash` - The (already known) blob hash of the file's content.
+/// * `path`      - The path of the file.
+/// * `name`      - The name of the file.
+/// * `hash`      - The (already known) blob or recipe hash of the file's content.
+/// * `item_type` - The entry type from the authoritative source (the tree / merge action). It is
+///   **not** re-derived from `stat`: a `stat` cannot tell a chunked file from a plain one
+///   (chunking is a storage choice), so the tree's `NormalChunked`/`ExecutableChunked` must be
+///   carried through here or the next stack would emit a wrong (plain) tree entry over a recipe
+///   hash. For a plain file this equals what `stat` reports; for a symlink it is `SymbolicLink`.
 ///
 /// # Returns
 /// * `Ok(InventoryItem)` - The inventory item.
 /// * `Err(String)`       - If the file's metadata could not be gathered.
 pub fn build_inventory_item_from_stat(path: &Path,
                                       name: &str,
-                                      hash: String) -> Result<InventoryItem, String> {
+                                      hash: String,
+                                      item_type: DirEntryType) -> Result<InventoryItem, String> {
     let metadata = file_utils::get_symlink_metadata_for_path(path)?;
-    let item_type = file_utils::get_type_of_dir_entry(&metadata);
 
     let mtime = file_utils::get_content_modification_timestamp_for_file(&metadata)?;
     let ctime = file_utils::get_metadata_modification_timestamp_for_file(&metadata);
@@ -434,23 +443,26 @@ pub fn build_inventory_item_from_stat(path: &Path,
     )
 }
 
-/// Stage a fresh inventory entry (with current stat data) for a file whose blob is
+/// Stage a fresh inventory entry (with current stat data) for a file whose blob or recipe is
 /// already stored (e.g. one just written from a tree or merge).
 ///
 /// # Arguments
-/// * `path` - The warehouse path of the file.
-/// * `hash` - The blob hash of the file's content.
+/// * `path`      - The warehouse path of the file.
+/// * `hash`      - The blob or recipe hash of the file's content.
+/// * `item_type` - The authoritative entry type (from the tree / merge action), carried through
+///   so a chunked entry keeps its `*Chunked` type in the inventory rather than being demoted to
+///   a plain type a `stat` would report.
 ///
 /// # Returns
 /// * `Ok(())`      - If the entry was staged.
 /// * `Err(String)` - If the file's metadata could not be gathered or the shard written.
-pub fn stage_file_entry_from_stat(path: &str, hash: String) -> Result<(), String> {
+pub fn stage_file_entry_from_stat(path: &str, hash: String, item_type: DirEntryType) -> Result<(), String> {
     let (parent_key, name) = match path.rsplit_once(file_utils::PATH_SEPARATOR_CHAR) {
         Some((parent, name)) => (parent, name),
         None => ("", path),
     };
 
-    let entry = build_inventory_item_from_stat(Path::new(path), name, hash)?;
+    let entry = build_inventory_item_from_stat(Path::new(path), name, hash, item_type)?;
 
     update_shard(parent_key, |inventory| {
         inventory.add_item(entry);
@@ -1042,7 +1054,13 @@ pub fn is_entry_unchanged(existing: &InventoryItem,
                       item_type: DirEntryType,
                       path: &Path,
                       shard_mtime: u64) -> bool {
-    if existing.item_type != item_type {
+    // Compare the on-disk kind, not the chunked storage decision: `item_type` is derived from a
+    // fresh `stat` and can only ever be `Normal`/`Executable`/`SymbolicLink`, while the inventory
+    // entry may hold a `*Chunked` variant for the same file. Chunking is a storage choice a stat
+    // cannot see, so an unchanged giant (stat says `Normal`, inventory says `NormalChunked`) must
+    // still hit this fast path and never be re-chunked. A genuine normal↔executable flip is still
+    // caught (their on-disk kinds differ).
+    if existing.item_type.on_disk_kind() != item_type.on_disk_kind() {
         return false;
     }
 
@@ -1087,29 +1105,42 @@ pub fn is_entry_unchanged(existing: &InventoryItem,
 pub fn build_inventory_item_from_file(path: &Path,
                                       name: &str,
                                       item_type: DirEntryType) -> Result<InventoryItem, String> {
-    let (item, mut object) = build_item_and_object_for_file(path, name, item_type)?;
+    // A first-time `load` of a file: persist its objects. A small file returns its blob for us to
+    // store; a chunked file already stored its chunks and recipe during ingest (`None`).
+    let (item, object) = build_item_and_object_for_file(path, name, item_type, IngestMode::Store)?;
 
-    object.store()?;
+    if let Some(mut object) = object {
+        object.store()?;
+    }
 
     Ok(item)
 }
 
-/// Create an inventory item for a file, together with its blob object — read and hashed,
-/// but **not** stored. Read-only callers (the stocktake walk) drop the object; writers
-/// (`load`) store it.
+/// Create an inventory item for a file, together with the built-but-unstored blob object for a
+/// small file. A file at or above the chunk threshold is ingested as a recipe plus chunks
+/// instead (its entry type becomes a `*Chunked` variant, its hash is the recipe hash) — those
+/// objects are handled per `mode`, so the returned object is `None` for a chunked file.
+///
+/// The read-only stocktake/diff caller passes `IngestMode::ComputeOnly` (nothing is written to
+/// the store, not even a chunked giant's chunks); `load`/`park` pass `IngestMode::Store`. Either
+/// way the returned blob (small files only) is unstored — writers store it, read-only callers
+/// drop it, exactly as before.
 ///
 /// # Arguments
 /// * `path`      - The path of the file.
 /// * `name`      - The name of the file.
-/// * `item_type` - The type of the directory entry.
+/// * `item_type` - The type of the directory entry (a `*Chunked` upgrade is decided here).
+/// * `mode`      - Whether to persist a chunked file's objects or only compute their hashes.
 ///
 /// # Returns
-/// * `Ok((InventoryItem, LooseObject))` - The inventory item and the unstored blob object.
-/// * `Err(String)`                      - If the file could not be read or stat'ed.
+/// * `Ok((InventoryItem, Option<LooseObject>))` - The item, and the unstored blob for a small
+///   file (`None` for a chunked file, whose objects were handled per `mode`).
+/// * `Err(String)`                              - If the file could not be read or stat'ed.
 fn build_item_and_object_for_file(path: &Path,
                                   name: &str,
-                                  item_type: DirEntryType)
-                                  -> Result<(InventoryItem, LooseObject), String> {
+                                  item_type: DirEntryType,
+                                  mode: IngestMode)
+                                  -> Result<(InventoryItem, Option<LooseObject>), String> {
     let metadata = file_utils::get_symlink_metadata_for_path(path)?;
 
     let mtime = file_utils::get_content_modification_timestamp_for_file(&metadata)?;
@@ -1124,27 +1155,24 @@ fn build_item_and_object_for_file(path: &Path,
     }?;
 
     let (user_id, group_id) = file_utils::get_owners_for_file(&metadata);
-    let blob = object_utils::get_blob_for_file(name, path, &item_type)?;
-    let file_size = blob.content.len() as u64;
-
-    let object = LooseObjectBuilder::build_blob(&blob);
+    let ingested = object_utils::ingest_file(name, path, item_type, mode)?;
 
     let item = InventoryItem {
         metadata_change_timestamp: ctime,
         content_change_timestamp: mtime,
         device: device_id,
         inode,
-        item_type,
+        item_type: ingested.item_type,
         user_id,
         group_id,
-        file_size,
-        hash: object.hash.clone(),
+        file_size: ingested.file_size,
+        hash: ingested.hash,
         file_name_length: name.len() as u64,
         state: InventoryItemState::Normal,
         name: String::from(name),
     };
 
-    Ok((item, object))
+    Ok((item, ingested.deferred))
 }
 
 /// The verdict of classifying one on-disk file against its existing inventory entry.
@@ -1157,15 +1185,16 @@ pub enum FileVerdict {
     UnchangedByStat,
 
     /// The stat cache missed, but the content hash matches the entry: the file is
-    /// unchanged. Carries the rebuilt item (same hash, fresh stat data) and the unstored
-    /// blob object — writers store it anyway (a cheap no-op when present), which is what
-    /// makes a re-load heal a blob that went missing from the object store.
-    UnchangedByHash(InventoryItem, LooseObject),
+    /// unchanged. Carries the rebuilt item (same hash, fresh stat data) and, for a small
+    /// file, the unstored blob object — writers store it anyway (a cheap no-op when present),
+    /// which is what makes a re-load heal a blob that went missing from the object store. A
+    /// chunked file carries `None` (its chunks/recipe were handled per the ingest mode).
+    UnchangedByHash(InventoryItem, Option<LooseObject>),
 
-    /// The content changed. Carries the rebuilt item (new hash, fresh stat data) and the
-    /// unstored blob object, so a writer can store it without reading the file again —
-    /// and a read-only caller simply drops it.
-    Modified(InventoryItem, LooseObject),
+    /// The content changed. Carries the rebuilt item (new hash, fresh stat data) and, for a
+    /// small file, the unstored blob object, so a writer can store it without reading the file
+    /// again — and a read-only caller simply drops it. A chunked file carries `None`.
+    Modified(InventoryItem, Option<LooseObject>),
 }
 
 /// Classify one on-disk file against its existing inventory entry: the stat-cache fast
@@ -1175,10 +1204,12 @@ pub enum FileVerdict {
 /// # Arguments
 /// * `existing`    - The inventory entry the file is compared against.
 /// * `metadata`    - The current (symlink) metadata of the file.
-/// * `item_type`   - The current type of the directory entry.
+/// * `item_type`   - The current type of the directory entry (the filesystem-visible kind).
 /// * `path`        - The path of the file.
 /// * `name`        - The name of the file.
 /// * `shard_mtime` - The modification timestamp of the shard the entry came from.
+/// * `mode`        - Whether a re-chunked giant's objects are stored (`load`) or only hashed
+///   (read-only stocktake/diff).
 ///
 /// # Returns
 /// * `Ok(FileVerdict)` - The verdict.
@@ -1188,12 +1219,13 @@ pub fn classify_file_against_entry(existing: &InventoryItem,
                                    item_type: DirEntryType,
                                    path: &Path,
                                    name: &str,
-                                   shard_mtime: u64) -> Result<FileVerdict, String> {
+                                   shard_mtime: u64,
+                                   mode: IngestMode) -> Result<FileVerdict, String> {
     if is_entry_unchanged(existing, metadata, item_type, path, shard_mtime) {
         return Ok(FileVerdict::UnchangedByStat);
     }
 
-    let (item, object) = build_item_and_object_for_file(path, name, item_type)?;
+    let (item, object) = build_item_and_object_for_file(path, name, item_type, mode)?;
 
     if item.hash == existing.hash {
         Ok(FileVerdict::UnchangedByHash(item, object))

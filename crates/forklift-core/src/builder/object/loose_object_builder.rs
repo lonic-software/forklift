@@ -1,11 +1,15 @@
 use crate::builder::object::blob::blob_object_builder::BlobObjectBuilder;
+use crate::builder::object::chunk::chunk_object_builder::ChunkObjectBuilder;
 use crate::builder::object::parcel::parcel_object_builder::ParcelObjectBuilder;
+use crate::builder::object::recipe::recipe_object_builder::RecipeObjectBuilder;
 use crate::builder::object::tree::tree_object_builder::TreeObjectBuilder;
 use crate::enums::object::loose_object_version::LooseObjectVersion;
 use crate::enums::object_type::ObjectType;
 use crate::model::blob::Blob;
+use crate::model::chunk::Chunk;
 use crate::model::object::loose_object::LooseObject;
 use crate::model::parcel::Parcel;
+use crate::model::recipe::Recipe;
 use crate::model::tree_item::TreeItem;
 use crate::util::{byte_utils, object_utils};
 
@@ -49,6 +53,44 @@ impl LooseObjectBuilder {
     pub fn build_blob(blob: &Blob) -> LooseObject {
         let builder = LooseObjectBuilder::new(ObjectType::Blob);
         let object = BlobObjectBuilder::build(blob);
+        let content = object.content;
+
+        builder
+            .write_header(content.len())
+            .write_content(content)
+            .generate_hash()
+            .build()
+    }
+
+    /// Build a recipe object (the chunk index of a chunked large file).
+    ///
+    /// # Arguments
+    /// * `recipe` - The recipe to build.
+    ///
+    /// # Returns
+    /// The recipe object.
+    pub fn build_recipe(recipe: &Recipe) -> LooseObject {
+        let builder = LooseObjectBuilder::new(ObjectType::Recipe);
+        let object = RecipeObjectBuilder::build(recipe);
+        let content = object.content;
+
+        builder
+            .write_header(content.len())
+            .write_content(content)
+            .generate_hash()
+            .build()
+    }
+
+    /// Build a chunk object (a leaf byte-range of a chunked large file).
+    ///
+    /// # Arguments
+    /// * `chunk` - The chunk to build.
+    ///
+    /// # Returns
+    /// The chunk object.
+    pub fn build_chunk(chunk: &Chunk) -> LooseObject {
+        let builder = LooseObjectBuilder::new(ObjectType::Chunk);
+        let object = ChunkObjectBuilder::build(chunk);
         let content = object.content;
 
         builder

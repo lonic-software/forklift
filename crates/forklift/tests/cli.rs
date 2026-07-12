@@ -4938,3 +4938,366 @@ fn compact_all_tolerates_a_sparse_store_and_a_later_scoped_stack_still_works() {
     assert_eq!(path_object_hash(&warehouse, &scoped_head, "src/web"), web_tree,
         "the sealed out-of-scope subtree hash must carry forward unchanged");
 }
+
+// =================================================================================================
+// Native large-file (chunked) handling (§9.4b, Stage 1).
+// =================================================================================================
+
+/// The chunk threshold (bytes): content at or above this is stored chunked, below it as a blob.
+/// Mirrors `chunk_utils::CHUNK_THRESHOLD_BYTES` (a frozen format constant).
+const CHUNK_THRESHOLD: usize = 8 * 1024 * 1024;
+
+/// Deterministic, seeded, incompressible-ish bytes (a SplitMix64 stream) — no clock, no RNG, so a
+/// test's chunk boundaries are stable. Different seeds give unrelated content.
+fn large_bytes(seed: u64, size: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(size);
+    let mut state = seed;
+    while out.len() < size {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        out.extend_from_slice(&(z ^ (z >> 31)).to_le_bytes());
+    }
+    out.truncate(size);
+    out
+}
+
+/// Write raw bytes to a path under the warehouse root (the harness `write_file` is text-only).
+fn write_bytes(warehouse: &TestWarehouse, relative_path: &str, bytes: &[u8]) {
+    let path = warehouse.root.join(relative_path);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, bytes).unwrap();
+}
+
+/// The stored object type (`"blob"`, `"recipe"`, …) of the tree entry a parcel commits at `path`.
+fn entry_object_type(warehouse: &TestWarehouse, parcel: &str, path: &str) -> String {
+    let hash = path_object_hash(warehouse, parcel, path);
+    let peeked = warehouse.run(&["--json", "peek", &hash]);
+    assert_success(&peeked);
+    json(&peeked)["data"]["object_type"].as_str().unwrap().to_string()
+}
+
+#[test]
+fn large_file_threshold_classifies_by_hashed_length() {
+    let warehouse = TestWarehouse::new("chunk-threshold");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    // A byte below the threshold is a blob; at and above it, a recipe (chunk iff len >= threshold).
+    write_bytes(&warehouse, "under.bin", &large_bytes(1, CHUNK_THRESHOLD - 1));
+    write_bytes(&warehouse, "exact.bin", &large_bytes(2, CHUNK_THRESHOLD));
+    write_bytes(&warehouse, "over.bin", &large_bytes(3, CHUNK_THRESHOLD + 1));
+
+    assert_success(&warehouse.run(&["load", "."]));
+    let parcel = extract_parcel_hash(&{
+        let out = warehouse.run(&["stack", "large files"]);
+        assert_success(&out);
+        out
+    });
+
+    assert_eq!(entry_object_type(&warehouse, &parcel, "under.bin"), "blob",
+               "just under the threshold must stay a blob");
+    assert_eq!(entry_object_type(&warehouse, &parcel, "exact.bin"), "recipe",
+               "exactly at the threshold must be chunked");
+    assert_eq!(entry_object_type(&warehouse, &parcel, "over.bin"), "recipe",
+               "above the threshold must be chunked");
+
+    // The warehouse reports clean after loading and stacking a chunked file.
+    let status = stdout(&warehouse.run(&["stocktake"]));
+    assert!(status.contains("The inventory matches the pallet head"), "staged must be clean: {}", status);
+    assert!(status.contains("The working directory matches the inventory"), "unstaged must be clean: {}", status);
+}
+
+#[test]
+fn chunked_file_round_trips_byte_identical_through_shift() {
+    let warehouse = TestWarehouse::new("chunk-roundtrip");
+    let big = large_bytes(0x5EED, CHUNK_THRESHOLD + 500_000);
+
+    write_bytes(&warehouse, "big.bin", &big);
+    warehouse.write_file("small.txt", "on main\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "with the giant"]));
+
+    // Diverge on a feature pallet that does not have the giant.
+    assert_success(&warehouse.run(&["palletize", "feature"]));
+    std::fs::remove_file(warehouse.root.join("big.bin")).unwrap();
+    warehouse.write_file("small.txt", "on feature\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "without the giant"]));
+
+    // `palletize` already switched us to feature, whose tree has no giant on disk.
+    assert!(!warehouse.root.join("big.bin").exists(), "the giant is gone on feature");
+
+    // Shifting back to main re-materializes the giant byte-for-byte (stream-assembled + verified).
+    assert_success(&warehouse.run(&["shift", "main"]));
+    let restored = std::fs::read(warehouse.root.join("big.bin")).unwrap();
+    assert_eq!(restored, big, "the chunked file must round-trip byte-identical");
+
+    // And forward again removes it (a chunked entry deleted by a shift).
+    assert_success(&warehouse.run(&["shift", "feature"]));
+    assert!(!warehouse.root.join("big.bin").exists(), "the giant is removed shifting to feature");
+
+    // Clean after the round trip.
+    let status = stdout(&warehouse.run(&["stocktake"]));
+    assert!(status.contains("The working directory matches the inventory"), "must be clean: {}", status);
+}
+
+#[test]
+fn identical_chunked_files_dedup_their_chunks() {
+    let warehouse = TestWarehouse::new("chunk-dedup");
+    let content = large_bytes(0xD3D0, CHUNK_THRESHOLD + 300_000);
+
+    // First: one chunked file.
+    write_bytes(&warehouse, "first.bin", &content);
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "first"]));
+    let objects_root = warehouse.root.join(".forklift").join("objects");
+    let after_first = count_loose_objects(&objects_root);
+
+    // Second: a byte-identical copy at a different path. It shares the same recipe and every chunk.
+    write_bytes(&warehouse, "second.bin", &content);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "second copy"]));
+    let after_second = count_loose_objects(&objects_root);
+
+    // The only new objects are the tree(s) and the parcel — no new chunk or recipe objects, since
+    // identical content produces the identical recipe hash and identical chunk hashes.
+    let added = after_second - after_first;
+    assert!(added <= 3,
+            "a byte-identical second chunked file should add only structural objects (trees/parcel), added {}",
+            added);
+}
+
+#[test]
+fn compact_leaves_chunks_loose_and_the_file_still_materializes() {
+    let warehouse = TestWarehouse::new("chunk-compact");
+    let big = large_bytes(0xBEE5, CHUNK_THRESHOLD + 200_000);
+
+    write_bytes(&warehouse, "big.bin", &big);
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    let parcel = extract_parcel_hash(&{
+        let out = warehouse.run(&["stack", "the giant"]);
+        assert_success(&out);
+        out
+    });
+
+    // Every chunk of the recipe, so we can prove they survive `compact` as loose objects.
+    let recipe_hash = path_object_hash(&warehouse, &parcel, "big.bin");
+    let peeked = warehouse.run(&["--json", "peek", &recipe_hash]);
+    assert_success(&peeked);
+    let chunk_hashes: Vec<String> = json(&peeked)["data"]["chunks"].as_array().unwrap().iter()
+        .map(|c| c["hash"].as_str().unwrap().to_string())
+        .collect();
+    assert!(chunk_hashes.len() >= 2, "a chunked file is at least two chunks");
+
+    // Compact the whole store (repack). Chunks must never be packed — they stay individually
+    // addressable loose objects.
+    assert_success(&warehouse.run(&["compact", "--all"]));
+
+    for chunk in &chunk_hashes {
+        assert!(object_store_path(&warehouse, chunk).exists(),
+                "chunk {} must remain a loose object after compact (never packed)", chunk);
+    }
+
+    // The file still materializes byte-identically after compaction.
+    assert_success(&warehouse.run(&["palletize", "empty"]));
+    std::fs::remove_file(warehouse.root.join("big.bin")).unwrap();
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "no giant"]));
+    assert_success(&warehouse.run(&["shift", "main"]));
+    assert_eq!(std::fs::read(warehouse.root.join("big.bin")).unwrap(), big,
+               "the chunked file must still assemble after compact");
+}
+
+#[test]
+fn a_corrupt_chunk_makes_materialization_fail_loudly() {
+    let warehouse = TestWarehouse::new("chunk-corrupt");
+    let big = large_bytes(0xC0FFEE, CHUNK_THRESHOLD + 100_000);
+
+    write_bytes(&warehouse, "big.bin", &big);
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    let parcel = extract_parcel_hash(&{
+        let out = warehouse.run(&["stack", "the giant"]);
+        assert_success(&out);
+        out
+    });
+
+    // Find the recipe, peek its first chunk hash, and corrupt that chunk object on disk.
+    let recipe_hash = path_object_hash(&warehouse, &parcel, "big.bin");
+    let peeked = warehouse.run(&["--json", "peek", &recipe_hash]);
+    assert_success(&peeked);
+    let chunk_hash = json(&peeked)["data"]["chunks"][0]["hash"].as_str().unwrap().to_string();
+    let chunk_path = object_store_path(&warehouse, &chunk_hash);
+    // Corrupt the stored chunk object (garbage that is neither valid zstd nor hashes to its name),
+    // so reading it back fails loudly rather than returning wrong bytes.
+    std::fs::write(&chunk_path, b"this is not the real chunk object").unwrap();
+
+    // On a branch, replace big.bin with a small plain "sentinel" and stack it. `palletize`
+    // switches to the new pallet.
+    assert_success(&warehouse.run(&["palletize", "other"]));
+    write_bytes(&warehouse, "big.bin", b"sentinel content\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "sentinel"]));
+
+    // Shift back to main: re-materializing the giant must fail loudly (the corrupt chunk no
+    // longer verifies), and — durable-before-destructive — the working copy is left intact rather
+    // than half-written or destroyed.
+    let shift_back = warehouse.run(&["shift", "main"]);
+    assert!(!shift_back.status.success(), "a corrupt chunk must fail materialization, not corrupt the file");
+    assert_eq!(std::fs::read(warehouse.root.join("big.bin")).unwrap(), b"sentinel content\n",
+               "a failed chunked materialization must not destroy the working copy");
+}
+
+#[test]
+fn blame_refuses_a_chunked_file() {
+    let warehouse = TestWarehouse::new("chunk-blame");
+    write_bytes(&warehouse, "big.bin", &large_bytes(7, CHUNK_THRESHOLD + 10_000));
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "the giant"]));
+
+    let blame = warehouse.run(&["blame", "big.bin"]);
+    assert!(!blame.status.success(), "blame must refuse a chunked file");
+    assert!(stderr(&blame).contains("large binary file") || stderr(&blame).contains("text files"),
+            "blame refusal must be clear: {}", stderr(&blame));
+}
+
+#[test]
+fn blame_succeeds_at_a_plain_head_with_a_chunked_ancestor() {
+    // A file that is plain text at head but was a chunked giant earlier in first-parent
+    // history must not abort the whole command: the chunked ancestor is an opaque binary
+    // boundary the walk clears state at (never a bare `load_blob` on a recipe hash, which
+    // would otherwise leak the raw internal "is a recipe, not a blob" error). Every
+    // post-transition line is attributed to the parcel that (re)introduced text.
+    let warehouse = TestWarehouse::new("chunk-blame-ancestor");
+
+    // First version: a chunked giant.
+    write_bytes(&warehouse, "f.txt", &large_bytes(99, CHUNK_THRESHOLD + 10_000));
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "chunked version"]));
+
+    // Second version: plain text (a chunked -> plain flip at this path).
+    warehouse.write_file("f.txt", "one\ntwo\nthree\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    let second = extract_parcel_hash(&warehouse.run(&["stack", "text version"]));
+
+    let blame = warehouse.run(&["--json", "blame", "f.txt"]);
+    assert_success(&blame);
+    let parsed = json(&blame);
+    let lines = parsed["data"]["lines"].as_array().unwrap();
+    assert_eq!(lines.len(), 3);
+    for line in lines {
+        assert_eq!(line["parcel"], second,
+                   "no line may cross the chunked-ancestor boundary; every line attributes to \
+                   the parcel that (re)introduced text");
+    }
+
+    // The human form must not leak the raw internal error either.
+    let human = stdout(&warehouse.run(&["blame", "f.txt"]));
+    assert!(!human.contains("is a recipe, not a blob"), "internal error leaked: {}", human);
+}
+
+#[test]
+fn diff_reports_a_changed_chunked_file_as_binary() {
+    let warehouse = TestWarehouse::new("chunk-diff");
+    write_bytes(&warehouse, "big.bin", &large_bytes(11, CHUNK_THRESHOLD + 10_000));
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "v1"]));
+
+    // Change the giant's content; the unstaged diff must report it as binary, never crash.
+    write_bytes(&warehouse, "big.bin", &large_bytes(12, CHUNK_THRESHOLD + 20_000));
+    let diff = warehouse.run(&["diff"]);
+    assert_success(&diff);
+    assert!(stdout(&diff).contains("binary contents"), "a changed chunked file is binary: {}", stdout(&diff));
+}
+
+#[test]
+fn a_file_flips_between_chunked_and_plain_across_revisions() {
+    let warehouse = TestWarehouse::new("chunk-flip-plain");
+    // Revision 1: the path is a chunked giant.
+    write_bytes(&warehouse, "x.bin", &large_bytes(21, CHUNK_THRESHOLD + 50_000));
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    let chunked_parcel = extract_parcel_hash(&{
+        let out = warehouse.run(&["stack", "chunked"]);
+        assert_success(&out);
+        out
+    });
+    assert_eq!(entry_object_type(&warehouse, &chunked_parcel, "x.bin"), "recipe");
+
+    // Revision 2 on a branch: the same path is now a tiny plain file (chunked -> plain flip).
+    assert_success(&warehouse.run(&["palletize", "plain"]));
+    write_bytes(&warehouse, "x.bin", b"now i am small\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    let plain_parcel = extract_parcel_hash(&{
+        let out = warehouse.run(&["stack", "plain"]);
+        assert_success(&out);
+        out
+    });
+    assert_eq!(entry_object_type(&warehouse, &plain_parcel, "x.bin"), "blob",
+               "the flipped entry is now a plain blob");
+
+    // Shift both ways: content and type compose with the deletes-before-writes flip machinery.
+    assert_success(&warehouse.run(&["shift", "main"]));
+    assert_eq!(std::fs::read(warehouse.root.join("x.bin")).unwrap(),
+               large_bytes(21, CHUNK_THRESHOLD + 50_000), "chunked content restored");
+
+    assert_success(&warehouse.run(&["shift", "plain"]));
+    assert_eq!(std::fs::read(warehouse.root.join("x.bin")).unwrap(), b"now i am small\n",
+               "plain content restored");
+    let status = stdout(&warehouse.run(&["stocktake"]));
+    assert!(status.contains("The working directory matches the inventory"), "clean after flip: {}", status);
+}
+
+#[test]
+fn a_chunked_file_directory_flip_shift_succeeds() {
+    // The tracked dir->file flip fix (merged from main) composes with chunked storage exactly
+    // like a plain file: the directory is a tracked, clean shard, so replacing it with the
+    // chunked file must succeed, not refuse as an untracked collision.
+    let warehouse = TestWarehouse::new("chunk-flip-dir");
+    let giant = large_bytes(31, CHUNK_THRESHOLD + 40_000);
+    write_bytes(&warehouse, "node", &giant);
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "node is a chunked file"]));
+
+    // On a branch, "node" becomes a directory. `palletize` switches to the new pallet.
+    assert_success(&warehouse.run(&["palletize", "asdir"]));
+    std::fs::remove_file(warehouse.root.join("node")).unwrap();
+    warehouse.write_file("node/inside.txt", "now a directory\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "node is a directory"]));
+
+    // Shifting back to "main" (where "node" is still a tracked, clean chunked file) must not
+    // refuse: it is exactly the tracked dir->file flip, and the file materializes from its
+    // recipe like any other chunked write.
+    let shift_back = warehouse.run(&["shift", "main"]);
+    assert_success(&shift_back);
+
+    assert!(!warehouse.root.join("node").is_dir(), "\"node\" must now be a file, not a directory");
+    assert_eq!(std::fs::read(warehouse.root.join("node")).unwrap(), giant,
+               "the chunked file's content must be materialized exactly");
+
+    let status = stdout(&warehouse.run(&["stocktake"]));
+    assert!(status.contains("The inventory matches the pallet head"), "status: {}", status);
+    assert!(status.contains("The working directory matches the inventory"), "status: {}", status);
+}

@@ -84,6 +84,8 @@ fn dir_code(item_type: DirEntryType) -> u8 {
         DirEntryType::Executable => 2,
         DirEntryType::SymbolicLink => 3,
         DirEntryType::Tree => 4,
+        DirEntryType::NormalChunked => 5,
+        DirEntryType::ExecutableChunked => 6,
     }
 }
 
