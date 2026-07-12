@@ -1155,6 +1155,25 @@ async fn authorize_subtree(_state: &AppState,
 }
 
 /// `GET /v1/objects/{hash}` — the raw object bytes.
+///
+/// This buffers the whole object in memory. `put_object` below buffers the whole request body too,
+/// and *that* side is bounded by the default-on body cap (`DefaultBodyLimit`, wired to
+/// `MAX_OBJECT_BYTES` — 64 MiB — unless `max_body_mb` overrides it): a request larger than the cap
+/// is rejected by the framework before this handler's body even runs. `get_object`'s bound is a
+/// different, write-side guarantee: `store_object_bytes`/`store_object_stream` refuse to *write* an
+/// over-ceiling object (W7), and post-chunking a blob is below the chunk threshold and a chunk is
+/// `<=` 4 MiB — so any object *authored under this policy* that a healthy GET can reach is already
+/// `<= MAX_OBJECT_BYTES` by construction, not because this handler enforces anything on the way out.
+/// **The one exception, by design:** a grandfathered pre-ceiling blob (imported from an old-version
+/// bundle before `MAX_OBJECT_BYTES` existed) stays readable forever — the ceiling gates writes and
+/// imports, never reads — so `get_object` serves it whole and genuinely unbounded; that is the
+/// documented cost of "old data stays readable," not an oversight here. True streaming of these two
+/// handlers (to match the AWS head's presigned-URL data plane) is deliberately not done: a streamed
+/// `GET` would have to bypass `retrieve_object_by_hash`, which content-verifies before returning and
+/// reconstructs packed/delta objects in memory — i.e. rework the store read API, not just the
+/// handler — and a streamed `PUT` would need a new ceiling-enforcing, EOF-terminated streaming store
+/// variant plus an async→sync body bridge. Neither is a handler-local change, and neither closes the
+/// grandfathered-blob gap above, so the boundedness is left as described rather than reworked here.
 async fn get_object(State(state): State<Arc<AppState>>,
                     headers: HeaderMap,
                     Path(params): Path<PathParams>) -> Response {

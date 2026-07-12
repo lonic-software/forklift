@@ -18,12 +18,16 @@
 //!
 //! # Where the bytes go
 //!
-//! On an S3-backed head the object and bundle endpoints answer `307` to a presigned storage
-//! URL: object `GET` redirects to the canonical key, a staged `PUT` redirects to
-//! `staging/{session}/{hash}` (never the hash key — invariant 1), and a `batch` bundle
-//! redirects to an ephemeral response key. The control plane never carries object bytes it
-//! can hand off, which is what keeps a Lambda inside its few-megabyte response limit. The
-//! self-host equivalent (the fakes) serves those bytes inline, and [`handle`] answers both
+//! On an S3-backed head the object and bundle endpoints answer with a redirect to a presigned
+//! storage URL: an object `GET` redirects to the canonical key and a staged `PUT` redirects to
+//! `staging/{session}/{hash}` (never the hash key — invariant 1), both `307 Temporary Redirect`
+//! since the client must replay the same method at the target. A `batch` bundle redirects to an
+//! ephemeral response key with `303 See Other` instead — the target is always a presigned `GET`,
+//! and the original request was a `POST`, so the redirect must tell the client to *switch*
+//! methods rather than replay the `POST` (which a `307`/`308` would, failing signature
+//! verification against a `GET`-only presigned URL). The control plane never carries object
+//! bytes it can hand off, which is what keeps a Lambda inside its few-megabyte response limit.
+//! The self-host equivalent (the fakes) serves those bytes inline, and [`handle`] answers both
 //! shapes so one router serves both stores.
 //!
 //! # Multi-warehouse routing
@@ -342,20 +346,24 @@ where
             match head.batch(&request.hashes)? {
                 // A bundle is already a zstd stream; mark it `identity` so nothing re-wraps it.
                 BatchResult::Bundle(bundle) => Ok(octet_stream(StatusCode::OK, bundle, true)),
-                BatchResult::Redirect(url) => Ok(redirect(&url)),
+                // `303`, not `307`/`308`: the redirect target is a presigned `GET`, but this
+                // request was a `POST` — the client must switch methods, not replay it (see
+                // `redirect`'s doc comment).
+                BatchResult::Redirect(url) => Ok(redirect(&url, StatusCode::SEE_OTHER)),
             }
         }
 
         Route::ObjectGet(hash) => match head.object_get(&hash)? {
             ObjectReadResult::Bytes(bytes) => Ok(octet_stream(StatusCode::OK, bytes, false)),
-            ObjectReadResult::Redirect(url) => Ok(redirect(&url)),
+            ObjectReadResult::Redirect(url) => Ok(redirect(&url, StatusCode::TEMPORARY_REDIRECT)),
         },
 
         Route::ObjectPut { hash, session } => {
             match head.object_put(session.as_deref(), &hash, &body)? {
                 ObjectWriteResult::Stored { created: true } => Ok(empty(StatusCode::CREATED)),
                 ObjectWriteResult::Stored { created: false } => Ok(empty(StatusCode::OK)),
-                ObjectWriteResult::Redirect(url) => Ok(redirect(&url)),
+                ObjectWriteResult::Redirect(url) =>
+                    Ok(redirect(&url, StatusCode::TEMPORARY_REDIRECT)),
             }
         }
 
@@ -468,7 +476,8 @@ fn parse_json<T: serde::de::DeserializeOwned>(body: &[u8]) -> HeadResult<T> {
 
 // -------------------------------------------------------------------------------------------
 // Response shaping. Every response the head emits is one of: a JSON body, raw object/bundle
-// bytes, a `307` to a storage URL, an empty status, or a JSON error `{"error": …}`.
+// bytes, a redirect to a storage URL (`307` or `303`, see `redirect`), an empty status, or a
+// JSON error `{"error": …}`.
 // -------------------------------------------------------------------------------------------
 
 /// A JSON response with the given status.
@@ -502,11 +511,22 @@ fn octet_stream(status: StatusCode, bytes: Vec<u8>, identity_encoding: bool) -> 
     builder.body(bytes).expect("a valid octet-stream response")
 }
 
-/// A `307 Temporary Redirect` to a presigned storage URL. The client follows it for the
-/// object/bundle bytes; the body is empty by design (the bytes are behind the `Location`).
-fn redirect(url: &str) -> Response<Vec<u8>> {
+/// A redirect to a presigned storage URL. The body is always empty by design — the bytes are
+/// behind the `Location` — but the *status* depends on whether the client must replay its
+/// original method at that URL or switch to `GET`:
+///
+/// * `307 Temporary Redirect` for an object `GET`/`PUT`: the target expects the same method,
+///   and `307`/`308` are the only redirect statuses standard HTTP clients replay unchanged
+///   (body included), which is exactly what a presigned PUT needs.
+/// * `303 See Other` for the `batch` bundle: the original request is a `POST`, but the target
+///   is always a presigned `GET` — replaying the `POST` there (what `307`/`308` would do) fails
+///   signature verification, since SigV4 bakes the method into the signature. `303` is the
+///   status built for precisely this "the response to your POST is over there, fetch it with
+///   GET" redirect, and every mainstream client (including this protocol's own `reqwest`-based
+///   one) follows it that way automatically.
+fn redirect(url: &str, status: StatusCode) -> Response<Vec<u8>> {
     Response::builder()
-        .status(StatusCode::TEMPORARY_REDIRECT)
+        .status(status)
         .header(header::LOCATION, url)
         .body(Vec::new())
         .expect("a valid redirect response")

@@ -2743,8 +2743,8 @@ fn a_content_corrupted_in_scope_blob_passes_closure_but_fails_on_read() {
     let _scope = forklift_core::globals::StorageRootScope::enter(&area.path("sparse"));
     let fetch_scope = forklift_core::util::scope_utils::read_fetch_scope().unwrap();
 
-    // Closure passes: the blob is present, and audit only presence-checks blobs.
-    forklift_core::util::audit_utils::verify_parcel_closure_scoped(&sparse_head, None, &fetch_scope)
+    // Closure passes: the blob is present, and a normal audit only presence-checks blobs.
+    forklift_core::util::audit_utils::verify_parcel_closure_scoped(&sparse_head, None, &fetch_scope, false)
         .expect("a present (if content-corrupted) in-scope blob passes the presence-only closure check");
 
     // Reading it does catch the corruption — the content-addressed read re-hashes.

@@ -284,6 +284,31 @@ pub fn parse_recipe_bytes(hash: &str, bytes: &[u8]) -> Result<Recipe, String> {
     }
 }
 
+/// Parse a tree from raw object bytes the caller already holds (rather than reading it from the
+/// local object store), enforcing the whole-object ceiling first. The store-backed tree-load path
+/// the AWS head needs for the commit-gate closure prune (§9.4b W1): pruning a new parcel's tree
+/// against the prior head's (already-complete) tree requires reading the prior head's subtrees,
+/// which are *not* mirrored into the audit scratch (they are already-audited history) — so the head
+/// fetches their bytes from object storage and parses them here. The ceiling check bounds a
+/// hand-crafted over-size tree the same way [`store_object_bytes`] would on any other import path.
+///
+/// # Arguments
+/// * `hash`  - The hash the bytes are addressed by (for the error message; not re-verified here —
+///             the caller reads it from a content-addressed store that already verified it).
+/// * `bytes` - The full (uncompressed) tree object bytes.
+///
+/// # Returns
+/// * `Ok(TreeItem)` - The parsed tree.
+/// * `Err(String)`  - If the bytes exceed the ceiling, or are not a tree.
+pub fn parse_tree_bytes(hash: &str, bytes: &[u8]) -> Result<TreeItem, String> {
+    enforce_object_ceiling(bytes)?;
+
+    match parser::object::loose_object_parser::parse(bytes)? {
+        ParsedObject::Tree(tree) => Ok(tree),
+        other => Err(format!("Object {} is a {}, not a tree.", hash, other.get_type())),
+    }
+}
+
 /// Load and parse the chunk object with the given hash from the object store. The per-chunk
 /// ceiling is enforced on read by the parser.
 ///

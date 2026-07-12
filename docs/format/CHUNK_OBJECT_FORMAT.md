@@ -25,3 +25,13 @@ claims.
 Chunks are **never** packed or delta-compressed: each stays an individually addressable loose
 object (a hosted head serves each chunk as its own presigned GET, and loose chunks give O(1)
 ranged reads). Recipes, by contrast, are packed and delta-compressed like blobs.
+
+At scale this leaves a known, self-host-only operability gap: a multi-TB warehouse is millions of
+loose chunk files (roughly one per megabyte of content), so `gc`/`audit`'s `read_dir`-based sweeps
+face real filesystem inode pressure, directory-scan cost, and backup/rsync cost on local disk.
+Object storage (the hosted head) has no such limit, so the gap is scoped to `forklift-server`'s
+local disk. The named-but-deferred mitigation is a **chunk-pack with a range index** for the
+self-host head — many chunks concatenated into one pack file with a `hash → (offset, length)`
+index and no delta between them (the reasons chunks stay undelta'd are unaffected: presigned-GET
+addressability does not apply to a self-host head, and O(1) ranged reads survive a flat offset
+index). It is not built here; it is recorded so it is not lost.

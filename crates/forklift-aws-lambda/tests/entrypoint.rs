@@ -322,7 +322,8 @@ fn signature_endpoints_map_created_idempotent_and_conflict() {
 }
 
 // -------------------------------------------------------------------------------------------
-// The presigned byte plane: object reads/writes and the batch bundle answer 307.
+// The presigned byte plane: object reads/writes answer 307 (same method replayed at the
+// target); the batch bundle answers 303 instead, since its POST must switch to a GET.
 // -------------------------------------------------------------------------------------------
 
 /// A staging store redirects object reads to the canonical key, refuses a session-less upload,
@@ -495,8 +496,10 @@ fn commit_lift_over_the_shared_cap_is_a_422() {
     assert!(message.contains(&MAX_MISSING_BATCH.to_string()), "{}", message);
 }
 
-/// A `batch` over a store that offloads answers 307 to a presigned response URL, outside the
-/// object namespace; a direct store streams the bundle inline as `application/octet-stream`.
+/// A `batch` over a store that offloads answers 303 (not 307 — this request is a POST, and the
+/// presigned response URL only ever accepts GET, so the client must switch methods rather than
+/// replay the POST there) to a presigned response URL, outside the object namespace; a direct
+/// store streams the bundle inline as `application/octet-stream`.
 #[test]
 fn batch_offloads_or_streams_by_store() {
     let area = Area::new("batch");
@@ -528,7 +531,7 @@ fn batch_offloads_or_streams_by_store() {
         staging.objects.put_verified(hash, bytes).expect("seed");
     }
     let response = staging.call(post_json("/v1/objects/batch", &MissingObjectsRequest { hashes }));
-    assert_eq!(status(&response), 307);
+    assert_eq!(status(&response), 303, "a POST redirecting to a GET-only target answers 303, not 307");
     let url = location(&response);
     assert!(url.starts_with("https://s3.example/bucket/responses/"), "{}", url);
     assert!(!url.contains("/objects/"), "a response body is never an object");

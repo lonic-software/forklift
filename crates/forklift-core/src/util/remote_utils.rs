@@ -130,6 +130,13 @@ pub enum LiftResult {
 #[derive(Clone)]
 pub struct RemoteClient {
     http: reqwest::Client,
+    /// Same endpoint, automatic redirect-following disabled. `fetch_batch`'s `POST` uses
+    /// this one: reqwest's default policy replays a `307`/`308` redirect with the original
+    /// method *and body*, which would re-`POST` this call's signed JSON at a URL presigned
+    /// for `GET` only — failing signature verification on a real S3-backed head (LocalStack
+    /// answers `500`, AWS `403 SignatureDoesNotMatch`). Redirects off this client are instead
+    /// inspected and followed by hand with a fresh `GET` (see `fetch_batch`).
+    no_redirect: reqwest::Client,
     base: String,
     token: Option<String>,
 }
@@ -149,8 +156,14 @@ impl RemoteClient {
             .build()
             .map_err(|e| format!("Error while creating the HTTP client: {}", e))?;
 
+        let no_redirect = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| format!("Error while creating the HTTP client: {}", e))?;
+
         Ok(RemoteClient {
             http,
+            no_redirect,
             base: url.trim_end_matches('/').to_string(),
             token,
         })
@@ -183,7 +196,17 @@ impl RemoteClient {
     }
 
     fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
-        let mut builder = self.http.request(method, format!("{}{}", self.base, path));
+        self.request_on(&self.http, method, path)
+    }
+
+    /// Build a request against this remote using a specific underlying `reqwest::Client` —
+    /// the seam `fetch_batch` uses to send its `POST` through [`RemoteClient::no_redirect`]
+    /// instead of the redirect-following default.
+    fn request_on(&self,
+                   http: &reqwest::Client,
+                   method: reqwest::Method,
+                   path: &str) -> reqwest::RequestBuilder {
+        let mut builder = http.request(method, format!("{}{}", self.base, path));
 
         if let Some(token) = &self.token {
             builder = builder.bearer_auth(token);
@@ -291,8 +314,21 @@ impl RemoteClient {
     /// Fetch many objects in one round trip as a bundle-format stream
     /// (`POST /v1/objects/batch`). `None` when the remote predates the endpoint
     /// (a `404`) — the caller falls back to loose fetches.
+    ///
+    /// An offloading (storage-backed) head cannot stream a large bundle back through its own
+    /// control plane, so it answers this `POST` with a redirect to a presigned `GET` of the
+    /// bundle bytes under an ephemeral response key (`303 See Other` from a fixed head; a
+    /// `307`/`308` from an older one is followed identically). The redirect is followed **by
+    /// hand**, never by reqwest's automatic policy (this call goes out on [`Self::no_redirect`]
+    /// for exactly that reason): a `307`/`308` replays the original request verbatim — method
+    /// and JSON body — which would re-`POST` this call's body at a URL SigV4-signed for `GET`
+    /// only, failing signature verification (`500` on LocalStack, `403 SignatureDoesNotMatch`
+    /// on real AWS) rather than fetching anything. The follow-up `GET` also deliberately omits
+    /// this remote's `Authorization` header: the presigned URL is self-authorizing, and
+    /// forwarding a bearer token meant for the control plane to a storage host it was never
+    /// issued for would be a needless credential leak.
     pub async fn fetch_batch(&self, hashes: &[String]) -> Result<Option<Vec<u8>>, String> {
-        let response = self.request(reqwest::Method::POST, "/v1/objects/batch")
+        let response = self.request_on(&self.no_redirect, reqwest::Method::POST, "/v1/objects/batch")
             .json(&MissingObjectsRequest { hashes: hashes.to_vec() })
             .send()
             .await
@@ -301,6 +337,28 @@ impl RemoteClient {
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
+
+        let response = match response.status() {
+            reqwest::StatusCode::SEE_OTHER
+            | reqwest::StatusCode::TEMPORARY_REDIRECT
+            | reqwest::StatusCode::PERMANENT_REDIRECT => {
+                let location = response.headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|value| value.to_str().ok())
+                    .ok_or_else(|| {
+                        "The remote's batch redirect carried no usable Location header.".to_string()
+                    })?
+                    .to_string();
+
+                // A bare GET: no Authorization header (the URL is self-authorizing) and no
+                // body — the request the redirect target is actually presigned for.
+                self.http.get(&location)
+                    .send()
+                    .await
+                    .map_err(|e| format!("Error while following the batch redirect: {}", e))?
+            }
+            _ => response,
+        };
 
         if !response.status().is_success() {
             return Err(Self::error_of(response, "the batch fetch").await);
@@ -1015,6 +1073,14 @@ async fn fetch_missing_objects(client: &RemoteClient, hashes: &[String]) -> Resu
 /// imports the tree+recipe closure and then fetches the in-scope chunks per object here, exactly
 /// the "a bundle is an optimization; missing objects fall back to loose GET" contract.
 ///
+/// Deliberately calls [`fetch_loose_objects`] directly rather than [`fetch_missing_objects`] —
+/// chunks always fetch one presigned `GET` each, **never** through `POST /v1/objects/batch`, no
+/// matter how many are missing (DESIGN.html §9.4b: "franchise, lower and expand fetch chunks
+/// per-object after the bundle wave"). A chunk is capped at 4 MiB and already hash-verified on
+/// store, so a bundle buys chunks nothing a loose fetch doesn't already give; routing them
+/// through `batch` would only be a redirect an offloading head has to mint and a client has to
+/// follow for no benefit.
+///
 /// Each recipe is loaded from the now-present local object (which re-hashes it and runs the
 /// `sum(sizes) == total` structural check) and its chunk hashes are collected — deduplicated across
 /// recipes so a chunk shared by two files is fetched once. `store_object_bytes` hash-verifies every
@@ -1045,7 +1111,19 @@ async fn fetch_recipe_chunks(client: &RemoteClient, recipe_hashes: &[String]) ->
         }
     }
 
-    fetch_missing_objects(client, &chunk_hashes).await
+    let mut missing: Vec<String> = Vec::new();
+
+    for hash in &chunk_hashes {
+        if !file_utils::does_object_exist(hash)? {
+            missing.push(hash.clone());
+        }
+    }
+
+    if missing.is_empty() {
+        return Ok(0);
+    }
+
+    fetch_loose_objects(client, &missing).await
 }
 
 /// Fetch (concurrently) the given objects one GET each. All of them are assumed
@@ -2045,6 +2123,7 @@ pub async fn resolve_office_display_names() -> BTreeMap<String, String> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::sync::Mutex;
     use crate::builder::object::loose_object_builder::LooseObjectBuilder;
     use crate::globals::StorageRootScope;
 
@@ -2726,7 +2805,7 @@ mod tests {
     ) {
         use std::io::Write;
 
-        let Some((path, body)) = read_test_request(&mut stream) else { return };
+        let Some((_method, path, _had_auth, body)) = read_test_request(&mut stream) else { return };
 
         let (status, response_body): (&str, String) = if path == "/v1/warehouse" {
             (
@@ -2763,9 +2842,10 @@ mod tests {
         let _ = stream.flush();
     }
 
-    /// Read one HTTP/1.1 request (start line + content-length body only; no header inspection is
-    /// needed by this fake). Returns `(path, body)`.
-    fn read_test_request(stream: &mut std::net::TcpStream) -> Option<(String, Vec<u8>)> {
+    /// Read one HTTP/1.1 request (start line, an `Authorization` header check, and a
+    /// content-length body; no other header inspection is needed by any of this file's fakes).
+    /// Returns `(method, path, had_authorization_header, body)`.
+    fn read_test_request(stream: &mut std::net::TcpStream) -> Option<(String, String, bool, Vec<u8>)> {
         use std::io::Read;
 
         let mut buffer = Vec::new();
@@ -2784,7 +2864,12 @@ mod tests {
         };
 
         let head = String::from_utf8_lossy(&buffer[..header_end]).to_string();
-        let path = head.lines().next()?.split_whitespace().nth(1)?.to_string();
+        let mut start_line = head.lines().next()?.split_whitespace();
+        let method = start_line.next()?.to_string();
+        let path = start_line.next()?.to_string();
+
+        let had_authorization = head.lines()
+            .any(|line| line.to_ascii_lowercase().starts_with("authorization:"));
 
         let content_length: usize = head.lines()
             .find(|line| line.to_ascii_lowercase().starts_with("content-length:"))
@@ -2804,7 +2889,7 @@ mod tests {
 
         body.truncate(content_length);
 
-        Some((path, body))
+        Some((method, path, had_authorization, body))
     }
 
     /// A synthetic candidate set larger than `MAX_MISSING_BATCH` — hashes that name no real
@@ -2867,5 +2952,287 @@ mod tests {
             remote.upload_or_commit_hits() > 0,
             "the small lift's upload/commit phase ran normally"
         );
+    }
+
+    // -----------------------------------------------------------------------------------
+    // The batch redirect, over a real socket (the §9.4b LocalStack pass fix). An offloading
+    // head answers `POST /v1/objects/batch` with a redirect to a presigned `GET`; the bug this
+    // fix closes is that reqwest's default policy replays a `307`/`308` redirect with the
+    // *original* request — method and body — which re-`POST`s this call's signed JSON at a URL
+    // presigned for `GET` only (a real S3-backed head answers `403 SignatureDoesNotMatch`,
+    // LocalStack `500`). `fetch_batch` must instead follow the redirect by hand: a bare `GET`,
+    // no body, no `Authorization` header (the presigned URL is self-authorizing). These tests
+    // also cover `fetch_recipe_chunks`'s designed-transport invariant: it must never reach
+    // `/v1/objects/batch` at all, only ever loose per-object `GET`s.
+    // -----------------------------------------------------------------------------------
+
+    /// A minimal HTTP server standing in for an OFFLOADING head. Unlike [`FakeStagingRemote`]
+    /// (which never redirects), `POST /v1/objects/batch` here answers a caller-chosen redirect
+    /// status pointing at a same-origin `GET` target serving real bundle bytes, and
+    /// `GET /v1/objects/{hash}` serves individually-registered object bytes (the loose-fetch
+    /// path). Every request's method, path, and whether it carried an `Authorization` header
+    /// are recorded, so a test can assert exactly which endpoint a client hit and whether it
+    /// leaked its bearer token to the redirect target.
+    struct FakeOffloadingRemote {
+        url: String,
+        hits: Arc<Mutex<Vec<(String, String, bool)>>>,
+    }
+
+    impl FakeOffloadingRemote {
+        /// `redirect_status` is what `POST /v1/objects/batch` answers with (this fix's server
+        /// half only ever emits `303`, but `307`/`308` from an older or non-conforming head
+        /// must be followed identically); `bundle` is served at the redirect target;
+        /// `objects` seeds the loose `GET /v1/objects/{hash}` endpoint.
+        fn start(
+            redirect_status: u16,
+            bundle: Vec<u8>,
+            objects: HashMap<String, Vec<u8>>,
+        ) -> FakeOffloadingRemote {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let hits: Arc<Mutex<Vec<(String, String, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+            let accepted_hits = Arc::clone(&hits);
+            let base = url.clone();
+            let bundle = Arc::new(bundle);
+            let objects = Arc::new(objects);
+
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(stream) = stream else { continue };
+                    let hits = Arc::clone(&accepted_hits);
+                    let base = base.clone();
+                    let bundle = Arc::clone(&bundle);
+                    let objects = Arc::clone(&objects);
+
+                    std::thread::spawn(move || {
+                        handle_offloading_request(stream, redirect_status, &base, &bundle, &objects, &hits);
+                    });
+                }
+            });
+
+            FakeOffloadingRemote { url, hits }
+        }
+
+        /// How many requests hit `/v1/objects/batch` — must stay `0` for a chunk fetch.
+        fn batch_hits(&self) -> usize {
+            self.hits.lock().unwrap().iter().filter(|(_, path, _)| path == "/v1/objects/batch").count()
+        }
+
+        /// How many requests hit exactly `path`.
+        fn hits_for(&self, path: &str) -> usize {
+            self.hits.lock().unwrap().iter().filter(|(_, p, _)| p == path).count()
+        }
+
+        /// Whether any recorded request to `path` carried an `Authorization` header.
+        fn any_had_auth(&self, path: &str) -> bool {
+            self.hits.lock().unwrap().iter().any(|(_, p, had_auth)| p == path && *had_auth)
+        }
+    }
+
+    /// Handle exactly one connection/request for [`FakeOffloadingRemote`].
+    fn handle_offloading_request(
+        mut stream: std::net::TcpStream,
+        redirect_status: u16,
+        base: &str,
+        bundle: &[u8],
+        objects: &HashMap<String, Vec<u8>>,
+        hits: &Mutex<Vec<(String, String, bool)>>,
+    ) {
+        use std::io::Write;
+
+        let Some((method, path, had_auth, _body)) = read_test_request(&mut stream) else { return };
+        hits.lock().unwrap().push((method.clone(), path.clone(), had_auth));
+
+        if method == "POST" && path == "/v1/objects/batch" {
+            let reason = match redirect_status {
+                303 => "See Other",
+                307 => "Temporary Redirect",
+                308 => "Permanent Redirect",
+                _ => "Redirect",
+            };
+            let location = format!("{}/responses/bundle", base);
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {} {}\r\nLocation: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                redirect_status, reason, location
+            );
+            let _ = stream.flush();
+            return;
+        }
+
+        if method == "GET" && path == "/responses/bundle" {
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                Content-Length: {}\r\nConnection: close\r\n\r\n",
+                bundle.len()
+            );
+            let _ = stream.write_all(bundle);
+            let _ = stream.flush();
+            return;
+        }
+
+        if method == "GET" {
+            if let Some(hash) = path.strip_prefix("/v1/objects/") {
+                if let Some(bytes) = objects.get(hash) {
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                        Content-Length: {}\r\nConnection: close\r\n\r\n",
+                        bytes.len()
+                    );
+                    let _ = stream.write_all(bytes);
+                    let _ = stream.flush();
+                    return;
+                }
+            }
+        }
+
+        let _ = write!(stream, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let _ = stream.flush();
+    }
+
+    /// The general bug, reproduced against the fast in-process suite (the original repro needed
+    /// real S3 + a real head, since the in-memory fakes' `offload_response` only offloads when
+    /// explicitly put in staging mode, and no prior test drove an actual `reqwest`-backed client
+    /// through that redirect): a multi-object batch fetch against an offloading head must land
+    /// every object by following the redirect **by hand**, whatever status it carries.
+    #[test]
+    fn fetch_missing_objects_follows_a_batch_redirect_by_hand_without_leaking_auth() {
+        for redirect_status in [303u16, 307, 308] {
+            // The "server side": build the exact bundle bytes a real `POST /v1/objects/batch`
+            // would answer, then tear the scope down before the "client side" begins. A hash is
+            // purely a function of an object's bytes, so `first`/`second` name the same objects
+            // regardless of which scope built them.
+            let (first, second, bundle) = {
+                let _server_scope = Scratch::new(&format!("offload-batch-server-{}", redirect_status));
+                let first = store_blob(&format!("first-{}", redirect_status));
+                let second = store_blob(&format!("second-{}", redirect_status));
+                let bundle =
+                    bundle_utils::build_partial_bundle(&[first.clone(), second.clone()]).unwrap();
+                (first, second, bundle)
+            };
+
+            // The "client side": a fresh, empty store, and a remote that redirects the batch
+            // POST to a same-origin GET serving that bundle.
+            let _client_scope = Scratch::new(&format!("offload-batch-client-{}", redirect_status));
+            let remote = FakeOffloadingRemote::start(redirect_status, bundle, HashMap::new());
+            let client = RemoteClient::new(&remote.url, Some("shhh".to_string())).unwrap();
+            let hashes = vec![first.clone(), second.clone()];
+
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let fetched = runtime.block_on(fetch_missing_objects(&client, &hashes))
+                .unwrap_or_else(|e| panic!("status {}: the redirect must be followed, not \
+                    replayed as a POST: {}", redirect_status, e));
+
+            assert_eq!(fetched, 2, "status {}", redirect_status);
+            assert!(file_utils::does_object_exist(&first).unwrap(), "status {}", redirect_status);
+            assert!(file_utils::does_object_exist(&second).unwrap(), "status {}", redirect_status);
+
+            assert_eq!(
+                remote.batch_hits(), 1,
+                "exactly one batch round trip, status {}", redirect_status
+            );
+            assert!(
+                remote.any_had_auth("/v1/objects/batch"),
+                "the batch POST itself still carries this remote's bearer token, status {}",
+                redirect_status
+            );
+            assert!(
+                !remote.any_had_auth("/responses/bundle"),
+                "the presigned-URL follow-up must not carry this remote's bearer token, status {}",
+                redirect_status
+            );
+        }
+    }
+
+    /// A redirect that carries no usable `Location` header (a malformed or hostile head) is an
+    /// honest error, not a panic and not a silently empty result.
+    #[test]
+    fn fetch_batch_errors_honestly_on_a_locationless_redirect() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+
+        std::thread::spawn(move || {
+            use std::io::Write;
+
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = read_test_request(&mut stream);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 303 See Other\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.flush();
+            }
+        });
+
+        let client = RemoteClient::new(&url, None).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let error = runtime.block_on(client.fetch_batch(&["a".repeat(64)])).unwrap_err();
+
+        assert!(
+            error.to_lowercase().contains("location"),
+            "the error should name the missing Location header: {}", error
+        );
+    }
+
+    /// The designed transport for chunks (DESIGN.html §9.4b: "franchise, lower and expand fetch
+    /// chunks per-object after the bundle wave") — `fetch_recipe_chunks` must never route
+    /// through `POST /v1/objects/batch`, no matter how many chunks are missing at once, unlike
+    /// the general `fetch_missing_objects` path it deliberately does not delegate to for this.
+    #[test]
+    fn fetch_recipe_chunks_never_touches_the_batch_endpoint() {
+        let _scratch = Scratch::new("recipe-chunks-loose-only");
+
+        // Two chunks, built but never stored — "missing locally", the precondition
+        // `fetch_recipe_chunks` expects for the chunks it fetches.
+        let chunk_a = LooseObjectBuilder::build_chunk(&crate::model::chunk::Chunk {
+            content: b"chunk a bytes".to_vec(),
+        });
+        let chunk_b = LooseObjectBuilder::build_chunk(&crate::model::chunk::Chunk {
+            content: b"chunk b bytes, a bit longer".to_vec(),
+        });
+
+        // The recipe itself must already be present locally (it rides the ordinary blob wave in
+        // production; `fetch_recipe_chunks` only ever runs after that has landed).
+        let recipe_hash = {
+            use crate::model::recipe::{Recipe, RecipeChunk};
+
+            let recipe = Recipe {
+                content_hash: "f".repeat(64),
+                total_size: (chunk_a.content.len() + chunk_b.content.len()) as u64,
+                chunks: vec![
+                    RecipeChunk { hash: chunk_a.hash.clone(), size: chunk_a.content.len() as u64 },
+                    RecipeChunk { hash: chunk_b.hash.clone(), size: chunk_b.content.len() as u64 },
+                ],
+            };
+            let mut object = LooseObjectBuilder::build_recipe(&recipe);
+            object.store().unwrap();
+            object.hash
+        };
+
+        assert!(!file_utils::does_object_exist(&chunk_a.hash).unwrap(), "chunk a starts missing");
+        assert!(!file_utils::does_object_exist(&chunk_b.hash).unwrap(), "chunk b starts missing");
+
+        let mut objects = HashMap::new();
+        objects.insert(chunk_a.hash.clone(), chunk_a.content.clone());
+        objects.insert(chunk_b.hash.clone(), chunk_b.content.clone());
+
+        // The batch endpoint is wired (so a regression fails loudly instead of hanging), but
+        // must never be hit.
+        let remote = FakeOffloadingRemote::start(303, Vec::new(), objects);
+        let client = RemoteClient::new(&remote.url, None).unwrap();
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let fetched = runtime.block_on(fetch_recipe_chunks(&client, &[recipe_hash]))
+            .expect("both chunks fetch loose");
+
+        assert_eq!(fetched, 2);
+        assert!(file_utils::does_object_exist(&chunk_a.hash).unwrap());
+        assert!(file_utils::does_object_exist(&chunk_b.hash).unwrap());
+
+        assert_eq!(remote.batch_hits(), 0, "chunks never route through the batch endpoint");
+        assert_eq!(remote.hits_for(&format!("/v1/objects/{}", chunk_a.hash)), 1);
+        assert_eq!(remote.hits_for(&format!("/v1/objects/{}", chunk_b.hash)), 1);
     }
 }

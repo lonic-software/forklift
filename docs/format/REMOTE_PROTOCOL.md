@@ -153,13 +153,19 @@ fall back entirely. Every imported record is hash-verified before it lands, exac
 like a bundle import.
 
 The bundle is the one response with no small upper bound — it is as large as the objects
-asked for. A storage-backed head may therefore answer `307` with a `Location` of a
+asked for. A storage-backed head may therefore answer `303 See Other` with a `Location` of a
 presigned `GET` for the bundle rather than streaming megabytes back through the control
 plane (the same medicine as the upload path, in the other direction; a Lambda control plane
-cannot return more than a few megabytes at all). The bytes live under an **ephemeral,
-content-addressed response prefix**, never the `objects/` namespace, so nothing there is
-reachable as an object at a hash key and invariant 1 is not in play — and the client
-hash-verifies every record on import regardless.
+cannot return more than a few megabytes at all). This is `303`, not the `307` a `GET`/`PUT`
+redirect uses: the original request here is a `POST`, but the target only ever accepts `GET`,
+so the redirect must tell the client to switch methods rather than replay the `POST` — which
+would fail signature verification against a presigned URL signed for `GET` only. Clients must
+follow this redirect by issuing a plain `GET` (no request body, and no `Authorization` header —
+the presigned URL is self-authorizing) rather than relying on generic HTTP redirect-following,
+since a `307`/`308` from an older or non-conforming head must still be handled the same way.
+The bytes live under an **ephemeral, content-addressed response prefix**, never the `objects/`
+namespace, so nothing there is reachable as an object at a hash key and invariant 1 is not in
+play — and the client hash-verifies every record on import regardless.
 
 ### `GET /v1/parcels/{parcel}/subtree/{path}` (additive; the path-addressed fetch)
 

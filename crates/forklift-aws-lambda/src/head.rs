@@ -29,6 +29,7 @@ use forklift_core::model::remote::{
     RefUpdateRequest, TrustAnchorDto, UploadTargetsResponse, WarehouseInfo,
     LIFT_SESSION_BLOB_NOT_READY, MAX_MISSING_BATCH, PROTOCOL_VERSION,
 };
+use forklift_core::model::tree_item::TreeItem;
 use forklift_core::util::office_utils::OFFICE_PALLET_NAME;
 use forklift_core::util::pallet_utils::{PalletNamespace, PalletRef};
 use forklift_core::util::{
@@ -66,7 +67,10 @@ pub enum ObjectWriteResult {
 pub enum BatchResult {
     /// The bundle-format stream (the head serves it itself).
     Bundle(Vec<u8>),
-    /// Follow this presigned URL for the bundle (`307`).
+    /// Follow this presigned URL for the bundle. The router answers `303` (not `307`/`308`):
+    /// this request was a `POST`, but the target is always a presigned `GET`, so the client
+    /// must switch methods rather than replay the `POST` — which would fail signature
+    /// verification against a `GET`-only presigned URL.
     Redirect(String),
 }
 
@@ -417,11 +421,25 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                     .map(|chunk| chunk.hash)
                     .collect())
             };
+            // The subtree prune (§9.4b W1) reads the prior head's trees to skip unchanged subtrees.
+            // Like recipes, those trees are already-audited history and are never mirrored into the
+            // audit scratch, so they are read from the object store here — and (the point of the
+            // prune) an unchanged large chunked file below such a subtree is skipped whole, sparing
+            // the ~million per-chunk S3 `HEAD`s its recipe descent would otherwise cost per push.
+            let load_base_tree = |hash: &str| -> Result<TreeItem, String> {
+                let bytes = self
+                    .objects
+                    .get(hash)?
+                    .ok_or_else(|| format!("Tree {} is missing.", hash))?;
+
+                object_utils::parse_tree_bytes(hash, &bytes)
+            };
             audit_utils::verify_parcel_closure_with(
                 &request.new_head,
                 request.old_head.as_deref(),
                 &blob_exists,
                 &load_recipe_chunks,
+                &load_base_tree,
             )
             .map_err(HeadError::unprocessable)?;
 
@@ -501,8 +519,9 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     ///
     /// The bundle is the one *response* that has no small bound — it is as large as the
     /// objects asked for — so a store that can offload it hands back a presigned `GET`
-    /// (`307`) rather than squeezing megabytes back through the control plane. Same
-    /// medicine as the upload path, in the other direction.
+    /// rather than squeezing megabytes back through the control plane. Same medicine as the
+    /// upload path, in the other direction — except the router answers `303`, not `307`, since
+    /// this request is a `POST` and the presigned target only ever accepts `GET`.
     pub fn batch(&self, hashes: &[String]) -> HeadResult<BatchResult> {
         self.reject_oversized_batch(hashes.len())?;
 

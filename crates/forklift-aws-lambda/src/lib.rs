@@ -5,9 +5,11 @@
 //! The crate is named for its cloud on purpose: a serverless head is an adapter to one
 //! provider's runtime, so a future Azure/GCP head would be a sibling crate, not a
 //! feature flag here. Its contract already exists: it speaks `docs/format/
-//! REMOTE_PROTOCOL.md` (like the self-hostable `forklift-server`), issuing 307
-//! redirects to presigned S3 URLs where the server head serves bytes itself, and
-//! reusing `forklift_core::util::audit_utils` for the ref-update verification.
+//! REMOTE_PROTOCOL.md` (like the self-hostable `forklift-server`), issuing redirects to
+//! presigned S3 URLs where the server head serves bytes itself — `307` for an object
+//! `GET`/`PUT`, `303` for the `batch` bundle, whose `POST` must switch to a `GET` at the
+//! presigned target rather than replay itself — and reusing `forklift_core::util::audit_utils`
+//! for the ref-update verification.
 //!
 //! This head is owned by this repo and open source (decided 2026-07-03): it is the AWS
 //! "driver" — anyone can deploy it on their own AWS infrastructure and host forklift,
