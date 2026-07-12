@@ -29,6 +29,7 @@ use forklift_core::model::remote::{
     RefUpdateRequest, TrustAnchorDto, UploadTargetsResponse, WarehouseInfo,
     LIFT_SESSION_BLOB_NOT_READY, MAX_MISSING_BATCH, PROTOCOL_VERSION,
 };
+use forklift_core::model::tree_item::TreeItem;
 use forklift_core::util::office_utils::OFFICE_PALLET_NAME;
 use forklift_core::util::pallet_utils::{PalletNamespace, PalletRef};
 use forklift_core::util::{
@@ -417,11 +418,25 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                     .map(|chunk| chunk.hash)
                     .collect())
             };
+            // The subtree prune (§9.4b W1) reads the prior head's trees to skip unchanged subtrees.
+            // Like recipes, those trees are already-audited history and are never mirrored into the
+            // audit scratch, so they are read from the object store here — and (the point of the
+            // prune) an unchanged large chunked file below such a subtree is skipped whole, sparing
+            // the ~million per-chunk S3 `HEAD`s its recipe descent would otherwise cost per push.
+            let load_base_tree = |hash: &str| -> Result<TreeItem, String> {
+                let bytes = self
+                    .objects
+                    .get(hash)?
+                    .ok_or_else(|| format!("Tree {} is missing.", hash))?;
+
+                object_utils::parse_tree_bytes(hash, &bytes)
+            };
             audit_utils::verify_parcel_closure_with(
                 &request.new_head,
                 request.old_head.as_deref(),
                 &blob_exists,
                 &load_recipe_chunks,
+                &load_base_tree,
             )
             .map_err(HeadError::unprocessable)?;
 

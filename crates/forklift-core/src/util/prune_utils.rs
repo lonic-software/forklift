@@ -14,6 +14,14 @@
 //! is retained, never freed. Meta pallets (office and the rest) are walked in full and never
 //! scoped — the carve-out this feature depends on.
 //!
+//! A chunked large file (§9.4b) reaches one level deeper: its tree entry names a *recipe*, whose
+//! chunks are content-addressed objects reachable only through it. Freeing such a file frees its
+//! recipe *and* every chunk — the recipe is descended while still present to enumerate them, and
+//! the chunks are freed before the recipe (children before parent, so a killed run stays
+//! resumable). Symmetrically, the retained set descends every in-scope chunked file's recipe too,
+//! so a chunk an out-of-scope pruned file shares with an in-scope kept file is retained, never
+//! freed — the shared-content guarantee, one level below the shared-blob one.
+//!
 //! Callers hold the warehouse lock and narrow the fetch scope *before* deleting (durable
 //! before destructive): once the scope is narrowed, every scope-aware walk reads the pruned
 //! path as out-of-scope, so no deletion can ever leave an object that reads as unexpectedly
@@ -208,6 +216,15 @@ fn collect_retained(
             // children, so an out-of-scope file's blob is simply freeable).
             if post_prune.classify(&join_key(&path, name)) != ScopeClass::OutOfScope {
                 retained.insert(file.hash.clone());
+
+                // A retained chunked file names a recipe (its `file.hash`) whose chunks ride the
+                // store as ordinary, content-addressed, *shareable* objects. Descend the recipe to
+                // retain every chunk too: a chunk this in-scope file shares with an out-of-scope
+                // pruned file must never be freed (the multi-bay/shared-content guard, one level
+                // deeper than the shared-blob guard the subtraction already provides).
+                if file.item_type.is_chunked() {
+                    retain_recipe_chunks(&file.hash, &mut retained)?;
+                }
             }
         }
 
@@ -238,6 +255,12 @@ fn collect_retained(
 
         for (_, file) in tree.get_files() {
             retained.insert(file.hash.clone());
+
+            // Everything under an in-scope (or meta) subtree is retained in full, chunks included
+            // — the same recipe descent the spine walk above does, for the same reason.
+            if file.item_type.is_chunked() {
+                retain_recipe_chunks(&file.hash, &mut retained)?;
+            }
         }
 
         for (_, subtree) in tree.get_subtrees() {
@@ -246,6 +269,26 @@ fn collect_retained(
     }
 
     Ok(retained)
+}
+
+/// Retain every chunk a retained chunked file's recipe names, so a chunk shared with a pruned
+/// out-of-scope file survives (chunks are content-addressed and shared). The recipe hash itself is
+/// already retained by the caller; this descends it to reach the chunk hashes.
+///
+/// The recipe is present by construction here — the caller only descends a file it has classified
+/// in-scope, and an in-scope object was fetched — so a missing one is genuine corruption and fails
+/// loudly (before `plan_prune` narrows or frees anything: durable-before-destructive is preserved),
+/// exactly as the surrounding `load_tree` calls do.
+///
+/// # Arguments
+/// * `recipe_hash` - The hash of a retained chunked file's recipe.
+/// * `retained`    - The live set to add the recipe's chunk hashes into.
+fn retain_recipe_chunks(recipe_hash: &str, retained: &mut HashSet<String>) -> Result<(), String> {
+    for chunk in object_utils::recipe_chunk_hashes(recipe_hash)? {
+        retained.insert(chunk);
+    }
+
+    Ok(())
 }
 
 /// The full closure of every version of the pruned subtree(s) across the reachable user
@@ -309,11 +352,34 @@ fn collect_prune_targets(
                 stack.push(Step::Finalize(hash.clone()));
 
                 for (_, file) in tree.get_files() {
-                    // A blob is a leaf — no descent needed — but it gets the same presence
-                    // tolerance: absent means an earlier run already freed it.
-                    if seen.insert(file.hash.clone()) && file_utils::does_object_exist(&file.hash)? {
-                        ordered.push(file.hash.clone());
+                    if !seen.insert(file.hash.clone()) {
+                        continue;
                     }
+
+                    // Absent already means an earlier run freed it (a recipe, or a plain blob):
+                    // the child-before-parent order guarantees everything beneath it is gone too,
+                    // so skip it whole. (A blob is a leaf; a recipe's chunks were freed first.)
+                    if !file_utils::does_object_exist(&file.hash)? {
+                        continue;
+                    }
+
+                    // A chunked file's tree-entry hash names a recipe, whose chunks are reachable
+                    // *only* through it. Descend the recipe WHILE IT IS STILL PRESENT to enumerate
+                    // its chunks, and place them BEFORE the recipe in `ordered` (children before
+                    // their parent) — so `free_objects` deletes chunks first, then the recipe, and
+                    // a killed run stays resumable: on the next call an absent recipe proves its
+                    // chunks were already freed, while a present recipe still names every chunk a
+                    // partial free left behind. A chunk shared with a retained scope is filtered out
+                    // later by `plan_prune`'s `retained` check, never here.
+                    if file.item_type.is_chunked() {
+                        for chunk in object_utils::recipe_chunk_hashes(&file.hash)? {
+                            if seen.insert(chunk.clone()) && file_utils::does_object_exist(&chunk)? {
+                                ordered.push(chunk);
+                            }
+                        }
+                    }
+
+                    ordered.push(file.hash.clone());
                 }
 
                 for (_, subtree) in tree.get_subtrees() {
@@ -408,6 +474,31 @@ mod tests {
             description: Some("p".to_string()),
         };
         let mut object = LooseObjectBuilder::build_parcel(&parcel);
+        object.store().unwrap();
+        object.hash
+    }
+
+    fn store_chunk(content: &[u8]) -> String {
+        let mut object = LooseObjectBuilder::build_chunk(&crate::model::chunk::Chunk {
+            content: content.to_vec(),
+        });
+        object.store().unwrap();
+        object.hash
+    }
+
+    /// Store a recipe naming the given chunks (a chunked file's tree-entry object). `content_hash`
+    /// is irrelevant to a prune (it enumerates chunk hashes, never re-derives the content), so a
+    /// placeholder is fine here.
+    fn store_recipe(chunks: &[(String, u64)]) -> String {
+        let total_size = chunks.iter().map(|(_, size)| *size).sum();
+        let recipe = crate::model::recipe::Recipe {
+            content_hash: "f".repeat(64),
+            total_size,
+            chunks: chunks.iter()
+                .map(|(h, s)| crate::model::recipe::RecipeChunk { hash: h.clone(), size: *s })
+                .collect(),
+        };
+        let mut object = LooseObjectBuilder::build_recipe(&recipe);
         object.store().unwrap();
         object.hash
     }
@@ -641,5 +732,211 @@ mod tests {
         assert!(!loose_exists(&f.web_tree) && !loose_exists(&f.web_blob), "the resumed prune finished the job");
         object_utils::load_tree(&f.src_tree).expect("the spine still loads after a resumed prune");
         assert!(loose_exists(&f.api_tree) && loose_exists(&f.api_blob), "in-scope content is untouched");
+    }
+
+    #[test]
+    fn plan_prune_frees_a_chunked_files_recipe_and_all_its_chunks() {
+        // A pruned chunked large file reclaims its recipe AND every chunk (chunks are reachable
+        // only through the recipe; a recipe-only free would orphan them), with the chunks ordered
+        // before the recipe so a killed run stays resumable.
+        let _scratch = Scratch::new("chunked-frees-all");
+
+        let api_blob = store_blob("api a v1\n");
+        let api_tree = store_tree(&[("a.txt", &api_blob, DirEntryType::Normal)]);
+
+        let c1 = store_chunk(b"chunk one contents ...");
+        let c2 = store_chunk(b"chunk two contents ...");
+        let recipe = store_recipe(&[(c1.clone(), 22), (c2.clone(), 22)]);
+        // The chunked file lives at web/big.bin — its tree entry names the recipe.
+        let web_tree = store_tree(&[("big.bin", &recipe, DirEntryType::NormalChunked)]);
+
+        let src_tree = store_tree(&[
+            ("api", &api_tree, DirEntryType::Tree),
+            ("web", &web_tree, DirEntryType::Tree),
+        ]);
+        let root_tree = store_tree(&[("src", &src_tree, DirEntryType::Tree)]);
+        let parcel = store_parcel(&root_tree, Vec::new());
+        pallet_utils::set_pallet_head("main", &parcel).unwrap();
+
+        let post_prune = MaterializationScope::from_prefixes(["src/api"]);
+        let plan = plan_prune(&["src/web".to_string()], &post_prune).unwrap();
+
+        // The recipe and both chunks and the web tree are freed — nothing else.
+        for freed in [&recipe, &c1, &c2, &web_tree] {
+            assert!(plan.to_free.contains(freed), "a chunked-file object must be freed: {}", freed);
+        }
+        assert_eq!(plan.to_free.len(), 4, "recipe + 2 chunks + web tree: {:?}", plan.to_free);
+
+        // Children before parents: each chunk precedes the recipe, and the recipe precedes the
+        // web tree that names it — the order that makes a killed free resumable.
+        let pos = |h: &str| plan.to_free.iter().position(|x| x == h).unwrap();
+        assert!(pos(&c1) < pos(&recipe) && pos(&c2) < pos(&recipe),
+            "every chunk must precede its recipe: {:?}", plan.to_free);
+        assert!(pos(&recipe) < pos(&web_tree),
+            "the recipe must precede the tree that names it: {:?}", plan.to_free);
+
+        // The in-scope side is untouched.
+        for kept in [&api_tree, &api_blob, &src_tree, &root_tree, &parcel] {
+            assert!(!plan.to_free.contains(kept), "an in-scope/spine object must survive: {}", kept);
+        }
+
+        // And a real free deletes exactly them.
+        let stats = free_objects(&plan.to_free).unwrap();
+        assert_eq!(stats.freed, 4);
+        assert!(!loose_exists(&c1) && !loose_exists(&c2) && !loose_exists(&recipe),
+            "the recipe and its chunks are gone");
+        assert!(loose_exists(&api_blob), "the in-scope blob survives");
+    }
+
+    #[test]
+    fn plan_prune_keeps_a_chunk_shared_between_a_pruned_and_a_kept_file() {
+        // Content-addressing at chunk granularity: an appended-to / near-identical file shares
+        // chunks. A chunk the pruned out-of-scope file shares with a still-fetched in-scope file
+        // must be retained — freeing it would break the kept file. Only the pruned file's *unique*
+        // chunk (and its recipe) is freed.
+        let _scratch = Scratch::new("chunked-keeps-shared");
+
+        let shared = store_chunk(b"a chunk both files share ...");
+        let api_only = store_chunk(b"the api file's own tail ...");
+        let web_only = store_chunk(b"the web file's own tail ...");
+
+        // api (in scope) = [shared, api_only]; web (pruned) = [shared, web_only].
+        let api_recipe = store_recipe(&[(shared.clone(), 28), (api_only.clone(), 26)]);
+        let web_recipe = store_recipe(&[(shared.clone(), 28), (web_only.clone(), 26)]);
+
+        let api_tree = store_tree(&[("a.bin", &api_recipe, DirEntryType::NormalChunked)]);
+        let web_tree = store_tree(&[("w.bin", &web_recipe, DirEntryType::NormalChunked)]);
+        let src_tree = store_tree(&[
+            ("api", &api_tree, DirEntryType::Tree),
+            ("web", &web_tree, DirEntryType::Tree),
+        ]);
+        let root_tree = store_tree(&[("src", &src_tree, DirEntryType::Tree)]);
+        let parcel = store_parcel(&root_tree, Vec::new());
+        pallet_utils::set_pallet_head("main", &parcel).unwrap();
+
+        let post_prune = MaterializationScope::from_prefixes(["src/api"]);
+        let plan = plan_prune(&["src/web".to_string()], &post_prune).unwrap();
+
+        // The shared chunk (and the api-only chunk and recipe) survive; web's unique chunk, its
+        // recipe and its tree are freed.
+        assert!(!plan.to_free.contains(&shared), "a chunk shared with a kept file must not be freed");
+        assert!(!plan.to_free.contains(&api_only), "the kept file's own chunk must survive");
+        assert!(!plan.to_free.contains(&api_recipe), "the kept file's recipe must survive");
+        for freed in [&web_only, &web_recipe, &web_tree] {
+            assert!(plan.to_free.contains(freed), "the pruned file's unique object is freed: {}", freed);
+        }
+        assert!(plan.retained_shared >= 1, "the shared chunk is counted as retained, not silently dropped");
+
+        // Freeing must leave the kept file fully materializable.
+        free_objects(&plan.to_free).unwrap();
+        assert!(loose_exists(&shared) && loose_exists(&api_only) && loose_exists(&api_recipe),
+            "the kept chunked file and its shared chunk survive the prune");
+    }
+
+    #[test]
+    fn plan_prune_keeps_a_whole_recipe_shared_between_a_pruned_and_a_kept_file() {
+        // File-level dedup (§9.4b): identical content at two paths chunks identically, so both
+        // tree entries name the exact SAME recipe object (content-addressing, one level above the
+        // shared-chunk case). Pruning one of the two paths must not free the recipe or any of its
+        // chunks — the other, still-in-scope path names the identical hash and needs them all.
+        let _scratch = Scratch::new("chunked-keeps-shared-recipe");
+
+        let c1 = store_chunk(b"giant content chunk one ...");
+        let c2 = store_chunk(b"giant content chunk two ...");
+        let giant_recipe = store_recipe(&[(c1.clone(), 27), (c2.clone(), 27)]);
+
+        // A distinguishing small file alongside the giant one in each directory, so api's and
+        // web's own TREE objects differ (a tree with only the identical giant.bin entry would be
+        // byte-identical too, which would trivially retain everything and prove nothing about the
+        // recipe/chunk descent specifically).
+        let api_note = store_blob("api's own note\n");
+        let web_note = store_blob("web's own note\n");
+
+        // api (kept) and web (pruned) both track the identical giant file — same recipe hash —
+        // alongside their own distinct small file.
+        let api_tree = store_tree(&[
+            ("giant.bin", &giant_recipe, DirEntryType::NormalChunked),
+            ("note.txt", &api_note, DirEntryType::Normal),
+        ]);
+        let web_tree = store_tree(&[
+            ("giant.bin", &giant_recipe, DirEntryType::NormalChunked),
+            ("note.txt", &web_note, DirEntryType::Normal),
+        ]);
+        assert_ne!(api_tree, web_tree, "the two directories must differ so this isn't a no-op prune");
+
+        let src_tree = store_tree(&[
+            ("api", &api_tree, DirEntryType::Tree),
+            ("web", &web_tree, DirEntryType::Tree),
+        ]);
+        let root_tree = store_tree(&[("src", &src_tree, DirEntryType::Tree)]);
+        let parcel = store_parcel(&root_tree, Vec::new());
+        pallet_utils::set_pallet_head("main", &parcel).unwrap();
+
+        let post_prune = MaterializationScope::from_prefixes(["src/api"]);
+        let plan = plan_prune(&["src/web".to_string()], &post_prune).unwrap();
+
+        // Nothing of the giant file is freed: the recipe and both its chunks are still needed by
+        // src/api/giant.bin. Only web's own (unshared) tree and note blob are freed.
+        for kept in [&giant_recipe, &c1, &c2, &api_note] {
+            assert!(!plan.to_free.contains(kept),
+                "content shared with (or belonging to) a kept path must not be freed: {}", kept);
+        }
+        for freed in [&web_tree, &web_note] {
+            assert!(plan.to_free.contains(freed), "web's own unshared object is freed: {}", freed);
+        }
+        assert_eq!(plan.to_free.len(), 2, "only web's tree and note are unique to the pruned path: {:?}", plan.to_free);
+        assert!(plan.retained_shared >= 3,
+            "the shared recipe and both its chunks are counted as retained, not silently dropped");
+
+        // Freeing must leave the kept (identical) file fully materializable.
+        free_objects(&plan.to_free).unwrap();
+        assert!(loose_exists(&giant_recipe) && loose_exists(&c1) && loose_exists(&c2),
+            "the recipe shared with the kept path, and its chunks, survive the prune");
+        object_utils::load_recipe(&giant_recipe).expect("the shared recipe still loads");
+    }
+
+    #[test]
+    fn plan_prune_of_a_chunked_file_is_resumable_after_a_partial_free() {
+        // A killed free deletes a PREFIX of the ordered plan (chunks first, then the recipe). A
+        // second plan_prune must tolerate the already-freed chunks and finish the job — the recipe
+        // is still present (freed last), so its remaining chunks are still discoverable.
+        let _scratch = Scratch::new("chunked-resumable");
+
+        let c1 = store_chunk(b"chunk one ...");
+        let c2 = store_chunk(b"chunk two ...");
+        let recipe = store_recipe(&[(c1.clone(), 13), (c2.clone(), 13)]);
+        let web_tree = store_tree(&[("big.bin", &recipe, DirEntryType::NormalChunked)]);
+        let api_blob = store_blob("api\n");
+        let api_tree = store_tree(&[("a.txt", &api_blob, DirEntryType::Normal)]);
+        let src_tree = store_tree(&[
+            ("api", &api_tree, DirEntryType::Tree),
+            ("web", &web_tree, DirEntryType::Tree),
+        ]);
+        let root_tree = store_tree(&[("src", &src_tree, DirEntryType::Tree)]);
+        let parcel = store_parcel(&root_tree, Vec::new());
+        pallet_utils::set_pallet_head("main", &parcel).unwrap();
+
+        let post_prune = MaterializationScope::from_prefixes(["src/api"]);
+        let plan = plan_prune(&["src/web".to_string()], &post_prune).unwrap();
+        assert_eq!(plan.to_free.len(), 4, "2 chunks + recipe + web tree");
+
+        // Simulate an interruption after freeing just the first chunk (the plan's own leading
+        // element, a child by construction — the recipe and web tree are NOT yet freed).
+        free_objects(&plan.to_free[..1]).unwrap();
+        assert!(!loose_exists(&plan.to_free[0]), "the first chunk was freed");
+        assert!(loose_exists(&recipe), "the recipe was NOT freed by the interruption");
+
+        // Re-planning must not error on the absent chunk, and must recompute exactly what is left:
+        // the surviving chunk, the recipe (still present, still names its chunks) and the tree.
+        let resumed = plan_prune(&["src/web".to_string()], &post_prune)
+            .expect("re-planning after a partial chunk free must tolerate the absent chunk");
+        assert_eq!(resumed.to_free, plan.to_free[1..].to_vec(),
+            "the resumed plan is exactly the interruption's remainder");
+
+        free_objects(&resumed.to_free).unwrap();
+        assert!(!loose_exists(&c1) && !loose_exists(&c2) && !loose_exists(&recipe) && !loose_exists(&web_tree),
+            "the resumed prune finished freeing the chunked file");
+        object_utils::load_tree(&src_tree).expect("the spine still loads: src/web is sealed by hash");
+        assert!(loose_exists(&api_blob), "in-scope content is untouched");
     }
 }

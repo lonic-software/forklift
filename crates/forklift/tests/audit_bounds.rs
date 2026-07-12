@@ -115,6 +115,13 @@ impl Warehouse {
         std::fs::remove_file(objects.join(&hash[2..])).expect("the object existed");
     }
 
+    /// Overwrite an object's on-disk bytes with garbage: the file stays *present* (a presence
+    /// check still passes) but its bytes no longer decode/hash to the name, so any read fails.
+    fn corrupt_object(&self, hash: &str) {
+        let objects = self.root.join(".forklift").join("objects").join(&hash[0..2]);
+        std::fs::write(objects.join(&hash[2..]), b"corrupted-not-valid-zstd").expect("the object existed");
+    }
+
     fn current_pallet(&self) -> String {
         std::fs::read_to_string(self.root.join(".forklift").join("pallet"))
             .unwrap()
@@ -294,6 +301,130 @@ fn the_closure_check_fails_when_a_chunk_of_a_chunked_file_is_missing() {
             err
         );
     });
+}
+
+/// The subtree prune (§9.4b W1): a push that leaves a large chunked file untouched must not
+/// re-presence-check its ~million chunks. Proven by making the check *impossible* — a chunk of the
+/// unchanged file is deleted, yet the incremental check still passes, because the file's subtree is
+/// byte-identical to the prior head's and is skipped whole. The control (a full audit, and a later
+/// push that *does* touch the file) proves the deletion was real and that W4 still bites the moment
+/// the file changes.
+#[test]
+fn the_prune_skips_an_unchanged_chunked_file_but_a_touching_push_still_catches_a_missing_chunk() {
+    let warehouse = Warehouse::new("prune-unchanged-chunked");
+
+    warehouse.stack("small.txt", "v1\n", "first");
+    // Introduce the large chunked file under data/.
+    let with_big =
+        warehouse.stack_large("data/big.bin", 0x1234, CHUNK_THRESHOLD + 40_000, "add the giant");
+    // A push that touches ONLY small.txt — data/big.bin is byte-identical across this step.
+    let touched_small = warehouse.stack("small.txt", "v2\n", "touch only the small file");
+
+    warehouse.scoped(|| {
+        graph_utils::build_from_heads(std::slice::from_ref(&touched_small)).expect("warm the graph");
+
+        // Everything is present, so the incremental check passes to begin with.
+        audit_utils::verify_parcel_closure(&touched_small, Some(&with_big)).expect("all present");
+
+        // Delete a chunk of the (unchanged) big.bin — the recipe itself stays present.
+        let big_tree = object_utils::load_parcel(&with_big).unwrap().tree_hash;
+        let (recipe_hash, item_type) = object_utils::resolve_tree_file(&big_tree, "data/big.bin")
+            .unwrap()
+            .expect("big.bin is tracked");
+        assert!(item_type.is_chunked(), "the giant is stored chunked");
+        let victim = object_utils::load_recipe(&recipe_hash).unwrap().chunks[0].hash.clone();
+        warehouse.delete_object(&victim);
+
+        // THE PRUNE: `with_big` → `touched_small` did not change data/big.bin, so its subtree is
+        // pruned by pure hash comparison — the missing chunk is never even looked for. (The same
+        // trust the incremental audit already extends to everything behind `known_complete`.)
+        audit_utils::verify_parcel_closure(&touched_small, Some(&with_big))
+            .expect("an unchanged chunked file's chunks are not re-checked (the W1 prune)");
+
+        // The control: a FULL audit walks big.bin and catches the hole — so the incremental pass
+        // skipped it by the prune, not because the deletion failed to take.
+        let err = audit_utils::verify_parcel_closure(&touched_small, None)
+            .expect_err("a full audit walks every chunk and finds the hole");
+        assert!(err.contains(&victim) && err.contains("missing"), "{}", err);
+    });
+
+    // A later push that DOES touch data/big.bin must catch a missing chunk in the changed file —
+    // the prune never weakens W4 for content the push actually introduced.
+    let changed_big =
+        warehouse.stack_large("data/big.bin", 0x9999, CHUNK_THRESHOLD + 40_000, "rewrite the giant");
+
+    warehouse.scoped(|| {
+        graph_utils::build_from_heads(std::slice::from_ref(&changed_big)).expect("warm the graph");
+
+        let big_tree = object_utils::load_parcel(&changed_big).unwrap().tree_hash;
+        let (recipe_hash, _) = object_utils::resolve_tree_file(&big_tree, "data/big.bin")
+            .unwrap()
+            .expect("big.bin is tracked");
+        let victim = object_utils::load_recipe(&recipe_hash).unwrap().chunks[0].hash.clone();
+        warehouse.delete_object(&victim);
+
+        // data/big.bin CHANGED across `touched_small` → `changed_big`, so its subtree is walked in
+        // full and the missing chunk fails the non-tolerant W4 descent.
+        let err = audit_utils::verify_parcel_closure(&changed_big, Some(&touched_small))
+            .expect_err("a changed chunked file with a missing chunk must fail (W4 preserved)");
+        assert!(err.contains(&victim) && err.contains("missing"), "{}", err);
+    });
+}
+
+/// `audit --full` re-reads every present chunk's bytes (§9.4b): a chunk whose on-disk bytes are
+/// corrupted — but still *present* — passes a normal (presence-only) audit yet fails a `--full`
+/// audit, because the content-addressed re-read re-hashes it and finds the mismatch. This is the
+/// integrity a normal audit deliberately does not pay for, made explicit.
+#[test]
+fn full_audit_re_reads_chunks_and_catches_corruption_a_presence_check_misses() {
+    let warehouse = Warehouse::new("full-audit-chunk");
+
+    let head = warehouse.stack_large("big.bin", 0x5EED, CHUNK_THRESHOLD + 60_000, "a giant");
+
+    warehouse.scoped(|| {
+        let full = forklift_core::util::scope_utils::MaterializationScope::full();
+
+        // Corrupt one chunk's bytes but leave the object present. (Corrupt before ever reading the
+        // chunk in this process, so the read cache never holds the good bytes — the on-disk
+        // corruption is what the re-read must catch. Healthy --full success is proven end to end by
+        // `full_audit_cli_reports_the_content_level_it_ran`, in its own fresh process.)
+        let tree = object_utils::load_parcel(&head).unwrap().tree_hash;
+        let (recipe_hash, _) = object_utils::resolve_tree_file(&tree, "big.bin").unwrap().unwrap();
+        let victim = object_utils::load_recipe(&recipe_hash).unwrap().chunks[0].hash.clone();
+        warehouse.corrupt_object(&victim);
+        assert!(file_utils::does_object_exist(&victim).unwrap(), "the chunk file is still present");
+
+        // Presence-only audit still passes — it never reads the bytes.
+        audit_utils::verify_parcel_closure_scoped(&head, None, &full, false)
+            .expect("a normal audit presence-checks chunks and does not notice corrupted bytes");
+
+        // --full re-reads the chunk, re-hashes it, and fails.
+        audit_utils::verify_parcel_closure_scoped(&head, None, &full, true)
+            .expect_err("a --full audit re-reads every chunk and catches the corruption");
+    });
+}
+
+/// `forklift audit --full` on a healthy chunked warehouse succeeds end to end and reports the
+/// stronger content level in its `--json` envelope, so a consumer can tell a `--full` pass from a
+/// presence-only one.
+#[test]
+fn full_audit_cli_reports_the_content_level_it_ran() {
+    let warehouse = Warehouse::new("full-audit-cli");
+    warehouse.stack_large("data/big.bin", 0xC0FFEE, CHUNK_THRESHOLD + 30_000, "a giant");
+
+    let out = warehouse.run_ok(&["audit", "--full", "--json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    assert!(stdout.contains("\"full\":true") || stdout.contains("\"full\": true"),
+        "the --json envelope echoes the --full level: {}", stdout);
+    assert!(stdout.contains("re-read and re-hashed"),
+        "the --json envelope states chunks were re-read under --full: {}", stdout);
+
+    // A plain audit of the same warehouse must NOT claim the full level.
+    let plain = warehouse.run_ok(&["audit", "--json"]);
+    let plain_stdout = String::from_utf8_lossy(&plain.stdout);
+    assert!(plain_stdout.contains("\"full\":false") || plain_stdout.contains("\"full\": false"),
+        "a normal audit reports full=false: {}", plain_stdout);
 }
 
 /// The office chain is verified once per `(warehouse, anchor, office head)`, not once per

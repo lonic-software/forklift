@@ -17,11 +17,15 @@ use crate::output::{self, CommandOutput};
 ///
 /// # Arguments
 /// * `pallet` - The pallet to audit (`None` audits the current pallet).
+/// * `full`   - Re-read every present chunk's bytes (re-hashing it on the content-addressed load)
+///   and re-assemble each fully-present chunked file to verify `Blake3(assembled) ==
+///   recipe.content_hash` — the one integrity claim a normal audit never checks. A normal audit
+///   presence-checks chunks (bounded, no bytes re-read); `--full` is the stronger, slower level.
 ///
 /// # Returns
 /// * `Ok(())`      - If the audit passed.
 /// * `Err(String)` - If trust is not established, or any verification failed.
-pub fn handle_command(pallet: Option<String>) -> Result<(), String> {
+pub fn handle_command(pallet: Option<String>, full: bool) -> Result<(), String> {
     let Some(anchor) = office_utils::read_trust_anchor()? else {
         return Err(
             "Trust is not established for this warehouse; there are no signatures to \
@@ -47,6 +51,7 @@ pub fn handle_command(pallet: Option<String>) -> Result<(), String> {
         pallet_verified: None,
         verified_parcels: 0,
         legacy_parcels: 0,
+        full,
         scope: None,
     };
 
@@ -70,11 +75,18 @@ pub fn handle_command(pallet: Option<String>) -> Result<(), String> {
         // for what is on disk. Prove the fetched content present and re-hashed (sealing the rest
         // by the hash a signed parcel commits), and report the boundary so a sparse pass can
         // never read as a full-clone pass. A full store keeps today's signature-only audit
-        // unchanged — object presence is a warehouse property, so the fetch scope is the seam.
+        // unchanged — unless `--full` is asked, which re-reads every present chunk and re-verifies
+        // each chunked file's content hash even on a full clone. Object presence is a warehouse
+        // property, so the fetch scope is the seam either way.
         let fetch_scope = scope_utils::read_fetch_scope()?;
-        if !fetch_scope.is_full() {
-            audit_utils::verify_parcel_closure_scoped(&head, None, &fetch_scope)?;
-            report.scope = Some(AuditScope::new(fetch_scope.prefixes().to_vec()));
+        let is_sparse = !fetch_scope.is_full();
+
+        if is_sparse || full {
+            audit_utils::verify_parcel_closure_scoped(&head, None, &fetch_scope, full)?;
+            report.scope = Some(AuditScope::new(
+                is_sparse.then(|| fetch_scope.prefixes().to_vec()),
+                full,
+            ));
         }
     }
 
@@ -104,20 +116,30 @@ struct AuditReport {
     /// How many legacy (pre-trust, unsigned) parcels were tolerated.
     legacy_parcels: usize,
 
-    /// Present only when the warehouse is sparse: the fetch-scope boundary the content audit
-    /// ran against. A full clone omits it entirely, so a sparse pass is never mistaken for one.
+    /// Whether this was a `--full` audit: every present chunk's bytes were re-read and re-hashed,
+    /// and each fully-present chunked file re-assembled to verify its recipe's content hash. A
+    /// normal audit presence-checks chunks without re-reading them.
+    full: bool,
+
+    /// The content audit that ran: present when the warehouse is sparse (to report the sealed
+    /// boundary) or when `--full` re-verified content on a full clone. A normal full-clone audit is
+    /// signature-only and omits it, so a partial or presence-only pass is never mistaken for a
+    /// complete content re-verification.
     #[serde(skip_serializing_if = "Option::is_none")]
     scope: Option<AuditScope>,
 }
 
-/// The scope boundary of a sparse warehouse's audit. Emitted only on a sparse run so that a
-/// skimming reader (or agent) can never mistake a sparse pass — which verified content only
-/// within the fetch scope — for a full-clone pass that verified all of it.
+/// What a content audit checked, and (on a sparse warehouse) the boundary it sealed rather than
+/// verified. Emitted so a skimming reader or agent can never mistake a sparse pass — which verified
+/// content only within the fetch scope — for a full-clone pass, nor a presence-only pass for a
+/// `--full` re-read.
 #[derive(Serialize)]
 struct AuditScope {
-    /// The warehouse fetch scope: the path prefixes whose content was fetched. Everything
-    /// outside is sealed by hash, not downloaded.
-    fetch_scope: Vec<String>,
+    /// The warehouse fetch scope: the path prefixes whose content was fetched. Present only on a
+    /// sparse warehouse; a full clone omits it (nothing is out of scope). Everything outside is
+    /// sealed by hash, not downloaded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fetch_scope: Option<Vec<String>>,
 
     /// Signatures — the office chain and every parcel — are verified in full regardless of
     /// scope (parcels and their sidecars are always fully present).
@@ -126,22 +148,40 @@ struct AuditScope {
     /// In-scope content: every tree was re-hashed on read and every blob confirmed present.
     in_scope_content: &'static str,
 
-    /// Out-of-scope content: sealed by the hash a signed parcel commits (unforgeable), verified
-    /// when it is fetched.
-    out_of_scope_content: &'static str,
+    /// How a chunked file's chunks were checked: `presence-checked` in a normal audit (bounded, no
+    /// bytes re-read), or, under `--full`, re-read and re-hashed with each file re-assembled to
+    /// verify its recipe's content hash.
+    chunks: &'static str,
 
-    /// The scope boundary is advisory — a client choice, not enforced by the remote.
-    enforcement: &'static str,
+    /// Out-of-scope content: sealed by the hash a signed parcel commits (unforgeable), verified
+    /// when it is fetched. Present only on a sparse warehouse.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    out_of_scope_content: Option<&'static str>,
+
+    /// The scope boundary is advisory — a client choice, not enforced by the remote. Present only
+    /// on a sparse warehouse.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enforcement: Option<&'static str>,
 }
 
 impl AuditScope {
-    fn new(fetch_scope: Vec<String>) -> AuditScope {
+    /// * `fetch_scope` - `Some(prefixes)` on a sparse warehouse (the sealed boundary), `None` on a
+    ///   full clone.
+    /// * `full`        - Whether `--full` re-read and re-verified chunks (vs. presence-checked).
+    fn new(fetch_scope: Option<Vec<String>>, full: bool) -> AuditScope {
+        let sparse = fetch_scope.is_some();
+
         AuditScope {
             fetch_scope,
             signatures: "verified",
             in_scope_content: "verified",
-            out_of_scope_content: "sealed",
-            enforcement: "advisory",
+            chunks: if full {
+                "re-read and re-hashed; each chunked file re-assembled to verify its content hash"
+            } else {
+                "presence-checked"
+            },
+            out_of_scope_content: sparse.then_some("sealed"),
+            enforcement: sparse.then_some("advisory"),
         }
     }
 }
@@ -165,18 +205,28 @@ impl CommandOutput for AuditReport {
             }
         );
 
+        // The stronger content level, stated plainly whenever it ran — so a presence-only pass is
+        // never read as a full re-verification.
+        if self.full {
+            println!(
+                "Full content re-verification: every present chunk was re-read and re-hashed, and \
+                each fully-present chunked file was re-assembled to confirm its recorded content \
+                hash. Blobs stay presence-checked."
+            );
+        }
+
         // A distinct, self-contained boundary statement whenever the store is sparse — the one
         // line a full-clone audit never prints, so a partial verification is never read as a
         // complete one.
-        if let Some(scope) = &self.scope {
+        if let Some(AuditScope { fetch_scope: Some(prefixes), .. }) = &self.scope {
             println!(
                 "This warehouse is sparse; content outside the fetched scope ({}) is sealed by \
                 hash, not downloaded.",
-                scope.fetch_scope.join(", ")
+                prefixes.join(", ")
             );
             println!(
                 "Signatures are verified in full; within the fetched scope every tree was \
-                re-hashed and every blob confirmed present."
+                re-hashed and every blob and chunk confirmed present."
             );
             println!(
                 "Out-of-scope content is pinned to the hash a signed parcel commits — it cannot \

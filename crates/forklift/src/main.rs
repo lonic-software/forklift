@@ -138,7 +138,7 @@ async fn forklift(cli: Cli) -> Result<(), ForkliftError> {
 async fn dispatch(cli: Cli) -> Result<(), String> {
     match cli.command {
         Command::Alias { action } => commands::alias::handle_command(action),
-        Command::Audit { pallet } => commands::audit::handle_command(pallet),
+        Command::Audit { pallet, full } => commands::audit::handle_command(pallet, full),
         Command::Blame { path, rev } => commands::blame::handle_command(&path, rev).await,
         Command::Config { global, unset, key, value } =>
             commands::config::handle_command(global, unset, key, value),

@@ -68,11 +68,20 @@ pub enum Command {
         visible_alias = "a",
         long_about = "Verify the warehouse's signed history offline: the office chain back to the \
                       genesis parcel, then the given pallet (the current one by default). Requires \
-                      established trust (\"forklift office enroll\")."
+                      established trust (\"forklift office enroll\").\n\n\
+                      By default, large chunked files are presence-checked (their chunks are \
+                      confirmed present without re-reading the bytes). \"--full\" re-reads every \
+                      present chunk — re-hashing it — and re-assembles each chunked file to confirm \
+                      its recorded content hash; a stronger, slower pass."
     )]
     Audit {
         /// The pallet to audit (default: the current pallet)
         pallet: Option<String>,
+
+        /// Re-read and re-hash every present chunk, and re-assemble each chunked file to verify its
+        /// content hash (a normal audit only presence-checks chunks)
+        #[arg(long)]
+        full: bool,
     },
 
     /// Manage bays: parallel working directories bound to this warehouse

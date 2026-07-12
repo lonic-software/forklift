@@ -382,6 +382,7 @@ attribute, so it fails with a clear message rather than assembling gigabytes to 
 forklift audit          # verify the office chain, then the current pallet
 forklift audit feature  # verify a specific pallet
 forklift audit @office  # verify just the office chain (the office is a meta pallet)
+forklift audit --full   # also re-read every chunk and re-verify each large file's content hash
 ```
 
 Requires established trust. Verifies the office chain from genesis (each office
@@ -390,6 +391,25 @@ parcels (each signed by a tracked key; parcels stacked before trust was
 established are tolerated as "legacy"). Any tampering — stripped or corrupted
 signatures, an unknown key, a chain that doesn't reach genesis — fails with a
 non-zero exit. See [`trust-and-identity.md`](trust-and-identity.md).
+
+A large file is stored as chunks indexed by a recipe. A normal audit **presence-checks**
+those chunks (confirms each is present without re-reading its bytes) — bounded and fast.
+`--full` is the stronger, slower level: it **re-reads every present chunk**, re-hashing it on
+the content-addressed read (so on-disk bit-rot a presence check cannot see is caught), and
+**re-assembles each fully-present chunked file** to confirm `Blake3(assembled) ==` the recipe's
+recorded content hash. Streamed one chunk at a time — never the whole file in memory. On a
+sparse warehouse, out-of-scope chunks stay sealed by hash under both levels; the output states
+exactly what was re-hashed, presence-checked, and sealed.
+
+**Run `--full` periodically as your own scrub against bit-rot.** Every `lift`/push used to
+incidentally re-presence-check a pushed pallet's whole tree, chunked files included; a large
+chunked file's subtree that a push leaves untouched is now pruned from that check (it is proven
+present by the prior head it is byte-identical to, not re-walked — the cost fix behind this
+release). That is sound for the commit gate — store durability between commits was never its job
+— but it does mean push time alone no longer doubles as an incidental content scrub for
+unchanged large files. A self-hosted `forklift-server` has no audit subcommand of its own, so
+periodic `forklift audit --full` against a clone is the recommended way to catch on-disk bit-rot
+that pushing quietly stopped surfacing for you.
 
 ### `manifest` — signed post-metadata on parcels (`mf`)
 
@@ -793,6 +813,12 @@ everywhere first. Nothing is lost: the pruned content is sealed by hash, re-fetc
 origin with `expand`. A full (non-sparse) warehouse has nothing to prune. Use `--dry-run` before
 you leap. (Objects already inside a pack are reported but not reclaimed yet — a scope-aware
 repack is future work.)
+
+Pruning a **large (chunked) file** frees its recipe **and every chunk** it names, not just the
+recipe — chunks are content-addressed objects reachable only through the recipe, so a
+recipe-only delete would orphan them. A chunk the pruned file shares with a still-fetched file
+elsewhere is **kept** (freeing it would break that file), exactly as a shared blob is. The chunks
+are freed before their recipe, so a killed prune resumes cleanly on the next run.
 
 If a prune gets interrupted (killed, crashed) before it finishes freeing everything, the fetch
 scope has already narrowed but some objects are left behind. Running `scope-prune` again on the
