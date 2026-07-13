@@ -109,15 +109,27 @@ pub fn render_json_schemas() -> Result<String, String> {
             )),
             (None, Some(_)) => {} // generic/no-data, nothing to render
             (Some(schemas), None) => {
+                // An empty registration is not "nothing to render" — it is a command that
+                // claims a typed schema (it's in command_schemas, not GENERIC_OR_NO_DATA) but
+                // supplied none, which would otherwise vanish from json-schemas.md silently.
                 if schemas.is_empty() {
-                    continue;
+                    return Err(format!(
+                        "docgen: CLI command `{name}` is registered in command_schemas but its \
+                         __docgen_schemas() returned no schemas. A command must yield at least \
+                         one schema, or be on GENERIC_OR_NO_DATA instead — never an empty \
+                         registration."
+                    ));
                 }
 
                 out.push_str(&format!("## `{}`\n\n", name));
                 for (struct_name, schema) in schemas {
                     out.push_str(&format!("### `{}`\n\n", struct_name));
-                    let pretty = serde_json::to_string_pretty(schema.as_value())
-                        .unwrap_or_else(|_| "{}".to_string());
+                    let pretty = serde_json::to_string_pretty(schema.as_value()).map_err(|e| {
+                        format!(
+                            "docgen: failed to render the `{name}`/`{struct_name}` JSON schema \
+                             to pretty-printed text: {e}"
+                        )
+                    })?;
                     out.push_str("```json\n");
                     out.push_str(&pretty);
                     out.push_str("\n```\n\n");
