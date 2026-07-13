@@ -784,7 +784,9 @@ fn sync_file(path: &Path, what: &str) -> Result<(), String> {
     if !file_utils::fsync_enabled() {
         return Ok(());
     }
-    std::fs::File::open(path)
+    // A *write* handle, not a read-only one: Windows refuses FlushFileBuffers on a handle
+    // without write access (POSIX fsyncs any descriptor).
+    std::fs::OpenOptions::new().write(true).open(path)
         .and_then(|file| file.sync_all())
         .map_err(|e| format!("Error while syncing {}: {}", what, e))
 }
@@ -816,32 +818,89 @@ fn pack_id_from_index(index: &[u8]) -> Result<String, String> {
 /// accelerates delta chains, but a hostile pack cannot make verification retain the whole
 /// decompressed store in RAM.
 fn verify_incoming_packs(packs: &[LoadedPack]) -> Result<Vec<[u8; HASH_LEN]>, String> {
-    let mut hashes = Vec::new();
-    {
-        let mut seen: HashSet<[u8; HASH_LEN]> = HashSet::new();
-        for pack in packs {
-            for position in 0..pack.count {
-                let record = INDEX_HEADER_LEN + position * INDEX_RECORD_LEN;
-                let mut hash = [0u8; HASH_LEN];
-                hash.copy_from_slice(&pack.index[record..record + HASH_LEN]);
-                if !seen.insert(hash) {
-                    return Err(format!(
-                        "The bundle's native packs contain duplicate object {}.",
-                        sign_utils::to_hex(&hash)
-                    ));
-                }
-                hashes.push(hash);
-            }
-        }
-    }
+    let locator = IncomingLocator::build(packs)?;
 
+    let mut hashes = Vec::with_capacity(locator.entries.len());
     let mut cache = IncomingVerificationCache::default();
     let mut visiting = HashSet::new();
-    for hash in &hashes {
-        resolve_incoming_object(hash, packs, &mut cache, &mut visiting, 0)?;
+
+    for entry in &locator.entries {
+        let mut hash = [0u8; HASH_LEN];
+        hash.copy_from_slice(locator.hash_of(*entry));
+        resolve_incoming_object(&hash, &locator, &mut cache, &mut visiting, 0)?;
+        hashes.push(hash);
     }
 
     Ok(hashes)
+}
+
+/// A sorted locator over every record in the quarantined incoming set, so each of the
+/// per-object (and per-delta-base) lookups during verification is one binary search across the
+/// whole set instead of one per pack — O(objects × log objects) total rather than
+/// O(objects × packs × log). Entries are indirect `(pack, record)` positions (8 bytes per
+/// object) comparing against the packs' resident index bytes; a hash-keyed map would cost an
+/// order of magnitude more transient memory on a large clone.
+struct IncomingLocator<'a> {
+    packs: &'a [LoadedPack],
+    /// `(pack position, record position)`, sorted by the record's hash bytes.
+    entries: Vec<(u32, u32)>,
+}
+
+impl<'a> IncomingLocator<'a> {
+    /// Build the locator. Sorting also surfaces cross-pack duplicates (adjacent equal hashes),
+    /// which are refused: the bundle builder emits every object exactly once.
+    fn build(packs: &'a [LoadedPack]) -> Result<IncomingLocator<'a>, String> {
+        let total = packs.iter().map(|pack| pack.count).sum();
+        let mut entries: Vec<(u32, u32)> = Vec::with_capacity(total);
+
+        for (pack_position, pack) in packs.iter().enumerate() {
+            for record_position in 0..pack.count {
+                entries.push((pack_position as u32, record_position as u32));
+            }
+        }
+
+        let hash_of = |entry: &(u32, u32)| -> &[u8] {
+            let record = INDEX_HEADER_LEN + entry.1 as usize * INDEX_RECORD_LEN;
+            &packs[entry.0 as usize].index[record..record + HASH_LEN]
+        };
+        entries.sort_unstable_by(|a, b| hash_of(a).cmp(hash_of(b)));
+
+        for pair in entries.windows(2) {
+            if hash_of(&pair[0]) == hash_of(&pair[1]) {
+                return Err(format!(
+                    "The bundle's native packs contain duplicate object {}.",
+                    sign_utils::to_hex(hash_of(&pair[0]))
+                ));
+            }
+        }
+
+        Ok(IncomingLocator { packs, entries })
+    }
+
+    fn hash_of(&self, entry: (u32, u32)) -> &'a [u8] {
+        let record = INDEX_HEADER_LEN + entry.1 as usize * INDEX_RECORD_LEN;
+        &self.packs[entry.0 as usize].index[record..record + HASH_LEN]
+    }
+
+    /// Locate a hash in the incoming set: its pack and the record's `(offset, length)` there.
+    fn locate(&self, hash: &[u8; HASH_LEN]) -> Option<(&'a LoadedPack, u64, u64)> {
+        let position = self.entries
+            .binary_search_by(|entry| self.hash_of(*entry).cmp(hash))
+            .ok()?;
+        let (pack_position, record_position) = self.entries[position];
+        let pack = &self.packs[pack_position as usize];
+        let record = INDEX_HEADER_LEN + record_position as usize * INDEX_RECORD_LEN;
+
+        Some((
+            pack,
+            read_u64_le(&pack.index, record + HASH_LEN),
+            read_u64_le(&pack.index, record + HASH_LEN + 8),
+        ))
+    }
+
+    fn contains(&self, hash: &[u8; HASH_LEN]) -> bool {
+        self.locate(hash).is_some()
+    }
 }
 
 const INCOMING_VERIFY_CACHE_BYTES: usize = 128 * 1024 * 1024;
@@ -874,7 +933,7 @@ impl IncomingVerificationCache {
 /// already-present local base for incremental compatibility), then enforce content addressing and
 /// import ceilings. Delta recursion is cycle-checked and hard-bounded independently of the writer.
 fn resolve_incoming_object(hash: &[u8; HASH_LEN],
-                           packs: &[LoadedPack],
+                           locator: &IncomingLocator<'_>,
                            cache: &mut IncomingVerificationCache,
                            visiting: &mut HashSet<[u8; HASH_LEN]>,
                            depth: u32) -> Result<Arc<Vec<u8>>, String> {
@@ -895,11 +954,7 @@ fn resolve_incoming_object(hash: &[u8; HASH_LEN],
     }
 
     let resolved = (|| -> Result<Vec<u8>, String> {
-        let located = packs.iter().find_map(|pack| {
-            pack.locate(hash).map(|(offset, length)| (pack, offset, length))
-        });
-
-        let Some((pack, offset, length)) = located else {
+        let Some((pack, offset, length)) = locator.locate(hash) else {
             return file_utils::retrieve_object_by_hash(&hex);
         };
         let record = pack.slice(offset, length)?;
@@ -927,8 +982,8 @@ fn resolve_incoming_object(hash: &[u8; HASH_LEN],
                     .filter(|start| *start <= body.len())
                     .ok_or_else(|| format!("Packed delta {} is truncated.", hex))?;
 
-                let base = if incoming_contains(packs, &base_hash) {
-                    resolve_incoming_object(&base_hash, packs, cache, visiting, depth + 1)?
+                let base = if locator.contains(&base_hash) {
+                    resolve_incoming_object(&base_hash, locator, cache, visiting, depth + 1)?
                 } else {
                     file_utils::retrieve_object_by_hash_shared(&sign_utils::to_hex(&base_hash))?
                 };
@@ -945,10 +1000,6 @@ fn resolve_incoming_object(hash: &[u8; HASH_LEN],
     let bytes = Arc::new(bytes);
     cache.insert(*hash, Arc::clone(&bytes));
     Ok(bytes)
-}
-
-fn incoming_contains(packs: &[LoadedPack], hash: &[u8; HASH_LEN]) -> bool {
-    packs.iter().any(|pack| pack.locate(hash).is_some())
 }
 
 /// Bounded full-record decompression for untrusted transport packs. Local packs predate this

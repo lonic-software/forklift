@@ -197,7 +197,24 @@ fn write_native_bundle(bundle_path: &Path,
     }
 
     let temporary_path = unique_sibling_temp(bundle_path, "latest.bundle");
-    let file = std::fs::File::create(&temporary_path)
+    let result = write_envelope_and_publish(
+        &temporary_path, bundle_path, artifacts, signature_path, signature_count
+    );
+    if result.is_err() {
+        // A failed write or rename must not strand a store-sized temp envelope until the stale
+        // sweep reclaims it; on success the rename already consumed the temp name.
+        let _ = std::fs::remove_file(&temporary_path);
+    }
+    result
+}
+
+/// Write the envelope to `temporary_path`, then atomically publish it at `bundle_path`.
+fn write_envelope_and_publish(temporary_path: &Path,
+                              bundle_path: &Path,
+                              artifacts: &[pack_utils::TransportPackArtifact],
+                              signature_path: &Path,
+                              signature_count: usize) -> Result<(), String> {
+    let file = std::fs::File::create(temporary_path)
         .map_err(|e| format!("Error while creating the bundle file: {}", e))?;
     let mut writer = std::io::BufWriter::new(file);
 
@@ -232,7 +249,7 @@ fn write_native_bundle(bundle_path: &Path,
     }
     drop(writer);
 
-    std::fs::rename(&temporary_path, bundle_path)
+    std::fs::rename(temporary_path, bundle_path)
         .map_err(|e| format!("Error while moving the bundle into place: {}", e))?;
     if let Some(parent) = bundle_path.parent() {
         file_utils::sync_dir(parent)?;
