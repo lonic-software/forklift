@@ -99,10 +99,19 @@ pub async fn handle_command(url: &str,
         }
 
         if client.fetch_bundle_to(&bundle_path).await? {
-            let imported = bundle_utils::import_bundle(&bundle_path)?;
-
-            report.bundle_objects = Some(imported.stored_objects);
-            report.bundle_signatures = Some(imported.stored_signatures);
+            match bundle_utils::import_bundle(&bundle_path) {
+                Ok(imported) => {
+                    report.bundle_objects = Some(imported.stored_objects);
+                    report.bundle_signatures = Some(imported.stored_signatures);
+                }
+                Err(error) if bundle_utils::is_unsupported_bundle_error(&error) => {
+                    // A future envelope is only an optimization this client cannot use. Do not
+                    // retain it as this warehouse's own `latest` bundle; continue through the
+                    // verified incremental-object walk below. Known-format corruption stays fatal.
+                    let _ = std::fs::remove_file(&bundle_path);
+                }
+                Err(error) => return Err(error),
+            }
         }
     }
 

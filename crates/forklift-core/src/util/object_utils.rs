@@ -441,6 +441,16 @@ pub fn verify_object_bytes(hash: &str, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// Validate an object's content address and every import-side size policy without storing it.
+/// Native transport packs use this after reconstructing a quarantined record: publication must
+/// enforce the same boundary as [`store_object_bytes`], even though the object's final home is an
+/// aggregate pack rather than a loose file.
+pub(crate) fn validate_imported_object(claimed_hash: &str, bytes: &[u8]) -> Result<(), String> {
+    verify_object_bytes(claimed_hash, bytes)?;
+    enforce_object_ceiling(bytes)?;
+    enforce_chunk_ceiling(claimed_hash, bytes)
+}
+
 /// Store raw object bytes received from elsewhere (a remote or a bundle). The claimed
 /// hash is verified against the bytes first — nothing unverified may enter the object
 /// store — and the object is compressed at rest like locally built ones.

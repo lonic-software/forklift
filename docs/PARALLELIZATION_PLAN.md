@@ -36,7 +36,7 @@ contention.** Two things decide almost every row:
 | **compact --all** (repack) | occasional (auto) | reachability walk + verbatim record copy, per object | one shared reachability pass (D/P3, below); `CopyRecord` targets need no CPU, only a memory copy | the steady-state case (no garbage, no loose) is **not** CPU-bound at all — it is walk-reads and small memcpys | **Done — steady-state repack ~4.5×** (238 ms → 53 ms on a 401-parcel/7442-object corpus; **byte-identical output**; see D/P3 below) | — |
 | **import-git** | rare (once) | read pipe → build → **store loose file** | the store is the bottleneck | *measured*: **71% is writing loose object files** — the same FS-metadata wall as `materialize`; pipe read 21% (serial source), compress 4% | **Not worth it** — parallel stores regress (materialize lesson); pipe is serial | — |
 | **export-git** | rare | spawn a `git` subprocess per object | DAG-ordered; subprocess per unit | one `git` process per commit/tree/blob, invoked serially; `&mut` memo | **Low** — commits are DAG-ordered; only independent blob `hash-object`s could overlap | med |
-| **bundle build** | occasional (server) | write object into one zstd stream | **sequential sink** | a single `zstd::Encoder` — one compression stream, inherently serial | **None** without a reframed multi-frame format | high |
+| **bundle build** | occasional (server) | compress object into bounded native pack | independent record compression, sequential append | deterministic history/path-delta order and one writer per pack | **Possible** for full-record compression; clone import already wins structurally by installing aggregate packs | med |
 | **history** (full log) | hot | decode+render parcel | **sequential heap walk** | must read every parcel to display it; ordering dependency; read/graph mutexes | **None** — see the blame lesson | — |
 | **blame** | hot | changed-path filter check + LCS | **sequential chain + LCS** | first-parent chain (linked list), LCS attribution (oldest→newest); filter checks too small a fraction | **None** — *measured*: no speedup even with an `RwLock` cache (below) | — |
 | **ancestry / merge-base** | hot (internal) | generation-pruned walk | bounded walk | already O(gap) via generation numbers; graph mutex | **None** — already fast + tiny | — |
@@ -266,8 +266,11 @@ contention.** Two things decide almost every row:
   341 → 391 ms for 8000 files, 18 cores) and reverted — concurrent small-file create/write/`chmod`
   contends on the OS's directory/inode metadata locks. See the ranked recommendations above.
 
-- **`bundle` — a single zstd stream.** One sequential compression sink; parallelizing emission
-  would mean reframing the on-disk format into independent frames. High effort, occasional op.
+- **`bundle` — deterministic pack assembly.** The `2026-07-13` envelope removed the single outer
+  zstd stream and carries independently-compressed native records, so compression could be farmed
+  out before ordered append. Path-based delta selection and deterministic pack layout still impose
+  an ordered assembly step; build is occasional, while the much larger clone-time win already came
+  from eliminating per-object loose writes and fsyncs.
 
 - **`import-git` — filesystem-metadata-bound (measured).** The guess was "input-bound on the
   `git cat-file` pipe"; the profile said otherwise: of a ~915 ms import, **71% is `store` — writing

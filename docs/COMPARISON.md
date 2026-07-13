@@ -98,8 +98,8 @@ counts.
 |---|-----|----------|
 | Objects | blob / tree / commit / tag | blob / tree / **compact parcel** (commit); no tag object yet |
 | Addressing | SHA-1 (SHA-256 opt-in, migration ongoing) | **Blake3** (fast, parallel, keyed-hashing capable) |
-| Content model | Snapshots (trees), delta-compressed in packs | Snapshots (trees), zstd-compressed loose objects |
-| On-disk compression | zlib; delta chains in packfiles | zstd; **no delta compression yet** [Forklift lacks this] |
+| Content model | Snapshots (trees), delta-compressed in packs | Snapshots (trees), zstd full/delta records in native packs |
+| On-disk compression | zlib; delta chains in packfiles | zstd; bounded delta chains in native packs and whole-clone bundles |
 | Staging area | The index (single file) | **Sharded per-directory inventory** ("the dock") |
 | Hashing large files | Single-threaded | **Parallel — Blake3 parallelizes one big file across cores** |
 
@@ -114,11 +114,10 @@ once (dedup). The meaningful divergences:
   what lets commands touch only the directories they need (**bounded memory** is an
   explicit design principle) and is the foundation of Forklift's parallel walks and its
   per-working-directory "bays".
-- **Delta compression.** This is a real, present Git advantage. Git's packfiles delta
-  successive versions of a file, which is a large transfer/storage win on long
-  histories. Forklift stores whole zstd-compressed objects and **does not delta-compress
-  yet** — its bundle format has a slot reserved for it but it is unbuilt
-  ([§8](#8-forklift-features-not-yet-implemented-future-work)). **[Forklift lacks this today.]**
+- **Delta compression.** Both systems delta-compress packed history. Git uses its pack delta
+  machinery; Forklift uses zstd dictionary frames against similar objects, with bounded chains.
+  Whole-clone bundles now carry Forklift's native pack/index pairs directly, while newly authored
+  objects remain loose until automatic or explicit compaction.
 
 ### 2.2 The staging area
 
@@ -462,11 +461,8 @@ honest that it is also a **bet on a future** that has not fully arrived.
 - 🔭 **AWS serverless head** (`forklift-aws-lambda`) — the Lambda + S3 + DynamoDB control
   plane that motivated the whole project. *Planned.* Today Forklift can be **self-hosted**
   (`forklift-server`) but the "runs on S3 with no server" deployment is not built.
-- 🔭 **Delta-compressed bundles (format v2)** — Git's biggest transfer/storage advantage;
-  the bundle format reserves a slot for it. *Needs design.* Until then Forklift has **no
-  delta compression**.
-- 🔭 **Bundle index + generational bundles** — ranged partial fetches and incremental
-  rebuilds. *Planned.*
+- 🔭 **Generational/ranged bundle delivery** — native indexes are shipped; range negotiation and
+  incremental bundle rebuilds remain planned.
 - 🔭 **A managed hosting service** (repo registry, web UI, auth, billing) — Forklift's
   GitHub/GitLab equivalent. *Planned as a separate product*, built on the AWS head.
 - 🔭 **Server metrics/observability, bundle auto-rebuild policy, native TLS listener** —

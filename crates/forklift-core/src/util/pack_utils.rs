@@ -30,7 +30,7 @@
 //! base can only fail a read, never return wrong bytes silently.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -111,6 +111,24 @@ const PACK_ROLLOVER_BYTES: u64 = 512 * 1024 * 1024;
 /// index's size — and the RAM to hold it — scales with object *count*, not their bytes; a
 /// pack full of tiny tree objects would otherwise carry a huge index).
 const PACK_ROLLOVER_OBJECTS: usize = 100_000;
+
+/// The largest native-pack data section a transport bundle may declare. A writer rolls after
+/// crossing `PACK_ROLLOVER_BYTES`, so the record that crosses it may itself be one maximal object.
+/// Keeping the import cap derived from those two writer bounds prevents a hostile bundle from
+/// turning one declared section length into an unbounded disk-fill stream.
+pub(crate) const MAX_TRANSPORT_PACK_BYTES: u64 =
+    PACK_ROLLOVER_BYTES + object_utils::MAX_OBJECT_BYTES as u64 + 2 * 1024 * 1024;
+
+/// The largest native-pack index section a transport bundle may declare. One writer can carry at
+/// most `PACK_ROLLOVER_OBJECTS` records before it rolls; the fixed header and fixed-width records
+/// make the exact upper bound cheap to state and enforce before reading the section.
+pub(crate) const MAX_TRANSPORT_INDEX_BYTES: u64 =
+    (INDEX_HEADER_LEN + PACK_ROLLOVER_OBJECTS * INDEX_RECORD_LEN) as u64;
+
+/// Bound the number of native packs in one bundle independently of its byte lengths. Real bundle
+/// builders need one pack per ~512 MiB or 100k objects; 4096 leaves enormous headroom while keeping
+/// a hostile count from allocating an unbounded section table.
+pub(crate) const MAX_TRANSPORT_PACKS: usize = 4096;
 
 /// The fan-out folder sampled to estimate the loose object count for auto-maintenance (git's
 /// `gc --auto` trick: count one folder, multiply by the 256 folders). Any fixed folder works —
@@ -482,30 +500,45 @@ fn load_packs_from_disk(pack_folder: &Path) -> Result<Vec<LoadedPack>, String> {
             continue;
         }
 
-        let index = std::fs::read(&path)
-            .map_err(|e| format!("Error while reading pack index \"{}\": {}", path.to_string_lossy(), e))?;
-        let (count, version) = parse_index_header(&index, &path)?;
-
         let data_path = path.with_extension(PACK_DATA_EXTENSION);
-        let file = std::fs::File::open(&data_path)
-            .map_err(|e| format!("Error while opening pack data \"{}\": {}", data_path.to_string_lossy(), e))?;
-        // SAFETY: a pack data file is immutable for its whole life — written once under a
-        // temporary name, fsynced, atomically renamed into place, and thereafter only ever
-        // deleted whole (never modified or truncated). So the mapped bytes cannot change or
-        // shrink under us, which is the invariant `Mmap` requires.
-        let data = unsafe { memmap2::Mmap::map(&file) }
-            .map_err(|e| format!("Error while mapping pack data \"{}\": {}", data_path.to_string_lossy(), e))?;
-
-        packs.push(LoadedPack {
-            data_path,
-            data,
-            index,
-            count,
-            version,
-        });
+        packs.push(load_pack_pair(&data_path, &path)?);
     }
 
     Ok(packs)
+}
+
+/// Load one native pack/index pair and validate the structural contract shared by ordinary local
+/// packs and transport-installed packs. Content hashes are checked separately: ordinary reads do
+/// it on demand, while a transport import checks the whole quarantined set before publication.
+fn load_pack_pair(data_path: &Path, index_path: &Path) -> Result<LoadedPack, String> {
+    let index = std::fs::read(index_path)
+        .map_err(|e| format!("Error while reading pack index \"{}\": {}", index_path.to_string_lossy(), e))?;
+    let (count, version) = parse_index_header(&index, index_path)?;
+
+    let file = std::fs::File::open(data_path)
+        .map_err(|e| format!("Error while opening pack data \"{}\": {}", data_path.to_string_lossy(), e))?;
+    // SAFETY: callers only pass immutable pack data: a published pack is write-once, and a
+    // transport staging file is closed and never modified again before this mapping is dropped.
+    let data = unsafe { memmap2::Mmap::map(&file) }
+        .map_err(|e| format!("Error while mapping pack data \"{}\": {}", data_path.to_string_lossy(), e))?;
+
+    if data.len() < PACK_DATA_HEADER_LEN as usize || &data[0..8] != PACK_DATA_MAGIC {
+        return Err(format!(
+            "Pack data \"{}\" is corrupt or has an unknown format.", data_path.to_string_lossy()
+        ));
+    }
+
+    let data_version = read_u32_le(&data, 8);
+    if data_version != version {
+        return Err(format!(
+            "Pack data \"{}\" has format version {}, but its index has version {}.",
+            data_path.to_string_lossy(), data_version, version
+        ));
+    }
+
+    validate_index_records(&index, count, data.len(), index_path)?;
+
+    Ok(LoadedPack { data_path: data_path.to_path_buf(), data, index, count, version })
 }
 
 /// Validate a pack index header and return its `(record count, format version)`.
@@ -532,6 +565,463 @@ fn parse_index_header(index: &[u8], path: &Path) -> Result<(usize, u32), String>
     }
 
     Ok((count, version))
+}
+
+/// Validate the index beyond its header: hashes are strictly sorted, record ranges are non-empty
+/// and in bounds, and the offset-sorted records cover the data body exactly once with no hidden
+/// gaps or overlaps. The native writer always has this shape; enforcing it on transport input
+/// makes every byte in a published pack accountable to exactly one hash.
+fn validate_index_records(index: &[u8], count: usize, data_len: usize, path: &Path) -> Result<(), String> {
+    let corrupt = || format!("Pack index \"{}\" is corrupt.", path.to_string_lossy());
+    let mut previous_hash: Option<&[u8]> = None;
+    let mut ranges: Vec<(u64, u64)> = Vec::with_capacity(count);
+
+    for position in 0..count {
+        let record = INDEX_HEADER_LEN + position * INDEX_RECORD_LEN;
+        let hash = &index[record..record + HASH_LEN];
+
+        if previous_hash.is_some_and(|previous| previous >= hash) {
+            return Err(corrupt());
+        }
+        previous_hash = Some(hash);
+
+        let offset = read_u64_le(index, record + HASH_LEN);
+        let length = read_u64_le(index, record + HASH_LEN + 8);
+        let end = offset.checked_add(length).ok_or_else(&corrupt)?;
+
+        if length == 0 || offset < PACK_DATA_HEADER_LEN || end > data_len as u64 {
+            return Err(corrupt());
+        }
+        ranges.push((offset, end));
+    }
+
+    ranges.sort_unstable_by_key(|(start, _)| *start);
+    let mut expected = PACK_DATA_HEADER_LEN;
+    for (start, end) in ranges {
+        if start != expected {
+            return Err(corrupt());
+        }
+        expected = end;
+    }
+
+    if expected != data_len as u64 {
+        return Err(corrupt());
+    }
+
+    Ok(())
+}
+
+/// What installing the native-pack payload of a transport bundle added to this object store.
+pub(crate) struct TransportImportStats {
+    pub stored_objects: usize,
+    pub skipped_objects: usize,
+}
+
+/// A quarantined native pack/index pair extracted from a transport bundle. Both paths live in the
+/// real pack directory but retain a `.tmp` suffix, so normal readers cannot discover them before
+/// verification and the index-last publication sequence below.
+struct StagedTransportPack {
+    data_path: PathBuf,
+    index_path: PathBuf,
+}
+
+/// Import consecutive native pack/index sections from `reader`. Every section is copied to an
+/// ignored temp file, the complete incoming set is structurally and content-hash verified, and
+/// only then are its pack pairs made visible. A failure before publication removes every temp;
+/// a crash during publication leaves at worst a valid subset, which the ordinary franchise
+/// history walk heals from loose/batch fetches.
+///
+/// The exists/rename publication sequence assumes no *concurrent* importer of the same store:
+/// `franchise` targets a directory it just created, and every other pack writer runs under the
+/// store lock (`compact`) or warehouse lock.
+pub(crate) fn import_transport_packs<R: Read>(reader: &mut R,
+                                               sections: &[(u64, u64)])
+                                               -> Result<TransportImportStats, String> {
+    if sections.len() > MAX_TRANSPORT_PACKS {
+        return Err(format!(
+            "The bundle declares {} native packs, above the {}-pack limit.",
+            sections.len(), MAX_TRANSPORT_PACKS
+        ));
+    }
+
+    let folder = pack_folder();
+    file_utils::create_folder_if_not_exists(&folder)?;
+    remove_stale_temp_files(&folder);
+    let mut staged: Vec<StagedTransportPack> = Vec::with_capacity(sections.len());
+
+    let result = (|| -> Result<TransportImportStats, String> {
+        for (data_len, index_len) in sections {
+            if *data_len > MAX_TRANSPORT_PACK_BYTES {
+                return Err(format!(
+                    "A bundle pack section declares {} bytes, above the {}-byte limit.",
+                    data_len, MAX_TRANSPORT_PACK_BYTES
+                ));
+            }
+            if *index_len > MAX_TRANSPORT_INDEX_BYTES {
+                return Err(format!(
+                    "A bundle pack index declares {} bytes, above the {}-byte limit.",
+                    index_len, MAX_TRANSPORT_INDEX_BYTES
+                ));
+            }
+
+            let data_path = temp_path(&folder, PACK_DATA_EXTENSION);
+            let index_path = temp_path(&folder, PACK_INDEX_EXTENSION);
+            staged.push(StagedTransportPack { data_path, index_path });
+            let pair = staged.last().expect("the transport staging pair was just pushed");
+            copy_exact_to_file(reader, *data_len, &pair.data_path, "pack data")?;
+            copy_exact_to_file(reader, *index_len, &pair.index_path, "pack index")?;
+        }
+
+        let incoming: Vec<LoadedPack> = staged.iter()
+            .map(|pair| load_pack_pair(&pair.data_path, &pair.index_path))
+            .collect::<Result<_, _>>()?;
+
+        let hashes = verify_incoming_packs(&incoming)?;
+        let mut stored_objects = 0;
+        let mut skipped_objects = 0;
+        for hash in &hashes {
+            if file_utils::does_object_exist(&sign_utils::to_hex(hash))? {
+                skipped_objects += 1;
+            } else {
+                stored_objects += 1;
+            }
+        }
+
+        // Drop every mmap before renaming the staged files (Windows refuses to rename a mapped
+        // file; POSIX permits it, but the portable contract is cheap to preserve).
+        drop(incoming);
+
+        if stored_objects == 0 {
+            return Ok(TransportImportStats { stored_objects, skipped_objects });
+        }
+
+        // All pack bytes and indexes are valid. Harden the small number of aggregate files, then
+        // publish each data file before its index (the index is the reader-visible commit point).
+        for pair in &staged {
+            sync_file(&pair.data_path, "bundle pack data")?;
+            sync_file(&pair.index_path, "bundle pack index")?;
+        }
+
+        for pair in &staged {
+            let index = std::fs::read(&pair.index_path)
+                .map_err(|e| format!("Error while reading a verified bundle pack index: {}", e))?;
+            let pack_id = pack_id_from_index(&index)?;
+            let data_final = folder.join(format!("{}.{}", pack_id, PACK_DATA_EXTENSION));
+            let index_final = folder.join(format!("{}.{}", pack_id, PACK_INDEX_EXTENSION));
+
+            match (data_final.exists(), index_final.exists()) {
+                (true, true) => {
+                    // An identical layout is already published. Its content-addressed reads were
+                    // previously validated; keep it and discard this redundant staging pair.
+                }
+                (true, false) => {
+                    // A prior crash may have published data but not its index. It is invisible;
+                    // replace it with the just-verified bytes before publishing the index.
+                    std::fs::remove_file(&data_final)
+                        .map_err(|e| format!("Error while replacing incomplete pack data: {}", e))?;
+                    std::fs::rename(&pair.data_path, &data_final)
+                        .map_err(|e| format!("Error while publishing bundle pack data: {}", e))?;
+                    std::fs::rename(&pair.index_path, &index_final)
+                        .map_err(|e| format!("Error while publishing bundle pack index: {}", e))?;
+                }
+                (false, true) => {
+                    // An index without data is reader-visible corruption. Remove the stale commit
+                    // point first, then publish the verified pair data-first/index-last.
+                    std::fs::remove_file(&index_final)
+                        .map_err(|e| format!("Error while replacing incomplete pack index: {}", e))?;
+                    std::fs::rename(&pair.data_path, &data_final)
+                        .map_err(|e| format!("Error while publishing bundle pack data: {}", e))?;
+                    std::fs::rename(&pair.index_path, &index_final)
+                        .map_err(|e| format!("Error while publishing bundle pack index: {}", e))?;
+                }
+                (false, false) => {
+                    std::fs::rename(&pair.data_path, &data_final)
+                        .map_err(|e| format!("Error while publishing bundle pack data: {}", e))?;
+                    std::fs::rename(&pair.index_path, &index_final)
+                        .map_err(|e| format!("Error while publishing bundle pack index: {}", e))?;
+                }
+            }
+        }
+
+        file_utils::sync_dir(&folder)?;
+        invalidate_cache();
+
+        Ok(TransportImportStats { stored_objects, skipped_objects })
+    })();
+
+    // Published paths were renamed away and return NotFound here; failed/unneeded staging files
+    // are removed. Cleanup errors never mask the import's real result.
+    for pair in staged {
+        let _ = std::fs::remove_file(pair.data_path);
+        let _ = std::fs::remove_file(pair.index_path);
+    }
+
+    result
+}
+
+/// Copy exactly `length` bytes into a fresh staging file without trusting the section length for
+/// allocation. The bundle itself is already on disk, but this remains streaming and memory-bounded.
+fn copy_exact_to_file(reader: &mut impl Read,
+                      length: u64,
+                      path: &Path,
+                      what: &str) -> Result<(), String> {
+    let mut file = std::fs::File::create(path)
+        .map_err(|e| format!("Error while creating bundle {} staging file: {}", what, e))?;
+    let copied = std::io::copy(&mut reader.take(length), &mut file)
+        .map_err(|e| format!("Error while reading bundle {}: {}", what, e))?;
+
+    if copied != length {
+        return Err(format!(
+            "The bundle is truncated: its {} declared {} bytes but only {} remained.",
+            what, length, copied
+        ));
+    }
+
+    file.flush().map_err(|e| format!("Error while flushing bundle {}: {}", what, e))
+}
+
+fn sync_file(path: &Path, what: &str) -> Result<(), String> {
+    if !file_utils::fsync_enabled() {
+        return Ok(());
+    }
+    // A *write* handle, not a read-only one: Windows refuses FlushFileBuffers on a handle
+    // without write access (POSIX fsyncs any descriptor).
+    std::fs::OpenOptions::new().write(true).open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|e| format!("Error while syncing {}: {}", what, e))
+}
+
+/// Derive the native pack filename from the index's sorted `(hash, offset, length)` records — the
+/// same layout identity `PackWriter::finalize` used when the server built it.
+fn pack_id_from_index(index: &[u8]) -> Result<String, String> {
+    let (count, _) = parse_index_header(index, Path::new("<bundle pack index>"))?;
+    let mut records = Vec::with_capacity(count);
+
+    for position in 0..count {
+        let record = INDEX_HEADER_LEN + position * INDEX_RECORD_LEN;
+        let mut hash = [0u8; HASH_LEN];
+        hash.copy_from_slice(&index[record..record + HASH_LEN]);
+        records.push((
+            hash,
+            read_u64_le(index, record + HASH_LEN),
+            read_u64_le(index, record + HASH_LEN + 8),
+        ));
+    }
+
+    Ok(compute_pack_id(&records))
+}
+
+/// Verify every object reachable through the incoming indexes before any pack is published.
+/// Returns the distinct object hashes for import statistics. Bookkeeping keeps hashes in their
+/// raw 32-byte index form — hex `String`s would multiply the per-object cost several times over,
+/// and a large clone carries millions of objects. The cache is deliberately bounded: it
+/// accelerates delta chains, but a hostile pack cannot make verification retain the whole
+/// decompressed store in RAM.
+fn verify_incoming_packs(packs: &[LoadedPack]) -> Result<Vec<[u8; HASH_LEN]>, String> {
+    let locator = IncomingLocator::build(packs)?;
+
+    let mut hashes = Vec::with_capacity(locator.entries.len());
+    let mut cache = IncomingVerificationCache::default();
+    let mut visiting = HashSet::new();
+
+    for entry in &locator.entries {
+        let mut hash = [0u8; HASH_LEN];
+        hash.copy_from_slice(locator.hash_of(*entry));
+        resolve_incoming_object(&hash, &locator, &mut cache, &mut visiting, 0)?;
+        hashes.push(hash);
+    }
+
+    Ok(hashes)
+}
+
+/// A sorted locator over every record in the quarantined incoming set, so each of the
+/// per-object (and per-delta-base) lookups during verification is one binary search across the
+/// whole set instead of one per pack — O(objects × log objects) total rather than
+/// O(objects × packs × log). Entries are indirect `(pack, record)` positions (8 bytes per
+/// object) comparing against the packs' resident index bytes; a hash-keyed map would cost an
+/// order of magnitude more transient memory on a large clone.
+struct IncomingLocator<'a> {
+    packs: &'a [LoadedPack],
+    /// `(pack position, record position)`, sorted by the record's hash bytes.
+    entries: Vec<(u32, u32)>,
+}
+
+impl<'a> IncomingLocator<'a> {
+    /// Build the locator. Sorting also surfaces cross-pack duplicates (adjacent equal hashes),
+    /// which are refused: the bundle builder emits every object exactly once.
+    fn build(packs: &'a [LoadedPack]) -> Result<IncomingLocator<'a>, String> {
+        let total = packs.iter().map(|pack| pack.count).sum();
+        let mut entries: Vec<(u32, u32)> = Vec::with_capacity(total);
+
+        for (pack_position, pack) in packs.iter().enumerate() {
+            for record_position in 0..pack.count {
+                entries.push((pack_position as u32, record_position as u32));
+            }
+        }
+
+        let hash_of = |entry: &(u32, u32)| -> &[u8] {
+            let record = INDEX_HEADER_LEN + entry.1 as usize * INDEX_RECORD_LEN;
+            &packs[entry.0 as usize].index[record..record + HASH_LEN]
+        };
+        entries.sort_unstable_by(|a, b| hash_of(a).cmp(hash_of(b)));
+
+        for pair in entries.windows(2) {
+            if hash_of(&pair[0]) == hash_of(&pair[1]) {
+                return Err(format!(
+                    "The bundle's native packs contain duplicate object {}.",
+                    sign_utils::to_hex(hash_of(&pair[0]))
+                ));
+            }
+        }
+
+        Ok(IncomingLocator { packs, entries })
+    }
+
+    fn hash_of(&self, entry: (u32, u32)) -> &'a [u8] {
+        let record = INDEX_HEADER_LEN + entry.1 as usize * INDEX_RECORD_LEN;
+        &self.packs[entry.0 as usize].index[record..record + HASH_LEN]
+    }
+
+    /// Locate a hash in the incoming set: its pack and the record's `(offset, length)` there.
+    fn locate(&self, hash: &[u8; HASH_LEN]) -> Option<(&'a LoadedPack, u64, u64)> {
+        let position = self.entries
+            .binary_search_by(|entry| self.hash_of(*entry).cmp(hash))
+            .ok()?;
+        let (pack_position, record_position) = self.entries[position];
+        let pack = &self.packs[pack_position as usize];
+        let record = INDEX_HEADER_LEN + record_position as usize * INDEX_RECORD_LEN;
+
+        Some((
+            pack,
+            read_u64_le(&pack.index, record + HASH_LEN),
+            read_u64_le(&pack.index, record + HASH_LEN + 8),
+        ))
+    }
+
+    fn contains(&self, hash: &[u8; HASH_LEN]) -> bool {
+        self.locate(hash).is_some()
+    }
+}
+
+const INCOMING_VERIFY_CACHE_BYTES: usize = 128 * 1024 * 1024;
+
+#[derive(Default)]
+struct IncomingVerificationCache {
+    objects: HashMap<[u8; HASH_LEN], Arc<Vec<u8>>>,
+    bytes: usize,
+}
+
+impl IncomingVerificationCache {
+    fn get(&self, hash: &[u8; HASH_LEN]) -> Option<Arc<Vec<u8>>> {
+        self.objects.get(hash).cloned()
+    }
+
+    fn insert(&mut self, hash: [u8; HASH_LEN], bytes: Arc<Vec<u8>>) {
+        if bytes.len() > INCOMING_VERIFY_CACHE_BYTES {
+            return;
+        }
+        if self.bytes.saturating_add(bytes.len()) > INCOMING_VERIFY_CACHE_BYTES {
+            self.objects.clear();
+            self.bytes = 0;
+        }
+        self.bytes += bytes.len();
+        self.objects.insert(hash, bytes);
+    }
+}
+
+/// Resolve one incoming native-pack object against the quarantined pack set (falling back to an
+/// already-present local base for incremental compatibility), then enforce content addressing and
+/// import ceilings. Delta recursion is cycle-checked and hard-bounded independently of the writer.
+fn resolve_incoming_object(hash: &[u8; HASH_LEN],
+                           locator: &IncomingLocator<'_>,
+                           cache: &mut IncomingVerificationCache,
+                           visiting: &mut HashSet<[u8; HASH_LEN]>,
+                           depth: u32) -> Result<Arc<Vec<u8>>, String> {
+    if let Some(bytes) = cache.get(hash) {
+        return Ok(bytes);
+    }
+
+    // One transient hex form for the store API and error messages; bookkeeping stays binary.
+    let hex = sign_utils::to_hex(hash);
+
+    if depth > MAX_DELTA_CHAIN {
+        return Err(format!(
+            "Packed delta {} exceeds the reconstruction depth limit (corrupt bundle?).", hex
+        ));
+    }
+    if !visiting.insert(*hash) {
+        return Err(format!("The bundle's native packs contain a delta cycle at {}.", hex));
+    }
+
+    let resolved = (|| -> Result<Vec<u8>, String> {
+        let Some((pack, offset, length)) = locator.locate(hash) else {
+            return file_utils::retrieve_object_by_hash(&hex);
+        };
+        let record = pack.slice(offset, length)?;
+
+        if pack.version < FIRST_FRAMED_VERSION {
+            return decode_full_transport_record(record, &hex);
+        }
+
+        let (&kind, body) = record.split_first()
+            .ok_or_else(|| format!("Packed object {} has an empty record.", hex))?;
+
+        match kind {
+            RECORD_FULL => decode_full_transport_record(body, &hex),
+            RECORD_DELTA => {
+                if body.len() < HASH_LEN {
+                    return Err(format!("Packed delta {} is truncated (no base hash).", hex));
+                }
+
+                let mut base_hash = [0u8; HASH_LEN];
+                base_hash.copy_from_slice(&body[..HASH_LEN]);
+                let (target_len, read) = byte_utils::number_from_vlq_bytes(HASH_LEN, body)?;
+                let target_len = usize::try_from(target_len)
+                    .map_err(|_| format!("Packed delta {} declares an unrepresentable length.", hex))?;
+                let payload_start = HASH_LEN.checked_add(read)
+                    .filter(|start| *start <= body.len())
+                    .ok_or_else(|| format!("Packed delta {} is truncated.", hex))?;
+
+                let base = if locator.contains(&base_hash) {
+                    resolve_incoming_object(&base_hash, locator, cache, visiting, depth + 1)?
+                } else {
+                    file_utils::retrieve_object_by_hash_shared(&sign_utils::to_hex(&base_hash))?
+                };
+
+                delta_utils::decompress_delta(&base, &body[payload_start..], target_len)
+            }
+            other => Err(format!("Packed object {} has an unknown record kind {}.", hex, other)),
+        }
+    })();
+
+    visiting.remove(hash);
+    let bytes = resolved?;
+    object_utils::validate_imported_object(&hex, &bytes)?;
+    let bytes = Arc::new(bytes);
+    cache.insert(*hash, Arc::clone(&bytes));
+    Ok(bytes)
+}
+
+/// Bounded full-record decompression for untrusted transport packs. Local packs predate this
+/// transport role and use the ordinary read path; a new bundle writer never emits a full object
+/// above the import ceiling, so producing one byte beyond it is an immediate refusal.
+fn decode_full_transport_record(record: &[u8], hash: &str) -> Result<Vec<u8>, String> {
+    let mut decoder = zstd::stream::read::Decoder::new(record)
+        .map_err(|e| format!("Error while opening packed object {}: {}", hash, e))?;
+    let mut bytes = Vec::new();
+    decoder.by_ref()
+        .take(object_utils::MAX_OBJECT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("Error while decompressing packed object {}: {}", hash, e))?;
+
+    if bytes.len() > object_utils::MAX_OBJECT_BYTES {
+        return Err(format!(
+            "Packed object {} expands above the {}-byte object ceiling; refusing the bundle.",
+            hash, object_utils::MAX_OBJECT_BYTES
+        ));
+    }
+
+    Ok(bytes)
 }
 
 /// Retrieve the decompressed bytes of an object from the packs, or `None` if no pack holds
@@ -777,6 +1267,8 @@ pub fn compact(all: bool) -> Result<CompactStats, String> {
     // auto-maintenance (which ignores compaction errors) simply skips the now-redundant work.
     // Taken after the folder exists so its parent (`forklift_root`) is present for `create_new`.
     let _store_lock = lock_utils::StoreLock::acquire()?;
+
+    remove_stale_temp_files(&pack_folder);
 
     // The objects to pack, and the old pack files a repack supersedes.
     //
@@ -1636,8 +2128,10 @@ impl PackWriter {
     /// pack, a file a new pack was just written to — an idempotent repack lands on that name).
     fn finalize(mut self) -> Result<Finalized, String> {
         self.data_writer.flush().map_err(|e| format!("Error while flushing pack: {}", e))?;
-        self.data_writer.get_ref().sync_all()
-            .map_err(|e| format!("Error while syncing pack: {}", e))?;
+        if file_utils::fsync_enabled() {
+            self.data_writer.get_ref().sync_all()
+                .map_err(|e| format!("Error while syncing pack: {}", e))?;
+        }
 
         // The index is sorted by hash for binary-search lookups.
         self.records.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1667,6 +2161,100 @@ impl PackWriter {
 struct Finalized {
     sources: Vec<PathBuf>,
     files: Vec<PathBuf>,
+}
+
+/// One native pack/index pair built for embedding in a transport bundle.
+pub(crate) struct TransportPackArtifact {
+    pub data_path: PathBuf,
+    pub index_path: PathBuf,
+}
+
+/// A narrow facade over the native pack writer for bundle construction. It preserves the same
+/// rollover, record framing, delta representation and layout-derived identity as local compaction,
+/// but has no loose sources to delete: the server is producing a read-only transport artifact.
+pub(crate) struct TransportPackBuilder {
+    folder: PathBuf,
+    writer: Option<PackWriter>,
+    artifacts: Vec<TransportPackArtifact>,
+}
+
+impl TransportPackBuilder {
+    pub fn new(folder: &Path) -> Result<TransportPackBuilder, String> {
+        file_utils::create_folder_if_not_exists(folder)?;
+        Ok(TransportPackBuilder {
+            folder: folder.to_path_buf(),
+            writer: None,
+            artifacts: Vec::new(),
+        })
+    }
+
+    /// Append raw verified object bytes as a native full record.
+    pub fn append_full(&mut self, hash: &str, raw: &[u8]) -> Result<(), String> {
+        let hash_bytes = hash_to_bytes(hash)
+            .ok_or_else(|| format!("Cannot pack \"{}\": not a 64-character object hash.", hash))?;
+        object_utils::verify_object_bytes(hash, raw)?;
+        let compressed = zstd::encode_all(raw, 0)
+            .map_err(|e| format!("Error while compressing bundled object {}: {}", hash, e))?;
+        self.writer_mut()?.append_full(hash_bytes, &compressed, None)?;
+        self.roll_if_needed()
+    }
+
+    /// Append a bundle delta in the native pack's framing. Both formats use the same zstd
+    /// dictionary payload; only the base-hash and target-length encodings differ.
+    pub fn append_delta(&mut self,
+                        target_hash: &str,
+                        base_hash: &str,
+                        target_len: u64,
+                        payload: &[u8]) -> Result<(), String> {
+        let target = hash_to_bytes(target_hash)
+            .ok_or_else(|| format!("Cannot pack \"{}\": not a 64-character object hash.", target_hash))?;
+        let base = hash_to_bytes(base_hash)
+            .ok_or_else(|| format!("Cannot delta against \"{}\": not a 64-character object hash.", base_hash))?;
+        self.writer_mut()?.append_delta(target, base, target_len, payload, None)?;
+        self.roll_if_needed()
+    }
+
+    pub fn finish(mut self) -> Result<Vec<TransportPackArtifact>, String> {
+        self.finish_current()?;
+        Ok(self.artifacts)
+    }
+
+    fn writer_mut(&mut self) -> Result<&mut PackWriter, String> {
+        if self.writer.is_none() {
+            self.writer = Some(PackWriter::new(&self.folder)?);
+        }
+        Ok(self.writer.as_mut().expect("the transport pack writer was just created"))
+    }
+
+    fn roll_if_needed(&mut self) -> Result<(), String> {
+        if self.writer.as_ref().is_some_and(PackWriter::should_roll_over) {
+            self.finish_current()?;
+        }
+        Ok(())
+    }
+
+    fn finish_current(&mut self) -> Result<(), String> {
+        let Some(writer) = self.writer.take() else {
+            return Ok(());
+        };
+        let finalized = writer.finalize()?;
+        let mut data_path = None;
+        let mut index_path = None;
+
+        for path in finalized.files {
+            match path.extension().and_then(|extension| extension.to_str()) {
+                Some(PACK_DATA_EXTENSION) => data_path = Some(path),
+                Some(PACK_INDEX_EXTENSION) => index_path = Some(path),
+                _ => {}
+            }
+        }
+
+        self.artifacts.push(TransportPackArtifact {
+            data_path: data_path.ok_or_else(|| "A built transport pack has no data file.".to_string())?,
+            index_path: index_path.ok_or_else(|| "A built transport pack has no index file.".to_string())?,
+        });
+        Ok(())
+    }
 }
 
 /// Build the on-disk index bytes: header, then the (already sorted) records.
@@ -1718,14 +2306,44 @@ fn temp_path(pack_folder: &Path, extension: &str) -> PathBuf {
     pack_folder.join(format!(".compact-{}-{}.{}.tmp", std::process::id(), sequence, extension))
 }
 
+/// How old an orphaned `.tmp` staging file must be before a later run reclaims it. Normal runs
+/// remove their staging on every exit path; only a hard kill (SIGKILL, power loss) leaves one
+/// behind. The generous age keeps any plausibly-live writer's files out of reach.
+const STALE_TEMP_SECONDS: u64 = 24 * 60 * 60;
+
+/// Best-effort removal of staging debris (`temp_path` names) that a killed writer left in the
+/// pack folder — otherwise it accumulates forever, and a recycled PID could even collide with it.
+/// Errors are ignored: reclaiming debris must never fail the operation that triggered it.
+fn remove_stale_temp_files(pack_folder: &Path) {
+    let Ok(entries) = std::fs::read_dir(pack_folder) else { return };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let is_temp = name.to_str()
+            .is_some_and(|name| name.starts_with(".compact-") && name.ends_with(".tmp"));
+        let is_stale = entry.metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age.as_secs() >= STALE_TEMP_SECONDS);
+
+        if is_temp && is_stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// Write a file and fsync it (used for the index, which must be durable before rename).
 fn write_and_sync(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let mut file = std::fs::File::create(path)
         .map_err(|e| format!("Error while creating \"{}\": {}", path.to_string_lossy(), e))?;
     file.write_all(bytes)
         .map_err(|e| format!("Error while writing \"{}\": {}", path.to_string_lossy(), e))?;
-    file.sync_all()
-        .map_err(|e| format!("Error while syncing \"{}\": {}", path.to_string_lossy(), e))
+    if file_utils::fsync_enabled() {
+        file.sync_all()
+            .map_err(|e| format!("Error while syncing \"{}\": {}", path.to_string_lossy(), e))?;
+    }
+    Ok(())
 }
 
 /// Whether an object's raw bytes are a parcel, read from the type in its header (`VLQ version,
