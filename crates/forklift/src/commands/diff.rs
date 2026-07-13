@@ -264,7 +264,7 @@ fn diff_pallets(from_revision: &str,
         if output::is_json() {
             output::emit("diff", &DiffReport { mode: "pallets", files: Vec::new() });
         } else {
-            println!("Pallets \"{}\" and \"{}\" have identical trees.", from_revision, to_revision);
+            println!("Revisions \"{}\" and \"{}\" have identical trees.", from_revision, to_revision);
         }
 
         return Ok(());

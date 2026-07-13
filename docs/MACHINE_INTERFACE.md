@@ -43,7 +43,10 @@ it emits (in `crates/forklift/src/commands/`).
 
 **Version 2** (current): `history` entries carry `parents` (every parcel's parents, in
 stored order, always present — `[]` for a root); the `empty_history` error code exists
-(`history` on an unborn pallet); and `palletize` list entries carry `head`.
+(`history` on an unborn pallet); `palletize` list entries carry `head`; the `show`
+command reads a file's content at a revision in one call; `diff` accepts the reserved
+`:empty` token (either revision) for the empty tree; and `peek` on a binary blob reports
+`binary: true` instead of silently mangling the bytes.
 
 ### `history --json`
 
@@ -104,6 +107,8 @@ comparing a root parcel (which has no real "before") against a clean slate, so e
 file it introduces lists as `Added`. `:empty` can never collide with a real revision:
 a pallet/meta-pallet name is restricted to ASCII letters, digits, `.`, `_`, `-` and
 `/`, and a hash prefix is hex digits only — neither grammar can contain `:`.
+
+### `show --json`
 
 `show <revision>:<path>` reads a file's content at a revision in one call — a
 program's alternative to resolving a revision, walking its tree and peeking the blob
