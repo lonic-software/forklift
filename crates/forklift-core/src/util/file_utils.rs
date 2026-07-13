@@ -241,17 +241,25 @@ pub fn sync_dir(dir: &Path) -> Result<(), String> {
     }
 }
 
-/// Write `content` to a fresh file at `path`, fsyncing its bytes before returning (unless
-/// [`fsync_enabled`] is off). A following rename can then never publish a name whose contents never
-/// reached disk — which, because object writers skip existing hashes, would otherwise be a torn
-/// object that is never repaired.
-fn write_and_sync_file(path: &Path, content: &[u8]) -> Result<(), String> {
+/// Create `path` and write `content` to it, with no durability guarantee at all. Split out of
+/// [`write_and_sync_file`] so a [`BulkStoreSession`]'s staged writes can share the exact same
+/// creation/write path without paying for (or skipping past) its fsync.
+fn create_and_write_file(path: &Path, content: &[u8]) -> Result<std::fs::File, String> {
     use std::io::Write;
 
     let mut file = std::fs::File::create(path)
         .map_err(|e| format!("Error while writing file \"{}\": {}", path.to_string_lossy(), e))?;
     file.write_all(content)
         .map_err(|e| format!("Error while writing file \"{}\": {}", path.to_string_lossy(), e))?;
+    Ok(file)
+}
+
+/// Write `content` to a fresh file at `path`, fsyncing its bytes before returning (unless
+/// [`fsync_enabled`] is off). A following rename can then never publish a name whose contents never
+/// reached disk — which, because object writers skip existing hashes, would otherwise be a torn
+/// object that is never repaired.
+fn write_and_sync_file(path: &Path, content: &[u8]) -> Result<(), String> {
+    let file = create_and_write_file(path, content)?;
     if fsync_enabled() {
         file.sync_all()
             .map_err(|e| format!("Error while syncing file \"{}\": {}", path.to_string_lossy(), e))?;
@@ -290,6 +298,20 @@ pub fn write_file_atomically(file_path: &Path, content: &[u8]) -> Result<(), Str
     let mut temporary_file_path = PathBuf::from(file_path);
     temporary_file_path.set_file_name(format!("{}.tmp{}-{}", file_name, std::process::id(), write_id));
 
+    // While a bulk-store session is active, stage the write and hand its (temp, final) pair to
+    // the session instead of fsyncing and renaming here — `BulkStoreSession::finish` runs the
+    // durability barrier and every rename as one batch. The invariant this function otherwise
+    // enforces per-write (a final name never exists before its bytes are durable) still holds:
+    // the rename simply has not happened yet, so `file_path` stays invisible until it does.
+    {
+        let mut session = bulk_session_registry().lock().expect("bulk store session lock poisoned");
+        if let Some(pending) = session.as_mut() {
+            create_and_write_file(&temporary_file_path, content)?;
+            pending.push((temporary_file_path, file_path.to_path_buf()));
+            return Ok(());
+        }
+    }
+
     write_and_sync_file(&temporary_file_path, content)?;
 
     std::fs::rename(&temporary_file_path, file_path).map_err(|e|
@@ -302,6 +324,193 @@ pub fn write_file_atomically(file_path: &Path, content: &[u8]) -> Result<(), Str
         Some(parent) if !parent.as_os_str().is_empty() => sync_dir(parent),
         _ => Ok(()),
     }
+}
+
+/// The process-global bulk-store session registry: `Some(pending)` while a session is active,
+/// where `pending` is the recorded `(temp_path, final_path)` writes staged so far. Behind a
+/// `Mutex` so [`write_file_atomically`] and [`BulkStoreSession`] can share it without either
+/// side needing to pass a handle around.
+fn bulk_session_registry() -> &'static std::sync::Mutex<Option<Vec<(PathBuf, PathBuf)>>> {
+    static SESSION: std::sync::OnceLock<std::sync::Mutex<Option<Vec<(PathBuf, PathBuf)>>>> =
+        std::sync::OnceLock::new();
+    SESSION.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// A scoped bulk-store session: batches the *publish*, not just the fsync, for a burst of loose
+/// writes through [`write_file_atomically`] (only that function — `object_utils::store_object_stream`
+/// and every other writer are untouched and behave exactly as before).
+///
+/// Every content-addressed writer in this store dedups by existence (skips writing a hash that is
+/// already there), so a final name must never exist before its bytes are durable — a crash between
+/// the two would leave a torn object that every future writer silently skips forever, permanent
+/// silent poison (see [`write_and_sync_file`]). The per-object fsync that invariant normally costs
+/// is what a bulk import spends most of its wall time on: on macOS, `File::sync_all` is
+/// `F_FULLFSYNC`, a real device-cache flush (~5-15 ms), paid once per object. A session defers both
+/// the durability wait and the rename for every write made while it is open to one barrier in
+/// [`BulkStoreSession::finish`] — so the invariant is enforced once for the whole batch instead of
+/// once per file, while still holding in every crash interleaving (see `finish`'s doc comment).
+///
+/// Exactly one session may be active per process (enforced by [`open`](BulkStoreSession::open)
+/// through the `Mutex` in [`bulk_session_registry`]). This is deliberately not a concurrency
+/// primitive: it exists for a single, sequential bulk writer (`import-git --no-compact`) and must
+/// never be opened by anything with concurrent writers — in particular the server head, which
+/// serves many warehouses and many requests from one process, must never open one.
+///
+/// The facility generalizes to any other bulk, sequential loose writer (an incremental batch
+/// fetch landing many objects loose, say) — it is deliberately not wired into one yet, since
+/// `import-git` is the only place that need has actually shown up so far.
+pub struct BulkStoreSession {
+    finished: bool,
+}
+
+impl BulkStoreSession {
+    /// Open a bulk-store session. Fails if one is already active in this process (see the type's
+    /// doc comment — only one may ever be open at a time).
+    pub fn open() -> Result<BulkStoreSession, String> {
+        let mut registry = bulk_session_registry().lock().expect("bulk store session lock poisoned");
+        if registry.is_some() {
+            return Err("A bulk store session is already active in this process.".to_string());
+        }
+        *registry = Some(Vec::new());
+        Ok(BulkStoreSession { finished: false })
+    }
+
+    /// The barrier: fsync every staged write's bytes, then — only once every byte is durable —
+    /// rename each into place and fsync the directories that changed.
+    ///
+    /// Runs in this exact order:
+    /// 1. A *cheap* data-to-device fsync per staged temp file (`libc::fsync`): on Linux that
+    ///    already is full durability; on macOS it only queues the write to the drive, without
+    ///    flushing its cache; on Windows there is no cheaper variant, so this step falls back to
+    ///    `File::sync_all` per file.
+    /// 2. macOS only: one `F_FULLFSYNC` on any single staged file. The drive's write cache is
+    ///    flushed device-wide, not per file, so one flush covers every write queued in step 1.
+    /// 3. Only now: rename every temp file to its final name (metadata-only, so fast) and record
+    ///    each distinct parent directory touched.
+    /// 4. Fsync every touched parent directory, so the renames themselves survive power loss.
+    ///
+    /// [`fsync_enabled`] gates steps 1, 2 and 4 exactly like every other writer's durability
+    /// escape hatch — but the deferred-rename structure in step 3 always applies regardless,
+    /// since that is what preserves the invariant, not the fsyncing.
+    ///
+    /// Crash analysis: before step 3 begins, only temp names exist on disk — invisible to every
+    /// reader, cleaned up by the existing stale-temp patterns that already tolerate a crashed
+    /// single-file write. During step 3, the durability barrier (steps 1-2) has already
+    /// completed, so every temp file's bytes are durable *before* any rename runs — a crash
+    /// partway through step 3 leaves some names published (durable bytes, correctly visible) and
+    /// the rest as still-invisible temps. The invariant — a final name never exists before its
+    /// bytes are durable — holds in every interleaving.
+    pub fn finish(mut self) -> Result<(), String> {
+        let result = self.run_barrier();
+        self.finished = true;
+        result
+    }
+
+    fn run_barrier(&mut self) -> Result<(), String> {
+        let pending = bulk_session_registry().lock().expect("bulk store session lock poisoned")
+            .take().unwrap_or_default();
+
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        if fsync_enabled() {
+            for (temp, _) in &pending {
+                fsync_data(temp)?;
+            }
+
+            #[cfg(target_os = "macos")]
+            macos_flush_device_cache(&pending[0].0)?;
+        }
+
+        let mut touched_parents: BTreeSet<PathBuf> = BTreeSet::new();
+        for (temp, final_path) in &pending {
+            std::fs::rename(temp, final_path).map_err(|e| format!(
+                "Error while moving file into place at \"{}\": {}", final_path.to_string_lossy(), e
+            ))?;
+            if let Some(parent) = final_path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    touched_parents.insert(parent.to_path_buf());
+                }
+            }
+        }
+
+        if fsync_enabled() {
+            for parent in &touched_parents {
+                sync_dir(parent)?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl Drop for BulkStoreSession {
+    /// Dropping without calling [`finish`](BulkStoreSession::finish) aborts: no staged write was
+    /// ever fsynced or renamed, so best-effort removing the temp files publishes nothing — the
+    /// durability invariant holds trivially, since there is nothing to un-publish.
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        if let Ok(mut registry) = bulk_session_registry().lock() {
+            if let Some(pending) = registry.take() {
+                for (temp, _) in pending {
+                    let _ = std::fs::remove_file(&temp);
+                }
+            }
+        }
+    }
+}
+
+/// Fsync one file's data to the drive — the *cheap* half of the durability barrier compared to
+/// `File::sync_all`. `libc::fsync` only queues the write to the drive: on Linux that already is
+/// full durability (there is no cheaper-vs-complete distinction there), so this is the entire
+/// per-file cost. On macOS it is cheaper than `sync_all`'s `F_FULLFSYNC` but leaves the drive's
+/// write cache unflushed — which is why [`BulkStoreSession::finish`] still runs one
+/// `F_FULLFSYNC` afterwards (see [`macos_flush_device_cache`]) to cover the whole batch.
+#[cfg(unix)]
+fn fsync_data(path: &Path) -> Result<(), String> {
+    use std::os::unix::io::AsRawFd;
+
+    let file = std::fs::File::open(path)
+        .map_err(|e| format!("Error while opening \"{}\" to sync it: {}", path.to_string_lossy(), e))?;
+    if unsafe { libc::fsync(file.as_raw_fd()) } != 0 {
+        return Err(format!(
+            "Error while syncing \"{}\": {}", path.to_string_lossy(), std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+/// Windows has no cheaper variant than a full flush, so the per-file step of the barrier falls
+/// back to `File::sync_all` here — the batch still amortizes the rename and directory syncs
+/// (steps 3-4 of [`BulkStoreSession::finish`]), just not this one.
+#[cfg(windows)]
+fn fsync_data(path: &Path) -> Result<(), String> {
+    std::fs::File::open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|e| format!("Error while syncing \"{}\": {}", path.to_string_lossy(), e))
+}
+
+/// Flush the drive's write cache once via `fcntl(F_FULLFSYNC)` — macOS's actual device-cache
+/// flush, which [`fsync_data`] deliberately does not pay per file. The flush is drive-wide, not
+/// file-specific, so running it on any one of the batch's files covers every write already
+/// queued there by [`fsync_data`].
+#[cfg(target_os = "macos")]
+fn macos_flush_device_cache(path: &Path) -> Result<(), String> {
+    use std::os::unix::io::AsRawFd;
+
+    let file = std::fs::File::open(path).map_err(|e| format!(
+        "Error while opening \"{}\" to flush the device cache: {}", path.to_string_lossy(), e
+    ))?;
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) } == -1 {
+        return Err(format!(
+            "Error while flushing the device cache via \"{}\": {}",
+            path.to_string_lossy(), std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
 }
 
 /// Write an object to a file (atomically, see [`write_file_atomically`]): object writes are
