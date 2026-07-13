@@ -1246,6 +1246,16 @@ struct WindowEntry {
 ///   repack re-deltas the live set from scratch and every path base is itself live, no delta
 ///   is ever left pointing at a dropped object.
 ///
+/// A repack's live *packed* objects normally take the fast path — copied verbatim, preserving
+/// whatever delta each already has (see `Source::CopyRecord`) — so the common repack is a
+/// byte-copy, not a re-compress. `redelta` (only meaningful with `all`; the caller is
+/// responsible for refusing the combination otherwise, see the CLI's `compact` handler) turns
+/// every live packed object into a recompression candidate instead — the same treatment a
+/// loose object gets (read, decompress, offer to the path base then the size window, keep the
+/// delta only if it wins) — so cross-path similarity a per-object copy structurally cannot see
+/// (renames, moved files) gets a chance to delta. One-shot and CPU-bound: every live object is
+/// re-read and re-compressed, not just the ones a plain repack would have touched anyway.
+///
 /// Signature sidecars (`.sig`) and temp files are left alone (sidecars are read by path).
 /// Objects are packed largest-first and offered as a **delta** — against the previous version
 /// of the same file (path-aware) or, failing that, a small size window — kept only when
@@ -1254,11 +1264,12 @@ struct WindowEntry {
 ///
 /// # Arguments
 /// * `all` - Repack existing packs too (drop packed garbage, consolidate), not just the loose set.
+/// * `redelta` - Re-delta every live packed object instead of copying it verbatim (see above).
 ///
 /// # Returns
 /// * `Ok(CompactStats)` - What was packed and removed.
 /// * `Err(String)`      - If enumeration, writing, or deletion failed.
-pub fn compact(all: bool) -> Result<CompactStats, String> {
+pub fn compact(all: bool, redelta: bool) -> Result<CompactStats, String> {
     let pack_folder = pack_folder();
     file_utils::create_folder_if_not_exists(&pack_folder)?;
 
@@ -1283,7 +1294,7 @@ pub fn compact(all: bool) -> Result<CompactStats, String> {
     let (targets, old_packs, source_packs, path_bases) = {
         let _parcel_memo = object_utils::ParcelReadMemo::activate();
 
-        let CollectedTargets { mut targets, old_packs, source_packs } = collect_targets(all)?;
+        let CollectedTargets { mut targets, old_packs, source_packs } = collect_targets(all, redelta)?;
         // Largest first (the delta/window heuristic), with the object hash as a total tie-breaker
         // so the packing order — and therefore every record's offset — is deterministic. Without
         // it, equal-size objects kept their filesystem-enumeration order, so two repacks of the
@@ -1647,7 +1658,12 @@ struct CollectedTargets {
 /// dropped is reconstructed and re-deltated instead. Unreachable objects are simply not
 /// carried over, so packed garbage is dropped; unreachable *loose* objects are left for the
 /// grace-period collector.
-fn collect_targets(all: bool) -> Result<CollectedTargets, String> {
+///
+/// `redelta` (densification, only meaningful when `all` is set) makes every live packed
+/// object a `Source::Reconstruct` unconditionally — the same path already used for the rare
+/// dropped-base case — instead of `Source::CopyRecord`, so nothing is copied verbatim: the
+/// whole live set is re-read and re-offered to path-base/window delta selection.
+fn collect_targets(all: bool, redelta: bool) -> Result<CollectedTargets, String> {
     if !all {
         return Ok(CollectedTargets {
             targets: enumerate_loose_objects()?,
@@ -1693,13 +1709,20 @@ fn collect_targets(all: bool) -> Result<CollectedTargets, String> {
             let framed = pack.version >= FIRST_FRAMED_VERSION;
 
             // A delta whose base is not itself live cannot be copied (the base is being
-            // dropped); reconstruct and re-delta it. Everything else is copied as-is. The record
-            // header (kind + base hash) is read straight from the pack's mmap, not a fresh file read.
-            let (is_delta, base) = read_record_header(pack, offset, framed)?;
-            let source = if is_delta && base.is_some_and(|b| !live.contains(&sign_utils::to_hex(&b))) {
+            // dropped); reconstruct and re-delta it. Everything else is copied as-is — unless
+            // `redelta` asked for every live object to be a recompression candidate, in which
+            // case skip the header read entirely (its result would be discarded) and always
+            // reconstruct. The record header (kind + base hash) is read straight from the pack's
+            // mmap, not a fresh file read.
+            let source = if redelta {
                 Source::Reconstruct
             } else {
-                Source::CopyRecord { pack_index, offset, len: length, framed, is_delta }
+                let (is_delta, base) = read_record_header(pack, offset, framed)?;
+                if is_delta && base.is_some_and(|b| !live.contains(&sign_utils::to_hex(&b))) {
+                    Source::Reconstruct
+                } else {
+                    Source::CopyRecord { pack_index, offset, len: length, framed, is_delta }
+                }
             };
 
             targets.push(PackTarget { hash, size: length, source });
@@ -2625,7 +2648,7 @@ mod tests {
 
         // Compaction relocates the bytes (loose → pack), but the content for a hash is
         // immutable, so the cached value stays valid — no stale reads.
-        compact(false).unwrap();
+        compact(false, false).unwrap();
         assert_eq!(file_utils::retrieve_object_by_hash(&hash).unwrap(), content);
 
         std::fs::remove_dir_all(&temp).ok();
@@ -2773,7 +2796,7 @@ mod tests {
             store_loose(hash, content);
         }
 
-        let stats = compact(false).unwrap();
+        let stats = compact(false, false).unwrap();
         assert_eq!(stats.objects_packed, 3);
         assert_eq!(stats.packs_written, 1);
         assert_eq!(stats.loose_removed, 3);
@@ -2828,7 +2851,7 @@ mod tests {
 
         let full_size: u64 = contents.iter().map(|c| c.len() as u64).sum();
 
-        let stats = compact(false).unwrap();
+        let stats = compact(false, false).unwrap();
         assert_eq!(stats.objects_packed, 30);
         assert!(stats.deltas > 0, "similar objects should be stored as deltas (got {})", stats.deltas);
 
@@ -2955,7 +2978,7 @@ mod tests {
         store_loose(&hash, &content);
 
         // Pack it (loose -> pack, loose file deleted). In-process this also invalidated the cache.
-        compact(false).unwrap();
+        compact(false, false).unwrap();
 
         // Simulate the stale peer: poison this process's registry back to "no packs" even though
         // the pack is on disk and the loose file is gone. A naive read now misses on both paths.
@@ -2984,9 +3007,9 @@ mod tests {
         store_loose(&blake3::hash(&content).to_hex().to_string(), &content);
 
         let held = lock_utils::StoreLock::acquire().expect("hold the store lock");
-        assert!(compact(false).is_err(), "compact must refuse while the shared store lock is held");
+        assert!(compact(false, false).is_err(), "compact must refuse while the shared store lock is held");
         drop(held);
-        assert!(compact(false).is_ok(), "compact runs once the store lock is free");
+        assert!(compact(false, false).is_ok(), "compact runs once the store lock is free");
 
         std::fs::remove_dir_all(&temp).ok();
     }
@@ -3013,11 +3036,11 @@ mod tests {
         // Two separate incremental packs, so the repack has more than one old pack to supersede.
         let content_a = b"first pack content".to_vec();
         store_loose(&blake3::hash(&content_a).to_hex().to_string(), &content_a);
-        compact(false).unwrap();
+        compact(false, false).unwrap();
 
         let content_b = b"second pack content".to_vec();
         store_loose(&blake3::hash(&content_b).to_hex().to_string(), &content_b);
-        compact(false).unwrap();
+        compact(false, false).unwrap();
 
         let pack_paths_before: Vec<PathBuf> = std::fs::read_dir(pack_folder()).unwrap()
             .filter_map(|e| e.ok())
@@ -3028,7 +3051,7 @@ mod tests {
 
         // No pallet refs exist in this bare store, so the live set is empty: a repack must drop
         // every packed object as garbage and remove both old packs entirely.
-        let stats = compact(true).unwrap();
+        let stats = compact(true, false).unwrap();
         assert_eq!(stats.objects_packed, 0, "nothing is reachable, so nothing should be repacked");
 
         for old_pack in &pack_paths_before {
