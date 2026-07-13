@@ -1075,7 +1075,23 @@ pub fn retrieve_from_packs_reloading(hash: &str) -> Result<Option<Vec<u8>>, Stri
 /// Chains are bounded far below this at write time (`MAX_DELTA_CHAIN`, an approximate bound
 /// since the path walk restarts recorded depth on repeats — real chains can run a small
 /// multiple of it), so this is only a backstop against a corrupt or adversarial pack that
-/// chains without end: it turns unbounded recursion (a crash) into a clean error.
+/// chains without end: it turns unbounded recursion (a crash) into a clean error, never a lost
+/// or wrong object (the failure is caught before anything is written or deleted).
+///
+/// KNOWN GAP (pre-existing, not introduced by the redelta densification work — reproduced on
+/// unmodified history-walk code too): `MAX_DELTA_CHAIN`'s write-time bound is *approximate* by
+/// design (see its own doc comment) because `compute_path_bases` counts only path hops since a
+/// reset, blind to a "reset" object's own real depth when that object itself won a *window*
+/// delta rather than a full record — so a path-chain segment's real depth can exceed the nominal
+/// cap, and — empirically, at real-repository scale, across repeated `compact --all --redelta`
+/// runs on the same store — real depth has been observed climbing into the hundreds and, once,
+/// tripping this exact backstop on a repository's most frequently-and-continuously-touched file
+/// paths. A correct fix needs a true per-object depth ledger reconciled with the size-first
+/// write order (which path bases are order-independent of, but window bases are not) — real
+/// design work, tracked as a follow-up rather than attempted as a quick patch here. The failure
+/// mode is safe (durable-before-destructive: a compact that hits this backstop writes and
+/// deletes nothing, so the store is exactly as it was before the attempt), just unavailable —
+/// which is why `redelta`'s CLI help does not recommend running it back-to-back on one store.
 const MAX_RECONSTRUCT_DEPTH: u32 = 1000;
 
 thread_local! {
@@ -1253,7 +1269,14 @@ struct WindowEntry {
 /// every live packed object into a recompression candidate instead — the same treatment a
 /// loose object gets (read, decompress, offer to the path base then the size window, keep the
 /// delta only if it wins) — so cross-path similarity a per-object copy structurally cannot see
-/// (renames, moved files) gets a chance to delta. One-shot and CPU-bound: every live object is
+/// (renames, moved files) gets a chance to delta. `compute_path_bases` credits *directories* as
+/// well as files with a path base (a directory's previous version at the same path), which
+/// matters enormously more here than in a plain repack: a plain repack's `CopyRecord` fast path
+/// preserves whatever delta a directory already had (from `import_git`'s own per-path chaining,
+/// say), but `redelta` discards that and starts every directory over from a decompress — without
+/// crediting directories too, every one of them (typically a third or more of a repo's objects)
+/// would fall back to the size window on every redelta, and a redelta pass could easily land
+/// *larger* than the store it started from. One-shot and CPU-bound: every live object is
 /// re-read and re-compressed, not just the ones a plain repack would have touched anyway.
 ///
 /// Signature sidecars (`.sig`) and temp files are left alone (sidecars are read by path).
@@ -1662,7 +1685,17 @@ struct CollectedTargets {
 /// `redelta` (densification, only meaningful when `all` is set) makes every live packed
 /// object a `Source::Reconstruct` unconditionally — the same path already used for the rare
 /// dropped-base case — instead of `Source::CopyRecord`, so nothing is copied verbatim: the
-/// whole live set is re-read and re-offered to path-base/window delta selection.
+/// whole live set is re-read and re-offered to path-base/window delta selection (which now
+/// credits directories with a path base too, not just files — see `compute_path_bases`).
+///
+/// A `Reconstruct` target's `size` (the largest-first sort key, shared with every other target)
+/// comes from the record header when the record is a delta — its raw target length, read
+/// straight from the delta's own cleartext VLQ field, the same real-content-size proxy a loose
+/// object's file size already stands in for — rather than the delta's own (small, previously
+/// packed) on-disk length: an import-produced store is mostly deltas, so using their on-disk
+/// length here would sort (and so window-batch) objects by how well they happened to already
+/// compress, not by how big they are, which is close to meaningless for grouping similar-sized
+/// objects together.
 fn collect_targets(all: bool, redelta: bool) -> Result<CollectedTargets, String> {
     if !all {
         return Ok(CollectedTargets {
@@ -1708,47 +1741,75 @@ fn collect_targets(all: bool, redelta: bool) -> Result<CollectedTargets, String>
             let length = read_u64_le(&pack.index, record + HASH_LEN + 8);
             let framed = pack.version >= FIRST_FRAMED_VERSION;
 
+            // The record header (kind + base hash + a delta's raw target length) is read
+            // straight from the pack's mmap, not a fresh file read — needed unconditionally now
+            // (not skipped under `redelta` the way it used to be): a delta's *on-disk* length is
+            // its payload size, which for a well-delta'd store is small and essentially
+            // unrelated to the object's real size, so using it as the largest-first sort key
+            // (below) would pair objects by how well they happened to already compress, not by
+            // how big they are — scrambling the very order the size-window fallback depends on.
+            let header = read_record_header(pack, offset, length, framed)?;
+
             // A delta whose base is not itself live cannot be copied (the base is being
             // dropped); reconstruct and re-delta it. Everything else is copied as-is — unless
             // `redelta` asked for every live object to be a recompression candidate, in which
-            // case skip the header read entirely (its result would be discarded) and always
-            // reconstruct. The record header (kind + base hash) is read straight from the pack's
-            // mmap, not a fresh file read.
-            let source = if redelta {
+            // case always reconstruct.
+            let base_dropped = header.is_delta && header.base.is_some_and(|b| !live.contains(&sign_utils::to_hex(&b)));
+            let source = if redelta || base_dropped {
                 Source::Reconstruct
             } else {
-                let (is_delta, base) = read_record_header(pack, offset, framed)?;
-                if is_delta && base.is_some_and(|b| !live.contains(&sign_utils::to_hex(&b))) {
-                    Source::Reconstruct
-                } else {
-                    Source::CopyRecord { pack_index, offset, len: length, framed, is_delta }
-                }
+                Source::CopyRecord { pack_index, offset, len: length, framed, is_delta: header.is_delta }
             };
 
-            targets.push(PackTarget { hash, size: length, source });
+            // A delta's raw target length is free (it is stored in cleartext right after the
+            // base hash — see `read_record_header`); a full record has no such field without
+            // decompressing it, so its on-disk (compressed) length is the best cheap proxy —
+            // the same one a loose object's file size already stands in for.
+            let size = header.raw_len.unwrap_or(length);
+
+            targets.push(PackTarget { hash, size, source });
         }
     }
 
     Ok(CollectedTargets { targets, old_packs, source_packs: packs })
 }
 
-/// Read a record's kind and (for a delta) its base hash, without reconstructing it — just the
-/// leading kind byte and, for a delta, the 32-byte base that follows. A version-1 (unframed)
-/// record is always a full object.
-fn read_record_header(pack: &LoadedPack, offset: u64, framed: bool) -> Result<(bool, Option<[u8; HASH_LEN]>), String> {
+/// A record's kind and, for a delta, its base hash and the raw (decompressed) length of the
+/// object it encodes — see [`read_record_header`].
+struct RecordHeader {
+    is_delta: bool,
+    base: Option<[u8; HASH_LEN]>,
+    /// A delta's raw target length, read straight from its own cleartext VLQ field — no
+    /// decompression needed. `None` for a full record: its raw length is not cheaply knowable
+    /// without decompressing the zstd blob, so a caller wanting a sort-key proxy for one falls
+    /// back to its on-disk (compressed) length instead (see `collect_targets`).
+    raw_len: Option<u64>,
+}
+
+/// Read a record's kind and (for a delta) its base hash and raw target length, without
+/// reconstructing it — just the leading kind byte, the 32-byte base that follows a delta, and
+/// the VLQ length after that (`base hash (32) || target length (VLQ) || zstd delta`, the layout
+/// `PackWriter::append_delta` writes). A version-1 (unframed) record is always a full object.
+fn read_record_header(pack: &LoadedPack, offset: u64, len: u64, framed: bool) -> Result<RecordHeader, String> {
     if !framed {
-        return Ok((false, None));
+        return Ok(RecordHeader { is_delta: false, base: None, raw_len: None });
     }
 
     let kind = pack.slice(offset, 1)?[0];
     if kind != RECORD_DELTA {
-        return Ok((false, None));
+        return Ok(RecordHeader { is_delta: false, base: None, raw_len: None });
     }
 
-    let base = pack.slice(offset + 1, HASH_LEN as u64)?;
-    let mut array = [0u8; HASH_LEN];
-    array.copy_from_slice(base);
-    Ok((true, Some(array)))
+    // The whole record, bounded by its own on-disk length (from the index) — safe to hand to
+    // the VLQ decoder as-is: it stops at the first byte whose high bit is clear, never reading
+    // past what is passed in.
+    let record = pack.slice(offset, len)?;
+    let mut base = [0u8; HASH_LEN];
+    base.copy_from_slice(&record[1..1 + HASH_LEN]);
+
+    let (raw_len, _) = byte_utils::number_from_vlq_bytes(1 + HASH_LEN, record)?;
+
+    Ok(RecordHeader { is_delta: true, base: Some(base), raw_len: Some(raw_len) })
 }
 
 /// A live record carried verbatim into the new pack, framed for a version-2 pack: a version-2
@@ -1820,63 +1881,96 @@ impl Bloom {
     }
 }
 
-/// Path-aware base selection (phase 2b): for every reachable blob, the previous version of
-/// the *same file* (by path) as its delta base — the ideal base git's name-sorted packer
-/// picks, which the size heuristic can only approximate. Returns `blob hash → base hash`, both
-/// as raw 32-byte Blake3 digests (not hex) — this map is purely an in-memory intermediate
-/// consulted once per blob during packing, never serialized, so a fixed `[u8; HASH_LEN]` key
-/// avoids a 64-byte hex `String` (allocation + `Eq`/`Hash` over 64 bytes) per entry in favour of
-/// a stack-sized array — a real win at the object counts this map is sized for (one entry per
-/// reachable blob). An object with no entry (a tree, a parcel, a first version, or an
-/// unreachable blob) has no path base and falls back to the size window.
+/// Path-aware base selection (phase 2b): for every reachable blob *and tree*, the previous
+/// version at the *same path* as its delta base — the ideal base git's name-sorted packer
+/// picks, which the size heuristic can only approximate. A directory changes one entry per
+/// commit and so deltas against its own previous version just as well as a file does — the
+/// same locality `import_git`'s pack-direct pipeline already exploits on the way in (its
+/// `latest_tree_at_path`) — so a `compact --redelta` recomputing bases from scratch must credit
+/// trees too, or every one of them (typically a third or more of a repo's objects) falls back
+/// to the size window on every redelta, not just the rare object whose base was dropped as
+/// garbage. Returns `hash → base hash` for both kinds in one map, both as raw 32-byte Blake3
+/// digests (not hex) — this map is purely an in-memory intermediate consulted once per object
+/// during packing, never serialized, so a fixed `[u8; HASH_LEN]` key avoids a 64-byte hex
+/// `String` (allocation + `Eq`/`Hash` over 64 bytes) per entry in favour of a stack-sized array
+/// — a real win at the object counts this map is sized for (one entry per reachable blob or
+/// tree). An object with no entry (a parcel, a first version at its path, or an unreachable
+/// object) has no path base and falls back to the size window.
 ///
 /// This walks the reachable DAG — all parcels and their trees, but never blob *content* —
 /// mirroring the bundle traversal (`bundle_utils`), and bounds each chain to `MAX_DELTA_CHAIN`
-/// so reconstruction recursion stays bounded. Its "seen trees" and "seen blobs" sets are Bloom
-/// filters, so the walk's memory is bounded (a bit budget) rather than one entry per object —
-/// what keeps it viable at kernel scale (see [`Bloom`]).
+/// so reconstruction recursion stays bounded. Every "seen" set is a Bloom filter, so the walk's
+/// memory is bounded (a bit budget) rather than one entry per object — what keeps it viable at
+/// kernel scale (see [`Bloom`]).
 fn compute_path_bases() -> Result<HashMap<[u8; HASH_LEN], [u8; HASH_LEN]>, String> {
     let heads: Vec<String> = pallet_utils::all_pallet_refs()?
         .into_iter().map(|(_, head)| head).collect();
 
     let reachable = audit_utils::collect_reachable(&heads)?;
-    // Oldest first, so a file's earlier version is visited before the later version that
-    // will delta against it.
+    // Oldest first, so a file's (or a directory's) earlier version is visited before the later
+    // version that will delta against it.
     let order = bundle_utils::topo_order_oldest_first(&reachable)?;
 
     // A repo averages several objects (trees + blobs) per parcel; size the Bloom filters from
     // that estimate so they are bounded and roughly right for both small and huge histories.
     let estimate = reachable.len().saturating_mul(5);
-    let mut seen_trees = Bloom::new(estimate);
-    let mut seen_blobs = Bloom::new(estimate);
-    // Bounded by the number of distinct paths (not by history depth); carries each path's
-    // latest blob and that blob's chain depth (so `depth_of` need not be a per-object map).
-    let mut latest_at_path: HashMap<String, ([u8; HASH_LEN], u32)> = HashMap::new();
-    let mut base_of: HashMap<[u8; HASH_LEN], [u8; HASH_LEN]> = HashMap::new();
+    let mut walk = PathBaseWalk {
+        seen_subtrees: Bloom::new(estimate),
+        seen_blobs: Bloom::new(estimate),
+        seen_trees: Bloom::new(estimate),
+        latest_blob_at_path: HashMap::new(),
+        latest_tree_at_path: HashMap::new(),
+        base_of: HashMap::new(),
+    };
 
     for parcel_hash in &order {
         let tree_hash = object_utils::load_parcel(parcel_hash)?.tree_hash;
-        walk_tree_for_bases(&tree_hash, "", &mut seen_trees, &mut seen_blobs,
-                            &mut latest_at_path, &mut base_of)?;
+        walk_tree_for_bases(&tree_hash, "", &mut walk)?;
     }
 
-    Ok(base_of)
+    Ok(walk.base_of)
 }
 
-/// Walk one tree's closure, recording each blob's path base (see [`compute_path_bases`]).
-/// Deduplicated by tree hash: an identical (unchanged) subtree carries no new blob versions,
-/// so it is skipped — the same optimisation the bundle walk makes. (A Bloom false positive
-/// skips a tree that was not in fact seen; its blobs then fall back to the size window.)
-fn walk_tree_for_bases(tree_hash: &str,
-                       path_prefix: &str,
-                       seen_trees: &mut Bloom,
-                       seen_blobs: &mut Bloom,
-                       latest_at_path: &mut HashMap<String, ([u8; HASH_LEN], u32)>,
-                       base_of: &mut HashMap<[u8; HASH_LEN], [u8; HASH_LEN]>) -> Result<(), String> {
-    if seen_trees.contains(tree_hash.as_bytes()) {
-        return Ok(());
+/// Mutable state threaded through [`walk_tree_for_bases`] (see [`compute_path_bases`]).
+struct PathBaseWalk {
+    /// Skips re-descending into an already-fully-walked (unchanged) subtree's *children* — a
+    /// pure recursion dedup (an identical subtree carries no new blob or tree versions beneath
+    /// it), orthogonal to `seen_blobs`/`seen_trees` below, which decide which objects a path
+    /// base is fixed for.
+    seen_subtrees: Bloom,
+    /// Fixes each blob's base on first encounter (see [`record_path_base`]).
+    seen_blobs: Bloom,
+    /// Fixes each tree's base on first encounter — a separate Bloom from `seen_blobs` so a
+    /// false positive in one can never suppress the other's base.
+    seen_trees: Bloom,
+    /// The newest blob at each path so far, and its chain depth. Bounded by the number of
+    /// distinct file paths (not by history depth).
+    latest_blob_at_path: HashMap<String, ([u8; HASH_LEN], u32)>,
+    /// The newest tree (directory) at each path so far, and its chain depth. Kept as a map
+    /// separate from `latest_blob_at_path`: a path that holds a file in one commit and a
+    /// directory in another (a rename over a deleted entry of the other kind) must never delta
+    /// one kind against the other, and reusing one map keyed only on path string could pair
+    /// them by coincidence.
+    latest_tree_at_path: HashMap<String, ([u8; HASH_LEN], u32)>,
+    /// hash → its delta base — the walk's output (see [`compute_path_bases`]). Blob and tree
+    /// hashes share this one map safely: both are content addresses of disjoint byte encodings,
+    /// so a tree's base is always another tree and a blob's base always another blob.
+    base_of: HashMap<[u8; HASH_LEN], [u8; HASH_LEN]>,
+}
+
+/// Walk one tree's closure, recording the tree's *own* path base and then each blob's (see
+/// [`compute_path_bases`]). Recursion into a subtree's children is deduplicated by tree hash: an
+/// identical (unchanged) subtree carries no new versions beneath it, so descending again is
+/// skipped — the same optimisation the bundle walk makes. (A Bloom false positive skips a
+/// subtree that was not in fact seen; its contents then fall back to the size window.) That
+/// dedup is *only* about children — the tree's own path base is fixed on every occurrence, same
+/// as a blob's, since even a repeated (reverted) directory is a legitimate base for whatever
+/// comes next at that path.
+fn walk_tree_for_bases(tree_hash: &str, path_prefix: &str, walk: &mut PathBaseWalk) -> Result<(), String> {
+    let already_expanded = walk.seen_subtrees.contains(tree_hash.as_bytes());
+    if !already_expanded {
+        walk.seen_subtrees.insert(tree_hash.as_bytes());
     }
-    seen_trees.insert(tree_hash.as_bytes());
 
     // Presence-tolerant descent, matching the live-set walk (`gc_utils::collect_live_set`). A
     // subtree object can be legitimately absent — sealed by hash in a signed parcel but never
@@ -1888,8 +1982,25 @@ fn walk_tree_for_bases(tree_hash: &str,
     // mid-walk, and `compact` runs only inside a short-lived, single-shot CLI process, so the pack
     // registry this walk reads was populated fresh by this same run, never carried over stale from
     // an earlier one. For a store missing some paths the output is deterministic given the same
-    // present set: the same objects are present, so the same bases are computed.
+    // present set: the same objects are present, so the same bases are computed. Checked on every
+    // occurrence, not just the first: presence is a pure property of the hash (invariant for the
+    // whole run, the store lock is held throughout), so this never contradicts an earlier result —
+    // and packed objects resolve it with a syscall-free resident-index lookup (`is_in_packs`), so
+    // paying it again on a repeat is cheap in the common (non-sparse) case this scales for.
     if !file_utils::does_object_exist(tree_hash)? {
+        return Ok(());
+    }
+
+    // A tree entry's hash is always a valid content address (it was written as one); the rare
+    // unparseable case (a corrupt tree) simply gets no path base here rather than aborting the
+    // walk — the same fallback a Bloom false positive already causes, and the object read/verify
+    // path is what actually guards against corruption.
+    if let Some(tree_hash_bytes) = hash_to_bytes(tree_hash) {
+        record_path_base(tree_hash_bytes, tree_hash, path_prefix,
+                         &mut walk.seen_trees, &mut walk.latest_tree_at_path, &mut walk.base_of);
+    }
+
+    if already_expanded {
         return Ok(());
     }
 
@@ -1897,10 +2008,6 @@ fn walk_tree_for_bases(tree_hash: &str,
 
     for (name, file) in tree.get_files() {
         let path = join_path(path_prefix, name);
-        // A tree entry's hash is always a valid content address (it was written as one); the
-        // rare unparseable case (a corrupt tree) simply gets no path base here rather than
-        // aborting the walk — the same fallback a Bloom false positive already causes, and the
-        // object read/verify path is what actually guards against corruption.
         if let Some(blob_hash) = hash_to_bytes(&file.hash) {
             // The Bloom filter is keyed on the *hex string* bytes, not the raw digest — pinned
             // deliberately, not an oversight: a Bloom filter is probabilistic, so which bytes it
@@ -1908,57 +2015,60 @@ fn walk_tree_for_bases(tree_hash: &str,
             // which blob gets a path-base delta vs. falls back to the size window — i.e. it can
             // change the packed bytes. Switching this encoding would silently change that pattern
             // (and so, at a scale where a false positive actually fires, the pack's bytes) even
-            // though `base_of`/`latest_at_path` themselves are exact `HashMap`s and safe to key on
-            // `[u8; HASH_LEN]` (see `compute_path_bases`'s doc comment) — an exact lookup gives an
-            // identical answer under any equivalent key encoding, but a hash-bucketed probabilistic
-            // structure does not. So this call keeps hashing exactly what the pre-D/P3 code hashed.
-            record_path_base(blob_hash, &file.hash, &path, seen_blobs, latest_at_path, base_of);
+            // though `base_of`/`latest_blob_at_path` themselves are exact `HashMap`s and safe to
+            // key on `[u8; HASH_LEN]` (see `compute_path_bases`'s doc comment) — an exact lookup
+            // gives an identical answer under any equivalent key encoding, but a hash-bucketed
+            // probabilistic structure does not. So this call keeps hashing exactly what the
+            // pre-D/P3 code hashed.
+            record_path_base(blob_hash, &file.hash, &path,
+                             &mut walk.seen_blobs, &mut walk.latest_blob_at_path, &mut walk.base_of);
         }
     }
 
     for (name, subtree) in tree.get_subtrees() {
         let child = join_path(path_prefix, name);
-        walk_tree_for_bases(&subtree.hash, &child, seen_trees, seen_blobs, latest_at_path, base_of)?;
+        walk_tree_for_bases(&subtree.hash, &child, walk)?;
     }
 
     Ok(())
 }
 
-/// Record a blob's path base: the most recent blob seen at this path (if its chain is not yet
-/// at the limit), and update the latest-at-path so the next version chains from this one.
+/// Record one object's (a blob's or a tree's) path base: the most recent object of the same kind
+/// seen at this path (if its chain is not yet at the limit), and update the latest-at-path so
+/// the next version chains from this one.
 ///
-/// Takes both `blob_hash` (raw, for the exact `base_of`/`latest_at_path` maps) and
-/// `blob_hash_hex` (for the probabilistic `seen_blobs` Bloom filter) — see the call site's doc
-/// comment for why the Bloom filter deliberately keeps hashing the hex-string bytes rather than
-/// switching to the raw ones the maps now use.
-fn record_path_base(blob_hash: [u8; HASH_LEN],
-                    blob_hash_hex: &str,
+/// Takes both `hash` (raw, for the exact `base_of`/`latest_at_path` maps) and `hash_hex` (for
+/// the probabilistic `seen` Bloom filter) — see the call site's doc comment for why the Bloom
+/// filter deliberately keeps hashing the hex-string bytes rather than switching to the raw ones
+/// the maps now use.
+fn record_path_base(hash: [u8; HASH_LEN],
+                    hash_hex: &str,
                     path: &str,
-                    seen_blobs: &mut Bloom,
+                    seen: &mut Bloom,
                     latest_at_path: &mut HashMap<String, ([u8; HASH_LEN], u32)>,
                     base_of: &mut HashMap<[u8; HASH_LEN], [u8; HASH_LEN]>) {
-    // First time this blob is seen fixes its base; a later appearance (or a Bloom false
+    // First time this object is seen fixes its base; a later appearance (or a Bloom false
     // positive) only advances the path. Its real chain depth is not tracked per object (that
     // would defeat the bounded-memory point), so the recorded depth restarts at 0 here — which
     // makes the `MAX_DELTA_CHAIN` bound approximate (a real chain can run a small multiple of
     // it). That is safe: base pointers stay acyclic so reconstruction always terminates, and
     // `MAX_RECONSTRUCT_DEPTH` is the hard backstop.
-    if seen_blobs.contains(blob_hash_hex.as_bytes()) {
-        latest_at_path.insert(path.to_string(), (blob_hash, 0));
+    if seen.contains(hash_hex.as_bytes()) {
+        latest_at_path.insert(path.to_string(), (hash, 0));
         return;
     }
-    seen_blobs.insert(blob_hash_hex.as_bytes());
+    seen.insert(hash_hex.as_bytes());
 
     let mut depth = 0;
 
     if let Some((base, base_depth)) = latest_at_path.get(path) {
-        if *base_depth < MAX_DELTA_CHAIN && *base != blob_hash {
-            base_of.insert(blob_hash, *base);
+        if *base_depth < MAX_DELTA_CHAIN && *base != hash {
+            base_of.insert(hash, *base);
             depth = base_depth + 1;
         }
     }
 
-    latest_at_path.insert(path.to_string(), (blob_hash, depth));
+    latest_at_path.insert(path.to_string(), (hash, depth));
 }
 
 /// Join a warehouse path prefix and an entry name (`""` prefix yields the bare name).

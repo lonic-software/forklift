@@ -4395,6 +4395,108 @@ fn compact_all_without_redelta_still_takes_the_copy_path() {
     assert_eq!(objects_store_bytes(&objects), bytes_first, "a steady-state repack must not change the store size");
 }
 
+/// How many files share the cycling directory in [`redelta_tree_fixture`] — many, not one, so a
+/// *full* tree record (every entry listed) is measurably larger than a *delta* one (just the one
+/// entry that changed), the gap the fixture exposes. Also the version count: each version
+/// touches a *different* file, cycling once through the whole directory (more than
+/// `DELTA_WINDOW`, 10, so a size-window fallback could not span the whole chain by luck either).
+const REDELTA_TREE_FIXTURE_FILES_PER_DIR: usize = 24;
+
+/// A store exercising the *directory* counterpart of the path-base machinery a blob's delta
+/// chain already uses: one directory with several files, a *different* one of which changes each
+/// commit (cycling once through all of them), so the directory's own tree object gets a new hash
+/// every version. Touching a different file each time (rather than the same one repeatedly)
+/// means only the *immediately preceding* version is a good delta base for a later one — by the
+/// time several versions have passed, enough *other* entries have also changed that a
+/// non-adjacent pairing is a measurably worse delta, mirroring how a real directory accumulates
+/// many small, unrelated changes over history (a fixture where every version stayed
+/// interchangeable with every other would let a lucky window match hide a broken path base).
+/// Each version is packed *alone* (an incremental `compact` per commit, like `redelta_fixture`),
+/// so cross-version matching can only come from `compute_path_bases`, not the window (which
+/// starts empty each run) — this is what `compute_path_bases` neglecting trees (only ever basing
+/// blobs) previously defeated. Returns the warehouse.
+fn redelta_tree_fixture(name: &str) -> TestWarehouse {
+    let warehouse = TestWarehouse::new(name);
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    for f in 0..REDELTA_TREE_FIXTURE_FILES_PER_DIR {
+        warehouse.write_file(&format!("data/sub/f{:02}.txt", f), &format!("file {} v0 filler content\n", f));
+    }
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "setup"]));
+    assert_success(&warehouse.run(&["compact"]));
+
+    for v in 0..REDELTA_TREE_FIXTURE_FILES_PER_DIR {
+        warehouse.write_file(&format!("data/sub/f{:02}.txt", v), &format!("file {} v1 filler content\n", v));
+        assert_success(&warehouse.run(&["load", "."]));
+        assert_success(&warehouse.run(&["stack", &format!("v{}", v)]));
+        assert_success(&warehouse.run(&["compact"]));
+    }
+
+    warehouse
+}
+
+#[test]
+fn compact_finds_a_directorys_path_base_across_many_versions() {
+    let warehouse = redelta_tree_fixture("redelta-tree-density");
+    let objects = warehouse.root.join(".forklift/objects");
+
+    // `compute_path_bases` runs on *every* compact (it is shared, not `--redelta`-only — see its
+    // doc comment), so the density this pins comes from the incremental compacts themselves;
+    // the closing `--all` (no `--redelta`) just consolidates the already-packed records
+    // verbatim into one pack for a clean total-byte measurement.
+    assert_success(&warehouse.run(&["compact", "--all"]));
+    let after_plain_all = objects_store_bytes(&objects);
+
+    // Each directory version is `REDELTA_TREE_FIXTURE_FILES_PER_DIR` entries; without a path
+    // base, every version but the first has nothing better than a full listing (or, absent any
+    // window neighbor at write time, the same thing) to fall back to. Calibrated against this
+    // exact fixture measured both ways: ~40,500 bytes before `compute_path_bases` covered trees
+    // (every version's tree stored close to full), ~21,900 bytes after (every version's tree and
+    // blob delta against its immediate predecessor) — most of what remains even in the fixed
+    // case is the per-parcel cost, which is fixed (a parcel is never delta'd, see `pack_utils`)
+    // and so does not move with the fix. The ceiling sits well below the broken number and with
+    // comfortable margin above the fixed one, so it stays a real (if approximate) regression trip
+    // wire rather than pinning an exact byte count to a heuristic that is free to improve.
+    let ceiling = 30_000;
+    assert!(
+        after_plain_all < ceiling,
+        "a directory with a real per-version path base should collapse to near-nothing per \
+         version, not store every version's full listing (after compact --all: {} bytes, \
+         ceiling {})", after_plain_all, ceiling
+    );
+
+    // `--all --redelta` on the same store must not be a regression: it has nothing further to
+    // buy back here (no cross-path rename in this fixture), but re-encoding from scratch must
+    // land in the same ballpark, not the multi-times-larger store the original bug produced.
+    let redelta = warehouse.run(&["--json", "compact", "--all", "--redelta"]);
+    assert_success(&redelta);
+    assert!(json(&redelta)["data"]["objects_packed"].as_u64().unwrap() > 0);
+    let after_redelta = objects_store_bytes(&objects);
+    assert!(
+        after_redelta < ceiling,
+        "redelta must not lose the directory path base plain compact already found \
+         (after --redelta: {} bytes, ceiling {})", after_redelta, ceiling
+    );
+
+    // Every object still reads back byte-correct — a full diff from empty forces every tree
+    // version (and the blob it carries) to reconstruct.
+    let diff = warehouse.run(&["diff", ":empty", "main"]);
+    assert_success(&diff);
+    let text = stdout(&diff);
+    assert!(text.contains("data/sub/f00.txt"), "unexpected diff output: {}", text);
+    assert!(
+        text.contains(&format!("file {} v1 filler content", REDELTA_TREE_FIXTURE_FILES_PER_DIR - 1)),
+        "the final directory version must reconstruct byte-correct: {}", text
+    );
+
+    assert_eq!(
+        json(&warehouse.run(&["--json", "history"]))["data"]["entries"].as_array().unwrap().len(),
+        REDELTA_TREE_FIXTURE_FILES_PER_DIR + 1, "every parcel must survive a redelta repack"
+    );
+}
+
 #[test]
 fn a_mutating_command_runs_maintenance_when_due() {
     let warehouse = TestWarehouse::new("auto-maintenance");

@@ -165,12 +165,15 @@ pub enum Command {
         /// Re-encode every object to delta-compress across the whole store (only with --all)
         #[arg(
             long,
-            long_help = "Re-encode every live object — packed or loose — to delta-compress \
-                         across the whole store, instead of a repack's usual verbatim copy of \
-                         already-packed records. Buys back the cross-path similarity (renames, \
-                         moved files) a per-object copy cannot see, at the cost of a full \
-                         re-read, re-compress and re-delta of every object: one-shot and \
-                         CPU-bound, not something to run routinely. Only valid with --all."
+            long_help = "Re-encode every live object — packed or loose, files and directories \
+                         alike — to delta-compress across the whole store, instead of a \
+                         repack's usual verbatim copy of already-packed records. Buys back the \
+                         cross-path similarity (renames, moved files) a per-object copy cannot \
+                         see, at the cost of a full re-read, re-compress and re-delta of every \
+                         object: one-shot and CPU-bound, not something to run routinely, and not \
+                         something to repeat back-to-back on the same store — run it once after \
+                         a big import, then let history move on before running it again. Only \
+                         valid with --all."
         )]
         redelta: bool,
     },
