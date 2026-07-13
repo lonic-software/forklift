@@ -1776,6 +1776,7 @@ fn collect_targets(all: bool, redelta: bool) -> Result<CollectedTargets, String>
 
 /// A record's kind and, for a delta, its base hash and the raw (decompressed) length of the
 /// object it encodes — see [`read_record_header`].
+#[derive(Debug)]
 struct RecordHeader {
     is_delta: bool,
     base: Option<[u8; HASH_LEN]>,
@@ -1804,9 +1805,30 @@ fn read_record_header(pack: &LoadedPack, offset: u64, len: u64, framed: bool) ->
     // the VLQ decoder as-is: it stops at the first byte whose high bit is clear, never reading
     // past what is passed in.
     let record = pack.slice(offset, len)?;
+
+    // `record`'s length is the index's declared record length, not a promise it actually holds a
+    // base hash: a native writer never emits a delta shorter than this, but a locally loaded pack
+    // is only checked for index-level consistency (`validate_index_records` — offsets/lengths in
+    // bounds, exactly covering the data file, no per-record shape check), not for whether *this*
+    // record's declared length is enough for the kind byte says it is. A transport-imported pack
+    // is separately re-verified against every hash it claims to hold, but a pack read straight off
+    // local disk is not. Bounds-check before indexing, so on-disk corruption fails this compact
+    // cleanly instead of panicking on a slice out of range (the fuzz suite's posture: reject, never
+    // panic, on any malformed input).
+    if record.len() < 1 + HASH_LEN {
+        return Err(format!(
+            "Pack \"{}\" delta record at offset {} is truncated (no base hash).",
+            pack.data_path.to_string_lossy(), offset
+        ));
+    }
+
     let mut base = [0u8; HASH_LEN];
     base.copy_from_slice(&record[1..1 + HASH_LEN]);
 
+    // `number_from_vlq_bytes` is itself bounds-safe on truncated input (it stops at `content.len()`
+    // and errors rather than indexing past it — see its own doc comment), so a delta record long
+    // enough for its base hash but truncated mid-VLQ fails cleanly here too, without a further
+    // explicit length check.
     let (raw_len, _) = byte_utils::number_from_vlq_bytes(1 + HASH_LEN, record)?;
 
     Ok(RecordHeader { is_delta: true, base: Some(base), raw_len: Some(raw_len) })
@@ -3069,6 +3091,57 @@ mod tests {
         let result = retrieve_from_packs(&hash_a);
         assert!(result.is_err(), "a record decompressing to the wrong bytes must fail the read, got {:?}", result);
         assert!(result.unwrap_err().contains("corrupt"), "the error should name the corruption");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn a_short_delta_record_is_rejected_not_panicked() {
+        // Index-level validation (`validate_index_records`) only checks that offsets/lengths are
+        // in bounds and exactly cover the data file — it has no notion of what a record's *kind*
+        // byte requires, so it happily accepts a record too short to hold a delta's base hash. A
+        // native writer never emits one, but a locally loaded pack is not re-verified against
+        // that shape (unlike a transport-imported one, checked hash-by-hash on the way in), so a
+        // disk-corrupted or hand-crafted index can still produce this. `read_record_header` must
+        // reject it cleanly rather than panic indexing past the record's declared length.
+        let temp = std::env::temp_dir().join(format!("forklift-pack-short-delta-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        let pack_folder = temp.join(".forklift/objects/pack");
+        std::fs::create_dir_all(&pack_folder).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+
+        // Framed (v2) data: header, then one RECORD_DELTA record with only 2 bytes after the
+        // kind byte — nowhere near the 32-byte base hash the kind promises, let alone a VLQ
+        // length after it.
+        let mut data = Vec::new();
+        data.extend_from_slice(PACK_DATA_MAGIC);
+        data.extend_from_slice(&PACK_FORMAT_VERSION.to_le_bytes());
+        let offset = data.len() as u64;
+        data.push(RECORD_DELTA);
+        data.extend_from_slice(&[0xAAu8, 0xBB]);
+        let length = 3u64;
+
+        // Index: header, then one record whose (offset, length) exactly covers the short
+        // record above — so index-level validation passes and the pack loads.
+        let mut index = Vec::new();
+        index.extend_from_slice(PACK_INDEX_MAGIC);
+        index.extend_from_slice(&PACK_FORMAT_VERSION.to_le_bytes());
+        index.extend_from_slice(&1u32.to_le_bytes());
+        index.extend_from_slice(&[0u8; HASH_LEN]);
+        index.extend_from_slice(&offset.to_le_bytes());
+        index.extend_from_slice(&length.to_le_bytes());
+
+        let data_path = pack_folder.join("short-delta.pack");
+        let index_path = pack_folder.join("short-delta.idx");
+        std::fs::write(&data_path, &data).unwrap();
+        std::fs::write(&index_path, &index).unwrap();
+
+        let pack = load_pack_pair(&data_path, &index_path).expect("index-level validation must accept this pack");
+
+        let result = read_record_header(&pack, offset, length, true);
+        assert!(result.is_err(), "a delta record too short for a base hash must be rejected, got {:?}", result);
+        let message = result.unwrap_err();
+        assert!(message.contains("truncated"), "the error should name the truncation: {}", message);
 
         std::fs::remove_dir_all(&temp).ok();
     }
