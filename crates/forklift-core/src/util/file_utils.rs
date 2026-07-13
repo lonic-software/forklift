@@ -463,6 +463,16 @@ impl Drop for BulkStoreSession {
     }
 }
 
+/// Open `path` for a sync/flush call that follows. A *write* handle, not a read-only one:
+/// Windows refuses `FlushFileBuffers` on a handle without write access, while POSIX fsyncs any
+/// descriptor — so a read-only open works on macOS/Linux and fails on Windows only (see the same
+/// constraint on `pack_utils::sync_file`). Opening for write here keeps every platform's staged
+/// temp file syncable through one code path.
+fn open_for_sync(path: &Path) -> Result<std::fs::File, String> {
+    std::fs::OpenOptions::new().write(true).open(path)
+        .map_err(|e| format!("Error while opening \"{}\" to sync it: {}", path.to_string_lossy(), e))
+}
+
 /// Fsync one file's data to the drive — the *cheap* half of the durability barrier compared to
 /// `File::sync_all`. `libc::fsync` only queues the write to the drive: on Linux that already is
 /// full durability (there is no cheaper-vs-complete distinction there), so this is the entire
@@ -473,8 +483,7 @@ impl Drop for BulkStoreSession {
 fn fsync_data(path: &Path) -> Result<(), String> {
     use std::os::unix::io::AsRawFd;
 
-    let file = std::fs::File::open(path)
-        .map_err(|e| format!("Error while opening \"{}\" to sync it: {}", path.to_string_lossy(), e))?;
+    let file = open_for_sync(path)?;
     if unsafe { libc::fsync(file.as_raw_fd()) } != 0 {
         return Err(format!(
             "Error while syncing \"{}\": {}", path.to_string_lossy(), std::io::Error::last_os_error()
@@ -488,8 +497,7 @@ fn fsync_data(path: &Path) -> Result<(), String> {
 /// (steps 3-4 of [`BulkStoreSession::finish`]), just not this one.
 #[cfg(windows)]
 fn fsync_data(path: &Path) -> Result<(), String> {
-    std::fs::File::open(path)
-        .and_then(|file| file.sync_all())
+    open_for_sync(path)?.sync_all()
         .map_err(|e| format!("Error while syncing \"{}\": {}", path.to_string_lossy(), e))
 }
 
@@ -501,9 +509,7 @@ fn fsync_data(path: &Path) -> Result<(), String> {
 fn macos_flush_device_cache(path: &Path) -> Result<(), String> {
     use std::os::unix::io::AsRawFd;
 
-    let file = std::fs::File::open(path).map_err(|e| format!(
-        "Error while opening \"{}\" to flush the device cache: {}", path.to_string_lossy(), e
-    ))?;
+    let file = open_for_sync(path)?;
     if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) } == -1 {
         return Err(format!(
             "Error while flushing the device cache via \"{}\": {}",
