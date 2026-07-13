@@ -9,6 +9,8 @@ that affects it (a new error code, or a `--json` output struct).
 
 Every `forklift` failure carries a stable `code` (in the `--json` error envelope) and the process exits with the matching deterministic status, so a script or an agent branches without parsing prose. `2` is reserved for clap's own argument/usage errors; `0` is success. Both tables are generated from the single `ErrorCode` enum in `crates/forklift/src/output.rs` — see `docs/guide/cli.md` for how a script is meant to use them.
 
+Exit codes 17 and 18 are reserved for future features and are not yet assigned to any code.
+
 | `code` | exit | Meaning |
 |---|---|---|
 | `error` | 1 | Anything without a more specific classification yet |

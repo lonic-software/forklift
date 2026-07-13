@@ -229,10 +229,12 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
         Command::Docgen { target } => {
             use crate::cli::DocgenTarget;
             match target {
-                DocgenTarget::Errors => print!("{}", docgen::render_errors()),
-                DocgenTarget::JsonSchemas => print!("{}", docgen::render_json_schemas()),
+                DocgenTarget::Errors => {
+                    print!("{}", docgen::render_errors());
+                    Ok(())
+                }
+                DocgenTarget::JsonSchemas => docgen::render_json_schemas().map(|out| print!("{}", out)),
             }
-            Ok(())
         }
     }
 }

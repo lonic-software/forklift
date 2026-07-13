@@ -9,7 +9,7 @@ that affects it (a new error code, or a `--json` output struct).
 
 Every command's `--json` result is `{ "forklift_json", "command", "ok": true, "data": … }` on success (see `docs/MACHINE_INTERFACE.md` for the envelope and the failure shape). This page is the exhaustive reference for each command's `data` — one [JSON Schema](https://json-schema.org/) per shape a command can emit; a command with more than one (e.g. one per subcommand) lists all of them. Descriptions come straight from the Rust doc comments on the underlying struct, so they stay in sync with the field they describe.
 
-A command not listed here (or listed with no schema below) either reports only the generic human-message shape `{ "message": string }`, or produces no `--json` data at all — see the command's entry in `docs/guide/cli.md`.
+A command not listed here either reports only the generic human-message shape `{ "message": string }`, or produces no `--json` data at all — see the command's entry in `docs/guide/cli.md`.
 
 ## `alias`
 
