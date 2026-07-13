@@ -34,6 +34,8 @@ use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::model::object::loose_object::LooseObject;
+
 use crate::util::{
     audit_utils, bundle_utils, byte_utils, delta_utils, fanout_utils, file_utils, graph_utils,
     lock_utils, object_utils, pallet_utils, sign_utils,
@@ -2257,6 +2259,181 @@ impl TransportPackBuilder {
     }
 }
 
+/// How a [`StoreIngest`] recorded one object.
+#[derive(Debug, PartialEq, Eq)]
+pub enum IngestStored {
+    /// The object was already in the store (or already appended this ingest) — nothing written.
+    AlreadyPresent,
+    /// Stored as a full record.
+    Full,
+    /// Stored as a delta whose chain depth is `depth` (its base's depth + 1). The caller feeds
+    /// this back as [`IngestBase::depth`] for the next version, keeping chains bounded.
+    Delta { depth: u32 },
+}
+
+/// A delta base candidate for [`StoreIngest::store_blob`]: the previous version at the same
+/// path, with its decompressed object bytes and current chain depth.
+pub struct IngestBase<'a> {
+    pub hash: &'a str,
+    pub bytes: &'a [u8],
+    pub depth: u32,
+}
+
+/// What a finished ingest wrote.
+pub struct IngestStats {
+    /// Objects appended (full and delta records).
+    pub objects: usize,
+    /// Of those, delta records.
+    pub deltas: usize,
+    /// Packs published.
+    pub packs: usize,
+}
+
+/// Direct-to-pack ingestion for bulk imports (`import-git`): objects append straight into
+/// native packs in the store's pack folder, publishing on rollover — never touching the loose
+/// store. Landing hundreds of thousands of individually-written loose files (and then compacting
+/// them straight back out) is the measured wall of a large import; this writes the dense form
+/// once. `finish` must run before anything reads the ingested objects: it publishes the last
+/// pack and refreshes the pack registry.
+pub struct StoreIngest {
+    folder: PathBuf,
+    writer: Option<PackWriter>,
+    /// Hashes appended across the whole ingest (published or not): the pack-direct equivalent
+    /// of the loose store's exists-check, so convergent inputs (e.g. two git trees differing
+    /// only by a skipped submodule) never append the same object twice.
+    appended: HashSet<[u8; HASH_LEN]>,
+    objects: usize,
+    deltas: usize,
+    packs: usize,
+}
+
+impl StoreIngest {
+    pub fn new() -> Result<StoreIngest, String> {
+        let folder = pack_folder();
+        file_utils::create_folder_if_not_exists(&folder)?;
+        remove_stale_temp_files(&folder);
+
+        Ok(StoreIngest {
+            folder,
+            writer: None,
+            appended: HashSet::new(),
+            objects: 0,
+            deltas: 0,
+            packs: 0,
+        })
+    }
+
+    /// Store one built object as a full record, skipping it when the store (or this ingest)
+    /// already holds it — the same idempotence as the loose `store()`.
+    pub fn store(&mut self, object: &LooseObject) -> Result<IngestStored, String> {
+        let Some(hash_bytes) = self.admit(object)? else {
+            return Ok(IngestStored::AlreadyPresent);
+        };
+        self.append_full(hash_bytes, &object.content)?;
+        Ok(IngestStored::Full)
+    }
+
+    /// Store one built blob — as a delta against the previous version at its path when that
+    /// pays, otherwise in full. The policy is the bundle builder's: never delta an over-large
+    /// target (the read-side bomb ceiling), never extend a maximal chain, and never keep a
+    /// delta that is not actually smaller than the object it encodes.
+    pub fn store_blob(&mut self,
+                      object: &LooseObject,
+                      base: Option<IngestBase<'_>>) -> Result<IngestStored, String> {
+        let Some(hash_bytes) = self.admit(object)? else {
+            return Ok(IngestStored::AlreadyPresent);
+        };
+
+        if let Some(base) = base {
+            let deltable = object.content.len() <= delta_utils::MAX_DELTA_TARGET_BYTES
+                && base.depth < MAX_DELTA_CHAIN
+                && base.hash != object.hash;
+
+            if deltable {
+                let base_hash = hash_to_bytes(base.hash).ok_or_else(|| format!(
+                    "Cannot delta against \"{}\": not a 64-character object hash.", base.hash
+                ))?;
+                let delta = delta_utils::compress_delta(base.bytes, &object.content)?;
+
+                if delta.len() < object.content.len() {
+                    self.writer_mut()?.append_delta(
+                        hash_bytes, base_hash, object.content.len() as u64, &delta, None
+                    )?;
+                    self.appended.insert(hash_bytes);
+                    self.objects += 1;
+                    self.deltas += 1;
+                    self.roll_if_needed()?;
+                    return Ok(IngestStored::Delta { depth: base.depth + 1 });
+                }
+            }
+        }
+
+        self.append_full(hash_bytes, &object.content)?;
+        Ok(IngestStored::Full)
+    }
+
+    /// Publish the final pack and make everything ingested visible to readers. Refs pointing at
+    /// ingested objects must only be written after this returns.
+    pub fn finish(mut self) -> Result<IngestStats, String> {
+        self.finish_current()?;
+
+        if self.packs > 0 {
+            file_utils::sync_dir(&self.folder)?;
+            invalidate_cache();
+        }
+
+        Ok(IngestStats { objects: self.objects, deltas: self.deltas, packs: self.packs })
+    }
+
+    /// Gate one object into the ingest: enforce the authorship ceiling and answer `None` when
+    /// the store or this ingest already holds it (nothing to write).
+    fn admit(&mut self, object: &LooseObject) -> Result<Option<[u8; HASH_LEN]>, String> {
+        object_utils::check_object_ceiling(&object.object_type, object.content.len())?;
+
+        let hash_bytes = hash_to_bytes(&object.hash).ok_or_else(|| format!(
+            "Cannot pack \"{}\": not a 64-character object hash.", object.hash
+        ))?;
+
+        if self.appended.contains(&hash_bytes) || file_utils::does_object_exist(&object.hash)? {
+            return Ok(None);
+        }
+
+        Ok(Some(hash_bytes))
+    }
+
+    fn append_full(&mut self, hash_bytes: [u8; HASH_LEN], raw: &[u8]) -> Result<(), String> {
+        let compressed = zstd::encode_all(raw, 0)
+            .map_err(|e| format!("Error while compressing an ingested object: {}", e))?;
+        self.writer_mut()?.append_full(hash_bytes, &compressed, None)?;
+        self.appended.insert(hash_bytes);
+        self.objects += 1;
+        self.roll_if_needed()
+    }
+
+    fn writer_mut(&mut self) -> Result<&mut PackWriter, String> {
+        if self.writer.is_none() {
+            self.writer = Some(PackWriter::new(&self.folder)?);
+        }
+        Ok(self.writer.as_mut().expect("the ingest pack writer was just created"))
+    }
+
+    fn roll_if_needed(&mut self) -> Result<(), String> {
+        if self.writer.as_ref().is_some_and(PackWriter::should_roll_over) {
+            self.finish_current()?;
+        }
+        Ok(())
+    }
+
+    fn finish_current(&mut self) -> Result<(), String> {
+        let Some(writer) = self.writer.take() else {
+            return Ok(());
+        };
+        writer.finalize()?;
+        self.packs += 1;
+        Ok(())
+    }
+}
+
 /// Build the on-disk index bytes: header, then the (already sorted) records.
 fn build_index_bytes(records: &[([u8; HASH_LEN], u64, u64)]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(INDEX_HEADER_LEN + records.len() * INDEX_RECORD_LEN);
@@ -2501,6 +2678,81 @@ mod tests {
         let compressed = zstd::encode_all(content, 0).unwrap();
         let (folder, file_name) = file_utils::get_path_for_object(hash).unwrap();
         file_utils::write_object_to_file(Path::new(&folder), &file_name, compressed).unwrap();
+    }
+
+    /// The pack-direct import sink, end to end: full and delta records land in one published
+    /// pack, read back byte-correct through the ordinary object path, with no loose files.
+    #[test]
+    fn store_ingest_writes_full_and_delta_records_readable_after_finish() {
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+        use crate::model::blob::Blob;
+
+        let temp = std::env::temp_dir().join(format!("forklift-ingest-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+
+        // Two versions of one file: the second differs by a suffix, so a delta clearly pays.
+        let base_object = LooseObjectBuilder::build_blob(&Blob {
+            content: b"a line of file content\n".repeat(500),
+        });
+        let target_object = LooseObjectBuilder::build_blob(&Blob {
+            content: [b"a line of file content\n".repeat(500), b"one more line\n".to_vec()].concat(),
+        });
+
+        let mut ingest = StoreIngest::new().unwrap();
+        assert_eq!(ingest.store_blob(&base_object, None).unwrap(), IngestStored::Full);
+
+        let stored = ingest.store_blob(&target_object, Some(IngestBase {
+            hash: &base_object.hash,
+            bytes: &base_object.content,
+            depth: 0,
+        })).unwrap();
+        assert_eq!(stored, IngestStored::Delta { depth: 1 });
+
+        // Re-ingesting either version is a no-op (the loose store's exists-check equivalent).
+        assert_eq!(ingest.store_blob(&base_object, None).unwrap(), IngestStored::AlreadyPresent);
+
+        let stats = ingest.finish().unwrap();
+        assert_eq!(stats.objects, 2);
+        assert_eq!(stats.deltas, 1);
+        assert_eq!(stats.packs, 1);
+
+        let status = store_status().unwrap();
+        assert_eq!(status.loose_objects, 0, "ingest must never create loose files");
+        assert_eq!(status.packed_objects, 2);
+
+        assert_eq!(
+            file_utils::retrieve_object_by_hash(&base_object.hash).unwrap(),
+            base_object.content
+        );
+        assert_eq!(
+            file_utils::retrieve_object_by_hash(&target_object.hash).unwrap(),
+            target_object.content
+        );
+    }
+
+    /// An object already in the store is skipped, and an ingest that wrote nothing publishes
+    /// nothing.
+    #[test]
+    fn store_ingest_skips_objects_the_store_already_holds() {
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+        use crate::model::blob::Blob;
+
+        let temp = std::env::temp_dir().join(format!("forklift-ingest-skip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+
+        let mut object = LooseObjectBuilder::build_blob(&Blob { content: b"already here".to_vec() });
+        object.store().unwrap();
+
+        let mut ingest = StoreIngest::new().unwrap();
+        assert_eq!(ingest.store(&object).unwrap(), IngestStored::AlreadyPresent);
+
+        let stats = ingest.finish().unwrap();
+        assert_eq!(stats.objects, 0);
+        assert_eq!(stats.packs, 0, "an empty ingest must not publish an empty pack");
     }
 
     #[test]

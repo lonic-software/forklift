@@ -60,6 +60,11 @@ legacy boundary (a later `audit` then tolerates the imported parcels as legacy).
 (gitlinks) are skipped with a warning. For agents, this means a project can be moved onto
 forklift with one command.
 
+The imported objects are written **straight into native packs**, delta-compressing
+successive versions of a file on the way in — the store arrives dense, without ever
+existing as one loose file per object (the slowest shape a big import can take). Pass
+`--no-compact` to store loose objects instead.
+
 A large history lands hundreds of thousands of loose objects at once — the case the store
 is slowest and largest in — so import **packs the store on the way out** ([`compact`](#compact--pack-the-object-store),
 so you never have to remember to). Pass `--no-compact` to skip it and leave the objects
@@ -926,8 +931,8 @@ changed-path filter — so `blame` skips parcels that did not touch the file. It
 repairs itself, so you never manage it; building it during `compact` just means it is warm the
 first time you need it.
 
-**You rarely need to run this by hand.** `import-git` compacts on the way out (unless you pass
-`--no-compact`), and afterwards forklift **compacts automatically** in the background of a
+**You rarely need to run this by hand.** `import-git` writes packs directly on the way in
+(unless you pass `--no-compact`), and afterwards forklift **compacts automatically** in the background of a
 mutating command once the store has accumulated enough loose objects or packs to warrant it
 (git's `gc --auto`). It runs synchronously, under that command's lock, so it is correct and
 never races — which means it can add a brief pause when it fires (rarely). Turn it off with

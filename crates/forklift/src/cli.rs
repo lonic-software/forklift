@@ -375,7 +375,8 @@ pub enum Command {
         /// The git repository to import from (e.g. \".\")
         path: String,
 
-        /// Leave the imported objects loose (skip the automatic post-import compaction)
+        /// Store the imported objects loose instead of packing (and delta-compressing) them
+        /// on the way in
         #[arg(long)]
         no_compact: bool,
     },

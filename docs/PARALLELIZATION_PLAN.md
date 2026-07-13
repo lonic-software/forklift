@@ -34,7 +34,7 @@ contention.** Two things decide almost every row:
 | **consolidate / merge** | occasional | 3-way LCS, per *divergent* file | **independent per file** | walk records deferred jobs; end-to-end diluted by the sequential apply-writes + stack | **Done — 6.4× merge / 2.5× end-to-end** (18 cores; compute-bound; only wide merges) | — |
 | **compact** | occasional (auto) | zstd delta-compress, per object | path-deltas independent; window + `PackWriter` sequential | the sliding delta `window` (each object deltas against just-packed neighbours) and the single-file append stay serial | **Done — ~2.1×** (18 cores; **byte-identical output**; read-cache-bound below the CPU ceiling) | — |
 | **compact --all** (repack) | occasional (auto) | reachability walk + verbatim record copy, per object | one shared reachability pass (D/P3, below); `CopyRecord` targets need no CPU, only a memory copy | the steady-state case (no garbage, no loose) is **not** CPU-bound at all — it is walk-reads and small memcpys | **Done — steady-state repack ~4.5×** (238 ms → 53 ms on a 401-parcel/7442-object corpus; **byte-identical output**; see D/P3 below) | — |
-| **import-git** | rare (once) | read pipe → build → **store loose file** | the store is the bottleneck | *measured*: **71% is writing loose object files** — the same FS-metadata wall as `materialize`; pipe read 21% (serial source), compress 4% | **Not worth it** — parallel stores regress (materialize lesson); pipe is serial | — |
+| **import-git** | rare (once) | read pipe → build → **append to native pack** | serial pipe source | *measured (pre-fix)*: **71% was writing loose object files** — solved structurally (pack-direct ingest, 2026-07-13), not with threads; pipe read 21% (serial source) is the remaining floor | **Not worth it** — the store wall is gone; the pipe is serial | — |
 | **export-git** | rare | spawn a `git` subprocess per object | DAG-ordered; subprocess per unit | one `git` process per commit/tree/blob, invoked serially; `&mut` memo | **Low** — commits are DAG-ordered; only independent blob `hash-object`s could overlap | med |
 | **bundle build** | occasional (server) | compress object into bounded native pack | independent record compression, sequential append | deterministic history/path-delta order and one writer per pack | **Possible** for full-record compression; clone import already wins structurally by installing aggregate packs | med |
 | **history** (full log) | hot | decode+render parcel | **sequential heap walk** | must read every parcel to display it; ordering dependency; read/graph mutexes | **None** — see the blame lesson | — |
@@ -272,14 +272,16 @@ contention.** Two things decide almost every row:
   an ordered assembly step; build is occasional, while the much larger clone-time win already came
   from eliminating per-object loose writes and fsyncs.
 
-- **`import-git` — filesystem-metadata-bound (measured).** The guess was "input-bound on the
-  `git cat-file` pipe"; the profile said otherwise: of a ~915 ms import, **71% is `store` — writing
-  the thousands of small loose object files** (the same APFS metadata wall as `materialize`), 21%
-  is the pipe read (a serial source that cannot be parallelized), and the compress is 4%. So there
-  is nothing to parallelize that would help: the dominant cost is exactly the small-file-write
-  pattern that *regressed* under threads in `materialize`. (A structural win exists — writing
-  imported objects straight into a pack instead of loose-then-`compact` — but that is a redesign,
-  not parallelism.)
+- **`import-git` — was filesystem-metadata-bound (measured), fixed structurally.** The guess was
+  "input-bound on the `git cat-file` pipe"; the profile said otherwise: of a ~915 ms import,
+  **71% was `store` — writing the thousands of small loose object files** (the same APFS metadata
+  wall as `materialize`), 21% the pipe read (a serial source that cannot be parallelized), and the
+  compress 4%. Parallelism could never help — the dominant cost was exactly the small-file-write
+  pattern that *regressed* under threads in `materialize`. The structural win shipped instead
+  (2026-07-13): import appends objects **straight into native packs** (`StoreIngest`),
+  delta-compressing successive versions of a file on the way in, which removes both the loose
+  store wall *and* the post-import `compact` pass that used to read it all back. The remaining
+  floor is the serial pipe.
 
 - **`export-git` — bound by an external boundary** (a `git` subprocess per object), not CPU.
 
@@ -361,9 +363,10 @@ So the lever's real beneficiary is **concurrency the single-process CLI cannot r
 multi-warehouse server serving the same hot objects to many clients (its object-GET now copies
 outside the cache lock), or many concurrent ancestry queries on one warehouse (each graph shard
 read/flush is now off the global lock). What the rework still does **not** help is unchanged:
-`checkout`/`materialize` and `import-git` (bound by the *filesystem* metadata wall) and
-`consolidate`'s write tail (that same wall) — a storage-format change (writing packs directly) is
-the only lever there. The two ceilings remain cleanly separated; this change lifted the object-cache
+`checkout`/`materialize` (bound by the *filesystem* metadata wall) and `consolidate`'s write tail
+(that same wall) — a storage-format change (writing packs directly) is the only lever there, and
+`import-git` proved it: its pack-direct ingest (2026-07-13) removed that wall structurally where
+threads had regressed. The two ceilings remain cleanly separated; this change lifted the object-cache
 one to pointer-sized locks, and a genuinely read-*hit*-bound parallel consumer is what would now
 turn that into a measured near-linear win.
 

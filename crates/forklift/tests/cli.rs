@@ -2018,24 +2018,33 @@ fn import_git_auto_compacts_unless_no_compact() {
             assert!(output.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&output.stderr));
         };
         git(&["init", "-q", "-b", "main"]);
-        std::fs::write(root.join("a.txt"), "hello\n").unwrap();
+        // Two versions of one file, big enough that the second pays as a delta.
+        let body = "a line of file content\n".repeat(400);
+        std::fs::write(root.join("a.txt"), &body).unwrap();
         git(&["add", "-A"]);
         git(&["commit", "-qm", "first commit"]);
+        std::fs::write(root.join("a.txt"), body + "one more line\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "second commit"]);
     }
 
-    // A large import lands a big loose set — so by default import packs the store on the
-    // way out, and the user gets a dense warehouse without having to remember `compact`.
+    // A large import lands a big object set — so by default import writes native packs
+    // directly (delta-compressing successive versions of a file on the way in), and the user
+    // gets a dense warehouse whose store never existed in its loose worst case.
     let packed = TestWarehouse::new("import-autocompact");
     seed_git_repo(&packed.root);
     assert_success(&packed.run(&["prepare"]));
     configure_operator(&packed);
     let out = packed.run(&["import-git", "."]);
     assert_success(&out);
-    assert!(stdout(&out).contains("Packed the imported store"), "import should auto-compact: {}", stdout(&out));
+    assert!(stdout(&out).contains("Packed the imported store"), "import should pack the store: {}", stdout(&out));
+    assert!(stdout(&out).contains("1 delta-compressed"),
+            "the second version of a.txt should be a path delta: {}", stdout(&out));
     assert_eq!(count_loose_objects(&packed.root.join(".forklift/objects")), 0, "no loose objects should remain after import");
     assert!(packed.root.join(".forklift/objects/pack").is_dir(), "a pack folder should exist after import");
     // Reads work against the packed store immediately.
     assert!(stdout(&packed.run(&["history"])).contains("first commit"));
+    assert!(stdout(&packed.run(&["stocktake"])).contains("matches the inventory"));
 
     // --no-compact opts out: the imported objects are left loose.
     let loose = TestWarehouse::new("import-no-compact");
