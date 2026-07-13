@@ -8,7 +8,8 @@ number by hand and add your own.
 > **Read this first — the honest framing.** Git is a 20-year-old C codebase tuned
 > against the exact repos below; Forklift is **v0.1.x**. Expect Git to win some raw
 > single-command timings and Forklift to reach parity or better on others (status,
-> commit, and — on a packed store — the history walk and on-disk size). The point of
+> commit, and — on a packed store — the history walk; on-disk size is still a known
+> gap, see §2). The point of
 > benchmarking here is not to "beat git" — it
 > is to (a) see where Forklift is already in the same ballpark, (b) find the
 > operations that are *unexpectedly* slow so they become optimization targets, and
@@ -85,30 +86,38 @@ git time, forklift time, the **forklift/git ratio** (below 1.0 means forklift wa
 faster), and a per-row note. Example shape:
 
 ```
-  Repo:      git — 81470 commits, 4775 tracked files
-  On-disk:   git .git = 316M   forklift .forklift = 236M  (forklift 1.3x smaller)
+  Repo:      git — 81471 commits, 4775 tracked files
+  On-disk:   git .git = 316M   forklift .forklift = 435M  (forklift 1.4x larger)
 
   Operation               git        forklift   forklift/git   Notes
   ----------------------  ---------  ---------  -------------  ----------------------------------
-  status (clean tree)     172 ms     22 ms      0.13x          git status vs forklift stocktake …
-  log (whole history)     929 ms     944 ms     1.02x          81470 commits walked
-  diff (20 files changed) 25 ms      43 ms      1.72x          git diff vs forklift diff --staged
-  commit (1 file)         41 ms      38 ms      0.93x          git add+commit vs load+stack
+  status (clean tree)     118 ms     31 ms      0.26x          git status vs forklift stocktake …
+  log (whole history)     869 ms     988 ms     1.14x          81471 commits walked
+  diff (20 files changed) 23 ms      40 ms      1.74x          git diff vs forklift diff --staged
+  commit (1 file)         37 ms      83 ms      2.24x          git add+commit vs load+stack
 
   Onboarding — measured separately; NOT a ratio (different operations):
-    git clone --local     462 ms     (copies an existing packfile)
-    forklift import-git   130.91 s   (re-encodes every commit/tree/blob straight into packs)
-    Packed the imported store: 402118 object(s) into 5 pack(s), 187332 delta-compressed.
+    git clone --local     418 ms     (copies an existing packfile)
+    forklift import-git   62.00 s    (re-encodes every commit/tree/blob straight into packs)
+    Packed the imported store: 402826 object(s) into 5 pack(s), 310230 delta-compressed.
 ```
 
 **The store arrives packed — no separate compaction pass.** `import-git` writes straight
 into native packs as it imports (delta-compressing successive file/tree versions on the
 way in), so the comparison table above runs on the **packed store** — the state a real
 user operates in (git ships packed too: `clone --local` copies packfiles). Packed vs
-packed, forklift lands smaller on disk than git's own pack and roughly at parity on the
-whole-history walk. Packing removes per-file slack and the open-per-object cost of a
-walk, and delta-compresses similar objects. See
-[`OBJECT_STORE_SCALING.md`](OBJECT_STORE_SCALING.md). *(Numbers illustrative — run it.)*
+packed, on git.git the pack-direct store currently lands **~1.4x larger** than git's own
+pack (435M vs 316M) — the whole-history walk is roughly at parity, but the on-disk size
+is not, and that gap is real. Per-path delta chains don't see the cross-path similarity
+(renames, moved files) that a global repack ordering does; the earlier loose-import-then-
+`compact` flow measured 236M on this same corpus, so the headroom is known and further
+densification is planned. On repos whose `.git` carries unreachable refs or stale
+remote-tracking branches, `.forklift` often lands far smaller — `import-git` only pulls
+branch-reachable history — but that reflects the source repo's ref clutter, not a general
+"forklift packs tighter" result; git.git above (a repo with little such clutter) is the
+representative case. See
+[`OBJECT_STORE_SCALING.md`](OBJECT_STORE_SCALING.md). *(Measured on git.git on one
+Apple-Silicon Mac, mean of 3 warm-cache runs — re-run for your own repo/hardware.)*
 
 **Onboarding is deliberately kept out of the ratio table.** `git clone --local` and
 `forklift import-git` do fundamentally different work (see §3), so pitting them in a
