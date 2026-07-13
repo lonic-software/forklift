@@ -281,7 +281,17 @@ contention.** Two things decide almost every row:
   (2026-07-13): import appends objects **straight into native packs** (`StoreIngest`),
   delta-compressing successive versions of files and directory trees on the way in, which removes both the loose
   store wall *and* the post-import `compact` pass that used to read it all back. The remaining
-  floor is the serial pipe.
+  floor is the pipe — *measured* (2026-07-13, post-fix): ~55% of import wall is `cat-file`,
+  and it is **throughput, not latency**: the synchronous ping-pong pattern moves bytes at the
+  same ~120 MB/s as request-free `--batch-all-objects` streaming, so the cost is git inflating
+  its own packs plus kernel copies, and eliminating round trips buys nothing. The one
+  intervention worth its complexity — **if** imports ever become recurring (the §9.8
+  git→Forklift mirror) rather than once-per-repo — is a bounded prefetch thread feeding a
+  second `cat-file` in `rev-list --objects` order, overlapping git's inflation with our
+  compression: wall drops from `pipe + cpu` to `max(pipe, cpu)`, ~1.8× best case, and that is
+  the ceiling short of reading git's packfiles ourselves (a new dependency and a real
+  correctness surface, contradicting the deliberate shell-out design). Accepted as the floor
+  until then.
 
 - **`export-git` — bound by an external boundary** (a `git` subprocess per object), not CPU.
 
