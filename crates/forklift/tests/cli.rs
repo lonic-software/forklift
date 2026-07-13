@@ -5543,10 +5543,9 @@ fn show_reports_chunked_metadata_without_assembling_the_file() {
 }
 
 #[test]
-fn show_resolves_a_subdirectory_path_and_a_path_containing_a_colon() {
+fn show_resolves_a_subdirectory_path() {
     let warehouse = TestWarehouse::new("show-paths");
     warehouse.write_file("src/data/nested.txt", "nested content\n");
-    warehouse.write_file("note:with:colons.txt", "colon path\n");
 
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
@@ -5556,6 +5555,21 @@ fn show_resolves_a_subdirectory_path_and_a_path_containing_a_colon() {
     let nested = warehouse.run(&["show", "main:src/data/nested.txt"]);
     assert_success(&nested);
     assert_eq!(stdout(&nested), "nested content\n");
+}
+
+// NTFS filenames cannot contain ":", so a fixture file with one in its name cannot even be
+// created on Windows — this is exactly the split-on-first-":" behavior under test, and there
+// is no cross-platform way to exercise it with a real on-disk path. Unix-only.
+#[cfg(unix)]
+#[test]
+fn show_resolves_a_path_containing_a_colon() {
+    let warehouse = TestWarehouse::new("show-colon-path");
+    warehouse.write_file("note:with:colons.txt", "colon path\n");
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "paths"]));
 
     // Only the *first* ":" splits revision from path — the rest belongs to the path.
     let colon_path = warehouse.run(&["show", "main:note:with:colons.txt"]);
