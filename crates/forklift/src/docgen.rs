@@ -185,6 +185,7 @@ fn command_schemas(name: &str) -> Option<Vec<(&'static str, schemars::Schema)>> 
         "scope-prune" => commands::scope_prune::__docgen_schemas(),
         "self-update" => commands::self_update::__docgen_schemas(),
         "shift" => commands::shift::__docgen_schemas(),
+        "show" => commands::show::__docgen_schemas(),
         "stack" => commands::stack::__docgen_schemas(),
         "stocktake" => commands::stocktake::__docgen_schemas(),
         "store" => commands::store::__docgen_schemas(),

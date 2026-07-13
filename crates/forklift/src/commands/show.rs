@@ -84,8 +84,9 @@ pub fn handle_command(target: &str) -> Result<(), String> {
 /// A `show` result: a file's content at a revision, or — when it is binary or a chunked
 /// large file — the metadata that explains why there is no `content` instead. The public
 /// JSON schema (a change here is a schema change; see `crate::output::SCHEMA_VERSION`).
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct Shown {
+pub(crate) struct Shown {
     /// The resolved parcel hash the revision argument named (a pallet head, a meta-pallet
     /// head, or the parcel a hash prefix matched) — never the raw revision argument, so a
     /// caller always gets the exact, disambiguated parcel this content came from.
@@ -137,4 +138,10 @@ impl CommandOutput for Shown {
             print!("{}", content);
         }
     }
+}
+
+/// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
+#[cfg(feature = "docgen")]
+pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+    vec![("Shown", schemars::schema_for!(Shown))]
 }

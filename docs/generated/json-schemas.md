@@ -1389,11 +1389,19 @@ A command not listed here either reports only the generic human-message shape `{
         },
         "parcel": {
           "type": "string"
+        },
+        "parents": {
+          "description": "This parcel's parents, in their stored (canonical, base-first) order — always present,\n`[]` for a root parcel. Unlike `consolidates` (kept for compatibility, only non-empty on\na merge), this is the graph edge a caller building a DAG needs regardless of parcel kind.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         }
       },
       "required": [
         "parcel",
         "consolidates",
+        "parents",
         "actions"
       ],
       "type": "object"
@@ -2012,6 +2020,13 @@ A command not listed here either reports only the generic human-message shape `{
         "current": {
           "type": "boolean"
         },
+        "head": {
+          "description": "The pallet's head parcel hash; `null` when it is unborn (nothing stacked on it yet).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "name": {
           "type": "string"
         }
@@ -2227,6 +2242,13 @@ A command not listed here either reports only the generic human-message shape `{
         "$ref": "#/$defs/PeekAction"
       },
       "type": "array"
+    },
+    "binary": {
+      "description": "Whether a blob is binary (contains a NUL byte) — `content` is then omitted\nrather than carrying lossily-mangled bytes. Absent for every other object type.",
+      "type": [
+        "boolean",
+        "null"
+      ]
     },
     "chunks": {
       "description": "A recipe's ordered chunk list.",
@@ -2476,6 +2498,73 @@ A command not listed here either reports only the generic human-message shape `{
     "head"
   ],
   "title": "Shifted",
+  "type": "object"
+}
+```
+
+## `show`
+
+### `Shown`
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "A `show` result: a file's content at a revision, or — when it is binary or a chunked\nlarge file — the metadata that explains why there is no `content` instead. The public\nJSON schema (a change here is a schema change; see `crate::output::SCHEMA_VERSION`).",
+  "properties": {
+    "binary": {
+      "description": "Whether the content is not shown as text: either non-text bytes (a NUL byte\nanywhere) or a chunked large file, which is never assembled just to answer `show`.",
+      "type": "boolean"
+    },
+    "chunk_count": {
+      "description": "A chunked file's chunk count. Present only for a chunked file.",
+      "format": "uint",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "content": {
+      "description": "The file's content as text. Present only when `binary` is `false`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "content_hash": {
+      "description": "A chunked file's whole-content hash (advisory until assembly; see [`object_utils`]'s\n`Recipe`). Present only for a chunked file.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "hash": {
+      "description": "The tree entry's own object hash: a blob hash for plain content, a recipe hash for a\nchunked large file.",
+      "type": "string"
+    },
+    "path": {
+      "description": "The path, as given (already validated to exist in the revision's tree).",
+      "type": "string"
+    },
+    "revision": {
+      "description": "The resolved parcel hash the revision argument named (a pallet head, a meta-pallet\nhead, or the parcel a hash prefix matched) — never the raw revision argument, so a\ncaller always gets the exact, disambiguated parcel this content came from.",
+      "type": "string"
+    },
+    "size": {
+      "description": "The file's size in bytes: the blob length, or a chunked file's assembled total size.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "revision",
+    "path",
+    "hash",
+    "binary",
+    "size"
+  ],
+  "title": "Shown",
   "type": "object"
 }
 ```
