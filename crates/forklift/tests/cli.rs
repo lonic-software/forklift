@@ -2116,6 +2116,76 @@ fn import_git_auto_compacts_unless_no_compact() {
     assert!(!loose.root.join(".forklift/objects/pack").exists(), "no pack folder should exist with --no-compact");
 }
 
+#[test]
+fn import_git_rederives_tree_bases_when_the_cache_is_starved() {
+    // Three commits touching the same file (in a subdirectory, so both its tree and the root
+    // tree change each time) build delta chains for blobs and trees alike.
+    fn seed_repo(root: &Path) {
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .env("GIT_AUTHOR_NAME", "Ada").env("GIT_AUTHOR_EMAIL", "ada@example.com")
+                .env("GIT_COMMITTER_NAME", "Ada").env("GIT_COMMITTER_EMAIL", "ada@example.com")
+                .output()
+                .expect("git must be installed to run this test");
+            assert!(output.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&output.stderr));
+        };
+
+        git(&["init", "-q", "-b", "main"]);
+        let body = "a line of file content\n".repeat(400);
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+
+        std::fs::write(root.join("sub/a.txt"), &body).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "first commit"]);
+
+        std::fs::write(root.join("sub/a.txt"), body.clone() + "one more line\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "second commit"]);
+
+        std::fs::write(root.join("sub/a.txt"), body + "one more line\nyet another line\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "third commit"]);
+    }
+
+    // Pull the delta count out of the "Packed the imported store: N object(s) into P pack(s),
+    // D delta-compressed." line.
+    fn delta_count(output: &str) -> usize {
+        let line = output.lines().find(|line| line.contains("Packed the imported store"))
+            .unwrap_or_else(|| panic!("no \"Packed the imported store\" line in: {}", output));
+        let (_, after) = line.split_once(", ").expect("a delta-compressed segment");
+        after.split_whitespace().next().expect("a delta count").parse().expect("a number")
+    }
+
+    // Default cache budget: bases mostly hit the cache.
+    let default_budget = TestWarehouse::new("import-tree-rederive-default");
+    seed_repo(&default_budget.root);
+    assert_success(&default_budget.run(&["prepare"]));
+    configure_operator(&default_budget);
+    let baseline = default_budget.run(&["import-git", "."]);
+    assert_success(&baseline);
+    let baseline_deltas = delta_count(&stdout(&baseline));
+    assert!(baseline_deltas > 0, "expected at least one delta in the baseline import: {}", stdout(&baseline));
+
+    // Zero-byte cache budget: every base lookup misses, forcing blob bases through the batch
+    // pipe re-read and tree bases through re-derivation on every single one. Density must not
+    // regress relative to the default-budget run of the identical repo.
+    let starved = TestWarehouse::new("import-tree-rederive-starved");
+    seed_repo(&starved.root);
+    assert_success(&starved.run(&["prepare"]));
+    configure_operator(&starved);
+    let zero_budget = starved.run_with_env(&["import-git", "."], &[("FORKLIFT_IMPORT_CACHE_BYTES", "0")]);
+    assert_success(&zero_budget);
+    let starved_deltas = delta_count(&stdout(&zero_budget));
+    assert_eq!(starved_deltas, baseline_deltas,
+        "a starved cache must re-derive every base rather than lose deltas: {}", stdout(&zero_budget));
+
+    // The starved import still reads back correctly.
+    assert!(stdout(&starved.run(&["history"])).contains("third commit"));
+    assert!(stdout(&starved.run(&["stocktake"])).contains("matches the inventory"));
+}
+
 #[cfg(unix)]
 #[test]
 fn import_git_tolerates_non_utf8_author_names() {

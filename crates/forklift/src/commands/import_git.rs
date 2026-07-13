@@ -253,27 +253,42 @@ struct Converter {
     /// there, re-readable from the batch pipe when its bytes have left the cache.
     latest_blob_at_path: HashMap<String, String>,
 
-    /// The newest tree seen at each directory path, by *forklift* hash. A directory usually
-    /// changes one entry per commit, so successive versions delta extremely well — this is
-    /// what `compact`'s size-window fallback catches for the loose path, done exactly here.
+    /// The newest tree seen at each directory path, by *git* hash — the delta base for the
+    /// next version there, re-derivable (via `tree_base_for`) when its bytes have left the
+    /// cache. A directory usually changes one entry per commit, so successive versions delta
+    /// extremely well — this is what `compact`'s size-window fallback catches for the loose
+    /// path, done exactly here.
     latest_tree_at_path: HashMap<String, String>,
 
     /// Each stored blob's delta-chain depth (by forklift hash), so chains stay bounded.
     stored_depth: HashMap<String, u32>,
 
-    /// Recently built blob object bytes (by git hash), so the common delta case never re-reads
-    /// its base from git. Bounded; a miss falls back to the pipe, never to a fatter store.
+    /// Recently built object bytes (blobs by git hash, trees by `tree_cache_key` of their
+    /// forklift hash — the two namespaces share this map but never collide), so the common
+    /// delta case never re-reads or rebuilds its base. Bounded; a miss falls back to the pipe
+    /// (blobs) or re-derivation (trees), never to a fatter store.
     base_cache: HashMap<String, Arc<Vec<u8>>>,
     base_cache_bytes: usize,
+    base_cache_budget: usize,
 
     /// Blobs stored as deltas (pack-direct mode only).
     deltas: usize,
 }
 
-/// The base-bytes cache budget. Delta bases are usually the version converted moments ago, so
-/// a modest bound hits nearly always; whole-map eviction on overflow is crude but keeps the
-/// import's memory flat on repos with huge blobs.
+/// The base-bytes cache budget's default. Delta bases are usually the version converted
+/// moments ago, so a modest bound hits nearly always; whole-map eviction on overflow is crude
+/// but keeps the import's memory flat on repos with huge blobs. Overridable per-run via
+/// `FORKLIFT_IMPORT_CACHE_BYTES` (tests force zero, to exercise the re-read/re-derive fallback
+/// on every base; not a user-facing knob).
 const BASE_CACHE_BYTES: usize = 256 * 1024 * 1024;
+
+/// The cache budget for this run: `FORKLIFT_IMPORT_CACHE_BYTES` if set and parseable, else the
+/// default. Read once at converter construction, not on every lookup.
+fn cache_budget() -> usize {
+    std::env::var("FORKLIFT_IMPORT_CACHE_BYTES").ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(BASE_CACHE_BYTES)
+}
 
 impl Converter {
     fn new(path: &str, pack_direct: bool) -> Result<Converter, String> {
@@ -297,6 +312,7 @@ impl Converter {
             stored_depth: HashMap::new(),
             base_cache: HashMap::new(),
             base_cache_bytes: 0,
+            base_cache_budget: cache_budget(),
             deltas: 0,
         })
     }
@@ -375,7 +391,7 @@ impl Converter {
             // here deltas against it.
             let hash = hash.clone();
             if self.ingest.is_some() {
-                self.latest_tree_at_path.insert(path_prefix.to_string(), hash.clone());
+                self.latest_tree_at_path.insert(path_prefix.to_string(), git_hash.to_string());
             }
             return Ok(hash);
         }
@@ -410,7 +426,7 @@ impl Converter {
         }
 
         let mut object = LooseObjectBuilder::build_tree(&tree);
-        self.store_tree(&mut object, path_prefix)?;
+        self.store_tree(&mut object, path_prefix, git_hash)?;
 
         self.trees.insert(git_hash.to_string(), object.hash.clone());
 
@@ -418,15 +434,16 @@ impl Converter {
     }
 
     /// Store one built tree — in pack-direct mode as a delta against the previous version of
-    /// the same directory when that saves space. Tree bases come only from the bounded cache
-    /// (an ingested tree is not re-readable before publication); a miss just stores in full.
-    fn store_tree(&mut self, object: &mut LooseObject, path: &str) -> Result<(), String> {
+    /// the same directory when that saves space. `git_hash` is this tree's own git hash, so a
+    /// later version at `path` can find it via `latest_tree_at_path` (and re-derive it on a
+    /// cache miss — an ingested tree is not otherwise re-readable before publication).
+    fn store_tree(&mut self, object: &mut LooseObject, path: &str, git_hash: &str) -> Result<(), String> {
         if self.ingest.is_none() {
             object.store()?;
             return Ok(());
         }
 
-        let base = self.tree_base_for(path);
+        let base = self.tree_base_for(path)?;
         let ingest = self.ingest.as_mut().expect("pack-direct mode was just checked");
         let stored = ingest.store_with_base(object, base.as_ref().map(|(hash, bytes, depth)| {
             IngestBase { hash, bytes, depth: *depth }
@@ -434,7 +451,7 @@ impl Converter {
 
         self.record_depth(&object.hash.clone(), &stored);
         self.cache_base(&tree_cache_key(&object.hash), Arc::new(std::mem::take(&mut object.content)));
-        self.latest_tree_at_path.insert(path.to_string(), object.hash.clone());
+        self.latest_tree_at_path.insert(path.to_string(), git_hash.to_string());
 
         Ok(())
     }
@@ -456,16 +473,85 @@ impl Converter {
         self.stored_depth.insert(hash.to_string(), depth);
     }
 
-    /// The delta base for the next version of the directory at `path`, when its bytes are
-    /// still cached.
-    fn tree_base_for(&self, path: &str) -> Option<(String, Arc<Vec<u8>>, u32)> {
-        let base_hash = self.latest_tree_at_path.get(path)?;
-        let bytes = Arc::clone(self.base_cache.get(&tree_cache_key(base_hash))?);
+    /// The delta base for the next version of the directory at `path`: the newest tree seen
+    /// there, as `(forklift hash, object bytes, chain depth)`. Bytes come from the bounded
+    /// cache, or — after an eviction — are rebuilt from the git tree via `rederive_tree_base`,
+    /// so density does not depend on the cache budget (mirroring `delta_base_for` for blobs,
+    /// which re-reads its base through the batch pipe instead).
+    #[allow(clippy::type_complexity)]
+    fn tree_base_for(&mut self, path: &str) -> Result<Option<(String, Arc<Vec<u8>>, u32)>, String> {
+        let Some(base_git) = self.latest_tree_at_path.get(path).cloned() else {
+            return Ok(None);
+        };
+        let Some(base_hash) = self.trees.get(&base_git).cloned() else {
+            return Ok(None);
+        };
+
+        let bytes = match self.base_cache.get(&tree_cache_key(&base_hash)) {
+            Some(bytes) => Arc::clone(bytes),
+            None => match self.rederive_tree_base(&base_git, &base_hash)? {
+                Some(bytes) => bytes,
+                // Rebuilding failed or mismatched (see `rederive_tree_base`) — no base rather
+                // than a delta the reader could not verify; the object stores full instead.
+                None => return Ok(None),
+            },
+        };
+
         // Unknown depth (a base this run never chained) is maxed-out, never zero: extending a
         // chain of unknown length could overshoot the read-side reconstruction bound.
-        let depth = self.stored_depth.get(base_hash).copied().unwrap_or(u32::MAX);
+        let depth = self.stored_depth.get(&base_hash).copied().unwrap_or(u32::MAX);
 
-        Some((base_hash.clone(), bytes, depth))
+        Ok(Some((base_hash, bytes, depth)))
+    }
+
+    /// Rebuild a tree's object bytes from its git hash, for when the cache has evicted them.
+    /// Every child hash the raw git tree names must already be memoized (it was converted
+    /// before it could become anyone's "latest at this path"), so the rebuild is just a
+    /// replay of `convert_tree`'s own mapping — deterministic, but the delta format trusts the
+    /// base's bytes completely, so verify: compare the rebuilt hash against `expect_fork_hash`
+    /// (what was actually stored) before handing back bytes a delta could be built against.
+    /// A mismatch, or a child hash this run never converted, is fail-safe: no base, never a
+    /// corrupt one.
+    fn rederive_tree_base(&mut self, git_hash: &str, expect_fork_hash: &str) -> Result<Option<Arc<Vec<u8>>>, String> {
+        let (_, bytes) = self.batch.read(git_hash)?;
+        let mut tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+
+        for entry in parse_raw_tree(&bytes, self.oid_len)? {
+            let child = match entry.mode.as_str() {
+                "40000" | "040000" => {
+                    let Some(hash) = self.trees.get(&entry.hash).cloned() else {
+                        return Ok(None);
+                    };
+                    TreeItem::new(entry.name, hash, DirEntryType::Tree)
+                }
+                // A gitlink was skipped (without storing anything) when this tree was first
+                // converted, and warned about then — do not warn about it again here.
+                "160000" => continue,
+                mode => {
+                    let item_type = match mode {
+                        "100755" => DirEntryType::Executable,
+                        "120000" => DirEntryType::SymbolicLink,
+                        _ => DirEntryType::Normal,
+                    };
+                    let Some(hash) = self.blobs.get(&entry.hash).cloned() else {
+                        return Ok(None);
+                    };
+                    TreeItem::new(entry.name, hash, item_type)
+                }
+            };
+
+            tree.add_child(child);
+        }
+
+        let mut object = LooseObjectBuilder::build_tree(&tree);
+        if object.hash != expect_fork_hash {
+            return Ok(None);
+        }
+
+        let bytes = Arc::new(std::mem::take(&mut object.content));
+        self.cache_base(&tree_cache_key(expect_fork_hash), Arc::clone(&bytes));
+
+        Ok(Some(bytes))
     }
 
     /// Convert one git blob — in pack-direct mode as a delta against the previous version at
@@ -537,19 +623,20 @@ impl Converter {
         Ok(Some((base_hash, bytes, depth)))
     }
 
-    /// Remember one blob's object bytes as a potential delta base. Overflow clears the whole
-    /// cache (the `IncomingVerificationCache` pattern): crude, but the flat memory bound
-    /// matters more than the rare re-read a clear causes.
-    fn cache_base(&mut self, git_hash: &str, bytes: Arc<Vec<u8>>) {
-        if bytes.len() > BASE_CACHE_BYTES {
+    /// Remember one object's bytes as a potential delta base, keyed by git hash for blobs or
+    /// by `tree_cache_key` for trees (the two namespaces share this map but never collide).
+    /// Overflow clears the whole cache (the `IncomingVerificationCache` pattern): crude, but
+    /// the flat memory bound matters more than the rare re-read/re-derive a clear causes.
+    fn cache_base(&mut self, key: &str, bytes: Arc<Vec<u8>>) {
+        if bytes.len() > self.base_cache_budget {
             return;
         }
-        if self.base_cache_bytes.saturating_add(bytes.len()) > BASE_CACHE_BYTES {
+        if self.base_cache_bytes.saturating_add(bytes.len()) > self.base_cache_budget {
             self.base_cache.clear();
             self.base_cache_bytes = 0;
         }
         self.base_cache_bytes += bytes.len();
-        self.base_cache.insert(git_hash.to_string(), bytes);
+        self.base_cache.insert(key.to_string(), bytes);
     }
 }
 
