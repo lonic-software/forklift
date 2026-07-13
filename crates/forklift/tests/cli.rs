@@ -720,6 +720,42 @@ fn palletize_creates_pallets_at_the_current_head() {
 }
 
 #[test]
+fn palletize_json_listing_reports_head_hashes() {
+    let warehouse = TestWarehouse::new("palletize-json");
+    warehouse.write_file("file.txt", "content\n");
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    // Before anything is stacked, the (only, current) pallet is listed with a null head —
+    // folded into `pallets` itself, not left as a side flag a caller must special-case.
+    let unborn = json(&warehouse.run(&["palletize", "--json"]));
+    assert_eq!(unborn["data"]["current_unborn"], true);
+    let pallets = unborn["data"]["pallets"].as_array().unwrap();
+    assert_eq!(pallets.len(), 1, "unexpected pallets: {:?}", pallets);
+    assert_eq!(pallets[0]["name"], "main");
+    assert_eq!(pallets[0]["current"], true);
+    assert_eq!(pallets[0]["head"], serde_json::Value::Null);
+
+    assert_success(&warehouse.run(&["load", "."]));
+    let main_head = extract_parcel_hash(&warehouse.run(&["stack", "first"]));
+    assert_success(&warehouse.run(&["palletize", "feature/x"]));
+
+    // Once born, each pallet's listed `head` is its actual head parcel hash.
+    let listing = json(&warehouse.run(&["palletize", "--json"]));
+    assert_eq!(listing["data"]["current_unborn"], false);
+    let pallets = listing["data"]["pallets"].as_array().unwrap();
+    let by_name = |name: &str| pallets.iter()
+        .find(|entry| entry["name"] == name)
+        .unwrap_or_else(|| panic!("pallet {} not found in: {:?}", name, pallets));
+
+    assert_eq!(by_name("main")["head"], main_head);
+    assert_eq!(by_name("main")["current"], false);
+    assert_eq!(by_name("feature/x")["head"], main_head, "the new pallet starts at the same head");
+    assert_eq!(by_name("feature/x")["current"], true);
+}
+
+#[test]
 fn stocktake_reports_staged_and_unstaged_changes() {
     let warehouse = TestWarehouse::new("stocktake");
     warehouse.write_file("a.txt", "original\n");
@@ -1592,7 +1628,7 @@ fn history_walks_the_parcel_graph_newest_first() {
     assert_success(&warehouse.run(&["shift", "main"]));
     warehouse.write_file("c.txt", "main\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "main parcel"]));
+    let main_parcel = extract_parcel_hash(&warehouse.run(&["stack", "main parcel"]));
     assert_success(&warehouse.run(&["consolidate", "feature"]));
 
     let merged = stdout(&warehouse.run(&["history"]));
@@ -1608,6 +1644,28 @@ fn history_walks_the_parcel_graph_newest_first() {
     let unknown = warehouse.run(&["history", "nope"]);
     assert!(!unknown.status.success());
     assert!(stderr(&unknown).contains("neither a pallet nor a parcel hash"));
+
+    // `--json` carries `parents` on every entry (unlike `consolidates`, which is only
+    // present, non-empty, on a merge): `[]` for the root, one parent for a linear
+    // parcel, and — for the consolidation — both parents in stored, base-first order
+    // (the current pallet's own prior head first, the merged-in pallet's head second).
+    let entries = json(&warehouse.run(&["history", "--json"]))["data"]["entries"].clone();
+    let entries = entries.as_array().unwrap();
+    let by_hash = |hash: &str| entries.iter()
+        .find(|entry| entry["parcel"] == hash)
+        .unwrap_or_else(|| panic!("parcel {} not found in: {:?}", hash, entries));
+
+    assert_eq!(by_hash(&first)["parents"], serde_json::json!([]), "a root parcel has no parents");
+    assert_eq!(by_hash(&second)["parents"], serde_json::json!([first]), "a linear parcel has one parent");
+
+    let merge_hash = entries.iter()
+        .find(|entry| !entry["consolidates"].as_array().unwrap_or(&Vec::new()).is_empty())
+        .expect("the merge parcel must be in the history");
+    assert_eq!(
+        merge_hash["parents"], serde_json::json!([main_parcel, feature]),
+        "a consolidation lists both parents, base (the target pallet's own prior head) first"
+    );
+    assert_eq!(merge_hash["parents"], merge_hash["consolidates"], "parents and consolidates agree on a merge parcel");
 }
 
 #[test]
@@ -2466,6 +2524,7 @@ fn history_json_pages_through_the_whole_log_with_a_cursor() {
 
     // Walk the whole log in pages of two, following the `next` cursor each time.
     let mut seen: Vec<String> = Vec::new();
+    let mut seen_parents: Vec<Vec<String>> = Vec::new();
     let mut cursor: Option<String> = None;
     for _ in 0..10 {
         let out = match &cursor {
@@ -2475,6 +2534,10 @@ fn history_json_pages_through_the_whole_log_with_a_cursor() {
         let data = json(&out)["data"].clone();
         for entry in data["entries"].as_array().unwrap() {
             seen.push(entry["parcel"].as_str().unwrap().to_string());
+            let parents = entry["parents"].as_array()
+                .unwrap_or_else(|| panic!("parents must always be present: {:?}", entry))
+                .iter().map(|p| p.as_str().unwrap().to_string()).collect();
+            seen_parents.push(parents);
         }
         match data["next"].as_str() {
             Some(next) => cursor = Some(next.to_string()),
@@ -2485,6 +2548,17 @@ fn history_json_pages_through_the_whole_log_with_a_cursor() {
     // Every parcel is shown exactly once, newest first — no gaps, no duplicates.
     let expected: Vec<String> = hashes.iter().rev().cloned().collect();
     assert_eq!(seen, expected, "cursor paging must cover the whole log once, newest first");
+
+    // `parents` is correct even across the page boundary (the 5th/3rd-newest parcels
+    // straddle the -n 2 pages): the oldest parcel is a root (`[]`), every other parcel's
+    // sole parent is the one immediately before it in the linear chain.
+    assert_eq!(seen_parents[4], Vec::<String>::new(), "the root parcel has no parents");
+    for i in 0..4 {
+        assert_eq!(
+            seen_parents[i], vec![seen[i + 1].clone()],
+            "parcel {} must list its predecessor as its one parent, across the page boundary", seen[i]
+        );
+    }
 }
 
 #[test]
@@ -2925,7 +2999,7 @@ fn json_mode_wraps_every_result_in_a_versioned_envelope() {
     let prepared = warehouse.run(&["prepare", "--json"]);
     assert_success(&prepared);
     let value = json(&prepared);
-    assert_eq!(value["forklift_json"], "1");
+    assert_eq!(value["forklift_json"], "2");
     assert_eq!(value["command"], "prepare");
     assert_eq!(value["ok"], true);
     assert!(value["data"]["created"].is_array());
@@ -2962,6 +3036,22 @@ fn json_errors_carry_a_stable_code_and_a_deterministic_exit_code() {
     assert_eq!(value["error"]["code"], "not_a_warehouse");
     assert!(value["error"]["next_step"].is_string());
     assert!(value["error"]["message"].is_string());
+}
+
+#[test]
+fn history_on_an_unborn_pallet_reports_the_empty_history_code() {
+    let warehouse = TestWarehouse::new("history-unborn-json");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    // Nothing has ever been stacked on "main": history has its own classification
+    // (distinct from the generic "error"), and its own exit code.
+    let unborn = warehouse.run(&["history", "--json"]);
+    assert_eq!(unborn.status.code(), Some(19));
+    let value = json(&unborn);
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["error"]["code"], "empty_history");
+    assert!(value["error"]["message"].as_str().unwrap().contains("nothing stacked"));
 }
 
 #[test]

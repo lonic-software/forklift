@@ -136,17 +136,27 @@ impl CommandOutput for Palletized {
 ///
 /// # Returns
 /// * `Ok(())`      - If the pallets were listed.
-/// * `Err(String)` - If a pallets folder could not be read.
+/// * `Err(String)` - If a pallets folder could not be read, or a pallet's ref could not be read.
 fn list_pallets(all: bool) -> Result<(), String> {
     let current = pallet_utils::get_current_pallet_name()?;
-    let names = pallet_utils::list_pallets()?;
+    let mut names = pallet_utils::list_pallets()?;
 
-    // The current pallet is listed even when unborn (it has no ref file yet).
+    // The current pallet is listed even when unborn (it has no ref file yet) — folded
+    // into `pallets` itself (with `head: null`) rather than left as a side flag only, so
+    // a JSON consumer building a pallet graph never needs a special case for "the one
+    // pallet that isn't in the list".
     let current_unborn = !names.contains(&current);
+    if current_unborn {
+        names.push(current.clone());
+        names.sort();
+    }
 
     let pallets = names.into_iter()
-        .map(|name| PalletEntry { current: name == current, name })
-        .collect();
+        .map(|name| {
+            let head = pallet_utils::get_pallet_head(&name)?;
+            Ok(PalletEntry { current: name == current, name, head })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
 
     // Meta pallets are addressed by their qualified form (`@office`), only when asked.
     let meta = if all {
@@ -186,6 +196,9 @@ struct PalletList {
 struct PalletEntry {
     name: String,
     current: bool,
+
+    /// The pallet's head parcel hash; `null` when it is unborn (nothing stacked on it yet).
+    head: Option<String>,
 }
 
 impl CommandOutput for PalletList {
@@ -195,6 +208,12 @@ impl CommandOutput for PalletList {
         }
 
         for entry in &self.pallets {
+            // The unborn current pallet was already printed above (with its "(unborn)"
+            // marker) — skip it here so it is not shown twice.
+            if entry.current && self.current_unborn {
+                continue;
+            }
+
             let marker = if entry.current { "*" } else { " " };
             println!("{} {}", marker, entry.name);
         }

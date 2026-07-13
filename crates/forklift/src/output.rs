@@ -21,7 +21,14 @@ use forklift_core::util::scope_utils;
 /// The output schema version, carried on every JSON envelope as `forklift_json`.
 /// It changes only when the envelope or a command's `data` shape changes
 /// incompatibly, so an agent can pin it and detect drift.
-pub const SCHEMA_VERSION: &str = "1";
+///
+/// Version 2 (this one): `history` entries carry `parents` (always present, `[]` for a
+/// root), the `empty_history` error code exists, and `palletize` list entries carry
+/// `head`. A consumer reads this field first, before parsing anything else, to know
+/// whether the command it is about to run supports the capability it needs — the
+/// version bump *is* the capability-detection mechanism, so it is worth pinning rather
+/// than sniffing for a field's presence.
+pub const SCHEMA_VERSION: &str = "2";
 
 /// How the process renders its output.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -214,6 +221,11 @@ pub enum ErrorCode {
     /// single byte is uploaded, rather than wasting the whole upload and failing confusingly at
     /// commit time.
     CommitPaginationUnsupported,
+
+    /// `history` was asked to walk a pallet that has nothing stacked on it yet: there is no
+    /// history to show. Head-only (there is no parcel graph to enter) and scoped to `history`
+    /// alone, so it is classified here directly rather than as a `forklift-core` `RefusalCode`.
+    EmptyHistory,
 }
 
 impl ErrorCode {
@@ -235,6 +247,7 @@ impl ErrorCode {
             ErrorCode::ChunkedTransportUnsupported => scope_utils::CODE_CHUNKED_TRANSPORT_UNSUPPORTED,
             ErrorCode::OversizedTransportUnsupported => scope_utils::CODE_OVERSIZED_TRANSPORT_UNSUPPORTED,
             ErrorCode::CommitPaginationUnsupported => scope_utils::CODE_COMMIT_PAGINATION_UNSUPPORTED,
+            ErrorCode::EmptyHistory => "empty_history",
         }
     }
 
@@ -257,6 +270,8 @@ impl ErrorCode {
             ErrorCode::ChunkedTransportUnsupported => 14,
             ErrorCode::OversizedTransportUnsupported => 15,
             ErrorCode::CommitPaginationUnsupported => 16,
+            // 17 and 18 are reserved for future features, not shipped yet — never assign them.
+            ErrorCode::EmptyHistory => 19,
         }
     }
 
@@ -321,6 +336,21 @@ impl From<CoreError> for ForkliftError {
     }
 }
 
+/// The sentinel this crate frames an `empty_history` refusal with — a **head-only**
+/// classification (there is no parcel graph to enter, so `forklift-core` never raises it), kept
+/// entirely local rather than routed through the `forklift-core` refusal bridge (that would mean
+/// adding a `RefusalCode` for something core cannot itself produce). [`empty_history`] builds the
+/// frame at the one call site (`history`'s unborn-pallet check); [`From<String>`](ForkliftError)
+/// recognizes it before falling back to the `CoreError` path.
+const EMPTY_HISTORY_SENTINEL: &str = "\u{1}empty_history\u{1}";
+
+/// Frame a human message as the `empty_history` error (see [`EMPTY_HISTORY_SENTINEL`]) —
+/// `history`'s unborn-pallet call site builds its `Err(String)` with this, so it classifies as
+/// [`ErrorCode::EmptyHistory`] (exit 19) instead of the generic fallback.
+pub fn empty_history(message: impl Into<String>) -> String {
+    format!("{EMPTY_HISTORY_SENTINEL}{}", message.into())
+}
+
 /// A bare `Err(String)` from a handler is the `?`-friendly default. Most of `forklift-core` still
 /// returns `Result<_, String>`, and a refusal that crossed such a still-String segment arrives here
 /// as a sentinel-framed string (the [`forklift_core::error`] bridge shim). Lifting it through
@@ -328,8 +358,15 @@ impl From<CoreError> for ForkliftError {
 /// classifies exactly as one that stayed typed throughout; a plain string becomes a generic error.
 /// A frame whose code this build does not recognize (a newer `forklift-core`) degrades to a generic
 /// error with the human message — the raw `\u{1f}` frame never leaks into human/JSON output.
+///
+/// Checked first: this crate's own [`EMPTY_HISTORY_SENTINEL`] frame, a head-only classification
+/// the `forklift-core` bridge above knows nothing about.
 impl From<String> for ForkliftError {
     fn from(message: String) -> ForkliftError {
+        if let Some(human) = message.strip_prefix(EMPTY_HISTORY_SENTINEL) {
+            return ForkliftError { code: ErrorCode::EmptyHistory, message: human.to_string(), next_step: None };
+        }
+
         ForkliftError::from(CoreError::from(message))
     }
 }
@@ -461,5 +498,17 @@ mod tests {
             // The core code string and the head's code string are the same contract.
             assert_eq!(code.as_str(), code_str, "core/head code strings agree for {:?}", code);
         }
+    }
+
+    /// The head-only `empty_history` sentinel (never routed through `forklift-core`) classifies
+    /// to its own code, exit 19, and carries no next step.
+    #[test]
+    fn an_empty_history_sentinel_classifies_with_no_next_step() {
+        let error: ForkliftError = empty_history("nothing stacked yet").into();
+
+        assert_eq!(error.code.as_str(), "empty_history");
+        assert_eq!(error.code.exit_code(), 19);
+        assert_eq!(error.message, "nothing stacked yet");
+        assert!(error.next_step.is_none());
     }
 }

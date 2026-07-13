@@ -77,9 +77,9 @@ pub async fn handle_command(revision: Option<String>, class: Option<String>, lim
             Some(revision) => pallet_utils::resolve_revision(&revision)?,
             None => {
                 let pallet = pallet_utils::get_current_pallet_name()?;
-                pallet_utils::get_pallet_head(&pallet)?.ok_or(format!(
+                pallet_utils::get_pallet_head(&pallet)?.ok_or_else(|| output::empty_history(format!(
                     "Pallet \"{}\" has nothing stacked yet; there is no history.", pallet
-                ))?
+                )))?
             }
         }],
     };
@@ -247,6 +247,11 @@ struct HistoryEntry {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     consolidates: Vec<String>,
 
+    /// This parcel's parents, in their stored (canonical, base-first) order — always present,
+    /// `[]` for a root parcel. Unlike `consolidates` (kept for compatibility, only non-empty on
+    /// a merge), this is the graph edge a caller building a DAG needs regardless of parcel kind.
+    parents: Vec<String>,
+
     actions: Vec<HistoryAction>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -320,6 +325,7 @@ impl HistoryEntry {
         HistoryEntry {
             parcel: hash.to_string(),
             consolidates: if parcel.parents.len() > 1 { parcel.parents.clone() } else { Vec::new() },
+            parents: parcel.parents.clone(),
             actions,
             description: parcel.description.clone(),
         }

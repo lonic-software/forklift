@@ -351,6 +351,17 @@ signed office record — so authorship stays forge-proof, and `--class
 <human|agent|bot|service>` filters the log to answer "which parcels did agents write,
 under whose supervision".
 
+With `--json`, each entry also carries `parents` — every parent of that parcel, in
+stacking order, `[]` for a root — which is what a caller building a graph (rather than
+just reading a log) walks:
+
+```json
+{ "parcel": "<hash>", "parents": ["<base>", "<other>"], "consolidates": ["<base>", "<other>"], "actions": [/* … */] }
+```
+
+`history` on a pallet with nothing stacked on it yet fails with the `empty_history`
+error code (exit 19) rather than a generic one.
+
 ### Paging
 
 Forklift pages output the way git does. When stdout is a **terminal**, long human
@@ -517,6 +528,18 @@ and other tracked metadata), each in its `@`-qualified form — the address you 
 with. Pallet names may contain `/` (mapped to subfolders). Creating one at a revision
 materializes that state (and refuses on a dirty warehouse); creating one at the
 current head just moves refs.
+
+With `--json`, each pallet in the list carries its `head` parcel hash (`null` for an
+unborn one — the current pallet is listed even when unborn, so a caller never has to
+special-case it):
+
+```json
+{ "current": "main", "current_unborn": false,
+  "pallets": [
+    { "name": "feature/x", "current": true, "head": "<hash>" },
+    { "name": "main", "current": false, "head": "<hash>" }
+  ] }
+```
 
 ### `shift` — switch pallets (`sh`)
 
@@ -1119,6 +1142,13 @@ Errors set a deterministic exit code so scripts branch without parsing prose:
 | 10 | Out of scope conflict (a scoped bay merge hit an out-of-scope entry changed on both sides) |
 | 11 | Non-origin lift (a sparse workspace tried to lift to a remote other than its origin) |
 | 12 | Narrow unclean (`narrow` would delete a subtree that still holds uncommitted work) |
+| 13 | Scope prune blocked (`scope-prune` would free a path a checkout still materializes) |
+| 14 | Chunked transport unsupported (a chunked large file can't go into a bundle, or is being lifted to a remote that doesn't support chunking) |
+| 15 | Oversized transport unsupported (an object predates the size limit and can't be sent to a remote or bundle) |
+| 16 | Commit pagination unsupported (a lift needs a paginated commit and the remote doesn't support it yet) |
+| 19 | Empty history (`history` was asked to walk a pallet that has nothing stacked on it yet) |
+
+(17 and 18 are reserved for future features and are not yet assigned to any code.)
 
 With `--json`, the same classification appears as `error.code` in the output
 envelope. See [`../MACHINE_INTERFACE.md`](../MACHINE_INTERFACE.md).

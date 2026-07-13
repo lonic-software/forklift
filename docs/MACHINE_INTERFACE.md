@@ -14,7 +14,7 @@ Success envelope:
 
 ```json
 {
-  "forklift_json": "1",
+  "forklift_json": "2",
   "command": "stocktake",
   "ok": true,
   "data": { "…command-specific…" }
@@ -25,7 +25,7 @@ Failure envelope (also sets the exit code below):
 
 ```json
 {
-  "forklift_json": "1",
+  "forklift_json": "2",
   "ok": false,
   "error": {
     "code": "not_a_warehouse",
@@ -36,8 +36,65 @@ Failure envelope (also sets the exit code below):
 ```
 
 `forklift_json` is the output schema version. It changes only when the envelope or a
-command's `data` shape changes incompatibly, so a consumer can pin it. A command's
-`data` shape is documented by the struct it emits (in `crates/forklift/src/commands/`).
+command's `data` shape changes incompatibly, so a consumer can pin it — and it *is* the
+capability-detection mechanism: check the version before relying on a field, rather than
+sniffing for the field's presence. A command's `data` shape is documented by the struct
+it emits (in `crates/forklift/src/commands/`).
+
+**Version 2** (current): `history` entries carry `parents` (every parcel's parents, in
+stored order, always present — `[]` for a root); the `empty_history` error code exists
+(`history` on an unborn pallet); and `palletize` list entries carry `head`.
+
+### `history --json`
+
+```json
+{
+  "data": {
+    "entries": [
+      {
+        "parcel": "<hash>",
+        "parents": ["<base-hash>", "<other-hash>"],
+        "consolidates": ["<base-hash>", "<other-hash>"],
+        "actions": [
+          { "action": "author", "operator": "<id>", "timestamp": "2026-07-13T00:00:00+00:00" },
+          { "action": "stack", "operator": "<id>", "timestamp": "2026-07-13T00:00:01+00:00" }
+        ],
+        "description": "…"
+      },
+      { "parcel": "<root-hash>", "parents": [], "actions": [ /* … */ ] }
+    ],
+    "next": null
+  }
+}
+```
+
+`parents` is always present, in the parcel's stored (canonical, base-first) order — a
+root parcel's is `[]`. It is the general graph edge (every parcel, not only merges); the
+older `consolidates` field is unchanged and kept for compatibility (present, non-empty,
+only on a merge parcel).
+
+`history` on an unborn pallet (nothing stacked yet) fails with `empty_history` (exit 19)
+rather than the generic `error` code.
+
+### `palletize --json` (listing)
+
+```json
+{
+  "data": {
+    "current": "main",
+    "current_unborn": false,
+    "pallets": [
+      { "name": "feature/x", "current": true, "head": "<hash>" },
+      { "name": "main", "current": false, "head": "<hash>" }
+    ],
+    "meta": []
+  }
+}
+```
+
+Every pallet in `pallets` carries its `head` parcel hash, `null` for an unborn one (the
+current pallet is included in `pallets` even when unborn, rather than only signaled
+through `current_unborn`).
 
 Token-cheap by default: `stocktake --summary` reports counts only (no per-path lists),
 and `diff --json` reports the changed-file set (path + kind) rather than every line —
@@ -66,10 +123,14 @@ is reserved for argument/usage errors (clap); `0` is success.
 | `chunked_transport_unsupported` | 14   | A chunked large file can't go into a bundle, or is being lifted to a remote that doesn't support chunking |
 | `oversized_transport_unsupported` | 15 | An object predates the size limit and can't be sent to a remote or bundle |
 | `commit_pagination_unsupported` | 16 | A lift needs a paginated commit (many objects) and the remote doesn't support it yet |
+| `empty_history`           | 19   | `history` was asked to walk a pallet that has nothing stacked on it yet            |
 
 The codes and exit numbers are a contract: they get added to, never repurposed. A single
 `match` in the head (over `forklift-core`'s `RefusalCode`) maps a refusal to its exit code, so a
-new code cannot ship without an exit code wired to it.
+new code cannot ship without an exit code wired to it. `empty_history` is the one exception to
+that match — a head-only condition `forklift-core` never raises, classified directly in the head
+(`crates/forklift/src/output.rs`) rather than through a `RefusalCode`. Exit codes 17 and 18 are
+reserved for future features and are not yet assigned to any code.
 
 A refusal a **remote** raises carries the same code: the server tags its JSON error body with the
 stable `code` (see `format/REMOTE_PROTOCOL.md`), and the client classifies it with the same code
