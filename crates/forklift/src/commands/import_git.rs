@@ -628,6 +628,11 @@ impl Converter {
     /// Overflow clears the whole cache (the `IncomingVerificationCache` pattern): crude, but
     /// the flat memory bound matters more than the rare re-read/re-derive a clear causes.
     fn cache_base(&mut self, key: &str, bytes: Arc<Vec<u8>>) {
+        // A real object's serialized bytes always carry a header, so this cannot fire in
+        // practice — but it keeps the budget check below airtight even at a budget of zero.
+        if bytes.is_empty() {
+            return;
+        }
         if bytes.len() > self.base_cache_budget {
             return;
         }
@@ -636,7 +641,12 @@ impl Converter {
             self.base_cache_bytes = 0;
         }
         self.base_cache_bytes += bytes.len();
-        self.base_cache.insert(key.to_string(), bytes);
+        // Two different git trees can converge to the same forklift tree (e.g. differing only
+        // by a skipped submodule), re-inserting the same key — without subtracting the
+        // replaced entry's size, the byte count would drift upward and force premature clears.
+        if let Some(replaced) = self.base_cache.insert(key.to_string(), bytes) {
+            self.base_cache_bytes = self.base_cache_bytes.saturating_sub(replaced.len());
+        }
     }
 }
 
