@@ -367,6 +367,23 @@ pub fn resolve_tree_file(root_tree_hash: &str,
     Ok(None)
 }
 
+/// The hash of an empty (root) tree: the canonical base for comparing or merging against
+/// "nothing" — a root parcel with no parent (cherry-pick), or the reserved empty-tree diff
+/// token (`diff :empty <revision>`, the head's CLI surface). Building and storing it is cheap
+/// and content-addressed (identical every time), so every caller gets the same hash back and
+/// the object always exists once any caller has run.
+///
+/// # Returns
+/// * `Ok(String)`  - The hash of the (now-stored) empty tree.
+/// * `Err(String)` - If the object could not be stored.
+pub fn empty_tree_hash() -> Result<String, String> {
+    let empty = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+    let mut object = LooseObjectBuilder::build_tree(&empty);
+    object.store()?;
+
+    Ok(object.hash)
+}
+
 /// Create a blob for a file. To store this in the object store, use the `LooseObjectBuilder`.
 ///
 /// # Arguments

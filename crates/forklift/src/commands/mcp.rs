@@ -373,6 +373,10 @@ fn build_args(name: &str, arguments: &Value) -> Result<Vec<String>, String> {
                 args.push(rev);
             }
         }
+        "show" => {
+            args.push("show".to_string());
+            args.push(require("target")?);
+        }
         "cherry_pick" => {
             args.push("cherry-pick".to_string());
             args.push(require("revision")?);
@@ -603,6 +607,8 @@ fn tool_definitions() -> Value {
             object(json!({ "object": string, "inventory": string }), json!([]))),
         tool("blame", "Attribute each line of a file to the parcel that last changed it (rev: at a revision, default the current head).",
             object(json!({ "path": string, "rev": string }), json!(["path"]))),
+        tool("show", "Print a file's content at a revision in one call. target is \"<revision>:<path>\" (a pallet name, an @-qualified meta pallet, or a parcel hash, then a colon, then the path). Reports binary content or a chunked large file's metadata (content hash, size, chunk count) instead of raw bytes.",
+            object(json!({ "target": string }), json!(["target"]))),
         tool("cherry_pick", "Apply a single parcel's change onto the current pallet as a new parcel.",
             object(json!({ "revision": string, "message": string }), json!(["revision"]))),
         tool("deliver", "Squash the current draft pallet onto a target pallet as one clean signed parcel, keeping the trail. Needs an enrolled key.",

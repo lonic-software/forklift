@@ -43,7 +43,10 @@ it emits (in `crates/forklift/src/commands/`).
 
 **Version 2** (current): `history` entries carry `parents` (every parcel's parents, in
 stored order, always present — `[]` for a root); the `empty_history` error code exists
-(`history` on an unborn pallet); and `palletize` list entries carry `head`.
+(`history` on an unborn pallet); `palletize` list entries carry `head`; the `show`
+command reads a file's content at a revision in one call; `diff` accepts the reserved
+`:empty` token (either revision) for the empty tree; and `peek` on a binary blob reports
+`binary: true` instead of silently mangling the bytes.
 
 ### `history --json`
 
@@ -98,7 +101,53 @@ through `current_unborn`).
 
 Token-cheap by default: `stocktake --summary` reports counts only (no per-path lists),
 and `diff --json` reports the changed-file set (path + kind) rather than every line —
-a program reads specific content by hash when it needs it.
+a program reads specific content by hash when it needs it. `diff` also accepts the
+reserved token `:empty` as either revision, meaning the empty tree — the base for
+comparing a root parcel (which has no real "before") against a clean slate, so every
+file it introduces lists as `Added`. `:empty` can never collide with a real revision:
+a pallet/meta-pallet name is restricted to ASCII letters, digits, `.`, `_`, `-` and
+`/`, and a hash prefix is hex digits only — neither grammar can contain `:`.
+
+### `show --json`
+
+`show <revision>:<path>` reads a file's content at a revision in one call — a
+program's alternative to resolving a revision, walking its tree and peeking the blob
+by hash itself. The argument splits on the *first* `:` (a revision can never contain
+one, so the split is unambiguous even when the path does). Its `data`:
+
+```json
+{
+  "revision": "<the resolved parcel hash>",
+  "path": "src/app.rs",
+  "hash": "<the tree entry's own object hash: a blob hash, or a recipe hash>",
+  "binary": false,
+  "content": "…file text…",
+  "size": 1234
+}
+```
+
+`binary: true` means `content` is absent — either the bytes are not text (a NUL byte
+anywhere, or the bytes are not valid UTF-8 — both count, and either alone is enough),
+or the path is a chunked large file, reported by its recipe metadata instead of being
+assembled:
+
+```json
+{
+  "revision": "<parcel hash>",
+  "path": "big.bin",
+  "hash": "<recipe hash>",
+  "binary": true,
+  "size": 104857600,
+  "content_hash": "<the assembled file's whole-content hash>",
+  "chunk_count": 13
+}
+```
+
+`peek <hash>` on a blob carries the same `binary` signal, with the same definition —
+a NUL byte anywhere, or bytes that are not valid UTF-8, either one enough on its own:
+`"binary": true` and `content` is omitted, instead of the pre-fix behavior of silently
+mangling the raw bytes through a lossy UTF-8 conversion with no signal that it
+had happened.
 
 ## Error codes and exit codes
 
@@ -175,8 +224,8 @@ human-only allow-list; a unit test (`every_cli_command_is_an_mcp_tool_or_explici
 fails CI if that ever drifts. Tools (arguments in parentheses):
 
 - **Inspect:** `stocktake` (summary?), `history` (revision?, class?, limit?, after?),
-  `diff` (staged?, targets?), `peek` (object | inventory), `blame` (path, rev?),
-  `audit` (pallet?), `conflicts`.
+  `diff` (staged?, targets?), `peek` (object | inventory), `show` (target — a single
+  "<revision>:<path>" string), `blame` (path, rev?), `audit` (pallet?), `conflicts`.
 - **Change:** `load` (path), `remove` (path — stage a removal), `unload` (path — unstage),
   `stack` (description?), `restore` (path,
   staged?), `undo`, `park` / `park_list` / `park_pop`, `cherry_pick` (revision, message?),

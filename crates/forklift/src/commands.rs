@@ -34,6 +34,7 @@ pub mod import_git;
 pub mod prepare;
 pub mod self_update;
 pub mod peek;
+pub mod show;
 pub mod load;
 pub mod mcp;
 pub mod manifest;

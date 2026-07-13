@@ -1,7 +1,4 @@
 use serde::Serialize;
-use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
-use forklift_core::enums::dir_entry_type::DirEntryType;
-use forklift_core::model::tree_item::TreeItem;
 use forklift_core::util::cherry_pick_utils::{self, CherryPickState};
 use forklift_core::util::{merge_utils, object_utils, office_utils, pallet_utils, stack_utils};
 use crate::commands::consolidate;
@@ -84,7 +81,7 @@ pub async fn handle_command(revision: &str, message: Option<String>) -> Result<(
     // root parcel, so every file it introduces is new relative to nothing.
     let base_tree = match source_parcel.parents.first() {
         Some(parent) => object_utils::load_parcel(parent)?.tree_hash,
-        None => empty_tree_hash()?,
+        None => object_utils::empty_tree_hash()?,
     };
     let theirs_tree = source_parcel.tree_hash.clone();
 
@@ -134,16 +131,6 @@ pub async fn handle_command(revision: &str, message: Option<String>) -> Result<(
     }
 
     Ok(())
-}
-
-/// The hash of an empty (root) tree — the base for cherry-picking a parcel that has no
-/// parent. Building and storing it is cheap and content-addressed (identical every time).
-fn empty_tree_hash() -> Result<String, String> {
-    let empty = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
-    let mut object = LooseObjectBuilder::build_tree(&empty);
-    object.store()?;
-
-    Ok(object.hash)
 }
 
 /// What a cherry-pick did. `Conflicts` is the only outcome that leaves work for the operator
