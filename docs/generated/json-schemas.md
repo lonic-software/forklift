@@ -3003,6 +3003,10 @@ A command not listed here either reports only the generic human-message shape `{
       "minimum": 0,
       "type": "integer"
     },
+    "densify_suggested": {
+      "description": "Whether this store was bulk-ingested (`import-git`, or a franchise's native bundle\ninstall) and would still benefit from a one-shot `compact --all --redelta` pass.\nAdditive field; never acted on automatically.",
+      "type": "boolean"
+    },
     "loose_bytes": {
       "description": "Total on-disk bytes of the loose objects.",
       "format": "uint64",
@@ -3060,7 +3064,8 @@ A command not listed here either reports only the generic human-message shape `{
     "pack_bytes",
     "total_bytes",
     "packs",
-    "maintenance"
+    "maintenance",
+    "densify_suggested"
   ],
   "title": "StoreReport",
   "type": "object"

@@ -38,6 +38,10 @@ pub(crate) struct StoreReport {
     packs: Vec<PackReport>,
     /// The maintenance thresholds and the current verdict.
     maintenance: Maintenance,
+    /// Whether this store was bulk-ingested (`import-git`, or a franchise's native bundle
+    /// install) and would still benefit from a one-shot `compact --all --redelta` pass.
+    /// Additive field; never acted on automatically.
+    densify_suggested: bool,
 }
 
 /// One pack's line in the census.
@@ -94,6 +98,7 @@ impl From<StoreStatus> for StoreReport {
                 compaction_due: status.incremental_due,
                 repack_due: status.repack_due,
             },
+            densify_suggested: status.densify_pending,
         }
     }
 }
@@ -137,6 +142,11 @@ impl CommandOutput for StoreReport {
             "    repack      {}",
             verdict(m.repack_due, self.pack_files, m.pack_threshold, "packs"),
         );
+
+        if self.densify_suggested {
+            println!();
+            println!("{}", output::DENSIFY_TIP);
+        }
     }
 }
 

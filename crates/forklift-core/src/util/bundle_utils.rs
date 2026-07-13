@@ -91,6 +91,11 @@ pub struct ImportStats {
     pub stored_objects: usize,
     pub stored_signatures: usize,
     pub skipped_records: usize,
+    /// Whether this import installed native packs straight from the bundle (only the whole-
+    /// warehouse native format does this — see `import_native_bundle_reader`). `franchise` uses
+    /// this to gate its densify suggestion: those packs are exactly the far end's own bulk-
+    /// ingest shape, never having seen cross-path similarity.
+    pub installed_packs: bool,
 }
 
 /// The path of the latest bundle of the current warehouse.
@@ -813,6 +818,9 @@ fn import_native_bundle_reader(reader: &mut impl Read) -> Result<ImportStats, St
         stored_objects: imported.stored_objects,
         stored_signatures: 0,
         skipped_records: imported.skipped_objects,
+        // `import_transport_packs` only publishes (and marks the store densify-pending) when it
+        // stored at least one object; mirror that gate here rather than re-deriving it.
+        installed_packs: imported.stored_objects > 0,
     };
 
     for _ in 0..signature_count {

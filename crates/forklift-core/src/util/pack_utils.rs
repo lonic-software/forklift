@@ -233,6 +233,10 @@ pub struct StoreStatus {
     pub incremental_due: bool,
     /// Whether a consolidating repack is due now (pack files over the threshold).
     pub repack_due: bool,
+    /// Whether this store was bulk-ingested (`import-git`'s pack-direct path, or a franchise's
+    /// native bundle install) and has not since been through a `compact --all --redelta` pass —
+    /// see `mark_densify_pending`. A suggestion only; nothing ever acts on it automatically.
+    pub densify_pending: bool,
 }
 
 /// Take an exact, read-only census of the object store: how many objects are loose vs packed,
@@ -305,6 +309,7 @@ pub fn store_status() -> Result<StoreStatus, String> {
         pack_threshold,
         incremental_due,
         repack_due,
+        densify_pending: densify_pending()?,
     })
 }
 
@@ -485,6 +490,43 @@ fn loaded_packs() -> Result<Arc<Vec<LoadedPack>>, String> {
 fn invalidate_cache() {
     registry().lock().expect("the pack registry lock is poisoned")
         .remove(&file_utils::get_path_objects_root());
+}
+
+/// The densify-pending marker's filename, in the pack folder. Presence-only — its content is
+/// just a human-readable note, never parsed — set after a bulk ingest (`StoreIngest::finish`,
+/// `import_transport_packs`) publishes at least one pack, and cleared after a successful
+/// `compact --all --redelta`. Those bulk paths append per-object or per-pack, so their delta
+/// chains can only ever see the similarity a per-path/per-pack window offers; a full `--redelta`
+/// pass is the one thing that lets them see cross-path similarity too, so the marker is a hint
+/// that the win is still on the table, not something anything auto-runs (redelta is a one-shot,
+/// CPU-bound minutes-long pass — out of budget for auto-maintenance's cheap-and-rare contract).
+const DENSIFY_MARKER_NAME: &str = "densify-pending";
+
+/// Record that this store would benefit from a `compact --all --redelta` pass. Best-effort: a
+/// failure here must never fail the ingest that just succeeded, so errors are swallowed — a
+/// missed marker only costs a missed suggestion, never correctness.
+fn mark_densify_pending(pack_folder: &Path) {
+    let _ = std::fs::write(
+        pack_folder.join(DENSIFY_MARKER_NAME),
+        "This store was bulk-ingested (import-git or a franchise bundle install) and has not \
+        been through a full delta-compress pass yet. Run \"forklift compact --all --redelta\" \
+        to shrink it further. Safe to delete; it is only a hint.\n",
+    );
+}
+
+/// Clear the densify-pending marker after a successful `compact --all --redelta` run, so the
+/// suggestion does not fire again until another bulk ingest re-sets it — redelta should not be
+/// repeated back-to-back on the same store (see the KNOWN GAP note on `retrieve_from_packs`).
+/// Best-effort, same reasoning as `mark_densify_pending`.
+fn clear_densify_pending(pack_folder: &Path) {
+    let _ = std::fs::remove_file(pack_folder.join(DENSIFY_MARKER_NAME));
+}
+
+/// Whether the object store carries the densify-pending marker — surfaced by `store` as a
+/// suggestion. Never consulted to decide behavior; the marker is presence-only and read here as
+/// a plain existence check, not parsed.
+pub fn densify_pending() -> Result<bool, String> {
+    Ok(pack_folder().join(DENSIFY_MARKER_NAME).exists())
 }
 
 /// Load every pack in `pack_folder` (its index resident, its data file left on disk for
@@ -753,6 +795,9 @@ pub(crate) fn import_transport_packs<R: Read>(reader: &mut R,
 
         file_utils::sync_dir(&folder)?;
         invalidate_cache();
+        // A native bundle installs whole packs verbatim from the far end's own bulk ingest —
+        // the same undensified shape `--redelta` exists to fix.
+        mark_densify_pending(&folder);
 
         Ok(TransportImportStats { stored_objects, skipped_objects })
     })();
@@ -1662,6 +1707,12 @@ pub fn compact(all: bool, redelta: bool) -> Result<CompactStats, String> {
     if let Ok(refs) = pallet_utils::all_pallet_refs() {
         let heads: Vec<String> = refs.into_iter().map(|(_, head)| head).collect();
         let _ = graph_utils::build_from_heads(&heads);
+    }
+
+    // A redelta pass just gave the whole live set its cross-path shot; the densify suggestion
+    // (set when a bulk ingest could not) no longer applies until another bulk ingest re-earns it.
+    if redelta {
+        clear_densify_pending(&pack_folder);
     }
 
     Ok(stats)
@@ -2767,6 +2818,9 @@ impl StoreIngest {
         if self.packs > 0 {
             file_utils::sync_dir(&self.folder)?;
             invalidate_cache();
+            // This is exactly the shape `--redelta` densifies: objects appended straight into
+            // packs, one path/window at a time, never seeing similarity across the whole store.
+            mark_densify_pending(&self.folder);
         }
 
         Ok(IngestStats { objects: self.objects, deltas: self.deltas, packs: self.packs })
