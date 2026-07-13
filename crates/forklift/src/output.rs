@@ -16,7 +16,7 @@
 use std::sync::OnceLock;
 use serde::Serialize;
 use forklift_core::error::{CoreError, RefusalCode};
-use forklift_core::util::scope_utils;
+use forklift_core::util::{merge_utils, scope_utils};
 
 /// The output schema version, carried on every JSON envelope as `forklift_json`.
 /// It changes only when the envelope or a command's `data` shape changes
@@ -105,6 +105,28 @@ pub fn human_bytes(bytes: u64) -> String {
     } else {
         format!("{:.1} {}", value, UNITS[unit])
     }
+}
+
+/// Classify blob bytes as safely displayable text, for the commands (`show`, `peek`) that
+/// report a `binary` signal instead of printing raw bytes. Text means **both** NUL-free
+/// (`merge_utils::is_mergeable_text`, the same test `diff`'s line-by-line display uses) **and**
+/// valid UTF-8 — a NUL-free blob can still be invalid UTF-8, and a NUL byte is itself valid
+/// UTF-8, so neither check alone is sufficient. Only this passing means content is safe to
+/// hand to a person or a JSON string: nothing here or downstream ever falls back to a lossy
+/// conversion, so no caller can silently mangle non-UTF-8 bytes into fake text.
+///
+/// # Arguments
+/// * `content` - The blob's raw bytes.
+///
+/// # Returns
+/// * `Some(&str)` - The content, when it is safe to display as text.
+/// * `None`       - When the content is binary (a NUL byte, or invalid UTF-8).
+pub fn blob_text(content: &[u8]) -> Option<&str> {
+    if !merge_utils::is_mergeable_text(content) {
+        return None;
+    }
+
+    std::str::from_utf8(content).ok()
 }
 
 /// Print the success envelope: `{ forklift_json, command, ok: true, data }`.

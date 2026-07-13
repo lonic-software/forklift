@@ -5517,6 +5517,27 @@ fn show_reports_binary_content_honestly_never_mangling_it() {
 }
 
 #[test]
+fn show_reports_nul_free_invalid_utf8_content_as_binary() {
+    // A NUL-free blob can still be invalid UTF-8 — text means both checks pass, not just the
+    // NUL-byte one, or this is exactly the mangled-content bug the "binary" signal exists to
+    // prevent.
+    let warehouse = TestWarehouse::new("show-invalid-utf8");
+    write_bytes(&warehouse, "blob.bin", &[0x66, 0x6f, 0xff, 0xfe]);
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "invalid utf8"]));
+
+    let json_out = warehouse.run(&["--json", "show", "main:blob.bin"]);
+    assert_success(&json_out);
+    let data = json(&json_out)["data"].clone();
+    assert_eq!(data["binary"], true);
+    assert_eq!(data["size"], 4);
+    assert!(data.get("content").is_none(), "invalid UTF-8 must never carry mangled content");
+}
+
+#[test]
 fn show_reports_chunked_metadata_without_assembling_the_file() {
     let warehouse = TestWarehouse::new("show-chunked");
     let giant = large_bytes(0x540, CHUNK_THRESHOLD + 10_000);
@@ -5623,6 +5644,30 @@ fn peek_json_reports_a_binary_blob_honestly() {
     let data = json(&peeked)["data"].clone();
     assert_eq!(data["binary"], true);
     assert!(data.get("content").is_none(), "a binary blob must never carry mangled content");
+}
+
+#[test]
+fn peek_json_reports_nul_free_invalid_utf8_content_as_binary() {
+    // Same fix, same test shape as `show`: a NUL-free blob that is not valid UTF-8 must still
+    // report binary, not fall through to a lossy conversion that mangles it into fake text.
+    let warehouse = TestWarehouse::new("peek-invalid-utf8-json");
+    write_bytes(&warehouse, "blob.bin", &[0x66, 0x6f, 0xff, 0xfe]);
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    let parcel = extract_parcel_hash(&{
+        let out = warehouse.run(&["stack", "invalid utf8"]);
+        assert_success(&out);
+        out
+    });
+
+    let hash = path_object_hash(&warehouse, &parcel, "blob.bin");
+    let peeked = warehouse.run(&["--json", "peek", &hash]);
+    assert_success(&peeked);
+    let data = json(&peeked)["data"].clone();
+    assert_eq!(data["binary"], true);
+    assert!(data.get("content").is_none(), "invalid UTF-8 must never carry mangled content");
 }
 
 #[test]

@@ -327,16 +327,17 @@ forklift peek --inventory src -v     # ...with full stat detail
 
 A debugging/inspection tool: it decodes any object by hash (a blob's text, a
 tree's entries, a parcel's tree/parents/actions/description) or dumps a folder's
-inventory shard. With `--json`, a binary blob reports `"binary": true` and omits
-`content` instead of mangling raw bytes through a lossy text conversion.
+inventory shard. With `--json`, a binary blob (a NUL byte anywhere, or bytes that
+are not valid UTF-8) reports `"binary": true` and omits `content` instead of
+mangling raw bytes through a lossy text conversion.
 
 ### `show` — a file's content at a revision
 
 ```sh
-forklift show main:src/app.rs           # the file as of main's head
-forklift show a1b2c3:src/app.rs         # ...at a parcel hash prefix instead
-forklift show main:notes/2024-01-01.md  # a path may itself contain ":" — only
-                                         # the first ":" splits revision from path
+forklift show main:src/app.rs               # the file as of main's head
+forklift show a1b2c3:src/app.rs             # ...at a parcel hash prefix instead
+forklift show main:logs/build:latest.txt    # a path may itself contain ":" — only
+                                             # the first ":" splits revision from path
 ```
 
 The one-invocation equivalent of resolving a revision, walking its tree to a path
@@ -346,10 +347,11 @@ an editor's review panel. The argument is `<revision>:<path>`, split on the *fir
 can never contain `:`, so the split is unambiguous even when the path does.
 
 A large file (stored in chunks) reports its metadata — content hash, total size,
-chunk count — instead of assembling it; non-text content reports binary. Either
-way `content` is absent and `binary` is `true`. In human mode a short notice
-prints instead of raw bytes; in `--json` mode see
-[`docs/MACHINE_INTERFACE.md`](../MACHINE_INTERFACE.md) for the exact shape.
+chunk count — instead of assembling it; non-text content (a NUL byte anywhere, or
+bytes that are not valid UTF-8) reports binary. Either way `content` is absent and
+`binary` is `true`. In human mode a short notice prints instead of raw bytes; in
+`--json` mode see [`docs/MACHINE_INTERFACE.md`](../MACHINE_INTERFACE.md) for the
+exact shape.
 
 ---
 

@@ -10,7 +10,7 @@ use forklift_core::model::recipe::Recipe;
 use forklift_core::model::tree_item::TreeItem;
 use forklift_core::parser;
 use forklift_core::parser::inventory::inventory_parser;
-use forklift_core::util::{file_utils, merge_utils};
+use forklift_core::util::file_utils;
 use crate::output::{self, CommandOutput};
 
 const PARCEL_FIELD_TREE: &str =   "tree  ";
@@ -136,16 +136,15 @@ fn peek_object_json(object: ParsedObject) -> Result<(), String> {
 
     let peeked = match object {
         ParsedObject::Blob(blob) => {
-            // A NUL byte anywhere marks the blob binary (the same test `diff` and `show`
-            // use) — reported honestly instead of mangling the bytes through a lossy
-            // UTF-8 conversion, which used to silently corrupt binary content into fake
-            // text with no signal that it happened.
-            let is_binary = !merge_utils::is_mergeable_text(&blob.content);
+            // Text means NUL-free *and* valid UTF-8 (see `output::blob_text`) — reported
+            // honestly instead of mangling the bytes through a lossy UTF-8 conversion, which
+            // used to silently corrupt binary content into fake text with no signal that it
+            // happened.
+            let text = output::blob_text(&blob.content);
 
             PeekObject {
-                content: (!is_binary)
-                    .then(|| String::from_utf8_lossy(&blob.content).to_string()),
-                binary: Some(is_binary),
+                content: text.map(str::to_string),
+                binary: Some(text.is_none()),
                 ..PeekObject::empty(object_type)
             }
         }
@@ -209,8 +208,9 @@ pub(crate) struct PeekObject {
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
 
-    /// Whether a blob is binary (contains a NUL byte) — `content` is then omitted
-    /// rather than carrying lossily-mangled bytes. Absent for every other object type.
+    /// Whether a blob is binary — contains a NUL byte, or is not valid UTF-8 (see
+    /// `output::blob_text`) — `content` is then omitted rather than carrying lossily-mangled
+    /// bytes. Absent for every other object type.
     #[serde(skip_serializing_if = "Option::is_none")]
     binary: Option<bool>,
 
@@ -309,7 +309,8 @@ fn print_header(object_type: &ObjectType) {
 }
 
 /// Print the content of the given blob to stdout — or, for a binary blob, a short
-/// notice instead of raw bytes (the same NUL-byte test `diff` and `show` use).
+/// notice instead of raw bytes (the same NUL-free-and-valid-UTF-8 text test `show` and
+/// `peek --json` use — see `output::blob_text`).
 ///
 /// # Arguments
 /// * `object` - The blob to print.
@@ -317,12 +318,12 @@ fn print_header(object_type: &ObjectType) {
 /// # Returns
 /// * `Ok(())` - Always (a binary blob is reported, never an error).
 fn peek_blob(object: Blob) -> Result<(), String> {
-    if !merge_utils::is_mergeable_text(&object.content) {
+    let Some(text) = output::blob_text(&object.content) else {
         println!("(binary blob, {} bytes)", object.content.len());
         return Ok(());
-    }
+    };
 
-    println!("{}", String::from_utf8_lossy(&object.content));
+    println!("{}", text);
 
     Ok(())
 }

@@ -128,8 +128,9 @@ one, so the split is unambiguous even when the path does). Its `data`:
 ```
 
 `binary: true` means `content` is absent — either the bytes are not text (a NUL byte
-anywhere), or the path is a chunked large file, reported by its recipe metadata
-instead of being assembled:
+anywhere, or the bytes are not valid UTF-8 — both count, and either alone is enough),
+or the path is a chunked large file, reported by its recipe metadata instead of being
+assembled:
 
 ```json
 {
@@ -143,8 +144,9 @@ instead of being assembled:
 }
 ```
 
-`peek <hash>` on a blob carries the same `binary` signal: a binary blob reports
-`"binary": true` and omits `content`, instead of the pre-fix behavior of silently
+`peek <hash>` on a blob carries the same `binary` signal, with the same definition —
+a NUL byte anywhere, or bytes that are not valid UTF-8, either one enough on its own:
+`"binary": true` and `content` is omitted, instead of the pre-fix behavior of silently
 mangling the raw bytes through a lossy UTF-8 conversion with no signal that it
 had happened.
 

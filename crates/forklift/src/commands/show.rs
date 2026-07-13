@@ -1,5 +1,5 @@
 use serde::Serialize;
-use forklift_core::util::{merge_utils, object_utils, pallet_utils};
+use forklift_core::util::{object_utils, pallet_utils};
 use crate::output::{self, CommandOutput};
 
 /// Handle the `show` command: print a file's content at a revision in one invocation
@@ -60,16 +60,17 @@ pub fn handle_command(target: &str) -> Result<(), String> {
         let blob = object_utils::load_blob(&hash)?;
         let size = blob.content.len() as u64;
 
-        // The same NUL-byte test `diff` and `peek` classify binary content with — never a
-        // guess unique to this command.
-        let is_binary = !merge_utils::is_mergeable_text(&blob.content);
+        // Text means NUL-free *and* valid UTF-8 (see `output::blob_text`) — never a lossy
+        // conversion that could mangle non-UTF-8 bytes into fake text with no signal that it
+        // happened.
+        let text = output::blob_text(&blob.content);
 
         Shown {
             revision: parcel_hash,
             path: path.to_string(),
             hash,
-            binary: is_binary,
-            content: (!is_binary).then(|| String::from_utf8_lossy(&blob.content).to_string()),
+            binary: text.is_none(),
+            content: text.map(str::to_string),
             size,
             content_hash: None,
             chunk_count: None,
@@ -99,8 +100,9 @@ pub(crate) struct Shown {
     /// chunked large file.
     hash: String,
 
-    /// Whether the content is not shown as text: either non-text bytes (a NUL byte
-    /// anywhere) or a chunked large file, which is never assembled just to answer `show`.
+    /// Whether the content is not shown as text: either non-text bytes (a NUL byte anywhere,
+    /// or invalid UTF-8 — see `output::blob_text`) or a chunked large file, which is never
+    /// assembled just to answer `show`.
     binary: bool,
 
     /// The file's content as text. Present only when `binary` is `false`.
