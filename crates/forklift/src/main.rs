@@ -215,6 +215,7 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
         Command::Scope { action } => commands::scope::handle_command(action),
         Command::ScopePrune { paths, dry_run } => commands::scope_prune::handle_command(paths, dry_run),
         Command::Shift { pallet } => commands::shift::handle_command(&pallet).await,
+        Command::Show { target } => commands::show::handle_command(&target),
         Command::Stack { description } => commands::stack::handle_command(description).await,
         Command::Tag { action } => commands::tag::handle_command(action).await,
         Command::Stocktake { summary } => commands::stocktake::handle_command(summary).await,

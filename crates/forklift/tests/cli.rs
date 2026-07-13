@@ -5452,3 +5452,191 @@ fn a_chunked_file_directory_flip_shift_succeeds() {
     assert!(status.contains("The inventory matches the pallet head"), "status: {}", status);
     assert!(status.contains("The working directory matches the inventory"), "status: {}", status);
 }
+
+#[test]
+fn show_prints_a_files_content_at_head_and_at_an_older_revision() {
+    let warehouse = TestWarehouse::new("show-text");
+    warehouse.write_file("src/app.rs", "v1\n");
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    let v1 = extract_parcel_hash(&{
+        let out = warehouse.run(&["stack", "v1"]);
+        assert_success(&out);
+        out
+    });
+
+    warehouse.write_file("src/app.rs", "v2\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "v2"]));
+
+    // The current head, by pallet name.
+    let head = warehouse.run(&["show", "main:src/app.rs"]);
+    assert_success(&head);
+    assert_eq!(stdout(&head), "v2\n");
+
+    // An older revision, by parcel hash — one invocation, no separate resolve/peek round trip.
+    let older = warehouse.run(&["show", &format!("{}:src/app.rs", v1)]);
+    assert_success(&older);
+    assert_eq!(stdout(&older), "v1\n");
+
+    // --json carries the resolved parcel hash, the blob hash, and the content.
+    let json_out = warehouse.run(&["--json", "show", "main:src/app.rs"]);
+    assert_success(&json_out);
+    let data = json(&json_out)["data"].clone();
+    assert_eq!(data["path"], "src/app.rs");
+    assert_eq!(data["binary"], false);
+    assert_eq!(data["content"], "v2\n");
+    assert_eq!(data["size"], 3);
+    assert!(data["revision"].as_str().unwrap().len() >= 4, "revision should be a resolved hash");
+    assert!(data.get("content_hash").is_none(), "content_hash is chunked-only");
+    assert!(data.get("chunk_count").is_none(), "chunk_count is chunked-only");
+}
+
+#[test]
+fn show_reports_binary_content_honestly_never_mangling_it() {
+    let warehouse = TestWarehouse::new("show-binary");
+    write_bytes(&warehouse, "blob.bin", b"bin\0ary");
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "binary"]));
+
+    let json_out = warehouse.run(&["--json", "show", "main:blob.bin"]);
+    assert_success(&json_out);
+    let data = json(&json_out)["data"].clone();
+    assert_eq!(data["binary"], true);
+    assert_eq!(data["size"], 7);
+    assert!(data.get("content").is_none(), "a binary blob must never carry mangled content");
+
+    let human = warehouse.run(&["show", "main:blob.bin"]);
+    assert_success(&human);
+    assert!(stdout(&human).contains("binary file"), "unexpected output: {}", stdout(&human));
+}
+
+#[test]
+fn show_reports_chunked_metadata_without_assembling_the_file() {
+    let warehouse = TestWarehouse::new("show-chunked");
+    let giant = large_bytes(0x540, CHUNK_THRESHOLD + 10_000);
+    write_bytes(&warehouse, "big.bin", &giant);
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "chunked"]));
+
+    let json_out = warehouse.run(&["--json", "show", "main:big.bin"]);
+    assert_success(&json_out);
+    let data = json(&json_out)["data"].clone();
+    assert_eq!(data["binary"], true);
+    assert_eq!(data["size"], giant.len());
+    assert!(data.get("content").is_none(), "a chunked file is never assembled just to show it");
+    assert!(data["content_hash"].as_str().unwrap().len() > 0);
+    assert!(data["chunk_count"].as_u64().unwrap() > 0);
+
+    let human = warehouse.run(&["show", "main:big.bin"]);
+    assert_success(&human);
+    let text = stdout(&human);
+    assert!(text.contains("chunked file") && text.contains("chunks"), "unexpected output: {}", text);
+}
+
+#[test]
+fn show_resolves_a_subdirectory_path_and_a_path_containing_a_colon() {
+    let warehouse = TestWarehouse::new("show-paths");
+    warehouse.write_file("src/data/nested.txt", "nested content\n");
+    warehouse.write_file("note:with:colons.txt", "colon path\n");
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "paths"]));
+
+    let nested = warehouse.run(&["show", "main:src/data/nested.txt"]);
+    assert_success(&nested);
+    assert_eq!(stdout(&nested), "nested content\n");
+
+    // Only the *first* ":" splits revision from path — the rest belongs to the path.
+    let colon_path = warehouse.run(&["show", "main:note:with:colons.txt"]);
+    assert_success(&colon_path);
+    assert_eq!(stdout(&colon_path), "colon path\n");
+}
+
+#[test]
+fn show_reports_a_clean_error_for_a_missing_path_or_revision() {
+    let warehouse = TestWarehouse::new("show-missing");
+    warehouse.write_file("src/app.rs", "content\n");
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base"]));
+
+    let missing_path = warehouse.run(&["show", "main:nope.txt"]);
+    assert!(!missing_path.status.success());
+    assert!(stderr(&missing_path).contains("was not found"), "unexpected error: {}", stderr(&missing_path));
+
+    let missing_revision = warehouse.run(&["show", "nope:src/app.rs"]);
+    assert!(!missing_revision.status.success());
+    assert!(
+        stderr(&missing_revision).contains("neither a pallet nor a parcel hash"),
+        "unexpected error: {}", stderr(&missing_revision)
+    );
+
+    let malformed = warehouse.run(&["show", "no-colon-here"]);
+    assert!(!malformed.status.success());
+    assert!(stderr(&malformed).contains("is not \"<revision>:<path>\""), "unexpected error: {}", stderr(&malformed));
+}
+
+#[test]
+fn peek_json_reports_a_binary_blob_honestly() {
+    let warehouse = TestWarehouse::new("peek-binary-json");
+    write_bytes(&warehouse, "blob.bin", b"bin\0ary");
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    let parcel = extract_parcel_hash(&{
+        let out = warehouse.run(&["stack", "binary"]);
+        assert_success(&out);
+        out
+    });
+
+    let hash = path_object_hash(&warehouse, &parcel, "blob.bin");
+    let peeked = warehouse.run(&["--json", "peek", &hash]);
+    assert_success(&peeked);
+    let data = json(&peeked)["data"].clone();
+    assert_eq!(data["binary"], true);
+    assert!(data.get("content").is_none(), "a binary blob must never carry mangled content");
+}
+
+#[test]
+fn diff_empty_token_lists_every_file_of_a_root_parcel_as_added() {
+    let warehouse = TestWarehouse::new("diff-empty-token");
+    warehouse.write_file("src/app.rs", "content\n");
+    warehouse.write_file("README.md", "readme\n");
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "root"]));
+
+    // A root parcel has no real "before" — diffing it against ":empty" reports every
+    // tracked file as added, rather than refusing for want of a second real revision.
+    let human = warehouse.run(&["diff", ":empty", "main"]);
+    assert_success(&human);
+    let text = stdout(&human);
+    assert!(text.contains("added: src/app.rs"), "unexpected diff output: {}", text);
+    assert!(text.contains("added: README.md"), "unexpected diff output: {}", text);
+
+    let json_out = warehouse.run(&["--json", "diff", ":empty", "main"]);
+    assert_success(&json_out);
+    let files = json(&json_out)["data"]["files"].as_array().unwrap().clone();
+    assert_eq!(files.len(), 2);
+    assert!(files.iter().all(|file| file["kind"] == "added"));
+
+    // The reverse direction: main vs nothing removes everything.
+    let reversed = stdout(&warehouse.run(&["diff", "main", ":empty"]));
+    assert!(reversed.contains("removed: src/app.rs"), "unexpected diff output: {}", reversed);
+}

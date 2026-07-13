@@ -48,7 +48,8 @@ impl DiffSide {
 /// Handle the diff command: show the changed files line by line.
 /// * `diff [path]`          - Working directory vs inventory (what a `load` would stage).
 /// * `diff --staged [path]` - Inventory vs pallet head (what the next `stack` records).
-/// * `diff <pallet-a> <pallet-b> [path]` - The head of one pallet vs the head of another.
+/// * `diff <revision-a> <revision-b> [path]` - The tree of one revision vs the tree of
+///   another (a pallet name, a parcel hash, or the reserved [`EMPTY_TREE_TOKEN`] for "nothing").
 ///
 /// The optional path limits the report to a file or directory. With the global
 /// `--verbose` flag, unchanged lines are printed too.
@@ -83,10 +84,10 @@ pub async fn handle_command(staged: bool, targets: &[String], verbose: bool) -> 
                 diff_worktree(filter.as_ref(), verbose).await
             }
         }
-        [from_pallet, to_pallet, rest @ ..] if rest.len() <= 1 => {
+        [from_revision, to_revision, rest @ ..] if rest.len() <= 1 => {
             if staged {
                 return Err(
-                    "--staged cannot be combined with a pallet comparison: the staged \
+                    "--staged cannot be combined with a revision comparison: the staged \
                     changes are always relative to the current pallet's head.".to_string()
                 );
             }
@@ -100,11 +101,11 @@ pub async fn handle_command(staged: bool, targets: &[String], verbose: bool) -> 
                 crate::commands::scope::ensure_path_in_scope(filter.as_key())?;
             }
 
-            diff_pallets(from_pallet, to_pallet, filter.as_ref(), verbose)
+            diff_pallets(from_revision, to_revision, filter.as_ref(), verbose)
         }
         _ => Err(
             "Too many arguments. Usage: \"diff [path]\", \"diff --staged [path]\" or \
-            \"diff <pallet-a> <pallet-b> [path]\".".to_string()
+            \"diff <revision-a> <revision-b> [path]\".".to_string()
         ),
     }
 }
@@ -235,32 +236,35 @@ async fn diff_staged(filter: Option<&WarehousePath>, verbose: bool) -> Result<()
     Ok(())
 }
 
-/// Diff the head trees of two pallets: `from` is the old side, `to` the new side (the
+/// Diff the trees of two revisions: `from` is the old side, `to` the new side (the
 /// report reads "what changed going from `from` to `to`"). Identical subtree hashes are
-/// skipped entirely.
+/// skipped entirely. Either side may be [`EMPTY_TREE_TOKEN`] instead of a real revision,
+/// meaning "nothing" — the tree with no entries — so a root parcel (or any revision) can be
+/// diffed against a clean slate instead of refusing for want of a second side.
 ///
 /// # Arguments
-/// * `from_pallet` - The name of the old-side pallet.
-/// * `to_pallet`   - The name of the new-side pallet.
-/// * `filter`      - An optional path that limits the report.
-/// * `verbose`     - Whether to print unchanged lines too.
+/// * `from_revision` - The old-side revision: a pallet name, a parcel hash (prefix), or
+///                     [`EMPTY_TREE_TOKEN`].
+/// * `to_revision`   - The new-side revision, same grammar.
+/// * `filter`        - An optional path that limits the report.
+/// * `verbose`       - Whether to print unchanged lines too.
 ///
 /// # Returns
 /// * `Ok(())`      - If the diff completed.
-/// * `Err(String)` - If a pallet does not exist (or is unborn), or an object could not
-///                   be read.
-fn diff_pallets(from_pallet: &str,
-                to_pallet: &str,
+/// * `Err(String)` - If a revision does not resolve (unknown pallet, unborn head, or
+///                   unresolvable hash), or an object could not be read.
+fn diff_pallets(from_revision: &str,
+                to_revision: &str,
                 filter: Option<&WarehousePath>,
                 verbose: bool) -> Result<(), String> {
-    let from_tree_hash = pallet_head_tree(from_pallet)?;
-    let to_tree_hash = pallet_head_tree(to_pallet)?;
+    let from_tree_hash = pallet_head_tree(from_revision)?;
+    let to_tree_hash = pallet_head_tree(to_revision)?;
 
     if from_tree_hash == to_tree_hash {
         if output::is_json() {
             output::emit("diff", &DiffReport { mode: "pallets", files: Vec::new() });
         } else {
-            println!("Pallets \"{}\" and \"{}\" have identical trees.", from_pallet, to_pallet);
+            println!("Pallets \"{}\" and \"{}\" have identical trees.", from_revision, to_revision);
         }
 
         return Ok(());
@@ -301,7 +305,7 @@ fn diff_pallets(from_pallet: &str,
         .collect();
 
     if selected.is_empty() {
-        println!("The tracked files of \"{}\" and \"{}\" match.", from_pallet, to_pallet);
+        println!("The tracked files of \"{}\" and \"{}\" match.", from_revision, to_revision);
         return Ok(());
     }
 
@@ -381,8 +385,17 @@ fn diff_block(change: &TreeChange, verbose: bool) -> Result<String, String> {
     Ok(format_file_diff(change.kind, &label, &old_side, &new_side, verbose))
 }
 
-/// Get the root tree hash of a revision: a pallet name (its head) or a parcel hash
-/// (prefix).
+/// The reserved token for "the empty tree" as either side of a two-revision `diff`: a root
+/// parcel has no real "before", so this lets it be compared against a clean slate — every
+/// file it introduces then lists as `Added` — instead of `diff` refusing for want of a second
+/// revision. Chosen so it can never collide with a real revision: a pallet or meta-pallet name
+/// is validated to ASCII letters/digits/`.`/`_`/`-` (`/`-separated; see
+/// [`pallet_utils::validate_pallet_name`]) and a hash prefix is 4+ hex digits — neither
+/// grammar can ever contain `:`, so this token is unambiguous at a glance and by construction.
+pub const EMPTY_TREE_TOKEN: &str = ":empty";
+
+/// Get the root tree hash of a revision: a pallet name (its head), a parcel hash (prefix),
+/// or [`EMPTY_TREE_TOKEN`] for the empty tree.
 ///
 /// # Arguments
 /// * `revision` - The revision argument.
@@ -392,6 +405,10 @@ fn diff_block(change: &TreeChange, verbose: bool) -> Result<String, String> {
 /// * `Err(String)` - If the revision could not be resolved or the parcel could not be
 ///                   read.
 fn pallet_head_tree(revision: &str) -> Result<String, String> {
+    if revision == EMPTY_TREE_TOKEN {
+        return object_utils::empty_tree_hash();
+    }
+
     let parcel_hash = pallet_utils::resolve_revision(revision)?;
 
     Ok(object_utils::load_parcel(&parcel_hash)?.tree_hash)

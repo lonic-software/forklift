@@ -238,15 +238,17 @@ pub enum Command {
         long_about = "Show the line-by-line changes between the working directory and the \
                       inventory (what \"load\" would stage). With --staged, show the changes \
                       between the inventory and the pallet head (what \"stack\" would record). \
-                      With two revisions (pallet names or parcel hashes), compare those instead. \
-                      An optional trailing path limits the report to a file or directory."
+                      With two revisions (pallet names or parcel hashes), compare those instead \
+                      — use \":empty\" as either revision to compare against the empty tree \
+                      (every file on the other side then lists as added). An optional trailing \
+                      path limits the report to a file or directory."
     )]
     Diff {
         /// Compare the inventory against the pallet head (what "stack" would record)
         #[arg(short, long)]
         staged: bool,
 
-        /// [path], or <revision> <revision> [path]
+        /// [path], or <revision-a> <revision-b> [path] — ":empty" is the empty tree
         #[arg(value_name = "REVISION|PATH")]
         targets: Vec<String>,
     },
@@ -584,6 +586,23 @@ pub enum Command {
     Shift {
         /// The pallet to shift to
         pallet: String,
+    },
+
+    /// Print a file's content at a revision (`git show <rev>:<path>`'s equivalent)
+    #[command(
+        long_about = "Print a file's content at a revision in one invocation: \
+                      \"<revision>:<path>\", split on the first \":\" (a revision — a pallet \
+                      name, an \"@\"-qualified meta pallet, or a parcel hash prefix — can never \
+                      contain \":\", so the split is unambiguous even when the path itself has \
+                      one). A chunked large file reports its metadata (content hash, size, chunk \
+                      count) instead of assembling it; non-text content is reported binary. With \
+                      --json, the envelope carries the resolved parcel hash, the tree entry's own \
+                      hash, the binary/chunked signal, and the content when it is text."
+    )]
+    Show {
+        /// "<revision>:<path>"
+        #[arg(value_name = "REVISION:PATH")]
+        target: String,
     },
 
     /// Stack the inventory as a new parcel (commit) on the current pallet
@@ -1336,6 +1355,7 @@ impl Command {
                 | Command::Scope { .. }
                 | Command::ScopePrune { .. }
                 | Command::Shift { .. }
+                | Command::Show { .. }
                 | Command::Stack { .. }
                 | Command::Stocktake { .. }
                 | Command::Store
@@ -1400,7 +1420,7 @@ impl Command {
     /// this is exactly the read-only display commands.
     ///
     /// # Returns
-    /// * `true`  - Page the output on a terminal (`history`, `diff`, `peek`, `blame`, `audit`).
+    /// * `true`  - Page the output on a terminal (`history`, `diff`, `peek`, `show`, `blame`, `audit`).
     /// * `false` - Print straight through (mutating, interactive, or short-output commands).
     pub fn pages_output(&self) -> bool {
         matches!(
@@ -1408,6 +1428,7 @@ impl Command {
             Command::History { .. }
                 | Command::Diff { .. }
                 | Command::Peek { .. }
+                | Command::Show { .. }
                 | Command::Blame { .. }
                 | Command::Audit { .. }
         )
