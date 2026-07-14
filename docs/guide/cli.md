@@ -1020,9 +1020,8 @@ packed in isolation (say, on import, or by an earlier incremental compact whose 
 only ever saw a few neighbors) has no way to know a much better match (a rename, a moved file,
 anything similar outside its own path) sits elsewhere in the store. `--redelta` gives every
 object one more shot at the best base across the *entire* live set. It costs a full re-encode —
-one-shot and CPU-bound, not something to run routinely, and not something to repeat
-back-to-back on the same store — run it once after a big import, then let history move on
-before running it again — and it is only valid together with `--all`.
+one-shot and CPU-bound, not something to run routinely — and it is only valid together with
+`--all`. Safe to repeat any number of times on the same store.
 
 > This step removes per-file slack and the open-per-object read cost. Delta compression
 > between similar versions (the rest of the size gap vs git) is additional work on top —

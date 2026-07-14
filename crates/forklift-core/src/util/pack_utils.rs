@@ -90,7 +90,13 @@ use crate::util::delta_utils::MAX_DELTA_TARGET_BYTES as MAX_DELTA_OBJECT_SIZE;
 
 /// The longest delta chain a base may already carry before a new delta refuses to extend it.
 /// Reconstructing a delta reads its base (recursively), so this bounds that recursion — the
-/// same bound bundles use (`bundle_utils::MAX_DELTA_CHAIN`).
+/// same bound bundles use (`bundle_utils::MAX_DELTA_CHAIN`). Enforced two ways: the window
+/// mechanism's own bookkeeping (`WindowEntry::depth`, always exact — a window base is always
+/// already written when chosen) and `compact`'s write-time depth ledger (`true_depth`, exact
+/// too — see `MAX_RECONSTRUCT_DEPTH`'s doc comment), which is what makes this bound *real* for a
+/// path-base delta as well, not just a window one. `compute_path_bases`'s own path-hop counter
+/// also checks against this same constant, but only as a coarse, approximate pre-filter on how
+/// many candidates the ledger even has to consider — see its doc comment.
 const MAX_DELTA_CHAIN: u32 = 50;
 
 /// The length of a pack data file header: magic (8) + version (4).
@@ -1072,26 +1078,20 @@ pub fn retrieve_from_packs_reloading(hash: &str) -> Result<Option<Vec<u8>>, Stri
 }
 
 /// A hard ceiling on how deep a delta chain may be followed when reconstructing an object.
-/// Chains are bounded far below this at write time (`MAX_DELTA_CHAIN`, an approximate bound
-/// since the path walk restarts recorded depth on repeats — real chains can run a small
-/// multiple of it), so this is only a backstop against a corrupt or adversarial pack that
-/// chains without end: it turns unbounded recursion (a crash) into a clean error, never a lost
-/// or wrong object (the failure is caught before anything is written or deleted).
 ///
-/// KNOWN GAP (pre-existing, not introduced by the redelta densification work — reproduced on
-/// unmodified history-walk code too): `MAX_DELTA_CHAIN`'s write-time bound is *approximate* by
-/// design (see its own doc comment) because `compute_path_bases` counts only path hops since a
-/// reset, blind to a "reset" object's own real depth when that object itself won a *window*
-/// delta rather than a full record — so a path-chain segment's real depth can exceed the nominal
-/// cap, and — empirically, at real-repository scale, across repeated `compact --all --redelta`
-/// runs on the same store — real depth has been observed climbing into the hundreds and, once,
-/// tripping this exact backstop on a repository's most frequently-and-continuously-touched file
-/// paths. A correct fix needs a true per-object depth ledger reconciled with the size-first
-/// write order (which path bases are order-independent of, but window bases are not) — real
-/// design work, tracked as a follow-up rather than attempted as a quick patch here. The failure
-/// mode is safe (durable-before-destructive: a compact that hits this backstop writes and
-/// deletes nothing, so the store is exactly as it was before the attempt), just unavailable —
-/// which is why `redelta`'s CLI help does not recommend running it back-to-back on one store.
+/// This is a backstop only, not the mechanism that keeps chains short: `compact`'s write-time
+/// depth ledger (`true_depth`, consulted by its depth-safety pre-pass) is what enforces the real
+/// invariant — **no written delta's true chain depth may ever exceed `MAX_DELTA_CHAIN`, on any
+/// pass, from any starting store** — by resolving every candidate path base's *actual* current
+/// depth (from record headers, no decompression) before committing to it, rather than trusting
+/// `compute_path_bases`'s own bookkeeping (which only counts path hops since a reset, and is
+/// deliberately silent about a reset point's own real depth — see its doc comment) at face value.
+/// A candidate that would push true depth past the cap is demoted to a full record instead.
+///
+/// So a well-formed pack's chains never approach this ceiling; it exists purely against a
+/// corrupt or adversarial pack that chains without end, turning unbounded recursion (a crash)
+/// into a clean error, never a lost or wrong object (caught before anything is written or
+/// deleted). `true_depth`'s own walk is bounded by this same constant for the same reason.
 const MAX_RECONSTRUCT_DEPTH: u32 = 1000;
 
 thread_local! {
@@ -1280,9 +1280,15 @@ struct WindowEntry {
 /// re-read and re-compressed, not just the ones a plain repack would have touched anyway.
 ///
 /// Signature sidecars (`.sig`) and temp files are left alone (sidecars are read by path).
-/// Objects are packed largest-first and offered as a **delta** — against the previous version
-/// of the same file (path-aware) or, failing that, a small size window — kept only when
-/// smaller than the full blob. Packs are written durably before any original is removed, so a
+/// Objects with no path base are packed largest-first and offered a **delta** against a small
+/// size window, kept only when smaller than the full blob — the size ordering is what gives
+/// that window any chance of similarity. Objects `compute_path_bases` gave a path base instead
+/// are packed in that walk's own order (a base always before its dependent, whatever their
+/// relative sizes), each offered a delta against the previous version of the same path — kept
+/// only when it wins the same size race *and* the write-time depth ledger confirms the base's
+/// true current depth leaves room for one more hop without exceeding `MAX_DELTA_CHAIN` (demoted
+/// to a full record otherwise; see `MAX_RECONSTRUCT_DEPTH`'s doc comment for why that check
+/// exists and cannot be skipped). Packs are written durably before any original is removed, so a
 /// failure never loses an object.
 ///
 /// # Arguments
@@ -1314,26 +1320,54 @@ pub fn compact(all: bool, redelta: bool) -> Result<CompactStats, String> {
     // whole reachability phase, which collapses those (~5 per parcel) re-reads to one decode each
     // and is dropped before the parallel batch loop below. `source_packs` are the existing packs,
     // kept mapped for the run so a `CopyRecord` copies its bytes straight from the mmap.
-    let (targets, old_packs, source_packs, path_bases) = {
+    let (targets, old_packs, source_packs, depth_packs, path_bases) = {
         let _parcel_memo = object_utils::ParcelReadMemo::activate();
 
-        let CollectedTargets { mut targets, old_packs, source_packs } = collect_targets(all, redelta)?;
-        // Largest first (the delta/window heuristic), with the object hash as a total tie-breaker
-        // so the packing order — and therefore every record's offset — is deterministic. Without
-        // it, equal-size objects kept their filesystem-enumeration order, so two repacks of the
-        // *same already-packed* live set produced different layouts every run; harmless under the
-        // old id (which hashed only the object set) but, now that the pack id folds in
-        // offsets/lengths, this determinism is what stops a steady-state repack from churning
-        // the pack onto a fresh name (rewrite + delete) each run and lets it land on the same name.
-        targets.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.hash.cmp(&b.hash)));
+        let CollectedTargets { targets, old_packs, source_packs } = collect_targets(all, redelta)?;
 
         // Path-aware base selection (phase 2b) is only needed to *build* new deltas — for loose
         // objects and for the rare object whose base is dropped. A repack that only copies existing
         // records (the common case) skips the whole DAG walk.
         let needs_delta = targets.iter().any(|t| !matches!(t.source, Source::CopyRecord { .. }));
-        let path_bases = if needs_delta { compute_path_bases()? } else { HashMap::new() };
+        let path_bases = if needs_delta {
+            compute_path_bases()?
+        } else {
+            PathBases { base_of: HashMap::new(), sequence: HashMap::new() }
+        };
 
-        (targets, old_packs, source_packs, path_bases)
+        // The depth ledger's cross-pack fallback (`true_depth`) needs the current pack registry
+        // regardless of `all`: an incremental compact's `source_packs` is deliberately empty (it
+        // never touches existing packs — see `collect_targets`), but a loose target's path base
+        // can still be one of them. Already cached when `all` is set (`collect_targets` itself
+        // called `loaded_packs`), so this is a free `Arc` clone in that case.
+        let depth_packs = loaded_packs()?;
+
+        // Split into root targets (no candidate path base: a first version at their path, or a
+        // `CopyRecord` this run never re-deltates) and chain targets (a candidate from
+        // `compute_path_bases`). Roots keep the largest-first order the size-window fallback
+        // depends on. Chains are reordered to the walk's own order instead — a chain's base is
+        // always ordered before it (`PathBases::sequence`) — so the depth ledger below can
+        // resolve every chain forward in one pass, a base's true depth always already known by
+        // the time its dependent asks for it, regardless of how the two compare in size.
+        let (mut chain_targets, mut root_targets): (Vec<PackTarget>, Vec<PackTarget>) = targets
+            .into_iter()
+            .partition(|t| !matches!(t.source, Source::CopyRecord { .. }) && path_bases.base_of.contains_key(&t.hash));
+
+        // Largest first, with the object hash as a total tie-breaker so the packing order — and
+        // therefore every record's offset — is deterministic. Without it, equal-size objects kept
+        // their filesystem-enumeration order, so two repacks of the *same already-packed* live set
+        // produced different layouts every run; harmless under the old id (which hashed only the
+        // object set) but, now that the pack id folds in offsets/lengths, this determinism is what
+        // stops a steady-state repack from churning the pack onto a fresh name (rewrite + delete)
+        // each run and lets it land on the same name.
+        root_targets.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.hash.cmp(&b.hash)));
+        chain_targets.sort_by_key(|t| *path_bases.sequence.get(&t.hash)
+            .expect("a chain target's hash was recorded by the same walk that gave it a base_of entry"));
+
+        root_targets.extend(chain_targets);
+        let targets = root_targets;
+
+        (targets, old_packs, source_packs, depth_packs, path_bases)
     };
 
     let mut stats = CompactStats {
@@ -1353,6 +1387,13 @@ pub fn compact(all: bool, redelta: bool) -> Result<CompactStats, String> {
     // The new packs' own paths, so a repack never deletes one as an "old" pack (the id is
     // content-derived, so an unchanged repack writes the very same filename).
     let mut new_pack_files: HashSet<PathBuf> = HashSet::new();
+
+    // The write-time depth ledger (see `true_depth`): every hash this run has assigned a real (or,
+    // for a still-pending chain target, a sound worst-case — see the pre-pass below) depth to.
+    // Consulted instead of a stale on-disk read for anything this run has already decided, since
+    // `redelta` may re-encode a hash as something else entirely. Spans the whole run (unlike
+    // `safe_base_of` below): a later batch's pre-pass must see an earlier batch's decisions.
+    let mut known_depth: HashMap<[u8; HASH_LEN], u32> = HashMap::new();
 
     // Process the targets in byte-bounded batches. Each batch's *path* deltas — the CPU-heavy
     // part — are compressed in parallel by `prepare_batch`; the writer then walks the batch in
@@ -1375,7 +1416,54 @@ pub fn compact(all: bool, redelta: bool) -> Result<CompactStats, String> {
         }
 
         let batch = &targets[start..end];
-        let mut prepared = prepare_batch(batch, &path_bases)?;
+
+        // Depth-safety pre-pass, sequential and header-read-only (no decompression — see
+        // `true_depth`): for every chain target in this batch, resolve its candidate base's
+        // *true* current depth — this run's own decision if the base was already processed
+        // (an earlier-sorted root, or an earlier chain target in this same walk order — see
+        // `PathBases::sequence`), otherwise a header-chain walk of whichever pack currently holds
+        // it (a `CopyRecord` object this run leaves untouched, or — an incremental compact — any
+        // pre-existing packed object at all). A candidate that would push true depth past
+        // `MAX_DELTA_CHAIN` is rejected here, *before* `prepare_batch` ever reads or compresses
+        // it — this is the hard invariant `compute_path_bases`'s own bookkeeping cannot provide
+        // (see `MAX_RECONSTRUCT_DEPTH`'s doc comment): no written delta's true chain depth may
+        // exceed `MAX_DELTA_CHAIN`, ever, on any pass, from any starting store.
+        //
+        // A safe candidate's depth is recorded here as the *planned* value — assuming it will
+        // in fact be kept as a delta — before `prepare_batch` has even computed its payload, let
+        // alone learned whether that payload beats the full blob. This is sound, not a race: if
+        // the size check below ends up rejecting it (kept full instead, true depth 0), the real
+        // depth only ever comes in *under* what was planned for it, so anything chaining off this
+        // hash that already used the planned value stays a valid (if occasionally conservative)
+        // upper bound. Never the reverse: nothing here ever assumes a shallower depth than a
+        // candidate can actually turn out to have.
+        //
+        // Scoped to this batch alone (rebuilt fresh every iteration, unlike `known_depth`):
+        // `prepare_batch` below only ever looks up *this* batch's targets in it, so carrying
+        // earlier batches' entries forward would just accumulate dead weight — at git.git scale,
+        // most of `path_bases.base_of` restated back into a second map nothing after this batch
+        // still reads.
+        let mut safe_base_of: HashMap<[u8; HASH_LEN], [u8; HASH_LEN]> = HashMap::new();
+        for target in batch {
+            if matches!(target.source, Source::CopyRecord { .. }) {
+                continue;
+            }
+            let Some(&base) = path_bases.base_of.get(&target.hash) else {
+                continue;
+            };
+
+            let base_depth = true_depth(base, &mut known_depth, &depth_packs)?;
+            let planned_depth = base_depth + 1;
+
+            if planned_depth <= MAX_DELTA_CHAIN {
+                safe_base_of.insert(target.hash, base);
+                known_depth.insert(target.hash, planned_depth);
+            } else {
+                known_depth.insert(target.hash, 0);
+            }
+        }
+
+        let mut prepared = prepare_batch(batch, &safe_base_of)?;
         start = end;
 
         for (i, target) in batch.iter().enumerate() {
@@ -1416,6 +1504,16 @@ pub fn compact(all: bool, redelta: bool) -> Result<CompactStats, String> {
                 continue;
             }
 
+            // A chain target (`compute_path_bases` offered it a candidate base) never falls back
+            // to the size window, whether its candidate was rejected by the pre-pass above or by
+            // `prepare_target`'s own size check: the window's own depth bookkeeping only holds
+            // (window bases are always already-written when chosen, so their depth is always
+            // known — see `WindowEntry`) because it never has to account for a base whose true
+            // depth might still be unknown. Letting a chain target compete for it would reopen
+            // exactly that gap. It still gets the same fallback a root does when it has no safe
+            // or winning delta at all: full.
+            let is_chain_target = path_bases.base_of.contains_key(&target.hash);
+
             let prep = prepared[i].take().expect("a non-copy target was prepared");
 
             let loose_path = match &target.source {
@@ -1435,10 +1533,11 @@ pub fn compact(all: bool, redelta: bool) -> Result<CompactStats, String> {
 
             // 2. Otherwise fall back to the size window (trees and the like) — sequential, as it
             //    deltas against the objects just packed — keeping the smallest delta only when
-            //    it beats the full blob.
+            //    it beats the full blob. Never for a chain target (see above): it goes straight
+            //    to full instead, and its `known_depth` entry already stands from the pre-pass.
             let mut window_depth = 0;
             if !path_delta {
-                let best = if prep.deltable {
+                let best = if !is_chain_target && prep.deltable {
                     best_delta(&prep.raw, &window)?
                 } else {
                     None
@@ -1450,10 +1549,16 @@ pub fn compact(all: bool, redelta: bool) -> Result<CompactStats, String> {
                         stats.deltas += 1;
                         stats.bytes_packed += written;
                         window_depth = base_depth + 1;
+                        if !is_chain_target {
+                            known_depth.insert(target.hash, window_depth);
+                        }
                     }
                     _ => {
                         let written = pack.append_full(target.hash, &prep.compressed, loose_path.clone())?;
                         stats.bytes_packed += written;
+                        if !is_chain_target {
+                            known_depth.insert(target.hash, 0);
+                        }
                     }
                 }
             }
@@ -1469,8 +1574,12 @@ pub fn compact(all: bool, redelta: bool) -> Result<CompactStats, String> {
             // Only fallback-packed objects seed the window: a path delta fetches its base from
             // the store, so it need never be a window base — keeping path and window chains
             // separate (so reconstruction recursion stays bounded per mechanism). Parcels never
-            // seed it either (nothing should delta against a parcel).
-            if !path_delta && prep.deltable {
+            // seed it either (nothing should delta against a parcel). Nor does a chain target
+            // that fell through to full (never tried the window, `window_depth` stayed 0) — a
+            // future window base's depth must be *known*, and the window's own bookkeeping can
+            // only guarantee that by construction if only fallback-full/window objects ever
+            // enter it (see `is_chain_target`'s doc comment above).
+            if !path_delta && prep.deltable && !is_chain_target {
                 window_bytes += prep.raw.len();
                 window.push_back(WindowEntry { hash: target.hash, raw: prep.raw, depth: window_depth });
                 while window.len() > DELTA_WINDOW || (window_bytes > DELTA_WINDOW_MEMORY && window.len() > 1) {
@@ -1688,14 +1797,14 @@ struct CollectedTargets {
 /// whole live set is re-read and re-offered to path-base/window delta selection (which now
 /// credits directories with a path base too, not just files — see `compute_path_bases`).
 ///
-/// A `Reconstruct` target's `size` (the largest-first sort key, shared with every other target)
-/// comes from the record header when the record is a delta — its raw target length, read
-/// straight from the delta's own cleartext VLQ field, the same real-content-size proxy a loose
-/// object's file size already stands in for — rather than the delta's own (small, previously
-/// packed) on-disk length: an import-produced store is mostly deltas, so using their on-disk
-/// length here would sort (and so window-batch) objects by how well they happened to already
-/// compress, not by how big they are, which is close to meaningless for grouping similar-sized
-/// objects together.
+/// A `Reconstruct` target's `size` (the largest-first sort key `compact` uses for whichever
+/// targets end up with no path base — see there for the rest of the ordering) comes from the
+/// record header when the record is a delta — its raw target length, read straight from the
+/// delta's own cleartext VLQ field, the same real-content-size proxy a loose object's file size
+/// already stands in for — rather than the delta's own (small, previously packed) on-disk
+/// length: an import-produced store is mostly deltas, so using their on-disk length here would
+/// sort (and so window-batch) objects by how well they happened to already compress, not by how
+/// big they are, which is close to meaningless for grouping similar-sized objects together.
 fn collect_targets(all: bool, redelta: bool) -> Result<CollectedTargets, String> {
     if !all {
         return Ok(CollectedTargets {
@@ -1851,6 +1960,82 @@ fn framed_record(pack: &LoadedPack, offset: u64, len: u64, framed: bool) -> Resu
     }
 }
 
+/// The first pack (if any) among `packs` that holds `hash`, with its record's `(offset, length)`
+/// — the same "which pack, if any" search `retrieve_from_packs`/`is_in_packs` do, factored out
+/// for the depth ledger below, which needs the pack itself (to read the record's header) rather
+/// than its resolved bytes.
+fn locate_in_packs<'a>(hash: &[u8; HASH_LEN], packs: &'a [LoadedPack]) -> Option<(&'a LoadedPack, u64, u64)> {
+    packs.iter().find_map(|pack| pack.locate(hash).map(|(offset, length)| (pack, offset, length)))
+}
+
+/// The *true* current reconstruction depth of `hash` — 0 for a full record or a loose file,
+/// `1 + true_depth(base)` for a delta — computed from record **headers only** (`read_record_header`,
+/// no decompression), memoized in `known` across the whole compact run.
+///
+/// This is the real ledger `compute_path_bases`'s own bookkeeping cannot be (see
+/// `MAX_RECONSTRUCT_DEPTH`'s doc comment): it does not matter whether `hash` is a chain root that
+/// won a size-window delta, a `CopyRecord` object whose shape this run never re-derives, or an
+/// object this run has *already* decided (via `known`, checked first and authoritative — a
+/// hash's on-disk shape from an old pack is never trusted once this run has re-decided it, since
+/// `redelta` may re-encode it as something else entirely). `known` is exactly `compact`'s
+/// depth-safety ledger; this function is how it answers a query it does not already have memoized,
+/// by resolving the on-disk chain of whichever pack currently holds `hash`.
+///
+/// Walks iteratively, not recursively: an *existing* store may currently hold a chain deep enough
+/// (up to `MAX_RECONSTRUCT_DEPTH`, the read-side backstop) that native call-stack recursion would
+/// risk overflow resolving it — exactly the kind of store this ledger exists to repair. Bounded by
+/// the same backstop, so a corrupt or adversarial pack that chains without end fails this compact
+/// cleanly instead of spinning forever.
+fn true_depth(hash: [u8; HASH_LEN], known: &mut HashMap<[u8; HASH_LEN], u32>, packs: &[LoadedPack]) -> Result<u32, String> {
+    if let Some(&depth) = known.get(&hash) {
+        return Ok(depth);
+    }
+
+    // Every hop from `hash` down to (but not including) whichever node ends the walk below.
+    let mut chain: Vec<[u8; HASH_LEN]> = Vec::new();
+    let mut current = hash;
+
+    let terminal_depth = loop {
+        if let Some(&depth) = known.get(&current) {
+            break depth;
+        }
+
+        let Some((pack, offset, length)) = locate_in_packs(&current, packs) else {
+            break 0; // Not packed at all: a loose file, always stored full.
+        };
+
+        let framed = pack.version >= FIRST_FRAMED_VERSION;
+        let header = read_record_header(pack, offset, length, framed)?;
+
+        if !header.is_delta {
+            break 0;
+        }
+
+        if chain.len() as u32 >= MAX_RECONSTRUCT_DEPTH {
+            return Err(format!(
+                "Object {} exceeds the reconstruction depth limit while computing its true depth (corrupt pack?).",
+                sign_utils::to_hex(&current)
+            ));
+        }
+
+        chain.push(current);
+        current = header.base.expect("a delta record's header always carries a base");
+    };
+
+    // Unwind: `current` (whatever ended the walk) has `terminal_depth`; each hop in `chain`,
+    // walked oldest-to-newest in reverse (i.e. newest-recorded-first), is one level deeper than
+    // the one after it. Memoizing every hop, not just `hash`, makes a later query for any of
+    // them (a common case: the same base shared by several dependents) O(1).
+    let mut depth = terminal_depth;
+    known.insert(current, depth);
+    for h in chain.into_iter().rev() {
+        depth += 1;
+        known.insert(h, depth);
+    }
+
+    Ok(*known.get(&hash).expect("hash was just inserted, if it was not already known"))
+}
+
 /// How many bits a Bloom filter probes per key (tuned with ~10 bits/element for ~1% false
 /// positives — see [`Bloom`]).
 const BLOOM_PROBES: usize = 7;
@@ -1924,7 +2109,7 @@ impl Bloom {
 /// so reconstruction recursion stays bounded. Every "seen" set is a Bloom filter, so the walk's
 /// memory is bounded (a bit budget) rather than one entry per object — what keeps it viable at
 /// kernel scale (see [`Bloom`]).
-fn compute_path_bases() -> Result<HashMap<[u8; HASH_LEN], [u8; HASH_LEN]>, String> {
+fn compute_path_bases() -> Result<PathBases, String> {
     let heads: Vec<String> = pallet_utils::all_pallet_refs()?
         .into_iter().map(|(_, head)| head).collect();
 
@@ -1943,6 +2128,8 @@ fn compute_path_bases() -> Result<HashMap<[u8; HASH_LEN], [u8; HASH_LEN]>, Strin
         latest_blob_at_path: HashMap::new(),
         latest_tree_at_path: HashMap::new(),
         base_of: HashMap::new(),
+        sequence: HashMap::new(),
+        next_sequence: 0,
     };
 
     for parcel_hash in &order {
@@ -1950,7 +2137,25 @@ fn compute_path_bases() -> Result<HashMap<[u8; HASH_LEN], [u8; HASH_LEN]>, Strin
         walk_tree_for_bases(&tree_hash, "", &mut walk)?;
     }
 
-    Ok(walk.base_of)
+    Ok(PathBases { base_of: walk.base_of, sequence: walk.sequence })
+}
+
+/// The output of [`compute_path_bases`]: candidate path bases, plus the walk order that makes
+/// them safe to act on out of packing's largest-first order (see `compact`'s write-time depth
+/// ledger).
+struct PathBases {
+    /// hash → its candidate delta base. Not a promise the base is depth-safe to actually delta
+    /// against — `compute_path_bases`'s own `MAX_DELTA_CHAIN` bookkeeping only counts path hops
+    /// since a reset, blind to a reset point's own real depth (see `MAX_RECONSTRUCT_DEPTH`'s doc
+    /// comment) — so `compact` re-checks every candidate's *true* depth at write time before
+    /// committing to it.
+    base_of: HashMap<[u8; HASH_LEN], [u8; HASH_LEN]>,
+    /// hash → the order this walk (oldest-parcel-first) established it in. `base_of[h]`'s
+    /// sequence number is always lower than `h`'s own — a base is always recorded (fixed, or
+    /// re-affirmed as the path's latest) strictly before the object that names it as a base is
+    /// processed — so sorting by this number, instead of by size, gives `compact` a safe order
+    /// to resolve a whole chain's true depths in: every base before its dependent.
+    sequence: HashMap<[u8; HASH_LEN], u64>,
 }
 
 /// Mutable state threaded through [`walk_tree_for_bases`] (see [`compute_path_bases`]).
@@ -1978,6 +2183,13 @@ struct PathBaseWalk {
     /// hashes share this one map safely: both are content addresses of disjoint byte encodings,
     /// so a tree's base is always another tree and a blob's base always another blob.
     base_of: HashMap<[u8; HASH_LEN], [u8; HASH_LEN]>,
+    /// hash → the sequence number it was last recorded under (see [`PathBases::sequence`]).
+    sequence: HashMap<[u8; HASH_LEN], u64>,
+    /// The next sequence number to hand out — one global counter across blobs and trees alike,
+    /// so a tree and the blobs beneath it still sort correctly relative to each other (not that
+    /// it matters for their own chains, which never cross kinds, but a single counter is simpler
+    /// than two and costs nothing).
+    next_sequence: u64,
 }
 
 /// Walk one tree's closure, recording the tree's *own* path base and then each blob's (see
@@ -2019,7 +2231,8 @@ fn walk_tree_for_bases(tree_hash: &str, path_prefix: &str, walk: &mut PathBaseWa
     // path is what actually guards against corruption.
     if let Some(tree_hash_bytes) = hash_to_bytes(tree_hash) {
         record_path_base(tree_hash_bytes, tree_hash, path_prefix,
-                         &mut walk.seen_trees, &mut walk.latest_tree_at_path, &mut walk.base_of);
+                         &mut walk.seen_trees, &mut walk.latest_tree_at_path, &mut walk.base_of,
+                         &mut walk.sequence, &mut walk.next_sequence);
     }
 
     if already_expanded {
@@ -2043,7 +2256,8 @@ fn walk_tree_for_bases(tree_hash: &str, path_prefix: &str, walk: &mut PathBaseWa
             // probabilistic structure does not. So this call keeps hashing exactly what the
             // pre-D/P3 code hashed.
             record_path_base(blob_hash, &file.hash, &path,
-                             &mut walk.seen_blobs, &mut walk.latest_blob_at_path, &mut walk.base_of);
+                             &mut walk.seen_blobs, &mut walk.latest_blob_at_path, &mut walk.base_of,
+                             &mut walk.sequence, &mut walk.next_sequence);
         }
     }
 
@@ -2057,24 +2271,41 @@ fn walk_tree_for_bases(tree_hash: &str, path_prefix: &str, walk: &mut PathBaseWa
 
 /// Record one object's (a blob's or a tree's) path base: the most recent object of the same kind
 /// seen at this path (if its chain is not yet at the limit), and update the latest-at-path so
-/// the next version chains from this one.
+/// the next version chains from this one. Also stamps `hash` with the current walk-order
+/// sequence number, regardless of which branch below fires — see [`PathBases::sequence`] for why
+/// every occurrence (not just a fresh `base_of` entry) needs one: a later object's base is
+/// whatever `latest_at_path` holds *at that moment*, so the base's own sequence must always be
+/// stamped strictly before, and the base is not always a fresh entry (a reverted/repeated
+/// object just re-affirms the path without creating one).
 ///
 /// Takes both `hash` (raw, for the exact `base_of`/`latest_at_path` maps) and `hash_hex` (for
 /// the probabilistic `seen` Bloom filter) — see the call site's doc comment for why the Bloom
 /// filter deliberately keeps hashing the hex-string bytes rather than switching to the raw ones
 /// the maps now use.
+// The seven state parameters are each a distinct, independently-borrowed field of `PathBaseWalk`
+// (blob and tree callers pass different ones for most of them); bundling them into one struct
+// parameter would just move the same borrows behind a name without shrinking anything real.
+#[allow(clippy::too_many_arguments)]
 fn record_path_base(hash: [u8; HASH_LEN],
                     hash_hex: &str,
                     path: &str,
                     seen: &mut Bloom,
                     latest_at_path: &mut HashMap<String, ([u8; HASH_LEN], u32)>,
-                    base_of: &mut HashMap<[u8; HASH_LEN], [u8; HASH_LEN]>) {
+                    base_of: &mut HashMap<[u8; HASH_LEN], [u8; HASH_LEN]>,
+                    sequence: &mut HashMap<[u8; HASH_LEN], u64>,
+                    next_sequence: &mut u64) {
+    let seq = *next_sequence;
+    *next_sequence += 1;
+    sequence.insert(hash, seq);
+
     // First time this object is seen fixes its base; a later appearance (or a Bloom false
     // positive) only advances the path. Its real chain depth is not tracked per object (that
     // would defeat the bounded-memory point), so the recorded depth restarts at 0 here — which
-    // makes the `MAX_DELTA_CHAIN` bound approximate (a real chain can run a small multiple of
-    // it). That is safe: base pointers stay acyclic so reconstruction always terminates, and
-    // `MAX_RECONSTRUCT_DEPTH` is the hard backstop.
+    // makes this bookkeeping only a coarse, approximate pre-filter on how many candidates
+    // `compact` even considers (real chain length can run a small multiple of `MAX_DELTA_CHAIN`);
+    // it is `compact`'s own write-time depth ledger that enforces the real bound (see
+    // `MAX_RECONSTRUCT_DEPTH`'s doc comment). That approximation is still safe here regardless:
+    // base pointers stay acyclic so any resolution of them terminates.
     if seen.contains(hash_hex.as_bytes()) {
         latest_at_path.insert(path.to_string(), (hash, 0));
         return;
@@ -3142,6 +3373,95 @@ mod tests {
         assert!(result.is_err(), "a delta record too short for a base hash must be rejected, got {:?}", result);
         let message = result.unwrap_err();
         assert!(message.contains("truncated"), "the error should name the truncation: {}", message);
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn true_depth_walks_a_delta_chain_iteratively_and_memoizes_every_hop() {
+        // `true_depth` exists because `compute_path_bases`'s own path-hop counter cannot see a
+        // chain's *real* depth (see `MAX_RECONSTRUCT_DEPTH`'s doc comment) — this pins its core
+        // correctness in isolation, against a hand-built chain of delta records (hash 0 full,
+        // then every later hash a delta against the one before it). Deliberately longer than
+        // `MAX_DELTA_CHAIN` (a cap `true_depth` itself does not enforce — that is `compact`'s
+        // write-time pre-pass's job, using this function's answer) to prove it reports the *true*
+        // depth regardless, not just up to some cap, and walks iteratively rather than
+        // recursively: a real store this ledger exists to repair can already hold a chain deep
+        // enough that native call-stack recursion would risk overflow resolving it.
+        let temp = std::env::temp_dir().join(format!("forklift-true-depth-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        let pack_folder = temp.join(".forklift/objects/pack");
+        std::fs::create_dir_all(&pack_folder).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+
+        const CHAIN_LEN: usize = 60;
+        let hashes: Vec<[u8; HASH_LEN]> = (0..CHAIN_LEN)
+            .map(|i| *blake3::hash(&(i as u64).to_le_bytes()).as_bytes())
+            .collect();
+
+        // `read_record_header` never touches a record's payload bytes (only the kind byte and,
+        // for a delta, the base hash and the VLQ length right after it), so placeholder bytes
+        // stand in for them — no real zstd/delta encoding needed to exercise this.
+        let mut data = Vec::new();
+        data.extend_from_slice(PACK_DATA_MAGIC);
+        data.extend_from_slice(&PACK_FORMAT_VERSION.to_le_bytes());
+
+        let mut records: Vec<([u8; HASH_LEN], u64, u64)> = Vec::new();
+        for (i, hash) in hashes.iter().enumerate() {
+            let offset = data.len() as u64;
+            if i == 0 {
+                data.push(RECORD_FULL);
+                data.extend_from_slice(&[0u8; 4]);
+            } else {
+                data.push(RECORD_DELTA);
+                data.extend_from_slice(&hashes[i - 1]);
+                data.extend_from_slice(&byte_utils::number_to_vlq_bytes(4));
+                data.extend_from_slice(&[0u8; 2]);
+            }
+            records.push((*hash, offset, data.len() as u64 - offset));
+        }
+
+        // Index: header, then every record sorted by hash (`validate_index_records` requires it).
+        let mut sorted = records.clone();
+        sorted.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut index = Vec::new();
+        index.extend_from_slice(PACK_INDEX_MAGIC);
+        index.extend_from_slice(&PACK_FORMAT_VERSION.to_le_bytes());
+        index.extend_from_slice(&(sorted.len() as u32).to_le_bytes());
+        for (hash, offset, length) in &sorted {
+            index.extend_from_slice(hash);
+            index.extend_from_slice(&offset.to_le_bytes());
+            index.extend_from_slice(&length.to_le_bytes());
+        }
+
+        let data_path = pack_folder.join("chain.pack");
+        let index_path = pack_folder.join("chain.idx");
+        std::fs::write(&data_path, &data).unwrap();
+        std::fs::write(&index_path, &index).unwrap();
+
+        let pack = load_pack_pair(&data_path, &index_path).expect("a well-formed hand-built pack must load");
+        let packs = vec![pack];
+
+        let mut known = HashMap::new();
+        let tip_depth = true_depth(hashes[CHAIN_LEN - 1], &mut known, &packs)
+            .expect("a well-formed chain must resolve");
+        assert_eq!(tip_depth, (CHAIN_LEN - 1) as u32, "the tip's depth must equal its distance from the full base");
+
+        // Every hop was memoized along the way at its *own* correct depth, not just the tip's.
+        for (i, hash) in hashes.iter().enumerate() {
+            assert_eq!(
+                *known.get(hash).unwrap(), i as u32,
+                "hop {} must be memoized at its own true depth, not the tip's", i
+            );
+        }
+
+        // A hash already resolved (in `known`) needs no pack access at all — the memoization
+        // that makes a repeated query in the same run O(1). An empty pack slice proves it: if
+        // this were not served from `known`, the lookup would find nothing and misreport 0.
+        let mid_depth = true_depth(hashes[CHAIN_LEN / 2], &mut known, &[])
+            .expect("a memoized hash needs no pack lookup");
+        assert_eq!(mid_depth, (CHAIN_LEN / 2) as u32);
 
         std::fs::remove_dir_all(&temp).ok();
     }
