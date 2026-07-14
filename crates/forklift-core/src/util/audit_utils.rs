@@ -494,7 +494,27 @@ pub enum SignatureTrust {
 /// the `Err`, never a soft verdict. Everything it touches is either immutable
 /// (`office_state`) or a per-object read through the shared, already-thread-safe object
 /// caches, so it is safe to run on many threads at once.
+///
+/// A caller that has already loaded the parcel body (a history walk resolving identities
+/// for parcels it just decoded) should use [`classify_signature_trust`] instead: parcels
+/// deliberately bypass the shared read cache, so the presence proof here is a second full
+/// disk read + decode, not a cache hit.
 pub fn classify_parcel_trust(hash: &str, office_state: &OfficeState) -> Result<SignatureTrust, String> {
+    let trust = classify_signature_trust(hash, office_state)?;
+
+    // Prove the parcel's body is present and decodable — for the audit, the guarantee
+    // phase 1 used to give by decoding each parcel for its parents (it now reads parents
+    // from the graph instead). Kept after the signature check so a bad signature still
+    // fails ahead of a missing body.
+    object_utils::load_parcel(hash)?;
+
+    Ok(trust)
+}
+
+/// The signature half of [`classify_parcel_trust`]: classify the parcel's signature without
+/// re-reading the parcel body. For callers that already hold (and so already proved) the
+/// body — the presence guarantee is theirs to keep.
+pub fn classify_signature_trust(hash: &str, office_state: &OfficeState) -> Result<SignatureTrust, String> {
     let trust = match sign_utils::load_parcel_signature(hash)? {
         None => SignatureTrust::Unsigned,
 
@@ -515,12 +535,6 @@ pub fn classify_parcel_trust(hash: &str, office_state: &OfficeState) -> Result<S
             }
         }
     };
-
-    // Prove the parcel's body is present and decodable — for the audit, the guarantee
-    // phase 1 used to give by decoding each parcel for its parents (it now reads parents
-    // from the graph instead). Kept after the signature check so a bad signature still
-    // fails ahead of a missing body.
-    object_utils::load_parcel(hash)?;
 
     Ok(trust)
 }

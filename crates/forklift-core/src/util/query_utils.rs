@@ -784,8 +784,12 @@ fn evaluate_leaf(leaf: &Leaf, hash: &str, parcel: &Parcel, identity: &IdentityFa
 
 /// Resolve one parcel's verified identity: the real signature classification, then the
 /// office join off the *verified signer* — never off the parcel's self-declared operator.
+///
+/// Signature-only classification: the walk already loaded (and thereby presence-proved)
+/// every parcel it hands here, and parcels bypass the shared read cache, so the
+/// body-re-reading variant would double parcel IO for nothing.
 fn resolve_verified(hash: &str, office: &OfficeState) -> Result<IdentityResolution, String> {
-    let trust = audit_utils::classify_parcel_trust(hash, office)?;
+    let trust = audit_utils::classify_signature_trust(hash, office)?;
 
     let (match_trust, key_id) = match trust {
         SignatureTrust::Verified { key_id } => (MatchTrust::Verified, Some(key_id)),

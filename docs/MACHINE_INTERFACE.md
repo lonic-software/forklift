@@ -97,9 +97,12 @@ that — the parcel's own recorded operator never decides what gets verified.
 
 Flags AND together; `--where <json>` (or `--where -` for stdin) takes the full
 predicate tree for or/not/nesting: combinators `{"all": […]}`, `{"any": […]}`,
-`{"not": …}` over leaves `{"field", "op", "value"}`. Operators: `eq`/`ne`/`in` (scalar,
-`null` tests absence), `matches` (glob `*`/`?` or literal substring — never regex),
-`before`/`after`/`between` (RFC 3339). Bounds (refused past them, exit 18): payload
+`{"not": …}` over leaves `{"field", "op", "value"}`. Operators: `eq`/`ne` (one scalar
+value), `in` (an array of values), `matches` (glob `*`/`?` or literal substring — never
+regex), `before`/`after` (one RFC 3339 timestamp), `between` (a two-element timestamp
+array, inclusive). `null` is a valid value only where absence is meaningful —
+`author.supervisor` (`"op": "eq", "value": null` = "has no supervisor"); anywhere else
+it is refused. Bounds (refused past them, exit 18): payload
 64 KiB, depth 16, 128 leaves, `in` ≤ 256 values, glob ≤ 256 chars.
 
 ```json
