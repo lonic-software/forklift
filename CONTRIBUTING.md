@@ -65,12 +65,17 @@ Two reasons, and neither is squeamishness about the tooling:
   written by a human or an agent, under whose supervision?"* A repository whose own
   history can't answer that would be a poor advertisement for it.
 
-If your assistant's tooling committed as itself, re-author before pushing:
+If your assistant's tooling committed as itself, re-author **your branch's own
+commits** before pushing:
 
 ```sh
-git rebase --root --exec 'git commit --amend --reset-author --no-edit'
+git rebase origin/main --exec 'git commit --amend --reset-author --no-edit'
 git push --force-with-lease
 ```
+
+Note the `origin/main` — it scopes the rewrite to the commits your branch adds.
+Do not reach for `--root` here: that would re-author the *entire* repository
+history to you, which is both a lie and a merge disaster.
 
 ## Before you build something big
 
