@@ -172,6 +172,8 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
         Command::Manifest { action } => commands::manifest::handle_command(action),
         Command::Haul { action } => commands::haul::handle_command(action).await,
         Command::Mcp { root } => commands::mcp::handle_command(root),
+        Command::Peer { token, ephemeral, server, tor_control, tor_control_password } =>
+            commands::peer::handle_command(token, ephemeral, server, tor_control, tor_control_password).await,
         Command::Office { action } => match action {
             Some(OfficeAction::Enroll { offline, passphrase }) =>
                 commands::office::enroll(offline, passphrase).await,

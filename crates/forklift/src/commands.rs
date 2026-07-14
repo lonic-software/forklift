@@ -32,6 +32,7 @@ pub mod haul;
 pub mod history;
 pub mod import_git;
 pub mod prepare;
+pub mod peer;
 pub mod self_update;
 pub mod peek;
 pub mod show;

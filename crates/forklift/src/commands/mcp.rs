@@ -711,6 +711,7 @@ mod tests {
         "self-update", // update the binary (host concern)
         "scope-prune", // destructive, warehouse-wide disk reclamation — an admin verb, never a sub-agent's
         "mcp",         // this server itself
+        "peer",        // runs a long-lived server head to share over Tor (host concern, blocks)
         "help",        // meta
         "version",     // meta
     ];

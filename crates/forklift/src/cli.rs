@@ -444,6 +444,40 @@ pub enum Command {
         root: Option<String>,
     },
 
+    /// Share this warehouse with a peer over Tor, one command, no server
+    #[command(
+        long_about = "Publish this warehouse as a Tor onion service and print the one line to \
+                      hand a peer — the peer-to-peer transport (docs/guide/p2p-tor.md). It runs \
+                      the forklift-server head against this warehouse, bound to loopback, and \
+                      asks your local Tor to expose it as a .onion; the peer franchises that \
+                      address and you both lift/lower over Tor — no hosted server, no fixed IP, \
+                      no port-forwarding. The address is stable across runs (a key is kept under \
+                      .forklift) unless --ephemeral, and an access token is minted once and \
+                      reused unless you pass one. Needs `tor` running with a ControlPort, and the \
+                      forklift-server binary (install.sh server). Press Ctrl-C to stop sharing."
+    )]
+    Peer {
+        /// The access token peers must present (default: minted once and reused)
+        #[arg(long)]
+        token: Option<String>,
+
+        /// Use a fresh throwaway .onion each run instead of the stable saved address
+        #[arg(long)]
+        ephemeral: bool,
+
+        /// Path to the forklift-server binary (default: found on PATH or beside forklift)
+        #[arg(long)]
+        server: Option<String>,
+
+        /// The Tor control address (default 127.0.0.1:9051)
+        #[arg(long)]
+        tor_control: Option<String>,
+
+        /// The Tor control password, when the control port uses HashedControlPassword
+        #[arg(long)]
+        tor_control_password: Option<String>,
+    },
+
     /// Manage the warehouse office: users and signing keys
     #[command(
         visible_alias = "o",
@@ -1371,6 +1405,7 @@ impl Command {
                 | Command::Palletize { .. }
                 | Command::Park { .. }
                 | Command::Peek { .. }
+                | Command::Peer { .. }
                 | Command::Remove { .. }
                 | Command::Restore { .. }
                 | Command::Scope { .. }

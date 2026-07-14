@@ -33,11 +33,51 @@ listens, by default, on:
 
 Nothing here needs the Tor Browser — just the `tor` daemon.
 
-## Host a warehouse as an onion service
+## Share in one command: `forklift peer`
 
-Serving is done by the [`forklift-server`](../SERVER.md) head. Self-hosting a peer for your own
-group is free under its licence — see [licensing](#licensing), below. Bind it to **loopback**
-(Tor connects to it locally) and add `--tor`:
+From inside the warehouse you want to share:
+
+```sh
+forklift peer
+```
+
+That's it. It publishes the warehouse as a Tor onion service and prints the one thing to hand a
+peer:
+
+```
+  Your warehouse is live and shared over Tor — no server needed.
+
+  Give your peer these two things:
+
+    address   http://abcdefghijklmnop234567abcdefghijklmnop234567abcdefg.onion
+    token     3f7c1e90-5b2a-4d18-9e6c-0a1b2c3d4e5f
+
+  They clone it with:
+
+    forklift franchise http://abcd…onion <dir> --token 3f7c1e90-…
+
+  This address is saved — it stays the same next time you share.
+  Peers can lift and lower while this runs. Press Ctrl-C to stop sharing.
+```
+
+- The **address is stable** — a key is kept under `.forklift/`, so the same warehouse keeps the
+  same `.onion` every time you share. (`--ephemeral` gives a throwaway address instead.)
+- The **token is minted once and reused** — pass `--token <t>` to set your own.
+- Serving runs until **Ctrl-C**, which takes the address offline. Do your own Forklift work
+  (`load`, `stack`, …) in another terminal meanwhile.
+
+`forklift peer` runs the [`forklift-server`](../SERVER.md) head for you as a local child process
+(the client and server stay separate binaries). It needs that binary installed —
+`curl … install.sh | sh -s -- all` installs both, or point `--peer`'s `--server <path>` at it.
+Options: `--token`, `--ephemeral`, `--server <path>`, `--tor-control <addr>`,
+`--tor-control-password <pw>`.
+
+## Under the hood: `forklift-server serve --tor`
+
+`forklift peer` is a convenience wrapper; you can run the server head directly for more control
+(serving many warehouses, per-operator tokens, a reverse proxy, systemd, …). Self-hosting a peer
+for your own group is free under the head's licence — see [licensing](#licensing), below. Bind it
+to **loopback** (Tor connects to it locally) and add `--tor`:
 
 ```sh
 # In the warehouse you want to share:
@@ -172,6 +212,7 @@ each line — neither needs a server.
 | `Error while configuring the Tor proxy` | The `remote.torProxy` value isn't a valid SOCKS URL (e.g. missing `socks5h://`). |
 | The `.onion` changed after a restart | That's the default (ephemeral). Pass `--tor-onion-key <path>` for a stable address. |
 | First connection is slow | Onion circuits take a few seconds to build; it settles after that. |
+| `forklift peer` says it can't find the forklift-server binary | Install the server head (`install.sh server` / `all`), or point `forklift peer --server <path>` at it. |
 
 ## Licensing
 

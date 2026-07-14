@@ -190,6 +190,7 @@ fn command_schemas(name: &str) -> Option<Vec<(&'static str, schemars::Schema)>> 
         "palletize" => commands::palletize::__docgen_schemas(),
         "park" => commands::park::__docgen_schemas(),
         "peek" => commands::peek::__docgen_schemas(),
+        "peer" => commands::peer::__docgen_schemas(),
         "prepare" => commands::prepare::__docgen_schemas(),
         "profile" => commands::profile::__docgen_schemas(),
         "remove" => commands::remove::__docgen_schemas(),

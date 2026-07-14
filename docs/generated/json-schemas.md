@@ -1862,6 +1862,43 @@ A command not listed here either reports only the generic human-message shape `{
 }
 ```
 
+## `peer`
+
+### `PeerReport`
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "What `peer` announces once the warehouse is live: the address and token to share, and the\nexact command a peer runs to clone it.",
+  "properties": {
+    "address": {
+      "description": "The Tor onion URL to give a peer (their `remote.url`).",
+      "type": "string"
+    },
+    "franchise_command": {
+      "description": "The exact command a peer runs to franchise (clone) this warehouse.",
+      "type": "string"
+    },
+    "stable": {
+      "description": "Whether the address is stable across runs (`false` for an `--ephemeral` share).",
+      "type": "boolean"
+    },
+    "token": {
+      "description": "The access token peers must present.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "address",
+    "token",
+    "franchise_command",
+    "stable"
+  ],
+  "title": "PeerReport",
+  "type": "object"
+}
+```
+
 ## `office`
 
 ### `OfficeListing`

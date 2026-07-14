@@ -842,6 +842,23 @@ its own pallet, `consolidate` it, then `lift` the merge). Requires a clean
 warehouse. In a sparse warehouse, `lower` stays pruned — it fetches new in-scope
 content and leaves out-of-scope changes sealed by hash, exactly as the franchise did.
 
+### `peer` — share with a friend over Tor, no server
+
+```sh
+forklift peer
+```
+
+Publishes this warehouse as a Tor onion service and prints the one thing to hand a peer — an
+address and a token — so you can collaborate with **no hosted server, no fixed IP, and no
+port-forwarding**. The peer franchises that `.onion`, and you both `lift`/`lower` over Tor
+(the client routes `.onion` remotes through Tor automatically). The address is stable across
+runs (`--ephemeral` for a throwaway one); the token is minted once and reused (`--token` to set
+it). Serving runs until Ctrl-C.
+
+It runs the `forklift-server` head as a local child process, so that binary must be installed
+(`install.sh all`), and needs a local `tor` with a `ControlPort`. Full walkthrough, including
+the Tor setup, is in [`p2p-tor.md`](p2p-tor.md).
+
 ### `expand` — widen a sparse warehouse's fetch scope
 
 ```sh
@@ -1149,6 +1166,7 @@ what you've `load`ed — it doesn't stage for you). `diff`, `restore`, `tag`, `s
 | `franchise` | `fr` | Clone a remote warehouse (`--only` for a sparse clone) |
 | `lift` | `li` | Push to a remote |
 | `lower` | `lo` | Pull from a remote |
+| `peer` | | Share this warehouse with a friend over Tor, no server |
 | `expand` | | Widen a sparse warehouse's fetch scope and fetch the new subtree(s) |
 | `narrow` | | Shrink this checkout's materialization scope (frees nothing) |
 | `office` | `o` | Manage users, keys, roles, agents, trust |
