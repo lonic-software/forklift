@@ -7,7 +7,9 @@
 # all of a contributor's past and future PRs.
 #
 # Security note: this runs on pull_request_target and must never check out or
-# execute PR code. The paths filter reads the diff via the API only.
+# execute PR code. The paths check reads the PR's file list via the API only,
+# and gates BOTH event types — a comment on a client-only PR must not summon
+# the CLA bot.
 
 name: CLA
 
@@ -17,6 +19,9 @@ on:
   pull_request_target:
     types: [opened, closed, synchronize]
 
+# actions: write is required by contributor-assistant's "recheck" comment
+# support (it re-triggers the workflow run via the API); the rest are its
+# documented permission set.
 permissions:
   actions: write
   contents: write
@@ -25,22 +30,25 @@ permissions:
 
 jobs:
   cla:
+    # Comments on plain issues (not PRs) have nothing to check.
+    if: github.event_name == 'pull_request_target' || github.event.issue.pull_request
     runs-on: ubuntu-latest
     steps:
       - name: Detect server-head changes
-        if: github.event_name == 'pull_request_target'
         id: paths
-        uses: dorny/paths-filter@v3
-        with:
-          filters: |
-            server:
-              - 'crates/forklift-server/**'
-              - 'crates/forklift-aws-lambda/**'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event_name == 'issue_comment' && github.event.issue.number || github.event.pull_request.number }}
+        run: |
+          files=$(gh api "repos/${{ github.repository }}/pulls/$PR/files" --paginate --jq '.[].filename')
+          if printf '%s\n' "$files" | grep -qE '^crates/(forklift-server|forklift-aws-lambda)/'; then
+            echo "server=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "server=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: CLA assistant
-        if: >-
-          (github.event_name == 'issue_comment' && github.event.issue.pull_request) ||
-          steps.paths.outputs.server == 'true'
+        if: steps.paths.outputs.server == 'true'
         uses: contributor-assistant/github-action@v2.6.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
