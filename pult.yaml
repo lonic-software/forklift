@@ -41,3 +41,7 @@ commands:
   - id: design
     title: Open the design doc (the source of truth) in your browser
     run: "./bin/design"
+
+  - id: gen-docs
+    title: Regenerate the derived docs (error codes, per-command JSON schemas)
+    run: "./bin/gen-docs"

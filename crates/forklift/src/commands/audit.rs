@@ -97,8 +97,9 @@ pub fn handle_command(pallet: Option<String>, full: bool) -> Result<(), String> 
 
 /// The result of an offline audit: the office chain always, plus a working pallet's
 /// parcel counts when one (not the office) was audited.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct AuditReport {
+pub(crate) struct AuditReport {
     /// The genesis the office chain verified back to.
     genesis: String,
 
@@ -133,8 +134,9 @@ struct AuditReport {
 /// verified. Emitted so a skimming reader or agent can never mistake a sparse pass — which verified
 /// content only within the fetch scope — for a full-clone pass, nor a presence-only pass for a
 /// `--full` re-read.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct AuditScope {
+pub(crate) struct AuditScope {
     /// The warehouse fetch scope: the path prefixes whose content was fetched. Present only on a
     /// sparse warehouse; a full clone omits it (nothing is out of scope). Everything outside is
     /// sealed by hash, not downloaded.
@@ -235,4 +237,13 @@ impl CommandOutput for AuditReport {
             );
         }
     }
+}
+
+
+/// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
+#[cfg(feature = "docgen")]
+pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+    vec![
+        ("AuditReport", schemars::schema_for!(AuditReport)),
+    ]
 }

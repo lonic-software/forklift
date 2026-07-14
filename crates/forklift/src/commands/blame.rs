@@ -80,8 +80,9 @@ pub async fn handle_command(path: &str, revision: Option<String>) -> Result<(), 
 }
 
 /// The blame of a file: its lines, and the parcels they are attributed to.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct Blame {
+pub(crate) struct Blame {
     path: String,
 
     /// The revision the blame was taken at (the resolved head parcel hash).
@@ -94,8 +95,9 @@ struct Blame {
 }
 
 /// One line of the blamed file.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct BlameLine {
+pub(crate) struct BlameLine {
     /// The 1-based line number.
     number: usize,
 
@@ -107,8 +109,9 @@ struct BlameLine {
 }
 
 /// A parcel a line is attributed to, with its author resolved to signed identity metadata.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct BlamedParcel {
+pub(crate) struct BlamedParcel {
     /// The primary author's pseudonymous operator id (the chain's record).
     operator: String,
 
@@ -116,7 +119,7 @@ struct BlamedParcel {
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
 
-    /// The author's identity class (§7.1), when it is not a plain human — so agent, bot and
+    /// The author's identity class, when it is not a plain human — so agent, bot and
     /// service authorship is legible in the blame.
     #[serde(skip_serializing_if = "Option::is_none")]
     class: Option<String>,
@@ -232,4 +235,13 @@ impl BlamedParcel {
             Err(_) => self.timestamp.clone(),
         }
     }
+}
+
+
+/// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
+#[cfg(feature = "docgen")]
+pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+    vec![
+        ("Blame", schemars::schema_for!(Blame)),
+    ]
 }

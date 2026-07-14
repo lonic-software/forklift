@@ -17,8 +17,9 @@ pub fn handle_command() -> Result<(), String> {
 
 /// The object-store census. The `Serialize` shape is the public `--json` schema; byte counts
 /// are exact integers there (the human view renders them in binary units).
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct StoreReport {
+pub(crate) struct StoreReport {
     /// Loose (unpacked) object files.
     loose_objects: usize,
     /// Total on-disk bytes of the loose objects.
@@ -37,11 +38,16 @@ struct StoreReport {
     packs: Vec<PackReport>,
     /// The maintenance thresholds and the current verdict.
     maintenance: Maintenance,
+    /// Whether this store was bulk-ingested (`import-git`, or a franchise's native bundle
+    /// install) and would still benefit from a one-shot `compact --all --redelta` pass.
+    /// Additive field; never acted on automatically.
+    densify_suggested: bool,
 }
 
 /// One pack's line in the census.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct PackReport {
+pub(crate) struct PackReport {
     /// The pack's id (its file stem).
     id: String,
     /// Objects the pack holds.
@@ -54,8 +60,9 @@ struct PackReport {
 
 /// The maintenance picture: whether auto-maintenance is on, the effective thresholds, and
 /// whether either action is due now.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct Maintenance {
+pub(crate) struct Maintenance {
     /// Whether background maintenance (`maintenance.auto`) is enabled.
     auto: bool,
     /// Loose-object count above which an incremental compaction is due (`maintenance.loose`).
@@ -91,6 +98,7 @@ impl From<StoreStatus> for StoreReport {
                 compaction_due: status.incremental_due,
                 repack_due: status.repack_due,
             },
+            densify_suggested: status.densify_pending,
         }
     }
 }
@@ -134,6 +142,11 @@ impl CommandOutput for StoreReport {
             "    repack      {}",
             verdict(m.repack_due, self.pack_files, m.pack_threshold, "packs"),
         );
+
+        if self.densify_suggested {
+            println!();
+            println!("{}", output::DENSIFY_TIP);
+        }
     }
 }
 
@@ -152,4 +165,13 @@ fn verdict(due: bool, current: usize, threshold: usize, noun: &str) -> String {
     } else {
         format!("not due — {} / {} {}", current, threshold, noun)
     }
+}
+
+
+/// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
+#[cfg(feature = "docgen")]
+pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+    vec![
+        ("StoreReport", schemars::schema_for!(StoreReport)),
+    ]
 }

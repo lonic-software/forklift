@@ -96,8 +96,9 @@ async fn create_pallet(name: &str, revision: Option<&str>) -> Result<(), String>
 }
 
 /// A newly created pallet.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct Palletized {
+pub(crate) struct Palletized {
     pallet: String,
 
     /// The head the new pallet points at (`null` when created unborn from an unborn
@@ -136,17 +137,27 @@ impl CommandOutput for Palletized {
 ///
 /// # Returns
 /// * `Ok(())`      - If the pallets were listed.
-/// * `Err(String)` - If a pallets folder could not be read.
+/// * `Err(String)` - If a pallets folder could not be read, or a pallet's ref could not be read.
 fn list_pallets(all: bool) -> Result<(), String> {
     let current = pallet_utils::get_current_pallet_name()?;
-    let names = pallet_utils::list_pallets()?;
+    let mut names = pallet_utils::list_pallets()?;
 
-    // The current pallet is listed even when unborn (it has no ref file yet).
+    // The current pallet is listed even when unborn (it has no ref file yet) — folded
+    // into `pallets` itself (with `head: null`) rather than left as a side flag only, so
+    // a JSON consumer building a pallet graph never needs a special case for "the one
+    // pallet that isn't in the list".
     let current_unborn = !names.contains(&current);
+    if current_unborn {
+        names.push(current.clone());
+        names.sort();
+    }
 
     let pallets = names.into_iter()
-        .map(|name| PalletEntry { current: name == current, name })
-        .collect();
+        .map(|name| {
+            let head = pallet_utils::get_pallet_head(&name)?;
+            Ok(PalletEntry { current: name == current, name, head })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
 
     // Meta pallets are addressed by their qualified form (`@office`), only when asked.
     let meta = if all {
@@ -164,8 +175,9 @@ fn list_pallets(all: bool) -> Result<(), String> {
 }
 
 /// The list of pallets, marking the current one.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct PalletList {
+pub(crate) struct PalletList {
     /// The current pallet (HEAD equivalent).
     current: String,
 
@@ -182,10 +194,14 @@ struct PalletList {
 }
 
 /// One pallet in the list.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct PalletEntry {
+pub(crate) struct PalletEntry {
     name: String,
     current: bool,
+
+    /// The pallet's head parcel hash; `null` when it is unborn (nothing stacked on it yet).
+    head: Option<String>,
 }
 
 impl CommandOutput for PalletList {
@@ -195,6 +211,12 @@ impl CommandOutput for PalletList {
         }
 
         for entry in &self.pallets {
+            // The unborn current pallet was already printed above (with its "(unborn)"
+            // marker) — skip it here so it is not shown twice.
+            if entry.current && self.current_unborn {
+                continue;
+            }
+
             let marker = if entry.current { "*" } else { " " };
             println!("{} {}", marker, entry.name);
         }
@@ -207,4 +229,14 @@ impl CommandOutput for PalletList {
             }
         }
     }
+}
+
+
+/// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
+#[cfg(feature = "docgen")]
+pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+    vec![
+        ("Palletized", schemars::schema_for!(Palletized)),
+        ("PalletList", schemars::schema_for!(PalletList)),
+    ]
 }

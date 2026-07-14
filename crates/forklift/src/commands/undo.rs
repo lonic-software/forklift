@@ -105,8 +105,9 @@ fn undo_last_stack() -> Result<(), String> {
 }
 
 /// The result of an undo.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct Undone {
+pub(crate) struct Undone {
     /// The operation that was reversed (`stack`, `consolidate`, `shift`).
     op: String,
 
@@ -147,4 +148,13 @@ impl CommandOutput for Undone {
         println!("The pallet head is now {}.", self.head);
         println!("Its changes are staged again — \"stack\" to redo, or adjust them first.");
     }
+}
+
+
+/// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
+#[cfg(feature = "docgen")]
+pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+    vec![
+        ("Undone", schemars::schema_for!(Undone)),
+    ]
 }

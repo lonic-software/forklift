@@ -211,8 +211,9 @@ fn status_name(status: &HaulStatus) -> &'static str {
 
 // ── output types ────────────────────────────────────────────────────────────
 
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct Opened {
+pub(crate) struct Opened {
     id: String,
     source: String,
     target: String,
@@ -226,8 +227,9 @@ impl CommandOutput for Opened {
     }
 }
 
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct Acted {
+pub(crate) struct Acted {
     id: String,
     action: String,
 }
@@ -238,8 +240,9 @@ impl CommandOutput for Acted {
     }
 }
 
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct Merged {
+pub(crate) struct Merged {
     id: String,
     merge_parcel: String,
     already: bool,
@@ -255,8 +258,9 @@ impl CommandOutput for Merged {
     }
 }
 
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct MergeConflicts {
+pub(crate) struct MergeConflicts {
     id: String,
     conflicts: Vec<String>,
 }
@@ -271,8 +275,9 @@ impl CommandOutput for MergeConflicts {
     }
 }
 
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct HaulSummary {
+pub(crate) struct HaulSummary {
     id: String,
     title: String,
     source: String,
@@ -294,8 +299,9 @@ impl HaulSummary {
     }
 }
 
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct HaulList {
+pub(crate) struct HaulList {
     state: String,
     hauls: Vec<HaulSummary>,
 }
@@ -317,8 +323,9 @@ impl CommandOutput for HaulList {
     }
 }
 
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct ReviewLine {
+pub(crate) struct ReviewLine {
     author: String,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -328,15 +335,17 @@ struct ReviewLine {
     body: String,
 }
 
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct ThreadLine {
+pub(crate) struct ThreadLine {
     author: String,
     kind: String,
     body: String,
 }
 
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct HaulDetail {
+pub(crate) struct HaulDetail {
     id: String,
     title: String,
     source: String,
@@ -435,4 +444,18 @@ fn capitalize(word: &str) -> String {
         Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
         None => String::new(),
     }
+}
+
+
+/// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
+#[cfg(feature = "docgen")]
+pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+    vec![
+        ("Opened", schemars::schema_for!(Opened)),
+        ("HaulList", schemars::schema_for!(HaulList)),
+        ("HaulDetail", schemars::schema_for!(HaulDetail)),
+        ("Acted", schemars::schema_for!(Acted)),
+        ("Merged", schemars::schema_for!(Merged)),
+        ("MergeConflicts", schemars::schema_for!(MergeConflicts)),
+    ]
 }

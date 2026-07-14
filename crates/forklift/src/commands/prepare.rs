@@ -20,8 +20,9 @@ pub fn handle_command(verbose: bool) -> Result<(), String> {
 }
 
 /// The pieces `prepare` created (empty when the warehouse already existed).
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct Prepared {
+pub(crate) struct Prepared {
     created: Vec<String>,
 
     /// Whether to list each created piece in human output (`--verbose`); not part of
@@ -44,4 +45,13 @@ impl CommandOutput for Prepared {
             println!("Prepared warehouse.");
         }
     }
+}
+
+
+/// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
+#[cfg(feature = "docgen")]
+pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+    vec![
+        ("Prepared", schemars::schema_for!(Prepared)),
+    ]
 }

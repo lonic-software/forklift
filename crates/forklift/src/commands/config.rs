@@ -63,8 +63,9 @@ pub fn handle_command(global: bool,
 }
 
 /// A `config <key> <value>` set (human output stays silent).
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct ConfigSet {
+pub(crate) struct ConfigSet {
     key: String,
     value: String,
 }
@@ -99,8 +100,9 @@ fn print_value(key: &str, scope: ConfigScope) -> Result<(), String> {
 }
 
 /// A `config <key>` read.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct ConfigValue {
+pub(crate) struct ConfigValue {
     key: String,
     value: String,
 }
@@ -148,14 +150,16 @@ fn list_configuration(scope: ConfigScope) -> Result<(), String> {
 }
 
 /// The full configuration listing.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct ConfigList {
+pub(crate) struct ConfigList {
     entries: Vec<ConfigEntry>,
 }
 
 /// One known configuration key and its effective value (if set).
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct ConfigEntry {
+pub(crate) struct ConfigEntry {
     key: String,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -175,4 +179,15 @@ impl CommandOutput for ConfigList {
             }
         }
     }
+}
+
+
+/// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
+#[cfg(feature = "docgen")]
+pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+    vec![
+        ("ConfigSet", schemars::schema_for!(ConfigSet)),
+        ("ConfigValue", schemars::schema_for!(ConfigValue)),
+        ("ConfigList", schemars::schema_for!(ConfigList)),
+    ]
 }

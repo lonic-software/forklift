@@ -163,8 +163,9 @@ fn guard_materialization_scopes(pruned: &[String], post_prune: &MaterializationS
 
 /// The result of a scope-prune: what was pruned, the fetch scope that remains, and how much was
 /// (or would be) freed.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct PruneReport {
+pub(crate) struct PruneReport {
     /// Whether this was a dry run (nothing changed).
     dry_run: bool,
 
@@ -252,4 +253,13 @@ impl CommandOutput for PruneReport {
 
         println!("The pruned content is re-fetchable from the origin with \"expand\".");
     }
+}
+
+
+/// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
+#[cfg(feature = "docgen")]
+pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+    vec![
+        ("PruneReport", schemars::schema_for!(PruneReport)),
+    ]
 }

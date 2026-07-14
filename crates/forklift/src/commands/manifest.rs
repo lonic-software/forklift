@@ -109,8 +109,9 @@ fn list() -> Result<(), String> {
 }
 
 /// A newly recorded manifest entry.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct Recorded {
+pub(crate) struct Recorded {
     kind: String,
     subject: String,
     operator: String,
@@ -133,8 +134,9 @@ impl CommandOutput for Recorded {
 }
 
 /// The manifest, or the slice of it about one parcel.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct ManifestView {
+pub(crate) struct ManifestView {
     /// The parcel the view is scoped to (`null` when listing the whole manifest).
     #[serde(skip_serializing_if = "Option::is_none")]
     subject: Option<String>,
@@ -143,8 +145,9 @@ struct ManifestView {
 }
 
 /// One manifest entry in a view, with its forge-proof author.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct EntryView {
+pub(crate) struct EntryView {
     kind: String,
     subject: String,
     author: String,
@@ -257,4 +260,14 @@ impl CommandOutput for ManifestView {
 /// A short parcel-hash prefix for display (full hashes stay in `--json`).
 fn short(hash: &str) -> String {
     hash.chars().take(12).collect()
+}
+
+
+/// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
+#[cfg(feature = "docgen")]
+pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+    vec![
+        ("Recorded", schemars::schema_for!(Recorded)),
+        ("ManifestView", schemars::schema_for!(ManifestView)),
+    ]
 }

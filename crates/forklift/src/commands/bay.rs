@@ -248,8 +248,9 @@ fn remove(name: &str) -> Result<(), String> {
 }
 
 /// A newly created bay.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct BayCreated {
+pub(crate) struct BayCreated {
     name: String,
     path: String,
     pallet: String,
@@ -280,14 +281,16 @@ impl CommandOutput for BayCreated {
 }
 
 /// The list of bays.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct BayList {
+pub(crate) struct BayList {
     bays: Vec<BayEntry>,
 }
 
 /// One bay in the list.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct BayEntry {
+pub(crate) struct BayEntry {
     name: String,
     path: String,
 
@@ -311,8 +314,9 @@ impl CommandOutput for BayList {
 }
 
 /// A removed bay.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct BayRemoved {
+pub(crate) struct BayRemoved {
     name: String,
 }
 
@@ -323,4 +327,15 @@ impl CommandOutput for BayRemoved {
             self.name
         );
     }
+}
+
+
+/// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
+#[cfg(feature = "docgen")]
+pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+    vec![
+        ("BayCreated", schemars::schema_for!(BayCreated)),
+        ("BayList", schemars::schema_for!(BayList)),
+        ("BayRemoved", schemars::schema_for!(BayRemoved)),
+    ]
 }

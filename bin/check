@@ -15,4 +15,16 @@ cargo test --workspace
 echo "── cargo clippy --workspace (report-only, like CI)"
 cargo clippy --workspace || true
 
-echo "check: build + tests green"
+echo "── docs freshness (bin/gen-docs)"
+# Regenerate into a scratch directory (never touching docs/generated in place) and diff —
+# catches both stale content and a deleted generated file, without side effects on a green run.
+docs_scratch="$(mktemp -d)"
+trap 'rm -rf "$docs_scratch"' EXIT
+./bin/gen-docs "$docs_scratch" >/dev/null
+if ! diff -ru docs/generated "$docs_scratch"; then
+    echo
+    echo "docs/generated/ is stale — run ./bin/gen-docs and commit the result." >&2
+    exit 1
+fi
+
+echo "check: build + tests + docs green"

@@ -19,9 +19,15 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 reqwest = { workspace = true }
 rpassword = { workspace = true }
+# Optional: JSON Schema derivation for the `docgen` feature (see bin/gen-docs). A release
+# build never enables this feature, so it never compiles into the shipped binary.
+schemars = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+
+[features]
+docgen = ["dep:schemars", "forklift-core/docgen"]
 
 [dev-dependencies]
 # The remote tests' mock hook endpoint verifies the signed hook requests with the

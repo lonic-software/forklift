@@ -17,6 +17,7 @@ use crate::util::scope_utils::{self, MaterializationScope, ScopeClass};
 use crate::util::{file_utils, inventory_utils, object_utils};
 
 /// The kind of a change reported by a stocktake.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ChangeKind {
@@ -27,7 +28,7 @@ pub enum ChangeKind {
     Modified,
 
     /// The item was moved: it disappeared from one path and reappeared at another with
-    /// the same content (detected by the §3.2.1 post-pass; the formats stay move-agnostic).
+    /// the same content (detected by a move-detection post-pass; the formats stay move-agnostic).
     Moved,
 
     /// The item exists in the older state but not in the newer one.
@@ -56,6 +57,7 @@ impl Display for ChangeKind {
 }
 
 /// A single change reported by a stocktake.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(serde::Serialize)]
 pub struct Change {
     pub kind: ChangeKind,

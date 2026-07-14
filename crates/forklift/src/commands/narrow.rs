@@ -162,8 +162,9 @@ fn is_strictly_under(child: &str, ancestor: &str) -> bool {
 }
 
 /// The result of a narrow: the paths dropped and the scope that remains.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct NarrowReport {
+pub(crate) struct NarrowReport {
     /// The in-scope prefixes dropped from this checkout.
     dropped: Vec<String>,
 
@@ -179,4 +180,13 @@ impl CommandOutput for NarrowReport {
         );
         println!("Nothing was freed in the object store — the content is still reachable history.");
     }
+}
+
+
+/// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
+#[cfg(feature = "docgen")]
+pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+    vec![
+        ("NarrowReport", schemars::schema_for!(NarrowReport)),
+    ]
 }

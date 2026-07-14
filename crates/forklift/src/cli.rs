@@ -153,12 +153,27 @@ pub enum Command {
                       Run it after a large \"import-git\" or periodically as maintenance. With \
                       --all, also rewrite the existing packs: drop unreachable (garbage) \
                       objects that were stuck in packs and consolidate many packs into few — a \
-                      heavier full repack, worth running occasionally."
+                      heavier full repack, worth running occasionally. Add --redelta to a full \
+                      repack to also re-delta-compress every object instead of copying already-\
+                      packed records verbatim — denser, but a one-shot CPU-bound pass."
     )]
     Compact {
         /// Repack existing packs too: drop unreachable objects and consolidate (a full repack)
         #[arg(long)]
         all: bool,
+
+        /// Re-encode every object to delta-compress across the whole store (only with --all)
+        #[arg(
+            long,
+            long_help = "Re-encode every live object — packed or loose, files and directories \
+                         alike — to delta-compress across the whole store, instead of a \
+                         repack's usual verbatim copy of already-packed records. Buys back the \
+                         cross-path similarity (renames, moved files) a per-object copy cannot \
+                         see, at the cost of a full re-read, re-compress and re-delta of every \
+                         object: one-shot and CPU-bound, not something to run routinely. Safe to \
+                         repeat any number of times on the same store. Only valid with --all."
+        )]
+        redelta: bool,
     },
 
     /// Read or change configuration values
@@ -238,15 +253,17 @@ pub enum Command {
         long_about = "Show the line-by-line changes between the working directory and the \
                       inventory (what \"load\" would stage). With --staged, show the changes \
                       between the inventory and the pallet head (what \"stack\" would record). \
-                      With two revisions (pallet names or parcel hashes), compare those instead. \
-                      An optional trailing path limits the report to a file or directory."
+                      With two revisions (pallet names or parcel hashes), compare those instead \
+                      — use \":empty\" as either revision to compare against the empty tree \
+                      (every file on the other side then lists as added). An optional trailing \
+                      path limits the report to a file or directory."
     )]
     Diff {
         /// Compare the inventory against the pallet head (what "stack" would record)
         #[arg(short, long)]
         staged: bool,
 
-        /// [path], or <revision> <revision> [path]
+        /// [path], or <revision-a> <revision-b> [path] — ":empty" is the empty tree
         #[arg(value_name = "REVISION|PATH")]
         targets: Vec<String>,
     },
@@ -375,7 +392,8 @@ pub enum Command {
         /// The git repository to import from (e.g. \".\")
         path: String,
 
-        /// Leave the imported objects loose (skip the automatic post-import compaction)
+        /// Store the imported objects loose instead of packing (and delta-compressing) them
+        /// on the way in
         #[arg(long)]
         no_compact: bool,
     },
@@ -529,6 +547,19 @@ pub enum Command {
         action: Option<ProfileAction>,
     },
 
+    /// Stage a file or directory for removal
+    #[command(
+        visible_alias = "rm",
+        long_about = "Stage a file or directory for removal: its inventory entries are marked as \
+                      deleted, so they will not be part of the next parcel. The working directory \
+                      is not touched. To unstage changes instead (undo a \"load\"), use \
+                      \"unload\"."
+    )]
+    Remove {
+        /// The file or directory to stage for removal
+        path: String,
+    },
+
     /// Restore a file or directory from the inventory (discard unstaged changes)
     #[command(
         visible_alias = "r",
@@ -570,6 +601,23 @@ pub enum Command {
     Shift {
         /// The pallet to shift to
         pallet: String,
+    },
+
+    /// Print a file's content at a revision (`git show <rev>:<path>`'s equivalent)
+    #[command(
+        long_about = "Print a file's content at a revision in one invocation: \
+                      \"<revision>:<path>\", split on the first \":\" (a revision — a pallet \
+                      name, an \"@\"-qualified meta pallet, or a parcel hash prefix — can never \
+                      contain \":\", so the split is unambiguous even when the path itself has \
+                      one). A chunked large file reports its metadata (content hash, size, chunk \
+                      count) instead of assembling it; non-text content is reported binary. With \
+                      --json, the envelope carries the resolved parcel hash, the tree entry's own \
+                      hash, the binary/chunked signal, and the content when it is text."
+    )]
+    Show {
+        /// "<revision>:<path>"
+        #[arg(value_name = "REVISION:PATH")]
+        target: String,
     },
 
     /// Stack the inventory as a new parcel (commit) on the current pallet
@@ -708,15 +756,16 @@ pub enum Command {
     )]
     Undo,
 
-    /// Stage a file or directory for removal
+    /// Unstage a file or directory (keep your changes)
     #[command(
         visible_alias = "ul",
-        long_about = "Stage a file or directory for removal: its inventory entries are marked as \
-                      deleted, so they will not be part of the next parcel. The working directory \
-                      is not touched."
+        long_about = "Unstage a file or directory: reset its inventory entries to the pallet \
+                      head, leaving the working directory untouched — the inverse of \"load\", \
+                      and the same as \"restore --staged\". To stage a removal instead, use \
+                      \"remove\"."
     )]
     Unload {
-        /// The file or directory to unload
+        /// The file or directory to unstage
         path: String,
     },
 
@@ -724,6 +773,27 @@ pub enum Command {
     #[command(visible_alias = "v")]
     Version,
 
+    /// [internal] Print a generated documentation fragment (`bin/gen-docs` only)
+    ///
+    /// Not part of the public CLI surface: only compiled in with the `docgen` feature, which
+    /// a release build never enables, and hidden from help either way. `bin/gen-docs` is the
+    /// only intended caller.
+    #[cfg(feature = "docgen")]
+    #[command(name = "__docgen", hide = true)]
+    Docgen {
+        #[arg(value_enum)]
+        target: DocgenTarget,
+    },
+}
+
+/// Which generated documentation fragment `forklift __docgen` prints to stdout.
+#[cfg(feature = "docgen")]
+#[derive(Clone, clap::ValueEnum)]
+pub enum DocgenTarget {
+    /// The error-code / exit-code reference table (`docs/generated/errors.md`).
+    Errors,
+    /// Every command's `--json` `data` payload schema (`docs/generated/json-schemas.md`).
+    JsonSchemas,
 }
 
 #[derive(Subcommand)]
@@ -1316,10 +1386,12 @@ impl Command {
                 | Command::Palletize { .. }
                 | Command::Park { .. }
                 | Command::Peek { .. }
+                | Command::Remove { .. }
                 | Command::Restore { .. }
                 | Command::Scope { .. }
                 | Command::ScopePrune { .. }
                 | Command::Shift { .. }
+                | Command::Show { .. }
                 | Command::Stack { .. }
                 | Command::Stocktake { .. }
                 | Command::Store
@@ -1353,6 +1425,7 @@ impl Command {
                 | Command::Office { .. }
                 | Command::Palletize { .. }
                 | Command::Park { .. }
+                | Command::Remove { .. }
                 | Command::Restore { .. }
                 | Command::ScopePrune { .. }
                 | Command::Shift { .. }
@@ -1383,7 +1456,7 @@ impl Command {
     /// this is exactly the read-only display commands.
     ///
     /// # Returns
-    /// * `true`  - Page the output on a terminal (`history`, `diff`, `peek`, `blame`, `audit`).
+    /// * `true`  - Page the output on a terminal (`history`, `diff`, `peek`, `show`, `blame`, `audit`).
     /// * `false` - Print straight through (mutating, interactive, or short-output commands).
     pub fn pages_output(&self) -> bool {
         matches!(
@@ -1391,6 +1464,7 @@ impl Command {
             Command::History { .. }
                 | Command::Diff { .. }
                 | Command::Peek { .. }
+                | Command::Show { .. }
                 | Command::Blame { .. }
                 | Command::Audit { .. }
         )
@@ -1399,7 +1473,7 @@ impl Command {
     /// The name this command records in the undo journal (§7.8), or `None` if it is not
     /// journaled. Only state-changing operations `undo` knows how to reverse are listed;
     /// their pre-operation state is snapshotted so `undo` can restore it. Pure-staging
-    /// (`load`/`unload`/`restore`), trust and remote commands are intentionally excluded.
+    /// (`load`/`remove`/`unload`/`restore`), trust and remote commands are intentionally excluded.
     pub fn journal_op(&self) -> Option<&'static str> {
         match self {
             Command::Stack { .. } => Some("stack"),

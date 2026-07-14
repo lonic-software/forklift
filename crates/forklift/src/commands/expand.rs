@@ -130,8 +130,9 @@ fn is_directory_in_tree(root_tree_hash: &str, key: &str) -> Result<bool, String>
 }
 
 /// The result of an expand: what was added to the fetch scope and how much was fetched.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct ExpandReport {
+pub(crate) struct ExpandReport {
     /// The prefixes newly added to the fetch scope (empty when everything was already in scope).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     added: Vec<String>,
@@ -156,4 +157,13 @@ impl CommandOutput for ExpandReport {
         );
         println!("Scope a bay to a newly fetched path with \"bay add --scope\".");
     }
+}
+
+
+/// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
+#[cfg(feature = "docgen")]
+pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+    vec![
+        ("ExpandReport", schemars::schema_for!(ExpandReport)),
+    ]
 }

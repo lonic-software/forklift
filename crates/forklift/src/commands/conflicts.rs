@@ -125,16 +125,18 @@ fn store_blob(content: Vec<u8>) -> Result<String, String> {
 }
 
 /// The conflict report: every file an unresolved consolidation left in conflict.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct ConflictReport {
+pub(crate) struct ConflictReport {
     conflicts: Vec<Conflict>,
 }
 
 /// One conflicted file. When the working copy carries diff3 markers, the three sides
 /// are content addresses (blob hashes) a resolver can fetch; otherwise `markers` is
 /// false and the sides are absent (a whole-file or binary conflict).
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct Conflict {
+pub(crate) struct Conflict {
     path: String,
     markers: bool,
 
@@ -184,4 +186,13 @@ fn short(hash: &Option<String>) -> &str {
         Some(hash) => &hash[..12.min(hash.len())],
         None => "—",
     }
+}
+
+
+/// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
+#[cfg(feature = "docgen")]
+pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+    vec![
+        ("ConflictReport", schemars::schema_for!(ConflictReport)),
+    ]
 }

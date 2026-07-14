@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.7"
+version = "0.2.0"
 edition = "2021"
 repository = "https://github.com/lonic-software/forklift"
 license = "MIT OR Apache-2.0"
@@ -42,6 +42,10 @@ toml_edit = "0.23"
 argon2 = "0.5"
 chacha20poly1305 = "0.10"
 rpassword = "7"
+# Doc generation only (the `docgen` feature, never enabled in a release build — see
+# bin/gen-docs): derives JSON Schema for the `--json` output structs. `chrono04` covers
+# `history`'s `DateTime<Utc>` field. Pulls in no TLS/crypto crate (no aws-lc risk).
+schemars = { version = "1.2", features = ["chrono04"] }
 # Constant-time secret comparison (bearer tokens): already in the tree transitively via
 # ed25519-dalek, promoted to a direct dependency for the two server heads' auth checks so a
 # byte-wise `==` never regresses back in. Zero dependencies of its own — pins no new crate.

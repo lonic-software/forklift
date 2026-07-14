@@ -388,8 +388,9 @@ fn remove_alias(_alias_path: &Path) -> io::Result<()> {
 }
 
 /// The result of creating (or confirming) the alias.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct Installed {
+pub(crate) struct Installed {
     name: String,
     path: String,
     target: String,
@@ -410,8 +411,9 @@ impl CommandOutput for Installed {
 }
 
 /// The result of removing (or confirming the absence of) the alias.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct Uninstalled {
+pub(crate) struct Uninstalled {
     name: String,
     path: String,
 
@@ -430,8 +432,9 @@ impl CommandOutput for Uninstalled {
 }
 
 /// Whether the alias exists, and where it points.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct StatusReport {
+pub(crate) struct StatusReport {
     name: String,
     path: String,
     installed: bool,
@@ -450,4 +453,15 @@ impl CommandOutput for StatusReport {
             ),
         }
     }
+}
+
+
+/// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
+#[cfg(feature = "docgen")]
+pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+    vec![
+        ("Installed", schemars::schema_for!(Installed)),
+        ("Uninstalled", schemars::schema_for!(Uninstalled)),
+        ("StatusReport", schemars::schema_for!(StatusReport)),
+    ]
 }

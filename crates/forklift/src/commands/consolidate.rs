@@ -102,9 +102,10 @@ pub async fn handle_command(target: &str) -> Result<(), String> {
 
 /// What a consolidation did. `Conflicts` is the only outcome that leaves work for the
 /// operator (resolve, load, stack); the rest are complete.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
-enum ConsolidateOutcome {
+pub(crate) enum ConsolidateOutcome {
     UpToDate,
     FastForward,
     Merged,
@@ -112,8 +113,9 @@ enum ConsolidateOutcome {
 }
 
 /// The result of a consolidate.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct ConsolidateReport {
+pub(crate) struct ConsolidateReport {
     outcome: ConsolidateOutcome,
 
     /// The pallet consolidated into (the current one).
@@ -576,4 +578,13 @@ fn split_path(path: &str) -> (&str, &str) {
         Some((parent, name)) => (parent, name),
         None => ("", path),
     }
+}
+
+
+/// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
+#[cfg(feature = "docgen")]
+pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+    vec![
+        ("ConsolidateReport", schemars::schema_for!(ConsolidateReport)),
+    ]
 }

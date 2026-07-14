@@ -24,8 +24,9 @@ pub async fn handle_command(description: Option<String>) -> Result<(), String> {
 }
 
 /// The parcel a `stack` created and the pallet it advanced.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct Stacked {
+pub(crate) struct Stacked {
     parcel: String,
     pallet: String,
 }
@@ -34,4 +35,13 @@ impl CommandOutput for Stacked {
     fn render_human(&self) {
         println!("Stacked parcel {} on pallet \"{}\".", self.parcel, self.pallet);
     }
+}
+
+
+/// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
+#[cfg(feature = "docgen")]
+pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+    vec![
+        ("Stacked", schemars::schema_for!(Stacked)),
+    ]
 }

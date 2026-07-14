@@ -5,6 +5,8 @@ use crate::output::{ErrorCode, ForkliftError, OutputMode};
 
 pub mod cli;
 pub mod commands;
+#[cfg(feature = "docgen")]
+pub mod docgen;
 pub mod output;
 pub mod pager;
 pub mod passphrase;
@@ -148,7 +150,7 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
             Some(ProfileAction::Use { name }) => commands::profile::use_profile(&name),
             Some(ProfileAction::List) | None => commands::profile::list(),
         },
-        Command::Compact { all } => commands::compact::handle_command(all),
+        Command::Compact { all, redelta } => commands::compact::handle_command(all, redelta),
         Command::Store => commands::store::handle_command(),
         Command::Conflicts => commands::conflicts::handle_command(),
         Command::Bay { action } => commands::bay::handle_command(action),
@@ -210,10 +212,12 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
         },
         Command::Peek { inventory, object } => commands::peek::handle_command(inventory, object, cli.verbose),
         Command::Prepare => commands::prepare::handle_command(cli.verbose),
+        Command::Remove { path } => commands::remove::handle_command(&path),
         Command::Restore { staged, path } => commands::restore::handle_command(staged, &path),
         Command::Scope { action } => commands::scope::handle_command(action),
         Command::ScopePrune { paths, dry_run } => commands::scope_prune::handle_command(paths, dry_run),
         Command::Shift { pallet } => commands::shift::handle_command(&pallet).await,
+        Command::Show { target } => commands::show::handle_command(&target),
         Command::Stack { description } => commands::stack::handle_command(description).await,
         Command::Tag { action } => commands::tag::handle_command(action).await,
         Command::Stocktake { summary } => commands::stocktake::handle_command(summary).await,
@@ -221,5 +225,16 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
         Command::Unload { path } => commands::unload::handle_command(&path),
         Command::Version => commands::version::handle_command(),
         Command::SelfUpdate { check } => commands::self_update::handle_command(check).await,
+        #[cfg(feature = "docgen")]
+        Command::Docgen { target } => {
+            use crate::cli::DocgenTarget;
+            match target {
+                DocgenTarget::Errors => {
+                    print!("{}", docgen::render_errors());
+                    Ok(())
+                }
+                DocgenTarget::JsonSchemas => docgen::render_json_schemas().map(|out| print!("{}", out)),
+            }
+        }
     }
 }

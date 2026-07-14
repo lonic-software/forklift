@@ -109,9 +109,10 @@ pub async fn handle_command() -> Result<(), String> {
 }
 
 /// What a lower did to the current pallet.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
-enum LowerOutcome {
+pub(crate) enum LowerOutcome {
     /// The local pallet was already at the remote head.
     UpToDate,
 
@@ -123,8 +124,9 @@ enum LowerOutcome {
 }
 
 /// The result of a lower: the trust sync that ran first, then the pallet's outcome.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct LowerReport {
+pub(crate) struct LowerReport {
     /// Whether the remote's trust anchor was adopted on first contact.
     adopted_anchor: bool,
 
@@ -248,4 +250,13 @@ async fn adopt_and_merge_meta(client: &RemoteClient,
     }
 
     Ok((result.adopted, merged))
+}
+
+
+/// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
+#[cfg(feature = "docgen")]
+pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+    vec![
+        ("LowerReport", schemars::schema_for!(LowerReport)),
+    ]
 }

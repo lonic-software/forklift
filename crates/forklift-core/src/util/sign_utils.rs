@@ -588,6 +588,11 @@ pub fn store_raw_parcel_signature(parcel_hash: &str, bytes: &[u8]) -> Result<(),
     }
 
     let path = get_signature_path(parcel_hash)?;
+    if let Some(parent) = path.parent() {
+        // A native bundle may install the signed parcel into a pack, so its loose-object fan-out
+        // directory need not exist. The sidecar remains loose and must create that directory.
+        file_utils::create_folder_if_not_exists(parent)?;
+    }
 
     file_utils::write_file_atomically(&path, bytes)
 }

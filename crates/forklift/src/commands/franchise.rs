@@ -86,6 +86,7 @@ pub async fn handle_command(url: &str,
         unborn: false,
         scope: fetch_scope.prefixes().to_vec(),
         fetched_objects: 0,
+        densify_suggested: false,
     };
 
     // The bundle is a fast start, not a requirement: whatever it lacks (or if there is none) is
@@ -99,10 +100,20 @@ pub async fn handle_command(url: &str,
         }
 
         if client.fetch_bundle_to(&bundle_path).await? {
-            let imported = bundle_utils::import_bundle(&bundle_path)?;
-
-            report.bundle_objects = Some(imported.stored_objects);
-            report.bundle_signatures = Some(imported.stored_signatures);
+            match bundle_utils::import_bundle(&bundle_path) {
+                Ok(imported) => {
+                    report.bundle_objects = Some(imported.stored_objects);
+                    report.bundle_signatures = Some(imported.stored_signatures);
+                    report.densify_suggested = imported.installed_packs;
+                }
+                Err(error) if bundle_utils::is_unsupported_bundle_error(&error) => {
+                    // A future envelope is only an optimization this client cannot use. Do not
+                    // retain it as this warehouse's own `latest` bundle; continue through the
+                    // verified incremental-object walk below. Known-format corruption stays fatal.
+                    let _ = std::fs::remove_file(&bundle_path);
+                }
+                Err(error) => return Err(error),
+            }
         }
     }
 
@@ -244,8 +255,9 @@ fn is_directory_in_tree(root_tree_hash: &str, key: &str) -> Result<bool, String>
 }
 
 /// The result of a franchise: what was imported and which pallet was checked out.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct FranchiseReport {
+pub(crate) struct FranchiseReport {
     remote: String,
     directory: String,
 
@@ -279,6 +291,11 @@ struct FranchiseReport {
 
     /// Loose objects fetched for the materialized pallet.
     fetched_objects: usize,
+
+    /// Whether the adopted bundle installed native packs straight from the remote's own bulk
+    /// ingest — the densify suggestion, human-output only (not part of the JSON contract).
+    #[serde(skip)]
+    densify_suggested: bool,
 }
 
 impl CommandOutput for FranchiseReport {
@@ -292,6 +309,10 @@ impl CommandOutput for FranchiseReport {
 
         if self.adopted_anchor {
             println!("Adopted the remote's trust anchor; every parcel is signed from now on.");
+        }
+
+        if self.densify_suggested {
+            println!("{}", output::DENSIFY_TIP);
         }
 
         for pallet in &self.meta_adopted {
@@ -320,4 +341,13 @@ impl CommandOutput for FranchiseReport {
             );
         }
     }
+}
+
+
+/// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
+#[cfg(feature = "docgen")]
+pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+    vec![
+        ("FranchiseReport", schemars::schema_for!(FranchiseReport)),
+    ]
 }

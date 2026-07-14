@@ -123,8 +123,9 @@ async fn show(name: &str) -> Result<(), String> {
 }
 
 /// The result of creating a tag.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct Created {
+pub(crate) struct Created {
     name: String,
     subject: String,
 
@@ -144,8 +145,9 @@ impl CommandOutput for Created {
 }
 
 /// The list of tags.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct TagList {
+pub(crate) struct TagList {
     tags: Vec<TagView>,
 }
 
@@ -176,8 +178,9 @@ impl CommandOutput for TagList {
 }
 
 /// One tag, with its tagger resolved to signed identity metadata.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct TagView {
+pub(crate) struct TagView {
     name: String,
 
     /// The parcel the tag points at.
@@ -265,4 +268,15 @@ fn render_display_date(rfc3339: &str) -> String {
         Ok(dt) => dt.with_timezone(&chrono::Utc).format("%Y-%m-%d %H:%M:%S UTC").to_string(),
         Err(_) => rfc3339.to_string(),
     }
+}
+
+
+/// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
+#[cfg(feature = "docgen")]
+pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+    vec![
+        ("Created", schemars::schema_for!(Created)),
+        ("TagList", schemars::schema_for!(TagList)),
+        ("TagView", schemars::schema_for!(TagView)),
+    ]
 }

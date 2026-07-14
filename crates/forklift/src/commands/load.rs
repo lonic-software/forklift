@@ -28,11 +28,21 @@ pub async fn handle_command(target: &str) -> Result<(), String> {
 
 /// The path a `load` staged. Human output stays silent (as it always has); `--json`
 /// still gets a confirmation envelope so a program sees a result.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct Loaded {
+pub(crate) struct Loaded {
     path: String,
 }
 
 impl CommandOutput for Loaded {
     fn render_human(&self) {}
+}
+
+
+/// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
+#[cfg(feature = "docgen")]
+pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+    vec![
+        ("Loaded", schemars::schema_for!(Loaded)),
+    ]
 }
