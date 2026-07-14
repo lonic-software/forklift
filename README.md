@@ -55,6 +55,30 @@ forklift stack "first parcel"             # commit
 forklift history                           # see it
 ```
 
+## Collaborate peer-to-peer — no server
+
+Work on a warehouse with a few friends without a hosted server, a fixed IP, or port-forwarding.
+One command publishes it as a [Tor](https://www.torproject.org/) onion service and prints the one
+thing to share:
+
+```sh
+forklift peer
+#   address   http://abcd…xyz.onion
+#   token     3f7c1e90-…
+```
+
+Your friend clones it, and you both push and pull over Tor:
+
+```sh
+forklift franchise http://abcd…xyz.onion myproject --token 3f7c1e90-…
+forklift lift        # push over Tor
+forklift lower       # pull over Tor
+```
+
+Every parcel is signed and content-addressed, so you trust the history, not the transport. It
+needs a local `tor` and the server head installed (`install.sh` with `all`). Full walkthrough,
+including a stable address and the Tor setup: **[Peer-to-peer over Tor](docs/guide/p2p-tor.md)**.
+
 ## GUIs
 
 Prefer a graphical client? Community-built GUIs for Forklift:
