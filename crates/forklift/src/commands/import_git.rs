@@ -938,6 +938,7 @@ impl CommandOutput for ImportReport {
                     "Packed the imported store: {} object(s) into {} pack(s), {} delta-compressed.",
                     packed.objects, packed.packs, packed.deltas
                 );
+                println!("{}", output::DENSIFY_TIP);
             }
         }
 

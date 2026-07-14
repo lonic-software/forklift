@@ -66,7 +66,10 @@ packs** ([`compact`](#compact--pack-the-object-store)'s format, without the deto
 one loose file per object), delta-compressing successive versions of files and directory
 trees on the way in. The store arrives dense and you never have to remember to `compact`
 it. Pass `--no-compact` to store loose objects instead (e.g. to inspect the raw store or
-benchmark the loose baseline).
+benchmark the loose baseline). Because that packing only ever sees one file's own history as
+it streams in, `import-git` tips a one-line suggestion (also visible from `store`) that a
+one-shot `compact --all --redelta` could shrink the result further by delta-compressing
+across the whole store, including similarity a per-path pass cannot see.
 
 Refuses in a scoped (sparse) bay (see `bay add --scope` below): importing builds
 every pallet's history straight from the git tree, bypassing the sparse overlay entirely,
@@ -788,6 +791,10 @@ all work; office and every meta pallet are always fetched in full, so a sparse f
 trusted warehouse still audits offline exactly as a full clone does. Widen later with `expand`.
 A sparse franchise records its origin — see the origin-only lift rule under `lift`.
 
+When the remote's bundle installs native packs straight into the new warehouse, `franchise`
+tips the same densify suggestion `import-git` does: those packs are the far end's own bulk
+ingest, unseen by a cross-store `compact --all --redelta` pass.
+
 ### Configuring a remote on an existing warehouse
 
 ```sh
@@ -1020,9 +1027,10 @@ packed in isolation (say, on import, or by an earlier incremental compact whose 
 only ever saw a few neighbors) has no way to know a much better match (a rename, a moved file,
 anything similar outside its own path) sits elsewhere in the store. `--redelta` gives every
 object one more shot at the best base across the *entire* live set. It costs a full re-encode —
-one-shot and CPU-bound, not something to run routinely, and not something to repeat
-back-to-back on the same store — run it once after a big import, then let history move on
-before running it again — and it is only valid together with `--all`.
+one-shot and CPU-bound, not something to run routinely — and it is only valid together with
+`--all`. Safe to repeat any number of times on the same store. `store` (and `import-git`'s and
+`franchise`'s own output) suggest running it when the store was bulk-ingested and has not been
+through a redelta pass yet; a successful run clears that suggestion.
 
 > This step removes per-file slack and the open-per-object read cost. Delta compression
 > between similar versions (the rest of the size gap vs git) is additional work on top —
@@ -1055,8 +1063,11 @@ Object store
 
 `--json` reports `{loose_objects, loose_bytes, packed_objects, pack_files, deltas, pack_bytes,
 total_bytes, packs:[{id, objects, deltas, bytes}], maintenance:{auto, loose_threshold,
-pack_threshold, compaction_due, repack_due}}` — every size an exact byte count. Nothing is
-written; run `compact` to act on what it reports.
+pack_threshold, compaction_due, repack_due}, densify_suggested}` — every size an exact byte
+count. Nothing is written; run `compact` to act on what it reports. `densify_suggested` (and,
+in the human view, a one-line tip) appears once the store was bulk-ingested (`import-git` or a
+franchise's bundle install) and clears once a `compact --all --redelta` pass has run
+(see [`--redelta`](#compact--pack-the-object-store)).
 
 ---
 

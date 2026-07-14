@@ -4415,22 +4415,28 @@ fn compact_all_redelta_repeats_without_data_loss() {
     assert_success(&warehouse.run(&["compact", "--all", "--redelta"]));
     assert!(objects_store_bytes(&objects) > 0);
 
-    // A second `--redelta` run re-encodes the whole live set again — `Source::Reconstruct` is
-    // unconditional under `--redelta`, never the copy-fast path — so, unlike a plain repack,
-    // this never reaches a cheap copy-bound steady state; every invocation pays the full CPU
-    // cost. Measured finding, not asserted here (it is a size/ordering property, not a
-    // guaranteed one): the shared largest-first sort key is each object's previously *packed*
-    // size — unchanged, per the constraint that ordering stays the shared code path — which a
-    // redelta run itself changes, so a later run's processing order can differ from an
-    // earlier one's even with byte-identical inputs, occasionally landing on a different (but
-    // no larger in aggregate) delta assignment and so a different pack id. What must hold, and
-    // does: no object is lost, and every object still reads back byte-correct.
-    let second = warehouse.run(&["--json", "compact", "--all", "--redelta"]);
-    assert_success(&second);
-    assert_eq!(
-        json(&second)["data"]["objects_packed"].as_u64().unwrap(), 20,
-        "a second redelta must still account for every live object"
-    );
+    // `--redelta` re-encodes the whole live set again on *every* run — `Source::Reconstruct` is
+    // unconditional under it, never the copy-fast path — so, unlike a plain repack, this never
+    // reaches a cheap copy-bound steady state; every invocation pays the full CPU cost. Repeating
+    // it three times pins the exact scenario a write-time depth-safety gap once made unsafe at
+    // real-repository scale: without a true per-object depth ledger, repeated redeltas could grow
+    // a delta chain's *real* depth well past its nominal cap (`compute_path_bases`'s own
+    // bookkeeping only counts path hops since a reset, blind to a reset point's own real depth)
+    // until the read-side reconstruction-depth backstop refused to compact at all — never losing
+    // data (durable-before-destructive held even then), just eventually unusable. `compact`'s
+    // depth ledger (`true_depth`) now resolves every path-base candidate's actual current depth
+    // before committing to it, so this must keep succeeding no matter how many times it repeats.
+    // The exact byte layout can still drift run to run (which candidates the ledger allows
+    // depends on the *previous* run's own shape), so this does not assert a fixed pack id — only
+    // what must hold on every run: no object lost, every object still reads back byte-correct.
+    for _ in 0..2 {
+        let repeat = warehouse.run(&["--json", "compact", "--all", "--redelta"]);
+        assert_success(&repeat);
+        assert_eq!(
+            json(&repeat)["data"]["objects_packed"].as_u64().unwrap(), 20,
+            "a repeated redelta must still account for every live object"
+        );
+    }
 
     assert_eq!(
         json(&warehouse.run(&["--json", "history"]))["data"]["entries"].as_array().unwrap().len(),
@@ -4607,6 +4613,100 @@ fn a_mutating_command_runs_maintenance_when_due() {
         json(&warehouse.run(&["--json", "history"]))["data"]["entries"].as_array().unwrap().len(),
         4, "history must survive maintenance"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The densify suggestion: `import-git`'s pack-direct path (and a franchise's native bundle
+// install) can only ever see per-path/per-window similarity on the way in, unlike a plain
+// `compact --all --redelta`'s whole-store pass — so a bulk-ingested store sets a marker that
+// `store` surfaces as a one-line suggestion, cleared once a redelta run actually earns it back.
+// Ordinary incremental use (stack -> auto-compact) already gets full delta selection at write
+// time and must never trip the marker at all.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn store_suggests_densify_after_import_git_and_clears_after_redelta() {
+    fn seed_git_repo(root: &Path) {
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .env("GIT_AUTHOR_NAME", "Ada").env("GIT_AUTHOR_EMAIL", "ada@example.com")
+                .env("GIT_COMMITTER_NAME", "Ada").env("GIT_COMMITTER_EMAIL", "ada@example.com")
+                .output()
+                .expect("git must be installed to run this test");
+            assert!(output.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&output.stderr));
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("a.txt"), "hello\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "first commit"]);
+    }
+
+    let warehouse = TestWarehouse::new("densify-suggestion");
+    seed_git_repo(&warehouse.root);
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    // The import itself packs at least one object, so its own human output tips the suggestion.
+    let imported = warehouse.run(&["import-git", "."]);
+    assert_success(&imported);
+    assert!(
+        stdout(&imported).contains("forklift compact --all --redelta"),
+        "import-git should tip the densify suggestion after packing on the way in: {}", stdout(&imported)
+    );
+
+    // `store` surfaces it too: the human line, and an additive `--json` flag.
+    let store = warehouse.run(&["store"]);
+    assert_success(&store);
+    assert!(
+        stdout(&store).contains("forklift compact --all --redelta"),
+        "store should surface the densify suggestion after a bulk ingest: {}", stdout(&store)
+    );
+
+    let store_json = warehouse.run(&["--json", "store"]);
+    assert_success(&store_json);
+    assert_eq!(json(&store_json)["data"]["densify_suggested"], true);
+
+    // A successful `compact --all --redelta` clears the marker — the suggestion is gone.
+    assert_success(&warehouse.run(&["compact", "--all", "--redelta"]));
+
+    let after = warehouse.run(&["--json", "store"]);
+    assert_success(&after);
+    assert_eq!(
+        json(&after)["data"]["densify_suggested"], false,
+        "a successful redelta run must clear the densify-pending marker"
+    );
+
+    let store_after = warehouse.run(&["store"]);
+    assert_success(&store_after);
+    assert!(
+        !stdout(&store_after).contains("forklift compact --all --redelta"),
+        "the human suggestion must be gone once the marker is cleared"
+    );
+}
+
+#[test]
+fn store_never_suggests_densify_for_ordinary_incremental_use() {
+    // Plain stack -> compact already gets full delta selection at write time (the loose path's
+    // path-base + window fallback) — the marker must never be set for it, so the suggestion
+    // must never fire, unlike the bulk-ingest paths above.
+    let warehouse = TestWarehouse::new("densify-no-bulk-ingest");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    warehouse.write_file("f.txt", "content\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "first"]));
+    assert_success(&warehouse.run(&["compact"]));
+
+    let store_json = warehouse.run(&["--json", "store"]);
+    assert_success(&store_json);
+    assert_eq!(json(&store_json)["data"]["densify_suggested"], false);
+
+    let store = warehouse.run(&["store"]);
+    assert_success(&store);
+    assert!(!stdout(&store).contains("forklift compact --all --redelta"));
 }
 
 // ---------------------------------------------------------------------------------------------

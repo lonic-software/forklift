@@ -87,6 +87,14 @@ pub fn message(command: &str, text: impl Into<String>) {
     }
 }
 
+/// The densify suggestion (§ densify-pending marker, `forklift_core::util::pack_utils`): shown
+/// by `store`, `import-git` and `franchise` whenever the object store carries content a bulk
+/// ingest wrote without ever seeing cross-path similarity. One shared string so the three
+/// commands never drift apart in wording. Never phrased as "recommended" — redelta is an
+/// optional, opt-in, CPU-bound pass, not something owed to every store.
+pub const DENSIFY_TIP: &str = "Tip: \"forklift compact --all --redelta\" can significantly \
+    shrink this store (one-shot, takes a few minutes on large histories).";
+
 /// Render a byte count in a human-friendly binary unit (B/KiB/MiB/GiB/TiB). The object store's
 /// scale makes raw byte counts noise, so the size-reporting commands (`compact`, `store`) show
 /// this instead. JSON output always carries the exact byte count, never this string.
