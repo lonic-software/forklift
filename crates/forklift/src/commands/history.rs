@@ -282,6 +282,12 @@ pub(crate) struct HistoryAction {
     #[serde(skip_serializing_if = "Option::is_none")]
     supervisor: Option<String>,
 
+    /// Always "recorded": history reads the identity the parcel itself records (and joins
+    /// the office off it) without verifying the signature. `query --class` is the verified
+    /// counterpart — same flag word, different trust tier, stamped here so no consumer can
+    /// mistake one for the other.
+    trust: &'static str,
+
     /// The action time. Serialized as RFC 3339 (UTC) for `--json`; formatted directly for
     /// the human log, so no timestamp is ever converted to a string and parsed back.
     #[serde(serialize_with = "serialize_rfc3339")]
@@ -321,6 +327,7 @@ impl HistoryEntry {
                 name,
                 class,
                 supervisor,
+                trust: "recorded",
                 timestamp: action.timestamp,
             }
         }).collect();

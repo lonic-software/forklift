@@ -80,6 +80,71 @@ only on a merge parcel).
 `history` on an unborn pallet (nothing stacked yet) fails with `empty_history` (exit 19)
 rather than the generic `error` code.
 
+Every action also carries `"trust": "recorded"`: history reads the identity the parcel
+itself records (and joins the office off it) without verifying the signature. The
+verified counterpart is `query` — same `--class` flag word, different trust tier, and
+both commands stamp theirs so a consumer can never mistake one for the other.
+
+### `query --json`
+
+`query` filters parcel history on its signed dimensions — identity class, supervisor,
+role, signing key — plus parcel-local facts (dates, description glob, merge-ness,
+parent count, hash prefix). Identity answers are **verified by default**: the walk
+prunes only on non-identity predicates, then resolves the *verified* signer (a real
+signature check plus the key's active/revoked status) for every survivor and filters on
+that — the parcel's own recorded operator never decides what gets verified.
+`--recorded` opts into the cheap, self-declared reading; every answer is then labeled.
+
+Flags AND together; `--where <json>` (or `--where -` for stdin) takes the full
+predicate tree for or/not/nesting: combinators `{"all": […]}`, `{"any": […]}`,
+`{"not": …}` over leaves `{"field", "op", "value"}`. Operators: `eq`/`ne` (one scalar
+value), `in` (an array of values), `matches` (glob `*`/`?` or literal substring — never
+regex), `before`/`after` (one RFC 3339 timestamp), `between` (a two-element timestamp
+array, inclusive). `null` is a valid value only where absence is meaningful —
+`author.supervisor` (`"op": "eq", "value": null` = "has no supervisor"); anywhere else
+it is refused. Bounds (refused past them, exit 18): payload
+64 KiB, depth 16, 128 leaves, `in` ≤ 256 values, glob ≤ 256 chars.
+
+```json
+{
+  "data": {
+    "matches": [
+      {
+        "parcel": "<hash>",
+        "author": { "operator": "<id>", "class": "agent", "supervisor": "<id>",
+                    "trust": "verified" },
+        "signer": { "key": "<key-id>", "operator": "<id>", "class": "agent" },
+        "is_merge": false,
+        "actions": [ { "action": "author", "operator": "<id>", "trust": "recorded",
+                       "timestamp": "…" } ],
+        "description": "…"
+      }
+    ],
+    "next": "<cursor>",
+    "scope": { "trust": "verified", "office_asof": "current",
+               "walked": 1234, "matched": 12, "out_of_scope": 0 }
+  }
+}
+```
+
+`author.trust` vocabulary: `verified` (live key, signature checks out) |
+`signed-revoked` (signature checks out, key revoked — never flattened to verified; the
+`signer` block then carries `revocation_reason`) | `unsigned` | `unknown-key` (signed,
+key not in the office) | `recorded` (only under `--recorded`). A parcel without a
+forge-proof identity (unsigned / unknown key) never matches an identity predicate in
+either direction — three-valued honesty, not a guess.
+
+The `scope` block is always present so a partial or unverified pass can never read as a
+complete, verified one. `office_asof` is always `"current"`: class/supervisor answers
+are as the office records them *today*, not as of each parcel's authoring time. A
+missing parcel body errors the whole query (like `audit`) — the parcel spine is never
+sparse, so a gap there is an incomplete fetch or tampering.
+
+Cost note: `--limit` bounds the output page, never the verification work — a verified
+identity query resolves every phase-1 survivor in its walked scope. Scope the walk (a
+pallet argument, `--from <rev>`) to bound work; an unscoped verified identity query
+over all of history costs about what `audit` does.
+
 ### `palletize --json` (listing)
 
 ```json

@@ -266,6 +266,33 @@ fn build_args(name: &str, arguments: &Value) -> Result<Vec<String>, String> {
                 args.push(after);
             }
         }
+        "query" => {
+            args.push("query".to_string());
+            if let Some(revision) = string_arg("revision") {
+                args.push(revision);
+            }
+            for flag in ["from", "class", "supervisor", "signer", "grep", "where", "after"] {
+                if let Some(value) = string_arg(flag) {
+                    args.push(format!("--{}", flag));
+                    args.push(value);
+                }
+            }
+            // The predicate tree may also arrive as a JSON object (the natural MCP form);
+            // it is re-serialized into the same --where the CLI takes.
+            if let Some(predicate) = arguments.get("where").filter(|value| value.is_object()) {
+                args.push("--where".to_string());
+                args.push(predicate.to_string());
+            }
+            for flag in ["unsupervised", "recorded", "merges", "no_merges"] {
+                if arguments.get(flag).and_then(Value::as_bool).unwrap_or(false) {
+                    args.push(format!("--{}", flag.replace('_', "-")));
+                }
+            }
+            if let Some(limit) = arguments.get("limit").and_then(Value::as_u64) {
+                args.push("--limit".to_string());
+                args.push(limit.to_string());
+            }
+        }
         "conflicts" => args.push("conflicts".to_string()),
         "scope" => args.push("scope".to_string()),
         "expand" => {
@@ -567,6 +594,8 @@ fn tool_definitions() -> Value {
             object(json!({ "staged": boolean, "targets": { "type": "array", "items": string } }), json!([]))),
         tool("history", "Walk the parcel history newest first from a revision (default: the current pallet). Read it in pages with limit (max parcels) plus after (the data.next cursor from the previous page); class filters by author identity class (human|agent|bot|service).",
             object(json!({ "revision": string, "class": string, "limit": integer, "after": string }), json!([]))),
+        tool("query", "Query parcel history on its signed dimensions - identity class, supervisor, signing key - plus parcel facts (dates, description glob, merge-ness). Identity answers are verified by default (the signature is checked; the office is joined off the verified signer, never the parcel's own claim); recorded=true opts into the cheap self-declared reading, labeled. Compose or/not/nesting via `where` (a JSON predicate tree: {all|any|not} over {field,op,value}). Scope the walk with revision and from - that, not limit, bounds verification work. Page with limit plus after (the data.next cursor).",
+            object(json!({ "revision": string, "from": string, "class": string, "unsupervised": boolean, "supervisor": string, "signer": string, "grep": string, "recorded": boolean, "merges": boolean, "no_merges": boolean, "where": { "type": "object" }, "limit": integer, "after": string }), json!([]))),
         tool("conflicts", "List the files an unresolved consolidation left in conflict, with each side as a content address.",
             object(json!({}), json!([]))),
         tool("compact", "Compact the object store: pack loose objects (delta-compressed) into a few dense pack files. Safe to run anytime; worth running after a large import. Pass all=true for a full repack that also rewrites existing packs, dropping unreachable garbage and consolidating.",

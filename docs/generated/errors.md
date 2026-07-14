@@ -28,5 +28,6 @@ Exit codes 17 and 18 are reserved for future features and are not yet assigned t
 | `chunked_transport_unsupported` | 14 | A chunked large file can't go into a bundle, or is being lifted to a remote that doesn't support chunking |
 | `oversized_transport_unsupported` | 15 | An object predates the size limit and can't be sent to a remote or bundle |
 | `commit_pagination_unsupported` | 16 | A lift needs a paginated commit (many objects) and the remote doesn't support it yet |
+| `query_predicate_invalid` | 18 | A "query" predicate is malformed or exceeds a fixed bound |
 | `empty_history` | 19 | "history" was asked to walk a pallet that has nothing stacked on it yet |
 

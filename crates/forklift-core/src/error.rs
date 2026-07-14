@@ -151,6 +151,12 @@ refusal_codes! {
     /// A lift's commit would need more than one paginated batch, and the remote does not advertise
     /// support for the pagination — refused right after negotiation, before a byte is uploaded.
     CommitPaginationUnsupported => "commit_pagination_unsupported",
+
+    /// A `query` predicate is not acceptable as written: malformed (unparsable JSON, an unknown
+    /// field or operator, a value of the wrong type), or past one of the fixed bounds (payload
+    /// size, nesting depth, leaf count, `in`-array length, glob length). One code for all of them:
+    /// every case is "the query you asked for is not acceptable as written."
+    QueryPredicateInvalid => "query_predicate_invalid",
 }
 
 impl RefusalCode {
