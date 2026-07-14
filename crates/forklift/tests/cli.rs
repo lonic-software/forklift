@@ -4607,8 +4607,11 @@ fn store_suggests_densify_after_import_git_and_clears_after_redelta() {
         json(&after)["data"]["densify_suggested"], false,
         "a successful redelta run must clear the densify-pending marker"
     );
+
+    let store_after = warehouse.run(&["store"]);
+    assert_success(&store_after);
     assert!(
-        !stdout(&warehouse.run(&["store"])).contains("forklift compact --all --redelta"),
+        !stdout(&store_after).contains("forklift compact --all --redelta"),
         "the human suggestion must be gone once the marker is cleared"
     );
 }
@@ -4630,7 +4633,10 @@ fn store_never_suggests_densify_for_ordinary_incremental_use() {
     let store_json = warehouse.run(&["--json", "store"]);
     assert_success(&store_json);
     assert_eq!(json(&store_json)["data"]["densify_suggested"], false);
-    assert!(!stdout(&warehouse.run(&["store"])).contains("forklift compact --all --redelta"));
+
+    let store = warehouse.run(&["store"]);
+    assert_success(&store);
+    assert!(!stdout(&store).contains("forklift compact --all --redelta"));
 }
 
 // ---------------------------------------------------------------------------------------------
