@@ -9,11 +9,12 @@
 # grant of indeterminate future works is void under Hungarian copyright law),
 # and the PR record itself is the evidence of each grant.
 #
-# Versioning: a signature legally binds the CLA text as of its date (CLA.md's
-# git history is the record of what that was). If the CLA terms ever change
-# MATERIALLY (rights granted, not typos), bump the signatures filename below
-# (-v1 → -v2): the bot then finds no signatures and re-prompts everyone,
-# while the old file remains in git as the v1 record.
+# Versioning: an acceptance (an electronic signature given by comment) binds
+# the CLA text as of its date (CLA.md's git history is the record of what that
+# was). If the CLA terms ever change MATERIALLY (rights granted, not typos),
+# bump the acceptances filename below (-v2 → -v3): the bot then finds no
+# acceptances and re-prompts everyone, while each old file remains in git as
+# the record for its version.
 #
 # Security note: this runs on pull_request_target and must never check out or
 # execute PR code. The paths check reads the PR's file list via the API only,

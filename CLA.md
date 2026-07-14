@@ -116,9 +116,9 @@ Your moral rights may lawfully be the subject of consent:
 
 You represent that:
 
-1. You are legally entitled to grant the above licenses, You have reached the
+1. You are legally entitled to grant the above licenses; You have reached the
    age of majority under the law applicable to You (or Your legal representative
-   has validly consented to this Agreement), and You are acting in Your own name
+   has validly consented to this Agreement); and You are acting in Your own name
    and in Your personal capacity unless You have expressly stated otherwise.
 2. If Your employer(s), Your clients (where You work as a contractor), or an
    academic institution You are affiliated with have rights to intellectual

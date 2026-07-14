@@ -42,8 +42,9 @@ because a blanket license of your unwritten future work would be void under
 Hungarian copyright law (which governs the CLA). Registering once is a
 convenience; it never claims your future works in advance.
 
-A pull request that touches both client and server code just needs the one CLA
-signature.
+A pull request that touches both client and server code triggers the one CLA
+check, and the resulting grant covers the whole contribution — you never deal
+with two processes for one pull request.
 
 ## Before you build something big
 
