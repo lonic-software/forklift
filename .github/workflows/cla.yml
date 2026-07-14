@@ -1,0 +1,66 @@
+# CLA gate for server-head contributions (see CONTRIBUTING.md and CLA.md).
+#
+# Client-only PRs are inbound = outbound (MIT/Apache) and skip this entirely;
+# the check only engages when a PR touches crates/forklift-server or
+# crates/forklift-aws-lambda. Signatures are recorded by the bot on the
+# `cla-signatures` branch — one signature covers all of a contributor's past
+# and future PRs.
+#
+# Versioning: a signature legally binds the CLA text as of its date (CLA.md's
+# git history is the record of what that was). If the CLA terms ever change
+# MATERIALLY (rights granted, not typos), bump the signatures filename below
+# (-v1 → -v2): the bot then finds no signatures and re-prompts everyone,
+# while the old file remains in git as the v1 record.
+#
+# Security note: this runs on pull_request_target and must never check out or
+# execute PR code. The paths check reads the PR's file list via the API only,
+# and gates BOTH event types — a comment on a client-only PR must not summon
+# the CLA bot.
+
+name: CLA
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_target:
+    types: [opened, closed, synchronize]
+
+# actions: write is required by contributor-assistant's "recheck" comment
+# support (it re-triggers the workflow run via the API); the rest are its
+# documented permission set.
+permissions:
+  actions: write
+  contents: write
+  pull-requests: write
+  statuses: write
+
+jobs:
+  cla:
+    # Comments on plain issues (not PRs) have nothing to check.
+    if: github.event_name == 'pull_request_target' || github.event.issue.pull_request
+    runs-on: ubuntu-latest
+    steps:
+      - name: Detect server-head changes
+        id: paths
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event_name == 'issue_comment' && github.event.issue.number || github.event.pull_request.number }}
+        run: |
+          files=$(gh api "repos/${{ github.repository }}/pulls/$PR/files" --paginate --jq '.[].filename')
+          if printf '%s\n' "$files" | grep -qE '^crates/(forklift-server|forklift-aws-lambda)/'; then
+            echo "server=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "server=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: CLA assistant
+        if: steps.paths.outputs.server == 'true'
+        uses: contributor-assistant/github-action@v2.6.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          path-to-signatures: '.github/cla-signatures-v1.json'
+          path-to-document: 'https://github.com/lonic-software/forklift/blob/main/CLA.md'
+          branch: 'cla-signatures'
+          allowlist: 'kolonicsmate,*[bot]'
+          lock-pullrequest-aftermerge: false

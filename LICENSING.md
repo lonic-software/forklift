@@ -48,7 +48,8 @@ Contributions to the **client** (`forklift-core`, `forklift`) are accepted under
 dual MIT/Apache terms (inbound = outbound), as noted in the README.
 
 Contributions to the **server heads** are under FSL-1.1. Because the maintainer reserves the
-right to offer Forklift hosting commercially, server-head contributions will require a
-Contributor License Agreement (CLA) granting the maintainer the rights to relicense and to
-license commercially. A CLA is not yet set up; until it is, external server-head
-contributions are not being merged. Open an issue first if you'd like to contribute there.
+right to offer Forklift hosting commercially, server-head contributions require a signed
+[Contributor License Agreement](CLA.md) granting the maintainer the rights to relicense and to
+license commercially (you keep the copyright to your work). Signing is automatic — a bot
+prompts on any pull request that touches the server heads, and one signature covers all your
+contributions. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full policy.
