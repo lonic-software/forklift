@@ -551,14 +551,17 @@ pub enum Command {
     #[command(
         visible_alias = "q",
         long_about = "Filter parcel history on its signed dimensions — identity class, \
-                      supervisor, role, signing key — plus parcel-local facts (dates, \
-                      description, merge-ness). By default identity answers are VERIFIED: the \
+                      supervisor, role, signing key, recorded machine-authorship provenance, \
+                      signed tags — plus parcel-local facts (dates, description, merge-ness, \
+                      touched paths). By default identity answers are VERIFIED: the \
                       signature is checked and the office joined off the verified signer, never \
                       off the parcel's own (forgeable) claim; --recorded opts into the cheap, \
-                      self-declared reading and labels every answer accordingly. Flags AND \
-                      together; --where takes a JSON predicate tree for or/not/nesting. Scope \
-                      the walk with revisions and --from — that (not --limit) is what bounds \
-                      verification work."
+                      self-declared reading and labels every answer accordingly. A parcel with \
+                      no provenance recorded at all never matches a --model/--tool predicate in \
+                      either direction (absence isn't a claim to negate); an untagged parcel \
+                      plainly does not carry a --tag. Flags AND together; --where takes a JSON \
+                      predicate tree for or/not/nesting. Scope the walk with revisions and \
+                      --from — that (not --limit) is what bounds verification work."
     )]
     Query {
         /// Walk from these revisions (pallet names or parcel hashes; default: the current
@@ -605,6 +608,27 @@ pub enum Command {
         /// Description matches this glob (*, ?) or contains it as a substring
         #[arg(long, value_name = "GLOB")]
         grep: Option<String>,
+
+        /// Recorded machine-authorship model matches this glob (*, ?) or contains it as a
+        /// substring (from a manifest provenance entry; absence of any entry never matches)
+        #[arg(long, value_name = "GLOB")]
+        model: Option<String>,
+
+        /// Recorded machine-authorship tool matches this glob (*, ?) or contains it as a
+        /// substring (from a manifest provenance entry; absence of any entry never matches)
+        #[arg(long, value_name = "GLOB")]
+        tool: Option<String>,
+
+        /// Carries this signed tag (from the @tags meta pallet)
+        #[arg(long, value_name = "NAME")]
+        tag: Option<String>,
+
+        /// Changed this warehouse path (or a path under it) versus the parcel's first
+        /// parent only — a merge whose result at the path already matches its first parent
+        /// (e.g. both sides added identical content) does not match, even if the other
+        /// parent touched it (see "forklift help query")
+        #[arg(long, value_name = "PATH")]
+        touches: Option<String>,
 
         /// Verify identity answers (the default; the flag exists to say so explicitly)
         #[arg(long, conflicts_with = "recorded")]

@@ -2486,6 +2486,17 @@ A command not listed here either reports only the generic human-message shape `{
         "parcel": {
           "type": "string"
         },
+        "provenance": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/QueryProvenance"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "This subject's newest machine-authorship provenance entry, if `@manifest` has any.\nAbsent both when there is no entry for this parcel and when the whole pallet has no\nhead — `scope.provenance_source` is what tells those two apart."
+        },
         "signer": {
           "anyOf": [
             {
@@ -2496,13 +2507,21 @@ A command not listed here either reports only the generic human-message shape `{
             }
           ],
           "description": "The verified signer, when the parcel carries a signature that verifies."
+        },
+        "tags": {
+          "description": "This subject's tag names (omitted, not empty-listed, when it carries none).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         }
       },
       "required": [
         "parcel",
         "author",
         "is_merge",
-        "actions"
+        "actions",
+        "tags"
       ],
       "type": "object"
     },
@@ -2538,6 +2557,30 @@ A command not listed here either reports only the generic human-message shape `{
       ],
       "type": "object"
     },
+    "QueryProvenance": {
+      "description": "The machine-authorship provenance a match carries, flattened for the report.",
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "session": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tool": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "model"
+      ],
+      "type": "object"
+    },
     "QueryScope": {
       "description": "The honesty block: what the walk covered, at what trust, and what it could not see.",
       "properties": {
@@ -2562,10 +2605,18 @@ A command not listed here either reports only the generic human-message shape `{
           "type": "string"
         },
         "out_of_scope": {
-          "description": "Parcels a predicate could not evaluate because their content is outside a sparse\nbay's scope. Always 0 until content predicates ship.",
+          "description": "Parcels a `touches` predicate could not confirm because the path was provably\noutside a sparse warehouse's fetch scope (degraded to `Unknown`, not an error). 0\noutside that case.",
           "format": "uint",
           "minimum": 0,
           "type": "integer"
+        },
+        "provenance_source": {
+          "description": "Whether the `@manifest` meta pallet has a head at all: `\"present\"`, or\n`\"meta_pallet_absent\"` when it does not exist (or was never fetched) — every\nprovenance leaf then reads `Unknown` for lack of a pallet to consult, not for lack\nof evidence on any one parcel.",
+          "type": "string"
+        },
+        "tags_source": {
+          "description": "Whether the `@tags` meta pallet has a head at all: `\"present\"`, or\n`\"meta_pallet_absent\"` when it does not exist (or was never fetched) — mirrors\n`provenance_source`. A match's omitted `tags` only proves \"genuinely untagged\" when\nthis reads `\"present\"`; when it reads `\"meta_pallet_absent\"` every `tags` omission is\nunknowable, not a negative result.",
+          "type": "string"
         },
         "trust": {
           "description": "\"verified\" or \"recorded\" — the trust level identity answers were resolved at.",
@@ -2583,7 +2634,9 @@ A command not listed here either reports only the generic human-message shape `{
         "office_asof",
         "walked",
         "matched",
-        "out_of_scope"
+        "out_of_scope",
+        "provenance_source",
+        "tags_source"
       ],
       "type": "object"
     },

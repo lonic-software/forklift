@@ -164,10 +164,11 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
         Command::Franchise { url, directory, pallet, token, only } =>
             commands::franchise::handle_command(&url, &directory, pallet, token, only).await,
         Command::History { revision, class, limit, after, oneline } => commands::history::handle_command(revision, class, limit, after, oneline).await,
-        Command::Query { revisions, from, class, unsupervised, supervisor, signer, author_after, author_before, merges, no_merges, grep, verify: _, recorded, r#where, limit, after, oneline } =>
+        Command::Query { revisions, from, class, unsupervised, supervisor, signer, author_after, author_before, merges, no_merges, grep, model, tool, tag, touches, verify: _, recorded, r#where, limit, after, oneline } =>
             commands::query::handle_command(commands::query::QueryArgs {
                 revisions, from, class, unsupervised, supervisor, signer, author_after,
-                author_before, merges, no_merges, grep, recorded, r#where, limit, after, oneline,
+                author_before, merges, no_merges, grep, recorded, model, tool, tag, touches,
+                r#where, limit, after, oneline,
             }).await,
         Command::ImportGit { path, no_compact } => commands::import_git::handle_command(&path, no_compact),
         Command::ExportGit { path } => commands::export_git::handle_command(&path),
