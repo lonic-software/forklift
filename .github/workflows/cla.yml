@@ -3,8 +3,14 @@
 # Client-only PRs are inbound = outbound (MIT/Apache) and skip this entirely;
 # the check only engages when a PR touches crates/forklift-server or
 # crates/forklift-aws-lambda. Signatures are recorded by the bot on the
-# `cla-signatures` branch (.github/cla-signatures.json) — one signature covers
-# all of a contributor's past and future PRs.
+# `cla-signatures` branch — one signature covers all of a contributor's past
+# and future PRs.
+#
+# Versioning: a signature legally binds the CLA text as of its date (CLA.md's
+# git history is the record of what that was). If the CLA terms ever change
+# MATERIALLY (rights granted, not typos), bump the signatures filename below
+# (-v1 → -v2): the bot then finds no signatures and re-prompts everyone,
+# while the old file remains in git as the v1 record.
 #
 # Security note: this runs on pull_request_target and must never check out or
 # execute PR code. The paths check reads the PR's file list via the API only,
@@ -53,7 +59,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          path-to-signatures: '.github/cla-signatures.json'
+          path-to-signatures: '.github/cla-signatures-v1.json'
           path-to-document: 'https://github.com/lonic-software/forklift/blob/main/CLA.md'
           branch: 'cla-signatures'
           allowlist: 'kolonicsmate,*[bot]'
