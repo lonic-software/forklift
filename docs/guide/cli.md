@@ -1101,7 +1101,7 @@ directly and unchanged. So an onion URL Just Works while a plain `http(s)` remot
 exactly as before.
 
 ```sh
-forklift config remote.torProxy socks5h://127.0.0.1:9150   # e.g. Tor Browser's SOCKS port
+forklift config remote.torProxy socks5h://127.0.0.1:9150   # Tor Browser's bundled SOCKS port
 forklift config --global remote.tor on                     # route every remote through Tor
 ```
 
@@ -1111,9 +1111,16 @@ forklift config --global remote.tor on                     # route every remote 
   `socks5h` scheme resolves the host **at the proxy**, which is what lets an opaque `.onion`
   name (it has no DNS record) resolve inside the Tor network.
 
-You need a local `tor` daemon running for this; nothing here uses the Tor Browser. The
-transport adds **no new dependency** — it flips on the SOCKS5 client already vendored in the
-HTTP stack.
+> **With `on`, use `https://` for any non-onion remote that carries a token.** Routing a plain
+> `http://` clearnet remote through Tor sends its bearer token out through a Tor **exit relay** —
+> a *worse* position than the direct network path, since hostile exits harvest plaintext
+> credentials. Onion remotes are unaffected: traffic is end-to-end encrypted to the onion key, so
+> `http://…​.onion` is fine.
+
+You need a local `tor` daemon for this. The default `9050` is a stock system `tor`; the `9150`
+example above is **Tor Browser's** bundled daemon — convenient, but it only listens while the
+browser is open. Either way, nothing here needs the Tor Browser *UI*. The transport adds **no new
+dependency** — it flips on the SOCKS5 client already vendored in the HTTP stack.
 
 ---
 

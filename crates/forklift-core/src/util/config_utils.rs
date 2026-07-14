@@ -56,6 +56,13 @@ pub const KEY_REMOTE_ORIGIN: &str = "remote.origin";
 /// `crate::util::remote_utils::TorMode`.
 pub const KEY_REMOTE_TOR: &str = "remote.tor";
 
+/// The values [`KEY_REMOTE_TOR`] accepts at set time. The runtime parse
+/// (`remote_utils::TorMode::parse`) is deliberately tolerant — an unrecognized value degrades
+/// to `auto` — as defense in depth for hand-edited files; the `config` command is strict so a
+/// privacy-relevant typo (`onn` silently meaning `auto`, leaving non-onion remotes un-proxied
+/// when the user believes everything is routed through Tor) can't pass silently.
+pub const REMOTE_TOR_VALUES: [&str; 3] = ["auto", "on", "off"];
+
 /// The Tor SOCKS proxy the client dials when [`KEY_REMOTE_TOR`] applies (default
 /// `socks5h://127.0.0.1:9050`, the address a stock local `tor` listens on). The `socks5h`
 /// scheme resolves the hostname *at the proxy*, which is what lets an opaque `.onion` name —
@@ -214,6 +221,7 @@ pub fn get_effective_value(key: &str) -> Result<Option<(String, ConfigScope)>, S
 ///                   or written.
 pub fn set_value(key: &str, value: &str, scope: ConfigScope) -> Result<(), String> {
     let (section, field) = split_key(key)?;
+    validate_value(key, value)?;
     let path = get_config_path(scope)?;
 
     let mut document = load_document(&path)?.unwrap_or_default();
@@ -486,6 +494,20 @@ fn split_key(key: &str) -> Result<(&str, &str), String> {
         .ok_or(format!("Configuration key \"{}\" is not in \"section.key\" form.", key))
 }
 
+/// Reject an out-of-range value for a key whose value is a fixed set, so a typo fails loudly at
+/// set time instead of degrading silently at runtime. Keys with a free-form value pass through.
+fn validate_value(key: &str, value: &str) -> Result<(), String> {
+    if key == KEY_REMOTE_TOR && !REMOTE_TOR_VALUES.contains(&value.trim().to_ascii_lowercase().as_str()) {
+        return Err(format!(
+            "\"{}\" is not a valid value for {}. Use one of: {}. \
+             A typo here would silently fall back to \"auto\", leaving non-onion remotes un-proxied.",
+            value, KEY_REMOTE_TOR, REMOTE_TOR_VALUES.join(", ")
+        ));
+    }
+
+    Ok(())
+}
+
 /// Load and parse the configuration file at the given path, if it exists.
 ///
 /// # Arguments
@@ -667,5 +689,20 @@ mod tests {
         assert!(error.contains(KEY_OPERATOR_NAME));
 
         assert_eq!(split_key(KEY_OPERATOR_NAME).unwrap(), ("operator", "name"));
+    }
+
+    #[test]
+    fn remote_tor_rejects_a_typo_but_accepts_the_documented_values() {
+        // The privacy-relevant case: a typo must fail loudly, not degrade to `auto`.
+        let error = validate_value(KEY_REMOTE_TOR, "onn").unwrap_err();
+        assert!(error.contains("not a valid value"));
+        assert!(error.contains("auto, on, off"));
+
+        for value in ["auto", "on", "off", "OFF", "  On  "] {
+            assert!(validate_value(KEY_REMOTE_TOR, value).is_ok(), "\"{value}\" should be accepted");
+        }
+
+        // A free-form key is unconstrained.
+        assert!(validate_value(KEY_REMOTE_TOR_PROXY, "socks5h://127.0.0.1:9150").is_ok());
     }
 }

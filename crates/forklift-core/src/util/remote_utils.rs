@@ -212,7 +212,9 @@ fn is_onion_url(url: &str) -> bool {
     reqwest::Url::parse(url)
         .ok()
         .and_then(|parsed| parsed.host_str().map(|host| host.to_ascii_lowercase()))
-        .is_some_and(|host| host.ends_with(".onion"))
+        // Tolerate a trailing FQDN dot (`x.onion.`) — still an onion, must route through Tor,
+        // not get dialed directly and fail local resolution with a confusing error.
+        .is_some_and(|host| host.trim_end_matches('.').ends_with(".onion"))
 }
 
 /// Whether to dial this remote through the Tor SOCKS proxy, given the mode. Pure and total, so
@@ -2298,6 +2300,7 @@ mod tests {
         assert!(is_onion_url("http://abcdefghij234567.onion"));
         assert!(is_onion_url("http://abcdefghij234567.onion:80/v1/warehouse"));
         assert!(is_onion_url("http://SubDomain.ABCDEF.onion"), "case-insensitive host match");
+        assert!(is_onion_url("http://abcdefghij234567.onion."), "trailing FQDN dot is still onion");
 
         assert!(!is_onion_url("http://127.0.0.1:9418"));
         assert!(!is_onion_url("https://forklift.example.com"));
