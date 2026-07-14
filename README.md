@@ -207,5 +207,5 @@ Forklift is **open-core**. See [LICENSING.md](LICENSING.md) for the full map; in
 Unless you explicitly state otherwise, any contribution to the **client** (`forklift-core`,
 `forklift`) intentionally submitted for inclusion in Forklift by you, as defined in the
 Apache-2.0 license, shall be dual licensed as MIT/Apache above, without any additional terms
-or conditions. Contributions to the **server heads** are under FSL-1.1 and (once a CLA is in
-place) require it — see [LICENSING.md](LICENSING.md).
+or conditions. Contributions to the **server heads** are under FSL-1.1 and require a signed
+[CLA](CLA.md) (a bot prompts on the pull request) — see [CONTRIBUTING.md](CONTRIBUTING.md).
