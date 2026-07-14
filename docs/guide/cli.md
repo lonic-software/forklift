@@ -413,6 +413,9 @@ forklift query --signer 91ff02                  # parcels signed by one key (pre
 forklift query --grep 'fix*walk' --no-merges    # parcel-local facts compose in
 forklift query --from v1-parcel feature         # scope: feature's line since a base
 forklift query --recorded --class agent         # the cheap, labeled, unverified read
+forklift query --model 'claude-*'               # recorded machine-authorship model
+forklift query --tag v1.2.0                     # carries this signed tag
+forklift query --touches src                    # changed this path (or under it)
 forklift query --where '{"any":[…]}' --json     # full or/not/nesting as a JSON tree
 ```
 
@@ -424,6 +427,18 @@ key matches `--class agent`, and an unsigned parcel matches no identity predicat
 all (its class is unknowable, and a compliance filter must not guess). Answers carry a
 trust label per match (`verified`, `signed-revoked`, `unsigned`, `unknown-key`, or
 `recorded` under `--recorded`) and a `scope` block saying what the pass covered.
+
+`--model`/`--tool` read recorded machine-authorship provenance (a `manifest provenance`
+entry): a parcel with *no* provenance recorded at all never matches, in either
+direction — absence is not a claim to negate, so `--where '{"not": {…matches…}}'`
+still excludes it. `--tag` is plain membership: an untagged parcel simply does not
+carry the tag (excluded, and included by its negation) — only a warehouse with no
+`@tags` pallet at all reads every `--tag` predicate as unknowable. `--touches <path>`
+tests whether the parcel's tree differs from its **first parent's** at that path (a
+file or a directory prefix); a merge parcel is judged the same way `blame` already is
+for line attribution — if the merge's own result at the path already matches what its
+first parent had (e.g. both branches added the identical content), it does not match,
+even though its other parent touched the path.
 
 Flags AND together; `--where` takes a JSON predicate tree (`all`/`any`/`not` over
 `{"field","op","value"}` leaves) for anything flags can't express. Match patterns are

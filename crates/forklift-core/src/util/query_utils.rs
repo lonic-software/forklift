@@ -1,6 +1,15 @@
 //! The parcel query engine (§9.4c): a walk-and-filter over parcel history whose predicates
-//! reach the signed dimensions (identity class, supervisor, signer, and — in later stages —
-//! provenance) that plain recorded metadata cannot prove.
+//! reach the signed dimensions (identity class, supervisor, signer, provenance, tags, and
+//! path history) that plain recorded metadata cannot prove.
+//!
+//! Provenance, tags and `touches` are phase-1 leaves, not identity leaves: a subject-hash
+//! join against the separately-signed `@manifest`/`@tags` meta pallets (or a tree-diff
+//! confirmed against the commit graph) is not spoofable the way a free-text action field
+//! is, so there is no forgery-evasion reason to defer them past phase 1 the way `signer.*`
+//! and `author.class` are. They still carry their own three-valued honesty rule, though:
+//! provenance is *opt-in evidence* (absence is Unknown, never a negation — see
+//! [`evaluate_leaf`]'s A5 note), while a tag is *membership* (absence is a plain False,
+//! except when the whole `@tags` pallet is unreadable).
 //!
 //! The spine of the design is the trust guarantee, and it is an *execution order*, not just a
 //! primitive choice: under verified trust (the default), identity predicates never prune the
@@ -22,6 +31,7 @@
 //! Core never prints: the engine hands each match to a caller-supplied sink and returns typed
 //! outcome data; the head renders.
 
+use std::cell::{Cell, RefCell};
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -30,7 +40,11 @@ use crate::error::{CoreError, RefusalCode};
 use crate::model::parcel::Parcel;
 use crate::util::audit_utils::{self, SignatureTrust};
 use crate::util::office_utils::{IdentityClass, OfficeState, RevocationReason, Role};
-use crate::util::{fanout_utils, merge_utils, object_utils};
+use crate::util::path_utils::WarehousePath;
+use crate::util::scope_utils::{self, MaterializationScope, ScopeClass};
+use crate::util::{
+    fanout_utils, manifest_utils, merge_utils, object_utils, pallet_utils, tag_utils, tree_utils,
+};
 
 /// The stable code for a rejected predicate, re-exported for the head's error table.
 pub const CODE_QUERY_PREDICATE_INVALID: &str = RefusalCode::QueryPredicateInvalid.as_str();
@@ -129,6 +143,14 @@ pub struct QueryMatch {
     pub hash: String,
     pub parcel: Parcel,
     pub identity: IdentityResolution,
+
+    /// This subject's newest provenance entry (by `recorded_at`), if `@manifest` has any —
+    /// an entry-level fact for the report, independent of whether the predicate tested
+    /// provenance at all (the index is always built; see [`QueryContext`]).
+    pub provenance: Option<ProvenanceRecord>,
+
+    /// This subject's tag names (empty when untagged, or when `@tags` has no head).
+    pub tags: Vec<String>,
 }
 
 /// What a finished (or limit-stopped) query reports besides its matches.
@@ -141,6 +163,133 @@ pub struct QueryOutcome {
 
     /// How many parcels matched (and were handed to the sink).
     pub matched: usize,
+
+    /// How many `touches` confirmations degraded to `Unknown` because the path was provably
+    /// outside the warehouse's fetch scope (§9.4c Finding 3) — always 0 outside a sparse
+    /// warehouse running a `touches` predicate.
+    pub out_of_scope: usize,
+
+    /// Whether the `@manifest` meta pallet has a head at all (§9.4c A9). `false` means every
+    /// provenance leaf read `Unknown` for lack of a pallet to consult, not for lack of
+    /// evidence on any one parcel — the report must be able to tell the two apart.
+    pub provenance_present: bool,
+}
+
+/// One subject's flattened provenance evidence for the report: the newest entry by
+/// `recorded_at` (a leaf itself matches on *any* of a subject's entries — see
+/// [`evaluate_leaf`] — but the report shows one, the freshest attestation).
+#[derive(Clone)]
+pub struct ProvenanceRecord {
+    pub model: String,
+    pub tool: Option<String>,
+    pub session: Option<String>,
+    pub recorded_at: i64,
+}
+
+/// The ephemeral, per-query facts Stage 2's non-identity predicates need beyond the parcel
+/// itself. Built once per query invocation (never persisted) because a warehouse's
+/// provenance and tag records are tiny beside the history a query already walks — see
+/// [`QueryContext::build`].
+struct QueryContext {
+    /// Subject hash → that subject's provenance entries. `None` when the `@manifest` meta
+    /// pallet itself has no head — distinct from `Some(empty-for-this-subject)`, which is
+    /// an ordinary parcel the pallet simply says nothing about.
+    provenance: Option<HashMap<String, Vec<ProvenanceRecord>>>,
+
+    /// Subject hash → tag names. `None` when the `@tags` meta pallet has no head.
+    tags: Option<HashMap<String, Vec<String>>>,
+
+    /// The warehouse's fetch scope, read once — `touches`'s confirming diff degrades to
+    /// `Unknown` (rather than a hard error) only for a path this scope provably never
+    /// fetched.
+    fetch_scope: MaterializationScope,
+
+    /// How many `touches` evaluations degraded per the above, across the whole walk.
+    /// `Cell` because evaluation only ever borrows the context immutably.
+    out_of_scope: Cell<usize>,
+
+    /// Parcel hash → its `tree_hash`, memoized. `touches`'s confirming diff needs the first
+    /// parent's tree hash, and the walk in `run_query` already loads (and decodes) every
+    /// parent's full parcel body once to enqueue it — parcels deliberately bypass the shared
+    /// read cache (see `object_utils::load_parcel`'s own doc), so without this memo a
+    /// `touches` query would pay a second full uncached read + decode for nearly every
+    /// walked parcel. `RefCell` because evaluation only ever borrows the context immutably,
+    /// and this stays single-threaded (evaluation runs on the walk thread only, never inside
+    /// the phase-2 fanout, which resolves identities, not tree hashes).
+    tree_hashes: RefCell<HashMap<String, String>>,
+}
+
+impl QueryContext {
+    /// Build the ephemeral indexes: read `@manifest` and `@tags` once each (empty-but-present
+    /// vs. absent-pallet is preserved — see the field docs), and the warehouse's fetch scope.
+    fn build() -> Result<QueryContext, String> {
+        let provenance = pallet_utils::get_meta_pallet_head(manifest_utils::MANIFEST_PALLET_NAME)?
+            .is_some()
+            .then(|| {
+                let mut index: HashMap<String, Vec<ProvenanceRecord>> = HashMap::new();
+                for attributed in manifest_utils::read_manifest()? {
+                    if let Some(provenance) = attributed.entry.provenance {
+                        index.entry(attributed.entry.subject).or_default().push(ProvenanceRecord {
+                            model: provenance.model,
+                            tool: provenance.tool,
+                            session: provenance.session,
+                            recorded_at: attributed.entry.recorded_at,
+                        });
+                    }
+                }
+                Ok::<_, String>(index)
+            })
+            .transpose()?;
+
+        let tags = pallet_utils::get_meta_pallet_head(tag_utils::TAGS_PALLET_NAME)?
+            .is_some()
+            .then(|| {
+                let mut index: HashMap<String, Vec<String>> = HashMap::new();
+                for attributed in tag_utils::read_tags()? {
+                    index.entry(attributed.tag.subject).or_default().push(attributed.tag.name);
+                }
+                Ok::<_, String>(index)
+            })
+            .transpose()?;
+
+        Ok(QueryContext {
+            provenance,
+            tags,
+            fetch_scope: scope_utils::read_fetch_scope()?,
+            out_of_scope: Cell::new(0),
+            tree_hashes: RefCell::new(HashMap::new()),
+        })
+    }
+
+    /// The newest provenance record for a subject, if any (`None` distinguishes both "the
+    /// pallet has no head" and "the pallet has one, but nothing about this subject" — a
+    /// `Leaf::Provenance` test needs only the presence split; the report wants the record).
+    fn newest_provenance(&self, hash: &str) -> Option<&ProvenanceRecord> {
+        self.provenance.as_ref()?.get(hash)?.iter().max_by_key(|record| record.recorded_at)
+    }
+
+    fn tags_of(&self, hash: &str) -> &[String] {
+        self.tags.as_ref().and_then(|index| index.get(hash)).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// Record a parcel's tree hash into the memo — called wherever `run_query` already loads
+    /// a parcel body (the seed loop, the parent-enqueue loop), so `touches` almost never has
+    /// to load one itself.
+    fn remember_tree_hash(&self, hash: &str, tree_hash: &str) {
+        self.tree_hashes.borrow_mut().entry(hash.to_string()).or_insert_with(|| tree_hash.to_string());
+    }
+
+    /// The tree hash of a parcel, from the memo if present, else loaded (and memoized) on the
+    /// spot — the fallback path for a parent already dropped from a previous page's frontier,
+    /// or a seed the walk never separately enqueued.
+    fn tree_hash_of(&self, hash: &str) -> Result<String, String> {
+        if let Some(tree_hash) = self.tree_hashes.borrow().get(hash) {
+            return Ok(tree_hash.clone());
+        }
+        let tree_hash = object_utils::load_parcel(hash)?.tree_hash;
+        self.remember_tree_hash(hash, &tree_hash);
+        Ok(tree_hash)
+    }
 }
 
 /// The query inputs. Seeds and `from` are already-resolved parcel hashes (revision
@@ -217,6 +366,37 @@ pub enum Leaf {
 
     /// `parcel`: the parcel hash, prefix-matched.
     ParcelPrefix { prefixes: Vec<String> },
+
+    /// `provenance.model` / `provenance.tool` / `provenance.session`: machine-authorship
+    /// evidence from the `@manifest` meta pallet (§9.4c A5 — opt-in evidence, so absence is
+    /// `Unknown`, never a negation match).
+    Provenance { field: ProvenanceField, test: ProvenanceTest },
+
+    /// `tag`: whether the parcel carries one of the named signed tags (from `@tags`) —
+    /// membership, not evidence, so a parcel with no matching tag reads `False` (only the
+    /// whole pallet being unreadable reads `Unknown`).
+    Tag { values: Vec<String> },
+
+    /// `path` / `touches`: whether the parcel's tree differs from its first parent's at a
+    /// warehouse path (§9.4c Finding 3 — degrades to `Unknown` on a sparse warehouse whose
+    /// fetch scope provably never covered the path).
+    Touches { path: String },
+}
+
+/// Which field of a provenance entry a `provenance.*` leaf reads.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ProvenanceField {
+    Model,
+    Tool,
+    Session,
+}
+
+/// The comparison a `provenance.*` leaf runs — the same eq/ne/in-vs-glob split every other
+/// string field in this engine offers, just named so `evaluate_leaf` can share one field
+/// accessor between the two forms.
+pub enum ProvenanceTest {
+    Membership { negate: bool, values: Vec<String> },
+    Matches { glob: String },
 }
 
 impl Leaf {
@@ -575,10 +755,66 @@ fn parse_leaf(object: &serde_json::Map<String, Value>) -> Result<Leaf, String> {
             Ok(Leaf::ParcelPrefix { prefixes: string_values(values, field)? })
         }
 
+        "provenance.model" | "provenance.tool" | "provenance.session" => {
+            let provenance_field = match field {
+                "provenance.model" => ProvenanceField::Model,
+                "provenance.tool" => ProvenanceField::Tool,
+                _ => ProvenanceField::Session,
+            };
+
+            if op == "matches" {
+                let glob = object
+                    .get("value")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| invalid(format!("\"{}\" matches against a string.", field)))?;
+                if glob.chars().count() > MAX_GLOB_CHARS {
+                    return Err(invalid(format!(
+                        "The \"matches\" pattern is longer than the maximum of {} characters.",
+                        MAX_GLOB_CHARS
+                    )));
+                }
+                return Ok(Leaf::Provenance {
+                    field: provenance_field,
+                    test: ProvenanceTest::Matches { glob: glob.to_string() },
+                });
+            }
+
+            let (negate, values) = membership_values(object, op, field)?;
+            Ok(Leaf::Provenance {
+                field: provenance_field,
+                test: ProvenanceTest::Membership { negate, values: string_values(values, field)? },
+            })
+        }
+
+        "tag" => {
+            let (negate, values) = membership_values(object, op, field)?;
+            if negate {
+                return Err(invalid("\"tag\" supports \"eq\" and \"in\" only.".to_string()));
+            }
+            Ok(Leaf::Tag { values: string_values(values, field)? })
+        }
+
+        "path" => {
+            if op != "touches" {
+                return Err(invalid("\"path\" supports the \"touches\" operator only.".to_string()));
+            }
+            let raw = object
+                .get("value")
+                .and_then(Value::as_str)
+                .ok_or_else(|| invalid("\"path\" touches a warehouse-relative path string.".to_string()))?;
+            // The same normalization every other path-taking command uses, so `--touches foo`
+            // and `--touches ./foo/` (and the equivalent `--where` leaf) agree on one key —
+            // both the CLI flag and a raw `--where` payload route through this same parser.
+            let normalized = WarehousePath::from_user_input(raw)
+                .map_err(|error| invalid(format!("\"path\" is not a valid warehouse path: {}", error)))?;
+            Ok(Leaf::Touches { path: normalized.as_key().to_string() })
+        }
+
         other => Err(invalid(format!(
             "Unknown query field \"{}\". Fields: author.operator, author.date, author.class, \
              author.supervisor, author.role, stacker.operator, stacker.date, signer.key, \
-             signer.operator, description, is_merge, parents.count, parcel.",
+             signer.operator, description, is_merge, parents.count, parcel, provenance.model, \
+             provenance.tool, provenance.session, tag, path.",
             other
         ))),
     }
@@ -676,18 +912,38 @@ enum IdentityFacts<'a> {
 }
 
 /// Evaluate the predicate for one parcel. `identity` supplies the identity facts at the
-/// caller's chosen trust; parcel-local leaves read the parcel directly.
-fn evaluate(predicate: &Predicate, hash: &str, parcel: &Parcel, identity: &IdentityFacts) -> Truth {
-    match predicate {
-        Predicate::All(children) => children
-            .iter()
-            .fold(Truth::True, |acc, child| acc.and(evaluate(child, hash, parcel, identity))),
-        Predicate::Any(children) => children
-            .iter()
-            .fold(Truth::False, |acc, child| acc.or(evaluate(child, hash, parcel, identity))),
-        Predicate::Not(child) => evaluate(child, hash, parcel, identity).not(),
-        Predicate::Leaf(leaf) => evaluate_leaf(leaf, hash, parcel, identity),
-    }
+/// caller's chosen trust; parcel-local leaves read the parcel directly; `ctx` supplies the
+/// Stage 2 ephemeral indexes and the sparse-degrade scope for `touches`.
+///
+/// Fallible only because `touches` may need to read a tree: every other leaf is a pure
+/// lookup. A read failure here is a hard error for the whole query — same as a missing
+/// parcel body elsewhere in this walk — unless [`evaluate_touches`] itself has already
+/// classified it as an honest sparse degrade.
+fn evaluate(
+    predicate: &Predicate,
+    hash: &str,
+    parcel: &Parcel,
+    identity: &IdentityFacts,
+    ctx: &QueryContext,
+) -> Result<Truth, String> {
+    Ok(match predicate {
+        Predicate::All(children) => {
+            let mut acc = Truth::True;
+            for child in children {
+                acc = acc.and(evaluate(child, hash, parcel, identity, ctx)?);
+            }
+            acc
+        }
+        Predicate::Any(children) => {
+            let mut acc = Truth::False;
+            for child in children {
+                acc = acc.or(evaluate(child, hash, parcel, identity, ctx)?);
+            }
+            acc
+        }
+        Predicate::Not(child) => evaluate(child, hash, parcel, identity, ctx)?.not(),
+        Predicate::Leaf(leaf) => evaluate_leaf(leaf, hash, parcel, identity, ctx)?,
+    })
 }
 
 /// Actions of one kind, as (operator, timestamp) pairs.
@@ -701,20 +957,26 @@ fn actions_of(parcel: &Parcel, kind: ActionKind) -> impl Iterator<Item = (&str, 
     })
 }
 
-fn evaluate_leaf(leaf: &Leaf, hash: &str, parcel: &Parcel, identity: &IdentityFacts) -> Truth {
+fn evaluate_leaf(
+    leaf: &Leaf,
+    hash: &str,
+    parcel: &Parcel,
+    identity: &IdentityFacts,
+    ctx: &QueryContext,
+) -> Result<Truth, String> {
     // Identity leaves resolve against the identity facts; everything else is parcel-local.
     if leaf.is_identity() {
         let (operator, class, supervisor, role, signer_key) = match identity {
-            IdentityFacts::Unresolved => return Truth::Unknown,
+            IdentityFacts::Unresolved => return Ok(Truth::Unknown),
             // No forge-proof identity exists: an identity test neither matches nor
             // negation-matches — three-valued honesty, not silent exclusion or inclusion.
-            IdentityFacts::Unknowable => return Truth::Unknown,
+            IdentityFacts::Unknowable => return Ok(Truth::Unknown),
             IdentityFacts::Resolved { operator, class, supervisor, role, signer_key } => {
                 (*operator, *class, *supervisor, *role, *signer_key)
             }
         };
 
-        return match leaf {
+        return Ok(match leaf {
             Leaf::Class { negate, values } => match class {
                 Some(class) => Truth::of(values.contains(&class) != *negate),
                 // Resolved to an operator the office does not enroll: the class is
@@ -737,10 +999,14 @@ fn evaluate_leaf(leaf: &Leaf, hash: &str, parcel: &Parcel, identity: &IdentityFa
                 Truth::of(values.iter().any(|value| value == operator) != *negate)
             }
             _ => unreachable!("is_identity() covers exactly the identity leaves"),
-        };
+        });
     }
 
-    match leaf {
+    if let Leaf::Touches { path } = leaf {
+        return evaluate_touches(parcel, path, ctx);
+    }
+
+    Ok(match leaf {
         Leaf::RecordedOperator { kind, negate, values } => {
             let any = actions_of(parcel, *kind).any(|(operator, _)| {
                 values.iter().any(|value| value == operator)
@@ -774,8 +1040,125 @@ fn evaluate_leaf(leaf: &Leaf, hash: &str, parcel: &Parcel, identity: &IdentityFa
             Truth::of(prefixes.iter().any(|prefix| hash.starts_with(prefix)))
         }
 
-        _ => unreachable!("identity leaves are handled above"),
+        // A5: provenance is opt-in evidence. No `@manifest` head at all, or no entry for
+        // this subject, both read `Unknown` — never `False` — so `not: {provenance.* …}`
+        // can never quietly sweep up a parcel that carries no provenance whatsoever.
+        Leaf::Provenance { field, test } => match ctx.provenance.as_ref().and_then(|index| index.get(hash)) {
+            None => Truth::Unknown,
+            Some(records) => match test {
+                // The aggregate-then-negate convention every other membership leaf in this
+                // file uses: `ne` reads "no entry equals this", not "some entry doesn't" —
+                // the same shape as `SignerOperator`/`RecordedOperator`.
+                ProvenanceTest::Membership { negate, values } => {
+                    let any = records.iter()
+                        .any(|record| values.iter().any(|v| v == provenance_field_value(*field, record)));
+                    Truth::of(any != *negate)
+                }
+                ProvenanceTest::Matches { glob } => Truth::of(
+                    records.iter().any(|record| glob_match(glob, provenance_field_value(*field, record))),
+                ),
+            },
+        },
+
+        // Membership, not evidence: an untagged parcel plainly does not carry the tag
+        // (`False`); only the whole `@tags` pallet being unreadable is `Unknown`.
+        Leaf::Tag { values } => match &ctx.tags {
+            None => Truth::Unknown,
+            Some(index) => {
+                let tags = index.get(hash).map(Vec::as_slice).unwrap_or(&[]);
+                Truth::of(values.iter().any(|value| tags.contains(value)))
+            }
+        },
+
+        // `Touches` is handled above (it may need to read a tree, hence the early return);
+        // it can never reach this match.
+        _ => unreachable!("identity leaves are handled above; touches is handled before this match"),
+    })
+}
+
+/// The string a `provenance.*` leaf compares, for one entry.
+fn provenance_field_value(field: ProvenanceField, record: &ProvenanceRecord) -> &str {
+    match field {
+        ProvenanceField::Model => &record.model,
+        ProvenanceField::Tool => record.tool.as_deref().unwrap_or(""),
+        ProvenanceField::Session => record.session.as_deref().unwrap_or(""),
     }
+}
+
+/// `path` / `touches`: whether the parcel's tree differs from its **first parent's** at
+/// `path` — the exact diff `blame` already does for its per-line attribution, so a merge
+/// parcel is judged by the same rule blame documents as its "honest limit of a first-parent
+/// walk": whichever parcel's *own* tree actually differs from what its first parent already
+/// had gets the credit. A merge that pulls in a change its first parent altogether lacked
+/// reads as touching the path too (same as blame attributing those lines to the merge, not
+/// the side branch) — but a merge whose result at the path happens to coincide with what its
+/// first parent already had (both sides added the identical content, or the resolution kept
+/// the first-parent side) reads as untouched there, even though the other branch touched it
+/// on its own line. In short: `touches` never looks past a parcel's first parent, so credit
+/// always lands on whichever step actually changed the tree relative to it, not on "did the
+/// change enter history somewhere upstream."
+///
+/// This does **not** gate on the commit-graph's changed-path Bloom filter the way `blame`
+/// does, despite the filter looking like a free win here too. `graph_utils::path_maybe_changed`
+/// only ever records *leaf file* paths (`compute_filter`'s tree diff inserts a changed file's
+/// full path, never any of its ancestor directories) — exactly enough for `blame`, which only
+/// ever probes a single file path. A `touches` predicate's path is routinely a directory
+/// prefix (`--touches src`), and probing the filter for the literal string `"src"` would almost
+/// always read `false` even when a file changed underneath it — a false negative the "no false
+/// negatives" guarantee this predicate depends on cannot absorb. So every candidate gets the
+/// real confirming diff below; the Bloom filter stays exactly what `blame` needs, unmodified
+/// (extending it to also index ancestor prefixes would fix this cheaply, but would also need a
+/// migration for whatever a warehouse already has computed and stored on disk — a bigger change
+/// than this predicate warrants).
+fn evaluate_touches(parcel: &Parcel, path: &str, ctx: &QueryContext) -> Result<Truth, String> {
+    match confirm_touched(parcel, path, ctx) {
+        Ok(changed) => Ok(Truth::of(changed)),
+        Err(error) => {
+            // Finding 3: the confirming diff needs a tree a sparse warehouse never fetched.
+            // Definitive only when the path is provably outside the fetch scope — a tree
+            // missing that the scope says *should* be present is tampering, not sparseness,
+            // and stays a hard error exactly like any other object read in this walk.
+            if ctx.fetch_scope.classify(path) == ScopeClass::OutOfScope {
+                ctx.out_of_scope.set(ctx.out_of_scope.get() + 1);
+                Ok(Truth::Unknown)
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+/// The confirming diff `touches` needs once the Bloom filter says "maybe": resolve `path` in
+/// the parcel's tree and in its first parent's (a root parcel's "first parent" is the absent
+/// empty tree — every path reads as not-present there), and compare entry hashes. Any
+/// difference, including one side having no entry at all, is a change.
+///
+/// The first parent's tree hash comes from `ctx`'s memo, not a fresh `load_parcel`: the walk
+/// in `run_query` already loads (and decodes) every parent's full body once, to enqueue it,
+/// and parcels deliberately bypass the shared read cache — a second uncached load per
+/// evaluation would double that cost across nearly every walked parcel. The memo only misses
+/// on a parent the walk never itself visited (already dropped from a previous page's
+/// frontier, or a seed).
+fn confirm_touched(parcel: &Parcel, path: &str, ctx: &QueryContext) -> Result<bool, String> {
+    let new_hash = resolve_entry_hash(&parcel.tree_hash, path)?;
+    let old_hash = match parcel.parents.first() {
+        Some(parent) => resolve_entry_hash(&ctx.tree_hash_of(parent)?, path)?,
+        None => None,
+    };
+
+    Ok(new_hash != old_hash)
+}
+
+/// Resolve a warehouse path to whatever sits there — file or directory — as its entry hash,
+/// or `None` when nothing does. A directory's tree hash already encodes everything beneath
+/// it, so comparing that one hash is the same "identical subtree, nothing changed under it"
+/// shortcut the commit-graph's own Bloom-filter builder (`graph_utils::compute_filter`) relies
+/// on internally.
+fn resolve_entry_hash(tree_hash: &str, path: &str) -> Result<Option<String>, String> {
+    if let Some((hash, _)) = object_utils::resolve_tree_file(tree_hash, path)? {
+        return Ok(Some(hash));
+    }
+    tree_utils::resolve_subtree_hash(tree_hash, path)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -878,6 +1261,11 @@ pub fn run_query(
         ));
     }
 
+    // The Stage 2 ephemeral indexes (provenance, tags, fetch scope) are built once, always —
+    // even when the predicate never reads them — because they enrich every reported match's
+    // report row (`provenance`/`tags`), not only the parcels a predicate actually filters on.
+    let ctx = QueryContext::build()?;
+
     let mut heap: BinaryHeap<(i64, String)> = BinaryHeap::new();
     let mut loaded: HashMap<String, Parcel> = HashMap::new();
     let mut enqueued: HashSet<String> = HashSet::new();
@@ -886,6 +1274,7 @@ pub fn run_query(
         if enqueued.insert(seed.clone()) {
             let parcel = object_utils::load_parcel(seed)?;
             heap.push((latest_action_timestamp(&parcel), seed.clone()));
+            ctx.remember_tree_hash(seed, &parcel.tree_hash);
             loaded.insert(seed.clone(), parcel);
         }
     }
@@ -912,6 +1301,8 @@ pub fn run_query(
                 next: (!frontier.is_empty()).then(|| frontier.join(",")),
                 walked,
                 matched,
+                out_of_scope: ctx.out_of_scope.get(),
+                provenance_present: ctx.provenance.is_some(),
             });
         }};
     }
@@ -930,6 +1321,19 @@ pub fn run_query(
 
         walked += 1;
 
+        // Parents enqueue before any limit stop (so the frontier cursor stays complete) and
+        // — moved ahead of `evaluate` below — before phase 1 runs, too: `touches` needs the
+        // first parent's tree hash, and loading (and memoizing) it here means `confirm_touched`
+        // finds it already in `ctx`'s memo instead of paying for a second uncached parcel load.
+        for parent in &parcel.parents {
+            if enqueued.insert(parent.clone()) {
+                let parent_parcel = object_utils::load_parcel(parent)?;
+                heap.push((latest_action_timestamp(&parent_parcel), parent.clone()));
+                ctx.remember_tree_hash(parent, &parent_parcel.tree_hash);
+                loaded.insert(parent.clone(), parent_parcel);
+            }
+        }
+
         // Phase 1: prune on what needs no identity. An identity leaf reads Unknown (or, under
         // recorded trust, the recorded facts — pruning early there is the mode's stated point).
         let recorded_resolution =
@@ -938,16 +1342,7 @@ pub fn run_query(
             Some(resolution) => identity_facts(resolution),
             None => IdentityFacts::Unresolved,
         };
-        let phase1 = evaluate(&params.predicate, &hash, &parcel, &phase1_facts);
-
-        // Parents enqueue before any limit stop, so the frontier cursor stays complete.
-        for parent in &parcel.parents {
-            if enqueued.insert(parent.clone()) {
-                let parent_parcel = object_utils::load_parcel(parent)?;
-                heap.push((latest_action_timestamp(&parent_parcel), parent.clone()));
-                loaded.insert(parent.clone(), parent_parcel);
-            }
-        }
+        let phase1 = evaluate(&params.predicate, &hash, &parcel, &phase1_facts, &ctx)?;
 
         if phase1 == Truth::False {
             continue;
@@ -963,8 +1358,14 @@ pub fn run_query(
             }
             let resolution = recorded_resolution.expect("recorded resolution built above");
             matched += 1;
-            if !on_match(QueryMatch { hash, parcel, identity: resolution }) {
-                return Ok(QueryOutcome { next: None, walked, matched });
+            let provenance = ctx.newest_provenance(&hash).cloned();
+            let tags = ctx.tags_of(&hash).to_vec();
+            if !on_match(QueryMatch { hash, parcel, identity: resolution, provenance, tags }) {
+                return Ok(QueryOutcome {
+                    next: None, walked, matched,
+                    out_of_scope: ctx.out_of_scope.get(),
+                    provenance_present: ctx.provenance.is_some(),
+                });
             }
             if params.limit.is_some_and(|limit| matched >= limit) {
                 outcome_at_limit!(Vec::new());
@@ -973,13 +1374,26 @@ pub fn run_query(
         }
 
         if !identity_filtering {
-            // Verified trust, but no identity predicate: the match is decided; the identity
-            // is resolved only for the parcels actually reported (bounded by the limit).
-            debug_assert!(phase1 == Truth::True, "no identity leaves, so phase 1 is definite");
+            // Verified trust, but no identity predicate: previously this meant phase 1 alone
+            // was always definite (`Description`/`IsMerge`/… never produce `Unknown`). Stage
+            // 2's non-identity leaves break that: a provenance/tag leaf with no evidence for
+            // this parcel, or a `touches` leaf whose confirming diff fell outside a sparse
+            // fetch scope, can read `Unknown` here too. `Unknown` never matches — the same
+            // "excluded, not guessed" rule identity leaves already followed under recorded
+            // trust, applied uniformly rather than assumed away.
+            if phase1 != Truth::True {
+                continue;
+            }
             let resolution = resolve_verified(&hash, office)?;
             matched += 1;
-            if !on_match(QueryMatch { hash, parcel, identity: resolution }) {
-                return Ok(QueryOutcome { next: None, walked, matched });
+            let provenance = ctx.newest_provenance(&hash).cloned();
+            let tags = ctx.tags_of(&hash).to_vec();
+            if !on_match(QueryMatch { hash, parcel, identity: resolution, provenance, tags }) {
+                return Ok(QueryOutcome {
+                    next: None, walked, matched,
+                    out_of_scope: ctx.out_of_scope.get(),
+                    provenance_present: ctx.provenance.is_some(),
+                });
             }
             if params.limit.is_some_and(|limit| matched >= limit) {
                 outcome_at_limit!(Vec::new());
@@ -998,13 +1412,19 @@ pub fn run_query(
 
             while let Some(((hash, parcel), resolution)) = remaining.next() {
                 let verdict =
-                    evaluate(&params.predicate, &hash, &parcel, &identity_facts(&resolution));
+                    evaluate(&params.predicate, &hash, &parcel, &identity_facts(&resolution), &ctx)?;
                 if verdict != Truth::True {
                     continue;
                 }
                 matched += 1;
-                if !on_match(QueryMatch { hash, parcel, identity: resolution }) {
-                    return Ok(QueryOutcome { next: None, walked, matched });
+                let provenance = ctx.newest_provenance(&hash).cloned();
+                let tags = ctx.tags_of(&hash).to_vec();
+                if !on_match(QueryMatch { hash, parcel, identity: resolution, provenance, tags }) {
+                    return Ok(QueryOutcome {
+                        next: None, walked, matched,
+                        out_of_scope: ctx.out_of_scope.get(),
+                        provenance_present: ctx.provenance.is_some(),
+                    });
                 }
                 if params.limit.is_some_and(|limit| matched >= limit) {
                     // Batch members after this one are popped but undecided: they resume
@@ -1022,13 +1442,19 @@ pub fn run_query(
     let mut remaining = survivors.into_iter().zip(resolutions);
 
     while let Some(((hash, parcel), resolution)) = remaining.next() {
-        let verdict = evaluate(&params.predicate, &hash, &parcel, &identity_facts(&resolution));
+        let verdict = evaluate(&params.predicate, &hash, &parcel, &identity_facts(&resolution), &ctx)?;
         if verdict != Truth::True {
             continue;
         }
         matched += 1;
-        if !on_match(QueryMatch { hash, parcel, identity: resolution }) {
-            return Ok(QueryOutcome { next: None, walked, matched });
+        let provenance = ctx.newest_provenance(&hash).cloned();
+        let tags = ctx.tags_of(&hash).to_vec();
+        if !on_match(QueryMatch { hash, parcel, identity: resolution, provenance, tags }) {
+            return Ok(QueryOutcome {
+                next: None, walked, matched,
+                out_of_scope: ctx.out_of_scope.get(),
+                provenance_present: ctx.provenance.is_some(),
+            });
         }
         if params.limit.is_some_and(|limit| matched >= limit) {
             let leftover: Vec<String> = remaining.map(|((hash, _), _)| hash).collect();
@@ -1036,7 +1462,11 @@ pub fn run_query(
         }
     }
 
-    Ok(QueryOutcome { next: None, walked, matched })
+    Ok(QueryOutcome {
+        next: None, walked, matched,
+        out_of_scope: ctx.out_of_scope.get(),
+        provenance_present: ctx.provenance.is_some(),
+    })
 }
 
 /// Resolve a batch of survivors' verified identities, fanning out across the cores once the
@@ -1118,7 +1548,10 @@ mod tests {
     #[test]
     fn unknown_fields_ops_and_bad_json_refuse_with_the_predicate_code() {
         for payload in [
-            "{\"field\": \"provenance.model\", \"op\": \"eq\", \"value\": \"x\"}",
+            // `provenance.model` was this probe's unknown-field case before Stage 2 made it
+            // a real field; `bogus.field` keeps testing the same thing (an unrecognized
+            // field name refuses).
+            "{\"field\": \"bogus.field\", \"op\": \"eq\", \"value\": \"x\"}",
             "{\"field\": \"is_merge\", \"op\": \"matches\", \"value\": \"x\"}",
             "not json at all",
             "{\"all\": [], \"any\": []}",
@@ -1151,14 +1584,24 @@ mod tests {
             description: None,
         };
 
+        // A context with no provenance/tags evidence and a full fetch scope — this test is
+        // only exercising the identity Kleene logic, not Stage 2's indexes.
+        let ctx = QueryContext {
+            provenance: None,
+            tags: None,
+            fetch_scope: MaterializationScope::full(),
+            out_of_scope: Cell::new(0),
+            tree_hashes: RefCell::new(HashMap::new()),
+        };
+
         // Unresolved identity: not(Unknown) stays Unknown — the parcel survives to phase 2
         // rather than being pruned on a value nobody verified.
-        let verdict = evaluate(&predicate, "abc", &parcel, &IdentityFacts::Unresolved);
+        let verdict = evaluate(&predicate, "abc", &parcel, &IdentityFacts::Unresolved, &ctx).unwrap();
         assert!(verdict == Truth::Unknown);
 
         // An unsigned parcel resolves to Unknowable: still Unknown, so an identity query
         // neither matches nor negation-matches it.
-        let verdict = evaluate(&predicate, "abc", &parcel, &IdentityFacts::Unknowable);
+        let verdict = evaluate(&predicate, "abc", &parcel, &IdentityFacts::Unknowable, &ctx).unwrap();
         assert!(verdict == Truth::Unknown);
     }
 }

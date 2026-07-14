@@ -172,6 +172,38 @@ fn matches_of(report: &serde_json::Value) -> Vec<(String, String, Option<String>
         .collect()
 }
 
+/// The set of parcel hashes a query reported (Stage 2 tests only care about membership).
+fn matched_hashes(report: &serde_json::Value) -> std::collections::HashSet<String> {
+    report["data"]["matches"]
+        .as_array()
+        .expect("matches is an array")
+        .iter()
+        .map(|entry| entry["parcel"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// The one match entry for a given parcel hash (panics if it is not there).
+fn entry_for<'a>(report: &'a serde_json::Value, hash: &str) -> &'a serde_json::Value {
+    report["data"]["matches"]
+        .as_array()
+        .expect("matches is an array")
+        .iter()
+        .find(|entry| entry["parcel"].as_str() == Some(hash))
+        .unwrap_or_else(|| panic!("no match for {} in {}", hash, report))
+}
+
+/// Extract the hash `consolidate` names after "stacked merge parcel " in its human output.
+fn extract_merge_hash(output: &Output) -> String {
+    let text = stdout(output);
+    let marker = "stacked merge parcel ";
+    let start = text.find(marker).unwrap_or_else(|| panic!("no merge parcel named in: {}", text));
+    text[start + marker.len()..]
+        .split(|c: char| c == '.' || c.is_whitespace())
+        .next()
+        .unwrap()
+        .to_string()
+}
+
 #[test]
 fn verified_query_filters_on_the_signer_never_the_recorded_author() {
     let warehouse = signed_warehouse_with_agent("query-two-phase");
@@ -303,7 +335,9 @@ fn predicate_bounds_and_malformed_predicates_refuse_with_exit_18() {
         in_bomb.as_str(),
         glob_bomb.as_str(),
         "not json",
-        "{\"field\":\"provenance.model\",\"op\":\"eq\",\"value\":\"x\"}",
+        // `provenance.model` is a real field now (Stage 2); `bogus.field` is the unknown-field
+        // probe instead.
+        "{\"field\":\"bogus.field\",\"op\":\"eq\",\"value\":\"x\"}",
         "{\"field\":\"is_merge\",\"op\":\"matches\",\"value\":\"x\"}",
     ] {
         let output = warehouse.run(&["--json", "query", "--where", payload]);
@@ -415,4 +449,202 @@ fn an_empty_pallet_answers_honestly_empty() {
     assert_eq!(report["ok"], true);
     assert_eq!(report["data"]["matches"].as_array().unwrap().len(), 0);
     assert_eq!(report["data"]["scope"]["walked"], 0);
+}
+
+// -------------------------------------------------------------------------------------------
+// Stage 2: provenance, tags, and touched-path predicates.
+// -------------------------------------------------------------------------------------------
+
+#[test]
+fn provenance_matches_and_absence_is_not_negation() {
+    let warehouse = TestWarehouse::new("query-provenance");
+    warehouse.write_file("a.txt", "one\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    let base = extract_parcel_hash(&warehouse.run(&["stack", "base parcel"]));
+    assert_success(&warehouse.run(&["office", "enroll"])); // test@forklift gets a signing key
+
+    // A parcel with no provenance recorded at all.
+    warehouse.write_file("bare.txt", "no provenance\n");
+    assert_success(&warehouse.run(&["load", "bare.txt"]));
+    let bare = extract_parcel_hash(&warehouse.run(&["stack", "bare work"]));
+
+    // A parcel attributed to claude-opus-4-8 via claude-code.
+    warehouse.write_file("attributed.txt", "generated\n");
+    assert_success(&warehouse.run(&["load", "attributed.txt"]));
+    let attributed = extract_parcel_hash(&warehouse.run(&["stack", "attributed work"]));
+    assert_success(&warehouse.run(&[
+        "manifest", "provenance", &attributed,
+        "--model", "claude-opus-4-8", "--tool", "claude-code", "--session", "sess-1",
+        "-m", "generated the module",
+    ]));
+
+    // A parcel attributed to a different model, to pin the negation-match direction.
+    warehouse.write_file("other.txt", "different model\n");
+    assert_success(&warehouse.run(&["load", "other.txt"]));
+    let other_model = extract_parcel_hash(&warehouse.run(&["stack", "other model work"]));
+    assert_success(&warehouse.run(&[
+        "manifest", "provenance", &other_model, "--model", "gpt-5", "-m", "not claude",
+    ]));
+
+    // --model matches exactly the attributed parcel.
+    let matched = json(&warehouse.run(&["--json", "query", "--model", "claude-*"]));
+    assert_eq!(matched_hashes(&matched), std::collections::HashSet::from([attributed.clone()]));
+
+    // Report enrichment: the matching entry carries the model/tool, and the scope says the
+    // pallet was present (not absent).
+    let entry = entry_for(&matched, &attributed);
+    assert_eq!(entry["provenance"]["model"], "claude-opus-4-8");
+    assert_eq!(entry["provenance"]["tool"], "claude-code");
+    assert_eq!(matched["data"]["scope"]["provenance_source"], "present");
+
+    // A5: absence is not a claim to negate. `not: {provenance.model matches claude-*}` must
+    // not sweep up the parcels with no provenance at all (base, bare) — only the parcel with
+    // a genuinely different recorded model.
+    let negated = json(&warehouse.run(&[
+        "--json", "query", "--where",
+        r#"{"not":{"field":"provenance.model","op":"matches","value":"claude-*"}}"#,
+    ]));
+    let negated_hashes = matched_hashes(&negated);
+    assert!(!negated_hashes.contains(&base), "a parcel with no provenance must not match: {:?}", negated_hashes);
+    assert!(!negated_hashes.contains(&bare), "a parcel with no provenance must not match: {:?}", negated_hashes);
+    assert!(!negated_hashes.contains(&attributed), "the claude-attributed parcel must not match its own negation");
+    assert!(negated_hashes.contains(&other_model), "a parcel with a different recorded model must match: {:?}", negated_hashes);
+}
+
+#[test]
+fn a_query_on_a_warehouse_with_no_manifest_reports_the_absence_honestly() {
+    let warehouse = TestWarehouse::new("query-provenance-absent");
+    warehouse.write_file("a.txt", "one\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base parcel"]));
+
+    // No `@manifest` was ever created: a --model query is an honest empty answer, not an
+    // error, and the scope block says exactly why (absent, not "we looked and found none").
+    let report = json(&warehouse.run(&["--json", "query", "--model", "claude-*"]));
+    assert_eq!(report["ok"], true);
+    assert_eq!(report["data"]["matches"].as_array().unwrap().len(), 0);
+    assert_eq!(report["data"]["scope"]["provenance_source"], "meta_pallet_absent");
+}
+
+#[test]
+fn tags_are_membership_and_an_absent_pallet_is_unknown_not_false() {
+    let warehouse = TestWarehouse::new("query-tags");
+    warehouse.write_file("a.txt", "one\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    let untagged = extract_parcel_hash(&warehouse.run(&["stack", "base parcel"]));
+    assert_success(&warehouse.run(&["office", "enroll"])); // test@forklift becomes admin
+
+    warehouse.write_file("b.txt", "two\n");
+    assert_success(&warehouse.run(&["load", "b.txt"]));
+    let tagged = extract_parcel_hash(&warehouse.run(&["stack", "release work"]));
+    assert_success(&warehouse.run(&["tag", "create", "v1", &tagged, "-m", "release"]));
+
+    // --tag matches exactly the tagged parcel.
+    let matched = json(&warehouse.run(&["--json", "query", "--tag", "v1"]));
+    assert_eq!(matched_hashes(&matched), std::collections::HashSet::from([tagged.clone()]));
+    let entry = entry_for(&matched, &tagged);
+    assert_eq!(entry["tags"], serde_json::json!(["v1"]));
+
+    // Membership, not evidence: since `@tags` exists, an untagged parcel plainly does not
+    // carry "v1" — `not: {tag eq v1}` matches it (False, not Unknown).
+    let negated = json(&warehouse.run(&[
+        "--json", "query", "--where", r#"{"not":{"field":"tag","op":"eq","value":"v1"}}"#,
+    ]));
+    let negated_hashes = matched_hashes(&negated);
+    assert!(negated_hashes.contains(&untagged), "an untagged parcel matches not(tag eq v1): {:?}", negated_hashes);
+    assert!(!negated_hashes.contains(&tagged), "the tagged parcel must not match its own negation");
+}
+
+#[test]
+fn touches_matches_the_changed_path_and_respects_first_parent_only() {
+    let warehouse = TestWarehouse::new("query-touches");
+    warehouse.write_file("root.txt", "base\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    let base = extract_parcel_hash(&warehouse.run(&["stack", "base parcel"]));
+
+    // A parcel touching src/, and one touching a different path.
+    warehouse.write_file("src/a.rs", "fn a() {}\n");
+    assert_success(&warehouse.run(&["load", "src/a.rs"]));
+    let src_touch = extract_parcel_hash(&warehouse.run(&["stack", "add src"]));
+
+    warehouse.write_file("docs/readme.md", "hi\n");
+    assert_success(&warehouse.run(&["load", "docs/readme.md"]));
+    let docs_touch = extract_parcel_hash(&warehouse.run(&["stack", "add docs"]));
+
+    let matched = json(&warehouse.run(&["--json", "query", "--touches", "src"]));
+    let hashes = matched_hashes(&matched);
+    assert!(hashes.contains(&src_touch), "the src-touching parcel must match: {:?}", hashes);
+    assert!(!hashes.contains(&docs_touch), "a docs-touching parcel must not match: {:?}", hashes);
+    assert!(!hashes.contains(&base), "the base parcel (no src/ yet) must not match: {:?}", hashes);
+
+    // First-parent limit: `touches` never looks past a parcel's first parent, so credit for
+    // a change lands on whichever step actually altered the tree relative to *its own* first
+    // parent — not on "did this change enter history somewhere upstream". A side pallet and
+    // main independently add the identical file under feature/ (so the merge is clean, no
+    // conflict); the merge's own result there exactly matches what its first parent (main's
+    // own prior head) already had, so the merge reads as untouched even though its *other*
+    // parent (side) plainly did touch the path. This is the same "honest limit of a
+    // first-parent walk" `blame` documents for merge-absorbed lines.
+    assert_success(&warehouse.run(&["palletize", "side"]));
+    warehouse.write_file("feature/new.txt", "shared content\n");
+    assert_success(&warehouse.run(&["load", "feature/new.txt"]));
+    let side_parcel = extract_parcel_hash(&warehouse.run(&["stack", "side change"]));
+
+    // main independently adds the exact same file+content, so consolidate resolves cleanly
+    // (no conflict) and the merge's tree at feature/ is identical to main's own.
+    assert_success(&warehouse.run(&["shift", "main"]));
+    warehouse.write_file("feature/new.txt", "shared content\n");
+    assert_success(&warehouse.run(&["load", "feature/new.txt"]));
+    let main_work = extract_parcel_hash(&warehouse.run(&["stack", "main also adds feature"]));
+
+    let merge_output = warehouse.run(&["consolidate", "side"]);
+    assert_success(&merge_output);
+    let merge_parcel = extract_merge_hash(&merge_output);
+
+    let feature_matched = json(&warehouse.run(&["--json", "query", "main", "--touches", "feature"]));
+    let feature_hashes = matched_hashes(&feature_matched);
+    assert!(
+        feature_hashes.contains(&side_parcel),
+        "the side-line parcel that introduced the change must match: {:?}", feature_hashes
+    );
+    assert!(
+        feature_hashes.contains(&main_work),
+        "main's own parcel that introduced the (identical) change must match too: {:?}", feature_hashes
+    );
+    assert!(
+        !feature_hashes.contains(&merge_parcel),
+        "the merge parcel's own result at the path matches its first parent, so it must not \
+         match, even though its other parent touched the path: {:?}", feature_hashes
+    );
+}
+
+#[test]
+fn new_predicate_fields_refuse_bad_ops_and_over_long_globs_with_exit_18() {
+    let warehouse = TestWarehouse::new("query-stage2-bounds");
+    warehouse.write_file("a.txt", "one\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base parcel"]));
+
+    let long_model = "x".repeat(257);
+    for args in [
+        vec!["--json", "query", "--where", r#"{"field":"tag","op":"matches","value":"v1"}"#],
+        vec!["--json", "query", "--where", r#"{"field":"path","op":"eq","value":"src"}"#],
+        vec!["--json", "query", "--model", long_model.as_str()],
+    ] {
+        let output = warehouse.run(&args);
+        assert_eq!(output.status.code(), Some(18), "must refuse with exit 18: {:?}", args);
+        let error = json(&output);
+        assert_eq!(error["ok"], false);
+        assert_eq!(error["error"]["code"], "query_predicate_invalid");
+    }
 }

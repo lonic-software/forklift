@@ -88,22 +88,51 @@ both commands stamp theirs so a consumer can never mistake one for the other.
 ### `query --json`
 
 `query` filters parcel history on its signed dimensions — identity class, supervisor,
-role, signing key — plus parcel-local facts (dates, description glob, merge-ness,
-parent count, hash prefix). Identity answers are **verified by default**: the walk
-prunes only on non-identity predicates, then resolves the *verified* signer (a real
-signature check plus the key's active/revoked status) for every survivor and filters on
-that — the parcel's own recorded operator never decides what gets verified.
-`--recorded` opts into the cheap, self-declared reading; every answer is then labeled.
+role, signing key, recorded machine-authorship provenance (`provenance.model`,
+`provenance.tool`, `provenance.session`), signed tags (`tag`) — plus parcel-local
+facts (dates, description glob, merge-ness, parent count, hash prefix, touched paths).
+Identity answers are **verified by default**: the walk prunes only on non-identity
+predicates, then resolves the *verified* signer (a real signature check plus the key's
+active/revoked status) for every survivor and filters on that — the parcel's own
+recorded operator never decides what gets verified. `--recorded` opts into the cheap,
+self-declared reading; every answer is then labeled.
 
 Flags AND together; `--where <json>` (or `--where -` for stdin) takes the full
 predicate tree for or/not/nesting: combinators `{"all": […]}`, `{"any": […]}`,
 `{"not": …}` over leaves `{"field", "op", "value"}`. Operators: `eq`/`ne` (one scalar
 value), `in` (an array of values), `matches` (glob `*`/`?` or literal substring — never
 regex), `before`/`after` (one RFC 3339 timestamp), `between` (a two-element timestamp
-array, inclusive). `null` is a valid value only where absence is meaningful —
-`author.supervisor` (`"op": "eq", "value": null` = "has no supervisor"); anywhere else
-it is refused. Bounds (refused past them, exit 18): payload
-64 KiB, depth 16, 128 leaves, `in` ≤ 256 values, glob ≤ 256 chars.
+array, inclusive), `touches` (a warehouse path, `path` field only). `null` is a valid
+value only where absence is meaningful — `author.supervisor` (`"op": "eq", "value":
+null` = "has no supervisor"); anywhere else it is refused. Bounds (refused past them,
+exit 18): payload 64 KiB, depth 16, 128 leaves, `in` ≤ 256 values, glob ≤ 256 chars
+(the glob bound also applies to `provenance.model`/`provenance.tool` patterns).
+
+Provenance and tags are honest about absence, differently:
+
+* **Provenance is opt-in evidence, not a claim.** A parcel with no provenance entry at
+  all matches no `provenance.*` predicate in either direction — `{"not": {"field":
+  "provenance.model", "op": "matches", "value": "claude-*"}}` never sweeps up a parcel
+  that simply has no provenance recorded. A subject can carry more than one provenance
+  entry (e.g. amended); a leaf matches if *any* entry matches, and the report shows the
+  newest by record time. If the whole `@manifest` pallet has no head yet (never
+  created, or a sparse clone that never fetched it), every `provenance.*` predicate
+  reads as unknowable and `scope.provenance_source` says `"meta_pallet_absent"` (vs.
+  `"present"`) — an honest empty answer, not an error.
+* **A tag is membership.** An untagged parcel plainly does not carry a given tag
+  (excluded by `tag eq …`, included by its negation) — only a warehouse with no
+  `@tags` pallet at all makes `tag` predicates unknowable.
+
+`touches` tests whether the parcel's tree differs from its **first parent's** at a
+warehouse path (a file or a directory prefix) — the same diff `blame` already does for
+its per-line attribution. A merge parcel is judged by the same rule: if the merge's
+own result at the path already matches what its first parent had (e.g. both branches
+added the identical content, or the resolution kept the first-parent side), the merge
+does not match, even though its *other* parent touched the path on its own line. On a
+sparse warehouse, a `touches` predicate whose confirming check needs a tree outside
+the fetch scope degrades to unknowable for that parcel (counted in
+`scope.out_of_scope`) rather than erroring; a tree missing that the scope says
+*should* be present still errors, as tampering rather than sparseness.
 
 ```json
 {
@@ -117,12 +146,16 @@ it is refused. Bounds (refused past them, exit 18): payload
         "is_merge": false,
         "actions": [ { "action": "author", "operator": "<id>", "trust": "recorded",
                        "timestamp": "…" } ],
-        "description": "…"
+        "description": "…",
+        "provenance": { "model": "claude-opus-4-8", "tool": "claude-code",
+                        "session": "sess-1" },
+        "tags": ["v1.2.0"]
       }
     ],
     "next": "<cursor>",
     "scope": { "trust": "verified", "office_asof": "current",
-               "walked": 1234, "matched": 12, "out_of_scope": 0 }
+               "walked": 1234, "matched": 12, "out_of_scope": 0,
+               "provenance_source": "present" }
   }
 }
 ```
@@ -133,6 +166,10 @@ it is refused. Bounds (refused past them, exit 18): payload
 key not in the office) | `recorded` (only under `--recorded`). A parcel without a
 forge-proof identity (unsigned / unknown key) never matches an identity predicate in
 either direction — three-valued honesty, not a guess.
+
+`provenance` and `tags` are always computed and attached to a match (even when the
+predicate never tested them); both are omitted entirely — not an empty object/array —
+when the subject carries no provenance entry, or no tags.
 
 The `scope` block is always present so a partial or unverified pass can never read as a
 complete, verified one. `office_asof` is always `"current"`: class/supervisor answers

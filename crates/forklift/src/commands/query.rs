@@ -24,6 +24,10 @@ pub struct QueryArgs {
     pub no_merges: bool,
     pub grep: Option<String>,
     pub recorded: bool,
+    pub model: Option<String>,
+    pub tool: Option<String>,
+    pub tag: Option<String>,
+    pub touches: Option<String>,
     pub r#where: Option<String>,
     pub limit: Option<usize>,
     pub after: Option<String>,
@@ -167,6 +171,18 @@ fn build_predicate(args: &QueryArgs) -> Result<query_utils::Predicate, String> {
     if let Some(grep) = &args.grep {
         leaves.push(leaf("description", "matches", json!(grep)));
     }
+    if let Some(model) = &args.model {
+        leaves.push(leaf("provenance.model", "matches", json!(model)));
+    }
+    if let Some(tool) = &args.tool {
+        leaves.push(leaf("provenance.tool", "matches", json!(tool)));
+    }
+    if let Some(tag) = &args.tag {
+        leaves.push(leaf("tag", "eq", json!(tag)));
+    }
+    if let Some(path) = &args.touches {
+        leaves.push(leaf("path", "touches", json!(path)));
+    }
 
     if let Some(payload) = &args.r#where {
         let payload = if payload == "-" {
@@ -199,7 +215,8 @@ fn scope_block(trust: TrustMode, outcome: &QueryOutcome, fetch_scope: Option<Vec
         office_asof: "current".to_string(),
         walked: outcome.walked,
         matched: outcome.matched,
-        out_of_scope: 0,
+        out_of_scope: outcome.out_of_scope,
+        provenance_source: if outcome.provenance_present { "present" } else { "meta_pallet_absent" }.to_string(),
         fetch_scope,
     }
 }
@@ -331,9 +348,16 @@ pub(crate) struct QueryScope {
     /// How many parcels matched.
     matched: usize,
 
-    /// Parcels a predicate could not evaluate because their content is outside a sparse
-    /// bay's scope. Always 0 until content predicates ship.
+    /// Parcels a `touches` predicate could not confirm because the path was provably
+    /// outside a sparse warehouse's fetch scope (degraded to `Unknown`, not an error). 0
+    /// outside that case.
     out_of_scope: usize,
+
+    /// Whether the `@manifest` meta pallet has a head at all: `"present"`, or
+    /// `"meta_pallet_absent"` when it does not exist (or was never fetched) — every
+    /// provenance leaf then reads `Unknown` for lack of a pallet to consult, not for lack
+    /// of evidence on any one parcel.
+    provenance_source: String,
 
     /// The warehouse's fetch-scope prefixes — present only on a sparse warehouse.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -363,6 +387,29 @@ pub(crate) struct QueryEntry {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     description: Option<String>,
+
+    /// This subject's newest machine-authorship provenance entry, if `@manifest` has any.
+    /// Absent both when there is no entry for this parcel and when the whole pallet has no
+    /// head — `scope.provenance_source` is what tells those two apart.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provenance: Option<QueryProvenance>,
+
+    /// This subject's tag names (omitted, not empty-listed, when it carries none).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tags: Vec<String>,
+}
+
+/// The machine-authorship provenance a match carries, flattened for the report.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[derive(Serialize)]
+pub(crate) struct QueryProvenance {
+    model: String,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session: Option<String>,
 }
 
 /// A resolved identity: operator, office class/supervisor, and the trust of the resolution.
@@ -452,6 +499,12 @@ impl QueryEntry {
             is_merge: found.parcel.parents.len() > 1,
             actions: actions_of(&found.parcel, office),
             description: found.parcel.description.clone(),
+            provenance: found.provenance.as_ref().map(|provenance| QueryProvenance {
+                model: provenance.model.clone(),
+                tool: provenance.tool.clone(),
+                session: provenance.session.clone(),
+            }),
+            tags: found.tags.clone(),
         }
     }
 }
