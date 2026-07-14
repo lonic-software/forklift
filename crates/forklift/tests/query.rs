@@ -49,6 +49,29 @@ impl TestWarehouse {
             .unwrap()
     }
 
+    /// Run a command feeding `input` on stdin (for `--where -`: an oversized predicate
+    /// cannot ride argv — Windows caps a command line at ~32 KB, far below the 64 KiB
+    /// payload bound this suite has to overflow).
+    fn run_with_stdin(&self, args: &[&str], input: &str) -> Output {
+        use std::io::Write;
+        use std::process::Stdio;
+
+        let mut child = Command::new(FORKLIFT)
+            .args(args)
+            .current_dir(&self.root)
+            .env("FORKLIFT_GLOBAL_CONFIG", self.home.join("global-config.toml"))
+            .env("FORKLIFT_KEYS_DIR", self.home.join("test-keys"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+
+        child.wait_with_output().unwrap()
+    }
+
     /// Delete a parcel object (and its signature sidecar) from the loose store.
     fn delete_parcel(&self, hash: &str) {
         let objects = self.root.join(".forklift").join("objects").join(&hash[0..2]);
@@ -274,17 +297,11 @@ fn predicate_bounds_and_malformed_predicates_refuse_with_exit_18() {
         "{{\"field\":\"description\",\"op\":\"matches\",\"value\":\"{}\"}}",
         "x".repeat(257)
     );
-    let payload_bomb = format!(
-        "{{\"field\":\"description\",\"op\":\"matches\",\"value\":\"{}\"}}",
-        "x".repeat(65 * 1024)
-    );
-
     for payload in [
         depth_bomb.as_str(),
         leaf_bomb.as_str(),
         in_bomb.as_str(),
         glob_bomb.as_str(),
-        payload_bomb.as_str(),
         "not json",
         "{\"field\":\"provenance.model\",\"op\":\"eq\",\"value\":\"x\"}",
         "{\"field\":\"is_merge\",\"op\":\"matches\",\"value\":\"x\"}",
@@ -300,6 +317,16 @@ fn predicate_bounds_and_malformed_predicates_refuse_with_exit_18() {
         assert_eq!(error["ok"], false);
         assert_eq!(error["error"]["code"], "query_predicate_invalid", "for: {}", payload);
     }
+
+    // The payload byte bound goes through stdin (`--where -`): a 65 KiB argument would
+    // overflow Windows' ~32 KB command line before forklift ever saw it.
+    let payload_bomb = format!(
+        "{{\"field\":\"description\",\"op\":\"matches\",\"value\":\"{}\"}}",
+        "x".repeat(65 * 1024)
+    );
+    let output = warehouse.run_with_stdin(&["--json", "query", "--where", "-"], &payload_bomb);
+    assert_eq!(output.status.code(), Some(18), "the payload byte bound refuses with exit 18");
+    assert_eq!(json(&output)["error"]["code"], "query_predicate_invalid");
 
     // Signer predicates have no recorded-trust fallback: refused up front, same code.
     let output = warehouse.run(&["--json", "query", "--recorded", "--signer", "abc"]);
