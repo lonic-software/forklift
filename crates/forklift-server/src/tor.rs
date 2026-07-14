@@ -521,8 +521,10 @@ mod tests {
         std::fs::write(&cookie_path, [0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
 
         let advert = format!(
+            // Real Tor C-escapes the path in this quoted field; do the same so Windows
+            // backslashes survive the parser (which unescapes them).
             r#"250-AUTH METHODS=COOKIE,SAFECOOKIE COOKIEFILE="{}""#,
-            cookie_path.to_string_lossy()
+            escape(&cookie_path.to_string_lossy())
         );
         let id = "svcaddress234567svcaddress234567svcaddress234567svcaddre";
         let (addr, rx) = fake_control_server(&advert, id, Some("ED25519-V3:PRIVATEKEYBLOB"));
