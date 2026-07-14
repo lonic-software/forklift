@@ -599,8 +599,9 @@ pub async fn list() -> Result<(), String> {
 }
 
 /// The office roster: users, their roles/grants, and their keys.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct OfficeListing {
+pub(crate) struct OfficeListing {
     /// Whether trust is established (anyone is enrolled).
     enrolled: bool,
 
@@ -609,8 +610,9 @@ struct OfficeListing {
 }
 
 /// One enrolled operator.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct OfficeUser {
+pub(crate) struct OfficeUser {
     identifier: String,
 
     /// The resolved display name, when a resolution hook supplied one.
@@ -619,7 +621,7 @@ struct OfficeUser {
 
     role: String,
 
-    /// The identity class (§7.1): human / agent / bot / service.
+    /// The identity class: human / agent / bot / service.
     class: String,
 
     /// The supervising human, for an automated identity.
@@ -634,8 +636,9 @@ struct OfficeUser {
 }
 
 /// One key of an operator.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct OfficeKey {
+pub(crate) struct OfficeKey {
     key_id: String,
     retired: bool,
 
@@ -931,4 +934,13 @@ fn require_admin(state: &OfficeState, actor_id: &str) -> Result<(), String> {
             actor_id
         ))
     }
+}
+
+
+/// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
+#[cfg(feature = "docgen")]
+pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+    vec![
+        ("OfficeListing", schemars::schema_for!(OfficeListing)),
+    ]
 }

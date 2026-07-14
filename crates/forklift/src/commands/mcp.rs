@@ -224,6 +224,10 @@ fn build_args(name: &str, arguments: &Value) -> Result<Vec<String>, String> {
             args.push("load".to_string());
             args.push(require("path")?);
         }
+        "remove" => {
+            args.push("remove".to_string());
+            args.push(require("path")?);
+        }
         "unload" => {
             args.push("unload".to_string());
             args.push(require("path")?);
@@ -368,6 +372,10 @@ fn build_args(name: &str, arguments: &Value) -> Result<Vec<String>, String> {
                 args.push("--rev".to_string());
                 args.push(rev);
             }
+        }
+        "show" => {
+            args.push("show".to_string());
+            args.push(require("target")?);
         }
         "cherry_pick" => {
             args.push("cherry-pick".to_string());
@@ -551,7 +559,9 @@ fn tool_definitions() -> Value {
             object(json!({ "description": string }), json!([]))),
         tool("load", "Stage a file or directory (its changes) into the inventory.",
             object(json!({ "path": string }), json!(["path"]))),
-        tool("unload", "Stage a file or directory for removal.",
+        tool("remove", "Stage a file or directory for removal (the working directory is not touched).",
+            object(json!({ "path": string }), json!(["path"]))),
+        tool("unload", "Unstage a file or directory: reset it to the pallet head, keeping the working directory as it is (the inverse of load).",
             object(json!({ "path": string }), json!(["path"]))),
         tool("diff", "Show changed files. Default: working directory vs inventory. staged=true: inventory vs head. targets: two revisions to compare, optionally plus a path.",
             object(json!({ "staged": boolean, "targets": { "type": "array", "items": string } }), json!([]))),
@@ -597,6 +607,8 @@ fn tool_definitions() -> Value {
             object(json!({ "object": string, "inventory": string }), json!([]))),
         tool("blame", "Attribute each line of a file to the parcel that last changed it (rev: at a revision, default the current head).",
             object(json!({ "path": string, "rev": string }), json!(["path"]))),
+        tool("show", "Print a file's content at a revision in one call. target is \"<revision>:<path>\" (a pallet name, an @-qualified meta pallet, or a parcel hash, then a colon, then the path). Reports binary content or a chunked large file's metadata (content hash, size, chunk count) instead of raw bytes.",
+            object(json!({ "target": string }), json!(["target"]))),
         tool("cherry_pick", "Apply a single parcel's change onto the current pallet as a new parcel.",
             object(json!({ "revision": string, "message": string }), json!(["revision"]))),
         tool("deliver", "Squash the current draft pallet onto a target pallet as one clean signed parcel, keeping the trail. Needs an enrolled key.",
@@ -718,6 +730,13 @@ mod tests {
         // or is on the human-only allow-list — but never neither, and never both.
         for command in cli.get_subcommands() {
             let name = command.get_name();
+
+            // Hidden dev-only diagnostics (e.g. `__docgen`, feature-gated and never part of a
+            // release build) are not part of the CLI/MCP contract this test enforces.
+            if name.starts_with("__") {
+                continue;
+            }
+
             let prefix = name.replace('-', "_");
             let covered = tools.iter().any(|tool| *tool == prefix || tool.starts_with(&format!("{}_", prefix)));
             let human_only = HUMAN_ONLY.contains(&name);

@@ -177,7 +177,7 @@ fn extract_parcel_hash(stack_output: &Output) -> String {
 }
 
 #[test]
-fn prepare_load_peek_unload_flow() {
+fn prepare_load_peek_remove_flow() {
     let warehouse = TestWarehouse::new("flow");
     warehouse.write_file("readme.txt", "root file\n");
     warehouse.write_file("src/main.txt", "hello\n");
@@ -195,35 +195,35 @@ fn prepare_load_peek_unload_flow() {
     assert_success(&peek_nested);
     assert!(stdout(&peek_nested).contains("nested.txt"));
 
-    assert_success(&warehouse.run(&["unload", "."]));
+    assert_success(&warehouse.run(&["remove", "."]));
 
-    // Unloading stages removals instead of erasing the inventory: the entries survive,
+    // Removing stages removals instead of erasing the inventory: the entries survive,
     // marked as staged for removal.
-    let peek_after_unload = warehouse.run(&["peek", "--inventory", "."]);
-    assert_success(&peek_after_unload);
-    let root_listing = stdout(&peek_after_unload);
+    let peek_after_remove = warehouse.run(&["peek", "--inventory", "."]);
+    assert_success(&peek_after_remove);
+    let root_listing = stdout(&peek_after_remove);
     assert!(root_listing.contains("readme.txt"));
     assert!(root_listing.contains("Staged for removal"));
 
-    let nested_after_unload = stdout(&warehouse.run(&["peek", "--inventory", "src/data"]));
-    assert!(nested_after_unload.contains("nested.txt"));
-    assert!(nested_after_unload.contains("Staged for removal"));
+    let nested_after_remove = stdout(&warehouse.run(&["peek", "--inventory", "src/data"]));
+    assert!(nested_after_remove.contains("nested.txt"));
+    assert!(nested_after_remove.contains("Staged for removal"));
 }
 
 #[test]
-fn unloading_a_file_stages_its_removal_and_reloading_restores_it() {
+fn removing_a_file_stages_its_removal_and_reloading_restores_it() {
     let warehouse = TestWarehouse::new("stage-removal");
     warehouse.write_file("file.txt", "content\n");
 
     assert_success(&warehouse.run(&["prepare"]));
     assert_success(&warehouse.run(&["load", "file.txt"]));
-    assert_success(&warehouse.run(&["unload", "file.txt"]));
+    assert_success(&warehouse.run(&["remove", "file.txt"]));
 
     let staged = stdout(&warehouse.run(&["peek", "--inventory", "."]));
-    assert!(staged.contains("Staged for removal"), "unload must mark the entry, not erase it");
+    assert!(staged.contains("Staged for removal"), "remove must mark the entry, not erase it");
 
-    // Unloading an untracked path is still an error.
-    let unknown = warehouse.run(&["unload", "missing.txt"]);
+    // Removing an untracked path is still an error.
+    let unknown = warehouse.run(&["remove", "missing.txt"]);
     assert!(!unknown.status.success());
     assert!(stderr(&unknown).contains("not in the inventory"));
 
@@ -271,7 +271,7 @@ fn commands_work_from_a_subdirectory_of_the_warehouse() {
 }
 
 #[test]
-fn unloading_a_directory_keeps_sibling_directories_with_the_same_prefix() {
+fn removing_a_directory_keeps_sibling_directories_with_the_same_prefix() {
     let warehouse = TestWarehouse::new("sibling");
     warehouse.write_file("src/a.txt", "a\n");
     warehouse.write_file("src2/b.txt", "b\n");
@@ -279,9 +279,9 @@ fn unloading_a_directory_keeps_sibling_directories_with_the_same_prefix() {
     assert_success(&warehouse.run(&["prepare"]));
     assert_success(&warehouse.run(&["load", "src"]));
     assert_success(&warehouse.run(&["load", "src2"]));
-    assert_success(&warehouse.run(&["unload", "src"]));
+    assert_success(&warehouse.run(&["remove", "src"]));
 
-    // "src2" shares a string prefix with "src" but must survive the unload.
+    // "src2" shares a string prefix with "src" but must survive the removal.
     let peek = warehouse.run(&["peek", "--inventory", "src2"]);
     assert_success(&peek);
     assert!(stdout(&peek).contains("b.txt"));
@@ -631,7 +631,7 @@ fn stack_consumes_staged_removals() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["unload", "remove.txt"]));
+    assert_success(&warehouse.run(&["remove", "remove.txt"]));
 
     let stack = warehouse.run(&["stack", "Drop remove.txt"]);
     assert_success(&stack);
@@ -720,6 +720,42 @@ fn palletize_creates_pallets_at_the_current_head() {
 }
 
 #[test]
+fn palletize_json_listing_reports_head_hashes() {
+    let warehouse = TestWarehouse::new("palletize-json");
+    warehouse.write_file("file.txt", "content\n");
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    // Before anything is stacked, the (only, current) pallet is listed with a null head —
+    // folded into `pallets` itself, not left as a side flag a caller must special-case.
+    let unborn = json(&warehouse.run(&["palletize", "--json"]));
+    assert_eq!(unborn["data"]["current_unborn"], true);
+    let pallets = unborn["data"]["pallets"].as_array().unwrap();
+    assert_eq!(pallets.len(), 1, "unexpected pallets: {:?}", pallets);
+    assert_eq!(pallets[0]["name"], "main");
+    assert_eq!(pallets[0]["current"], true);
+    assert_eq!(pallets[0]["head"], serde_json::Value::Null);
+
+    assert_success(&warehouse.run(&["load", "."]));
+    let main_head = extract_parcel_hash(&warehouse.run(&["stack", "first"]));
+    assert_success(&warehouse.run(&["palletize", "feature/x"]));
+
+    // Once born, each pallet's listed `head` is its actual head parcel hash.
+    let listing = json(&warehouse.run(&["palletize", "--json"]));
+    assert_eq!(listing["data"]["current_unborn"], false);
+    let pallets = listing["data"]["pallets"].as_array().unwrap();
+    let by_name = |name: &str| pallets.iter()
+        .find(|entry| entry["name"] == name)
+        .unwrap_or_else(|| panic!("pallet {} not found in: {:?}", name, pallets));
+
+    assert_eq!(by_name("main")["head"], main_head);
+    assert_eq!(by_name("main")["current"], false);
+    assert_eq!(by_name("feature/x")["head"], main_head, "the new pallet starts at the same head");
+    assert_eq!(by_name("feature/x")["current"], true);
+}
+
+#[test]
 fn stocktake_reports_staged_and_unstaged_changes() {
     let warehouse = TestWarehouse::new("stocktake");
     warehouse.write_file("a.txt", "original\n");
@@ -764,7 +800,7 @@ fn stocktake_reports_staged_and_unstaged_changes() {
     assert!(staged.contains("modified:"));
 
     // A staged removal is reported as removed; the file (still on disk) as untracked.
-    assert_success(&warehouse.run(&["unload", "dir/b.txt"]));
+    assert_success(&warehouse.run(&["remove", "dir/b.txt"]));
     let removal = stdout(&warehouse.run(&["stocktake"]));
     assert!(removal.contains("removed:"));
     assert!(removal.contains("dir/b.txt"));
@@ -994,7 +1030,7 @@ fn restore_staged_resets_the_inventory_to_the_head() {
     assert!(after_add.contains("untracked: new.txt"), "status: {}", after_add);
 
     // Unstage a staged removal: the entry comes back from the head.
-    assert_success(&warehouse.run(&["unload", "a.txt"]));
+    assert_success(&warehouse.run(&["remove", "a.txt"]));
     let with_removal = stdout(&warehouse.run(&["stocktake"]));
     assert!(with_removal.contains("removed:"), "status: {}", with_removal);
 
@@ -1006,6 +1042,56 @@ fn restore_staged_resets_the_inventory_to_the_head() {
     let unknown = warehouse.run(&["restore", "--staged", "ghost.txt"]);
     assert!(!unknown.status.success());
     assert!(stderr(&unknown).contains("neither in the inventory nor in the pallet head"));
+}
+
+#[test]
+fn unload_unstages_instead_of_staging_a_removal() {
+    let warehouse = TestWarehouse::new("unload-unstages");
+    warehouse.write_file("a.txt", "original\n");
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "baseline"]));
+
+    // unload is the inverse of load: the staged modification is unstaged (back to the
+    // head), the worktree keeps the change — and crucially no removal is staged.
+    warehouse.write_file("a.txt", "modified\n");
+    assert_success(&warehouse.run(&["load", "a.txt"]));
+    assert_success(&warehouse.run(&["unload", "a.txt"]));
+
+    let status = stdout(&warehouse.run(&["stocktake"]));
+    assert!(status.contains("The inventory matches the pallet head"), "status: {}", status);
+    assert!(status.contains("modified:"), "status: {}", status);
+    assert!(!status.contains("removed:"), "unload must never stage a removal: {}", status);
+    assert_eq!(
+        std::fs::read_to_string(warehouse.root.join("a.txt")).unwrap(),
+        "modified\n"
+    );
+
+    // Stacking now records no change to the file: a mistaken load undone by unload can
+    // never turn into a deletion in the next parcel.
+    let nothing = warehouse.run(&["stack", "empty"]);
+    assert!(!nothing.status.success(), "nothing must be staged after unload");
+
+    // The JSON envelope carries the verb the user ran, not the shared implementation's.
+    warehouse.write_file("a.txt", "modified again\n");
+    assert_success(&warehouse.run(&["load", "a.txt"]));
+    let unloaded = warehouse.run(&["--json", "unload", "a.txt"]);
+    assert_success(&unloaded);
+    assert_eq!(json(&unloaded)["command"], "unload");
+
+    // The `ul` alias follows the verb.
+    warehouse.write_file("a.txt", "modified once more\n");
+    assert_success(&warehouse.run(&["load", "a.txt"]));
+    assert_success(&warehouse.run(&["ul", "a.txt"]));
+    let after_alias = stdout(&warehouse.run(&["stocktake"]));
+    assert!(after_alias.contains("The inventory matches the pallet head"), "status: {}", after_alias);
+
+    // And `rm` is the alias for staging a removal.
+    assert_success(&warehouse.run(&["rm", "a.txt"]));
+    let removal = stdout(&warehouse.run(&["stocktake"]));
+    assert!(removal.contains("removed:"), "status: {}", removal);
 }
 
 #[test]
@@ -1542,7 +1628,7 @@ fn history_walks_the_parcel_graph_newest_first() {
     assert_success(&warehouse.run(&["shift", "main"]));
     warehouse.write_file("c.txt", "main\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "main parcel"]));
+    let main_parcel = extract_parcel_hash(&warehouse.run(&["stack", "main parcel"]));
     assert_success(&warehouse.run(&["consolidate", "feature"]));
 
     let merged = stdout(&warehouse.run(&["history"]));
@@ -1558,6 +1644,28 @@ fn history_walks_the_parcel_graph_newest_first() {
     let unknown = warehouse.run(&["history", "nope"]);
     assert!(!unknown.status.success());
     assert!(stderr(&unknown).contains("neither a pallet nor a parcel hash"));
+
+    // `--json` carries `parents` on every entry (unlike `consolidates`, which is only
+    // present, non-empty, on a merge): `[]` for the root, one parent for a linear
+    // parcel, and — for the consolidation — both parents in stored, base-first order
+    // (the current pallet's own prior head first, the merged-in pallet's head second).
+    let entries = json(&warehouse.run(&["history", "--json"]))["data"]["entries"].clone();
+    let entries = entries.as_array().unwrap();
+    let by_hash = |hash: &str| entries.iter()
+        .find(|entry| entry["parcel"] == hash)
+        .unwrap_or_else(|| panic!("parcel {} not found in: {:?}", hash, entries));
+
+    assert_eq!(by_hash(&first)["parents"], serde_json::json!([]), "a root parcel has no parents");
+    assert_eq!(by_hash(&second)["parents"], serde_json::json!([first]), "a linear parcel has one parent");
+
+    let merge_hash = entries.iter()
+        .find(|entry| !entry["consolidates"].as_array().unwrap_or(&Vec::new()).is_empty())
+        .expect("the merge parcel must be in the history");
+    assert_eq!(
+        merge_hash["parents"], serde_json::json!([main_parcel, feature]),
+        "a consolidation lists both parents, base (the target pallet's own prior head) first"
+    );
+    assert_eq!(merge_hash["parents"], merge_hash["consolidates"], "parents and consolidates agree on a merge parcel");
 }
 
 #[test]
@@ -1968,24 +2076,33 @@ fn import_git_auto_compacts_unless_no_compact() {
             assert!(output.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&output.stderr));
         };
         git(&["init", "-q", "-b", "main"]);
-        std::fs::write(root.join("a.txt"), "hello\n").unwrap();
+        // Two versions of one file, big enough that the second pays as a delta.
+        let body = "a line of file content\n".repeat(400);
+        std::fs::write(root.join("a.txt"), &body).unwrap();
         git(&["add", "-A"]);
         git(&["commit", "-qm", "first commit"]);
+        std::fs::write(root.join("a.txt"), body + "one more line\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "second commit"]);
     }
 
-    // A large import lands a big loose set — so by default import packs the store on the
-    // way out, and the user gets a dense warehouse without having to remember `compact`.
+    // A large import lands a big object set — so by default import writes native packs
+    // directly (delta-compressing successive versions of a file on the way in), and the user
+    // gets a dense warehouse whose store never existed in its loose worst case.
     let packed = TestWarehouse::new("import-autocompact");
     seed_git_repo(&packed.root);
     assert_success(&packed.run(&["prepare"]));
     configure_operator(&packed);
     let out = packed.run(&["import-git", "."]);
     assert_success(&out);
-    assert!(stdout(&out).contains("Packed the imported store"), "import should auto-compact: {}", stdout(&out));
+    assert!(stdout(&out).contains("Packed the imported store"), "import should pack the store: {}", stdout(&out));
+    assert!(stdout(&out).contains("2 delta-compressed"),
+            "the second versions of a.txt and of the root tree should be path deltas: {}", stdout(&out));
     assert_eq!(count_loose_objects(&packed.root.join(".forklift/objects")), 0, "no loose objects should remain after import");
     assert!(packed.root.join(".forklift/objects/pack").is_dir(), "a pack folder should exist after import");
     // Reads work against the packed store immediately.
     assert!(stdout(&packed.run(&["history"])).contains("first commit"));
+    assert!(stdout(&packed.run(&["stocktake"])).contains("matches the inventory"));
 
     // --no-compact opts out: the imported objects are left loose.
     let loose = TestWarehouse::new("import-no-compact");
@@ -1997,6 +2114,76 @@ fn import_git_auto_compacts_unless_no_compact() {
     assert!(!stdout(&out).contains("Packed the imported store"), "--no-compact must skip packing: {}", stdout(&out));
     assert!(count_loose_objects(&loose.root.join(".forklift/objects")) > 0, "objects should stay loose with --no-compact");
     assert!(!loose.root.join(".forklift/objects/pack").exists(), "no pack folder should exist with --no-compact");
+}
+
+#[test]
+fn import_git_rederives_tree_bases_when_the_cache_is_starved() {
+    // Three commits touching the same file (in a subdirectory, so both its tree and the root
+    // tree change each time) build delta chains for blobs and trees alike.
+    fn seed_repo(root: &Path) {
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .env("GIT_AUTHOR_NAME", "Ada").env("GIT_AUTHOR_EMAIL", "ada@example.com")
+                .env("GIT_COMMITTER_NAME", "Ada").env("GIT_COMMITTER_EMAIL", "ada@example.com")
+                .output()
+                .expect("git must be installed to run this test");
+            assert!(output.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&output.stderr));
+        };
+
+        git(&["init", "-q", "-b", "main"]);
+        let body = "a line of file content\n".repeat(400);
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+
+        std::fs::write(root.join("sub/a.txt"), &body).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "first commit"]);
+
+        std::fs::write(root.join("sub/a.txt"), body.clone() + "one more line\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "second commit"]);
+
+        std::fs::write(root.join("sub/a.txt"), body + "one more line\nyet another line\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "third commit"]);
+    }
+
+    // Pull the delta count out of the "Packed the imported store: N object(s) into P pack(s),
+    // D delta-compressed." line.
+    fn delta_count(output: &str) -> usize {
+        let line = output.lines().find(|line| line.contains("Packed the imported store"))
+            .unwrap_or_else(|| panic!("no \"Packed the imported store\" line in: {}", output));
+        let (_, after) = line.split_once(", ").expect("a delta-compressed segment");
+        after.split_whitespace().next().expect("a delta count").parse().expect("a number")
+    }
+
+    // Default cache budget: bases mostly hit the cache.
+    let default_budget = TestWarehouse::new("import-tree-rederive-default");
+    seed_repo(&default_budget.root);
+    assert_success(&default_budget.run(&["prepare"]));
+    configure_operator(&default_budget);
+    let baseline = default_budget.run(&["import-git", "."]);
+    assert_success(&baseline);
+    let baseline_deltas = delta_count(&stdout(&baseline));
+    assert!(baseline_deltas > 0, "expected at least one delta in the baseline import: {}", stdout(&baseline));
+
+    // Zero-byte cache budget: every base lookup misses, forcing blob bases through the batch
+    // pipe re-read and tree bases through re-derivation on every single one. Density must not
+    // regress relative to the default-budget run of the identical repo.
+    let starved = TestWarehouse::new("import-tree-rederive-starved");
+    seed_repo(&starved.root);
+    assert_success(&starved.run(&["prepare"]));
+    configure_operator(&starved);
+    let zero_budget = starved.run_with_env(&["import-git", "."], &[("FORKLIFT_IMPORT_CACHE_BYTES", "0")]);
+    assert_success(&zero_budget);
+    let starved_deltas = delta_count(&stdout(&zero_budget));
+    assert_eq!(starved_deltas, baseline_deltas,
+        "a starved cache must re-derive every base rather than lose deltas: {}", stdout(&zero_budget));
+
+    // The starved import still reads back correctly.
+    assert!(stdout(&starved.run(&["history"])).contains("third commit"));
+    assert!(stdout(&starved.run(&["stocktake"])).contains("matches the inventory"));
 }
 
 #[cfg(unix)]
@@ -2407,6 +2594,7 @@ fn history_json_pages_through_the_whole_log_with_a_cursor() {
 
     // Walk the whole log in pages of two, following the `next` cursor each time.
     let mut seen: Vec<String> = Vec::new();
+    let mut seen_parents: Vec<Vec<String>> = Vec::new();
     let mut cursor: Option<String> = None;
     for _ in 0..10 {
         let out = match &cursor {
@@ -2416,6 +2604,10 @@ fn history_json_pages_through_the_whole_log_with_a_cursor() {
         let data = json(&out)["data"].clone();
         for entry in data["entries"].as_array().unwrap() {
             seen.push(entry["parcel"].as_str().unwrap().to_string());
+            let parents = entry["parents"].as_array()
+                .unwrap_or_else(|| panic!("parents must always be present: {:?}", entry))
+                .iter().map(|p| p.as_str().unwrap().to_string()).collect();
+            seen_parents.push(parents);
         }
         match data["next"].as_str() {
             Some(next) => cursor = Some(next.to_string()),
@@ -2426,6 +2618,17 @@ fn history_json_pages_through_the_whole_log_with_a_cursor() {
     // Every parcel is shown exactly once, newest first — no gaps, no duplicates.
     let expected: Vec<String> = hashes.iter().rev().cloned().collect();
     assert_eq!(seen, expected, "cursor paging must cover the whole log once, newest first");
+
+    // `parents` is correct even across the page boundary (the 5th/3rd-newest parcels
+    // straddle the -n 2 pages): the oldest parcel is a root (`[]`), every other parcel's
+    // sole parent is the one immediately before it in the linear chain.
+    assert_eq!(seen_parents[4], Vec::<String>::new(), "the root parcel has no parents");
+    for i in 0..4 {
+        assert_eq!(
+            seen_parents[i], vec![seen[i + 1].clone()],
+            "parcel {} must list its predecessor as its one parent, across the page boundary", seen[i]
+        );
+    }
 }
 
 #[test]
@@ -2866,7 +3069,7 @@ fn json_mode_wraps_every_result_in_a_versioned_envelope() {
     let prepared = warehouse.run(&["prepare", "--json"]);
     assert_success(&prepared);
     let value = json(&prepared);
-    assert_eq!(value["forklift_json"], "1");
+    assert_eq!(value["forklift_json"], "2");
     assert_eq!(value["command"], "prepare");
     assert_eq!(value["ok"], true);
     assert!(value["data"]["created"].is_array());
@@ -2903,6 +3106,22 @@ fn json_errors_carry_a_stable_code_and_a_deterministic_exit_code() {
     assert_eq!(value["error"]["code"], "not_a_warehouse");
     assert!(value["error"]["next_step"].is_string());
     assert!(value["error"]["message"].is_string());
+}
+
+#[test]
+fn history_on_an_unborn_pallet_reports_the_empty_history_code() {
+    let warehouse = TestWarehouse::new("history-unborn-json");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    // Nothing has ever been stacked on "main": history has its own classification
+    // (distinct from the generic "error"), and its own exit code.
+    let unborn = warehouse.run(&["history", "--json"]);
+    assert_eq!(unborn.status.code(), Some(19));
+    let value = json(&unborn);
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["error"]["code"], "empty_history");
+    assert!(value["error"]["message"].as_str().unwrap().contains("nothing stacked"));
 }
 
 #[test]
@@ -4049,6 +4268,311 @@ fn compact_all_repacks_consolidates_and_drops_garbage() {
     );
 }
 
+// ---------------------------------------------------------------------------------------------
+// `compact --all --redelta`: the opt-in densification pass. Cross-path similarity (renames,
+// moved files) that a per-object copy structurally cannot see.
+// ---------------------------------------------------------------------------------------------
+
+/// The `.pack` data file names under an object store's pack folder, sorted — the
+/// deterministic-layout property (an unchanged repack must write the exact same names) is
+/// what an idempotency check compares.
+fn pack_file_names(objects_root: &Path) -> Vec<String> {
+    let pack_dir = objects_root.join("pack");
+    let mut names: Vec<String> = match std::fs::read_dir(&pack_dir) {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "pack"))
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    names.sort();
+    names
+}
+
+/// Total bytes under an object store root (loose files, sidecars and packs) — a coarse but
+/// sufficient stand-in for the `du -sk .forklift` used at scale.
+fn objects_store_bytes(objects_root: &Path) -> u64 {
+    fn walk(dir: &Path, total: &mut u64) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, total);
+            } else {
+                *total += entry.metadata().unwrap().len();
+            }
+        }
+    }
+
+    let mut total = 0;
+    walk(objects_root, &mut total);
+    total
+}
+
+/// A store with the cross-path gap `--redelta` targets: several versions of one file, each
+/// packed *alone* (so a plain incremental `compact`'s delta window never spans a different
+/// run), plus a same-content file at a *different* path (a rename) also packed alone — so at
+/// write time it has neither a path base (a new path has no predecessor) nor a window neighbor
+/// (a fresh, single-object incremental compact starts with an empty window), and lands full
+/// even though a near-duplicate already sits in an earlier pack. Returns the warehouse.
+fn redelta_fixture(name: &str) -> TestWarehouse {
+    let warehouse = TestWarehouse::new(name);
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    // Large enough that the real delta-vs-full saving dominates the fixed per-record framing
+    // overhead (a delta record's base-hash field): at trivial object sizes the two are the
+    // same order of magnitude and the choice between them is noise, not signal.
+    let body: String = (0..1000).map(|i| format!("line {} payload {} filler\n", i, (i * 13) % 97)).collect();
+
+    for v in 0..4 {
+        warehouse.write_file("data/a.txt", &format!("{}unique tail v{}\n", body, v));
+        assert_success(&warehouse.run(&["load", "."]));
+        assert_success(&warehouse.run(&["stack", &format!("v{}", v)]));
+        assert_success(&warehouse.run(&["compact"]));
+    }
+
+    // Near-duplicate (not byte-identical — a true duplicate would just dedupe to the same
+    // content-addressed blob, testing nothing) of the final version of "data/a.txt", at a
+    // different path: a rename a per-path chain (import-git) and a per-batch window (a fresh
+    // incremental compact, whose window starts empty) both miss.
+    warehouse.write_file("data/b-renamed.txt", &format!("{}unique tail v3 renamed copy tweak\n", body));
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "renamed"]));
+    assert_success(&warehouse.run(&["compact"]));
+
+    warehouse
+}
+
+#[test]
+fn compact_redelta_without_all_is_refused() {
+    let warehouse = TestWarehouse::new("redelta-refused");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    warehouse.write_file("f.txt", "content\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "first"]));
+
+    let refused = warehouse.run(&["compact", "--redelta"]);
+    assert!(!refused.status.success(), "--redelta without --all must be refused");
+    assert!(
+        stderr(&refused).contains("--redelta") && stderr(&refused).contains("--all"),
+        "unexpected refusal message: {}", stderr(&refused)
+    );
+
+    // Nothing was touched: the loose object is still there to compact normally.
+    let objects = warehouse.root.join(".forklift/objects");
+    assert!(count_loose_objects(&objects) > 0, "a refused compact must not run at all");
+}
+
+#[test]
+fn compact_all_redelta_shrinks_the_store_and_round_trips() {
+    let warehouse = redelta_fixture("redelta-density");
+    let objects = warehouse.root.join(".forklift/objects");
+
+    // Plain `--all` is the copy-fast path: it consolidates packs but must not, by itself,
+    // improve on the (sub-optimal) encodings already on disk.
+    assert_success(&warehouse.run(&["compact", "--all"]));
+    let after_plain_all = objects_store_bytes(&objects);
+
+    let redelta = warehouse.run(&["--json", "compact", "--all", "--redelta"]);
+    assert_success(&redelta);
+    assert!(json(&redelta)["data"]["objects_packed"].as_u64().unwrap() > 0);
+
+    let after_redelta = objects_store_bytes(&objects);
+    assert!(
+        after_redelta < after_plain_all,
+        "redelta should find the cross-path near-duplicate and shrink the store \
+         (plain --all {} bytes, after redelta {} bytes)", after_plain_all, after_redelta
+    );
+
+    // Every object still reads back byte-correct: a full diff from empty forces every blob —
+    // including the path-delta chain and the just-redeltad rename — to reconstruct.
+    let diff = warehouse.run(&["diff", ":empty", "main"]);
+    assert_success(&diff);
+    let text = stdout(&diff);
+    assert!(text.contains("data/a.txt"), "unexpected diff output: {}", text);
+    assert!(text.contains("data/b-renamed.txt"), "unexpected diff output: {}", text);
+    assert!(text.contains("unique tail v3"), "data/a.txt must reconstruct byte-correct: {}", text);
+    assert!(
+        text.contains("unique tail v3 renamed copy tweak"),
+        "the just-redeltad rename must reconstruct byte-correct: {}", text
+    );
+
+    assert_eq!(
+        json(&warehouse.run(&["--json", "history"]))["data"]["entries"].as_array().unwrap().len(),
+        5, "every parcel must survive a redelta repack"
+    );
+}
+
+#[test]
+fn compact_all_redelta_repeats_without_data_loss() {
+    let warehouse = redelta_fixture("redelta-repeat");
+    let objects = warehouse.root.join(".forklift/objects");
+
+    assert_success(&warehouse.run(&["compact", "--all", "--redelta"]));
+    assert!(objects_store_bytes(&objects) > 0);
+
+    // `--redelta` re-encodes the whole live set again on *every* run — `Source::Reconstruct` is
+    // unconditional under it, never the copy-fast path — so, unlike a plain repack, this never
+    // reaches a cheap copy-bound steady state; every invocation pays the full CPU cost. Repeating
+    // it three times pins the exact scenario a write-time depth-safety gap once made unsafe at
+    // real-repository scale: without a true per-object depth ledger, repeated redeltas could grow
+    // a delta chain's *real* depth well past its nominal cap (`compute_path_bases`'s own
+    // bookkeeping only counts path hops since a reset, blind to a reset point's own real depth)
+    // until the read-side reconstruction-depth backstop refused to compact at all — never losing
+    // data (durable-before-destructive held even then), just eventually unusable. `compact`'s
+    // depth ledger (`true_depth`) now resolves every path-base candidate's actual current depth
+    // before committing to it, so this must keep succeeding no matter how many times it repeats.
+    // The exact byte layout can still drift run to run (which candidates the ledger allows
+    // depends on the *previous* run's own shape), so this does not assert a fixed pack id — only
+    // what must hold on every run: no object lost, every object still reads back byte-correct.
+    for _ in 0..2 {
+        let repeat = warehouse.run(&["--json", "compact", "--all", "--redelta"]);
+        assert_success(&repeat);
+        assert_eq!(
+            json(&repeat)["data"]["objects_packed"].as_u64().unwrap(), 20,
+            "a repeated redelta must still account for every live object"
+        );
+    }
+
+    assert_eq!(
+        json(&warehouse.run(&["--json", "history"]))["data"]["entries"].as_array().unwrap().len(),
+        5, "a repeated redelta must not lose objects"
+    );
+
+    let diff = warehouse.run(&["diff", ":empty", "main"]);
+    assert_success(&diff);
+    let text = stdout(&diff);
+    assert!(
+        text.contains("unique tail v3 renamed copy tweak"),
+        "content must still reconstruct byte-correct after a repeated redelta: {}", text
+    );
+}
+
+#[test]
+fn compact_all_without_redelta_still_takes_the_copy_path() {
+    let warehouse = redelta_fixture("redelta-steady-state-guard");
+    let objects = warehouse.root.join(".forklift/objects");
+
+    // First `--all` consolidates the several incremental packs into one, by copying each
+    // live record verbatim.
+    assert_success(&warehouse.run(&["compact", "--all"]));
+    let names_first = pack_file_names(&objects);
+    let bytes_first = objects_store_bytes(&objects);
+
+    // A second plain `--all`, with nothing to drop and nothing new, must be the steady-state
+    // copy-bound repack: same pack name (nothing re-encoded to a different layout), same size.
+    let second = warehouse.run(&["--json", "compact", "--all"]);
+    assert_success(&second);
+    assert_eq!(pack_file_names(&objects), names_first, "a steady-state repack must not churn pack names");
+    assert_eq!(objects_store_bytes(&objects), bytes_first, "a steady-state repack must not change the store size");
+}
+
+/// How many files share the cycling directory in [`redelta_tree_fixture`] — many, not one, so a
+/// *full* tree record (every entry listed) is measurably larger than a *delta* one (just the one
+/// entry that changed), the gap the fixture exposes. Also the version count: each version
+/// touches a *different* file, cycling once through the whole directory (more than
+/// `DELTA_WINDOW`, 10, so a size-window fallback could not span the whole chain by luck either).
+const REDELTA_TREE_FIXTURE_FILES_PER_DIR: usize = 24;
+
+/// A store exercising the *directory* counterpart of the path-base machinery a blob's delta
+/// chain already uses: one directory with several files, a *different* one of which changes each
+/// commit (cycling once through all of them), so the directory's own tree object gets a new hash
+/// every version. Touching a different file each time (rather than the same one repeatedly)
+/// means only the *immediately preceding* version is a good delta base for a later one — by the
+/// time several versions have passed, enough *other* entries have also changed that a
+/// non-adjacent pairing is a measurably worse delta, mirroring how a real directory accumulates
+/// many small, unrelated changes over history (a fixture where every version stayed
+/// interchangeable with every other would let a lucky window match hide a broken path base).
+/// Each version is packed *alone* (an incremental `compact` per commit, like `redelta_fixture`),
+/// so cross-version matching can only come from `compute_path_bases`, not the window (which
+/// starts empty each run) — this is what `compute_path_bases` neglecting trees (only ever basing
+/// blobs) previously defeated. Returns the warehouse.
+fn redelta_tree_fixture(name: &str) -> TestWarehouse {
+    let warehouse = TestWarehouse::new(name);
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    for f in 0..REDELTA_TREE_FIXTURE_FILES_PER_DIR {
+        warehouse.write_file(&format!("data/sub/f{:02}.txt", f), &format!("file {} v0 filler content\n", f));
+    }
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "setup"]));
+    assert_success(&warehouse.run(&["compact"]));
+
+    for v in 0..REDELTA_TREE_FIXTURE_FILES_PER_DIR {
+        warehouse.write_file(&format!("data/sub/f{:02}.txt", v), &format!("file {} v1 filler content\n", v));
+        assert_success(&warehouse.run(&["load", "."]));
+        assert_success(&warehouse.run(&["stack", &format!("v{}", v)]));
+        assert_success(&warehouse.run(&["compact"]));
+    }
+
+    warehouse
+}
+
+#[test]
+fn compact_finds_a_directorys_path_base_across_many_versions() {
+    let warehouse = redelta_tree_fixture("redelta-tree-density");
+    let objects = warehouse.root.join(".forklift/objects");
+
+    // `compute_path_bases` runs on *every* compact (it is shared, not `--redelta`-only — see its
+    // doc comment), so the density this pins comes from the incremental compacts themselves;
+    // the closing `--all` (no `--redelta`) just consolidates the already-packed records
+    // verbatim into one pack for a clean total-byte measurement.
+    assert_success(&warehouse.run(&["compact", "--all"]));
+    let after_plain_all = objects_store_bytes(&objects);
+
+    // Each directory version is `REDELTA_TREE_FIXTURE_FILES_PER_DIR` entries; without a path
+    // base, every version but the first has nothing better than a full listing (or, absent any
+    // window neighbor at write time, the same thing) to fall back to. Calibrated against this
+    // exact fixture measured both ways: ~40,500 bytes before `compute_path_bases` covered trees
+    // (every version's tree stored close to full), ~21,900 bytes after (every version's tree and
+    // blob delta against its immediate predecessor) — most of what remains even in the fixed
+    // case is the per-parcel cost, which is fixed (a parcel is never delta'd, see `pack_utils`)
+    // and so does not move with the fix. The ceiling sits well below the broken number and with
+    // comfortable margin above the fixed one, so it stays a real (if approximate) regression trip
+    // wire rather than pinning an exact byte count to a heuristic that is free to improve.
+    let ceiling = 30_000;
+    assert!(
+        after_plain_all < ceiling,
+        "a directory with a real per-version path base should collapse to near-nothing per \
+         version, not store every version's full listing (after compact --all: {} bytes, \
+         ceiling {})", after_plain_all, ceiling
+    );
+
+    // `--all --redelta` on the same store must not be a regression: it has nothing further to
+    // buy back here (no cross-path rename in this fixture), but re-encoding from scratch must
+    // land in the same ballpark, not the multi-times-larger store the original bug produced.
+    let redelta = warehouse.run(&["--json", "compact", "--all", "--redelta"]);
+    assert_success(&redelta);
+    assert!(json(&redelta)["data"]["objects_packed"].as_u64().unwrap() > 0);
+    let after_redelta = objects_store_bytes(&objects);
+    assert!(
+        after_redelta < ceiling,
+        "redelta must not lose the directory path base plain compact already found \
+         (after --redelta: {} bytes, ceiling {})", after_redelta, ceiling
+    );
+
+    // Every object still reads back byte-correct — a full diff from empty forces every tree
+    // version (and the blob it carries) to reconstruct.
+    let diff = warehouse.run(&["diff", ":empty", "main"]);
+    assert_success(&diff);
+    let text = stdout(&diff);
+    assert!(text.contains("data/sub/f00.txt"), "unexpected diff output: {}", text);
+    assert!(
+        text.contains(&format!("file {} v1 filler content", REDELTA_TREE_FIXTURE_FILES_PER_DIR - 1)),
+        "the final directory version must reconstruct byte-correct: {}", text
+    );
+
+    assert_eq!(
+        json(&warehouse.run(&["--json", "history"]))["data"]["entries"].as_array().unwrap().len(),
+        REDELTA_TREE_FIXTURE_FILES_PER_DIR + 1, "every parcel must survive a redelta repack"
+    );
+}
+
 #[test]
 fn a_mutating_command_runs_maintenance_when_due() {
     let warehouse = TestWarehouse::new("auto-maintenance");
@@ -4089,6 +4613,100 @@ fn a_mutating_command_runs_maintenance_when_due() {
         json(&warehouse.run(&["--json", "history"]))["data"]["entries"].as_array().unwrap().len(),
         4, "history must survive maintenance"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The densify suggestion: `import-git`'s pack-direct path (and a franchise's native bundle
+// install) can only ever see per-path/per-window similarity on the way in, unlike a plain
+// `compact --all --redelta`'s whole-store pass — so a bulk-ingested store sets a marker that
+// `store` surfaces as a one-line suggestion, cleared once a redelta run actually earns it back.
+// Ordinary incremental use (stack -> auto-compact) already gets full delta selection at write
+// time and must never trip the marker at all.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn store_suggests_densify_after_import_git_and_clears_after_redelta() {
+    fn seed_git_repo(root: &Path) {
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .env("GIT_AUTHOR_NAME", "Ada").env("GIT_AUTHOR_EMAIL", "ada@example.com")
+                .env("GIT_COMMITTER_NAME", "Ada").env("GIT_COMMITTER_EMAIL", "ada@example.com")
+                .output()
+                .expect("git must be installed to run this test");
+            assert!(output.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&output.stderr));
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("a.txt"), "hello\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "first commit"]);
+    }
+
+    let warehouse = TestWarehouse::new("densify-suggestion");
+    seed_git_repo(&warehouse.root);
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    // The import itself packs at least one object, so its own human output tips the suggestion.
+    let imported = warehouse.run(&["import-git", "."]);
+    assert_success(&imported);
+    assert!(
+        stdout(&imported).contains("forklift compact --all --redelta"),
+        "import-git should tip the densify suggestion after packing on the way in: {}", stdout(&imported)
+    );
+
+    // `store` surfaces it too: the human line, and an additive `--json` flag.
+    let store = warehouse.run(&["store"]);
+    assert_success(&store);
+    assert!(
+        stdout(&store).contains("forklift compact --all --redelta"),
+        "store should surface the densify suggestion after a bulk ingest: {}", stdout(&store)
+    );
+
+    let store_json = warehouse.run(&["--json", "store"]);
+    assert_success(&store_json);
+    assert_eq!(json(&store_json)["data"]["densify_suggested"], true);
+
+    // A successful `compact --all --redelta` clears the marker — the suggestion is gone.
+    assert_success(&warehouse.run(&["compact", "--all", "--redelta"]));
+
+    let after = warehouse.run(&["--json", "store"]);
+    assert_success(&after);
+    assert_eq!(
+        json(&after)["data"]["densify_suggested"], false,
+        "a successful redelta run must clear the densify-pending marker"
+    );
+
+    let store_after = warehouse.run(&["store"]);
+    assert_success(&store_after);
+    assert!(
+        !stdout(&store_after).contains("forklift compact --all --redelta"),
+        "the human suggestion must be gone once the marker is cleared"
+    );
+}
+
+#[test]
+fn store_never_suggests_densify_for_ordinary_incremental_use() {
+    // Plain stack -> compact already gets full delta selection at write time (the loose path's
+    // path-base + window fallback) — the marker must never be set for it, so the suggestion
+    // must never fire, unlike the bulk-ingest paths above.
+    let warehouse = TestWarehouse::new("densify-no-bulk-ingest");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    warehouse.write_file("f.txt", "content\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "first"]));
+    assert_success(&warehouse.run(&["compact"]));
+
+    let store_json = warehouse.run(&["--json", "store"]);
+    assert_success(&store_json);
+    assert_eq!(json(&store_json)["data"]["densify_suggested"], false);
+
+    let store = warehouse.run(&["store"]);
+    assert_success(&store);
+    assert!(!stdout(&store).contains("forklift compact --all --redelta"));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -4278,9 +4896,11 @@ fn a_scoped_bay_refuses_out_of_scope_path_arguments() {
     let scoped_dir = warehouse.home.join("bay-scoped");
     assert_success(&warehouse.run(&["bay", "add", "scoped", scoped_dir.to_str().unwrap(), "--scope", "src/api"]));
 
-    // load / unload / blame / diff on an out-of-scope path refuse with the stable code + exit 7.
+    // load / remove / unload / blame / diff on an out-of-scope path refuse with the stable
+    // code + exit 7.
     for args in [
         vec!["--json", "load", "src/web/w.txt"],
+        vec!["--json", "remove", "src/web/w.txt"],
         vec!["--json", "unload", "src/web/w.txt"],
         vec!["--json", "blame", "src/web/w.txt"],
         vec!["--json", "diff", "main", "scoped", "src/web"],
@@ -5300,4 +5920,251 @@ fn a_chunked_file_directory_flip_shift_succeeds() {
     let status = stdout(&warehouse.run(&["stocktake"]));
     assert!(status.contains("The inventory matches the pallet head"), "status: {}", status);
     assert!(status.contains("The working directory matches the inventory"), "status: {}", status);
+}
+
+#[test]
+fn show_prints_a_files_content_at_head_and_at_an_older_revision() {
+    let warehouse = TestWarehouse::new("show-text");
+    warehouse.write_file("src/app.rs", "v1\n");
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    let v1 = extract_parcel_hash(&{
+        let out = warehouse.run(&["stack", "v1"]);
+        assert_success(&out);
+        out
+    });
+
+    warehouse.write_file("src/app.rs", "v2\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "v2"]));
+
+    // The current head, by pallet name.
+    let head = warehouse.run(&["show", "main:src/app.rs"]);
+    assert_success(&head);
+    assert_eq!(stdout(&head), "v2\n");
+
+    // An older revision, by parcel hash — one invocation, no separate resolve/peek round trip.
+    let older = warehouse.run(&["show", &format!("{}:src/app.rs", v1)]);
+    assert_success(&older);
+    assert_eq!(stdout(&older), "v1\n");
+
+    // --json carries the resolved parcel hash, the blob hash, and the content.
+    let json_out = warehouse.run(&["--json", "show", "main:src/app.rs"]);
+    assert_success(&json_out);
+    let data = json(&json_out)["data"].clone();
+    assert_eq!(data["path"], "src/app.rs");
+    assert_eq!(data["binary"], false);
+    assert_eq!(data["content"], "v2\n");
+    assert_eq!(data["size"], 3);
+    assert!(data["revision"].as_str().unwrap().len() >= 4, "revision should be a resolved hash");
+    assert!(data.get("content_hash").is_none(), "content_hash is chunked-only");
+    assert!(data.get("chunk_count").is_none(), "chunk_count is chunked-only");
+}
+
+#[test]
+fn show_reports_binary_content_honestly_never_mangling_it() {
+    let warehouse = TestWarehouse::new("show-binary");
+    write_bytes(&warehouse, "blob.bin", b"bin\0ary");
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "binary"]));
+
+    let json_out = warehouse.run(&["--json", "show", "main:blob.bin"]);
+    assert_success(&json_out);
+    let data = json(&json_out)["data"].clone();
+    assert_eq!(data["binary"], true);
+    assert_eq!(data["size"], 7);
+    assert!(data.get("content").is_none(), "a binary blob must never carry mangled content");
+
+    let human = warehouse.run(&["show", "main:blob.bin"]);
+    assert_success(&human);
+    assert!(stdout(&human).contains("binary file"), "unexpected output: {}", stdout(&human));
+}
+
+#[test]
+fn show_reports_nul_free_invalid_utf8_content_as_binary() {
+    // A NUL-free blob can still be invalid UTF-8 — text means both checks pass, not just the
+    // NUL-byte one, or this is exactly the mangled-content bug the "binary" signal exists to
+    // prevent.
+    let warehouse = TestWarehouse::new("show-invalid-utf8");
+    write_bytes(&warehouse, "blob.bin", &[0x66, 0x6f, 0xff, 0xfe]);
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "invalid utf8"]));
+
+    let json_out = warehouse.run(&["--json", "show", "main:blob.bin"]);
+    assert_success(&json_out);
+    let data = json(&json_out)["data"].clone();
+    assert_eq!(data["binary"], true);
+    assert_eq!(data["size"], 4);
+    assert!(data.get("content").is_none(), "invalid UTF-8 must never carry mangled content");
+}
+
+#[test]
+fn show_reports_chunked_metadata_without_assembling_the_file() {
+    let warehouse = TestWarehouse::new("show-chunked");
+    let giant = large_bytes(0x540, CHUNK_THRESHOLD + 10_000);
+    write_bytes(&warehouse, "big.bin", &giant);
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "chunked"]));
+
+    let json_out = warehouse.run(&["--json", "show", "main:big.bin"]);
+    assert_success(&json_out);
+    let data = json(&json_out)["data"].clone();
+    assert_eq!(data["binary"], true);
+    assert_eq!(data["size"], giant.len());
+    assert!(data.get("content").is_none(), "a chunked file is never assembled just to show it");
+    assert!(data["content_hash"].as_str().unwrap().len() > 0);
+    assert!(data["chunk_count"].as_u64().unwrap() > 0);
+
+    let human = warehouse.run(&["show", "main:big.bin"]);
+    assert_success(&human);
+    let text = stdout(&human);
+    assert!(text.contains("chunked file") && text.contains("chunks"), "unexpected output: {}", text);
+}
+
+#[test]
+fn show_resolves_a_subdirectory_path() {
+    let warehouse = TestWarehouse::new("show-paths");
+    warehouse.write_file("src/data/nested.txt", "nested content\n");
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "paths"]));
+
+    let nested = warehouse.run(&["show", "main:src/data/nested.txt"]);
+    assert_success(&nested);
+    assert_eq!(stdout(&nested), "nested content\n");
+}
+
+// NTFS filenames cannot contain ":", so a fixture file with one in its name cannot even be
+// created on Windows — this is exactly the split-on-first-":" behavior under test, and there
+// is no cross-platform way to exercise it with a real on-disk path. Unix-only.
+#[cfg(unix)]
+#[test]
+fn show_resolves_a_path_containing_a_colon() {
+    let warehouse = TestWarehouse::new("show-colon-path");
+    warehouse.write_file("note:with:colons.txt", "colon path\n");
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "paths"]));
+
+    // Only the *first* ":" splits revision from path — the rest belongs to the path.
+    let colon_path = warehouse.run(&["show", "main:note:with:colons.txt"]);
+    assert_success(&colon_path);
+    assert_eq!(stdout(&colon_path), "colon path\n");
+}
+
+#[test]
+fn show_reports_a_clean_error_for_a_missing_path_or_revision() {
+    let warehouse = TestWarehouse::new("show-missing");
+    warehouse.write_file("src/app.rs", "content\n");
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base"]));
+
+    let missing_path = warehouse.run(&["show", "main:nope.txt"]);
+    assert!(!missing_path.status.success());
+    assert!(stderr(&missing_path).contains("was not found"), "unexpected error: {}", stderr(&missing_path));
+
+    let missing_revision = warehouse.run(&["show", "nope:src/app.rs"]);
+    assert!(!missing_revision.status.success());
+    assert!(
+        stderr(&missing_revision).contains("neither a pallet nor a parcel hash"),
+        "unexpected error: {}", stderr(&missing_revision)
+    );
+
+    let malformed = warehouse.run(&["show", "no-colon-here"]);
+    assert!(!malformed.status.success());
+    assert!(stderr(&malformed).contains("is not \"<revision>:<path>\""), "unexpected error: {}", stderr(&malformed));
+}
+
+#[test]
+fn peek_json_reports_a_binary_blob_honestly() {
+    let warehouse = TestWarehouse::new("peek-binary-json");
+    write_bytes(&warehouse, "blob.bin", b"bin\0ary");
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    let parcel = extract_parcel_hash(&{
+        let out = warehouse.run(&["stack", "binary"]);
+        assert_success(&out);
+        out
+    });
+
+    let hash = path_object_hash(&warehouse, &parcel, "blob.bin");
+    let peeked = warehouse.run(&["--json", "peek", &hash]);
+    assert_success(&peeked);
+    let data = json(&peeked)["data"].clone();
+    assert_eq!(data["binary"], true);
+    assert!(data.get("content").is_none(), "a binary blob must never carry mangled content");
+}
+
+#[test]
+fn peek_json_reports_nul_free_invalid_utf8_content_as_binary() {
+    // Same fix, same test shape as `show`: a NUL-free blob that is not valid UTF-8 must still
+    // report binary, not fall through to a lossy conversion that mangles it into fake text.
+    let warehouse = TestWarehouse::new("peek-invalid-utf8-json");
+    write_bytes(&warehouse, "blob.bin", &[0x66, 0x6f, 0xff, 0xfe]);
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    let parcel = extract_parcel_hash(&{
+        let out = warehouse.run(&["stack", "invalid utf8"]);
+        assert_success(&out);
+        out
+    });
+
+    let hash = path_object_hash(&warehouse, &parcel, "blob.bin");
+    let peeked = warehouse.run(&["--json", "peek", &hash]);
+    assert_success(&peeked);
+    let data = json(&peeked)["data"].clone();
+    assert_eq!(data["binary"], true);
+    assert!(data.get("content").is_none(), "invalid UTF-8 must never carry mangled content");
+}
+
+#[test]
+fn diff_empty_token_lists_every_file_of_a_root_parcel_as_added() {
+    let warehouse = TestWarehouse::new("diff-empty-token");
+    warehouse.write_file("src/app.rs", "content\n");
+    warehouse.write_file("README.md", "readme\n");
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "root"]));
+
+    // A root parcel has no real "before" — diffing it against ":empty" reports every
+    // tracked file as added, rather than refusing for want of a second real revision.
+    let human = warehouse.run(&["diff", ":empty", "main"]);
+    assert_success(&human);
+    let text = stdout(&human);
+    assert!(text.contains("added: src/app.rs"), "unexpected diff output: {}", text);
+    assert!(text.contains("added: README.md"), "unexpected diff output: {}", text);
+
+    let json_out = warehouse.run(&["--json", "diff", ":empty", "main"]);
+    assert_success(&json_out);
+    let files = json(&json_out)["data"]["files"].as_array().unwrap().clone();
+    assert_eq!(files.len(), 2);
+    assert!(files.iter().all(|file| file["kind"] == "added"));
+
+    // The reverse direction: main vs nothing removes everything.
+    let reversed = stdout(&warehouse.run(&["diff", "main", ":empty"]));
+    assert!(reversed.contains("removed: src/app.rs"), "unexpected diff output: {}", reversed);
 }

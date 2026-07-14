@@ -14,7 +14,7 @@ Success envelope:
 
 ```json
 {
-  "forklift_json": "1",
+  "forklift_json": "2",
   "command": "stocktake",
   "ok": true,
   "data": { "…command-specific…" }
@@ -25,7 +25,7 @@ Failure envelope (also sets the exit code below):
 
 ```json
 {
-  "forklift_json": "1",
+  "forklift_json": "2",
   "ok": false,
   "error": {
     "code": "not_a_warehouse",
@@ -36,12 +36,119 @@ Failure envelope (also sets the exit code below):
 ```
 
 `forklift_json` is the output schema version. It changes only when the envelope or a
-command's `data` shape changes incompatibly, so a consumer can pin it. A command's
-`data` shape is documented by the struct it emits (in `crates/forklift/src/commands/`).
+command's `data` shape changes incompatibly, so a consumer can pin it — and it *is* the
+capability-detection mechanism: check the version before relying on a field, rather than
+sniffing for the field's presence. A command's `data` shape is documented by the struct
+it emits (in `crates/forklift/src/commands/`) — the generated, exhaustive reference for
+every one of them is [`generated/json-schemas.md`](generated/json-schemas.md).
+
+**Version 2** (current): `history` entries carry `parents` (every parcel's parents, in
+stored order, always present — `[]` for a root); the `empty_history` error code exists
+(`history` on an unborn pallet); `palletize` list entries carry `head`; the `show`
+command reads a file's content at a revision in one call; `diff` accepts the reserved
+`:empty` token (either revision) for the empty tree; and `peek` on a binary blob reports
+`binary: true` instead of silently mangling the bytes.
+
+### `history --json`
+
+```json
+{
+  "data": {
+    "entries": [
+      {
+        "parcel": "<hash>",
+        "parents": ["<base-hash>", "<other-hash>"],
+        "consolidates": ["<base-hash>", "<other-hash>"],
+        "actions": [
+          { "action": "author", "operator": "<id>", "timestamp": "2026-07-13T00:00:00+00:00" },
+          { "action": "stack", "operator": "<id>", "timestamp": "2026-07-13T00:00:01+00:00" }
+        ],
+        "description": "…"
+      },
+      { "parcel": "<root-hash>", "parents": [], "actions": [ /* … */ ] }
+    ],
+    "next": null
+  }
+}
+```
+
+`parents` is always present, in the parcel's stored (canonical, base-first) order — a
+root parcel's is `[]`. It is the general graph edge (every parcel, not only merges); the
+older `consolidates` field is unchanged and kept for compatibility (present, non-empty,
+only on a merge parcel).
+
+`history` on an unborn pallet (nothing stacked yet) fails with `empty_history` (exit 19)
+rather than the generic `error` code.
+
+### `palletize --json` (listing)
+
+```json
+{
+  "data": {
+    "current": "main",
+    "current_unborn": false,
+    "pallets": [
+      { "name": "feature/x", "current": true, "head": "<hash>" },
+      { "name": "main", "current": false, "head": "<hash>" }
+    ],
+    "meta": []
+  }
+}
+```
+
+Every pallet in `pallets` carries its `head` parcel hash, `null` for an unborn one (the
+current pallet is included in `pallets` even when unborn, rather than only signaled
+through `current_unborn`).
 
 Token-cheap by default: `stocktake --summary` reports counts only (no per-path lists),
 and `diff --json` reports the changed-file set (path + kind) rather than every line —
-a program reads specific content by hash when it needs it.
+a program reads specific content by hash when it needs it. `diff` also accepts the
+reserved token `:empty` as either revision, meaning the empty tree — the base for
+comparing a root parcel (which has no real "before") against a clean slate, so every
+file it introduces lists as `Added`. `:empty` can never collide with a real revision:
+a pallet/meta-pallet name is restricted to ASCII letters, digits, `.`, `_`, `-` and
+`/`, and a hash prefix is hex digits only — neither grammar can contain `:`.
+
+### `show --json`
+
+`show <revision>:<path>` reads a file's content at a revision in one call — a
+program's alternative to resolving a revision, walking its tree and peeking the blob
+by hash itself. The argument splits on the *first* `:` (a revision can never contain
+one, so the split is unambiguous even when the path does). Its `data`:
+
+```json
+{
+  "revision": "<the resolved parcel hash>",
+  "path": "src/app.rs",
+  "hash": "<the tree entry's own object hash: a blob hash, or a recipe hash>",
+  "binary": false,
+  "content": "…file text…",
+  "size": 1234
+}
+```
+
+`binary: true` means `content` is absent — either the bytes are not text (a NUL byte
+anywhere, or the bytes are not valid UTF-8 — both count, and either alone is enough),
+or the path is a chunked large file, reported by its recipe metadata instead of being
+assembled:
+
+```json
+{
+  "revision": "<parcel hash>",
+  "path": "big.bin",
+  "hash": "<recipe hash>",
+  "binary": true,
+  "size": 104857600,
+  "content_hash": "<the assembled file's whole-content hash>",
+  "chunk_count": 13
+}
+```
+
+`peek <hash>` on a blob carries the same `binary` signal, with the same definition —
+a NUL byte anywhere, or bytes that are not valid UTF-8, either one enough on its own:
+`"binary": true` and `content` is omitted, instead of the pre-fix behavior of silently
+mangling the raw bytes through a lossy UTF-8 conversion with no signal that it
+had happened.
 
 ## Error codes and exit codes
 
@@ -49,27 +156,15 @@ Every failure carries a stable `code` an agent can branch on, and the process ex
 with a deterministic status so a script can branch without parsing prose. `2`
 is reserved for argument/usage errors (clap); `0` is success.
 
-| `code`                    | exit | Meaning                                                          |
-|---------------------------|------|-------------------------------------------------------------------|
-| `error`                   | 1    | Anything without a more specific classification yet               |
-| `not_a_warehouse`         | 3    | The command needs a warehouse; this directory is none             |
-| `conflict`                | 4    | Working state blocks the operation (unresolved / dirty)           |
-| `diverged`                | 5    | A remote ref moved under a lift — lower, retry                     |
-| `warehouse_locked`        | 6    | Another forklift process holds the warehouse lock                 |
-| `out_of_scope`            | 7    | A path argument is outside a scoped (sparse) bay's scope          |
-| `scope_path_type_changed` | 8    | A scoped bay's spine path flipped dir↔file; scope no longer valid |
-| `sparse_workspace`        | 9    | A whole-tree verb is not supported in a scoped (sparse) bay yet   |
-| `out_of_scope_conflict`   | 10   | A scoped bay merge hit an out-of-scope entry changed on both sides |
-| `non_origin_lift`         | 11   | A sparse workspace tried to lift to a remote other than its origin |
-| `narrow_unclean`          | 12   | `narrow` would delete a subtree that still holds uncommitted work  |
-| `scope_prune_blocked`     | 13   | `scope-prune` would free a path a checkout still materializes       |
-| `chunked_transport_unsupported` | 14   | A chunked large file can't go into a bundle, or is being lifted to a remote that doesn't support chunking |
-| `oversized_transport_unsupported` | 15 | An object predates the size limit and can't be sent to a remote or bundle |
-| `commit_pagination_unsupported` | 16 | A lift needs a paginated commit (many objects) and the remote doesn't support it yet |
+The full table — generated from the `ErrorCode` enum the binary itself branches on, so
+it can never fall behind as codes are added — is
+[`generated/errors.md`](generated/errors.md).
 
 The codes and exit numbers are a contract: they get added to, never repurposed. A single
 `match` in the head (over `forklift-core`'s `RefusalCode`) maps a refusal to its exit code, so a
-new code cannot ship without an exit code wired to it.
+new code cannot ship without an exit code wired to it. `empty_history` is the one exception to
+that match — a head-only condition `forklift-core` never raises, classified directly in the head
+(`crates/forklift/src/output.rs`) rather than through a `RefusalCode`.
 
 A refusal a **remote** raises carries the same code: the server tags its JSON error body with the
 stable `code` (see `format/REMOTE_PROTOCOL.md`), and the client classifies it with the same code
@@ -114,9 +209,10 @@ human-only allow-list; a unit test (`every_cli_command_is_an_mcp_tool_or_explici
 fails CI if that ever drifts. Tools (arguments in parentheses):
 
 - **Inspect:** `stocktake` (summary?), `history` (revision?, class?, limit?, after?),
-  `diff` (staged?, targets?), `peek` (object | inventory), `blame` (path, rev?),
-  `audit` (pallet?), `conflicts`.
-- **Change:** `load` (path), `unload` (path), `stack` (description?), `restore` (path,
+  `diff` (staged?, targets?), `peek` (object | inventory), `show` (target — a single
+  "<revision>:<path>" string), `blame` (path, rev?), `audit` (pallet?), `conflicts`.
+- **Change:** `load` (path), `remove` (path — stage a removal), `unload` (path — unstage),
+  `stack` (description?), `restore` (path,
   staged?), `undo`, `park` / `park_list` / `park_pop`, `cherry_pick` (revision, message?),
   `deliver` (target, message?).
 - **Maintain:** `compact` (all?) — pack the loose object store into a few dense pack files

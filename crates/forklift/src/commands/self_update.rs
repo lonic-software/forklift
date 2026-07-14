@@ -198,8 +198,9 @@ impl InstallMethod {
 }
 
 /// The result of a self-update check (or update).
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct SelfUpdate {
+pub(crate) struct SelfUpdate {
     current: String,
 
     /// The latest published release, or `None` if there are none yet / GitHub was silent.
@@ -270,4 +271,13 @@ mod tests {
         assert!(!is_newer("0.1.0", "0.2.0"));
         assert!(!is_newer("garbage", "0.1.0"));
     }
+}
+
+
+/// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
+#[cfg(feature = "docgen")]
+pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+    vec![
+        ("SelfUpdate", schemars::schema_for!(SelfUpdate)),
+    ]
 }

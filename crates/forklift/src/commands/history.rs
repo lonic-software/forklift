@@ -77,9 +77,9 @@ pub async fn handle_command(revision: Option<String>, class: Option<String>, lim
             Some(revision) => pallet_utils::resolve_revision(&revision)?,
             None => {
                 let pallet = pallet_utils::get_current_pallet_name()?;
-                pallet_utils::get_pallet_head(&pallet)?.ok_or(format!(
+                pallet_utils::get_pallet_head(&pallet)?.ok_or_else(|| output::empty_history(format!(
                     "Pallet \"{}\" has nothing stacked yet; there is no history.", pallet
-                ))?
+                )))?
             }
         }],
     };
@@ -228,8 +228,9 @@ fn latest_action_timestamp(parcel: &Parcel) -> i64 {
 }
 
 /// The parcel history: parcels newest first.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct History {
+pub(crate) struct History {
     entries: Vec<HistoryEntry>,
 
     /// The cursor for the next `--json` page: pass it back as `--after` to resume. Absent
@@ -239,13 +240,19 @@ struct History {
 }
 
 /// One parcel in the history.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct HistoryEntry {
+pub(crate) struct HistoryEntry {
     parcel: String,
 
     /// The parents a consolidation merges (present only for merge parcels).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     consolidates: Vec<String>,
+
+    /// This parcel's parents, in their stored (canonical, base-first) order — always present,
+    /// `[]` for a root parcel. Unlike `consolidates` (kept for compatibility, only non-empty on
+    /// a merge), this is the graph edge a caller building a DAG needs regardless of parcel kind.
+    parents: Vec<String>,
 
     actions: Vec<HistoryAction>,
 
@@ -254,8 +261,9 @@ struct HistoryEntry {
 }
 
 /// One authorship/stack action within a parcel.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct HistoryAction {
+pub(crate) struct HistoryAction {
     action: String,
 
     /// The pseudonymous operator id (always present — it is what the chain records).
@@ -265,7 +273,7 @@ struct HistoryAction {
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
 
-    /// The operator's identity class (§7.1), when it is not a plain human — so agent,
+    /// The operator's identity class, when it is not a plain human — so agent,
     /// bot and service authorship is legible in the log.
     #[serde(skip_serializing_if = "Option::is_none")]
     class: Option<String>,
@@ -320,6 +328,7 @@ impl HistoryEntry {
         HistoryEntry {
             parcel: hash.to_string(),
             consolidates: if parcel.parents.len() > 1 { parcel.parents.clone() } else { Vec::new() },
+            parents: parcel.parents.clone(),
             actions,
             description: parcel.description.clone(),
         }
@@ -401,3 +410,12 @@ impl CommandOutput for History {
     }
 }
 
+
+
+/// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
+#[cfg(feature = "docgen")]
+pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+    vec![
+        ("History", schemars::schema_for!(History)),
+    ]
+}

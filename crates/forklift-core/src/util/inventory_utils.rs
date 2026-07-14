@@ -1384,12 +1384,12 @@ mod tests {
     #[test]
     fn carry_over_keeps_already_staged_removals() {
         let mut old_inventory = Inventory::new();
-        old_inventory.add_item(item("unloaded.txt", 1, InventoryItemState::Deleted));
+        old_inventory.add_item(item("removed.txt", 1, InventoryItemState::Deleted));
 
         let mut new_inventory = Inventory::new();
 
         carry_over_missing_entries_as_deleted(&old_inventory, &mut new_inventory);
 
-        assert!(new_inventory.get_item_by_name("unloaded.txt").unwrap().state == InventoryItemState::Deleted);
+        assert!(new_inventory.get_item_by_name("removed.txt").unwrap().state == InventoryItemState::Deleted);
     }
 }

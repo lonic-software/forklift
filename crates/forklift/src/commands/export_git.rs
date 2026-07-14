@@ -376,8 +376,9 @@ fn git_env(path: &str, args: &[&str], env: &[(&str, &str)]) -> Result<String, St
 }
 
 /// The result of a git export.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct ExportReport {
+pub(crate) struct ExportReport {
     path: String,
     commits: usize,
     trees: usize,
@@ -407,4 +408,13 @@ impl CommandOutput for ExportReport {
             not exported — git has no equivalent."
         );
     }
+}
+
+
+/// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
+#[cfg(feature = "docgen")]
+pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+    vec![
+        ("ExportReport", schemars::schema_for!(ExportReport)),
+    ]
 }

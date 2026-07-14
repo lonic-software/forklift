@@ -60,10 +60,16 @@ legacy boundary (a later `audit` then tolerates the imported parcels as legacy).
 (gitlinks) are skipped with a warning. For agents, this means a project can be moved onto
 forklift with one command.
 
-A large history lands hundreds of thousands of loose objects at once — the case the store
-is slowest and largest in — so import **packs the store on the way out** ([`compact`](#compact--pack-the-object-store),
-so you never have to remember to). Pass `--no-compact` to skip it and leave the objects
-loose (e.g. to inspect the raw store or benchmark the loose baseline).
+A large history lands hundreds of thousands of objects at once — the case the loose store
+is slowest and largest in — so the imported objects are written **straight into native
+packs** ([`compact`](#compact--pack-the-object-store)'s format, without the detour through
+one loose file per object), delta-compressing successive versions of files and directory
+trees on the way in. The store arrives dense and you never have to remember to `compact`
+it. Pass `--no-compact` to store loose objects instead (e.g. to inspect the raw store or
+benchmark the loose baseline). Because that packing only ever sees one file's own history as
+it streams in, `import-git` tips a one-line suggestion (also visible from `store`) that a
+one-shot `compact --all --redelta` could shrink the result further by delta-compressing
+across the whole store, including similarity a per-path pass cannot see.
 
 Refuses in a scoped (sparse) bay (see `bay add --scope` below): importing builds
 every pallet's history straight from the git tree, bypassing the sparse overlay entirely,
@@ -172,16 +178,28 @@ is incremental — unchanged files are recognized by their stat data and never
 re-read. `load` (like every mutating command) holds the warehouse lock while it
 runs, so two forklift processes never interleave.
 
-### `unload` — stage a removal (`ul`)
+### `unload` — unstage (`ul`)
 
 ```sh
-forklift unload old.txt
+forklift unload src/main.rs
+```
+
+The inverse of `load`: resets the path's inventory entries to the pallet head,
+so the next parcel won't record the staged change. The working directory is
+**not** touched — your edits stay, they're just no longer staged. (`restore
+--staged` does the same thing; `unload` is its natural name.) To stage a
+removal instead, use `remove`.
+
+### `remove` — stage a removal (`rm`)
+
+```sh
+forklift remove old.txt
 ```
 
 Marks the path's inventory entries as deleted so the next parcel won't contain
 them. The working directory is **not** touched (the file stays on disk). To
 un-stage the removal, `load` the file again (if it's still there) or use
-`restore --staged`.
+`unload`.
 
 ### `stocktake` — status (`st`)
 
@@ -205,6 +223,7 @@ forklift diff --staged              # inventory vs pallet head (what stack would
 forklift diff main feature          # two revisions, tree vs tree
 forklift diff main feature src/     # ...limited to a path
 forklift diff --verbose             # include unchanged context lines
+forklift diff :empty main           # main's root parcel vs nothing: every file is "added"
 ```
 
 Binary files are reported, not printed. Whitespace-only changes are shown faint
@@ -215,6 +234,15 @@ A large file (stored in chunks — see below) is a binary as far as diff is conc
 a changed one reports as `(binary contents; not shown line by line)`, never assembled
 or line-diffed.
 
+The two-revision form accepts anything `show` and `history` do — a pallet name, an
+`@`-qualified meta pallet, or a parcel hash prefix — plus one reserved token,
+`:empty`, meaning the empty tree. It exists for a root parcel, which has no real
+"before": `diff :empty <revision>` compares it against a clean slate, so every file
+it introduces lists as `Added` instead of `diff` refusing for want of a second
+revision. `:empty` can never collide with a real revision — a pallet/meta name is
+restricted to ASCII letters, digits, `.`, `_`, `-` and `/`, and a hash prefix is hex
+digits only, so neither grammar can ever contain a `:`.
+
 ### `restore` — discard changes (`r`)
 
 ```sh
@@ -224,7 +252,8 @@ forklift restore --staged path   # reset the inventory entry to the pallet head 
 
 `restore path` overwrites the working file(s) from what's staged — it throws away
 unstaged edits, so use it deliberately. `restore --staged path` leaves the
-working directory alone and only un-stages (the inverse of `load`).
+working directory alone and only un-stages (the inverse of `load`) — the same
+operation as `unload`.
 
 ### `stack` — commit (`s`)
 
@@ -288,8 +317,8 @@ time:
 
 Re-`stack` to redo (e.g. with a corrected message). When the journal is empty (a stack made
 before this feature), `undo` falls back to soft-resetting the current pallet's head to its
-first parent. Undoing a pallet's *very first* parcel, pure-staging (`load`/`unload`) and
-trust/remote commands are out of scope; `park` is reversed with `park pop`.
+first parent. Undoing a pallet's *very first* parcel, pure-staging (`load`/`remove`/`unload`)
+and trust/remote commands are out of scope; `park` is reversed with `park pop`.
 
 ### `peek` — inspect an object (`pk`)
 
@@ -301,7 +330,31 @@ forklift peek --inventory src -v     # ...with full stat detail
 
 A debugging/inspection tool: it decodes any object by hash (a blob's text, a
 tree's entries, a parcel's tree/parents/actions/description) or dumps a folder's
-inventory shard.
+inventory shard. With `--json`, a binary blob (a NUL byte anywhere, or bytes that
+are not valid UTF-8) reports `"binary": true` and omits `content` instead of
+mangling raw bytes through a lossy text conversion.
+
+### `show` — a file's content at a revision
+
+```sh
+forklift show main:src/app.rs               # the file as of main's head
+forklift show a1b2c3:src/app.rs             # ...at a parcel hash prefix instead
+forklift show main:logs/build:latest.txt    # a path may itself contain ":" — only
+                                             # the first ":" splits revision from path
+```
+
+The one-invocation equivalent of resolving a revision, walking its tree to a path
+and peeking the blob by hash yourself — a single call in and out for a caller like
+an editor's review panel. The argument is `<revision>:<path>`, split on the *first*
+`:` — a revision (a pallet name, an `@`-qualified meta pallet, or a hash prefix)
+can never contain `:`, so the split is unambiguous even when the path does.
+
+A large file (stored in chunks) reports its metadata — content hash, total size,
+chunk count — instead of assembling it; non-text content (a NUL byte anywhere, or
+bytes that are not valid UTF-8) reports binary. Either way `content` is absent and
+`binary` is `true`. In human mode a short notice prints instead of raw bytes; in
+`--json` mode see [`docs/MACHINE_INTERFACE.md`](../MACHINE_INTERFACE.md) for the
+exact shape.
 
 ---
 
@@ -334,6 +387,17 @@ agent, bot or service is shown as `[agent, supervised by <human>]`, read from th
 signed office record — so authorship stays forge-proof, and `--class
 <human|agent|bot|service>` filters the log to answer "which parcels did agents write,
 under whose supervision".
+
+With `--json`, each entry also carries `parents` — every parent of that parcel, in
+their stored (canonical) order — base-first for a consolidation — `[]` for a root —
+which is what a caller building a graph (rather than just reading a log) walks:
+
+```json
+{ "parcel": "<hash>", "parents": ["<base>", "<other>"], "consolidates": ["<base>", "<other>"], "actions": [/* … */] }
+```
+
+`history` on a pallet with nothing stacked on it yet fails with the `empty_history`
+error code (exit 19) rather than a generic one.
 
 ### Paging
 
@@ -501,6 +565,18 @@ and other tracked metadata), each in its `@`-qualified form — the address you 
 with. Pallet names may contain `/` (mapped to subfolders). Creating one at a revision
 materializes that state (and refuses on a dirty warehouse); creating one at the
 current head just moves refs.
+
+With `--json`, each pallet in the list carries its `head` parcel hash (`null` for an
+unborn one — the current pallet is listed even when unborn, so a caller never has to
+special-case it):
+
+```json
+{ "current": "main", "current_unborn": false,
+  "pallets": [
+    { "name": "feature/x", "current": true, "head": "<hash>" },
+    { "name": "main", "current": false, "head": "<hash>" }
+  ] }
+```
 
 ### `shift` — switch pallets (`sh`)
 
@@ -715,6 +791,10 @@ all work; office and every meta pallet are always fetched in full, so a sparse f
 trusted warehouse still audits offline exactly as a full clone does. Widen later with `expand`.
 A sparse franchise records its origin — see the origin-only lift rule under `lift`.
 
+When the remote's bundle installs native packs straight into the new warehouse, `franchise`
+tips the same densify suggestion `import-git` does: those packs are the far end's own bulk
+ingest, unseen by a cross-store `compact --all --redelta` pass.
+
 ### Configuring a remote on an existing warehouse
 
 ```sh
@@ -913,8 +993,8 @@ changed-path filter — so `blame` skips parcels that did not touch the file. It
 repairs itself, so you never manage it; building it during `compact` just means it is warm the
 first time you need it.
 
-**You rarely need to run this by hand.** `import-git` compacts on the way out (unless you pass
-`--no-compact`), and afterwards forklift **compacts automatically** in the background of a
+**You rarely need to run this by hand.** `import-git` writes packs directly on the way in
+(unless you pass `--no-compact`), and afterwards forklift **compacts automatically** in the background of a
 mutating command once the store has accumulated enough loose objects or packs to warrant it
 (git's `gc --auto`). It runs synchronously, under that command's lock, so it is correct and
 never races — which means it can add a brief pause when it fires (rarely). Turn it off with
@@ -938,6 +1018,19 @@ does when packs pile up, or a server off-peak).
 forklift compact          # incremental: pack the loose objects
 forklift compact --all    # full repack: drop garbage, consolidate every pack
 ```
+
+`compact --all --redelta` goes further: instead of reusing each object's existing delta, it
+re-reads and re-compresses **every** live object (packed or loose, files and directories alike)
+and re-runs delta selection on the whole store together. That matters because a repack's
+copy-fast-path can only keep whatever delta an object was *originally* given — and an object
+packed in isolation (say, on import, or by an earlier incremental compact whose delta window
+only ever saw a few neighbors) has no way to know a much better match (a rename, a moved file,
+anything similar outside its own path) sits elsewhere in the store. `--redelta` gives every
+object one more shot at the best base across the *entire* live set. It costs a full re-encode —
+one-shot and CPU-bound, not something to run routinely — and it is only valid together with
+`--all`. Safe to repeat any number of times on the same store. `store` (and `import-git`'s and
+`franchise`'s own output) suggest running it when the store was bulk-ingested and has not been
+through a redelta pass yet; a successful run clears that suggestion.
 
 > This step removes per-file slack and the open-per-object read cost. Delta compression
 > between similar versions (the rest of the size gap vs git) is additional work on top —
@@ -970,8 +1063,11 @@ Object store
 
 `--json` reports `{loose_objects, loose_bytes, packed_objects, pack_files, deltas, pack_bytes,
 total_bytes, packs:[{id, objects, deltas, bytes}], maintenance:{auto, loose_threshold,
-pack_threshold, compaction_due, repack_due}}` — every size an exact byte count. Nothing is
-written; run `compact` to act on what it reports.
+pack_threshold, compaction_due, repack_due}, densify_suggested}` — every size an exact byte
+count. Nothing is written; run `compact` to act on what it reports. `densify_suggested` (and,
+in the human view, a one-line tip) appears once the store was bulk-ingested (`import-git` or a
+franchise's bundle install) and clears once a `compact --all --redelta` pass has run
+(see [`--redelta`](#compact--pack-the-object-store)).
 
 ---
 
@@ -1032,11 +1128,12 @@ nudge you toward the real names as you go):
 | `status` | `stocktake` | | `push` | `lift` |
 | `log` | `history` | | `pull` | `lower` |
 | `branch` | `palletize` | | `stash` | `park` |
-| `annotate` | `blame` | | | |
+| `annotate` | `blame` | | `rm --cached` | `remove` |
+| `restore --staged` | `unload` | | | |
 
 The mapping isn't always one-to-one in *behavior* (e.g. `commit` runs `stack`, which commits
-what you've `load`ed — it doesn't stage for you). `diff`, `restore`, `tag` and `cherry-pick`
-keep their git names outright. For the review workflow, git's "pull request" is
+what you've `load`ed — it doesn't stage for you). `diff`, `restore`, `tag`, `show` and
+`cherry-pick` keep their git names outright. For the review workflow, git's "pull request" is
 [`haul`](#haul--pull-requests-reviewable-merge-proposals).
 
 | Command | Alias | Does |
@@ -1048,13 +1145,15 @@ keep their git names outright. For the review workflow, git's "pull request" is
 | `config` | `cfg` | Read/set/unset configuration |
 | `profile` | | Manage named identity profiles |
 | `load` | `l` | Stage changes into the inventory |
-| `unload` | `ul` | Stage a removal |
+| `unload` | `ul` | Unstage (undo a `load`) |
+| `remove` | `rm` | Stage a removal |
 | `restore` | `r` | Restore from the inventory (discard changes) |
 | `stocktake` | `st` | Show staged and unstaged changes |
 | `diff` | `d` | Show line-by-line changes |
 | `stack` | `s` | Record the inventory as a new parcel |
 | `undo` | | Soft-reset the last stack |
 | `peek` | `pk` | Inspect an object or inventory |
+| `show` | | Print a file's content at a revision (`<revision>:<path>`) |
 | `history` | `hi` | Walk the parcel graph |
 | `blame` | `bl` | Attribute each line to its author (with identity class) |
 | `audit` | `a` | Verify signed history offline |
@@ -1084,23 +1183,13 @@ keep their git names outright. For the review workflow, git's "pull request" is
 
 ## 11. Exit codes
 
-Errors set a deterministic exit code so scripts branch without parsing prose:
+Errors set a deterministic exit code so scripts branch without parsing prose. `0` is
+success and `2` is clap's own usage/argument error; every other code is one of forklift's
+own classified failures.
 
-| Code | Meaning |
-|------|---------|
-| 0 | Success |
-| 1 | Generic error |
-| 2 | Usage / argument error |
-| 3 | Not a warehouse |
-| 4 | Conflict (working state blocks the operation) |
-| 5 | Diverged (a remote ref moved under a lift) |
-| 6 | Warehouse locked (another forklift process holds it) |
-| 7 | Out of scope (a path argument is outside a scoped bay's scope) |
-| 8 | Scope path type changed (a scoped bay's spine path flipped dir↔file) |
-| 9 | Sparse workspace (a whole-tree verb is not supported in a scoped bay yet) |
-| 10 | Out of scope conflict (a scoped bay merge hit an out-of-scope entry changed on both sides) |
-| 11 | Non-origin lift (a sparse workspace tried to lift to a remote other than its origin) |
-| 12 | Narrow unclean (`narrow` would delete a subtree that still holds uncommitted work) |
+The full, always-current table — generated from the same enum the binary itself
+branches on, so it can never fall behind — is
+[`../generated/errors.md`](../generated/errors.md).
 
 With `--json`, the same classification appears as `error.code` in the output
 envelope. See [`../MACHINE_INTERFACE.md`](../MACHINE_INTERFACE.md).

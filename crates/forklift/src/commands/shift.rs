@@ -32,6 +32,7 @@ pub async fn handle_command(target: &str) -> Result<(), String> {
 }
 
 /// The pallet a `shift` moved to and its head.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
 pub struct Shifted {
     pub pallet: String,
@@ -136,4 +137,13 @@ async fn ensure_warehouse_is_clean(current_tree_hash: Option<&str>) -> Result<()
         "There are local changes that shifting would overwrite. Stack them, restore them, \
         or park them first (see \"stocktake\" for the details).".to_string()
     )
+}
+
+
+/// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
+#[cfg(feature = "docgen")]
+pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+    vec![
+        ("Shifted", schemars::schema_for!(Shifted)),
+    ]
 }

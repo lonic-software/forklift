@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Regenerate the parts of the docs that are derivable from code: the error/exit-code
+# reference table and every command's `--json` output schema. Both come out of the
+# `forklift` binary itself, built with the dev-only `docgen` feature (never enabled in a
+# release build — see crates/forklift/Cargo.toml and crates/forklift/src/docgen.rs).
+#
+# usage: gen-docs [output-dir]     (default docs/generated)
+#
+# The optional output-dir lets `bin/check` generate into a scratch directory and diff it
+# against docs/generated without touching the working tree — see the "docs freshness"
+# step there. Normal use (regenerating for a commit) takes no argument.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+out="${1:-docs/generated}"
+mkdir -p "$out"
+
+echo "── building forklift --features docgen"
+cargo build --quiet -p forklift --features docgen
+
+bin="./target/debug/forklift"
+
+"$bin" __docgen errors > "$out/errors.md"
+"$bin" __docgen json-schemas > "$out/json-schemas.md"
+
+echo "gen-docs: wrote $out/errors.md and $out/json-schemas.md"

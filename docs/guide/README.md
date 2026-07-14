@@ -39,7 +39,8 @@ vocabulary, forklift uses shipping-yard words — the concepts map one-to-one:
 | `merge` | **consolidate** | merge another pallet in |
 | `stash` | **park** | set work aside and return to the head |
 | `add` | **load** | stage a file or directory |
-| `rm --cached` | **unload** | stage a removal |
+| `rm --cached` | **remove** | stage a removal |
+| `restore --staged` | **unload** | unstage (undo a `load`) |
 | `status` | **stocktake** | show staged and unstaged changes |
 | `push` | **lift** | upload to a remote |
 | `pull` | **lower** | fetch and fast-forward from a remote |

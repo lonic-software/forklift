@@ -51,15 +51,17 @@ pub fn list() -> Result<(), String> {
 }
 
 /// The profile listing: the default identity and every named profile.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct ProfileList {
+pub(crate) struct ProfileList {
     default: ProfileEntry,
     profiles: Vec<ProfileEntry>,
 }
 
 /// One profile and how many local keys it holds.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct ProfileEntry {
+pub(crate) struct ProfileEntry {
     name: String,
 
     /// The operator id (`null` for the default before any id is minted).
@@ -145,4 +147,13 @@ pub fn use_profile(profile: &str) -> Result<(), String> {
     ));
 
     Ok(())
+}
+
+
+/// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
+#[cfg(feature = "docgen")]
+pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+    vec![
+        ("ProfileList", schemars::schema_for!(ProfileList)),
+    ]
 }

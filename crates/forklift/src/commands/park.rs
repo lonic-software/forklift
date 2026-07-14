@@ -247,14 +247,16 @@ pub fn list_parked() -> Result<(), String> {
 }
 
 /// The list of parked parcels, newest first.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct ParkedList {
+pub(crate) struct ParkedList {
     parked: Vec<ParkedEntry>,
 }
 
 /// One parked parcel.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct ParkedEntry {
+pub(crate) struct ParkedEntry {
     parcel: String,
     description: String,
 }
@@ -270,4 +272,13 @@ impl CommandOutput for ParkedList {
             println!("{} {}", entry.parcel, entry.description);
         }
     }
+}
+
+
+/// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
+#[cfg(feature = "docgen")]
+pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+    vec![
+        ("ParkedList", schemars::schema_for!(ParkedList)),
+    ]
 }

@@ -8,7 +8,8 @@ number by hand and add your own.
 > **Read this first — the honest framing.** Git is a 20-year-old C codebase tuned
 > against the exact repos below; Forklift is **v0.1.x**. Expect Git to win some raw
 > single-command timings and Forklift to reach parity or better on others (status,
-> commit, and — on a packed store — the history walk and on-disk size). The point of
+> commit, and — on a packed store — the history walk; on-disk size is still a known
+> gap, see §2). The point of
 > benchmarking here is not to "beat git" — it
 > is to (a) see where Forklift is already in the same ballpark, (b) find the
 > operations that are *unexpectedly* slow so they become optimization targets, and
@@ -74,49 +75,49 @@ in copy `B`:
 | **diff** (dirty tree) | `git diff` | `forklift diff --staged` |
 | **commit** (1 file) | `git add` + `git commit` | `forklift load` + `forklift stack` |
 | **onboard** *(separate)* | `git clone --local` | `forklift import-git .` |
-| **compaction** *(payoff, separate)* | — | `forklift compact` — loose→packed before/after |
 
-The forklift copy is **compacted right after import**, so the four comparison rows run
-on the *packed* store — the same shape git is always measured in (`clone --local` copies
-packfiles; a real `import-git` packs on the way out). The loose→packed win is reported
-separately as a forklift-only payoff, never as a ratio against git.
+`import-git` writes straight into native packs as it imports — there is no loose store
+and no separate compaction pass. So the forklift copy is already packed the moment the
+import finishes, and the four comparison rows run on the *packed* store — the same shape
+git is always measured in (`clone --local` copies packfiles).
 
 Output is an **aligned text table** (pass `--markdown` for a pasteable markdown one):
 git time, forklift time, the **forklift/git ratio** (below 1.0 means forklift was
 faster), and a per-row note. Example shape:
 
 ```
-  Repo:      git — 81470 commits, 4775 tracked files
-  On-disk:   git .git = 316M   forklift .forklift = 236M  (forklift 1.3x smaller)
+  Repo:      git — 81471 commits, 4775 tracked files
+  On-disk:   git .git = 316M   forklift .forklift = 435M  (forklift 1.4x larger)
 
   Operation               git        forklift   forklift/git   Notes
   ----------------------  ---------  ---------  -------------  ----------------------------------
-  status (clean tree)     172 ms     22 ms      0.13x          git status vs forklift stocktake …
-  log (whole history)     929 ms     944 ms     1.02x          81470 commits walked
-  diff (20 files changed) 25 ms      43 ms      1.72x          git diff vs forklift diff --staged
-  commit (1 file)         41 ms      38 ms      0.93x          git add+commit vs load+stack
+  status (clean tree)     118 ms     31 ms      0.26x          git status vs forklift stocktake …
+  log (whole history)     869 ms     988 ms     1.14x          81471 commits walked
+  diff (20 files changed) 23 ms      40 ms      1.74x          git diff vs forklift diff --staged
+  commit (1 file)         37 ms      83 ms      2.24x          git add+commit vs load+stack
 
   Onboarding — measured separately; NOT a ratio (different operations):
-    git clone --local     462 ms     (copies an existing packfile)
-    forklift import-git   130.91 s   (re-encodes every commit/tree/blob)
-
-  Compaction payoff (forklift's own before/after — no git equivalent):
-  The table above runs packed; this is what packing bought over the loose store.
-    Compacted 402118 loose objects into 5 packs, delta-compressed (236 MiB).
-    on-disk:  .forklift 4.8G loose -> 236M packed
-    log walk: 4.37 s loose -> 944 ms packed   (0.22x once packed)
-    compacted in 22.38 s   (a real import-git folds this in automatically)
+    git clone --local     418 ms     (copies an existing packfile)
+    forklift import-git   62.00 s    (re-encodes every commit/tree/blob straight into packs)
+    Packed the imported store: 402826 object(s) into 5 pack(s), 310230 delta-compressed.
 ```
 
-**Compaction runs *first*, right after import**, so the comparison table above runs on
-the **packed store** — the state a real user operates in (git ships packed too:
-`clone --local` copies packfiles, and a real `import-git` packs on the way out). Packed
-vs packed, forklift lands smaller on disk than git's own pack and roughly at parity on
-the whole-history walk. The loose→packed before/after is then reported on its own as a
-**forklift-only payoff** — there is no git equivalent (git packs during `clone`/`gc`).
-Packing removes per-file slack and the open-per-object cost of a walk, and
-delta-compresses similar objects. See
-[`OBJECT_STORE_SCALING.md`](OBJECT_STORE_SCALING.md). *(Numbers illustrative — run it.)*
+**The store arrives packed — no separate compaction pass.** `import-git` writes straight
+into native packs as it imports (delta-compressing successive file/tree versions on the
+way in), so the comparison table above runs on the **packed store** — the state a real
+user operates in (git ships packed too: `clone --local` copies packfiles). Packed vs
+packed, on git.git the pack-direct store currently lands **~1.4x larger** than git's own
+pack (435M vs 316M) — the whole-history walk is roughly at parity, but the on-disk size
+is not, and that gap is real. Per-path delta chains don't see the cross-path similarity
+(renames, moved files) that a global repack ordering does; the earlier loose-import-then-
+`compact` flow measured 236M on this same corpus, so the headroom is known and further
+densification is planned. On repos whose `.git` carries unreachable refs or stale
+remote-tracking branches, `.forklift` often lands far smaller — `import-git` only pulls
+branch-reachable history — but that reflects the source repo's ref clutter, not a general
+"forklift packs tighter" result; git.git above (a repo with little such clutter) is the
+representative case. See
+[`OBJECT_STORE_SCALING.md`](OBJECT_STORE_SCALING.md). *(Measured on git.git on one
+Apple-Silicon Mac, mean of 3 warm-cache runs — re-run for your own repo/hardware.)*
 
 **Onboarding is deliberately kept out of the ratio table.** `git clone --local` and
 `forklift import-git` do fundamentally different work (see §3), so pitting them in a
@@ -139,25 +140,23 @@ These matter. A benchmark that hides them is a sales pitch, not a measurement.
   Two things to expect from `import-git` today:
   - **Import speed.** The importer streams every object through one long-lived
     `git cat-file --batch` pipe rather than forking git per object, so it stays fast
-    at scale: all of git.git (~81k commits, ~402k objects → a 4.8 GB warehouse)
-    imports in ~135 s. It still re-encodes and stores every object, so it is not
-    instant like a local clone — expect a couple of minutes for kernel-scale history,
-    not seconds. (Before this was batched it ran ~30× slower — one `git` fork+exec
-    per object, ~67 min projected for the same import.)
+    at scale, and it writes straight into native packs as it goes — delta-compressing
+    successive versions of files and directory trees on the way in. It still re-encodes
+    and stores every object, so it is not instant like a local clone — expect a couple
+    of minutes for kernel-scale history, not seconds. (Before batching + pack-direct
+    writes, this ran far slower: one `git` fork+exec per object, then a loose object
+    per file with an fsync each.)
   - **Non-UTF-8 history is tolerated.** Real repos carry commits with Latin-1 author
     names (git.git has several); the importer coerces such display text lossily
     rather than aborting. If you see U+FFFD (`�`) in an imported name, that's why —
     the author's email (the stable id) is preserved exactly.
-  - **The table is measured packed, because git is.** By default `import-git` compacts
-    the store on the way out, so a real user's warehouse is already packed — and git is
-    always measured packed (`clone --local` copies packfiles). So the harness imports
-    with `--no-compact`, captures the loose baseline for the payoff callout, then packs
-    the store *before* the comparison table. Every `status`/`log`/`diff`/`commit` row is
-    therefore packed-vs-packed. Measuring the read-only ops on the loose store instead
-    would pit git-packed against forklift-loose — apples-to-oranges, and it understates
-    forklift several-fold on `log` (a loose store is a transient that exists only in the
-    seconds between an import and its auto-compaction). The loose→packed win is reported
-    separately, not folded into the ratios.
+  - **The table is measured packed, because git is.** `import-git` writes straight into
+    native packs — there's no loose store and no separate compaction step to run before
+    the comparison table. Every `status`/`log`/`diff`/`commit` row is packed-vs-packed
+    from the moment the import finishes, the same way git is always measured packed
+    (`clone --local` copies packfiles). A `--no-compact` flag exists but stores loose
+    objects instead as a debug/inspection opt-out — it is not part of the normal
+    onboarding path and the harness doesn't use it.
 - **`log` output differs.** `git log` and `forklift history` don't print identical
   text (history density, merge interleaving). The harness compares the *graph-walk
   cost* of the default command each ships, not byte-for-byte output. If you want a
@@ -193,14 +192,11 @@ git clone --local ~/bench/git-src ~/bench/A          # git measured here
 cp -a ~/bench/A ~/bench/B                             # forklift measured here
 
 # 2. Import history into the forklift copy (this is the 'onboard' number).
+#    import-git writes straight into native packs as it goes — the store is
+#    already packed the moment this finishes, same as git is always packed.
 cd ~/bench/B
 forklift prepare
-time forklift import-git . --no-compact      # --no-compact so we can see the loose→packed win
-
-# 2b. Pack the store BEFORE comparing — git is always packed, so this keeps it fair.
-#     (A plain `import-git` without --no-compact does this for you.)
-du -sh .forklift                             # loose baseline
-time forklift compact
+time forklift import-git .
 du -sh .forklift                             # packed — this is the state the table compares
 
 # 3. Compare, running each tool in its own copy.
@@ -271,10 +267,9 @@ Use `--export-markdown out.md` to capture a table, or `--export-json` for plots.
   (process start, lock acquisition, inventory open) that amortizes away on big
   operations — note the absolute time, not just the ratio.
 - **`log`/`history`** stresses graph-walk and object decode, measured on the **packed**
-  store (where forklift is ~at parity with git). On a *loose* store it is several-fold
-  slower — that's the object-store read-path cost compaction exists to remove, which is
-  why the harness packs before measuring and reports the loose penalty as a payoff, not a
-  row. A regression in the *packed* number is the real object-store read-path signal.
+  store (where forklift is ~at parity with git) — the store `import-git` always produces
+  now, since it packs on the way in. A regression here is the real object-store
+  read-path signal.
 - **`onboard`** will always favor git (see §3). Track it over releases to catch
   import regressions, not to compare against clone.
 - **A regression across releases matters more than the absolute gap to git.**

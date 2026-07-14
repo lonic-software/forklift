@@ -167,8 +167,9 @@ async fn try_auto_merge(client: &RemoteClient,
 
 /// The result of a lift: the pallet's outcome, plus the office lift when trust
 /// required its keys to reach the remote first.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct LiftReport {
+pub(crate) struct LiftReport {
     /// The parcels the office lift uploaded, when one happened.
     #[serde(skip_serializing_if = "Option::is_none")]
     office_new_parcels: Option<usize>,
@@ -226,4 +227,13 @@ impl CommandOutput for LiftReport {
             );
         }
     }
+}
+
+
+/// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
+#[cfg(feature = "docgen")]
+pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+    vec![
+        ("LiftReport", schemars::schema_for!(LiftReport)),
+    ]
 }

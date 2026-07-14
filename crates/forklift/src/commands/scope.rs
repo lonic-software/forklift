@@ -65,8 +65,9 @@ fn status() -> Result<(), String> {
 
 /// The sparse-workspace scope of the current bay (§7.6). An empty prefix list means the full
 /// tree (an unscoped bay or the main tree).
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct ScopeStatus {
+pub(crate) struct ScopeStatus {
     /// The active bay's name (`null` in the main tree).
     #[serde(skip_serializing_if = "Option::is_none")]
     bay: Option<String>,
@@ -107,4 +108,13 @@ impl CommandOutput for ScopeStatus {
             }
         }
     }
+}
+
+
+/// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
+#[cfg(feature = "docgen")]
+pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+    vec![
+        ("ScopeStatus", schemars::schema_for!(ScopeStatus)),
+    ]
 }

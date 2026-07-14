@@ -9,12 +9,23 @@ use crate::output::{self, CommandOutput};
 /// # Arguments
 /// * `all` - Repack existing packs too: drop unreachable (garbage) objects and consolidate,
 ///   rather than only sweeping the loose set into a new pack.
+/// * `redelta` - Re-encode every live object (packed or loose) to delta-compress across the
+///   whole store, instead of a repack's usual verbatim copy of already-packed records. Only
+///   meaningful with `all`; refused otherwise (a plain incremental compact never touches
+///   packed records, so there would be nothing for it to redo).
 ///
 /// # Returns
 /// * `Ok(())`      - If the store was compacted (a no-op when there is nothing to do).
-/// * `Err(String)` - If the store could not be compacted (no object is lost on failure).
-pub fn handle_command(all: bool) -> Result<(), String> {
-    let stats = pack_utils::compact(all)?;
+/// * `Err(String)` - If the store could not be compacted (no object is lost on failure), or if
+///   `redelta` was passed without `all`.
+pub fn handle_command(all: bool, redelta: bool) -> Result<(), String> {
+    if redelta && !all {
+        return Err(
+            "--redelta re-encodes everything and only makes sense with --all.".to_string()
+        );
+    }
+
+    let stats = pack_utils::compact(all, redelta)?;
 
     output::emit("compact", &Compacted {
         all,
@@ -29,8 +40,9 @@ pub fn handle_command(all: bool) -> Result<(), String> {
 }
 
 /// The result of a compaction.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct Compacted {
+pub(crate) struct Compacted {
     /// Whether this was a full repack (existing packs rewritten, garbage dropped).
     all: bool,
 
@@ -81,4 +93,13 @@ impl CommandOutput for Compacted {
             output::human_bytes(self.bytes_packed),
         );
     }
+}
+
+
+/// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
+#[cfg(feature = "docgen")]
+pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+    vec![
+        ("Compacted", schemars::schema_for!(Compacted)),
+    ]
 }

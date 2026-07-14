@@ -16,12 +16,19 @@
 use std::sync::OnceLock;
 use serde::Serialize;
 use forklift_core::error::{CoreError, RefusalCode};
-use forklift_core::util::scope_utils;
+use forklift_core::util::{merge_utils, scope_utils};
 
 /// The output schema version, carried on every JSON envelope as `forklift_json`.
 /// It changes only when the envelope or a command's `data` shape changes
 /// incompatibly, so an agent can pin it and detect drift.
-pub const SCHEMA_VERSION: &str = "1";
+///
+/// Version 2 (this one): `history` entries carry `parents` (always present, `[]` for a
+/// root), the `empty_history` error code exists, and `palletize` list entries carry
+/// `head`. A consumer reads this field first, before parsing anything else, to know
+/// whether the command it is about to run supports the capability it needs — the
+/// version bump *is* the capability-detection mechanism, so it is worth pinning rather
+/// than sniffing for a field's presence.
+pub const SCHEMA_VERSION: &str = "2";
 
 /// How the process renders its output.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -80,6 +87,14 @@ pub fn message(command: &str, text: impl Into<String>) {
     }
 }
 
+/// The densify suggestion (§ densify-pending marker, `forklift_core::util::pack_utils`): shown
+/// by `store`, `import-git` and `franchise` whenever the object store carries content a bulk
+/// ingest wrote without ever seeing cross-path similarity. One shared string so the three
+/// commands never drift apart in wording. Never phrased as "recommended" — redelta is an
+/// optional, opt-in, CPU-bound pass, not something owed to every store.
+pub const DENSIFY_TIP: &str = "Tip: \"forklift compact --all --redelta\" can significantly \
+    shrink this store (one-shot, takes a few minutes on large histories).";
+
 /// Render a byte count in a human-friendly binary unit (B/KiB/MiB/GiB/TiB). The object store's
 /// scale makes raw byte counts noise, so the size-reporting commands (`compact`, `store`) show
 /// this instead. JSON output always carries the exact byte count, never this string.
@@ -98,6 +113,28 @@ pub fn human_bytes(bytes: u64) -> String {
     } else {
         format!("{:.1} {}", value, UNITS[unit])
     }
+}
+
+/// Classify blob bytes as safely displayable text, for the commands (`show`, `peek`) that
+/// report a `binary` signal instead of printing raw bytes. Text means **both** NUL-free
+/// (`merge_utils::is_mergeable_text`, the same test `diff`'s line-by-line display uses) **and**
+/// valid UTF-8 — a NUL-free blob can still be invalid UTF-8, and a NUL byte is itself valid
+/// UTF-8, so neither check alone is sufficient. Only this passing means content is safe to
+/// hand to a person or a JSON string: nothing here or downstream ever falls back to a lossy
+/// conversion, so no caller can silently mangle non-UTF-8 bytes into fake text.
+///
+/// # Arguments
+/// * `content` - The blob's raw bytes.
+///
+/// # Returns
+/// * `Some(&str)` - The content, when it is safe to display as text.
+/// * `None`       - When the content is binary (a NUL byte, or invalid UTF-8).
+pub fn blob_text(content: &[u8]) -> Option<&str> {
+    if !merge_utils::is_mergeable_text(content) {
+        return None;
+    }
+
+    std::str::from_utf8(content).ok()
 }
 
 /// Print the success envelope: `{ forklift_json, command, ok: true, data }`.
@@ -147,19 +184,45 @@ pub fn report_error(error: &ForkliftError) {
     }
 }
 
-/// A stable error classification: a machine-branchable code and a deterministic exit
-/// code (§7.8). The string codes and the exit numbers are a public contract — add,
-/// never repurpose.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum ErrorCode {
+/// Defines `ErrorCode` and generates [`ErrorCode::ALL`] from the same variant list, in the
+/// same expansion — so the two can never drift apart. Before this macro, `ALL` was a
+/// hand-kept-in-sync array next to the enum, guarded only by a separate exhaustive-match
+/// function; nothing forced a new variant to be *added to `ALL`*, only to be matched somewhere
+/// — which is exactly how the docs generator could still silently miss a code. Deriving `ALL`
+/// from the same list the enum itself is built from removes the possibility outright: there is
+/// only one list, so there is nothing left to fall out of sync. `as_str`/`exit_code`/
+/// `description`/`from_refusal` stay ordinary exhaustive `match` expressions below (the
+/// compiler already forces those to cover every variant; the macro would add nothing there).
+macro_rules! error_codes {
+    ($($(#[$meta:meta])* $variant:ident),+ $(,)?) => {
+        /// A stable error classification: a machine-branchable code and a deterministic exit
+        /// code (§7.8). The string codes and the exit numbers are a public contract — add,
+        /// never repurpose.
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        pub enum ErrorCode {
+            $($(#[$meta])* $variant),+
+        }
+
+        impl ErrorCode {
+            /// Every variant, oldest-first (the order the docs generator renders). Generated by
+            /// [`error_codes!`] from the same list as the enum itself, so a variant can never be
+            /// added here without it.
+            pub const ALL: [ErrorCode; { [$(ErrorCode::$variant),+].len() }] = [
+                $(ErrorCode::$variant),+
+            ];
+        }
+    };
+}
+
+// Variant order below is ascending exit code (see `exit_code()`), which is also the order
+// `ErrorCode::ALL` renders in — not the historical enum-declaration order (harmless: exit
+// codes/strings are the public contract, not a variant's discriminant or declaration position).
+error_codes! {
     /// Anything without a more specific classification yet.
     Generic,
 
     /// The command must run inside a warehouse, and the working directory is not one.
     NotAWarehouse,
-
-    /// Another forklift process holds the warehouse lock.
-    WarehouseLocked,
 
     /// The working state blocks the operation: unresolved conflicts, a dirty tree.
     Conflict,
@@ -167,12 +230,11 @@ pub enum ErrorCode {
     /// A remote ref moved under a lift (the CAS failed): lower, consolidate, retry.
     Diverged,
 
+    /// Another forklift process holds the warehouse lock.
+    WarehouseLocked,
+
     /// A path argument is outside the bay's materialization scope (§7.6).
     OutOfScope,
-
-    /// A merge in a scoped bay hit an out-of-scope entry that changed on both sides:
-    /// there is no content to reconcile, so it refuses rather than guess.
-    OutOfScopeConflict,
 
     /// A scoped bay's spine path flipped between a directory and a file (§7.6): the scope
     /// is no longer valid there and the operation refuses rather than guess.
@@ -180,6 +242,10 @@ pub enum ErrorCode {
 
     /// A whole-tree verb is not (yet) supported in a scoped (sparse) bay (§7.6).
     SparseWorkspace,
+
+    /// A merge in a scoped bay hit an out-of-scope entry that changed on both sides:
+    /// there is no content to reconcile, so it refuses rather than guess.
+    OutOfScopeConflict,
 
     /// A lift from a sparse warehouse was aimed at a remote other than its origin: the
     /// out-of-scope closure was only ever proved present on the origin, so it refuses up front.
@@ -214,6 +280,11 @@ pub enum ErrorCode {
     /// single byte is uploaded, rather than wasting the whole upload and failing confusingly at
     /// commit time.
     CommitPaginationUnsupported,
+
+    /// `history` was asked to walk a pallet that has nothing stacked on it yet: there is no
+    /// history to show. Head-only (there is no parcel graph to enter) and scoped to `history`
+    /// alone, so it is classified here directly rather than as a `forklift-core` `RefusalCode`.
+    EmptyHistory,
 }
 
 impl ErrorCode {
@@ -235,6 +306,7 @@ impl ErrorCode {
             ErrorCode::ChunkedTransportUnsupported => scope_utils::CODE_CHUNKED_TRANSPORT_UNSUPPORTED,
             ErrorCode::OversizedTransportUnsupported => scope_utils::CODE_OVERSIZED_TRANSPORT_UNSUPPORTED,
             ErrorCode::CommitPaginationUnsupported => scope_utils::CODE_COMMIT_PAGINATION_UNSUPPORTED,
+            ErrorCode::EmptyHistory => "empty_history",
         }
     }
 
@@ -257,6 +329,44 @@ impl ErrorCode {
             ErrorCode::ChunkedTransportUnsupported => 14,
             ErrorCode::OversizedTransportUnsupported => 15,
             ErrorCode::CommitPaginationUnsupported => 16,
+            // 17 and 18 are reserved for future features, not shipped yet — never assign them.
+            ErrorCode::EmptyHistory => 19,
+        }
+    }
+
+    /// A one-line, present-tense description of the condition — the docs generator's
+    /// "Meaning" column. Plain prose only: no design section numbers or milestone names (this
+    /// text ships in generated user-facing docs).
+    pub fn description(&self) -> &'static str {
+        match self {
+            ErrorCode::Generic => "Anything without a more specific classification yet",
+            ErrorCode::NotAWarehouse => "The command needs a warehouse; this directory is none",
+            ErrorCode::Conflict => "Working state blocks the operation (unresolved / dirty)",
+            ErrorCode::Diverged => "A remote ref moved under a lift — lower, retry",
+            ErrorCode::WarehouseLocked => "Another forklift process holds the warehouse lock",
+            ErrorCode::OutOfScope => "A path argument is outside a scoped (sparse) bay's scope",
+            ErrorCode::ScopePathTypeChanged =>
+                "A scoped bay's spine path flipped dir\u{2194}file; scope no longer valid",
+            ErrorCode::SparseWorkspace =>
+                "A whole-tree verb is not supported in a scoped (sparse) bay yet",
+            ErrorCode::OutOfScopeConflict =>
+                "A scoped bay merge hit an out-of-scope entry changed on both sides",
+            ErrorCode::NonOriginLift =>
+                "A sparse workspace tried to lift to a remote other than its origin",
+            ErrorCode::NarrowUnclean =>
+                "\"narrow\" would delete a subtree that still holds uncommitted work",
+            ErrorCode::ScopePruneBlocked =>
+                "\"scope-prune\" would free a path a checkout still materializes",
+            ErrorCode::ChunkedTransportUnsupported =>
+                "A chunked large file can't go into a bundle, or is being lifted to a remote \
+                 that doesn't support chunking",
+            ErrorCode::OversizedTransportUnsupported =>
+                "An object predates the size limit and can't be sent to a remote or bundle",
+            ErrorCode::CommitPaginationUnsupported =>
+                "A lift needs a paginated commit (many objects) and the remote doesn't support \
+                 it yet",
+            ErrorCode::EmptyHistory =>
+                "\"history\" was asked to walk a pallet that has nothing stacked on it yet",
         }
     }
 
@@ -321,6 +431,21 @@ impl From<CoreError> for ForkliftError {
     }
 }
 
+/// The sentinel this crate frames an `empty_history` refusal with — a **head-only**
+/// classification (there is no parcel graph to enter, so `forklift-core` never raises it), kept
+/// entirely local rather than routed through the `forklift-core` refusal bridge (that would mean
+/// adding a `RefusalCode` for something core cannot itself produce). [`empty_history`] builds the
+/// frame at the one call site (`history`'s unborn-pallet check); [`From<String>`](ForkliftError)
+/// recognizes it before falling back to the `CoreError` path.
+const EMPTY_HISTORY_SENTINEL: &str = "\u{1}empty_history\u{1}";
+
+/// Frame a human message as the `empty_history` error (see [`EMPTY_HISTORY_SENTINEL`]) —
+/// `history`'s unborn-pallet call site builds its `Err(String)` with this, so it classifies as
+/// [`ErrorCode::EmptyHistory`] (exit 19) instead of the generic fallback.
+pub fn empty_history(message: impl Into<String>) -> String {
+    format!("{EMPTY_HISTORY_SENTINEL}{}", message.into())
+}
+
 /// A bare `Err(String)` from a handler is the `?`-friendly default. Most of `forklift-core` still
 /// returns `Result<_, String>`, and a refusal that crossed such a still-String segment arrives here
 /// as a sentinel-framed string (the [`forklift_core::error`] bridge shim). Lifting it through
@@ -328,8 +453,15 @@ impl From<CoreError> for ForkliftError {
 /// classifies exactly as one that stayed typed throughout; a plain string becomes a generic error.
 /// A frame whose code this build does not recognize (a newer `forklift-core`) degrades to a generic
 /// error with the human message — the raw `\u{1f}` frame never leaks into human/JSON output.
+///
+/// Checked first: this crate's own [`EMPTY_HISTORY_SENTINEL`] frame, a head-only classification
+/// the `forklift-core` bridge above knows nothing about.
 impl From<String> for ForkliftError {
     fn from(message: String) -> ForkliftError {
+        if let Some(human) = message.strip_prefix(EMPTY_HISTORY_SENTINEL) {
+            return ForkliftError { code: ErrorCode::EmptyHistory, message: human.to_string(), next_step: None };
+        }
+
         ForkliftError::from(CoreError::from(message))
     }
 }
@@ -461,5 +593,17 @@ mod tests {
             // The core code string and the head's code string are the same contract.
             assert_eq!(code.as_str(), code_str, "core/head code strings agree for {:?}", code);
         }
+    }
+
+    /// The head-only `empty_history` sentinel (never routed through `forklift-core`) classifies
+    /// to its own code, exit 19, and carries no next step.
+    #[test]
+    fn an_empty_history_sentinel_classifies_with_no_next_step() {
+        let error: ForkliftError = empty_history("nothing stacked yet").into();
+
+        assert_eq!(error.code.as_str(), "empty_history");
+        assert_eq!(error.code.exit_code(), 19);
+        assert_eq!(error.message, "nothing stacked yet");
+        assert!(error.next_step.is_none());
     }
 }

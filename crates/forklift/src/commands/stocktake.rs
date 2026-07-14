@@ -48,8 +48,9 @@ pub async fn handle_command(summary: bool) -> Result<(), String> {
 
 /// The stocktake report: the current pallet's state plus the staged and unstaged
 /// changes (counts always; per-path lists unless `--summary`).
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct StocktakeReport {
+pub(crate) struct StocktakeReport {
     /// The current pallet.
     pallet: String,
 
@@ -117,6 +118,12 @@ impl CommandOutput for StocktakeReport {
             print_changes(&self.unstaged);
         }
     }
+}
+
+/// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
+#[cfg(feature = "docgen")]
+pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+    vec![("StocktakeReport", schemars::schema_for!(StocktakeReport))]
 }
 
 /// Print a list of changes, one per line, with aligned change kinds.
