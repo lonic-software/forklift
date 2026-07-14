@@ -86,6 +86,7 @@ pub async fn handle_command(url: &str,
         unborn: false,
         scope: fetch_scope.prefixes().to_vec(),
         fetched_objects: 0,
+        densify_suggested: false,
     };
 
     // The bundle is a fast start, not a requirement: whatever it lacks (or if there is none) is
@@ -103,6 +104,7 @@ pub async fn handle_command(url: &str,
                 Ok(imported) => {
                     report.bundle_objects = Some(imported.stored_objects);
                     report.bundle_signatures = Some(imported.stored_signatures);
+                    report.densify_suggested = imported.installed_packs;
                 }
                 Err(error) if bundle_utils::is_unsupported_bundle_error(&error) => {
                     // A future envelope is only an optimization this client cannot use. Do not
@@ -289,6 +291,11 @@ pub(crate) struct FranchiseReport {
 
     /// Loose objects fetched for the materialized pallet.
     fetched_objects: usize,
+
+    /// Whether the adopted bundle installed native packs straight from the remote's own bulk
+    /// ingest — the densify suggestion, human-output only (not part of the JSON contract).
+    #[serde(skip)]
+    densify_suggested: bool,
 }
 
 impl CommandOutput for FranchiseReport {
@@ -302,6 +309,10 @@ impl CommandOutput for FranchiseReport {
 
         if self.adopted_anchor {
             println!("Adopted the remote's trust anchor; every parcel is signed from now on.");
+        }
+
+        if self.densify_suggested {
+            println!("{}", output::DENSIFY_TIP);
         }
 
         for pallet in &self.meta_adopted {

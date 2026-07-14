@@ -4546,6 +4546,100 @@ fn a_mutating_command_runs_maintenance_when_due() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// The densify suggestion: `import-git`'s pack-direct path (and a franchise's native bundle
+// install) can only ever see per-path/per-window similarity on the way in, unlike a plain
+// `compact --all --redelta`'s whole-store pass — so a bulk-ingested store sets a marker that
+// `store` surfaces as a one-line suggestion, cleared once a redelta run actually earns it back.
+// Ordinary incremental use (stack -> auto-compact) already gets full delta selection at write
+// time and must never trip the marker at all.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn store_suggests_densify_after_import_git_and_clears_after_redelta() {
+    fn seed_git_repo(root: &Path) {
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .env("GIT_AUTHOR_NAME", "Ada").env("GIT_AUTHOR_EMAIL", "ada@example.com")
+                .env("GIT_COMMITTER_NAME", "Ada").env("GIT_COMMITTER_EMAIL", "ada@example.com")
+                .output()
+                .expect("git must be installed to run this test");
+            assert!(output.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&output.stderr));
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("a.txt"), "hello\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "first commit"]);
+    }
+
+    let warehouse = TestWarehouse::new("densify-suggestion");
+    seed_git_repo(&warehouse.root);
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    // The import itself packs at least one object, so its own human output tips the suggestion.
+    let imported = warehouse.run(&["import-git", "."]);
+    assert_success(&imported);
+    assert!(
+        stdout(&imported).contains("forklift compact --all --redelta"),
+        "import-git should tip the densify suggestion after packing on the way in: {}", stdout(&imported)
+    );
+
+    // `store` surfaces it too: the human line, and an additive `--json` flag.
+    let store = warehouse.run(&["store"]);
+    assert_success(&store);
+    assert!(
+        stdout(&store).contains("forklift compact --all --redelta"),
+        "store should surface the densify suggestion after a bulk ingest: {}", stdout(&store)
+    );
+
+    let store_json = warehouse.run(&["--json", "store"]);
+    assert_success(&store_json);
+    assert_eq!(json(&store_json)["data"]["densify_suggested"], true);
+
+    // A successful `compact --all --redelta` clears the marker — the suggestion is gone.
+    assert_success(&warehouse.run(&["compact", "--all", "--redelta"]));
+
+    let after = warehouse.run(&["--json", "store"]);
+    assert_success(&after);
+    assert_eq!(
+        json(&after)["data"]["densify_suggested"], false,
+        "a successful redelta run must clear the densify-pending marker"
+    );
+
+    let store_after = warehouse.run(&["store"]);
+    assert_success(&store_after);
+    assert!(
+        !stdout(&store_after).contains("forklift compact --all --redelta"),
+        "the human suggestion must be gone once the marker is cleared"
+    );
+}
+
+#[test]
+fn store_never_suggests_densify_for_ordinary_incremental_use() {
+    // Plain stack -> compact already gets full delta selection at write time (the loose path's
+    // path-base + window fallback) — the marker must never be set for it, so the suggestion
+    // must never fire, unlike the bulk-ingest paths above.
+    let warehouse = TestWarehouse::new("densify-no-bulk-ingest");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    warehouse.write_file("f.txt", "content\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "first"]));
+    assert_success(&warehouse.run(&["compact"]));
+
+    let store_json = warehouse.run(&["--json", "store"]);
+    assert_success(&store_json);
+    assert_eq!(json(&store_json)["data"]["densify_suggested"], false);
+
+    let store = warehouse.run(&["store"]);
+    assert_success(&store);
+    assert!(!stdout(&store).contains("forklift compact --all --redelta"));
+}
+
+// ---------------------------------------------------------------------------------------------
 // Task-scoped sparse workspaces: scoped bays on a full object store.
 //
 // Materialization-only sparseness — the store holds everything; a scoped bay materializes and
