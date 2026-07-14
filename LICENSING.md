@@ -51,5 +51,6 @@ Contributions to the **server heads** are under FSL-1.1. Because the maintainer 
 right to offer Forklift hosting commercially, server-head contributions require a signed
 [Contributor License Agreement](CLA.md) granting the maintainer the rights to relicense and to
 license commercially (you keep the copyright to your work). Signing is automatic — a bot
-prompts on any pull request that touches the server heads, and one signature covers all your
-contributions. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full policy.
+prompts on any pull request that touches the server heads; you register once per CLA
+version, and each contribution you then submit carries its own grant. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for the full policy.

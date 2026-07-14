@@ -2,15 +2,19 @@
 #
 # Client-only PRs are inbound = outbound (MIT/Apache) and skip this entirely;
 # the check only engages when a PR touches crates/forklift-server or
-# crates/forklift-aws-lambda. Signatures are recorded by the bot on the
-# `cla-signatures` branch — one signature covers all of a contributor's past
-# and future PRs.
+# crates/forklift-aws-lambda. Acceptances are recorded by the bot on the
+# `cla-signatures` branch. A contributor registers once per CLA version;
+# legally, each subsequent PR is a fresh per-contribution grant under the
+# registered agreement (CLA.md is deliberately per-contribution — a blanket
+# grant of indeterminate future works is void under Hungarian copyright law),
+# and the PR record itself is the evidence of each grant.
 #
-# Versioning: a signature legally binds the CLA text as of its date (CLA.md's
-# git history is the record of what that was). If the CLA terms ever change
-# MATERIALLY (rights granted, not typos), bump the signatures filename below
-# (-v1 → -v2): the bot then finds no signatures and re-prompts everyone,
-# while the old file remains in git as the v1 record.
+# Versioning: an acceptance (an electronic signature given by comment) binds
+# the CLA text as of its date (CLA.md's git history is the record of what that
+# was). If the CLA terms ever change MATERIALLY (rights granted, not typos),
+# bump the acceptances filename below (-v2 → -v3): the bot then finds no
+# acceptances and re-prompts everyone, while each old file remains in git as
+# the record for its version.
 #
 # Security note: this runs on pull_request_target and must never check out or
 # execute PR code. The paths check reads the PR's file list via the API only,
@@ -59,7 +63,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          path-to-signatures: '.github/cla-signatures-v1.json'
+          path-to-signatures: '.github/cla-signatures-v2.json'
           path-to-document: 'https://github.com/lonic-software/forklift/blob/main/CLA.md'
           branch: 'cla-signatures'
           allowlist: 'kolonicsmate,*[bot]'

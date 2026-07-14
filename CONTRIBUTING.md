@@ -34,11 +34,17 @@ while **you keep the copyright** to your work — it is a license, not an
 assignment, and it never restricts what you can do with your own code elsewhere.
 
 **How:** it's automatic. When you open a pull request that touches the server
-heads, a bot comments with a sentence to reply with; replying signs the CLA. You
-sign once, and it covers all your past and future contributions.
+heads, a bot comments with a sentence to reply with; replying registers your
+acceptance, and the bot won't prompt you again for the same CLA version. One
+legal nuance, deliberate: the agreement works contribution by contribution —
+each pull request you submit is a fresh grant for that specific contribution,
+because a blanket license of your unwritten future work would be void under
+Hungarian copyright law (which governs the CLA). Registering once is a
+convenience; it never claims your future works in advance.
 
-A pull request that touches both client and server code just needs the one CLA
-signature.
+A pull request that touches both client and server code triggers the one CLA
+check, and the resulting grant covers the whole contribution — you never deal
+with two processes for one pull request.
 
 ## AI-assisted contributions: a human must be the author
 
