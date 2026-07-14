@@ -399,6 +399,41 @@ which is what a caller building a graph (rather than just reading a log) walks:
 `history` on a pallet with nothing stacked on it yet fails with the `empty_history`
 error code (exit 19) rather than a generic one.
 
+One trust note: `history --class` reads the **recorded** (self-declared) identity —
+each action in `--json` says so with `"trust": "recorded"`. `query --class` is the
+verified counterpart.
+
+### `query` — filter history on signed identity (`q`)
+
+```sh
+forklift query --class agent                    # parcels verifiably signed by an agent
+forklift query office --class agent --unsupervised   # the compliance headline, scoped
+forklift query --supervisor alice@corp          # work supervised by one human
+forklift query --signer 91ff02                  # parcels signed by one key (prefix)
+forklift query --grep 'fix*walk' --no-merges    # parcel-local facts compose in
+forklift query --from v1-parcel feature         # scope: feature's line since a base
+forklift query --recorded --class agent         # the cheap, labeled, unverified read
+forklift query --where '{"any":[…]}' --json     # full or/not/nesting as a JSON tree
+```
+
+The compliance question `history` cannot answer: *"all parcels authored by an agent,
+unsupervised"* — answered **verified**. Where `history --class` trusts what the parcel
+records, `query --class` checks the signature and joins the office off the *verified
+signer*; a parcel that merely *claims* a human author but is signed with an agent's
+key matches `--class agent`, and an unsigned parcel matches no identity predicate at
+all (its class is unknowable, and a compliance filter must not guess). Answers carry a
+trust label per match (`verified`, `signed-revoked`, `unsigned`, `unknown-key`, or
+`recorded` under `--recorded`) and a `scope` block saying what the pass covered.
+
+Flags AND together; `--where` takes a JSON predicate tree (`all`/`any`/`not` over
+`{"field","op","value"}` leaves) for anything flags can't express. Match patterns are
+globs (`*`, `?`) or plain substrings — never regex. Pagination works like history
+(`-n`, `--after`, `--oneline`).
+
+The honest cost: `--limit` bounds *output*, not verification — a verified identity
+query resolves every candidate its walk considers. Scope the walk (a pallet argument,
+`--from`) to bound the work; unscoped over all of history costs about an `audit`.
+
 ### Paging
 
 Forklift pages output the way git does. When stdout is a **terminal**, long human

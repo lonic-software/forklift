@@ -40,6 +40,7 @@ pub mod mcp;
 pub mod manifest;
 pub mod office;
 pub mod profile;
+pub mod query;
 pub mod remove;
 pub mod undo;
 pub mod unload;

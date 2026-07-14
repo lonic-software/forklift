@@ -547,6 +547,92 @@ pub enum Command {
         action: Option<ProfileAction>,
     },
 
+    /// Query parcel history by signed identity, signer and parcel facts
+    #[command(
+        visible_alias = "q",
+        long_about = "Filter parcel history on its signed dimensions — identity class, \
+                      supervisor, role, signing key — plus parcel-local facts (dates, \
+                      description, merge-ness). By default identity answers are VERIFIED: the \
+                      signature is checked and the office joined off the verified signer, never \
+                      off the parcel's own (forgeable) claim; --recorded opts into the cheap, \
+                      self-declared reading and labels every answer accordingly. Flags AND \
+                      together; --where takes a JSON predicate tree for or/not/nesting. Scope \
+                      the walk with revisions and --from — that (not --limit) is what bounds \
+                      verification work."
+    )]
+    Query {
+        /// Walk from these revisions (pallet names or parcel hashes; default: the current
+        /// pallet's head)
+        #[arg(value_name = "REVISION")]
+        revisions: Vec<String>,
+
+        /// Exclude this revision and all its ancestors from the walk (git's A..B shape)
+        #[arg(long, value_name = "REVISION")]
+        from: Option<String>,
+
+        /// Verified author identity class: human | agent | bot | service
+        #[arg(long)]
+        class: Option<String>,
+
+        /// Verified author is automated (agent/bot/service) and has no supervisor
+        #[arg(long)]
+        unsupervised: bool,
+
+        /// Verified author is supervised by this operator id
+        #[arg(long, value_name = "OPERATOR")]
+        supervisor: Option<String>,
+
+        /// Verified signing key (id prefix)
+        #[arg(long, value_name = "KEYPREFIX")]
+        signer: Option<String>,
+
+        /// Only parcels authored after this RFC 3339 timestamp
+        #[arg(long, value_name = "TIMESTAMP")]
+        author_after: Option<String>,
+
+        /// Only parcels authored before this RFC 3339 timestamp
+        #[arg(long, value_name = "TIMESTAMP")]
+        author_before: Option<String>,
+
+        /// Only merge parcels (more than one parent)
+        #[arg(long, conflicts_with = "no_merges")]
+        merges: bool,
+
+        /// Only non-merge parcels
+        #[arg(long)]
+        no_merges: bool,
+
+        /// Description matches this glob (*, ?) or contains it as a substring
+        #[arg(long, value_name = "GLOB")]
+        grep: Option<String>,
+
+        /// Verify identity answers (the default; the flag exists to say so explicitly)
+        #[arg(long, conflicts_with = "recorded")]
+        verify: bool,
+
+        /// Use the recorded (self-declared, forgeable) identity instead of verifying:
+        /// cheaper, prunes early, and every answer is labeled "recorded"
+        #[arg(long)]
+        recorded: bool,
+
+        /// A JSON predicate tree ("-" reads it from stdin) AND-ed with the flags
+        #[arg(long, value_name = "JSON")]
+        r#where: Option<String>,
+
+        /// Show at most this many matches (bounds the output page, never the verification
+        /// work — scope the walk with revisions or --from for that)
+        #[arg(long, short = 'n')]
+        limit: Option<usize>,
+
+        /// Resume paging from a cursor returned as `next` by a previous `--json` page
+        #[arg(long, value_name = "CURSOR")]
+        after: Option<String>,
+
+        /// One line per match: the abbreviated hash and the description's first line
+        #[arg(long)]
+        oneline: bool,
+    },
+
     /// Stage a file or directory for removal
     #[command(
         visible_alias = "rm",
@@ -1386,6 +1472,7 @@ impl Command {
                 | Command::Palletize { .. }
                 | Command::Park { .. }
                 | Command::Peek { .. }
+                | Command::Query { .. }
                 | Command::Remove { .. }
                 | Command::Restore { .. }
                 | Command::Scope { .. }
@@ -1462,6 +1549,7 @@ impl Command {
         matches!(
             self,
             Command::History { .. }
+                | Command::Query { .. }
                 | Command::Diff { .. }
                 | Command::Peek { .. }
                 | Command::Show { .. }

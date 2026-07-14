@@ -458,16 +458,48 @@ fn verify_signatures(parcels: &[String],
     fanout_utils::fanout_map(parcels, |hash| classify_signature(hash, office_state))
 }
 
-/// Classify one parcel's signature against the office key registry — the body of the
-/// parallel phase. Everything it touches is either immutable (`office_state`) or a
-/// per-object read through the shared, already-thread-safe object caches, so it is safe to
-/// run on many threads at once.
-fn classify_signature(hash: &str, office_state: &OfficeState) -> Result<Verdict, String> {
-    let verdict = match sign_utils::load_parcel_signature(hash)? {
-        None => Verdict::TrustBoundary(TrustBoundaryReason::Unsigned),
+/// The forge-proof trust classification of one parcel's signature — the only primitive a
+/// caller may label "verified". It verifies the actual Ed25519 signature over the parcel
+/// hash against the office's recorded public key AND checks the key's active/revoked
+/// status; the weaker resolvers (a sidecar `key_id` looked up without verifying, or the
+/// parcel body's self-declared operator) are attribution sugar, never verification.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum SignatureTrust {
+    /// A valid signature by a key active in the office.
+    Verified {
+        /// The signing key's id.
+        key_id: String,
+    },
+
+    /// A valid signature by a *revoked* key: cryptographically sound, but the key has been
+    /// retired — never to be flattened into `Verified`.
+    SignedRevoked {
+        /// The revoked signing key's id.
+        key_id: String,
+    },
+
+    /// The parcel carries no signature at all.
+    Unsigned,
+
+    /// Signed, but by a key the office does not track.
+    UnknownKey {
+        /// The claimed signing key's id (untracked, so unverifiable).
+        key_id: String,
+    },
+}
+
+/// Classify one parcel's trust against the office key registry: verify the signature (when
+/// one exists and its key is tracked) and report the key's active/revoked status. Also
+/// proves the parcel body itself is present and decodable — a missing or corrupt parcel is
+/// the `Err`, never a soft verdict. Everything it touches is either immutable
+/// (`office_state`) or a per-object read through the shared, already-thread-safe object
+/// caches, so it is safe to run on many threads at once.
+pub fn classify_parcel_trust(hash: &str, office_state: &OfficeState) -> Result<SignatureTrust, String> {
+    let trust = match sign_utils::load_parcel_signature(hash)? {
+        None => SignatureTrust::Unsigned,
 
         Some(signature) if office_state.find_key(&signature.key_id).is_none() => {
-            Verdict::TrustBoundary(TrustBoundaryReason::UnknownKey(signature.key_id))
+            SignatureTrust::UnknownKey { key_id: signature.key_id }
         }
 
         Some(signature) => {
@@ -477,20 +509,34 @@ fn classify_signature(hash: &str, office_state: &OfficeState) -> Result<Verdict,
                 .expect("verify_one_signature found this key");
 
             if key.is_active() {
-                Verdict::Verified
+                SignatureTrust::Verified { key_id: signature.key_id }
             } else {
-                Verdict::DistrustBoundary(signature.key_id)
+                SignatureTrust::SignedRevoked { key_id: signature.key_id }
             }
         }
     };
 
-    // Prove every parcel's body is present and decodable — the guarantee phase 1 used to
-    // give by decoding each parcel for its parents (it now reads parents from the graph
-    // instead). Kept after the signature check so a bad signature still fails ahead of a
-    // missing body, and confined to this parallel phase so it costs no sequential time.
+    // Prove the parcel's body is present and decodable — for the audit, the guarantee
+    // phase 1 used to give by decoding each parcel for its parents (it now reads parents
+    // from the graph instead). Kept after the signature check so a bad signature still
+    // fails ahead of a missing body.
     object_utils::load_parcel(hash)?;
 
-    Ok(verdict)
+    Ok(trust)
+}
+
+/// Classify one parcel's signature against the office key registry — the body of the
+/// parallel phase, mapping the shared [`classify_parcel_trust`] onto the audit's
+/// boundary-resolution verdicts.
+fn classify_signature(hash: &str, office_state: &OfficeState) -> Result<Verdict, String> {
+    Ok(match classify_parcel_trust(hash, office_state)? {
+        SignatureTrust::Verified { .. } => Verdict::Verified,
+        SignatureTrust::SignedRevoked { key_id } => Verdict::DistrustBoundary(key_id),
+        SignatureTrust::Unsigned => Verdict::TrustBoundary(TrustBoundaryReason::Unsigned),
+        SignatureTrust::UnknownKey { key_id } => {
+            Verdict::TrustBoundary(TrustBoundaryReason::UnknownKey(key_id))
+        }
+    })
 }
 
 /// Verified office chains, remembered per `(warehouse, anchor, office head)`.

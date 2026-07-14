@@ -1356,11 +1356,16 @@ A command not listed here either reports only the generic human-message shape `{
           "description": "The action time. Serialized as RFC 3339 (UTC) for `--json`; formatted directly for\nthe human log, so no timestamp is ever converted to a string and parsed back.",
           "format": "date-time",
           "type": "string"
+        },
+        "trust": {
+          "description": "Always \"recorded\": history reads the identity the parcel itself records (and joins\nthe office off it) without verifying the signature. `query --class` is the verified\ncounterpart — same flag word, different trust tier, stamped here so no consumer can\nmistake one for the other.",
+          "type": "string"
         }
       },
       "required": [
         "action",
         "operator",
+        "trust",
         "timestamp"
       ],
       "type": "object"
@@ -2405,6 +2410,241 @@ A command not listed here either reports only the generic human-message shape `{
     "profiles"
   ],
   "title": "ProfileList",
+  "type": "object"
+}
+```
+
+## `query`
+
+### `QueryReport`
+
+```json
+{
+  "$defs": {
+    "QueryAction": {
+      "description": "One recorded authorship/stack action (history-shaped, explicitly labeled recorded).",
+      "properties": {
+        "action": {
+          "type": "string"
+        },
+        "class": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "operator": {
+          "description": "The pseudonymous operator id the parcel records (self-declared).",
+          "type": "string"
+        },
+        "supervisor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "timestamp": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "trust": {
+          "description": "Always \"recorded\": a per-action identity is the parcel's own claim. The parcel-level\n`author` block carries the verified resolution.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "action",
+        "operator",
+        "trust",
+        "timestamp"
+      ],
+      "type": "object"
+    },
+    "QueryEntry": {
+      "description": "One matching parcel.",
+      "properties": {
+        "actions": {
+          "description": "The recorded per-action history (always the parcel's own claim, so each action is\nlabeled trust \"recorded\" — the parcel-level `author` is where verification lives).",
+          "items": {
+            "$ref": "#/$defs/QueryAction"
+          },
+          "type": "array"
+        },
+        "author": {
+          "$ref": "#/$defs/QueryIdentity",
+          "description": "The resolved author identity at the query's trust level. Under verified trust this\nis the verified signer (the only forge-proof attribution a parcel has); under\nrecorded trust, the parcel's own claim."
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "is_merge": {
+          "type": "boolean"
+        },
+        "parcel": {
+          "type": "string"
+        },
+        "signer": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/QuerySigner"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The verified signer, when the parcel carries a signature that verifies."
+        }
+      },
+      "required": [
+        "parcel",
+        "author",
+        "is_merge",
+        "actions"
+      ],
+      "type": "object"
+    },
+    "QueryIdentity": {
+      "description": "A resolved identity: operator, office class/supervisor, and the trust of the resolution.",
+      "properties": {
+        "class": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "operator": {
+          "description": "The resolved operator id; absent when nothing resolves (unsigned / unknown key).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "supervisor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "trust": {
+          "description": "\"verified\" | \"signed-revoked\" | \"unsigned\" | \"unknown-key\" | \"recorded\".",
+          "type": "string"
+        }
+      },
+      "required": [
+        "trust"
+      ],
+      "type": "object"
+    },
+    "QueryScope": {
+      "description": "The honesty block: what the walk covered, at what trust, and what it could not see.",
+      "properties": {
+        "fetch_scope": {
+          "description": "The warehouse's fetch-scope prefixes — present only on a sparse warehouse.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "matched": {
+          "description": "How many parcels matched.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "office_asof": {
+          "description": "Office reads are a current snapshot: class/supervisor answers are \"as recorded in\nthe office today\", not as of each parcel's authoring time. Always \"current\".",
+          "type": "string"
+        },
+        "out_of_scope": {
+          "description": "Parcels a predicate could not evaluate because their content is outside a sparse\nbay's scope. Always 0 until content predicates ship.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "trust": {
+          "description": "\"verified\" or \"recorded\" — the trust level identity answers were resolved at.",
+          "type": "string"
+        },
+        "walked": {
+          "description": "How many parcels the walk considered.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "trust",
+        "office_asof",
+        "walked",
+        "matched",
+        "out_of_scope"
+      ],
+      "type": "object"
+    },
+    "QuerySigner": {
+      "description": "The verified signing key and its office binding.",
+      "properties": {
+        "class": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "key": {
+          "type": "string"
+        },
+        "operator": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "revocation_reason": {
+          "description": "Why the signing key was revoked — present exactly when the match is signed-revoked.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "key"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The query result: the matching parcels plus the honesty scope block.",
+  "properties": {
+    "matches": {
+      "items": {
+        "$ref": "#/$defs/QueryEntry"
+      },
+      "type": "array"
+    },
+    "next": {
+      "description": "The cursor for the next `--json` page: pass it back as `--after` to resume. Absent\nonce the history is exhausted. (Only meaningful with `-n`/`--limit`.)",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "scope": {
+      "$ref": "#/$defs/QueryScope",
+      "description": "What this pass covered and at what trust — always present, so a consumer can never\nmistake a partial or unverified pass for a complete, verified one."
+    }
+  },
+  "required": [
+    "matches",
+    "scope"
+  ],
+  "title": "QueryReport",
   "type": "object"
 }
 ```

@@ -16,7 +16,7 @@
 use std::sync::OnceLock;
 use serde::Serialize;
 use forklift_core::error::{CoreError, RefusalCode};
-use forklift_core::util::{merge_utils, scope_utils};
+use forklift_core::util::{merge_utils, query_utils, scope_utils};
 
 /// The output schema version, carried on every JSON envelope as `forklift_json`.
 /// It changes only when the envelope or a command's `data` shape changes
@@ -281,6 +281,11 @@ error_codes! {
     /// commit time.
     CommitPaginationUnsupported,
 
+    /// A `query` predicate is not acceptable as written: malformed (unparsable JSON, an unknown
+    /// field or operator, a value of the wrong type), or past one of the fixed bounds (payload
+    /// size, nesting depth, leaf count, `in`-array length, glob length).
+    QueryPredicateInvalid,
+
     /// `history` was asked to walk a pallet that has nothing stacked on it yet: there is no
     /// history to show. Head-only (there is no parcel graph to enter) and scoped to `history`
     /// alone, so it is classified here directly rather than as a `forklift-core` `RefusalCode`.
@@ -306,6 +311,7 @@ impl ErrorCode {
             ErrorCode::ChunkedTransportUnsupported => scope_utils::CODE_CHUNKED_TRANSPORT_UNSUPPORTED,
             ErrorCode::OversizedTransportUnsupported => scope_utils::CODE_OVERSIZED_TRANSPORT_UNSUPPORTED,
             ErrorCode::CommitPaginationUnsupported => scope_utils::CODE_COMMIT_PAGINATION_UNSUPPORTED,
+            ErrorCode::QueryPredicateInvalid => query_utils::CODE_QUERY_PREDICATE_INVALID,
             ErrorCode::EmptyHistory => "empty_history",
         }
     }
@@ -329,7 +335,8 @@ impl ErrorCode {
             ErrorCode::ChunkedTransportUnsupported => 14,
             ErrorCode::OversizedTransportUnsupported => 15,
             ErrorCode::CommitPaginationUnsupported => 16,
-            // 17 and 18 are reserved for future features, not shipped yet — never assign them.
+            // 17 stays reserved for the parked conflicts design — never assign it.
+            ErrorCode::QueryPredicateInvalid => 18,
             ErrorCode::EmptyHistory => 19,
         }
     }
@@ -365,6 +372,8 @@ impl ErrorCode {
             ErrorCode::CommitPaginationUnsupported =>
                 "A lift needs a paginated commit (many objects) and the remote doesn't support \
                  it yet",
+            ErrorCode::QueryPredicateInvalid =>
+                "A \"query\" predicate is malformed or exceeds a fixed bound",
             ErrorCode::EmptyHistory =>
                 "\"history\" was asked to walk a pallet that has nothing stacked on it yet",
         }
@@ -388,6 +397,7 @@ impl ErrorCode {
             RefusalCode::ChunkedTransportUnsupported => ErrorCode::ChunkedTransportUnsupported,
             RefusalCode::OversizedTransportUnsupported => ErrorCode::OversizedTransportUnsupported,
             RefusalCode::CommitPaginationUnsupported => ErrorCode::CommitPaginationUnsupported,
+            RefusalCode::QueryPredicateInvalid => ErrorCode::QueryPredicateInvalid,
         }
     }
 }
