@@ -540,6 +540,11 @@ fn tags_are_membership_and_an_absent_pallet_is_unknown_not_false() {
     let untagged = extract_parcel_hash(&warehouse.run(&["stack", "base parcel"]));
     assert_success(&warehouse.run(&["office", "enroll"])); // test@forklift becomes admin
 
+    // Before any tag is ever created, the pallet has no head at all: the omission of `tags`
+    // on every match is unknowable, not proof of "untagged" — the scope block must say so.
+    let before_any_tag = json(&warehouse.run(&["--json", "query"]));
+    assert_eq!(before_any_tag["data"]["scope"]["tags_source"], "meta_pallet_absent");
+
     warehouse.write_file("b.txt", "two\n");
     assert_success(&warehouse.run(&["load", "b.txt"]));
     let tagged = extract_parcel_hash(&warehouse.run(&["stack", "release work"]));
@@ -550,6 +555,7 @@ fn tags_are_membership_and_an_absent_pallet_is_unknown_not_false() {
     assert_eq!(matched_hashes(&matched), std::collections::HashSet::from([tagged.clone()]));
     let entry = entry_for(&matched, &tagged);
     assert_eq!(entry["tags"], serde_json::json!(["v1"]));
+    assert_eq!(matched["data"]["scope"]["tags_source"], "present");
 
     // Membership, not evidence: since `@tags` exists, an untagged parcel plainly does not
     // carry "v1" — `not: {tag eq v1}` matches it (False, not Unknown).

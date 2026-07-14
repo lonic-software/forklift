@@ -2614,6 +2614,10 @@ A command not listed here either reports only the generic human-message shape `{
           "description": "Whether the `@manifest` meta pallet has a head at all: `\"present\"`, or\n`\"meta_pallet_absent\"` when it does not exist (or was never fetched) — every\nprovenance leaf then reads `Unknown` for lack of a pallet to consult, not for lack\nof evidence on any one parcel.",
           "type": "string"
         },
+        "tags_source": {
+          "description": "Whether the `@tags` meta pallet has a head at all: `\"present\"`, or\n`\"meta_pallet_absent\"` when it does not exist (or was never fetched) — mirrors\n`provenance_source`. A match's omitted `tags` only proves \"genuinely untagged\" when\nthis reads `\"present\"`; when it reads `\"meta_pallet_absent\"` every `tags` omission is\nunknowable, not a negative result.",
+          "type": "string"
+        },
         "trust": {
           "description": "\"verified\" or \"recorded\" — the trust level identity answers were resolved at.",
           "type": "string"
@@ -2631,7 +2635,8 @@ A command not listed here either reports only the generic human-message shape `{
         "walked",
         "matched",
         "out_of_scope",
-        "provenance_source"
+        "provenance_source",
+        "tags_source"
       ],
       "type": "object"
     },

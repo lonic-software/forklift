@@ -173,6 +173,13 @@ pub struct QueryOutcome {
     /// provenance leaf read `Unknown` for lack of a pallet to consult, not for lack of
     /// evidence on any one parcel — the report must be able to tell the two apart.
     pub provenance_present: bool,
+
+    /// Whether the `@tags` meta pallet has a head at all. `false` means every `tag` leaf
+    /// read `Unknown` for lack of a pallet to consult — and, just as importantly, means a
+    /// match's omitted `tags` is unknowable, not a proven "untagged": without this, a
+    /// consumer reading an absent `tags` array cannot tell a genuinely untagged parcel from
+    /// one queried before `@tags` ever existed.
+    pub tags_present: bool,
 }
 
 /// One subject's flattened provenance evidence for the report: the newest entry by
@@ -927,10 +934,21 @@ fn evaluate(
     ctx: &QueryContext,
 ) -> Result<Truth, String> {
     Ok(match predicate {
+        // Kleene absorption makes stopping early sound: `False` absorbs `and` and `True`
+        // absorbs `or`, so once the accumulator hits its absorbing value no later sibling can
+        // move it. This matters beyond the obvious IO saving: a `touches` leaf reads a tree
+        // and can bump `out_of_scope` (or hard-error on an in-scope-but-missing tree); once a
+        // cheaper leaf has already decided the `all`/`any`, that leaf never runs at all. So
+        // which leaves actually execute — and therefore the `out_of_scope` count and whether a
+        // `touches` hard-error even surfaces — depends on predicate order once a branch is
+        // decided. That is deliberate: a decided parcel owes the rest of the predicate nothing.
         Predicate::All(children) => {
             let mut acc = Truth::True;
             for child in children {
                 acc = acc.and(evaluate(child, hash, parcel, identity, ctx)?);
+                if acc == Truth::False {
+                    break;
+                }
             }
             acc
         }
@@ -938,6 +956,9 @@ fn evaluate(
             let mut acc = Truth::False;
             for child in children {
                 acc = acc.or(evaluate(child, hash, parcel, identity, ctx)?);
+                if acc == Truth::True {
+                    break;
+                }
             }
             acc
         }
@@ -1303,6 +1324,7 @@ pub fn run_query(
                 matched,
                 out_of_scope: ctx.out_of_scope.get(),
                 provenance_present: ctx.provenance.is_some(),
+                tags_present: ctx.tags.is_some(),
             });
         }};
     }
@@ -1365,6 +1387,7 @@ pub fn run_query(
                     next: None, walked, matched,
                     out_of_scope: ctx.out_of_scope.get(),
                     provenance_present: ctx.provenance.is_some(),
+                    tags_present: ctx.tags.is_some(),
                 });
             }
             if params.limit.is_some_and(|limit| matched >= limit) {
@@ -1393,6 +1416,7 @@ pub fn run_query(
                     next: None, walked, matched,
                     out_of_scope: ctx.out_of_scope.get(),
                     provenance_present: ctx.provenance.is_some(),
+                    tags_present: ctx.tags.is_some(),
                 });
             }
             if params.limit.is_some_and(|limit| matched >= limit) {
@@ -1424,6 +1448,7 @@ pub fn run_query(
                         next: None, walked, matched,
                         out_of_scope: ctx.out_of_scope.get(),
                         provenance_present: ctx.provenance.is_some(),
+                        tags_present: ctx.tags.is_some(),
                     });
                 }
                 if params.limit.is_some_and(|limit| matched >= limit) {
@@ -1454,6 +1479,7 @@ pub fn run_query(
                 next: None, walked, matched,
                 out_of_scope: ctx.out_of_scope.get(),
                 provenance_present: ctx.provenance.is_some(),
+                tags_present: ctx.tags.is_some(),
             });
         }
         if params.limit.is_some_and(|limit| matched >= limit) {
@@ -1466,6 +1492,7 @@ pub fn run_query(
         next: None, walked, matched,
         out_of_scope: ctx.out_of_scope.get(),
         provenance_present: ctx.provenance.is_some(),
+        tags_present: ctx.tags.is_some(),
     })
 }
 
@@ -1603,5 +1630,44 @@ mod tests {
         // neither matches nor negation-matches it.
         let verdict = evaluate(&predicate, "abc", &parcel, &IdentityFacts::Unknowable, &ctx).unwrap();
         assert!(verdict == Truth::Unknown);
+    }
+
+    #[test]
+    fn all_short_circuits_on_a_definitive_false_before_a_later_touches_leaf_runs() {
+        // `is_merge eq true` is definitively False for a non-merge parcel; `all` must stop
+        // there rather than go on to evaluate the `touches` leaf too. If it did not, `touches`
+        // would try to read a tree from a storage root this test never sets up and return an
+        // `Err`, which `evaluate` would propagate — so a broken short-circuit fails this test
+        // loudly (via the `expect` below) rather than silently.
+        let predicate = parse_value(&serde_json::json!({
+            "all": [
+                leaf("is_merge", "eq", Value::Bool(true)),
+                leaf("path", "touches", Value::String("x".to_string())),
+            ]
+        }))
+        .unwrap();
+
+        let parcel = Parcel {
+            tree_hash: "0".repeat(64),
+            parents: Vec::new(),
+            actions: Vec::new(),
+            description: None,
+        };
+
+        let ctx = QueryContext {
+            provenance: None,
+            tags: None,
+            fetch_scope: MaterializationScope::full(),
+            out_of_scope: Cell::new(0),
+            tree_hashes: RefCell::new(HashMap::new()),
+        };
+
+        let verdict = evaluate(&predicate, "abc", &parcel, &IdentityFacts::Unresolved, &ctx)
+            .expect("the touches leaf must never run once `all`'s first child is already False");
+        assert!(verdict == Truth::False);
+        // A `touches` leaf that actually ran (with this full fetch scope) would have hard-
+        // errored above rather than degrade — so a live `Ok` already proves it did not run;
+        // this is a second, cheap witness of the same fact.
+        assert_eq!(ctx.out_of_scope.get(), 0, "touches must not have run at all");
     }
 }

@@ -217,6 +217,7 @@ fn scope_block(trust: TrustMode, outcome: &QueryOutcome, fetch_scope: Option<Vec
         matched: outcome.matched,
         out_of_scope: outcome.out_of_scope,
         provenance_source: if outcome.provenance_present { "present" } else { "meta_pallet_absent" }.to_string(),
+        tags_source: if outcome.tags_present { "present" } else { "meta_pallet_absent" }.to_string(),
         fetch_scope,
     }
 }
@@ -358,6 +359,13 @@ pub(crate) struct QueryScope {
     /// provenance leaf then reads `Unknown` for lack of a pallet to consult, not for lack
     /// of evidence on any one parcel.
     provenance_source: String,
+
+    /// Whether the `@tags` meta pallet has a head at all: `"present"`, or
+    /// `"meta_pallet_absent"` when it does not exist (or was never fetched) — mirrors
+    /// `provenance_source`. A match's omitted `tags` only proves "genuinely untagged" when
+    /// this reads `"present"`; when it reads `"meta_pallet_absent"` every `tags` omission is
+    /// unknowable, not a negative result.
+    tags_source: String,
 
     /// The warehouse's fetch-scope prefixes — present only on a sparse warehouse.
     #[serde(skip_serializing_if = "Option::is_none")]

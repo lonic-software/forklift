@@ -121,7 +121,9 @@ Provenance and tags are honest about absence, differently:
   `"present"`) — an honest empty answer, not an error.
 * **A tag is membership.** An untagged parcel plainly does not carry a given tag
   (excluded by `tag eq …`, included by its negation) — only a warehouse with no
-  `@tags` pallet at all makes `tag` predicates unknowable.
+  `@tags` pallet at all makes `tag` predicates unknowable, and `scope.tags_source`
+  says so the same way `provenance_source` does (`"present"` vs.
+  `"meta_pallet_absent"`).
 
 `touches` tests whether the parcel's tree differs from its **first parent's** at a
 warehouse path (a file or a directory prefix) — the same diff `blame` already does for
@@ -155,7 +157,7 @@ the fetch scope degrades to unknowable for that parcel (counted in
     "next": "<cursor>",
     "scope": { "trust": "verified", "office_asof": "current",
                "walked": 1234, "matched": 12, "out_of_scope": 0,
-               "provenance_source": "present" }
+               "provenance_source": "present", "tags_source": "present" }
   }
 }
 ```
@@ -169,7 +171,10 @@ either direction — three-valued honesty, not a guess.
 
 `provenance` and `tags` are always computed and attached to a match (even when the
 predicate never tested them); both are omitted entirely — not an empty object/array —
-when the subject carries no provenance entry, or no tags.
+when the subject carries no provenance entry, or no tags. An omitted `tags` is proof
+of "genuinely untagged" only when `scope.tags_source` reads `"present"`; when it reads
+`"meta_pallet_absent"` the omission is unknowable, exactly like a provenance omission
+under `provenance_source: "meta_pallet_absent"`.
 
 The `scope` block is always present so a partial or unverified pass can never read as a
 complete, verified one. `office_asof` is always `"current"`: class/supervisor answers
