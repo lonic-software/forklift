@@ -1391,16 +1391,9 @@ pub fn compact(all: bool, redelta: bool) -> Result<CompactStats, String> {
     // The write-time depth ledger (see `true_depth`): every hash this run has assigned a real (or,
     // for a still-pending chain target, a sound worst-case — see the pre-pass below) depth to.
     // Consulted instead of a stale on-disk read for anything this run has already decided, since
-    // `redelta` may re-encode a hash as something else entirely.
+    // `redelta` may re-encode a hash as something else entirely. Spans the whole run (unlike
+    // `safe_base_of` below): a later batch's pre-pass must see an earlier batch's decisions.
     let mut known_depth: HashMap<[u8; HASH_LEN], u32> = HashMap::new();
-    // Chain targets `compute_path_bases` offered a base for, but only once this run's own
-    // depth-safety pre-pass (below) has confirmed using it cannot push the true chain depth past
-    // `MAX_DELTA_CHAIN` — the filtered view of `path_bases.base_of` actually handed to
-    // `prepare_batch`, so a target this pre-pass rejected is indistinguishable, from
-    // `prepare_target`'s point of view, from one `compute_path_bases` never offered a base for at
-    // all (falls through to full, per the `is_chain_target` gate below — never the window: see
-    // its own comment).
-    let mut safe_base_of: HashMap<[u8; HASH_LEN], [u8; HASH_LEN]> = HashMap::new();
 
     // Process the targets in byte-bounded batches. Each batch's *path* deltas — the CPU-heavy
     // part — are compressed in parallel by `prepare_batch`; the writer then walks the batch in
@@ -1444,6 +1437,13 @@ pub fn compact(all: bool, redelta: bool) -> Result<CompactStats, String> {
         // hash that already used the planned value stays a valid (if occasionally conservative)
         // upper bound. Never the reverse: nothing here ever assumes a shallower depth than a
         // candidate can actually turn out to have.
+        //
+        // Scoped to this batch alone (rebuilt fresh every iteration, unlike `known_depth`):
+        // `prepare_batch` below only ever looks up *this* batch's targets in it, so carrying
+        // earlier batches' entries forward would just accumulate dead weight — at git.git scale,
+        // most of `path_bases.base_of` restated back into a second map nothing after this batch
+        // still reads.
+        let mut safe_base_of: HashMap<[u8; HASH_LEN], [u8; HASH_LEN]> = HashMap::new();
         for target in batch {
             if matches!(target.source, Source::CopyRecord { .. }) {
                 continue;
