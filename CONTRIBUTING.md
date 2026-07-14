@@ -43,8 +43,10 @@ signature.
 ## AI-assisted contributions: a human must be the author
 
 AI coding assistants are welcome here — Forklift is built with them. But **every
-commit must be authored by a human**, with the assistant credited in a
-`Co-Authored-By:` trailer rather than in the author field:
+commit in a contribution you submit must be authored by a human**, with the
+assistant credited in a `Co-Authored-By:` trailer rather than in the author
+field (this is about your commits in a pull request — automation like
+Dependabot committing as a `[bot]` account is a different thing and fine):
 
 ```
 Area - Topic: short description
