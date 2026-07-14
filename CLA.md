@@ -1,8 +1,9 @@
 # Forklift Individual Contributor License Agreement
 
 Thank you for your interest in contributing to Forklift (the "Project"), maintained
-by **Máté Kolonics** (the "Maintainer", which term includes his successors and
-assigns — for example a legal entity to which the Project is later transferred).
+by **Máté Árpád Kolonics** (the "Maintainer", which term includes his successors
+and assigns — for example a legal entity to which the Project is later
+transferred).
 
 This Contributor License Agreement ("Agreement") documents the rights granted by
 contributors to the Maintainer. It is for your protection as a Contributor as well
