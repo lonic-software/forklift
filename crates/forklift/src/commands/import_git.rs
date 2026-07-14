@@ -13,6 +13,7 @@ use forklift_core::model::operator::Operator;
 use forklift_core::model::parcel::Parcel;
 use forklift_core::model::parcel_action::ParcelAction;
 use forklift_core::model::tree_item::TreeItem;
+use forklift_core::util::file_utils::BulkStoreSession;
 use forklift_core::util::pack_utils::{IngestBase, IngestStored, StoreIngest};
 use forklift_core::util::{inventory_utils, object_utils, office_utils, pallet_utils, shift_utils};
 use crate::output::{self, CommandOutput};
@@ -72,6 +73,12 @@ pub fn handle_command(path: &str, no_compact: bool) -> Result<(), String> {
 
     let mut converter = Converter::new(path, !no_compact)?;
 
+    // `--no-compact` writes straight to the loose store, one file per object — exactly the
+    // bulk write burst `BulkStoreSession` batches the publish for, instead of fsyncing and
+    // renaming every object as it lands (the loose path's measured cost at import scale).
+    // Pack-direct mode does not need it: it already batches many objects into few pack files.
+    let bulk_session = no_compact.then(BulkStoreSession::open).transpose()?;
+
     // Convert every commit oldest-first (so each commit's parents are already mapped),
     // pulling in the trees and blobs each one references on the way.
     for commit in all_commits(path)? {
@@ -79,8 +86,14 @@ pub fn handle_command(path: &str, no_compact: bool) -> Result<(), String> {
     }
 
     // Publish the final pack before anything points at (or reads) the imported objects:
-    // the pallet heads below must never reference an object that is not yet visible.
+    // the pallet heads below must never reference an object that is not yet visible. The
+    // loose store's bulk session is the same barrier for `--no-compact` — every staged loose
+    // object must be durable and visible before any ref, pallet head, or inventory entry below
+    // can point at it.
     let packed = converter.finish_ingest()?;
+    if let Some(session) = bulk_session {
+        session.finish()?;
+    }
 
     // Each local branch becomes a pallet.
     let mut imported: Vec<(String, String)> = Vec::new();
