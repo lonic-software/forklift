@@ -35,7 +35,7 @@ memmap2 = "0.9"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 file-id = "0.2.3"
 rand = "0.8"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "zstd", "gzip"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "zstd", "gzip", "socks"] }
 percent-encoding = "2"
 regex = "1.10.6"
 toml_edit = "0.23"

@@ -127,6 +127,107 @@ pub enum LiftResult {
     Lifted(LiftStats),
 }
 
+/// The default Tor SOCKS proxy: the address a stock local `tor` daemon listens on. The
+/// `socks5h` scheme (not `socks5`) hands the hostname to the proxy to resolve, which is
+/// mandatory for an onion address — it has no DNS record and only resolves inside the Tor
+/// network, so resolving it locally would always fail.
+pub const DEFAULT_TOR_PROXY: &str = "socks5h://127.0.0.1:9050";
+
+/// How the client reaches a remote through Tor — the peer-to-peer transport (DESIGN.html §4.7).
+/// A peer publishes its warehouse as a Tor onion service (no fixed IP, no port-forwarding, no
+/// NAT configuration — just a shareable `.onion`), and this decides whether a given remote is
+/// dialed through the local Tor SOCKS proxy.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum TorMode {
+    /// Route through Tor only when the remote is an onion service (its host ends in `.onion`).
+    /// The default: a plain `http(s)` remote is dialed directly, an onion one through Tor — so
+    /// nothing changes for existing remotes and an onion URL Just Works.
+    Auto,
+
+    /// Always route through Tor, even a clearnet remote — reach it anonymously.
+    On,
+
+    /// Never route through Tor, even an onion host (which then fails to resolve locally). The
+    /// escape hatch for a caller that reaches `.onion` through some other transport.
+    Off,
+}
+
+impl TorMode {
+    /// Parse a `remote.tor` value. `auto` (or anything unrecognized) → [`TorMode::Auto`];
+    /// `on`/`true`/`yes`/`1` → [`TorMode::On`]; `off`/`false`/`no`/`0` → [`TorMode::Off`].
+    /// Case- and surrounding-whitespace-insensitive. An unrecognized value falls back to the
+    /// safe default (`Auto`): it never forces traffic through a proxy the user did not ask for,
+    /// and never blocks an onion remote.
+    fn parse(value: &str) -> TorMode {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "on" | "true" | "yes" | "1" => TorMode::On,
+            "off" | "false" | "no" | "0" => TorMode::Off,
+            _ => TorMode::Auto,
+        }
+    }
+}
+
+/// The client's Tor transport settings, resolved from configuration.
+#[derive(Clone)]
+pub struct TorSettings {
+    pub mode: TorMode,
+    pub proxy: String,
+}
+
+impl Default for TorSettings {
+    fn default() -> TorSettings {
+        TorSettings { mode: TorMode::Auto, proxy: DEFAULT_TOR_PROXY.to_string() }
+    }
+}
+
+impl TorSettings {
+    /// Read the Tor settings from configuration (`remote.tor`, `remote.torProxy`), falling back
+    /// to the defaults for anything unset — and, deliberately, for anything *unreadable* too: a
+    /// missing or malformed configuration file must never make constructing a client fail (a
+    /// client is built on hot paths, and in contexts with no warehouse at all), so a read error
+    /// degrades to the defaults, which route only onion remotes through the stock local proxy.
+    pub fn from_config() -> TorSettings {
+        let mode = config_utils::get_effective_value(config_utils::KEY_REMOTE_TOR)
+            .ok()
+            .flatten()
+            .map(|(value, _)| TorMode::parse(&value))
+            .unwrap_or(TorMode::Auto);
+
+        let proxy = config_utils::get_effective_value(config_utils::KEY_REMOTE_TOR_PROXY)
+            .ok()
+            .flatten()
+            .map(|(value, _)| value)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_TOR_PROXY.to_string());
+
+        TorSettings { mode, proxy }
+    }
+}
+
+/// Whether a remote URL names a Tor onion service — its host is a `.onion` address. Tolerant by
+/// design: an unparseable URL, or one with no host, is simply "not onion", so the decision
+/// degrades to a direct dial rather than erroring here — a genuinely broken URL fails later at
+/// the actual request, with a clearer message than a proxy-parse error would give.
+fn is_onion_url(url: &str) -> bool {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(|host| host.to_ascii_lowercase()))
+        // Tolerate a trailing FQDN dot (`x.onion.`) — still an onion, must route through Tor,
+        // not get dialed directly and fail local resolution with a confusing error.
+        .is_some_and(|host| host.trim_end_matches('.').ends_with(".onion"))
+}
+
+/// Whether to dial this remote through the Tor SOCKS proxy, given the mode. Pure and total, so
+/// the policy is unit-testable without a socket: `On` always, `Off` never, `Auto` iff the
+/// remote is an onion address.
+fn should_route_through_tor(mode: &TorMode, url: &str) -> bool {
+    match mode {
+        TorMode::On => true,
+        TorMode::Off => false,
+        TorMode::Auto => is_onion_url(url),
+    }
+}
+
 /// The remote endpoint: base URL, optional bearer token, and the HTTP client.
 #[derive(Clone)]
 pub struct RemoteClient {
@@ -176,13 +277,51 @@ impl RemoteClient {
     /// * `Ok(RemoteClient)` - The client.
     /// * `Err(String)`      - If the HTTP client could not be built.
     pub fn new(url: &str, token: Option<String>) -> Result<RemoteClient, String> {
-        let http = reqwest::Client::builder()
-            .build()
+        RemoteClient::new_with_tor(url, token, TorSettings::from_config())
+    }
+
+    /// Like [`RemoteClient::new`], but with explicit Tor settings rather than reading them from
+    /// configuration — the seam the tests use to exercise onion routing without a config file,
+    /// and the constructor a caller with settings already in hand can use.
+    ///
+    /// When the settings route this remote through Tor (see [`should_route_through_tor`]), both
+    /// underlying clients dial through the Tor SOCKS proxy; otherwise they are built exactly as
+    /// before, so every non-onion remote and every existing call is byte-for-byte unchanged.
+    ///
+    /// # Arguments
+    /// * `url`   - The base URL of the remote (`http://…`, or `http://<onion>.onion`).
+    /// * `token` - The bearer token, when the remote requires one.
+    /// * `tor`   - The Tor transport settings.
+    ///
+    /// # Returns
+    /// * `Ok(RemoteClient)` - The client.
+    /// * `Err(String)`      - If the HTTP client, or the configured proxy, could not be built.
+    pub fn new_with_tor(url: &str,
+                        token: Option<String>,
+                        tor: TorSettings) -> Result<RemoteClient, String> {
+        let proxy = if should_route_through_tor(&tor.mode, url) {
+            Some(reqwest::Proxy::all(&tor.proxy).map_err(|e| format!(
+                "Error while configuring the Tor proxy \"{}\": {}", tor.proxy, e
+            ))?)
+        } else {
+            None
+        };
+
+        let mut http = reqwest::Client::builder();
+        let mut no_redirect = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none());
+
+        // The same proxy governs both clients: the redirect-following default and the
+        // hand-following `no_redirect` one alike route through Tor when the remote does.
+        if let Some(proxy) = &proxy {
+            http = http.proxy(proxy.clone());
+            no_redirect = no_redirect.proxy(proxy.clone());
+        }
+
+        let http = http.build()
             .map_err(|e| format!("Error while creating the HTTP client: {}", e))?;
 
-        let no_redirect = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
+        let no_redirect = no_redirect.build()
             .map_err(|e| format!("Error while creating the HTTP client: {}", e))?;
 
         Ok(RemoteClient {
@@ -2152,6 +2291,76 @@ mod tests {
     use crate::builder::object::loose_object_builder::LooseObjectBuilder;
     use crate::globals::StorageRootScope;
     use crate::model::remote::ErrorResponse;
+
+    /// A host ending in `.onion` is recognized as an onion service; a clearnet host, an IP, and a
+    /// bare/garbage string are not — and neither is a `.onion` that only appears in the path or a
+    /// query string, since it is the *host* that must be the onion address.
+    #[test]
+    fn only_onion_hosts_are_recognized() {
+        assert!(is_onion_url("http://abcdefghij234567.onion"));
+        assert!(is_onion_url("http://abcdefghij234567.onion:80/v1/warehouse"));
+        assert!(is_onion_url("http://SubDomain.ABCDEF.onion"), "case-insensitive host match");
+        assert!(is_onion_url("http://abcdefghij234567.onion."), "trailing FQDN dot is still onion");
+
+        assert!(!is_onion_url("http://127.0.0.1:9418"));
+        assert!(!is_onion_url("https://forklift.example.com"));
+        assert!(!is_onion_url("http://example.com/path/to.onion"), "path, not host");
+        assert!(!is_onion_url("http://example.com/?q=x.onion"), "query, not host");
+        assert!(!is_onion_url("not a url"));
+    }
+
+    /// The routing policy is exactly: `On` always dials through Tor, `Off` never does, and `Auto`
+    /// does iff the remote is an onion host. This is the whole contract the client's transport
+    /// choice rests on, proven without a socket.
+    #[test]
+    fn tor_routing_policy() {
+        let onion = "http://abcdefghij234567.onion";
+        let clearnet = "http://127.0.0.1:9418";
+
+        assert!(should_route_through_tor(&TorMode::Auto, onion));
+        assert!(!should_route_through_tor(&TorMode::Auto, clearnet));
+
+        assert!(should_route_through_tor(&TorMode::On, onion));
+        assert!(should_route_through_tor(&TorMode::On, clearnet), "on routes even clearnet");
+
+        assert!(!should_route_through_tor(&TorMode::Off, onion), "off never routes, even onion");
+        assert!(!should_route_through_tor(&TorMode::Off, clearnet));
+    }
+
+    /// `remote.tor` parsing: the three canonical values plus their truthy/falsey synonyms, and an
+    /// unrecognized value degrading to the safe default (`Auto`) rather than erroring.
+    #[test]
+    fn tor_mode_parsing() {
+        for on in ["on", "On", " ON ", "true", "yes", "1"] {
+            assert_eq!(TorMode::parse(on), TorMode::On, "{on:?} is on");
+        }
+        for off in ["off", "OFF", "false", "no", "0"] {
+            assert_eq!(TorMode::parse(off), TorMode::Off, "{off:?} is off");
+        }
+        for auto in ["auto", "", "sometimes", "socks"] {
+            assert_eq!(TorMode::parse(auto), TorMode::Auto, "{auto:?} degrades to auto");
+        }
+    }
+
+    /// Building a client for an onion remote with an explicit proxy succeeds (the SOCKS proxy is
+    /// accepted and wired in), and a non-onion remote under the default `Auto` settings builds a
+    /// direct client — the construction path both peers rely on, exercised without any live Tor.
+    #[test]
+    fn a_tor_client_builds_for_an_onion_remote() {
+        let onion = RemoteClient::new_with_tor(
+            "http://abcdefghij234567.onion",
+            Some("secret".to_string()),
+            TorSettings { mode: TorMode::Auto, proxy: DEFAULT_TOR_PROXY.to_string() },
+        );
+        assert!(onion.is_ok(), "an onion remote builds through the SOCKS proxy: {:?}", onion.err());
+
+        let direct = RemoteClient::new_with_tor(
+            "http://127.0.0.1:9418",
+            None,
+            TorSettings::default(),
+        );
+        assert!(direct.is_ok(), "a clearnet remote builds directly: {:?}", direct.err());
+    }
 
     /// The server-to-client wire round trip (§7.4): a server-side refusal carries its stable code
     /// in the additive `ErrorResponse.code` field; after that body crosses the wire (here through
