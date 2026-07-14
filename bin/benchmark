@@ -4,19 +4,14 @@
 # What it does, end to end:
 #   1. Clones the target repo once (a local mirror), then makes two working copies:
 #        A/  a plain `git clone --local`   (git is measured here)
-#        B/  a copy of A + `forklift import-git .`   (forklift is measured here)
-#      B is then *compacted* before the table runs, so both stores are packed for the
-#      comparison — git ships packed (`clone --local` copies packfiles) and a real
-#      `import-git` packs on the way out, so the packed store is the state users
-#      actually operate in. The loose store is a transient (it exists only between an
-#      import and its auto-compaction), so measuring read-only ops there would compare
-#      git-packed to forklift-loose and understate forklift.
-#      Both copies hold the same working tree, so every read-only comparison is
-#      apples-to-apples: identical files, identical history, one tool each.
+#        B/  a copy of A, then `forklift import-git .`   (forklift is measured here)
+#      `import-git` writes straight into native packs as it imports — there is no
+#      loose store and no separate compaction pass. B is packed the moment the
+#      import finishes, same as A is packed the moment the clone finishes, so
+#      every read-only comparison after that is apples-to-apples: identical
+#      files, identical history, one tool each, both packed.
 #   2. Times the operations people actually run — onboard, status, log, diff,
-#      commit — for both tools and prints a markdown table with the ratio. The
-#      loose→packed win from compaction is reported separately, as forklift's own
-#      before/after (git has no equivalent — it packs during clone/gc).
+#      commit — for both tools and prints a markdown table with the ratio.
 #
 # It is dependency-free (no hyperfine required) and honest about its limits; see
 # docs/BENCHMARK.md for the fairness caveats and how to go deeper.
@@ -109,9 +104,10 @@ echo "→ building the git working copy (A)…"
 git clone --quiet --local "$MIRROR" "$A"
 MAIN_REF=$(git -C "$A" symbolic-ref --short HEAD)
 
-echo "→ building the forklift working copy (B = copy of A + import-git)…"
+echo "→ building the forklift working copy (B = copy of A)…"
 cp -a "$A" "$B"
 ( cd "$B" && forklift prepare >/dev/null )
+# forklift import-git itself is timed below, in step [1/5] — that IS the onboard cost.
 
 # ── repo shape (context for the report) ─────────────────────────────────────
 N_COMMITS=$(git -C "$A" rev-list --count HEAD)
@@ -190,19 +186,11 @@ GIT_ONBOARD=$(( t1 - t0 )); rm -rf "$WORK/_gc"
 # rejects). Capture its output and surface it — a swallowed error here reads as a silent
 # crash, and every later benchmark would run against a half-imported warehouse.
 #
-# Real imports pack the store on the way out (auto-compact), which is the right default
-# for users. But this benchmark's job is to *measure* that optimization, so it imports
-# with --no-compact to leave the loose baseline in place — the compaction pass (step 6)
-# then packs it and reports the before/after. (--no-compact is probed so an older forklift
-# that lacks it still runs; there the store is loose anyway.)
-IMPORT_ARGS="."
-LOOSE_BASELINE=0
-if forklift import-git --help 2>/dev/null | grep -q -- '--no-compact'; then
-    IMPORT_ARGS=". --no-compact"
-    LOOSE_BASELINE=1
-fi
+# This is a plain import: forklift writes straight into native packs as it imports
+# (delta-compressing successive file/tree versions on the way in), so the timed number
+# IS the real onboarding cost — there is no separate loose store or compaction pass.
 t0=$(_now_ms)
-if ! import_log=$( cd "$B" && forklift import-git $IMPORT_ARGS 2>&1 ); then
+if ! import_log=$( cd "$B" && forklift import-git . 2>&1 ); then
     echo "error: 'forklift import-git .' failed — the benchmark cannot continue." >&2
     echo "── forklift said ──────────────────────────────────────────────" >&2
     echo "$import_log" | tail -20 >&2
@@ -212,36 +200,16 @@ if ! import_log=$( cd "$B" && forklift import-git $IMPORT_ARGS 2>&1 ); then
 fi
 t1=$(_now_ms)
 FORK_ONBOARD=$(( t1 - t0 ))
+# The import prints its own packing summary (e.g. "Packed the imported store: N object(s)
+# into M pack(s), D delta-compressed."); surface it verbatim in the onboarding report.
+IMPORT_PACK_SUMMARY=$(printf '%s\n' "$import_log" | grep -m1 'Packed the imported store' || true)
 # Onboarding is NOT added to the ratio table: `git clone --local` (copy a pack) and
 # `forklift import-git` (re-encode every object) are different operations, so a ratio
 # between them is misleading. They are reported on their own, below the table.
 GIT_SIZE_K=$(du -sk "$A/.git" 2>/dev/null | cut -f1)
 
-# The store is loose right now (we imported --no-compact). Capture the loose baseline —
-# on-disk size and a whole-history walk — for the compaction payoff callout, THEN pack it,
-# so every read-only comparison below runs against the PACKED store. This is the fairness
-# fix: git is always measured packed (git clone --local copies existing packfiles) and a real
-# import-git compacts on the way out, so the packed store is the steady state a user operates
-# in. The loose store exists only in the seconds between an import and its auto-compaction —
-# measuring log/diff there compares git-packed to forklift-loose, understating forklift.
-FORK_SIZE_LOOSE=$(du -sh "$B/.forklift" 2>/dev/null | cut -f1)
-
-COMPACT_DONE=0
-if [ "$LOOSE_BASELINE" -eq 1 ] && ( cd "$B" && forklift compact --help ) >/dev/null 2>&1; then
-    echo "→ measuring the loose baseline, then compacting (so the table runs packed)…"
-    # Before: a whole-history walk against the loose store (the "before" for the payoff).
-    read -r HIST_LOOSE _ <<< "$(time_cmd "$RUNS" "$B" "" 'forklift history')"
-    # Pack the loose objects (a one-shot maintenance pass; time it once).
-    t0=$(_now_ms)
-    if ! COMPACT_OUT=$( cd "$B" && forklift compact 2>&1 ); then
-        COMPACT_OUT="(forklift compact failed: $COMPACT_OUT)"
-    fi
-    t1=$(_now_ms); COMPACT_MS=$(( t1 - t0 ))
-    COMPACT_DONE=1
-fi
-
-# Size in the header/ratio is the packed store when we packed (the steady state); otherwise
-# whatever import produced (older forklift with no compact — the table then runs loose).
+# The store arrives packed — no separate compaction step. Every read-only comparison below
+# runs against the same packed store a user actually operates in.
 FORK_SIZE_K=$(du -sk "$B/.forklift" 2>/dev/null | cut -f1)
 FORK_SIZE=$(du -sh "$B/.forklift" 2>/dev/null | cut -f1)
 
@@ -257,7 +225,6 @@ add_row "status (clean tree)" "$GM" "$FM" "git status vs forklift stocktake --su
 echo "→ [3/5] log…"
 read -r GM _        <<< "$(time_cmd "$RUNS" "$A" "" 'git log')"
 read -r FM _        <<< "$(time_cmd "$RUNS" "$B" "" 'forklift history')"
-HIST_PACKED="$FM"   # the packed-store walk — also the "after" for the compaction payoff
 add_row "log (whole history)" "$GM" "$FM" "$N_COMMITS commits walked"
 
 # ── 4. diff of a dirty tree ─────────────────────────────────────────────────
@@ -291,9 +258,6 @@ read -r GM _        <<< "$(time_cmd "$COMMIT_RUNS" "$A" "$GIT_SETUP"  'git commi
 read -r FM _        <<< "$(time_cmd "$COMMIT_RUNS" "$B" "$FORK_SETUP" 'forklift stack bench')"
 add_row "commit (1 file)" "$GM" "$FM" "git add+commit vs forklift load+stack; mean of $COMMIT_RUNS"
 
-# Compaction already happened up front (right after import), so the table above ran on the
-# packed store. Its loose→packed before/after is reported below as a forklift-only payoff.
-
 # ── report ──────────────────────────────────────────────────────────────────
 SIZE_NOTE=$(awk -v g="${GIT_SIZE_K:-0}" -v f="${FORK_SIZE_K:-0}" 'BEGIN{
     if (g>0 && f>0) {
@@ -311,22 +275,15 @@ build_report() {
         echo "- **On-disk:** git \`.git\` = ${GIT_SIZE:-?}, forklift \`.forklift\` = ${FORK_SIZE:-?}${SIZE_NOTE}"
         echo "- **Tools:** $GIT_VERSION · $FORKLIFT_VERSION"
         echo "- **Method:** read-only ops = mean of $RUNS runs, commit = mean of $COMMIT_RUNS; warm cache. Ratio < 1 means forklift is faster."
-        if [ "$COMPACT_DONE" -eq 1 ]; then
-            echo "- **Store:** both packed — forklift compacted after import, as git ships packed. The loose→packed win is the payoff callout below."
-        fi
+        echo "- **Store:** both packed — git ships packed (\`clone --local\` copies packfiles) and \`import-git\` packs on the way in (no loose store, no separate compaction pass)."
         echo
         render_table_markdown
         echo
         echo "**Onboarding** — different operations, reported without a ratio:"
         echo "- \`git clone --local\`: $(fmt_ms "$GIT_ONBOARD") (copies an existing packfile)"
-        echo "- \`forklift import-git\`: $(fmt_ms "$FORK_ONBOARD") (re-encodes every commit/tree/blob into the store)"
-        if [ "$COMPACT_DONE" -eq 1 ]; then
-            echo
-            echo "**Compaction payoff** — forklift's own before/after, *not* a comparison against git (git has no equivalent; it packs during clone/gc). The table above already runs on the packed store; this is what packing bought:"
-            echo "- $COMPACT_OUT"
-            echo "- On-disk: \`.forklift\` ${FORK_SIZE_LOOSE:-?} loose → ${FORK_SIZE:-?} packed"
-            echo "- log (whole history): $(fmt_ms "$HIST_LOOSE") loose → $(fmt_ms "$HIST_PACKED") packed ($(ratio "$HIST_LOOSE" "$HIST_PACKED") once packed)"
-            echo "- compacted in $(fmt_ms "$COMPACT_MS") — a real \`import-git\` folds this into onboarding automatically"
+        echo "- \`forklift import-git\`: $(fmt_ms "$FORK_ONBOARD") (re-encodes every commit/tree/blob straight into packs)"
+        if [ -n "$IMPORT_PACK_SUMMARY" ]; then
+            echo "- \`$IMPORT_PACK_SUMMARY\`"
         fi
         echo
         echo "> Quick comparison on one machine, not a published benchmark. For tighter"
@@ -340,23 +297,15 @@ build_report() {
         printf '  Tools:     %s · %s\n' "$GIT_VERSION" "$FORKLIFT_VERSION"
         printf '  Method:    read-only ops = mean of %s runs, commit = mean of %s; warm cache.\n' "$RUNS" "$COMMIT_RUNS"
         printf '             A ratio below 1.00 means forklift is faster.\n'
-        if [ "$COMPACT_DONE" -eq 1 ]; then
-            printf '             Table runs on the packed store (compacted after import), as git ships packed.\n'
-        fi
+        printf '             Both stores are packed: git ships packed, and import-git packs on the way in.\n'
         echo
         render_table_aligned
         echo
         echo "  Onboarding — measured separately; NOT a ratio (different operations):"
         printf '    git clone --local     %-10s (copies an existing packfile)\n' "$(fmt_ms "$GIT_ONBOARD")"
-        printf '    forklift import-git   %-10s (re-encodes every commit/tree/blob)\n' "$(fmt_ms "$FORK_ONBOARD")"
-        if [ "$COMPACT_DONE" -eq 1 ]; then
-            echo
-            echo "  Compaction payoff (forklift's own before/after — no git equivalent):"
-            echo "  The table above runs packed; this is what packing bought over the loose store."
-            printf '    %s\n' "$COMPACT_OUT"
-            printf '    on-disk:  .forklift %s loose -> %s packed\n' "${FORK_SIZE_LOOSE:-?}" "${FORK_SIZE:-?}"
-            printf '    log walk: %s loose -> %s packed   (%s once packed)\n' "$(fmt_ms "$HIST_LOOSE")" "$(fmt_ms "$HIST_PACKED")" "$(ratio "$HIST_LOOSE" "$HIST_PACKED")"
-            printf '    compacted in %s   (a real import-git folds this in automatically)\n' "$(fmt_ms "$COMPACT_MS")"
+        printf '    forklift import-git   %-10s (re-encodes every commit/tree/blob straight into packs)\n' "$(fmt_ms "$FORK_ONBOARD")"
+        if [ -n "$IMPORT_PACK_SUMMARY" ]; then
+            printf '    %s\n' "$IMPORT_PACK_SUMMARY"
         fi
         echo
         echo "  Quick comparison on one machine — for tighter stats use hyperfine."
