@@ -430,8 +430,11 @@ trust label per match (`verified`, `signed-revoked`, `unsigned`, `unknown-key`, 
 `signed-revoked` match also carries `signer.boundary` — `"vouched"` when it sits inside
 the revoking key's distrust boundary, or `"suspect"` when it sits outside it (a forged
 backdate, or the key's holder kept signing after the revocation); `audit` refuses a
-suspect parcel outright, but a read-only query labels it loudly instead. Filter on it
-with `--where '{"field":"signer.boundary","op":"eq","value":"suspect"}'`.
+suspect parcel outright, but a read-only query labels it loudly instead. It can also
+read `"unresolved"`, when a partial clone is simply missing one of the revocation's
+boundary heads — never treat that as `"suspect"`; query the origin, or fetch the full
+history, for a definitive answer. Filter on it with
+`--where '{"field":"signer.boundary","op":"eq","value":"suspect"}'`.
 
 `--model`/`--tool` read recorded machine-authorship provenance (a `manifest provenance`
 entry): a parcel with *no* provenance recorded at all never matches, in either

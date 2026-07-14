@@ -175,8 +175,15 @@ revocation time — e.g. `{ "signer": { "key": "<key-id>", "revocation_reason":
 "compromise", "boundary": "vouched" } }`), or `"suspect"` when it sits outside that
 boundary: a forged backdate, or the key's holder kept signing after the revocation.
 `audit` refuses a suspect parcel outright; a read-only query cannot refuse a signed
-history it was only asked to read, so this is the loud label instead. Filter on it with
-a `where` leaf on `signer.boundary` (`eq`/`in`, values `"vouched"` or `"suspect"`).
+history it was only asked to read, so this is the loud label instead. It can also read
+`"unresolved"`: at least one of the revocation's boundary heads is not present on *this*
+store (a partial clone whose franchise only ever fetched reachable history — an orphaned
+head never arrives), so the question cannot be answered here at all. `"unresolved"` must
+never be read as `"suspect"` — a parcel that is plainly vouched on the origin would
+otherwise look suspicious purely because this clone is incomplete; run the query against
+the origin, or fetch the full history, for a definitive answer. Filter on it with a
+`where` leaf on `signer.boundary` (`eq`/`in`, values `"vouched"` or `"suspect"` only —
+`"unresolved"` is an answer this leaf can produce, never a value it accepts as input).
 
 `provenance` and `tags` are always computed and attached to a match (even when the
 predicate never tested them); both are omitted entirely — not an empty object/array —

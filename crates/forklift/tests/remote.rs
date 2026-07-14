@@ -2121,6 +2121,155 @@ fn a_sparse_franchise_degrades_touches_to_unknown_out_of_scope() {
 }
 
 #[test]
+fn a_partial_clone_missing_a_boundary_head_reads_signer_boundary_as_unresolved() {
+    // The presence guard, end to end: a distrust boundary can name a head this store never
+    // has at all.
+    //
+    // Construction note (a deviation from the original sketch, which tried to manufacture
+    // this with `undo`): un-stacking a side-pallet parcel with `undo` *after* retiring past
+    // it does not work, because `undo`'s journal snapshots and restores *every* pallet ref,
+    // meta pallets included (`journal_utils::JournalEntry::heads`) — reversing the stack
+    // would also silently revert the office pallet's own ref, un-retiring the key right
+    // back to active. That's a real wrinkle in `undo` (out of scope for this predicate
+    // work: it never expected a meta-pallet mutation to land *between* the operation being
+    // undone and the undo itself). A pallet that is simply never lifted sidesteps it
+    // entirely — and is arguably the more realistic shape besides, since `office retire`
+    // snapshots *every* current pallet head regardless of what's ever reached the remote:
+    // a purely local, never-pushed pallet's head lands in a distrust boundary exactly the
+    // same as a published one's.
+    //
+    // So: a second local-only pallet ("side") supplies the boundary head that a plain
+    // (non-sparse) franchise of `main` alone will never even hear about, let alone fetch —
+    // it is flatly absent on the clone, not merely "not reachable from here". Silently
+    // treating that absence as "not reachable" (the way an ordinary reachability walk
+    // always would) must not happen: it would misclassify the agent's still-perfectly-
+    // vouched main-line parcel as suspect. It must read "unresolved" instead. On the
+    // origin, where the side pallet (and its head) are still right there, the same parcel
+    // is fully resolvable and reads its real answer: vouched.
+    let area = TestArea::new("boundary-unresolved");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/base.txt", "base\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["office", "enroll"]));
+
+    // Admit an agent.
+    assert_success(&area.forklift("dev", &["config", "operator.identifier", "agent@forklift"]));
+    let keygen = area.forklift("dev", &["office", "keygen"]);
+    assert_success(&keygen);
+    let admit_args: Vec<String> = stdout(&keygen)
+        .lines()
+        .find(|line| line.trim_start().starts_with("office admit "))
+        .expect("keygen prints the admit line")
+        .split_whitespace()
+        .skip(2)
+        .map(str::to_string)
+        .collect();
+    assert_success(&area.forklift("dev", &["config", "operator.identifier", "tester@forklift"]));
+    assert_success(&area.forklift("dev", &[
+        "office", "admit", &admit_args[0], &admit_args[1], &admit_args[2],
+        "--agent", "--supervisor", "tester@forklift",
+    ]));
+
+    // The agent's main-line parcel — this is the one whose boundary classification the test
+    // actually checks. It stays reachable from `main` throughout.
+    assert_success(&area.forklift("dev", &["config", "operator.identifier", "agent@forklift"]));
+    area.write_file("dev/agent-main.txt", "agent main work\n");
+    assert_success(&area.forklift("dev", &["load", "agent-main.txt"]));
+    let agent_stack = area.forklift("dev", &["--json", "stack", "agent main work"]);
+    assert_success(&agent_stack);
+    let agent_parcel: serde_json::Value = serde_json::from_str(&stdout(&agent_stack)).unwrap();
+    let agent_parcel = agent_parcel["data"]["parcel"].as_str().unwrap().to_string();
+
+    // A second, local-only pallet: its head will sit in the retirement's boundary below but
+    // will never reach the remote — nothing ever lifts `side`.
+    assert_success(&area.forklift("dev", &["palletize", "side"]));
+    area.write_file("dev/side.txt", "side work\n");
+    assert_success(&area.forklift("dev", &["load", "side.txt"]));
+    assert_success(&area.forklift("dev", &["stack", "side work"]));
+
+    // Retire the agent's key: the distrust boundary snapshots every current pallet head —
+    // main's and side's alike, published or not.
+    assert_success(&area.forklift("dev", &["config", "operator.identifier", "tester@forklift"]));
+    // `office list` does not print users in enrollment order (it groups/sorts by
+    // identifier), so the agent's key is found by identifier, not by line position.
+    let listing = area.forklift("dev", &["--json", "office", "list"]);
+    assert_success(&listing);
+    let listing: serde_json::Value = serde_json::from_str(&stdout(&listing)).unwrap();
+    let agent_key_id = listing["data"]["users"]
+        .as_array().unwrap().iter()
+        .find(|user| user["identifier"] == "agent@forklift")
+        .expect("the agent is enrolled")
+        ["keys"][0]["key_id"]
+        .as_str().unwrap().to_string();
+    assert_success(&area.forklift("dev", &["office", "retire", &agent_key_id, "--offline"]));
+
+    // Back to `main` (only it ever gets lifted; `side` and its head stay purely local).
+    assert_success(&area.forklift("dev", &["shift", "main"]));
+
+    // The origin, where the side pallet's head is still right there: the agent's main-line
+    // parcel is fully resolvable, and it is — legitimately — vouched (it's one of the
+    // boundary's own snapshotted heads).
+    let on_origin = area.forklift("dev", &["--json", "query", "main", "--class", "agent"]);
+    assert_success(&on_origin);
+    let origin_report: serde_json::Value = serde_json::from_str(&stdout(&on_origin)).unwrap();
+    let origin_entry = origin_report["data"]["matches"]
+        .as_array().unwrap().iter()
+        .find(|entry| entry["parcel"] == agent_parcel)
+        .unwrap_or_else(|| panic!("no match for the agent parcel on the origin: {}", origin_report));
+    assert_eq!(origin_entry["author"]["trust"], "signed-revoked");
+    assert_eq!(
+        origin_entry["signer"]["boundary"], "vouched",
+        "on the origin, where the side pallet's head is present, the agent parcel resolves \
+         to its real answer: {}",
+        origin_report
+    );
+
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    // A fresh clone: an ordinary (non-sparse) franchise fetches only what the remote
+    // actually knows about — `side` was never lifted, so its head never reaches the clone
+    // at all.
+    let franchised = area.forklift(".", &["franchise", &server.url, "clone"]);
+    assert_success(&franchised);
+
+    let on_clone = area.forklift("clone", &["--json", "query", "main", "--class", "agent"]);
+    assert_success(&on_clone);
+    let clone_report: serde_json::Value = serde_json::from_str(&stdout(&on_clone)).unwrap();
+    let clone_entry = clone_report["data"]["matches"]
+        .as_array().unwrap().iter()
+        .find(|entry| entry["parcel"] == agent_parcel)
+        .unwrap_or_else(|| panic!("no match for the agent parcel on the clone: {}", clone_report));
+    assert_eq!(clone_entry["author"]["trust"], "signed-revoked");
+    assert_eq!(
+        clone_entry["signer"]["boundary"], "unresolved",
+        "on a clone missing the orphaned boundary head, the question must read unresolved, \
+         never suspect: {}",
+        clone_report
+    );
+
+    // A `signer.boundary eq suspect` predicate must not match the unresolved parcel on the
+    // clone (unresolved reads Unknown for this leaf, which never matches either value).
+    let suspect_on_clone = area.forklift("clone", &[
+        "--json", "query", "main", "--where",
+        r#"{"field":"signer.boundary","op":"eq","value":"suspect"}"#,
+    ]);
+    assert_success(&suspect_on_clone);
+    let suspect_report: serde_json::Value = serde_json::from_str(&stdout(&suspect_on_clone)).unwrap();
+    let suspect_matches: std::collections::HashSet<String> = suspect_report["data"]["matches"]
+        .as_array().unwrap().iter()
+        .map(|entry| entry["parcel"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        !suspect_matches.contains(&agent_parcel),
+        "an unresolved boundary must never satisfy signer.boundary eq suspect: {}",
+        suspect_report
+    );
+}
+
+#[test]
 fn a_sparse_franchise_still_audits() {
     // The meta/office carve-out: a sparse franchise fetches office and every meta pallet at full
     // scope, so a trusted warehouse's offline audit still passes — the office chain is verified

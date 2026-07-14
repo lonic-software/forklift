@@ -745,6 +745,30 @@ fn signed_revoked_matches_carry_vouched_or_suspect_boundary() {
     let matched = json(&warehouse.run(&["--json", "query", "main", "--where", suspect_predicate]));
     assert_eq!(matched_hashes(&matched).len(), 0, "{:?}", matched);
 
+    // The positive case: `signer.boundary eq vouched` matches the vouched parcel on main,
+    // and matches nothing when seeded at the suspect parcel (its own boundary is suspect,
+    // not vouched).
+    let vouched_predicate = r#"{"field":"signer.boundary","op":"eq","value":"vouched"}"#;
+
+    let matched = json(&warehouse.run(&["--json", "query", "main", "--where", vouched_predicate]));
+    assert_eq!(
+        matched_hashes(&matched),
+        std::collections::HashSet::from([vouched_parcel.clone()]),
+        "{:?}", matched
+    );
+
+    // Seeding at the suspect parcel also walks its parent (the vouched parcel is the side
+    // pallet's branch point), so the vouched match legitimately reappears here — the
+    // assertion is that the suspect parcel itself never satisfies "vouched", not that the
+    // whole walk comes up empty.
+    let matched = json(&warehouse.run(&[
+        "--json", "query", &suspect_parcel, "--where", vouched_predicate,
+    ]));
+    assert!(
+        !matched_hashes(&matched).contains(&suspect_parcel),
+        "the suspect parcel must never satisfy signer.boundary eq vouched: {:?}", matched
+    );
+
     // `signer.boundary` is a signer leaf (like `signer.key`/`signer.operator`): no recorded
     // fallback, refused up front under `--recorded`.
     let output = warehouse.run(&["--json", "query", "--recorded", "--where", suspect_predicate]);

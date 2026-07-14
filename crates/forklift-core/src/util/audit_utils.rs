@@ -7,7 +7,7 @@
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::sync::{Mutex, OnceLock};
 use crate::model::tree_item::TreeItem;
-use crate::util::office_utils::{OfficeState, TrustAnchor};
+use crate::util::office_utils::{KeyRecord, OfficeState, TrustAnchor};
 use crate::util::scope_utils::{MaterializationScope, ScopeClass};
 use crate::util::{fanout_utils, file_utils, graph_utils, object_utils, sign_utils};
 
@@ -333,8 +333,9 @@ pub fn verify_pallet_history(head: &str,
     let mut legacy_parcels: Option<HashSet<String>> = None;
 
     // Per revoked key: the parcels its distrust boundary vouches for (lazy — an
-    // all-active-keys history never pays for it).
-    let mut distrust_boundaries: HashMap<String, Result<HashSet<String>, String>> = HashMap::new();
+    // all-active-keys history never pays for it). Shared with the query engine's
+    // `signer.boundary` predicate via [`DistrustBoundaryMemo`]; this use is unmodified.
+    let mut distrust_boundaries = DistrustBoundaryMemo::new();
 
     let mut verified = 0usize;
     let mut legacy = 0usize;
@@ -380,12 +381,7 @@ pub fn verify_pallet_history(head: &str,
                 let key = office_state.find_key(&key_id)
                     .expect("phase 2 verified this parcel against this key");
 
-                let vouched = distrust_boundaries
-                    .entry(key_id.clone())
-                    .or_insert_with(|| collect_reachable_present(&key.distrust_boundary))
-                    .as_ref()
-                    .map_err(|e| e.clone())?
-                    .contains(hash);
+                let vouched = distrust_boundaries.vouched(key, hash)?;
 
                 if !vouched {
                     return Err(format!(
@@ -947,6 +943,36 @@ pub fn collect_reachable_present(heads: &[String]) -> Result<HashSet<String>, St
     }
 
     Ok(reachable)
+}
+
+/// Per-revoked-key memo of a distrust boundary's vouched parcel set: the reachability walk
+/// ([`collect_reachable_present`]) runs at most once per distinct key, not once per parcel
+/// that key signed. Shared between `audit`'s phase-3 resolution (below) and the query
+/// engine's `signer.boundary` predicate (`query_utils::QueryContext`) — the walk-and-
+/// membership arithmetic must never drift between the two. The query engine layers its own
+/// presence guard on top (a partial clone may be missing a boundary head outright, which
+/// this memo cannot distinguish from "not reachable"); `audit`'s use here is unmodified from
+/// before this memo existed.
+#[derive(Default)]
+pub struct DistrustBoundaryMemo {
+    vouched_sets: HashMap<String, HashSet<String>>,
+}
+
+impl DistrustBoundaryMemo {
+    pub fn new() -> DistrustBoundaryMemo {
+        DistrustBoundaryMemo::default()
+    }
+
+    /// Whether `parcel` sits inside `key`'s distrust boundary (§8.11): the boundary's
+    /// vouched set is computed and cached on first use for this key, then it's a plain
+    /// membership check on every call after.
+    pub fn vouched(&mut self, key: &KeyRecord, parcel: &str) -> Result<bool, String> {
+        if !self.vouched_sets.contains_key(&key.key_id) {
+            let vouched = collect_reachable_present(&key.distrust_boundary)?;
+            self.vouched_sets.insert(key.key_id.clone(), vouched);
+        }
+        Ok(self.vouched_sets.get(&key.key_id).unwrap().contains(parcel))
+    }
 }
 
 /// Verify that every new office parcel stays within its signer's privileges.

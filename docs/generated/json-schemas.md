@@ -2644,7 +2644,7 @@ A command not listed here either reports only the generic human-message shape `{
       "description": "The verified signing key and its office binding.",
       "properties": {
         "boundary": {
-          "description": "\"vouched\" | \"suspect\": whether this signed-revoked match sits inside the revoking\nkey's distrust boundary (the history the revoker vouched for at revocation time) or\noutside it. \"suspect\" means a forged backdate, or the key's holder kept signing\nafter the revocation — `audit` refuses such a warehouse outright; a read-only query\ncannot refuse a signed history it was only asked to read, so this is the loud label\ninstead. Present exactly when the match is signed-revoked.",
+          "description": "\"vouched\" | \"suspect\" | \"unresolved\": whether this signed-revoked match sits inside\nthe revoking key's distrust boundary (the history the revoker vouched for at\nrevocation time) or outside it. \"suspect\" means a forged backdate, or the key's\nholder kept signing after the revocation — `audit` refuses such a warehouse outright;\na read-only query cannot refuse a signed history it was only asked to read, so this\nis the loud label instead. \"unresolved\" means the question cannot be answered on\n*this* store: at least one of the revocation's boundary heads was never fetched here\n(a partial clone that only ever pulled reachable history) — never treat this as\n\"suspect\"; query the origin, or fetch the full history, for a definitive answer.\nPresent exactly when the match is signed-revoked.",
           "type": [
             "string",
             "null"
