@@ -68,7 +68,7 @@ peer:
 
 `forklift peer` runs the [`forklift-server`](../SERVER.md) head for you as a local child process
 (the client and server stay separate binaries). It needs that binary installed —
-`curl … install.sh | sh -s -- all` installs both, or point `--peer`'s `--server <path>` at it.
+`curl … install.sh | sh -s -- all` installs both, or point `forklift peer`'s `--server <path>` at it.
 Options: `--token`, `--ephemeral`, `--server <path>`, `--tor-control <addr>`,
 `--tor-control-password <pw>`.
 

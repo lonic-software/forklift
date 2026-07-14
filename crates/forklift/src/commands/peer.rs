@@ -167,35 +167,47 @@ fn resolve_token(explicit: Option<String>, peer_dir: &std::path::Path) -> Result
 
     let path = peer_dir.join(TOKEN_FILE);
 
-    if let Ok(existing) = std::fs::read_to_string(&path) {
-        let existing = existing.trim();
-        if !existing.is_empty() {
-            return Ok(existing.to_string());
+    match std::fs::read_to_string(&path) {
+        Ok(existing) => {
+            let existing = existing.trim();
+            if !existing.is_empty() {
+                return Ok(existing.to_string());
+            }
         }
+        // No token yet — fall through and mint one.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        // A present-but-unreadable token must not be silently rotated: that would lock out
+        // every peer already holding the old one. Surface it instead.
+        Err(e) => return Err(format!(
+            "Error while reading the peer token \"{}\": {} — refusing to mint a new one over it",
+            path.display(), e
+        )),
     }
 
     let token = config_utils::mint_uuid_v4();
 
-    std::fs::write(&path, &token)
+    write_secret(&path, token.as_bytes())
         .map_err(|e| format!("Error while saving the peer token \"{}\": {}", path.display(), e))?;
-
-    restrict_to_owner(&path)?;
 
     Ok(token)
 }
 
-/// Restrict a file to owner-read/write (`0600`) on Unix — the token and onion key are secrets.
-/// A no-op elsewhere, where the file inherits the default ACL.
-fn restrict_to_owner(path: &std::path::Path) -> Result<(), String> {
+/// Write a secret file (token, key) owner-only *from creation*. On Unix the `0600` mode is set in
+/// the open itself, closing the umask-dependent window a create-then-chmod leaves open — the same
+/// pattern `sign_utils` uses for signing keys. Elsewhere the file inherits the default ACL.
+fn write_secret(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("Error while restricting permissions on \"{}\": {}", path.display(), e))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
 
-    let _ = path;
-    Ok(())
+    options.open(path)?.write_all(bytes)
 }
 
 /// Find the `forklift-server` binary: the explicit path when given (and present), otherwise a

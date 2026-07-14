@@ -397,9 +397,15 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
     // wants the address, not a silent clearnet-only fallback.
     let _onion = if options.tor {
         // Onion traffic exits the Tor daemon on the local host, so an all-interfaces bind is
-        // reached at loopback; a specific-interface bind is dialed as-is.
+        // reached at loopback; a specific-interface bind is dialed as-is. Match the loopback to
+        // the bound family — a v6-only `[::]` listener is not reachable at 127.0.0.1.
         let target = if bound.ip().is_unspecified() {
-            std::net::SocketAddr::new(std::net::IpAddr::from([127, 0, 0, 1]), bound.port())
+            let loopback = if bound.is_ipv6() {
+                std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+            } else {
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+            };
+            std::net::SocketAddr::new(loopback, bound.port())
         } else {
             bound
         };

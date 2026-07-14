@@ -324,17 +324,23 @@ fn write_key_file(path: &Path, blob: &str) -> Result<(), String> {
         }
     }
 
-    std::fs::write(path, blob).map_err(|e| format!(
-        "Error while writing the onion key file \"{}\": {}", path.display(), e
-    ))?;
+    // Create the file owner-only (`0600`) in the open itself, not with a create-then-chmod that
+    // would briefly expose the address-owning secret under the process umask.
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
 
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| format!(
-            "Error while restricting permissions on the onion key file \"{}\": {}", path.display(), e
-        ))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
+
+    options.open(path)
+        .and_then(|mut f| f.write_all(blob.as_bytes()))
+        .map_err(|e| format!(
+            "Error while writing the onion key file \"{}\": {}", path.display(), e
+        ))?;
 
     Ok(())
 }
