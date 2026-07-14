@@ -40,6 +40,38 @@ sign once, and it covers all your past and future contributions.
 A pull request that touches both client and server code just needs the one CLA
 signature.
 
+## AI-assisted contributions: a human must be the author
+
+AI coding assistants are welcome here — Forklift is built with them. But **every
+commit must be authored by a human**, with the assistant credited in a
+`Co-Authored-By:` trailer rather than in the author field:
+
+```
+Area - Topic: short description
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+```
+
+Two reasons, and neither is squeamishness about the tooling:
+
+- **Only a human can sign the CLA.** An assistant is not a legal person: it can't
+  grant a license or make the representations in the CLA (that the work is yours
+  to give, and that you've disclosed any third-party restrictions you know of).
+  The human author is the one taking responsibility for the code, so the human
+  author is the one the CLA bot asks. If a commit's author is a machine account,
+  there is nobody to ask.
+- **Forklift is a provenance tool.** It signs authorship, classes it (human /
+  agent / service), and records supervisors, so that `blame` can answer *"was this
+  written by a human or an agent, under whose supervision?"* A repository whose own
+  history can't answer that would be a poor advertisement for it.
+
+If your assistant's tooling committed as itself, re-author before pushing:
+
+```sh
+git rebase --root --exec 'git commit --amend --reset-author --no-edit'
+git push --force-with-lease
+```
+
 ## Before you build something big
 
 For anything larger than a bug fix — especially on the server heads or anything
