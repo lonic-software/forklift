@@ -2643,6 +2643,13 @@ A command not listed here either reports only the generic human-message shape `{
     "QuerySigner": {
       "description": "The verified signing key and its office binding.",
       "properties": {
+        "boundary": {
+          "description": "\"vouched\" | \"suspect\": whether this signed-revoked match sits inside the revoking\nkey's distrust boundary (the history the revoker vouched for at revocation time) or\noutside it. \"suspect\" means a forged backdate, or the key's holder kept signing\nafter the revocation — `audit` refuses such a warehouse outright; a read-only query\ncannot refuse a signed history it was only asked to read, so this is the loud label\ninstead. Present exactly when the match is signed-revoked.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "class": {
           "type": [
             "string",

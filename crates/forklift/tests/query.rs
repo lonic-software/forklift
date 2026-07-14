@@ -654,3 +654,106 @@ fn new_predicate_fields_refuse_bad_ops_and_over_long_globs_with_exit_18() {
         assert_eq!(error["error"]["code"], "query_predicate_invalid");
     }
 }
+
+// -------------------------------------------------------------------------------------------
+// Stage 3: the distrust-boundary refinement (`signer.boundary`: vouched vs. suspect).
+// -------------------------------------------------------------------------------------------
+
+/// The key id of an enrolled operator's identity-root key, via `office list --json`.
+fn key_id_of(warehouse: &TestWarehouse, operator_id: &str) -> String {
+    let listing = json(&warehouse.run(&["--json", "office", "list"]));
+    listing["data"]["users"]
+        .as_array()
+        .expect("users is an array")
+        .iter()
+        .find(|user| user["identifier"] == operator_id)
+        .unwrap_or_else(|| panic!("no user \"{}\" in office listing: {}", operator_id, listing))
+        ["keys"][0]["key_id"]
+        .as_str()
+        .expect("the operator has a key")
+        .to_string()
+}
+
+#[test]
+fn signed_revoked_matches_carry_vouched_or_suspect_boundary() {
+    let warehouse = signed_warehouse_with_agent("query-boundary");
+    let agent_key = key_id_of(&warehouse, "agent@forklift");
+
+    // An agent-signed parcel that stays reachable from main's head straight through the
+    // retirement below: this one will read "vouched".
+    assert_success(&warehouse.run(&["config", "operator.identifier", "agent@forklift"]));
+    warehouse.write_file("agent-main.txt", "agent main work\n");
+    assert_success(&warehouse.run(&["load", "agent-main.txt"]));
+    let vouched_parcel = extract_parcel_hash(&warehouse.run(&["stack", "agent main work"]));
+
+    // A second agent-signed parcel, stacked on a side pallet branched from main's current
+    // head — then immediately un-stacked with `undo`. `palletize` itself is not journaled,
+    // so the stack just made is the only (and therefore top) journal entry: `undo` reverses
+    // exactly it, soft-resetting the side pallet's head back to its parent. The parcel
+    // object and its signature sidecar stay on disk (undo never deletes them); nothing —
+    // main or side — reaches this parcel anymore.
+    assert_success(&warehouse.run(&["palletize", "side"]));
+    warehouse.write_file("side.txt", "side work\n");
+    assert_success(&warehouse.run(&["load", "side.txt"]));
+    let suspect_parcel = extract_parcel_hash(&warehouse.run(&["stack", "side work"]));
+    assert_success(&warehouse.run(&["undo"]));
+
+    // Retire the agent's key as the admin: the distrust boundary is every pallet head
+    // vouched for right now — main and side both sit at `vouched_parcel` (side was just
+    // reset back to it), so `suspect_parcel` (side's un-stacked child) falls outside it.
+    assert_success(&warehouse.run(&["config", "operator.identifier", "test@forklift"]));
+    assert_success(&warehouse.run(&["office", "retire", &agent_key, "--offline"]));
+
+    // The reachable agent-signed parcel: signed-revoked, and vouched.
+    let on_main = json(&warehouse.run(&["--json", "query", "main", "--class", "agent"]));
+    let entry = entry_for(&on_main, &vouched_parcel);
+    assert_eq!(entry["author"]["trust"], "signed-revoked");
+    assert_eq!(entry["signer"]["boundary"], "vouched");
+
+    // The un-stacked parcel, queried by seeding the walk directly at its hash (it is no
+    // longer reachable from any pallet head, but the parcel object is still present, so
+    // `query <hash>` still resolves and walks it): still signed-revoked — the signature and
+    // key both still classify the same way — but suspect, outside the revocation's vouched
+    // history. `audit` would hard-error on this; a read-only query labels it loudly instead.
+    let seeded = json(&warehouse.run(&["--json", "query", &suspect_parcel]));
+    let entry = entry_for(&seeded, &suspect_parcel);
+    assert_eq!(entry["author"]["trust"], "signed-revoked");
+    assert_eq!(entry["signer"]["boundary"], "suspect");
+
+    // The human-readable render says so too: the trust suffix and the trailing note.
+    let human = stdout(&warehouse.run(&["query", &suspect_parcel]));
+    assert!(human.contains("signed-revoked") && human.contains("suspect"), "{}", human);
+    assert!(
+        human.contains("outside the revocation's vouched history"),
+        "the honesty note must call out the suspect match: {}", human
+    );
+
+    // The predicate: matches the suspect parcel when seeded there; matches nothing walking
+    // main (main never reaches the suspect parcel, and main's own signed-revoked match is
+    // vouched, not suspect).
+    let suspect_predicate = r#"{"field":"signer.boundary","op":"eq","value":"suspect"}"#;
+
+    let matched = json(&warehouse.run(&[
+        "--json", "query", &suspect_parcel, "--where", suspect_predicate,
+    ]));
+    assert_eq!(
+        matched_hashes(&matched),
+        std::collections::HashSet::from([suspect_parcel.clone()]),
+        "{:?}", matched
+    );
+
+    let matched = json(&warehouse.run(&["--json", "query", "main", "--where", suspect_predicate]));
+    assert_eq!(matched_hashes(&matched).len(), 0, "{:?}", matched);
+
+    // `signer.boundary` is a signer leaf (like `signer.key`/`signer.operator`): no recorded
+    // fallback, refused up front under `--recorded`.
+    let output = warehouse.run(&["--json", "query", "--recorded", "--where", suspect_predicate]);
+    assert_eq!(output.status.code(), Some(18));
+    assert_eq!(json(&output)["error"]["code"], "query_predicate_invalid");
+
+    // A value other than "vouched"/"suspect" refuses the same way.
+    let bogus = r#"{"field":"signer.boundary","op":"eq","value":"bogus"}"#;
+    let output = warehouse.run(&["--json", "query", "--where", bogus]);
+    assert_eq!(output.status.code(), Some(18));
+    assert_eq!(json(&output)["error"]["code"], "query_predicate_invalid");
+}

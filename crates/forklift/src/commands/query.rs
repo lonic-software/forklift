@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use forklift_core::model::parcel::Parcel;
 use forklift_core::util::office_utils::{OfficeState, RevocationReason};
 use forklift_core::util::query_utils::{
-    self, MatchTrust, QueryMatch, QueryOutcome, QueryParams, TrustMode,
+    self, Boundary, MatchTrust, QueryMatch, QueryOutcome, QueryParams, TrustMode,
 };
 use forklift_core::util::{office_utils, pallet_utils, scope_utils};
 use crate::output::{self, CommandOutput};
@@ -104,10 +104,14 @@ pub async fn handle_command(args: QueryArgs) -> Result<(), String> {
     let mut out = std::io::stdout().lock();
     let mut shown = 0usize;
     let mut revoked = 0usize;
+    let mut suspect = 0usize;
 
     let outcome = query_utils::run_query(&params, &office, |found| {
         if found.identity.trust == MatchTrust::SignedRevoked {
             revoked += 1;
+            if found.identity.boundary == Some(Boundary::Suspect) {
+                suspect += 1;
+            }
         }
         let rendered = if args.oneline {
             render_oneline(&mut out, &found)
@@ -125,7 +129,13 @@ pub async fn handle_command(args: QueryArgs) -> Result<(), String> {
         notes.push("identities are as recorded in the parcels, not verified".to_string());
     }
     if revoked > 0 {
-        notes.push(format!("{} match(es) signed by a revoked key", revoked));
+        let mut note = format!("{} match(es) signed by a revoked key", revoked);
+        if suspect > 0 {
+            note.push_str(&format!(
+                ", {} of them outside the revocation's vouched history", suspect
+            ));
+        }
+        notes.push(note);
     }
     if !notes.is_empty() {
         let separator = if shown > 0 { "\n" } else { "" };
@@ -269,11 +279,14 @@ fn render_match(
     } else {
         format!(" [{}]", qualifiers.join(", "))
     };
-    let trust = match (identity.trust, identity.revocation_reason) {
-        (MatchTrust::SignedRevoked, Some(reason)) => {
+    let trust = match (identity.trust, identity.revocation_reason, identity.boundary) {
+        (MatchTrust::SignedRevoked, Some(reason), Some(boundary)) => {
+            format!("signed-revoked ({}, {})", reason.as_str(), boundary.as_str())
+        }
+        (MatchTrust::SignedRevoked, Some(reason), None) => {
             format!("signed-revoked ({})", reason.as_str())
         }
-        (trust, _) => trust.as_str().to_string(),
+        (trust, _, _) => trust.as_str().to_string(),
     };
     writeln!(out, "identity {}{} — {}", operator, qualifiers, trust)?;
 
@@ -453,6 +466,15 @@ pub(crate) struct QuerySigner {
     /// Why the signing key was revoked — present exactly when the match is signed-revoked.
     #[serde(skip_serializing_if = "Option::is_none")]
     revocation_reason: Option<String>,
+
+    /// "vouched" | "suspect": whether this signed-revoked match sits inside the revoking
+    /// key's distrust boundary (the history the revoker vouched for at revocation time) or
+    /// outside it. "suspect" means a forged backdate, or the key's holder kept signing
+    /// after the revocation — `audit` refuses such a warehouse outright; a read-only query
+    /// cannot refuse a signed history it was only asked to read, so this is the loud label
+    /// instead. Present exactly when the match is signed-revoked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    boundary: Option<String>,
 }
 
 /// One recorded authorship/stack action (history-shaped, explicitly labeled recorded).
@@ -493,6 +515,7 @@ impl QueryEntry {
             revocation_reason: identity
                 .revocation_reason
                 .map(|reason: RevocationReason| reason.as_str().to_string()),
+            boundary: identity.boundary.map(|boundary| boundary.as_str().to_string()),
         });
 
         QueryEntry {

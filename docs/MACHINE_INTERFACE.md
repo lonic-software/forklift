@@ -164,10 +164,19 @@ the fetch scope degrades to unknowable for that parcel (counted in
 
 `author.trust` vocabulary: `verified` (live key, signature checks out) |
 `signed-revoked` (signature checks out, key revoked — never flattened to verified; the
-`signer` block then carries `revocation_reason`) | `unsigned` | `unknown-key` (signed,
-key not in the office) | `recorded` (only under `--recorded`). A parcel without a
-forge-proof identity (unsigned / unknown key) never matches an identity predicate in
-either direction — three-valued honesty, not a guess.
+`signer` block then carries `revocation_reason` and `boundary`) | `unsigned` |
+`unknown-key` (signed, key not in the office) | `recorded` (only under `--recorded`). A
+parcel without a forge-proof identity (unsigned / unknown key) never matches an
+identity predicate in either direction — three-valued honesty, not a guess.
+
+A `signed-revoked` match's `signer.boundary` is `"vouched"` when the parcel sits inside
+the revoking key's distrust boundary (the history the revoker vouched for at
+revocation time — e.g. `{ "signer": { "key": "<key-id>", "revocation_reason":
+"compromise", "boundary": "vouched" } }`), or `"suspect"` when it sits outside that
+boundary: a forged backdate, or the key's holder kept signing after the revocation.
+`audit` refuses a suspect parcel outright; a read-only query cannot refuse a signed
+history it was only asked to read, so this is the loud label instead. Filter on it with
+a `where` leaf on `signer.boundary` (`eq`/`in`, values `"vouched"` or `"suspect"`).
 
 `provenance` and `tags` are always computed and attached to a match (even when the
 predicate never tested them); both are omitted entirely — not an empty object/array —

@@ -2040,6 +2040,87 @@ fn a_sparse_franchise_fetches_only_the_scoped_subtree() {
 }
 
 #[test]
+fn a_sparse_franchise_degrades_touches_to_unknown_out_of_scope() {
+    // The query engine's sparse degrade (§9.4c Finding 3), end to end: a `--touches`
+    // predicate whose confirming diff needs a tree the sparse clone never fetched reads
+    // Unknown for that parcel — never an error — and is counted in `scope.out_of_scope`;
+    // the parcel simply does not match. The same predicate against an in-scope path on the
+    // very same sparse clone still matches normally.
+    let area = TestArea::new("sparse-query-touches");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/src/api/a.txt", "api v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+
+    area.write_file("dev/docs/readme.md", "docs v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    let docs_stack = area.forklift("dev", &["--json", "stack", "touch docs"]);
+    assert_success(&docs_stack);
+    let docs_parcel: serde_json::Value = serde_json::from_str(&stdout(&docs_stack)).unwrap();
+    let docs_parcel = docs_parcel["data"]["parcel"].as_str().unwrap().to_string();
+
+    area.write_file("dev/src/api/b.txt", "api v2\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    let src_stack = area.forklift("dev", &["--json", "stack", "touch src"]);
+    assert_success(&src_stack);
+    let src_parcel: serde_json::Value = serde_json::from_str(&stdout(&src_stack)).unwrap();
+    let src_parcel = src_parcel["data"]["parcel"].as_str().unwrap().to_string();
+
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    // A sparse clone scoped to src/api only: the full signed history lands, but docs/ is
+    // never fetched.
+    let franchised = area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src/api"]);
+    assert_success(&franchised);
+    assert!(stdout(&franchised).contains("Sparse"), "{}", stdout(&franchised));
+
+    // `--touches docs/readme.md` cannot confirm the docs-touching parcel: resolving a file
+    // path (not just a bare directory prefix) needs to descend into the `docs/` subtree
+    // object itself to list its files, and that subtree was never fetched by the sparse
+    // clone. It must degrade to Unknown rather than error — the parcel does not match, the
+    // walk still succeeds, and the degrade is counted.
+    let touches_docs = area.forklift("sparse", &["--json", "query", "--touches", "docs/readme.md"]);
+    assert_success(&touches_docs);
+    let report: serde_json::Value = serde_json::from_str(&stdout(&touches_docs)).unwrap();
+    assert_eq!(report["ok"], true);
+    let matched: std::collections::HashSet<String> = report["data"]["matches"]
+        .as_array().unwrap().iter()
+        .map(|entry| entry["parcel"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        !matched.contains(&docs_parcel),
+        "the docs-touching parcel must not match on a clone that never fetched docs/: {}",
+        stdout(&touches_docs)
+    );
+    assert!(
+        report["data"]["scope"]["out_of_scope"].as_u64().unwrap() > 0,
+        "the sparse degrade must be counted in scope.out_of_scope: {}",
+        stdout(&touches_docs)
+    );
+    assert!(
+        report["data"]["scope"]["fetch_scope"].is_array(),
+        "scope.fetch_scope must be present on a sparse warehouse: {}",
+        stdout(&touches_docs)
+    );
+
+    // The in-scope path still matches correctly on the same sparse clone.
+    let touches_src = area.forklift("sparse", &["--json", "query", "--touches", "src"]);
+    assert_success(&touches_src);
+    let report: serde_json::Value = serde_json::from_str(&stdout(&touches_src)).unwrap();
+    let matched: std::collections::HashSet<String> = report["data"]["matches"]
+        .as_array().unwrap().iter()
+        .map(|entry| entry["parcel"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        matched.contains(&src_parcel),
+        "an in-scope --touches must still match on the sparse clone: {}",
+        stdout(&touches_src)
+    );
+}
+
+#[test]
 fn a_sparse_franchise_still_audits() {
     // The meta/office carve-out: a sparse franchise fetches office and every meta pallet at full
     // scope, so a trusted warehouse's offline audit still passes — the office chain is verified

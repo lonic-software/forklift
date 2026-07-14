@@ -112,6 +112,30 @@ impl MatchTrust {
     }
 }
 
+/// Whether a signed-revoked match sits inside its revoking key's distrust boundary — present
+/// exactly when [`IdentityResolution::trust`] is `SignedRevoked`. `Vouched` means the parcel
+/// is part of the history the revoker vouched for at revocation time (the same reachability
+/// test `audit` runs to accept a revoked-key signature at all — see
+/// [`audit_utils::collect_reachable_present`]); `Suspect` means it sits outside that boundary
+/// — a forged backdate, or the key's holder kept signing after the revocation. `audit` hard-
+/// errors on a suspect parcel; a read-only query was only asked to read the history, so it
+/// cannot refuse it — it labels the parcel loudly instead.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Boundary {
+    Vouched,
+    Suspect,
+}
+
+impl Boundary {
+    /// The stable output value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Boundary::Vouched => "vouched",
+            Boundary::Suspect => "suspect",
+        }
+    }
+}
+
 /// One match's resolved identity, at whatever trust the query ran with. Under verified trust
 /// this is the signer's identity (the only forge-proof attribution a parcel has); under
 /// recorded trust it is the first authoring action's self-declared operator.
@@ -136,6 +160,13 @@ pub struct IdentityResolution {
 
     /// Why the signing key was revoked — present exactly when `trust` is `SignedRevoked`.
     pub revocation_reason: Option<RevocationReason>,
+
+    /// Whether a `SignedRevoked` match sits inside the revoking key's distrust boundary —
+    /// present exactly when `trust` is `SignedRevoked`. Filled by [`QueryContext::fill_boundary`]
+    /// on the main walk thread, after the resolution itself is built (`resolve_verified` never
+    /// sets this — it has no `QueryContext` and runs inside `fanout_map`'s worker threads,
+    /// where the boundary memo must not need a `Mutex`).
+    pub boundary: Option<Boundary>,
 }
 
 /// One query match: the parcel and its identity resolution, ready to render.
@@ -224,6 +255,14 @@ struct QueryContext {
     /// and this stays single-threaded (evaluation runs on the walk thread only, never inside
     /// the phase-2 fanout, which resolves identities, not tree hashes).
     tree_hashes: RefCell<HashMap<String, String>>,
+
+    /// Revoked key id → that revocation's vouched parcel set (the same reachability
+    /// primitive `audit` uses, [`audit_utils::collect_reachable_present`], over the key's
+    /// `distrust_boundary`), memoized so a walk with many parcels signed by the same
+    /// revoked key pays for one boundary walk, not one per parcel. Filled by
+    /// [`Self::fill_boundary`] on the main walk thread only — never inside `fanout_map`'s
+    /// worker threads — so this memo needs no `Mutex`.
+    boundaries: RefCell<HashMap<String, HashSet<String>>>,
 }
 
 impl QueryContext {
@@ -265,6 +304,7 @@ impl QueryContext {
             fetch_scope: scope_utils::read_fetch_scope()?,
             out_of_scope: Cell::new(0),
             tree_hashes: RefCell::new(HashMap::new()),
+            boundaries: RefCell::new(HashMap::new()),
         })
     }
 
@@ -296,6 +336,35 @@ impl QueryContext {
         let tree_hash = object_utils::load_parcel(hash)?.tree_hash;
         self.remember_tree_hash(hash, &tree_hash);
         Ok(tree_hash)
+    }
+
+    /// Fill a `SignedRevoked` resolution's `boundary`: is the parcel inside the revoking
+    /// key's distrust boundary (`Vouched`) or outside it (`Suspect`)? Reuses `audit`'s own
+    /// reachability primitive ([`audit_utils::collect_reachable_present`]) rather than
+    /// reinventing the walk, memoized per distinct revoked key. A no-op for any other trust.
+    ///
+    /// Must run on the main walk thread, after a batch's identities are resolved and before
+    /// `evaluate` reads them — never inside `fanout_utils::fanout_map`'s worker threads,
+    /// which is exactly why this is a separate pass rather than something `resolve_verified`
+    /// does inline.
+    fn fill_boundary(&self, hash: &str, resolution: &mut IdentityResolution, office: &OfficeState) -> Result<(), String> {
+        if resolution.trust != MatchTrust::SignedRevoked {
+            return Ok(());
+        }
+
+        let key_id = resolution.signer_key.as_deref()
+            .expect("a signed-revoked resolution always carries its signer key");
+        let key = office.find_key(key_id)
+            .expect("resolve_verified already found this key to classify the signature");
+
+        if !self.boundaries.borrow().contains_key(key_id) {
+            let vouched = audit_utils::collect_reachable_present(&key.distrust_boundary)?;
+            self.boundaries.borrow_mut().insert(key_id.to_string(), vouched);
+        }
+
+        let vouched = self.boundaries.borrow().get(key_id).unwrap().contains(hash);
+        resolution.boundary = Some(if vouched { Boundary::Vouched } else { Boundary::Suspect });
+        Ok(())
     }
 }
 
@@ -362,6 +431,13 @@ pub enum Leaf {
     /// `signer.operator`: the verified signing key's operator id.
     SignerOperator { negate: bool, values: Vec<String> },
 
+    /// `signer.boundary`: for a `signed-revoked` match, whether the parcel sits inside the
+    /// revoking key's distrust boundary (`vouched`) or outside it (`suspect`) — see
+    /// [`Boundary`]. A live `verified` match reads `False` (definitively not revoked-key);
+    /// anything without a forge-proof identity reads `Unknown`, same as every other signer
+    /// leaf.
+    SignerBoundary { values: Vec<Boundary> },
+
     /// `description`: glob/substring over the parcel description and action descriptions.
     Description { glob: String },
 
@@ -417,13 +493,14 @@ impl Leaf {
                 | Leaf::RoleIs { .. }
                 | Leaf::SignerKey { .. }
                 | Leaf::SignerOperator { .. }
+                | Leaf::SignerBoundary { .. }
         )
     }
 
     /// Whether this leaf needs a signature to answer at all (signer facts have no recorded
     /// fallback: under recorded trust they are refused up front).
     fn is_signer(&self) -> bool {
-        matches!(self, Leaf::SignerKey { .. } | Leaf::SignerOperator { .. })
+        matches!(self, Leaf::SignerKey { .. } | Leaf::SignerOperator { .. } | Leaf::SignerBoundary { .. })
     }
 }
 
@@ -713,6 +790,25 @@ fn parse_leaf(object: &serde_json::Map<String, Value>) -> Result<Leaf, String> {
             Ok(Leaf::SignerOperator { negate, values: string_values(values, field)? })
         }
 
+        "signer.boundary" => {
+            let (negate, values) = membership_values(object, op, field)?;
+            if negate {
+                return Err(invalid("\"signer.boundary\" supports \"eq\" and \"in\" only.".to_string()));
+            }
+            let values = string_values(values, field)?
+                .into_iter()
+                .map(|value| match value.as_str() {
+                    "vouched" => Ok(Boundary::Vouched),
+                    "suspect" => Ok(Boundary::Suspect),
+                    other => Err(invalid(format!(
+                        "\"signer.boundary\" compares \"vouched\" or \"suspect\"; got \"{}\".",
+                        other
+                    ))),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Leaf::SignerBoundary { values })
+        }
+
         "description" => {
             if op != "matches" {
                 return Err(invalid(
@@ -820,8 +916,8 @@ fn parse_leaf(object: &serde_json::Map<String, Value>) -> Result<Leaf, String> {
         other => Err(invalid(format!(
             "Unknown query field \"{}\". Fields: author.operator, author.date, author.class, \
              author.supervisor, author.role, stacker.operator, stacker.date, signer.key, \
-             signer.operator, description, is_merge, parents.count, parcel, provenance.model, \
-             provenance.tool, provenance.session, tag, path.",
+             signer.operator, signer.boundary, description, is_merge, parents.count, parcel, \
+             provenance.model, provenance.tool, provenance.session, tag, path.",
             other
         ))),
     }
@@ -915,6 +1011,15 @@ enum IdentityFacts<'a> {
         supervisor: Option<&'a str>,
         role: Option<Role>,
         signer_key: Option<&'a str>,
+
+        /// The resolution's trust, so `signer.boundary` can tell a live `Verified` match
+        /// (definitively not a revoked-key one) from a `SignedRevoked` one (where `boundary`
+        /// below actually answers the question).
+        trust: MatchTrust,
+
+        /// Present exactly when `trust` is `SignedRevoked` (filled by
+        /// [`QueryContext::fill_boundary`] before `evaluate` runs).
+        boundary: Option<Boundary>,
     },
 }
 
@@ -987,13 +1092,13 @@ fn evaluate_leaf(
 ) -> Result<Truth, String> {
     // Identity leaves resolve against the identity facts; everything else is parcel-local.
     if leaf.is_identity() {
-        let (operator, class, supervisor, role, signer_key) = match identity {
+        let (operator, class, supervisor, role, signer_key, trust, boundary) = match identity {
             IdentityFacts::Unresolved => return Ok(Truth::Unknown),
             // No forge-proof identity exists: an identity test neither matches nor
             // negation-matches — three-valued honesty, not silent exclusion or inclusion.
             IdentityFacts::Unknowable => return Ok(Truth::Unknown),
-            IdentityFacts::Resolved { operator, class, supervisor, role, signer_key } => {
-                (*operator, *class, *supervisor, *role, *signer_key)
+            IdentityFacts::Resolved { operator, class, supervisor, role, signer_key, trust, boundary } => {
+                (*operator, *class, *supervisor, *role, *signer_key, *trust, *boundary)
             }
         };
 
@@ -1019,6 +1124,17 @@ fn evaluate_leaf(
             Leaf::SignerOperator { negate, values } => {
                 Truth::of(values.iter().any(|value| value == operator) != *negate)
             }
+            // A `SignedRevoked` match compares against the boundary `QueryContext::fill_boundary`
+            // filled before this call; a live `Verified` match is definitively not a revoked-key
+            // one (`False`, not `Unknown` — the signer facts are fully resolved either way);
+            // anything else identity-resolved here (only `Recorded`, which never reaches this
+            // leaf — signer predicates are refused outright under recorded trust) is honestly
+            // unknowable.
+            Leaf::SignerBoundary { values } => match trust {
+                MatchTrust::SignedRevoked => Truth::of(boundary.is_some_and(|boundary| values.contains(&boundary))),
+                MatchTrust::Verified => Truth::False,
+                _ => Truth::Unknown,
+            },
             _ => unreachable!("is_identity() covers exactly the identity leaves"),
         });
     }
@@ -1216,6 +1332,10 @@ fn resolve_verified(hash: &str, office: &OfficeState) -> Result<IdentityResoluti
         revocation_reason: key.and_then(|key| key.revocation_reason),
         signer_key: key_id,
         operator,
+        // Filled by `QueryContext::fill_boundary` on the main walk thread, not here: this
+        // runs inside `fanout_utils::fanout_map`'s worker threads, where the boundary memo
+        // must not need a `Mutex`.
+        boundary: None,
     })
 }
 
@@ -1238,6 +1358,8 @@ fn resolve_recorded(parcel: &Parcel, office: &OfficeState) -> IdentityResolution
         signer_key: None,
         revocation_reason: None,
         operator,
+        // Recorded trust never resolves a signer, so a boundary question never arises.
+        boundary: None,
     }
 }
 
@@ -1249,6 +1371,8 @@ fn identity_facts<'a>(resolution: &'a IdentityResolution) -> IdentityFacts<'a> {
             supervisor: resolution.supervisor.as_deref(),
             role: resolution.role,
             signer_key: resolution.signer_key.as_deref(),
+            trust: resolution.trust,
+            boundary: resolution.boundary,
         },
         None => IdentityFacts::Unknowable,
     }
@@ -1407,7 +1531,8 @@ pub fn run_query(
             if phase1 != Truth::True {
                 continue;
             }
-            let resolution = resolve_verified(&hash, office)?;
+            let mut resolution = resolve_verified(&hash, office)?;
+            ctx.fill_boundary(&hash, &mut resolution, office)?;
             matched += 1;
             let provenance = ctx.newest_provenance(&hash).cloned();
             let tags = ctx.tags_of(&hash).to_vec();
@@ -1434,7 +1559,8 @@ pub fn run_query(
             let resolutions = resolve_batch(&survivors, office)?;
             let mut remaining = survivors.into_iter().zip(resolutions);
 
-            while let Some(((hash, parcel), resolution)) = remaining.next() {
+            while let Some(((hash, parcel), mut resolution)) = remaining.next() {
+                ctx.fill_boundary(&hash, &mut resolution, office)?;
                 let verdict =
                     evaluate(&params.predicate, &hash, &parcel, &identity_facts(&resolution), &ctx)?;
                 if verdict != Truth::True {
@@ -1466,7 +1592,8 @@ pub fn run_query(
     let resolutions = resolve_batch(&survivors, office)?;
     let mut remaining = survivors.into_iter().zip(resolutions);
 
-    while let Some(((hash, parcel), resolution)) = remaining.next() {
+    while let Some(((hash, parcel), mut resolution)) = remaining.next() {
+        ctx.fill_boundary(&hash, &mut resolution, office)?;
         let verdict = evaluate(&params.predicate, &hash, &parcel, &identity_facts(&resolution), &ctx)?;
         if verdict != Truth::True {
             continue;
@@ -1619,6 +1746,7 @@ mod tests {
             fetch_scope: MaterializationScope::full(),
             out_of_scope: Cell::new(0),
             tree_hashes: RefCell::new(HashMap::new()),
+            boundaries: RefCell::new(HashMap::new()),
         };
 
         // Unresolved identity: not(Unknown) stays Unknown — the parcel survives to phase 2
@@ -1660,6 +1788,7 @@ mod tests {
             fetch_scope: MaterializationScope::full(),
             out_of_scope: Cell::new(0),
             tree_hashes: RefCell::new(HashMap::new()),
+            boundaries: RefCell::new(HashMap::new()),
         };
 
         let verdict = evaluate(&predicate, "abc", &parcel, &IdentityFacts::Unresolved, &ctx)
