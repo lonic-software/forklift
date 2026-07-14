@@ -4345,22 +4345,28 @@ fn compact_all_redelta_repeats_without_data_loss() {
     assert_success(&warehouse.run(&["compact", "--all", "--redelta"]));
     assert!(objects_store_bytes(&objects) > 0);
 
-    // A second `--redelta` run re-encodes the whole live set again — `Source::Reconstruct` is
-    // unconditional under `--redelta`, never the copy-fast path — so, unlike a plain repack,
-    // this never reaches a cheap copy-bound steady state; every invocation pays the full CPU
-    // cost. Measured finding, not asserted here (it is a size/ordering property, not a
-    // guaranteed one): the shared largest-first sort key is each object's previously *packed*
-    // size — unchanged, per the constraint that ordering stays the shared code path — which a
-    // redelta run itself changes, so a later run's processing order can differ from an
-    // earlier one's even with byte-identical inputs, occasionally landing on a different (but
-    // no larger in aggregate) delta assignment and so a different pack id. What must hold, and
-    // does: no object is lost, and every object still reads back byte-correct.
-    let second = warehouse.run(&["--json", "compact", "--all", "--redelta"]);
-    assert_success(&second);
-    assert_eq!(
-        json(&second)["data"]["objects_packed"].as_u64().unwrap(), 20,
-        "a second redelta must still account for every live object"
-    );
+    // `--redelta` re-encodes the whole live set again on *every* run — `Source::Reconstruct` is
+    // unconditional under it, never the copy-fast path — so, unlike a plain repack, this never
+    // reaches a cheap copy-bound steady state; every invocation pays the full CPU cost. Repeating
+    // it three times pins the exact scenario a write-time depth-safety gap once made unsafe at
+    // real-repository scale: without a true per-object depth ledger, repeated redeltas could grow
+    // a delta chain's *real* depth well past its nominal cap (`compute_path_bases`'s own
+    // bookkeeping only counts path hops since a reset, blind to a reset point's own real depth)
+    // until the read-side reconstruction-depth backstop refused to compact at all — never losing
+    // data (durable-before-destructive held even then), just eventually unusable. `compact`'s
+    // depth ledger (`true_depth`) now resolves every path-base candidate's actual current depth
+    // before committing to it, so this must keep succeeding no matter how many times it repeats.
+    // The exact byte layout can still drift run to run (which candidates the ledger allows
+    // depends on the *previous* run's own shape), so this does not assert a fixed pack id — only
+    // what must hold on every run: no object lost, every object still reads back byte-correct.
+    for _ in 0..2 {
+        let repeat = warehouse.run(&["--json", "compact", "--all", "--redelta"]);
+        assert_success(&repeat);
+        assert_eq!(
+            json(&repeat)["data"]["objects_packed"].as_u64().unwrap(), 20,
+            "a repeated redelta must still account for every live object"
+        );
+    }
 
     assert_eq!(
         json(&warehouse.run(&["--json", "history"]))["data"]["entries"].as_array().unwrap().len(),
