@@ -150,7 +150,7 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
             Some(ProfileAction::Use { name }) => commands::profile::use_profile(&name),
             Some(ProfileAction::List) | None => commands::profile::list(),
         },
-        Command::Compact { all } => commands::compact::handle_command(all),
+        Command::Compact { all, redelta } => commands::compact::handle_command(all, redelta),
         Command::Store => commands::store::handle_command(),
         Command::Conflicts => commands::conflicts::handle_command(),
         Command::Bay { action } => commands::bay::handle_command(action),

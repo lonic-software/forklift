@@ -153,12 +153,29 @@ pub enum Command {
                       Run it after a large \"import-git\" or periodically as maintenance. With \
                       --all, also rewrite the existing packs: drop unreachable (garbage) \
                       objects that were stuck in packs and consolidate many packs into few — a \
-                      heavier full repack, worth running occasionally."
+                      heavier full repack, worth running occasionally. Add --redelta to a full \
+                      repack to also re-delta-compress every object instead of copying already-\
+                      packed records verbatim — denser, but a one-shot CPU-bound pass."
     )]
     Compact {
         /// Repack existing packs too: drop unreachable objects and consolidate (a full repack)
         #[arg(long)]
         all: bool,
+
+        /// Re-encode every object to delta-compress across the whole store (only with --all)
+        #[arg(
+            long,
+            long_help = "Re-encode every live object — packed or loose, files and directories \
+                         alike — to delta-compress across the whole store, instead of a \
+                         repack's usual verbatim copy of already-packed records. Buys back the \
+                         cross-path similarity (renames, moved files) a per-object copy cannot \
+                         see, at the cost of a full re-read, re-compress and re-delta of every \
+                         object: one-shot and CPU-bound, not something to run routinely, and not \
+                         something to repeat back-to-back on the same store — run it once after \
+                         a big import, then let history move on before running it again. Only \
+                         valid with --all."
+        )]
+        redelta: bool,
     },
 
     /// Read or change configuration values
