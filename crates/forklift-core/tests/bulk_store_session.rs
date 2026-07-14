@@ -107,3 +107,48 @@ fn writes_outside_any_session_are_unaffected_by_bulk_sessions() {
 
     std::fs::remove_dir_all(&temp).ok();
 }
+
+#[test]
+fn a_failed_finish_removes_every_staged_temp_and_publishes_nothing() {
+    // Unlike the pack folder, the loose store has no stale-temp sweeper — so a barrier that
+    // returns an error (disk full, a permission flip) must not strand any staged temp behind,
+    // or it leaks forever. Sabotage one staged write (delete its temp out from under the
+    // session) so its fsync fails, and check the *other*, otherwise-healthy staged write is
+    // cleaned up too, and neither ever got published.
+    let _guard = lock_session();
+    let temp = std::env::temp_dir().join(format!("forklift-bulk-fail-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&temp);
+    std::fs::create_dir_all(&temp).unwrap();
+
+    let target_a = temp.join("a");
+    let target_b = temp.join("b");
+    let session = BulkStoreSession::open().unwrap();
+    write_file_atomically(&target_a, b"alpha").unwrap();
+    write_file_atomically(&target_b, b"beta").unwrap();
+
+    let staged_temps: Vec<_> = std::fs::read_dir(&temp).unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+        .collect();
+    assert_eq!(staged_temps.len(), 2, "expected exactly two staged temp files before sabotage");
+    std::fs::remove_file(staged_temps[0].path()).unwrap();
+
+    let result = session.finish();
+    assert!(result.is_err(), "finish must surface the sabotaged fsync as an error");
+
+    // Neither write was published...
+    assert!(!target_a.exists() && !target_b.exists(), "a failed finish must publish nothing");
+    // ...and no temp file — sabotaged or not — is left behind.
+    let leftovers: Vec<_> = std::fs::read_dir(&temp).unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "a failed finish must remove every staged temp, found {:?}",
+        leftovers.iter().map(|e| e.file_name()).collect::<Vec<_>>());
+
+    // The one-active-session slot must be released even after a failed finish.
+    let session = BulkStoreSession::open().unwrap();
+    session.finish().unwrap();
+
+    std::fs::remove_dir_all(&temp).ok();
+}

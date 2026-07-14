@@ -400,12 +400,28 @@ impl BulkStoreSession {
     /// partway through step 3 leaves some names published (durable bytes, correctly visible) and
     /// the rest as still-invisible temps. The invariant — a final name never exists before its
     /// bytes are durable — holds in every interleaving.
+    ///
+    /// A hard kill mid-barrier is covered by that crash analysis (nothing survives that isn't
+    /// either durable-and-published or an invisible temp for the existing stale-temp patterns to
+    /// find later). A *returned* error (disk full, a permission flip) is different: the process
+    /// keeps running, and unlike the pack folder the loose store has no stale-temp sweeper, so a
+    /// stranded temp would leak forever. `run_barrier` therefore cleans up every staged temp
+    /// itself before propagating any error — see its doc comment — which is why `finished` is
+    /// only set to `true` on success below: on the error path the registry slot and every temp
+    /// are already gone, so `Drop`'s own abort pass (see below) just finds nothing left to do.
     pub fn finish(mut self) -> Result<(), String> {
-        let result = self.run_barrier();
+        self.run_barrier()?;
         self.finished = true;
-        result
+        Ok(())
     }
 
+    /// Runs the four-step barrier described on [`finish`](BulkStoreSession::finish). On *any*
+    /// error partway through, best-effort removes every staged temp before returning it — no
+    /// staged write may survive a failed `finish`, since nothing else will ever clean it up.
+    /// Harmless for an entry already renamed by the time the failure hit (its temp path is gone,
+    /// so removing it again just fails `NotFound`, ignored) — that entry is durably published,
+    /// which is a fine outcome for it, not a violation: the barrier had already made its bytes
+    /// durable before any rename began.
     fn run_barrier(&mut self) -> Result<(), String> {
         let pending = bulk_session_registry().lock().expect("bulk store session lock poisoned")
             .take().unwrap_or_default();
@@ -414,8 +430,19 @@ impl BulkStoreSession {
             return Ok(());
         }
 
-        if fsync_enabled() {
+        if let Err(error) = Self::run_barrier_steps(&pending) {
             for (temp, _) in &pending {
+                let _ = std::fs::remove_file(temp);
+            }
+            return Err(error);
+        }
+
+        Ok(())
+    }
+
+    fn run_barrier_steps(pending: &[(PathBuf, PathBuf)]) -> Result<(), String> {
+        if fsync_enabled() {
+            for (temp, _) in pending {
                 fsync_data(temp)?;
             }
 
@@ -424,7 +451,7 @@ impl BulkStoreSession {
         }
 
         let mut touched_parents: BTreeSet<PathBuf> = BTreeSet::new();
-        for (temp, final_path) in &pending {
+        for (temp, final_path) in pending {
             std::fs::rename(temp, final_path).map_err(|e| format!(
                 "Error while moving file into place at \"{}\": {}", final_path.to_string_lossy(), e
             ))?;
@@ -448,7 +475,10 @@ impl BulkStoreSession {
 impl Drop for BulkStoreSession {
     /// Dropping without calling [`finish`](BulkStoreSession::finish) aborts: no staged write was
     /// ever fsynced or renamed, so best-effort removing the temp files publishes nothing — the
-    /// durability invariant holds trivially, since there is nothing to un-publish.
+    /// durability invariant holds trivially, since there is nothing to un-publish. This also runs
+    /// (as a harmless no-op) after a *failed* `finish`: `run_barrier` already removed every temp
+    /// and cleared the registry itself before returning its error, so there is nothing left here
+    /// to find.
     fn drop(&mut self) {
         if self.finished {
             return;
