@@ -225,7 +225,10 @@ FORK_SIZE_IMPORT=$(du -sh "$B/.forklift" 2>/dev/null | cut -f1 | tr -d ' ')
 # timed as part of onboarding (a one-time cost, like the import — never a ratio row),
 # and every comparison below then runs on the densified store: the steady state a user
 # who followed the suggestion operates in. FORK_REDELTA_MS stays empty if the pass is
-# skipped (--no-redelta) or fails, and the report falls back to the single size.
+# skipped (--no-redelta); the report then falls back to the as-imported size. A failed
+# redelta is NOT the same as a skip: compact is durable-before-destructive, so a
+# mid-flight failure can leave the store partially repacked (up to ~2x size, mixed
+# pack state) — that is not a number worth publishing, so it is a hard error below.
 FORK_REDELTA_MS=""
 if [ "$REDELTA" -eq 1 ]; then
     echo "→ densifying the imported store (compact --all --redelta; one-shot, timed as onboarding)…"
@@ -234,7 +237,15 @@ if [ "$REDELTA" -eq 1 ]; then
         t1=$(_now_ms)
         FORK_REDELTA_MS=$(( t1 - t0 ))
     else
-        echo "warning: 'forklift compact --all --redelta' failed — timing the as-imported store instead" >&2
+        echo "error: 'forklift compact --all --redelta' failed partway through — the store in" >&2
+        echo "  $B/.forklift" >&2
+        echo "is now in an indeterminate, partially-repacked state (compact is durable-before-" >&2
+        echo "destructive, so a mid-flight failure can leave old and new pack generations mixed" >&2
+        echo "together). No honest size or timing numbers can be produced from it, so the" >&2
+        echo "benchmark cannot continue." >&2
+        echo "  - Re-run with --no-redelta to time the as-imported store instead." >&2
+        echo "  - Add --keep to preserve the work dir and inspect the failure by hand." >&2
+        exit 1
     fi
 fi
 FORK_SIZE_K=$(du -sk "$B/.forklift" 2>/dev/null | cut -f1)
