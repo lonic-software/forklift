@@ -7,16 +7,21 @@
 #        B/  a copy of A, then `forklift import-git .`   (forklift is measured here)
 #      `import-git` writes straight into native packs as it imports — there is no
 #      loose store and no separate compaction pass. B is packed the moment the
-#      import finishes, same as A is packed the moment the clone finishes, so
-#      every read-only comparison after that is apples-to-apples: identical
-#      files, identical history, one tool each, both packed.
-#   2. Times the operations people actually run — onboard, status, log, diff,
+#      import finishes, same as A is packed the moment the clone finishes.
+#   2. Densifies B with a one-shot `compact --all --redelta` (the pass import itself
+#      suggests): import's per-path delta chains miss cross-path similarity, so the
+#      as-imported store is larger than it needs to be. Both sizes are reported —
+#      as imported and after redelta — and the timed comparisons run on the
+#      densified store, the steady state a user who followed the suggestion is in.
+#      `--no-redelta` skips this (redelta re-encodes every object; on kernel-scale
+#      repos that is minutes of CPU) and times the as-imported store instead.
+#   3. Times the operations people actually run — onboard, status, log, diff,
 #      commit — for both tools and prints a markdown table with the ratio.
 #
 # It is dependency-free (no hyperfine required) and honest about its limits; see
 # docs/BENCHMARK.md for the fairness caveats and how to go deeper.
 #
-# Usage:  bin/benchmark [--repo git|linux|<url>|<path>] [--runs N] [--work DIR] [--keep] [--out FILE] [--markdown]
+# Usage:  bin/benchmark [--repo git|linux|<url>|<path>] [--runs N] [--work DIR] [--keep] [--out FILE] [--markdown] [--no-redelta]
 #
 # Output is an aligned text table by default; pass --markdown for a table you can paste
 # into a doc. Onboarding (clone vs import-git) is reported separately, never as a ratio.
@@ -30,6 +35,7 @@ WORK=""                            # working dir (default: a fresh temp dir)
 KEEP=0                             # keep the work dir on exit
 OUT=""                            # also append the results table here
 MARKDOWN=0                         # render a markdown table instead of aligned text
+REDELTA=1                          # densify with `compact --all --redelta` after import
 
 usage() { sed -n '2,/^set /{ /^set /d; s/^# \{0,1\}//; p; }' "$0"; exit "${1:-0}"; }
 
@@ -41,6 +47,7 @@ while [ $# -gt 0 ]; do
         --out)   OUT="$2"; shift 2;;
         --keep)  KEEP=1; shift;;
         --markdown) MARKDOWN=1; shift;;
+        --no-redelta) REDELTA=0; shift;;
         -h|--help) usage 0;;
         *) echo "unknown argument: $1" >&2; usage 2;;
     esac
@@ -112,7 +119,7 @@ cp -a "$A" "$B"
 # ── repo shape (context for the report) ─────────────────────────────────────
 N_COMMITS=$(git -C "$A" rev-list --count HEAD)
 N_FILES=$(git -C "$A" ls-files | wc -l | tr -d ' ')
-GIT_SIZE=$(du -sh "$A/.git" 2>/dev/null | cut -f1)
+GIT_SIZE=$(du -sh "$A/.git" 2>/dev/null | cut -f1 | tr -d ' ')
 
 # ── the timing core ─────────────────────────────────────────────────────────
 # time_cmd <runs> <dir> <setup> <cmd>  → echoes "mean_ms min_ms"
@@ -208,10 +215,30 @@ IMPORT_PACK_SUMMARY=$(printf '%s\n' "$import_log" | grep -m1 'Packed the importe
 # between them is misleading. They are reported on their own, below the table.
 GIT_SIZE_K=$(du -sk "$A/.git" 2>/dev/null | cut -f1)
 
-# The store arrives packed — no separate compaction step. Every read-only comparison below
-# runs against the same packed store a user actually operates in.
+# The store arrives packed straight from the import; record that size before anything
+# else touches it — it is the honest "what import-git alone gives you" number.
+FORK_SIZE_IMPORT=$(du -sh "$B/.forklift" 2>/dev/null | cut -f1 | tr -d ' ')
+
+# Densify. Import's per-path delta chains never see cross-path similarity (renames,
+# moved files), so the as-imported store is larger than a globally re-delta-compressed
+# one; `compact --all --redelta` is the one-shot pass import itself suggests. It is
+# timed as part of onboarding (a one-time cost, like the import — never a ratio row),
+# and every comparison below then runs on the densified store: the steady state a user
+# who followed the suggestion operates in. FORK_REDELTA_MS stays empty if the pass is
+# skipped (--no-redelta) or fails, and the report falls back to the single size.
+FORK_REDELTA_MS=""
+if [ "$REDELTA" -eq 1 ]; then
+    echo "→ densifying the imported store (compact --all --redelta; one-shot, timed as onboarding)…"
+    t0=$(_now_ms)
+    if ( cd "$B" && forklift compact --all --redelta ) >/dev/null 2>&1; then
+        t1=$(_now_ms)
+        FORK_REDELTA_MS=$(( t1 - t0 ))
+    else
+        echo "warning: 'forklift compact --all --redelta' failed — timing the as-imported store instead" >&2
+    fi
+fi
 FORK_SIZE_K=$(du -sk "$B/.forklift" 2>/dev/null | cut -f1)
-FORK_SIZE=$(du -sh "$B/.forklift" 2>/dev/null | cut -f1)
+FORK_SIZE=$(du -sh "$B/.forklift" 2>/dev/null | cut -f1 | tr -d ' ')
 
 # From here B is a fully imported, packed warehouse whose current pallet is '$MAIN_REF'.
 
@@ -259,12 +286,21 @@ read -r FM _        <<< "$(time_cmd "$COMMIT_RUNS" "$B" "$FORK_SETUP" 'forklift 
 add_row "commit (1 file)" "$GM" "$FM" "git add+commit vs forklift load+stack; mean of $COMMIT_RUNS"
 
 # ── report ──────────────────────────────────────────────────────────────────
+# The size ratio compares git against the store the timings ran on (densified when
+# the redelta pass ran, as-imported otherwise).
 SIZE_NOTE=$(awk -v g="${GIT_SIZE_K:-0}" -v f="${FORK_SIZE_K:-0}" 'BEGIN{
     if (g>0 && f>0) {
         if (f >= g) printf "  (forklift %.1fx larger)", f/g;
         else        printf "  (forklift %.1fx smaller)", g/f;
     }
 }')
+if [ -n "$FORK_REDELTA_MS" ]; then
+    FORK_SIZE_FIELD="${FORK_SIZE_IMPORT:-?} as imported, ${FORK_SIZE:-?} after redelta"
+    STORE_STATE="packed + densified (one-shot \`compact --all --redelta\` after import)"
+else
+    FORK_SIZE_FIELD="${FORK_SIZE:-?} as imported (redelta pass skipped)"
+    STORE_STATE="packed as imported (redelta pass skipped)"
+fi
 
 build_report() {
     if [ "$MARKDOWN" -eq 1 ]; then
@@ -272,18 +308,21 @@ build_report() {
         echo "## Benchmark: forklift vs git — $REPO_NAME"
         echo
         echo "- **Repo:** $REPO_NAME — $N_COMMITS commits, $N_FILES tracked files"
-        echo "- **On-disk:** git \`.git\` = ${GIT_SIZE:-?}, forklift \`.forklift\` = ${FORK_SIZE:-?}${SIZE_NOTE}"
+        echo "- **On-disk:** git \`.git\` = ${GIT_SIZE:-?}, forklift \`.forklift\` = ${FORK_SIZE_FIELD}${SIZE_NOTE}"
         echo "- **Tools:** $GIT_VERSION · $FORKLIFT_VERSION"
         echo "- **Method:** read-only ops = mean of $RUNS runs, commit = mean of $COMMIT_RUNS; warm cache. Ratio < 1 means forklift is faster."
-        echo "- **Store:** both packed — git ships packed (\`clone --local\` copies packfiles) and \`import-git\` packs on the way in (no loose store, no separate compaction pass)."
+        echo "- **Store:** git ships packed (\`clone --local\` copies packfiles); forklift is ${STORE_STATE} — the timings below ran on that store."
         echo
         render_table_markdown
         echo
         echo "**Onboarding** — different operations, reported without a ratio:"
         echo "- \`git clone --local\`: $(fmt_ms "$GIT_ONBOARD") (copies an existing packfile)"
-        echo "- \`forklift import-git\`: $(fmt_ms "$FORK_ONBOARD") (re-encodes every commit/tree/blob straight into packs)"
+        echo "- \`forklift import-git\`: $(fmt_ms "$FORK_ONBOARD") (re-encodes every commit/tree/blob straight into packs; store lands at ${FORK_SIZE_IMPORT:-?})"
         if [ -n "$IMPORT_PACK_SUMMARY" ]; then
             echo "- \`$IMPORT_PACK_SUMMARY\`"
+        fi
+        if [ -n "$FORK_REDELTA_MS" ]; then
+            echo "- \`forklift compact --all --redelta\`: $(fmt_ms "$FORK_REDELTA_MS") (one-shot densify: ${FORK_SIZE_IMPORT:-?} → ${FORK_SIZE:-?})"
         fi
         echo
         echo "> Quick comparison on one machine, not a published benchmark. For tighter"
@@ -293,19 +332,22 @@ build_report() {
         echo "Benchmark: forklift vs git — $REPO_NAME"
         echo
         printf '  Repo:      %s — %s commits, %s tracked files\n' "$REPO_NAME" "$N_COMMITS" "$N_FILES"
-        printf '  On-disk:   git .git = %s   forklift .forklift = %s%s\n' "${GIT_SIZE:-?}" "${FORK_SIZE:-?}" "$SIZE_NOTE"
+        printf '  On-disk:   git .git = %s   forklift .forklift = %s%s\n' "${GIT_SIZE:-?}" "$FORK_SIZE_FIELD" "$SIZE_NOTE"
         printf '  Tools:     %s · %s\n' "$GIT_VERSION" "$FORKLIFT_VERSION"
         printf '  Method:    read-only ops = mean of %s runs, commit = mean of %s; warm cache.\n' "$RUNS" "$COMMIT_RUNS"
         printf '             A ratio below 1.00 means forklift is faster.\n'
-        printf '             Both stores are packed: git ships packed, and import-git packs on the way in.\n'
+        printf '             git ships packed; forklift is %s.\n' "$(printf '%s' "$STORE_STATE" | tr -d '`')"
         echo
         render_table_aligned
         echo
         echo "  Onboarding — measured separately; NOT a ratio (different operations):"
         printf '    git clone --local     %-10s (copies an existing packfile)\n' "$(fmt_ms "$GIT_ONBOARD")"
-        printf '    forklift import-git   %-10s (re-encodes every commit/tree/blob straight into packs)\n' "$(fmt_ms "$FORK_ONBOARD")"
+        printf '    forklift import-git   %-10s (re-encodes every commit/tree/blob straight into packs; store lands at %s)\n' "$(fmt_ms "$FORK_ONBOARD")" "${FORK_SIZE_IMPORT:-?}"
         if [ -n "$IMPORT_PACK_SUMMARY" ]; then
             printf '    %s\n' "$IMPORT_PACK_SUMMARY"
+        fi
+        if [ -n "$FORK_REDELTA_MS" ]; then
+            printf '    compact --all --redelta  %-7s (one-shot densify: %s -> %s)\n' "$(fmt_ms "$FORK_REDELTA_MS")" "${FORK_SIZE_IMPORT:-?}" "${FORK_SIZE:-?}"
         fi
         echo
         echo "  Quick comparison on one machine — for tighter stats use hyperfine."
