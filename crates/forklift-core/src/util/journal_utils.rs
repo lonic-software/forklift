@@ -31,6 +31,14 @@ pub struct JournalEntry {
     /// (`main`, `@office`) → head hash.
     pub heads: BTreeMap<String, String>,
 
+    /// The same refs immediately *after* the operation ran. Used by `restore_refs` to tell
+    /// "the op moved this ref" (safe to roll back) from "something un-journaled moved this
+    /// ref later" (must be left alone — see `restore_refs`). `#[serde(default)]` so journal
+    /// entries written before this field existed deserialize with it empty; those entries
+    /// fall back to the conservative legacy rule.
+    #[serde(default)]
+    pub heads_after: BTreeMap<String, String>,
+
     /// Any consolidation in progress before the operation (`their_head`, `their_pallet`).
     pub consolidation: Option<(String, String)>,
 }
@@ -61,7 +69,10 @@ pub fn capture(op: &str) -> Result<JournalEntry, String> {
     let consolidation = merge_utils::read_consolidation_state()?
         .map(|state| (state.their_head, state.their_pallet));
 
-    Ok(JournalEntry { op: op.to_string(), current_pallet, heads, consolidation })
+    // Populated later by `push_if_changed` once the operation has actually run; a bare
+    // `capture` (e.g. this function's own tests, or the "pre" snapshot before the op
+    // executes) has no "after" to report yet.
+    Ok(JournalEntry { op: op.to_string(), current_pallet, heads, heads_after: BTreeMap::new(), consolidation })
 }
 
 /// Append `pre` to the journal, but only if the state actually changed since it was
@@ -86,6 +97,11 @@ pub fn push_if_changed(pre: JournalEntry) -> Result<(), String> {
         return Ok(());
     }
 
+    // Record where every ref landed once the operation actually ran, so `restore_refs` can
+    // later tell "the op moved this" from "something un-journaled moved this afterwards".
+    let mut pre = pre;
+    pre.heads_after = now.heads;
+
     let mut entries = read();
     entries.push(pre);
 
@@ -97,7 +113,20 @@ pub fn push_if_changed(pre: JournalEntry) -> Result<(), String> {
     write(&entries)
 }
 
-/// Remove and return the most recent journal entry.
+/// Look at the most recent journal entry without consuming it. The caller (`undo`) must
+/// validate — and, for a soft reset, actually restore — an entry *before* it commits to
+/// removing it from the journal: `pop` throws the entry away the moment it is called, so a
+/// refused or failed undo must call this first and only `pop` once it has fully succeeded.
+///
+/// # Returns
+/// * `Ok(Some(JournalEntry))` - The most recent entry, left in place.
+/// * `Ok(None)`               - If the journal is empty.
+pub fn peek() -> Result<Option<JournalEntry>, String> {
+    Ok(read().pop())
+}
+
+/// Remove and return the most recent journal entry. Only call this once the undo it
+/// describes has actually gone through — never as a way to decide whether it can.
 ///
 /// # Returns
 /// * `Ok(Some(JournalEntry))` - The popped entry.
@@ -114,16 +143,69 @@ pub fn pop() -> Result<Option<JournalEntry>, String> {
     Ok(popped)
 }
 
+/// Whether `entry`'s own `current_pallet` ref has moved since the journaled op ran —
+/// meaning some un-journaled operation advanced it before this undo got a chance to run.
+/// A soft reset must refuse outright in that case (see `restore_refs`'s doc comment for
+/// why the same reasoning doesn't stop there): silently restoring every ref *except* the
+/// one that moved would report success for an undo that changed nothing visible, and — for
+/// a `consolidate` entry — would still resurrect its pre-op consolidation state against a
+/// head it no longer describes.
+///
+/// A legacy entry (recorded before `heads_after` existed) cannot be checked this way; the
+/// caller keeps today's behavior for those (proceed as if unmoved).
+///
+/// # Returns
+/// * `Ok(true)`    - The entry's pallet has moved since the op; a soft reset must refuse.
+/// * `Ok(false)`   - Unmoved, or unverifiable (a legacy entry) — safe to proceed.
+/// * `Err(String)` - If the ref could not be read.
+pub fn current_pallet_moved_since(entry: &JournalEntry) -> Result<bool, String> {
+    let Some(post_head) = entry.heads_after.get(&entry.current_pallet) else {
+        return Ok(false);
+    };
+
+    let current_head = pallet_utils::get_pallet_head(&entry.current_pallet)?;
+
+    Ok(current_head.as_deref() != Some(post_head.as_str()))
+}
+
 /// Restore the pallet refs, current pallet and consolidation state from an entry. The
 /// working directory and inventory are left untouched — the `undo` command decides whether
 /// to re-materialize (a soft reset keeps them; reversing a `shift` re-materializes).
 ///
+/// Only the journaled operation itself is undone — never anything that happened after it.
+/// Commands outside the journal (office/meta-pallet mutations such as a key retirement, and
+/// anything else `journal_op` excludes) can run between the journaled op and this `undo`;
+/// a ref they touched must not be rolled back just because it was also in this snapshot.
+/// So each ref is restored only if it still sits exactly where the journaled op left it:
+///
+/// * `heads_after` known (the normal case) and unchanged since → safe, restore `pre_head`.
+/// * `heads_after` known but the ref has since moved → something un-journaled advanced it;
+///   leave it alone.
+/// * the ref no longer exists → never resurrect a deleted ref.
+/// * `heads_after` missing entirely (a journal entry written before this field existed) →
+///   conservative fallback: restore user pallets as before, but never touch a meta-pallet
+///   ref (`@office` and friends) we have no "after" evidence for.
+///
 /// # Arguments
 /// * `entry` - The snapshot to restore.
 pub fn restore_refs(entry: &JournalEntry) -> Result<(), String> {
-    for (wire, head) in &entry.heads {
+    for (wire, pre_head) in &entry.heads {
         let reference = PalletRef::parse(wire)?;
-        pallet_utils::set_pallet_head_in(reference.namespace, &reference.name, head)?;
+
+        let current_head = pallet_utils::get_pallet_head_in(reference.namespace, &reference.name)?;
+        let Some(current_head) = current_head else {
+            // Deleted since the op ran (or never born) — nothing to roll back to.
+            continue;
+        };
+
+        let should_restore = match entry.heads_after.get(wire) {
+            Some(post_head) => &current_head == post_head,
+            None => reference.namespace == pallet_utils::PalletNamespace::User,
+        };
+
+        if should_restore {
+            pallet_utils::set_pallet_head_in(reference.namespace, &reference.name, pre_head)?;
+        }
     }
 
     pallet_utils::set_current_pallet_name(&entry.current_pallet)?;
@@ -201,6 +283,8 @@ mod tests {
         }
     }
 
+    /// Builds a legacy-shaped entry (no `heads_after`) — most existing tests below predate
+    /// that field and exercise the pre-upgrade fallback rule in `restore_refs`.
     fn entry(op: &str, pallet: &str, head: &str) -> JournalEntry {
         let mut heads = BTreeMap::new();
         heads.insert(pallet.to_string(), head.to_string());
@@ -209,6 +293,7 @@ mod tests {
             op: op.to_string(),
             current_pallet: pallet.to_string(),
             heads,
+            heads_after: BTreeMap::new(),
             consolidation: None,
         }
     }
@@ -277,17 +362,95 @@ mod tests {
     }
 
     #[test]
+    fn peek_returns_the_most_recent_entry_without_consuming_it() {
+        let _scratch = Scratch::new("peek-leaves-it");
+
+        push_if_changed(entry("stack", "main", "1".repeat(64).as_str())).unwrap();
+
+        assert_eq!(peek().unwrap().unwrap().op, "stack");
+        assert_eq!(peek().unwrap().unwrap().op, "stack", "peek must not remove the entry");
+        assert_eq!(pop().unwrap().unwrap().op, "stack", "the entry is still there to pop");
+        assert!(peek().unwrap().is_none());
+    }
+
+    #[test]
+    fn current_pallet_moved_since_detects_an_un_journaled_advance() {
+        let _scratch = Scratch::new("moved-since-true");
+
+        // Something outside the journal advanced "main" past the op's own recorded outcome.
+        pallet_utils::set_pallet_head("main", &"9".repeat(64)).unwrap();
+
+        let mut heads = BTreeMap::new();
+        heads.insert("main".to_string(), "1".repeat(64));
+        let mut heads_after = BTreeMap::new();
+        heads_after.insert("main".to_string(), "2".repeat(64));
+
+        let stale = JournalEntry {
+            op: "stack".to_string(),
+            current_pallet: "main".to_string(),
+            heads,
+            heads_after,
+            consolidation: None,
+        };
+
+        assert!(current_pallet_moved_since(&stale).unwrap());
+    }
+
+    #[test]
+    fn current_pallet_moved_since_is_false_when_the_ref_still_sits_where_the_op_left_it() {
+        let _scratch = Scratch::new("moved-since-false");
+
+        pallet_utils::set_pallet_head("main", &"2".repeat(64)).unwrap();
+
+        let mut heads = BTreeMap::new();
+        heads.insert("main".to_string(), "1".repeat(64));
+        let mut heads_after = BTreeMap::new();
+        heads_after.insert("main".to_string(), "2".repeat(64));
+
+        let unmoved = JournalEntry {
+            op: "stack".to_string(),
+            current_pallet: "main".to_string(),
+            heads,
+            heads_after,
+            consolidation: None,
+        };
+
+        assert!(!current_pallet_moved_since(&unmoved).unwrap());
+    }
+
+    #[test]
+    fn current_pallet_moved_since_cannot_validate_a_legacy_entry() {
+        let _scratch = Scratch::new("moved-since-legacy");
+
+        // No `heads_after` at all (a pre-upgrade journal entry) — unverifiable, so the
+        // caller is told "not moved" and keeps its old (pre-gate) behavior.
+        let legacy = entry("stack", "main", &"1".repeat(64));
+
+        assert!(!current_pallet_moved_since(&legacy).unwrap());
+    }
+
+    #[test]
     fn restore_refs_puts_pallet_heads_current_pallet_and_consolidation_back() {
         let _scratch = Scratch::new("restore-refs");
+
+        // Both refs currently sit exactly where the journaled op left them (`heads_after`),
+        // so `restore_refs` is free to roll them back to their pre-op values.
+        pallet_utils::set_pallet_head("main", &"2".repeat(64)).unwrap();
+        pallet_utils::set_meta_pallet_head("office", &"4".repeat(64)).unwrap();
 
         let mut heads = BTreeMap::new();
         heads.insert("main".to_string(), "a".repeat(64));
         heads.insert("@office".to_string(), "b".repeat(64));
 
+        let mut heads_after = BTreeMap::new();
+        heads_after.insert("main".to_string(), "2".repeat(64));
+        heads_after.insert("@office".to_string(), "4".repeat(64));
+
         let restored = JournalEntry {
             op: "consolidate".to_string(),
             current_pallet: "feature".to_string(),
             heads,
+            heads_after,
             consolidation: Some(("c".repeat(64), "their-pallet".to_string())),
         };
 
@@ -306,6 +469,100 @@ mod tests {
         let consolidation = merge_utils::read_consolidation_state().unwrap().unwrap();
         assert_eq!(consolidation.their_head, "c".repeat(64));
         assert_eq!(consolidation.their_pallet, "their-pallet");
+    }
+
+    #[test]
+    fn restore_refs_leaves_a_ref_untouched_if_it_moved_after_the_journaled_op() {
+        let _scratch = Scratch::new("restore-refs-moved");
+
+        // "main" sits exactly where the op left it: safe to restore.
+        pallet_utils::set_pallet_head("main", &"2".repeat(64)).unwrap();
+        // "feature" has since moved on to a third value — some un-journaled operation ran
+        // between the journaled op and this undo. It must be left exactly where it is.
+        pallet_utils::set_pallet_head("feature", &"5".repeat(64)).unwrap();
+
+        let mut heads = BTreeMap::new();
+        heads.insert("main".to_string(), "1".repeat(64));
+        heads.insert("feature".to_string(), "3".repeat(64));
+
+        let mut heads_after = BTreeMap::new();
+        heads_after.insert("main".to_string(), "2".repeat(64));
+        heads_after.insert("feature".to_string(), "4".repeat(64));
+
+        let restored = JournalEntry {
+            op: "stack".to_string(),
+            current_pallet: "main".to_string(),
+            heads,
+            heads_after,
+            consolidation: None,
+        };
+
+        restore_refs(&restored).unwrap();
+
+        assert_eq!(
+            pallet_utils::get_pallet_head("main").unwrap(),
+            Some("1".repeat(64)),
+            "unmoved ref must be restored"
+        );
+        assert_eq!(
+            pallet_utils::get_pallet_head("feature").unwrap(),
+            Some("5".repeat(64)),
+            "a ref moved by a later un-journaled op must be left untouched"
+        );
+    }
+
+    #[test]
+    fn restore_refs_on_a_legacy_entry_skips_meta_refs_but_restores_user_refs() {
+        let _scratch = Scratch::new("restore-refs-legacy");
+
+        pallet_utils::set_pallet_head("main", &"9".repeat(64)).unwrap();
+        pallet_utils::set_meta_pallet_head("office", &"8".repeat(64)).unwrap();
+
+        let mut heads = BTreeMap::new();
+        heads.insert("main".to_string(), "1".repeat(64));
+        heads.insert("@office".to_string(), "2".repeat(64));
+
+        // A pre-upgrade journal entry: no `heads_after` at all.
+        let restored = JournalEntry {
+            op: "stack".to_string(),
+            current_pallet: "main".to_string(),
+            heads,
+            heads_after: BTreeMap::new(),
+            consolidation: None,
+        };
+
+        restore_refs(&restored).unwrap();
+
+        assert_eq!(
+            pallet_utils::get_pallet_head("main").unwrap(),
+            Some("1".repeat(64)),
+            "a legacy entry still restores user-namespace refs"
+        );
+        assert_eq!(
+            pallet_utils::get_meta_pallet_head("office").unwrap(),
+            Some("8".repeat(64)),
+            "a legacy entry must never move a meta-pallet ref like @office"
+        );
+    }
+
+    #[test]
+    fn push_if_changed_populates_heads_after() {
+        let _scratch = Scratch::new("push-heads-after");
+
+        pallet_utils::set_pallet_head("main", &"a".repeat(64)).unwrap();
+        let pre = capture("stack").unwrap();
+
+        // The operation itself: the pallet head moves.
+        pallet_utils::set_pallet_head("main", &"b".repeat(64)).unwrap();
+        push_if_changed(pre).unwrap();
+
+        let popped = pop().unwrap().expect("a real change must be journaled");
+        assert_eq!(popped.heads.get("main"), Some(&"a".repeat(64)));
+        assert_eq!(
+            popped.heads_after.get("main"),
+            Some(&"b".repeat(64)),
+            "heads_after must record where the ref landed once the op ran"
+        );
     }
 
     #[test]

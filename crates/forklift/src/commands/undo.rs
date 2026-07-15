@@ -17,22 +17,31 @@ use crate::output::{self, CommandOutput};
 /// When the journal is empty (e.g. a stack made before this feature), it falls back to the
 /// classic behavior: soft-reset the current pallet's head to its first parent.
 ///
+/// The journal entry is only ever consumed (`journal_utils::pop`) once its undo has fully
+/// succeeded — `peek` looks at it first. A refused or failed undo (the target has moved, or
+/// a later step errors) must leave the journal exactly as it found it, so a retried `undo`
+/// sees the same entry rather than skipping straight past it.
+///
 /// # Returns
 /// * `Ok(())`      - If an operation was undone.
 /// * `Err(String)` - If there is nothing to undo, or the reversal failed.
 pub async fn handle_command() -> Result<(), String> {
-    match journal_utils::pop()? {
+    match journal_utils::peek()? {
         Some(entry) => undo_from_journal(entry).await,
         None => undo_last_stack(),
     }
 }
 
-/// Reverse the operation described by a journal entry.
+/// Reverse the operation described by a journal entry (not yet popped — see
+/// `handle_command`).
 async fn undo_from_journal(entry: JournalEntry) -> Result<(), String> {
     if entry.op == "shift" {
         // Move back to the pallet that was current before the shift, re-materializing it.
+        // `shift_to` refuses up front (a dirty workdir, a missing target pallet, …) without
+        // touching anything, so the entry is only popped once it has actually succeeded.
         let left = pallet_utils::get_current_pallet_name().unwrap_or_default();
         let head = shift::shift_to(&entry.current_pallet).await?;
+        journal_utils::pop()?;
 
         output::emit("undo", &Undone {
             op: entry.op,
@@ -46,11 +55,27 @@ async fn undo_from_journal(entry: JournalEntry) -> Result<(), String> {
         return Ok(());
     }
 
+    // Gate before mutating anything: if the entry's own pallet has moved since the op ran,
+    // something outside the undo journal advanced it (an un-journaled command, or a fast
+    // forward), and restoring around that would either be a silent no-op (the ref itself
+    // stays put, `restore_refs` already leaves a moved ref alone) or — for a `consolidate`
+    // entry — resurrect a stale in-progress-merge record against a head that has moved on.
+    // Refuse outright instead of guessing; the journal entry stays untouched.
+    if journal_utils::current_pallet_moved_since(&entry)? {
+        return Err(format!(
+            "Pallet \"{}\" has moved since that operation — something outside the undo \
+            journal advanced it, and undo will not rewind that too. Continue forward \
+            instead (e.g. re-stack).",
+            entry.current_pallet
+        ));
+    }
+
     // A soft reset: restore the refs (and any consolidation), keep the working directory.
     let pallet = pallet_utils::get_current_pallet_name()?;
     let undone = pallet_utils::get_pallet_head(&pallet)?.unwrap_or_default();
 
     journal_utils::restore_refs(&entry)?;
+    journal_utils::pop()?;
 
     let head = pallet_utils::get_pallet_head(&entry.current_pallet)?.unwrap_or_default();
     let description = object_utils::load_parcel(&undone).ok()

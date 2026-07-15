@@ -3423,6 +3423,189 @@ fn undo_reverses_a_consolidate_and_a_shift() {
     assert!(!stdout(&warehouse.run(&["history"])).contains("consolidates"), "merge must be off the pallet");
 }
 
+// Regression test for a bug where `undo` rolled back pallet refs it never journaled.
+// `JournalEntry` snapshots every pallet ref (user and meta, `@office` included) before a
+// journaled op so it can be restored, but an office/meta-pallet mutation between the
+// journaled op and the `undo` is not itself journaled. Undo used to restore `@office`
+// unconditionally along with everything else, silently un-retiring a key that was revoked
+// after the stack. `restore_refs` now only rolls a ref back if it still sits exactly where
+// the journaled op left it.
+#[test]
+fn undo_never_reverts_a_key_retirement_that_happened_after_the_journaled_stack() {
+    let warehouse = TestWarehouse::new("undo-office-boundary");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["office", "enroll"])); // test@forklift becomes admin
+
+    let bob = keygen_admit_args(&warehouse, "bob@forklift");
+    assert_success(&warehouse.run(&["office", "admit", &bob[0], &bob[1], &bob[2]]));
+
+    // A first parcel to be born onto: a stack onto an unborn pallet isn't journaled at all
+    // (there is no ref to restore back to), so this one has to precede the one under test.
+    warehouse.write_file("a.txt", "one\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "genesis"]));
+
+    // The journaled operation: a stack, undo-able on its own.
+    warehouse.write_file("b.txt", "two\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "first"]));
+
+    // Un-journaled, in between: an admin retires bob's key. This advances `@office`.
+    let list_json = json(&warehouse.run(&["office", "list", "--json"]));
+    let users = list_json["data"]["users"].as_array().unwrap();
+    let bob_user = users.iter().find(|user| user["identifier"] == "bob@forklift").unwrap();
+    let bob_key_id = bob_user["keys"][0]["key_id"].as_str().unwrap().to_string();
+    assert_success(&warehouse.run(&["office", "retire", &bob_key_id]));
+
+    // Undo reverses the stack…
+    let undone = warehouse.run(&["undo", "--json"]);
+    assert_success(&undone);
+    let staged = warehouse.run(&["stocktake", "--json"]);
+    assert_eq!(json(&staged)["data"]["staged_count"], 1, "the stack's change must be re-staged");
+
+    // …but must leave the retirement alone: bob's key stays retired, not silently restored
+    // to active by rolling `@office` back to its pre-stack head.
+    let after_json = json(&warehouse.run(&["office", "list", "--json"]));
+    let after_users = after_json["data"]["users"].as_array().unwrap();
+    let bob_after = after_users.iter().find(|user| user["identifier"] == "bob@forklift").unwrap();
+    assert_eq!(bob_after["keys"][0]["key_id"], bob_key_id);
+    assert_eq!(
+        bob_after["keys"][0]["retired"], true,
+        "the retirement must survive undo: {}", bob_after
+    );
+}
+
+// Regression test for a second bug in the same area: `restore_refs` correctly leaves a
+// moved ref alone, but `undo` itself didn't know it had — it popped (and so consumed) the
+// journal entry and reported full success ("Undid stack …, its changes are staged again")
+// even though the pallet head never actually moved back. `undo` now checks, before
+// consuming the entry or touching anything, whether the journaled op's own pallet ref still
+// sits where that op left it; if something un-journaled (here: a haul merge) advanced it in
+// the meantime, `undo` refuses outright and leaves the journal untouched.
+#[test]
+fn undo_refuses_rather_than_silently_no_opping_when_the_pallet_moved_on() {
+    let warehouse = TestWarehouse::new("undo-moved-refuses");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["office", "enroll"])); // haul needs a signing actor
+
+    // Born onto main.
+    warehouse.write_file("base.txt", "base\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base"]));
+
+    // "feature"'s own divergent work is set up *before* the op under test, so it doesn't
+    // end up on top of the journal (a stack there would be the next thing undo reverses).
+    assert_success(&warehouse.run(&["palletize", "feature"])); // switches onto feature
+    warehouse.write_file("feature.txt", "feat\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "feature work"]));
+    assert_success(&warehouse.run(&["shift", "main"]));
+
+    // The journaled operation under test — the last thing on the journal from here on.
+    warehouse.write_file("main.txt", "v1\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "second"]));
+
+    // Un-journaled: a haul merge advances main's head past "second" with a real merge
+    // parcel (haul is not in the journaled command set).
+    assert_success(&warehouse.run(&[
+        "haul", "open", "--target", "main", "--source", "feature", "--title", "Add feature", "-m", "please review",
+    ]));
+    let id = json(&warehouse.run(&["haul", "list", "--json"]))["data"]["hauls"][0]["id"].as_str().unwrap().to_string();
+    assert_success(&warehouse.run(&["haul", "merge", &id]));
+
+    let head_before = std::fs::read_to_string(warehouse.root.join(".forklift/pallets/main")).unwrap();
+
+    let refused = warehouse.run(&["undo"]);
+    assert!(!refused.status.success());
+    assert!(stderr(&refused).contains("moved since that operation"), "{}", stderr(&refused));
+
+    let head_after = std::fs::read_to_string(warehouse.root.join(".forklift/pallets/main")).unwrap();
+    assert_eq!(head_before, head_after, "a refused undo must not touch the pallet head");
+
+    // The journal entry is untouched too: a fresh legitimate stack/undo cycle still works.
+    warehouse.write_file("main.txt", "v2\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "third"]));
+    let undone = warehouse.run(&["undo", "--json"]);
+    assert_success(&undone);
+    assert_eq!(json(&undone)["data"]["op"], "stack");
+}
+
+// The same root cause, hitting the consolidation state instead: an unconditional restore
+// would resurrect a stale in-progress-merge record (captured before a conflict was resolved
+// and stacked) against a head that has since moved past it — corrupting the next `stack`
+// with a spurious second merge parent. The pre-mutation gate must stop this too.
+#[test]
+fn undo_refuses_a_stale_consolidation_after_the_pallet_moved_on() {
+    let warehouse = TestWarehouse::new("undo-consolidation-boundary");
+    warehouse.write_file("file.txt", "one\ntwo\nthree\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["office", "enroll"])); // haul needs a signing actor
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base"]));
+
+    // "feature" diverges on the very line "main" will also change (a guaranteed conflict).
+    assert_success(&warehouse.run(&["palletize", "feature"])); // switches onto feature
+    warehouse.write_file("file.txt", "one\nTHEIRS\nthree\n");
+    assert_success(&warehouse.run(&["load", "file.txt"]));
+    assert_success(&warehouse.run(&["stack", "theirs"]));
+
+    // "extra" is the un-journaled advance's future source — set up now, before the op
+    // under test, so its own stack doesn't land on top of the journal.
+    assert_success(&warehouse.run(&["shift", "main"]));
+    assert_success(&warehouse.run(&["palletize", "extra"])); // switches onto extra
+    warehouse.write_file("extra.txt", "extra work\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "extra work"]));
+
+    assert_success(&warehouse.run(&["shift", "main"]));
+    warehouse.write_file("file.txt", "one\nOURS\nthree\n");
+    assert_success(&warehouse.run(&["load", "file.txt"]));
+    assert_success(&warehouse.run(&["stack", "ours"]));
+
+    // A conflicting consolidate: leaves an in-progress consolidation record, main unmoved.
+    let merge = warehouse.run(&["consolidate", "feature"]);
+    assert_success(&merge);
+    assert!(stdout(&merge).contains("conflict: file.txt"));
+
+    // Resolve and finish: this "stack" is the journaled op under test — its pre-op snapshot
+    // carries the in-progress consolidation record, which clears once the merge lands.
+    warehouse.write_file("file.txt", "one\nresolved\nthree\n");
+    assert_success(&warehouse.run(&["load", "file.txt"]));
+    assert_success(&warehouse.run(&["stack", "resolved"]));
+    assert!(!warehouse.root.join(".forklift/consolidation").exists());
+
+    // Un-journaled: haul merges "extra" into main, advancing it past the resolved merge.
+    assert_success(&warehouse.run(&[
+        "haul", "open", "--target", "main", "--source", "extra", "--title", "Extra", "-m", "please review",
+    ]));
+    let id = json(&warehouse.run(&["haul", "list", "--json"]))["data"]["hauls"][0]["id"].as_str().unwrap().to_string();
+    assert_success(&warehouse.run(&["haul", "merge", &id]));
+
+    let head_before = std::fs::read_to_string(warehouse.root.join(".forklift/pallets/main")).unwrap();
+
+    let refused = warehouse.run(&["undo"]);
+    assert!(!refused.status.success());
+    assert!(stderr(&refused).contains("moved since that operation"), "{}", stderr(&refused));
+
+    let head_after = std::fs::read_to_string(warehouse.root.join(".forklift/pallets/main")).unwrap();
+    assert_eq!(head_before, head_after, "a refused undo must not touch the pallet head");
+    assert!(
+        !warehouse.root.join(".forklift/consolidation").exists(),
+        "a refused undo must never resurrect a stale consolidation record"
+    );
+
+    // A subsequent legitimate undo-able op still works.
+    warehouse.write_file("file.txt", "one\nresolved\nfour\n");
+    assert_success(&warehouse.run(&["load", "file.txt"]));
+    assert_success(&warehouse.run(&["stack", "fourth"]));
+    assert_success(&warehouse.run(&["undo"]));
+}
+
 #[test]
 fn config_unset_removes_a_value() {
     let warehouse = TestWarehouse::new("config-unset");
