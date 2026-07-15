@@ -383,7 +383,33 @@ pub fn verify_pallet_history(head: &str,
 
                 let vouched = distrust_boundaries.vouched(key, hash)?;
 
+                // `vouched`'s reachability walk only ever *grows* as more of the boundary's
+                // ancestry becomes present, so a `true` here is trustworthy regardless of what
+                // else is missing — this is the common case (this store, this server, has
+                // everything that actually matters for this parcel) and it must stay cheap: an
+                // ordinary lift must not pay a presence check, let alone fail one, just because
+                // a revocation's boundary also names some unrelated pallet's head this store
+                // was never going to have (that pallet may simply never be lifted).
+                //
+                // A `false` is the ambiguous case: it might be the genuine "outside the
+                // boundary" verdict, or it might be an artifact of a gap this store's own walk
+                // ran into — a missing boundary head, or a missing interior ancestor behind
+                // one — either of which could have been exactly what would have vouched for
+                // this parcel. `unresolved_head` names that gap when there is one; it reads off
+                // the very walk `vouched` just ran, so this never re-derives reachability or
+                // pays for a second pass.
                 if !vouched {
+                    if let Some(missing) = distrust_boundaries.unresolved_head(key)? {
+                        return Err(format!(
+                            "Parcel {} is signed with revoked key {}: this store cannot \
+                            resolve the revocation's distrust boundary (boundary parcel {} is \
+                            not present locally), so it cannot tell whether this parcel \
+                            predates the revocation or the key kept signing after it. Verify \
+                            against a store with the full history.",
+                            hash, key_id, missing
+                        ));
+                    }
+
                     return Err(format!(
                         "Parcel {} is signed with key {}, which is revoked \
                         ({}), and the parcel is outside the revocation's \
@@ -925,11 +951,44 @@ pub fn collect_reachable(heads: &[String]) -> Result<HashSet<String>, String> {
 /// * `Ok(HashSet<String>)` - The reachable, locally present parcel hashes.
 /// * `Err(String)`         - If a present parcel could not be read.
 pub fn collect_reachable_present(heads: &[String]) -> Result<HashSet<String>, String> {
+    Ok(collect_reachable_present_noting_gaps(heads)?.0)
+}
+
+/// [`collect_reachable_present`], but also reporting every reference the walk found absent —
+/// a head itself, or a parent edge pointing at an object this store doesn't have — in the
+/// order the walk first met them.
+///
+/// A head-only presence pre-scan is not enough to know whether a walk's answer is complete:
+/// every one of a key's boundary heads can be present while the walk still runs into a gap
+/// *behind* one of them (an interior ancestor this store never fetched or has since lost),
+/// and a plain "not reachable" and "not present" look identical from outside the walk. This
+/// variant makes that distinction the walk's own business, so a caller — [`DistrustBoundaryMemo`]
+/// — can tell "genuinely outside the boundary" from "this store cannot answer" without
+/// re-deriving reachability from scratch or trusting a pre-scan that only ever looked at the
+/// starting heads.
+///
+/// # Arguments
+/// * `heads` - The starting parcel hashes.
+///
+/// # Returns
+/// * `Ok((reachable, gaps))` - `reachable` is the present, reachable set (as
+///   [`collect_reachable_present`]); `gaps` is every absent hash the walk actually referenced,
+///   deduplicated, first-encountered order.
+/// * `Err(String)`           - If a present parcel could not be read.
+pub fn collect_reachable_present_noting_gaps(
+    heads: &[String],
+) -> Result<(HashSet<String>, Vec<String>), String> {
     let mut queue: VecDeque<String> = heads.iter().cloned().collect();
     let mut reachable: HashSet<String> = HashSet::new();
+    let mut gaps: Vec<String> = Vec::new();
+    let mut seen_gaps: HashSet<String> = HashSet::new();
 
     while let Some(hash) = queue.pop_front() {
         if !file_utils::does_object_exist(&hash)? {
+            if seen_gaps.insert(hash.clone()) {
+                gaps.push(hash);
+            }
+
             continue;
         }
 
@@ -942,20 +1001,45 @@ pub fn collect_reachable_present(heads: &[String]) -> Result<HashSet<String>, St
         }
     }
 
-    Ok(reachable)
+    Ok((reachable, gaps))
 }
 
 /// Per-revoked-key memo of a distrust boundary's vouched parcel set: the reachability walk
 /// ([`collect_reachable_present`]) runs at most once per distinct key, not once per parcel
 /// that key signed. Shared between `audit`'s phase-3 resolution (below) and the query
 /// engine's `signer.boundary` predicate (`query_utils::QueryContext`) — the walk-and-
-/// membership arithmetic must never drift between the two. The query engine layers its own
-/// presence guard on top (a partial clone may be missing a boundary head outright, which
-/// this memo cannot distinguish from "not reachable"); `audit`'s use here is unmodified from
-/// before this memo existed.
+/// membership arithmetic must never drift between the two.
+///
+/// **Presence-guarded, asymmetrically, and gap-aware.** A partial store may be missing part
+/// of a key's distrust-boundary ancestry — not only a boundary head itself, but any interior
+/// ancestor the walk would otherwise have to cross to decide a parcel's membership. Either
+/// kind of gap can only ever shrink the vouched set the walk computes, never grow it, so a
+/// `true` from [`Self::vouched`] is trustworthy no matter what else is missing; a `false` is
+/// ambiguous — genuinely outside the boundary, or an artifact of this store's own gaps — and
+/// [`Self::resolvable`]/[`Self::unresolved_head`] are the tie-breaker for exactly that case.
+/// Both read off the *same* walk [`Self::vouched`] runs (via
+/// [`collect_reachable_present_noting_gaps`]), so a head-only pre-scan can never miss a gap
+/// that only shows up once the walk actually crosses it.
+///
+/// The two callers weigh the vouched/resolvable asymmetry differently. `audit`'s phase 3
+/// (below) — shared with every server's ref-update check — consults `resolvable`/
+/// `unresolved_head` only once `vouched` has already answered `false`, so an ordinary lift
+/// whose boundary happens to name some unrelated, never-to-be-lifted pallet's head never pays
+/// for (or fails) a presence check it does not need — and by the time it does ask, the walk
+/// (and its gap record) already exist from computing `vouched`, so there is no extra walk to
+/// pay for. The query engine's `fill_boundary` checks `resolvable` unconditionally instead —
+/// it would rather label a subtle case "unresolved" a little too eagerly than ever risk
+/// reading a `true` that later turns out to have been lucky; for it, asking `resolvable` first
+/// is what *forces* the walk (see the method docs).
 #[derive(Default)]
 pub struct DistrustBoundaryMemo {
     vouched_sets: HashMap<String, HashSet<String>>,
+
+    /// Per key id: every absent hash the walk that built `vouched_sets` actually referenced
+    /// (a boundary head, or an interior ancestor), in the order first encountered. Empty means
+    /// the walk crossed no gap at all. Built in the same pass as the matching `vouched_sets`
+    /// entry — never derived from a separate, heads-only pre-scan.
+    gaps: HashMap<String, Vec<String>>,
 }
 
 impl DistrustBoundaryMemo {
@@ -963,15 +1047,63 @@ impl DistrustBoundaryMemo {
         DistrustBoundaryMemo::default()
     }
 
+    /// Whether `key`'s distrust boundary is fully resolvable on this store: the walk that
+    /// decides `vouched` crossed no gap at all (no absent boundary head, no absent interior
+    /// ancestor). Memoized per key, and it *is* the walk — the first call for a given key
+    /// (whether this, [`Self::unresolved_head`], or [`Self::vouched`]) builds and caches it;
+    /// every call after is a lookup.
+    ///
+    /// A caller only ever needs this once [`Self::vouched`] has already answered `false` for
+    /// a parcel — that `false` could be genuine, or it could be this store's own
+    /// incompleteness (see the struct docs).
+    pub fn resolvable(&mut self, key: &KeyRecord) -> Result<bool, String> {
+        Ok(self.gaps_of(key)?.is_empty())
+    }
+
+    /// The first gap [`Self::resolvable`] found for `key`, if any — a boundary head or an
+    /// interior ancestor this store does not have — so a caller's refusal can name an actual
+    /// missing parcel rather than just say "unresolved". `None` when the boundary is fully
+    /// resolvable (i.e. when `resolvable` is `true`).
+    pub fn unresolved_head(&mut self, key: &KeyRecord) -> Result<Option<String>, String> {
+        Ok(self.gaps_of(key)?.first().cloned())
+    }
+
     /// Whether `parcel` sits inside `key`'s distrust boundary (§8.11): the boundary's
     /// vouched set is computed and cached on first use for this key, then it's a plain
     /// membership check on every call after.
+    ///
+    /// The walk that builds it treats any gap — an absent boundary head, or an absent
+    /// interior ancestor it runs into partway — as "not reachable", which can only shrink
+    /// what it reports as vouched. A `true` answer is safe to trust as-is; a caller that gets
+    /// `false` back and needs to know whether that reflects a real gap should consult
+    /// [`Self::resolvable`]/[`Self::unresolved_head`] next (see the struct docs) — they read
+    /// off this same walk, not a separate one.
     pub fn vouched(&mut self, key: &KeyRecord, parcel: &str) -> Result<bool, String> {
-        if !self.vouched_sets.contains_key(&key.key_id) {
-            let vouched = collect_reachable_present(&key.distrust_boundary)?;
-            self.vouched_sets.insert(key.key_id.clone(), vouched);
-        }
+        self.ensure_walked(key)?;
+
         Ok(self.vouched_sets.get(&key.key_id).unwrap().contains(parcel))
+    }
+
+    /// Build (once per key id, memoized) the reachable-and-present set alongside the gaps the
+    /// same walk crossed — the single source both [`Self::vouched`] and
+    /// [`Self::resolvable`]/[`Self::unresolved_head`] read from.
+    fn ensure_walked(&mut self, key: &KeyRecord) -> Result<(), String> {
+        if self.vouched_sets.contains_key(&key.key_id) {
+            return Ok(());
+        }
+
+        let (vouched, gaps) = collect_reachable_present_noting_gaps(&key.distrust_boundary)?;
+
+        self.vouched_sets.insert(key.key_id.clone(), vouched);
+        self.gaps.insert(key.key_id.clone(), gaps);
+
+        Ok(())
+    }
+
+    fn gaps_of(&mut self, key: &KeyRecord) -> Result<&[String], String> {
+        self.ensure_walked(key)?;
+
+        Ok(self.gaps.get(&key.key_id).unwrap())
     }
 }
 
@@ -2118,6 +2250,255 @@ mod tests {
         for i in 2..MAX_MEMOIZED_OFFICE_CHAINS {
             assert!(memo.get(&format!("key-{i}")).is_some(), "key-{i} should not have been evicted");
         }
+    }
+
+    /// A fresh warehouse root for one test, entered as the active storage-root scope for its
+    /// lifetime (mirrors `object_utils`'s own test fixture — kept local here since that one
+    /// is private to its module).
+    struct Scratch {
+        _scope: crate::globals::StorageRootScope,
+        root: std::path::PathBuf,
+    }
+
+    impl Scratch {
+        fn new(name: &str) -> Scratch {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "forklift-audit-test-{}-{}-{}", name, std::process::id(), id
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+            let scope = crate::globals::StorageRootScope::enter(&root);
+            Scratch { _scope: scope, root }
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// A minimal revoked `KeyRecord` for [`DistrustBoundaryMemo`] tests: only `key_id` and
+    /// `distrust_boundary` matter to `resolvable`/`unresolved_head`, so everything else is a
+    /// cheap placeholder.
+    fn revoked_key(key_id: &str, distrust_boundary: Vec<String>) -> KeyRecord {
+        KeyRecord {
+            key_id: key_id.to_string(),
+            operator: "someone".to_string(),
+            public_key: "00".repeat(32),
+            issued_at: 1,
+            retired_at: Some(2),
+            revocation_reason: Some(crate::util::office_utils::RevocationReason::Retirement),
+            distrust_boundary,
+            authorized_by: key_id.to_string(),
+            endorsement: "00".repeat(64),
+            proof_of_possession: "00".repeat(64),
+        }
+    }
+
+    /// `resolvable` reads `true` only when every boundary head is actually present in the
+    /// object store — not merely a plausible-looking hash — and `unresolved_head` names the
+    /// first one it found missing. Boundary heads must be real, loadable parcels here (not
+    /// arbitrary bytes at a matching hash): the walk behind `resolvable` parses each present
+    /// node to keep walking its ancestry (see [`collect_reachable_present_noting_gaps`]), so a
+    /// non-parcel object at a "present" hash would fail to decode instead of just counting as
+    /// present.
+    #[test]
+    fn distrust_boundary_memo_resolvable_requires_every_head_present() {
+        let _scratch = Scratch::new("distrust-boundary-resolvable");
+
+        let present = store_parcel(Vec::new());
+        let absent = object_utils::hash_object_bytes(b"a boundary head nobody ever fetched");
+
+        let mut memo = DistrustBoundaryMemo::new();
+
+        // Every head present: resolvable, and there is nothing missing to name.
+        let all_present = revoked_key("key-all-present", vec![present.clone()]);
+        assert!(memo.resolvable(&all_present).unwrap());
+        assert_eq!(memo.unresolved_head(&all_present).unwrap(), None);
+
+        // One head missing: not resolvable, and the missing one is named exactly.
+        let missing_one = revoked_key("key-missing-one", vec![present.clone(), absent.clone()]);
+        assert!(!memo.resolvable(&missing_one).unwrap());
+        assert_eq!(memo.unresolved_head(&missing_one).unwrap(), Some(absent.clone()));
+
+        // Memoized: a second call for the same key id does not re-derive a different answer
+        // (there is nothing to change to, but this also proves the memo doesn't panic on a
+        // repeat lookup for a key already resolved either way).
+        assert!(memo.resolvable(&all_present).unwrap());
+        assert!(!memo.resolvable(&missing_one).unwrap());
+    }
+
+    /// Build and store a minimal parcel, returning its hash. `actions` are irrelevant to
+    /// signature/ancestry verification, so an empty description and no actions keep this
+    /// cheap; `tree_hash` is never read by `verify_pallet_history` either, so a plausible-
+    /// looking placeholder is fine.
+    fn store_parcel(parents: Vec<String>) -> String {
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+        use crate::model::parcel::Parcel;
+
+        let parcel = Parcel {
+            tree_hash: "e".repeat(64),
+            parents,
+            actions: Vec::new(),
+            description: None,
+        };
+        let mut object = LooseObjectBuilder::build_parcel(&parcel);
+        let hash = object.hash.clone();
+        object.store().unwrap();
+
+        hash
+    }
+
+    /// Sign `hash` with `key` under `key_id` and store the sidecar, so `classify_parcel_trust`
+    /// finds and verifies it against the matching `KeyRecord`.
+    fn sign_and_store(hash: &str, key_id: &str, key: &SigningKey) {
+        let raw = key.sign(hash.as_bytes());
+
+        sign_utils::store_parcel_signature(hash, &sign_utils::ParcelSignature {
+            key_id: key_id.to_string(),
+            signature: raw.to_bytes().to_vec(),
+        }).unwrap();
+    }
+
+    /// The genuine "unresolved" case, exercised directly against [`verify_pallet_history`]
+    /// (the function `audit` and every server's ref-update check share): a parcel signed by a
+    /// revoked key whose distrust boundary names a head this store has never had at all.
+    ///
+    /// This is deliberately *not* built through the CLI/franchise machinery the way the
+    /// sibling `remote.rs` tests are (see
+    /// `a_partial_clone_missing_an_unrelated_boundary_head_still_audits_the_vouched_parcel`'s
+    /// doc for why that path cannot reach this case): `office retire` always folds the
+    /// audited pallet's own current head into the boundary, and that head — being the pallet
+    /// under audit's own history — is guaranteed present and, being at or after any
+    /// legitimately pre-revocation parcel on that same pallet, always sufficient to vouch it
+    /// on its own. A boundary can only ever fail to resolve, without that trivial rescue,
+    /// when every head it names is absent — which a hand-built `KeyRecord` can express
+    /// directly, without fighting that structural rescue.
+    #[test]
+    fn a_boundary_head_absent_from_this_store_refuses_honestly_instead_of_alleging_tampering() {
+        let _scratch = Scratch::new("distrust-boundary-unresolved-audit");
+
+        let (admin_key, admin_id, admin_hex) = keypair(51);
+        let (agent_key, agent_id, agent_hex) = keypair(52);
+
+        let root = endorsed_key(ALICE, &admin_key, &admin_id, &admin_hex, &admin_key, &admin_id);
+        let mut agent = endorsed_key(BOB, &agent_key, &agent_id, &agent_hex, &admin_key, &admin_id);
+
+        // A boundary head this store never had — no object stored at this hash, ever.
+        let never_fetched = object_utils::hash_object_bytes(b"a boundary head this store never fetched");
+        agent.retired_at = Some(2);
+        agent.revocation_reason = Some(crate::util::office_utils::RevocationReason::Compromise);
+        agent.distrust_boundary = vec![never_fetched.clone()];
+
+        let office_state = OfficeState {
+            users: vec![user(ALICE, Role::Admin, &admin_id), user(BOB, Role::Writer, &agent_id)],
+            keys: vec![root, agent],
+        };
+
+        // The target: a real, signed, present parcel — the revocation, not the parcel body,
+        // is what makes this ambiguous.
+        let target = store_parcel(Vec::new());
+        sign_and_store(&target, &agent_id, &agent_key);
+
+        let anchor = TrustAnchor {
+            genesis: "0".repeat(64),
+            enabled_at: 0,
+            boundary: Vec::new(),
+            prior_genesis: None,
+            adopts: None,
+        };
+
+        let error = verify_pallet_history(&target, &anchor, &office_state, None).unwrap_err();
+
+        assert!(error.contains(&target), "names the parcel under question: {}", error);
+        assert!(error.contains(&agent_id), "names the revoked key: {}", error);
+        assert!(
+            error.contains(&never_fetched),
+            "names the specific absent boundary parcel: {}",
+            error
+        );
+        assert!(
+            !error.to_lowercase().contains("tampered"),
+            "an unresolved boundary is a store limitation, not evidence of tampering: {}",
+            error
+        );
+    }
+
+    /// The case a heads-only presence pre-scan cannot catch: every one of the key's recorded
+    /// `distrust_boundary` heads is present, but an *interior* ancestor the walk must cross to
+    /// reach the signed parcel is not. Before the walk itself tracked gaps, a pre-scan of just
+    /// the boundary heads would see nothing wrong (the one head named is right there) and
+    /// `vouched` would come back `false` from a walk that quietly gave up at the gap — exactly
+    /// reproducing the bug this fix round closed: a genuinely-in-boundary parcel misreported
+    /// as tampering, purely because this store lost (or never had) something *behind* the
+    /// boundary head, not the head itself.
+    #[test]
+    fn an_absent_interior_ancestor_behind_a_present_boundary_head_is_unresolved_not_suspect() {
+        let _scratch = Scratch::new("distrust-boundary-interior-gap");
+
+        let (admin_key, admin_id, admin_hex) = keypair(71);
+        let (agent_key, agent_id, agent_hex) = keypair(72);
+
+        let root = endorsed_key(ALICE, &admin_key, &admin_id, &admin_hex, &admin_key, &admin_id);
+        let mut agent = endorsed_key(BOB, &agent_key, &agent_id, &agent_hex, &admin_key, &admin_id);
+
+        // target <- missing_ancestor <- boundary_head: `target` genuinely sits inside the
+        // boundary's ancestry, but the walk can never prove it — `missing_ancestor` is never
+        // stored (as if lost, or never fetched), so a walk starting at the present
+        // `boundary_head` runs out of road one hop short of `target`.
+        let target = store_parcel(Vec::new());
+
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+        use crate::model::parcel::Parcel;
+
+        let missing_ancestor_parcel = Parcel {
+            tree_hash: "e".repeat(64),
+            parents: vec![target.clone()],
+            actions: Vec::new(),
+            description: None,
+        };
+        // Computed, but deliberately never `.store()`d.
+        let missing_ancestor = LooseObjectBuilder::build_parcel(&missing_ancestor_parcel).hash;
+
+        let boundary_head = store_parcel(vec![missing_ancestor.clone()]);
+
+        agent.retired_at = Some(2);
+        agent.revocation_reason = Some(crate::util::office_utils::RevocationReason::Compromise);
+        agent.distrust_boundary = vec![boundary_head];
+
+        let office_state = OfficeState {
+            users: vec![user(ALICE, Role::Admin, &admin_id), user(BOB, Role::Writer, &agent_id)],
+            keys: vec![root, agent],
+        };
+
+        sign_and_store(&target, &agent_id, &agent_key);
+
+        let anchor = TrustAnchor {
+            genesis: "0".repeat(64),
+            enabled_at: 0,
+            boundary: Vec::new(),
+            prior_genesis: None,
+            adopts: None,
+        };
+
+        let error = verify_pallet_history(&target, &anchor, &office_state, None).unwrap_err();
+
+        assert!(error.contains(&target), "names the parcel under question: {}", error);
+        assert!(
+            error.contains(&missing_ancestor),
+            "names the interior gap the walk actually hit, not just the (present) boundary \
+             head: {}",
+            error
+        );
+        assert!(
+            !error.to_lowercase().contains("tampered"),
+            "a gap behind a present boundary head is a store limitation, not evidence of \
+             tampering: {}",
+            error
+        );
     }
 
     /// The bulk chunk-presence seam (§9.4b W4): passes when the store lacks nothing, and fails
