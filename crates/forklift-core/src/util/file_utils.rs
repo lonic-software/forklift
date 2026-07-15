@@ -707,7 +707,10 @@ fn read_cache() -> &'static std::sync::Mutex<ReadCache> {
 /// The cache key: the object hash qualified by the warehouse's object root, so a server hosting
 /// several warehouses keeps them isolated (identical content shares a hash regardless, but a
 /// warehouse must never be served an object it does not itself hold).
-fn read_cache_key(hash: &str) -> String {
+///
+/// `pub(crate)` so `object_utils`'s parsed-tree cache can key itself identically — the two
+/// caches must never disagree about which warehouse a hash belongs to.
+pub(crate) fn read_cache_key(hash: &str) -> String {
     format!("{}\u{0}{}", get_path_objects_root(), hash)
 }
 

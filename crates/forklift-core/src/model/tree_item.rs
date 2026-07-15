@@ -3,6 +3,13 @@ use std::collections::BTreeMap;
 use crate::enums::dir_entry_type::DirEntryType;
 
 /// Represents a tree item (i.e., a directory or file).
+///
+/// `Clone` is cheap: only one level is ever loaded (see [`object_utils::load_tree`]), so a
+/// subtree child's own `tree_children`/`file_children` are always empty maps — cloning a
+/// `TreeItem` copies its immediate entries, never a whole subtree recursively.
+///
+/// [`object_utils::load_tree`]: crate::util::object_utils::load_tree
+#[derive(Clone)]
 pub struct TreeItem {
     pub name: String,
     pub hash: String,

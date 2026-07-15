@@ -1,9 +1,11 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+use std::sync::Arc;
 use serde::Serialize;
 use forklift_core::enums::diff_type::DiffType;
 use forklift_core::enums::dir_entry_type::DirEntryType;
 use forklift_core::model::diff::Diff;
+use forklift_core::model::inventory::Inventory;
 use forklift_core::model::tree_item::TreeItem;
 use forklift_core::util::path_utils::WarehousePath;
 use forklift_core::util::scope_utils::{self, MaterializationScope, ScopeClass};
@@ -121,7 +123,7 @@ pub async fn handle_command(staged: bool, targets: &[String], verbose: bool) -> 
 /// * `Ok(())`      - If the diff completed.
 /// * `Err(String)` - If a shard, blob or working file could not be read.
 async fn diff_worktree(filter: Option<&WarehousePath>, verbose: bool) -> Result<(), String> {
-    let changes = stocktake_utils::collect_unstaged_changes().await?;
+    let (changes, shards) = stocktake_utils::collect_unstaged_changes_with_shards().await?;
 
     // The line-by-line diff is a human display; a program gets the changed-file set
     // (path + kind) and reads content by hash when it needs it (§7.4 keeps agent
@@ -146,10 +148,10 @@ async fn diff_worktree(filter: Option<&WarehousePath>, verbose: bool) -> Result<
 
         let (old_content, new_content) = match (change.kind, &change.moved_from) {
             (ChangeKind::Untracked, _) => continue,
-            (ChangeKind::Removed, _) => (inventory_content(&change.path)?, DiffSide::empty()),
+            (ChangeKind::Removed, _) => (inventory_content(&change.path, &shards)?, DiffSide::empty()),
             (ChangeKind::Moved, Some(from)) =>
-                (inventory_content(from)?, worktree_content(&change.path)?),
-            _ => (inventory_content(&change.path)?, worktree_content(&change.path)?),
+                (inventory_content(from, &shards)?, worktree_content(&change.path)?),
+            _ => (inventory_content(&change.path, &shards)?, worktree_content(&change.path)?),
         };
 
         print_file_diff(change.kind, &change_label(change), &old_content, &new_content,
@@ -183,7 +185,8 @@ async fn diff_staged(filter: Option<&WarehousePath>, verbose: bool) -> Result<()
         None => None,
     };
 
-    let changes = stocktake_utils::collect_staged_changes(head_tree_hash.as_deref()).await?;
+    let (changes, shards) =
+        stocktake_utils::collect_staged_changes_with_shards(head_tree_hash.as_deref()).await?;
 
     if output::is_json() {
         let files = changes.iter()
@@ -222,7 +225,7 @@ async fn diff_staged(filter: Option<&WarehousePath>, verbose: bool) -> Result<()
 
         let new_content = match change.kind {
             ChangeKind::Removed => DiffSide::empty(),
-            _ => inventory_content(&change.path)?,
+            _ => inventory_content(&change.path, &shards)?,
         };
 
         print_file_diff(change.kind, &change_label(change), &old_content, &new_content,
@@ -642,14 +645,22 @@ fn is_within(path: &str, filter: Option<&WarehousePath>) -> bool {
 /// Get the staged content of a tracked file: its inventory entry's blob.
 ///
 /// # Arguments
-/// * `path` - The warehouse path of the file.
+/// * `path`   - The warehouse path of the file.
+/// * `shards` - The per-directory inventories the preceding stocktake walk already parsed
+///              (see `stocktake_utils::collect_staged_changes_with_shards`/
+///              `collect_unstaged_changes_with_shards`). A directory's shard is read fresh
+///              only when it is missing from this invocation-scoped memo.
 ///
 /// # Returns
 /// * `Ok(Vec<u8>)` - The blob content.
 /// * `Err(String)` - If the file has no inventory entry or the blob could not be read.
-fn inventory_content(path: &str) -> Result<DiffSide, String> {
+fn inventory_content(path: &str, shards: &HashMap<String, Arc<Inventory>>) -> Result<DiffSide, String> {
     let (parent_key, name) = split_parent(path);
-    let inventory = stocktake_utils::load_shard_or_empty(parent_key)?;
+
+    let inventory = match shards.get(parent_key) {
+        Some(inventory) => Arc::clone(inventory),
+        None => Arc::new(stocktake_utils::load_shard_or_empty(parent_key)?),
+    };
 
     let Some(item) = inventory.get_item_by_name(name) else {
         return Err(format!("\"{}\" is not in the inventory.", path));
