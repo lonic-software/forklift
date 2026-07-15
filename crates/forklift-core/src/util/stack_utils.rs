@@ -5,8 +5,8 @@ use crate::model::operator::Operator;
 use crate::model::parcel::Parcel;
 use crate::model::parcel_action::ParcelAction;
 use crate::util::{
-    cherry_pick_utils, config_utils, inventory_utils, merge_utils, object_utils, office_utils,
-    pallet_utils, scope_utils, sign_utils, tree_utils,
+    cherry_pick_utils, config_utils, file_utils, inventory_utils, merge_utils, object_utils,
+    office_utils, pallet_utils, scope_utils, sign_utils, tree_utils,
 };
 
 /// Resolve the key a parcel must be signed with: `None` while trust is not established,
@@ -70,7 +70,14 @@ pub async fn stack_parcel(description: Option<String>) -> Result<(String, String
     // stack before objects are written.
     let signing_key_id = resolve_signing_key(&operator)?;
 
-    if inventory_utils::has_conflict_entries()? {
+    // Every inventory shard is read and parsed exactly once here (§ perf: this used to be three
+    // separate full O(shard count) passes — the conflict check, the tree build and the
+    // post-stack cleanup each re-read and re-parsed the same on-disk shards). The parse happens
+    // up front, before anything is written, so the conflict check below still runs strictly
+    // before any warehouse mutation — parse-then-check-then-write, exactly as before.
+    let prepared = std::sync::Arc::new(inventory_utils::prepare_stack_inventory()?);
+
+    if inventory_utils::has_conflict_entries_in(&prepared) {
         return Err(
             "There are unresolved conflicts in the inventory. Resolve them, \"load\" the \
             resolved files, and stack again (see \"stocktake\" for the list).".to_string()
@@ -96,7 +103,17 @@ pub async fn stack_parcel(description: Option<String>) -> Result<(String, String
     let pallet = pallet_utils::get_current_pallet_name()?;
     let head = pallet_utils::get_pallet_head(&pallet)?;
 
-    let partial_root = tree_utils::build_tree_from_inventory().await?
+    // Every tree object built below is staged into `batch`, not fsynced immediately — one
+    // durability barrier for the whole burst instead of a per-object fsync pair (§ perf). The
+    // tree build runs from `TaskExecutor`'s parallel workers, so this uses `WriteBatch` (its
+    // `stage` is safe to share across threads), not `BulkStoreSession` (a documented
+    // single-sequential-writer primitive — see its doc comment for why sharing it across
+    // parallel writers is unsafe). Nothing may depend on a staged object's durability or
+    // visibility until `batch.finish()` below returns `Ok` — in particular the pallet head is
+    // only ever set after that, never staged into this same batch (see the comment there).
+    let batch = std::sync::Arc::new(file_utils::WriteBatch::new());
+
+    let partial_root = tree_utils::build_tree_from_inventory_deferred(&prepared, &batch).await?
         .ok_or("There is nothing to stack. Use the \"load\" command to stage changes first.".to_string())?;
 
     // In a scoped (sparse) bay the dock materializes only the in-scope subtree(s), so the freshly
@@ -124,8 +141,11 @@ pub async fn stack_parcel(description: Option<String>) -> Result<(String, String
             None => merge_utils::OutOfScopeSkeleton::default(),
         };
 
+        // Runs sequentially (no TaskExecutor here), but staged into the very same batch as the
+        // parallel tree build above so every spine object it writes joins the same one barrier.
         tree_utils::build_scoped_root_tree(
-            head_root_hash.as_deref(), &partial_root, &scope, skeleton.entries()
+            head_root_hash.as_deref(), &partial_root, &scope, skeleton.entries(),
+            &tree_utils::ObjectSink::Deferred(std::sync::Arc::clone(&batch)),
         )?
     };
 
@@ -223,18 +243,40 @@ pub async fn stack_parcel(description: Option<String>) -> Result<(String, String
         description,
     };
 
+    // The parcel object itself joins the same batch as the tree objects it points to: the head
+    // will reference it directly, so it must be just as durable as everything beneath it before
+    // anything downstream can see it.
     let mut object = LooseObjectBuilder::build_parcel(&parcel);
-    object.store()?;
+    object.store_deferred(&batch)?;
+
+    // The barrier: every tree object and the parcel object staged above become durable and
+    // visible at their final content-addressed paths now, all at once, in exchange for far
+    // fewer device flushes than fsyncing each individually. This must complete (return `Ok`)
+    // before anything below is allowed to reference what it just published — the signature
+    // sidecar and the pallet head are both written only from this point on, deliberately kept
+    // out of this same batch (see the crash-ordering note on `set_pallet_head` below).
+    batch.finish()?;
 
     if let Some(key_id) = &signing_key_id {
         let signature = sign_utils::sign_parcel_hash(key_id, &object.hash)?;
         sign_utils::store_parcel_signature(&object.hash, &signature)?;
     }
 
+    // Deliberately its own separate atomic write (unbatched, exactly as every other caller of
+    // `set_pallet_head`), not folded into `batch` above: `WriteBatch::finish` offers no
+    // atomicity *across* its entries, only that each one individually is never visible before
+    // its bytes are durable (see its doc comment). Sequencing the ref write as a distinct step
+    // that only starts after `batch.finish()` has already returned `Ok` is what guarantees the
+    // head can never become visible pointing at a parcel (or any tree beneath it) that is not
+    // yet durable — batching the ref in with the objects it references would trade that
+    // guarantee for a few more saved fsyncs, which is not a trade this makes.
     pallet_utils::set_pallet_head(&pallet, &object.hash)?;
 
     // The parcel consumed the staged removals (and the consolidation or cherry-pick, if any).
-    inventory_utils::cleanup_after_stack()?;
+    // Reuses the same parsed snapshot the conflict check and tree build already read — nothing
+    // between then and here changes a shard's content on disk, only the object store, the ref
+    // and the signature sidecar (see `cleanup_after_stack_with`'s doc comment).
+    inventory_utils::cleanup_after_stack_with(&prepared)?;
     merge_utils::clear_consolidation_state()?;
     merge_utils::OutOfScopeSkeleton::clear()?;
     cherry_pick_utils::clear_state()?;

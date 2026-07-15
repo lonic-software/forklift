@@ -183,9 +183,116 @@ pub fn load_parcel(hash: &str) -> Result<Parcel, String> {
     }
 }
 
+/// A bounded content-addressed cache of *parsed* trees, one layer above `file_utils`'s raw-bytes
+/// read cache. A tree's hash is its content and `parser::object::loose_object_parser::parse` is a
+/// pure function of the bytes (no environment, no randomness), so a hash-keyed parse is valid
+/// forever — the only question is how much of it to keep around, not when to invalidate it.
+///
+/// Without this, a reconstruction-heavy walk that revisits the same tree from many descents
+/// (`resolve_tree_file` walking root→leaf once per changed file, each time re-entering the same
+/// shared ancestors) re-parses that tree's bytes — reallocating every entry's name and hash
+/// `String` — on every visit, even though the byte cache below already served the decompressed
+/// bytes for free. Caching the *parse* turns every visit after the first into a pointer clone.
+///
+/// Mirrors `file_utils`'s read cache exactly — both share [`super::two_gen_cache::TwoGenCache`]'s
+/// eviction/bounding shape, so they can't silently drift apart. Same warehouse-qualified key
+/// (`read_cache_key`, so a server hosting several warehouses never serves one's parsed tree for
+/// another's request). It is weighted by each tree's raw object size (the number already in hand
+/// from the byte-cache read that always precedes a parse here) as an inexpensive proxy for the
+/// parsed form's live memory — budgeted well below the byte cache's own 128 MiB, since a parsed
+/// tree's `String`s cost more live memory per input byte than the bytes they were parsed from,
+/// and this cache is additive on top of (not a replacement for) the byte cache it sits above.
+const TREE_PARSE_CACHE_BUDGET: usize = 32 * 1024 * 1024;
+
+/// Trees whose raw bytes exceed this are not cached (one huge tree must not evict the whole
+/// working set of small trees a walk actually revisits) — the same one-eighth-of-budget ratio
+/// `file_utils::READ_CACHE_MAX_ENTRY` uses.
+const TREE_PARSE_CACHE_MAX_ENTRY: usize = TREE_PARSE_CACHE_BUDGET / 8;
+
+fn tree_parse_cache() -> &'static crate::util::two_gen_cache::TwoGenCache<TreeItem> {
+    static CACHE: std::sync::OnceLock<crate::util::two_gen_cache::TwoGenCache<TreeItem>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(||
+        crate::util::two_gen_cache::TwoGenCache::new(TREE_PARSE_CACHE_BUDGET, TREE_PARSE_CACHE_MAX_ENTRY)
+    )
+}
+
+fn tree_parse_cache_get(hash: &str) -> Option<std::sync::Arc<TreeItem>> {
+    tree_parse_cache().get(&file_utils::read_cache_key(hash))
+}
+
+fn tree_parse_cache_put(hash: &str, tree: std::sync::Arc<TreeItem>, weight: usize) {
+    tree_parse_cache().put(&file_utils::read_cache_key(hash), tree, weight);
+}
+
+/// Read and parse a tree object's bytes straight from the byte cache, touching the parsed-tree
+/// cache neither for a hit nor a put. The shared core of both `load_tree`'s and
+/// [`load_tree_shared`]'s miss path — the parse itself, and the byte length [`load_tree_shared`]
+/// needs to weigh the cache entry it inserts.
+///
+/// # Returns
+/// * `Ok((TreeItem, usize))` - The parsed tree and its raw (pre-parse) object byte length.
+/// * `Err(String)`           - If the object does not exist, could not be parsed, or is not a tree.
+fn parse_tree_uncached(hash: &str) -> Result<(TreeItem, usize), String> {
+    // Only the parse borrows the bytes, so take the shared `Arc` — a byte-cache hit is a pointer
+    // clone under its lock, not a copy of the whole tree object.
+    let bytes = file_utils::retrieve_object_by_hash_shared(hash)?;
+
+    let tree = match parser::object::loose_object_parser::parse(&bytes)? {
+        ParsedObject::Tree(tree) => tree,
+        other => return Err(format!("Object {} is a {}, not a tree.", hash, other.get_type())),
+    };
+
+    Ok((tree, bytes.len()))
+}
+
+/// Load and parse the tree object with the given hash from the object store, sharing the parsed
+/// result through the process-wide parsed-tree cache (see the module-level
+/// [`super::two_gen_cache::TwoGenCache`] this is built on). Note that only one level is loaded: the
+/// returned tree's subtree children carry their hashes, but their own children must be loaded
+/// separately.
+///
+/// Callers that only need to borrow the tree (walk its entries, look one up by name) should
+/// prefer this over [`load_tree`]: a cache hit is a pointer clone, not a copy of the tree's
+/// entries. Prefer it specifically for a tree a caller expects to *revisit* — a resolve or walk
+/// that re-enters the same shared ancestors from many descents. A one-shot caller that reads each
+/// tree at most once (a full-history walk, an export) should still use [`load_tree`]: caching a
+/// tree it will never revisit only pays a cache-maintenance tax and evicts trees other callers
+/// (in the same process) would have reused.
+///
+/// # Arguments
+/// * `hash` - The hash of the tree object.
+///
+/// # Returns
+/// * `Ok(Arc<TreeItem>)` - The parsed tree, shared with the cache.
+/// * `Err(String)`       - If the object does not exist, could not be parsed, or is not a tree.
+pub fn load_tree_shared(hash: &str) -> Result<std::sync::Arc<TreeItem>, String> {
+    if let Some(tree) = tree_parse_cache_get(hash) {
+        return Ok(tree);
+    }
+
+    let (tree, weight) = parse_tree_uncached(hash)?;
+
+    let tree = std::sync::Arc::new(tree);
+    tree_parse_cache_put(hash, std::sync::Arc::clone(&tree), weight);
+    Ok(tree)
+}
+
 /// Load and parse the tree object with the given hash from the object store.
 /// Note that only one level is loaded: the returned tree's subtree children carry their
 /// hashes, but their own children must be loaded separately.
+///
+/// This owns-the-tree form is for callers that keep or mutate the result. Callers that only
+/// *borrow* the tree (a walk that just reads entries) should use [`load_tree_shared`], which hands
+/// back the cached `Arc` so a hit is a pointer clone rather than a clone of every entry.
+///
+/// A cache hit is served the same way `load_tree_shared` serves one (a pointer clone, then one
+/// `TreeItem` clone off the lock — cheap, since only one tree level is ever loaded, see the
+/// type's doc comment). A cache *miss*, though, is parsed and returned directly without ever
+/// entering the parsed-tree cache: this owned form is also the one every one-shot walk uses (gc
+/// reachability, `export-git`, `merge`, `audit`), and those never revisit a tree they load, so
+/// caching it here would only evict the shared-ancestor working set `load_tree_shared`'s
+/// revisit-heavy callers actually rely on, for a cache entry that would never be hit again.
 ///
 /// # Arguments
 /// * `hash` - The hash of the tree object.
@@ -194,14 +301,12 @@ pub fn load_parcel(hash: &str) -> Result<Parcel, String> {
 /// * `Ok(TreeItem)` - The parsed tree.
 /// * `Err(String)`  - If the object does not exist, could not be parsed, or is not a tree.
 pub fn load_tree(hash: &str) -> Result<TreeItem, String> {
-    // Only the parse borrows the bytes, so take the shared `Arc` — a cache hit is a pointer
-    // clone under the lock, not a copy of the whole tree object.
-    let bytes = file_utils::retrieve_object_by_hash_shared(hash)?;
-
-    match parser::object::loose_object_parser::parse(&bytes)? {
-        ParsedObject::Tree(tree) => Ok(tree),
-        other => Err(format!("Object {} is a {}, not a tree.", hash, other.get_type())),
+    if let Some(tree) = tree_parse_cache_get(hash) {
+        // The single clone an owned caller needs happens here, *outside* the cache lock.
+        return Ok((*tree).clone());
     }
+
+    Ok(parse_tree_uncached(hash)?.0)
 }
 
 /// Load and parse the blob object with the given hash from the object store.
@@ -340,7 +445,12 @@ pub fn load_chunk(hash: &str) -> Result<Chunk, String> {
 /// * `Err(String)`                      - If a tree object could not be loaded.
 pub fn resolve_tree_file(root_tree_hash: &str,
                          path: &str) -> Result<Option<(String, DirEntryType)>, String> {
-    let mut current = load_tree(root_tree_hash)?;
+    // Every ancestor along the walk is only ever borrowed (name/hash lookups), so the shared
+    // form pays off here in particular: a caller resolving many paths under the same root (a
+    // `diff --staged` render loop, one call per changed file) re-enters the same shared ancestor
+    // trees over and over, and each re-entry after the first is a pointer clone out of the cache
+    // instead of a re-parse.
+    let mut current = load_tree_shared(root_tree_hash)?;
     let components: Vec<&str> = path.split('/').collect();
 
     for (index, component) in components.iter().enumerate() {
@@ -359,7 +469,7 @@ pub fn resolve_tree_file(root_tree_hash: &str,
             .map(|(_, item)| item.hash.clone());
 
         match subtree {
-            Some(subtree_hash) => current = load_tree(&subtree_hash)?,
+            Some(subtree_hash) => current = load_tree_shared(&subtree_hash)?,
             None => return Ok(None),
         }
     }

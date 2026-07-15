@@ -47,4 +47,33 @@ impl LooseObject {
 
         Ok((path.add(file_utils::PATH_SEPARATOR).add(&file_name), !does_exist))
     }
+
+    /// Stage this object's write into `batch` instead of writing (and fsyncing) it immediately.
+    /// See [`file_utils::WriteBatch`] for why: `stack`'s tree build writes from parallel workers,
+    /// where [`file_utils::BulkStoreSession`] cannot safely be shared (see its doc comment).
+    ///
+    /// The caller must call `batch.finish()` — and it must return `Ok` — before anything is
+    /// allowed to depend on this object's durability or visibility (a ref pointing at it, or a
+    /// reader expecting to find it): staging alone makes no promise about either.
+    ///
+    /// # Returns
+    /// * `Ok((String, bool))`:
+    ///    * `String`: The full path (relative to the root of the warehouse) where the object
+    ///      will be stored once `batch.finish()` runs.
+    ///    * `bool`: True if a write was staged, false if the object already existed and nothing
+    ///      was staged at all.
+    /// * `Err(String)` - The error message, if the operation failed.
+    pub fn store_deferred(&mut self, batch: &file_utils::WriteBatch) -> Result<(String, bool), String> {
+        object_utils::check_object_ceiling(&self.object_type, self.content.len())?;
+
+        let does_exist = file_utils::does_object_exist(&self.hash)?;
+        let (path, file_name) = file_utils::get_path_for_object(&self.hash)?;
+
+        if !does_exist {
+            let compressed = self.compress()?;
+            file_utils::write_object_to_file_deferred(Path::new(&path), &file_name, compressed, batch)?;
+        }
+
+        Ok((path.add(file_utils::PATH_SEPARATOR).add(&file_name), !does_exist))
+    }
 }

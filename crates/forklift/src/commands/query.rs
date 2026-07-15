@@ -100,8 +100,9 @@ pub async fn handle_command(args: QueryArgs) -> Result<(), String> {
     }
 
     // Human output streams match-by-match, so a quit pager or a closed `| head` stops the
-    // walk and memory stays bounded.
-    let mut out = std::io::stdout().lock();
+    // walk and memory stays bounded. Buffered (256KiB) so the many small per-match writes
+    // become a handful of `write` syscalls instead of one each.
+    let mut out = std::io::BufWriter::with_capacity(256 * 1024, std::io::stdout().lock());
     let mut shown = 0usize;
     let mut revoked = 0usize;
     let mut suspect = 0usize;
@@ -122,7 +123,13 @@ pub async fn handle_command(args: QueryArgs) -> Result<(), String> {
             render_match(&mut out, &found, &office, shown == 0)
         };
         shown += 1;
-        rendered.is_ok()
+
+        // Flushed after every match, not just at the end: matches are expensive to produce
+        // (signature verification between them), so one syscall per match is negligible —
+        // and without it, the 256KiB buffer would make a verified query look hung, and a
+        // reader going away (`| head`, a closed pager) would only be noticed once the
+        // buffer fills. A failed flush is a write error like any other: stop the walk.
+        rendered.is_ok() && out.flush().is_ok()
     })?;
 
     // The trailing honesty note, printed when there is something to be honest about:
@@ -156,6 +163,11 @@ pub async fn handle_command(args: QueryArgs) -> Result<(), String> {
     }
 
     let _ = outcome;
+
+    // BufWriter's Drop flush swallows its error; flush explicitly and, matching the write
+    // above, ignore a failure (the reader is gone, there's nothing left to do about it).
+    let _ = out.flush();
+
     Ok(())
 }
 

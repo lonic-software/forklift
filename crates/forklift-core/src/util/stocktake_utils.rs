@@ -91,6 +91,35 @@ impl Change {
 /// * `Ok(Vec<Change>)` - The staged changes, sorted by path.
 /// * `Err(String)`     - If a shard or tree object could not be read.
 pub async fn collect_staged_changes(head_tree_hash: Option<&str>) -> Result<Vec<Change>, String> {
+    collect_staged_changes_impl(head_tree_hash, false).await.map(|(changes, _)| changes)
+}
+
+/// Like [`collect_staged_changes`], but also returns the per-directory inventories the walk
+/// parsed along the way, keyed by warehouse path key.
+///
+/// `diff --staged` uses this to render each changed file's staged content without re-reading and
+/// re-parsing a shard the walk already read moments earlier — see `diff.rs`'s
+/// `inventory_content`. The map is invocation-scoped: it belongs to this one walk, never a
+/// process-wide cache, because a shard is a mutable file (unlike the content-addressed object
+/// caches in `file_utils`/`object_utils`, which are safe to share across calls forever).
+///
+/// # Arguments
+/// * `head_tree_hash` - The hash of the head parcel's tree, or `None` for an unborn pallet.
+///
+/// # Returns
+/// * `Ok((Vec<Change>, HashMap<String, Arc<Inventory>>))` - The staged changes (sorted by path)
+///   and the shards the walk parsed.
+/// * `Err(String)` - If a shard or tree object could not be read.
+pub async fn collect_staged_changes_with_shards(head_tree_hash: Option<&str>)
+    -> Result<(Vec<Change>, HashMap<String, Arc<Inventory>>), String> {
+    collect_staged_changes_impl(head_tree_hash, true).await
+}
+
+/// The shared body of [`collect_staged_changes`] and [`collect_staged_changes_with_shards`].
+/// `collect_shards` gates whether the walk pays for populating the shard memo — see
+/// [`ChangeWalkContext::collect_shards`].
+async fn collect_staged_changes_impl(head_tree_hash: Option<&str>, collect_shards: bool)
+    -> Result<(Vec<Change>, HashMap<String, Arc<Inventory>>), String> {
     let (_, metadata_opt) = file_utils::retrieve_inventory_metadata_or_none()?;
     let metadata = metadata_opt.unwrap_or_default();
 
@@ -99,8 +128,11 @@ pub async fn collect_staged_changes(head_tree_hash: Option<&str>) -> Result<Vec<
         .collect();
     let children = Arc::new(directory_children(&keys));
 
+    // Only ever borrowed by the walk below (name/hash lookups over its files and subtrees, one
+    // level at a time) — the shared form avoids cloning every entry of a root tree that can be
+    // large (the whole warehouse's top level).
     let head_tree = match head_tree_hash {
-        Some(hash) => Some(object_utils::load_tree(hash)?),
+        Some(hash) => Some(object_utils::load_tree_shared(hash)?),
         None => None,
     };
 
@@ -110,7 +142,7 @@ pub async fn collect_staged_changes(head_tree_hash: Option<&str>) -> Result<Vec<
     // unchanged there.
     let scope = Arc::new(scope_utils::current_scope()?);
 
-    let context = Arc::new(ChangeWalkContext::new());
+    let context = Arc::new(ChangeWalkContext::new(collect_shards));
     let executor = TaskExecutor::new(Arc::clone(&context));
 
     let root_task: Task<(), String> = Box::pin(walk_directory_staged(
@@ -131,7 +163,9 @@ pub async fn collect_staged_changes(head_tree_hash: Option<&str>) -> Result<Vec<
 
     changes.sort_by(|a, b| a.path.cmp(&b.path));
 
-    Ok(changes)
+    let shards = std::mem::take(&mut *context.shards.lock().await);
+
+    Ok((changes, shards))
 }
 
 /// The per-directory task of the staged walk: compare one directory's shard against the
@@ -150,7 +184,7 @@ pub async fn collect_staged_changes(head_tree_hash: Option<&str>) -> Result<Vec<
 /// * `Err(String)` - If a shard or tree object could not be read.
 fn walk_directory_staged(context: Arc<ChangeWalkContext>,
                          key: String,
-                         head_tree: Option<TreeItem>,
+                         head_tree: Option<Arc<TreeItem>>,
                          children: Arc<BTreeMap<String, Vec<String>>>,
                          scope: Arc<MaterializationScope>)
                          -> impl Future<Output = Result<(), String>> + Send {
@@ -161,7 +195,8 @@ fn walk_directory_staged(context: Arc<ChangeWalkContext>,
         // them away entirely, the same way `stack_parcel` gates the whole overlay on `is_full()`.
         let scope_is_full = scope.is_full();
 
-        let inventory = load_shard_or_empty(&key)?;
+        let inventory = Arc::new(load_shard_or_empty(&key)?);
+
         let mut found: Vec<Change> = Vec::new();
 
         let head_files: BTreeMap<&String, &TreeItem> = head_tree.as_ref()
@@ -223,7 +258,7 @@ fn walk_directory_staged(context: Arc<ChangeWalkContext>,
             let child_name = last_component(child_key);
 
             let child_head_tree = match head_subtrees.get(&child_name.to_string()) {
-                Some(subtree) => Some(object_utils::load_tree(&subtree.hash)?),
+                Some(subtree) => Some(object_utils::load_tree_shared(&subtree.hash)?),
                 None => None,
             };
 
@@ -248,7 +283,7 @@ fn walk_directory_staged(context: Arc<ChangeWalkContext>,
                     continue;
                 }
 
-                let subtree_tree = object_utils::load_tree(&subtree.hash)?;
+                let subtree_tree = object_utils::load_tree_shared(&subtree.hash)?;
 
                 context.send_task(Box::pin(walk_directory_staged(
                     Arc::clone(&context),
@@ -258,6 +293,18 @@ fn walk_directory_staged(context: Arc<ChangeWalkContext>,
                     Arc::clone(&scope),
                 )))?;
             }
+        }
+
+        // Shared with the caller so a content-render pass over this walk's changes (`diff
+        // --staged`) can reuse this parse instead of re-reading and re-parsing the same shard.
+        // Gated twice over: `collect_shards` (a caller that only wants the change list never
+        // reads this map, so it must not pay for the extra lock) and, per directory, whether
+        // this directory actually produced a change (the render loop only ever looks up a
+        // *changed* file's parent shard — retaining every walked directory's inventory here
+        // would be O(whole inventory), defeating the point of sharding it by directory in the
+        // first place; O(changed directories) is what the memo is for).
+        if context.collect_shards && !found.is_empty() {
+            context.shards.lock().await.insert(key.clone(), inventory);
         }
 
         context.changes.lock().await.extend(found);
@@ -276,6 +323,27 @@ fn walk_directory_staged(context: Arc<ChangeWalkContext>,
 /// * `Ok(Vec<Change>)` - The unstaged changes, sorted by path.
 /// * `Err(String)`     - If the working directory or a shard could not be read.
 pub async fn collect_unstaged_changes() -> Result<Vec<Change>, String> {
+    collect_unstaged_changes_impl(false).await.map(|(changes, _)| changes)
+}
+
+/// Like [`collect_unstaged_changes`], but also returns the per-directory inventories the walk
+/// parsed along the way, keyed by warehouse path key — see
+/// [`collect_staged_changes_with_shards`] for why this exists and why it is invocation-scoped.
+///
+/// # Returns
+/// * `Ok((Vec<Change>, HashMap<String, Arc<Inventory>>))` - The unstaged changes (sorted by
+///   path) and the shards the walk parsed.
+/// * `Err(String)` - If the working directory or a shard could not be read.
+pub async fn collect_unstaged_changes_with_shards()
+    -> Result<(Vec<Change>, HashMap<String, Arc<Inventory>>), String> {
+    collect_unstaged_changes_impl(true).await
+}
+
+/// The shared body of [`collect_unstaged_changes`] and [`collect_unstaged_changes_with_shards`].
+/// `collect_shards` gates whether the walk pays for populating the shard memo — see
+/// [`ChangeWalkContext::collect_shards`].
+async fn collect_unstaged_changes_impl(collect_shards: bool)
+    -> Result<(Vec<Change>, HashMap<String, Arc<Inventory>>), String> {
     let ignored_paths = Arc::new(file_utils::get_ignored_paths()?);
 
     let (_, metadata_opt) = file_utils::retrieve_inventory_metadata_or_none()?;
@@ -285,7 +353,7 @@ pub async fn collect_unstaged_changes() -> Result<Vec<Change>, String> {
         .map(|entry| inventory_utils::metadata_entry_to_key(entry).to_string())
         .collect());
 
-    let context = Arc::new(ChangeWalkContext::new());
+    let context = Arc::new(ChangeWalkContext::new(collect_shards));
     let executor = TaskExecutor::new(Arc::clone(&context));
 
     let root_task: Task<(), String> = Box::pin(walk_directory_unstaged(
@@ -305,7 +373,9 @@ pub async fn collect_unstaged_changes() -> Result<Vec<Change>, String> {
 
     changes.sort_by(|a, b| a.path.cmp(&b.path));
 
-    Ok(changes)
+    let shards = std::mem::take(&mut *context.shards.lock().await);
+
+    Ok((changes, shards))
 }
 
 /// The per-directory task of the unstaged walk: reconcile one tracked directory's
@@ -345,6 +415,7 @@ fn walk_directory_unstaged(context: Arc<ChangeWalkContext>,
                 .map_err(|e| format!("Error while parsing the inventory of folder \"{}\": {}", key, e))?,
             None => Inventory::new(),
         };
+        let inventory = Arc::new(inventory);
 
         let mut found: Vec<Change> = Vec::new();
         let mut seen_files: BTreeSet<String> = BTreeSet::new();
@@ -443,6 +514,13 @@ fn walk_directory_unstaged(context: Arc<ChangeWalkContext>,
             if !seen_dirs.contains(relative) && !ignored_names.contains(relative) {
                 report_missing_directory_unstaged(tracked_key, &keys, &mut found)?;
             }
+        }
+
+        // Shared with the caller so a content-render pass over this walk's changes (`diff`) can
+        // reuse this parse instead of re-reading and re-parsing the same shard. Gated — see the
+        // matching comment in `walk_directory_staged`.
+        if context.collect_shards && !found.is_empty() {
+            context.shards.lock().await.insert(key.clone(), inventory);
         }
 
         context.changes.lock().await.extend(found);

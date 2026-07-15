@@ -267,6 +267,33 @@ fn write_and_sync_file(path: &Path, content: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// Generate a fresh, process-unique temp-file path for `file_path`.
+///
+/// The temporary name must be unique per *write*, not just per process: two parallel tasks
+/// writing the same path (e.g. storing identical object content) would otherwise share a
+/// temporary file and race each other's rename. This counter is shared by every writer that
+/// stages a temp file this way — [`write_file_atomically`] itself, [`BulkStoreSession`]'s
+/// deferred writes (which call `write_file_atomically` directly), and [`WriteBatch::stage`] — so
+/// no two ever collide even when several are staging concurrently.
+/// `object_utils::store_object_stream` writes its own temp files off its own independent
+/// counter — its `.stream.tmp` infix (vs. this function's plain `.tmp`) is deliberately
+/// different so the two paths can never collide on the same temp name even if both counters
+/// reach the same numeric value at the same moment (two independent counters offer no such
+/// guarantee on their own).
+fn temp_path_for(file_path: &Path) -> Result<PathBuf, String> {
+    static TEMP_FILE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let write_id = TEMP_FILE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    let file_name = file_path.file_name()
+        .ok_or(format!("Cannot write to \"{}\": it has no file name.", file_path.to_string_lossy()))?
+        .to_string_lossy();
+
+    let mut temporary_file_path = PathBuf::from(file_path);
+    temporary_file_path.set_file_name(format!("{}.tmp{}-{}", file_name, std::process::id(), write_id));
+
+    Ok(temporary_file_path)
+}
+
 /// Write a file atomically: the content is written to a temporary file in the same folder first,
 /// fsynced, then renamed into place, and finally the parent directory is fsynced. A crash mid-write
 /// can therefore never leave a truncated file at the final path — the file either has its old
@@ -281,22 +308,7 @@ fn write_and_sync_file(path: &Path, content: &[u8]) -> Result<(), String> {
 /// * `Ok(())`      - If the file was written successfully.
 /// * `Err(String)` - If an error occurred while writing the file.
 pub fn write_file_atomically(file_path: &Path, content: &[u8]) -> Result<(), String> {
-    // The temporary name must be unique per *write*, not just per process: two parallel
-    // tasks writing the same path (e.g. storing identical object content) would otherwise
-    // share a temporary file and race each other's rename. `object_utils::store_object_stream`
-    // writes its own temp files the same way, off its own independent counter — its `.stream.tmp`
-    // infix (vs. this function's plain `.tmp`) is deliberately different so the two paths can
-    // never collide on the same temp name even if both counters reach the same numeric value at
-    // the same moment (two independent counters offer no such guarantee on their own).
-    static TEMP_FILE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let write_id = TEMP_FILE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-    let file_name = file_path.file_name()
-        .ok_or(format!("Cannot write to \"{}\": it has no file name.", file_path.to_string_lossy()))?
-        .to_string_lossy();
-
-    let mut temporary_file_path = PathBuf::from(file_path);
-    temporary_file_path.set_file_name(format!("{}.tmp{}-{}", file_name, std::process::id(), write_id));
+    let temporary_file_path = temp_path_for(file_path)?;
 
     // While a bulk-store session is active, stage the write and hand its (temp, final) pair to
     // the session instead of fsyncing and renaming here — `BulkStoreSession::finish` runs the
@@ -387,7 +399,17 @@ impl BulkStoreSession {
     ///    flushed device-wide, not per file, so one flush covers every write queued in step 1.
     /// 3. Only now: rename every temp file to its final name (metadata-only, so fast) and record
     ///    each distinct parent directory touched.
-    /// 4. Fsync every touched parent directory, so the renames themselves survive power loss.
+    /// 4. Fsync every touched parent directory, so the renames themselves survive power loss —
+    ///    using the exact same cheap-then-shared-flush structure as steps 1-2, one level up: a
+    ///    cheap per-directory `fsync` (Unix only — matching [`sync_dir`]'s own read-only open;
+    ///    Windows has no directory handle to fsync at all, see `sync_dir`'s doc comment) queues
+    ///    every touched directory's entry, then one more macOS-only `F_FULLFSYNC` (on any one of
+    ///    them) flushes the device-wide write cache again — covering every directory queued in
+    ///    this step, not just the file data from steps 1-2. On Linux the per-directory `fsync`
+    ///    alone is already full durability (as in step 1), so no second flush runs there either.
+    ///    A directory is fsynced *after* the renames into it (this step), never before — a
+    ///    directory entry cannot be queued for durability before the change that creates it
+    ///    exists on the filesystem.
     ///
     /// [`fsync_enabled`] gates steps 1, 2 and 4 exactly like every other writer's durability
     /// escape hatch — but the deferred-rename structure in step 3 always applies regardless,
@@ -399,7 +421,12 @@ impl BulkStoreSession {
     /// completed, so every temp file's bytes are durable *before* any rename runs — a crash
     /// partway through step 3 leaves some names published (durable bytes, correctly visible) and
     /// the rest as still-invisible temps. The invariant — a final name never exists before its
-    /// bytes are durable — holds in every interleaving.
+    /// bytes are durable — holds in every interleaving. Step 4 only ever makes an *already*
+    /// kernel-visible rename power-loss durable too (the same "visible now, power-loss durable
+    /// once fsynced" gap every single-write path already has between its own rename and its own
+    /// `sync_dir` call); it never widens what a crash between steps 3 and 4 can lose, since that
+    /// window is exactly the one `sync_dir` closes on every other path in this codebase, applied
+    /// once per directory instead of once per write.
     ///
     /// A hard kill mid-barrier is covered by that crash analysis (nothing survives that isn't
     /// either durable-and-published or an invisible temp for the existing stale-temp patterns to
@@ -430,7 +457,7 @@ impl BulkStoreSession {
             return Ok(());
         }
 
-        if let Err(error) = Self::run_barrier_steps(&pending) {
+        if let Err(error) = run_write_barrier(&pending) {
             for (temp, _) in &pending {
                 let _ = std::fs::remove_file(temp);
             }
@@ -439,37 +466,243 @@ impl BulkStoreSession {
 
         Ok(())
     }
+}
 
-    fn run_barrier_steps(pending: &[(PathBuf, PathBuf)]) -> Result<(), String> {
-        if fsync_enabled() {
-            for (temp, _) in pending {
-                fsync_data(temp)?;
-            }
-
-            #[cfg(target_os = "macos")]
-            macos_flush_device_cache(&pending[0].0)?;
+/// The four-step durability barrier shared by [`BulkStoreSession`] and [`WriteBatch`] — see
+/// [`BulkStoreSession::finish`]'s doc comment for the exact steps and the crash analysis. Kept
+/// as a free function (not tied to either type) so both share exactly one implementation of the
+/// crash-safety-critical ordering instead of risking it drifting between two copies.
+fn run_write_barrier(pending: &[(PathBuf, PathBuf)]) -> Result<(), String> {
+    if fsync_enabled() {
+        for (temp, _) in pending {
+            fsync_data(temp)?;
         }
 
-        let mut touched_parents: BTreeSet<PathBuf> = BTreeSet::new();
-        for (temp, final_path) in pending {
-            std::fs::rename(temp, final_path).map_err(|e| format!(
-                "Error while moving file into place at \"{}\": {}", final_path.to_string_lossy(), e
-            ))?;
-            if let Some(parent) = final_path.parent() {
-                if !parent.as_os_str().is_empty() {
-                    touched_parents.insert(parent.to_path_buf());
-                }
+        #[cfg(target_os = "macos")]
+        macos_flush_device_cache(&pending[0].0)?;
+    }
+
+    let mut touched_parents: BTreeSet<PathBuf> = BTreeSet::new();
+    for (temp, final_path) in pending {
+        std::fs::rename(temp, final_path).map_err(|e| format!(
+            "Error while moving file into place at \"{}\": {}", final_path.to_string_lossy(), e
+        ))?;
+        if let Some(parent) = final_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                touched_parents.insert(parent.to_path_buf());
             }
         }
+    }
 
-        if fsync_enabled() {
-            for parent in &touched_parents {
-                sync_dir(parent)?;
+    if fsync_enabled() {
+        // `pending[0].1` (a final path) is guaranteed to exist now (every rename above already
+        // ran) and is an ordinary file, safely opened write-mode by `macos_flush_device_cache` —
+        // unlike a directory, which `OpenOptions::write(true).open` refuses with `EISDIR` on
+        // macOS. Reusing it here (rather than any of `touched_parents`) is what lets the
+        // directory half of the flush share `macos_flush_device_cache` unchanged.
+        sync_touched_directories(&touched_parents, &pending[0].1)?;
+    }
+
+    Ok(())
+}
+
+/// Fsync every touched directory once the renames into it are done (step 4 of
+/// [`run_write_barrier`] — see [`BulkStoreSession::finish`]'s doc comment for the full
+/// crash-ordering analysis). Uses the same cheap-then-shared-flush structure as the file half of
+/// the barrier (steps 1-2: [`fsync_data`] + one [`macos_flush_device_cache`]), one level up:
+/// batches what would otherwise be one full (`F_FULLFSYNC`-class) directory fsync *per touched
+/// directory* ([`sync_dir`], called individually) into a cheap `fsync` per directory plus one
+/// shared device flush — the same aggregation [`run_write_barrier`] already applies to file data,
+/// applied here to directory *entries* instead.
+///
+/// # Arguments
+/// * `touched_parents` - Every distinct directory a rename just landed in.
+/// * `flush_via`       - A regular file (a final, already-renamed path) to open write-mode for
+///                       the macOS device flush — a directory cannot be opened write-mode
+///                       (`EISDIR`), so the flush borrows any file guaranteed to already exist.
+///
+/// Unix only, exactly like [`sync_dir`]: on non-Unix targets there is no directory handle to
+/// fsync at all (NTFS gives the ordering some other way — see `sync_dir`'s doc comment), so the
+/// non-Unix half of this is a no-op, matching `sync_dir`'s own no-op there.
+#[cfg(unix)]
+fn sync_touched_directories(touched_parents: &BTreeSet<PathBuf>, flush_via: &Path) -> Result<(), String> {
+    for parent in touched_parents {
+        fsync_dir_data(parent)?;
+    }
+
+    #[cfg(target_os = "macos")]
+    if !touched_parents.is_empty() {
+        macos_flush_device_cache(flush_via)?;
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_touched_directories(_touched_parents: &BTreeSet<PathBuf>, _flush_via: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+/// Fsync one directory's pending entry changes (e.g. a rename into it) to the drive — the
+/// directory counterpart of [`fsync_data`], used by [`sync_touched_directories`]. Opens
+/// read-only, exactly like [`sync_dir`]'s own open: a directory cannot be opened write-mode on
+/// this platform (`EISDIR`), and POSIX `fsync` works on a read-only descriptor regardless (see
+/// [`open_for_sync`]'s doc comment for the same point about files, where a write-mode open is
+/// chosen only for Windows' sake — moot here, since this function is Unix-only).
+#[cfg(unix)]
+fn fsync_dir_data(dir: &Path) -> Result<(), String> {
+    use std::os::unix::io::AsRawFd;
+
+    let file = std::fs::File::open(dir)
+        .map_err(|e| format!("Error while opening directory \"{}\" to sync it: {}", dir.to_string_lossy(), e))?;
+
+    if unsafe { libc::fsync(file.as_raw_fd()) } != 0 {
+        return Err(format!(
+            "Error while syncing directory \"{}\": {}", dir.to_string_lossy(), std::io::Error::last_os_error()
+        ));
+    }
+
+    Ok(())
+}
+
+/// A local, explicitly-scoped write batch — the same deferred-publish idea as
+/// [`BulkStoreSession`] (see its doc comment for the full crash analysis, which applies here
+/// unchanged), but passed by the caller instead of intercepted through the process-wide
+/// registry, and safe to share (via `Arc`) across concurrent writer threads.
+///
+/// [`BulkStoreSession`] is documented as a single-sequential-writer primitive — intercepting
+/// *every* [`write_file_atomically`] call in the process through one global registry slot is
+/// exactly what makes it unsafe to open around a burst of writes that come from parallel
+/// workers (an unrelated concurrent write elsewhere in the process would be silently swept into
+/// the same batch). `WriteBatch` avoids that by construction: nothing is intercepted — a writer
+/// must explicitly call [`stage`](WriteBatch::stage) on a specific instance, so only writes the
+/// caller actually hands to *this* batch ever participate in it. Every `stage` call's own file
+/// write happens before it ever touches the shared list, so concurrent callers only ever
+/// contend on the cheap final push.
+///
+/// It exists for `stack`'s tree build, whose object writes run from `TaskExecutor`'s parallel
+/// workers (see `model::task::tree_builder::tree_builder_context::ObjectSink`).
+///
+/// `finish` takes `&self`, not `self` by value (unlike `BulkStoreSession::finish`): a
+/// `WriteBatch` is shared via `Arc` across parallel workers for the whole build, so there is no
+/// single owner to consume. This is safe because `finish` (and `Drop`) both operate by taking
+/// (`mem::take`/`drain`) whatever is currently staged — idempotent by construction: a successful
+/// `finish` leaves `pending` empty, so a second `finish` call, or the `Drop` that eventually
+/// runs, both find nothing left to do. A *failed* `finish` also leaves `pending` empty (every
+/// staged temp is removed before the error is returned — see below), so nothing double-cleans up
+/// there either.
+///
+/// The caller must not let anything that *depends on* a staged write's visibility (most
+/// importantly: a ref pointing at a batched object) run until `finish` has returned `Ok` —
+/// batching does not make the batch's renames atomic as a set (a crash mid-`finish` can still
+/// leave some entries published and others not, exactly like `BulkStoreSession` — see its doc
+/// comment), it only amortizes the fsyncs. `stack_utils::stack_parcel` relies on this: it never
+/// batches the pallet-head ref write itself, and only calls `set_pallet_head` after the batch
+/// covering every object the parcel references has already finished successfully.
+pub struct WriteBatch {
+    pending: std::sync::Mutex<Vec<(PathBuf, PathBuf)>>,
+}
+
+impl WriteBatch {
+    /// Create a new, empty write batch.
+    pub fn new() -> Self {
+        Self { pending: std::sync::Mutex::new(Vec::new()) }
+    }
+
+    /// Stage a write: create and write a fresh temp file now (no fsync — that is the whole
+    /// point of batching), and record the `(temp, final)` pair to publish in [`finish`](Self::finish).
+    /// `file_path` stays exactly as invisible as it was before this call until `finish` runs —
+    /// the atomic-visibility rule (a final name never exists before its bytes are durable)
+    /// still holds, the rename has simply not happened yet.
+    ///
+    /// Safe to call from multiple threads at once: each call's write happens before it ever
+    /// touches the shared list, so concurrent callers never contend on anything but the final,
+    /// pointer-cheap push.
+    ///
+    /// # Returns
+    /// * `Ok(())`      - If the write was staged.
+    /// * `Err(String)` - If the temp file could not be created or written.
+    pub fn stage(&self, file_path: &Path, content: &[u8]) -> Result<(), String> {
+        let temp_path = temp_path_for(file_path)?;
+        create_and_write_file(&temp_path, content)?;
+
+        self.pending.lock().expect("write batch lock poisoned").push((temp_path, file_path.to_path_buf()));
+
+        Ok(())
+    }
+
+    /// The barrier: fsync every staged write's bytes, then — only once every byte is durable —
+    /// rename each into place and fsync the directories that changed. See
+    /// [`BulkStoreSession::finish`]'s doc comment for the exact four steps and the full crash
+    /// analysis (shared implementation, [`run_write_barrier`]): every conclusion there — no
+    /// torn object survives any crash interleaving, an in-flight error leaves no stranded temp —
+    /// applies here unchanged.
+    ///
+    /// # Returns
+    /// * `Ok(())`      - Every staged write is durable and visible at its final path.
+    /// * `Err(String)` - A write or rename failed; every staged temp for this batch was
+    ///                   best-effort removed before returning (nothing survives to leak).
+    pub fn finish(&self) -> Result<(), String> {
+        let pending = std::mem::take(&mut *self.pending.lock().expect("write batch lock poisoned"));
+
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        if let Err(error) = run_write_barrier(&pending) {
+            for (temp, _) in &pending {
+                let _ = std::fs::remove_file(temp);
             }
+            return Err(error);
         }
 
         Ok(())
     }
+}
+
+impl Default for WriteBatch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for WriteBatch {
+    /// Whatever is still staged when a `WriteBatch` is dropped was never published — a
+    /// successful or failed [`finish`](WriteBatch::finish) both empty `pending` on every path
+    /// (see their doc comments), so this only ever finds work to do when `finish` was never
+    /// called at all (an early `?` return elsewhere). Best-effort removes those temps so that
+    /// case leaks nothing either — the durability invariant holds trivially, since nothing
+    /// staged here was ever published.
+    fn drop(&mut self) {
+        if let Ok(mut pending) = self.pending.lock() {
+            for (temp, _) in pending.drain(..) {
+                let _ = std::fs::remove_file(&temp);
+            }
+        }
+    }
+}
+
+/// Stage an object write into a [`WriteBatch`] instead of writing (and fsyncing) it immediately.
+/// See [`write_object_to_file`] for the immediate form and [`WriteBatch`] for why the deferred
+/// form exists.
+///
+/// # Arguments
+/// * `path`      - The path to the folder where the object should be stored.
+/// * `file_name` - The name of the file where the object should be stored.
+/// * `content`   - The content of the object (should be compressed).
+/// * `batch`     - The batch to stage the write into.
+///
+/// # Returns
+/// * `Ok(())`      - If the write was staged.
+/// * `Err(String)` - If an error occurred while staging the write.
+pub fn write_object_to_file_deferred(path: &Path, file_name: &str, content: Vec<u8>,
+                                     batch: &WriteBatch) -> Result<(), String> {
+    let mut file_path = PathBuf::from(path);
+    file_path.push(file_name);
+
+    create_folder_if_not_exists(path)?;
+
+    batch.stage(&file_path, &content)
 }
 
 impl Drop for BulkStoreSession {
@@ -685,78 +918,35 @@ const READ_CACHE_BUDGET: usize = 128 * 1024 * 1024;
 /// set of small trees and blobs a walk actually reuses).
 const READ_CACHE_MAX_ENTRY: usize = READ_CACHE_BUDGET / 8;
 
-/// A bounded content-addressed object cache (two generations for approximate LRU). Entries are
-/// `Arc`-shared, so a hit clones a pointer under the lock and the caller shares that one
-/// allocation — an owned-bytes caller copies out afterwards, off the lock (see
-/// [`retrieve_object_by_hash`] vs [`retrieve_object_by_hash_shared`]).
-struct ReadCache {
-    live: std::collections::HashMap<String, std::sync::Arc<Vec<u8>>>,
-    old: std::collections::HashMap<String, std::sync::Arc<Vec<u8>>>,
-    live_bytes: usize,
-}
-
-fn read_cache() -> &'static std::sync::Mutex<ReadCache> {
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<ReadCache>> = std::sync::OnceLock::new();
-    CACHE.get_or_init(|| std::sync::Mutex::new(ReadCache {
-        live: std::collections::HashMap::new(),
-        old: std::collections::HashMap::new(),
-        live_bytes: 0,
-    }))
+/// A bounded content-addressed object cache. Entries are `Arc`-shared, so a hit clones a pointer
+/// under the lock and the caller shares that one allocation — an owned-bytes caller copies out
+/// afterwards, off the lock (see [`retrieve_object_by_hash`] vs [`retrieve_object_by_hash_shared`]).
+/// See [`super::two_gen_cache::TwoGenCache`] for the eviction/bounding shape (shared with
+/// `object_utils`'s parsed-tree cache).
+fn read_cache() -> &'static super::two_gen_cache::TwoGenCache<Vec<u8>> {
+    static CACHE: std::sync::OnceLock<super::two_gen_cache::TwoGenCache<Vec<u8>>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| super::two_gen_cache::TwoGenCache::new(READ_CACHE_BUDGET, READ_CACHE_MAX_ENTRY))
 }
 
 /// The cache key: the object hash qualified by the warehouse's object root, so a server hosting
 /// several warehouses keeps them isolated (identical content shares a hash regardless, but a
 /// warehouse must never be served an object it does not itself hold).
-fn read_cache_key(hash: &str) -> String {
+///
+/// `pub(crate)` so `object_utils`'s parsed-tree cache can key itself identically — the two
+/// caches must never disagree about which warehouse a hash belongs to.
+pub(crate) fn read_cache_key(hash: &str) -> String {
     format!("{}\u{0}{}", get_path_objects_root(), hash)
 }
 
 fn read_cache_get(hash: &str) -> Option<std::sync::Arc<Vec<u8>>> {
-    let key = read_cache_key(hash);
-    let mut cache = read_cache().lock().expect("the read cache lock is poisoned");
-
-    if let Some(bytes) = cache.live.get(&key) {
-        // Clone the `Arc`, not the bytes: the critical section is a pointer bump, not a memcpy.
-        return Some(std::sync::Arc::clone(bytes));
-    }
-
-    // A hit in the older generation is promoted to the live one (so it survives the next retire).
-    if let Some(bytes) = cache.old.remove(&key) {
-        let out = std::sync::Arc::clone(&bytes);
-        cache.live_bytes += bytes.len();
-        cache.live.insert(key, bytes);
-        retire_if_full(&mut cache);
-        return Some(out);
-    }
-
-    None
+    read_cache().get(&read_cache_key(hash))
 }
 
 fn read_cache_put(hash: &str, bytes: std::sync::Arc<Vec<u8>>) {
-    if bytes.len() > READ_CACHE_MAX_ENTRY {
-        return;
-    }
-
-    let key = read_cache_key(hash);
-    let mut cache = read_cache().lock().expect("the read cache lock is poisoned");
-
-    if cache.live.contains_key(&key) {
-        return;
-    }
-
-    // Store the caller's `Arc` directly — the fetched allocation is shared, never re-copied.
-    cache.live_bytes += bytes.len();
-    cache.live.insert(key, bytes);
-    retire_if_full(&mut cache);
-}
-
-/// Retire the live generation to the old one (dropping the previous old generation) once it
-/// fills — bounding the cache to ~2× the budget with O(1) eviction.
-fn retire_if_full(cache: &mut ReadCache) {
-    if cache.live_bytes >= READ_CACHE_BUDGET {
-        cache.old = std::mem::take(&mut cache.live);
-        cache.live_bytes = 0;
-    }
+    // Weighed by its own length; store the caller's `Arc` directly — the fetched allocation is
+    // shared, never re-copied.
+    let weight = bytes.len();
+    read_cache().put(&read_cache_key(hash), bytes, weight);
 }
 
 /// Retrieve the bytes of the inventory data file for the given warehouse path key.
@@ -1513,5 +1703,150 @@ mod tests {
 
         std::fs::remove_dir_all(&temp_a).ok();
         std::fs::remove_dir_all(&temp_b).ok();
+    }
+
+    // `WriteBatch` tests (modeled on `tests/bulk_store_session.rs`'s coverage of the same
+    // durability barrier). Unlike `BulkStoreSession`, `WriteBatch` is not a process-global
+    // registry — each instance is its own, independently owned batch — so these are ordinary
+    // unit tests here rather than needing their own integration-test binary: nothing about one
+    // test's `WriteBatch` can intercept another's write.
+
+    #[test]
+    fn write_batch_finish_is_idempotent() {
+        // `finish` takes `&self` (unlike `BulkStoreSession::finish`, which consumes `self`) so it
+        // can be shared via `Arc` across parallel workers — its doc comment promises a second
+        // call is a harmless no-op, since the first `finish` already took every staged write out
+        // of `pending`. This is also what makes `Drop` safe to run unconditionally afterwards.
+        let temp = std::env::temp_dir().join(format!("forklift-writebatch-idempotent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+
+        let target = temp.join("staged-object");
+        let batch = WriteBatch::new();
+        batch.stage(&target, b"batch content").unwrap();
+
+        batch.finish().unwrap();
+        assert!(target.exists(), "the first finish must publish the staged write");
+        assert_eq!(std::fs::read(&target).unwrap(), b"batch content");
+
+        // A second `finish` on the same batch must succeed and change nothing further.
+        batch.finish().unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"batch content",
+            "a second finish must not disturb the already-published content");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn write_batch_dropped_without_finish_removes_every_staged_temp_and_publishes_nothing() {
+        // Abort semantics, exactly like `BulkStoreSession`: a batch dropped without `finish` must
+        // remove its staged temp files and must never let the final name come into existence.
+        let temp = std::env::temp_dir().join(format!("forklift-writebatch-abort-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+
+        let target_a = temp.join("never-published-a");
+        let target_b = temp.join("never-published-b");
+        {
+            let batch = WriteBatch::new();
+            batch.stage(&target_a, b"should vanish a").unwrap();
+            batch.stage(&target_b, b"should vanish b").unwrap();
+            assert!(!target_a.exists() && !target_b.exists());
+            // `batch` drops here without `finish` being called.
+        }
+
+        assert!(!target_a.exists() && !target_b.exists(),
+            "a dropped batch must never publish its staged writes");
+
+        let leftovers: Vec<_> = std::fs::read_dir(&temp).unwrap().filter_map(|e| e.ok()).collect();
+        assert!(leftovers.is_empty(), "a dropped batch must remove every staged temp, found {:?}",
+            leftovers.iter().map(|e| e.file_name()).collect::<Vec<_>>());
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn write_batch_concurrent_stage_of_the_same_final_path_ends_with_the_file_intact_and_no_leftover_temps() {
+        // The duplicate-hash race `stage`'s doc comment allows for: several parallel tree-build
+        // workers can legitimately build the *same* content-addressed object (e.g. two identical
+        // empty-looking directories) and all stage a write to the same final path before any of
+        // them is renamed. `finish` must still end with the final file present and correct, and
+        // — since every staged temp is individually consumed by its own rename, even when several
+        // renames target the same destination — with none of the (many) temp files left behind.
+        let temp = std::env::temp_dir().join(format!("forklift-writebatch-duprace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+
+        let target = temp.join("duplicate-object");
+        let content: &[u8] = b"identical content every racer writes";
+        let batch = WriteBatch::new();
+
+        let target_ref: &Path = &target;
+        let batch_ref: &WriteBatch = &batch;
+        std::thread::scope(|scope| {
+            for _ in 0..200 {
+                scope.spawn(move || {
+                    batch_ref.stage(target_ref, content).unwrap();
+                });
+            }
+        });
+
+        // Every racer staged into the same target, and none may have been visible yet.
+        assert!(!target.exists(), "nothing may be visible before finish");
+
+        batch.finish().unwrap();
+
+        assert!(target.exists(), "finish must publish the contested target");
+        assert_eq!(std::fs::read(&target).unwrap(), content);
+
+        let leftovers: Vec<_> = std::fs::read_dir(&temp).unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path() != target)
+            .collect();
+        assert!(leftovers.is_empty(),
+            "every staged temp (200 racers) must be consumed by its own rename, found {:?}",
+            leftovers.iter().map(|e| e.file_name()).collect::<Vec<_>>());
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn write_batch_finish_syncs_every_touched_directory_across_a_multi_directory_batch() {
+        // `run_write_barrier`'s directory-sync step (`sync_touched_directories`) fsyncs every
+        // *distinct* touched parent, not just the first — exercised here transitively: staging
+        // writes into three separate directories and confirming `finish` still publishes every
+        // one of them (not just the ones sharing a directory with the last-written file, which is
+        // the case a bug that only synced one directory would miss).
+        let temp = std::env::temp_dir().join(format!("forklift-writebatch-multidir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+
+        let dirs: Vec<_> = ["alpha", "beta", "gamma"].iter().map(|name| temp.join(name)).collect();
+        for dir in &dirs {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+
+        let batch = WriteBatch::new();
+        let targets: Vec<_> = dirs.iter().enumerate()
+            .map(|(i, dir)| {
+                let target = dir.join("object");
+                let content = format!("content for directory {}", i);
+                batch.stage(&target, content.as_bytes()).unwrap();
+                (target, content)
+            })
+            .collect();
+
+        for (target, _) in &targets {
+            assert!(!target.exists(), "nothing may be visible before finish");
+        }
+
+        batch.finish().unwrap();
+
+        for (target, content) in &targets {
+            assert!(target.exists(), "finish must publish every directory's staged write");
+            assert_eq!(std::fs::read_to_string(target).unwrap(), *content);
+        }
+
+        std::fs::remove_dir_all(&temp).ok();
     }
 }

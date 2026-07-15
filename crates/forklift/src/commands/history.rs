@@ -104,8 +104,10 @@ pub async fn handle_command(revision: Option<String>, class: Option<String>, lim
 
     // Human output streams entry-by-entry, so a quit pager or a closed `| head` stops the
     // walk and memory stays bounded; --json buffers one page and reports a `next` cursor.
+    // Buffered (256KiB) so ~17 `writeln!`s per parcel become one `write` syscall's worth
+    // instead of many: history on a large corpus is dominated by syscall count, not bytes.
     let streaming = !output::is_json();
-    let mut sink = streaming.then(|| std::io::stdout().lock());
+    let mut sink = streaming.then(|| std::io::BufWriter::with_capacity(256 * 1024, std::io::stdout().lock()));
 
     let mut entries: Vec<HistoryEntry> = Vec::new();
     let mut shown: usize = 0;
@@ -119,10 +121,22 @@ pub async fn handle_command(revision: Option<String>, class: Option<String>, lim
         if class_filter.is_none_or(|class| entry.matches_class(class)) {
             match sink.as_mut() {
                 // A write error means the reader (pager / pipe) went away: stop cleanly.
-                Some(out) => if entry.render(out, shown == 0).is_err() { return Ok(()); },
-                None => entries.push(entry),
+                Some(out) => {
+                    if entry.render(out, shown == 0).is_err() { return Ok(()); }
+                    shown += 1;
+
+                    // Flushed every 16 entries (not just at the end): otherwise a filtering
+                    // walk (`--class`, few matches over many parcels) looks hung under the
+                    // 256KiB buffer, and a reader that goes away (`| head`, a closed pager)
+                    // is only noticed once the buffer fills. A failed flush is a write error
+                    // like any other: stop cleanly the same way.
+                    if shown % 16 == 0 && out.flush().is_err() { return Ok(()); }
+                }
+                None => {
+                    entries.push(entry);
+                    shown += 1;
+                }
             }
-            shown += 1;
         }
 
         // Enqueue parents before the limit check so the frontier (the `next` cursor) is
@@ -136,6 +150,12 @@ pub async fn handle_command(revision: Option<String>, class: Option<String>, lim
     }
 
     if streaming {
+        // BufWriter's Drop flushes but swallows any error, so a reader that went away right
+        // at the end would otherwise vanish silently: flush explicitly and apply the same
+        // "reader gone, stop cleanly" handling as every other write above.
+        if let Some(out) = sink.as_mut() {
+            let _ = out.flush();
+        }
         return Ok(());
     }
 
@@ -167,7 +187,9 @@ fn render_terse(
     /// How many leading hash characters the terse form prints (git abbreviates similarly).
     const ABBREV: usize = 12;
 
-    let mut out = std::io::stdout().lock();
+    // Buffered for the same reason as the verbose walk: one line per parcel is a lot of
+    // small `write` syscalls on a large history.
+    let mut out = std::io::BufWriter::with_capacity(256 * 1024, std::io::stdout().lock());
     let mut shown: usize = 0;
 
     while let Some((_, hash)) = heap.pop() {
@@ -188,6 +210,13 @@ fn render_terse(
                 return Ok(());
             }
             shown += 1;
+
+            // Flushed every 128 lines: --oneline is one short line per parcel, so the buffer
+            // would otherwise take a long walk to fill — same "stop cleanly" handling as a
+            // failed write above.
+            if shown % 128 == 0 && out.flush().is_err() {
+                return Ok(());
+            }
         }
 
         enqueue_parents(&parcel, &mut heap, &mut loaded, &mut enqueued)?;
@@ -197,6 +226,9 @@ fn render_terse(
         }
     }
 
+    // See the verbose walk: BufWriter's Drop flush swallows errors, so flush explicitly and
+    // apply the same "reader gone, stop cleanly" handling as every write above.
+    let _ = out.flush();
     Ok(())
 }
 
@@ -407,13 +439,24 @@ impl CommandOutput for History {
     // The human walk streams entries directly (see `handle_command`); this buffered path
     // serves any caller that emits a fully-built `History`.
     fn render_human(&self) {
-        let mut out = std::io::stdout().lock();
+        let mut out = std::io::BufWriter::with_capacity(256 * 1024, std::io::stdout().lock());
 
         for (index, entry) in self.entries.iter().enumerate() {
             if entry.render(&mut out, index == 0).is_err() {
                 return;
             }
+
+            // Flushed every 16 entries, same as the streaming walk in `handle_command`: this
+            // path is used by any caller emitting a fully-built `History`, and should look
+            // the same to a reader (a pager, a `| head`) as the streaming path does.
+            if (index + 1) % 16 == 0 && out.flush().is_err() {
+                return;
+            }
         }
+
+        // See the streaming walk in `handle_command`: flush explicitly, BufWriter's Drop
+        // would swallow the error.
+        let _ = out.flush();
     }
 }
 
