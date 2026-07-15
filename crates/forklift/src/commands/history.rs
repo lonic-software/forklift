@@ -121,10 +121,22 @@ pub async fn handle_command(revision: Option<String>, class: Option<String>, lim
         if class_filter.is_none_or(|class| entry.matches_class(class)) {
             match sink.as_mut() {
                 // A write error means the reader (pager / pipe) went away: stop cleanly.
-                Some(out) => if entry.render(out, shown == 0).is_err() { return Ok(()); },
-                None => entries.push(entry),
+                Some(out) => {
+                    if entry.render(out, shown == 0).is_err() { return Ok(()); }
+                    shown += 1;
+
+                    // Flushed every 16 entries (not just at the end): otherwise a filtering
+                    // walk (`--class`, few matches over many parcels) looks hung under the
+                    // 256KiB buffer, and a reader that goes away (`| head`, a closed pager)
+                    // is only noticed once the buffer fills. A failed flush is a write error
+                    // like any other: stop cleanly the same way.
+                    if shown % 16 == 0 && out.flush().is_err() { return Ok(()); }
+                }
+                None => {
+                    entries.push(entry);
+                    shown += 1;
+                }
             }
-            shown += 1;
         }
 
         // Enqueue parents before the limit check so the frontier (the `next` cursor) is
@@ -198,6 +210,13 @@ fn render_terse(
                 return Ok(());
             }
             shown += 1;
+
+            // Flushed every 128 lines: --oneline is one short line per parcel, so the buffer
+            // would otherwise take a long walk to fill — same "stop cleanly" handling as a
+            // failed write above.
+            if shown % 128 == 0 && out.flush().is_err() {
+                return Ok(());
+            }
         }
 
         enqueue_parents(&parcel, &mut heap, &mut loaded, &mut enqueued)?;
@@ -424,6 +443,13 @@ impl CommandOutput for History {
 
         for (index, entry) in self.entries.iter().enumerate() {
             if entry.render(&mut out, index == 0).is_err() {
+                return;
+            }
+
+            // Flushed every 16 entries, same as the streaming walk in `handle_command`: this
+            // path is used by any caller emitting a fully-built `History`, and should look
+            // the same to a reader (a pager, a `| head`) as the streaming path does.
+            if (index + 1) % 16 == 0 && out.flush().is_err() {
                 return;
             }
         }

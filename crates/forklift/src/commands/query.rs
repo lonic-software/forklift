@@ -116,7 +116,13 @@ pub async fn handle_command(args: QueryArgs) -> Result<(), String> {
             render_match(&mut out, &found, &office, shown == 0)
         };
         shown += 1;
-        rendered.is_ok()
+
+        // Flushed after every match, not just at the end: matches are expensive to produce
+        // (signature verification between them), so one syscall per match is negligible —
+        // and without it, the 256KiB buffer would make a verified query look hung, and a
+        // reader going away (`| head`, a closed pager) would only be noticed once the
+        // buffer fills. A failed flush is a write error like any other: stop the walk.
+        rendered.is_ok() && out.flush().is_ok()
     })?;
 
     // The trailing honesty note, printed when there is something to be honest about:
