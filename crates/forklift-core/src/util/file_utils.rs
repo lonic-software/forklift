@@ -918,23 +918,14 @@ const READ_CACHE_BUDGET: usize = 128 * 1024 * 1024;
 /// set of small trees and blobs a walk actually reuses).
 const READ_CACHE_MAX_ENTRY: usize = READ_CACHE_BUDGET / 8;
 
-/// A bounded content-addressed object cache (two generations for approximate LRU). Entries are
-/// `Arc`-shared, so a hit clones a pointer under the lock and the caller shares that one
-/// allocation — an owned-bytes caller copies out afterwards, off the lock (see
-/// [`retrieve_object_by_hash`] vs [`retrieve_object_by_hash_shared`]).
-struct ReadCache {
-    live: std::collections::HashMap<String, std::sync::Arc<Vec<u8>>>,
-    old: std::collections::HashMap<String, std::sync::Arc<Vec<u8>>>,
-    live_bytes: usize,
-}
-
-fn read_cache() -> &'static std::sync::Mutex<ReadCache> {
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<ReadCache>> = std::sync::OnceLock::new();
-    CACHE.get_or_init(|| std::sync::Mutex::new(ReadCache {
-        live: std::collections::HashMap::new(),
-        old: std::collections::HashMap::new(),
-        live_bytes: 0,
-    }))
+/// A bounded content-addressed object cache. Entries are `Arc`-shared, so a hit clones a pointer
+/// under the lock and the caller shares that one allocation — an owned-bytes caller copies out
+/// afterwards, off the lock (see [`retrieve_object_by_hash`] vs [`retrieve_object_by_hash_shared`]).
+/// See [`super::two_gen_cache::TwoGenCache`] for the eviction/bounding shape (shared with
+/// `object_utils`'s parsed-tree cache).
+fn read_cache() -> &'static super::two_gen_cache::TwoGenCache<Vec<u8>> {
+    static CACHE: std::sync::OnceLock<super::two_gen_cache::TwoGenCache<Vec<u8>>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| super::two_gen_cache::TwoGenCache::new(READ_CACHE_BUDGET, READ_CACHE_MAX_ENTRY))
 }
 
 /// The cache key: the object hash qualified by the warehouse's object root, so a server hosting
@@ -948,51 +939,14 @@ pub(crate) fn read_cache_key(hash: &str) -> String {
 }
 
 fn read_cache_get(hash: &str) -> Option<std::sync::Arc<Vec<u8>>> {
-    let key = read_cache_key(hash);
-    let mut cache = read_cache().lock().expect("the read cache lock is poisoned");
-
-    if let Some(bytes) = cache.live.get(&key) {
-        // Clone the `Arc`, not the bytes: the critical section is a pointer bump, not a memcpy.
-        return Some(std::sync::Arc::clone(bytes));
-    }
-
-    // A hit in the older generation is promoted to the live one (so it survives the next retire).
-    if let Some(bytes) = cache.old.remove(&key) {
-        let out = std::sync::Arc::clone(&bytes);
-        cache.live_bytes += bytes.len();
-        cache.live.insert(key, bytes);
-        retire_if_full(&mut cache);
-        return Some(out);
-    }
-
-    None
+    read_cache().get(&read_cache_key(hash))
 }
 
 fn read_cache_put(hash: &str, bytes: std::sync::Arc<Vec<u8>>) {
-    if bytes.len() > READ_CACHE_MAX_ENTRY {
-        return;
-    }
-
-    let key = read_cache_key(hash);
-    let mut cache = read_cache().lock().expect("the read cache lock is poisoned");
-
-    if cache.live.contains_key(&key) {
-        return;
-    }
-
-    // Store the caller's `Arc` directly — the fetched allocation is shared, never re-copied.
-    cache.live_bytes += bytes.len();
-    cache.live.insert(key, bytes);
-    retire_if_full(&mut cache);
-}
-
-/// Retire the live generation to the old one (dropping the previous old generation) once it
-/// fills — bounding the cache to ~2× the budget with O(1) eviction.
-fn retire_if_full(cache: &mut ReadCache) {
-    if cache.live_bytes >= READ_CACHE_BUDGET {
-        cache.old = std::mem::take(&mut cache.live);
-        cache.live_bytes = 0;
-    }
+    // Weighed by its own length; store the caller's `Arc` directly — the fetched allocation is
+    // shared, never re-copied.
+    let weight = bytes.len();
+    read_cache().put(&read_cache_key(hash), bytes, weight);
 }
 
 /// Retrieve the bytes of the inventory data file for the given warehouse path key.

@@ -27,6 +27,7 @@ pub mod stocktake_utils;
 pub mod warehouse_utils;
 pub mod file_utils;
 pub mod object_utils;
+pub(crate) mod two_gen_cache;
 pub mod diff;
 pub mod byte_utils;
 pub mod lcs;
