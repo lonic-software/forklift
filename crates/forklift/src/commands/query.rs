@@ -100,8 +100,9 @@ pub async fn handle_command(args: QueryArgs) -> Result<(), String> {
     }
 
     // Human output streams match-by-match, so a quit pager or a closed `| head` stops the
-    // walk and memory stays bounded.
-    let mut out = std::io::stdout().lock();
+    // walk and memory stays bounded. Buffered (256KiB) so the many small per-match writes
+    // become a handful of `write` syscalls instead of one each.
+    let mut out = std::io::BufWriter::with_capacity(256 * 1024, std::io::stdout().lock());
     let mut shown = 0usize;
     let mut revoked = 0usize;
 
@@ -133,6 +134,11 @@ pub async fn handle_command(args: QueryArgs) -> Result<(), String> {
     }
 
     let _ = outcome;
+
+    // BufWriter's Drop flush swallows its error; flush explicitly and, matching the write
+    // above, ignore a failure (the reader is gone, there's nothing left to do about it).
+    let _ = out.flush();
+
     Ok(())
 }
 
