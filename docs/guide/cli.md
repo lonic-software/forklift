@@ -321,6 +321,8 @@ first parent. Undoing a pallet's *very first* parcel, pure-staging (`load`/`remo
 and trust/remote commands are out of scope; `park` is reversed with `park pop`. Anything that
 happened between the journaled operation and the `undo` but was never journaled itself stays
 exactly as it is — trust operations such as a key retirement are preserved, never rolled back.
+If the pallet itself has moved since (something outside the journal advanced it), `undo`
+refuses outright rather than guessing at a partial reversal.
 
 ### `peek` — inspect an object (`pk`)
 

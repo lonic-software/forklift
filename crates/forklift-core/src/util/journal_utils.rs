@@ -113,7 +113,20 @@ pub fn push_if_changed(pre: JournalEntry) -> Result<(), String> {
     write(&entries)
 }
 
-/// Remove and return the most recent journal entry.
+/// Look at the most recent journal entry without consuming it. The caller (`undo`) must
+/// validate — and, for a soft reset, actually restore — an entry *before* it commits to
+/// removing it from the journal: `pop` throws the entry away the moment it is called, so a
+/// refused or failed undo must call this first and only `pop` once it has fully succeeded.
+///
+/// # Returns
+/// * `Ok(Some(JournalEntry))` - The most recent entry, left in place.
+/// * `Ok(None)`               - If the journal is empty.
+pub fn peek() -> Result<Option<JournalEntry>, String> {
+    Ok(read().pop())
+}
+
+/// Remove and return the most recent journal entry. Only call this once the undo it
+/// describes has actually gone through — never as a way to decide whether it can.
 ///
 /// # Returns
 /// * `Ok(Some(JournalEntry))` - The popped entry.
@@ -128,6 +141,31 @@ pub fn pop() -> Result<Option<JournalEntry>, String> {
     }
 
     Ok(popped)
+}
+
+/// Whether `entry`'s own `current_pallet` ref has moved since the journaled op ran —
+/// meaning some un-journaled operation advanced it before this undo got a chance to run.
+/// A soft reset must refuse outright in that case (see `restore_refs`'s doc comment for
+/// why the same reasoning doesn't stop there): silently restoring every ref *except* the
+/// one that moved would report success for an undo that changed nothing visible, and — for
+/// a `consolidate` entry — would still resurrect its pre-op consolidation state against a
+/// head it no longer describes.
+///
+/// A legacy entry (recorded before `heads_after` existed) cannot be checked this way; the
+/// caller keeps today's behavior for those (proceed as if unmoved).
+///
+/// # Returns
+/// * `Ok(true)`    - The entry's pallet has moved since the op; a soft reset must refuse.
+/// * `Ok(false)`   - Unmoved, or unverifiable (a legacy entry) — safe to proceed.
+/// * `Err(String)` - If the ref could not be read.
+pub fn current_pallet_moved_since(entry: &JournalEntry) -> Result<bool, String> {
+    let Some(post_head) = entry.heads_after.get(&entry.current_pallet) else {
+        return Ok(false);
+    };
+
+    let current_head = pallet_utils::get_pallet_head(&entry.current_pallet)?;
+
+    Ok(current_head.as_deref() != Some(post_head.as_str()))
 }
 
 /// Restore the pallet refs, current pallet and consolidation state from an entry. The
@@ -321,6 +359,74 @@ mod tests {
         assert_eq!(pop().unwrap().unwrap().op, "shift");
         assert_eq!(pop().unwrap().unwrap().op, "stack");
         assert!(pop().unwrap().is_none());
+    }
+
+    #[test]
+    fn peek_returns_the_most_recent_entry_without_consuming_it() {
+        let _scratch = Scratch::new("peek-leaves-it");
+
+        push_if_changed(entry("stack", "main", "1".repeat(64).as_str())).unwrap();
+
+        assert_eq!(peek().unwrap().unwrap().op, "stack");
+        assert_eq!(peek().unwrap().unwrap().op, "stack", "peek must not remove the entry");
+        assert_eq!(pop().unwrap().unwrap().op, "stack", "the entry is still there to pop");
+        assert!(peek().unwrap().is_none());
+    }
+
+    #[test]
+    fn current_pallet_moved_since_detects_an_un_journaled_advance() {
+        let _scratch = Scratch::new("moved-since-true");
+
+        // Something outside the journal advanced "main" past the op's own recorded outcome.
+        pallet_utils::set_pallet_head("main", &"9".repeat(64)).unwrap();
+
+        let mut heads = BTreeMap::new();
+        heads.insert("main".to_string(), "1".repeat(64));
+        let mut heads_after = BTreeMap::new();
+        heads_after.insert("main".to_string(), "2".repeat(64));
+
+        let stale = JournalEntry {
+            op: "stack".to_string(),
+            current_pallet: "main".to_string(),
+            heads,
+            heads_after,
+            consolidation: None,
+        };
+
+        assert!(current_pallet_moved_since(&stale).unwrap());
+    }
+
+    #[test]
+    fn current_pallet_moved_since_is_false_when_the_ref_still_sits_where_the_op_left_it() {
+        let _scratch = Scratch::new("moved-since-false");
+
+        pallet_utils::set_pallet_head("main", &"2".repeat(64)).unwrap();
+
+        let mut heads = BTreeMap::new();
+        heads.insert("main".to_string(), "1".repeat(64));
+        let mut heads_after = BTreeMap::new();
+        heads_after.insert("main".to_string(), "2".repeat(64));
+
+        let unmoved = JournalEntry {
+            op: "stack".to_string(),
+            current_pallet: "main".to_string(),
+            heads,
+            heads_after,
+            consolidation: None,
+        };
+
+        assert!(!current_pallet_moved_since(&unmoved).unwrap());
+    }
+
+    #[test]
+    fn current_pallet_moved_since_cannot_validate_a_legacy_entry() {
+        let _scratch = Scratch::new("moved-since-legacy");
+
+        // No `heads_after` at all (a pre-upgrade journal entry) — unverifiable, so the
+        // caller is told "not moved" and keeps its old (pre-gate) behavior.
+        let legacy = entry("stack", "main", &"1".repeat(64));
+
+        assert!(!current_pallet_moved_since(&legacy).unwrap());
     }
 
     #[test]
