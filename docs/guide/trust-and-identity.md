@@ -237,11 +237,13 @@ forklift office retire <key-id> --compromised   # revoke a key that may be in ot
   parcels reachable from that boundary — decided by **exact ancestry, never
   timestamps**, so a shifted clock can't forge validity. A `--compromised` key's
   signatures beyond the boundary fail every future audit.
-- If a store is missing one of the boundary's heads outright (a partial clone
-  whose gap happens to matter for the parcel in question), `audit` never treats
-  that as tampering — it refuses honestly, naming the specific boundary parcel it
-  could not find. Fetch the full history, or audit a complete store, for a
-  definitive answer.
+- If a store cannot resolve the boundary at all — a head is missing outright, or
+  an ancestor behind one is, and the gap happens to matter for the parcel in
+  question — `audit` still refuses (fail-closed), but says so honestly: it names
+  the specific boundary parcel it could not find and says it cannot tell whether
+  the parcel predates the revocation or the key kept signing after it, rather
+  than asserting tampering it cannot actually prove. Verify against a store with
+  the full history for a definitive answer.
 - Revocations are append-once for everyone (including admins) and a revoked key
   can no longer extend the office chain or endorse new keys.
 

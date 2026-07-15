@@ -2364,7 +2364,7 @@ fn a_partial_clone_missing_an_unrelated_boundary_head_still_audits_the_vouched_p
     let franchised = area.forklift(".", &["franchise", &server.url, "clone"]);
     assert_success(&franchised);
     assert!(
-        !area.path("clone").join(".forklift/objects").join(&side_head[0..2]).join(&side_head[2..]).exists(),
+        !object_store_path(&area, "clone", &side_head).exists(),
         "the side pallet's head must genuinely be absent from the clone for this test to mean \
          anything"
     );
