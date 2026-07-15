@@ -147,3 +147,16 @@ fn parse_item(offset: usize, content: &[u8]) -> Result<(InventoryItem, usize), S
         cursor,
     ))
 }
+
+/// Parse the inventory header's extra bytes for version `V2024_09_04`: none — this version
+/// predates the rollup hash.
+///
+/// # Arguments
+/// * `_offset`  - Unused: this version has no header extras to parse.
+/// * `_content` - Unused: this version has no header extras to parse.
+///
+/// # Returns
+/// * `Ok((None, 0))` - Always: no rollup hash, no bytes consumed.
+pub fn parse_header(_offset: usize, _content: &[u8]) -> Result<(Option<String>, usize), String> {
+    Ok((None, 0))
+}

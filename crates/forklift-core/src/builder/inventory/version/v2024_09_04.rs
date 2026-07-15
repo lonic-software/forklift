@@ -34,3 +34,15 @@ pub fn build(inventory: &Inventory) -> Vec<u8> {
 
     content
 }
+
+/// Build the inventory header's extra bytes for version `V2024_09_04`: none — this version
+/// predates the rollup hash, so its header ends right after the entry count.
+///
+/// # Arguments
+/// * `inventory` - The inventory data (unused: this version has no header extras).
+///
+/// # Returns
+/// The (empty) extra header bytes.
+pub fn build_header(_inventory: &Inventory) -> Vec<u8> {
+    Vec::new()
+}

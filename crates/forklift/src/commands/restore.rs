@@ -5,7 +5,7 @@ use forklift_core::model::inventory::Inventory;
 use forklift_core::model::tree_item::TreeItem;
 use forklift_core::util::path_utils::WarehousePath;
 use forklift_core::util::scope_utils::{self, MaterializationScope, ScopeClass};
-use forklift_core::util::{file_utils, inventory_utils, object_utils, pallet_utils, shift_utils};
+use forklift_core::util::{file_utils, inventory_utils, object_utils, pallet_utils, shift_utils, tree_utils};
 use crate::output;
 
 /// A resolved entry of the pallet head's tree.
@@ -13,8 +13,10 @@ enum HeadEntry {
     /// A file (normal, executable or symlink) with its blob hash.
     File { hash: String, item_type: DirEntryType },
 
-    /// A directory, loaded.
-    Tree(TreeItem),
+    /// A directory, loaded, together with its own tree hash (the parent's entry for it —
+    /// `tree` as loaded carries no hash of its own; the root resolution uses the root tree
+    /// hash directly). Needed to stamp the rebuilt shard's rollup in `build_stale_shards`.
+    Tree { tree: TreeItem, hash: String },
 }
 
 /// Handle the restore command.
@@ -237,7 +239,7 @@ fn restore_staged(path: &WarehousePath, command: &str) -> Result<(), String> {
     let has_shard = file_utils::get_inventory_data_path_for_key(path.as_key()).exists();
     let treat_as_directory = path.is_root()
         || has_shard
-        || matches!(head_entry, Some(HeadEntry::Tree(_)));
+        || matches!(head_entry, Some(HeadEntry::Tree { .. }));
 
     if treat_as_directory {
         // Rebuild the whole subtree of the staging area from the head: directories that
@@ -245,13 +247,13 @@ fn restore_staged(path: &WarehousePath, command: &str) -> Result<(), String> {
         // come back (with stale stat data).
         let mut shards: BTreeMap<String, Inventory> = BTreeMap::new();
 
-        if let Some(HeadEntry::Tree(tree)) = &head_entry {
+        if let Some(HeadEntry::Tree { tree, hash }) = &head_entry {
             // In a scoped bay, only in-scope directories were ever materialized — the walk
             // must not resurrect out-of-scope shards for content that was never actually
             // written to this bay's working directory.
             let scope = scope_utils::current_scope()?;
 
-            build_stale_shards(tree, path.as_key(), &mut shards, &scope)?;
+            build_stale_shards(tree, path.as_key(), hash, &mut shards, &scope)?;
         }
 
         inventory_utils::replace_subtree_inventories(path.as_key(), &shards)?;
@@ -276,7 +278,7 @@ fn restore_staged(path: &WarehousePath, command: &str) -> Result<(), String> {
                 Ok(())
             })?;
         }
-        Some(HeadEntry::Tree(_)) => unreachable!("directories are handled above"),
+        Some(HeadEntry::Tree { .. }) => unreachable!("directories are handled above"),
         None => {
             let mut removed = false;
 
@@ -308,10 +310,13 @@ fn restore_staged(path: &WarehousePath, command: &str) -> Result<(), String> {
 /// §3.1 type-change: refuse rather than guess, exactly like the stack overlay does.
 ///
 /// # Arguments
-/// * `tree`   - The (loaded) head tree of the directory.
-/// * `key`    - The warehouse path key of the directory.
-/// * `shards` - The collected shards.
-/// * `scope`  - The active bay's materialization scope.
+/// * `tree`      - The (loaded) head tree of the directory.
+/// * `key`       - The warehouse path key of the directory.
+/// * `tree_hash` - The hash of `tree` itself (its parent's entry for it — `tree` as loaded
+///                 carries no hash of its own; the caller passes the resolved head subtree
+///                 hash for the root of the walk).
+/// * `shards`    - The collected shards.
+/// * `scope`     - The active bay's materialization scope.
 ///
 /// Once a level is itself fully in scope (`ScopeClass::InScope`), everything below it is
 /// included without further per-entry classification — the classifier's own "nothing below
@@ -322,6 +327,7 @@ fn restore_staged(path: &WarehousePath, command: &str) -> Result<(), String> {
 /// * `Err(String)` - If a subtree object could not be loaded, or a spine path's type changed.
 fn build_stale_shards(tree: &TreeItem,
                       key: &str,
+                      tree_hash: &str,
                       shards: &mut BTreeMap<String, Inventory>,
                       scope: &MaterializationScope) -> Result<(), String> {
     // Hoisted once per directory (not per entry): a full (unscoped) scope, or a level already
@@ -352,6 +358,14 @@ fn build_stale_shards(tree: &TreeItem,
         ));
     }
 
+    // `tree_hash` is a byte-for-byte-trustworthy rollup for this shard only when the reset here
+    // is a complete materialization of `tree` — see `tree_utils::rollup_stampable`'s doc comment
+    // (shared with `shift`'s own tree-to-shard builder, which must decide this exactly the same
+    // way).
+    if tree_utils::rollup_stampable(scope, key, tree) {
+        inventory.set_rollup_hash(Some(tree_hash.to_string()));
+    }
+
     shards.insert(key.to_string(), inventory);
 
     for (name, subtree) in tree.get_subtrees() {
@@ -364,7 +378,7 @@ fn build_stale_shards(tree: &TreeItem,
         }
 
         let subtree_loaded = object_utils::load_tree(&subtree.hash)?;
-        build_stale_shards(&subtree_loaded, &child_key, shards, scope)?;
+        build_stale_shards(&subtree_loaded, &child_key, &subtree.hash, shards, scope)?;
     }
 
     Ok(())
@@ -391,9 +405,10 @@ fn join_key(key: &str, name: &str) -> String {
 /// * `Err(String)`         - If a tree object could not be loaded.
 fn resolve_head_entry(root_tree_hash: &str, key: &str) -> Result<Option<HeadEntry>, String> {
     let mut current = object_utils::load_tree(root_tree_hash)?;
+    let mut current_hash = root_tree_hash.to_string();
 
     if key.is_empty() {
-        return Ok(Some(HeadEntry::Tree(current)));
+        return Ok(Some(HeadEntry::Tree { tree: current, hash: current_hash }));
     }
 
     let components: Vec<&str> = key.split(file_utils::PATH_SEPARATOR_CHAR).collect();
@@ -415,10 +430,13 @@ fn resolve_head_entry(root_tree_hash: &str, key: &str) -> Result<Option<HeadEntr
             .map(|(_, item)| item.hash.clone());
 
         match subtree {
-            Some(subtree_hash) => current = object_utils::load_tree(&subtree_hash)?,
+            Some(subtree_hash) => {
+                current = object_utils::load_tree(&subtree_hash)?;
+                current_hash = subtree_hash;
+            }
             None => return Ok(None),
         }
     }
 
-    Ok(Some(HeadEntry::Tree(current)))
+    Ok(Some(HeadEntry::Tree { tree: current, hash: current_hash }))
 }

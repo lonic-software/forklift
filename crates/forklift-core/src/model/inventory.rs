@@ -10,6 +10,14 @@ use crate::enums::dir_entry_type::DirEntryType;
 /// the inventory.
 pub struct Inventory {
     items_by_name: BTreeMap<String, Arc<InventoryItem>>,
+
+    /// The rollup hash of this shard's entire subtree (this directory's files plus every
+    /// descendant shard, with empty-subtree pruning), from current staged state — directly
+    /// comparable to a head subtree hash. `None` when the shard's true subtree hash is not
+    /// currently known (never derived independently; only ever stamped from a tree hash the
+    /// writer already holds, or cleared). See `inventory_utils::write_shard_mutation` and the
+    /// per-writer maintenance around it (DESIGN.html §5.0 D item 8) for how this stays correct.
+    rollup_hash: Option<String>,
 }
 
 impl Inventory {
@@ -20,7 +28,27 @@ impl Inventory {
     pub fn new() -> Inventory {
         Inventory {
             items_by_name: BTreeMap::new(),
+            rollup_hash: None,
         }
+    }
+
+    /// Get the rollup hash of this shard's subtree, if currently known.
+    ///
+    /// # Returns
+    /// * `Some(&String)` - The rollup hash.
+    /// * `None`          - If the rollup is not currently known.
+    pub fn get_rollup_hash(&self) -> Option<&String> {
+        self.rollup_hash.as_ref()
+    }
+
+    /// Set (or clear) the rollup hash of this shard's subtree. Callers own the correctness of
+    /// this value — the model never derives or invalidates it on its own; see
+    /// `inventory_utils::write_shard_mutation`.
+    ///
+    /// # Arguments
+    /// * `rollup_hash` - The new rollup hash, or `None` to clear it.
+    pub fn set_rollup_hash(&mut self, rollup_hash: Option<String>) {
+        self.rollup_hash = rollup_hash;
     }
 
     /// Add an item to the inventory. If an item with the same name already exists

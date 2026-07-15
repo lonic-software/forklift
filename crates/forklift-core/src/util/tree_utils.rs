@@ -9,6 +9,7 @@ use crate::enums::dir_entry_type::DirEntryType;
 use crate::enums::inventory_item_state::InventoryItemState;
 use crate::model::task::tree_builder::tree_builder_context::{ShardSource, TreeBuilderContext};
 pub use crate::model::task::tree_builder::tree_builder_context::ObjectSink;
+use crate::model::inventory::Inventory;
 use crate::model::task::TaskExecutor;
 use crate::model::tree_item::TreeItem;
 use crate::parser;
@@ -44,7 +45,15 @@ pub async fn build_tree_from_inventory() -> Result<Option<TreeItem>, String> {
         return Ok(None);
     };
 
-    build_tree_from_inventory_core(&metadata, ShardSource::Disk, ObjectSink::Immediate).await
+    // No head to compare rollups against here (this caller — `park` — never needs the skip; see
+    // `build_tree_from_inventory_deferred` for `stack`'s optimized path), so no skip is
+    // attempted: every directory is read and rebuilt exactly as before stage 2 existed. This
+    // caller also has no use for the per-directory tree hashes `stack` stamps rollups with
+    // afterward, so `track_tree_hashes` is `false` — nothing here would ever read them.
+    let (root, _tree_hashes, _untouched) =
+        build_tree_from_inventory_core(&metadata, ShardSource::Disk, ObjectSink::Immediate, None, false).await?;
+
+    Ok(root)
 }
 
 /// Like [`build_tree_from_inventory`], but reads shard content from an already-parsed
@@ -56,24 +65,50 @@ pub async fn build_tree_from_inventory() -> Result<Option<TreeItem>, String> {
 /// per-object fsync pairs this build would otherwise pay (one per built directory) into one
 /// barrier the caller runs after this returns (see [`file_utils::WriteBatch`]).
 ///
+/// Also applies the rollup-based skip (DESIGN.html §5.0 D item 8, stage 2) when `head_root_tree_hash`
+/// is given: a directory whose shard's rollup already matches the corresponding head subtree
+/// hash is never read past its header, never hashed, never (re)stored — its parent's tree
+/// includes it verbatim by the hash the rollup and the head agree on. See
+/// [`compute_rollup_skip_plan`] for exactly which keys are eligible.
+///
 /// # Arguments
-/// * `prepared` - The already-parsed shard snapshot.
-/// * `batch`    - Where every built tree object's write is staged.
+/// * `prepared`           - The already-parsed shard snapshot.
+/// * `batch`               - Where every built tree object's write is staged.
+/// * `head_root_tree_hash` - The current pallet head's root tree hash, if any (`None` for an
+///                           unborn pallet — no skip is possible with nothing to compare
+///                           against). The skip is also disabled by the
+///                           `FORKLIFT_DISABLE_ROLLUP_SKIP` kill switch (see
+///                           [`inventory_utils::rollup_skip_enabled`]).
+/// * `scope`               - The active bay's materialization scope — a skip is only ever
+///                           attempted where it cannot interact with a scoped bay's spine
+///                           splice (see [`compute_rollup_skip_plan`]).
 ///
 /// # Returns
-/// Same as [`build_tree_from_inventory`].
+/// * `Ok((Some(TreeItem), BTreeMap<String, String>, BTreeSet<String>))` - The root tree, every
+///   freshly built directory's subtree hash by warehouse path key (a non-empty subtree only —
+///   see [`build_tree_for_inventory_key`]), and every directory key the rollup skip proved
+///   unchanged and never read (`stack` leaves these shards' rollups untouched rather than
+///   stamping or clearing them).
+/// * `Ok((None, _, _))`                                                  - If there is no
+///   inventory at all.
+/// * `Err(String)`                                                       - If a shard could not
+///   be read or an object could not be stored.
 pub async fn build_tree_from_inventory_deferred(
     prepared: &Arc<inventory_utils::PreparedInventory>,
     batch: &Arc<file_utils::WriteBatch>,
-) -> Result<Option<TreeItem>, String> {
+    head_root_tree_hash: Option<&str>,
+    scope: &MaterializationScope,
+) -> Result<(Option<TreeItem>, BTreeMap<String, String>, BTreeSet<String>), String> {
     let Some(metadata) = &prepared.metadata else {
-        return Ok(None);
+        return Ok((None, BTreeMap::new(), BTreeSet::new()));
     };
 
     build_tree_from_inventory_core(
         metadata,
         ShardSource::Prepared(Arc::clone(prepared)),
         ObjectSink::Deferred(Arc::clone(batch)),
+        head_root_tree_hash.map(|hash| (hash, scope, &prepared.shards)),
+        true,
     ).await
 }
 
@@ -84,16 +119,37 @@ pub async fn build_tree_from_inventory_deferred(
 /// (leaves-first, bottom-up, parent enqueued once its last child completes) can never drift
 /// between two copies.
 ///
+/// # Arguments
+/// * `skip_context`      - `Some((head_root_tree_hash, scope, shards))` to attempt the
+///                         rollup-based skip (stage 2) against that head; `None` to build in
+///                         full, exactly as before stage 2 existed (every caller except
+///                         `stack`'s optimized path). `shards` is the same already-parsed shard
+///                         snapshot `stack` built `PreparedInventory` from — the skip plan reads
+///                         rollups out of it directly instead of re-reading shard headers off
+///                         disk a second time (nothing mutates a shard between
+///                         `prepare_stack_inventory` and here — see `PreparedInventory`'s own
+///                         doc comment).
+/// * `track_tree_hashes` - Whether the caller will actually consult the returned tree-hash map —
+///                         see [`TreeBuilderContext::track_tree_hashes`]. `false` for every
+///                         caller that immediately discards it (`build_tree_from_inventory`).
+///
 /// # Returns
-/// * `Ok(Some(TreeItem))` - The root tree (its hash set, all tree objects stored or staged).
-/// * `Ok(None)`           - If `metadata` is empty (nothing was ever loaded).
-/// * `Err(String)`        - If a shard could not be read or an object could not be stored.
+/// * `Ok((Some(TreeItem), BTreeMap<String, String>, BTreeSet<String>))` - The root tree (its
+///   hash set, all tree objects stored or staged), every built directory's non-empty subtree
+///   hash by warehouse path key (empty when `track_tree_hashes` is `false`), and every directory
+///   key the rollup skip proved unchanged and never read.
+/// * `Ok((None, _, _))`                                                 - If `metadata` is
+///   empty (nothing was ever loaded).
+/// * `Err(String)`                                                      - If a shard could not
+///   be read or an object could not be stored.
 async fn build_tree_from_inventory_core(metadata: &BTreeSet<String>,
                                         shard_source: ShardSource,
-                                        object_sink: ObjectSink)
-                                        -> Result<Option<TreeItem>, String> {
+                                        object_sink: ObjectSink,
+                                        skip_context: Option<(&str, &MaterializationScope, &BTreeMap<String, Inventory>)>,
+                                        track_tree_hashes: bool)
+                                        -> Result<(Option<TreeItem>, BTreeMap<String, String>, BTreeSet<String>), String> {
     if metadata.is_empty() {
-        return Ok(None);
+        return Ok((None, BTreeMap::new(), BTreeSet::new()));
     }
 
     // Collect every inventoried directory key plus all of its ancestors (ancestors may
@@ -129,9 +185,43 @@ async fn build_tree_from_inventory_core(metadata: &BTreeSet<String>,
         children.entry(parent.to_string()).or_default().push(key.clone());
     }
 
+    let skip_plan = match skip_context {
+        Some((head_root_tree_hash, scope, shards)) => compute_rollup_skip_plan(&children, head_root_tree_hash, scope, shards)?,
+        None => RollupSkipPlan::default(),
+    };
+
+    // The entire staged tree is provably identical to head (the root's own rollup already
+    // named it): nothing is read past the shards `prepare_stack_inventory` already parsed for
+    // the conflict check, nothing is hashed, nothing is (re)stored.
+    if let Some(whole_tree_hash) = skip_plan.whole_tree_hash {
+        return Ok((
+            Some(TreeItem::new(String::new(), whole_tree_hash, DirEntryType::Tree)),
+            BTreeMap::new(),
+            skip_plan.pruned,
+        ));
+    }
+
+    // Every pruned key (a skipped subtree's root, and everything beneath it) is excluded from
+    // the task graph entirely — as if it were never inventoried. Its parent instead gets it
+    // injected verbatim (by hash) inside `build_tree_for_inventory_key`, from `context.injections`.
+    // Only worth rebuilding `keys`/`children` when the skip plan actually pruned something —
+    // every caller except `stack`'s optimized path always has an empty `pruned` set (no skip
+    // plan at all), so this would otherwise pay a full clone-and-filter pass over both for
+    // nothing on the common path.
+    if !skip_plan.pruned.is_empty() {
+        keys = keys.difference(&skip_plan.pruned).cloned().collect();
+        children = children.into_iter()
+            .filter(|(key, _)| !skip_plan.pruned.contains(key))
+            .map(|(key, child_keys)| {
+                let child_keys = child_keys.into_iter().filter(|c| !skip_plan.pruned.contains(c)).collect();
+                (key, child_keys)
+            })
+            .collect();
+    }
+
     let children = Arc::new(children);
 
-    // Dependency counters: a directory becomes buildable once all of its children are
+    // Dependency counters: a directory becomes buildable once all of its (unpruned) children are
     // built. Directories without children (the leaves) are buildable immediately.
     let pending_children: HashMap<String, usize> = keys.iter()
         .map(|key| (key.clone(), children.get(key).map(|c| c.len()).unwrap_or(0)))
@@ -142,7 +232,9 @@ async fn build_tree_from_inventory_core(metadata: &BTreeSet<String>,
         .cloned()
         .collect();
 
-    let context = Arc::new(TreeBuilderContext::new(pending_children, shard_source, object_sink));
+    let context = Arc::new(TreeBuilderContext::new(
+        pending_children, shard_source, object_sink, Arc::new(skip_plan.injections), track_tree_hashes,
+    ));
     let executor = TaskExecutor::new(Arc::clone(&context));
 
     let first_leaf = leaves.pop()
@@ -169,7 +261,143 @@ async fn build_tree_from_inventory_core(metadata: &BTreeSet<String>,
     let root = context.built.lock().await.remove("")
         .ok_or("The tree build finished without producing a root tree.".to_string())?;
 
-    Ok(Some(root))
+    let tree_hashes: BTreeMap<String, String> = context.tree_hashes.lock().await.iter()
+        .map(|(key, hash)| (key.clone(), hash.clone()))
+        .collect();
+
+    Ok((Some(root), tree_hashes, skip_plan.pruned))
+}
+
+/// What [`compute_rollup_skip_plan`] decided for one tree build: which subtrees the rollup skip
+/// lets it never read, hash or store, and what to splice into each surviving parent instead.
+#[derive(Default)]
+struct RollupSkipPlan {
+    /// Set only when the *entire* staged tree is provably unchanged from head (the warehouse
+    /// root's own rollup matches the head root tree hash): every registered key ends up in
+    /// `pruned` and the caller returns a hash-only root immediately, without building anything.
+    whole_tree_hash: Option<String>,
+
+    /// Directory keys entirely excluded from the task graph — a skip root or one of its
+    /// descendants. Also `cleanup_after_stack_with`'s "leave untouched" set: none of these were
+    /// read this stack, so their on-disk rollups (already equal to what a fresh build would
+    /// produce — that is *why* they were skipped) are left exactly as they sit.
+    pruned: BTreeSet<String>,
+
+    /// For each *unpruned* directory key, the `(name, head_hash)` pairs of its immediate
+    /// children that a matching rollup let the build skip — added directly into that
+    /// directory's tree with no load, no task (mirrors `build_scoped_root_tree`'s
+    /// `splice_out_of_scope_entry` by-hash pattern).
+    injections: BTreeMap<String, Vec<(String, String)>>,
+}
+
+/// Resolve, top-down, which inventoried subtrees can be skipped entirely because their shard's
+/// rollup already matches the corresponding head subtree hash — no staged change is possible
+/// anywhere in one (Stage 1's maintenance guarantees the rollup would have been cleared the
+/// moment anything below it actually changed). A match stops the descent right there: everything
+/// beneath a skip root is skipped too, without ever comparing its own rollup (redundant — the
+/// parent's hash match already proves the whole subtree, content-addressing being what it is).
+///
+/// **Scoped-bay caveat.** A skip is only attempted where a key's *parent* is already fully in
+/// scope (`scope.classify(parent) == InScope`, or the bay is unscoped). The outermost in-scope
+/// boundary directory (whose parent is `Spine`) is deliberately never a skip candidate: a scoped
+/// stack's spine splice (`build_scoped_root_tree`) later re-visits exactly that directory as an
+/// opaque `TreeItem` and prunes it if `is_tree_empty` — which a hash-only, no-children stand-in
+/// would wrongly report, silently dropping a real (non-empty) subtree from the signed tree. A
+/// full workspace's root has no such boundary crossing to worry about; a scoped bay's own root is
+/// always `Spine` itself, so it is never a skip candidate either way (see the `is_full()` gate
+/// on the whole-tree fast path below).
+///
+/// # Arguments
+/// * `children`             - The parent → children relation over every inventoried directory
+///                            key (pre-pruning).
+/// * `head_root_tree_hash`  - The pallet head's root tree hash.
+/// * `scope`                - The active bay's materialization scope.
+/// * `shards`               - The already-parsed shard snapshot (`stack_utils::stack_parcel`'s
+///                            `PreparedInventory`) to read every candidate's rollup out of — an
+///                            in-memory lookup, not a disk re-read (nothing mutates a shard
+///                            between that snapshot and this call).
+///
+/// # Returns
+/// * `Ok(RollupSkipPlan)` - The plan (empty when the kill switch is set, or nothing matched).
+/// * `Err(String)`        - If a head tree object could not be read.
+fn compute_rollup_skip_plan(children: &BTreeMap<String, Vec<String>>,
+                            head_root_tree_hash: &str,
+                            scope: &MaterializationScope,
+                            shards: &BTreeMap<String, Inventory>) -> Result<RollupSkipPlan, String> {
+    let mut plan = RollupSkipPlan::default();
+
+    if !inventory_utils::rollup_skip_enabled() {
+        return Ok(plan);
+    }
+
+    let rollup_of = |key: &str| shards.get(key).and_then(|inventory| inventory.get_rollup_hash().cloned());
+
+    let scope_is_full = scope.is_full();
+    let root_head_tree = object_utils::load_tree_shared(head_root_tree_hash)?;
+
+    if scope_is_full {
+        if let Some(rollup) = rollup_of("") {
+            if rollup == head_root_tree_hash {
+                prune_subtree("", children, &mut plan.pruned);
+                plan.whole_tree_hash = Some(rollup);
+                inventory_utils::record_rollup_skip();
+                return Ok(plan);
+            }
+        }
+    }
+
+    // (key, the head subtree at key, whether `key` itself is fully in scope — gates whether
+    // `key`'s *children* are eligible for a skip; see the caveat above).
+    let mut stack: Vec<(String, Arc<TreeItem>, bool)> = vec![(String::new(), root_head_tree, scope_is_full)];
+
+    while let Some((key, head_tree, key_in_scope)) = stack.pop() {
+        let Some(child_keys) = children.get(&key) else { continue };
+
+        // Keyed by `&str` (not `&String`) so a candidate's lookup below needs no allocation —
+        // `child_name` is already a borrow out of `child_key`.
+        let head_subtrees: BTreeMap<&str, &TreeItem> = head_tree.get_subtrees()
+            .map(|(name, item)| (name.as_str(), item))
+            .collect();
+
+        for child_key in child_keys {
+            let child_name = last_component(child_key);
+            let Some(head_child) = head_subtrees.get(child_name) else { continue };
+
+            // A rollup lookup is now a plain in-memory map read (`shards` is the same snapshot
+            // already parsed for the conflict check), so there is nothing left to parallelize
+            // here — unlike a disk re-read per candidate, which used to cost more wall clock
+            // than the parallel rebuild it replaced (DESIGN.html §5.0 D item 8 stage 2b finding).
+            if key_in_scope {
+                if let Some(rollup) = rollup_of(child_key) {
+                    if rollup == head_child.hash {
+                        plan.injections.entry(key.clone()).or_default()
+                            .push((child_name.to_string(), rollup));
+                        prune_subtree(child_key, children, &mut plan.pruned);
+                        inventory_utils::record_rollup_skip();
+                        continue;
+                    }
+                }
+            }
+
+            let child_in_scope = scope_is_full || scope.classify(child_key) == ScopeClass::InScope;
+            let head_child_tree = object_utils::load_tree_shared(&head_child.hash)?;
+            stack.push((child_key.clone(), head_child_tree, child_in_scope));
+        }
+    }
+
+    Ok(plan)
+}
+
+/// Add `key` and every one of its descendants (found transitively through `children`) to
+/// `pruned` — the whole subtree a matched rollup lets the build skip entirely.
+fn prune_subtree(key: &str, children: &BTreeMap<String, Vec<String>>, pruned: &mut BTreeSet<String>) {
+    pruned.insert(key.to_string());
+
+    if let Some(child_keys) = children.get(key) {
+        for child_key in child_keys {
+            prune_subtree(child_key, children, pruned);
+        }
+    }
 }
 
 /// The per-directory task of the tree build: build (and store) the tree object for one
@@ -235,12 +463,20 @@ fn build_tree_for_inventory_key(context: Arc<TreeBuilderContext>,
                 let child_tree = built.remove(child_key)
                     .ok_or(format!("Subtree \"{}\" was not built before its parent.", child_key))?;
 
-                let is_empty = child_tree.get_files().len() == 0
-                    && child_tree.get_subtrees().len() == 0;
-
-                if !is_empty {
+                if !is_tree_empty(&child_tree) {
                     tree.add_child(child_tree);
                 }
+            }
+        }
+
+        // Skip-injected children (DESIGN.html §5.0 D item 8, stage 2): subtrees whose rollup
+        // already matched the head, added verbatim by hash — no load, no task, and unlike the
+        // `built`-sourced children above, never empty (a matching rollup is only ever recorded
+        // for a non-empty subtree — see `build_tree_for_inventory_key`'s own rollup stamping —
+        // so no emptiness check applies here).
+        if let Some(injected) = context.injections.get(&key) {
+            for (child_name, head_hash) in injected {
+                tree.add_child(TreeItem::new(child_name.clone(), head_hash.clone(), DirEntryType::Tree));
             }
         }
 
@@ -250,6 +486,15 @@ fn build_tree_for_inventory_key(context: Arc<TreeBuilderContext>,
         match &context.object_sink {
             ObjectSink::Immediate => { object.store()?; }
             ObjectSink::Deferred(batch) => { object.store_deferred(batch)?; }
+        }
+
+        // Only a non-empty subtree's hash is a meaningful rollup: an empty directory is pruned
+        // by its parent (below), so "the tree stack would build for this subtree" is ill-defined
+        // for it — omitted here rather than recorded and later filtered out. Skipped entirely
+        // (not even the emptiness check) when this build's caller has no use for the map at all
+        // — see `TreeBuilderContext::track_tree_hashes`.
+        if context.track_tree_hashes && !is_tree_empty(&tree) {
+            context.tree_hashes.lock().await.insert(key.clone(), tree.hash.clone());
         }
 
         context.built.lock().await.insert(key.clone(), tree);
@@ -534,6 +779,30 @@ fn shallow_entry(item: &TreeItem) -> TreeItem {
 /// [`build_tree_from_inventory`] prunes on (`:173-178`).
 fn is_tree_empty(tree: &TreeItem) -> bool {
     tree.get_files().len() == 0 && tree.get_subtrees().len() == 0
+}
+
+/// Whether a directory's inventory shard, just rebuilt wholesale from `tree`, may be trusted to
+/// carry `tree`'s hash as its rollup. Shared by `restore --staged`'s and `shift`'s tree-to-shard
+/// builders (`build_stale_shards`, `shift_utils::build_inventory_for_tree_directory`), which each
+/// independently rebuild every shard of a subtree straight from a resolved tree and must decide
+/// the same way whether the shard they just wrote is a trustworthy rollup — kept as one function
+/// so the (subtle) rule can never drift between the two copies.
+///
+/// A rewrite is only trustworthy when both hold:
+/// * it is a *complete* materialization of `tree` — the whole tree (an unscoped bay), or a
+///   directory already fully in scope (see [`MaterializationScope::classify`]). A spine
+///   directory in a scoped bay only ever rebuilds the in-scope subset of its real content, so
+///   stamping it with `tree`'s hash would misrepresent staged state.
+/// * `tree` is not empty. An empty tree is only possible for the warehouse root (a stored tree
+///   never carries a pruned-empty child entry) — pruning makes "this subtree's hash" ill-defined
+///   as a rollup either way.
+///
+/// # Arguments
+/// * `scope` - The active bay's materialization scope.
+/// * `key`   - The warehouse path key of the directory whose shard was just rebuilt.
+/// * `tree`  - The (loaded) tree the shard was rebuilt from.
+pub fn rollup_stampable(scope: &MaterializationScope, key: &str, tree: &TreeItem) -> bool {
+    (scope.is_full() || scope.classify(key) == ScopeClass::InScope) && !is_tree_empty(tree)
 }
 
 /// Build, store and hash a tree object (setting the item's hash), like the per-directory step

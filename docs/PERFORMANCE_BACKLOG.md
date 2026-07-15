@@ -77,52 +77,99 @@ wins on paths that were already correct.
 
 ---
 
+## Fixed on the rollup-hash branch
+
+Landed on `perf-rollup-hash`: the structural fix from the "highest value" item this
+document originally listed as remaining. Numbers below are measured on that branch;
+`BENCHMARK.md` gets its own full re-run once it merges.
+
+**Mechanism.** Each inventory shard's header can now carry an optional rollup hash
+(format `v2026_07_15`) — the tree hash `stack` would build for that shard's entire
+staged subtree, directly comparable against the corresponding head subtree's hash.
+`walk_directory_staged` (`stocktake`/`diff --staged`) and `stack`'s tree-build skip
+plan (`compute_rollup_skip_plan`) both skip load+parse+descend for a subtree the
+moment its shard's rollup matches the head subtree hash — the same short-circuit
+`diff`'s pallet-vs-pallet walk already had
+(`crates/forklift/src/commands/diff.rs:584-586`), now extended to the staged/stack
+side. These are the two O(all tracked directories) walks this item originally
+described.
+
+**Stamp / invalidate rules.** A rollup is written whenever a shard is materialized
+straight from a known tree hash: the materialize-from-tree paths (`shift`,
+`park`/pop, `restore`, `consolidate`'s fast-forward) and `stack`'s post-cleanup
+stamp; a shard that is merely re-verified with no content change (a pure stat-only
+refresh) carries its existing rollup forward unchanged. Every content-mutating
+writer funnels through a single maintenance path that clears the rollup of every
+ancestor shard, root-first, and makes that clear durable *before* the mutated
+shard's own write becomes visible — so a crash between the two can only ever lose
+skips (falling back to a full walk), never leave a stale-valid rollup sitting above
+genuinely changed content. A shard with no rollup — old-format or never stamped —
+is treated as "unknown" and falls back to the pre-existing unconditional load; no
+migration is required to keep reading an older store.
+
+**Measured — synthetic 300-directory corpus, one file touched, main vs branch:**
+
+| Command | main | branch |
+|---|---|---|
+| `stocktake` | 34 ms | 27 ms |
+| `diff --staged` | 17 ms | 8 ms |
+| `stack` (steady state) | 45 ms | 50 ms |
+| `load .` | 68 ms | 43 ms |
+| `load .` (no-op) | 54 ms | 33 ms |
+| first `stack` after upgrade (one-time re-stamp) | 142 ms | 250 ms |
+
+**Measured — git.git (81,489 commits, 4,775 tracked files, 224 tracked
+directories), densified store, main vs branch:**
+
+| Command | main | branch |
+|---|---|---|
+| `stocktake` | 50 ms | 29 ms |
+| `diff --staged` (2 files staged) | 46 ms | 28 ms |
+| `stack` (steady state, 1 file touched) | 63 ms | 57 ms |
+
+`stocktake` and `diff --staged` drop by roughly the fraction of directories left
+untouched, tracking the synthetic corpus's ratios. `stack` improves here (63→57 ms)
+rather than showing the small regression the synthetic corpus does (45→50 ms) —
+plausible given `stack`'s per-write overhead is closer to fixed-cost, so it shows up
+more against a 300-directory synthetic corpus than against git.git's 224.
+
+**The one-time cost.** The first `stack` after upgrading a warehouse to this format
+pays to freshly stamp every shard that has never carried a rollup before — measured
+142→250 ms on the synthetic corpus. This is paid once per warehouse, not once per
+invocation.
+
+**Two fixes shipped alongside it:**
+
+- **Atomic shard writes**, closing a real crash-corruption hole. The higher
+  shard-write volume this change introduced (an ancestor chain touched on both
+  `load` and `stack`'s cleanup) exposed a latent bug: `save_inventory` was a plain
+  `std::fs::write`, not the store's usual temp-file/fsync/rename contract — a crash
+  mid-write could leave a torn shard. `crash_consistency.rs` caught it; every shard
+  write now goes through the same atomic contract as every other state file in the
+  store.
+- **`load .` got faster than main**, not just neutral. Batching the maintenance
+  funnel's per-shard durability barriers into a single-threaded, two-phase join
+  point (at most two fsync barriers per `load`, not one per touched ancestor)
+  benefited plain `load .` as a side effect: 68→43 ms on the synthetic corpus,
+  faster than main despite doing strictly more bookkeeping (maintaining rollups)
+  than main's `load` ever did.
+
+**Adversarial review.** This shipped after an adversarial review pass, not just
+tests. The review caught one critical bug: an early version of the maintenance
+funnel (`pre_clear_rollups_for_load`) unconditionally wiped every rollup in the
+loaded scope on every `load` — for `load .`, the whole warehouse — which meant the
+standard `load .; stack` workflow got **zero benefit** from the entire feature
+(every shard's rollup was cleared before `stack` could ever read it). Verified fixed
+with a skip-count A/B: 0 shards skipped before the fix, 2 after, on the same
+`stack` → `narrow load` → `stack` repro, with and without an interposed no-op
+`load .`.
+
+---
+
 ## Remaining items
 
-### a. Per-shard rollup hash (the structural fix — highest value)
-
-**Symptom.** `diff --staged` (and `stocktake`'s staged walk, the same code path) and
-`stack`'s shard pass are **O(all tracked directories), not O(changed)**. On git.git
-(224 tracked directories), this is ~18–19 ms of every `diff` and 4–12 ms of every
-`stack` — confirmed linear on synthetic corpora at 0.08–0.12 ms per directory,
-independent of how many of those directories actually changed.
-
-**Root cause.** `walk_directory_staged`
-(`crates/forklift-core/src/util/stocktake_utils.rs:151-267`) loads every inventory
-shard and unconditionally calls `object_utils::load_tree` on every corresponding head
-subtree, for every directory in the walk — there is no short-circuit for a subtree
-that is unchanged since the head. This is the mirror image of a bug that does *not*
-exist on the tree-vs-tree path: `diff`'s pallet-vs-pallet walk already skips a
-subtree the moment the child and head subtree hashes are equal
-(`crates/forklift/src/commands/diff.rs:584-586`, `if from_subtree.hash ==
-to_subtree.hash { continue; }`). The staged walk has no equivalent test to skip on,
-because an inventory shard has no single hash to compare against the head subtree's
-hash — it is a set of per-file entries, not a rolled-up value.
-
-**Direction.** Give each inventory shard an aggregate ("rollup") hash that is
-comparable against the corresponding head subtree hash, and skip
-load+parse+descend for that subtree the moment the two match — exactly the
-short-circuit `diff` already has, extended to the staged/stack side. This was
-already floated in the 2026-07-07 stocktake/diff scaling review (see
-`OBJECT_STORE_SCALING.md`'s revision history and the internal review notes referenced
-from `DESIGN.html` §5.0 milestone A) as a known gap, not a new finding.
-
-**Correctness-critical, not a drop-in patch.** A stale rollup hash silently hides a
-real staged change — the failure mode is not a crash but `diff --staged`/`stocktake`
-under-reporting, which is worse. Every mutating path that can leave a shard's rollup
-hash out of sync with its contents must maintain it: `load`, `unload` (formerly
-`remove`), `restore`, sparse `narrow`/`expand`, `consolidate`/merge, `cherry-pick`,
-and `park`/pop. This is very likely a shard format/version bump (the rollup hash has
-to be *stored*, not recomputed on every read — recomputing it on every read is the
-same O(all directories) cost this change exists to remove). Needs a design pass —
-covering exactly which mutating paths must update the hash, whether it is
-incrementally maintained or recomputed on write, and how a shard from an
-old-format store degrades (presumably: treated as "unknown", falls back to the
-current unconditional-load behavior) — not a quick patch.
-
-**Expected effect.** Fixes both the staged diff walk directly and, combined with the
-quick-wins scan collapse (item 2 above), removes most of `stack`'s remaining
-shard-pass cost — the two paths share the same root cause.
+With the rollup hash fixed (above), **(b) pack-index validation tax is now the top
+remaining item** — a store-wide read-floor cost, not specific to one command.
 
 ### b. Pack-index validation tax
 
@@ -169,6 +216,44 @@ densified pack's stored base. This is genuine reconstruction cost — the store 
 size for exactly this at compaction time (see `OBJECT_STORE_SCALING.md` §A) — not
 overhead to eliminate. Only worth revisiting if `diff` is still hot after (a) lands;
 until then this is the store working as designed, not a bug.
+
+### e. Durability-barrier audit (write-batching sweep)
+
+**What.** A systematic audit of every durability barrier in forklift-core and the
+CLI head — `write_file_atomically` call sites, `WriteBatch` construction, every raw
+`fsync` — counting barriers paid per logical operation, before any patching is
+attempted. Audit first, patches second: the point is to size the remaining problem
+rather than fix whatever is found first.
+
+**Why now.** Three unrelated pieces of work converged on the same cost in short
+succession. The quick-wins track already had to batch `stack`'s per-object fsyncs
+into one barrier (quick-win #3, above). The rollup-hash work on this branch had to
+batch shard-write barriers *twice* — once to bring stack cleanup's overhead down
+from 70% to 18%, again to get `load .`'s join point faster than main rather than
+merely neutral. And this branch's own benchmark verification (PR #59) surfaced
+`park` costing roughly **+28 ms** and `park` pop roughly **+8 ms** on git.git,
+tracing to unbatched barriers nobody had measured before. Three independent
+investigations tripping over the same class of cost is a pattern, not a
+coincidence.
+
+**Known suspects to check first.**
+
+- `consolidate`/cherry-pick's per-merge-action shard writes — each action pays the
+  two-barrier mutation funnel individually; a 50-file merge is on the order of 100
+  barriers, untimed so far.
+- `park` pop's per-file replay.
+- Multi-file `restore`.
+- Journal writes.
+
+**Method.** Classify each write site as: (a) already batched; (b) batchable with no
+ordering constraint; (c) batchable with phased ordering — the `load .` join-point
+pattern above, where ordering-constrained groups become ordered sub-barriers rather
+than one barrier per file; (d) must remain individual for correctness.
+
+**Standing rule.** Batching may reduce the *count* of barriers; it must never weaken
+a barrier's *guarantee*. The durable-before-destructive contract and the ordering
+invariants this doc already protects (ancestor-clears-before-content,
+fsync-before-ref-move) are preserved exactly — only the granularity changes.
 
 ---
 

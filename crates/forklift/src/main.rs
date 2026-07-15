@@ -71,6 +71,14 @@ async fn async_main() {
         pager.close();
     }
 
+    // Undocumented, test-only debug hook (mirrors the `FORKLIFT_DISABLE_ROLLUP_SKIP` kill
+    // switch): the rollup-skip equivalence tests need to observe, across the subprocess
+    // boundary, that a skip actually fired — not just that its output happens to be correct
+    // (which the rest of those tests already cover independently).
+    if std::env::var("FORKLIFT_DEBUG_ROLLUP_SKIP_COUNT").is_ok() {
+        eprintln!("rollup-skip-count: {}", forklift_core::util::inventory_utils::rollup_skip_count());
+    }
+
     if let Err(error) = result {
         output::report_error(&error);
         std::process::exit(error.code.exit_code());

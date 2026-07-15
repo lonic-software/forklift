@@ -631,6 +631,42 @@ impl WriteBatch {
         Ok(())
     }
 
+    /// Like [`stage`](Self::stage), but sets the staged temp file's modification time to
+    /// `mtime` — through the same write handle the content was just written with, never a
+    /// reopen-by-path (the project's Windows fsync convention applies here too: a fresh
+    /// `File::open` on Windows can fail to observe the write that just happened without an
+    /// intervening flush) — before it is queued for the barrier.
+    ///
+    /// This exists for a rewrite that must be invisible, timing-wise, to a later mtime-based
+    /// staleness check (`inventory_utils`'s rollup-clear maintenance: see
+    /// `stage_rollup_clear`'s doc comment). Setting the mtime on the *temp* file, before the
+    /// barrier's fsync and rename, means the final path never has an observable window where its
+    /// mtime is wrong — `rename` does not itself change a file's mtime, so whatever the temp
+    /// file's mtime was at rename time is exactly what the final path carries. A caller that
+    /// instead set the mtime on the final path *after* `finish()` would leave a real crash
+    /// window: a crash between the rename becoming durable and the mtime fix-up would durably
+    /// publish the wrong (advanced) mtime.
+    ///
+    /// # Returns
+    /// * `Ok(())`      - The write was staged, with its temp file's mtime already set.
+    /// * `Err(String)` - If the temp file could not be created, written, or have its
+    ///                   modification time set.
+    pub fn stage_with_mtime(&self,
+                            file_path: &Path,
+                            content: &[u8],
+                            mtime: std::time::SystemTime) -> Result<(), String> {
+        let temp_path = temp_path_for(file_path)?;
+        let file = create_and_write_file(&temp_path, content)?;
+
+        file.set_modified(mtime).map_err(|e| format!(
+            "Error while setting the modification time of \"{}\": {}", temp_path.to_string_lossy(), e
+        ))?;
+
+        self.pending.lock().expect("write batch lock poisoned").push((temp_path, file_path.to_path_buf()));
+
+        Ok(())
+    }
+
     /// The barrier: fsync every staged write's bytes, then — only once every byte is durable —
     /// rename each into place and fsync the directories that changed. See
     /// [`BulkStoreSession::finish`]'s doc comment for the exact four steps and the full crash

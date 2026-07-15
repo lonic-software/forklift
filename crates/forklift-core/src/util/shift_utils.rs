@@ -4,7 +4,7 @@ use crate::enums::dir_entry_type::DirEntryType;
 use crate::model::inventory::Inventory;
 use crate::model::tree_item::TreeItem;
 use crate::util::scope_utils::{self, MaterializationScope, ScopeClass};
-use crate::util::{file_utils, inventory_utils, object_utils};
+use crate::util::{file_utils, inventory_utils, object_utils, tree_utils};
 
 /// A single file operation needed to turn one tree into another in the working directory.
 pub enum FileOp {
@@ -461,23 +461,27 @@ pub fn build_inventories_for_tree(root_tree_hash: &str) -> Result<BTreeMap<Strin
     // or the main tree) inventories the whole tree exactly as before.
     let scope = scope_utils::current_scope()?;
 
-    build_inventory_for_tree_directory(&root_tree, "", &mut shards, &scope)?;
+    build_inventory_for_tree_directory(&root_tree, "", root_tree_hash, &mut shards, &scope)?;
 
     Ok(shards)
 }
 
-/// Build the inventory shard for one directory of a tree (recursively).
+/// Build the inventory shard for one directory of a tree (recursively), stamping each shard's
+/// rollup with the tree hash it was built from.
 ///
 /// # Arguments
-/// * `tree`   - The (loaded) tree of the directory.
-/// * `key`    - The warehouse path key of the directory.
-/// * `shards` - The collected shards.
+/// * `tree`      - The (loaded) tree of the directory.
+/// * `key`       - The warehouse path key of the directory.
+/// * `tree_hash` - The hash of `tree` itself (its parent's entry for it — `tree` as loaded
+///                 carries no hash of its own; the root passes `root_tree_hash` directly).
+/// * `shards`    - The collected shards.
 ///
 /// # Returns
 /// * `Ok(())`      - If the shard was built.
 /// * `Err(String)` - If a subtree could not be loaded or a file's metadata gathered.
 fn build_inventory_for_tree_directory(tree: &TreeItem,
                                       key: &str,
+                                      tree_hash: &str,
                                       shards: &mut BTreeMap<String, Inventory>,
                                       scope: &MaterializationScope) -> Result<(), String> {
     // Hoisted once per directory (not per entry): a full (unscoped) scope always classifies
@@ -506,6 +510,14 @@ fn build_inventory_for_tree_directory(tree: &TreeItem,
         )?);
     }
 
+    // `tree_hash` is a byte-for-byte-trustworthy rollup for this shard only when its content
+    // here is a complete materialization of `tree` — see `tree_utils::rollup_stampable`'s doc
+    // comment (shared with `restore --staged`'s own tree-to-shard builder, which must decide
+    // this exactly the same way).
+    if tree_utils::rollup_stampable(scope, key, tree) {
+        inventory.set_rollup_hash(Some(tree_hash.to_string()));
+    }
+
     shards.insert(key.to_string(), inventory);
 
     for (name, subtree) in tree.get_subtrees() {
@@ -517,7 +529,7 @@ fn build_inventory_for_tree_directory(tree: &TreeItem,
         }
 
         let subtree_loaded = object_utils::load_tree(&subtree.hash)?;
-        build_inventory_for_tree_directory(&subtree_loaded, &subtree_key, shards, scope)?;
+        build_inventory_for_tree_directory(&subtree_loaded, &subtree_key, &subtree.hash, shards, scope)?;
     }
 
     Ok(())
