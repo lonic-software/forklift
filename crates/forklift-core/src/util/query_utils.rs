@@ -43,7 +43,7 @@ use crate::util::office_utils::{IdentityClass, OfficeState, RevocationReason, Ro
 use crate::util::path_utils::WarehousePath;
 use crate::util::scope_utils::{self, MaterializationScope, ScopeClass};
 use crate::util::{
-    fanout_utils, file_utils, manifest_utils, merge_utils, object_utils, pallet_utils, tag_utils,
+    fanout_utils, manifest_utils, merge_utils, object_utils, pallet_utils, tag_utils,
     tree_utils,
 };
 
@@ -267,20 +267,14 @@ struct QueryContext {
     /// the phase-2 fanout, which resolves identities, not tree hashes).
     tree_hashes: RefCell<HashMap<String, String>>,
 
-    /// Revoked key id → whether its distrust boundary can even be evaluated on this store:
-    /// every one of its `distrust_boundary` heads must be present locally, checked (and
-    /// memoized) once per distinct key. `false` means at least one boundary head was never
-    /// fetched (an orphaned head on a partial clone) — the reachability walk below is never
-    /// even attempted for that key, because an absent head would silently shrink the
-    /// vouched set and misclassify a genuinely vouched parcel as suspect.
-    resolvable_boundaries: RefCell<HashMap<String, bool>>,
-
-    /// The shared audit primitive ([`audit_utils::DistrustBoundaryMemo`]) that actually
-    /// walks and memoizes each resolvable key's vouched set, so a walk with many parcels
-    /// signed by the same revoked key pays for one boundary walk, not one per parcel — and
-    /// so this engine's reachability arithmetic never drifts from `audit`'s. Filled by
-    /// [`Self::fill_boundary`] on the main walk thread only — never inside `fanout_map`'s
-    /// worker threads — so this memo needs no `Mutex`.
+    /// The shared audit primitive ([`audit_utils::DistrustBoundaryMemo`]) that walks and
+    /// memoizes each key's vouched set *and* whether its distrust boundary can even be
+    /// evaluated on this store (a gap the walk itself ran into — an absent boundary head, or
+    /// an absent interior ancestor behind one), so a walk with many parcels signed by the
+    /// same revoked key pays for one boundary walk, not one per parcel — and so this engine's
+    /// reachability arithmetic never drifts from `audit`'s. Filled by [`Self::fill_boundary`]
+    /// on the main walk thread only — never inside `fanout_map`'s worker threads — so this
+    /// memo needs no `Mutex`.
     boundary_memo: RefCell<audit_utils::DistrustBoundaryMemo>,
 }
 
@@ -323,7 +317,6 @@ impl QueryContext {
             fetch_scope: scope_utils::read_fetch_scope()?,
             out_of_scope: Cell::new(0),
             tree_hashes: RefCell::new(HashMap::new()),
-            resolvable_boundaries: RefCell::new(HashMap::new()),
             boundary_memo: RefCell::new(audit_utils::DistrustBoundaryMemo::new()),
         })
     }
@@ -362,14 +355,14 @@ impl QueryContext {
     /// key's distrust boundary (`Vouched`), outside it (`Suspect`), or is the question
     /// unanswerable on this store at all (`Unresolved`)? A no-op for any other trust.
     ///
-    /// Presence-guarded: every one of the key's `distrust_boundary` heads must be present
-    /// locally before the reachability walk ever runs (checked once per key, memoized in
-    /// `resolvable_boundaries`) — a partial clone that never fetched an orphaned boundary
-    /// head must read `Unresolved`, never `Suspect`, or a parcel plainly vouched on the
-    /// origin would be misclassified as suspicious purely for this store's incompleteness.
-    /// The walk itself (once the guard passes) is the shared [`audit_utils::DistrustBoundaryMemo`]
-    /// — the same primitive `audit`'s own phase 3 uses, so the two can never disagree on
-    /// what "vouched" means.
+    /// Presence-guarded: the boundary must be fully resolvable — every `distrust_boundary`
+    /// head present, and every interior ancestor the walk crosses to decide membership too —
+    /// before its answer is trusted, or a gap this store never fetched (an orphaned head, or
+    /// an ancestor behind one) could silently shrink the vouched set and misclassify a
+    /// parcel plainly vouched on the origin as suspicious. Both the presence guard and the
+    /// reachability walk it guards are the shared [`audit_utils::DistrustBoundaryMemo`] — the
+    /// same primitive `audit`'s own phase 3 uses, reading off the very same walk, so the two
+    /// can never disagree on what "vouched" or "resolvable" means.
     ///
     /// Deliberately lazy at the call site (see `run_query`): called for every `SignedRevoked`
     /// resolution only when the predicate itself reads `signer.boundary` (correctness — the
@@ -390,24 +383,12 @@ impl QueryContext {
         let key = office.find_key(key_id)
             .expect("resolve_verified already found this key to classify the signature");
 
-        // Copied out of the `Ref` (not matched on directly): a match on the borrow's
-        // temporary would hold it alive through the `None` arm, where the `borrow_mut()`
-        // below would then panic on the same `RefCell`.
-        let already_checked = self.resolvable_boundaries.borrow().get(key_id).copied();
-        let resolvable = match already_checked {
-            Some(resolvable) => resolvable,
-            None => {
-                let mut resolvable = true;
-                for head in &key.distrust_boundary {
-                    if !file_utils::does_object_exist(head)? {
-                        resolvable = false;
-                        break;
-                    }
-                }
-                self.resolvable_boundaries.borrow_mut().insert(key_id.to_string(), resolvable);
-                resolvable
-            }
-        };
+        // `resolvable` is what forces the walk (memoized in `boundary_memo`) for this engine:
+        // asking it first, unconditionally, is the deliberately more cautious posture a
+        // read-only reporting tool takes (see the struct docs on `boundary_memo`). The borrow
+        // it takes is released before `vouched`'s own `borrow_mut()` below — never held across
+        // it — so there is no double-borrow hazard even though both go through one `RefCell`.
+        let resolvable = self.boundary_memo.borrow_mut().resolvable(key)?;
 
         resolution.boundary = Some(if !resolvable {
             Boundary::Unresolved
@@ -1851,7 +1832,6 @@ mod tests {
             fetch_scope: MaterializationScope::full(),
             out_of_scope: Cell::new(0),
             tree_hashes: RefCell::new(HashMap::new()),
-            resolvable_boundaries: RefCell::new(HashMap::new()),
             boundary_memo: RefCell::new(audit_utils::DistrustBoundaryMemo::new()),
         };
 
@@ -1894,7 +1874,6 @@ mod tests {
             fetch_scope: MaterializationScope::full(),
             out_of_scope: Cell::new(0),
             tree_hashes: RefCell::new(HashMap::new()),
-            resolvable_boundaries: RefCell::new(HashMap::new()),
             boundary_memo: RefCell::new(audit_utils::DistrustBoundaryMemo::new()),
         };
 
