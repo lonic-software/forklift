@@ -4,7 +4,7 @@ use crate::enums::dir_entry_type::DirEntryType;
 use crate::model::inventory::Inventory;
 use crate::model::tree_item::TreeItem;
 use crate::util::scope_utils::{self, MaterializationScope, ScopeClass};
-use crate::util::{file_utils, inventory_utils, object_utils};
+use crate::util::{file_utils, inventory_utils, object_utils, tree_utils};
 
 /// A single file operation needed to turn one tree into another in the working directory.
 pub enum FileOp {
@@ -511,17 +511,10 @@ fn build_inventory_for_tree_directory(tree: &TreeItem,
     }
 
     // `tree_hash` is a byte-for-byte-trustworthy rollup for this shard only when its content
-    // here is a complete materialization of `tree` — the warehouse root, or a directory itself
-    // fully in scope (everything beneath an in-scope boundary materializes verbatim). A spine
-    // directory in a scoped bay only ever materializes the in-scope subset of its real content,
-    // so stamping it with `tree_hash` would misrepresent staged state; left unstamped instead
-    // (the rollup-based skip is not designed for scoped bays yet — DESIGN.html §5.0 D item 8).
-    // An empty tree (only possible for the root — a stored tree never carries a pruned-empty
-    // child entry) is also left unstamped: pruning makes "this subtree's hash" ill-defined.
-    let is_empty = tree.get_files().len() == 0 && tree.get_subtrees().len() == 0;
-    let trustworthy = scope_is_full || scope.classify(key) == ScopeClass::InScope;
-
-    if trustworthy && !is_empty {
+    // here is a complete materialization of `tree` — see `tree_utils::rollup_stampable`'s doc
+    // comment (shared with `restore --staged`'s own tree-to-shard builder, which must decide
+    // this exactly the same way).
+    if tree_utils::rollup_stampable(scope, key, tree) {
         inventory.set_rollup_hash(Some(tree_hash.to_string()));
     }
 

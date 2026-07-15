@@ -59,8 +59,17 @@ pub struct TreeBuilderContext {
     /// (unlike `built`, whose entries a parent removes once it consumes them) — the per-key
     /// rollup a caller like `stack` can stamp shards with afterward (DESIGN.html §5.0 D item
     /// 8). Includes synthesized ancestors that have no shard of their own (harmless: a caller
-    /// stamping rollups only ever looks up keys that do have a shard).
+    /// stamping rollups only ever looks up keys that do have a shard). Only ever populated when
+    /// [`track_tree_hashes`](Self::track_tree_hashes) is set — see its doc comment.
     pub tree_hashes: Arc<Mutex<HashMap<String, String>>>,
+
+    /// Whether the per-directory build task should bother recording this build's `tree_hashes`
+    /// at all. `stack`'s optimized path needs the map (to stamp shards' rollups afterward); every
+    /// other caller (`park`'s plain `build_tree_from_inventory`, in particular) discards it
+    /// immediately, so populating it there would only pay a lock and a clone per directory for a
+    /// value nobody ever reads. Set once at construction, read (never mutated) by every parallel
+    /// task, so no lock is needed.
+    pub track_tree_hashes: bool,
 
     /// The rollup-skip plan's verbatim injections: for a directory key whose task graph was
     /// *not* pruned, the `(name, head_hash)` pairs of its immediate children that a matching
@@ -76,18 +85,20 @@ impl TreeBuilderContext {
     /// Create a new tree builder context.
     ///
     /// # Arguments
-    /// * `pending_children` - The initial child counts per directory key.
-    /// * `shard_source`     - Where each directory's shard content should be read from.
-    /// * `object_sink`      - Where each built tree object should be written.
-    /// * `injections`       - The rollup-skip plan's verbatim injections (empty when no skip
-    ///                        plan applies).
+    /// * `pending_children`   - The initial child counts per directory key.
+    /// * `shard_source`       - Where each directory's shard content should be read from.
+    /// * `object_sink`        - Where each built tree object should be written.
+    /// * `injections`         - The rollup-skip plan's verbatim injections (empty when no skip
+    ///                          plan applies).
+    /// * `track_tree_hashes`  - Whether to populate `tree_hashes` at all — see its doc comment.
     ///
     /// # Returns
     /// * `TreeBuilderContext` - The new context.
     pub fn new(pending_children: HashMap<String, usize>,
               shard_source: ShardSource,
               object_sink: ObjectSink,
-              injections: Arc<BTreeMap<String, Vec<(String, String)>>>) -> Self {
+              injections: Arc<BTreeMap<String, Vec<(String, String)>>>,
+              track_tree_hashes: bool) -> Self {
         Self {
             base_context: Arc::new(BaseTaskContext::new()),
             built: Arc::new(Mutex::new(HashMap::new())),
@@ -95,6 +106,7 @@ impl TreeBuilderContext {
             shard_source,
             object_sink,
             tree_hashes: Arc::new(Mutex::new(HashMap::new())),
+            track_tree_hashes,
             injections,
         }
     }

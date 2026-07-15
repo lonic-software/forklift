@@ -5,7 +5,7 @@ use forklift_core::model::inventory::Inventory;
 use forklift_core::model::tree_item::TreeItem;
 use forklift_core::util::path_utils::WarehousePath;
 use forklift_core::util::scope_utils::{self, MaterializationScope, ScopeClass};
-use forklift_core::util::{file_utils, inventory_utils, object_utils, pallet_utils, shift_utils};
+use forklift_core::util::{file_utils, inventory_utils, object_utils, pallet_utils, shift_utils, tree_utils};
 use crate::output;
 
 /// A resolved entry of the pallet head's tree.
@@ -359,13 +359,10 @@ fn build_stale_shards(tree: &TreeItem,
     }
 
     // `tree_hash` is a byte-for-byte-trustworthy rollup for this shard only when the reset here
-    // is a complete materialization of `tree` (`fully_in_scope`) — a spine directory in a scoped
-    // bay only ever resets the in-scope subset of its real content. An empty tree (only possible
-    // for the root; a stored tree never carries a pruned-empty child entry) is also left
-    // unstamped: pruning makes "this subtree's hash" ill-defined.
-    let is_empty = tree.get_files().len() == 0 && tree.get_subtrees().len() == 0;
-
-    if fully_in_scope && !is_empty {
+    // is a complete materialization of `tree` — see `tree_utils::rollup_stampable`'s doc comment
+    // (shared with `shift`'s own tree-to-shard builder, which must decide this exactly the same
+    // way).
+    if tree_utils::rollup_stampable(scope, key, tree) {
         inventory.set_rollup_hash(Some(tree_hash.to_string()));
     }
 

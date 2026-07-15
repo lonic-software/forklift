@@ -521,3 +521,65 @@ fn skip_count_is_unaffected_by_an_interposed_no_op_load_dot() {
         "an interposed no-op `load .` must not change how many subtrees a later stack can skip");
     assert!(count_a >= 1, "the scenario must actually exercise a skip for this comparison to mean anything");
 }
+
+#[test]
+fn a_shard_that_vanishes_out_from_under_load_still_invalidates_its_ancestors() {
+    // Regression (multi-agent review of PR #59, finding 3): the dirty-path branch for a shard
+    // whose *file* has gone missing (not just its working-directory content) used to drop the
+    // key from metadata without extending the ancestor invalidation its sibling branch (a
+    // shard whose entries got marked `Deleted`) already applied. A stale-but-still-matching
+    // ancestor rollup then let `stocktake`/`diff --staged`/`stack` skip straight past the whole
+    // subtree — silently reporting (and re-stacking) a tree that still contained the deleted
+    // directory.
+    let warehouse = Warehouse::new("vanished-shard-invalidates-ancestors", false);
+    warehouse.prepare();
+
+    warehouse.write_file("a/b/c/file.txt", "deep v1\n");
+    warehouse.write_file("sibling/file.txt", "sibling v1\n");
+    warehouse.run_ok(&["load", "."]);
+    warehouse.run_ok(&["stack", "base"]);
+
+    assert!(shard_rollup(&warehouse, "").is_some(), "the root must be stamped after the base stack");
+    assert!(shard_rollup(&warehouse, "a").is_some(), "\"a\" must be stamped after the base stack");
+    assert!(shard_rollup(&warehouse, "a/b").is_some(), "\"a/b\" must be stamped after the base stack");
+
+    // Delete the tracked directory from the working tree *and* its inventory shard directly —
+    // the shard file itself going missing (not merely its content) is what routes `load`'s
+    // dirty-path pass into the specific branch this regression targets, rather than the
+    // already-correct "shard exists, mark everything Deleted" branch a plain working-directory
+    // deletion alone would hit.
+    std::fs::remove_dir_all(warehouse.root.join("a/b/c")).unwrap();
+    {
+        let _scope = forklift_core::globals::StorageRootScope::enter(&warehouse.root);
+        let shard_folder = forklift_core::util::file_utils::get_inventory_folder_for_key("a/b/c");
+        std::fs::remove_dir_all(&shard_folder).unwrap();
+    }
+
+    warehouse.run_ok(&["load", "."]);
+
+    // Every ancestor of the vanished shard must be invalidated exactly like any other real
+    // content change — a directory disappearing entirely is one.
+    assert_eq!(shard_rollup(&warehouse, ""), None,
+        "the root's rollup must be cleared when a tracked descendant's shard vanishes");
+    assert_eq!(shard_rollup(&warehouse, "a"), None,
+        "an intermediate ancestor's rollup must be cleared too");
+    assert_eq!(shard_rollup(&warehouse, "a/b"), None,
+        "the immediate parent's rollup must be cleared too");
+
+    // `diff --staged` must report the deletion, not silently skip past it via a stale rollup
+    // that (before the fix) still matched head.
+    let staged = warehouse.run_ok(&["--json", "diff", "--staged"]);
+    let staged_value: serde_json::Value = serde_json::from_slice(&staged.stdout).unwrap();
+    let staged_files = staged_value["data"]["files"].as_array().unwrap();
+    assert!(staged_files.iter().any(|f| f["path"] == "a/b/c/file.txt" && f["kind"] == "removed"),
+        "the vanished deep file must be reported as a staged removal: {}", staged_value);
+
+    // A subsequent stack must not include the deleted subtree — the old (pre-deletion) subtree
+    // must never be reused via a stale-but-still-matching rollup.
+    warehouse.run_ok(&["stack", "remove a/b/c"]);
+    let tree_hash = warehouse.head_tree_hash("main");
+
+    let _scope = forklift_core::globals::StorageRootScope::enter(&warehouse.root);
+    let resolved = forklift_core::util::tree_utils::resolve_subtree_hash(&tree_hash, "a/b/c").unwrap();
+    assert!(resolved.is_none(), "the stacked tree must not contain the deleted subtree \"a/b/c\"");
+}

@@ -102,9 +102,14 @@ fn stage_rollup_clear(key: &str, batch: &file_utils::WriteBatch) -> Result<(), S
     match original_mtime {
         Some(mtime) => batch.stage_with_mtime(&shard_path, &bytes, mtime),
         // No mtime could be determined (the shard's metadata is unreadable, however that
-        // happened) — stage a plain write rather than fail the whole clear over a cosmetic
-        // staleness concern that has nothing to attach itself to here.
-        None => batch.stage(&shard_path, &bytes),
+        // happened) — this is not cosmetic: staging a plain write here would carry "now" as the
+        // published mtime, which is exactly the racily-clean widening this function exists to
+        // avoid (see the doc comment above). With no real mtime to preserve, the safe direction
+        // is the most conservative one — an epoch mtime collapses this shard's stat-cache trust
+        // entirely, so every one of its entries gets re-verified against the file system on the
+        // next load, instead of possibly being trusted on the strength of a timestamp that never
+        // actually verified anything.
+        None => batch.stage_with_mtime(&shard_path, &bytes, std::time::SystemTime::UNIX_EPOCH),
     }
 }
 
@@ -325,7 +330,13 @@ pub async fn create_inventory_for_directory(path: &WarehousePath) -> Result<(), 
         Arc::new(ignored_paths)
     ));
 
-    let result = executor.execute(root_task).await;
+    // `result` accumulates the *first* failure from anywhere in this function — the walk itself,
+    // or any fallible step of the join point below. Every join-point step still runs its
+    // best-effort work even once `result` already holds an error (exactly as the walk's own
+    // failure already tolerated: whatever the tasks that did complete decided is still published
+    // — see the join point's own doc comment), but never lets a later, possibly less useful,
+    // error overwrite the first one a caller would want to see.
+    let mut result: Result<(), Option<String>> = executor.execute(root_task).await;
 
     // The join point (DESIGN.html §5.0 D item 8, stage 2b): every per-directory task only ever
     // *decided* what to write (`ShardOutcome`, collected in `context.outcomes`) and which
@@ -342,7 +353,15 @@ pub async fn create_inventory_for_directory(path: &WarehousePath) -> Result<(), 
     // per directory. Only ever considered after a fully successful walk — on failure, the walk
     // may not have reached every directory, so a shard still marked "dirty" here might simply be
     // one it hasn't visited yet, not one that is actually gone (the original contract, preserved
-    // below in the error branch: dirty inventories are never touched on failure).
+    // below: dirty inventories are never removed from metadata unless this pass actually proved
+    // them stale).
+    //
+    // A failure partway through this pass (an unreadable or corrupt leftover shard) stops the
+    // pass right there — exactly like a walk failure, whatever was classified before the failure
+    // is kept, and the loop's own error is folded into `result` instead of aborting the function:
+    // the failure-resilience branch below must still run so the shards this walk *did* manage to
+    // publish stay registered, and the user sees the same "entries loaded so far were kept"
+    // message a walk failure gives, not a raw, unwrapped parse error.
     if result.is_ok() {
         let dirty_paths = context.dirty_inventory_paths.lock().await;
 
@@ -352,15 +371,28 @@ pub async fn create_inventory_for_directory(path: &WarehousePath) -> Result<(), 
             // `ShardOutcome`'s doc comment); here, "verification" is this read itself.
             let verified_at = std::time::SystemTime::now();
 
-            let (_, bytes_opt) = file_utils::retrieve_inventory_or_none_by_key(dirty_key)?;
+            let bytes_opt = match file_utils::retrieve_inventory_or_none_by_key(dirty_key) {
+                Ok((_, bytes_opt)) => bytes_opt,
+                Err(e) => { result = Err(Some(e)); break; }
+            };
 
             let Some(bytes) = bytes_opt else {
+                // The shard itself is gone — every ancestor's rollup that named a tree including
+                // this directory is now wrong (it would still match head, but head no longer
+                // reflects a subtree that no longer exists), so they must be invalidated exactly
+                // like any other real content change, not just dropped from metadata.
+                clear_keys.extend(ancestor_keys_root_first(dirty_key));
                 stale_keys.insert(dirty_key.clone());
                 continue;
             };
 
-            let mut inventory = parser::inventory::inventory_parser::parse_inventory(&bytes)
-                .map_err(|e| format!("Error while parsing the inventory of folder \"{}\": {}", dirty_key, e))?;
+            let inventory_result = parser::inventory::inventory_parser::parse_inventory(&bytes)
+                .map_err(|e| format!("Error while parsing the inventory of folder \"{}\": {}", dirty_key, e));
+
+            let mut inventory = match inventory_result {
+                Ok(inventory) => inventory,
+                Err(e) => { result = Err(Some(e)); break; }
+            };
 
             if inventory.mark_all_items_deleted() {
                 clear_keys.extend(ancestor_keys_root_first(dirty_key));
@@ -372,7 +404,8 @@ pub async fn create_inventory_for_directory(path: &WarehousePath) -> Result<(), 
 
     // Step 1: a carried rollup that turns out to be an ancestor of some other real change in the
     // same walk must be dropped, not published — deterministic, no locks, no races (everything
-    // that could produce a `clear_keys` entry has already run by this point).
+    // that could produce a `clear_keys` entry has already run by this point). Always safe to run,
+    // whatever `result` holds by now: purely in-memory, nothing here touches disk.
     for (key, outcome) in outcomes.iter_mut() {
         if let ShardOutcome::Carry(inventory, _) = outcome {
             if clear_keys.contains(key) {
@@ -384,33 +417,96 @@ pub async fn create_inventory_for_directory(path: &WarehousePath) -> Result<(), 
     // Step 2 (phase A): clear every invalidation target that is not already being rewritten in
     // phase B below (rewriting it there already publishes rollup `None`, so a separate clear
     // would be redundant) — one batched, mtime-preserving barrier, durable before phase B starts.
+    //
+    // A failure here (staging or the barrier itself) is folded into `result` instead of
+    // propagated immediately: every ancestor clear staged before the failure never got renamed
+    // (`WriteBatch::stage`'s write only ever touches a temp file; `finish`'s barrier fsyncs every
+    // staged temp before renaming any of them, so a failure anywhere in it durably renames
+    // nothing), so nothing below counts anything from this phase as published — the shards it
+    // was clearing were already registered from before this walk, so failing to clear them costs
+    // only a few lost skips next time, never a wrong one (see `stage_rollup_clear`'s doc comment).
+    // Phase B is skipped entirely on a phase A failure, preserving `write_shard_mutation`'s
+    // ordering invariant: nothing beneath an ancestor may become durable before that ancestor's
+    // own clear already is.
     let phase_a_batch = file_utils::WriteBatch::new();
+    let mut phase_a_published = true;
+
     for key in clear_keys.iter().filter(|key| !outcomes.contains_key(key.as_str())) {
-        stage_rollup_clear(key, &phase_a_batch)?;
+        if let Err(e) = stage_rollup_clear(key, &phase_a_batch) {
+            if result.is_ok() { result = Err(Some(e)); }
+            phase_a_published = false;
+            break;
+        }
     }
-    phase_a_batch.finish()?;
+
+    if phase_a_published {
+        if let Err(e) = phase_a_batch.finish() {
+            if result.is_ok() { result = Err(Some(e)); }
+            phase_a_published = false;
+        }
+    }
 
     // Step 3 (phase B): publish every directory's own shard content — durable, and visible, only
     // after phase A above already is. `context.batch` is the whole walk's single publish batch.
     // Each shard is published with the mtime its outcome was verified at, not "now" — see
     // `ShardOutcome`'s doc comment.
-    for (key, outcome) in &outcomes {
-        let (inventory, verified_at) = match outcome {
-            ShardOutcome::Carry(inventory, verified_at) | ShardOutcome::Changed(inventory, verified_at) =>
-                (inventory, *verified_at),
-        };
+    //
+    // Same reasoning as phase A applies to a failure here: staging or the barrier itself may
+    // fail before every outcome is durably renamed, so — since this is one shared batch with no
+    // per-key visibility into what actually landed — none of `outcomes` is trusted as published
+    // unless this whole phase reports success (see `phase_b_published`, below, and how it gates
+    // metadata registration).
+    let mut phase_b_published = false;
 
-        save_inventory_deferred_with_mtime(
-            inventory, &file_utils::get_inventory_data_path_for_key(key), &context.batch, verified_at,
-        )?;
+    if phase_a_published {
+        let mut phase_b_staged = true;
+
+        for (key, outcome) in &outcomes {
+            let (inventory, verified_at) = match outcome {
+                ShardOutcome::Carry(inventory, verified_at) | ShardOutcome::Changed(inventory, verified_at) =>
+                    (inventory, *verified_at),
+            };
+
+            if let Err(e) = save_inventory_deferred_with_mtime(
+                inventory, &file_utils::get_inventory_data_path_for_key(key), &context.batch, verified_at,
+            ) {
+                if result.is_ok() { result = Err(Some(e)); }
+                phase_b_staged = false;
+                break;
+            }
+        }
+
+        if phase_b_staged {
+            match context.batch.finish() {
+                Ok(()) => phase_b_published = true,
+                Err(e) => { if result.is_ok() { result = Err(Some(e)); } }
+            }
+        }
     }
-    context.batch.finish()?;
+
+    // Metadata must never claim a directory's shard is on disk when publishing it may not have
+    // actually happened: a key with a recorded `ShardOutcome` only belongs in the registered set
+    // when phase B is known to have durably published every outcome (one shared batch — see
+    // above). Every other visited directory (no outcome: its shard was already correct and
+    // durable from before this walk, untouched either way) is unaffected by phase A/B and is
+    // always safe to (re-)register.
+    let keys_to_add: BTreeSet<String> = {
+        let new_inventory_paths = context.new_inventory_paths.lock().await;
+
+        if phase_b_published {
+            new_inventory_paths.clone()
+        } else {
+            new_inventory_paths.iter().filter(|key| !outcomes.contains_key(key.as_str())).cloned().collect()
+        }
+    };
 
     if let Err(e) = result {
-        // Register every inventory that was written, even on failure, so the metadata file
-        // stays consistent with the inventory folders that exist on disk. Dirty inventories
-        // are deliberately *not* removed on failure: the walk may not have reached them.
-        update_inventory_metadata(&*context.new_inventory_paths.lock().await, &BTreeSet::new())?;
+        // Register every inventory that was actually published, even on failure, so the metadata
+        // file stays consistent with what exists on disk. Stale keys are only ever populated by
+        // a dirty-path pass that ran (in full, or up to the point it failed) over a fully
+        // successful walk, so removing them here is exactly as safe as it is on the ordinary
+        // success path below.
+        update_inventory_metadata(&keys_to_add, &stale_keys)?;
 
         let message = e.unwrap_or("An unknown error occurred while building the inventory.".to_string());
 
@@ -421,7 +517,7 @@ pub async fn create_inventory_for_directory(path: &WarehousePath) -> Result<(), 
         ));
     }
 
-    update_inventory_metadata(&*context.new_inventory_paths.lock().await, &stale_keys)?;
+    update_inventory_metadata(&keys_to_add, &stale_keys)?;
 
     Ok(())
 }
@@ -1465,7 +1561,23 @@ pub fn cleanup_after_stack_with(prepared: &PreparedInventory,
             }
 
             rebuilt.set_rollup_hash(target_rollup);
-            save_inventory_deferred(&rebuilt, &file_utils::get_inventory_data_path_for_key(key), &batch)?;
+
+            let shard_path = file_utils::get_inventory_data_path_for_key(key);
+
+            // Neither case rewritten here re-verifies a single entry against the file system —
+            // the stamp comes from `stack`'s own just-finished tree build, and a Deleted-drop
+            // just copies `prepared`'s already-parsed entries — so this write is exactly the
+            // "rewrite that verifies nothing" hazard `load`'s join point was fixed against (see
+            // `ShardOutcome`'s doc comment): publishing it with "now" would let a file edited
+            // between this shard's last real verification and this cleanup satisfy
+            // `is_entry_unchanged`'s `mtime < shard_mtime` on a now-stale cached hash, forever.
+            // The shard's own current mtime is captured and carried through unchanged instead —
+            // exactly like `stage_rollup_clear`'s rollup-only rewrite, and for the same reason.
+            let original_mtime = file_utils::get_symlink_metadata_for_path(&shard_path).ok()
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+
+            save_inventory_deferred_with_mtime(&rebuilt, &shard_path, &batch, original_mtime)?;
         }
     }
 
@@ -1936,14 +2048,19 @@ fn save_inventory_deferred(inventory: &Inventory,
 }
 
 /// Like [`save_inventory_deferred`], but publishes with an explicit mtime instead of "now" — see
-/// [`file_utils::WriteBatch::stage_with_mtime`]. Used by `load`'s join point
-/// (`create_inventory_for_directory`) to publish each [`ShardOutcome`] with the timestamp
-/// captured when it was actually verified, not the (potentially much later) moment the whole
-/// walk finishes and publishes: the shard's mtime is `is_entry_unchanged`'s proof that its
-/// entries were checked against the file system no earlier than that moment, and "now" would
-/// overstate that — a file edited between this directory's own verification and the join
-/// point's publish would satisfy `mtime < shard_mtime` on a now-stale cached hash and be
-/// silently missed on the next load.
+/// [`file_utils::WriteBatch::stage_with_mtime`]. Every caller uses this for the same reason: the
+/// rewrite being published does not itself verify anything against the file system, so it must
+/// not be allowed to advance a shard's mtime — doing so would overstate `is_entry_unchanged`'s
+/// proof that this shard's entries were checked against the file system no earlier than that
+/// moment, and a file edited between the shard's real last verification and this publish would
+/// then satisfy `mtime < shard_mtime` on a now-stale cached hash and be silently missed forever.
+///
+/// * `load`'s join point (`create_inventory_for_directory`) publishes each [`ShardOutcome`] with
+///   the timestamp captured when it was actually verified, not the (potentially much later)
+///   moment the whole walk finishes and publishes.
+/// * `cleanup_after_stack_with`'s post-stack rewrite (a rollup stamp, or a `Deleted`-entry drop)
+///   publishes with the shard's own pre-rewrite mtime — neither rewrite re-verifies a single
+///   entry, so "now" would be just as wrong there.
 fn save_inventory_deferred_with_mtime(inventory: &Inventory,
                                       inventory_path: &Path,
                                       batch: &file_utils::WriteBatch,
@@ -2265,5 +2382,149 @@ mod tests {
         assert!(diff < std::time::Duration::from_secs(2),
             "a published shard's mtime must equal its ShardOutcome's verified_at timestamp, not \
             \"now\": got {:?}, expected {:?} (diff {:?})", published_mtime, anchor, diff);
+    }
+
+    /// Set a file's modification time directly, through an open write handle — never a
+    /// reopen-by-path (the project's Windows fsync convention; see `WriteBatch::stage_with_mtime`).
+    fn set_mtime(path: &Path, mtime: std::time::SystemTime) {
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(mtime).unwrap();
+    }
+
+    #[test]
+    fn cleanup_after_stack_does_not_advance_a_stamped_shard_s_mtime() {
+        // Regression (multi-agent review of PR #59, finding 1): `cleanup_after_stack_with`'s
+        // rollup-stamp rewrite never re-verifies a single entry against the file system (the
+        // entries come straight from the already-parsed `PreparedInventory` snapshot) — exactly
+        // the "rewrite that verifies nothing" hazard the join-point redesign was already fixed
+        // against for `load` itself. Publishing this rewrite with "now" would widen the
+        // racily-clean trust window the same way; the shard's own current mtime must survive it.
+        let _scratch = Scratch::new("cleanup-mtime-stamp");
+
+        write_stamped_shard("", Some("stale-rollup"));
+        let shard_path = file_utils::get_inventory_data_path_for_key("");
+
+        let old_mtime = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(3600)).unwrap();
+        set_mtime(&shard_path, old_mtime);
+
+        let mut metadata: BTreeSet<String> = BTreeSet::new();
+        metadata.insert(key_to_metadata_entry(""));
+        let (metadata_path, _) = file_utils::retrieve_inventory_metadata_or_none().unwrap();
+        write_metadata_to_file(&metadata_path, &metadata).unwrap();
+
+        let prepared = prepare_stack_inventory().unwrap();
+
+        let mut stamp_hashes: BTreeMap<String, String> = BTreeMap::new();
+        stamp_hashes.insert("".to_string(), "fresh-rollup".to_string());
+
+        cleanup_after_stack_with(&prepared, &stamp_hashes, &BTreeSet::new()).unwrap();
+
+        // The stamp itself must still take effect — this test is about the mtime, not about
+        // whether the rewrite happens at all.
+        assert_eq!(read_rollup(""), Some("fresh-rollup".to_string()));
+
+        let published_mtime = file_utils::get_symlink_metadata_for_path(&shard_path).unwrap()
+            .modified().unwrap();
+        let diff = published_mtime.duration_since(old_mtime).unwrap_or_else(|e| e.duration());
+        assert!(diff < std::time::Duration::from_secs(2),
+            "a rollup stamp verifies nothing, so it must not advance the shard's mtime: got {:?}, \
+            expected close to {:?} (diff {:?})", published_mtime, old_mtime, diff);
+    }
+
+    #[test]
+    fn cleanup_after_stack_does_not_advance_mtime_when_dropping_deleted_entries() {
+        // The other rewrite `cleanup_after_stack_with` performs — dropping now-consumed
+        // `Deleted` entries — is exactly as unverified as the stamp above (same regression,
+        // same fix): the survivors are copied straight out of `PreparedInventory`, nothing here
+        // is re-checked against the file system either.
+        let _scratch = Scratch::new("cleanup-mtime-deleted-drop");
+
+        let mut inventory = Inventory::new();
+        inventory.add_item(item("kept.txt", 1, InventoryItemState::Normal));
+        inventory.add_item(item("removed.txt", 2, InventoryItemState::Deleted));
+        save_inventory(&inventory, &file_utils::get_inventory_data_path_for_key("")).unwrap();
+
+        let shard_path = file_utils::get_inventory_data_path_for_key("");
+        let old_mtime = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(3600)).unwrap();
+        set_mtime(&shard_path, old_mtime);
+
+        let mut metadata: BTreeSet<String> = BTreeSet::new();
+        metadata.insert(key_to_metadata_entry(""));
+        let (metadata_path, _) = file_utils::retrieve_inventory_metadata_or_none().unwrap();
+        write_metadata_to_file(&metadata_path, &metadata).unwrap();
+
+        let prepared = prepare_stack_inventory().unwrap();
+
+        // No stamp target at all — the rewrite is triggered purely by the staged `Deleted`
+        // entry that needs dropping, not by a rollup mismatch.
+        cleanup_after_stack_with(&prepared, &BTreeMap::new(), &BTreeSet::new()).unwrap();
+
+        assert!(read_rollup("").is_none());
+
+        let (_, bytes) = file_utils::retrieve_inventory_or_none_by_key("").unwrap();
+        let rebuilt = parser::inventory::inventory_parser::parse_inventory(&bytes.unwrap()).unwrap();
+        assert!(rebuilt.get_item_by_name("kept.txt").is_some(), "a surviving entry must be kept");
+        assert!(rebuilt.get_item_by_name("removed.txt").is_none(), "the Deleted entry must be dropped");
+
+        let published_mtime = file_utils::get_symlink_metadata_for_path(&shard_path).unwrap()
+            .modified().unwrap();
+        let diff = published_mtime.duration_since(old_mtime).unwrap_or_else(|e| e.duration());
+        assert!(diff < std::time::Duration::from_secs(2),
+            "dropping a Deleted entry verifies nothing either, so it must not advance the shard's \
+            mtime: got {:?}, expected close to {:?} (diff {:?})", published_mtime, old_mtime, diff);
+    }
+
+    #[test]
+    fn a_corrupt_dirty_shard_during_load_yields_the_resilience_message_not_a_raw_parse_error() {
+        // Regression (multi-agent review of PR #59, finding 2): a join-point failure (here, a
+        // leftover shard that fails to parse) used to `?`-propagate straight out of
+        // `create_inventory_for_directory`, bypassing the failure-resilience branch entirely —
+        // skipping `update_inventory_metadata` for whatever *was* successfully published this
+        // walk, and surfacing a raw parse error instead of the documented "entries loaded so far
+        // were kept, re-run" message a walk failure already gives.
+        let _scratch = Scratch::new("load-corrupt-dirty-shard");
+
+        // A previously-registered directory whose shard is corrupt, with no counterpart left in
+        // the working directory — exactly what `load`'s post-walk "leftover dirty entries" pass
+        // consults, so this is the shard the join point's dirty-path loop tries (and fails) to
+        // parse.
+        let corrupt_path = file_utils::get_inventory_data_path_for_key("gone");
+        std::fs::create_dir_all(corrupt_path.parent().unwrap()).unwrap();
+        std::fs::write(&corrupt_path, b"not a valid inventory shard").unwrap();
+
+        let mut metadata: BTreeSet<String> = BTreeSet::new();
+        metadata.insert(key_to_metadata_entry("gone"));
+        let (metadata_path, _) = file_utils::retrieve_inventory_metadata_or_none().unwrap();
+        write_metadata_to_file(&metadata_path, &metadata).unwrap();
+
+        // A real, trackable file in the actual working directory — proves the walk's own
+        // successful work is still published despite the dirty-path failure that comes after it.
+        std::fs::write(_scratch.root.join("real.txt"), b"hello").unwrap();
+
+        let path = crate::util::path_utils::WarehousePath::from_user_input(".").unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let result = runtime.block_on(create_inventory_for_directory(&path));
+
+        let error = match result {
+            Ok(()) => panic!("a corrupt dirty shard must fail the load"),
+            Err(message) => message,
+        };
+        assert!(error.contains("did not complete"),
+            "must use the graceful-failure resilience message, not a raw parse error: {error}");
+        assert!(error.contains("gone"),
+            "the underlying parse error should still name the offending shard: {error}");
+
+        // The walk's own real work is still durable and registered: "entries loaded so far were
+        // kept" is a real guarantee, not just wording in the message.
+        assert!(file_utils::get_inventory_data_path_for_key("").exists(),
+            "the root shard this walk produced must still exist on disk");
+        assert!(file_utils::get_inventory_data_path_for_key("real.txt").parent().is_some());
+
+        let (_, metadata_opt) = file_utils::retrieve_inventory_metadata_or_none().unwrap();
+        let metadata_after = metadata_opt.unwrap();
+        assert!(metadata_after.contains(&key_to_metadata_entry("")),
+            "the newly discovered root directory must still be registered: {:?}", metadata_after);
     }
 }
