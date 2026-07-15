@@ -60,74 +60,51 @@ fn ancestor_keys_root_first(key: &str) -> Vec<String> {
 /// item 8, stage 2b): a caller invalidating several ancestors stages them all here and calls
 /// [`file_utils::WriteBatch::finish`] once, instead of paying a full atomic-write barrier per
 /// shard — see [`clear_ancestors_batched`].
+///
+/// The staged write preserves the shard's *current* mtime (via
+/// [`file_utils::WriteBatch::stage_with_mtime`], set on the temp file before it is ever
+/// renamed — no post-`finish` fix-up, and so no crash window where a durable, renamed shard
+/// briefly carries the wrong mtime). This matters because a rollup clear is invisible
+/// *content*-wise to every other reader (it only ever removes a value nothing outside the
+/// rollup machinery consults), but a shard's own mtime is not: `load`'s "racily clean"
+/// stat-cache fast path (`is_entry_unchanged`) treats a shard's mtime as proof that its entries
+/// were verified against the file system no earlier than that moment. A rollup-only rewrite
+/// verifies nothing — so if it were allowed to advance the shard's mtime, a file edited just
+/// before the clear could satisfy `mtime < shard_mtime` on a stale cached hash and be wrongly
+/// reported unchanged. Preserving the mtime keeps the clear invisible to the stat cache too,
+/// exactly as if only the rollup field had changed in place.
+///
 /// # Returns
-/// * `Ok(Some((PathBuf, SystemTime)))` - The clear was staged; the shard's path and its mtime
-///   *before* this rewrite, to be restored once `batch` is durable (see
-///   [`restore_shard_mtimes`] and why this matters).
-/// * `Ok(None)`                        - Nothing was staged (missing shard, or no rollup to
-///   clear).
-/// * `Err(String)`                     - If the shard could not be read, parsed, or staged.
-fn stage_rollup_clear(key: &str,
-                      batch: &file_utils::WriteBatch)
-                      -> Result<Option<(std::path::PathBuf, std::time::SystemTime)>, String> {
+/// * `Ok(())`      - The clear was staged (or there was nothing to clear).
+/// * `Err(String)` - If the shard could not be read, parsed, or staged.
+fn stage_rollup_clear(key: &str, batch: &file_utils::WriteBatch) -> Result<(), String> {
     let (shard_path, bytes_opt) = file_utils::retrieve_inventory_or_none_by_key(key)?;
 
     let Some(bytes) = bytes_opt else {
-        return Ok(None);
+        return Ok(());
     };
 
     let mut inventory = parser::inventory::inventory_parser::parse_inventory(&bytes)
         .map_err(|e| format!("Error while parsing the inventory of folder \"{}\": {}", key, e))?;
 
     if inventory.get_rollup_hash().is_none() {
-        return Ok(None);
+        return Ok(());
     }
 
-    // Captured *before* the rewrite below touches the file at all — see `restore_shard_mtimes`.
+    // Captured before the rewrite below is even staged — this is the mtime the temp file
+    // (and, after the barrier, the renamed final file) will carry instead of "now".
     let original_mtime = file_utils::get_symlink_metadata_for_path(&shard_path).ok()
         .and_then(|m| m.modified().ok());
 
     inventory.set_rollup_hash(None);
-    save_inventory_deferred(&inventory, &shard_path, batch)?;
+    let bytes = ensure_inventory_folder_and_build(&inventory, &shard_path)?;
 
-    Ok(original_mtime.map(|mtime| (shard_path, mtime)))
-}
-
-/// Restore each shard's mtime to what it was before a rollup-only rewrite cleared it — call
-/// once, after the [`file_utils::WriteBatch`] that staged those rewrites has finished (so the
-/// files being touched here are the final, renamed ones, not temps).
-///
-/// This matters because a rollup clear is invisible *content*-wise to every other reader (it
-/// only ever removes a value nothing outside the rollup machinery consults), but a shard's own
-/// mtime is *not* invisible: `load`'s "racily clean" stat-cache fast path
-/// (`inventory_utils::is_entry_unchanged`) treats a shard's mtime as proof that its entries were
-/// verified against the file system no earlier than that moment. A rollup-only rewrite verifies
-/// nothing — so if its rewrite is allowed to advance the shard's mtime, a file edited just
-/// before the clear (the exact case `create_inventory_for_directory`'s upfront pre-clear runs
-/// into on every `load`) can satisfy `mtime < shard_mtime` on a *stale* cached hash and be
-/// wrongly reported unchanged. Putting the mtime back closes that: the clear becomes invisible
-/// to the stat cache too, exactly as if only the rollup field had changed in place.
-///
-/// Best-effort per file (a failure to reset one mtime does not fail the whole batch) but not
-/// silent: every failure is collected and reported together, since a mtime that stays bumped is
-/// exactly the staleness hazard this function exists to prevent, not a cosmetic issue.
-fn restore_shard_mtimes(entries: &[(std::path::PathBuf, std::time::SystemTime)]) -> Result<(), String> {
-    let mut errors: Vec<String> = Vec::new();
-
-    for (path, mtime) in entries {
-        let result = std::fs::OpenOptions::new().write(true).open(path)
-            .and_then(|file| file.set_modified(*mtime));
-
-        if let Err(e) = result {
-            errors.push(format!("\"{}\": {}", path.to_string_lossy(), e));
-        }
-    }
-
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(format!("Error while restoring the modification time of {} shard(s) after a rollup \
-            clear: {}", errors.len(), errors.join("; ")))
+    match original_mtime {
+        Some(mtime) => batch.stage_with_mtime(&shard_path, &bytes, mtime),
+        // No mtime could be determined (the shard's metadata is unreadable, however that
+        // happened) — stage a plain write rather than fail the whole clear over a cosmetic
+        // staleness concern that has nothing to attach itself to here.
+        None => batch.stage(&shard_path, &bytes),
     }
 }
 
@@ -140,17 +117,12 @@ fn restore_shard_mtimes(entries: &[(std::path::PathBuf, std::time::SystemTime)])
 /// batch — see its doc comment for why the boundary between them matters).
 fn clear_ancestors_batched(key: &str) -> Result<(), String> {
     let batch = file_utils::WriteBatch::new();
-    let mut mtimes = Vec::new();
 
     for ancestor_key in ancestor_keys_root_first(key) {
-        if let Some(entry) = stage_rollup_clear(&ancestor_key, &batch)? {
-            mtimes.push(entry);
-        }
+        stage_rollup_clear(&ancestor_key, &batch)?;
     }
 
-    batch.finish()?;
-
-    restore_shard_mtimes(&mtimes)
+    batch.finish()
 }
 
 /// Clear the rollup hash of every existing ancestor shard of `key` — see
@@ -207,53 +179,6 @@ pub fn write_shard_mutation(key: &str, inventory: &mut Inventory) -> Result<(), 
 
     inventory.set_rollup_hash(None);
     save_inventory(inventory, &file_utils::get_inventory_data_path_for_key(key))
-}
-
-/// Clear the rollup of every shard named in `keys` that currently has one, as one batched
-/// durability barrier (DESIGN.html §5.0 D item 8, stage 2b) — the upfront, conservative
-/// alternative to per-task ancestor-clearing for `load`'s parallel per-directory walker
-/// (`build_inventory`, via `create_inventory_for_directory`). That walker's tasks are
-/// fire-and-forget concurrent (a directory's task fires off its subdirectories' tasks and writes
-/// its own shard without waiting for them), so clearing ancestors reactively — one mutation at a
-/// time, the way every other writer does via [`write_shard_mutation`] — would need the same
-/// cross-task synchronization that shape otherwise requires. Clearing every shard the walk might
-/// touch, and therefore every one of *their* ancestors, before any task starts writing sidesteps
-/// the race entirely: nothing concurrent is touching any of these files yet when this runs, so no
-/// lock is needed here, and the whole set becomes one barrier instead of one per mutated
-/// directory. Once this returns, every per-directory task may write its own shard directly (no
-/// ancestor walk, no lock — see `build_inventory`'s own writes).
-///
-/// Conservative by construction: `keys` should be every directory the walk might visit (from
-/// `dirty_inventory_paths`, populated before this runs) plus the walked root and its ancestors.
-/// A directory that turns out unchanged still loses its rollup, and so does every one of its own
-/// ancestors, even though nothing below it actually changed — a lost skip, never a correctness
-/// problem (DESIGN.html §5.0 D item 8's standing rule: any doubt clears the rollup).
-///
-/// # Arguments
-/// * `keys` - Every warehouse path key whose rollup should be cleared if it has one.
-///
-/// # Returns
-/// * `Ok(())`      - Every existing shard named in `keys` with a rollup now has it cleared,
-///                   durable.
-/// * `Err(String)` - If a shard could not be read, parsed or written.
-pub fn pre_clear_rollups_for_load(keys: &BTreeSet<String>) -> Result<(), String> {
-    let batch = file_utils::WriteBatch::new();
-    let mut mtimes = Vec::new();
-
-    for key in keys {
-        if let Some(entry) = stage_rollup_clear(key, &batch)? {
-            mtimes.push(entry);
-        }
-    }
-
-    batch.finish()?;
-
-    // Restoring every cleared shard's mtime is not just tidiness here: `build_inventory`'s own
-    // "racily clean" stat-cache check (`is_entry_unchanged`) runs moments later, on these same
-    // directories, and trusts a shard's mtime as proof its entries were verified against the
-    // file system — see `restore_shard_mtimes`'s doc comment for the exact failure this closes
-    // (a file edited just before this `load` silently reported unchanged).
-    restore_shard_mtimes(&mtimes)
 }
 
 /// Process-wide count of rollup-based skips actually applied (DESIGN.html §5.0 D item 8, stage
@@ -394,17 +319,6 @@ pub async fn create_inventory_for_directory(path: &WarehousePath) -> Result<(), 
     // as removals.
     populate_dirty_inventory_paths(&context, path).await?;
 
-    // Pre-clear every rollup this walk might invalidate, batched into one durability barrier,
-    // before any concurrent per-directory task starts writing — see
-    // `pre_clear_rollups_for_load`'s doc comment for why this replaces per-task ancestor
-    // clearing for this specific (fire-and-forget concurrent) walker.
-    {
-        let mut to_invalidate: BTreeSet<String> = context.dirty_inventory_paths.lock().await.clone();
-        to_invalidate.insert(path.as_key().to_string());
-        to_invalidate.extend(ancestor_keys_root_first(path.as_key()));
-        pre_clear_rollups_for_load(&to_invalidate)?;
-    }
-
     let root_task: InventoryBuilderTask = Box::pin(build_inventory(
         Arc::clone(&context),
         Arc::new(path.clone()),
@@ -412,6 +326,75 @@ pub async fn create_inventory_for_directory(path: &WarehousePath) -> Result<(), 
     ));
 
     let result = executor.execute(root_task).await;
+
+    // The join point (DESIGN.html §5.0 D item 8, stage 2b): every per-directory task only ever
+    // *decided* what to write (`ShardOutcome`, collected in `context.outcomes`) and which
+    // ancestors that decision invalidates (`context.clear_keys`) — nothing was written to disk
+    // by any task. Publishing happens here, once, single-threaded, after every task that managed
+    // to run has reported in (whether or not the walk as a whole succeeded — see below).
+    let mut clear_keys: BTreeSet<String> = std::mem::take(&mut *context.clear_keys.lock().await);
+    let mut outcomes: BTreeMap<String, ShardOutcome> = std::mem::take(&mut *context.outcomes.lock().await);
+    let mut stale_keys: BTreeSet<String> = BTreeSet::new();
+
+    // Directories that are gone from the working directory (deleted, or ignored now) keep their
+    // inventory shard, with every entry marked as a staged removal. Folded into the same join
+    // point as every other mutation this walk makes, rather than its own separate atomic write
+    // per directory. Only ever considered after a fully successful walk — on failure, the walk
+    // may not have reached every directory, so a shard still marked "dirty" here might simply be
+    // one it hasn't visited yet, not one that is actually gone (the original contract, preserved
+    // below in the error branch: dirty inventories are never touched on failure).
+    if result.is_ok() {
+        let dirty_paths = context.dirty_inventory_paths.lock().await;
+
+        for dirty_key in dirty_paths.iter() {
+            let (_, bytes_opt) = file_utils::retrieve_inventory_or_none_by_key(dirty_key)?;
+
+            let Some(bytes) = bytes_opt else {
+                stale_keys.insert(dirty_key.clone());
+                continue;
+            };
+
+            let mut inventory = parser::inventory::inventory_parser::parse_inventory(&bytes)
+                .map_err(|e| format!("Error while parsing the inventory of folder \"{}\": {}", dirty_key, e))?;
+
+            if inventory.mark_all_items_deleted() {
+                clear_keys.extend(ancestor_keys_root_first(dirty_key));
+                inventory.set_rollup_hash(None);
+                outcomes.insert(dirty_key.clone(), ShardOutcome::Changed(inventory));
+            }
+        }
+    }
+
+    // Step 1: a carried rollup that turns out to be an ancestor of some other real change in the
+    // same walk must be dropped, not published — deterministic, no locks, no races (everything
+    // that could produce a `clear_keys` entry has already run by this point).
+    for (key, outcome) in outcomes.iter_mut() {
+        if let ShardOutcome::Carry(inventory) = outcome {
+            if clear_keys.contains(key) {
+                inventory.set_rollup_hash(None);
+            }
+        }
+    }
+
+    // Step 2 (phase A): clear every invalidation target that is not already being rewritten in
+    // phase B below (rewriting it there already publishes rollup `None`, so a separate clear
+    // would be redundant) — one batched, mtime-preserving barrier, durable before phase B starts.
+    let phase_a_batch = file_utils::WriteBatch::new();
+    for key in clear_keys.iter().filter(|key| !outcomes.contains_key(key.as_str())) {
+        stage_rollup_clear(key, &phase_a_batch)?;
+    }
+    phase_a_batch.finish()?;
+
+    // Step 3 (phase B): publish every directory's own shard content — durable, and visible, only
+    // after phase A above already is. `context.batch` is the whole walk's single publish batch.
+    for (key, outcome) in &outcomes {
+        let inventory = match outcome {
+            ShardOutcome::Carry(inventory) | ShardOutcome::Changed(inventory) => inventory,
+        };
+
+        save_inventory_deferred(inventory, &file_utils::get_inventory_data_path_for_key(key), &context.batch)?;
+    }
+    context.batch.finish()?;
 
     if let Err(e) = result {
         // Register every inventory that was written, even on failure, so the metadata file
@@ -426,19 +409,6 @@ pub async fn create_inventory_for_directory(path: &WarehousePath) -> Result<(), 
             Re-run the load once the problem is fixed.",
             message
         ));
-    }
-
-    let dirty_paths = context.dirty_inventory_paths.lock().await;
-    let mut stale_keys: BTreeSet<String> = BTreeSet::new();
-
-    // Directories that are gone from the working directory (deleted, or ignored now) keep
-    // their inventory shard, with every entry marked as a staged removal — stacking the next
-    // parcel is what consumes and cleans up the staged state. Only shards that no longer
-    // exist on disk are dropped from the metadata file.
-    for dirty_key in dirty_paths.iter() {
-        if !mark_shard_entries_deleted(dirty_key)? {
-            stale_keys.insert(dirty_key.clone());
-        }
     }
 
     update_inventory_metadata(&*context.new_inventory_paths.lock().await, &stale_keys)?;
@@ -569,8 +539,38 @@ fn mark_shard_entries_deleted(key: &str) -> Result<bool, String> {
     Ok(true)
 }
 
+/// One directory's write decision from `load`'s parallel walk (`build_inventory`), collected
+/// for the single-threaded join point (`create_inventory_for_directory`) instead of written
+/// immediately from the (concurrent) task that decided it — see the join point's own doc
+/// comment for why a task never touches disk directly.
+pub enum ShardOutcome {
+    /// Content unchanged from the previous shard (same name/type/hash/state for every entry),
+    /// but it still needs rewriting: stat data drifted, or at least one entry had to be
+    /// re-verified (read and rehashed) even though it ended up matching. Carries the previous
+    /// rollup forward — the join point drops it back to `None` instead if this key turns out to
+    /// be an ancestor of some other real change in the same walk.
+    Carry(Inventory),
+
+    /// Effective content changed (a brand-new shard, an entry added or removed, or any entry's
+    /// name/type/hash/state differs from before) — or every non-`Deleted` item was just staged
+    /// for removal by the post-walk dirty-path pass. Always published with rollup `None`.
+    Changed(Inventory),
+}
+
 /// A task for building an inventory file for a given directory.
 /// When encountering a subdirectory, a new task is created to build the inventory for that directory.
+///
+/// Never writes to disk itself: it only *decides* this directory's [`ShardOutcome`] (or that
+/// nothing changed at all, in which case it decides nothing) and records that decision — plus,
+/// for a real content change, this directory's ancestor keys — in the shared
+/// [`InventoryBuilderContext`], for `create_inventory_for_directory`'s single-threaded join
+/// point to publish once every task has run. This is deliberate: this walker is fire-and-forget
+/// concurrent (a directory's task fires off its subdirectories' tasks and returns without
+/// waiting for them), so writing — and, worse, invalidating ancestors — directly from here would
+/// need the same cross-task synchronization every other writer's funnel
+/// ([`write_shard_mutation`]) uses, one durability barrier at a time. Deferring the decision to
+/// a join point instead turns the whole walk into at most two barriers total, and needs no lock
+/// at all: nothing concurrent ever touches another task's key.
 ///
 /// # Arguments
 /// * `context`         - The task context.
@@ -579,7 +579,7 @@ fn mark_shard_entries_deleted(key: &str) -> Result<bool, String> {
 /// matched against warehouse path keys (see `WarehousePath::as_key`).
 ///
 /// # Returns
-/// * `Ok(())`      - If the inventory file was build successfully.
+/// * `Ok(())`      - If the directory was classified successfully.
 /// * `Err(String)` - If there was an error during the operation.
 fn build_inventory(context: Arc<InventoryBuilderContext>,
                    path: Arc<WarehousePath>,
@@ -595,7 +595,8 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
         // file metadata is unchanged are reused without reading or hashing the file.
         // An unreadable or unparsable shard simply means a full rebuild of this directory.
         // The shard's own modification time is needed to reject "racily clean" entries
-        // (see `is_entry_unchanged`).
+        // (see `is_entry_unchanged`). Its rollup (if any) is captured here too, at task start —
+        // the tentative "carry forward" value if this directory's content turns out unchanged.
         let existing_inventory = match file_utils::retrieve_inventory_or_none_by_key(path.as_key()) {
             Ok((shard_path, Some(bytes))) => {
                 let shard_mtime = file_utils::get_symlink_metadata_for_path(&shard_path).ok()
@@ -607,6 +608,9 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
         };
 
         let mut inventory = Inventory::new();
+        // Whether any entry needed more than the pure stat-cache fast path (read, rehashed, or
+        // newly built) — see the case (a)/(b) split below.
+        let mut any_entry_rebuilt = false;
 
         {
             let key = path.as_key().to_string();
@@ -646,7 +650,10 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
                                 // Loading stages the *current* state: a file that is present
                                 // on disk is staged as Normal even if it was staged for
                                 // removal before (the same way "git add" re-stages a file
-                                // after "git rm --cached").
+                                // after "git rm --cached"). A state flip here (Deleted ->
+                                // Normal) is a real content change, caught below by
+                                // `inventory_content_matches` comparing `.state` too — no
+                                // special-casing needed here.
                                 let mut item = (*item).clone();
                                 item.state = InventoryItemState::Normal;
                                 item
@@ -657,6 +664,7 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
                             // were already stored during ingest (`object` is `None`).
                             FileVerdict::UnchangedByHash(fresh, object)
                                 | FileVerdict::Modified(fresh, object) => {
+                                any_entry_rebuilt = true;
                                 if let Some(mut object) = object {
                                     object.store()?;
                                 }
@@ -664,11 +672,10 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
                             }
                         }
                     }
-                    None => build_inventory_item_from_file(
-                        &entry.path(),
-                        name.as_str(),
-                        item_type
-                    )?,
+                    None => {
+                        any_entry_rebuilt = true;
+                        build_inventory_item_from_file(&entry.path(), name.as_str(), item_type)?
+                    }
                 };
 
                 inventory.add_item(index_item);
@@ -686,32 +693,41 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
         // Entries of the old inventory whose file is no longer in the directory (deleted,
         // renamed, newly ignored, or replaced by a directory) are carried over as staged
         // removals — this is the "present only in the shard → Deleted" half of the
-        // per-directory merge-join.
+        // per-directory merge-join. A real content change (a state flip to `Deleted`), caught
+        // the same way as any other by `inventory_content_matches` below.
         if let Some((old_inventory, _)) = existing_inventory.as_ref() {
             carry_over_missing_entries_as_deleted(old_inventory, &mut inventory);
         }
 
-        // A pure stat-cache refresh (every entry's name/type/hash/state is exactly what the
-        // previous shard already had) never changes the tree `stack` would build here: carry
-        // the previous rollup forward instead of leaving it cleared. Anything else (a real
-        // change, or a brand new shard) keeps `inventory`'s rollup at `None` — its default from
-        // `Inventory::new()` above, never set to anything else on this path.
-        //
-        // Ancestor invalidation is *not* done here, unlike every other content-mutating writer
-        // (contrast `write_shard_mutation`): `create_inventory_for_directory` already cleared
-        // every ancestor this whole walk could touch, in one batch, before any task (including
-        // this one) started — see `pre_clear_rollups_for_load`. Re-deriving and re-clearing them
-        // per directory here would be both redundant and, since these tasks run concurrently,
-        // exactly the race that pre-clearing exists to avoid. This directory's own shard is the
-        // only file this task ever touches, so no lock is needed for it either.
-        if let Some((old_inventory, _)) = existing_inventory.as_ref() {
-            if inventory_content_matches(&inventory, old_inventory) {
-                inventory.set_rollup_hash(old_inventory.get_rollup_hash().cloned());
-            }
-        }
+        let key = path.as_key().to_string();
 
-        let inventory_data_path = file_utils::get_inventory_data_path_for_key(path.as_key());
-        save_inventory(&inventory, &inventory_data_path)?;
+        let is_carry = existing_inventory.as_ref()
+            .is_some_and(|(old_inventory, _)| inventory_content_matches(&inventory, old_inventory));
+
+        if is_carry {
+            // Case (a): every entry hit the pure stat-cache fast path and the entry set is
+            // unchanged — literally nothing here differs from what is already on disk (not even
+            // stat data). Write nothing at all: the old shard's mtime (and rollup) stay exactly
+            // as they were, so the "racily clean" stat-cache guard on this directory's *parent*
+            // stays exactly as conservative as it already was.
+            if any_entry_rebuilt {
+                // Case (b): content unchanged, but at least one entry was re-verified (or stat
+                // data drifted). Tentatively carry the rollup this task read at start — the join
+                // point drops it if this key is also an ancestor of some other real change.
+                let carried_rollup = existing_inventory.as_ref()
+                    .and_then(|(old_inventory, _)| old_inventory.get_rollup_hash().cloned());
+                inventory.set_rollup_hash(carried_rollup);
+
+                context.outcomes.lock().await.insert(key, ShardOutcome::Carry(inventory));
+            }
+        } else {
+            // Case (c): effective content changed (or this is a brand-new shard). Always
+            // published with rollup `None`; every ancestor becomes an invalidation target.
+            inventory.set_rollup_hash(None);
+
+            context.clear_keys.lock().await.extend(ancestor_keys_root_first(&key));
+            context.outcomes.lock().await.insert(key, ShardOutcome::Changed(inventory));
+        }
 
         Ok(())
     }

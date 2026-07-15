@@ -409,3 +409,115 @@ fn a_narrowed_sparse_bay_still_produces_correct_stocktake_and_stack_with_skips_a
     let off_value2: serde_json::Value = serde_json::from_slice(&off_output2.stdout).unwrap();
     assert_eq!(on_value2, off_value2);
 }
+
+// -------------------------------------------------------------------------------------------
+// Regressions for the `load .` join-point redesign (DESIGN.html §5.0 D item 8, review fix 1):
+// the pre-clear approach it replaced unconditionally wiped every rollup in the loaded scope on
+// every load — for `load .`, the whole warehouse, changed or not — defeating the feature on the
+// most common workflow ("load .; stack"). These pin the fixed behavior directly.
+// -------------------------------------------------------------------------------------------
+
+#[test]
+fn a_no_op_load_dot_preserves_every_rollup_and_a_later_stack_still_skips() {
+    let warehouse = Warehouse::new("noop-load-preserves", false);
+    warehouse.prepare();
+
+    warehouse.write_file("a/b/c/file.txt", "deep v1\n");
+    warehouse.write_file("sibling/file.txt", "sibling v1\n");
+    warehouse.run_ok(&["load", "."]);
+    warehouse.run_ok(&["stack", "base"]);
+
+    let root_rollup_before = shard_rollup(&warehouse, "");
+    let deep_rollup_before = shard_rollup(&warehouse, "a/b/c");
+    let sibling_rollup_before = shard_rollup(&warehouse, "sibling");
+    assert!(root_rollup_before.is_some(), "the root must be stamped after the base stack");
+    assert!(deep_rollup_before.is_some(), "the deep subtree must be stamped after the base stack");
+    assert!(sibling_rollup_before.is_some(), "the sibling subtree must be stamped after the base stack");
+
+    // A no-op `load .`: nothing on disk changed since the stack above.
+    warehouse.run_ok(&["load", "."]);
+
+    assert_eq!(shard_rollup(&warehouse, ""), root_rollup_before,
+        "a no-op `load .` must not touch the root's rollup");
+    assert_eq!(shard_rollup(&warehouse, "a/b/c"), deep_rollup_before,
+        "a no-op `load .` must not touch a deep, unchanged subtree's rollup");
+    assert_eq!(shard_rollup(&warehouse, "sibling"), sibling_rollup_before,
+        "a no-op `load .` must not touch an unrelated sibling's rollup");
+
+    // A later stack of a real, unrelated change must still find something to skip — proving the
+    // no-op load didn't just leave the *values* looking right while quietly losing the ability
+    // to skip on them.
+    warehouse.write_file("a/b/c/file.txt", "deep v2\n");
+    warehouse.run_ok(&["load", "a/b/c/file.txt"]);
+
+    let mut command = warehouse.command(&["stack", "touch deep"]);
+    command.env("FORKLIFT_DEBUG_ROLLUP_SKIP_COUNT", "1");
+    let output = command.output().unwrap();
+    assert!(output.status.success());
+    assert!(skip_count(&output) >= 1,
+        "a stack after a no-op load must still skip the untouched sibling subtree");
+}
+
+#[test]
+fn load_dot_after_a_deep_edit_invalidates_only_the_changed_spine() {
+    let warehouse = Warehouse::new("load-dot-spine", false);
+    warehouse.prepare();
+
+    warehouse.write_file("a/b/c/file.txt", "deep v1\n");
+    warehouse.write_file("sibling/file.txt", "sibling v1\n");
+    warehouse.run_ok(&["load", "."]);
+    warehouse.run_ok(&["stack", "base"]);
+
+    let sibling_rollup_before = shard_rollup(&warehouse, "sibling");
+    assert!(sibling_rollup_before.is_some());
+    assert!(shard_rollup(&warehouse, "").is_some());
+    assert!(shard_rollup(&warehouse, "a").is_some());
+    assert!(shard_rollup(&warehouse, "a/b").is_some());
+    assert!(shard_rollup(&warehouse, "a/b/c").is_some());
+
+    warehouse.write_file("a/b/c/file.txt", "deep v2\n");
+    warehouse.run_ok(&["load", "."]); // a whole-directory load, not a narrow single-file one
+
+    assert_eq!(shard_rollup(&warehouse, ""), None, "the root must be invalidated");
+    assert_eq!(shard_rollup(&warehouse, "a"), None, "an intermediate ancestor must be invalidated");
+    assert_eq!(shard_rollup(&warehouse, "a/b"), None, "the immediate parent must be invalidated");
+    assert_eq!(shard_rollup(&warehouse, "a/b/c"), None, "the changed shard itself must be invalidated");
+
+    assert_eq!(shard_rollup(&warehouse, "sibling"), sibling_rollup_before,
+        "an untouched sibling subtree's rollup must survive a `load .` that changed something elsewhere");
+}
+
+#[test]
+fn skip_count_is_unaffected_by_an_interposed_no_op_load_dot() {
+    let warehouse = Warehouse::new("noop-load-ab", false);
+    warehouse.prepare();
+
+    warehouse.write_file("a/b/c/file.txt", "deep v1\n");
+    warehouse.write_file("sibling1/file.txt", "s1 v1\n");
+    warehouse.write_file("sibling2/file.txt", "s2 v1\n");
+    warehouse.run_ok(&["load", "."]);
+    warehouse.run_ok(&["stack", "base"]);
+
+    // A: touch the deep file, narrow-load it, stack — no interposed no-op load.
+    warehouse.write_file("a/b/c/file.txt", "deep v2\n");
+    warehouse.run_ok(&["load", "a/b/c/file.txt"]);
+    let mut command_a = warehouse.command(&["stack", "touch a"]);
+    command_a.env("FORKLIFT_DEBUG_ROLLUP_SKIP_COUNT", "1");
+    let output_a = command_a.output().unwrap();
+    assert!(output_a.status.success());
+    let count_a = skip_count(&output_a);
+
+    // B: touch again, narrow-load, but interpose a no-op `load .` before the stack this time.
+    warehouse.write_file("a/b/c/file.txt", "deep v3\n");
+    warehouse.run_ok(&["load", "a/b/c/file.txt"]);
+    warehouse.run_ok(&["load", "."]);
+    let mut command_b = warehouse.command(&["stack", "touch b"]);
+    command_b.env("FORKLIFT_DEBUG_ROLLUP_SKIP_COUNT", "1");
+    let output_b = command_b.output().unwrap();
+    assert!(output_b.status.success());
+    let count_b = skip_count(&output_b);
+
+    assert_eq!(count_a, count_b,
+        "an interposed no-op `load .` must not change how many subtrees a later stack can skip");
+    assert!(count_a >= 1, "the scenario must actually exercise a skip for this comparison to mean anything");
+}

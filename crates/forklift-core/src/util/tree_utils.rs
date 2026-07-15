@@ -9,13 +9,14 @@ use crate::enums::dir_entry_type::DirEntryType;
 use crate::enums::inventory_item_state::InventoryItemState;
 use crate::model::task::tree_builder::tree_builder_context::{ShardSource, TreeBuilderContext};
 pub use crate::model::task::tree_builder::tree_builder_context::ObjectSink;
+use crate::model::inventory::Inventory;
 use crate::model::task::TaskExecutor;
 use crate::model::tree_item::TreeItem;
 use crate::parser;
 use crate::traits::task_context::TaskContext;
 use crate::types::task::Task;
 use crate::util::scope_utils::{self, MaterializationScope, ScopeClass};
-use crate::util::{fanout_utils, file_utils, inventory_utils, object_utils};
+use crate::util::{file_utils, inventory_utils, object_utils};
 
 const FILENAME_METADATA_SUFFIX: &str = ".metadata";
 
@@ -104,7 +105,7 @@ pub async fn build_tree_from_inventory_deferred(
         metadata,
         ShardSource::Prepared(Arc::clone(prepared)),
         ObjectSink::Deferred(Arc::clone(batch)),
-        head_root_tree_hash.map(|hash| (hash, scope)),
+        head_root_tree_hash.map(|hash| (hash, scope, &prepared.shards)),
     ).await
 }
 
@@ -116,9 +117,14 @@ pub async fn build_tree_from_inventory_deferred(
 /// between two copies.
 ///
 /// # Arguments
-/// * `skip_context` - `Some((head_root_tree_hash, scope))` to attempt the rollup-based skip
-///                    (stage 2) against that head; `None` to build in full, exactly as before
-///                    stage 2 existed (every caller except `stack`'s optimized path).
+/// * `skip_context` - `Some((head_root_tree_hash, scope, shards))` to attempt the rollup-based
+///                    skip (stage 2) against that head; `None` to build in full, exactly as
+///                    before stage 2 existed (every caller except `stack`'s optimized path).
+///                    `shards` is the same already-parsed shard snapshot `stack` built
+///                    `PreparedInventory` from — the skip plan reads rollups out of it directly
+///                    instead of re-reading shard headers off disk a second time (nothing
+///                    mutates a shard between `prepare_stack_inventory` and here — see
+///                    `PreparedInventory`'s own doc comment).
 ///
 /// # Returns
 /// * `Ok((Some(TreeItem), BTreeMap<String, String>, BTreeSet<String>))` - The root tree (its
@@ -132,7 +138,7 @@ pub async fn build_tree_from_inventory_deferred(
 async fn build_tree_from_inventory_core(metadata: &BTreeSet<String>,
                                         shard_source: ShardSource,
                                         object_sink: ObjectSink,
-                                        skip_context: Option<(&str, &MaterializationScope)>)
+                                        skip_context: Option<(&str, &MaterializationScope, &BTreeMap<String, Inventory>)>)
                                         -> Result<(Option<TreeItem>, BTreeMap<String, String>, BTreeSet<String>), String> {
     if metadata.is_empty() {
         return Ok((None, BTreeMap::new(), BTreeSet::new()));
@@ -172,7 +178,7 @@ async fn build_tree_from_inventory_core(metadata: &BTreeSet<String>,
     }
 
     let skip_plan = match skip_context {
-        Some((head_root_tree_hash, scope)) => compute_rollup_skip_plan(&children, head_root_tree_hash, scope)?,
+        Some((head_root_tree_hash, scope, shards)) => compute_rollup_skip_plan(&children, head_root_tree_hash, scope, shards)?,
         None => RollupSkipPlan::default(),
     };
 
@@ -292,24 +298,31 @@ struct RollupSkipPlan {
 ///                            key (pre-pruning).
 /// * `head_root_tree_hash`  - The pallet head's root tree hash.
 /// * `scope`                - The active bay's materialization scope.
+/// * `shards`               - The already-parsed shard snapshot (`stack_utils::stack_parcel`'s
+///                            `PreparedInventory`) to read every candidate's rollup out of — an
+///                            in-memory lookup, not a disk re-read (nothing mutates a shard
+///                            between that snapshot and this call).
 ///
 /// # Returns
 /// * `Ok(RollupSkipPlan)` - The plan (empty when the kill switch is set, or nothing matched).
-/// * `Err(String)`        - If a shard's header or a head tree object could not be read.
+/// * `Err(String)`        - If a head tree object could not be read.
 fn compute_rollup_skip_plan(children: &BTreeMap<String, Vec<String>>,
                             head_root_tree_hash: &str,
-                            scope: &MaterializationScope) -> Result<RollupSkipPlan, String> {
+                            scope: &MaterializationScope,
+                            shards: &BTreeMap<String, Inventory>) -> Result<RollupSkipPlan, String> {
     let mut plan = RollupSkipPlan::default();
 
     if !inventory_utils::rollup_skip_enabled() {
         return Ok(plan);
     }
 
+    let rollup_of = |key: &str| shards.get(key).and_then(|inventory| inventory.get_rollup_hash().cloned());
+
     let scope_is_full = scope.is_full();
     let root_head_tree = object_utils::load_tree_shared(head_root_tree_hash)?;
 
     if scope_is_full {
-        if let Some(rollup) = inventory_utils::peek_shard_rollup("")? {
+        if let Some(rollup) = rollup_of("") {
             if rollup == head_root_tree_hash {
                 prune_subtree("", children, &mut plan.pruned);
                 plan.whole_tree_hash = Some(rollup);
@@ -328,39 +341,23 @@ fn compute_rollup_skip_plan(children: &BTreeMap<String, Vec<String>>,
 
         let head_subtrees: BTreeMap<&String, &TreeItem> = head_tree.get_subtrees().collect();
 
-        // Only a child with a corresponding head subtree is a skip candidate at all (see the
-        // per-child match check below); a newly-inventoried directory with no head counterpart
-        // never has anything to peek.
-        let candidates: Vec<(&String, &TreeItem)> = child_keys.iter()
-            .filter_map(|child_key| {
-                let child_name = last_component(child_key);
-                head_subtrees.get(&child_name.to_string()).map(|head_child| (child_key, *head_child))
-            })
-            .collect();
+        for child_key in child_keys {
+            let child_name = last_component(child_key);
+            let Some(head_child) = head_subtrees.get(&child_name.to_string()) else { continue };
 
-        // Peek every candidate's rollup in parallel — a flat, independent batch, exactly what
-        // `fanout_map` is for. This is what makes the skip a genuine win rather than a wash: the
-        // per-directory rebuild it replaces used to run on `TaskExecutor`'s full worker pool, so
-        // a *sequential* peek pass here (one small header read at a time) can cost more wall
-        // clock than the parallel rebuild ever did, even though it reads far less data overall —
-        // confirmed on a synthetic 300-sibling-directory corpus (§5.0 D item 8 stage 2 measurement).
-        let rollups: Vec<Result<Option<String>, String>> = if key_in_scope && !candidates.is_empty() {
-            fanout_utils::fanout_map(&candidates, |(child_key, _)| inventory_utils::peek_shard_rollup(child_key))
-        } else {
-            candidates.iter().map(|_| Ok(None)).collect()
-        };
-
-        for ((child_key, head_child), rollup_result) in candidates.into_iter().zip(rollups) {
-            let rollup = rollup_result?;
-
-            if let Some(rollup) = rollup {
-                if rollup == head_child.hash {
-                    let child_name = last_component(child_key);
-                    plan.injections.entry(key.clone()).or_default()
-                        .push((child_name.to_string(), rollup));
-                    prune_subtree(child_key, children, &mut plan.pruned);
-                    inventory_utils::record_rollup_skip();
-                    continue;
+            // A rollup lookup is now a plain in-memory map read (`shards` is the same snapshot
+            // already parsed for the conflict check), so there is nothing left to parallelize
+            // here — unlike a disk re-read per candidate, which used to cost more wall clock
+            // than the parallel rebuild it replaced (DESIGN.html §5.0 D item 8 stage 2b finding).
+            if key_in_scope {
+                if let Some(rollup) = rollup_of(child_key) {
+                    if rollup == head_child.hash {
+                        plan.injections.entry(key.clone()).or_default()
+                            .push((child_name.to_string(), rollup));
+                        prune_subtree(child_key, children, &mut plan.pruned);
+                        inventory_utils::record_rollup_skip();
+                        continue;
+                    }
                 }
             }
 
