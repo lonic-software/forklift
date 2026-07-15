@@ -347,6 +347,11 @@ pub async fn create_inventory_for_directory(path: &WarehousePath) -> Result<(), 
         let dirty_paths = context.dirty_inventory_paths.lock().await;
 
         for dirty_key in dirty_paths.iter() {
+            // Captured right when this pass starts reading this shard — the same "no later than
+            // any verification actually performed" anchor `build_inventory`'s own tasks use (see
+            // `ShardOutcome`'s doc comment); here, "verification" is this read itself.
+            let verified_at = std::time::SystemTime::now();
+
             let (_, bytes_opt) = file_utils::retrieve_inventory_or_none_by_key(dirty_key)?;
 
             let Some(bytes) = bytes_opt else {
@@ -360,7 +365,7 @@ pub async fn create_inventory_for_directory(path: &WarehousePath) -> Result<(), 
             if inventory.mark_all_items_deleted() {
                 clear_keys.extend(ancestor_keys_root_first(dirty_key));
                 inventory.set_rollup_hash(None);
-                outcomes.insert(dirty_key.clone(), ShardOutcome::Changed(inventory));
+                outcomes.insert(dirty_key.clone(), ShardOutcome::Changed(inventory, verified_at));
             }
         }
     }
@@ -369,7 +374,7 @@ pub async fn create_inventory_for_directory(path: &WarehousePath) -> Result<(), 
     // same walk must be dropped, not published — deterministic, no locks, no races (everything
     // that could produce a `clear_keys` entry has already run by this point).
     for (key, outcome) in outcomes.iter_mut() {
-        if let ShardOutcome::Carry(inventory) = outcome {
+        if let ShardOutcome::Carry(inventory, _) = outcome {
             if clear_keys.contains(key) {
                 inventory.set_rollup_hash(None);
             }
@@ -387,12 +392,17 @@ pub async fn create_inventory_for_directory(path: &WarehousePath) -> Result<(), 
 
     // Step 3 (phase B): publish every directory's own shard content — durable, and visible, only
     // after phase A above already is. `context.batch` is the whole walk's single publish batch.
+    // Each shard is published with the mtime its outcome was verified at, not "now" — see
+    // `ShardOutcome`'s doc comment.
     for (key, outcome) in &outcomes {
-        let inventory = match outcome {
-            ShardOutcome::Carry(inventory) | ShardOutcome::Changed(inventory) => inventory,
+        let (inventory, verified_at) = match outcome {
+            ShardOutcome::Carry(inventory, verified_at) | ShardOutcome::Changed(inventory, verified_at) =>
+                (inventory, *verified_at),
         };
 
-        save_inventory_deferred(inventory, &file_utils::get_inventory_data_path_for_key(key), &context.batch)?;
+        save_inventory_deferred_with_mtime(
+            inventory, &file_utils::get_inventory_data_path_for_key(key), &context.batch, verified_at,
+        )?;
     }
     context.batch.finish()?;
 
@@ -549,12 +559,18 @@ pub enum ShardOutcome {
     /// re-verified (read and rehashed) even though it ended up matching. Carries the previous
     /// rollup forward — the join point drops it back to `None` instead if this key turns out to
     /// be an ancestor of some other real change in the same walk.
-    Carry(Inventory),
+    ///
+    /// The `SystemTime` is the shard's *published* mtime — see the join point's publish step for
+    /// why it is not simply "now".
+    Carry(Inventory, std::time::SystemTime),
 
     /// Effective content changed (a brand-new shard, an entry added or removed, or any entry's
     /// name/type/hash/state differs from before) — or every non-`Deleted` item was just staged
     /// for removal by the post-walk dirty-path pass. Always published with rollup `None`.
-    Changed(Inventory),
+    ///
+    /// The `SystemTime` is the shard's *published* mtime — see the join point's publish step for
+    /// why it is not simply "now".
+    Changed(Inventory, std::time::SystemTime),
 }
 
 /// A task for building an inventory file for a given directory.
@@ -585,6 +601,14 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
                    path: Arc<WarehousePath>,
                    paths_to_ignore: Arc<Vec<Regex>>) -> impl Future<Output = Result<(), String>> + Send {
     async move {
+        // Captured before this task reads, stats or hashes anything below — the timestamp this
+        // directory's published shard will carry as its mtime (see the join point's publish
+        // step). Deliberately the task's *start*, not its end or the join point's later publish
+        // time: it must be no later than any verification (a stat, a rehash) this task actually
+        // performs, so a file edited after that verification but before the join point publishes
+        // is never mistaken, on a future load, for one that was already accounted for.
+        let verified_at = std::time::SystemTime::now();
+
         let directory = file_utils::read_directory(&path.to_fs_path())?;
 
         if !path.is_root() && file_utils::is_path_ignored(path.as_key(), &paths_to_ignore) {
@@ -718,7 +742,7 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
                     .and_then(|(old_inventory, _)| old_inventory.get_rollup_hash().cloned());
                 inventory.set_rollup_hash(carried_rollup);
 
-                context.outcomes.lock().await.insert(key, ShardOutcome::Carry(inventory));
+                context.outcomes.lock().await.insert(key, ShardOutcome::Carry(inventory, verified_at));
             }
         } else {
             // Case (c): effective content changed (or this is a brand-new shard). Always
@@ -726,7 +750,7 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
             inventory.set_rollup_hash(None);
 
             context.clear_keys.lock().await.extend(ancestor_keys_root_first(&key));
-            context.outcomes.lock().await.insert(key, ShardOutcome::Changed(inventory));
+            context.outcomes.lock().await.insert(key, ShardOutcome::Changed(inventory, verified_at));
         }
 
         Ok(())
@@ -1911,6 +1935,24 @@ fn save_inventory_deferred(inventory: &Inventory,
     batch.stage(inventory_path, &bytes)
 }
 
+/// Like [`save_inventory_deferred`], but publishes with an explicit mtime instead of "now" — see
+/// [`file_utils::WriteBatch::stage_with_mtime`]. Used by `load`'s join point
+/// (`create_inventory_for_directory`) to publish each [`ShardOutcome`] with the timestamp
+/// captured when it was actually verified, not the (potentially much later) moment the whole
+/// walk finishes and publishes: the shard's mtime is `is_entry_unchanged`'s proof that its
+/// entries were checked against the file system no earlier than that moment, and "now" would
+/// overstate that — a file edited between this directory's own verification and the join
+/// point's publish would satisfy `mtime < shard_mtime` on a now-stale cached hash and be
+/// silently missed on the next load.
+fn save_inventory_deferred_with_mtime(inventory: &Inventory,
+                                      inventory_path: &Path,
+                                      batch: &file_utils::WriteBatch,
+                                      mtime: std::time::SystemTime) -> Result<(), String> {
+    let bytes = ensure_inventory_folder_and_build(inventory, inventory_path)?;
+
+    batch.stage_with_mtime(inventory_path, &bytes, mtime)
+}
+
 /// The shared prelude of [`save_inventory`] and [`save_inventory_deferred`]: make sure the
 /// shard's parent folder exists, and serialize its bytes.
 fn ensure_inventory_folder_and_build(inventory: &Inventory, inventory_path: &Path) -> Result<Vec<u8>, String> {
@@ -2185,5 +2227,43 @@ mod tests {
         c.add_item(changed);
 
         assert!(!inventory_content_matches(&a, &c), "a real hash change must count as a content change");
+    }
+
+    #[test]
+    fn a_published_shard_carries_its_outcome_verified_at_mtime_not_now() {
+        // `load`'s join point publishes every `ShardOutcome` with the timestamp captured when it
+        // was verified, not "now" (the join point's own, potentially much later, publish time —
+        // see `ShardOutcome`'s doc comment for the staleness hazard that closes). Pin that the
+        // publish path (`save_inventory_deferred_with_mtime`) actually honours the outcome's own
+        // timestamp field, using a deliberately old anchor so a stray `SystemTime::now()`
+        // anywhere in the path would be caught immediately.
+        let _scratch = Scratch::new("publish-mtime-anchor");
+
+        let anchor = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(3600))
+            .unwrap();
+        let outcome = ShardOutcome::Changed(Inventory::new(), anchor);
+
+        let (inventory, verified_at) = match &outcome {
+            ShardOutcome::Carry(inventory, verified_at) | ShardOutcome::Changed(inventory, verified_at) =>
+                (inventory, *verified_at),
+        };
+
+        let batch = file_utils::WriteBatch::new();
+        let path = file_utils::get_inventory_data_path_for_key("some/key");
+        save_inventory_deferred_with_mtime(inventory, &path, &batch, verified_at).unwrap();
+        batch.finish().unwrap();
+
+        let published_mtime = file_utils::get_symlink_metadata_for_path(&path).unwrap()
+            .modified().unwrap();
+
+        // Filesystem mtime resolution can be coarser than `SystemTime`'s own precision (whole
+        // seconds on some filesystems), so compare within a small tolerance rather than
+        // bit-for-bit — the anchor is an hour old, so any real bug (publishing with "now")
+        // would miss by nearly an hour, nowhere near this tolerance.
+        let diff = published_mtime.duration_since(anchor).unwrap_or_else(|e| e.duration());
+        assert!(diff < std::time::Duration::from_secs(2),
+            "a published shard's mtime must equal its ShardOutcome's verified_at timestamp, not \
+            \"now\": got {:?}, expected {:?} (diff {:?})", published_mtime, anchor, diff);
     }
 }
