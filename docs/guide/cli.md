@@ -318,7 +318,9 @@ time:
 Re-`stack` to redo (e.g. with a corrected message). When the journal is empty (a stack made
 before this feature), `undo` falls back to soft-resetting the current pallet's head to its
 first parent. Undoing a pallet's *very first* parcel, pure-staging (`load`/`remove`/`unload`)
-and trust/remote commands are out of scope; `park` is reversed with `park pop`.
+and trust/remote commands are out of scope; `park` is reversed with `park pop`. Anything that
+happened between the journaled operation and the `undo` but was never journaled itself stays
+exactly as it is — trust operations such as a key retirement are preserved, never rolled back.
 
 ### `peek` — inspect an object (`pk`)
 

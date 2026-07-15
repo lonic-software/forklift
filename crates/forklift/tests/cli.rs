@@ -3423,6 +3423,57 @@ fn undo_reverses_a_consolidate_and_a_shift() {
     assert!(!stdout(&warehouse.run(&["history"])).contains("consolidates"), "merge must be off the pallet");
 }
 
+// Regression test for a bug where `undo` rolled back pallet refs it never journaled.
+// `JournalEntry` snapshots every pallet ref (user and meta, `@office` included) before a
+// journaled op so it can be restored, but an office/meta-pallet mutation between the
+// journaled op and the `undo` is not itself journaled. Undo used to restore `@office`
+// unconditionally along with everything else, silently un-retiring a key that was revoked
+// after the stack. `restore_refs` now only rolls a ref back if it still sits exactly where
+// the journaled op left it.
+#[test]
+fn undo_never_reverts_a_key_retirement_that_happened_after_the_journaled_stack() {
+    let warehouse = TestWarehouse::new("undo-office-boundary");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["office", "enroll"])); // test@forklift becomes admin
+
+    let bob = keygen_admit_args(&warehouse, "bob@forklift");
+    assert_success(&warehouse.run(&["office", "admit", &bob[0], &bob[1], &bob[2]]));
+
+    // A first parcel to be born onto: a stack onto an unborn pallet isn't journaled at all
+    // (there is no ref to restore back to), so this one has to precede the one under test.
+    warehouse.write_file("a.txt", "one\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "genesis"]));
+
+    // The journaled operation: a stack, undo-able on its own.
+    warehouse.write_file("b.txt", "two\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "first"]));
+
+    // Un-journaled, in between: an admin retires bob's key. This advances `@office`.
+    // (Users are listed alphabetically, not by admission order, so find bob's own block
+    // rather than assuming his key is the first or last line.)
+    let list = stdout(&warehouse.run(&["office", "list"]));
+    let bob_key_id = list.split("bob@forklift").nth(1)
+        .and_then(|after| after.lines().find(|line| line.trim_start().starts_with("key ")))
+        .and_then(|line| line.split_whitespace().nth(1))
+        .expect("office list shows bob's key")
+        .to_string();
+    assert_success(&warehouse.run(&["office", "retire", &bob_key_id]));
+
+    // Undo reverses the stack…
+    let undone = warehouse.run(&["undo", "--json"]);
+    assert_success(&undone);
+    let staged = warehouse.run(&["stocktake", "--json"]);
+    assert_eq!(json(&staged)["data"]["staged_count"], 1, "the stack's change must be re-staged");
+
+    // …but must leave the retirement alone: bob's key stays retired, not silently restored
+    // to active by rolling `@office` back to its pre-stack head.
+    let after = stdout(&warehouse.run(&["office", "list"]));
+    assert!(after.contains("retired"), "the retirement must survive undo: {}", after);
+}
+
 #[test]
 fn config_unset_removes_a_value() {
     let warehouse = TestWarehouse::new("config-unset");
