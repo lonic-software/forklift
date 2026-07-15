@@ -217,6 +217,44 @@ size for exactly this at compaction time (see `OBJECT_STORE_SCALING.md` §A) —
 overhead to eliminate. Only worth revisiting if `diff` is still hot after (a) lands;
 until then this is the store working as designed, not a bug.
 
+### e. Durability-barrier audit (write-batching sweep)
+
+**What.** A systematic audit of every durability barrier in forklift-core and the
+CLI head — `write_file_atomically` call sites, `WriteBatch` construction, every raw
+`fsync` — counting barriers paid per logical operation, before any patching is
+attempted. Audit first, patches second: the point is to size the remaining problem
+rather than fix whatever is found first.
+
+**Why now.** Three unrelated pieces of work converged on the same cost in short
+succession. The quick-wins track already had to batch `stack`'s per-object fsyncs
+into one barrier (quick-win #3, above). The rollup-hash work on this branch had to
+batch shard-write barriers *twice* — once to bring stack cleanup's overhead down
+from 70% to 18%, again to get `load .`'s join point faster than main rather than
+merely neutral. And this branch's own benchmark verification (PR #59) surfaced
+`park` costing roughly **+28 ms** and `park` pop roughly **+8 ms** on git.git,
+tracing to unbatched barriers nobody had measured before. Three independent
+investigations tripping over the same class of cost is a pattern, not a
+coincidence.
+
+**Known suspects to check first.**
+
+- `consolidate`/cherry-pick's per-merge-action shard writes — each action pays the
+  two-barrier mutation funnel individually; a 50-file merge is on the order of 100
+  barriers, untimed so far.
+- `park` pop's per-file replay.
+- Multi-file `restore`.
+- Journal writes.
+
+**Method.** Classify each write site as: (a) already batched; (b) batchable with no
+ordering constraint; (c) batchable with phased ordering — the `load .` join-point
+pattern above, where ordering-constrained groups become ordered sub-barriers rather
+than one barrier per file; (d) must remain individual for correctness.
+
+**Standing rule.** Batching may reduce the *count* of barriers; it must never weaken
+a barrier's *guarantee*. The durable-before-destructive contract and the ordering
+invariants this doc already protects (ancestor-clears-before-content,
+fsync-before-ref-move) are preserved exactly — only the granularity changes.
+
 ---
 
 ## Deliberately NOT doing
