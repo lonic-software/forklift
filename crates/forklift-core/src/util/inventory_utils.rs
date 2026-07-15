@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
@@ -620,6 +620,68 @@ pub fn refresh_tracked_entries() -> Result<(), String> {
     Ok(())
 }
 
+/// A single read-and-parse pass over every registered inventory shard.
+///
+/// Built once per `stack` (`prepare_stack_inventory`) and shared by three steps that used to
+/// each read+parse the whole shard set independently — `has_conflict_entries`,
+/// `build_tree_from_inventory` and `cleanup_after_stack` (§ perf: on a large tree this was three
+/// full O(shard count) passes over the same on-disk state per stacked parcel). See
+/// `stack_utils::stack_parcel`: it builds this once, checks conflicts on it (still strictly
+/// before any warehouse mutation — parse-then-check-then-write is preserved), threads it into
+/// the tree build, and reuses it again for the post-stack cleanup's rewrite decision. Every
+/// other caller of the three originals (`park`, in particular) is unaffected: it still reads
+/// fresh, exactly as before.
+///
+/// Held only for the duration of one `stack_parcel` call — the same transient window
+/// `build_tree_from_inventory`'s own parallel read pass already held the parsed shards for, so
+/// peak memory retention is unchanged (this does not hold anything longer than the code already
+/// did; it just stops re-reading and re-parsing the same bytes two more times).
+pub struct PreparedInventory {
+    /// `None` when there is no inventory metadata file at all (nothing was ever loaded).
+    /// `Some` (possibly empty) mirrors the metadata file's own registered directory keys —
+    /// kept distinct from an empty set purely so callers can reproduce the exact behavior of
+    /// the original functions where "no file" and "empty file" diverge (e.g.
+    /// `cleanup_after_stack`'s early return when there was never a file to rewrite).
+    pub metadata: Option<BTreeSet<String>>,
+
+    /// Every registered directory's parsed inventory, keyed by its warehouse path key. A key
+    /// present in `metadata` but absent here means its shard file could not be found on disk
+    /// (a stale metadata entry) — every original caller silently skips such an entry, and so
+    /// does everything built on this snapshot.
+    pub shards: BTreeMap<String, Inventory>,
+}
+
+/// Read the inventory metadata file and parse every registered shard exactly once. See
+/// [`PreparedInventory`] for why (`stack` used to pay this read+parse cost three times per
+/// parcel).
+///
+/// # Returns
+/// * `Ok(PreparedInventory)` - The snapshot (empty when there is nothing staged).
+/// * `Err(String)`           - If the metadata file or a shard could not be read or parsed.
+pub fn prepare_stack_inventory() -> Result<PreparedInventory, String> {
+    let (_, metadata_opt) = file_utils::retrieve_inventory_metadata_or_none()?;
+
+    let Some(metadata) = metadata_opt else {
+        return Ok(PreparedInventory { metadata: None, shards: BTreeMap::new() });
+    };
+
+    let mut shards: BTreeMap<String, Inventory> = BTreeMap::new();
+
+    for entry in &metadata {
+        let key = metadata_entry_to_key(entry);
+        let (_, bytes_opt) = file_utils::retrieve_inventory_or_none_by_key(key)?;
+
+        let Some(bytes) = bytes_opt else { continue; };
+
+        let inventory = parser::inventory::inventory_parser::parse_inventory(&bytes)
+            .map_err(|e| format!("Error while parsing the inventory of folder \"{}\": {}", key, e))?;
+
+        shards.insert(key.to_string(), inventory);
+    }
+
+    Ok(PreparedInventory { metadata: Some(metadata), shards })
+}
+
 /// Check whether any inventory entry is in a conflict state (an unresolved consolidation).
 ///
 /// # Returns
@@ -656,6 +718,22 @@ pub fn has_conflict_entries() -> Result<bool, String> {
     }
 
     Ok(false)
+}
+
+/// Like [`has_conflict_entries`], but against an already-parsed [`PreparedInventory`] snapshot
+/// instead of reading and parsing the shards again. Used by `stack` (`stack_utils::stack_parcel`),
+/// which must still abort before any warehouse mutation when this is true.
+///
+/// # Returns
+/// * `true`  - At least one entry is in conflict.
+/// * `false` - No entry is in conflict.
+pub fn has_conflict_entries_in(prepared: &PreparedInventory) -> bool {
+    prepared.shards.values().any(|inventory| inventory.get_items().any(|(_, item)| matches!(
+        item.state,
+        InventoryItemState::FirstParentConflict
+            | InventoryItemState::SecondParentConflict
+            | InventoryItemState::ThirdParentConflict
+    )))
 }
 
 /// List the warehouse paths of every inventory entry in a conflict state (an
@@ -900,6 +978,76 @@ pub fn cleanup_after_stack() -> Result<(), String> {
             }
 
             save_inventory(&inventory, &shard_path)?;
+        }
+    }
+
+    update_inventory_metadata(&BTreeSet::new(), &removed_keys)
+}
+
+/// Like [`cleanup_after_stack`], but reuses an already-parsed [`PreparedInventory`] snapshot —
+/// the same one `stack` used for its conflict check and tree build — instead of reading and
+/// parsing every shard a third time. The snapshot was taken before `stack` wrote anything, but
+/// nothing between then and this call mutates a shard's *content* on disk (tree/parcel objects,
+/// the pallet ref and the signature sidecar are the only writes stacking does before this point,
+/// none of them touch an inventory shard), so reusing it here produces exactly the same result
+/// as a fresh read would. The directory-existence checks below are unaffected — they always
+/// read the working directory fresh, exactly as [`cleanup_after_stack`] does.
+///
+/// # Arguments
+/// * `prepared` - The snapshot from [`prepare_stack_inventory`].
+///
+/// # Returns
+/// * `Ok(())`      - If the cleanup completed.
+/// * `Err(String)` - If a shard could not be written, or a folder could not be removed.
+pub fn cleanup_after_stack_with(prepared: &PreparedInventory) -> Result<(), String> {
+    let Some(metadata) = &prepared.metadata else {
+        return Ok(());
+    };
+
+    let mut removed_keys: BTreeSet<String> = BTreeSet::new();
+
+    for entry in metadata {
+        let key = metadata_entry_to_key(entry);
+
+        let dir_path = if key.is_empty() {
+            Path::new(".").to_path_buf()
+        } else {
+            std::path::PathBuf::from(key)
+        };
+
+        if !dir_path.is_dir() {
+            // The directory is gone from the working tree, and the parcel that was just
+            // stacked recorded its removal; its shard has served its purpose.
+            let folder = file_utils::get_inventory_folder_for_key(key);
+
+            // A parent directory earlier in the (sorted) set may have removed this folder.
+            if folder.exists() {
+                std::fs::remove_dir_all(&folder).map_err(|e|
+                    format!("Error while removing the inventory of folder \"{}\": {}", key, e)
+                )?;
+            }
+
+            removed_keys.insert(key.to_string());
+            continue;
+        }
+
+        let Some(inventory) = prepared.shards.get(key) else {
+            continue;
+        };
+
+        let has_staged_removals = inventory.get_items()
+            .any(|(_, item)| item.state == InventoryItemState::Deleted);
+
+        if has_staged_removals {
+            let mut rebuilt = Inventory::new();
+
+            for (_, item) in inventory.get_items() {
+                if item.state != InventoryItemState::Deleted {
+                    rebuilt.add_item((**item).clone());
+                }
+            }
+
+            save_inventory(&rebuilt, &file_utils::get_inventory_data_path_for_key(key))?;
         }
     }
 

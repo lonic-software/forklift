@@ -7,7 +7,8 @@ use regex::Regex;
 use crate::builder::object::loose_object_builder::LooseObjectBuilder;
 use crate::enums::dir_entry_type::DirEntryType;
 use crate::enums::inventory_item_state::InventoryItemState;
-use crate::model::task::tree_builder::tree_builder_context::TreeBuilderContext;
+use crate::model::task::tree_builder::tree_builder_context::{ShardSource, TreeBuilderContext};
+pub use crate::model::task::tree_builder::tree_builder_context::ObjectSink;
 use crate::model::task::TaskExecutor;
 use crate::model::tree_item::TreeItem;
 use crate::parser;
@@ -43,6 +44,54 @@ pub async fn build_tree_from_inventory() -> Result<Option<TreeItem>, String> {
         return Ok(None);
     };
 
+    build_tree_from_inventory_core(&metadata, ShardSource::Disk, ObjectSink::Immediate).await
+}
+
+/// Like [`build_tree_from_inventory`], but reads shard content from an already-parsed
+/// [`inventory_utils::PreparedInventory`] snapshot instead of the disk, and stages every built
+/// tree object's write into `batch` instead of writing (and fsyncing) it immediately.
+///
+/// Used by `stack` (`stack_utils::stack_parcel`): the snapshot is the single read+parse pass
+/// shared with the conflict check and the post-stack cleanup (§ perf), and the batch turns the
+/// per-object fsync pairs this build would otherwise pay (one per built directory) into one
+/// barrier the caller runs after this returns (see [`file_utils::WriteBatch`]).
+///
+/// # Arguments
+/// * `prepared` - The already-parsed shard snapshot.
+/// * `batch`    - Where every built tree object's write is staged.
+///
+/// # Returns
+/// Same as [`build_tree_from_inventory`].
+pub async fn build_tree_from_inventory_deferred(
+    prepared: &Arc<inventory_utils::PreparedInventory>,
+    batch: &Arc<file_utils::WriteBatch>,
+) -> Result<Option<TreeItem>, String> {
+    let Some(metadata) = &prepared.metadata else {
+        return Ok(None);
+    };
+
+    build_tree_from_inventory_core(
+        metadata,
+        ShardSource::Prepared(Arc::clone(prepared)),
+        ObjectSink::Deferred(Arc::clone(batch)),
+    ).await
+}
+
+/// The shared bottom-up parallel tree build, parameterized over where shard content is read
+/// from and where built objects are written — see [`build_tree_from_inventory`] (the original,
+/// disk-reading, immediately-writing behavior) and [`build_tree_from_inventory_deferred`]
+/// (`stack`'s optimized path). Kept as one implementation so the dependency-scheduling logic
+/// (leaves-first, bottom-up, parent enqueued once its last child completes) can never drift
+/// between two copies.
+///
+/// # Returns
+/// * `Ok(Some(TreeItem))` - The root tree (its hash set, all tree objects stored or staged).
+/// * `Ok(None)`           - If `metadata` is empty (nothing was ever loaded).
+/// * `Err(String)`        - If a shard could not be read or an object could not be stored.
+async fn build_tree_from_inventory_core(metadata: &BTreeSet<String>,
+                                        shard_source: ShardSource,
+                                        object_sink: ObjectSink)
+                                        -> Result<Option<TreeItem>, String> {
     if metadata.is_empty() {
         return Ok(None);
     }
@@ -51,7 +100,7 @@ pub async fn build_tree_from_inventory() -> Result<Option<TreeItem>, String> {
     // have no shard of their own), then derive the parent → children relation.
     let mut keys: BTreeSet<String> = BTreeSet::new();
 
-    for entry in &metadata {
+    for entry in metadata {
         let mut key = inventory_utils::metadata_entry_to_key(entry);
 
         loop {
@@ -93,7 +142,7 @@ pub async fn build_tree_from_inventory() -> Result<Option<TreeItem>, String> {
         .cloned()
         .collect();
 
-    let context = Arc::new(TreeBuilderContext::new(pending_children));
+    let context = Arc::new(TreeBuilderContext::new(pending_children, shard_source, object_sink));
     let executor = TaskExecutor::new(Arc::clone(&context));
 
     let first_leaf = leaves.pop()
@@ -149,18 +198,33 @@ fn build_tree_for_inventory_key(context: Arc<TreeBuilderContext>,
 
         let mut tree = TreeItem::new(name.to_string(), String::new(), DirEntryType::Tree);
 
-        let (_, shard_bytes) = file_utils::retrieve_inventory_or_none_by_key(&key)?;
+        match &context.shard_source {
+            ShardSource::Disk => {
+                let (_, shard_bytes) = file_utils::retrieve_inventory_or_none_by_key(&key)?;
 
-        if let Some(bytes) = shard_bytes {
-            let inventory = parser::inventory::inventory_parser::parse_inventory(&bytes)
-                .map_err(|e| format!("Error while parsing the inventory of folder \"{}\": {}", key, e))?;
+                if let Some(bytes) = shard_bytes {
+                    let inventory = parser::inventory::inventory_parser::parse_inventory(&bytes)
+                        .map_err(|e| format!("Error while parsing the inventory of folder \"{}\": {}", key, e))?;
 
-            for (_, item) in inventory.get_items() {
-                if item.state == InventoryItemState::Deleted {
-                    continue;
+                    for (_, item) in inventory.get_items() {
+                        if item.state == InventoryItemState::Deleted {
+                            continue;
+                        }
+
+                        tree.add_child(TreeItem::new(item.name.clone(), item.hash.clone(), item.item_type));
+                    }
                 }
+            }
+            ShardSource::Prepared(prepared) => {
+                if let Some(inventory) = prepared.shards.get(&key) {
+                    for (_, item) in inventory.get_items() {
+                        if item.state == InventoryItemState::Deleted {
+                            continue;
+                        }
 
-                tree.add_child(TreeItem::new(item.name.clone(), item.hash.clone(), item.item_type));
+                        tree.add_child(TreeItem::new(item.name.clone(), item.hash.clone(), item.item_type));
+                    }
+                }
             }
         }
 
@@ -182,7 +246,11 @@ fn build_tree_for_inventory_key(context: Arc<TreeBuilderContext>,
 
         let mut object = LooseObjectBuilder::build_tree(&tree);
         tree.hash = object.hash.clone();
-        object.store()?;
+
+        match &context.object_sink {
+            ObjectSink::Immediate => { object.store()?; }
+            ObjectSink::Deferred(batch) => { object.store_deferred(batch)?; }
+        }
 
         context.built.lock().await.insert(key.clone(), tree);
 
@@ -241,15 +309,20 @@ fn build_tree_for_inventory_key(context: Arc<TreeBuilderContext>,
 ///                      in-scope subtree objects are already stored with correct hashes.
 /// * `scope`          - The bay's materialization scope (the caller gates on it not being full).
 /// * `overrides`      - The out-of-scope skeleton for a completing merge (empty for a plain stack).
+/// * `sink`           - Where every new spine tree object built here is written — see
+///                      [`ObjectSink`]. `stack` passes the same batch its tree build used, so
+///                      these writes join the same single durability barrier.
 ///
 /// # Returns
-/// * `Ok(TreeItem)` - The spliced root tree (its hash set, every new spine tree object stored).
+/// * `Ok(TreeItem)` - The spliced root tree (its hash set, every new spine tree object stored or
+///                    staged, per `sink`).
 /// * `Err(String)`  - On a spine-path type flip (`scope_path_type_changed`), or a failed load
 ///                    or store.
 pub fn build_scoped_root_tree(head_root_hash: Option<&str>,
                               partial_root: &TreeItem,
                               scope: &MaterializationScope,
-                              overrides: &BTreeMap<String, Option<(String, DirEntryType)>>)
+                              overrides: &BTreeMap<String, Option<(String, DirEntryType)>>,
+                              sink: &ObjectSink)
                               -> Result<TreeItem, String> {
     let head_root = match head_root_hash {
         Some(hash) => Some(object_utils::load_tree(hash)?),
@@ -258,11 +331,11 @@ pub fn build_scoped_root_tree(head_root_hash: Option<&str>,
 
     // The root is never pruned, even when empty — matching build_tree_from_inventory, which
     // always keeps (and stores) the root tree object.
-    match splice_spine_level(head_root.as_ref(), Some(partial_root), "", scope, overrides)? {
+    match splice_spine_level(head_root.as_ref(), Some(partial_root), "", scope, overrides, sink)? {
         Some(tree) => Ok(tree),
         None => {
             let mut tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
-            store_tree(&mut tree)?;
+            store_tree(&mut tree, sink)?;
             Ok(tree)
         }
     }
@@ -281,7 +354,8 @@ fn splice_spine_level(head: Option<&TreeItem>,
                       dock: Option<&TreeItem>,
                       key: &str,
                       scope: &MaterializationScope,
-                      overrides: &BTreeMap<String, Option<(String, DirEntryType)>>)
+                      overrides: &BTreeMap<String, Option<(String, DirEntryType)>>,
+                      sink: &ObjectSink)
                       -> Result<Option<TreeItem>, String> {
     let mut tree = TreeItem::new(last_component(key).to_string(), String::new(), DirEntryType::Tree);
 
@@ -364,7 +438,7 @@ fn splice_spine_level(head: Option<&TreeItem>,
                 let dock_subtree = dock_subtrees.get(name).copied();
 
                 if let Some(spliced) =
-                    splice_spine_level(Some(&head_subtree), dock_subtree, &child_key, scope, overrides)?
+                    splice_spine_level(Some(&head_subtree), dock_subtree, &child_key, scope, overrides, sink)?
                 {
                     tree.add_child(spliced);
                 }
@@ -390,7 +464,7 @@ fn splice_spine_level(head: Option<&TreeItem>,
             }
             ScopeClass::Spine => {
                 if let Some(spliced) =
-                    splice_spine_level(None, Some(dock_subtree), &child_key, scope, overrides)?
+                    splice_spine_level(None, Some(dock_subtree), &child_key, scope, overrides, sink)?
                 {
                     tree.add_child(spliced);
                 }
@@ -428,7 +502,7 @@ fn splice_spine_level(head: Option<&TreeItem>,
         return Ok(None);
     }
 
-    store_tree(&mut tree)?;
+    store_tree(&mut tree, sink)?;
 
     Ok(Some(tree))
 }
@@ -463,11 +537,16 @@ fn is_tree_empty(tree: &TreeItem) -> bool {
 }
 
 /// Build, store and hash a tree object (setting the item's hash), like the per-directory step
-/// of [`build_tree_from_inventory`].
-fn store_tree(tree: &mut TreeItem) -> Result<(), String> {
+/// of [`build_tree_from_inventory`]. `sink` decides whether the write happens immediately or is
+/// staged into a batch — see [`ObjectSink`].
+fn store_tree(tree: &mut TreeItem, sink: &ObjectSink) -> Result<(), String> {
     let mut object = LooseObjectBuilder::build_tree(tree);
     tree.hash = object.hash.clone();
-    object.store()?;
+
+    match sink {
+        ObjectSink::Immediate => { object.store()?; }
+        ObjectSink::Deferred(batch) => { object.store_deferred(batch)?; }
+    }
 
     Ok(())
 }

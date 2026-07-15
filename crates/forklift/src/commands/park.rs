@@ -65,7 +65,9 @@ pub async fn park_changes() -> Result<(), String> {
         // every out-of-scope sibling is copied verbatim from the head.
         let overrides = std::collections::BTreeMap::new();
 
-        tree_utils::build_scoped_root_tree(Some(&head_tree_hash), &partial_root, &scope, &overrides)?
+        tree_utils::build_scoped_root_tree(
+            Some(&head_tree_hash), &partial_root, &scope, &overrides, &tree_utils::ObjectSink::Immediate,
+        )?
     };
 
     if root_tree.hash == head_tree_hash {
