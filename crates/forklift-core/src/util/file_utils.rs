@@ -1750,4 +1750,149 @@ mod tests {
         std::fs::remove_dir_all(&temp_a).ok();
         std::fs::remove_dir_all(&temp_b).ok();
     }
+
+    // `WriteBatch` tests (modeled on `tests/bulk_store_session.rs`'s coverage of the same
+    // durability barrier). Unlike `BulkStoreSession`, `WriteBatch` is not a process-global
+    // registry — each instance is its own, independently owned batch — so these are ordinary
+    // unit tests here rather than needing their own integration-test binary: nothing about one
+    // test's `WriteBatch` can intercept another's write.
+
+    #[test]
+    fn write_batch_finish_is_idempotent() {
+        // `finish` takes `&self` (unlike `BulkStoreSession::finish`, which consumes `self`) so it
+        // can be shared via `Arc` across parallel workers — its doc comment promises a second
+        // call is a harmless no-op, since the first `finish` already took every staged write out
+        // of `pending`. This is also what makes `Drop` safe to run unconditionally afterwards.
+        let temp = std::env::temp_dir().join(format!("forklift-writebatch-idempotent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+
+        let target = temp.join("staged-object");
+        let batch = WriteBatch::new();
+        batch.stage(&target, b"batch content").unwrap();
+
+        batch.finish().unwrap();
+        assert!(target.exists(), "the first finish must publish the staged write");
+        assert_eq!(std::fs::read(&target).unwrap(), b"batch content");
+
+        // A second `finish` on the same batch must succeed and change nothing further.
+        batch.finish().unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"batch content",
+            "a second finish must not disturb the already-published content");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn write_batch_dropped_without_finish_removes_every_staged_temp_and_publishes_nothing() {
+        // Abort semantics, exactly like `BulkStoreSession`: a batch dropped without `finish` must
+        // remove its staged temp files and must never let the final name come into existence.
+        let temp = std::env::temp_dir().join(format!("forklift-writebatch-abort-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+
+        let target_a = temp.join("never-published-a");
+        let target_b = temp.join("never-published-b");
+        {
+            let batch = WriteBatch::new();
+            batch.stage(&target_a, b"should vanish a").unwrap();
+            batch.stage(&target_b, b"should vanish b").unwrap();
+            assert!(!target_a.exists() && !target_b.exists());
+            // `batch` drops here without `finish` being called.
+        }
+
+        assert!(!target_a.exists() && !target_b.exists(),
+            "a dropped batch must never publish its staged writes");
+
+        let leftovers: Vec<_> = std::fs::read_dir(&temp).unwrap().filter_map(|e| e.ok()).collect();
+        assert!(leftovers.is_empty(), "a dropped batch must remove every staged temp, found {:?}",
+            leftovers.iter().map(|e| e.file_name()).collect::<Vec<_>>());
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn write_batch_concurrent_stage_of_the_same_final_path_ends_with_the_file_intact_and_no_leftover_temps() {
+        // The duplicate-hash race `stage`'s doc comment allows for: several parallel tree-build
+        // workers can legitimately build the *same* content-addressed object (e.g. two identical
+        // empty-looking directories) and all stage a write to the same final path before any of
+        // them is renamed. `finish` must still end with the final file present and correct, and
+        // — since every staged temp is individually consumed by its own rename, even when several
+        // renames target the same destination — with none of the (many) temp files left behind.
+        let temp = std::env::temp_dir().join(format!("forklift-writebatch-duprace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+
+        let target = temp.join("duplicate-object");
+        let content: &[u8] = b"identical content every racer writes";
+        let batch = WriteBatch::new();
+
+        let target_ref: &Path = &target;
+        let batch_ref: &WriteBatch = &batch;
+        std::thread::scope(|scope| {
+            for _ in 0..200 {
+                scope.spawn(move || {
+                    batch_ref.stage(target_ref, content).unwrap();
+                });
+            }
+        });
+
+        // Every racer staged into the same target, and none may have been visible yet.
+        assert!(!target.exists(), "nothing may be visible before finish");
+
+        batch.finish().unwrap();
+
+        assert!(target.exists(), "finish must publish the contested target");
+        assert_eq!(std::fs::read(&target).unwrap(), content);
+
+        let leftovers: Vec<_> = std::fs::read_dir(&temp).unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path() != target)
+            .collect();
+        assert!(leftovers.is_empty(),
+            "every staged temp (200 racers) must be consumed by its own rename, found {:?}",
+            leftovers.iter().map(|e| e.file_name()).collect::<Vec<_>>());
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn write_batch_finish_syncs_every_touched_directory_across_a_multi_directory_batch() {
+        // `run_write_barrier`'s directory-sync step (`sync_touched_directories`) fsyncs every
+        // *distinct* touched parent, not just the first — exercised here transitively: staging
+        // writes into three separate directories and confirming `finish` still publishes every
+        // one of them (not just the ones sharing a directory with the last-written file, which is
+        // the case a bug that only synced one directory would miss).
+        let temp = std::env::temp_dir().join(format!("forklift-writebatch-multidir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+
+        let dirs: Vec<_> = ["alpha", "beta", "gamma"].iter().map(|name| temp.join(name)).collect();
+        for dir in &dirs {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+
+        let batch = WriteBatch::new();
+        let targets: Vec<_> = dirs.iter().enumerate()
+            .map(|(i, dir)| {
+                let target = dir.join("object");
+                let content = format!("content for directory {}", i);
+                batch.stage(&target, content.as_bytes()).unwrap();
+                (target, content)
+            })
+            .collect();
+
+        for (target, _) in &targets {
+            assert!(!target.exists(), "nothing may be visible before finish");
+        }
+
+        batch.finish().unwrap();
+
+        for (target, content) in &targets {
+            assert!(target.exists(), "finish must publish every directory's staged write");
+            assert_eq!(std::fs::read_to_string(target).unwrap(), *content);
+        }
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
 }
