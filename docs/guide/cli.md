@@ -514,6 +514,17 @@ established are tolerated as "legacy"). Any tampering — stripped or corrupted
 signatures, an unknown key, a chain that doesn't reach genesis — fails with a
 non-zero exit. See [`trust-and-identity.md`](trust-and-identity.md).
 
+A parcel signed by a *revoked* key is checked against that revocation's distrust
+boundary — exact ancestry, so a forged timestamp changes nothing. If the boundary
+genuinely does not cover the parcel, that is real tampering and `audit` fails
+saying so. But if this store is simply missing one of the boundary's heads (a
+partial clone whose gap happens to matter for this parcel), `audit` refuses with
+an honest message naming the specific missing boundary parcel instead — that is a
+question this store cannot answer, never a "tampered" verdict. Fetch the full
+history, or audit a complete store, to get a definitive answer. A gap that turns
+out to be irrelevant to the parcel in question (the boundary already resolves
+some other way) never trips this at all.
+
 A large file is stored as chunks indexed by a recipe. A normal audit **presence-checks**
 those chunks (confirms each is present without re-reading its bytes) — bounded and fast.
 `--full` is the stronger, slower level: it **re-reads every present chunk**, re-hashing it on

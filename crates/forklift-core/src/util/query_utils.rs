@@ -43,7 +43,7 @@ use crate::util::office_utils::{IdentityClass, OfficeState, RevocationReason, Ro
 use crate::util::path_utils::WarehousePath;
 use crate::util::scope_utils::{self, MaterializationScope, ScopeClass};
 use crate::util::{
-    fanout_utils, file_utils, manifest_utils, merge_utils, object_utils, pallet_utils, tag_utils,
+    fanout_utils, manifest_utils, merge_utils, object_utils, pallet_utils, tag_utils,
     tree_utils,
 };
 
@@ -397,13 +397,12 @@ impl QueryContext {
         let resolvable = match already_checked {
             Some(resolvable) => resolvable,
             None => {
-                let mut resolvable = true;
-                for head in &key.distrust_boundary {
-                    if !file_utils::does_object_exist(head)? {
-                        resolvable = false;
-                        break;
-                    }
-                }
+                // The presence check itself is shared with `audit`'s own boundary guard
+                // (`audit_utils::DistrustBoundaryMemo::resolvable`) so the two can never
+                // disagree on what "resolvable" means; only the memoization shape differs
+                // (this engine's is `RefCell`-keyed per key id, not per-key-and-missing-head,
+                // since a query only ever needs the yes/no answer, never the specific head).
+                let resolvable = audit_utils::first_missing_boundary_head(&key.distrust_boundary)?.is_none();
                 self.resolvable_boundaries.borrow_mut().insert(key_id.to_string(), resolvable);
                 resolvable
             }

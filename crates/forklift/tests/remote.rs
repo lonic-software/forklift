@@ -2270,6 +2270,122 @@ fn a_partial_clone_missing_a_boundary_head_reads_signer_boundary_as_unresolved()
 }
 
 #[test]
+fn a_partial_clone_missing_an_unrelated_boundary_head_still_audits_the_vouched_parcel() {
+    // `audit`'s side of the presence guard is asymmetric, on purpose (see
+    // `audit_utils::DistrustBoundaryMemo`'s doc): a distrust boundary can name a head this
+    // store never has, but `audit` (unlike `query`) must not refuse just because *some*
+    // boundary head is missing — only when the parcel under test cannot be vouched *without*
+    // it. This construction reuses the query engine's own partial-clone fixture (a
+    // never-lifted local "side" pallet's head sits in the boundary alongside main's own) to
+    // pin exactly that: the agent's main-line parcel is vouched by main's own boundary
+    // snapshot alone, so `audit` must pass on the clone even though `side`'s head never
+    // arrived there — the missing head is irrelevant to this parcel, and an audit that
+    // refused anyway would be a regression (the same construction's `lift`, run against the
+    // very same gap, must keep succeeding: see
+    // `a_partial_clone_missing_a_boundary_head_reads_signer_boundary_as_unresolved`, which
+    // shares this scenario and predates this test). The complementary case — a boundary that
+    // truly *cannot* be resolved, where `audit` must refuse honestly rather than allege
+    // tampering — is exercised directly against `verify_pallet_history` in
+    // `audit_utils::tests`, because (as the reasoning above implies) a same-pallet parcel's
+    // vouching can never genuinely hinge on a head absent from a plain, non-sparse clone of
+    // that same pallet: the pallet's own retirement-time snapshot is always present and
+    // always sufficient for anything on it that predates the retirement.
+    let area = TestArea::new("audit-boundary-unresolved");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/base.txt", "base\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["office", "enroll"]));
+
+    // Admit an agent.
+    assert_success(&area.forklift("dev", &["config", "operator.identifier", "agent@forklift"]));
+    let keygen = area.forklift("dev", &["office", "keygen"]);
+    assert_success(&keygen);
+    let admit_args: Vec<String> = stdout(&keygen)
+        .lines()
+        .find(|line| line.trim_start().starts_with("office admit "))
+        .expect("keygen prints the admit line")
+        .split_whitespace()
+        .skip(2)
+        .map(str::to_string)
+        .collect();
+    assert_success(&area.forklift("dev", &["config", "operator.identifier", "tester@forklift"]));
+    assert_success(&area.forklift("dev", &[
+        "office", "admit", &admit_args[0], &admit_args[1], &admit_args[2],
+        "--agent", "--supervisor", "tester@forklift",
+    ]));
+
+    // The agent's main-line parcel: it stays reachable from `main` throughout, and is the one
+    // whose revoked-key signature `audit` must resolve against the distrust boundary.
+    assert_success(&area.forklift("dev", &["config", "operator.identifier", "agent@forklift"]));
+    area.write_file("dev/agent-main.txt", "agent main work\n");
+    assert_success(&area.forklift("dev", &["load", "agent-main.txt"]));
+    assert_success(&area.forklift("dev", &["stack", "agent main work"]));
+
+    // A second, local-only pallet: its head will sit in the retirement's boundary below but
+    // will never reach the remote — nothing ever lifts `side`.
+    assert_success(&area.forklift("dev", &["palletize", "side"]));
+    area.write_file("dev/side.txt", "side work\n");
+    assert_success(&area.forklift("dev", &["load", "side.txt"]));
+    assert_success(&area.forklift("dev", &["stack", "side work"]));
+    let side_head = std::fs::read_to_string(area.path("dev/.forklift/pallets/side"))
+        .expect("the side pallet has a head")
+        .trim()
+        .to_string();
+
+    // Retire the agent's key: the distrust boundary snapshots every current pallet head —
+    // main's and side's alike, published or not.
+    assert_success(&area.forklift("dev", &["config", "operator.identifier", "tester@forklift"]));
+    let listing = area.forklift("dev", &["--json", "office", "list"]);
+    assert_success(&listing);
+    let listing: serde_json::Value = serde_json::from_str(&stdout(&listing)).unwrap();
+    let agent_key_id = listing["data"]["users"]
+        .as_array().unwrap().iter()
+        .find(|user| user["identifier"] == "agent@forklift")
+        .expect("the agent is enrolled")
+        ["keys"][0]["key_id"]
+        .as_str().unwrap().to_string();
+    assert_success(&area.forklift("dev", &["office", "retire", &agent_key_id, "--offline"]));
+
+    // Back to `main` (only it ever gets lifted; `side` and its head stay purely local).
+    assert_success(&area.forklift("dev", &["shift", "main"]));
+
+    // On the origin, where the side pallet's head is still right there, the agent's
+    // main-line parcel is fully resolvable and legitimately vouched — audit passes.
+    let audit_on_origin = area.forklift("dev", &["audit"]);
+    assert_success(&audit_on_origin);
+
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    // A fresh clone: an ordinary (non-sparse) franchise fetches only what the remote
+    // actually knows about — `side` was never lifted, so its head never reaches the clone.
+    let franchised = area.forklift(".", &["franchise", &server.url, "clone"]);
+    assert_success(&franchised);
+    assert!(
+        !area.path("clone").join(".forklift/objects").join(&side_head[0..2]).join(&side_head[2..]).exists(),
+        "the side pallet's head must genuinely be absent from the clone for this test to mean \
+         anything"
+    );
+
+    // `side`'s head never reaching the clone must not stop `audit` from passing: the agent's
+    // main-line parcel is reachable from main's own present boundary snapshot regardless.
+    let audit_on_clone = area.forklift("clone", &["audit"]);
+    assert!(
+        audit_on_clone.status.success(),
+        "a missing boundary head that this parcel's vouching does not need must never make \
+         audit refuse: {}",
+        stderr(&audit_on_clone)
+    );
+    assert!(
+        stdout(&audit_on_clone).contains("verified"),
+        "{}",
+        stdout(&audit_on_clone)
+    );
+}
+
+#[test]
 fn a_sparse_franchise_still_audits() {
     // The meta/office carve-out: a sparse franchise fetches office and every meta pallet at full
     // scope, so a trusted warehouse's offline audit still passes — the office chain is verified
