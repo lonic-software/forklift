@@ -21,7 +21,7 @@ impl InventoryBuilder {
     pub fn build(inventory: &Inventory) -> Vec<u8> {
         let builder = InventoryBuilder::new(InventoryVersion::latest());
 
-        builder.write_header(inventory.get_items_count() as u64).write_content(inventory).content
+        builder.write_header(inventory).write_content(inventory).content
     }
 
     /// Create a new inventory builder.
@@ -38,16 +38,19 @@ impl InventoryBuilder {
         }
     }
 
-    /// Write the header to the bytes of the inventory object.
+    /// Write the header to the bytes of the inventory object: the version code, the entry
+    /// count, then the version's header extras (e.g. the rollup hash, since `V2026_07_15`),
+    /// terminated by a null byte.
     ///
     /// # Arguments
-    /// * `entry_count` - The number of entries in the inventory.
+    /// * `inventory` - The inventory to write the header for.
     ///
     /// # Returns
     /// * `InventoryBuilder` - The inventory builder.
-    fn write_header(mut self, entry_count: u64) -> Self {
+    fn write_header(mut self, inventory: &Inventory) -> Self {
         self.content.extend(byte_utils::number_to_vlq_bytes(self.version.get_code()));
-        self.content.extend(byte_utils::number_to_vlq_bytes(entry_count));
+        self.content.extend(byte_utils::number_to_vlq_bytes(inventory.get_items_count() as u64));
+        self.content.extend(self.version.get_header_builder()(inventory));
         object_utils::push_null(&mut self.content);
 
         self

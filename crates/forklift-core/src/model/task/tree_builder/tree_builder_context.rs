@@ -54,6 +54,13 @@ pub struct TreeBuilderContext {
     /// Where each built tree object is written — see [`ObjectSink`]. Set once at construction,
     /// read (never mutated) by every parallel task, so no lock is needed.
     pub object_sink: ObjectSink,
+
+    /// Every built directory's tree hash by warehouse path key, kept for the whole build
+    /// (unlike `built`, whose entries a parent removes once it consumes them) — the per-key
+    /// rollup a caller like `stack` can stamp shards with afterward (DESIGN.html §5.0 D item
+    /// 8). Includes synthesized ancestors that have no shard of their own (harmless: a caller
+    /// stamping rollups only ever looks up keys that do have a shard).
+    pub tree_hashes: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl TreeBuilderContext {
@@ -75,6 +82,7 @@ impl TreeBuilderContext {
             pending_children: Arc::new(Mutex::new(pending_children)),
             shard_source,
             object_sink,
+            tree_hashes: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }

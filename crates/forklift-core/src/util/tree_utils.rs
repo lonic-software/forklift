@@ -44,7 +44,10 @@ pub async fn build_tree_from_inventory() -> Result<Option<TreeItem>, String> {
         return Ok(None);
     };
 
-    build_tree_from_inventory_core(&metadata, ShardSource::Disk, ObjectSink::Immediate).await
+    let (root, _tree_hashes) =
+        build_tree_from_inventory_core(&metadata, ShardSource::Disk, ObjectSink::Immediate).await?;
+
+    Ok(root)
 }
 
 /// Like [`build_tree_from_inventory`], but reads shard content from an already-parsed
@@ -61,13 +64,18 @@ pub async fn build_tree_from_inventory() -> Result<Option<TreeItem>, String> {
 /// * `batch`    - Where every built tree object's write is staged.
 ///
 /// # Returns
-/// Same as [`build_tree_from_inventory`].
+/// * `Ok((Some(TreeItem), BTreeMap<String, String>))` - The root tree, and every built
+///   directory's subtree hash by warehouse path key (a non-empty subtree only — see
+///   [`build_tree_for_inventory_key`]). `stack` stamps rollups from this map afterward.
+/// * `Ok((None, _))`                                  - If there is no inventory at all.
+/// * `Err(String)`                                     - If a shard could not be read or an
+///   object could not be stored.
 pub async fn build_tree_from_inventory_deferred(
     prepared: &Arc<inventory_utils::PreparedInventory>,
     batch: &Arc<file_utils::WriteBatch>,
-) -> Result<Option<TreeItem>, String> {
+) -> Result<(Option<TreeItem>, BTreeMap<String, String>), String> {
     let Some(metadata) = &prepared.metadata else {
-        return Ok(None);
+        return Ok((None, BTreeMap::new()));
     };
 
     build_tree_from_inventory_core(
@@ -85,15 +93,19 @@ pub async fn build_tree_from_inventory_deferred(
 /// between two copies.
 ///
 /// # Returns
-/// * `Ok(Some(TreeItem))` - The root tree (its hash set, all tree objects stored or staged).
-/// * `Ok(None)`           - If `metadata` is empty (nothing was ever loaded).
-/// * `Err(String)`        - If a shard could not be read or an object could not be stored.
+/// * `Ok((Some(TreeItem), BTreeMap<String, String>))` - The root tree (its hash set, all tree
+///   objects stored or staged), and every built directory's non-empty subtree hash by
+///   warehouse path key.
+/// * `Ok((None, _))`                                  - If `metadata` is empty (nothing was
+///   ever loaded).
+/// * `Err(String)`                                     - If a shard could not be read or an
+///   object could not be stored.
 async fn build_tree_from_inventory_core(metadata: &BTreeSet<String>,
                                         shard_source: ShardSource,
                                         object_sink: ObjectSink)
-                                        -> Result<Option<TreeItem>, String> {
+                                        -> Result<(Option<TreeItem>, BTreeMap<String, String>), String> {
     if metadata.is_empty() {
-        return Ok(None);
+        return Ok((None, BTreeMap::new()));
     }
 
     // Collect every inventoried directory key plus all of its ancestors (ancestors may
@@ -169,7 +181,11 @@ async fn build_tree_from_inventory_core(metadata: &BTreeSet<String>,
     let root = context.built.lock().await.remove("")
         .ok_or("The tree build finished without producing a root tree.".to_string())?;
 
-    Ok(Some(root))
+    let tree_hashes: BTreeMap<String, String> = context.tree_hashes.lock().await.iter()
+        .map(|(key, hash)| (key.clone(), hash.clone()))
+        .collect();
+
+    Ok((Some(root), tree_hashes))
 }
 
 /// The per-directory task of the tree build: build (and store) the tree object for one
@@ -250,6 +266,15 @@ fn build_tree_for_inventory_key(context: Arc<TreeBuilderContext>,
         match &context.object_sink {
             ObjectSink::Immediate => { object.store()?; }
             ObjectSink::Deferred(batch) => { object.store_deferred(batch)?; }
+        }
+
+        // Only a non-empty subtree's hash is a meaningful rollup: an empty directory is pruned
+        // by its parent (below), so "the tree stack would build for this subtree" is ill-defined
+        // for it — omitted here rather than recorded and later filtered out.
+        let is_empty = tree.get_files().len() == 0 && tree.get_subtrees().len() == 0;
+
+        if !is_empty {
+            context.tree_hashes.lock().await.insert(key.clone(), tree.hash.clone());
         }
 
         context.built.lock().await.insert(key.clone(), tree);

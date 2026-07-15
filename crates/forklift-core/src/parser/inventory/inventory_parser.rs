@@ -7,6 +7,7 @@ struct ParsedInventoryHeader {
     version: InventoryVersion,
     // TODO: uncomment this once it's used
     //entry_count: u64,
+    rollup_hash: Option<String>,
 }
 
 /// Parse an inventory file.
@@ -26,9 +27,10 @@ pub fn parse_inventory(content: &[u8]) -> Result<Inventory, String> {
             header
         })?;
 
-    let inventory = header.version.get_parser()(cursor, content);
+    let mut inventory = header.version.get_parser()(cursor, content)?;
+    inventory.set_rollup_hash(header.rollup_hash);
 
-    inventory
+    Ok(inventory)
 }
 
 /// Parse the header of an inventory file.
@@ -58,13 +60,21 @@ fn parse_inventory_header(content: &[u8]) -> Result<(ParsedInventoryHeader, usiz
             count
         })?;
 
-    // Discard everything until the next null byte (indicating the end of the header)
+    let rollup_hash = version.get_header_parser()(cursor, content)
+        .map(|(rollup_hash, bytes_read)| {
+            cursor += bytes_read;
+            rollup_hash
+        })?;
+
+    // Discard everything until the next null byte (indicating the end of the header). The
+    // version's header parser above is expected to stop exactly at the null already; this
+    // keeps a header that grows again in some future version forward-tolerant, as it always has.
     byte_utils::read_until_byte_value(cursor, content, globals::BYTE_NULL)
         .inspect(|(_, bytes_read)| {
             cursor += bytes_read;
         });
 
-    Ok((ParsedInventoryHeader { version }, cursor))
+    Ok((ParsedInventoryHeader { version, rollup_hash }, cursor))
 }
 #[cfg(test)]
 mod tests {
@@ -145,5 +155,46 @@ mod tests {
         for name in hostile_names {
             assert!(parsed.get_item_by_name(name).is_some(), "name not found: {:?}", name);
         }
+    }
+
+    #[test]
+    fn round_trip_preserves_a_present_rollup_hash() {
+        let mut inventory = crate::model::inventory::Inventory::new();
+        inventory.add_item(item("file.txt"));
+        inventory.set_rollup_hash(Some("a".repeat(64)));
+
+        let bytes = InventoryBuilder::build(&inventory);
+        let parsed = parse_inventory(&bytes).unwrap();
+
+        assert_eq!(parsed.get_rollup_hash(), Some(&"a".repeat(64)));
+    }
+
+    #[test]
+    fn round_trip_preserves_an_absent_rollup_hash() {
+        let mut inventory = crate::model::inventory::Inventory::new();
+        inventory.add_item(item("file.txt"));
+        inventory.set_rollup_hash(None);
+
+        let bytes = InventoryBuilder::build(&inventory);
+        let parsed = parse_inventory(&bytes).unwrap();
+
+        assert_eq!(parsed.get_rollup_hash(), None);
+    }
+
+    #[test]
+    fn an_old_version_shard_parses_with_no_rollup_hash() {
+        // A hand-built version-1 (`V2024_09_04`) shard, predating the rollup hash: version
+        // code, entry count, and the header's terminating null, immediately followed by the
+        // (unchanged) per-item content encoding — exactly what a pre-upgrade forklift wrote.
+        let mut inventory = crate::model::inventory::Inventory::new();
+        inventory.add_item(item("file.txt"));
+
+        let mut bytes: Vec<u8> = vec![1, 1, 0]; // version=1, entry_count=1, header NULL
+        bytes.extend(crate::builder::inventory::version::v2024_09_04::build(&inventory));
+
+        let parsed = parse_inventory(&bytes).unwrap();
+
+        assert_eq!(parsed.get_rollup_hash(), None);
+        assert!(parsed.get_item_by_name("file.txt").is_some());
     }
 }

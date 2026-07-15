@@ -113,7 +113,8 @@ pub async fn stack_parcel(description: Option<String>) -> Result<(String, String
     // only ever set after that, never staged into this same batch (see the comment there).
     let batch = std::sync::Arc::new(file_utils::WriteBatch::new());
 
-    let partial_root = tree_utils::build_tree_from_inventory_deferred(&prepared, &batch).await?
+    let (partial_root, tree_hashes) = tree_utils::build_tree_from_inventory_deferred(&prepared, &batch).await?;
+    let partial_root = partial_root
         .ok_or("There is nothing to stack. Use the \"load\" command to stage changes first.".to_string())?;
 
     // In a scoped (sparse) bay the dock materializes only the in-scope subtree(s), so the freshly
@@ -147,6 +148,21 @@ pub async fn stack_parcel(description: Option<String>) -> Result<(String, String
             head_root_hash.as_deref(), &partial_root, &scope, skeleton.entries(),
             &tree_utils::ObjectSink::Deferred(std::sync::Arc::clone(&batch)),
         )?
+    };
+
+    // The per-key hashes above come straight from the plain (unspliced) inventory tree build,
+    // so they are only trustworthy for a key the splice never touches: the whole warehouse when
+    // the bay is fully in scope, or an individually fully-in-scope directory otherwise (the
+    // splice only ever rewrites the spine above an in-scope boundary and the root — see
+    // `tree_utils::build_scoped_root_tree` — never a key inside one). Anything else (a spine or
+    // out-of-scope key) is dropped rather than stamped with a hash the splice may have changed
+    // underneath it — cleanup below leaves those unstamped (DESIGN.html §5.0 D item 8).
+    let stamp_hashes: std::collections::BTreeMap<String, String> = if scope.is_full() {
+        tree_hashes
+    } else {
+        tree_hashes.into_iter()
+            .filter(|(key, _)| scope.classify(key) == scope_utils::ScopeClass::InScope)
+            .collect()
     };
 
     let root_is_empty = root_tree.get_files().len() == 0 && root_tree.get_subtrees().len() == 0;
@@ -276,7 +292,7 @@ pub async fn stack_parcel(description: Option<String>) -> Result<(String, String
     // Reuses the same parsed snapshot the conflict check and tree build already read — nothing
     // between then and here changes a shard's content on disk, only the object store, the ref
     // and the signature sidecar (see `cleanup_after_stack_with`'s doc comment).
-    inventory_utils::cleanup_after_stack_with(&prepared)?;
+    inventory_utils::cleanup_after_stack_with(&prepared, &stamp_hashes)?;
     merge_utils::clear_consolidation_state()?;
     merge_utils::OutOfScopeSkeleton::clear()?;
     cherry_pick_utils::clear_state()?;

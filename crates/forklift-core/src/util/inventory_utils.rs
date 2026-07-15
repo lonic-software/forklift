@@ -22,6 +22,131 @@ use crate::util::path_utils::WarehousePath;
 /// which would be confusing as a line in the metadata file).
 const METADATA_ENTRY_ROOT: &str = "./";
 
+/// Serializes the read-modify-write step of rollup maintenance (clearing an ancestor's rollup,
+/// or writing a mutated shard) against every other such step in this process.
+///
+/// This is needed because `load`'s per-directory walker (`build_inventory`, below) is genuinely
+/// concurrent: a directory's task fires off its subdirectories' tasks and then writes its own
+/// shard without waiting for them (see the task's own doc comment). So a directory's shard can
+/// be mid-write on one task while a descendant's task is independently walking up to invalidate
+/// that same directory's rollup as one of its ancestors. Without serializing the two, a
+/// read-modify-write ancestor clear could read stale content, race a sibling task's fresh
+/// rewrite of the same file, and lose that rewrite's real content changes — not just its rollup.
+///
+/// The lock is held only across the (cheap) parse-decide-rewrite of a shard file, never across
+/// the (expensive) filesystem walk, hashing or object I/O that produces the content to write —
+/// so it costs real parallelism only for that narrow step, and is uncontended (near-free)
+/// outside `load`, where every other writer touches shards one at a time to begin with.
+static SHARD_MUTATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The warehouse path keys of every strict ancestor of `key`, from the root (`""`) down to
+/// (but not including) `key` itself.
+fn ancestor_keys_root_first(key: &str) -> Vec<String> {
+    let mut chain: Vec<String> = Vec::new();
+    let mut current = key;
+
+    while !current.is_empty() {
+        current = current.rsplit_once('/').map(|(parent, _)| parent).unwrap_or("");
+        chain.push(current.to_string());
+    }
+
+    chain.reverse();
+    chain
+}
+
+/// Clear a single shard's rollup hash on disk, if it exists and currently has one. A missing
+/// shard, or a shard whose rollup is already `None`, is left untouched — not even rewritten.
+/// Callers must hold [`SHARD_MUTATION_LOCK`].
+fn clear_single_shard_rollup_locked(key: &str) -> Result<(), String> {
+    let (shard_path, bytes_opt) = file_utils::retrieve_inventory_or_none_by_key(key)?;
+
+    let Some(bytes) = bytes_opt else {
+        return Ok(());
+    };
+
+    let mut inventory = parser::inventory::inventory_parser::parse_inventory(&bytes)
+        .map_err(|e| format!("Error while parsing the inventory of folder \"{}\": {}", key, e))?;
+
+    if inventory.get_rollup_hash().is_none() {
+        return Ok(());
+    }
+
+    inventory.set_rollup_hash(None);
+    save_inventory(&inventory, &shard_path)
+}
+
+/// Clear the rollup hash of every existing ancestor shard of `key`, from the root down to (but
+/// not including) `key` itself. Must run to completion before a caller writes new content at
+/// `key` — see [`write_shard_mutation`], the funnel that does both in the correct order. Public
+/// on its own for a caller that removes (rather than rewrites) the shard at `key` — e.g.
+/// `remove_inventories_under` — which still needs its ancestors invalidated but has no new
+/// content of its own to write there.
+///
+/// # Arguments
+/// * `key` - The warehouse path key whose ancestors should be invalidated.
+///
+/// # Returns
+/// * `Ok(())`      - Every existing ancestor shard's rollup is now cleared on disk.
+/// * `Err(String)` - If an ancestor shard could not be read, parsed or written.
+pub fn clear_ancestor_rollups(key: &str) -> Result<(), String> {
+    let _guard = SHARD_MUTATION_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    for ancestor_key in ancestor_keys_root_first(key) {
+        clear_single_shard_rollup_locked(&ancestor_key)?;
+    }
+
+    Ok(())
+}
+
+/// Write a shard whose effective content (any entry's name/type/hash/state) just changed: the
+/// rollup hash of every ancestor shard is cleared first, top-down (root first), then this
+/// shard's own rollup is cleared and its new content written.
+///
+/// Every writer that changes a shard's effective content must go through this instead of
+/// writing the shard directly — a direct write would leave a stale-but-still-matching rollup on
+/// an ancestor above the change, silently hiding it from a future rollup-based skip
+/// (DESIGN.html §5.0 D item 8). A writer that only refreshes stat data (mtime/ctime/inode) for
+/// an otherwise-identical entry should *not* go through this — it may write the shard directly
+/// and carry its existing rollup forward unchanged.
+///
+/// Ordering matters for crash safety: nothing above the mutated shard is ever left stale once
+/// this shard's write is durable, because every ancestor is cleared first; a crash before this
+/// shard's write only costs a few lost skips (ancestors cleared for a mutation that, from disk's
+/// perspective, never actually happened yet), never a wrong one.
+///
+/// # Arguments
+/// * `key`       - The warehouse path key of the shard being written.
+/// * `inventory` - The new content. Its rollup hash is overwritten with `None` here — callers
+///                 never need to (and must not) set it themselves.
+///
+/// # Returns
+/// * `Ok(())`      - Every ancestor was invalidated and the shard was written.
+/// * `Err(String)` - If an ancestor or this shard could not be read, parsed or written.
+pub fn write_shard_mutation(key: &str, inventory: &mut Inventory) -> Result<(), String> {
+    let _guard = SHARD_MUTATION_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    for ancestor_key in ancestor_keys_root_first(key) {
+        clear_single_shard_rollup_locked(&ancestor_key)?;
+    }
+
+    inventory.set_rollup_hash(None);
+    save_inventory(inventory, &file_utils::get_inventory_data_path_for_key(key))
+}
+
+/// Whether two inventories carry the same *effective* content — the same set of entries, each
+/// with the same name, type, hash and state. Stat fields (timestamps, device/inode, size,
+/// ownership) are deliberately excluded: they can differ (e.g. after a stat-only refresh)
+/// without the tree `stack` would build from either inventory differing at all. Used to decide
+/// whether a shard rewrite may carry its existing rollup forward instead of invalidating it.
+fn inventory_content_matches(a: &Inventory, b: &Inventory) -> bool {
+    a.get_items_count() == b.get_items_count()
+        && a.get_items().all(|(name, item)| {
+            b.get_item_by_name(name).is_some_and(|other| {
+                other.hash == item.hash && other.item_type == item.item_type && other.state == item.state
+            })
+        })
+}
+
 /// Add a file or directory to its corresponding inventory.
 /// If no inventory exists for the given directory, a new inventory file will be created.
 ///
@@ -244,7 +369,7 @@ fn stage_removal_for_directory(path: &WarehousePath) -> Result<(), String> {
 /// * `Ok(false)`   - If no shard exists for the given key.
 /// * `Err(String)` - If the shard could not be read, parsed or written.
 fn mark_shard_entries_deleted(key: &str) -> Result<bool, String> {
-    let (shard_path, bytes_opt) = file_utils::retrieve_inventory_or_none_by_key(key)?;
+    let (_, bytes_opt) = file_utils::retrieve_inventory_or_none_by_key(key)?;
 
     let Some(bytes) = bytes_opt else {
         return Ok(false);
@@ -254,7 +379,7 @@ fn mark_shard_entries_deleted(key: &str) -> Result<bool, String> {
         .map_err(|e| format!("Error while parsing the inventory of folder \"{}\": {}", key, e))?;
 
     if inventory.mark_all_items_deleted() {
-        save_inventory(&inventory, &shard_path)?;
+        write_shard_mutation(key, &mut inventory)?;
     }
 
     Ok(true)
@@ -382,8 +507,20 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
             carry_over_missing_entries_as_deleted(old_inventory, &mut inventory);
         }
 
-        let inventory_data_path = file_utils::get_inventory_data_path_for_key(path.as_key());
-        save_inventory(&inventory, &inventory_data_path)?;
+        // A pure stat-cache refresh (every entry's name/type/hash/state is exactly what the
+        // previous shard already had) never changes the tree `stack` would build here: carry
+        // the previous rollup forward instead of invalidating it and every ancestor above it.
+        // Anything else (a real change, or a brand new shard) goes through the funnel.
+        match existing_inventory.as_ref() {
+            Some((old_inventory, _)) if inventory_content_matches(&inventory, old_inventory) => {
+                inventory.set_rollup_hash(old_inventory.get_rollup_hash().cloned());
+                let inventory_data_path = file_utils::get_inventory_data_path_for_key(path.as_key());
+                save_inventory(&inventory, &inventory_data_path)?;
+            }
+            _ => {
+                write_shard_mutation(path.as_key(), &mut inventory)?;
+            }
+        }
 
         Ok(())
     }
@@ -577,6 +714,10 @@ pub fn refresh_tracked_entries() -> Result<(), String> {
 
         let names: Vec<String> = inventory.get_items().map(|(name, _)| name.clone()).collect();
         let mut changed = false;
+        // Whether any entry's *effective* content (hash/type/state) actually changed, as
+        // opposed to only its stat fields going stale (e.g. a re-save with identical bytes).
+        // Only a real content change invalidates the rollup — see `write_shard_mutation`.
+        let mut content_changed = false;
 
         for name in names {
             let item = inventory.get_item_by_name(&name).unwrap();
@@ -595,6 +736,7 @@ pub fn refresh_tracked_entries() -> Result<(), String> {
                 // The file is gone from disk: its removal becomes staged.
                 inventory.mark_item_deleted(&name);
                 changed = true;
+                content_changed = true;
                 continue;
             };
 
@@ -609,10 +751,18 @@ pub fn refresh_tracked_entries() -> Result<(), String> {
             let rebuilt = build_inventory_item_from_file(&file_path, &name, item_type)?;
             changed = true;
 
+            if rebuilt.hash != item.hash || rebuilt.item_type != item.item_type || rebuilt.state != item.state {
+                content_changed = true;
+            }
+
             inventory.add_item(rebuilt);
         }
 
-        if changed {
+        if content_changed {
+            write_shard_mutation(key, &mut inventory)?;
+        } else if changed {
+            // Only stat data went stale: the tree `stack` would build from this shard is
+            // unchanged, so its (and its ancestors') rollup stays valid as-is.
             save_inventory(&inventory, &shard_path)?;
         }
     }
@@ -856,7 +1006,7 @@ pub fn build_stale_inventory_item(name: &str, hash: String, item_type: DirEntryT
 /// * `Err(String)` - If the shard could not be read, parsed or written.
 pub fn update_shard(key: &str,
                     change: impl FnOnce(&mut Inventory) -> Result<(), String>) -> Result<(), String> {
-    let (shard_path, bytes_opt) = file_utils::retrieve_inventory_or_none_by_key(key)?;
+    let (_, bytes_opt) = file_utils::retrieve_inventory_or_none_by_key(key)?;
 
     let mut inventory = match bytes_opt {
         Some(bytes) => parser::inventory::inventory_parser::parse_inventory(&bytes)
@@ -866,7 +1016,7 @@ pub fn update_shard(key: &str,
 
     change(&mut inventory)?;
 
-    save_inventory(&inventory, &shard_path)?;
+    write_shard_mutation(key, &mut inventory)?;
 
     let mut new_keys: BTreeSet<String> = BTreeSet::new();
     new_keys.insert(key.to_string());
@@ -888,6 +1038,13 @@ pub fn update_shard(key: &str,
 /// * `Err(String)` - If a folder or file operation failed.
 pub fn replace_subtree_inventories(key: &str,
                                    shards: &std::collections::BTreeMap<String, Inventory>) -> Result<(), String> {
+    // The subtree at `key` is about to be replaced wholesale — a content change from any
+    // ancestor's point of view — so their rollups (if any) must be cleared before the new
+    // content lands, exactly as `write_shard_mutation` orders it. `shards` itself carries
+    // correctly-stamped rollups already (the caller builds them from a known tree), so nothing
+    // further is needed for `key` and below.
+    clear_ancestor_rollups(key)?;
+
     let folder = file_utils::get_inventory_folder_for_key(key);
 
     if folder.exists() {
@@ -963,13 +1120,22 @@ pub fn replace_all_inventories(shards: &std::collections::BTreeMap<String, Inven
 /// as a fresh read would. The directory-existence checks below are unaffected — they always
 /// read the working directory fresh.
 ///
+/// After a stack, staged state *is* the new head — so every surviving shard's rollup is stamped
+/// with its just-built subtree hash from `stamp_hashes` (warehouse path key → hash, from the
+/// same tree build `stack` just ran; a key absent from the map — an out-of-scope/spine shard in
+/// a scoped bay, or a genuinely empty subtree — is stamped `None` instead of guessed).
+///
 /// # Arguments
-/// * `prepared` - The snapshot from [`prepare_stack_inventory`].
+/// * `prepared`     - The snapshot from [`prepare_stack_inventory`].
+/// * `stamp_hashes` - Warehouse path key → the subtree hash `stack` just built there. Trusted
+///                    for every key it names (see `stack_utils::stack_parcel`, which omits any
+///                    key a scoped bay's spine splice could have changed).
 ///
 /// # Returns
 /// * `Ok(())`      - If the cleanup completed.
 /// * `Err(String)` - If a shard could not be written, or a folder could not be removed.
-pub fn cleanup_after_stack_with(prepared: &PreparedInventory) -> Result<(), String> {
+pub fn cleanup_after_stack_with(prepared: &PreparedInventory,
+                                stamp_hashes: &BTreeMap<String, String>) -> Result<(), String> {
     let Some(metadata) = &prepared.metadata else {
         return Ok(());
     };
@@ -1008,7 +1174,13 @@ pub fn cleanup_after_stack_with(prepared: &PreparedInventory) -> Result<(), Stri
         let has_staged_removals = inventory.get_items()
             .any(|(_, item)| item.state == InventoryItemState::Deleted);
 
-        if has_staged_removals {
+        let target_rollup = stamp_hashes.get(key).cloned();
+
+        // A rewrite is needed either to drop the now-consumed `Deleted` entries (unchanged
+        // behavior — dropping them never changes the tree `stack` already built, since the tree
+        // build itself excludes `Deleted` entries) or, even with nothing to drop, purely to
+        // stamp a rollup this shard did not already carry.
+        if has_staged_removals || inventory.get_rollup_hash() != target_rollup.as_ref() {
             let mut rebuilt = Inventory::new();
 
             for (_, item) in inventory.get_items() {
@@ -1017,6 +1189,7 @@ pub fn cleanup_after_stack_with(prepared: &PreparedInventory) -> Result<(), Stri
                 }
             }
 
+            rebuilt.set_rollup_hash(target_rollup);
             save_inventory(&rebuilt, &file_utils::get_inventory_data_path_for_key(key))?;
         }
     }
@@ -1042,6 +1215,11 @@ pub fn remove_inventories_under(prefix: &str) -> Result<(), String> {
     let Some(metadata) = metadata_opt else {
         return Ok(());
     };
+
+    // Conservative: the removed shards themselves have no content left to invalidate (their
+    // files are about to be deleted below), but every ancestor above `prefix` may have had a
+    // rollup describing a subtree that included them — clear those before anything is removed.
+    clear_ancestor_rollups(prefix)?;
 
     let mut removed_keys: BTreeSet<String> = BTreeSet::new();
 
@@ -1364,7 +1542,7 @@ pub fn classify_file_against_entry(existing: &InventoryItem,
 fn add_file_to_inventory(path: &WarehousePath) -> Result<(), String> {
     let (parent, file_name) = path.split_parent()?;
 
-    let (inventory_path, mut inventory) = retrieve_inventory_or_empty(&parent)?;
+    let (_, mut inventory) = retrieve_inventory_or_empty(&parent)?;
 
     let fs_path = path.to_fs_path();
     let file_metadata = file_utils::get_symlink_metadata_for_path(&fs_path)?;
@@ -1377,7 +1555,7 @@ fn add_file_to_inventory(path: &WarehousePath) -> Result<(), String> {
 
     inventory.add_item(item);
 
-    save_inventory(&inventory, &inventory_path)?;
+    write_shard_mutation(parent.as_key(), &mut inventory)?;
 
     let mut new_items: BTreeSet<String> = BTreeSet::new();
     new_items.insert(parent.as_key().to_string());
@@ -1400,7 +1578,7 @@ fn add_file_to_inventory(path: &WarehousePath) -> Result<(), String> {
 fn stage_removal_for_file(path: &WarehousePath) -> Result<(), String> {
     let (parent, file_name) = path.split_parent()?;
 
-    let (inventory_path, inventory_bytes) = file_utils::retrieve_inventory_or_none_by_key(parent.as_key())?;
+    let (_, inventory_bytes) = file_utils::retrieve_inventory_or_none_by_key(parent.as_key())?;
     let mut inventory = match inventory_bytes {
         Some(bytes) => parser::inventory::inventory_parser::parse_inventory(&bytes)?,
         None => return Err(format!("\"{}\" is not in the inventory.", path.as_key())),
@@ -1410,7 +1588,7 @@ fn stage_removal_for_file(path: &WarehousePath) -> Result<(), String> {
         return Err(format!("\"{}\" is not in the inventory.", path.as_key()));
     }
 
-    save_inventory(&inventory, &inventory_path)?;
+    write_shard_mutation(parent.as_key(), &mut inventory)?;
 
     Ok(())
 }
@@ -1454,11 +1632,12 @@ fn save_inventory(inventory: &Inventory, inventory_path: &Path) -> Result<(), St
 
     file_utils::create_folder_if_not_exists(&parent_path)?;
 
-    std::fs::write(inventory_path, bytes).map_err(|e|
-        format!("Error while writing inventory to file {}", e)
-    )?;
-
-    Ok(())
+    // Atomic (temp file, fsync, rename, directory fsync) — the store-wide "durable before
+    // destructive" contract. This matters far more now than it used to: post-stack rollup
+    // stamping (`cleanup_after_stack_with`) can rewrite every registered shard on a single
+    // `stack`, not just the ones with consumed staged removals, so a shard write is on the hot
+    // path of a crash-safety-sensitive operation far more often than before.
+    file_utils::write_file_atomically(inventory_path, &bytes)
 }
 
 #[cfg(test)]
@@ -1603,5 +1782,126 @@ mod tests {
             Err(message) => message,
         };
         assert!(error.contains("zzz"), "the error should name the offending shard, got: {error}");
+    }
+
+    /// Write a shard directly (bypassing the funnel) with the given rollup hash already
+    /// stamped — simulates a shard as it would sit right after a `stack` (see
+    /// `cleanup_after_stack_with`), without needing a real tree build.
+    fn write_stamped_shard(key: &str, rollup_hash: Option<&str>) {
+        let mut inventory = Inventory::new();
+        inventory.add_item(item("file.txt", 1, InventoryItemState::Normal));
+        inventory.set_rollup_hash(rollup_hash.map(|h| h.to_string()));
+        save_inventory(&inventory, &file_utils::get_inventory_data_path_for_key(key)).unwrap();
+    }
+
+    fn read_rollup(key: &str) -> Option<String> {
+        let (_, bytes) = file_utils::retrieve_inventory_or_none_by_key(key).unwrap();
+        let inventory = parser::inventory::inventory_parser::parse_inventory(&bytes.unwrap()).unwrap();
+        inventory.get_rollup_hash().cloned()
+    }
+
+    #[test]
+    fn write_shard_mutation_clears_every_ancestor_top_down_but_spares_an_unrelated_sibling() {
+        let _scratch = Scratch::new("mutation-clears-ancestors");
+
+        // A chain of previously-stamped shards from root down to a depth-3 directory, plus an
+        // unrelated sibling subtree stamped the same way.
+        for key in ["", "a", "a/b", "a/b/c", "x"] {
+            write_stamped_shard(key, Some("stale-rollup"));
+        }
+
+        let mut metadata: BTreeSet<String> = BTreeSet::new();
+        for key in ["", "a", "a/b", "a/b/c", "x"] {
+            metadata.insert(key_to_metadata_entry(key));
+        }
+        let (metadata_path, _) = file_utils::retrieve_inventory_metadata_or_none().unwrap();
+        write_metadata_to_file(&metadata_path, &metadata).unwrap();
+
+        // A content-changing mutation three levels deep.
+        update_shard("a/b/c", |inventory| {
+            inventory.add_item(item("new.txt", 99, InventoryItemState::Normal));
+            Ok(())
+        }).unwrap();
+
+        // Every ancestor, root first, is cleared — and the mutated shard itself never keeps a
+        // stale rollup (the funnel always writes `None` for the shard it mutates).
+        assert_eq!(read_rollup(""), None, "the root's stale rollup must be cleared");
+        assert_eq!(read_rollup("a"), None, "an intermediate ancestor's stale rollup must be cleared");
+        assert_eq!(read_rollup("a/b"), None, "the immediate parent's stale rollup must be cleared");
+        assert_eq!(read_rollup("a/b/c"), None, "the mutated shard itself must not keep a rollup");
+
+        // An unrelated sibling subtree is untouched.
+        assert_eq!(read_rollup("x").as_deref(), Some("stale-rollup"),
+            "a sibling subtree outside the mutated chain must keep its rollup");
+    }
+
+    #[test]
+    fn write_shard_mutation_is_a_no_op_on_an_already_clear_ancestor() {
+        // A shard whose rollup is already `None` must not be rewritten by ancestor invalidation
+        // — a light regression guard for the "no-op, don't rewrite" contract, checked via the
+        // shard file's absence of change (it was never given a rollup to lose either way, but
+        // this at least exercises the skip path without a real tree build).
+        let _scratch = Scratch::new("mutation-noop-ancestor");
+
+        write_stamped_shard("", None);
+        write_stamped_shard("a", None);
+
+        let mut metadata: BTreeSet<String> = BTreeSet::new();
+        metadata.insert(key_to_metadata_entry(""));
+        metadata.insert(key_to_metadata_entry("a"));
+        let (metadata_path, _) = file_utils::retrieve_inventory_metadata_or_none().unwrap();
+        write_metadata_to_file(&metadata_path, &metadata).unwrap();
+
+        update_shard("a", |inventory| {
+            inventory.add_item(item("new.txt", 1, InventoryItemState::Normal));
+            Ok(())
+        }).unwrap();
+
+        assert_eq!(read_rollup(""), None);
+        assert_eq!(read_rollup("a"), None);
+    }
+
+    #[test]
+    fn remove_inventories_under_clears_ancestor_rollups_conservatively() {
+        let _scratch = Scratch::new("narrow-clears-ancestors");
+
+        for key in ["", "a", "a/b"] {
+            write_stamped_shard(key, Some("stale-rollup"));
+        }
+
+        let mut metadata: BTreeSet<String> = BTreeSet::new();
+        for key in ["", "a", "a/b"] {
+            metadata.insert(key_to_metadata_entry(key));
+        }
+        let (metadata_path, _) = file_utils::retrieve_inventory_metadata_or_none().unwrap();
+        write_metadata_to_file(&metadata_path, &metadata).unwrap();
+
+        remove_inventories_under("a/b").unwrap();
+
+        assert_eq!(read_rollup(""), None, "narrow must conservatively clear the root's rollup");
+        assert_eq!(read_rollup("a"), None, "narrow must conservatively clear the parent's rollup");
+        assert!(!file_utils::get_inventory_data_path_for_key("a/b").exists());
+    }
+
+    #[test]
+    fn build_inventory_preserves_rollup_across_a_pure_stat_refresh() {
+        // The comparison helper that decides whether a rebuilt shard's content is truly
+        // unchanged (so its rollup may be carried forward) versus genuinely different (so it
+        // must go through the funnel).
+        let mut a = Inventory::new();
+        a.add_item(item("file.txt", 1, InventoryItemState::Normal));
+
+        let mut b = Inventory::new();
+        b.add_item(item("file.txt", 2, InventoryItemState::Normal)); // different inode only
+
+        assert!(inventory_content_matches(&a, &b),
+            "a stat-only difference (inode) must not count as a content change");
+
+        let mut c = Inventory::new();
+        let mut changed = item("file.txt", 1, InventoryItemState::Normal);
+        changed.hash = "different-hash".to_string();
+        c.add_item(changed);
+
+        assert!(!inventory_content_matches(&a, &c), "a real hash change must count as a content change");
     }
 }

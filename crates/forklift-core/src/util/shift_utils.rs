@@ -461,23 +461,27 @@ pub fn build_inventories_for_tree(root_tree_hash: &str) -> Result<BTreeMap<Strin
     // or the main tree) inventories the whole tree exactly as before.
     let scope = scope_utils::current_scope()?;
 
-    build_inventory_for_tree_directory(&root_tree, "", &mut shards, &scope)?;
+    build_inventory_for_tree_directory(&root_tree, "", root_tree_hash, &mut shards, &scope)?;
 
     Ok(shards)
 }
 
-/// Build the inventory shard for one directory of a tree (recursively).
+/// Build the inventory shard for one directory of a tree (recursively), stamping each shard's
+/// rollup with the tree hash it was built from.
 ///
 /// # Arguments
-/// * `tree`   - The (loaded) tree of the directory.
-/// * `key`    - The warehouse path key of the directory.
-/// * `shards` - The collected shards.
+/// * `tree`      - The (loaded) tree of the directory.
+/// * `key`       - The warehouse path key of the directory.
+/// * `tree_hash` - The hash of `tree` itself (its parent's entry for it — `tree` as loaded
+///                 carries no hash of its own; the root passes `root_tree_hash` directly).
+/// * `shards`    - The collected shards.
 ///
 /// # Returns
 /// * `Ok(())`      - If the shard was built.
 /// * `Err(String)` - If a subtree could not be loaded or a file's metadata gathered.
 fn build_inventory_for_tree_directory(tree: &TreeItem,
                                       key: &str,
+                                      tree_hash: &str,
                                       shards: &mut BTreeMap<String, Inventory>,
                                       scope: &MaterializationScope) -> Result<(), String> {
     // Hoisted once per directory (not per entry): a full (unscoped) scope always classifies
@@ -506,6 +510,21 @@ fn build_inventory_for_tree_directory(tree: &TreeItem,
         )?);
     }
 
+    // `tree_hash` is a byte-for-byte-trustworthy rollup for this shard only when its content
+    // here is a complete materialization of `tree` — the warehouse root, or a directory itself
+    // fully in scope (everything beneath an in-scope boundary materializes verbatim). A spine
+    // directory in a scoped bay only ever materializes the in-scope subset of its real content,
+    // so stamping it with `tree_hash` would misrepresent staged state; left unstamped instead
+    // (the rollup-based skip is not designed for scoped bays yet — DESIGN.html §5.0 D item 8).
+    // An empty tree (only possible for the root — a stored tree never carries a pruned-empty
+    // child entry) is also left unstamped: pruning makes "this subtree's hash" ill-defined.
+    let is_empty = tree.get_files().len() == 0 && tree.get_subtrees().len() == 0;
+    let trustworthy = scope_is_full || scope.classify(key) == ScopeClass::InScope;
+
+    if trustworthy && !is_empty {
+        inventory.set_rollup_hash(Some(tree_hash.to_string()));
+    }
+
     shards.insert(key.to_string(), inventory);
 
     for (name, subtree) in tree.get_subtrees() {
@@ -517,7 +536,7 @@ fn build_inventory_for_tree_directory(tree: &TreeItem,
         }
 
         let subtree_loaded = object_utils::load_tree(&subtree.hash)?;
-        build_inventory_for_tree_directory(&subtree_loaded, &subtree_key, shards, scope)?;
+        build_inventory_for_tree_directory(&subtree_loaded, &subtree_key, &subtree.hash, shards, scope)?;
     }
 
     Ok(())
