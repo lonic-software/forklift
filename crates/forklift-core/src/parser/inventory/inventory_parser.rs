@@ -33,6 +33,23 @@ pub fn parse_inventory(content: &[u8]) -> Result<Inventory, String> {
     Ok(inventory)
 }
 
+/// Parse only an inventory shard's header and return its rollup hash — never its entries
+/// (which can dwarf the header on a large directory). The cheap probe the rollup-based skip
+/// (DESIGN.html §5.0 D item 8, stage 2) uses before committing to a skip: a directory with many
+/// entries costs the same one small header parse as one with a single entry.
+///
+/// # Arguments
+/// * `content` - The content of the inventory file.
+///
+/// # Returns
+/// * `Ok(Some(String))` - The shard carries a rollup hash.
+/// * `Ok(None)`         - The shard carries no rollup (including every old-version shard, which
+///                        never has one).
+/// * `Err(String)`      - If the header itself could not be parsed.
+pub fn peek_rollup_hash(content: &[u8]) -> Result<Option<String>, String> {
+    parse_inventory_header(content).map(|(header, _)| header.rollup_hash)
+}
+
 /// Parse the header of an inventory file.
 ///
 /// # Arguments

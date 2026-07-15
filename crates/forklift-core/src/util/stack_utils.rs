@@ -113,7 +113,19 @@ pub async fn stack_parcel(description: Option<String>) -> Result<(String, String
     // only ever set after that, never staged into this same batch (see the comment there).
     let batch = std::sync::Arc::new(file_utils::WriteBatch::new());
 
-    let (partial_root, tree_hashes) = tree_utils::build_tree_from_inventory_deferred(&prepared, &batch).await?;
+    // Computed up front (not just inside the scoped-splice branch below, as before) because the
+    // rollup-based skip (stage 2) needs both: the head to compare rollups against, and the scope
+    // to gate which keys are ever eligible for a skip (see `tree_utils::compute_rollup_skip_plan`'s
+    // doc comment on the scoped-bay caveat).
+    let scope = scope_utils::current_scope()?;
+    let head_root_hash = match &head {
+        Some(head_hash) => Some(object_utils::load_parcel(head_hash)?.tree_hash),
+        None => None,
+    };
+
+    let (partial_root, tree_hashes, untouched_keys) = tree_utils::build_tree_from_inventory_deferred(
+        &prepared, &batch, head_root_hash.as_deref(), &scope,
+    ).await?;
     let partial_root = partial_root
         .ok_or("There is nothing to stack. Use the \"load\" command to stage changes first.".to_string())?;
 
@@ -121,16 +133,9 @@ pub async fn stack_parcel(description: Option<String>) -> Result<(String, String
     // built root above is a sparse partial that would drop every out-of-scope sibling. The overlay
     // splices it onto the head's spine — copying out-of-scope siblings verbatim by hash — so the
     // stacked root tree is byte-identical to what a full workspace would produce (§3.2).
-    let scope = scope_utils::current_scope()?;
-
     let root_tree = if scope.is_full() {
         partial_root
     } else {
-        let head_root_hash = match &head {
-            Some(head_hash) => Some(object_utils::load_parcel(head_hash)?.tree_hash),
-            None => None,
-        };
-
         // A completing merge splices its out-of-scope skeleton into the merge parcel's
         // tree: the out-of-scope siblings theirs changed one-sided, adopted by hash. A plain
         // stack has no skeleton, so the overlay copies every out-of-scope sibling verbatim.
@@ -291,8 +296,11 @@ pub async fn stack_parcel(description: Option<String>) -> Result<(String, String
     // The parcel consumed the staged removals (and the consolidation or cherry-pick, if any).
     // Reuses the same parsed snapshot the conflict check and tree build already read — nothing
     // between then and here changes a shard's content on disk, only the object store, the ref
-    // and the signature sidecar (see `cleanup_after_stack_with`'s doc comment).
-    inventory_utils::cleanup_after_stack_with(&prepared, &stamp_hashes)?;
+    // and the signature sidecar (see `cleanup_after_stack_with`'s doc comment). `untouched_keys`
+    // needs no scope filtering of its own (unlike `stamp_hashes` above): a rollup-skipped
+    // subtree is only ever InScope by construction (`compute_rollup_skip_plan`'s scoped-bay
+    // caveat), or the whole tree when the bay is fully in scope.
+    inventory_utils::cleanup_after_stack_with(&prepared, &stamp_hashes, &untouched_keys)?;
     merge_utils::clear_consolidation_state()?;
     merge_utils::OutOfScopeSkeleton::clear()?;
     cherry_pick_utils::clear_state()?;

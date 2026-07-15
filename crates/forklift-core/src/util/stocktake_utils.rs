@@ -120,6 +120,17 @@ pub async fn collect_staged_changes_with_shards(head_tree_hash: Option<&str>)
 /// [`ChangeWalkContext::collect_shards`].
 async fn collect_staged_changes_impl(head_tree_hash: Option<&str>, collect_shards: bool)
     -> Result<(Vec<Change>, HashMap<String, Arc<Inventory>>), String> {
+    // The rollup-based skip (DESIGN.html §5.0 D item 8, stage 2): the root shard's rollup
+    // already names the whole staged tree, so if it matches the head root tree hash exactly, no
+    // staged change is possible anywhere — return without reading the metadata file, loading a
+    // single head tree object, or spawning a single walk task.
+    if let Some(head_hash) = head_tree_hash {
+        if rollup_skip_matches("", head_hash)? {
+            inventory_utils::record_rollup_skip();
+            return Ok((Vec::new(), HashMap::new()));
+        }
+    }
+
     let (_, metadata_opt) = file_utils::retrieve_inventory_metadata_or_none()?;
     let metadata = metadata_opt.unwrap_or_default();
 
@@ -166,6 +177,23 @@ async fn collect_staged_changes_impl(head_tree_hash: Option<&str>, collect_shard
     let shards = std::mem::take(&mut *context.shards.lock().await);
 
     Ok((changes, shards))
+}
+
+/// Whether the subtree at `key` can be skipped entirely during the staged-changes walk: its
+/// rollup exactly matches `head_subtree_hash`, so — by Stage 1's maintenance guarantee that a
+/// rollup is cleared the moment anything at or below it actually changes — no staged change is
+/// possible anywhere in it. Gated by the kill switch (`FORKLIFT_DISABLE_ROLLUP_SKIP`) so the
+/// equivalence tests can force a full walk and diff it against the optimized one.
+///
+/// # Arguments
+/// * `key`               - The warehouse path key of the directory.
+/// * `head_subtree_hash` - The head tree's subtree hash at that same key.
+fn rollup_skip_matches(key: &str, head_subtree_hash: &str) -> Result<bool, String> {
+    if !inventory_utils::rollup_skip_enabled() {
+        return Ok(false);
+    }
+
+    Ok(inventory_utils::peek_shard_rollup(key)?.as_deref() == Some(head_subtree_hash))
 }
 
 /// The per-directory task of the staged walk: compare one directory's shard against the
@@ -256,8 +284,21 @@ fn walk_directory_staged(context: Arc<ChangeWalkContext>,
 
         for child_key in child_keys {
             let child_name = last_component(child_key);
+            let head_subtree = head_subtrees.get(&child_name.to_string());
 
-            let child_head_tree = match head_subtrees.get(&child_name.to_string()) {
+            // The rollup-based skip (DESIGN.html §5.0 D item 8, stage 2): a matching rollup
+            // means no staged change is possible anywhere at or below this child — skip the
+            // head tree load and the entire recursion (that subtree's shard is never even
+            // read). A missing rollup, missing shard, or missing head subtree all fall through
+            // to the ordinary walk, unchanged.
+            if let Some(subtree) = head_subtree {
+                if rollup_skip_matches(child_key, &subtree.hash)? {
+                    inventory_utils::record_rollup_skip();
+                    continue;
+                }
+            }
+
+            let child_head_tree = match head_subtree {
                 Some(subtree) => Some(object_utils::load_tree_shared(&subtree.hash)?),
                 None => None,
             };

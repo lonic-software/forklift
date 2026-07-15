@@ -133,6 +133,78 @@ pub fn write_shard_mutation(key: &str, inventory: &mut Inventory) -> Result<(), 
     save_inventory(inventory, &file_utils::get_inventory_data_path_for_key(key))
 }
 
+/// Write a shard whose effective content is unchanged from its previous version, carrying its
+/// existing rollup forward as-is — no ancestor invalidation needed, since nothing that would
+/// affect the tree `stack` builds here actually changed.
+///
+/// Still funneled through [`SHARD_MUTATION_LOCK`], even though it never touches an ancestor:
+/// `load`'s per-directory walker (`build_inventory`) is genuinely concurrent, so this directory's
+/// own "nothing changed" rewrite can race a *descendant* task's [`write_shard_mutation`] call
+/// treating this same shard as one of *its* ancestors. Without the lock, this write could land
+/// after that clear and silently resurrect the exact stale rollup it just correctly cleared —
+/// the same hazard [`write_shard_mutation`]'s own doc comment describes, from the other side of
+/// the race.
+///
+/// # Arguments
+/// * `key`       - The warehouse path key of the shard being written.
+/// * `inventory` - The content to write, rollup already set by the caller (typically carried
+///                 forward from the previous version).
+fn write_shard_preserved(key: &str, inventory: &Inventory) -> Result<(), String> {
+    let _guard = SHARD_MUTATION_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    save_inventory(inventory, &file_utils::get_inventory_data_path_for_key(key))
+}
+
+/// Process-wide count of rollup-based skips actually applied (DESIGN.html §5.0 D item 8, stage
+/// 2) — incremented once per skipped subtree root, by both consumers (the staged-changes walk,
+/// `stack`'s tree build). Not a performance feature: a cheap, always-on observability hook the
+/// tests use to prove a skip *actually fired* (not just that its output happens to be correct,
+/// which the equivalence tests already cover) — see `rollup_skip_count`.
+static ROLLUP_SKIP_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Record that a rollup-based skip was just applied to one subtree root. Call exactly once per
+/// skip decision (never once per key it covers — a skip's whole point is never visiting its
+/// descendants to begin with).
+pub fn record_rollup_skip() {
+    ROLLUP_SKIP_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The current value of the process-wide rollup-skip counter — see [`record_rollup_skip`].
+pub fn rollup_skip_count() -> u64 {
+    ROLLUP_SKIP_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether the rollup-based skip (DESIGN.html §5.0 D item 8, stage 2) is currently allowed.
+/// Test-only kill switch: set `FORKLIFT_DISABLE_ROLLUP_SKIP=1` to force every consumer (the
+/// staged-changes walk in `stocktake_utils`, `stack`'s tree build in `tree_utils`) to behave
+/// exactly as if no shard ever carried a rollup — a full walk/build every time. Both consumers
+/// call this (never re-implement their own env check) so the equivalence tests can flip one
+/// switch and diff the result against the optimized path. Undocumented; not a supported setting.
+pub fn rollup_skip_enabled() -> bool {
+    std::env::var("FORKLIFT_DISABLE_ROLLUP_SKIP").is_err()
+}
+
+/// Peek a shard's rollup hash without parsing its entries. Missing shard, absent rollup, or an
+/// old-version shard (which never carries one) all read as `None` — the caller decides what
+/// that means (usually: no skip, fall back to the ordinary walk/build).
+///
+/// # Arguments
+/// * `key` - The warehouse path key of the directory.
+///
+/// # Returns
+/// * `Ok(Some(String))` - The shard exists and carries a rollup.
+/// * `Ok(None)`         - The shard is missing or carries no rollup.
+/// * `Err(String)`      - If the shard exists but its header could not be parsed.
+pub fn peek_shard_rollup(key: &str) -> Result<Option<String>, String> {
+    let (_, bytes_opt) = file_utils::retrieve_inventory_or_none_by_key(key)?;
+
+    let Some(bytes) = bytes_opt else {
+        return Ok(None);
+    };
+
+    parser::inventory::inventory_parser::peek_rollup_hash(&bytes)
+}
+
 /// Whether two inventories carry the same *effective* content — the same set of entries, each
 /// with the same name, type, hash and state. Stat fields (timestamps, device/inode, size,
 /// ownership) are deliberately excluded: they can differ (e.g. after a stat-only refresh)
@@ -514,8 +586,7 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
         match existing_inventory.as_ref() {
             Some((old_inventory, _)) if inventory_content_matches(&inventory, old_inventory) => {
                 inventory.set_rollup_hash(old_inventory.get_rollup_hash().cloned());
-                let inventory_data_path = file_utils::get_inventory_data_path_for_key(path.as_key());
-                save_inventory(&inventory, &inventory_data_path)?;
+                write_shard_preserved(path.as_key(), &inventory)?;
             }
             _ => {
                 write_shard_mutation(path.as_key(), &mut inventory)?;
@@ -1120,22 +1191,39 @@ pub fn replace_all_inventories(shards: &std::collections::BTreeMap<String, Inven
 /// as a fresh read would. The directory-existence checks below are unaffected — they always
 /// read the working directory fresh.
 ///
-/// After a stack, staged state *is* the new head — so every surviving shard's rollup is stamped
-/// with its just-built subtree hash from `stamp_hashes` (warehouse path key → hash, from the
-/// same tree build `stack` just ran; a key absent from the map — an out-of-scope/spine shard in
-/// a scoped bay, or a genuinely empty subtree — is stamped `None` instead of guessed).
+/// After a stack, staged state *is* the new head — so every surviving shard's rollup ends up in
+/// one of three states:
+///  * **Stamp** — `key` is in `stamp_hashes`: rewrite it with the just-built subtree hash from
+///    the same tree build `stack` just ran.
+///  * **Untouched** — `key` is in `untouched_keys` (a rollup-skipped subtree `stack`'s tree
+///    build never even read): its on-disk rollup already names the right tree (that is *why* it
+///    was skipped) and its staged state provably did not change this stack, so it is left
+///    exactly as it sits — no read beyond the [`PreparedInventory`] snapshot already parsed
+///    up front, no write.
+///  * **Clear** — everything else (a key in neither set: an out-of-scope/spine shard in a
+///    scoped bay, or a genuinely empty subtree): stamped `None` instead of guessed, exactly as
+///    before stage 2 existed.
+///
+/// A key that is in `untouched_keys` but unexpectedly still carries a staged removal (the
+/// invariant `write_shard_mutation` maintains — a pending `Deleted` entry always clears its own
+/// rollup, so a shard with one still staged could never have had a rollup for the skip to have
+/// matched on in the first place — is violated) falls through to the normal stamp-or-clear
+/// handling below instead of being silently trusted.
 ///
 /// # Arguments
-/// * `prepared`     - The snapshot from [`prepare_stack_inventory`].
-/// * `stamp_hashes` - Warehouse path key → the subtree hash `stack` just built there. Trusted
-///                    for every key it names (see `stack_utils::stack_parcel`, which omits any
-///                    key a scoped bay's spine splice could have changed).
+/// * `prepared`       - The snapshot from [`prepare_stack_inventory`].
+/// * `stamp_hashes`   - Warehouse path key → the subtree hash `stack` just built there. Trusted
+///                      for every key it names (see `stack_utils::stack_parcel`, which omits any
+///                      key a scoped bay's spine splice could have changed).
+/// * `untouched_keys` - Warehouse path keys `stack`'s tree build proved unchanged and skipped
+///                      entirely (a rollup-skipped subtree's root and every descendant).
 ///
 /// # Returns
 /// * `Ok(())`      - If the cleanup completed.
 /// * `Err(String)` - If a shard could not be written, or a folder could not be removed.
 pub fn cleanup_after_stack_with(prepared: &PreparedInventory,
-                                stamp_hashes: &BTreeMap<String, String>) -> Result<(), String> {
+                                stamp_hashes: &BTreeMap<String, String>,
+                                untouched_keys: &BTreeSet<String>) -> Result<(), String> {
     let Some(metadata) = &prepared.metadata else {
         return Ok(());
     };
@@ -1173,6 +1261,10 @@ pub fn cleanup_after_stack_with(prepared: &PreparedInventory,
 
         let has_staged_removals = inventory.get_items()
             .any(|(_, item)| item.state == InventoryItemState::Deleted);
+
+        if untouched_keys.contains(key) && !has_staged_removals {
+            continue;
+        }
 
         let target_rollup = stamp_hashes.get(key).cloned();
 
