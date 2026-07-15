@@ -6,12 +6,15 @@ below that, the manual steps the harness automates — so you can reproduce ever
 number by hand and add your own.
 
 > **Read this first — the honest framing.** Git is a 20-year-old C codebase tuned
-> against the exact repos below; Forklift is **v0.1.x**. Expect Git to win some raw
-> single-command timings and Forklift to reach parity or better on others (status,
-> the history walk on a packed store, and — after the one-shot redelta pass — on-disk
-> size; see §2). The point of
+> against the exact repos below; Forklift is **v0.2.x**. Forklift's `status` and
+> `log` are both *faster* than git today — `status` from the sharded per-directory
+> inventory (no per-file stat pass), `log` from buffered streaming output — and
+> on-disk size ends up smaller after the one-shot redelta pass; see §2. `diff` and
+> `commit` are still roughly 2x slower than git and are tracked as open
+> optimization targets in [`PERFORMANCE_BACKLOG.md`](PERFORMANCE_BACKLOG.md). The
+> point of
 > benchmarking here is not to "beat git" — it
-> is to (a) see where Forklift is already in the same ballpark, (b) find the
+> is to (a) see where Forklift is already in the same ballpark or ahead, (b) find the
 > operations that are *unexpectedly* slow so they become optimization targets, and
 > (c) measure the things Forklift does that Git doesn't have a column for (signed
 > history, per-directory inventory). Treat a result that's within a small multiple
@@ -95,20 +98,24 @@ faster), and a per-row note. Example shape:
 
 ```
   Repo:      git — 81489 commits, 4775 tracked files
-  On-disk:   git .git = 316M   forklift .forklift = 435M as imported, 234M after redelta  (forklift 1.3x smaller)
+  On-disk:   git .git = 316M   forklift .forklift = 435M as imported, 235M after redelta  (forklift 1.3x smaller)
+  Tools:     git version 2.33.0 · Forklift version 0.2.1
+  Method:    read-only ops = mean of 5 runs, commit = mean of 3; warm cache.
+             A ratio below 1.00 means forklift is faster.
+             git ships packed; forklift is packed + densified (one-shot compact --all --redelta after import).
 
   Operation               git        forklift   forklift/git   Notes
   ----------------------  ---------  ---------  -------------  ----------------------------------
-  status (clean tree)     56 ms      41 ms      0.73x          git status vs forklift stocktake …
-  log (whole history)     888 ms     962 ms     1.08x          81489 commits walked
-  diff (20 files changed) 22 ms      53 ms      2.41x          git diff vs forklift diff --staged
-  commit (1 file)         31 ms      88 ms      2.84x          git add+commit vs load+stack
+  status (clean tree)     143 ms     45 ms      0.31x          git status vs forklift stocktake --summary
+  log (whole history)     952 ms     455 ms     0.48x          81489 commits walked
+  diff (20 files changed)  21 ms      46 ms      2.19x          git diff vs forklift diff --staged
+  commit (1 file)         32 ms      66 ms      2.06x          git add+commit vs forklift load+stack; mean of 3
 
   Onboarding — measured separately; NOT a ratio (different operations):
-    git clone --local     433 ms     (copies an existing packfile)
-    forklift import-git   63.41 s    (re-encodes every commit/tree/blob straight into packs; store lands at 435M)
+    git clone --local     492 ms     (copies an existing packfile)
+    forklift import-git   63.76 s    (re-encodes every commit/tree/blob straight into packs; store lands at 435M)
     Packed the imported store: 402959 object(s) into 5 pack(s), 310344 delta-compressed.
-    compact --all --redelta  169.64 s (one-shot densify: 435M -> 234M)
+    compact --all --redelta  176.63 s (one-shot densify: 435M -> 235M)
 ```
 
 **Two sizes, one store.** `import-git` writes straight into native packs as it imports
@@ -116,10 +123,11 @@ faster), and a per-row note. Example shape:
 chains don't see the cross-path similarity (renames, moved files) that a global repack
 ordering does — on git.git the as-imported store lands **~1.4x larger** than git's own
 pack (435M vs 316M). The one-shot `compact --all --redelta` densify pass closes that
-and more: **234M, ~1.3x smaller than git**, for ~170 s of one-time CPU on this corpus.
+and more: **235M, ~1.3x smaller than git**, for ~177 s of one-time CPU on this corpus.
 The harness reports both sizes and times the comparison rows on the densified store;
-the redelta pass had no measurable effect on the timing rows themselves (the log walk
-stayed at ~1.1x parity). On repos whose `.git` carries unreachable refs or stale
+redelta itself did not measurably change the timing rows — the `log` speedup seen in
+§2 comes from buffering the history walk's output, not from redelta. On
+repos whose `.git` carries unreachable refs or stale
 remote-tracking branches, `.forklift` often lands far smaller still — `import-git` only
 pulls branch-reachable history — but that reflects the source repo's ref clutter, not a
 general "forklift packs tighter" result; git.git above (a repo with little such clutter)
@@ -185,6 +193,11 @@ These matter. A benchmark that hides them is a sales pitch, not a measurement.
 - **Forklift signs; git doesn't (by default).** If you `office enroll` the imported
   warehouse, every `stack` afterwards signs the parcel — real work git isn't doing
   in its `commit`. Benchmark signed vs unsigned deliberately; don't conflate them.
+- **The `git` binary itself may not be native.** On this machine the `git` on PATH
+  is x86_64 running under Rosetta 2 (an arm64 Mac), which taxes git's syscall-heavy
+  rows — `status` especially. Forklift's `status` win is real, but the multiple is
+  flattered by this; see [`PERFORMANCE_BACKLOG.md`](PERFORMANCE_BACKLOG.md), which
+  records it. Check `file $(command -v git)` before you quote a ratio.
 
 ---
 
@@ -281,8 +294,8 @@ Use `--export-markdown out.md` to capture a table, or `--export-json` for plots.
   (process start, lock acquisition, inventory open) that amortizes away on big
   operations — note the absolute time, not just the ratio.
 - **`log`/`history`** stresses graph-walk and object decode, measured on the **packed,
-  densified** store (where forklift is ~at parity with git). A regression here is the
-  real object-store read-path signal.
+  densified** store (where forklift is now ~2x *faster* than git). A regression here
+  is the real object-store read-path signal.
 - **`onboard`** will always favor git (see §3). Track it over releases to catch
   import regressions, not to compare against clone.
 - **A regression across releases matters more than the absolute gap to git.**
