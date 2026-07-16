@@ -242,8 +242,18 @@ pub fn pop_parked() -> Result<(), String> {
             continue;
         }
 
-        // Untracked files must not be overwritten either.
-        if in_head.is_none() && std::path::Path::new(path).exists() {
+        // Untracked files must not be overwritten either — *unless* the file already on disk
+        // holds exactly the content this op would write there. That is either a user who happens
+        // to have identical content (safe to treat as already applied — nothing would change),
+        // or, since batching made a `batch.publish()` failure land strictly *after* every op's
+        // working-directory write, this op's own leftover from a previous `park pop` attempt that
+        // failed after writing this file but before its shard mutation was ever published (see
+        // `pop_parked`'s own doc comment above). Without this check, a retry after such a failure
+        // would see its own prior write as a "conflict" and refuse forever — the parked parcel
+        // could never be popped again until the operator manually deleted files forklift itself
+        // wrote. `existing_file_matches_write` hashes the on-disk file read-only (no store write)
+        // to tell the two cases apart from a genuine foreign conflict.
+        if in_head.is_none() && std::path::Path::new(path).exists() && !existing_file_matches_write(op)? {
             conflicts.push(path);
         }
     }
@@ -324,6 +334,42 @@ pub fn pop_parked() -> Result<(), String> {
     output::message("park", format!("Re-applied the parked changes from {} (staged).", parked_hash));
 
     Ok(())
+}
+
+/// Whether the file already on disk at `op`'s path holds exactly the content (and entry type)
+/// `op` would write there — see the conflict check above for why this matters. Read-only: hashes
+/// the file's current content without touching the object store
+/// (`object_utils::IngestMode::ComputeOnly`), the same read path `stocktake`'s own classification
+/// uses, never a full read-and-store.
+///
+/// Only meaningful for `FileOp::Write` (always reports `false`, i.e. "not a match", for
+/// `FileOp::Remove` — which has no content of its own to compare against; not that the caller's
+/// conflict check can actually reach a `Remove` op here in practice, since it only calls this when
+/// `in_head` is `None`, and every `Remove` op's path is guaranteed present in the parked base —
+/// see `pop_parked`'s own conflict loop).
+///
+/// # Returns
+/// * `Ok(true)`    - The file exists, its on-disk type matches `op`'s, and its content hash
+///                   matches `op`'s target hash exactly.
+/// * `Ok(false)`   - The file's type or content differs, or `op` is a `Remove`.
+/// * `Err(String)` - The file's metadata could not be read, or its content could not be hashed.
+fn existing_file_matches_write(op: &FileOp) -> Result<bool, String> {
+    let FileOp::Write { path, hash, item_type, .. } = op else {
+        return Ok(false);
+    };
+
+    let fs_path = std::path::Path::new(path);
+    let metadata = file_utils::get_symlink_metadata_for_path(fs_path)?;
+
+    if file_utils::get_type_of_dir_entry(&metadata) != *item_type {
+        return Ok(false);
+    }
+
+    let name = path.rsplit_once('/').map(|(_, name)| name).unwrap_or(path.as_str());
+
+    let ingested = object_utils::ingest_file(name, fs_path, *item_type, object_utils::IngestMode::ComputeOnly)?;
+
+    Ok(ingested.hash == *hash)
 }
 
 /// List the parked parcels, newest first.

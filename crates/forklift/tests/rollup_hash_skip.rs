@@ -1006,3 +1006,89 @@ fn consolidate_recovers_via_restore_after_a_batch_publish_failure_from_an_unwrit
 }
 
 // -------------------------------------------------------------------------------------------
+// Adversarial-review finding (PR B review finding #2, DESIGN.html §5.0 D item 10): batching made
+// a `batch.publish()` failure land strictly *after* every op's working-directory write, so a
+// failed `park pop` that added a brand-new file (absent from both the parked base and the current
+// head) always leaves that file sitting on disk. The pre-check `in_head.is_none() &&
+// Path::new(path).exists()` used to treat that leftover as a *user* conflict — permanently, since
+// every retry recomputes the same diff and finds the same file still there. This pins the
+// promised retry actually working end to end: fail `publish()` once (the same unwritable-
+// inventory-root trick as the consolidate recovery test above), fix the permission, re-run
+// `park pop`, and confirm it now succeeds instead of reporting a phantom conflict forever.
+// -------------------------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn park_pop_recovers_via_retry_after_a_batch_publish_failure_from_an_unwritable_inventory_root() {
+    let warehouse = Warehouse::new("park-pop-batch-publish-failure-recovery", false);
+    warehouse.prepare();
+
+    warehouse.write_file("existing.txt", "existing v1\n");
+    warehouse.run_ok(&["load", "."]);
+    warehouse.run_ok(&["stack", "base"]);
+
+    // A brand-new, root-level file: absent from both the parked base and the current head, so
+    // popping it hits the `in_head.is_none()` branch of the conflict pre-check.
+    warehouse.write_file("new.txt", "new content\n");
+    warehouse.run_ok(&["load", "."]);
+    warehouse.run_ok(&["park"]);
+
+    // Parking must have reset the working directory to head — the new file is gone until popped.
+    assert!(!warehouse.root.join("new.txt").exists(), "park push must reset the working directory");
+
+    // The root shard's own inventory folder, read-only: `pop_parked`'s own conflict pre-check
+    // (read-only itself) still passes cleanly, but `ShardMutationBatch::publish` fails when phase
+    // A tries to stage the root's ancestor-clear temp file there — after `new.txt`'s
+    // working-directory write already landed.
+    let root_inventory_folder = {
+        let _scope = forklift_core::globals::StorageRootScope::enter(&warehouse.root);
+        let mut path = forklift_core::util::file_utils::get_inventory_data_path_for_key("");
+        path.pop();
+        path
+    };
+
+    use std::os::unix::fs::PermissionsExt;
+    let original_permissions = std::fs::metadata(&root_inventory_folder).unwrap().permissions();
+    std::fs::set_permissions(&root_inventory_folder, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let first_pop = warehouse.run(&["park", "pop"]);
+
+    // Always restore permissions before any assertion can early-return/panic, so a failing
+    // assertion below never leaves the warehouse directory permanently read-only for `Drop`'s
+    // own cleanup (`std::fs::remove_dir_all`) to choke on.
+    std::fs::set_permissions(&root_inventory_folder, original_permissions).unwrap();
+
+    assert!(!first_pop.status.success(), "the pop must fail: its root shard's folder is unwritable");
+    let stderr = String::from_utf8_lossy(&first_pop.stderr);
+    assert!(stderr.contains("safe to retry"),
+        "the failure must promise the retry is safe: {}", stderr);
+
+    // The working-directory write already landed despite the batch publish failure.
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("new.txt")).unwrap(), "new content\n");
+
+    // The parked parcel must still be listed — the pop never completed.
+    let parked_after_failure = warehouse.run_ok(&["--json", "park", "list"]);
+    let parked_after_failure_value: serde_json::Value =
+        serde_json::from_slice(&parked_after_failure.stdout).unwrap();
+    assert_eq!(parked_after_failure_value["data"]["parked"].as_array().unwrap().len(), 1,
+        "the parked parcel must still be listed after the failed pop: {}", parked_after_failure_value);
+
+    // The actual retry the message promises: this used to fail forever, reporting "new.txt" —
+    // forklift's own unpublished write — as a conflict with the current state of the file.
+    warehouse.run_ok(&["park", "pop"]);
+
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("new.txt")).unwrap(), "new content\n",
+        "the retried pop must (re-)materialize the parked file correctly");
+
+    let staged = warehouse.run_ok(&["--json", "diff", "--staged"]);
+    let staged_value: serde_json::Value = serde_json::from_slice(&staged.stdout).unwrap();
+    let staged_files = staged_value["data"]["files"].as_array().unwrap();
+    assert!(staged_files.iter().any(|f| f["path"] == "new.txt"),
+        "the retried pop must actually stage \"new.txt\": {}", staged_value);
+
+    let parked_after_retry = warehouse.run_ok(&["--json", "park", "list"]);
+    let parked_after_retry_value: serde_json::Value =
+        serde_json::from_slice(&parked_after_retry.stdout).unwrap();
+    assert_eq!(parked_after_retry_value["data"]["parked"].as_array().unwrap().len(), 0,
+        "the parked parcel must be gone once the retry succeeds: {}", parked_after_retry_value);
+}
