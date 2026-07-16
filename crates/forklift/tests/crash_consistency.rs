@@ -363,7 +363,7 @@ fn calibrate_load_duration(area: &Area, files: &[PathBuf], base_line: &str, labe
 /// entries, so a second `load .` would not necessarily re-touch (or heal) a shard a first,
 /// interrupted `load .` already made durable and visible. `stack` itself never verifies a blob's
 /// existence (it only carries hashes forward into tree entries), so the sharp check is deferred
-/// to a final `export-git` after the whole spread (DESIGN.html §5.0 D item 10, finding #1) —
+/// to a final `export-git` after the whole spread (DESIGN.html §5.0 D item 10) —
 /// see the caller.
 ///
 /// Returns how many iterations produced a completed `stack` (the signal that this iteration's
@@ -427,8 +427,8 @@ fn run_load_kill_spread(
     stacked
 }
 
-/// Extends the crash-consistency spine to `load`'s parallel per-directory walk (DESIGN.html §5.0
-/// D item 10, finding #1): every changed file's blob is now staged into the walk's own shared
+/// Extends the crash-consistency spine to `load`'s parallel per-directory walk:
+/// every changed file's blob is now staged into the walk's own shared
 /// batch (`InventoryBuilderContext::batch`) instead of paying its own atomic-write barrier, and
 /// that same batch is what the walk's single-threaded join point later publishes shard content
 /// through — so a blob and the shard that references it can land in the very same durability
@@ -442,8 +442,8 @@ fn killing_load_midway_never_leaves_a_shard_referencing_a_missing_or_torn_blob()
     let area = Area::new("load");
     let warehouse = area.warehouse();
 
-    // Several directories with several files each: `load`'s walk (DESIGN.html §5.0 D item 10,
-    // finding #1) runs one concurrent task per directory, each staging its own changed files'
+    // Several directories with several files each: `load`'s walk runs one concurrent task per
+    // directory, each staging its own changed files'
     // blobs into the same shared batch — this corpus shape is what actually exercises that
     // concurrency, unlike `stack`'s crash test above (a single flat file is enough there, since
     // `stack`'s object write concurrency comes from its tree build, not this walk).
@@ -513,6 +513,66 @@ fn killing_load_midway_never_leaves_a_shard_referencing_a_missing_or_torn_blob()
         });
 }
 
+/// Regression: `load`'s join point used to gate inventory-metadata registration on whether its
+/// shard-content publish fully succeeded, excluding *every* directory with a decided change
+/// whenever *any* publish failure occurred anywhere in the same walk — even a directory whose own
+/// shard write had already landed durably before a later one's failed. The publish stages and
+/// renames shards in sorted key order, so an earlier key's rename can complete durably before a
+/// later key's fails, and that already-on-disk directory must still be registered — leaving it
+/// unregistered would silently drop it from the next stacked parcel even though its content is
+/// sitting right there.
+#[cfg(unix)]
+#[test]
+fn a_partial_publish_failure_during_load_still_registers_the_directory_that_landed() {
+    let area = Area::new("load-partial-publish-failure");
+    let warehouse = area.warehouse();
+
+    // "a" sorts before "z": the publish stages and renames every changed shard in sorted key
+    // order, so "a"'s rename completes before "z"'s is even attempted.
+    std::fs::create_dir_all(warehouse.join("a")).unwrap();
+    std::fs::write(warehouse.join("a/file.txt"), "a content\n").unwrap();
+    std::fs::create_dir_all(warehouse.join("z")).unwrap();
+    std::fs::write(warehouse.join("z/file.txt"), "z content\n").unwrap();
+
+    assert!(area.run(&["prepare"]).status.success());
+    assert!(area.run(&["config", "operator.name", "partial-publish@forklift"]).status.success());
+    assert!(area.run(&["config", "operator.identifier", "partial-publish@forklift"]).status.success());
+
+    // Sabotage "z"'s shard *rename*, not its staging: pre-create its final data path as a
+    // directory. Staging still succeeds (the temp file's name never collides with the sibling
+    // "data" entry), but `std::fs::rename` onto an existing directory fails — the failure lands
+    // strictly *after* "a"'s own rename has already durably completed, reproducing a genuine
+    // partial publish. A permissions or missing-parent sabotage would instead fail at *staging*
+    // time, before any rename in the batch has even run — a different (already-covered) shape.
+    let z_data_path = warehouse.join(".forklift/inventory/inv_/inv_z/data");
+    std::fs::create_dir_all(&z_data_path).unwrap();
+
+    let load = area.run(&["load", "."]);
+    assert!(!load.status.success(), "the sabotaged \"z\" shard must fail the load");
+    let stderr = String::from_utf8_lossy(&load.stderr);
+    assert!(stderr.contains("Is a directory") || stderr.contains("directory"),
+        "the failure should name the actual rename problem: {}", stderr);
+
+    // "a"'s shard genuinely landed durably — its rename already completed before "z"'s failed.
+    let a_data_path = warehouse.join(".forklift/inventory/inv_/inv_a/data");
+    assert!(a_data_path.exists(), "\"a\"'s shard write must have landed durably before \"z\"'s failed");
+    let a_bytes = std::fs::read(&a_data_path).unwrap();
+    assert!(a_bytes.windows(8).any(|w| w == b"file.txt"),
+        "\"a\"'s durable shard must actually contain the file it decided to write");
+
+    // The bug: "a" used to be excluded from metadata purely because *some other* key in the same
+    // walk failed, even though "a" itself durably published. Read the metadata file directly
+    // (not through a command) since "z"'s corrupted, directory-shaped shard would otherwise make
+    // any metadata-driven read of the whole warehouse fail — orthogonal to what this test proves.
+    let metadata = std::fs::read_to_string(warehouse.join(".forklift/inventory/metadata")).unwrap();
+    let entries: Vec<&str> = metadata.lines().collect();
+    assert!(entries.contains(&"a"),
+        "\"a\"'s durably-published shard must be registered despite \"z\"'s failure: {:?}", entries);
+    assert!(entries.contains(&"./"),
+        "the root directory (also durably published before \"z\"'s failure) must be registered \
+        too: {:?}", entries);
+}
+
 /// Time a few uninterrupted `park` pushes over the given multi-directory corpus and return the
 /// slowest — the `park` counterpart of [`calibrate_load_duration`]. Each sample parks, then
 /// immediately pops (a `park` needs a clean, unparked tracked state to push a *new* parcel), so
@@ -557,7 +617,7 @@ fn parked_count(warehouse: &Path) -> usize {
 /// When an iteration's `park` did commit, this pops it right back — a real read of every tree and
 /// blob the parcel references (`shift_utils::diff_trees`/`apply_file_op` walk the tree and
 /// materialize every file's content), the sharp check that a torn or missing object referenced by
-/// the newly committed parcel fails loudly on (DESIGN.html §5.0 D item 10, finding #3). When it
+/// the newly committed parcel fails loudly on. When it
 /// did not commit, `park`'s reset-to-head step (the only thing that touches the working
 /// directory's tracked file *content*) never ran — it only ever runs after the parked-list write
 /// already succeeded — so the working directory still holds this iteration's rewritten content
@@ -612,8 +672,8 @@ fn run_park_kill_spread(
     parked
 }
 
-/// Extends the crash-consistency spine to `park` push's own object batch (DESIGN.html §5.0 D
-/// item 10, finding #3): every tree object and the parcel object are now staged into one shared
+/// Extends the crash-consistency spine to `park` push's own object batch: every tree object and
+/// the parcel object are now staged into one shared
 /// `WriteBatch`, finished once before the signature sidecar and the parked-list record — the same
 /// pattern `stack`'s crash test above already covers for `stack`, applied here to `park`'s own
 /// distinct code path (and `refresh_tracked_entries`'s own separate blob batch, finished before
@@ -743,10 +803,10 @@ fn load_barrier_count_for(files_per_dir: usize) -> u64 {
     barrier_count(&output)
 }
 
-/// DESIGN.html §5.0 D item 10, finding #10: `file_utils::barrier_count` exists so a test can
+/// `file_utils::barrier_count` exists so a test can
 /// prove a burst of writes actually collapsed to a constant number of barriers, not just that
 /// the resulting state happens to be correct. This is that test for `load`'s join point
-/// (findings #1/#7's fix restructured it into three barriers — a blob barrier, an
+/// (its own fix restructured it into three barriers — a blob barrier, an
 /// ancestor-clear barrier, and a shard-content barrier — still a constant number regardless of
 /// how many files changed within the touched directories, not one that scales with the changed
 /// file count the way the pre-batching baseline did).
@@ -766,8 +826,8 @@ fn load_pays_a_constant_number_of_barriers_regardless_of_changed_file_count() {
 }
 
 // -------------------------------------------------------------------------------------------
-// Barrier-count assertions for the batched merge/replay funnel (DESIGN.html §5.0 D item 10,
-// findings #2/#4): `consolidate`'s per-merge-action funnel, `restore <dir>`'s plain replay and
+// Barrier-count assertions for the batched merge/replay funnel: `consolidate`'s per-merge-action
+// funnel, `restore <dir>`'s plain replay and
 // `park pop`'s replay all now route through `inventory_utils::ShardMutationBatch`. Each of these
 // mirrors `load_pays_a_constant_number_of_barriers_regardless_of_changed_file_count` above:
 // touching more *files within the same set of directories* must not raise the barrier count.
@@ -825,7 +885,7 @@ fn consolidate_barrier_count_for(actions_per_dir: usize) -> u64 {
     barrier_count(&output)
 }
 
-/// DESIGN.html §5.0 D item 10, finding #2: `apply_merge_action`'s per-action funnel now
+/// `apply_merge_actions`'s per-action funnel
 /// publishes every action's shard mutation (and any new blob) through one shared
 /// `ShardMutationBatch` instead of a full two-barrier `write_shard_mutation` call per action — a
 /// 50-action merge across 5 directories must pay the same barrier count as a 5-action merge
@@ -884,7 +944,7 @@ fn restore_directory_barrier_count_for(files_per_dir: usize) -> u64 {
     barrier_count(&output)
 }
 
-/// DESIGN.html §5.0 D item 10, finding #4: `restore <dir>`'s plain replay now publishes every
+/// `restore <dir>`'s plain replay now publishes every
 /// restored file's refreshed inventory entry through one shared `ShardMutationBatch` instead of
 /// a full two-barrier `update_shard` call per file.
 #[test]
@@ -901,7 +961,7 @@ fn restore_directory_pays_a_constant_number_of_barriers_regardless_of_file_count
 }
 
 /// One `restore .` run over `dir_count` single-file, top-level directories, with
-/// `FORKLIFT_DEBUG_BARRIER_COUNT=1` and (when `Some`) `FORKLIFT_RESTORE_SHARD_GROUP_SIZE` set —
+/// `FORKLIFT_DEBUG_BARRIER_COUNT=1` and (when `Some`) `FORKLIFT_SHARD_BATCH_GROUP_SIZE` set —
 /// returns the barrier count that run paid.
 fn restore_directory_barrier_count_for_group_size(dir_count: usize, group_size: Option<usize>) -> u64 {
     let area = Area::new(&format!(
@@ -929,7 +989,7 @@ fn restore_directory_barrier_count_for_group_size(dir_count: usize, group_size: 
     let mut command = area.command(&["restore", "."]);
     command.env("FORKLIFT_DEBUG_BARRIER_COUNT", "1");
     if let Some(size) = group_size {
-        command.env("FORKLIFT_RESTORE_SHARD_GROUP_SIZE", size.to_string());
+        command.env("FORKLIFT_SHARD_BATCH_GROUP_SIZE", size.to_string());
     }
     let output = command.output().unwrap();
     assert!(output.status.success(), "restore failed: {}", String::from_utf8_lossy(&output.stderr));
@@ -937,11 +997,11 @@ fn restore_directory_barrier_count_for_group_size(dir_count: usize, group_size: 
     barrier_count(&output)
 }
 
-/// Regression (DESIGN.html §5.0 D item 10, PR B review finding #4): the pre-fix
+/// Regression: an earlier version of
 /// `ShardMutationBatch` held every shard it ever touched, parsed, in memory until the very end of
 /// `restore .`'s whole call — an unbounded batch that gives up the sharded inventory's whole
 /// RAM-scaling rationale for this one caller (worst case, a repository-wide `restore .`). The fix
-/// flushes (publishes, then starts a fresh batch) every `FORKLIFT_RESTORE_SHARD_GROUP_SIZE`
+/// flushes (publishes, then starts a fresh batch) every `FORKLIFT_SHARD_BATCH_GROUP_SIZE`
 /// shards instead of once for the whole call. A memory measurement would be slow and fragile to
 /// automate reliably, so this proves the *behavioral* consequence instead, the same way the
 /// project's other barrier-count tests do: a small group size over a fixed set of directories
@@ -970,7 +1030,7 @@ fn restore_directory_flushes_its_batch_in_bounded_groups_instead_of_one_unbounde
     assert!(one_group > 0, "the counter must observe real barrier work, got {one_group}");
 }
 
-/// Regression (DESIGN.html §5.0 D item 10, PR B review finding #5): anchoring a shard's published
+/// Regression: anchoring a shard's published
 /// mtime to the *first* file `ShardMutationBatch::update` touched in it (rather than a moment
 /// after every one of that shard's real writes) meant every file *after* the first in a
 /// multi-file shard had a real on-disk mtime that postdated the published shard mtime —
@@ -1041,6 +1101,123 @@ fn restore_directory_anchors_the_shard_mtime_after_every_files_own_write_not_jus
     }
 }
 
+/// The same mtime-anchor property as [`restore_directory_anchors_the_shard_mtime_after_every_
+/// files_own_write_not_just_the_first`], for `consolidate`: `apply_merge_actions` calls
+/// `ShardMutationBatch::update`/`stage_file_entry_from_stat_into` once per *action*, not once per
+/// *shard*, so several take-theirs actions landing in the same directory used to anchor that
+/// shard's published mtime at the first action's own touch — postdated by every later action's
+/// real write, permanently failing the stat-cache guard for every file after the first. Fixed by
+/// splitting `apply_merge_actions` into a working-directory-write pass followed by a
+/// shard-decision pass, so the batch's first touch of any shard happens strictly after every
+/// action in the whole merge has already written its file.
+#[test]
+fn consolidate_anchors_the_shard_mtime_after_every_actions_own_write_not_just_the_first() {
+    let area = Area::new("consolidate-anchors-mtime-after-every-write");
+    let warehouse = area.warehouse();
+
+    const FILE_COUNT: usize = 8;
+
+    let dir_path = warehouse.join("dir0");
+    std::fs::create_dir_all(&dir_path).unwrap();
+    for f in 0..FILE_COUNT {
+        std::fs::write(dir_path.join(format!("file{f}.txt")), format!("v1 {f}\n")).unwrap();
+    }
+
+    assert!(area.run(&["prepare"]).status.success());
+    assert!(area.run(&["config", "operator.name", "mtime-anchor@forklift"]).status.success());
+    assert!(area.run(&["config", "operator.identifier", "mtime-anchor@forklift"]).status.success());
+    assert!(area.run(&["load", "."]).status.success());
+    assert!(area.run(&["stack", "base"]).status.success());
+
+    // "feature" changes every file in dir0 — a clean take-theirs of each once merged.
+    assert!(area.run(&["palletize", "feature"]).status.success());
+    for f in 0..FILE_COUNT {
+        std::fs::write(dir_path.join(format!("file{f}.txt")), format!("v2 {f}\n")).unwrap();
+    }
+    assert!(area.run(&["load", "."]).status.success());
+    assert!(area.run(&["stack", "feature work"]).status.success());
+
+    // "main" diverges independently, touching none of dir0 — the merge below is a clean,
+    // conflict-free take-theirs of every changed file.
+    assert!(area.run(&["shift", "main"]).status.success());
+    std::fs::write(warehouse.join("unrelated.txt"), "unrelated v1\n").unwrap();
+    assert!(area.run(&["load", "."]).status.success());
+    assert!(area.run(&["stack", "main work"]).status.success());
+
+    let merge = area.run(&["consolidate", "feature"]);
+    assert!(merge.status.success(), "the merge must be clean: {}", String::from_utf8_lossy(&merge.stderr));
+
+    let shard_mtime = {
+        let _scope = forklift_core::globals::StorageRootScope::enter(&warehouse);
+        let data_path = forklift_core::util::file_utils::get_inventory_data_path_for_key("dir0");
+        std::fs::metadata(&data_path).unwrap().modified().unwrap()
+    };
+
+    for f in 0..FILE_COUNT {
+        let file_path = dir_path.join(format!("file{f}.txt"));
+        let file_mtime = std::fs::metadata(&file_path).unwrap().modified().unwrap();
+
+        assert!(shard_mtime >= file_mtime,
+            "\"dir0\"'s published shard mtime ({shard_mtime:?}) must be at or after every one of \
+             its files' own real write mtime — file{f}.txt was written at {file_mtime:?}, which \
+             is later");
+    }
+}
+
+/// The same mtime-anchor property as [`restore_directory_anchors_the_shard_mtime_after_every_
+/// files_own_write_not_just_the_first`], for `park pop`: its replay loop called `ShardMutationBatch::
+/// update`/`stage_file_entry_from_stat_into` once per *op*, not once per *shard*, so several ops
+/// landing in the same directory used to anchor that shard's published mtime at the first op's own
+/// touch. Fixed by splitting the replay into a working-directory-write pass followed by a
+/// shard-decision pass, so the batch's first touch of any shard happens strictly after every op in
+/// the whole pop has already written its file.
+#[test]
+fn park_pop_anchors_the_shard_mtime_after_every_ops_own_write_not_just_the_first() {
+    let area = Area::new("park-pop-anchors-mtime-after-every-write");
+    let warehouse = area.warehouse();
+
+    const FILE_COUNT: usize = 8;
+
+    let dir_path = warehouse.join("dir0");
+    std::fs::create_dir_all(&dir_path).unwrap();
+    for f in 0..FILE_COUNT {
+        std::fs::write(dir_path.join(format!("file{f}.txt")), format!("v1 {f}\n")).unwrap();
+    }
+
+    assert!(area.run(&["prepare"]).status.success());
+    assert!(area.run(&["config", "operator.name", "mtime-anchor@forklift"]).status.success());
+    assert!(area.run(&["config", "operator.identifier", "mtime-anchor@forklift"]).status.success());
+    assert!(area.run(&["load", "."]).status.success());
+    assert!(area.run(&["stack", "base"]).status.success());
+
+    for f in 0..FILE_COUNT {
+        std::fs::write(dir_path.join(format!("file{f}.txt")), format!("v2 {f}\n")).unwrap();
+    }
+    assert!(area.run(&["load", "."]).status.success());
+    assert!(area.run(&["park"]).status.success());
+
+    // Parking must have reset dir0 to head (v1) — popping re-applies v2 to every file.
+    assert_eq!(std::fs::read_to_string(dir_path.join("file0.txt")).unwrap(), "v1 0\n");
+
+    assert!(area.run(&["park", "pop"]).status.success());
+
+    let shard_mtime = {
+        let _scope = forklift_core::globals::StorageRootScope::enter(&warehouse);
+        let data_path = forklift_core::util::file_utils::get_inventory_data_path_for_key("dir0");
+        std::fs::metadata(&data_path).unwrap().modified().unwrap()
+    };
+
+    for f in 0..FILE_COUNT {
+        let file_path = dir_path.join(format!("file{f}.txt"));
+        let file_mtime = std::fs::metadata(&file_path).unwrap().modified().unwrap();
+
+        assert!(shard_mtime >= file_mtime,
+            "\"dir0\"'s published shard mtime ({shard_mtime:?}) must be at or after every one of \
+             its files' own real write mtime — file{f}.txt was written at {file_mtime:?}, which \
+             is later");
+    }
+}
+
 /// One `park` push, then `park pop`, over a fixed set of directories, each holding
 /// `files_per_dir` already-tracked files that are all given real content changes before both
 /// calls — returns `(park_push_barrier_count, park_pop_barrier_count)`, each measured with
@@ -1087,14 +1264,11 @@ fn park_push_and_pop_barrier_counts_for(files_per_dir: usize) -> (u64, u64) {
     (push_count, pop_count)
 }
 
-/// DESIGN.html §5.0 D item 10, finding #4 (`park pop`) and the PR A leftover it queued for PR B
-/// (`park` push's own `refresh_tracked_entries` funnel): `park pop`'s replay now publishes every
+/// `park pop`'s replay now publishes every
 /// re-applied file's shard mutation through one shared `ShardMutationBatch`, and `park` push's
 /// own `refresh_tracked_entries` call — already routed through the same
-/// `ShardOutcome`/`publish_shard_outcomes` join point `load` uses since PR A's round-2 review
-/// fix — is confirmed here to already pay a constant barrier count too (the backlog's "one
-/// barrier per touched directory" note predates that fix; this test replaces the manual
-/// measurement with a real assertion).
+/// `ShardOutcome`/`publish_shard_outcomes` join point `load` uses — is confirmed here to already
+/// pay a constant barrier count too.
 #[test]
 fn park_push_and_pop_both_pay_a_constant_number_of_barriers_regardless_of_file_count() {
     let (push_1, pop_1) = park_push_and_pop_barrier_counts_for(1);
@@ -1152,8 +1326,7 @@ fn park_barrier_count_with_root_touch(touch_root_without_changing_its_content: b
     barrier_count(&output)
 }
 
-/// Post-merge review finding A (durability-barrier audit, following PR #61's finding #1 fix):
-/// an ancestor that also happens to be one of a publish batch's own outcomes (here: the
+/// An ancestor that also happens to be one of a publish batch's own outcomes (here: the
 /// warehouse root, needing only a stat-drift `Carry` rewrite because `README.md` was touched
 /// without changing its content) used to be filtered out of `publish_shard_outcomes`'s phase A
 /// entirely, on the theory that phase B would publish it anyway. That reasoning covered content
@@ -1185,8 +1358,8 @@ fn park_pays_the_same_barrier_count_whether_or_not_a_carry_ancestor_is_also_touc
 }
 
 // -------------------------------------------------------------------------------------------
-// SIGKILL crash-consistency spreads for the batched merge/replay funnel (DESIGN.html §5.0 D
-// item 10, findings #2/#4). What a hard kill *can* prove: no shard is left durably referencing a
+// SIGKILL crash-consistency spreads for the batched merge/replay funnel. What a hard kill *can*
+// prove: no shard is left durably referencing a
 // missing/torn object, the store stays usable (`assert_consistent`), and a rollup never sits
 // stale-valid above content the batch actually changed (checked via the skip on/off equivalence
 // this file uses throughout — a real divergence there means a rollup wrongly survived a crash).
@@ -1194,10 +1367,9 @@ fn park_pays_the_same_barrier_count_whether_or_not_a_carry_ancestor_is_also_touc
 // (`touched_parents` is a `BTreeSet`, so `.forklift/inventory/` fsyncs before `.forklift/objects/`
 // within one barrier) — a process kill leaves every rename that already happened kernel-visible
 // regardless of fsync order, so an ordering hazard between two *separate* barriers (the blob
-// barrier finishing before the shard-content barrier even stages, DESIGN.html §5.0 D item 10,
-// finding #7) is verified by code inspection instead (see `ShardMutationBatch::publish`'s own doc
-// comment: the blob batch's `finish()` is a hard `?` before phase A/B are ever staged), exactly
-// as PR A's own finding #7 fix was.
+// barrier finishing before the shard-content barrier even stages) is verified by code inspection
+// instead (see `ShardMutationBatch::publish`'s own doc
+// comment: the blob batch's `finish()` runs before phase A/B are ever staged).
 // -------------------------------------------------------------------------------------------
 
 /// Time a few uninterrupted `consolidate` runs and return the slowest — the merge counterpart of
@@ -1311,8 +1483,8 @@ fn run_consolidate_kill_spread(
     advanced
 }
 
-/// Extends the crash-consistency spine to `consolidate`'s batched merge-action funnel
-/// (DESIGN.html §5.0 D item 10, finding #2): every merge action's shard mutation (and any new
+/// Extends the crash-consistency spine to `consolidate`'s batched merge-action funnel:
+/// every merge action's shard mutation (and any new
 /// blob a `Merged` action stages) is now decided in memory and published once through
 /// `inventory_utils::ShardMutationBatch` instead of one `write_shard_mutation` call per action.
 /// SIGKILL `consolidate` at a spread of delays straddling its write window; after every kill,
@@ -1488,8 +1660,8 @@ fn run_restore_kill_spread(
     actually_killed
 }
 
-/// Extends the crash-consistency spine to `restore <dir>`'s batched replay (DESIGN.html §5.0 D
-/// item 10, finding #4): every restored file's refreshed inventory entry is now decided in
+/// Extends the crash-consistency spine to `restore <dir>`'s batched replay: every restored file's
+/// refreshed inventory entry is now decided in
 /// memory and published once per touched shard through `inventory_utils::ShardMutationBatch`,
 /// instead of one `update_shard` call per file. SIGKILL `restore .` at a spread of delays; after
 /// every kill, heal with an uninterrupted `restore .` and confirm every file converges to the
@@ -1673,8 +1845,8 @@ fn run_park_pop_kill_spread(
     popped
 }
 
-/// Extends the crash-consistency spine to `park pop`'s batched replay (DESIGN.html §5.0 D item
-/// 10, finding #4): every re-applied op's shard mutation is now decided in memory and published
+/// Extends the crash-consistency spine to `park pop`'s batched replay: every re-applied op's
+/// shard mutation is now decided in memory and published
 /// once per touched shard through `inventory_utils::ShardMutationBatch`, instead of one
 /// `stage_file_entry_from_stat`/`update_shard` call per op. SIGKILL `park pop` at a spread of
 /// delays straddling its write window; `pop_parked`'s diff is recomputed fresh from immutable
