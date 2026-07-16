@@ -583,3 +583,115 @@ fn a_shard_that_vanishes_out_from_under_load_still_invalidates_its_ancestors() {
     let resolved = forklift_core::util::tree_utils::resolve_subtree_hash(&tree_hash, "a/b/c").unwrap();
     assert!(resolved.is_none(), "the stacked tree must not contain the deleted subtree \"a/b/c\"");
 }
+
+// -------------------------------------------------------------------------------------------
+// `park` regression (DESIGN.html §5.0 D item 10, finding #3): `park`'s tree build used to call
+// `tree_utils::build_tree_from_inventory` (no head to compare rollups against, so no skip was
+// ever possible on this path) instead of `build_tree_from_inventory_deferred`, unlike `stack`.
+// This pins that `park` now gets the same rollup-based skip `stack` already had.
+// -------------------------------------------------------------------------------------------
+
+#[test]
+fn park_gets_the_rollup_based_skip_stack_already_had() {
+    let warehouse = Warehouse::new("park-rollup-skip", false);
+    warehouse.prepare();
+
+    warehouse.write_file("subtree_a/file.txt", "a v1\n");
+    warehouse.write_file("subtree_b/deep/file.txt", "b v1\n");
+    warehouse.run_ok(&["load", "."]);
+    warehouse.run_ok(&["stack", "base"]);
+
+    let rollup_before = shard_rollup(&warehouse, "subtree_b/deep");
+    assert!(rollup_before.is_some(), "subtree_b/deep must be stamped after the base stack");
+
+    // Touch only subtree_a, and park without an intervening explicit `load` — `park`'s own
+    // working-directory refresh (`refresh_tracked_entries`) stages tracked changes itself.
+    warehouse.write_file("subtree_a/file.txt", "a v2\n");
+
+    let mut command = warehouse.command(&["park"]);
+    command.env("FORKLIFT_DEBUG_ROLLUP_SKIP_COUNT", "1");
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "park failed: {}", String::from_utf8_lossy(&output.stderr));
+
+    // The debug counter is the ground truth that the skip actually fired for `park`'s tree
+    // build, not just that the resulting parked parcel happens to be correct.
+    assert!(skip_count(&output) >= 1,
+        "park's tree build must skip the untouched subtree_b/deep subtree, exactly like stack's does");
+
+    // subtree_b/deep's rollup must still name the same (unchanged) subtree hash. `park` always
+    // rewrites every shard from the head tree at the end (resetting the warehouse back to head),
+    // so this is not "untouched bytes on disk" the way the stack regression above checks it —
+    // but the value stamped by that reset is the subtree's tree hash either way, so an unchanged
+    // subtree stamps back to the exact same rollup regardless of whether the skip fired.
+    let rollup_after = shard_rollup(&warehouse, "subtree_b/deep");
+    assert_eq!(rollup_before, rollup_after,
+        "an untouched subtree's rollup must be the same value before and after a park");
+}
+
+// -------------------------------------------------------------------------------------------
+// Regression for a PR #61 review finding on `refresh_tracked_entries` (`park`'s
+// working-directory refresh): its pass-1/pass-2 split read every tracked shard's content in
+// pass 1, then published each pass 2 in metadata order. A directory sorting *before* the root's
+// "./" metadata entry (any name starting with a byte < 0x2E — e.g. this route-group-style name)
+// whose own real content change ran through the ancestor-clear funnel in pass 2 correctly
+// cleared the root's rollup on disk — but the root's *own*, later pass-2 write then restamped
+// the stale pass-1-decided rollup right back over that clear, because it never re-checked
+// whether it had just become an ancestor of some other change decided in the very same pass.
+// `park` then took the whole-tree rollup-skip fast path (the restamped rollup matched head) and
+// refused with "nothing to park", silently dropping the real edit.
+// -------------------------------------------------------------------------------------------
+
+#[test]
+fn park_never_restamps_a_stale_rollup_over_a_same_pass_ancestor_clear() {
+    let warehouse = Warehouse::new("park-ancestor-clear-race", false);
+    warehouse.prepare();
+
+    // "(marketing)" sorts before the root's "./" metadata entry (0x28 < 0x2E) — the exact
+    // ordering the review's repro depends on.
+    warehouse.write_file("(marketing)/page.tsx", "page v1\n");
+    warehouse.write_file("README.md", "readme v1\n");
+    warehouse.run_ok(&["load", "."]);
+    warehouse.run_ok(&["stack", "base"]);
+
+    let head_before = warehouse.head_tree_hash("main");
+    let root_rollup_before = shard_rollup(&warehouse, "");
+    assert_eq!(root_rollup_before.as_deref(), Some(head_before.as_str()),
+        "the root shard must be stamped with the head tree hash after the base stack");
+
+    // A real content change inside the directory that sorts before "./" in metadata order...
+    warehouse.write_file("(marketing)/page.tsx", "page v2 -- a real edit\n");
+    // ...and a same-*content* rewrite of a root-level file: its shard entry is rebuilt (the
+    // rewrite advances its mtime past the shard's own, so the stat-cache fast path cannot trust
+    // it), but the rebuilt hash matches the old one exactly, so this is "changed" without being
+    // "content_changed" — the exact combination that hit the buggy `save_inventory` path
+    // (as opposed to the ancestor-clearing `write_shard_mutation` path) for the root shard.
+    warehouse.write_file("README.md", "readme v1\n");
+
+    let park = warehouse.run(&["park"]);
+    assert!(park.status.success(),
+        "park must capture the real edit under (marketing)/, not report nothing to park: {}",
+        String::from_utf8_lossy(&park.stderr));
+
+    // Not just a successful exit: pop the parked parcel right back and confirm the edit is
+    // actually there, not silently dropped along the way.
+    warehouse.run_ok(&["park", "pop"]);
+
+    let content = std::fs::read_to_string(warehouse.root.join("(marketing)/page.tsx")).unwrap();
+    assert_eq!(content, "page v2 -- a real edit\n",
+        "the parked-then-popped content must be the real edit, not silently dropped");
+
+    // The pallet head must still be exactly where `stack base` left it — a park never advances
+    // it (only stacks do), so this also confirms park did not (wrongly) no-op against a stale,
+    // restamped root rollup that happened to equal head.
+    assert_eq!(warehouse.head_tree_hash("main"), head_before);
+}
+
+// A PR #61 review finding (#6) on `refresh_tracked_entries` — a shard rewritten only because its
+// stat data drifted (no real content change) used to publish with the wall clock's value *when
+// the whole refresh finished deciding every tracked shard*, not the instant this particular shard
+// was actually verified — is covered by
+// `crates/forklift-core/tests/refresh_tracked_entries_verified_at.rs`, not here: `park`'s own
+// reset-to-head step (`inventory_utils::replace_all_inventories`) unconditionally rewrites every
+// shard right after `refresh_tracked_entries` returns, so a shard's mtime observed after a full
+// `park` command reflects that later, unrelated rewrite — not what this refresh itself published.
+// That dedicated test calls `refresh_tracked_entries` directly instead.

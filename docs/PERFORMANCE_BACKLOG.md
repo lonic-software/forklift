@@ -219,7 +219,15 @@ until then this is the store working as designed, not a bug.
 
 ### e. Durability-barrier audit (write-batching sweep)
 
-**Status: audit complete (2026-07-15, on main @ 18a04f9); implementation queued.**
+**Status: audit complete (2026-07-15, on main @ 18a04f9); findings 1 and 3 shipped
+(PR A, 2026-07-16), then hardened by a second, multi-agent review of PR A itself
+(2026-07-16 — 10 findings, all resolved: #1 data-loss fixed, #2 dedupe fixed, #3
+docs corrected against a verified `gc` mitigation, #4 invariant comment fixed, #5
+`park`'s read-phase parallelism restored, #6 mtime-anchoring fixed, #7 blob/shard
+ordering fixed for `load` (refuted for `park`, verified separate barrier), #8 dead
+`Mutex` traffic removed, #9 dead code deleted, #10 barrier-count now asserted by a
+test); findings 2 and 4 (the shared multi-mutation join-point primitive) still
+queued for PR B.**
 Three unrelated pieces of work had converged on the same cost in short succession —
 quick-win #3's `stack` fsync batching, the rollup-hash work's two rounds of
 shard-write batching, and PR #59's benchmark verification surfacing unbatched-barrier
@@ -236,23 +244,114 @@ itself as well as the findings.
 
 **Findings, ranked** (measured on synthetic corpora, release builds):
 
-1. **`load`'s per-file blob store** (`inventory_utils::build_inventory`) — ~7–8 ms
-   per changed file (N=50 `load`: ~376 ms total, ~326 ms of it this). The
-   rollup-hash join point batched shard writes but never the blob stores; fix is
-   `store()` → `store_deferred()` into the context's existing `WriteBatch`. Highest
-   value, lowest risk — `load` is the most-run mutating command.
+1. **FIXED (PR A, hardened by review round 2). `load`'s per-file blob store**
+   (`inventory_utils::build_inventory`) — ~7–8 ms per changed file (N=50 `load`:
+   ~376 ms total, ~326 ms of it this). The rollup-hash join point batched shard
+   writes but never the blob stores; fixed by staging each changed or brand-new
+   file's blob (`LooseObject::store_deferred`) into a batch — durable no later than
+   the shard that references it. Re-measured on this box (N=50, synthetic corpus,
+   7-run median, release build): **413 ms → 37 ms** (≈11×), unchanged after review
+   round 2's fixes below. Highest value, lowest risk — `load` is the most-run
+   mutating command.
+   * **Round 2, finding #7 (ordering).** The blob batch and the join point's shard-content
+     batch turned out *not* to be safe to merge into one `WriteBatch`/one `run_write_barrier`
+     call the way PR A shipped it: `touched_parents` there is a `BTreeSet<PathBuf>`, so
+     `.forklift/inventory/` directories sort (and fsync) before `.forklift/objects/` ones —
+     a crash between the two could durably publish a shard naming a blob whose own rename
+     never became durable. Fixed by giving the blob batch (`InventoryBuilderContext::blob_batch`)
+     its own barrier, finished strictly before the join point even stages shard content — three
+     barriers total per `load` now (blob, ancestor-clear, shard-content) instead of two; SIGKILL
+     tests structurally cannot catch this ordering hazard (a kill leaves all renames
+     kernel-visible regardless of fsync order), so this was verified by code inspection, not a
+     crash test.
+   * **Round 2, finding #2 (dedupe).** Batching defeated `store_deferred`'s existence-based
+     dedupe: `does_object_exist` cannot see a write staged earlier in the *same*, not-yet-finished
+     batch, so N occurrences of identical content each independently decided "not on disk yet"
+     and staged their own full compressed temp — a load with heavy content duplication could
+     turn ~1 MB of real data into tens of GB of staged temps, and fail with ENOSPC on a load that
+     used to succeed. Fixed with `WriteBatch::reserve_final_path` — an atomic check-and-reserve
+     on the batch's final-path set, consulted (and populated) before compressing — so only the
+     first occurrence of a given hash in a batch ever stages anything; a 50-occurrence regression
+     test (`store_deferred_dedupes_repeated_identical_content_within_one_batch`) failed with 50
+     staged temps before the fix, passes with exactly 1 after.
 2. **`consolidate`/cherry-pick's per-merge-action funnel** (`apply_merge_action`) —
    measured ~9.1 ms/action; a 50-action merge is ≈570 ms, confirming this doc's
    original ~100-barrier prediction. Needs the phased join-point shape (a shared
    phase-A ancestor-clears sub-barrier, a shared phase-B content-writes
    sub-barrier; the two phases must never merge into one). Medium risk — the
-   busiest write path — so needs adversarial review.
-3. **`park` push** — ~8.9 ms/changed file across three unbatched layers; half the
-   fix is swapping `build_tree_from_inventory` for the already-existing
-   `_deferred` variant, which also gives `park` the rollup-hash skip it currently
-   lacks.
+   busiest write path — so needs adversarial review. Queued for PR B.
+3. **FIXED (PR A, hardened by review round 2). `park` push** — ~8.9 ms/changed file
+   across three unbatched layers: the per-file blob store inside
+   `refresh_tracked_entries`, the per-directory tree-object store inside
+   `tree_utils::build_tree_from_inventory` (the non-deferred variant `park` used
+   to call), and the parcel object's own store. All three are now staged into one
+   shared `WriteBatch` — `refresh_tracked_entries` batches its own blob stores into
+   an internal barrier (finished before any shard rewrite, so a rewritten shard's
+   entries never outrun the blobs they reference), and `park` was switched to
+   `build_tree_from_inventory_deferred` (which also gives `park` the rollup-hash
+   skip it previously lacked) and now stages the parcel object into the same batch,
+   finished once before the signature sidecar and the parked-list record.
+   Re-measured on this box after review round 2's fixes (fixed 8-directory corpus,
+   7-run median, release build): **N=50 → 153 ms → 89 ms**, a further ≈1.7× on top
+   of PR A's own ≈4.1× (main's 632 ms) — see finding #5 below, which is what moved
+   this number again.
+   * **Round 2, finding #1 (data loss, CONFIRMED).** `refresh_tracked_entries`'s pass-1/pass-2
+     split read every tracked shard's rollup up front (pass 1), then published each in pass 2 in
+     metadata order. A directory sorting *before* the root's `"./"` metadata entry (any name
+     starting with a byte < `0x2E`) whose own real content change ran through the
+     ancestor-clearing funnel in pass 2 correctly cleared the root's rollup on disk — but the
+     root's *own*, later pass-2 write then restamped the *stale* pass-1-decided rollup right back
+     over that clear, since it never re-checked whether it had just become an ancestor of some
+     other change decided in the same pass. `park` then took the whole-tree rollup-skip fast path
+     (the restamped rollup matched head) and refused with "nothing to park" — the real edit was
+     never captured, and a subsequent `stack` would have taken the same skip and silently dropped
+     it from the parcel. Fixed by reusing `load`'s join-point machinery instead of a bespoke
+     second implementation: `refresh_tracked_entries` now decides every shard through the same
+     `ShardOutcome`/`publish_shard_outcomes` primitive `load` does, so a carried rollup that turns
+     out to be an ancestor of another shard's real change (computed from *every* decision in the
+     batch, not just the ones already processed) is dropped before anything is published. A CLI
+     regression test translating the review's exact repro (a `(marketing)/` directory, a real edit
+     inside it, a same-content root-level rewrite) failed with the predicted "nothing to park"
+     error on the pre-fix branch and passes now.
+   * **Round 2, finding #6 (mtime widening, PLAUSIBLE, confirmed real).** The same pass-1/pass-2
+     split published a stat-only shard rewrite (no real content change, just stale stat data) with
+     "now" — the moment the *whole* refresh finished deciding every tracked shard — instead of the
+     instant *that* shard was actually verified. `is_entry_unchanged`'s "racily clean" guard trusts
+     a cached entry only when its own mtime predates the shard's published mtime; publishing later
+     than the true verification instant widens that trust window, so a file edited in the gap
+     could be silently missed forever after. Fixed by the same join-point reuse as finding #1 —
+     `publish_shard_outcomes` anchors every shard's published mtime to its own decision-time
+     `verified_at`, exactly like `load`'s join point already does. A dedicated (cwd-isolated)
+     integration test manufactures a measurable gap by deciding 1,000 shards and checking the
+     first-decided one's published mtime: unfixed, it landed **~41 ms** after the call started
+     (≈ the time to decide all 1,000 shards, i.e. "now" at pass-2 time); fixed, **~0.2 ms**
+     (≈ the time to decide just that one shard).
+   * **Round 2, finding #5 (park's read-phase parallelism, CONFIRMED).** `park` traded a parallel
+     per-directory shard read (its pre-PR-A tree build read+parsed each shard from inside its own
+     `TaskExecutor` task) for a single serial `prepare_stack_inventory()` pass — an N-core-to-1-core
+     regression on park's read phase in a PR whose stated purpose was making park faster. Fixed by
+     fanning `prepare_stack_inventory`'s read+parse pass out across every core
+     (`fanout_utils::fanout_map`), while still reproducing the exact "first conflict, or first
+     parse error, in sorted key order wins" priority the serial loop guaranteed (verified by an
+     existing regression test, `prepare_stack_inventory_reports_a_conflict_found_before_a_later_corrupt_shard`,
+     which still passes). This is what took the N=50 synthetic number from 153 ms to 89 ms above,
+     and git.git-scale park push from 166 ms (PR A) to ~156 ms (see the git.git sanity numbers
+     below — the remaining cost there is the unrelated O(all-tracked-files) stat scan
+     `refresh_tracked_entries` always pays inside itself, not the read parallelism this fixed).
+   * **Round 2, finding #7 (blob/object ordering — verified, refuted for `park` specifically).**
+     Unlike `load` (see finding #1 in item 1's entry above), `park`'s own tree/parcel object batch
+     does *not* have the analogous hazard: the parked-list record (what makes a parcel *reachable*)
+     is written by `park_utils::write_parked`, a separate, immediate `write_file_atomically` call
+     strictly after `batch.finish()` returns — never batched with the tree/parcel objects
+     themselves. So even in the crash window where some of those objects might not all be durable,
+     nothing durable ever references them yet (confirmed by code inspection: `write_parked` and
+     `sign_utils::store_parcel_signature` are both outside `batch`).
+   * The per-*shard* (not per-object) mutation funnel inside `refresh_tracked_entries` still pays
+     one barrier per touched-directory-that-needs-an-ancestor-clear — that collapse needs the same
+     shared multi-mutation join-point primitive as findings 2/4, so a change that touches many
+     distinct directories still costs more than one that touches a few; queued for PR B.
 4. **`restore <dir>` (plain) and `park pop`** — ~9.2–9.6 ms/file; same join-point
-   primitive as #2, bundles with it.
+   primitive as #2, bundles with it. Queued for PR B.
 5. **`remove <dir>`'s per-shard loop and commit-graph multi-shard writes** —
    untimed, small, rare operations; demand-gated.
 
@@ -265,16 +364,124 @@ measured flat (30→36 ms, N=1→20), confirming the shipped batching already wo
 move; ancestor clears durable before own content (phases may be shared across
 callers but never merged with each other); durable-before-destructive dedup;
 loose-object fsync stays; working-directory writes stay deliberately unfsynced.
+PR A's changes stay inside this list: blobs join the *same* barrier as the shard
+content that references them (at least as strong as "no later than"), and `park`'s
+object batch (blobs/trees/parcel) is finished strictly before the signature sidecar
+and the parked-list record, exactly like `stack`'s identical ordering.
 
 **Implementation note.** Several loops call `update_shard` per file against the
 same shard; the batching work needs to collapse same-shard actions into one
 read-modify-write, not merely share one fsync across N rewrites of the same file.
+PR A's `refresh_tracked_entries` rewrite does this implicitly for its blob layer (one
+shared blob batch across every shard it touches); the shard-content layer itself
+(one `write_shard_mutation`/`save_inventory` call per shard) is unchanged, left for
+PR B's shared primitive.
 
-**Correctness.** No missing-barrier bug was found anywhere in the sweep.
+**git.git sanity (PR A, re-verified after review round 2).** A full first-time `load` of
+git.git's working tree (4,775 files, every file brand-new — the same per-file blob-store
+barrier finding 1 fixed) went **35.8 s → 0.66 s** (≈54×) under PR A; unchanged by round
+2 (that fix only reordered *when* the same work becomes durable, not how much of it there
+is). A git.git-scale incremental script (5 real files touched, `import-git`'d history,
+release build) re-measured after round 2's fixes, median of 5 runs (1 for `stack`, which
+consumes its staged input, so 6 independent touch-load-stack cycles were used instead):
+`stocktake` **28.8 ms**, `diff --staged` **20.2 ms**, `stack` **55.9 ms** — no regression
+on any of the three read/write paths PR A's own table claimed 22/16/54 ms for (`diff
+--staged` in particular came in faster, 20.2 ms vs. the original 15-16 ms measurement's
+*touch count* being different — not a like-for-like comparison, so not claimed as a further
+win, just noted as no regression). `park` push at the same git.git scale: **155.7 ms**
+(PR A: 166 ms) — a small further improvement from finding #5's read-phase parallelism fix,
+smaller than the synthetic-corpus jump below because the dominant cost here is
+`refresh_tracked_entries`'s own O(all-4,775-tracked-files) stat scan, which finding #5 did
+not touch (it fixed the *tree-build* read phase, a separate step).
 
-**Recommended implementation packaging (queued).** PR A = findings 1+3 (low risk).
-PR B = findings 2+4 (one shared multi-mutation join-point primitive + adversarial
-review). Finding 5 is demand-gated.
+**Synthetic-corpus re-verification (release build, 7-run median, same fixed 8-directory
+corpus PR A used).** `load` N=50: **37.9 ms** (PR A: 37 ms) — unchanged, as expected:
+finding #7's extra barrier (blob barrier now strictly separate from, and before, the
+shard-content barrier) did not show a measurable cost on this box for this corpus shape,
+within run-to-run noise. `park` push N=50: **89.3 ms** (PR A: 153 ms, main: 632 ms) — a
+further ≈1.7× from finding #5's fix restoring `park`'s read-phase parallelism, ≈7.1×
+total against main.
+
+**Barrier-count sanity.** A process-wide debug counter (`file_utils::barrier_count`,
+`FORKLIFT_DEBUG_BARRIER_COUNT=1`) now backs a real assertion instead of only a manual
+measurement (finding #10) —
+`crates/forklift/tests/crash_consistency.rs::load_pays_a_constant_number_of_barriers_regardless_of_changed_file_count`
+asserts `load`'s barrier count is identical whether 1 or 10 files change in each of 5
+already-tracked directories. The count itself moved from PR A's constant 2 (phase A +
+phase B) to a constant **3** (blob barrier + phase A + phase B — finding #7's fix, see
+item 1 above), gated by `fsync_enabled()` like the fsync work it counts (also finding
+#10). `park` push's barrier count still tracks the number of *directories* touched (not
+files), unchanged by review round 2 — that residual per-shard funnel is explicitly left
+for PR B (see findings 2/4).
+
+**Correctness.** No missing-barrier bug was found anywhere in the original sweep,
+but review round 2 (a second, independent multi-agent pass specifically over PR A's own
+diff) found and fixed a real data-loss bug (finding #1) and a real staleness-widening bug
+(finding #6) in the code that sweep produced — see the round-2 findings under item 3 above,
+and "Review findings, round 2" below for the full list, including the two findings verified
+and refuted. PR A's own crash-consistency coverage stands unchanged:
+`crates/forklift/tests/crash_consistency.rs` gained a `load`-targeted SIGKILL spread
+(`killing_load_midway_never_leaves_a_shard_referencing_a_missing_or_torn_blob`)
+proving a killed `load` never leaves a shard durably referencing a blob that isn't, and a
+`park`-targeted spread (`killing_park_midway_never_leaves_a_parked_parcel_referencing_a_missing_or_torn_object`)
+covering the same property for `park`'s own object batch — every kill that lands after the
+parked-list record becomes durable is popped right back, a real read of every tree and blob
+the parcel references. Review round 2's own finding #7 note: those SIGKILL tests structurally
+cannot catch a directory-fsync-*ordering* hazard (a kill leaves every completed rename
+kernel-visible regardless of fsync order) — the finding #7 fix for `load` was verified by
+code inspection instead, and `park`'s analogous hazard was verified absent the same way.
+
+**Review findings, round 1 (fixed before PR A merged).** Two independent review passes over
+PR A's own draft caught: (1) `refresh_tracked_entries`'s pass-1/pass-2 split had silently
+dropped the keep-whatever-was-decided resilience `create_inventory_for_directory` gives
+`load` on a mid-scan failure — fixed by deciding each shard through a fallible closure so
+every shard decided *before* a failure still reaches pass 2; (2) `park` built a
+`PreparedInventory` (whose `shards` map is silently incomplete past the first conflict entry
+it finds) without the paired `has_conflict_entries_in` guard `stack_parcel` always checks
+immediately after building its own — safe in practice only because the function's earlier,
+decoupled `has_conflict_entries()` call already refuses before any conflict can exist, but
+not a guarantee at the point `prepared` is actually consumed; fixed by adding the same guard
+`stack` has. Doc comments that overclaimed the blob-staging exception covered a
+chunked/large file's recipe and chunks too (it doesn't — those still store immediately,
+unchanged, out of scope for this finding) were also corrected.
+
+**Review findings, round 2 (a second, independent multi-agent review of PR A itself, once
+it was posted as PR #61 — 10 findings, all resolved).** #1 CONFIRMED, data loss (see item 3 above) —
+fixed by reusing `load`'s join-point machinery in `refresh_tracked_entries`. #2 CONFIRMED,
+`store_deferred` dedupe defeated by batching (see item 1 above) — fixed with
+`WriteBatch::reserve_final_path`. #3 CONFIRMED, the stranded-temp window widened from one
+file to a whole batch on a hard kill — verified (`gc_utils`'s ordinary reachability sweep,
+not a name-pattern sweeper, already reclaims a stranded `WriteBatch` temp past the grace
+period exactly like any other unreferenced loose file; new tests
+`gc_sweeps_a_stranded_write_batch_temp_past_the_grace_period` and
+`gc_protects_a_stranded_write_batch_temp_within_the_grace_period` pin this) and the
+misleading "no stale-temp sweeper" doc language this finding flagged as self-contradictory
+was corrected in `file_utils.rs` and `bulk_store_session.rs`'s tests, rather than inventing
+a new sweep mechanism — finding #2 also shrinks the *worst case* here from O(occurrences)
+to O(distinct hashes). #4 CONFIRMED, a false all-or-nothing invariant in a comment (`finish()`
+actually publishes every rename before the first failure, not none) — the comment was
+rewritten to state the true, still-safe, "drop everything on any failure" behavior and why
+it is conservative rather than incorrect; carried into `publish_shard_outcomes`'s own doc
+comment for the same reasoning PR B will build on. #5 CONFIRMED, `park`'s read-phase
+N-core-to-1-core regression (see item 3 above) — fixed by parallelizing
+`prepare_stack_inventory`. #6 PLAUSIBLE, confirmed real, mtime widening (see item 3 above)
+— fixed by the same join-point reuse as #1. #7 PLAUSIBLE, confirmed real for `load` (see
+item 1 above; fixed with a dedicated blob barrier), refuted for `park` specifically (see
+item 3 above; verified the parked-list record is a genuinely separate, later barrier). #8
+CONFIRMED, cleanup — `park`'s tree build paid `Mutex` traffic for a `tree_hashes` map it
+immediately discarded; `track_tree_hashes` is now a parameter `build_tree_from_inventory_deferred`
+takes explicitly (`stack` passes `true`, `park` passes `false`). #9 CONFIRMED, cleanup —
+`build_tree_from_inventory` (the plain, disk-reading, immediately-writing form) had zero
+callers left; deleted, along with the `ShardSource`/`ObjectSink` enums it was the sole
+`Disk`/`Immediate` variant of (both collapsed to their single remaining case). #10
+CONFIRMED, cleanup — `barrier_count` existed but nothing asserted on it; now backed by
+`load_pays_a_constant_number_of_barriers_regardless_of_changed_file_count` (see
+"Barrier-count sanity" above) and gated by `fsync_enabled()` to match the work it counts.
+
+**Recommended implementation packaging.** PR A (shipped) = findings 1+3 (low risk).
+PR B (queued) = findings 2+4 (one shared multi-mutation join-point primitive +
+adversarial review), plus the residual per-shard funnel finding 3 left behind.
+Finding 5 is demand-gated.
 
 ---
 

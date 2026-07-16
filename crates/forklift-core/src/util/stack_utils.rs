@@ -123,8 +123,11 @@ pub async fn stack_parcel(description: Option<String>) -> Result<(String, String
         None => None,
     };
 
+    // `track_tree_hashes: true` — the per-key hashes below are read to stamp shards' rollups
+    // after a successful stack (DESIGN.html §5.0 D item 10, finding #8; `park`'s own call passes
+    // `false`, since it discards the map immediately instead).
     let (partial_root, tree_hashes, untouched_keys) = tree_utils::build_tree_from_inventory_deferred(
-        &prepared, &batch, head_root_hash.as_deref(), &scope,
+        &prepared, &batch, head_root_hash.as_deref(), &scope, true,
     ).await?;
     let partial_root = partial_root
         .ok_or("There is nothing to stack. Use the \"load\" command to stage changes first.".to_string())?;
@@ -150,8 +153,7 @@ pub async fn stack_parcel(description: Option<String>) -> Result<(String, String
         // Runs sequentially (no TaskExecutor here), but staged into the very same batch as the
         // parallel tree build above so every spine object it writes joins the same one barrier.
         tree_utils::build_scoped_root_tree(
-            head_root_hash.as_deref(), &partial_root, &scope, skeleton.entries(),
-            &tree_utils::ObjectSink::Deferred(std::sync::Arc::clone(&batch)),
+            head_root_hash.as_deref(), &partial_root, &scope, skeleton.entries(), &batch,
         )?
     };
 

@@ -18,13 +18,26 @@ pub struct InventoryBuilderContext {
     /// These inventories should be removed.
     pub dirty_inventory_paths: Arc<Mutex<BTreeSet<String>>>,
 
-    /// The shared join-point publish batch for this whole `load` (DESIGN.html §5.0 D item 8) —
-    /// every directory's shard write is staged here (see [`ShardOutcome`]) and published as one
-    /// durability barrier for the whole walk, instead of one per directory. Populated, and
-    /// finished, only at the single-threaded join point in
-    /// `inventory_utils::create_inventory_for_directory` — never touched from inside a
-    /// concurrent per-directory task.
-    pub batch: Arc<file_utils::WriteBatch>,
+    /// The shared batch for this whole `load`'s per-file blob stores (DESIGN.html §5.0 D item 10,
+    /// finding #1) — the one thing a concurrent per-directory task touches directly (via
+    /// `LooseObject::store_deferred`), since a content-addressed object write is safe to share
+    /// across threads exactly like `stack`'s tree build already relies on (see
+    /// [`file_utils::WriteBatch::stage`]'s doc comment).
+    ///
+    /// Finished on its own, strictly *before* any shard content is staged (see
+    /// `create_inventory_for_directory`'s join point, which staged shard content through its own
+    /// local batch inside `publish_shard_outcomes`, not through this context at all) — DESIGN.html
+    /// §5.0 D item 10, finding #7: a shard published afterward can name one of these blobs'
+    /// hashes, so the blob must already be durable — not merely staged in some batch that has not
+    /// been through its own `finish()` yet — before that shard's rename can land. Sharing one
+    /// `WriteBatch` (and hence one `run_write_barrier` call) between blobs and shard content would
+    /// not give that ordering: `touched_parents` there is a `BTreeSet<PathBuf>`, so
+    /// `.forklift/inventory/` directories sort (and get fsynced) before `.forklift/objects/` ones,
+    /// and a crash between the two could durably publish a shard naming a blob whose own rename
+    /// never became durable. A large (chunked) file's recipe and chunks are a separate,
+    /// still-unbatched write this batch never sees — see `inventory_utils::build_inventory`'s own
+    /// doc comment for why that is out of scope here.
+    pub blob_batch: Arc<file_utils::WriteBatch>,
 
     /// Every ancestor key some directory's real content change (or the post-walk dirty-path
     /// deleted-marking) requires invalidated. Collected here by every task instead of cleared
@@ -47,7 +60,7 @@ impl InventoryBuilderContext {
             base_context: Arc::new(BaseTaskContext::new()),
             new_inventory_paths: Arc::new(Mutex::new(BTreeSet::new())),
             dirty_inventory_paths: Arc::new(Mutex::new(BTreeSet::new())),
-            batch: Arc::new(file_utils::WriteBatch::new()),
+            blob_batch: Arc::new(file_utils::WriteBatch::new()),
             clear_keys: Arc::new(Mutex::new(BTreeSet::new())),
             outcomes: Arc::new(Mutex::new(BTreeMap::new())),
         }

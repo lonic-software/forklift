@@ -6,7 +6,7 @@ use forklift_core::model::parcel_action::ParcelAction;
 use forklift_core::util::shift_utils::FileOp;
 use serde::Serialize;
 use forklift_core::util::{
-    config_utils, inventory_utils, merge_utils, object_utils, pallet_utils, park_utils,
+    config_utils, file_utils, inventory_utils, merge_utils, object_utils, pallet_utils, park_utils,
     scope_utils, shift_utils, sign_utils, stack_utils, tree_utils,
 };
 use crate::output::{self, CommandOutput};
@@ -45,28 +45,77 @@ pub async fn park_changes() -> Result<(), String> {
     let head_tree_hash = object_utils::load_parcel(&head)?.tree_hash;
 
     // Stage the whole work in progress: modified tracked files are rehashed, deleted
-    // tracked files become staged removals. Untracked files stay untracked.
+    // tracked files become staged removals. Untracked files stay untracked. Its own blob
+    // stores are already batched internally (DESIGN.html §5.0 D item 10, finding #3).
     inventory_utils::refresh_tracked_entries()?;
-
-    let partial_root = tree_utils::build_tree_from_inventory().await?
-        .ok_or("There is nothing to park.".to_string())?;
 
     // In a scoped (sparse) bay the dock only materializes the in-scope subtree(s); splice it
     // onto the head's spine exactly like `stack` does (§3.2), so the parked parcel commits the
     // same root a full bay would — `park` is documented to inherit the overlay, and a truncated
     // parked tree would silently break that. The "nothing to park" check below must compare the
-    // *spliced* root against head, or it never fires in a scoped bay.
+    // *spliced* root against head, or it never fires in a scoped bay. Computed before the tree
+    // build below (not just for the splice branch, as before) because the rollup-based skip
+    // (stage 2) needs it too — see `tree_utils::compute_rollup_skip_plan`'s scoped-bay caveat.
     let scope = scope_utils::current_scope()?;
+
+    // Every tree object below (and, further down, the parcel object) is staged into `batch`
+    // instead of fsynced immediately — one durability barrier for the whole push instead of one
+    // per object (DESIGN.html §5.0 D item 10, finding #3). Nothing may depend on a staged
+    // object's durability or visibility until `batch.finish()` below returns `Ok` — see
+    // `stack_utils::stack_parcel`'s identical batch, which this mirrors.
+    let batch = std::sync::Arc::new(file_utils::WriteBatch::new());
+
+    // Read fresh (not `stack`'s shared `PreparedInventory`, which exists to avoid re-parsing
+    // shards across several steps of one `stack` — `park` only reads the inventory once here),
+    // but after `refresh_tracked_entries` above so this snapshot reflects the just-rehashed
+    // working directory, not stale pre-refresh content.
+    let prepared = std::sync::Arc::new(inventory_utils::prepare_stack_inventory()?);
+
+    // `prepare_stack_inventory` stops parsing at the first conflict entry it finds (sorted key
+    // order), so `prepared.shards` is silently *incomplete* past that point when `has_conflict`
+    // is true — exactly like `stack_parcel`'s identical guard, checked immediately after building
+    // its own `PreparedInventory` for the same reason. The `has_conflict_entries()` check at the
+    // top of this function already refuses a park before any conflict exists anywhere in the
+    // warehouse (so this can only ever be reached with `has_conflict` false in practice — nothing
+    // between the two checks can introduce a conflict state), but this makes that safety a
+    // guarantee at the point `prepared` is actually consumed, not an invariant borrowed from a
+    // decoupled check far above.
+    if inventory_utils::has_conflict_entries_in(&prepared) {
+        return Err(
+            "There are unresolved conflicts in the inventory; parking is not possible.".to_string()
+        );
+    }
+
+    // `Some(&head_tree_hash)` gives `park` the same rollup-based skip (stage 2) `stack` already
+    // has: a directory whose shard's rollup already matches the corresponding head subtree hash
+    // is never hashed or (re)stored — its subtree is spliced into its parent verbatim by hash
+    // instead of walked and rebuilt. Its shard *is* still fully read and parsed, by
+    // `prepare_stack_inventory` above, not just peeked past its header (DESIGN.html §5.0 D item
+    // 10, finding #5): the skip plan reads every candidate's rollup out of that already-parsed
+    // `prepared` snapshot (an in-memory lookup), which is what makes `prepare_stack_inventory`'s
+    // own read+parse pass worth parallelizing — it is real, unavoidable work here, not a header
+    // peek a skip could make disappear. The per-directory tree hashes this call also returns are
+    // `stack`-only bookkeeping (for stamping rollups after a successful stack) — `park`
+    // immediately overwrites every shard from head a few lines down (`replace_all_inventories`),
+    // so it passes `track_tree_hashes: false` (DESIGN.html §5.0 D item 10, finding #8) instead of
+    // making every one of the build's per-directory tasks pay a `Mutex` acquisition to populate a
+    // map nobody reads; the untouched-key set is discarded for the same reason.
+    let (partial_root, _tree_hashes, _untouched) = tree_utils::build_tree_from_inventory_deferred(
+        &prepared, &batch, Some(&head_tree_hash), &scope, false,
+    ).await?;
+    let partial_root = partial_root.ok_or("There is nothing to park.".to_string())?;
 
     let root_tree = if scope.is_full() {
         partial_root
     } else {
         // A park is a WIP snapshot, never a merge completion, so it has no out-of-scope skeleton:
-        // every out-of-scope sibling is copied verbatim from the head.
+        // every out-of-scope sibling is copied verbatim from the head. Runs sequentially (no
+        // `TaskExecutor` here), but staged into the very same batch as the tree build above so
+        // every spine object it writes joins the same barrier.
         let overrides = std::collections::BTreeMap::new();
 
         tree_utils::build_scoped_root_tree(
-            Some(&head_tree_hash), &partial_root, &scope, &overrides, &tree_utils::ObjectSink::Immediate,
+            Some(&head_tree_hash), &partial_root, &scope, &overrides, &batch,
         )?
     };
 
@@ -98,8 +147,18 @@ pub async fn park_changes() -> Result<(), String> {
         description: Some(format!("Parked changes on pallet \"{}\".", pallet)),
     };
 
+    // The parcel object itself joins the same batch as the tree objects it points to: the parked
+    // list will reference it directly, so it must be just as durable as everything beneath it
+    // before anything downstream can see it.
     let mut object = LooseObjectBuilder::build_parcel(&parcel);
-    object.store()?;
+    object.store_deferred(&batch)?;
+
+    // The barrier: every tree object and the parcel object staged above become durable and
+    // visible at their final content-addressed paths now, all at once. Must complete (return
+    // `Ok`) before anything below is allowed to reference what it just published — the signature
+    // sidecar and the parked-list record are both written only from this point on, deliberately
+    // kept out of this same batch (see `stack_utils::stack_parcel`'s identical ordering note).
+    batch.finish()?;
 
     if let Some(key_id) = &signing_key_id {
         let signature = sign_utils::sign_parcel_hash(key_id, &object.hash)?;

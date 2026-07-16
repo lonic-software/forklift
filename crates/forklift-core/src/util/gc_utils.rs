@@ -546,4 +546,57 @@ mod tests {
         assert!(result.is_err(), "a present-but-corrupt object must surface as an error, not be tolerated");
         assert!(loose_path(&garbage).exists(), "gc must delete nothing when the live set cannot be computed");
     }
+
+    /// DESIGN.html §5.0 D item 10, finding #3: a `WriteBatch`-staged write that never reaches
+    /// `finish()` (the exact shape a SIGKILL mid-`load` leaves behind, now that a whole walk's
+    /// blobs share one batch instead of each paying its own immediate barrier) leaves a stray
+    /// `<hash>.tmp<pid>-<n>` temp in an object fan-out folder. `compact` never touches it
+    /// (`pack_utils::enumerate_loose_objects` explicitly skips any name containing `.tmp`) — this
+    /// pins that `gc`'s ordinary reachability sweep does the reclaiming instead, once the temp
+    /// ages past the grace period: `collect_garbage` does not pattern-match on `.tmp` at all, it
+    /// just treats any non-`.sig`, unreferenced file sitting in an object folder as garbage, so a
+    /// stranded batch temp is swept exactly like any other abandoned loose write, no special
+    /// casing required.
+    #[test]
+    fn gc_sweeps_a_stranded_write_batch_temp_past_the_grace_period() {
+        let _scratch = Scratch::new("gc-stranded-temp");
+
+        let hash = "a".repeat(64);
+        let (folder, file_name) = file_utils::get_path_for_object(&hash).unwrap();
+        std::fs::create_dir_all(&folder).unwrap();
+
+        // Mirrors `file_utils::temp_path_for`'s naming exactly (`<final-name>.tmp<pid>-<n>`)
+        // without going through `WriteBatch` itself — a `WriteBatch` still owned by a live
+        // process cleans up after itself on `Drop`; this simulates what a hard kill leaves
+        // behind instead, when nothing ever runs `Drop` at all.
+        let stray_temp = Path::new(&folder).join(format!("{}.tmp{}-0", file_name, std::process::id()));
+        std::fs::write(&stray_temp, b"partial content, never finished").unwrap();
+        assert!(stray_temp.exists(), "the stray temp must exist before gc runs");
+
+        let stats = collect_garbage(0).expect("gc must tolerate an unrecognized loose file");
+        assert!(!stray_temp.exists(),
+            "gc's ordinary reachability sweep must remove a stranded WriteBatch temp past the grace period");
+        assert_eq!(stats.deleted, 1);
+    }
+
+    /// The other half of the finding #3 claim above: a temp stranded by a *very recent* kill is
+    /// exactly as protected as any other young, unreferenced object — `gc` cannot (and does not
+    /// try to) tell "an in-flight write's temp, still needed" apart from "a stranded batch temp,
+    /// safe to reclaim" any better than it can for an ordinary loose object, and applies the same
+    /// mtime grace period to both.
+    #[test]
+    fn gc_protects_a_stranded_write_batch_temp_within_the_grace_period() {
+        let _scratch = Scratch::new("gc-stranded-temp-protected");
+
+        let hash = "b".repeat(64);
+        let (folder, file_name) = file_utils::get_path_for_object(&hash).unwrap();
+        std::fs::create_dir_all(&folder).unwrap();
+
+        let stray_temp = Path::new(&folder).join(format!("{}.tmp{}-0", file_name, std::process::id()));
+        std::fs::write(&stray_temp, b"partial content, never finished").unwrap();
+
+        let stats = collect_garbage(3600).expect("gc must tolerate an unrecognized loose file");
+        assert!(stray_temp.exists(), "a recently stranded temp must survive gc within the grace period");
+        assert_eq!(stats.kept_recent, 1);
+    }
 }
