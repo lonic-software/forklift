@@ -1660,21 +1660,30 @@ impl ShardMutationBatch {
     ///
     /// A failing `change` never leaves this key's *partial* mutation sitting in the batch for
     /// [`publish`](Self::publish) to later write out as if it had fully succeeded (DESIGN.html
-    /// §5.0 D item 10, PR B review finding #7): every current caller's `change` closure is a
-    /// single, infallible mutation (`add_item`/`mark_item_deleted`, neither of which returns
-    /// `Result`), so this is latent today — but the type's own contract advertises `Err(String)`
-    /// for "`change` itself failed", and the moment a closure that mutates *then* validates is
-    /// added (e.g. an `add_item` followed by a check that rejects), a naive "insert, then run
-    /// `change`, keep whatever it left behind" implementation would durably publish that
-    /// half-applied state as a real content change. Guarded by snapshotting this key's state
-    /// immediately before `change` runs and restoring it on `Err` — cheap: [`Inventory::clone`]
-    /// only clones its `name → Arc<InventoryItem>` map structure (an `Arc` refcount bump per
-    /// entry), never an entry's own data, so this costs nothing close to a deep copy even for a
-    /// shard with many items. Only *this* key's mutation is undone; every other key this batch
-    /// already decided (before or after this call) is unaffected — preserving the same "keep
-    /// whatever was decided" resilience every converted caller's own doc comment promises for a
-    /// mid-loop decision failure (a whole-batch rollback here would silently break that for every
-    /// other key, which is not what any caller wants from a single bad decision).
+    /// §5.0 D item 10, PR B review finding #7). This is not latent: `restore.rs`'s
+    /// `restore_shard_files_into` (finding #5's fix) stages a closure that calls
+    /// `build_inventory_item_from_stat`, which is genuinely fallible (an unreadable file id, a
+    /// file that vanished between being written and being stat'd) — so a real caller's `change`
+    /// can fail mid-mutation today, not just hypothetically. Guarded by snapshotting this key's
+    /// state immediately before `change` runs (for a key already touched earlier in this batch —
+    /// see below for a first touch) and restoring it on `Err` — cheap: [`Inventory::clone`] only
+    /// clones its `name → Arc<InventoryItem>` map structure (an `Arc` refcount bump per entry),
+    /// never an entry's own data, so this costs nothing close to a deep copy even for a shard with
+    /// many items. Only *this* key's mutation is undone; every other key this batch already
+    /// decided (before or after this call) is unaffected — preserving the same "keep whatever was
+    /// decided" resilience every converted caller's own doc comment promises for a mid-loop
+    /// decision failure (a whole-batch rollback here would silently break that for every other
+    /// key, which is not what any caller wants from a single bad decision).
+    ///
+    /// **The granularity of "this key's mutation" is whatever one `change` call covers, which is
+    /// not always one file.** `restore_shard_files_into` deliberately makes one `update` call
+    /// cover every file in a shard (needed for finding #5's mtime-anchor fix — see its own doc
+    /// comment), so a stat failure on file *k* of an *n*-file shard rolls back files `1..k-1`'s
+    /// accounting too, not just file *k*'s — wider than the pre-batching per-file funnel, which
+    /// could only ever lose the one file that failed. Not data loss (every file's real on-disk
+    /// content already matches what was intended; a rolled-back entry is merely stale-until-the-
+    /// next-`load`/`restore`, exactly like this PR's other, already-documented `batch.publish()`-
+    /// failure wideners), but worth knowing before assuming "this key" means "this file".
     ///
     /// A key whose very *first* touch in this batch fails is dropped from the batch entirely
     /// (not left behind as a content-unchanged copy): nothing was ever successfully decided for
@@ -1682,7 +1691,10 @@ impl ShardMutationBatch {
     /// would still be safe (never a wrong answer, see [`publish`](Self::publish)'s own doc
     /// comment on over-registering), but it would cost this key a real durability barrier and an
     /// unnecessary ancestor-rollup invalidation for zero actual content change, on every call
-    /// whose first decision happens to fail.
+    /// whose first decision happens to fail. This also means the snapshot-for-rollback is only
+    /// ever cloned for a key's *second or later* touch, when there is a real prior decision worth
+    /// being able to restore — a first touch has nothing to restore to (failure just removes the
+    /// key), so no clone is taken for it at all.
     ///
     /// # Returns
     /// * `Ok(())`      - The mutation was applied (in memory only; nothing is durable yet).
@@ -1708,17 +1720,37 @@ impl ShardMutationBatch {
             self.shards.insert(key.to_string(), inventory);
         }
 
-        let before_change = self.shards.get(key)
-            .expect("just inserted above, if it was missing").clone();
+        // Only a *second or later* touch needs a snapshot to restore on failure — a first touch's
+        // own failure just removes the key (see below), so cloning here would be pure waste (never
+        // read either way). Skipping it matters: `apply_merge_action`/`stage_file_entry_from_stat_
+        // into` call `update` once per changed *file*, not once per shard, so several files landing
+        // in the same directory would otherwise pay a real (`BTreeMap`-and-`String`-copying, not
+        // just `Arc`-bumping) clone of that shard's whole in-memory `Inventory` on every single one
+        // of those calls. Skipping the first touch's clone does not fully eliminate that cost for a
+        // shard touched *many* times in one batch (a directory with thousands of changed files in
+        // one merge): touches 2..k each still clone a growing `Inventory`, an O(k²)-ish cost for k
+        // touches to a k-entry shard. Measured negligible at the tens-of-files-per-directory scale
+        // this project's own benchmarks use (consolidate: ~110ms median for 50 actions across 5
+        // directories, unaffected within noise), but a real, roughly-quadratic cost confirmed by a
+        // dedicated benchmark to become noticeable in the thousands (~75ms of a ~340ms total for
+        // 2,000 actions all landing in one directory) — a known, deliberately-deferred tradeoff for
+        // correctness over a bigger redesign (e.g. a persistent/structurally-shared map for O(1)
+        // clones) that was judged out of scope for the fix this comment documents.
+        let before_change = if is_first_touch {
+            None
+        } else {
+            Some(self.shards.get(key).expect("just inserted above").clone())
+        };
 
         let result = change(self.shards.get_mut(key).expect("just inserted above"));
 
         if result.is_err() {
-            if is_first_touch {
-                self.shards.remove(key);
-                self.first_touched_at.remove(key);
-            } else {
-                self.shards.insert(key.to_string(), before_change);
+            match before_change {
+                Some(snapshot) => { self.shards.insert(key.to_string(), snapshot); }
+                None => {
+                    self.shards.remove(key);
+                    self.first_touched_at.remove(key);
+                }
             }
         }
 
