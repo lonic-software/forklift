@@ -532,6 +532,49 @@ CONFIRMED, cleanup — `barrier_count` existed but nothing asserted on it; now b
 `load_pays_a_constant_number_of_barriers_regardless_of_changed_file_count` (see
 "Barrier-count sanity" above) and gated by `fsync_enabled()` to match the work it counts.
 
+**Review findings, round 3 (two independent adversarial reviews of PR B itself, mandated by this
+audit's own gate before opening the PR — 4 findings between them, all resolved).** Both reviewers
+independently traced the batch-wide ancestor-clear property, the mtime anchor, the blob/shard
+ordering rule and the failure-path state machine against PR A's three historical bug classes
+(restamped-stale-rollup data loss, mtime widening, blob/object ordering) and found none of them
+reintroduced — each property holds by construction (see "PR B design summary"/"mtime
+anchoring"/"Cross-batch reference ordering" above, independently derived by one reviewer before
+cross-checking against this doc). One reviewer additionally confirmed the undo journal
+(`journal_utils`) is unaffected — it hooks at the CLI dispatch boundary in `main.rs`, entirely
+agnostic to a command's internal batching (see "Journal/undo interaction" above). Concrete findings:
+
+- **CONFIRMED, real (the "Failure semantics" finding above).** A `batch.publish()` failure — as
+  opposed to a per-action decision failure, which the doc's original claim already covered
+  correctly — widens the working-directory-ahead-of-inventory divergence window from at most one
+  action (the pre-batching funnel's ceiling) to potentially the whole batch, and for
+  `consolidate`/`cherry-pick` specifically this blocks a naive retry behind
+  `ensure_warehouse_is_clean`'s clean-check. Not data loss (self-heals via `load .`, verified by a
+  dedicated regression test — see above), but a real, traceable UX regression the original PR
+  text didn't call out. Fixed with explicit recovery guidance appended to the propagated error at
+  all three call sites, and the doc comments corrected to state the true, wider blast radius
+  instead of only describing the per-action-failure case.
+- **CONFIRMED, cleanup.** `ShardMutationBatch::publish`'s `first_touched_at` lookup used a silent
+  `unwrap_or_else(SystemTime::now)` fallback that can never actually trigger (`update` always
+  inserts into `first_touched_at` and `shards` together) — but a silent fallback is exactly the
+  "now at publish time" shape finding #6 (PR A) closed, so a future refactor that ever breaks that
+  pairing would silently reintroduce the mtime-widening hazard with nothing to catch it. Replaced
+  with an `.expect()` that documents the invariant and fails loudly instead.
+- **CONFIRMED, minor doc overclaim.** `restore_worktree_directory`'s doc comment claimed the batch
+  "collapses into one read-modify-write" of each touched shard — true for the write, not for the
+  read: the function's own enumeration pass and the batch's first-touch lazy load each
+  independently read and parse the same shard once (harmless — nothing mutates it on disk between
+  the two reads — but not the full collapse the comment implied). Doc comment corrected rather
+  than restructuring the read path this late (the fix would need a `ShardMutationBatch::seed`-style
+  API addition purely for a bounded, per-directory-not-per-file efficiency gain — judged not worth
+  the added risk for this PR).
+- **REFUTED, worth recording.** Both reviewers independently suspected the mtime anchor could be
+  unsafe for a shard touched by several actions/files in one batch (a later file's real write
+  happening after the shard's `first_touched_at` was already fixed by an earlier one) — traced
+  through and confirmed conservative, not unsafe: it can only cost an extra rehash on a future
+  scan, never a wrongly-trusted stale one, and is strictly more conservative than the pre-batching
+  per-action immediate-write path's own timing (which stamped a fresh "now" — later still — on
+  every individual call with no historical mtime preservation at all).
+
 **Recommended implementation packaging (as executed).** PR A (shipped 2026-07-16) =
 findings 1+3 (low risk). PR B (shipped 2026-07-16) = findings 2+4, using one shared
 multi-mutation join-point primitive (`ShardMutationBatch`, built on `load`/`park`'s
@@ -539,6 +582,187 @@ existing `publish_shard_outcomes`) across three producers — `apply_merge_actio
 `restore <dir>`'s replay, `park pop`'s replay — plus adversarial review; finding
 3's "leftover" turned out to already be closed by round 2's finding #1 fix, so PR B
 only needed to add the missing assertion for it. Finding 5 stays demand-gated.
+
+**PR B design summary.** `ShardMutationBatch` (`crates/forklift-core/src/util/inventory_utils.rs`)
+is an in-memory accumulator, not a fourth reimplementation of the join point: `update(key, closure)`
+lazily reads a shard from disk the first time this batch touches `key` and applies `closure` to that
+one in-memory copy on every later call for the same key (the same-shard collapse the audit's
+implementation note asked for), `blob_batch()` exposes an internal `WriteBatch` for any new blob a
+caller's decision references (only `apply_merge_action`'s `Merged` case has one — a three-way-merged
+file's freshly built blob, via `LooseObject::store_deferred` instead of the old immediate `store()`),
+and `publish(self)` finishes the blob batch first (a hard `?` — a blob-batch failure skips everything
+else, mirroring `create_inventory_for_directory`'s identical phase-0 gating), then treats every
+touched key unconditionally as `ShardOutcome::Changed` with its rollup forced to `None` and calls the
+same `publish_shard_outcomes` `load` and `park` already use. "Always `Changed`, never `Carry`" is a
+deliberate simplification, not an oversight: every caller this batch replaces
+(`update_shard`/`stage_file_entry_from_stat`, both wrappers around `write_shard_mutation`) already
+unconditionally invalidated ancestors on *every* call, whether or not the entry's hash actually
+changed (`restore`'s stat-only refresh included) — so this batch preserves that exact contract, and
+round-2 finding #1's specific hazard (a *carried* rollup restamped over a same-batch ancestor clear)
+cannot recur on this path by construction, since there is no `Carry` outcome here to restamp. Each
+touched shard's published mtime is anchored to `first_touched_at` — captured the moment `update`
+first touches that key, before the caller's own file write/stat for that action even runs in two of
+the three call sites and immediately after it in the third (see "mtime anchoring" below) — never "now"
+at the whole batch's publish time, the same conservative anchor `ShardOutcome::verified_at` uses
+elsewhere.
+
+**mtime anchoring, worked through call-by-call.** All three call sites write the working-directory
+file *before* calling into the batch for that action (`shift_utils::write_tracked_file`/
+`std::fs::write`, then `build_inventory_item_from_stat`, then `batch.update`/
+`stage_file_entry_from_stat_into`) — so for the *first* action to touch a given shard key,
+`first_touched_at` is captured a few instructions after that file's own real write+stat, never before
+it: the published shard mtime is bounded to be *at or after* that first file's real content mtime,
+the safe direction (`is_entry_unchanged` only wrongly trusts a stale hash when the published mtime is
+*later* than a racing edit's mtime in the same rounded second — never when it merely equals or exceeds
+the very write that produced the value being trusted). For a *second or later* action touching the
+*same* shard key later in the same batch (e.g. several files restored from the same directory, or two
+merge actions in one directory), `first_touched_at` is **not** updated — it stays pinned to the first
+touch — so a later file's real mtime can end up *later* than the shard's eventually-published mtime.
+This is the conservative direction, not a hazard: it can only cost that file an extra rehash on a
+future scan (the racily-clean guard requires `mtime < shard_mtime`, and a later real mtime failing
+that check just means "rehash", never "wrongly trust"). Pinned by a dedicated unit test,
+`shard_mutation_batch_anchors_each_shards_published_mtime_at_its_own_first_touch`
+(`crates/forklift-core/src/util/inventory_utils.rs`), which manufactures a real, measurable
+(1.1&nbsp;second) gap between two shards' first touches and asserts the earlier one's published mtime
+falls inside its own first-touch window, not the later one's.
+
+**Failure semantics.** Each call site accumulates a `result: Result<(), String>` across its
+decision loop exactly like `refresh_tracked_entries` does — a mid-loop decision failure (an
+unreadable file, a corrupt shard) stops that loop but still runs `batch.publish()` afterward, so
+every action/file decided before the failure is still published, then the original error is
+returned. `batch.publish()`'s own failure (the blob barrier, phase A or phase B) means nothing
+this batch decided is published — the same all-or-nothing-per-call contract
+`publish_shard_outcomes` already documents (a batch's `WriteBatch::finish` durably renames every
+prefix before the first failure, but there is no per-key way to tell which from outside
+`WriteBatch`, so the conservative choice is to treat the whole call as unpublished). For `park
+pop` specifically: `parked.pop()`/`park_utils::write_parked` sit strictly after `batch.publish()`
+succeeds, so a failure at any point leaves the parked parcel listed as still parked; a retry
+recomputes the same diff fresh from the parked parcel's and its base's immutable tree hashes
+(`shift_utils::diff_trees`) and redoes exactly the same work, converging on the same correct state
+regardless of how far the previous attempt got — this idempotency is pre-existing (not introduced
+by this PR), but batching preserves it exactly.
+
+**A `batch.publish()` failure widens the working-directory-ahead-of-inventory window — a real
+finding from adversarial review, addressed with better recovery guidance, not a redesign.** For
+`apply_merge_actions` and `restore_worktree_directory` specifically, every action/file's
+working-directory write happens unconditionally, immediately, *before* its shard mutation is ever
+staged — so by the time `batch.publish()` runs, the working directory may already reflect every
+action in the call, even though `publish()` can fail for a reason unrelated to any specific action
+(an unreadable ancestor shard anywhere in the batch's combined `clear_keys`, or a mid-barrier I/O
+error such as a full or read-only inventory volume). The pre-batching per-action funnel could only
+ever leave *one* action's file diverged from its shard this way; this batch can leave several. Not
+data loss — every diverged file's real content is exactly what was decided, and `load .` always
+reconciles the inventory to whatever the working directory actually holds, regardless of why they
+diverged (verified — see below) — but for `consolidate`/`cherry-pick` specifically, a retry is
+*blocked* until that reconciliation happens: `ensure_warehouse_is_clean`'s pre-check (which walks
+and parses every tracked shard, comparing working directory against inventory) now sees the
+diverged files as unstaged changes and refuses with "There are local changes that consolidating
+would overwrite" — technically true, but confusing when the "local changes" are the previous
+failed attempt's own writes, not anything the operator did. Fixed by appending explicit recovery
+guidance to the propagated error at all three call sites ("Run \"load .\" to reconcile...";
+`park pop`'s case is simpler — it is always safe to just retry, since `parked.pop()`/`write_parked`
+never run on any failure path and the diff is recomputed fresh from immutable tree hashes each
+time). A dedicated CLI regression test,
+`consolidate_recovers_via_load_after_a_batch_publish_failure_from_an_unwritable_inventory_root`
+(`rollup_hash_skip.rs`, Unix-only), reproduces the real failure shape: two merge actions land on
+disk, then `apply_merge_actions`'s own `ShardMutationBatch::publish` fails staging the root's
+ancestor-clear temp file into a read-only inventory folder — a *write*-side failure, not a
+read-side one, since a corrupt/unreadable shard is actually caught *earlier*, by
+`ensure_warehouse_is_clean`'s own read-only walk, before `apply_merge_actions` ever starts (traced
+by first attempting the obvious repro — corrupting an ancestor shard — and finding it never
+reaches this code path at all, always intercepted by that pre-check first). The test confirms the
+error message's guidance and that `load .` genuinely recovers: the merge's real content ends up
+correctly staged, and a subsequent `stack` succeeds cleanly.
+
+**Correctness (regression tests).** `crates/forklift/tests/rollup_hash_skip.rs` gained two
+CLI-level regressions for the merge path: `consolidate_clears_every_ancestor_rollup_across_a_batch_where_one_actions_ancestor_is_another_actions_own_shard`
+— a merge whose batch touches a nested shard and that shard's own parent directly (so the parent
+is both an ancestor-clear target *and* its own touched outcome), plus a *third*, unrelated deep
+change (`zzz/deep`) whose own intermediate ancestor is never itself directly touched — asserting
+every ancestor ends up cleared regardless of touch order, an untouched sibling shard is
+completely unaffected, and the merge's real content survives; verified to actually discriminate
+by deliberately injecting a "only clear the first-processed key's ancestors" bug into
+`ShardMutationBatch::publish` and confirming the test fails on it (reverted before commit). And
+`apply_merge_actions_collapses_two_actions_in_the_same_shard_into_one_correct_read_modify_write`
+— a delete and a take-theirs of different files in the same directory, proving the collapse keeps
+both mutations rather than one clobbering the other. A third,
+`consolidate_recovers_via_load_after_a_batch_publish_failure_from_an_unwritable_inventory_root`,
+covers the failure-semantics finding above. `crates/forklift-core/src/util/inventory_utils.rs`
+gained a unit test for the mtime anchor,
+`shard_mutation_batch_anchors_each_shards_published_mtime_at_its_own_first_touch` (see "mtime
+anchoring" above) — both this test and the ancestor-clear regression were verified to actually
+discriminate by deliberately injecting the bug they're meant to catch and confirming a failure,
+then reverting.
+
+**Barrier-count sanity.** `crates/forklift/tests/crash_consistency.rs` gained four assertions
+extending the `FORKLIFT_DEBUG_BARRIER_COUNT` pattern finding #10 established:
+`consolidate_pays_a_constant_number_of_barriers_regardless_of_action_count` (50 actions across 5
+directories pays the same barrier count as 5 actions across the same 5 directories — **11** on
+this box either way, most of it the completing stack's own barriers, at most 3 of it the merge
+funnel itself), `restore_directory_pays_a_constant_number_of_barriers_regardless_of_file_count`
+(**2**, constant — phase A + phase B, no blob barrier since a restore never stores new content),
+and `park_push_and_pop_both_pay_a_constant_number_of_barriers_regardless_of_file_count` (`park`
+pop: **2**, constant, same shape as restore; `park` push: **6**, constant — this is the assertion
+that formally closes finding 3's "leftover", proving `park` push's barrier count was already
+independent of directory count before PR B changed a line of its own code).
+
+**SIGKILL crash-consistency spreads.** Three new tests in `crash_consistency.rs`, the same
+calibrated-delay-spread pattern PR A's own `load`/`park` push tests use:
+`killing_consolidate_midway_never_corrupts_the_store_or_leaves_a_stale_rollup`,
+`killing_restore_directory_midway_never_corrupts_the_store_or_leaves_a_stale_rollup`, and
+`killing_park_pop_midway_never_corrupts_the_store_or_leaves_a_stale_rollup`. Each SIGKILLs the
+command at a spread of delays straddling its calibrated write window, and after every kill:
+`assert_consistent` (a whole pallet ref, readable history/peek/stocktake), a rollup-skip on/off
+equivalence check on `stocktake` (the same technique `rollup_hash_skip.rs`'s `Twin` uses — a real
+divergence here means a crash left a stale-valid rollup sitting above genuinely changed content),
+and a final `export-git` walk that read-side hash-verifies every object reachable from every
+pallet's history (a torn or missing referenced object fails loudly there). The `consolidate` test
+does not require the specific two-parent-merge shape to survive every kill (a kill before
+`.forklift/consolidation` is even written just leaves ordinary staged content for the healing
+`stack` to commit single-parent) — only that nothing is corrupted and every reachable object
+reads back, matching the property this whole crash-consistency spine actually proves. As with PR
+A, these tests structurally cannot catch the directory-fsync-*ordering* hazard between the blob
+batch and the shard-content batch (a kill leaves every completed rename kernel-visible regardless
+of fsync order) — that ordering (`ShardMutationBatch::publish`'s hard `self.blob_batch.finish()?`
+before phase A/B are ever staged) was verified by code inspection instead, the same way finding
+#7 was for `load` and `park` in PR A.
+
+**Journal/undo interaction — checked, unaffected.** The undo journal
+(`crates/forklift-core/src/util/journal_utils.rs`) hooks at the CLI dispatch boundary in
+`main.rs`, not inside any command: it snapshots every journaled command's pallet-ref state
+*before* `dispatch(cli).await` runs and pushes the entry only if that state actually changed,
+*after* `dispatch` returns `Ok` — entirely agnostic to how many durability barriers a command
+pays internally, or in what order, as long as the command's own atomicity (guaranteed by the
+warehouse lock held for its whole runtime) and final ref state are unchanged. This PR changes
+neither: no pallet ref moves any differently, and the whole command still runs under the same
+lock. Confirmed by reading `main.rs:105-148` directly, not inferred.
+
+**Benchmarks (this box, release build).**
+
+| Scenario | Before (main @ 2739751) | After (this branch) | Δ |
+|---|---|---|---|
+| `consolidate`, 50 actions across 5 dirs (synthetic, 7-run median) | 534 ms | 114 ms | ≈4.7× |
+| `cherry-pick`, 30-action pick (synthetic, 7-run median) | 342 ms | 85 ms | ≈4.0× |
+| `restore .`, 48 dirtied files (synthetic, 7-run median) | 441 ms | 38 ms | ≈11.6× |
+| `park` pop, 48 files (synthetic, 7-run median) | 440 ms | 39 ms | ≈11.3× |
+| `park` push, 48 files (synthetic, 7-run median, unaffected — sanity) | 83 ms | 82 ms | ~1.0× |
+| git.git `stocktake` (5 touched files, median of 6 cycles) | 34.0 ms | 40.5 ms | no regression (noise) |
+| git.git `diff --staged` (5 touched files, median of 6 cycles) | 22.5 ms | 27.5 ms | no regression (noise) |
+| git.git `stack` (5 touched files, median of 6 cycles) | 57.0 ms | 57.0 ms | unchanged |
+| git.git `load .` (5 touched files, median of 6 cycles) | 52.0 ms | 52.0 ms | unchanged |
+
+Methodology: the four synthetic scenarios use the same fixed 8-directory corpus shape PR A used
+(large enough files that hashing/fsync work is real, 7-run medians); git.git numbers are median-of-6
+independent touch→command→(re-)stack cycles against the same freshly `import-git`'d + `compact --all
+--redelta`'d git.git (81,526 commits, 403,193 objects, 206.1&nbsp;MiB packed), one densified store
+copied twice (before/after) so neither run's writes affect the other's baseline. `stocktake`/`diff
+--staged` show a few ms of run-to-run noise (both before and after include one cold first-cycle
+outlier, ~85–200 ms, excluded from the reported medians' character but included in the raw per-cycle
+numbers) — `stack` and `load .`, the two write-heavy ops, land on the exact same median either side,
+which is the expected result for four commands (`stocktake`, `diff --staged`, `stack`, `load`) whose
+own code this PR does not touch at all. None of PR B's changes are on any of these four commands'
+paths — this table exists to catch an accidental interaction (a shared type change, a compile-time
+surprise), not because a regression here was ever mechanically likely.
 
 ---
 

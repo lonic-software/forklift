@@ -264,7 +264,13 @@ pub fn pop_parked() -> Result<(), String> {
     // Several ops in the same shard collapse into one read-modify-write of it, published once at
     // the end. If an op's decision step fails partway through, every op decided before the
     // failure is still published — see `apply_merge_actions`'s identical resilience contract for
-    // the same reasoning.
+    // the same reasoning, including its caveat: a `batch.publish()` failure (not a per-op decision
+    // failure) can leave more ops' working-directory writes ahead of their shard entries than the
+    // old per-op immediate funnel ever could. Unlike `consolidate`, this call site is safe to just
+    // retry without any extra reconciliation step: `ops` is always recomputed fresh from the
+    // parked parcel's and its base's immutable tree hashes above, and `parked.pop()`/
+    // `park_utils::write_parked` below never run on any failure path, so the parked entry stays
+    // listed and a retried `park pop` redoes exactly the same (idempotent) work.
     let mut batch = inventory_utils::ShardMutationBatch::new();
     let mut result: Result<(), String> = Ok(());
 
@@ -301,7 +307,14 @@ pub fn pop_parked() -> Result<(), String> {
         if result.is_ok() { result = Err(e); }
     }
 
-    result?;
+    if let Err(e) = result {
+        return Err(format!(
+            "{}\nThe pop did not complete: some files may already have been rewritten without \
+            being staged. The parked parcel is still listed — re-run \"park pop\" once the \
+            problem is fixed; it recomputes the same change from scratch and is safe to retry.",
+            e
+        ));
+    }
 
     shift_utils::remove_empty_directories(&removed_dirs);
 

@@ -119,14 +119,28 @@ fn restore_worktree(path: &WarehousePath) -> Result<(), String> {
 /// Every file's working-directory write happens immediately (unfsynced, same as always), but its
 /// refreshed inventory entry is only *decided* here — collected into one shared
 /// [`inventory_utils::ShardMutationBatch`] instead of paying `update_shard`'s full two-barrier
-/// funnel per file (DESIGN.html §5.0 D item 10, finding #4). Several files in the same shard
-/// collapse into one read-modify-write of it, published once at the end.
+/// *write* funnel per file (DESIGN.html §5.0 D item 10, finding #4). Several files in the same
+/// shard collapse into one read-modify-*write* of it, published once at the end — this loop still
+/// reads and parses each shard once itself (to enumerate the files it needs to restore) and the
+/// batch's own first touch of that same key reads and parses it again; harmless (nothing mutates
+/// the shard on disk between the two reads, so both reads see identical bytes) but not collapsed,
+/// unlike the write side.
 ///
 /// If a file's restore fails partway through (an unreadable or missing blob), every file decided
 /// before the failure is still published — the same keep-whatever-was-decided resilience
 /// `refresh_tracked_entries` gives a per-shard failure (see its own doc comment): under the old
 /// per-file immediate-write loop this replaced, every prior file was already durably applied by
 /// the time a later one failed, so this preserves that same guarantee under batching.
+///
+/// A `batch.publish()` failure (as opposed to a per-file decision failure above) is a wider case
+/// than the old code had: every file's working-directory write already happened, unconditionally,
+/// before the batch is published, so a publish failure unrelated to any specific file (a corrupt
+/// ancestor shard, a mid-barrier I/O error) can leave more files' inventory entries stale than the
+/// old per-file immediate funnel ever could (at most one, there). Not data loss — every file's
+/// on-disk content already matches the pallet head (that is what a restore materializes), so the
+/// only thing a subsequent read could get wrong is stat-cache staleness, self-healing on the next
+/// `load`/`restore`/`stocktake` — but the caller's error message below says so explicitly rather
+/// than leaving the operator to guess.
 ///
 /// # Arguments
 /// * `key` - The warehouse path key of the directory.
@@ -198,7 +212,15 @@ fn restore_worktree_directory(key: &str) -> Result<(), String> {
         if result.is_ok() { result = Err(e); }
     }
 
-    result?;
+    if let Err(e) = result {
+        return Err(format!(
+            "{}\nThe restore did not complete: some files may already have been rewritten from \
+            the inventory without their stat data being refreshed. Re-run \"restore {}\" (or \
+            \"load .\") once the problem is fixed to reconcile.",
+            e,
+            if key.is_empty() { "." } else { key }
+        ));
+    }
 
     if !restored_any {
         return Err(format!(

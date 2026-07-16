@@ -861,3 +861,103 @@ fn apply_merge_actions_collapses_two_actions_in_the_same_shard_into_one_correct_
     let status = String::from_utf8_lossy(&warehouse.run(&["stocktake"]).stdout).to_string();
     assert!(status.contains("matches"), "the warehouse must report clean after the merge: {}", status);
 }
+
+// -------------------------------------------------------------------------------------------
+// Adversarial-review finding (PR B, DESIGN.html §5.0 D item 10, findings #2/#4): a
+// `ShardMutationBatch::publish` failure — as opposed to a per-action decision failure — is a
+// wider case than the old per-action immediate funnel had, because every action's
+// working-directory write already happened, unconditionally, before the batch is published. The
+// old code could only ever leave *one* action's file diverged from its shard (the one whose own
+// `write_shard_mutation` call failed); this batch can leave several. Not data loss — every
+// diverged file's real content is exactly what the merge decided, and "load ." (recommended by
+// the enriched error message this finding motivated) always reconciles the inventory with
+// whatever the working directory actually holds, from scratch, regardless of why they diverged.
+// This pins that recovery path end to end: force a real `batch.publish()` failure (an ancestor
+// shard the merge's own actions never touch, corrupted out from under it), confirm the working
+// directory already shows the merge's real content despite the failure, confirm the error message
+// carries the promised guidance, then confirm "load ." actually recovers cleanly.
+// -------------------------------------------------------------------------------------------
+
+// Unix-only: simulates the write-side I/O failure `ShardMutationBatch::publish` can hit
+// (`stage_rollup_clear`/`WriteBatch::stage` failing to create a temp file) via a read-only
+// directory. A *read*-side failure (a corrupt shard) does not actually reach this code path in
+// practice — `consolidate`'s own pre-check (`ensure_warehouse_is_clean`, which walks and parses
+// every tracked shard before any merge action runs) already catches an unreadable shard earlier,
+// with its own clear parse-error message, before `apply_merge_actions` ever starts. A write-side
+// failure has no equivalent earlier guard (nothing writes during the pre-check), so it is the
+// realistic way this batch's own failure path actually triggers.
+#[cfg(unix)]
+#[test]
+fn consolidate_recovers_via_load_after_a_batch_publish_failure_from_an_unwritable_inventory_root() {
+    let warehouse = Warehouse::new("consolidate-batch-publish-failure-recovery", false);
+    warehouse.prepare();
+
+    warehouse.write_file("dirA/dirB/file.txt", "deep v1\n");
+    warehouse.write_file("dirA/direct.txt", "direct v1\n");
+    warehouse.write_file("sibling.txt", "sibling v1\n");
+    warehouse.run_ok(&["load", "."]);
+    warehouse.run_ok(&["stack", "base"]);
+
+    warehouse.run_ok(&["palletize", "feature"]);
+    warehouse.write_file("dirA/dirB/file.txt", "deep v2 (feature)\n");
+    warehouse.write_file("dirA/direct.txt", "direct v2 (feature)\n");
+    warehouse.run_ok(&["load", "."]);
+    warehouse.run_ok(&["stack", "feature work"]);
+
+    warehouse.run_ok(&["shift", "main"]);
+    warehouse.write_file("sibling.txt", "sibling v2 (main)\n");
+    warehouse.run_ok(&["load", "."]);
+    warehouse.run_ok(&["stack", "main work"]);
+
+    // The root shard's own inventory folder, read-only: `ensure_warehouse_is_clean`'s pre-check
+    // (read-only itself) still passes cleanly, but `apply_merge_actions`' own
+    // `ShardMutationBatch::publish` fails when phase A tries to stage the root's ancestor-clear
+    // temp file there — after both merge actions' working-directory writes already landed.
+    let root_inventory_folder = {
+        let _scope = forklift_core::globals::StorageRootScope::enter(&warehouse.root);
+        let mut path = forklift_core::util::file_utils::get_inventory_data_path_for_key("");
+        path.pop();
+        path
+    };
+
+    use std::os::unix::fs::PermissionsExt;
+    let original_permissions = std::fs::metadata(&root_inventory_folder).unwrap().permissions();
+    std::fs::set_permissions(&root_inventory_folder, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let merge = warehouse.run(&["consolidate", "feature"]);
+
+    // Always restore permissions before any assertion can early-return/panic, so a failing
+    // assertion below never leaves the warehouse directory permanently read-only for `Drop`'s
+    // own cleanup (`std::fs::remove_dir_all`) to choke on.
+    std::fs::set_permissions(&root_inventory_folder, original_permissions).unwrap();
+
+    assert!(!merge.status.success(), "the merge must fail: its root shard's folder is unwritable");
+    let stderr = String::from_utf8_lossy(&merge.stderr);
+    assert!(stderr.contains("load"),
+        "the failure must tell the operator to run \"load .\" to reconcile: {}", stderr);
+
+    // The working-directory writes already landed despite the batch publish failure — exactly
+    // the wider blast radius this finding is about, not data loss: the real content is right
+    // there on disk, just not yet reflected in the (unpublished) inventory.
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("dirA/dirB/file.txt")).unwrap(), "deep v2 (feature)\n");
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("dirA/direct.txt")).unwrap(), "direct v2 (feature)\n");
+
+    // The recommended recovery: "load ." reconciles the inventory with the working directory
+    // from scratch, regardless of why they diverged.
+    warehouse.run_ok(&["load", "."]);
+
+    // The merge's real content is now correctly staged — nothing was lost, just deferred.
+    let staged = warehouse.run_ok(&["--json", "diff", "--staged"]);
+    let staged_value: serde_json::Value = serde_json::from_slice(&staged.stdout).unwrap();
+    let staged_files = staged_value["data"]["files"].as_array().unwrap();
+    assert!(staged_files.iter().any(|f| f["path"] == "dirA/dirB/file.txt"),
+        "the recovered load must stage the merge's real deep change: {}", staged_value);
+    assert!(staged_files.iter().any(|f| f["path"] == "dirA/direct.txt"),
+        "the recovered load must stage the merge's real direct change: {}", staged_value);
+
+    // The store stays fully usable: stacking the recovered state succeeds cleanly.
+    warehouse.run_ok(&["stack", "recovered after unwritable-root failure"]);
+    let clean = warehouse.run_ok(&["--json", "stocktake"]);
+    let clean_value: serde_json::Value = serde_json::from_slice(&clean.stdout).unwrap();
+    assert_eq!(clean_value["data"]["staged_count"], 0);
+}

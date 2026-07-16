@@ -455,6 +455,20 @@ fn inventory_lookup(path: &str) -> Result<Option<InventoryItem>, String> {
 /// its own doc comment): under the old per-action immediate-write loop this replaced, every prior
 /// action was already durably applied by the time a later one failed, so this preserves that same
 /// user-visible guarantee under batching instead of silently regressing to all-or-nothing.
+///
+/// **A `batch.publish()` failure is a different, and wider, case than the old code had** (caught
+/// in adversarial review): every action's working-directory write still happens unconditionally,
+/// synchronously, before its shard mutation is ever staged — so by the time `publish()` runs, the
+/// working directory may already reflect *every* action in this call, even though `publish()` can
+/// fail for a reason unrelated to any specific action (an unreadable ancestor shard anywhere in
+/// the batch's combined `clear_keys`, or a mid-barrier I/O error). The old per-action immediate
+/// funnel could only ever leave *one* action's file diverged from its shard this way (the one
+/// whose own `write_shard_mutation` call failed — every action after it in the loop never even ran);
+/// this batch can leave many. Not data loss (the caller's error message below tells the operator
+/// how to reconcile, and `load .` — or `restore`/`park` as appropriate — always converges the
+/// inventory to whatever the working directory actually holds), but a real widening of the
+/// "working directory and inventory can disagree after a failure" surface that batching
+/// introduces here, worth documenting rather than glossing over.
 pub(crate) fn apply_merge_actions(actions: &[MergeAction]) -> Result<Vec<String>, String> {
     let mut conflict_paths: Vec<String> = Vec::new();
     let mut batch = inventory_utils::ShardMutationBatch::new();
@@ -484,7 +498,14 @@ pub(crate) fn apply_merge_actions(actions: &[MergeAction]) -> Result<Vec<String>
         if result.is_ok() { result = Err(e); }
     }
 
-    result?;
+    if let Err(e) = result {
+        return Err(format!(
+            "{}\nThe merge did not complete: some of its working-directory writes may have \
+            already landed without being staged. Run \"load .\" to reconcile the inventory with \
+            what's actually on disk, inspect the result with \"stocktake\"/\"diff\", then retry.",
+            e
+        ));
+    }
 
     Ok(conflict_paths)
 }

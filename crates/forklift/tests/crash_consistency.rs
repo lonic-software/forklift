@@ -1215,7 +1215,13 @@ fn run_restore_kill_spread(
     delays: &[Duration],
     tag: &str,
 ) -> usize {
-    let mut completed = 0usize;
+    // Counts iterations where the kill actually landed on a still-running process (a real
+    // SIGKILL, not a no-op against one that had already exited before `kill()` ran) — the signal
+    // that this iteration's delay genuinely fell inside the write window, not just "some restore
+    // ran and then we healed it regardless". Unlike `stack`/`load`/`park`'s spreads, `restore`
+    // has no ref of its own to check for an "advanced" signal, so this is the direct substitute:
+    // read the killed child's own exit status instead of inferring anything from store state.
+    let mut actually_killed = 0usize;
 
     for (i, delay) in delays.iter().enumerate() {
         area.clear_stale_lock();
@@ -1233,8 +1239,24 @@ fn run_restore_kill_spread(
 
         std::thread::sleep(*delay);
 
-        let _ = child.kill();
-        let _ = child.wait();
+        let kill_result = child.kill();
+        let wait_result = child.wait();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            if kill_result.is_ok() {
+                if let Ok(status) = &wait_result {
+                    if status.signal() == Some(9) {
+                        actually_killed += 1;
+                    }
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = &kill_result;
+        }
 
         area.clear_stale_lock();
 
@@ -1249,10 +1271,9 @@ fn run_restore_kill_spread(
             assert!(content.starts_with(base_line), "{tag} kill #{i}: {file:?} did not heal to staged content");
         }
 
-        completed += 1;
     }
 
-    completed
+    actually_killed
 }
 
 /// Extends the crash-consistency spine to `restore <dir>`'s batched replay (DESIGN.html §5.0 D
@@ -1288,11 +1309,23 @@ fn killing_restore_directory_midway_never_corrupts_the_store_or_leaves_a_stale_r
 
     const DELAY_COUNT: usize = 18;
 
-    let measured = calibrate_restore_duration(&area, &files, base_line, "calibration", 3);
-    let delays = kill_delay_spread(measured, DELAY_COUNT, 0.02, 1.30);
+    let measured_1 = calibrate_restore_duration(&area, &files, base_line, "calibration-1", 3);
+    let delays_1 = kill_delay_spread(measured_1, DELAY_COUNT, 0.02, 1.30);
 
-    let completed = run_restore_kill_spread(&area, &files, base_line, &delays, "a");
-    assert!(completed >= 1, "no restore-then-heal iteration ran at all");
+    let mut actually_killed = run_restore_kill_spread(&area, &files, base_line, &delays_1, "a");
+
+    // Same bounded-retry guard as the other crash-consistency spreads: if the first spread never
+    // actually landed a kill on a still-running process, re-measure and try a wider spread once
+    // before failing for real.
+    let mut measured_2 = None;
+    let mut delays_2 = None;
+    if actually_killed == 0 {
+        let measured = calibrate_restore_duration(&area, &files, base_line, "calibration-2", 3);
+        let delays = kill_delay_spread(measured, DELAY_COUNT, 0.0, 2.5);
+        actually_killed += run_restore_kill_spread(&area, &files, base_line, &delays, "b");
+        measured_2 = Some(measured);
+        delays_2 = Some(delays);
+    }
 
     area.clear_stale_lock();
     area.assert_consistent("final");
@@ -1313,6 +1346,18 @@ fn killing_restore_directory_midway_never_corrupts_the_store_or_leaves_a_stale_r
     assert!(export.status.success(),
         "export-git must read every committed object without a torn or missing one, stderr: {}",
         String::from_utf8_lossy(&export.stderr));
+
+    // Sanity: across the run at least one kill actually landed on a still-running `restore`, so
+    // the write window (not just the "killed before anything started" path) was exercised.
+    assert!(actually_killed >= 1,
+        "no kill ever landed on a still-running restore across {} attempt(s) — the write window \
+         was never exercised. attempt 1: measured {measured_1:?} uninterrupted, tried delays \
+         {delays_1:?}.{}",
+        if measured_2.is_some() { 2 } else { 1 },
+        match (measured_2, delays_2) {
+            (Some(m), Some(d)) => format!(" attempt 2: measured {m:?} uninterrupted, tried delays {d:?}."),
+            _ => String::new(),
+        });
 }
 
 /// Time a few uninterrupted `park pop` runs (each preceded by an uninterrupted `park` push of a

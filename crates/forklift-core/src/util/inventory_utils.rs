@@ -1672,8 +1672,14 @@ impl ShardMutationBatch {
             clear_keys.extend(ancestor_keys_root_first(&key));
             inventory.set_rollup_hash(None);
 
-            let verified_at = self.first_touched_at.get(&key).copied()
-                .unwrap_or_else(std::time::SystemTime::now);
+            // `update` always inserts into `first_touched_at` in the same branch it first
+            // inserts into `shards` (see its own doc comment), so every key reached here is
+            // guaranteed to have one — `expect`, not a silent `unwrap_or_else(SystemTime::now)`
+            // fallback, so a future refactor that ever breaks that pairing fails loudly here
+            // instead of quietly reintroducing the exact "now at publish time" mtime-widening
+            // hazard finding #6 closed (DESIGN.html §5.0 D item 10).
+            let verified_at = *self.first_touched_at.get(&key)
+                .expect("update() always pairs a shards entry with a first_touched_at entry");
 
             outcomes.insert(key, ShardOutcome::Changed(inventory, verified_at));
         }
