@@ -219,41 +219,127 @@ until then this is the store working as designed, not a bug.
 
 ### e. Durability-barrier audit (write-batching sweep)
 
-**What.** A systematic audit of every durability barrier in forklift-core and the
-CLI head — `write_file_atomically` call sites, `WriteBatch` construction, every raw
-`fsync` — counting barriers paid per logical operation, before any patching is
-attempted. Audit first, patches second: the point is to size the remaining problem
-rather than fix whatever is found first.
+**Status: audit complete (2026-07-15, on main @ 18a04f9); findings 1 and 3 shipped
+(PR A, 2026-07-16); findings 2 and 4 queued (PR B).**
+Three unrelated pieces of work had converged on the same cost in short succession —
+quick-win #3's `stack` fsync batching, the rollup-hash work's two rounds of
+shard-write batching, and PR #59's benchmark verification surfacing unbatched-barrier
+costs in `park`/`park` pop — so the audit sized the remaining problem before any
+further patching.
 
-**Why now.** Three unrelated pieces of work converged on the same cost in short
-succession. The quick-wins track already had to batch `stack`'s per-object fsyncs
-into one barrier (quick-win #3, above). The rollup-hash work on this branch had to
-batch shard-write barriers *twice* — once to bring stack cleanup's overhead down
-from 70% to 18%, again to get `load .`'s join point faster than main rather than
-merely neutral. And this branch's own benchmark verification (PR #59) surfaced
-`park` costing roughly **+28 ms** and `park` pop roughly **+8 ms** on git.git,
-tracing to unbatched barriers nobody had measured before. Three independent
-investigations tripping over the same class of cost is a pattern, not a
-coincidence.
+**Method + validation.** Every barrier site was swept: `write_file_atomically` call
+sites, `WriteBatch` construction, every raw `fsync`. None exist outside
+`file_utils`'s primitives — no hand-rolled temp-file-plus-rename anywhere in the
+tree. `F_FULLFSYNC` measured ~4 ms/call on the dev box, giving a ~8–9 ms
+per-unbatched-atomic-write model (file fsync + directory fsync). Every measured
+delta below matches the N × ~9 ms model within noise, which validates the model
+itself as well as the findings.
 
-**Known suspects to check first.**
+**Findings, ranked** (measured on synthetic corpora, release builds):
 
-- `consolidate`/cherry-pick's per-merge-action shard writes — each action pays the
-  two-barrier mutation funnel individually; a 50-file merge is on the order of 100
-  barriers, untimed so far.
-- `park` pop's per-file replay.
-- Multi-file `restore`.
-- Journal writes.
+1. **FIXED (PR A). `load`'s per-file blob store** (`inventory_utils::build_inventory`)
+   — ~7–8 ms per changed file (N=50 `load`: ~376 ms total, ~326 ms of it this). The
+   rollup-hash join point batched shard writes but never the blob stores; fixed by
+   staging each changed or brand-new file's blob (`LooseObject::store_deferred`) into
+   the same `WriteBatch` the join point already publishes shard content through — a
+   blob is now durable in the very same barrier as the shard that references it,
+   never a later one. Re-measured on this box (N=50, synthetic corpus, 7-run
+   median, release build): **413 ms → 37 ms** (≈11×). Highest value, lowest risk —
+   `load` is the most-run mutating command.
+2. **`consolidate`/cherry-pick's per-merge-action funnel** (`apply_merge_action`) —
+   measured ~9.1 ms/action; a 50-action merge is ≈570 ms, confirming this doc's
+   original ~100-barrier prediction. Needs the phased join-point shape (a shared
+   phase-A ancestor-clears sub-barrier, a shared phase-B content-writes
+   sub-barrier; the two phases must never merge into one). Medium risk — the
+   busiest write path — so needs adversarial review. Queued for PR B.
+3. **FIXED (PR A). `park` push** — ~8.9 ms/changed file across three unbatched
+   layers: the per-file blob store inside `refresh_tracked_entries`, the per-directory
+   tree-object store inside `tree_utils::build_tree_from_inventory` (the
+   non-deferred variant `park` used to call), and the parcel object's own store.
+   All three are now staged into one shared `WriteBatch` — `refresh_tracked_entries`
+   batches its own blob stores into an internal barrier (finished before any shard
+   rewrite, so a rewritten shard's entries never outrun the blobs they reference),
+   and `park` was switched from `build_tree_from_inventory` to the already-existing
+   `build_tree_from_inventory_deferred` variant (which also gives `park` the
+   rollup-hash skip it previously lacked) and now stages the parcel object into the
+   same batch, finished once before the signature sidecar and the parked-list
+   record. Re-measured on this box (fixed 8-directory corpus, 7-run median, release
+   build): **N=10 → 308 ms → 146 ms; N=50 → 632 ms → 153 ms** — near-flat in the
+   changed-file count now (main scaled ~8.1 ms/marginal file over that range; this
+   branch, ~0.2 ms/marginal file). The per-*shard* (not per-object) mutation
+   funnel inside `refresh_tracked_entries` still pays one barrier per directory
+   touched — that collapse needs the same shared multi-mutation join-point
+   primitive as findings 2/4, so a change that touches many distinct directories
+   still costs more than one that touches a few; queued for PR B.
+4. **`restore <dir>` (plain) and `park pop`** — ~9.2–9.6 ms/file; same join-point
+   primitive as #2, bundles with it. Queued for PR B.
+5. **`remove <dir>`'s per-shard loop and commit-graph multi-shard writes** —
+   untimed, small, rare operations; demand-gated.
 
-**Method.** Classify each write site as: (a) already batched; (b) batchable with no
-ordering constraint; (c) batchable with phased ordering — the `load .` join-point
-pattern above, where ordering-constrained groups become ordered sub-barriers rather
-than one barrier per file; (d) must remain individual for correctness.
+**Confirmed already-batched (class a).** The `load` join point, `cleanup_after_stack_with`,
+`replace_all`/`subtree_inventories`, and `stack`'s tree+parcel batch. `restore --staged`
+measured flat (30→36 ms, N=1→20), confirming the shipped batching already works.
 
-**Standing rule.** Batching may reduce the *count* of barriers; it must never weaken
-a barrier's *guarantee*. The durable-before-destructive contract and the ordering
-invariants this doc already protects (ancestor-clears-before-content,
-fsync-before-ref-move) are preserved exactly — only the granularity changes.
+**No-go list** — batching may share barrier *cost*, it must never drop a
+*guarantee*: signature durable before ref move; object batch durable before ref
+move; ancestor clears durable before own content (phases may be shared across
+callers but never merged with each other); durable-before-destructive dedup;
+loose-object fsync stays; working-directory writes stay deliberately unfsynced.
+PR A's changes stay inside this list: blobs join the *same* barrier as the shard
+content that references them (at least as strong as "no later than"), and `park`'s
+object batch (blobs/trees/parcel) is finished strictly before the signature sidecar
+and the parked-list record, exactly like `stack`'s identical ordering.
+
+**Implementation note.** Several loops call `update_shard` per file against the
+same shard; the batching work needs to collapse same-shard actions into one
+read-modify-write, not merely share one fsync across N rewrites of the same file.
+PR A's `refresh_tracked_entries` rewrite does this implicitly for its blob layer (one
+shared blob batch across every shard it touches); the shard-content layer itself
+(one `write_shard_mutation`/`save_inventory` call per shard) is unchanged, left for
+PR B's shared primitive.
+
+**git.git sanity (PR A).** A full first-time `load` of git.git's working tree (4,775
+files, every file brand-new — the same per-file blob-store barrier finding 1 fixed)
+went **35.8 s → 0.66 s** (≈54×). After that, a git.git-scale incremental script (a
+handful of touched files, matching the rollup-hash PR's own methodology) showed no
+regression on the unaffected read paths — `stocktake` 22→22 ms, `diff --staged`
+16→15 ms, `stack` 54→53 ms — and an improvement on `park` push, 231→166 ms (the
+remainder there is the unrelated O(all-tracked-files) stat scan `refresh_tracked_entries`
+always pays, not a durability barrier).
+
+**Barrier-count sanity.** A process-wide debug counter (`file_utils::barrier_count`,
+`FORKLIFT_DEBUG_BARRIER_COUNT=1`) confirms `load` now pays a constant 2 barriers
+(phase A + phase B) regardless of N — measured identically at N=10 and N=50 changed
+files. `park` push's barrier count tracks the number of *directories* touched (not
+files) — 9–10 barriers whether 10 or 50 files changed across the same 5 directories
+— consistent with the residual per-shard funnel noted in finding 3 above.
+
+**Correctness.** No missing-barrier bug was found anywhere in the sweep. PR A's
+crash-consistency coverage: `crates/forklift/tests/crash_consistency.rs` gained a
+`load`-targeted SIGKILL spread (`killing_load_midway_never_leaves_a_shard_referencing_a_missing_or_torn_blob`)
+proving a killed `load` never leaves a shard durably referencing a blob that isn't, and a
+`park`-targeted spread (`killing_park_midway_never_leaves_a_parked_parcel_referencing_a_missing_or_torn_object`)
+covering the same property for `park`'s own object batch — every kill that lands after the
+parked-list record becomes durable is popped right back, a real read of every tree and blob
+the parcel references.
+
+**Review findings, fixed before merge.** Two independent review passes over PR A caught: (1)
+`refresh_tracked_entries`'s pass-1/pass-2 split had silently dropped the
+keep-whatever-was-decided resilience `create_inventory_for_directory` gives `load` on a mid-scan
+failure — fixed by deciding each shard through a fallible closure so every shard decided *before*
+a failure still reaches pass 2; (2) `park` built a `PreparedInventory` (whose `shards` map is
+silently incomplete past the first conflict entry it finds) without the paired
+`has_conflict_entries_in` guard `stack_parcel` always checks immediately after building its own —
+safe in practice only because the function's earlier, decoupled `has_conflict_entries()` call
+already refuses before any conflict can exist, but not a guarantee at the point `prepared` is
+actually consumed; fixed by adding the same guard `stack` has. Doc comments that overclaimed the
+blob-staging exception covered a chunked/large file's recipe and chunks too (it doesn't — those
+still store immediately, unchanged, out of scope for this finding) were also corrected.
+
+**Recommended implementation packaging.** PR A (shipped) = findings 1+3 (low risk).
+PR B (queued) = findings 2+4 (one shared multi-mutation join-point primitive +
+adversarial review), plus the residual per-shard funnel finding 3 left behind.
+Finding 5 is demand-gated.
 
 ---
 
