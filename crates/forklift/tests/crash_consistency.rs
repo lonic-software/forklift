@@ -972,6 +972,77 @@ fn park_push_and_pop_both_pay_a_constant_number_of_barriers_regardless_of_file_c
     assert!(pop_1 > 0, "the pop counter must observe real barrier work, got {pop_1}");
 }
 
+/// One `park` push over a warehouse root file and a subdirectory file, optionally giving the
+/// root file a same-content rewrite (a stat-only touch: new mtime, identical bytes) before the
+/// measured `park`, with `FORKLIFT_DEBUG_BARRIER_COUNT=1` set — returns the barrier count that
+/// run paid. The subdirectory file always gets a real content edit.
+fn park_barrier_count_with_root_touch(touch_root_without_changing_its_content: bool) -> u64 {
+    let area = Area::new(&format!("phase-a-ancestor-barrier-{touch_root_without_changing_its_content}"));
+    let warehouse = area.warehouse();
+
+    std::fs::write(warehouse.join("README.md"), "readme v1\n").unwrap();
+    std::fs::create_dir_all(warehouse.join("sub")).unwrap();
+    std::fs::write(warehouse.join("sub/file.txt"), "sub v1\n").unwrap();
+
+    assert!(area.run(&["prepare"]).status.success());
+    assert!(area.run(&["config", "operator.name", "barrier@forklift"]).status.success());
+    assert!(area.run(&["config", "operator.identifier", "barrier@forklift"]).status.success());
+    assert!(area.run(&["load", "."]).status.success());
+    assert!(area.run(&["stack", "base"]).status.success());
+
+    if touch_root_without_changing_its_content {
+        // Same bytes, fresh mtime: the root shard's entry for this file must be re-verified
+        // (the racily-clean stat-cache fast path cannot trust a bumped mtime), but the rebuilt
+        // hash matches the old one exactly — a `Carry`, not a `Changed`, outcome for the root
+        // shard itself.
+        std::fs::write(warehouse.join("README.md"), "readme v1\n").unwrap();
+    }
+
+    // A real content change in the subdirectory either way — a `Changed` outcome whose ancestor
+    // chain (the root) needs its rollup cleared, exactly like the control case where the root
+    // is otherwise untouched.
+    std::fs::write(warehouse.join("sub/file.txt"), "sub v2 -- a real edit\n").unwrap();
+
+    let mut command = area.command(&["park"]);
+    command.env("FORKLIFT_DEBUG_BARRIER_COUNT", "1");
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "park failed: {}", String::from_utf8_lossy(&output.stderr));
+
+    barrier_count(&output)
+}
+
+/// Post-merge review finding A (durability-barrier audit, following PR #61's finding #1 fix):
+/// an ancestor that also happens to be one of a publish batch's own outcomes (here: the
+/// warehouse root, needing only a stat-drift `Carry` rewrite because `README.md` was touched
+/// without changing its content) used to be filtered out of `publish_shard_outcomes`'s phase A
+/// entirely, on the theory that phase B would publish it anyway. That reasoning covered content
+/// correctness but not the crash window: filtered out of phase A, the root's cleared rollup rode
+/// the very same phase-B barrier as `sub/file.txt`'s real, unrelated content change, instead of
+/// being durable on its own first — exactly the ordering `write_shard_mutation`'s doc comment
+/// says a mutation funnel must never allow.
+///
+/// This is the barrier-count signature of that gap, exercised through `park` itself rather than
+/// a hand-built `publish_shard_outcomes` call: with the root *also* directly touched (a `Carry`
+/// that is simultaneously an ancestor of `sub`'s real change), the root's clear pre-fix skipped
+/// phase A and rode phase B for free, paying **one fewer** barrier than the control case where
+/// the root is untouched and is *only* ever an ancestor (always durably cleared in its own phase
+/// A, both before and after this fix). Post-fix, both cases pay the same count: the root's clear
+/// is staged in phase A unconditionally, whether or not the root is also one of this batch's own
+/// outcomes.
+#[test]
+fn park_pays_the_same_barrier_count_whether_or_not_a_carry_ancestor_is_also_touched() {
+    let control = park_barrier_count_with_root_touch(false);
+    let with_carry_ancestor = park_barrier_count_with_root_touch(true);
+
+    assert_eq!(control, with_carry_ancestor,
+        "park must pay the same barrier count whether the root is untouched (a pure ancestor, \
+        always cleared in its own phase-A barrier) or also directly touched by a stat-only \
+        `Carry` (which pre-fix let its clear skip phase A and ride phase B for free instead): \
+        control (root untouched) = {control}, with a Carry ancestor = {with_carry_ancestor}");
+
+    assert!(control > 0, "the counter must observe real barrier work, got {control}");
+}
+
 // -------------------------------------------------------------------------------------------
 // SIGKILL crash-consistency spreads for the batched merge/replay funnel (DESIGN.html §5.0 D
 // item 10, findings #2/#4). What a hard kill *can* prove: no shard is left durably referencing a

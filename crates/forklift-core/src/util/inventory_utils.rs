@@ -644,12 +644,32 @@ pub enum ShardOutcome {
 /// of some other real change in the very same batch (step 1, in-memory only — this is what closes
 /// DESIGN.html §5.0 D item 10, finding #1: a decision made *before* a sibling's later-processed
 /// real change is never blindly restamped over the ancestor clear that change requires, because
-/// this check runs after every decision in the batch is already known), then clear every *other*
-/// invalidation target as one batched, mtime-preserving barrier (phase A), then publish every
-/// outcome's own new content as a second, separate barrier (phase B). The two phases are
-/// deliberately never merged into one shared batch — see [`write_shard_mutation`]'s doc comment
-/// for why the ordering boundary between "an ancestor's clear is durable" and "the mutated
-/// shard's own content is durable" matters.
+/// this check runs after every decision in the batch is already known), then clear *every*
+/// invalidation target — including one that is *also* a key in `outcomes` — as one batched,
+/// mtime-preserving barrier (phase A), then publish every outcome's own new content as a second,
+/// separate barrier (phase B). The two phases are deliberately never merged into one shared batch
+/// — see [`write_shard_mutation`]'s doc comment for why the ordering boundary between "an
+/// ancestor's clear is durable" and "the mutated shard's own content is durable" matters.
+///
+/// Phase A staging *every* key in `clear_keys` — not just the ones absent from `outcomes` — is
+/// itself a fix (post-merge review of PR #61's finding #1 fix): an ancestor that also happens to
+/// be one of this batch's own outcomes (e.g. a root-level file's stat-only `Carry`, which is
+/// simultaneously an ancestor of some unrelated `Changed` descendant elsewhere in the same batch)
+/// used to be filtered out of phase A on the theory that phase B would publish it anyway. That
+/// reasoning covered *content* correctness (step 1 above already zeroes its in-memory rollup) but
+/// not *crash-window* durability: filtered out of phase A, that ancestor's cleared shard rode the
+/// very same phase-B barrier as the descendant's new content, and `WriteBatch::finish`'s rename
+/// loop gives no ordering guarantee between the renames inside it — only that all of them are
+/// durable by the time it returns. A crash inside that window could leave the descendant's content
+/// durable while the ancestor's stale (pre-clear) rollup was still on disk, which — if that stale
+/// rollup happened to match the head tree hash — silently hid the descendant's change from a
+/// future rollup-based whole-subtree skip. Staging every clear unconditionally in phase A closes
+/// that window: an ancestor's clear is now durable, on its own, strictly before phase B ever
+/// starts, exactly like an ancestor that has no outcome of its own. Phase B then republishes that
+/// same key (with its final, decided content) as it always did — a redundant but harmless second
+/// write, not a second barrier (`stage_rollup_clear` is a no-op, staging nothing, for a shard whose
+/// on-disk rollup is already absent — see its own doc comment — so this never inflates the barrier
+/// count when there is nothing left for phase A to clear).
 ///
 /// Any blob a published outcome's content might reference must already be durable *before* this
 /// is called — neither phase here stages a blob write; each caller finishes its own blob batch
@@ -683,7 +703,7 @@ fn publish_shard_outcomes(clear_keys: &BTreeSet<String>,
 
     let phase_a_batch = file_utils::WriteBatch::new();
 
-    for key in clear_keys.iter().filter(|key| !outcomes.contains_key(key.as_str())) {
+    for key in clear_keys.iter() {
         stage_rollup_clear(key, &phase_a_batch)?;
     }
 
@@ -2707,6 +2727,63 @@ mod tests {
 
         assert_eq!(read_rollup(""), None);
         assert_eq!(read_rollup("a"), None);
+    }
+
+    #[test]
+    fn publish_shard_outcomes_durably_clears_an_ancestor_outcome_in_phase_a_before_phase_b_runs() {
+        // Regression (post-merge review of PR #61's finding #1 fix, finding A): an ancestor that
+        // is *also* one of this batch's own outcomes (here: the root, needing only a stat-drift
+        // `Carry` rewrite) used to be filtered out of phase A entirely, on the theory that phase
+        // B would publish its (already in-memory-cleared) content anyway. That covers content
+        // correctness but not the crash window: filtered out of phase A, the ancestor's cleared
+        // shard rode the very same phase-B barrier as an unrelated descendant's real content
+        // change, and `WriteBatch::finish`'s rename loop gives no ordering guarantee between the
+        // renames inside it — only that all of them are durable by the time it returns. A crash
+        // in that window could leave the descendant's new content durable while the ancestor's
+        // stale (pre-clear) rollup was still on disk — exactly the "ancestor clear durable
+        // before mutated content" invariant `write_shard_mutation` documents.
+        //
+        // This proves phase A now durably clears the ancestor's rollup on its own, strictly
+        // before phase B ever runs: the descendant ("a")'s own phase-B publish is sabotaged (its
+        // inventory folder is pre-occupied by a plain file, so staging its content fails with
+        // ENOTDIR) so `phase_b_batch.finish()` is never even reached — nothing from phase B can
+        // possibly be durable. If the root's rollup is still cleared on disk after this
+        // (necessarily failing) call, that clear can only have come from phase A.
+        let _scratch = Scratch::new("publish-outcomes-phase-a-ancestor-clear");
+
+        write_stamped_shard("", Some("stale-rollup"));
+
+        let mut clear_keys: BTreeSet<String> = BTreeSet::new();
+        clear_keys.insert("".to_string());
+
+        let mut outcomes: BTreeMap<String, ShardOutcome> = BTreeMap::new();
+
+        let mut root_inventory = Inventory::new();
+        root_inventory.add_item(item("file.txt", 1, InventoryItemState::Normal));
+        root_inventory.set_rollup_hash(Some("stale-rollup".to_string()));
+        outcomes.insert("".to_string(), ShardOutcome::Carry(root_inventory, std::time::SystemTime::now()));
+
+        let mut descendant_inventory = Inventory::new();
+        descendant_inventory.add_item(item("new.txt", 2, InventoryItemState::Normal));
+        outcomes.insert(
+            "a".to_string(),
+            ShardOutcome::Changed(descendant_inventory, std::time::SystemTime::now()),
+        );
+
+        // Sabotage "a"'s publish: a plain file sitting exactly where its inventory folder needs
+        // to be created blocks `stage_with_mtime`'s temp-file creation with ENOTDIR, without
+        // touching the root's own folder (a sibling entry, not this one) at all.
+        let blocked_folder = file_utils::get_inventory_folder_for_key("a");
+        std::fs::create_dir_all(blocked_folder.parent().unwrap()).unwrap();
+        std::fs::write(&blocked_folder, b"blocking a plain file where a directory is expected").unwrap();
+
+        if let Ok(()) = publish_shard_outcomes(&clear_keys, &mut outcomes) {
+            panic!("the sabotaged descendant publish must fail, not silently succeed");
+        }
+
+        assert_eq!(read_rollup(""), None,
+            "phase A must durably clear the ancestor's rollup on its own, even though phase B \
+            (which would otherwise republish it) never got the chance to run at all");
     }
 
     #[test]
