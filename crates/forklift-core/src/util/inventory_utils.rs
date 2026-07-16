@@ -41,7 +41,7 @@ const METADATA_ENTRY_ROOT: &str = "./";
 /// Also serializes [`publish_shard_outcomes`] — the single-threaded join point every producer
 /// (`create_inventory_for_directory`, `refresh_tracked_entries`, [`ShardMutationBatch::publish`])
 /// funnels its decisions through — against every *other* call into it (DESIGN.html §5.0 D item
-/// 10, PR B review finding #8). This protects a related but distinct hazard: not a walker task
+/// 10). This protects a related but distinct hazard: not a walker task
 /// racing its own join point (the walk never writes directly, only decides — see
 /// [`ShardOutcome`]'s doc comment), but two entirely separate high-level operations running
 /// concurrently in the same process (a future async caller, or fanned-out work) each reaching
@@ -352,41 +352,50 @@ pub async fn create_inventory_for_directory(path: &WarehousePath) -> Result<(), 
     let mut result: Result<(), Option<String>> = executor.execute(root_task).await;
 
     // Phase 0: every changed or brand-new small file's blob the walk staged becomes durable now,
-    // in its own barrier — strictly before any shard content is even staged below (DESIGN.html
-    // §5.0 D item 10, findings #1/#7). A shard phase B publishes can name one of these blobs'
-    // hashes, so the blob must already be durable — not merely staged in a batch that has not yet
-    // been through its own `finish()` — before that shard's rename is allowed to land. See
-    // `publish_shard_outcomes`'s doc comment for why blobs and shard content cannot share one
-    // batch and still give that ordering.
+    // in its own barrier — strictly before any shard content is even staged below. A shard phase
+    // B publishes can name one of these blobs' hashes, so the blob must already be durable — not
+    // merely staged in a batch that has not yet been through its own `finish()` — before that
+    // shard's rename is allowed to land. See `publish_shard_outcomes`'s doc comment for why blobs
+    // and shard content cannot share one batch and still give that ordering.
     //
     // A failure here is different from every other failure this join point tolerates: this batch
-    // covers *every* blob the whole walk decided, and `WriteBatch::finish`'s rename loop returns
-    // on the *first* failure (see `write_shard_mutation`'s doc comment on why that is not
-    // all-or-nothing — DESIGN.html §5.0 D item 10, finding #4) — so on an error here some blobs
-    // this batch covers may be durable and others not, with no per-hash way to tell which from
-    // outside `WriteBatch`. Publishing any shard content below could then durably name a blob
-    // that never actually landed. So a failure here — unlike the walk's own failure, which still
-    // publishes whatever it *did* decide — skips phase A/B entirely (`blob_batch_published`
-    // below): nothing this walk decided is published this round, and a retry starts over. Still
-    // strictly better than the pre-batching baseline, where a torn single-object write could only
-    // ever cost that one file, never an entire load — this failure mode is rare (disk-level I/O
-    // errors), and losing a whole walk's *decisions* (not their eventual content — nothing here
-    // is destructive) to a retry is a fair trade for closing finding #7.
+    // covers *every* blob the whole walk decided, and a rename-loop failure gives no per-hash way
+    // to tell which of them are durable and which are not — so a plain (non-leaked) failure here
+    // skips phase A/B entirely (`blob_batch_published` below): nothing this walk decided is
+    // published this round, and a retry starts over. A *leaked-reservation* failure is different:
+    // it names the exact blob(s) that never landed, precise enough to drop only the outcome(s)
+    // that actually reference one of them (below) and still publish everything else — so phase
+    // A/B still runs in that case. Either way this is strictly better than the pre-batching
+    // baseline, where a torn single-object write could only ever cost that one file, never an
+    // entire load.
     let mut blob_batch_published = true;
+    let mut missing_blob_hashes: BTreeSet<String> = BTreeSet::new();
 
-    if let Err(e) = context.blob_batch.finish() {
-        if result.is_ok() { result = Err(Some(e)); }
-        blob_batch_published = false;
+    match context.blob_batch.finish_detailed() {
+        Ok(()) => {}
+        Err(file_utils::WriteBatchFailure::LeakedReservations { message, missing }) => {
+            missing_blob_hashes = missing_blob_hashes_from(&missing);
+            if result.is_ok() { result = Err(Some(message)); }
+        }
+        Err(file_utils::WriteBatchFailure::Other(message)) => {
+            if result.is_ok() { result = Err(Some(message)); }
+            blob_batch_published = false;
+        }
     }
 
-    // The join point (DESIGN.html §5.0 D item 8, stage 2b): every per-directory task only ever
-    // *decided* what to write (`ShardOutcome`, collected in `context.outcomes`) and which
-    // ancestors that decision invalidates (`context.clear_keys`) — nothing was written to disk
-    // by any task. Publishing happens here, once, single-threaded, after every task that managed
-    // to run has reported in (whether or not the walk as a whole succeeded — see below).
+    // The join point: every per-directory task only ever *decided* what to write (`ShardOutcome`,
+    // collected in `context.outcomes`) and which ancestors that decision invalidates
+    // (`context.clear_keys`) — nothing was written to disk by any task. Publishing happens here,
+    // once, single-threaded, after every task that managed to run has reported in (whether or not
+    // the walk as a whole succeeded — see below).
     let mut clear_keys: BTreeSet<String> = std::mem::take(&mut *context.clear_keys.lock().await);
     let mut outcomes: BTreeMap<String, ShardOutcome> = std::mem::take(&mut *context.outcomes.lock().await);
     let mut stale_keys: BTreeSet<String> = BTreeSet::new();
+
+    // A leaked-reservation blob failure above named specific missing blobs: only the outcome(s)
+    // whose content actually references one of them can never be published this round — every
+    // other decision this walk made is unaffected. A no-op when nothing leaked.
+    drop_outcomes_referencing_missing_blobs(&mut outcomes, &missing_blob_hashes);
 
     // Directories that are gone from the working directory (deleted, or ignored now) keep their
     // inventory shard, with every entry marked as a staged removal. Folded into the same join
@@ -445,39 +454,28 @@ pub async fn create_inventory_for_directory(path: &WarehousePath) -> Result<(), 
 
     // Steps 1-3 (phase A ancestor clears, then phase B shard content): shared with `park`'s
     // working-directory refresh via `publish_shard_outcomes` — see its own doc comment for the
-    // exact ordering. Only attempted when phase 0 (the blob barrier above) fully succeeded — see
-    // its own doc comment for why a blob-batch failure must not let any shard content publish at
-    // all. A failure in either phase A or phase B here is folded into `result` instead of
-    // propagated immediately: every ancestor clear (or shard) staged before the failure never got
-    // renamed (a batch's `finish` fsyncs every staged temp before renaming any of them, so a
-    // failure anywhere in it durably renames nothing), so `phase_b_published` (gating metadata
-    // registration below) is correctly `false` on any failure here — the shards phase A was
-    // clearing were already registered from before this walk, so failing to clear them costs
-    // only a few lost skips next time, never a wrong one (see `stage_rollup_clear`'s doc comment).
-    let phase_b_published = if blob_batch_published {
-        match publish_shard_outcomes(&clear_keys, &mut outcomes) {
-            Ok(()) => true,
-            Err(e) => { if result.is_ok() { result = Err(Some(e)); } false }
+    // exact ordering, and for why it now registers every one of `outcomes`' keys in metadata
+    // itself before returning, regardless of its own `Ok`/`Err` result. Only attempted when phase
+    // 0 (the blob barrier above) durably resolved every blob some outcome might reference — either
+    // fully (`Ok`) or precisely enough to have already dropped the only outcomes that could not be
+    // (a leaked-reservation failure, handled above) — never when it failed in some other, less
+    // precise way (`blob_batch_published` false): publishing shard content in that case could name
+    // a blob with no way to know whether it is actually durable.
+    if blob_batch_published {
+        if let Err(e) = publish_shard_outcomes(&clear_keys, &mut outcomes) {
+            if result.is_ok() { result = Err(Some(e)); }
         }
-    } else {
-        false
-    };
+    }
 
-    // Metadata must never claim a directory's shard is on disk when publishing it may not have
-    // actually happened: a key with a recorded `ShardOutcome` only belongs in the registered set
-    // when phase B is known to have durably published every outcome (one shared batch — see
-    // above). Every other visited directory (no outcome: its shard was already correct and
-    // durable from before this walk, untouched either way) is unaffected by phase A/B and is
-    // always safe to (re-)register.
-    let keys_to_add: BTreeSet<String> = {
-        let new_inventory_paths = context.new_inventory_paths.lock().await;
-
-        if phase_b_published {
-            new_inventory_paths.clone()
-        } else {
-            new_inventory_paths.iter().filter(|key| !outcomes.contains_key(key.as_str())).cloned().collect()
-        }
-    };
+    // Every directory this walk visited is safe to (re-)register regardless of what happened
+    // above: one with no outcome was already correct and durable from before this walk, untouched
+    // either way; one *with* an outcome that did not end up durable this round is still safe to
+    // register (`publish_shard_outcomes` already did so itself, for the same reason) — every
+    // metadata-driven reader treats a listed shard that is missing or unchanged as empty/stale,
+    // never an error, so this can only ever surface more of what genuinely exists on disk. A key
+    // whose shard *did* durably land must never be excluded here just because some other key in
+    // the same walk failed — that was this join point's original bug.
+    let keys_to_add: BTreeSet<String> = context.new_inventory_paths.lock().await.clone();
 
     if let Err(e) = result {
         // Register every inventory that was actually published, even on failure, so the metadata
@@ -489,11 +487,23 @@ pub async fn create_inventory_for_directory(path: &WarehousePath) -> Result<(), 
 
         let message = e.unwrap_or("An unknown error occurred while building the inventory.".to_string());
 
-        return Err(format!(
-            "{}\nThe load did not complete; entries loaded so far were kept. \
-            Re-run the load once the problem is fixed.",
-            message
-        ));
+        // `blob_batch_published` false means phase A/B above never even ran: nothing this run
+        // discovered or changed was published, so the usual "entries loaded so far were kept"
+        // framing would be false, not just imprecise — whatever remains on disk is entirely
+        // whatever this walk found already there before it started. Every other failure shape
+        // (the walk's own, a leaked-reservation blob drop, a phase A/B failure) still leaves a
+        // real, possibly-partial amount of this run's own work durably published, so the original
+        // framing holds for those.
+        let outcome_note = if blob_batch_published {
+            "The load did not complete; entries loaded so far were kept. Re-run the load once the \
+            problem is fixed."
+        } else {
+            "The load did not complete: nothing this run discovered or changed was kept (only \
+            whatever was already durable from before this run remains). Re-run the load once the \
+            problem is fixed."
+        };
+
+        return Err(format!("{}\n{}", message, outcome_note));
     }
 
     update_inventory_metadata(&keys_to_add, &stale_keys)?;
@@ -654,18 +664,18 @@ pub enum ShardOutcome {
 /// Publish a batch of [`ShardOutcome`] decisions through the same two-phase ordering `load`'s
 /// join point (`create_inventory_for_directory`) and `park`'s working-directory refresh
 /// (`refresh_tracked_entries`) both need: drop a carried rollup that turns out to be an ancestor
-/// of some other real change in the very same batch (step 1, in-memory only — this is what closes
-/// DESIGN.html §5.0 D item 10, finding #1: a decision made *before* a sibling's later-processed
-/// real change is never blindly restamped over the ancestor clear that change requires, because
-/// this check runs after every decision in the batch is already known), then clear *every*
+/// of some other real change in the very same batch (step 1, in-memory only — this is what
+/// prevents a decision made *before* a sibling's later-processed real change from being blindly
+/// restamped over the ancestor clear that change requires, because this check runs after every
+/// decision in the batch is already known), then clear *every*
 /// invalidation target — including one that is *also* a key in `outcomes` — as one batched,
 /// mtime-preserving barrier (phase A), then publish every outcome's own new content as a second,
 /// separate barrier (phase B). The two phases are deliberately never merged into one shared batch
 /// — see [`write_shard_mutation`]'s doc comment for why the ordering boundary between "an
 /// ancestor's clear is durable" and "the mutated shard's own content is durable" matters.
 ///
-/// Phase A staging *every* key in `clear_keys` — not just the ones absent from `outcomes` — is
-/// itself a fix (post-merge review of PR #61's finding #1 fix): an ancestor that also happens to
+/// Phase A staging *every* key in `clear_keys` — not just the ones absent from `outcomes` —
+/// matters for a subtle reason: an ancestor that also happens to
 /// be one of this batch's own outcomes (e.g. a root-level file's stat-only `Carry`, which is
 /// simultaneously an ancestor of some unrelated `Changed` descendant elsewhere in the same batch)
 /// used to be filtered out of phase A on the theory that phase B would publish it anyway. That
@@ -686,12 +696,11 @@ pub enum ShardOutcome {
 ///
 /// Any blob a published outcome's content might reference must already be durable *before* this
 /// is called — neither phase here stages a blob write; each caller finishes its own blob batch
-/// first (DESIGN.html §5.0 D item 10, finding #7): `create_inventory_for_directory`'s
+/// first: `create_inventory_for_directory`'s
 /// `context.blob_batch`, `refresh_tracked_entries`'s own local one.
 ///
-/// **A failure here is not all-or-nothing — this false premise was acted on once already and
-/// produced a real bug (DESIGN.html §5.0 D item 10, PR B review finding #1), so read this
-/// carefully before writing a new caller.** `WriteBatch::finish`'s rename loop (`run_write_barrier`
+/// **A failure here is not all-or-nothing — read this carefully before writing a new caller.**
+/// `WriteBatch::finish`'s rename loop (`run_write_barrier`
 /// in `file_utils`) returns on the *first* failing rename, not before any of them — every rename
 /// that ran before the failure is already durably visible on disk, kernel-visible to every other
 /// reader immediately (rename is atomic; a reader does not wait for this function's own eventual
@@ -710,14 +719,25 @@ pub enum ShardOutcome {
 ///    already had a shard — or nothing at all, for a brand-new one).
 ///
 /// Every caller must therefore treat a durable-but-possibly-partial phase B as the thing to design
-/// for, not "nothing landed": in particular, a key in `outcomes` must be registered in inventory
-/// metadata regardless of this function's own `Err`/`Ok` result (not only on `Ok`) — see
-/// [`ShardMutationBatch::publish`] for why over-registering a key whose shard did *not* end up
-/// durable this round is itself safe (every reader already treats a metadata-listed shard that is
-/// missing, or unchanged from before this call, as empty/stale rather than an error — see
-/// [`PreparedInventory::shards`]'s own doc comment). A caller that wants to retry after an `Err`
+/// for, not "nothing landed". This function itself is where that gets enforced, not something
+/// left to each caller to get right on its own: **every key in `outcomes` is registered in
+/// inventory metadata before this returns, regardless of whether phase A/B above succeeded** — a
+/// key whose shard did *not* end up durable this round is always safe to register anyway (every
+/// reader already treats a metadata-listed shard that is missing, or unchanged from before this
+/// call, as empty/stale rather than an error — see [`PreparedInventory::shards`]'s own doc
+/// comment), so over-registering here can only ever surface *more* of what genuinely exists on
+/// disk, never fabricate content that was never written. Registering unconditionally, in one
+/// place, means no caller (present or future) can reintroduce the gating bug this once had: a key
+/// whose shard *did* durably land, in a partial phase B, silently absent from metadata anyway
+/// because some *other* key in the same batch failed. A caller that wants to retry after an `Err`
 /// here must redo its decisions from scratch (re-derive `outcomes` fresh, the same way `load .`
-/// always does), not assume any particular one of them did or did not land.
+/// always does), not assume any particular key did or did not land — this function's own
+/// registration already covers whichever ones did.
+///
+/// Only `outcomes`' own keys are registered — a caller that also needs to register (or remove)
+/// keys with no outcome of their own (`create_inventory_for_directory`'s directories that were
+/// visited but had nothing to write) still does that itself afterward; harmless overlap, since
+/// registering an already-registered key is a no-op.
 ///
 /// # Arguments
 /// * `clear_keys` - Every ancestor key some outcome's real content change invalidates.
@@ -726,25 +746,27 @@ pub enum ShardOutcome {
 ///
 /// # Returns
 /// * `Ok(())`      - Phase A and phase B both fully succeeded: every outcome in `outcomes` is
-///                   durably published, and every ancestor clear this batch owed is durable too.
-/// * `Err(String)` - Phase A or phase B failed. See the doc comment above: phase A failing means
-///                   no outcome's content landed (only, possibly, a prefix of its ancestor
-///                   clears); phase B failing may still have durably published a prefix of
-///                   `outcomes` itself. Never assume "nothing was published" from this alone.
+///                   durably published (and registered), and every ancestor clear this batch
+///                   owed is durable too.
+/// * `Err(String)` - Phase A or phase B failed. Phase A failing means no outcome's content landed
+///                   (only, possibly, a prefix of its ancestor clears); phase B failing may still
+///                   have durably published a prefix of `outcomes` itself — never assume "nothing
+///                   was published" from this alone. Every key in `outcomes` is registered in
+///                   metadata regardless (see above); if metadata itself could also not be
+///                   updated, that failure is folded into this message rather than silently lost.
 fn publish_shard_outcomes(clear_keys: &BTreeSet<String>,
                           outcomes: &mut BTreeMap<String, ShardOutcome>) -> Result<(), String> {
     // Serializes this whole read-decide-clear-write step against every other call into this
     // function (from `create_inventory_for_directory`, `refresh_tracked_entries`, or
     // `ShardMutationBatch::publish`) anywhere in this process — see `SHARD_MUTATION_LOCK`'s own
-    // doc comment. Closes DESIGN.html §5.0 D item 10, PR B review finding #8: without this, two
-    // concurrent callers could interleave their phase A and phase B (one clears an ancestor's
-    // rollup, the other republishes that same ancestor with a freshly (re)computed rollup in
-    // between), resurrecting a stale rollup that a rollup-based skip would then wrongly trust.
-    // Held only across this function's own body (mirrors `write_shard_mutation`'s "clear the
-    // ancestors, then write the content" scope, never the caller's own read/decide phase before
-    // it) — nothing inside this function (the batches themselves, `stage_rollup_clear`,
-    // `save_inventory_deferred_with_mtime`) ever tries to reacquire this lock, so there is no
-    // reentrant deadlock risk from holding it here.
+    // doc comment: without this, two concurrent callers could interleave their phase A and phase
+    // B (one clears an ancestor's rollup, the other republishes that same ancestor with a
+    // freshly (re)computed rollup in between), resurrecting a stale rollup that a rollup-based
+    // skip would then wrongly trust. Held only across this function's own body (mirrors
+    // `write_shard_mutation`'s "clear the ancestors, then write the content" scope, never the
+    // caller's own read/decide phase before it) — nothing inside this function (the batches
+    // themselves, `stage_rollup_clear`, `save_inventory_deferred_with_mtime`) ever tries to
+    // reacquire this lock, so there is no reentrant deadlock risk from holding it here.
     let _guard = SHARD_MUTATION_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
     for (key, outcome) in outcomes.iter_mut() {
@@ -755,28 +777,112 @@ fn publish_shard_outcomes(clear_keys: &BTreeSet<String>,
         }
     }
 
+    // Accumulated instead of `?`-propagated so the unconditional registration step below always
+    // runs, on every path — see the doc comment above.
+    let mut result: Result<(), String> = Ok(());
+
     let phase_a_batch = file_utils::WriteBatch::new();
 
     for key in clear_keys.iter() {
-        stage_rollup_clear(key, &phase_a_batch)?;
+        if let Err(e) = stage_rollup_clear(key, &phase_a_batch) {
+            result = Err(e);
+            break;
+        }
     }
 
-    phase_a_batch.finish()?;
+    if result.is_ok() {
+        result = phase_a_batch.finish();
+    }
 
-    let phase_b_batch = file_utils::WriteBatch::new();
+    if result.is_ok() {
+        let phase_b_batch = file_utils::WriteBatch::new();
 
-    for (key, outcome) in outcomes.iter() {
-        let (inventory, verified_at) = match outcome {
-            ShardOutcome::Carry(inventory, verified_at) | ShardOutcome::Changed(inventory, verified_at) =>
-                (inventory, *verified_at),
+        for (key, outcome) in outcomes.iter() {
+            let (inventory, verified_at) = match outcome {
+                ShardOutcome::Carry(inventory, verified_at) | ShardOutcome::Changed(inventory, verified_at) =>
+                    (inventory, *verified_at),
+            };
+
+            if let Err(e) = save_inventory_deferred_with_mtime(
+                inventory, &file_utils::get_inventory_data_path_for_key(key), &phase_b_batch, verified_at,
+            ) {
+                result = Err(e);
+                break;
+            }
+        }
+
+        if result.is_ok() {
+            result = phase_b_batch.finish();
+        }
+    }
+
+    let touched_keys: BTreeSet<String> = outcomes.keys().cloned().collect();
+
+    match (update_inventory_metadata(&touched_keys, &BTreeSet::new()), result) {
+        (Ok(()), result) => result,
+        (Err(metadata_err), Ok(())) => Err(metadata_err),
+        (Err(metadata_err), Err(publish_err)) => Err(format!(
+            "{}\n(the inventory metadata file could also not be updated afterward: {})",
+            publish_err, metadata_err
+        )),
+    }
+}
+
+/// Drop every outcome in `outcomes` whose content references one of `missing_hashes` — the
+/// recovery step for a blob batch that partially failed (a leaked reservation names the exact
+/// final path(s) that never landed; [`file_utils::hash_from_object_path`] recovers the hash(es)
+/// they addressed). Every *other* outcome is untouched: it references none of `missing_hashes`,
+/// so it is exactly as safe to publish as it always was — a single object write failing must cost
+/// only the shard(s) that actually depend on it, not every directory a whole walk or batch
+/// otherwise decided.
+///
+/// Deliberately does not also prune `clear_keys` (a caller's separately-computed ancestor
+/// invalidation set derived from the *same* decisions, before this runs): staging an ancestor
+/// clear for a dropped outcome is always safe, never wrong, even though it turns out to be
+/// unnecessary — see [`stage_rollup_clear`]'s own doc comment on why a clear that did not
+/// strictly need to happen costs only a future rehash, never a wrongly-trusted skip.
+///
+/// A no-op when `missing_hashes` is empty — every caller may call this unconditionally after a
+/// blob batch finishes, whether or not it actually failed.
+///
+/// # Returns
+/// The keys dropped (for a caller's own error reporting) — empty when nothing was dropped.
+fn drop_outcomes_referencing_missing_blobs(outcomes: &mut BTreeMap<String, ShardOutcome>,
+                                           missing_hashes: &BTreeSet<String>) -> BTreeSet<String> {
+    if missing_hashes.is_empty() {
+        return BTreeSet::new();
+    }
+
+    let mut dropped: BTreeSet<String> = BTreeSet::new();
+
+    outcomes.retain(|key, outcome| {
+        let inventory = match outcome {
+            ShardOutcome::Carry(inventory, _) | ShardOutcome::Changed(inventory, _) => inventory,
         };
 
-        save_inventory_deferred_with_mtime(
-            inventory, &file_utils::get_inventory_data_path_for_key(key), &phase_b_batch, verified_at,
-        )?;
-    }
+        let references_missing = inventory.get_items().any(|(_, item)| missing_hashes.contains(&item.hash));
 
-    phase_b_batch.finish()
+        if references_missing {
+            dropped.insert(key.clone());
+        }
+
+        !references_missing
+    });
+
+    dropped
+}
+
+/// Every final path a [`file_utils::WriteBatchFailure::LeakedReservations`] names, translated to
+/// the object hash(es) it addressed (via [`file_utils::hash_from_object_path`]) — the shared
+/// "what do I hand to [`drop_outcomes_referencing_missing_blobs`]" step for every one of this
+/// blob batch's callers. A path that does not decode to a valid hash is silently dropped rather
+/// than failing the whole translation: `hash_from_object_path` can only ever be handed a path
+/// this same process just staged into an object-only [`file_utils::WriteBatch`] (a blob batch
+/// never carries anything else), so this is not expected to happen in practice — but since the
+/// caller already has a real error to report either way, silently ignoring an unparseable entry
+/// here is strictly more conservative than panicking on it.
+fn missing_blob_hashes_from(missing: &[std::path::PathBuf]) -> BTreeSet<String> {
+    missing.iter().filter_map(|path| file_utils::hash_from_object_path(path)).collect()
 }
 
 /// A task for building an inventory file for a given directory.
@@ -791,27 +897,27 @@ fn publish_shard_outcomes(clear_keys: &BTreeSet<String>,
 /// without waiting for them), so writing — and, worse, invalidating ancestors — directly from
 /// here would need the same cross-task synchronization every other writer's funnel
 /// ([`write_shard_mutation`]) uses, one durability barrier at a time. Deferring the decision to
-/// a join point instead turns the whole walk into at most three barriers total (DESIGN.html §5.0
-/// D item 10, finding #7 — one more than the two of the original stage 2b design, because the
+/// a join point instead turns the whole walk into at most three barriers total (one more than a
+/// two-barrier ancestor-clear-then-content design would need, because the
 /// blob barrier below must complete, on its own, before shard content publishes), and needs no
 /// lock at all: nothing concurrent ever touches another task's key.
 ///
-/// A changed or brand-new *small* file's blob is the one exception (DESIGN.html §5.0 D item 10,
-/// finding #1): its content is content-addressed and its write is staged (not fsynced) via
+/// A changed or brand-new *small* file's blob is the one exception: its content is
+/// content-addressed and its write is staged (not fsynced) via
 /// [`file_utils::WriteBatch::stage`] into `context.blob_batch` — a batch the join point finishes,
 /// on its own, strictly *before* it stages any shard content (see `publish_shard_outcomes`'s doc
 /// comment for why the two must not share one batch) — instead of paying its own atomic-write
 /// barrier per file. This is safe to do straight from a concurrent task (unlike a shard's
 /// content): `WriteBatch::stage` is documented safe for concurrent callers. Two tasks staging the
-/// same hash never both pay the compress-and-write cost either (DESIGN.html §5.0 D item 10,
-/// finding #2): `LooseObject::store_deferred` reserves the
+/// same hash never both pay the compress-and-write cost either: `LooseObject::store_deferred`
+/// reserves the
 /// object's final path in the batch before compressing, so only the first occurrence actually
 /// stages anything — see [`file_utils::WriteBatch::reserve_final_path`]'s doc comment. Every blob
 /// staged here is durable — `blob_batch.finish()` has already returned `Ok` — strictly before any
 /// shard content that might reference it is even staged, never merely "in the same barrier".
 ///
 /// A large (chunked) file's recipe and chunks are a separate, still-unbatched exception this
-/// finding does not touch: `object_utils::ingest_file`'s `IngestMode::Store` path stores each of
+/// blob-batching does not touch: `object_utils::ingest_file`'s `IngestMode::Store` path stores each of
 /// them immediately (`flush_chunk_batch`/the recipe's own `store()`), still from within this same
 /// concurrent task. Out of scope here — chunking has its own design (§9.4b) and its own
 /// parallelism (`fanout_utils::fanout_map`, not this walk's per-directory `TaskExecutor`) — and
@@ -917,9 +1023,9 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
                             // store comes back on the next re-load. A chunked file's objects
                             // were already stored during ingest (`object` is `None`).
                             //
-                            // Staged, not stored immediately (DESIGN.html §5.0 D item 10, finding
-                            // #1): see `context.blob_batch`'s and this task's own doc comments for
-                            // why staging straight from a concurrent task is safe here.
+                            // Staged, not stored immediately — see `context.blob_batch`'s and this
+                            // task's own doc comments for why staging straight from a concurrent
+                            // task is safe here.
                             FileVerdict::UnchangedByHash(fresh, object)
                                 | FileVerdict::Modified(fresh, object) => {
                                 any_entry_rebuilt = true;
@@ -1124,19 +1230,21 @@ fn directory_has_no_untracked_content(key: &str, ignored_paths: Arc<Vec<Regex>>)
 /// staged removals. Untracked files are deliberately left alone — this is `park`'s way of
 /// staging the whole work in progress without swallowing untracked content.
 ///
-/// Decides every shard's new content first, without writing any of it (DESIGN.html §5.0 D item
-/// 10, finding #3) — one [`ShardOutcome`] per shard that needs rewriting, the same shape `load`'s
+/// Decides every shard's new content first, without writing any of it — one [`ShardOutcome`] per
+/// shard that needs rewriting, the same shape `load`'s
 /// parallel walk decides per directory — then publishes through [`publish_shard_outcomes`], the
 /// join-point machinery shared with `load`'s own `create_inventory_for_directory`. Sharing that
-/// machinery (rather than a bespoke second implementation) is what closes two correctness gaps an
-/// earlier version of this batching had:
+/// machinery (rather than a bespoke second implementation) is what keeps two correctness
+/// invariants intact that a naive per-shard immediate-write loop would violate:
 ///
-/// * **Finding #1.** A shard decided early in this loop (say, because only its stat data drifted)
-///   must not blindly restamp its *decision-time* rollup over an ancestor clear a *later*-decided
-///   sibling's real content change requires — `publish_shard_outcomes`'s step 1 drops a carried
-///   rollup for any key that ends up in `clear_keys`, computed from every decision in this whole
-///   batch, not just the ones already processed when a given shard was decided.
-/// * **Finding #6.** Each decision's `verified_at` is captured at that decision's *start* — before
+/// * **A shard's carried rollup must never outlive an ancestor clear a sibling requires.** A shard
+///   decided early in this loop (say, because only its stat data drifted) must not blindly
+///   restamp its *decision-time* rollup over an ancestor clear a *later*-decided sibling's real
+///   content change requires — `publish_shard_outcomes`'s step 1 drops a carried rollup for any
+///   key that ends up in `clear_keys`, computed from every decision in this whole batch, not just
+///   the ones already processed when a given shard was decided.
+/// * **A shard's published mtime must never postdate its own verification.** Each decision's
+///   `verified_at` is captured at that decision's *start* — before
 ///   it reads, stats or rehashes anything — and carried through to publish as that shard's mtime
 ///   (`save_inventory_deferred_with_mtime`, inside `publish_shard_outcomes`), never "now" at
 ///   publish time. `is_entry_unchanged`'s "racily clean" guard trusts a cached entry only when its
@@ -1146,9 +1254,8 @@ fn directory_has_no_untracked_content(key: &str, ignored_paths: Arc<Vec<Regex>>)
 ///   every future load, park or stack.
 ///
 /// Every rebuilt file's blob is staged into its own batch, finished on its own — durable —
-/// strictly before `publish_shard_outcomes` stages any shard content (DESIGN.html §5.0 D item 10,
-/// finding #7; see `publish_shard_outcomes`'s doc comment for why the two must not share one
-/// batch).
+/// strictly before `publish_shard_outcomes` stages any shard content (see `publish_shard_outcomes`'s
+/// doc comment for why the two must not share one batch).
 ///
 /// If deciding a shard's new content fails partway through (an unreadable file, a corrupt
 /// shard), every shard decided *before* the failure is still published — the same
@@ -1185,7 +1292,7 @@ pub fn refresh_tracked_entries() -> Result<(), String> {
         let key = metadata_entry_to_key(entry);
 
         // Captured before this decision reads, stats or rehashes anything below — see the
-        // function's own doc comment (finding #6) for why this, and not the moment every shard in
+        // function's own doc comment for why this, and not the moment every shard in
         // this refresh has been decided, is the timestamp this shard's published content carries.
         let verified_at = std::time::SystemTime::now();
 
@@ -1280,26 +1387,36 @@ pub fn refresh_tracked_entries() -> Result<(), String> {
     }
 
     // Every rebuilt file's blob decided above becomes durable now, in its own barrier — strictly
-    // before `publish_shard_outcomes` below even stages any shard content (DESIGN.html §5.0 D
-    // item 10, finding #7): a published shard's entries may carry one of these blobs' hashes, so
-    // the blob must already be durable — not merely staged — before that shard's rename can land.
+    // before `publish_shard_outcomes` below even stages any shard content: a published shard's
+    // entries may carry one of these blobs' hashes, so the blob must already be durable — not
+    // merely staged — before that shard's rename can land.
     //
-    // A failure here skips `publish_shard_outcomes` entirely, rather than the "keep whatever was
-    // decided" resilience the decide loop above gives a per-shard failure: `WriteBatch::finish`'s
-    // rename loop returns on the *first* failure (see `write_shard_mutation`'s doc comment on why
-    // that is not all-or-nothing — finding #4), so on an error here some of this pass's blobs may
-    // be durable and others not, with no per-hash way to tell which from outside `WriteBatch`.
-    // Publishing any shard content below could then durably name a blob that never actually
-    // landed — see `create_inventory_for_directory`'s identical phase-0 gating for the same
-    // reasoning in more detail.
-    let blob_batch_published = match blob_batch.finish() {
-        Ok(()) => true,
-        Err(e) => { if result.is_ok() { result = Err(e); } false }
-    };
+    // A plain (non-leaked) failure here skips `publish_shard_outcomes` entirely, rather than the
+    // "keep whatever was decided" resilience the decide loop above gives a per-shard failure: a
+    // rename-loop failure gives no per-hash way to tell which of this pass's blobs are durable and
+    // which are not, so publishing any shard content below could then durably name a blob that
+    // never actually landed — see `create_inventory_for_directory`'s identical phase-0 gating for
+    // the same reasoning in more detail. A leaked-reservation failure is precise enough to instead
+    // drop just the outcome(s) that reference the missing blob(s) and still publish the rest.
+    let mut blob_batch_published = true;
+    let mut missing_blob_hashes: BTreeSet<String> = BTreeSet::new();
+
+    match blob_batch.finish_detailed() {
+        Ok(()) => {}
+        Err(file_utils::WriteBatchFailure::LeakedReservations { message, missing }) => {
+            missing_blob_hashes = missing_blob_hashes_from(&missing);
+            if result.is_ok() { result = Err(message); }
+        }
+        Err(file_utils::WriteBatchFailure::Other(message)) => {
+            if result.is_ok() { result = Err(message); }
+            blob_batch_published = false;
+        }
+    }
+
+    drop_outcomes_referencing_missing_blobs(&mut outcomes, &missing_blob_hashes);
 
     // Publish every shard this pass decided to rewrite — see `publish_shard_outcomes`'s doc
-    // comment for the exact ordering (and how it closes findings #1 and #6, per this function's
-    // own doc comment above).
+    // comment for the exact ordering.
     if blob_batch_published {
         if let Err(e) = publish_shard_outcomes(&clear_keys, &mut outcomes) {
             if result.is_ok() { result = Err(e); }
@@ -1319,7 +1436,7 @@ pub fn refresh_tracked_entries() -> Result<(), String> {
 /// before any warehouse mutation — parse-then-check-then-write is preserved), threads it into
 /// the tree build, and reuses it again for the post-stack cleanup's rewrite decision.
 ///
-/// `park` push (`park::park_changes`, DESIGN.html §5.0 D item 10, finding #3) also builds one now
+/// `park` push (`park::park_changes`) also builds one now
 /// — its own, single-use snapshot (it has no second or third step to share it with, unlike
 /// `stack`) — for the same reason: `build_tree_from_inventory_deferred` needs a
 /// `PreparedInventory` to read shard content from. `park` checks `has_conflict_entries_in` on its
@@ -1358,8 +1475,8 @@ pub struct PreparedInventory {
 /// [`PreparedInventory`] for why (`stack` used to pay this read+parse cost three times per
 /// parcel).
 ///
-/// The read-and-parse work itself is fanned out across every core (DESIGN.html §5.0 D item 10,
-/// finding #5) — [`fanout_utils::fanout_map`], order-independent I/O plus CPU-bound parsing over
+/// The read-and-parse work itself is fanned out across every core —
+/// [`fanout_utils::fanout_map`], order-independent I/O plus CPU-bound parsing over
 /// a flat, already-collected key list. `park` push (`park::park_changes`) is the reason this
 /// matters here specifically: before it was switched onto this shared snapshot, its own tree
 /// build read every shard from inside its own per-directory `TaskExecutor` task, in parallel; a
@@ -1597,7 +1714,7 @@ pub fn update_shard(key: &str,
 /// <dir>`, `park pop`), collapsed so that N steps touching the same shard read-modify-write it
 /// exactly once, and published once through the same [`publish_shard_outcomes`] join point
 /// `load`'s walk and `park`'s working-directory refresh (`refresh_tracked_entries`) already use
-/// (DESIGN.html §5.0 D item 10, findings #2/#4).
+/// (DESIGN.html §5.0 D item 10).
 ///
 /// Every shard this batch touches is always published as [`ShardOutcome::Changed`] — matching
 /// [`write_shard_mutation`]'s existing, unconditional "this shard's effective content changed"
@@ -1614,7 +1731,7 @@ pub fn update_shard(key: &str,
 /// `apply_merge_action`'s `Merged` case) must be staged into [`blob_batch`](Self::blob_batch)
 /// rather than stored immediately — [`publish`](Self::publish) finishes it as its own barrier,
 /// strictly before any shard content is staged, exactly like `load`'s and `park`'s own
-/// blob-batch/shard-content ordering (DESIGN.html §5.0 D item 10, finding #7).
+/// blob-batch/shard-content ordering.
 pub struct ShardMutationBatch {
     /// Warehouse path key → the in-memory inventory this batch has decided for it so far.
     shards: BTreeMap<String, Inventory>,
@@ -1623,7 +1740,7 @@ pub struct ShardMutationBatch {
     /// first mutation is applied, never updated by a later mutation of the same key. Anchors the
     /// shard's eventually-published mtime (see [`publish`](Self::publish)) to the earliest,
     /// most conservative instant available, exactly like `load`'s and `park`'s join points anchor
-    /// `ShardOutcome::verified_at` (DESIGN.html §5.0 D item 10, finding #6) — never "now" at
+    /// `ShardOutcome::verified_at` — never "now" at
     /// publish time, which would let a file rewritten later in this same batch's processing (or
     /// concurrently, by something else) satisfy `is_entry_unchanged`'s racily-clean guard on a
     /// now-stale cached hash. A second or later mutation of the same key in this batch may itself
@@ -1647,7 +1764,7 @@ impl ShardMutationBatch {
     }
 
     /// The blob batch every staged object write for this operation should join instead of
-    /// storing immediately — see the type's own doc comment for why (finding #7's ordering rule).
+    /// storing immediately — see the type's own doc comment for why (the ordering rule).
     pub fn blob_batch(&self) -> &file_utils::WriteBatch {
         &self.blob_batch
     }
@@ -1655,13 +1772,13 @@ impl ShardMutationBatch {
     /// Apply `change` to the shard at `key`: the first call for a given `key` in this batch loads
     /// it fresh from disk (or starts a new, empty one if no shard exists there yet — exactly like
     /// [`update_shard`]); every later call for the same `key` mutates the very same in-memory
-    /// copy — the same-shard collapse this type exists for (DESIGN.html §5.0 D item 10,
-    /// implementation note) — instead of a fresh read-modify-write per call.
+    /// copy — the same-shard collapse this type exists for — instead of a fresh read-modify-write
+    /// per call.
     ///
     /// A failing `change` never leaves this key's *partial* mutation sitting in the batch for
-    /// [`publish`](Self::publish) to later write out as if it had fully succeeded (DESIGN.html
-    /// §5.0 D item 10, PR B review finding #7). This is not latent: `restore.rs`'s
-    /// `restore_shard_files_into` (finding #5's fix) stages a closure that calls
+    /// [`publish`](Self::publish) to later write out as if it had fully succeeded. This is not
+    /// latent: `restore.rs`'s
+    /// `restore_shard_files_into` stages a closure that calls
     /// `build_inventory_item_from_stat`, which is genuinely fallible (an unreadable file id, a
     /// file that vanished between being written and being stat'd) — so a real caller's `change`
     /// can fail mid-mutation today, not just hypothetically. Guarded by snapshotting this key's
@@ -1677,13 +1794,14 @@ impl ShardMutationBatch {
     ///
     /// **The granularity of "this key's mutation" is whatever one `change` call covers, which is
     /// not always one file.** `restore_shard_files_into` deliberately makes one `update` call
-    /// cover every file in a shard (needed for finding #5's mtime-anchor fix — see its own doc
+    /// cover every file in a shard (needed for its own mtime-anchor soundness — see its own doc
     /// comment), so a stat failure on file *k* of an *n*-file shard rolls back files `1..k-1`'s
     /// accounting too, not just file *k*'s — wider than the pre-batching per-file funnel, which
     /// could only ever lose the one file that failed. Not data loss (every file's real on-disk
     /// content already matches what was intended; a rolled-back entry is merely stale-until-the-
-    /// next-`load`/`restore`, exactly like this PR's other, already-documented `batch.publish()`-
-    /// failure wideners), but worth knowing before assuming "this key" means "this file".
+    /// next-`load`/`restore`, the same self-healing shape every other `batch.publish()`-failure
+    /// blast-radius widener in this primitive already has), but worth knowing before assuming
+    /// "this key" means "this file".
     ///
     /// A key whose very *first* touch in this batch fails is dropped from the batch entirely
     /// (not left behind as a content-unchanged copy): nothing was ever successfully decided for
@@ -1762,25 +1880,16 @@ impl ShardMutationBatch {
     /// every ancestor this batch's touched shards invalidate is cleared (phase A), then every
     /// touched shard's new content is written (phase B) — the exact two-phase ordering
     /// [`write_shard_mutation`] gives a single shard, now shared across every shard this whole
-    /// batch touched.
+    /// batch touched. [`publish_shard_outcomes`] registers every one of `outcomes`' keys in
+    /// inventory metadata itself, regardless of its own `Ok`/`Err` result — see its own doc
+    /// comment for why over-registering a key whose shard did not end up durable this round is
+    /// always safe, never a wrong answer.
     ///
-    /// **Every touched key is registered in the inventory metadata regardless of whether phase
-    /// A/B fully succeeded — not only on `Ok`** (DESIGN.html §5.0 D item 10, PR B review finding
-    /// #1, the core bug this fix closes). [`publish_shard_outcomes`]'s own doc comment explains
-    /// why: its `Err` does not mean "nothing landed" — a phase B failure may have durably
-    /// published a real prefix of `outcomes`, and a durable-but-unregistered shard is invisible
-    /// to every metadata-driven reader (`stack`'s tree build, `stocktake`), silently dropping a
-    /// merge's/restore's real, already-durable content from history with no error at all. The old
-    /// per-action `update_shard` funnel never had this gap: it re-registered its one key
-    /// immediately after every successful shard write, so "durable" and "registered" always
-    /// coincided. This restores that property for the whole batch: registering a key whose shard
-    /// did *not* end up durable this round is itself always safe, never a wrong answer — every
-    /// metadata-driven reader already treats a listed-but-missing shard (a brand-new key that
-    /// never got its rename) or one whose content is simply unchanged from before this call (an
-    /// existing key phase B never reached) as empty/stale rather than an error (see
-    /// [`PreparedInventory::shards`]'s own doc comment, and `restore`/`stocktake`'s matching
-    /// `load_shard_or_empty`-style handling) — it can only ever surface *more* of what is
-    /// genuinely on disk, never fabricate content that was not actually written.
+    /// A blob batch failure that names specific missing blobs (a leaked reservation) does not
+    /// discard this whole batch: only the shard(s) whose content actually references one of them
+    /// are dropped (see [`drop_outcomes_referencing_missing_blobs`]) — everything else this batch
+    /// decided still publishes normally. Any *other* blob-batch failure carries no such itemized
+    /// list, so it is treated as before: nothing here is touched, nothing to register.
     ///
     /// A no-op (no blob barrier, no phase A/B, no metadata rewrite) when nothing was ever staged
     /// or mutated — a caller with an empty action list can call this unconditionally.
@@ -1788,27 +1897,19 @@ impl ShardMutationBatch {
     /// # Returns
     /// * `Ok(())`      - Every decided mutation (and its ancestor clears) is durable, and every
     ///                   touched key is registered.
-    /// * `Err(String)` - The blob batch failed (phase A/B never even started — nothing here is
-    ///                   touched, nothing to register), or phase A/B itself failed. In the phase
-    ///                   A/B case every touched key is *still* registered (see above) before this
-    ///                   returns — a caller that wants to retry must still redo its decisions from
-    ///                   scratch (the same way `load .` always does), not assume any particular
-    ///                   key did or did not durably land, but it must not assume metadata is
-    ///                   unaffected either.
+    /// * `Err(String)` - The blob batch failed in a way that gives up the whole batch (nothing
+    ///                   here is touched, nothing to register), a blob batch failure dropped one
+    ///                   or more shards (everything else still published and registered), or
+    ///                   phase A/B itself failed (every touched key is *still* registered — a
+    ///                   caller that wants to retry must redo its decisions from scratch, the same
+    ///                   way `load .` always does, not assume any particular key did or did not
+    ///                   durably land, but it must not assume metadata is unaffected either).
     pub fn publish(self) -> Result<(), String> {
-        // Phase 0: every blob a decided mutation's content might reference becomes durable now,
-        // in its own barrier — strictly before any shard content below is even staged
-        // (DESIGN.html §5.0 D item 10, finding #7; see `publish_shard_outcomes`'s doc comment for
-        // why the two must not share one batch). A failure here means some of this batch's blobs
-        // may be durable and others not (`WriteBatch::finish`'s rename loop returns on the first
-        // failure — finding #4), so — exactly like `create_inventory_for_directory`'s identical
-        // phase-0 gating — nothing this batch decided is published this round on a blob failure:
-        // no shard content below can reference a blob that might not exist, so nothing is staged
-        // and nothing needs registering either.
-        self.blob_batch.finish()?;
-
         if self.shards.is_empty() {
-            return Ok(());
+            // Even an empty batch must still resolve its own blob batch — though in practice
+            // nothing could have staged anything into it either (every blob this type stages is
+            // staged as part of deciding a shard mutation), so this is always a true no-op.
+            return self.blob_batch.finish();
         }
 
         let mut clear_keys: BTreeSet<String> = BTreeSet::new();
@@ -1822,35 +1923,100 @@ impl ShardMutationBatch {
             // inserts into `shards` (see its own doc comment), so every key reached here is
             // guaranteed to have one — `expect`, not a silent `unwrap_or_else(SystemTime::now)`
             // fallback, so a future refactor that ever breaks that pairing fails loudly here
-            // instead of quietly reintroducing the exact "now at publish time" mtime-widening
-            // hazard finding #6 closed (DESIGN.html §5.0 D item 10).
+            // instead of quietly reintroducing the "now at publish time" mtime-widening hazard
+            // `first_touched_at` exists to close.
             let verified_at = *self.first_touched_at.get(&key)
                 .expect("update() always pairs a shards entry with a first_touched_at entry");
 
             outcomes.insert(key, ShardOutcome::Changed(inventory, verified_at));
         }
 
-        let touched_keys: BTreeSet<String> = outcomes.keys().cloned().collect();
+        // Phase 0: every blob a decided mutation's content might reference becomes durable now,
+        // in its own barrier — strictly before any shard content below is even staged (see
+        // `publish_shard_outcomes`'s doc comment for why the two must not share one batch). A
+        // leaked-reservation failure names the exact missing blob(s), precise enough to drop only
+        // the shard(s) that reference one and still publish the rest (below); any other failure
+        // carries no such itemized list, so nothing here is staged and nothing needs registering.
+        match self.blob_batch.finish_detailed() {
+            Ok(()) => {}
+            Err(file_utils::WriteBatchFailure::LeakedReservations { message, missing }) => {
+                let missing_hashes = missing_blob_hashes_from(&missing);
+                drop_outcomes_referencing_missing_blobs(&mut outcomes, &missing_hashes);
 
-        // Deliberately *not* short-circuited by `?` — see the doc comment above. Every touched
-        // key is registered whether `publish_shard_outcomes` returns `Ok` or `Err`, because its
-        // `Err` may still mean a real prefix of `outcomes` is now durable on disk.
-        let publish_result = publish_shard_outcomes(&clear_keys, &mut outcomes);
+                if outcomes.is_empty() {
+                    return Err(message);
+                }
 
-        match update_inventory_metadata(&touched_keys, &BTreeSet::new()) {
-            Ok(()) => publish_result,
-            Err(metadata_err) => match publish_result {
-                // The metadata rewrite is the only thing that failed — surface it directly.
-                Ok(()) => Err(metadata_err),
-                // Both failed: the original `publish_shard_outcomes` error is almost always the
-                // more useful one for the operator (it names the actual I/O problem), but the
-                // metadata failure is real too and must not be silently dropped.
-                Err(publish_err) => Err(format!(
-                    "{}\n(the inventory metadata file could also not be updated afterward: {})",
-                    publish_err, metadata_err
-                )),
-            },
+                return match publish_shard_outcomes(&clear_keys, &mut outcomes) {
+                    Ok(()) => Err(message),
+                    Err(publish_err) => Err(format!("{}\n{}", message, publish_err)),
+                };
+            }
+            Err(file_utils::WriteBatchFailure::Other(message)) => return Err(message),
         }
+
+        publish_shard_outcomes(&clear_keys, &mut outcomes)
+    }
+
+    /// How many distinct shards this batch may hold decided-but-unpublished before
+    /// [`flush_if_full`](Self::flush_if_full) publishes what has accumulated and starts fresh —
+    /// the bound that keeps a caller's peak memory independent of the size of the *whole* logical
+    /// operation, not just of the repository as a whole. A merge diff, a parked diff, or a
+    /// `restore <dir>` subtree can each be as large as the repository itself (a formatter run
+    /// touching every tracked file, say), so "bounded by the diff" is not actually a bound.
+    /// Chosen generously (a real durability barrier is not free, and a typical call touches far
+    /// fewer shards than this): high enough that almost every real invocation still pays exactly
+    /// the same one-or-two-barrier cost an unbounded batch would, low enough that an operation
+    /// spanning hundreds of thousands of directories never holds more than a small, constant
+    /// slice of them in memory at once.
+    pub const GROUP_SIZE_DEFAULT: usize = 256;
+
+    /// The group size [`flush_if_full`](Self::flush_if_full) actually flushes at — see
+    /// [`GROUP_SIZE_DEFAULT`](Self::GROUP_SIZE_DEFAULT). Overridable via
+    /// `FORKLIFT_SHARD_BATCH_GROUP_SIZE` so a test can exercise the periodic-flush boundary with a
+    /// handful of directories instead of needing hundreds to cross the production threshold (same
+    /// undocumented, test-only-override shape as [`rollup_skip_enabled`]'s
+    /// `FORKLIFT_DISABLE_ROLLUP_SKIP`). An unset, empty, or unparseable value falls back to the
+    /// default; not a supported setting.
+    fn group_size() -> usize {
+        std::env::var("FORKLIFT_SHARD_BATCH_GROUP_SIZE")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|&size: &usize| size > 0)
+            .unwrap_or(Self::GROUP_SIZE_DEFAULT)
+    }
+
+    /// If this batch currently holds at least [`group_size`](Self::group_size) distinct shards'
+    /// decisions, publish everything decided so far (see [`publish`](Self::publish)) and reset
+    /// this batch to a fresh, empty one — otherwise a no-op. Every caller whose operation's
+    /// working set can grow unboundedly (`restore <dir>`, `consolidate`/`cherry-pick`'s
+    /// per-action funnel, `park pop`'s replay) calls this once per unit of work decided, instead
+    /// of holding one unbounded batch for the whole call.
+    ///
+    /// Sound across the flush boundary this creates for the same reason calling `publish()`
+    /// several times in a row already is: every flush is its own complete, independent
+    /// `publish()` (a full blob barrier, then phase A, then phase B, then metadata registration),
+    /// so [`SHARD_MUTATION_LOCK`] is acquired and released per flush, never held across the whole
+    /// operation. A later flush touching a key an earlier flush already published re-reads that
+    /// key fresh from disk on its own first touch ([`update`](Self::update)'s own contract),
+    /// correctly seeing the earlier flush's already-durable content. And since every mutation
+    /// this type stages is unconditionally a [`ShardOutcome::Changed`] (never a `Carry` — see the
+    /// type's own doc comment), the specific hazard that makes ancestor-clear *ordering* matter
+    /// elsewhere (a stale carried-forward rollup publishing after its ancestor was already
+    /// cleared — see `publish_shard_outcomes`'s own doc comment) cannot arise here regardless of
+    /// flush order: no flush from this type ever republishes a non-`None` rollup for a later one
+    /// to race against.
+    ///
+    /// # Returns
+    /// * `Ok(())`      - Either nothing needed flushing yet, or the flush published successfully.
+    /// * `Err(String)` - The flush's `publish()` failed — see its own doc comment for what that
+    ///                   does and does not mean for the shards it covered.
+    pub fn flush_if_full(&mut self) -> Result<(), String> {
+        if self.shards.len() < Self::group_size() {
+            return Ok(());
+        }
+
+        std::mem::take(self).publish()
     }
 }
 
@@ -1864,8 +2030,8 @@ impl Default for ShardMutationBatch {
 /// already stored (e.g. one just written from a tree or merge) into `batch` (see
 /// [`ShardMutationBatch`]) instead of writing it immediately. The unbatched twin this replaced
 /// (`stage_file_entry_from_stat`, a thin wrapper around [`update_shard`]) was removed as dead
-/// code once every production call site converted to this batched form (DESIGN.html §5.0 D item
-/// 10, finding #9) — keeping it around `pub` but uncalled left a second, unbatched staging
+/// code once every production call site converted to this batched form — keeping it around `pub`
+/// but uncalled left a second, unbatched staging
 /// helper beside this one for a future contributor to pick by mistake, silently reintroducing
 /// the per-file two-barrier funnel this whole primitive exists to remove.
 ///
@@ -2346,8 +2512,8 @@ pub fn build_inventory_item_from_file(path: &Path,
 }
 
 /// Like [`build_inventory_item_from_file`], but stages the file's blob into `batch` (see
-/// [`file_utils::WriteBatch`]) instead of writing and fsyncing it immediately (DESIGN.html §5.0 D
-/// item 10, finding #1). Used by every caller that rebuilds several files in one operation
+/// [`file_utils::WriteBatch`]) instead of writing and fsyncing it immediately. Used by every
+/// caller that rebuilds several files in one operation
 /// (`load`'s parallel walk, `park`'s working-directory refresh), so what used to be one
 /// atomic-write barrier per file collapses into the caller's own shared batch.
 ///
@@ -2879,7 +3045,7 @@ mod tests {
 
     #[test]
     fn publish_shard_outcomes_durably_clears_an_ancestor_outcome_in_phase_a_before_phase_b_runs() {
-        // Regression (post-merge review of PR #61's finding #1 fix, finding A): an ancestor that
+        // Regression: an ancestor that
         // is *also* one of this batch's own outcomes (here: the root, needing only a stat-drift
         // `Carry` rewrite) used to be filtered out of phase A entirely, on the theory that phase
         // B would publish its (already in-memory-cleared) content anyway. That covers content
@@ -3025,8 +3191,9 @@ mod tests {
 
     #[test]
     fn shard_mutation_batch_anchors_each_shards_published_mtime_at_its_own_first_touch() {
-        // DESIGN.html §5.0 D item 10, finding #6 (generalized to the batched merge/replay
-        // funnel, findings #2/#4): a shard decided *early* in a batch must not have its published
+        // The same mtime-anchor invariant `load`'s and `park`'s join points already have,
+        // generalized to the batched merge/replay funnel: a shard decided *early* in a batch must
+        // not have its published
         // mtime advanced to "now" at the whole batch's publish time — that would widen
         // `is_entry_unchanged`'s racily-clean trust window for every entry in it, exactly the bug
         // that hit `refresh_tracked_entries`'s pass-1/pass-2 split. `ShardMutationBatch` anchors
@@ -3081,8 +3248,7 @@ mod tests {
 
     #[test]
     fn shard_mutation_batch_registers_a_durably_published_prefix_even_when_publish_fails() {
-        // Regression (DESIGN.html §5.0 D item 10, PR B review finding #1 — the core finding):
-        // `WriteBatch::finish`'s rename loop (`run_write_barrier`) returns on the *first* failing
+        // Regression: `WriteBatch::finish`'s rename loop (`run_write_barrier`) returns on the *first* failing
         // rename, not before any of them — so a phase B failure can still leave a real prefix of
         // this batch's shards durably renamed on disk. The old (pre-fix) `publish` short-circuited
         // metadata registration via `?` on that same failure, so a durably-published shard could
@@ -3111,8 +3277,8 @@ mod tests {
         // succeeds for both "aaa" and "zzz" — but `run_write_barrier`'s rename loop then fails
         // renaming "zzz"'s temp file *onto* that existing directory (`EISDIR`/`ENOTDIR`,
         // platform-dependent), strictly after "aaa"'s own rename (staged, and so renamed, first —
-        // `outcomes` is a `BTreeMap`, and "aaa" sorts before "zzz") already completed. This is the
-        // actual failure shape finding #1 is about: a *renameloop* failure partway through, not a
+        // `outcomes` is a `BTreeMap`, and "aaa" sorts before "zzz") already completed. This is a
+        // genuine rename-loop failure partway through, not a
         // staging failure that would prevent every rename in the batch from ever starting.
         let zzz_data_path = file_utils::get_inventory_data_path_for_key("zzz");
         std::fs::create_dir_all(&zzz_data_path).unwrap();
@@ -3136,8 +3302,78 @@ mod tests {
     }
 
     #[test]
+    fn shard_mutation_batch_publish_drops_only_the_outcome_referencing_a_leaked_blob() {
+        // Regression: a leaked blob reservation (a fallible step between `reserve_final_path`
+        // winning and the write actually being staged — see `file_utils::WriteBatch::
+        // finish_detailed`'s own doc comment) used to refuse this batch's *entire* publish, even
+        // though the leak names the exact blob(s) that never landed and so precisely identifies
+        // which decided shard(s) actually depend on one — every other shard this batch decided is
+        // completely unaffected and safe to publish. The pre-fix all-or-nothing response also
+        // made the caller's own "entries loaded so far were kept" message false whenever this
+        // happened: nothing at all was kept, not just the directory referencing the missing blob.
+        let _scratch = Scratch::new("shard-batch-leaked-blob-partial-resilience");
+
+        // A syntactically valid (but never actually built or staged) object hash — the test needs
+        // only a path `file_utils::hash_from_object_path` can decode back, not a real blob.
+        let leaked_hash = "a".repeat(64);
+        let (path, file_name) = file_utils::get_path_for_object(&leaked_hash).unwrap();
+        let mut leaked_final_path = std::path::PathBuf::from(&path);
+        leaked_final_path.push(&file_name);
+
+        let mut batch = ShardMutationBatch::new();
+
+        // Simulate "reserved, then a fallible step before staging failed": nothing ever pushes
+        // this path into `pending`.
+        assert!(batch.blob_batch().reserve_final_path(&leaked_final_path),
+            "the simulated reservation must win");
+
+        // Directory "a": its only entry references the leaked hash.
+        batch.update("a", |inventory| {
+            let mut leaked_item = item("leaked.txt", 1, InventoryItemState::Normal);
+            leaked_item.hash = leaked_hash.clone();
+            inventory.add_item(leaked_item);
+            Ok(())
+        }).unwrap();
+
+        // Directory "b": an unrelated, fully-fine mutation — must survive "a"'s blob failure.
+        batch.update("b", |inventory| {
+            inventory.add_item(item("fine.txt", 2, InventoryItemState::Normal));
+            Ok(())
+        }).unwrap();
+
+        let error = match batch.publish() {
+            Ok(()) => panic!(
+                "a leaked reservation must still be reported as a failure, not silently succeed"),
+            Err(e) => e,
+        };
+        assert!(error.contains(&*leaked_final_path.to_string_lossy()),
+            "the error must name the leaked reservation: {error}");
+
+        // Partial resilience: "b"'s unrelated mutation published (and registered) normally
+        // despite "a"'s leaked blob.
+        let (_, b_bytes) = file_utils::retrieve_inventory_or_none_by_key("b").unwrap();
+        let b_bytes = b_bytes.unwrap_or_else(|| panic!(
+            "\"b\"'s unrelated mutation must still be published despite \"a\"'s leaked blob"));
+        let b_inventory = parser::inventory::inventory_parser::parse_inventory(&b_bytes).unwrap();
+        assert!(b_inventory.get_item_by_name("fine.txt").is_some());
+
+        let (_, metadata_opt) = file_utils::retrieve_inventory_metadata_or_none().unwrap();
+        let metadata = metadata_opt.unwrap_or_default();
+        assert!(metadata.contains(&key_to_metadata_entry("b")),
+            "\"b\" must be registered despite \"a\"'s leaked blob: {:?}", metadata);
+
+        // "a"'s shard must never have been published referencing the blob that never landed —
+        // its outcome was dropped entirely; there was nothing on disk for it before this batch,
+        // so it must still be absent now (the leaked-reservation guarantee: no published shard
+        // may ever reference a blob that did not land).
+        let (_, a_bytes) = file_utils::retrieve_inventory_or_none_by_key("a").unwrap();
+        assert!(a_bytes.is_none(),
+            "\"a\"'s shard must not be published referencing a blob that never landed");
+    }
+
+    #[test]
     fn shard_mutation_batch_update_rolls_back_this_keys_partial_mutation_on_a_failing_change() {
-        // Regression (DESIGN.html §5.0 D item 10, PR B review finding #7): `update`'s old
+        // Regression: `update`'s old
         // implementation inserted a key into `self.shards` (or looked up the existing entry)
         // *before* running `change`, with no rollback if `change` returned `Err` — so a closure
         // that mutates and then fails validation would leave its half-applied mutation sitting in
@@ -3233,7 +3469,7 @@ mod tests {
 
     #[test]
     fn publish_shard_outcomes_is_held_across_by_shard_mutation_lock() {
-        // Regression (DESIGN.html §5.0 D item 10, PR B review finding #8): the batched paths
+        // Regression: the batched paths
         // (`ShardMutationBatch::publish`, via `publish_shard_outcomes`) used to call into the
         // shared join point without holding `SHARD_MUTATION_LOCK` at all, unlike every other
         // shard-mutating funnel (`write_shard_mutation`, `clear_ancestor_rollups`), which could
@@ -3291,7 +3527,7 @@ mod tests {
 
     #[test]
     fn cleanup_after_stack_does_not_advance_a_stamped_shard_s_mtime() {
-        // Regression (multi-agent review of PR #59, finding 1): `cleanup_after_stack_with`'s
+        // Regression: `cleanup_after_stack_with`'s
         // rollup-stamp rewrite never re-verifies a single entry against the file system (the
         // entries come straight from the already-parsed `PreparedInventory` snapshot) — exactly
         // the "rewrite that verifies nothing" hazard the join-point redesign was already fixed
@@ -3376,7 +3612,7 @@ mod tests {
 
     #[test]
     fn a_corrupt_dirty_shard_during_load_yields_the_resilience_message_not_a_raw_parse_error() {
-        // Regression (multi-agent review of PR #59, finding 2): a join-point failure (here, a
+        // Regression: a join-point failure (here, a
         // leftover shard that fails to parse) used to `?`-propagate straight out of
         // `create_inventory_for_directory`, bypassing the failure-resilience branch entirely —
         // skipping `update_inventory_metadata` for whatever *was* successfully published this

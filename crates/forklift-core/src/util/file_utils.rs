@@ -196,6 +196,30 @@ pub fn get_path_for_object(hash: &str) -> Result<(String, String), String> {
     Ok((path, hash[OBJECT_HASH_FOLDER_PATH_CHARACTERS..].to_string()))
 }
 
+/// Recover the object hash a loose object's final on-disk path encodes — the exact inverse of
+/// [`get_path_for_object`]. Used to translate a [`WriteBatch::finish_detailed`] leaked-reservation
+/// failure (which names the final paths that never landed) back into the blob hash(es) they
+/// address, so a caller can identify which already-decided content actually depends on one of
+/// them (see `inventory_utils`'s use of this for `load`/`park`/`ShardMutationBatch`'s blob
+/// batches).
+///
+/// # Returns
+/// * `Some(String)` - The hash, if `path`'s last two components have the `<2 hex chars>/<rest>`
+///                     fan-out shape [`get_path_for_object`] produces.
+/// * `None`         - `path` does not have that shape (not an object path, or corrupt).
+pub fn hash_from_object_path(path: &Path) -> Option<String> {
+    let file_name = path.file_name()?.to_str()?;
+    let folder_name = path.parent()?.file_name()?.to_str()?;
+
+    if folder_name.len() != OBJECT_HASH_FOLDER_PATH_CHARACTERS {
+        return None;
+    }
+
+    let candidate = format!("{}{}", folder_name, file_name);
+
+    candidate.bytes().all(|b| b.is_ascii_hexdigit()).then_some(candidate)
+}
+
 /// Whether writes fsync for durability. Durable by default; set `FORKLIFT_FSYNC` to `0`, `off`,
 /// `false`, or `no` to skip every fsync — a throughput escape hatch for bulk, disposable work
 /// (large imports, test fixtures, CI) where a mid-run crash just means re-running the whole
@@ -476,7 +500,7 @@ impl BulkStoreSession {
     /// special-casing needed (see `gc_utils`'s own
     /// `gc_sweeps_a_stranded_write_batch_temp_past_the_grace_period` test). This is the same
     /// reclaiming path every other crashed single-file write already relied on before batching
-    /// existed (DESIGN.html §5.0 D item 10, finding #3) — batching only widens *how much* can be
+    /// existed — batching only widens *how much* can be
     /// staged in one still-unfinished barrier, not *whether* an abandoned temp is ever reclaimed.
     pub fn finish(mut self) -> Result<(), String> {
         self.run_barrier()?;
@@ -656,6 +680,33 @@ pub struct WriteBatch {
     state: std::sync::Mutex<WriteBatchState>,
 }
 
+/// Why [`WriteBatch::finish_detailed`] failed — see its own doc comment for what a caller can (and
+/// cannot) do with each variant.
+pub enum WriteBatchFailure {
+    /// One or more final paths were [`reserve_final_path`](WriteBatch::reserve_final_path)'d but
+    /// never staged — see [`finish`](WriteBatch::finish)'s doc comment. `missing` names exactly
+    /// those paths (and only those); nothing in this batch had even begun renaming when this is
+    /// returned, since a leaked reservation is caught *before* [`run_write_barrier`] ever runs.
+    LeakedReservations {
+        message: String,
+        missing: Vec<PathBuf>,
+    },
+
+    /// Any other failure (an fsync or rename error). No itemized list of what did or did not land
+    /// is available.
+    Other(String),
+}
+
+impl WriteBatchFailure {
+    /// The human-readable message, regardless of variant — what [`WriteBatch::finish`] returns.
+    pub fn into_message(self) -> String {
+        match self {
+            WriteBatchFailure::LeakedReservations { message, .. } => message,
+            WriteBatchFailure::Other(message) => message,
+        }
+    }
+}
+
 /// The mutable state behind one lock, so [`WriteBatch::reserve_final_path`] and every `stage`
 /// call see (and update) the reservation set and the pending list atomically together — see
 /// `reserve_final_path`'s doc comment for why that atomicity is what makes it a real dedupe
@@ -743,7 +794,7 @@ impl WriteBatch {
     /// with the same path, which must *not* stage it again.
     ///
     /// This is the dedupe [`crate::model::object::loose_object::LooseObject::store_deferred`]
-    /// needs (DESIGN.html §5.0 D item 10, finding #2): [`does_object_exist`] alone only sees
+    /// needs: [`does_object_exist`] alone only sees
     /// packs and already-*renamed* final paths, never a write staged earlier in the very same
     /// batch (its final name does not exist yet — that is the whole point of batching). Without
     /// this, every repeated occurrence of the same content hash in one batched walk would
@@ -799,6 +850,30 @@ impl WriteBatch {
     /// * `Err(String)` - A write or rename failed, or a reserved path was never staged; every
     ///                   staged temp for this batch was best-effort removed before returning.
     pub fn finish(&self) -> Result<(), String> {
+        self.finish_detailed().map_err(WriteBatchFailure::into_message)
+    }
+
+    /// Like [`finish`](Self::finish), but distinguishes *why* it failed instead of collapsing
+    /// everything into one opaque message — see [`WriteBatchFailure`]. Every one of `finish`'s
+    /// own guarantees (nothing staged here survives a failed call; the reservation set is
+    /// cleared together with `pending`) hold identically here; `finish` is a thin wrapper over
+    /// this that keeps its existing `Result<(), String>` signature for every caller that has no
+    /// use for the distinction.
+    ///
+    /// The distinction exists for a caller that wants to recover *around* a failure instead of
+    /// discarding everything this batch decided (`inventory_utils`'s blob batches): a leaked
+    /// reservation names the *exact* final path(s) that never landed, precise enough to identify
+    /// (via [`hash_from_object_path`]) which already-decided content actually depends on one of
+    /// them and drop only that, publishing everything else normally. A rename/fsync failure
+    /// carries no such itemized list — [`run_write_barrier`]'s rename loop returns on the first
+    /// failure without recording which entries before it already landed versus which after it
+    /// were never attempted, so there is nothing precise for a caller to recover around; the
+    /// safe, and only, response there is to treat the whole batch as unpublished.
+    ///
+    /// # Returns
+    /// * `Ok(())`               - Every staged write is durable and visible at its final path.
+    /// * `Err(WriteBatchFailure)` - See the variants' own doc comments.
+    pub fn finish_detailed(&self) -> Result<(), WriteBatchFailure> {
         let (pending, leaked) = {
             let mut state = self.state.lock().expect("write batch lock poisoned");
             let pending = std::mem::take(&mut state.pending);
@@ -818,14 +893,15 @@ impl WriteBatch {
             for (temp, _) in &pending {
                 let _ = std::fs::remove_file(temp);
             }
-            return Err(format!(
+            let message = format!(
                 "Error: {} final path(s) were reserved but never staged — a fallible step between \
                 reservation and staging must have failed (any concurrent or later caller for the \
                 same path would have read the reservation as already handled and staged nothing of \
                 its own either); refusing to publish this batch: {}",
                 leaked.len(),
                 leaked.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>().join(", "),
-            ));
+            );
+            return Err(WriteBatchFailure::LeakedReservations { message, missing: leaked });
         }
 
         if pending.is_empty() {
@@ -836,7 +912,7 @@ impl WriteBatch {
             for (temp, _) in &pending {
                 let _ = std::fs::remove_file(temp);
             }
-            return Err(error);
+            return Err(WriteBatchFailure::Other(error));
         }
 
         Ok(())
@@ -1995,8 +2071,8 @@ mod tests {
 
     #[test]
     fn reserve_final_path_wins_exactly_once_then_loses_forever() {
-        // The dedupe primitive `LooseObject::store_deferred` needs (DESIGN.html §5.0 D item 10,
-        // finding #2): the first caller to reserve a given final path gets `true` (it owns
+        // The dedupe primitive `LooseObject::store_deferred` needs: the first caller to reserve
+        // a given final path gets `true` (it owns
         // staging that path); every later call for the same path — even after the winner has
         // gone on to actually stage it — gets `false`.
         let batch = WriteBatch::new();

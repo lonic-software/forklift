@@ -114,59 +114,19 @@ fn restore_worktree(path: &WarehousePath) -> Result<(), String> {
     Ok(())
 }
 
-/// How many shards' decisions [`restore_worktree_directory`] accumulates in one
-/// [`inventory_utils::ShardMutationBatch`] before publishing and starting a fresh one
-/// (DESIGN.html §5.0 D item 10, PR B review finding #4). Bounds `restore .`'s peak memory to
-/// roughly this many parsed `Inventory` shards regardless of how large the repository is — see
-/// the function's own doc comment for why an unbounded batch gives up the sharded inventory's
-/// whole RAM-scaling rationale for this one caller. Chosen generously (a real barrier is not
-/// free, and typical `restore <dir>` calls touch far fewer shards than this): high enough that
-/// almost every real invocation still pays exactly the same one-or-two-barrier cost the
-/// unbounded design had, low enough that `restore .` on a repository with hundreds of thousands
-/// of directories never holds more than a small, constant slice of them in memory at once.
-const RESTORE_SHARD_GROUP_SIZE_DEFAULT: usize = 256;
-
-/// The group size [`restore_worktree_directory`] actually flushes at — see
-/// [`RESTORE_SHARD_GROUP_SIZE_DEFAULT`]. Overridable via `FORKLIFT_RESTORE_SHARD_GROUP_SIZE` so a
-/// test can exercise the periodic-flush boundary with a handful of directories instead of needing
-/// hundreds to cross the production threshold (same undocumented, test-only-override shape as
-/// `inventory_utils::rollup_skip_enabled`'s `FORKLIFT_DISABLE_ROLLUP_SKIP`). An unset, empty, or
-/// unparseable value falls back to the default; not a supported setting.
-fn restore_shard_group_size() -> usize {
-    std::env::var("FORKLIFT_RESTORE_SHARD_GROUP_SIZE")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .filter(|&size: &usize| size > 0)
-        .unwrap_or(RESTORE_SHARD_GROUP_SIZE_DEFAULT)
-}
-
 /// Restore every tracked file of a directory (and its subdirectories) from the inventory.
 ///
 /// Every file's working-directory write happens immediately (unfsynced, same as always), but its
 /// refreshed inventory entry is only *decided* here — collected into one shared
 /// [`inventory_utils::ShardMutationBatch`] instead of paying `update_shard`'s full two-barrier
-/// *write* funnel per file (DESIGN.html §5.0 D item 10, finding #4). Several files in the same
-/// shard collapse into one read-modify-*write* of it, published once per group of shards (see
-/// [`restore_shard_group_size`]) — this loop still reads and parses each shard once itself (to
-/// enumerate the files it needs to restore) and the batch's own first touch of that same key
-/// reads and parses it again; harmless (nothing mutates the shard on disk between the two reads,
-/// so both reads see identical bytes) but not collapsed, unlike the write side.
-///
-/// **Bounded memory, not one unbounded batch for the whole call** (DESIGN.html §5.0 D item 10, PR
-/// B review finding #4): a `ShardMutationBatch` keeps every shard it has ever touched parsed in
-/// memory until it is published, so a single batch spanning this whole function would hold every
-/// directory's `Inventory` resident at once for `restore .` — the old per-file `update_shard`
-/// funnel this replaced loaded one shard, wrote it, and dropped it, bounding peak memory to the
-/// largest single directory *regardless of repository size*; giving that up for one caller's
-/// convenience is exactly the tradeoff the sharded inventory design exists to avoid. `consolidate`/
-/// `cherry-pick` and `park pop` stay a single batch (unaffected by this): their working set is
-/// bounded by the merge/parked diff, never by the repository as a whole, so they keep their full
-/// constant-barrier win. `restore <dir>` (worst case `restore .`) is the one caller whose working
-/// set is unbounded, so — and *only* here — the batch is flushed (published, then replaced with a
-/// fresh one) every [`restore_shard_group_size`] shards: barrier count becomes
-/// `O(shards / group size)` instead of one for the whole call, still far below the
-/// old per-file funnel's `O(files)`, while peak memory stays bounded by the group size instead of
-/// the repository size.
+/// *write* funnel per file. Several files in the same shard collapse into one read-modify-*write*
+/// of it, published once per group of shards (see [`inventory_utils::ShardMutationBatch::
+/// flush_if_full`], called once per shard below — the bound that keeps `restore .`'s peak memory
+/// independent of repository size, see its own doc comment) — this loop still reads and parses
+/// each shard once itself (to enumerate the files it needs to restore) and the batch's own first
+/// touch of that same key reads and parses it again; harmless (nothing mutates the shard on disk
+/// between the two reads, so both reads see identical bytes) but not collapsed, unlike the write
+/// side.
 ///
 /// If a file's restore fails partway through (an unreadable or missing blob), every file decided
 /// before the failure — including every already-published group before this one — is still
@@ -200,7 +160,6 @@ fn restore_worktree_directory(key: &str) -> Result<(), String> {
     let mut restored_any = false;
     let mut restored_count = 0usize;
     let mut batch = inventory_utils::ShardMutationBatch::new();
-    let mut shards_in_batch = 0usize;
 
     // `result` accumulates the *first* failure — see the function's own doc comment for why this,
     // rather than propagating immediately, matters here.
@@ -250,23 +209,11 @@ fn restore_worktree_directory(key: &str) -> Result<(), String> {
             Err(e) => { result = Err(e); break 'shards; }
         }
 
-        shards_in_batch += 1;
-
-        if shards_in_batch >= restore_shard_group_size() {
-            // `std::mem::take` swaps in a fresh, empty (`Default`) batch and hands this function
-            // ownership of the full one to publish — `batch` itself is therefore *never* left in
-            // a moved-out state, on either the success or the failure path below, which is what
-            // lets the trailing `publish()` after the loop always be valid to call, even after a
-            // failure here (it would just publish the fresh, empty replacement — a documented
-            // no-op, see `ShardMutationBatch::publish`'s own doc comment).
-            let full_batch = std::mem::take(&mut batch);
-
-            if let Err(e) = full_batch.publish() {
-                result = Err(e);
-                break 'shards;
-            }
-
-            shards_in_batch = 0;
+        // Bounds peak memory to a small, constant slice of shards instead of the whole repository
+        // — see `ShardMutationBatch::flush_if_full`'s own doc comment.
+        if let Err(e) = batch.flush_if_full() {
+            result = Err(e);
+            break 'shards;
         }
     }
 
@@ -304,7 +251,7 @@ fn restore_worktree_directory(key: &str) -> Result<(), String> {
 /// Restore every one of a single shard's (non-deleted) files from its staged blob, and refresh
 /// all of their inventory entries in one `batch.update` call for the whole shard — collapsing
 /// every file in the directory into one read-modify-write, as before, but *also* fixing the stat
-/// cache regression batching introduced (DESIGN.html §5.0 D item 10, PR B review finding #5):
+/// cache regression batching introduced (DESIGN.html §5.0 D item 10):
 /// every file in `files` is written to disk *first* (pass 1, this function's own loop), and only
 /// *then* is `batch.update` called — so the whole batch's first-touch anchor for this shard
 /// (`ShardMutationBatch`'s `first_touched_at`, captured immediately before the closure below
