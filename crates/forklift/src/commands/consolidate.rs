@@ -527,7 +527,7 @@ fn inventory_lookup(path: &str) -> Result<Option<InventoryItem>, String> {
 /// likewise still published.
 ///
 /// **A `batch.publish()`/`flush_if_full()` failure is a different, and wider, case than the old
-/// code had** (caught in adversarial review): every action's working-directory write still
+/// code had:** every action's working-directory write still
 /// happens unconditionally, before its shard mutation is ever staged — so by the time a flush or
 /// the final `publish()` runs, the working directory may already reflect *every* action in this
 /// call, even though publishing can fail for a reason unrelated to any specific action (an

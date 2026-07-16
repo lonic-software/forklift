@@ -367,7 +367,7 @@ fn the_staging_byte_plane_answers_307_and_refuses_a_session_less_put() {
     assert_eq!(status(&fixture.call(get(&format!("/v1/objects/{}", "c".repeat(64))))), 404);
 }
 
-/// Review fix: `?session=` with an empty value must not be treated as a real session — that
+/// `?session=` with an empty value must not be treated as a real session — that
 /// would presign a `staging//{hash}` key `commit_lift` could never promote, stranding the
 /// object. It is routed exactly like a request with no `session` parameter: `422
 /// SessionRequired`, never a `307` to a doubled-slash staging key.
@@ -417,7 +417,7 @@ fn upload_targets_negotiates_over_http() {
     );
 }
 
-/// Review fix: `upload-targets` has its own, smaller batch cap than the protocol's shared
+/// `upload-targets` has its own, smaller batch cap than the protocol's shared
 /// `MAX_MISSING_BATCH` (10 000) — each response entry carries a presigned URL, not a bare hash,
 /// so a `MAX_MISSING_BATCH`-sized request would answer with several megabytes of JSON, at or
 /// over a Lambda synchronous response's limit. A request over the router's cap is refused
@@ -481,7 +481,7 @@ fn commit_lift_verifies_and_promotes_over_http() {
     assert_eq!(location(&response), format!("https://s3.example/bucket/objects/{}", good_hash));
 }
 
-/// Review fix: `commit_lift` had no batch cap at all (every other list-taking route enforces the
+/// `commit_lift` had no batch cap at all (every other list-taking route enforces the
 /// protocol's shared `MAX_MISSING_BATCH` inside `Head`). A request whose `control_plane` and
 /// `blobs` lists together exceed the cap is refused with a 422 before `Head::commit_lift` runs.
 #[test]
@@ -659,7 +659,7 @@ fn unknown_routes_are_404() {
     assert_eq!(status(&fixture.call(get("/warehouse"))), 404);
 }
 
-/// Review fix: a `500` must not forward `Head`'s internal message verbatim — that message can
+/// A `500` must not forward `Head`'s internal message verbatim — that message can
 /// wrap a raw SDK failure carrying a request id, a bucket or table name, which this hosted,
 /// multi-tenant edge must not hand to whoever is asking (unlike `forklift-server`, which
 /// forwards its `500`s because that self-host head only ever runs on the operator's own

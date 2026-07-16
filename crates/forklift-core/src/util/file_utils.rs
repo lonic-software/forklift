@@ -828,7 +828,7 @@ impl WriteBatch {
     /// each `finish` as its own barrier.
     ///
     /// Refuses to run the barrier at all if some path was [`reserve_final_path`](Self::reserve_final_path)'d
-    /// but never actually staged (post-merge review, finding B): the winner of a reservation is
+    /// but never actually staged: the winner of a reservation is
     /// trusted to go on and stage it, but a fallible step between winning and staging (in
     /// [`crate::model::object::loose_object::LooseObject::store_deferred`]: `compress()`, or the
     /// write itself) can fail after the reservation is already recorded. Every other caller for

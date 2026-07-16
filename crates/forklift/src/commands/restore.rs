@@ -273,15 +273,15 @@ fn restore_worktree_directory(key: &str) -> Result<(), String> {
 /// own doc comments for the full racily-clean reasoning this preserves.
 ///
 /// **One `update` call per shard also means one failure-rollback unit per shard, not per file**
-/// (adversarial review of this fix; see [`ShardMutationBatch::update`]'s own doc comment for the
+/// (see [`ShardMutationBatch::update`]'s own doc comment for the
 /// general rule). If pass 2's stat fails partway through — file *k* of *n* — `update`'s own
-/// finding-#7 rollback discards *every* file this closure had already added this call, including
+/// rollback discards *every* file this closure had already added this call, including
 /// files `1..k-1`'s, not only file *k*'s: the pre-batching per-file funnel could only ever lose
 /// the one file that failed, since each file was its own independent, already-completed call.
 /// Not data loss (every file in `files` was already written to disk in pass 1 with its real,
 /// correct content — a rolled-back entry is merely stale-until-the-next-`load`/`restore`
-/// re-verifies it, exactly like this PR's other, already-documented `batch.publish()`-failure
-/// blast-radius wideners for `restore`/`consolidate`), but a real widening worth knowing about:
+/// re-verifies it, the same self-healing shape every other `batch.publish()`-failure
+/// blast-radius widener for `restore`/`consolidate` already has), but a real widening worth knowing about:
 /// a single unreadable file, or one that vanishes between being written and being stat'd,
 /// mid-shard, costs the whole shard's stat-cache freshness for this pass, not just that file's.
 ///
