@@ -991,33 +991,6 @@ pub fn build_inventory_item_from_stat(path: &Path,
     )
 }
 
-/// Stage a fresh inventory entry (with current stat data) for a file whose blob or recipe is
-/// already stored (e.g. one just written from a tree or merge).
-///
-/// # Arguments
-/// * `path`      - The warehouse path of the file.
-/// * `hash`      - The blob or recipe hash of the file's content.
-/// * `item_type` - The authoritative entry type (from the tree / merge action), carried through
-///   so a chunked entry keeps its `*Chunked` type in the inventory rather than being demoted to
-///   a plain type a `stat` would report.
-///
-/// # Returns
-/// * `Ok(())`      - If the entry was staged.
-/// * `Err(String)` - If the file's metadata could not be gathered or the shard written.
-pub fn stage_file_entry_from_stat(path: &str, hash: String, item_type: DirEntryType) -> Result<(), String> {
-    let (parent_key, name) = match path.rsplit_once(file_utils::PATH_SEPARATOR_CHAR) {
-        Some((parent, name)) => (parent, name),
-        None => ("", path),
-    };
-
-    let entry = build_inventory_item_from_stat(Path::new(path), name, hash, item_type)?;
-
-    update_shard(parent_key, |inventory| {
-        inventory.add_item(entry);
-        Ok(())
-    })
-}
-
 /// Whether the directory at `path` may be safely replaced (by a file, or cleared to make
 /// way for one) without losing data: it is tracked — represented by its own inventory
 /// shard, the sharded-inventory way a directory is recognized (see `stage_removal`) — and
@@ -1718,8 +1691,14 @@ impl Default for ShardMutationBatch {
     }
 }
 
-/// Like [`stage_file_entry_from_stat`], but stages the mutation into `batch` (see
-/// [`ShardMutationBatch`]) instead of writing it immediately.
+/// Stage a fresh inventory entry (with current stat data) for a file whose blob or recipe is
+/// already stored (e.g. one just written from a tree or merge) into `batch` (see
+/// [`ShardMutationBatch`]) instead of writing it immediately. The unbatched twin this replaced
+/// (`stage_file_entry_from_stat`, a thin wrapper around [`update_shard`]) was removed as dead
+/// code once every production call site converted to this batched form (DESIGN.html §5.0 D item
+/// 10, finding #9) — keeping it around `pub` but uncalled left a second, unbatched staging
+/// helper beside this one for a future contributor to pick by mistake, silently reintroducing
+/// the per-file two-barrier funnel this whole primitive exists to remove.
 ///
 /// # Arguments
 /// * `batch`     - The batch to stage this mutation into.
