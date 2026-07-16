@@ -1093,6 +1093,39 @@ pub fn ingest_file(file_name: &str,
     })
 }
 
+/// Whether the on-disk file at `path` already holds exactly `hash`/`item_type` — read-only, never
+/// touches the object store beyond reading the file itself (`IngestMode::ComputeOnly`). Shared by
+/// every retry-safe check that must tell "this file already holds the content an operation is
+/// about to write" (already applied, or a user's own untracked file that happens to match) from a
+/// genuine foreign conflict — `park pop`'s untracked-file conflict check, `consolidate`/
+/// `cherry-pick`'s untracked-collision check.
+///
+/// The type comparison projects the chunked storage decision away first (`DirEntryType::
+/// on_disk_kind`) before comparing: a fresh `stat` can only ever report a file's plain kind
+/// (`Normal`/`Executable`/`SymbolicLink`), never `NormalChunked`/`ExecutableChunked`, so comparing
+/// the raw stat-derived type directly against a target type that may legitimately be a chunked
+/// variant would report every on-disk match for a large tracked file as a mismatch — this is the
+/// same normalization `is_entry_unchanged` (`inventory_utils`) already applies for the identical
+/// reason; reuse it rather than re-deriving the comparison here.
+///
+/// # Returns
+/// * `Ok(true)`    - The file exists, its on-disk kind matches `item_type`, and its content hash
+///                   matches `hash` exactly.
+/// * `Ok(false)`   - The file's kind or content differs.
+/// * `Err(String)` - The file's metadata could not be read, or its content could not be hashed.
+pub fn on_disk_file_matches_hash(path: &Path, hash: &str, item_type: DirEntryType) -> Result<bool, String> {
+    let metadata = file_utils::get_symlink_metadata_for_path(path)?;
+
+    if file_utils::get_type_of_dir_entry(&metadata).on_disk_kind() != item_type.on_disk_kind() {
+        return Ok(false);
+    }
+
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    let ingested = ingest_file(name, path, item_type, IngestMode::ComputeOnly)?;
+
+    Ok(ingested.hash == hash)
+}
+
 /// Hash (and, in `Store` mode, store) a batch of chunks in parallel, appending their
 /// `(hash, size)` to `recipe_chunks` in the batch's order. The batch is drained.
 fn flush_chunk_batch(batch: &mut Vec<Vec<u8>>,

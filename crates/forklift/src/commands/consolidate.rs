@@ -374,29 +374,55 @@ pub(crate) fn ensure_no_untracked_collisions(actions: &[MergeAction], target: &s
     let mut collisions: Vec<&str> = Vec::new();
 
     for action in actions {
-        let new_path = match action {
-            MergeAction::TakeTheirs { path, is_new: true, .. } => Some(path),
+        let new_write = match action {
+            MergeAction::TakeTheirs { path, hash, item_type, is_new: true } =>
+                Some((path, ExpectedWrite::ByHash { hash, item_type: *item_type })),
             // A delete/modify conflict re-creates a file we deleted.
             MergeAction::Conflict { path, content: Some(_), .. }
                 if !std::path::Path::new(path).exists() => None,
-            MergeAction::Conflict { path, content: Some(_), .. } => Some(path),
+            MergeAction::Conflict { path, content: Some(content), item_type, .. } =>
+                Some((path, ExpectedWrite::ByBytes { content, item_type: *item_type })),
             _ => None,
         };
 
-        if let Some(path) = new_path {
-            // A tracked file cannot collide (tracked paths were verified clean). A tracked
-            // directory with no untracked content beneath it cannot collide either — the merge
-            // legitimately replaces it with the new entry (see `apply_merge_action`'s
-            // deletes-before-writes ordering); a directory is tracked by its own inventory
-            // shard, not as an item in its parent's inventory, so it is checked separately.
-            let is_tracked_file = inventory_lookup(path)?.is_some();
-            let fs_path = std::path::Path::new(path);
-            let is_replaceable_dir = fs_path.is_dir()
-                && inventory_utils::directory_is_safe_to_replace(path)?;
+        let Some((path, expected)) = new_write else { continue };
 
-            if !is_tracked_file && !is_replaceable_dir && fs_path.exists() {
-                collisions.push(path);
-            }
+        // A tracked file cannot collide (tracked paths were verified clean). A tracked
+        // directory with no untracked content beneath it cannot collide either — the merge
+        // legitimately replaces it with the new entry (see `apply_merge_actions`'s
+        // deletes-before-writes ordering); a directory is tracked by its own inventory
+        // shard, not as an item in its parent's inventory, so it is checked separately.
+        let is_tracked_file = inventory_lookup(path)?.is_some();
+        let fs_path = std::path::Path::new(path);
+        let is_replaceable_dir = fs_path.is_dir()
+            && inventory_utils::directory_is_safe_to_replace(path)?;
+
+        if is_tracked_file || is_replaceable_dir || !fs_path.exists() {
+            continue;
+        }
+
+        // An untracked file already on disk is a real collision — unless it already holds
+        // exactly the content this action would write there (mirrors `park pop`'s identical
+        // recovery-retry check, and reuses the same underlying comparison for `TakeTheirs`): a
+        // user who happens to have identical untracked content, or this merge's own leftover
+        // working-directory write from a previous attempt whose `batch.publish()` failed after
+        // every action's write landed but before its shard mutation was ever published — the
+        // exact scenario `apply_merge_actions`'s own recovery advice (`restore --staged .` then
+        // `restore .`) cannot itself clean up, since neither step deletes a path that is
+        // untracked on the pallet head. Without this check the advice is self-defeating: the
+        // retry it recommends would see the merge's own prior write as a permanent conflict with
+        // itself. An unreadable file is conservatively still a listed conflict, not an aborted
+        // scan — same infallible-scan discipline as `park pop`'s identical check.
+        let matches = match expected {
+            ExpectedWrite::ByHash { hash, item_type } =>
+                object_utils::on_disk_file_matches_hash(fs_path, hash, item_type),
+            ExpectedWrite::ByBytes { content, item_type } =>
+                on_disk_file_matches_bytes(fs_path, content, item_type),
+        };
+
+        match matches {
+            Ok(true) => {}
+            Ok(false) | Err(_) => collisions.push(path),
         }
     }
 
@@ -410,6 +436,39 @@ pub(crate) fn ensure_no_untracked_collisions(actions: &[MergeAction], target: &s
         target,
         collisions.join("\n  ")
     ))
+}
+
+/// What [`ensure_no_untracked_collisions`] expects an action to write at a path, in whichever
+/// shape that action's own `MergeAction` variant already carries it — a target hash for
+/// `TakeTheirs` (its content is already stored, addressed by hash), or the raw bytes for
+/// `Conflict` (a line-merge result or a delete/modify conflict's content, held in memory, never
+/// itself hashed as a standalone object).
+enum ExpectedWrite<'a> {
+    ByHash { hash: &'a str, item_type: DirEntryType },
+    ByBytes { content: &'a [u8], item_type: DirEntryType },
+}
+
+/// Whether the on-disk file at `path` already holds exactly `content`/`item_type` — the
+/// [`MergeAction::Conflict`] counterpart of [`object_utils::on_disk_file_matches_hash`] (used for
+/// [`MergeAction::TakeTheirs`] above), which has no target *hash* to compare against: its content
+/// is already fully in memory. Same [`DirEntryType::on_disk_kind`] type-normalization, a direct
+/// byte comparison instead of a hash — `content` here is always a plain, non-chunked file's worth
+/// of bytes (a chunked conflict always materializes from `entry_hash` instead, never carries
+/// inline `content` — see `apply_merge_action_write`'s own doc comment), so reading it whole is
+/// bounded the same way building it in memory already was.
+fn on_disk_file_matches_bytes(path: &std::path::Path,
+                              content: &[u8],
+                              item_type: DirEntryType) -> Result<bool, String> {
+    let metadata = forklift_core::util::file_utils::get_symlink_metadata_for_path(path)?;
+
+    if forklift_core::util::file_utils::get_type_of_dir_entry(&metadata).on_disk_kind() != item_type.on_disk_kind() {
+        return Ok(false);
+    }
+
+    let on_disk = std::fs::read(path)
+        .map_err(|e| format!("Error while reading \"{}\": {}", path.to_string_lossy(), e))?;
+
+    Ok(on_disk == content)
 }
 
 /// Look up the inventory entry for a warehouse path (`None` when the file is untracked).
@@ -435,84 +494,120 @@ fn inventory_lookup(path: &str) -> Result<Option<InventoryItem>, String> {
 /// paths left in conflict. Shared with `cherry-pick`, which applies a parcel's diff through
 /// the same `MergeAction`s.
 ///
-/// Every deletion is applied first, so a directory a write is about to replace (or a file a
-/// write is about to turn into a directory) is emptied — and, via `apply_merge_action`'s
-/// parent-chain cleanup, itself removed — before that write lands. Writing first would
-/// otherwise fail (`EISDIR`/`EEXIST`) for a tracked type flip in either direction.
+/// Three passes, in this order: every delete's working-directory removal
+/// ([`apply_delete_working_directory`]), then every other action's working-directory write
+/// ([`apply_merge_action_write`]), then every applied action's shard decision
+/// ([`apply_merge_action_decide`]) — collected into one shared
+/// [`inventory_utils::ShardMutationBatch`] instead of paying `update_shard`'s full two-barrier
+/// funnel per action. Deletes run before writes so a directory a write is about to replace (or a
+/// file a write is about to turn into a directory) is emptied first — writing first would
+/// otherwise fail (`EISDIR`/`EEXIST`) for a tracked type flip in either direction — but *deciding*
+/// a delete's shard mutation is deferred to the third pass along with everything else.
 ///
-/// Every action's working-directory write (unfsynced, same as always) happens immediately, but
-/// its shard mutation (and, for `Merged`, its new blob) is only *decided* here — collected into
-/// one shared [`inventory_utils::ShardMutationBatch`] instead of paying `update_shard`'s full
-/// two-barrier funnel per action (DESIGN.html §5.0 D item 10, finding #2). Deletes and
-/// non-deletes both accumulate into the very same batch, in the same two-pass order as before, so
-/// two actions touching the same directory (say, a delete and a take-theirs of different files in
-/// it) still collapse into one read-modify-write of that shard, applied in the same
-/// deletes-then-writes order the working-directory side already requires.
+/// This is what makes the batch's first-touch anchor for any shard more than one action lands in
+/// sound *and* useful, not just the first: every real working-directory write (pass 1 or 2) for
+/// the whole merge completes strictly before the decide pass (3) ever starts, so a shard touched
+/// by several actions has its published mtime anchored after every one of them — satisfying
+/// `is_entry_unchanged`'s `mtime < shard_mtime` stat-cache guard for every file, not only whichever
+/// action happened to touch that shard first (mirrors `restore_shard_files_into`'s identical
+/// write-then-decide mtime-anchor fix — see its own doc comment for the full reasoning). Two
+/// actions touching the same directory still collapse into one read-modify-write of that shard —
+/// `ShardMutationBatch::flush_if_full`, called once per decided action, also bounds this batch's
+/// peak memory to a small, constant slice of shards instead of the whole merge (a merge diff can
+/// be as large as the repository itself — a formatter run touching every tracked file, say — so
+/// "bounded by the diff" was never actually a bound).
 ///
-/// If an action's decision step fails partway through (an unreadable source object, a corrupt
-/// shard), every action decided *before* the failure is still published — the same
-/// keep-whatever-was-decided resilience `refresh_tracked_entries` gives a per-shard failure (see
-/// its own doc comment): under the old per-action immediate-write loop this replaced, every prior
-/// action was already durably applied by the time a later one failed, so this preserves that same
-/// user-visible guarantee under batching instead of silently regressing to all-or-nothing.
+/// If a working-directory write fails partway through (pass 1 or 2), only the actions that
+/// already wrote successfully reach the decide pass — every one of *those* is still decided and
+/// published, the same keep-whatever-was-decided resilience `refresh_tracked_entries` gives a
+/// per-shard failure (see its own doc comment): under the old per-action immediate-write loop this
+/// replaced, every prior action was already durably applied by the time a later one failed, so
+/// this preserves that same user-visible guarantee under batching instead of silently regressing
+/// to all-or-nothing. If a *decision* fails instead (pass 3), every action decided before it is
+/// likewise still published.
 ///
-/// **A `batch.publish()` failure is a different, and wider, case than the old code had** (caught
-/// in adversarial review): every action's working-directory write still happens unconditionally,
-/// synchronously, before its shard mutation is ever staged — so by the time `publish()` runs, the
-/// working directory may already reflect *every* action in this call, even though `publish()` can
-/// fail for a reason unrelated to any specific action (an unreadable ancestor shard anywhere in
-/// the batch's combined `clear_keys`, or a mid-barrier I/O error). The old per-action immediate
-/// funnel could only ever leave *one* action's file diverged from its shard this way (the one
-/// whose own `write_shard_mutation` call failed — every action after it in the loop never even ran);
-/// this batch can leave many. Not data loss (nothing here destroys anything — every real change is
-/// either already sitting in the working directory or still recoverable from the pre-merge head),
-/// but a real widening of the "working directory and inventory can disagree after a failure"
-/// surface that batching introduces here, worth documenting rather than glossing over.
+/// **A `batch.publish()`/`flush_if_full()` failure is a different, and wider, case than the old
+/// code had** (caught in adversarial review): every action's working-directory write still
+/// happens unconditionally, before its shard mutation is ever staged — so by the time a flush or
+/// the final `publish()` runs, the working directory may already reflect *every* action in this
+/// call, even though publishing can fail for a reason unrelated to any specific action (an
+/// unreadable ancestor shard, a mid-barrier I/O error). The old per-action immediate funnel could
+/// only ever leave *one* action's file diverged from its shard this way (the one whose own
+/// `write_shard_mutation` call failed — every action after it in the loop never even ran); this
+/// batch can leave many, though bounded to at most one flush group's worth by the periodic
+/// flushing above, not the whole merge. Not data loss (nothing here destroys anything — every real
+/// change is either already sitting in the working directory or still recoverable from the
+/// pre-merge head), but a real widening of the "working directory and inventory can disagree after
+/// a failure" surface that batching introduces here, worth documenting rather than glossing over.
 ///
-/// **Recovery is two commands, in this order, not one** (PR B review finding #3 — an earlier
-/// version of the caller's error message below recommended `load .` alone, which is actively
-/// self-defeating: `load .` stages the half-applied working directory, and the resulting non-empty
-/// staged diff then makes `ensure_warehouse_is_clean` *refuse* the very retry the message told the
-/// operator to attempt). `publish()` can leave the *inventory* itself diverged from head too, not
-/// only the working directory — `ShardMutationBatch::publish`'s own contract (DESIGN.html §5.0 D
-/// item 10, finding #1) means a phase B failure may still have durably published a real prefix of
-/// this call's decided shards, so `restore .` alone (which only reverts the working directory to
-/// match whatever the *inventory* currently holds) is not sufficient in general — it would leave
-/// those already-published shards' merge content staged, which still fails
-/// `ensure_warehouse_is_clean` on retry. The order that actually always works: `restore --staged
-/// .` first (unconditionally rebuilds every shard from the pallet head, regardless of whatever
-/// partial state `publish()` left behind — see `restore_staged`'s own doc comment), *then*
-/// `restore .` (now safe: with the inventory back at head, this rewrites the working directory to
-/// match it exactly). Both steps are cheap, always-available, and require no reconciliation
-/// beyond themselves; a subsequent `consolidate`/`cherry-pick` retry starts from a genuinely clean
-/// warehouse and, on success, records a proper multi-parent merge — unlike `load .` followed by a
-/// plain `stack`, which would silently commit the recovered content as an ordinary single-parent
-/// parcel with the target pallet recorded as never merged.
+/// **Recovery is two commands, in this order, not one**: `restore --staged .` first
+/// (unconditionally rebuilds every shard from the pallet head, regardless of whatever partial
+/// state publishing left behind — see `restore_staged`'s own doc comment), *then* `restore .`
+/// (now safe: with the inventory back at head, this rewrites the working directory to match it
+/// exactly). `load .` alone is actively self-defeating here: it would stage the half-applied
+/// working directory, and the resulting non-empty staged diff then makes `ensure_warehouse_is_
+/// clean` *refuse* the very retry an operator would be attempting. Both recovery steps are cheap,
+/// always-available, and require no reconciliation beyond themselves; a subsequent `consolidate`/
+/// `cherry-pick` retry starts from a genuinely clean warehouse and, on success, records a proper
+/// multi-parent merge — unlike `load .` followed by a plain `stack`, which would silently commit
+/// the recovered content as an ordinary single-parent parcel with the target pallet recorded as
+/// never merged.
 pub(crate) fn apply_merge_actions(actions: &[MergeAction]) -> Result<Vec<String>, String> {
     let mut conflict_paths: Vec<String> = Vec::new();
     let mut batch = inventory_utils::ShardMutationBatch::new();
 
     // `result` accumulates the *first* failure — see the function's own doc comment for why this,
-    // rather than propagating immediately, matters here.
+    // rather than propagating immediately, matters here. `applied` collects every action whose
+    // working-directory step (pass 1 or 2) actually succeeded, in the same deletes-then-writes
+    // relative order the old single interleaved loop used — the decide pass (3) below only ever
+    // considers these, preserving the original resilience contract despite writes and decisions
+    // no longer being interleaved per action.
     let mut result: Result<(), String> = Ok(());
+    let mut applied: Vec<&MergeAction> = Vec::with_capacity(actions.len());
 
-    'passes: for deletes_pass in [true, false] {
-        for action in actions {
-            if matches!(action, MergeAction::Delete { .. }) != deletes_pass {
-                continue;
-            }
-
-            if let Err(e) = apply_merge_action(action, &mut conflict_paths, &mut batch) {
+    'deletes: for action in actions {
+        if matches!(action, MergeAction::Delete { .. }) {
+            if let Err(e) = apply_delete_working_directory(action) {
                 result = Err(e);
-                break 'passes;
+                break 'deletes;
             }
+
+            applied.push(action);
         }
     }
 
-    // Every action decided above — whether or not the whole pass finished — becomes durable now,
-    // through the shared join point (blob barrier, then phase A ancestor clears, then phase B
-    // shard content). Attempted even after a mid-loop failure, exactly like
-    // `refresh_tracked_entries`'s identical resilience contract, for the same reason.
+    if result.is_ok() {
+        'writes: for action in actions {
+            if matches!(action, MergeAction::Delete { .. }) {
+                continue;
+            }
+
+            if let Err(e) = apply_merge_action_write(action) {
+                result = Err(e);
+                break 'writes;
+            }
+
+            applied.push(action);
+        }
+    }
+
+    'decide: for action in &applied {
+        if let Err(e) = apply_merge_action_decide(action, &mut conflict_paths, &mut batch) {
+            if result.is_ok() { result = Err(e); }
+            break 'decide;
+        }
+
+        // Bounds peak memory to a small, constant slice of shards instead of the whole merge —
+        // see `ShardMutationBatch::flush_if_full`'s own doc comment.
+        if let Err(e) = batch.flush_if_full() {
+            if result.is_ok() { result = Err(e); }
+            break 'decide;
+        }
+    }
+
+    // Every action decided above becomes durable now, through the shared join point. Attempted
+    // even after a mid-loop failure, exactly like `refresh_tracked_entries`'s identical resilience
+    // contract, for the same reason.
     if let Err(e) = batch.publish() {
         if result.is_ok() { result = Err(e); }
     }
@@ -531,71 +626,97 @@ pub(crate) fn apply_merge_actions(actions: &[MergeAction]) -> Result<Vec<String>
     Ok(conflict_paths)
 }
 
-/// Apply one merge action to the working directory immediately, and stage its inventory
-/// mutation (and, for `Merged`, its new blob) into `batch` instead of writing either
-/// immediately. Shared with `cherry-pick`, which applies a parcel's diff through the same
-/// `MergeAction`s.
-pub(crate) fn apply_merge_action(action: &MergeAction,
-                                 conflict_paths: &mut Vec<String>,
-                                 batch: &mut inventory_utils::ShardMutationBatch) -> Result<(), String> {
-    match action {
-        MergeAction::TakeTheirs { path, hash, item_type, .. } => {
-            shift_utils::write_tracked_file(path, hash, *item_type)?;
-            inventory_utils::stage_file_entry_from_stat_into(batch, path, hash.clone(), *item_type)
+/// Apply a [`MergeAction::Delete`]'s working-directory removal (and directory-chain cleanup) —
+/// see [`apply_merge_actions`]'s own doc comment for why every working-directory step across the
+/// whole merge happens before any shard decision. A no-op for any other action variant (deletes
+/// are the only variant with a *separate* working-directory pass from the rest — see
+/// [`apply_merge_action_write`]).
+fn apply_delete_working_directory(action: &MergeAction) -> Result<(), String> {
+    let MergeAction::Delete { path } = action else {
+        return Ok(());
+    };
+
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("Error while removing \"{}\": {}", path, e)),
+    }
+
+    // Clean up the directory chain if the removal emptied it.
+    let mut dir = std::path::Path::new(path).parent();
+
+    while let Some(parent) = dir {
+        if parent.as_os_str().is_empty() || std::fs::remove_dir(parent).is_err() {
+            break;
         }
 
-        MergeAction::Delete { path } => {
-            match std::fs::remove_file(path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(format!("Error while removing \"{}\": {}", path, e)),
-            }
+        dir = parent.parent();
+    }
 
+    Ok(())
+}
+
+/// Apply one non-delete merge action's working-directory write only — no shard decision, no blob
+/// store; see [`apply_merge_actions`]'s own doc comment for why. A no-op for [`MergeAction::Delete`]
+/// (handled separately, first, by [`apply_delete_working_directory`]) and
+/// [`MergeAction::ResolveOutOfScope`] (never touches the working directory at all).
+fn apply_merge_action_write(action: &MergeAction) -> Result<(), String> {
+    match action {
+        MergeAction::TakeTheirs { path, hash, item_type, .. } =>
+            shift_utils::write_tracked_file(path, hash, *item_type),
+
+        MergeAction::Merged { path, content, item_type } =>
+            write_merged_file(path, content, *item_type),
+
+        MergeAction::Conflict { path, content, entry_hash, item_type } => {
+            if let Some(content) = content {
+                write_merged_file(path, content, *item_type)
+            } else if item_type.is_chunked() {
+                // A chunked (binary) conflict carries no inline content: materialize the
+                // should-be-on-disk version from its recipe (`entry_hash` is ours when we keep
+                // ours, theirs when theirs is put back). Bounded, verified stream-assembly.
+                shift_utils::write_tracked_file(path, entry_hash, *item_type)
+            } else {
+                Ok(())
+            }
+        }
+
+        MergeAction::Delete { .. } | MergeAction::ResolveOutOfScope { .. } => Ok(()),
+    }
+}
+
+/// Stage one merge action's inventory mutation (and, for [`MergeAction::Merged`], its new blob)
+/// into `batch` — see [`apply_merge_actions`]'s own doc comment for why this always runs strictly
+/// after every action's own working-directory write has already completed (mtime-anchor
+/// soundness), not interleaved with it.
+fn apply_merge_action_decide(action: &MergeAction,
+                             conflict_paths: &mut Vec<String>,
+                             batch: &mut inventory_utils::ShardMutationBatch) -> Result<(), String> {
+    match action {
+        MergeAction::TakeTheirs { path, hash, item_type, .. } =>
+            inventory_utils::stage_file_entry_from_stat_into(batch, path, hash.clone(), *item_type),
+
+        MergeAction::Delete { path } => {
             let (parent_key, name) = split_path(path);
 
             batch.update(parent_key, |inventory| {
                 inventory.remove_item_by_name(name);
                 Ok(())
-            })?;
-
-            // Clean up the directory chain if the removal emptied it.
-            let mut dir = std::path::Path::new(path).parent();
-
-            while let Some(parent) = dir {
-                if parent.as_os_str().is_empty() || std::fs::remove_dir(parent).is_err() {
-                    break;
-                }
-
-                dir = parent.parent();
-            }
-
-            Ok(())
+            })
         }
 
         MergeAction::Merged { path, content, item_type } => {
-            write_merged_file(path, content, *item_type)?;
-
             // The merged content is new — stage its blob into the batch's own blob barrier so the
-            // next stack can point at it (DESIGN.html §5.0 D item 10, finding #7: durable before
-            // any shard content that might reference it, never stored immediately here). A
-            // three-way merge only ever runs on plain text files, so a `Merged` result is always
-            // a plain blob, never chunked.
+            // next stack can point at it (durable before any shard content that might reference
+            // it, never stored immediately here). A three-way merge only ever runs on plain text
+            // files, so a `Merged` result is always a plain blob, never chunked.
             let mut object = LooseObjectBuilder::build_blob(&Blob { content: content.clone() });
             object.store_deferred(batch.blob_batch())?;
 
             inventory_utils::stage_file_entry_from_stat_into(batch, path, object.hash, *item_type)
         }
 
-        MergeAction::Conflict { path, content, entry_hash, item_type } => {
-            if let Some(content) = content {
-                write_merged_file(path, content, *item_type)?;
-            } else if item_type.is_chunked() {
-                // A chunked (binary) conflict carries no inline content: materialize the
-                // should-be-on-disk version from its recipe (`entry_hash` is ours when we keep
-                // ours, theirs when theirs is put back). Bounded, verified stream-assembly.
-                shift_utils::write_tracked_file(path, entry_hash, *item_type)?;
-            }
-
+        MergeAction::Conflict { path, entry_hash, item_type, .. } => {
             let (parent_key, name) = split_path(path);
 
             let mut entry = inventory_utils::build_stale_inventory_item(

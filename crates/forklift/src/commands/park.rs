@@ -46,7 +46,7 @@ pub async fn park_changes() -> Result<(), String> {
 
     // Stage the whole work in progress: modified tracked files are rehashed, deleted
     // tracked files become staged removals. Untracked files stay untracked. Its own blob
-    // stores are already batched internally (DESIGN.html §5.0 D item 10, finding #3).
+    // stores are already batched internally.
     inventory_utils::refresh_tracked_entries()?;
 
     // In a scoped (sparse) bay the dock only materializes the in-scope subtree(s); splice it
@@ -60,7 +60,7 @@ pub async fn park_changes() -> Result<(), String> {
 
     // Every tree object below (and, further down, the parcel object) is staged into `batch`
     // instead of fsynced immediately — one durability barrier for the whole push instead of one
-    // per object (DESIGN.html §5.0 D item 10, finding #3). Nothing may depend on a staged
+    // per object (DESIGN.html §5.0 D item 10). Nothing may depend on a staged
     // object's durability or visibility until `batch.finish()` below returns `Ok` — see
     // `stack_utils::stack_parcel`'s identical batch, which this mirrors.
     let batch = std::sync::Arc::new(file_utils::WriteBatch::new());
@@ -90,14 +90,13 @@ pub async fn park_changes() -> Result<(), String> {
     // has: a directory whose shard's rollup already matches the corresponding head subtree hash
     // is never hashed or (re)stored — its subtree is spliced into its parent verbatim by hash
     // instead of walked and rebuilt. Its shard *is* still fully read and parsed, by
-    // `prepare_stack_inventory` above, not just peeked past its header (DESIGN.html §5.0 D item
-    // 10, finding #5): the skip plan reads every candidate's rollup out of that already-parsed
+    // `prepare_stack_inventory` above, not just peeked past its header: the skip plan reads every candidate's rollup out of that already-parsed
     // `prepared` snapshot (an in-memory lookup), which is what makes `prepare_stack_inventory`'s
     // own read+parse pass worth parallelizing — it is real, unavoidable work here, not a header
     // peek a skip could make disappear. The per-directory tree hashes this call also returns are
     // `stack`-only bookkeeping (for stamping rollups after a successful stack) — `park`
     // immediately overwrites every shard from head a few lines down (`replace_all_inventories`),
-    // so it passes `track_tree_hashes: false` (DESIGN.html §5.0 D item 10, finding #8) instead of
+    // so it passes `track_tree_hashes: false` instead of
     // making every one of the build's per-directory tasks pay a `Mutex` acquisition to populate a
     // map nobody reads; the untouched-key set is discarded for the same reason.
     let (partial_root, _tree_hashes, _untouched) = tree_utils::build_tree_from_inventory_deferred(
@@ -253,8 +252,16 @@ pub fn pop_parked() -> Result<(), String> {
         // could never be popped again until the operator manually deleted files forklift itself
         // wrote. `existing_file_matches_write` hashes the on-disk file read-only (no store write)
         // to tell the two cases apart from a genuine foreign conflict.
-        if in_head.is_none() && std::path::Path::new(path).exists() && !existing_file_matches_write(op)? {
-            conflicts.push(path);
+        //
+        // An unreadable file is conservatively still a listed conflict, not an aborted scan: the
+        // whole point of this loop is to collect *every* actionable conflict for one clear
+        // message, so one unreadable path must not raise a raw I/O error and hide every other
+        // conflict (or non-conflict) this loop would otherwise have found.
+        if in_head.is_none() && std::path::Path::new(path).exists() {
+            match existing_file_matches_write(op) {
+                Ok(true) => {}
+                Ok(false) | Err(_) => conflicts.push(path),
+            }
         }
     }
 
@@ -267,22 +274,39 @@ pub fn pop_parked() -> Result<(), String> {
         ));
     }
 
-    // Every op's working-directory write happens immediately (unfsynced, same as always), but its
-    // shard mutation is only *decided* here — collected into one shared
-    // `inventory_utils::ShardMutationBatch` instead of paying `stage_file_entry_from_stat`'s/
-    // `update_shard`'s full two-barrier funnel per op (DESIGN.html §5.0 D item 10, finding #4).
-    // Several ops in the same shard collapse into one read-modify-write of it, published once at
-    // the end. If an op's decision step fails partway through, every op decided before the
-    // failure is still published — see `apply_merge_actions`'s identical resilience contract for
-    // the same reasoning, including its caveat: a `batch.publish()` failure (not a per-op decision
-    // failure) can leave more ops' working-directory writes ahead of their shard entries than the
-    // old per-op immediate funnel ever could. Unlike `consolidate`, this call site is safe to just
-    // retry without any extra reconciliation step: `ops` is always recomputed fresh from the
-    // parked parcel's and its base's immutable tree hashes above, and `parked.pop()`/
-    // `park_utils::write_parked` below never run on any failure path, so the parked entry stays
-    // listed and a retried `park pop` redoes exactly the same (idempotent) work.
+    // Every op's working-directory write happens immediately (unfsynced, same as always, pass 1
+    // below), but its shard mutation is only *decided* afterward (pass 2) — collected into one
+    // shared `inventory_utils::ShardMutationBatch` instead of paying `stage_file_entry_from_stat`'s/
+    // `update_shard`'s full two-barrier funnel per op. Several ops in the same shard collapse into
+    // one read-modify-write of it, flushed in bounded groups (`ShardMutationBatch::
+    // flush_if_full`) instead of one unbounded batch for the whole pop.
+    //
+    // The two passes are deliberately separate, not interleaved per op as a single loop would be:
+    // `pass 2` only starts once every one of pass 1's real writes has already landed, so the
+    // batch's first-touch anchor for any shard more than one op lands in is captured strictly
+    // *after* every one of this pop's real writes — not just the first op to touch that shard —
+    // satisfying `is_entry_unchanged`'s `mtime < shard_mtime` stat-cache guard for every one of
+    // them (mirrors `restore_shard_files_into`'s identical write-then-decide mtime-anchor fix —
+    // see its own doc comment for the full reasoning). Splitting into two passes preserves the
+    // original resilience contract despite that reordering: `written` is exactly the prefix of
+    // `ops` whose write actually succeeded (pass 1 stops at the first failure, same as the old
+    // interleaved loop did), and pass 2 only ever decides ops in `written` — so a write failure at
+    // op *k* still leaves every op *before* it fully decided and eligible to publish, exactly as
+    // before.
+    //
+    // If a *decision* step fails partway through pass 2, every op decided before the failure is
+    // still published — see `apply_merge_actions`'s identical resilience contract for the same
+    // reasoning, including its caveat: a `batch.publish()`/`flush_if_full()` failure (not a
+    // per-op decision failure) can leave more ops' working-directory writes ahead of their shard
+    // entries than the old per-op immediate funnel ever could. Unlike `consolidate`, this call
+    // site is safe to just retry without any extra reconciliation step: `ops` is always
+    // recomputed fresh from the parked parcel's and its base's immutable tree hashes above, and
+    // `parked.pop()`/`park_utils::write_parked` below never run on any failure path, so the
+    // parked entry stays listed and a retried `park pop` redoes exactly the same (idempotent)
+    // work.
     let mut batch = inventory_utils::ShardMutationBatch::new();
     let mut result: Result<(), String> = Ok(());
+    let mut written: Vec<&FileOp> = Vec::with_capacity(ops.len());
 
     for op in &ops {
         if let Err(e) = shift_utils::apply_file_op(op) {
@@ -290,6 +314,10 @@ pub fn pop_parked() -> Result<(), String> {
             break;
         }
 
+        written.push(op);
+    }
+
+    'decide: for op in &written {
         let decision = match op {
             FileOp::Write { path, hash, item_type, .. } => {
                 inventory_utils::stage_file_entry_from_stat_into(&mut batch, path, hash.clone(), *item_type)
@@ -308,8 +336,15 @@ pub fn pop_parked() -> Result<(), String> {
         };
 
         if let Err(e) = decision {
-            result = Err(e);
-            break;
+            if result.is_ok() { result = Err(e); }
+            break 'decide;
+        }
+
+        // Bounds peak memory to a small, constant slice of shards instead of the whole parked
+        // diff — see `ShardMutationBatch::flush_if_full`'s own doc comment.
+        if let Err(e) = batch.flush_if_full() {
+            if result.is_ok() { result = Err(e); }
+            break 'decide;
         }
     }
 
@@ -337,10 +372,10 @@ pub fn pop_parked() -> Result<(), String> {
 }
 
 /// Whether the file already on disk at `op`'s path holds exactly the content (and entry type)
-/// `op` would write there — see the conflict check above for why this matters. Read-only: hashes
-/// the file's current content without touching the object store
-/// (`object_utils::IngestMode::ComputeOnly`), the same read path `stocktake`'s own classification
-/// uses, never a full read-and-store.
+/// `op` would write there — see the conflict check above for why this matters. A thin wrapper
+/// over [`object_utils::on_disk_file_matches_hash`] (shared with `consolidate`/`cherry-pick`'s
+/// identical untracked-collision check — see its own doc comment for the read path and the
+/// chunked-file type-comparison hazard it guards against).
 ///
 /// Only meaningful for `FileOp::Write` (always reports `false`, i.e. "not a match", for
 /// `FileOp::Remove` — which has no content of its own to compare against; not that the caller's
@@ -358,18 +393,7 @@ fn existing_file_matches_write(op: &FileOp) -> Result<bool, String> {
         return Ok(false);
     };
 
-    let fs_path = std::path::Path::new(path);
-    let metadata = file_utils::get_symlink_metadata_for_path(fs_path)?;
-
-    if file_utils::get_type_of_dir_entry(&metadata) != *item_type {
-        return Ok(false);
-    }
-
-    let name = path.rsplit_once('/').map(|(_, name)| name).unwrap_or(path.as_str());
-
-    let ingested = object_utils::ingest_file(name, fs_path, *item_type, object_utils::IngestMode::ComputeOnly)?;
-
-    Ok(ingested.hash == *hash)
+    object_utils::on_disk_file_matches_hash(std::path::Path::new(path), hash, *item_type)
 }
 
 /// List the parked parcels, newest first.
