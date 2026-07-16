@@ -88,12 +88,20 @@ pub async fn park_changes() -> Result<(), String> {
 
     // `Some(&head_tree_hash)` gives `park` the same rollup-based skip (stage 2) `stack` already
     // has: a directory whose shard's rollup already matches the corresponding head subtree hash
-    // is never read past its header, never hashed, never (re)stored. The per-directory tree
-    // hashes and untouched-key set this also returns are `stack`-only bookkeeping (for stamping
-    // rollups after a successful stack) — `park` immediately overwrites every shard from head a
-    // few lines down (`replace_all_inventories`), so both are discarded here.
+    // is never hashed or (re)stored — its subtree is spliced into its parent verbatim by hash
+    // instead of walked and rebuilt. Its shard *is* still fully read and parsed, by
+    // `prepare_stack_inventory` above, not just peeked past its header (DESIGN.html §5.0 D item
+    // 10, finding #5): the skip plan reads every candidate's rollup out of that already-parsed
+    // `prepared` snapshot (an in-memory lookup), which is what makes `prepare_stack_inventory`'s
+    // own read+parse pass worth parallelizing — it is real, unavoidable work here, not a header
+    // peek a skip could make disappear. The per-directory tree hashes this call also returns are
+    // `stack`-only bookkeeping (for stamping rollups after a successful stack) — `park`
+    // immediately overwrites every shard from head a few lines down (`replace_all_inventories`),
+    // so it passes `track_tree_hashes: false` (DESIGN.html §5.0 D item 10, finding #8) instead of
+    // making every one of the build's per-directory tasks pay a `Mutex` acquisition to populate a
+    // map nobody reads; the untouched-key set is discarded for the same reason.
     let (partial_root, _tree_hashes, _untouched) = tree_utils::build_tree_from_inventory_deferred(
-        &prepared, &batch, Some(&head_tree_hash), &scope,
+        &prepared, &batch, Some(&head_tree_hash), &scope, false,
     ).await?;
     let partial_root = partial_root.ok_or("There is nothing to park.".to_string())?;
 
@@ -107,8 +115,7 @@ pub async fn park_changes() -> Result<(), String> {
         let overrides = std::collections::BTreeMap::new();
 
         tree_utils::build_scoped_root_tree(
-            Some(&head_tree_hash), &partial_root, &scope, &overrides,
-            &tree_utils::ObjectSink::Deferred(std::sync::Arc::clone(&batch)),
+            Some(&head_tree_hash), &partial_root, &scope, &overrides, &batch,
         )?
     };
 

@@ -110,11 +110,13 @@ fn writes_outside_any_session_are_unaffected_by_bulk_sessions() {
 
 #[test]
 fn a_failed_finish_removes_every_staged_temp_and_publishes_nothing() {
-    // Unlike the pack folder, the loose store has no stale-temp sweeper — so a barrier that
-    // returns an error (disk full, a permission flip) must not strand any staged temp behind,
-    // or it leaks forever. Sabotage one staged write (delete its temp out from under the
-    // session) so its fsync fails, and check the *other*, otherwise-healthy staged write is
-    // cleaned up too, and neither ever got published.
+    // A barrier that returns an error (disk full, a permission flip) must not strand any staged
+    // temp behind: the process is still running (unlike a hard kill, which `gc`'s ordinary
+    // reachability sweep eventually reclaims — see `gc_utils`), so an actively leaked temp here
+    // would accumulate for as long as the process keeps hitting this path, not just until the
+    // next `gc`. Sabotage one staged write (delete its temp out from under the session) so its
+    // fsync fails, and check the *other*, otherwise-healthy staged write is cleaned up too, and
+    // neither ever got published.
     let _guard = lock_session();
     let temp = std::env::temp_dir().join(format!("forklift-bulk-fail-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&temp);

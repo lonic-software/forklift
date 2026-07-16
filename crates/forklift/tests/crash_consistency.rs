@@ -687,3 +687,80 @@ fn killing_park_midway_never_leaves_a_parked_parcel_referencing_a_missing_or_tor
             _ => String::new(),
         });
 }
+
+/// The `barrier-count: N` line the `FORKLIFT_DEBUG_BARRIER_COUNT` debug hook prints to stderr
+/// (see `main.rs`) — the process-wide count of durability barriers actually paid, mirrors
+/// `rollup_hash_skip.rs`'s `skip_count` helper for the analogous rollup-skip counter.
+fn barrier_count(output: &std::process::Output) -> u64 {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    stderr.lines()
+        .find_map(|line| line.strip_prefix("barrier-count: "))
+        .unwrap_or_else(|| panic!("no barrier-count line in stderr: {}", stderr))
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+/// One `load` run over a fixed set of directories, each holding `files_per_dir` already-tracked
+/// files that are all given real content changes before the measured `load .`, with
+/// `FORKLIFT_DEBUG_BARRIER_COUNT=1` set — returns the barrier count that run paid.
+fn load_barrier_count_for(files_per_dir: usize) -> u64 {
+    let area = Area::new(&format!("barrier-count-{}", files_per_dir));
+    let warehouse = area.warehouse();
+
+    const DIR_COUNT: usize = 5;
+
+    for dir in 0..DIR_COUNT {
+        let dir_path = warehouse.join(format!("dir{dir}"));
+        std::fs::create_dir_all(&dir_path).unwrap();
+        for f in 0..files_per_dir {
+            std::fs::write(dir_path.join(format!("file{f}.txt")), format!("v1 {dir} {f}\n")).unwrap();
+        }
+    }
+
+    assert!(area.run(&["prepare"]).status.success());
+    assert!(area.run(&["config", "operator.name", "barrier@forklift"]).status.success());
+    assert!(area.run(&["config", "operator.identifier", "barrier@forklift"]).status.success());
+    assert!(area.run(&["load", "."]).status.success());
+    assert!(area.run(&["stack", "base"]).status.success());
+
+    // A real content change to every already-tracked file: every one of the `DIR_COUNT`
+    // directories has a genuine content change, so the same single ancestor (the root) needs
+    // clearing regardless of `files_per_dir` — only the number of *changed files within* each
+    // already-touched directory differs between calls.
+    for dir in 0..DIR_COUNT {
+        let dir_path = warehouse.join(format!("dir{dir}"));
+        for f in 0..files_per_dir {
+            std::fs::write(dir_path.join(format!("file{f}.txt")), format!("v2 {dir} {f}\n")).unwrap();
+        }
+    }
+
+    let mut command = area.command(&["load", "."]);
+    command.env("FORKLIFT_DEBUG_BARRIER_COUNT", "1");
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "load failed: {}", String::from_utf8_lossy(&output.stderr));
+
+    barrier_count(&output)
+}
+
+/// DESIGN.html §5.0 D item 10, finding #10: `file_utils::barrier_count` exists so a test can
+/// prove a burst of writes actually collapsed to a constant number of barriers, not just that
+/// the resulting state happens to be correct. This is that test for `load`'s join point
+/// (findings #1/#7's fix restructured it into three barriers — a blob barrier, an
+/// ancestor-clear barrier, and a shard-content barrier — still a constant number regardless of
+/// how many files changed within the touched directories, not one that scales with the changed
+/// file count the way the pre-batching baseline did).
+#[test]
+fn load_pays_a_constant_number_of_barriers_regardless_of_changed_file_count() {
+    let count_1 = load_barrier_count_for(1);
+    let count_10 = load_barrier_count_for(10);
+
+    assert_eq!(count_1, count_10,
+        "load's barrier count must not scale with the number of changed files: {count_1} for 1 \
+         changed file/directory, {count_10} for 10 changed files/directory (the same 5 \
+         directories touched either way)");
+
+    // Sanity: the counter is not just always zero, which would trivially "pass" the equality
+    // above without proving anything about batching actually happening.
+    assert!(count_1 > 0, "the counter must observe real barrier work, got {count_1}");
+}

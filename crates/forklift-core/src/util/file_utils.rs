@@ -221,11 +221,14 @@ fn parse_fsync_setting(value: Option<&str>) -> bool {
 /// completed immediate write ([`write_file_atomically`], outside an active bulk session) or one
 /// per completed [`run_write_barrier`] call (the shared implementation behind both
 /// [`WriteBatch::finish`] and [`BulkStoreSession::finish`]), incremented exactly once per barrier
-/// no matter how many files/objects it covers. Not a performance feature: a cheap, always-on
-/// observability hook — see [`barrier_count`] — that lets the batching work's tests (and a
-/// maintainer running `FORKLIFT_DEBUG_BARRIER_COUNT=1`) prove a burst of N writes actually
-/// collapsed to a constant number of barriers, not just that the resulting state happens to be
-/// correct.
+/// no matter how many files/objects it covers. Gated by [`fsync_enabled`], like every other step
+/// of the barrier it counts (see both increment sites): with fsync off there is no durability
+/// wait to amortize, so counting a "barrier" there would count work that never happened. Not a
+/// performance feature: a cheap, always-on observability hook — see [`barrier_count`] — that lets
+/// the batching work's tests (`crates/forklift/tests/crash_consistency.rs`'s
+/// `load_pays_a_constant_number_of_barriers_regardless_of_changed_file_count`, and a maintainer
+/// running `FORKLIFT_DEBUG_BARRIER_COUNT=1`) prove a burst of N writes actually collapsed to a
+/// constant number of barriers, not just that the resulting state happens to be correct.
 static BARRIER_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The current value of the process-wide durability-barrier counter — see [`BARRIER_COUNT`].
@@ -355,8 +358,12 @@ pub fn write_file_atomically(file_path: &Path, content: &[u8]) -> Result<(), Str
 
     // Counted only once every step above has actually succeeded — see `BARRIER_COUNT`'s doc
     // comment ("one per *completed* barrier"). A caller that hit the `?` above already got the
-    // error; nothing durable was left half-finished for this counter to over-report.
-    BARRIER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // error; nothing durable was left half-finished for this counter to over-report. Gated by
+    // `fsync_enabled` like the fsync/directory-sync steps above: with fsync off, this rename paid
+    // no durability wait at all, so it is not the barrier the counter exists to measure.
+    if fsync_enabled() {
+        BARRIER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     Ok(())
 }
 
@@ -438,8 +445,9 @@ impl BulkStoreSession {
     /// since that is what preserves the invariant, not the fsyncing.
     ///
     /// Crash analysis: before step 3 begins, only temp names exist on disk — invisible to every
-    /// reader, cleaned up by the existing stale-temp patterns that already tolerate a crashed
-    /// single-file write. During step 3, the durability barrier (steps 1-2) has already
+    /// reader, eventually reclaimed by `gc`'s ordinary reachability sweep (see below) the same
+    /// way any crashed single-file write's stranded temp already is. During step 3, the
+    /// durability barrier (steps 1-2) has already
     /// completed, so every temp file's bytes are durable *before* any rename runs — a crash
     /// partway through step 3 leaves some names published (durable bytes, correctly visible) and
     /// the rest as still-invisible temps. The invariant — a final name never exists before its
@@ -451,13 +459,25 @@ impl BulkStoreSession {
     /// once per directory instead of once per write.
     ///
     /// A hard kill mid-barrier is covered by that crash analysis (nothing survives that isn't
-    /// either durable-and-published or an invisible temp for the existing stale-temp patterns to
-    /// find later). A *returned* error (disk full, a permission flip) is different: the process
-    /// keeps running, and unlike the pack folder the loose store has no stale-temp sweeper, so a
-    /// stranded temp would leak forever. `run_barrier` therefore cleans up every staged temp
-    /// itself before propagating any error — see its doc comment — which is why `finished` is
-    /// only set to `true` on success below: on the error path the registry slot and every temp
-    /// are already gone, so `Drop`'s own abort pass (see below) just finds nothing left to do.
+    /// either durable-and-published or an invisible temp `gc` can reclaim once it ages past the
+    /// grace period — see below). A *returned* error (disk full, a permission flip) is different:
+    /// the process keeps running, so `run_barrier` cleans up every staged temp itself before
+    /// propagating any error — see its doc comment — which is why `finished` is only set to
+    /// `true` on success below: on the error path the registry slot and every temp are already
+    /// gone, so `Drop`'s own abort pass (see below) just finds nothing left to do.
+    ///
+    /// Unlike the *pack* folder, the loose store has no sweeper *dedicated* to `.tmp` names
+    /// (`pack_utils` has one, for its own `.compact-*.tmp` staging files — see
+    /// `remove_stale_temp_files`) — but a loose-store temp left behind by a hard kill (rather
+    /// than a returned error, which is handled above) is not actually unreclaimed: `gc_utils`'s
+    /// ordinary reachability sweep (`collect_garbage`) does not pattern-match on `.tmp` at all,
+    /// it simply treats *any* non-`.sig`, unreferenced file sitting in an object fan-out folder
+    /// as garbage once it ages past the mtime grace period — a stranded temp qualifies with no
+    /// special-casing needed (see `gc_utils`'s own
+    /// `gc_sweeps_a_stranded_write_batch_temp_past_the_grace_period` test). This is the same
+    /// reclaiming path every other crashed single-file write already relied on before batching
+    /// existed (DESIGN.html §5.0 D item 10, finding #3) — batching only widens *how much* can be
+    /// staged in one still-unfinished barrier, not *whether* an abandoned temp is ever reclaimed.
     pub fn finish(mut self) -> Result<(), String> {
         self.run_barrier()?;
         self.finished = true;
@@ -530,7 +550,11 @@ fn run_write_barrier(pending: &[(PathBuf, PathBuf)]) -> Result<(), String> {
     // here already returned past this point on failure): both callers only ever reach this
     // function with a non-empty `pending` (each checks first), so this never double-counts an
     // empty `finish()` that had nothing staged, and never counts a barrier that failed partway.
-    BARRIER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Gated by `fsync_enabled`, exactly like steps 1-2 and 4 above: with fsync off, the rename
+    // loop (step 3) is the only work that actually ran, and it paid no durability wait to amortize.
+    if fsync_enabled() {
+        BARRIER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
 
     Ok(())
 }
@@ -609,8 +633,8 @@ fn fsync_dir_data(dir: &Path) -> Result<(), String> {
 /// write happens before it ever touches the shared list, so concurrent callers only ever
 /// contend on the cheap final push.
 ///
-/// It exists for `stack`'s tree build, whose object writes run from `TaskExecutor`'s parallel
-/// workers (see `model::task::tree_builder::tree_builder_context::ObjectSink`).
+/// It exists for `stack`'s and `park`'s tree build, whose object writes run from `TaskExecutor`'s
+/// parallel workers (see `model::task::tree_builder::tree_builder_context::TreeBuilderContext`).
 ///
 /// `finish` takes `&self`, not `self` by value (unlike `BulkStoreSession::finish`): a
 /// `WriteBatch` is shared via `Arc` across parallel workers for the whole build, so there is no
@@ -629,13 +653,26 @@ fn fsync_dir_data(dir: &Path) -> Result<(), String> {
 /// batches the pallet-head ref write itself, and only calls `set_pallet_head` after the batch
 /// covering every object the parcel references has already finished successfully.
 pub struct WriteBatch {
-    pending: std::sync::Mutex<Vec<(PathBuf, PathBuf)>>,
+    state: std::sync::Mutex<WriteBatchState>,
+}
+
+/// The mutable state behind one lock, so [`WriteBatch::reserve_final_path`] and every `stage`
+/// call see (and update) the reservation set and the pending list atomically together — see
+/// `reserve_final_path`'s doc comment for why that atomicity is what makes it a real dedupe
+/// guard, not just a racy best-effort hint.
+#[derive(Default)]
+struct WriteBatchState {
+    pending: Vec<(PathBuf, PathBuf)>,
+
+    /// Every final path staged (or reserved) into this batch so far — see
+    /// [`WriteBatch::reserve_final_path`].
+    final_paths: std::collections::HashSet<PathBuf>,
 }
 
 impl WriteBatch {
     /// Create a new, empty write batch.
     pub fn new() -> Self {
-        Self { pending: std::sync::Mutex::new(Vec::new()) }
+        Self { state: std::sync::Mutex::new(WriteBatchState::default()) }
     }
 
     /// Stage a write: create and write a fresh temp file now (no fsync — that is the whole
@@ -655,7 +692,9 @@ impl WriteBatch {
         let temp_path = temp_path_for(file_path)?;
         create_and_write_file(&temp_path, content)?;
 
-        self.pending.lock().expect("write batch lock poisoned").push((temp_path, file_path.to_path_buf()));
+        let mut state = self.state.lock().expect("write batch lock poisoned");
+        state.final_paths.insert(file_path.to_path_buf());
+        state.pending.push((temp_path, file_path.to_path_buf()));
 
         Ok(())
     }
@@ -691,9 +730,36 @@ impl WriteBatch {
             "Error while setting the modification time of \"{}\": {}", temp_path.to_string_lossy(), e
         ))?;
 
-        self.pending.lock().expect("write batch lock poisoned").push((temp_path, file_path.to_path_buf()));
+        let mut state = self.state.lock().expect("write batch lock poisoned");
+        state.final_paths.insert(file_path.to_path_buf());
+        state.pending.push((temp_path, file_path.to_path_buf()));
 
         Ok(())
+    }
+
+    /// Atomically reserve `final_path` for staging in this batch: `true` exactly once for a
+    /// given path (the caller that gets it "wins" and must go on to actually stage it, e.g. via
+    /// [`write_object_to_file_deferred`]), `false` for every other call — concurrent or later —
+    /// with the same path, which must *not* stage it again.
+    ///
+    /// This is the dedupe [`crate::model::object::loose_object::LooseObject::store_deferred`]
+    /// needs (DESIGN.html §5.0 D item 10, finding #2): [`does_object_exist`] alone only sees
+    /// packs and already-*renamed* final paths, never a write staged earlier in the very same
+    /// batch (its final name does not exist yet — that is the whole point of batching). Without
+    /// this, every repeated occurrence of the same content hash in one batched walk would
+    /// independently decide "not on disk yet" and stage its own full compressed temp — for
+    /// heavily duplicated content (many copies of the same vendored asset, say) that is a
+    /// multiplier on both wall time and peak disk usage that dedupe-by-existence is supposed to
+    /// prevent entirely.
+    ///
+    /// Checked and inserted under one lock acquisition (the same lock `stage`/`stage_with_mtime`
+    /// use) so two threads reserving the same path at the same instant can never both "win" —
+    /// unlike a separate check-then-stage, which would leave a real (if narrow) race window.
+    /// Reserving a path does not itself stage anything; the winning caller is still responsible
+    /// for calling `stage`/`stage_with_mtime` afterward (which records the same path into this
+    /// same set again — a harmless re-insert).
+    pub fn reserve_final_path(&self, final_path: &Path) -> bool {
+        self.state.lock().expect("write batch lock poisoned").final_paths.insert(final_path.to_path_buf())
     }
 
     /// The barrier: fsync every staged write's bytes, then — only once every byte is durable —
@@ -703,12 +769,23 @@ impl WriteBatch {
     /// torn object survives any crash interleaving, an in-flight error leaves no stranded temp —
     /// applies here unchanged.
     ///
+    /// Clears the reservation set together with the pending list (both live behind the same
+    /// lock) — a batch is drained here either way, so nothing about a prior round should still
+    /// influence [`reserve_final_path`] if this instance is ever reused afterward. Nothing is
+    /// lost by that: once a write is durable (this call returned `Ok`), [`does_object_exist`]
+    /// sees it directly, and a caller reusing a `WriteBatch` for a later round already treats
+    /// each `finish` as its own barrier.
+    ///
     /// # Returns
     /// * `Ok(())`      - Every staged write is durable and visible at its final path.
     /// * `Err(String)` - A write or rename failed; every staged temp for this batch was
     ///                   best-effort removed before returning (nothing survives to leak).
     pub fn finish(&self) -> Result<(), String> {
-        let pending = std::mem::take(&mut *self.pending.lock().expect("write batch lock poisoned"));
+        let pending = {
+            let mut state = self.state.lock().expect("write batch lock poisoned");
+            state.final_paths.clear();
+            std::mem::take(&mut state.pending)
+        };
 
         if pending.is_empty() {
             return Ok(());
@@ -739,8 +816,8 @@ impl Drop for WriteBatch {
     /// case leaks nothing either — the durability invariant holds trivially, since nothing
     /// staged here was ever published.
     fn drop(&mut self) {
-        if let Ok(mut pending) = self.pending.lock() {
-            for (temp, _) in pending.drain(..) {
+        if let Ok(mut state) = self.state.lock() {
+            for (temp, _) in state.pending.drain(..) {
                 let _ = std::fs::remove_file(&temp);
             }
         }
@@ -1871,6 +1948,90 @@ mod tests {
         assert!(leftovers.is_empty(),
             "every staged temp (200 racers) must be consumed by its own rename, found {:?}",
             leftovers.iter().map(|e| e.file_name()).collect::<Vec<_>>());
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn reserve_final_path_wins_exactly_once_then_loses_forever() {
+        // The dedupe primitive `LooseObject::store_deferred` needs (DESIGN.html §5.0 D item 10,
+        // finding #2): the first caller to reserve a given final path gets `true` (it owns
+        // staging that path); every later call for the same path — even after the winner has
+        // gone on to actually stage it — gets `false`.
+        let batch = WriteBatch::new();
+        let target = Path::new("/some/warehouse/.forklift/objects/ab/cdef");
+
+        assert!(batch.reserve_final_path(target), "the first reservation must win");
+        assert!(!batch.reserve_final_path(target), "a second reservation for the same path must lose");
+        assert!(!batch.reserve_final_path(target), "losing is permanent, not just once");
+
+        // An unrelated path is entirely unaffected.
+        let other = Path::new("/some/warehouse/.forklift/objects/ab/0000");
+        assert!(batch.reserve_final_path(other), "a different path must still win its own reservation");
+    }
+
+    #[test]
+    fn reserve_final_path_is_race_free_under_concurrent_callers() {
+        // The atomicity claim: many threads racing to reserve the *same* path must produce
+        // exactly one winner, never zero and never more than one — a separate check-then-insert
+        // (rather than one lock covering both) could let two racers both observe "not reserved
+        // yet" and both proceed to stage (and compress) redundant work.
+        let batch = WriteBatch::new();
+        let target = Path::new("/some/warehouse/.forklift/objects/cd/ef01");
+        let target_ref: &Path = target;
+        let batch_ref: &WriteBatch = &batch;
+
+        let wins: Vec<bool> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..200)
+                .map(|_| scope.spawn(move || batch_ref.reserve_final_path(target_ref)))
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        assert_eq!(wins.iter().filter(|w| **w).count(), 1,
+            "exactly one of 200 concurrent reservations for the same path must win");
+    }
+
+    #[test]
+    fn a_staged_write_also_counts_as_reserved() {
+        // `stage`/`stage_with_mtime` populate the same reservation set `reserve_final_path`
+        // checks — a caller that stages a path directly (not through `reserve_final_path` first)
+        // still blocks a later reservation attempt for that same path.
+        let temp = std::env::temp_dir().join(format!("forklift-writebatch-reserve-stage-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+
+        let target = temp.join("object");
+        let batch = WriteBatch::new();
+        batch.stage(&target, b"content").unwrap();
+
+        assert!(!batch.reserve_final_path(&target),
+            "a path already staged directly must read as already reserved");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn finish_clears_the_reservation_set_so_a_reused_batch_starts_fresh() {
+        // `finish` drains `pending` and `final_paths` together (same doc comment) — a `WriteBatch`
+        // reused for a second round after a successful `finish` must not have the first round's
+        // reservations linger and block the second round's otherwise-unrelated write to the same
+        // path (e.g. a rewrite of the same file in a later, independent batch).
+        let temp = std::env::temp_dir().join(format!("forklift-writebatch-reserve-reuse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+
+        let target = temp.join("object");
+        let batch = WriteBatch::new();
+
+        batch.stage(&target, b"round one").unwrap();
+        batch.finish().unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"round one");
+
+        // A fresh reservation for the same path in the *same* batch instance, after `finish`,
+        // must win again — the first round is over and published.
+        assert!(batch.reserve_final_path(&target),
+            "a path must be reservable again after the batch that staged it has finished");
 
         std::fs::remove_dir_all(&temp).ok();
     }
