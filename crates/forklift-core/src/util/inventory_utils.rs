@@ -1676,14 +1676,26 @@ impl ShardMutationBatch {
     /// mid-loop decision failure (a whole-batch rollback here would silently break that for every
     /// other key, which is not what any caller wants from a single bad decision).
     ///
+    /// A key whose very *first* touch in this batch fails is dropped from the batch entirely
+    /// (not left behind as a content-unchanged copy): nothing was ever successfully decided for
+    /// it, so there is nothing for `publish` to write — restoring an unmodified snapshot instead
+    /// would still be safe (never a wrong answer, see [`publish`](Self::publish)'s own doc
+    /// comment on over-registering), but it would cost this key a real durability barrier and an
+    /// unnecessary ancestor-rollup invalidation for zero actual content change, on every call
+    /// whose first decision happens to fail.
+    ///
     /// # Returns
     /// * `Ok(())`      - The mutation was applied (in memory only; nothing is durable yet).
     /// * `Err(String)` - The shard could not be read or parsed, or `change` itself failed — in the
-    ///                   latter case this key's state is exactly what it was before this call.
+    ///                   latter case this key's state is exactly what it was before this call (or,
+    ///                   if this was the key's first touch in this batch, the key is absent from
+    ///                   the batch altogether, exactly as if `update` had never been called for it).
     pub fn update(&mut self,
                   key: &str,
                   change: impl FnOnce(&mut Inventory) -> Result<(), String>) -> Result<(), String> {
-        if !self.shards.contains_key(key) {
+        let is_first_touch = !self.shards.contains_key(key);
+
+        if is_first_touch {
             let (_, bytes_opt) = file_utils::retrieve_inventory_or_none_by_key(key)?;
 
             let inventory = match bytes_opt {
@@ -1702,7 +1714,12 @@ impl ShardMutationBatch {
         let result = change(self.shards.get_mut(key).expect("just inserted above"));
 
         if result.is_err() {
-            self.shards.insert(key.to_string(), before_change);
+            if is_first_touch {
+                self.shards.remove(key);
+                self.first_touched_at.remove(key);
+            } else {
+                self.shards.insert(key.to_string(), before_change);
+            }
         }
 
         result
@@ -3139,6 +3156,47 @@ mod tests {
         let unrelated_inventory = parser::inventory::inventory_parser::parse_inventory(&unrelated_bytes.unwrap()).unwrap();
         assert!(unrelated_inventory.get_item_by_name("kept.txt").is_some(),
             "an unrelated key's own already-decided mutation must survive another key's rollback");
+    }
+
+    #[test]
+    fn shard_mutation_batch_update_drops_a_key_entirely_when_its_first_touch_fails() {
+        // Companion to the rollback test above: when a key's *first* touch in the batch fails,
+        // there is nothing to "restore" to — restoring the freshly-loaded, unmodified snapshot
+        // would still be safe (never a wrong answer) but wasteful: `publish` would durably
+        // rewrite that key for zero actual content change, paying a real barrier and an
+        // unnecessary ancestor-rollup invalidation. The key must be dropped from the batch
+        // entirely instead, so `publish` never touches it at all.
+        let _scratch = Scratch::new("shard-mutation-batch-first-touch-drop");
+
+        // Pre-seed "aaa" on disk so a naive "restore the loaded snapshot" implementation would
+        // still have *something* to (redundantly) publish — proving the key is truly dropped,
+        // not just restored to a content-equal copy.
+        let mut existing = Inventory::new();
+        existing.add_item(item("preexisting.txt", 1, InventoryItemState::Normal));
+        save_inventory(&existing, &file_utils::get_inventory_data_path_for_key("aaa")).unwrap();
+
+        let shard_path = file_utils::get_inventory_data_path_for_key("aaa");
+        let original_mtime = file_utils::get_symlink_metadata_for_path(&shard_path).unwrap().modified().unwrap();
+
+        let mut batch = ShardMutationBatch::new();
+
+        let result = batch.update("aaa", |_inventory| {
+            Err("first touch rejected".to_string())
+        });
+        assert!(result.is_err(), "a failing first-touch change must propagate its error");
+
+        batch.publish().unwrap();
+
+        // The shard file must be completely untouched — not merely content-equal, but literally
+        // never rewritten (same mtime): proving `publish` never attempted to write it at all.
+        let after_mtime = file_utils::get_symlink_metadata_for_path(&shard_path).unwrap().modified().unwrap();
+        assert_eq!(original_mtime, after_mtime,
+            "a key whose only touch failed must never be rewritten by publish()");
+
+        // And it must not be registered in inventory metadata either.
+        let (_, metadata_opt) = file_utils::retrieve_inventory_metadata_or_none().unwrap();
+        assert!(metadata_opt.unwrap_or_default().is_empty(),
+            "a key whose only touch failed must never be registered in metadata");
     }
 
     #[test]
