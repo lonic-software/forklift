@@ -411,8 +411,8 @@ fn a_narrowed_sparse_bay_still_produces_correct_stocktake_and_stack_with_skips_a
 }
 
 // -------------------------------------------------------------------------------------------
-// Regressions for the `load .` join-point redesign (DESIGN.html §5.0 D item 8, review fix 1):
-// the pre-clear approach it replaced unconditionally wiped every rollup in the loaded scope on
+// Regressions for the `load .` join-point redesign: the pre-clear approach it replaced
+// unconditionally wiped every rollup in the loaded scope on
 // every load — for `load .`, the whole warehouse, changed or not — defeating the feature on the
 // most common workflow ("load .; stack"). These pin the fixed behavior directly.
 // -------------------------------------------------------------------------------------------
@@ -524,7 +524,7 @@ fn skip_count_is_unaffected_by_an_interposed_no_op_load_dot() {
 
 #[test]
 fn a_shard_that_vanishes_out_from_under_load_still_invalidates_its_ancestors() {
-    // Regression (multi-agent review of PR #59, finding 3): the dirty-path branch for a shard
+    // Regression: the dirty-path branch for a shard
     // whose *file* has gone missing (not just its working-directory content) used to drop the
     // key from metadata without extending the ancestor invalidation its sibling branch (a
     // shard whose entries got marked `Deleted`) already applied. A stale-but-still-matching
@@ -585,7 +585,7 @@ fn a_shard_that_vanishes_out_from_under_load_still_invalidates_its_ancestors() {
 }
 
 // -------------------------------------------------------------------------------------------
-// `park` regression (DESIGN.html §5.0 D item 10, finding #3): `park`'s tree build used to call
+// `park` regression: `park`'s tree build used to call
 // `tree_utils::build_tree_from_inventory` (no head to compare rollups against, so no skip was
 // ever possible on this path) instead of `build_tree_from_inventory_deferred`, unlike `stack`.
 // This pins that `park` now gets the same rollup-based skip `stack` already had.
@@ -629,7 +629,7 @@ fn park_gets_the_rollup_based_skip_stack_already_had() {
 }
 
 // -------------------------------------------------------------------------------------------
-// Regression for a PR #61 review finding on `refresh_tracked_entries` (`park`'s
+// Regression on `refresh_tracked_entries` (`park`'s
 // working-directory refresh): its pass-1/pass-2 split read every tracked shard's content in
 // pass 1, then published each pass 2 in metadata order. A directory sorting *before* the root's
 // "./" metadata entry (any name starting with a byte < 0x2E — e.g. this route-group-style name)
@@ -647,7 +647,7 @@ fn park_never_restamps_a_stale_rollup_over_a_same_pass_ancestor_clear() {
     warehouse.prepare();
 
     // "(marketing)" sorts before the root's "./" metadata entry (0x28 < 0x2E) — the exact
-    // ordering the review's repro depends on.
+    // ordering this regression depends on.
     warehouse.write_file("(marketing)/page.tsx", "page v1\n");
     warehouse.write_file("README.md", "readme v1\n");
     warehouse.run_ok(&["load", "."]);
@@ -686,7 +686,7 @@ fn park_never_restamps_a_stale_rollup_over_a_same_pass_ancestor_clear() {
     assert_eq!(warehouse.head_tree_hash("main"), head_before);
 }
 
-// A PR #61 review finding (#6) on `refresh_tracked_entries` — a shard rewritten only because its
+// On `refresh_tracked_entries` — a shard rewritten only because its
 // stat data drifted (no real content change) used to publish with the wall clock's value *when
 // the whole refresh finished deciding every tracked shard*, not the instant this particular shard
 // was actually verified — is covered by
@@ -695,3 +695,693 @@ fn park_never_restamps_a_stale_rollup_over_a_same_pass_ancestor_clear() {
 // shard right after `refresh_tracked_entries` returns, so a shard's mtime observed after a full
 // `park` command reflects that later, unrelated rewrite — not what this refresh itself published.
 // That dedicated test calls `refresh_tracked_entries` directly instead.
+
+// -------------------------------------------------------------------------------------------
+// Regressions for the batched merge/replay funnel: `apply_merge_actions` (consolidate/
+// cherry-pick), `restore <dir>`'s plain replay and `park pop`'s
+// replay all used to pay `update_shard`/`stage_file_entry_from_stat`'s full two-barrier funnel
+// per action/file — now routed through `inventory_utils::ShardMutationBatch`, the same shared
+// join-point primitive `load` and `park`'s working-directory refresh already use. One
+// hazard shape this exercises: a multi-decision batch where one decision's ancestor
+// is *another* decision's own shard, decided in an order the ancestor-clearing logic must not
+// depend on. These pin that shape specifically for the merge path.
+// -------------------------------------------------------------------------------------------
+
+#[test]
+fn consolidate_clears_every_ancestor_rollup_across_a_batch_where_one_actions_ancestor_is_another_actions_own_shard() {
+    let warehouse = Warehouse::new("consolidate-batch-ancestor-clear", false);
+    warehouse.prepare();
+
+    // "dirA" is the immediate ancestor of "dirA/dirB" — this repro needs a
+    // single merge batch that touches both a nested shard *and* that shard's own parent directly.
+    // "zzz/deep" is a *second*, unrelated nested change whose own intermediate ancestor ("zzz")
+    // is never itself directly touched by anything — sorted after "dirA/dirB" in every BTreeMap
+    // key order this batch could iterate in, so a clear-keys computation that only accounted for
+    // the *first*-processed decision (rather than every decision in the batch) would silently
+    // leave "zzz" carrying a stale rollup.
+    warehouse.write_file("dirA/dirB/deep.txt", "deep v1\n");
+    warehouse.write_file("dirA/direct.txt", "direct v1\n");
+    warehouse.write_file("zzz/deep/leaf.txt", "leaf v1\n");
+    warehouse.write_file("conflict.txt", "conflict v1\n");
+    warehouse.write_file("sibling/other.txt", "sibling v1\n");
+    warehouse.run_ok(&["load", "."]);
+    warehouse.run_ok(&["stack", "base"]);
+
+    assert!(shard_rollup(&warehouse, "dirA").is_some(), "\"dirA\" must be stamped after the base stack");
+    assert!(shard_rollup(&warehouse, "dirA/dirB").is_some(), "\"dirA/dirB\" must be stamped after the base stack");
+    assert!(shard_rollup(&warehouse, "zzz").is_some(), "\"zzz\" must be stamped after the base stack");
+
+    // Diverge: feature changes both the nested file and dirA's own direct file, the unrelated
+    // deep "zzz" file, plus the line that will conflict.
+    warehouse.run_ok(&["palletize", "feature"]);
+    warehouse.write_file("dirA/dirB/deep.txt", "deep v2 (feature)\n");
+    warehouse.write_file("dirA/direct.txt", "direct v2 (feature)\n");
+    warehouse.write_file("zzz/deep/leaf.txt", "leaf v2 (feature)\n");
+    warehouse.write_file("conflict.txt", "feature version\n");
+    warehouse.run_ok(&["load", "."]);
+    warehouse.run_ok(&["stack", "feature work"]);
+
+    // Main diverges independently: an unrelated sibling edit (so dirA/dirA-dirB's rollups stay
+    // exactly as the base stack left them going into the merge) and a conflicting edit to the
+    // same single-line file feature also touched, so the merge below cannot auto-stack — it
+    // stops right after `apply_merge_actions`, leaving the batch's own decisions directly
+    // inspectable instead of immediately overwritten by a following stack's own rollup stamping.
+    warehouse.run_ok(&["shift", "main"]);
+    warehouse.write_file("sibling/other.txt", "sibling v2 (main)\n");
+    warehouse.write_file("conflict.txt", "main version\n");
+    warehouse.run_ok(&["load", "."]);
+    warehouse.run_ok(&["stack", "main work"]);
+
+    let sibling_rollup_before_merge = shard_rollup(&warehouse, "sibling");
+    assert!(sibling_rollup_before_merge.is_some(), "\"sibling\" must be stamped after main's own stack");
+
+    let merge = warehouse.run(&["consolidate", "feature"]);
+    assert!(merge.status.success(), "consolidate must report conflicts, not fail outright: {}",
+        String::from_utf8_lossy(&merge.stderr));
+    let merge_stdout = String::from_utf8_lossy(&merge.stdout).to_string();
+    assert!(merge_stdout.contains("conflict"), "the merge must report the conflict.txt conflict: {}", merge_stdout);
+
+    // The batch's own decisions, inspectable now because the conflict stopped the auto-stack:
+    // every ancestor of a real content change must be cleared, whether or not that ancestor was
+    // *also* directly touched by another action in the very same batch.
+    assert_eq!(shard_rollup(&warehouse, "dirA/dirB"), None,
+        "the directly-touched nested shard must have its own rollup cleared");
+    assert_eq!(shard_rollup(&warehouse, "dirA"), None,
+        "\"dirA\" must be cleared: it is both an ancestor of the dirA/dirB change *and* the \
+         target of its own direct-file action in the same batch");
+    assert_eq!(shard_rollup(&warehouse, ""), None, "the root must be cleared as an ancestor of both changes");
+    assert_eq!(shard_rollup(&warehouse, "zzz"), None,
+        "\"zzz\" must be cleared too: an ancestor of a *different*, unrelated change in the same \
+         batch that is never itself directly touched by any action");
+
+    // An unrelated shard the merge batch never touched must be completely unaffected.
+    assert_eq!(shard_rollup(&warehouse, "sibling"), sibling_rollup_before_merge,
+        "an unrelated shard outside the merge's diff must keep exactly the rollup it had going in");
+
+    // Not just rollup bookkeeping: the actual content the batch decided must be present and
+    // correct on disk — a wrongly-restamped-then-skipped ancestor is exactly what would have let
+    // one of these two changes go missing.
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("dirA/dirB/deep.txt")).unwrap(), "deep v2 (feature)\n");
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("dirA/direct.txt")).unwrap(), "direct v2 (feature)\n");
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("zzz/deep/leaf.txt")).unwrap(), "leaf v2 (feature)\n");
+
+    // Resolve the conflict and complete the consolidation with an ordinary stack.
+    warehouse.write_file("conflict.txt", "resolved\n");
+    warehouse.run_ok(&["load", "conflict.txt"]);
+    warehouse.run_ok(&["stack", "resolve conflict"]);
+
+    // The completing stack's own cleanup restamps every shard against the newly-committed tree —
+    // confirm it lands on the *correct* (post-merge) tree, not a value derived from a rollup the
+    // merge batch should have cleared but didn't.
+    let head_tree = warehouse.head_tree_hash("main");
+    let dira_hash;
+    let dira_dirb_hash;
+    {
+        let _scope = forklift_core::globals::StorageRootScope::enter(&warehouse.root);
+        dira_hash = forklift_core::util::tree_utils::resolve_subtree_hash(&head_tree, "dirA").unwrap().unwrap();
+        dira_dirb_hash = forklift_core::util::tree_utils::resolve_subtree_hash(&head_tree, "dirA/dirB").unwrap().unwrap();
+    }
+
+    assert_eq!(shard_rollup(&warehouse, "dirA"), Some(dira_hash),
+        "\"dirA\"'s rollup after the completing stack must match the real, merged tree");
+    assert_eq!(shard_rollup(&warehouse, "dirA/dirB"), Some(dira_dirb_hash),
+        "\"dirA/dirB\"'s rollup after the completing stack must match the real, merged tree");
+
+    // Final belt-and-braces: a stocktake must agree byte-for-byte whether the rollup skip is
+    // forced off or left on — the same equivalence property every other rollup regression in
+    // this file checks, applied to the just-completed merge.
+    let mut off_command = warehouse.command(&["--json", "stocktake"]);
+    off_command.env("FORKLIFT_DISABLE_ROLLUP_SKIP", "1");
+    let off_output = off_command.output().unwrap();
+    assert!(off_output.status.success());
+    let on_output = warehouse.run_ok(&["--json", "stocktake"]);
+    let on_value: serde_json::Value = serde_json::from_slice(&on_output.stdout).unwrap();
+    let off_value: serde_json::Value = serde_json::from_slice(&off_output.stdout).unwrap();
+    assert_eq!(on_value, off_value, "stocktake after the merge must agree whether the skip is active or not");
+}
+
+#[test]
+fn apply_merge_actions_collapses_two_actions_in_the_same_shard_into_one_correct_read_modify_write() {
+    // Same-shard collapse: a delete and a
+    // take-theirs both landing in "dirA" must both survive in the final shard, not have one
+    // clobber the other via a lost read-modify-write.
+    let warehouse = Warehouse::new("consolidate-same-shard-collapse", false);
+    warehouse.prepare();
+
+    warehouse.write_file("dirA/keep.txt", "keep v1\n");
+    warehouse.write_file("dirA/removed.txt", "removed v1\n");
+    warehouse.run_ok(&["load", "."]);
+    warehouse.run_ok(&["stack", "base"]);
+
+    warehouse.run_ok(&["palletize", "feature"]);
+    // Feature adds a brand-new file in "dirA" and deletes another existing one — two distinct
+    // merge actions ("dirA/new.txt" TakeTheirs, "dirA/removed.txt" Delete) that both target the
+    // very same shard key ("dirA").
+    warehouse.write_file("dirA/new.txt", "new v1\n");
+    std::fs::remove_file(warehouse.root.join("dirA/removed.txt")).unwrap();
+    warehouse.run_ok(&["load", "."]);
+    warehouse.run_ok(&["stack", "feature work"]);
+
+    warehouse.run_ok(&["shift", "main"]);
+    warehouse.write_file("sibling.txt", "sibling v1\n");
+    warehouse.run_ok(&["load", "."]);
+    warehouse.run_ok(&["stack", "main work"]);
+
+    let merge = warehouse.run(&["consolidate", "feature"]);
+    assert!(merge.status.success(), "consolidate must succeed cleanly (no overlapping changes): {}",
+        String::from_utf8_lossy(&merge.stderr));
+
+    // Both of "dirA"'s actions must have landed: the new file present, the removed file gone,
+    // and the untouched file in the same shard still present.
+    assert!(warehouse.root.join("dirA/new.txt").exists(), "the take-theirs addition must survive the collapse");
+    assert!(!warehouse.root.join("dirA/removed.txt").exists(), "the delete must survive the collapse");
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("dirA/keep.txt")).unwrap(), "keep v1\n",
+        "an untouched entry in the same shard must be unaffected by the collapse");
+
+    let status = String::from_utf8_lossy(&warehouse.run(&["stocktake"]).stdout).to_string();
+    assert!(status.contains("matches"), "the warehouse must report clean after the merge: {}", status);
+}
+
+// -------------------------------------------------------------------------------------------
+// A `ShardMutationBatch::publish` failure — as opposed to a per-action decision failure — is a
+// wider case than the old per-action immediate funnel had, because every action's
+// working-directory write already happened, unconditionally, before the batch is published. The
+// old code could only ever leave *one* action's file diverged from its shard (the one whose own
+// `write_shard_mutation` call failed); this batch can leave several. Not data loss — every
+// diverged file's real content is exactly what the merge decided, and the recovery sequence the
+// error message recommends (`restore --staged .` then `restore .`) always reconciles the
+// inventory and the working directory from scratch, regardless of why they diverged.
+// This pins that recovery path end to end: force a real `batch.publish()` failure (an ancestor
+// shard the merge's own actions never touch, corrupted out from under it), confirm the working
+// directory already shows the merge's real content despite the failure, confirm the error message
+// carries the promised guidance, then confirm the recommended recovery actually works cleanly.
+// -------------------------------------------------------------------------------------------
+
+// Unix-only: simulates the write-side I/O failure `ShardMutationBatch::publish` can hit
+// (`stage_rollup_clear`/`WriteBatch::stage` failing to create a temp file) via a read-only
+// directory. A *read*-side failure (a corrupt shard) does not actually reach this code path in
+// practice — `consolidate`'s own pre-check (`ensure_warehouse_is_clean`, which walks and parses
+// every tracked shard before any merge action runs) already catches an unreadable shard earlier,
+// with its own clear parse-error message, before `apply_merge_actions` ever starts. A write-side
+// failure has no equivalent earlier guard (nothing writes during the pre-check), so it is the
+// realistic way this batch's own failure path actually triggers.
+#[cfg(unix)]
+#[test]
+fn consolidate_recovers_via_restore_after_a_batch_publish_failure_from_an_unwritable_inventory_root() {
+    // Regression: an earlier version of the failure message recommended "load ." then
+    // "retry" — but "load ." *stages* the half-applied working directory, and the resulting
+    // non-empty staged diff then makes `ensure_warehouse_is_clean` *refuse* the very retry the
+    // message told the operator to attempt. Following that advice literally could only ever reach
+    // a `stack`, never a real retried `consolidate` — silently recording the merge as never having
+    // happened (a single-parent parcel with "feature" left unmerged in the DAG). This test follows
+    // the *corrected* message's advice literally, end to end: `restore --staged .` (reset the
+    // inventory to head) then `restore .` (rewrite the working directory to match), then an actual
+    // retried `consolidate feature`, asserting it completes as a genuine two-parent merge.
+    let warehouse = Warehouse::new("consolidate-batch-publish-failure-recovery", false);
+    warehouse.prepare();
+
+    warehouse.write_file("dirA/dirB/file.txt", "deep v1\n");
+    warehouse.write_file("dirA/direct.txt", "direct v1\n");
+    warehouse.write_file("sibling.txt", "sibling v1\n");
+    warehouse.run_ok(&["load", "."]);
+    warehouse.run_ok(&["stack", "base"]);
+
+    warehouse.run_ok(&["palletize", "feature"]);
+    warehouse.write_file("dirA/dirB/file.txt", "deep v2 (feature)\n");
+    warehouse.write_file("dirA/direct.txt", "direct v2 (feature)\n");
+    warehouse.run_ok(&["load", "."]);
+    let feature_stack = warehouse.run_ok(&["--json", "stack", "feature work"]);
+    let feature_head = serde_json::from_slice::<serde_json::Value>(&feature_stack.stdout).unwrap()
+        ["data"]["parcel"].as_str().unwrap().to_string();
+
+    warehouse.run_ok(&["shift", "main"]);
+    warehouse.write_file("sibling.txt", "sibling v2 (main)\n");
+    warehouse.run_ok(&["load", "."]);
+    let main_stack = warehouse.run_ok(&["--json", "stack", "main work"]);
+    let main_head = serde_json::from_slice::<serde_json::Value>(&main_stack.stdout).unwrap()
+        ["data"]["parcel"].as_str().unwrap().to_string();
+
+    // The root shard's own inventory folder, read-only: `ensure_warehouse_is_clean`'s pre-check
+    // (read-only itself) still passes cleanly, but `apply_merge_actions`' own
+    // `ShardMutationBatch::publish` fails when phase A tries to stage the root's ancestor-clear
+    // temp file there — after both merge actions' working-directory writes already landed.
+    let root_inventory_folder = {
+        let _scope = forklift_core::globals::StorageRootScope::enter(&warehouse.root);
+        let mut path = forklift_core::util::file_utils::get_inventory_data_path_for_key("");
+        path.pop();
+        path
+    };
+
+    use std::os::unix::fs::PermissionsExt;
+    let original_permissions = std::fs::metadata(&root_inventory_folder).unwrap().permissions();
+    std::fs::set_permissions(&root_inventory_folder, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let merge = warehouse.run(&["consolidate", "feature"]);
+
+    // Always restore permissions before any assertion can early-return/panic, so a failing
+    // assertion below never leaves the warehouse directory permanently read-only for `Drop`'s
+    // own cleanup (`std::fs::remove_dir_all`) to choke on.
+    std::fs::set_permissions(&root_inventory_folder, original_permissions).unwrap();
+
+    assert!(!merge.status.success(), "the merge must fail: its root shard's folder is unwritable");
+    let stderr = String::from_utf8_lossy(&merge.stderr);
+    assert!(stderr.contains("restore --staged .") && stderr.contains("restore ."),
+        "the failure must tell the operator the actual working recovery sequence: {}", stderr);
+    assert!(!stderr.contains("Run \"load .\" to reconcile"),
+        "the failure must no longer recommend the self-defeating \"load .\" advice: {}", stderr);
+
+    // The working-directory writes already landed despite the batch publish failure — exactly
+    // the wider blast radius this finding is about, not data loss: the real content is right
+    // there on disk, just not yet reflected in the (unpublished) inventory.
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("dirA/dirB/file.txt")).unwrap(), "deep v2 (feature)\n");
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("dirA/direct.txt")).unwrap(), "direct v2 (feature)\n");
+
+    // The recommended recovery, followed literally: reset the inventory to head first...
+    warehouse.run_ok(&["restore", "--staged", "."]);
+    // ...then rewrite the working directory to match it — undoing the half-applied merge.
+    warehouse.run_ok(&["restore", "."]);
+
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("dirA/dirB/file.txt")).unwrap(), "deep v1\n",
+        "restore must revert the half-merged file back to head's content");
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("dirA/direct.txt")).unwrap(), "direct v1\n",
+        "restore must revert the half-merged file back to head's content");
+
+    let after_restore = warehouse.run_ok(&["--json", "stocktake"]);
+    let after_restore_value: serde_json::Value = serde_json::from_slice(&after_restore.stdout).unwrap();
+    assert_eq!(after_restore_value["data"]["staged_count"], 0,
+        "the warehouse must be genuinely clean before the retry: {}", after_restore_value);
+
+    // The actual retry the message promises now works — this is the point of the fix.
+    warehouse.run_ok(&["consolidate", "feature"]);
+
+    // The merge's real content is present in the final result.
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("dirA/dirB/file.txt")).unwrap(), "deep v2 (feature)\n");
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("dirA/direct.txt")).unwrap(), "direct v2 (feature)\n");
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("sibling.txt")).unwrap(), "sibling v2 (main)\n");
+
+    // And — unlike "load ." followed by a plain "stack" — it is recorded as a genuine two-parent
+    // consolidation, not an ordinary single-parent parcel with "feature" left unmerged.
+    let entries = warehouse.run_ok(&["--json", "history"]);
+    let entries_value: serde_json::Value = serde_json::from_slice(&entries.stdout).unwrap();
+    let entries_array = entries_value["data"]["entries"].as_array().unwrap();
+    let merge_entry = entries_array.iter()
+        .find(|entry| !entry["consolidates"].as_array().map(|a| a.is_empty()).unwrap_or(true))
+        .unwrap_or_else(|| panic!("the retried consolidate must produce a real merge parcel: {}", entries_value));
+
+    let parents = merge_entry["parents"].as_array().unwrap();
+    assert_eq!(parents.len(), 2, "a real consolidation has two parents: {}", merge_entry);
+    assert_eq!(
+        parents[0].as_str().unwrap(), main_head,
+        "the base parent must be the current pallet's own prior head: {}", merge_entry
+    );
+    assert_eq!(
+        parents[1].as_str().unwrap(), feature_head,
+        "the second parent must be the merged-in pallet's head: {}", merge_entry
+    );
+
+    let clean = warehouse.run_ok(&["--json", "stocktake"]);
+    let clean_value: serde_json::Value = serde_json::from_slice(&clean.stdout).unwrap();
+    assert_eq!(clean_value["data"]["staged_count"], 0);
+}
+
+/// Deterministic, seeded, incompressible-ish bytes — mirrors `cli.rs`'s identical helper.
+fn merge_recovery_large_bytes(seed: u64, size: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(size);
+    let mut state = seed;
+    while out.len() < size {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        out.extend_from_slice(&(z ^ (z >> 31)).to_le_bytes());
+    }
+    out.truncate(size);
+    out
+}
+
+/// Regression: `apply_merge_actions`'s recovery advice (`restore --staged .` then `restore .`)
+/// cannot itself clean up a merge-created file that is untracked on the current pallet head —
+/// `restore --staged .` resets the inventory to head (which never knew about the new file), and
+/// `restore .` only ever rewrites *tracked* files, never deletes an untracked one. Retrying the
+/// merge after following that advice literally used to hit `ensure_no_untracked_collisions`,
+/// which treated the merge's own already-landed leftover write as a permanent foreign conflict —
+/// the exact same self-defeating shape the advice itself was fixed to stop causing one review
+/// round earlier, just one step later in the sequence. This test follows the corrected advice
+/// literally, end to end, with a brand-new file (untracked on head — the case that broke this
+/// round) and a second, ≥8MiB (chunked) new file alongside it.
+#[test]
+fn consolidate_recovers_via_restore_when_the_merge_creates_a_file_untracked_on_head() {
+    let warehouse = Warehouse::new("consolidate-recovery-untracked-on-head", false);
+    warehouse.prepare();
+
+    warehouse.write_file("sibling.txt", "sibling v1\n");
+    warehouse.run_ok(&["load", "."]);
+    warehouse.run_ok(&["stack", "base"]);
+
+    warehouse.run_ok(&["palletize", "feature"]);
+
+    // Two brand-new files, both absent from base and from "main": a small one and a ≥8MiB
+    // (chunked) one — `ensure_no_untracked_collisions`'s hash-compare must handle both the
+    // `TakeTheirs`-by-hash path and the chunked-type-comparison hazard `park pop`'s identical
+    // fix closed one file over.
+    let big_content = merge_recovery_large_bytes(0x6d65_7267_6531, 8 * 1024 * 1024 + 4096);
+    let big_path = warehouse.root.join("dirA/big.bin");
+    std::fs::create_dir_all(big_path.parent().unwrap()).unwrap();
+    std::fs::write(&big_path, &big_content).unwrap();
+    warehouse.write_file("dirA/newfile.txt", "new content (feature)\n");
+    warehouse.run_ok(&["load", "."]);
+    let feature_stack = warehouse.run_ok(&["--json", "stack", "feature work"]);
+    let feature_head = serde_json::from_slice::<serde_json::Value>(&feature_stack.stdout).unwrap()
+        ["data"]["parcel"].as_str().unwrap().to_string();
+
+    warehouse.run_ok(&["shift", "main"]);
+    warehouse.write_file("sibling.txt", "sibling v2 (main)\n");
+    warehouse.run_ok(&["load", "."]);
+    let main_stack = warehouse.run_ok(&["--json", "stack", "main work"]);
+    let main_head = serde_json::from_slice::<serde_json::Value>(&main_stack.stdout).unwrap()
+        ["data"]["parcel"].as_str().unwrap().to_string();
+
+    // The root shard's own inventory folder, read-only: `ensure_warehouse_is_clean`'s and
+    // `ensure_no_untracked_collisions`'s pre-checks (both read-only) still pass cleanly, but
+    // `apply_merge_actions`'s own `ShardMutationBatch::publish` fails when phase A tries to
+    // stage the root's ancestor-clear temp file there — after both new files' working-directory
+    // writes already landed.
+    let root_inventory_folder = {
+        let _scope = forklift_core::globals::StorageRootScope::enter(&warehouse.root);
+        let mut path = forklift_core::util::file_utils::get_inventory_data_path_for_key("");
+        path.pop();
+        path
+    };
+
+    use std::os::unix::fs::PermissionsExt;
+    let original_permissions = std::fs::metadata(&root_inventory_folder).unwrap().permissions();
+    std::fs::set_permissions(&root_inventory_folder, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let merge = warehouse.run(&["consolidate", "feature"]);
+
+    std::fs::set_permissions(&root_inventory_folder, original_permissions).unwrap();
+
+    assert!(!merge.status.success(), "the merge must fail: its root shard's folder is unwritable");
+    let stderr = String::from_utf8_lossy(&merge.stderr);
+    assert!(stderr.contains("restore --staged .") && stderr.contains("restore ."),
+        "the failure must tell the operator the actual working recovery sequence: {}", stderr);
+
+    // Both new files' working-directory writes already landed despite the batch publish failure.
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("dirA/newfile.txt")).unwrap(),
+        "new content (feature)\n");
+    assert_eq!(std::fs::read(&big_path).unwrap(), big_content);
+
+    // The recommended recovery, followed literally.
+    warehouse.run_ok(&["restore", "--staged", "."]);
+    warehouse.run_ok(&["restore", "."]);
+
+    // Neither step can know about (or remove) a file that is untracked on head: both new files
+    // are exactly where the failed merge left them, now genuinely untracked.
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("dirA/newfile.txt")).unwrap(),
+        "new content (feature)\n",
+        "restore --staged . / restore . cannot delete a merge-created file untracked on head");
+    assert_eq!(std::fs::read(&big_path).unwrap(), big_content);
+
+    let after_restore = warehouse.run_ok(&["--json", "stocktake"]);
+    let after_restore_value: serde_json::Value = serde_json::from_slice(&after_restore.stdout).unwrap();
+    assert_eq!(after_restore_value["data"]["staged_count"], 0,
+        "the warehouse must be genuinely clean before the retry: {}", after_restore_value);
+
+    // The actual retry the message promises now works — this is the point of the fix. Before it,
+    // this failed forever with "would overwrite these untracked files: dirA/newfile.txt,
+    // dirA/big.bin" — forklift's own unpublished leftover reported as a permanent conflict with
+    // itself.
+    let retry = warehouse.run(&["consolidate", "feature"]);
+    assert!(retry.status.success(),
+        "the retry must succeed, not report the merge's own leftover as a permanent conflict: {}",
+        String::from_utf8_lossy(&retry.stderr));
+
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("dirA/newfile.txt")).unwrap(),
+        "new content (feature)\n");
+    assert_eq!(std::fs::read(&big_path).unwrap(), big_content);
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("sibling.txt")).unwrap(), "sibling v2 (main)\n");
+
+    // A genuine two-parent consolidation, not an ordinary single-parent parcel.
+    let entries = warehouse.run_ok(&["--json", "history"]);
+    let entries_value: serde_json::Value = serde_json::from_slice(&entries.stdout).unwrap();
+    let entries_array = entries_value["data"]["entries"].as_array().unwrap();
+    let merge_entry = entries_array.iter()
+        .find(|entry| !entry["consolidates"].as_array().map(|a| a.is_empty()).unwrap_or(true))
+        .unwrap_or_else(|| panic!("the retried consolidate must produce a real merge parcel: {}", entries_value));
+
+    let parents = merge_entry["parents"].as_array().unwrap();
+    assert_eq!(parents.len(), 2, "a real consolidation has two parents: {}", merge_entry);
+    assert_eq!(parents[0].as_str().unwrap(), main_head);
+    assert_eq!(parents[1].as_str().unwrap(), feature_head);
+
+    let clean = warehouse.run_ok(&["--json", "stocktake"]);
+    let clean_value: serde_json::Value = serde_json::from_slice(&clean.stdout).unwrap();
+    assert_eq!(clean_value["data"]["staged_count"], 0);
+}
+
+// -------------------------------------------------------------------------------------------
+// Batching made
+// a `batch.publish()` failure land strictly *after* every op's working-directory write, so a
+// failed `park pop` that added a brand-new file (absent from both the parked base and the current
+// head) always leaves that file sitting on disk. The pre-check `in_head.is_none() &&
+// Path::new(path).exists()` used to treat that leftover as a *user* conflict — permanently, since
+// every retry recomputes the same diff and finds the same file still there. This pins the
+// promised retry actually working end to end: fail `publish()` once (the same unwritable-
+// inventory-root trick as the consolidate recovery test above), fix the permission, re-run
+// `park pop`, and confirm it now succeeds instead of reporting a phantom conflict forever.
+// -------------------------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn park_pop_recovers_via_retry_after_a_batch_publish_failure_from_an_unwritable_inventory_root() {
+    let warehouse = Warehouse::new("park-pop-batch-publish-failure-recovery", false);
+    warehouse.prepare();
+
+    warehouse.write_file("existing.txt", "existing v1\n");
+    warehouse.run_ok(&["load", "."]);
+    warehouse.run_ok(&["stack", "base"]);
+
+    // A brand-new, root-level file: absent from both the parked base and the current head, so
+    // popping it hits the `in_head.is_none()` branch of the conflict pre-check.
+    warehouse.write_file("new.txt", "new content\n");
+    warehouse.run_ok(&["load", "."]);
+    warehouse.run_ok(&["park"]);
+
+    // Parking must have reset the working directory to head — the new file is gone until popped.
+    assert!(!warehouse.root.join("new.txt").exists(), "park push must reset the working directory");
+
+    // The root shard's own inventory folder, read-only: `pop_parked`'s own conflict pre-check
+    // (read-only itself) still passes cleanly, but `ShardMutationBatch::publish` fails when phase
+    // A tries to stage the root's ancestor-clear temp file there — after `new.txt`'s
+    // working-directory write already landed.
+    let root_inventory_folder = {
+        let _scope = forklift_core::globals::StorageRootScope::enter(&warehouse.root);
+        let mut path = forklift_core::util::file_utils::get_inventory_data_path_for_key("");
+        path.pop();
+        path
+    };
+
+    use std::os::unix::fs::PermissionsExt;
+    let original_permissions = std::fs::metadata(&root_inventory_folder).unwrap().permissions();
+    std::fs::set_permissions(&root_inventory_folder, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let first_pop = warehouse.run(&["park", "pop"]);
+
+    // Always restore permissions before any assertion can early-return/panic, so a failing
+    // assertion below never leaves the warehouse directory permanently read-only for `Drop`'s
+    // own cleanup (`std::fs::remove_dir_all`) to choke on.
+    std::fs::set_permissions(&root_inventory_folder, original_permissions).unwrap();
+
+    assert!(!first_pop.status.success(), "the pop must fail: its root shard's folder is unwritable");
+    let stderr = String::from_utf8_lossy(&first_pop.stderr);
+    assert!(stderr.contains("safe to retry"),
+        "the failure must promise the retry is safe: {}", stderr);
+
+    // The working-directory write already landed despite the batch publish failure.
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("new.txt")).unwrap(), "new content\n");
+
+    // The parked parcel must still be listed — the pop never completed.
+    let parked_after_failure = warehouse.run_ok(&["--json", "park", "list"]);
+    let parked_after_failure_value: serde_json::Value =
+        serde_json::from_slice(&parked_after_failure.stdout).unwrap();
+    assert_eq!(parked_after_failure_value["data"]["parked"].as_array().unwrap().len(), 1,
+        "the parked parcel must still be listed after the failed pop: {}", parked_after_failure_value);
+
+    // The actual retry the message promises: this used to fail forever, reporting "new.txt" —
+    // forklift's own unpublished write — as a conflict with the current state of the file.
+    warehouse.run_ok(&["park", "pop"]);
+
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("new.txt")).unwrap(), "new content\n",
+        "the retried pop must (re-)materialize the parked file correctly");
+
+    let staged = warehouse.run_ok(&["--json", "diff", "--staged"]);
+    let staged_value: serde_json::Value = serde_json::from_slice(&staged.stdout).unwrap();
+    let staged_files = staged_value["data"]["files"].as_array().unwrap();
+    assert!(staged_files.iter().any(|f| f["path"] == "new.txt"),
+        "the retried pop must actually stage \"new.txt\": {}", staged_value);
+
+    let parked_after_retry = warehouse.run_ok(&["--json", "park", "list"]);
+    let parked_after_retry_value: serde_json::Value =
+        serde_json::from_slice(&parked_after_retry.stdout).unwrap();
+    assert_eq!(parked_after_retry_value["data"]["parked"].as_array().unwrap().len(), 0,
+        "the parked parcel must be gone once the retry succeeds: {}", parked_after_retry_value);
+}
+
+/// The chunk threshold (bytes): content at or above this is stored chunked (a `NormalChunked`/
+/// `ExecutableChunked` entry type), below it as a plain blob. Mirrors
+/// `chunk_utils::CHUNK_THRESHOLD_BYTES` (a frozen format constant).
+const CHUNK_THRESHOLD: usize = 8 * 1024 * 1024;
+
+/// Deterministic, seeded, incompressible-ish bytes (a SplitMix64 stream) — no clock, no RNG, so a
+/// test's chunk boundaries are stable. Mirrors `cli.rs`'s identical helper.
+fn large_bytes(seed: u64, size: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(size);
+    let mut state = seed;
+    while out.len() < size {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        out.extend_from_slice(&(z ^ (z >> 31)).to_le_bytes());
+    }
+    out.truncate(size);
+    out
+}
+
+/// Regression: `park pop`'s untracked-file conflict check (`existing_file_matches_write`) used to
+/// compare a fresh `stat`'s raw `DirEntryType` directly against the parked op's target type —
+/// which for a chunked (≥8MiB) file is `NormalChunked`/`ExecutableChunked`, a variant a `stat` can
+/// never itself report (chunking is a storage choice, not a filesystem property). The comparison
+/// therefore reported every on-disk match for a large parked file as a mismatch before it ever
+/// hashed anything, permanently treating this pop's own already-landed leftover as a foreign
+/// conflict — a large parked file could never be popped again after a `batch.publish()` failure,
+/// exactly the "unpoppable after a failed retry" regression the same fix closed for small files.
+#[cfg(unix)]
+#[test]
+fn park_pop_recovers_via_retry_for_a_chunked_file_after_a_batch_publish_failure() {
+    let warehouse = Warehouse::new("park-pop-chunked-batch-publish-failure-recovery", false);
+    warehouse.prepare();
+
+    warehouse.write_file("existing.txt", "existing v1\n");
+    warehouse.run_ok(&["load", "."]);
+    warehouse.run_ok(&["stack", "base"]);
+
+    // A brand-new, root-level, ≥8MiB file: absent from both the parked base and the current
+    // head, so popping it hits the `in_head.is_none()` branch of the conflict pre-check — and,
+    // being at or above the chunk threshold, its parked op's `item_type` is `NormalChunked`.
+    let big_content = large_bytes(0x6267_5f70_6172_6b31, CHUNK_THRESHOLD + 4096);
+    std::fs::write(warehouse.root.join("big.bin"), &big_content).unwrap();
+    warehouse.run_ok(&["load", "."]);
+    warehouse.run_ok(&["park"]);
+
+    assert!(!warehouse.root.join("big.bin").exists(), "park push must reset the working directory");
+
+    // Sabotage the root shard's own inventory folder exactly like the small-file recovery test
+    // above: `pop_parked`'s conflict pre-check (read-only itself) still passes cleanly, but
+    // `ShardMutationBatch::publish` fails when phase A tries to stage the root's ancestor-clear
+    // temp file there — after `big.bin`'s working-directory write already landed.
+    let root_inventory_folder = {
+        let _scope = forklift_core::globals::StorageRootScope::enter(&warehouse.root);
+        let mut path = forklift_core::util::file_utils::get_inventory_data_path_for_key("");
+        path.pop();
+        path
+    };
+
+    use std::os::unix::fs::PermissionsExt;
+    let original_permissions = std::fs::metadata(&root_inventory_folder).unwrap().permissions();
+    std::fs::set_permissions(&root_inventory_folder, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let first_pop = warehouse.run(&["park", "pop"]);
+
+    std::fs::set_permissions(&root_inventory_folder, original_permissions).unwrap();
+
+    assert!(!first_pop.status.success(), "the pop must fail: its root shard's folder is unwritable");
+
+    // The working-directory write already landed despite the batch publish failure.
+    let landed = std::fs::read(warehouse.root.join("big.bin")).unwrap();
+    assert_eq!(landed, big_content, "the chunked file's content must have landed byte-for-byte");
+
+    // The retry must succeed instead of reporting forklift's own unpublished chunked write as a
+    // permanent conflict with itself.
+    let retry = warehouse.run(&["park", "pop"]);
+    assert!(retry.status.success(),
+        "the retried pop must succeed, not report the chunked leftover as a conflict: {}",
+        String::from_utf8_lossy(&retry.stderr));
+
+    let repopped = std::fs::read(warehouse.root.join("big.bin")).unwrap();
+    assert_eq!(repopped, big_content, "the retried pop must (re-)materialize the chunked file correctly");
+
+    let parked_after_retry = warehouse.run_ok(&["--json", "park", "list"]);
+    let parked_after_retry_value: serde_json::Value =
+        serde_json::from_slice(&parked_after_retry.stdout).unwrap();
+    assert_eq!(parked_after_retry_value["data"]["parked"].as_array().unwrap().len(), 0,
+        "the parked parcel must be gone once the retry succeeds: {}", parked_after_retry_value);
+}
+
+/// Regression: making `park pop`'s untracked-file conflict check hash-compare (the fix above)
+/// also made the whole conflict *scan* fallible — an unreadable file's `?` used to abort the
+/// entire loop with a raw I/O error instead of appearing in the actionable conflict list the loop
+/// exists to build. Restores the original infallible-scan behavior: an unreadable file is
+/// conservatively still a listed conflict (never a match, since it cannot even be compared), and
+/// the scan keeps going past it — proven here by a *second*, definite conflict later in the same
+/// pop that must still be reported, not swallowed by the first file's read error.
+#[cfg(unix)]
+#[test]
+fn park_pop_lists_an_unreadable_file_as_a_conflict_instead_of_aborting_the_scan() {
+    let warehouse = Warehouse::new("park-pop-unreadable-file-conflict-scan", false);
+    warehouse.prepare();
+
+    warehouse.write_file("existing.txt", "existing v1\n");
+    warehouse.run_ok(&["load", "."]);
+    warehouse.run_ok(&["stack", "base"]);
+
+    // Two brand-new, root-level files: both absent from the parked base and the current head, so
+    // popping either hits the `in_head.is_none()` branch of the conflict pre-check.
+    warehouse.write_file("unreadable.bin", "parked content\n");
+    warehouse.write_file("conflict.bin", "parked content\n");
+    warehouse.run_ok(&["load", "."]);
+    warehouse.run_ok(&["park"]);
+
+    assert!(!warehouse.root.join("unreadable.bin").exists(), "park push must reset the working directory");
+    assert!(!warehouse.root.join("conflict.bin").exists(), "park push must reset the working directory");
+
+    // A genuine foreign conflict: content that will never match what the pop would write.
+    warehouse.write_file("conflict.bin", "a user's own untracked content\n");
+
+    // A file whose content cannot even be read: `get_symlink_metadata_for_path` (a `stat`) still
+    // succeeds — so the type comparison passes and the scan proceeds to hash-compare — but
+    // opening it to read its content fails. This is what must land in the conflict list instead
+    // of aborting the whole scan.
+    warehouse.write_file("unreadable.bin", "some other untracked content\n");
+    let unreadable_path = warehouse.root.join("unreadable.bin");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&unreadable_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let pop = warehouse.run(&["park", "pop"]);
+
+    // Restore permissions before any assertion can early-return/panic, so a failing assertion
+    // never leaves the warehouse directory with an unreadable file for `Drop`'s own cleanup.
+    std::fs::set_permissions(&unreadable_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    assert!(!pop.status.success(), "genuine untracked collisions must still refuse the pop");
+    let stderr = String::from_utf8_lossy(&pop.stderr);
+    assert!(stderr.contains("The parked changes conflict with the current state of these files"),
+        "an unreadable file must be reported through the ordinary conflict-list message, not a \
+        raw, unformatted I/O error that aborted the scan: {}", stderr);
+    assert!(stderr.contains("unreadable.bin"),
+        "the unreadable file itself must be listed as a conflict (unreadable ⇒ inconclusive ⇒ \
+        conservatively treated as a conflict, never silently skipped): {}", stderr);
+    assert!(stderr.contains("conflict.bin"),
+        "a second, definite conflict later in the same scan must still be reported — proving the \
+        first file's read error did not abort the loop before reaching it: {}", stderr);
+
+    // Neither untracked file was touched.
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("conflict.bin")).unwrap(),
+        "a user's own untracked content\n");
+
+    // The parked parcel is still listed — the pop never completed.
+    let parked = warehouse.run_ok(&["--json", "park", "list"]);
+    let parked_value: serde_json::Value = serde_json::from_slice(&parked.stdout).unwrap();
+    assert_eq!(parked_value["data"]["parked"].as_array().unwrap().len(), 1,
+        "the parked parcel must still be listed after the refused pop: {}", parked_value);
+}

@@ -322,7 +322,7 @@ async fn s3_verify_and_promote_gates_the_canonical_namespace() {
     .expect("the blocking assertions");
 }
 
-/// The DoS-hardening review finding (C1): a staged object at or above
+/// DoS hardening: a staged object at or above
 /// [`forklift_aws_lambda::aws::STREAMING_THRESHOLD_BYTES`] is never buffered whole —
 /// `verify_and_promote` stream-hashes it through an incremental Blake3 hasher and promotes it
 /// with a server-side `CopyObject` pinned to the exact bytes it hashed. This is the first time

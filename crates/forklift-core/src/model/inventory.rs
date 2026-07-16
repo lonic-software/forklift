@@ -8,6 +8,13 @@ use crate::enums::dir_entry_type::DirEntryType;
 /// The inventory contains the full list of objects that have been taken into inventory
 /// (using the `load` command). Changes that have not been loaded yet are not reflected in
 /// the inventory.
+///
+/// `Clone` is cheap: every entry is `Arc`-wrapped and never mutated in place (every mutator —
+/// `add_item`, `mark_item_deleted`, ... — replaces the map entry with a fresh `Arc` instead), so
+/// cloning only bumps refcounts and copies the `BTreeMap`'s own node structure, never an entry's
+/// data. Relied on by `inventory_utils::ShardMutationBatch::update`, which snapshots and restores
+/// a shard on a failing mutation.
+#[derive(Clone)]
 pub struct Inventory {
     items_by_name: BTreeMap<String, Arc<InventoryItem>>,
 

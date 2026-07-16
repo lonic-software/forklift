@@ -18,16 +18,16 @@ pub struct InventoryBuilderContext {
     /// These inventories should be removed.
     pub dirty_inventory_paths: Arc<Mutex<BTreeSet<String>>>,
 
-    /// The shared batch for this whole `load`'s per-file blob stores (DESIGN.html §5.0 D item 10,
-    /// finding #1) — the one thing a concurrent per-directory task touches directly (via
+    /// The shared batch for this whole `load`'s per-file blob stores (DESIGN.html §5.0 D item 10)
+    /// — the one thing a concurrent per-directory task touches directly (via
     /// `LooseObject::store_deferred`), since a content-addressed object write is safe to share
     /// across threads exactly like `stack`'s tree build already relies on (see
     /// [`file_utils::WriteBatch::stage`]'s doc comment).
     ///
     /// Finished on its own, strictly *before* any shard content is staged (see
     /// `create_inventory_for_directory`'s join point, which staged shard content through its own
-    /// local batch inside `publish_shard_outcomes`, not through this context at all) — DESIGN.html
-    /// §5.0 D item 10, finding #7: a shard published afterward can name one of these blobs'
+    /// local batch inside `publish_shard_outcomes`, not through this context at all): a shard
+    /// published afterward can name one of these blobs'
     /// hashes, so the blob must already be durable — not merely staged in some batch that has not
     /// been through its own `finish()` yet — before that shard's rename can land. Sharing one
     /// `WriteBatch` (and hence one `run_write_barrier` call) between blobs and shard content would

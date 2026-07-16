@@ -2014,8 +2014,7 @@ mod tests {
     }
 
     /// Pins the equality semantics the constant-time compare must preserve: a same-length
-    /// near-miss still refuses. This is the regression test for the review finding that the
-    /// static-token compare was a naive (timing-leaky) `==`; a constant-time comparator that
+    /// near-miss still refuses — guards against a naive (timing-leaky) `==`; a constant-time comparator that
     /// were subtly wrong (e.g. always agreeing once lengths match) would slip through every
     /// other test here, since they all use tokens of different lengths.
     #[tokio::test]

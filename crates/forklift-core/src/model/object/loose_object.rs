@@ -53,7 +53,7 @@ impl LooseObject {
     /// where [`file_utils::BulkStoreSession`] cannot safely be shared (see its doc comment).
     ///
     /// Dedupes against writes staged earlier in *this same batch*, not just what is already
-    /// durable on disk (DESIGN.html §5.0 D item 10, finding #2): [`file_utils::does_object_exist`]
+    /// durable on disk (DESIGN.html §5.0 D item 10): [`file_utils::does_object_exist`]
     /// cannot see a staged-but-not-yet-renamed temp (it has no final name until `batch.finish()`
     /// runs), so without this every repeated occurrence of the same content hash in one batched
     /// walk (many copies of the same vendored asset, say) would independently compress and stage
@@ -152,7 +152,7 @@ mod tests {
         count
     }
 
-    /// DESIGN.html §5.0 D item 10, finding #2: `does_object_exist` alone cannot see a
+    /// `does_object_exist` alone cannot see a
     /// staged-but-not-yet-renamed write — a batch has no way to know, from the store alone,
     /// whether some *other* occurrence of the same content already staged a write earlier in
     /// this same batch. Without `WriteBatch::reserve_final_path`, N occurrences of the same
@@ -230,6 +230,62 @@ mod tests {
         assert_eq!(staged_files, DISTINCT, "every distinct content hash must have its own staged temp");
 
         batch.finish().unwrap();
+        drop(scratch);
+    }
+
+    /// Regression: `store_deferred`
+    /// reserves the final path *before* the two fallible steps that actually fulfil it
+    /// (`compress()`, then `write_object_to_file_deferred`). If a caller wins the reservation and
+    /// then hits a fallible step, the reservation stays "won" forever with nothing ever pushed
+    /// into `pending` — reproduced here directly via `reserve_final_path` (the exact primitive
+    /// `store_deferred` uses internally), which faithfully stands in for "task 1 reserved, then a
+    /// fallible step failed" without needing to actually force `compress()` or the write itself
+    /// to error.
+    ///
+    /// A second occurrence of the *same* content then loses the race (`reserve_final_path`
+    /// returns `false`), reads that as "already staged," and returns `Ok` without staging
+    /// anything of its own either — exactly what a concurrent or later task hitting the same hash
+    /// does in the real walk. Pre-fix, `finish()` had no way to notice the mismatch: `pending` is
+    /// empty for this hash, so it would return `Ok`, and a caller downstream could publish a
+    /// shard naming a blob that was never actually written. `finish()` must now refuse instead.
+    #[test]
+    fn finish_fails_loudly_when_a_reservation_was_never_staged() {
+        let scratch = Scratch::new("leaked-reservation");
+
+        let content = vec![0x99u8; 4000];
+        let batch = file_utils::WriteBatch::new();
+
+        // "Task 1": wins the reservation for this content's hash, then (as if `compress()` or
+        // the write itself had failed) never goes on to actually stage it.
+        let (path, file_name) = {
+            let object = LooseObjectBuilder::build_blob(&Blob { content: content.clone() });
+            file_utils::get_path_for_object(&object.hash).unwrap()
+        };
+        let mut final_path = std::path::PathBuf::from(&path);
+        final_path.push(&file_name);
+        assert!(batch.reserve_final_path(&final_path),
+            "the simulated first occurrence must win the reservation");
+
+        // "Task 2": the same content arriving afterward, losing the race against the still-live
+        // (never released, never fulfilled) reservation above.
+        let mut second = LooseObjectBuilder::build_blob(&Blob { content });
+        let (_, staged) = second.store_deferred(&batch).unwrap();
+        assert!(!staged,
+            "a second occurrence must lose the race exactly like the real concurrent interleaving");
+
+        let error = match batch.finish() {
+            Ok(()) => panic!(
+                "finish() must refuse to publish a batch that leaked a reservation nobody ever \
+                staged, not silently succeed"),
+            Err(e) => e,
+        };
+        assert!(error.contains(&*final_path.to_string_lossy()),
+            "the error should name the leaked reservation's path: {error}");
+
+        // Nothing was ever durably published for this hash — the whole point of refusing.
+        assert!(!file_utils::does_object_exist(&second.hash).unwrap(),
+            "the object must not exist on disk after a refused finish()");
+
         drop(scratch);
     }
 }
