@@ -1779,6 +1779,50 @@ mod tests {
     }
 
     #[test]
+    fn hash_from_object_path_round_trips_with_get_path_for_object() {
+        // The inverse `hash_from_object_path` exists to recover: a leaked-reservation failure
+        // names final paths, and a caller needs the hash(es) those paths address to identify
+        // which already-decided shard content depends on one — a wrong answer here (a hash that
+        // does not actually match the path, or a path that should decode but returns `None`)
+        // would either fail to protect the leaked-reservation guarantee (a shard could still
+        // reference a blob that never landed) or wrongly drop unrelated content.
+        for hash in ["a".repeat(64), "0123456789abcdef".repeat(4), "f".repeat(65), "1".repeat(3)] {
+            let (folder, file_name) = get_path_for_object(&hash).unwrap();
+            let mut final_path = PathBuf::from(&folder);
+            final_path.push(&file_name);
+
+            assert_eq!(hash_from_object_path(&final_path), Some(hash.clone()),
+                "must recover the exact hash \"{hash}\" that produced this path");
+        }
+    }
+
+    #[test]
+    fn hash_from_object_path_rejects_a_shape_get_path_for_object_never_produces() {
+        // Any path that does not have the fan-out shape (a 2-hex-char folder, then the rest of
+        // the hash) must decode to `None`, not silently produce a garbage hash that could then
+        // coincidentally (or maliciously) match a real item's recorded hash.
+        let cases: Vec<PathBuf> = vec![
+            PathBuf::from("/some/warehouse/.forklift/objects/ab/cdef"), // well-formed control case, see below
+            PathBuf::from("/some/warehouse/.forklift/objects/a/bcdef"), // 1-char folder, not 2
+            PathBuf::from("/some/warehouse/.forklift/objects/abc/def"), // 3-char folder, not 2
+            PathBuf::from("/some/warehouse/.forklift/objects/zz/cdef"), // non-hex folder
+            PathBuf::from("/some/warehouse/.forklift/objects/ab/cdeg"), // non-hex filename
+            PathBuf::from("no-parent-at-all"),
+            PathBuf::from("/"),
+        ];
+
+        // The control case (a genuinely well-formed path) must still decode correctly — proves
+        // the other cases are rejected for their specific shape defect, not by some overly broad
+        // check that rejects everything.
+        assert_eq!(hash_from_object_path(&cases[0]), Some("abcdef".to_string()));
+
+        for path in &cases[1..] {
+            assert_eq!(hash_from_object_path(path), None,
+                "must reject {path:?} instead of returning a garbage hash");
+        }
+    }
+
+    #[test]
     fn fsync_setting_is_on_unless_explicitly_disabled() {
         // Durability is the default: absent, blank, or any unrecognised value keeps fsync on.
         assert!(parse_fsync_setting(None), "absent means durable");
