@@ -900,6 +900,147 @@ fn restore_directory_pays_a_constant_number_of_barriers_regardless_of_file_count
     assert!(count_1 > 0, "the counter must observe real barrier work, got {count_1}");
 }
 
+/// One `restore .` run over `dir_count` single-file, top-level directories, with
+/// `FORKLIFT_DEBUG_BARRIER_COUNT=1` and (when `Some`) `FORKLIFT_RESTORE_SHARD_GROUP_SIZE` set —
+/// returns the barrier count that run paid.
+fn restore_directory_barrier_count_for_group_size(dir_count: usize, group_size: Option<usize>) -> u64 {
+    let area = Area::new(&format!(
+        "restore-group-size-{}-{}", dir_count,
+        group_size.map(|g| g.to_string()).unwrap_or_else(|| "default".to_string())
+    ));
+    let warehouse = area.warehouse();
+
+    for dir in 0..dir_count {
+        let dir_path = warehouse.join(format!("dir{dir}"));
+        std::fs::create_dir_all(&dir_path).unwrap();
+        std::fs::write(dir_path.join("file.txt"), format!("v1 {dir}\n")).unwrap();
+    }
+
+    assert!(area.run(&["prepare"]).status.success());
+    assert!(area.run(&["config", "operator.name", "barrier@forklift"]).status.success());
+    assert!(area.run(&["config", "operator.identifier", "barrier@forklift"]).status.success());
+    assert!(area.run(&["load", "."]).status.success());
+    assert!(area.run(&["stack", "base"]).status.success());
+
+    for dir in 0..dir_count {
+        std::fs::write(warehouse.join(format!("dir{dir}")).join("file.txt"), format!("dirty {dir}\n")).unwrap();
+    }
+
+    let mut command = area.command(&["restore", "."]);
+    command.env("FORKLIFT_DEBUG_BARRIER_COUNT", "1");
+    if let Some(size) = group_size {
+        command.env("FORKLIFT_RESTORE_SHARD_GROUP_SIZE", size.to_string());
+    }
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "restore failed: {}", String::from_utf8_lossy(&output.stderr));
+
+    barrier_count(&output)
+}
+
+/// Regression (DESIGN.html §5.0 D item 10, PR B review finding #4): the pre-fix
+/// `ShardMutationBatch` held every shard it ever touched, parsed, in memory until the very end of
+/// `restore .`'s whole call — an unbounded batch that gives up the sharded inventory's whole
+/// RAM-scaling rationale for this one caller (worst case, a repository-wide `restore .`). The fix
+/// flushes (publishes, then starts a fresh batch) every `FORKLIFT_RESTORE_SHARD_GROUP_SIZE`
+/// shards instead of once for the whole call. A memory measurement would be slow and fragile to
+/// automate reliably, so this proves the *behavioral* consequence instead, the same way the
+/// project's other barrier-count tests do: a small group size over a fixed set of directories
+/// must pay measurably more barriers than a group size that fits all of them in one group — if
+/// the flush were not actually happening (an unbounded batch bug reintroduced), both would pay
+/// the same, small, constant barrier count regardless of the group-size env var.
+#[test]
+fn restore_directory_flushes_its_batch_in_bounded_groups_instead_of_one_unbounded_batch() {
+    const DIR_COUNT: usize = 6;
+
+    let small_group = restore_directory_barrier_count_for_group_size(DIR_COUNT, Some(2));
+    let one_group = restore_directory_barrier_count_for_group_size(DIR_COUNT, Some(DIR_COUNT));
+
+    assert!(small_group > one_group,
+        "a small group size (2) must pay more barriers than one big enough to cover all \
+         {DIR_COUNT} directories in a single group, over the very same {DIR_COUNT} directories \
+         — otherwise the batch was never actually flushed early: got {small_group} (group size 2) \
+         vs {one_group} (group size {DIR_COUNT})");
+
+    // Still real batching *within* each group, not one barrier per shard: group size 2 must not
+    // regress all the way back to the old per-file/per-shard funnel's barrier count.
+    assert!(small_group < DIR_COUNT as u64 * 2,
+        "group size 2 must still batch within each group, not pay a barrier per shard: got \
+         {small_group} for {DIR_COUNT} directories");
+
+    assert!(one_group > 0, "the counter must observe real barrier work, got {one_group}");
+}
+
+/// Regression (DESIGN.html §5.0 D item 10, PR B review finding #5): anchoring a shard's published
+/// mtime to the *first* file `ShardMutationBatch::update` touched in it (rather than a moment
+/// after every one of that shard's real writes) meant every file *after* the first in a
+/// multi-file shard had a real on-disk mtime that postdated the published shard mtime —
+/// permanently failing `is_entry_unchanged`'s `mtime < shard_mtime` stat-cache guard for those
+/// files until the next `load` rewrote the shard from scratch. Restoring several files in one
+/// directory is the common case for `restore <dir>`, not a rare one, so this defeated the stat
+/// cache for nearly every restored file, not just an edge case: every following `stocktake`/
+/// `diff` would re-read and rehash the full content of every one of them.
+///
+/// Pins the fix directly and deterministically: `restore.rs`'s `restore_shard_files_into` writes
+/// every file in a shard first and only *then* stats and stages all of them in one `batch.update`
+/// call, so the shard's published mtime (`ShardMutationBatch`'s first-touch anchor) must land at
+/// or after every one of that shard's files' own real write mtime. This is checked by reading the
+/// raw, full-precision mtimes straight off disk — *not* by asserting a `stocktake` afterward
+/// needs zero rehashes: `is_entry_unchanged`'s own guard compares *second-truncated* timestamps
+/// (`get_content_modification_timestamp_for_file`'s `.as_secs()`, the project's documented
+/// "racily clean" protection), and restoring a handful of tiny files reliably completes within a
+/// single wall-clock second on any real machine — so a behavioral "did it actually skip the
+/// rehash" test would need an artificial multi-second delay to be non-flaky (the project's own
+/// precedent for that tradeoff, `shard_mutation_batch_anchors_each_shards_published_mtime_at_its_
+/// own_first_touch` in `inventory_utils.rs`, accepts exactly that cost). Comparing the raw mtimes
+/// directly instead tests the *underlying* invariant the fix establishes, at full precision, with
+/// no timing dependency at all: under the pre-fix bug, sequential `SystemTime::now()` calls in
+/// program order for files 2..N are strictly later (even if only by microseconds) than the
+/// anchor captured during file 1's own touch, which this test's inequality still catches even
+/// when both timestamps happen to round to the same second.
+#[test]
+fn restore_directory_anchors_the_shard_mtime_after_every_files_own_write_not_just_the_first() {
+    let area = Area::new("restore-anchors-mtime-after-every-write");
+    let warehouse = area.warehouse();
+
+    const FILE_COUNT: usize = 8;
+
+    let dir_path = warehouse.join("dir0");
+    std::fs::create_dir_all(&dir_path).unwrap();
+    for f in 0..FILE_COUNT {
+        std::fs::write(dir_path.join(format!("file{f}.txt")), format!("v1 {f}\n")).unwrap();
+    }
+
+    assert!(area.run(&["prepare"]).status.success());
+    assert!(area.run(&["config", "operator.name", "mtime-anchor@forklift"]).status.success());
+    assert!(area.run(&["config", "operator.identifier", "mtime-anchor@forklift"]).status.success());
+    assert!(area.run(&["load", "."]).status.success());
+    assert!(area.run(&["stack", "base"]).status.success());
+
+    // Dirty every file (unstaged edits) — `restore .` discards these back to the staged content,
+    // rewriting every file and refreshing its stat data.
+    for f in 0..FILE_COUNT {
+        std::fs::write(dir_path.join(format!("file{f}.txt")), format!("dirty {f}\n")).unwrap();
+    }
+
+    assert!(area.run(&["restore", "."]).status.success());
+
+    let shard_mtime = {
+        let _scope = forklift_core::globals::StorageRootScope::enter(&warehouse);
+        let data_path = forklift_core::util::file_utils::get_inventory_data_path_for_key("dir0");
+        std::fs::metadata(&data_path).unwrap().modified().unwrap()
+    };
+
+    for f in 0..FILE_COUNT {
+        let file_path = dir_path.join(format!("file{f}.txt"));
+        let file_mtime = std::fs::metadata(&file_path).unwrap().modified().unwrap();
+
+        assert!(shard_mtime >= file_mtime,
+            "\"dir0\"'s published shard mtime ({shard_mtime:?}) must be at or after every one of \
+             its files' own real write mtime — file{f}.txt was written at {file_mtime:?}, which \
+             is later");
+    }
+}
+
 /// One `park` push, then `park pop`, over a fixed set of directories, each holding
 /// `files_per_dir` already-tracked files that are all given real content changes before both
 /// calls — returns `(park_push_barrier_count, park_pop_barrier_count)`, each measured with
