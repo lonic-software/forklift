@@ -743,8 +743,8 @@ mod tests {
         assert!(body.code.is_none());
     }
 
-    /// `query_param` treats a missing, empty, or whitespace-only value as absent — the fix for
-    /// the review finding that `?session=` presigned a `staging//{hash}` key nothing could ever
+    /// `query_param` treats a missing, empty, or whitespace-only value as absent — otherwise
+    /// `?session=` would presign a `staging//{hash}` key nothing could ever
     /// commit against. A non-empty value (including one with embedded whitespace) still round
     /// trips untouched, and no percent-decoding happens (the client never encodes these values).
     #[test]

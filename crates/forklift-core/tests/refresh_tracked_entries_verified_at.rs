@@ -1,4 +1,4 @@
-//! Isolated integration test for a PR #61 review finding (#6) on `refresh_tracked_entries`
+//! Isolated integration test for `refresh_tracked_entries`'s mtime-anchor invariant
 //! (`park`'s working-directory refresh): a shard rewritten only because its stat data drifted
 //! (no real content change) used to publish with the wall clock's value *when the whole refresh
 //! finished deciding every tracked shard*, not the instant this particular shard was actually

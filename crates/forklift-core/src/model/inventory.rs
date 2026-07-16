@@ -13,7 +13,7 @@ use crate::enums::dir_entry_type::DirEntryType;
 /// `add_item`, `mark_item_deleted`, ... — replaces the map entry with a fresh `Arc` instead), so
 /// cloning only bumps refcounts and copies the `BTreeMap`'s own node structure, never an entry's
 /// data. Relied on by `inventory_utils::ShardMutationBatch::update`, which snapshots and restores
-/// a shard on a failing mutation (DESIGN.html §5.0 D item 10, PR B review finding #7).
+/// a shard on a failing mutation.
 #[derive(Clone)]
 pub struct Inventory {
     items_by_name: BTreeMap<String, Arc<InventoryItem>>,

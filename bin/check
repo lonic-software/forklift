@@ -15,6 +15,22 @@ cargo test --workspace
 echo "── cargo clippy --workspace (report-only, like CI)"
 cargo clippy --workspace || true
 
+echo "── comment hygiene (no transient process labels in code comments)"
+# Durable §-pointers (e.g. "DESIGN.html §5.0 D item 10") are fine, sparingly — at most one per
+# module. What's banned is a transient process artifact leaking into a comment instead of the
+# invariant it protects: a review-round label, a "finding #N" tag, or similar. "D item <digit>"
+# itself is deliberately not in this deny-list — it is a legitimate, already-widespread durable
+# pointer, and "no more than one per module" is a per-file judgment call a sweep review makes, not
+# something a line-pattern grep can enforce without flagging every existing, legitimate anchor.
+hygiene_pattern='review finding|PR #[0-9]+ review|post-merge verification|finding #[0-9]+'
+if hits=$(grep -rnEi --include='*.rs' "$hygiene_pattern" crates/); then
+    echo "$hits"
+    echo
+    echo "Transient process-label comments found (see above) — state the durable invariant the" >&2
+    echo "fix protects instead of the review round or finding number that motivated it." >&2
+    exit 1
+fi
+
 echo "── docs freshness (bin/gen-docs)"
 # Regenerate into a scratch directory (never touching docs/generated in place) and diff —
 # catches both stale content and a deleted generated file, without side effects on a green run.

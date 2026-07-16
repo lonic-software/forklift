@@ -53,7 +53,7 @@ impl LooseObject {
     /// where [`file_utils::BulkStoreSession`] cannot safely be shared (see its doc comment).
     ///
     /// Dedupes against writes staged earlier in *this same batch*, not just what is already
-    /// durable on disk (DESIGN.html §5.0 D item 10, finding #2): [`file_utils::does_object_exist`]
+    /// durable on disk (DESIGN.html §5.0 D item 10): [`file_utils::does_object_exist`]
     /// cannot see a staged-but-not-yet-renamed temp (it has no final name until `batch.finish()`
     /// runs), so without this every repeated occurrence of the same content hash in one batched
     /// walk (many copies of the same vendored asset, say) would independently compress and stage
@@ -152,7 +152,7 @@ mod tests {
         count
     }
 
-    /// DESIGN.html §5.0 D item 10, finding #2: `does_object_exist` alone cannot see a
+    /// `does_object_exist` alone cannot see a
     /// staged-but-not-yet-renamed write — a batch has no way to know, from the store alone,
     /// whether some *other* occurrence of the same content already staged a write earlier in
     /// this same batch. Without `WriteBatch::reserve_final_path`, N occurrences of the same
@@ -233,7 +233,7 @@ mod tests {
         drop(scratch);
     }
 
-    /// Regression (post-merge review of PR #61's finding #2 fix, finding B): `store_deferred`
+    /// Regression: `store_deferred`
     /// reserves the final path *before* the two fallible steps that actually fulfil it
     /// (`compress()`, then `write_object_to_file_deferred`). If a caller wins the reservation and
     /// then hits a fallible step, the reservation stays "won" forever with nothing ever pushed
