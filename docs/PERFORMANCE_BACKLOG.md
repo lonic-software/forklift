@@ -219,41 +219,62 @@ until then this is the store working as designed, not a bug.
 
 ### e. Durability-barrier audit (write-batching sweep)
 
-**What.** A systematic audit of every durability barrier in forklift-core and the
-CLI head — `write_file_atomically` call sites, `WriteBatch` construction, every raw
-`fsync` — counting barriers paid per logical operation, before any patching is
-attempted. Audit first, patches second: the point is to size the remaining problem
-rather than fix whatever is found first.
+**Status: audit complete (2026-07-15, on main @ 18a04f9); implementation queued.**
+Three unrelated pieces of work had converged on the same cost in short succession —
+quick-win #3's `stack` fsync batching, the rollup-hash work's two rounds of
+shard-write batching, and PR #59's benchmark verification surfacing unbatched-barrier
+costs in `park`/`park` pop — so the audit sized the remaining problem before any
+further patching.
 
-**Why now.** Three unrelated pieces of work converged on the same cost in short
-succession. The quick-wins track already had to batch `stack`'s per-object fsyncs
-into one barrier (quick-win #3, above). The rollup-hash work on this branch had to
-batch shard-write barriers *twice* — once to bring stack cleanup's overhead down
-from 70% to 18%, again to get `load .`'s join point faster than main rather than
-merely neutral. And this branch's own benchmark verification (PR #59) surfaced
-`park` costing roughly **+28 ms** and `park` pop roughly **+8 ms** on git.git,
-tracing to unbatched barriers nobody had measured before. Three independent
-investigations tripping over the same class of cost is a pattern, not a
-coincidence.
+**Method + validation.** Every barrier site was swept: `write_file_atomically` call
+sites, `WriteBatch` construction, every raw `fsync`. None exist outside
+`file_utils`'s primitives — no hand-rolled temp-file-plus-rename anywhere in the
+tree. `F_FULLFSYNC` measured ~4 ms/call on the dev box, giving a ~8–9 ms
+per-unbatched-atomic-write model (file fsync + directory fsync). Every measured
+delta below matches the N × ~9 ms model within noise, which validates the model
+itself as well as the findings.
 
-**Known suspects to check first.**
+**Findings, ranked** (measured on synthetic corpora, release builds):
 
-- `consolidate`/cherry-pick's per-merge-action shard writes — each action pays the
-  two-barrier mutation funnel individually; a 50-file merge is on the order of 100
-  barriers, untimed so far.
-- `park` pop's per-file replay.
-- Multi-file `restore`.
-- Journal writes.
+1. **`load`'s per-file blob store** (`inventory_utils::build_inventory`) — ~7–8 ms
+   per changed file (N=50 `load`: ~376 ms total, ~326 ms of it this). The
+   rollup-hash join point batched shard writes but never the blob stores; fix is
+   `store()` → `store_deferred()` into the context's existing `WriteBatch`. Highest
+   value, lowest risk — `load` is the most-run mutating command.
+2. **`consolidate`/cherry-pick's per-merge-action funnel** (`apply_merge_action`) —
+   measured ~9.1 ms/action; a 50-action merge is ≈570 ms, confirming this doc's
+   original ~100-barrier prediction. Needs the phased join-point shape (a shared
+   phase-A ancestor-clears sub-barrier, a shared phase-B content-writes
+   sub-barrier; the two phases must never merge into one). Medium risk — the
+   busiest write path — so needs adversarial review.
+3. **`park` push** — ~8.9 ms/changed file across three unbatched layers; half the
+   fix is swapping `build_tree_from_inventory` for the already-existing
+   `_deferred` variant, which also gives `park` the rollup-hash skip it currently
+   lacks.
+4. **`restore <dir>` (plain) and `park pop`** — ~9.2–9.6 ms/file; same join-point
+   primitive as #2, bundles with it.
+5. **`remove <dir>`'s per-shard loop and commit-graph multi-shard writes** —
+   untimed, small, rare operations; demand-gated.
 
-**Method.** Classify each write site as: (a) already batched; (b) batchable with no
-ordering constraint; (c) batchable with phased ordering — the `load .` join-point
-pattern above, where ordering-constrained groups become ordered sub-barriers rather
-than one barrier per file; (d) must remain individual for correctness.
+**Confirmed already-batched (class a).** The `load` join point, `cleanup_after_stack_with`,
+`replace_all`/`subtree_inventories`, and `stack`'s tree+parcel batch. `restore --staged`
+measured flat (30→36 ms, N=1→20), confirming the shipped batching already works.
 
-**Standing rule.** Batching may reduce the *count* of barriers; it must never weaken
-a barrier's *guarantee*. The durable-before-destructive contract and the ordering
-invariants this doc already protects (ancestor-clears-before-content,
-fsync-before-ref-move) are preserved exactly — only the granularity changes.
+**No-go list** — batching may share barrier *cost*, it must never drop a
+*guarantee*: signature durable before ref move; object batch durable before ref
+move; ancestor clears durable before own content (phases may be shared across
+callers but never merged with each other); durable-before-destructive dedup;
+loose-object fsync stays; working-directory writes stay deliberately unfsynced.
+
+**Implementation note.** Several loops call `update_shard` per file against the
+same shard; the batching work needs to collapse same-shard actions into one
+read-modify-write, not merely share one fsync across N rewrites of the same file.
+
+**Correctness.** No missing-barrier bug was found anywhere in the sweep.
+
+**Recommended implementation packaging (queued).** PR A = findings 1+3 (low risk).
+PR B = findings 2+4 (one shared multi-mutation join-point primitive + adversarial
+review). Finding 5 is demand-gated.
 
 ---
 
