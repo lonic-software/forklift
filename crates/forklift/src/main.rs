@@ -79,6 +79,13 @@ async fn async_main() {
         eprintln!("rollup-skip-count: {}", forklift_core::util::inventory_utils::rollup_skip_count());
     }
 
+    // Undocumented, test-only debug hook, same shape as the one above: lets the durability-barrier
+    // batching work (DESIGN.html §5.0 D item 10) prove a burst of writes actually collapsed to a
+    // constant number of barriers — see `file_utils::barrier_count`'s doc comment.
+    if std::env::var("FORKLIFT_DEBUG_BARRIER_COUNT").is_ok() {
+        eprintln!("barrier-count: {}", forklift_core::util::file_utils::barrier_count());
+    }
+
     if let Err(error) = result {
         output::report_error(&error);
         std::process::exit(error.code.exit_code());

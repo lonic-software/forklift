@@ -20,10 +20,19 @@ pub struct InventoryBuilderContext {
 
     /// The shared join-point publish batch for this whole `load` (DESIGN.html §5.0 D item 8) —
     /// every directory's shard write is staged here (see [`ShardOutcome`]) and published as one
-    /// durability barrier for the whole walk, instead of one per directory. Populated, and
-    /// finished, only at the single-threaded join point in
-    /// `inventory_utils::create_inventory_for_directory` — never touched from inside a
-    /// concurrent per-directory task.
+    /// durability barrier for the whole walk, instead of one per directory. Shard *content* is
+    /// staged, and finished, only at the single-threaded join point in
+    /// `inventory_utils::create_inventory_for_directory`.
+    ///
+    /// A changed or brand-new *small* file's blob is staged here too (DESIGN.html §5.0 D item 10,
+    /// finding #1) — the one thing a concurrent per-directory task does touch this batch for
+    /// directly (via `LooseObject::store_deferred`), since a content-addressed object write is
+    /// safe to share across threads exactly like `stack`'s tree build already relies on (see
+    /// [`file_utils::WriteBatch::stage`]'s doc comment). Landing blobs and shard content in the
+    /// same batch means the same barrier — a blob is always durable no later than the shard that
+    /// references it becomes visible. A large (chunked) file's recipe and chunks are a separate,
+    /// still-unbatched write this batch never sees — see `inventory_utils::build_inventory`'s own
+    /// doc comment for why that is out of scope here.
     pub batch: Arc<file_utils::WriteBatch>,
 
     /// Every ancestor key some directory's real content change (or the post-walk dirty-path

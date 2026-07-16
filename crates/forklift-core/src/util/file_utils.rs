@@ -217,6 +217,22 @@ fn parse_fsync_setting(value: Option<&str>) -> bool {
     }
 }
 
+/// Process-wide count of durability barriers actually paid (DESIGN.html §5.0 D item 10) — one per
+/// completed immediate write ([`write_file_atomically`], outside an active bulk session) or one
+/// per completed [`run_write_barrier`] call (the shared implementation behind both
+/// [`WriteBatch::finish`] and [`BulkStoreSession::finish`]), incremented exactly once per barrier
+/// no matter how many files/objects it covers. Not a performance feature: a cheap, always-on
+/// observability hook — see [`barrier_count`] — that lets the batching work's tests (and a
+/// maintainer running `FORKLIFT_DEBUG_BARRIER_COUNT=1`) prove a burst of N writes actually
+/// collapsed to a constant number of barriers, not just that the resulting state happens to be
+/// correct.
+static BARRIER_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The current value of the process-wide durability-barrier counter — see [`BARRIER_COUNT`].
+pub fn barrier_count() -> u64 {
+    BARRIER_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// fsync a directory so a create/rename/unlink inside it is durable across power loss, not merely a
 /// process crash. Renaming a file into place makes its *contents* reachable, but the directory
 /// entry recording the new name is itself only on disk once the directory is fsynced — without this
@@ -333,9 +349,15 @@ pub fn write_file_atomically(file_path: &Path, content: &[u8]) -> Result<(), Str
     // The rename is only durable once the directory entry recording the new name is on disk;
     // otherwise a power loss can undo it even though the file's bytes were already synced.
     match file_path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => sync_dir(parent),
-        _ => Ok(()),
-    }
+        Some(parent) if !parent.as_os_str().is_empty() => sync_dir(parent)?,
+        _ => (),
+    };
+
+    // Counted only once every step above has actually succeeded — see `BARRIER_COUNT`'s doc
+    // comment ("one per *completed* barrier"). A caller that hit the `?` above already got the
+    // error; nothing durable was left half-finished for this counter to over-report.
+    BARRIER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
 }
 
 /// The process-global bulk-store session registry: `Some(pending)` while a session is active,
@@ -502,6 +524,13 @@ fn run_write_barrier(pending: &[(PathBuf, PathBuf)]) -> Result<(), String> {
         // directory half of the flush share `macos_flush_device_cache` unchanged.
         sync_touched_directories(&touched_parents, &pending[0].1)?;
     }
+
+    // One barrier no matter how many files `pending` covers — see `BARRIER_COUNT`'s doc comment.
+    // Counted only here, after every step above has actually succeeded (every `?` on the way
+    // here already returned past this point on failure): both callers only ever reach this
+    // function with a non-empty `pending` (each checks first), so this never double-counts an
+    // empty `finish()` that had nothing staged, and never counts a barrier that failed partway.
+    BARRIER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     Ok(())
 }

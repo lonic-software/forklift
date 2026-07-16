@@ -64,11 +64,13 @@ pub struct TreeBuilderContext {
     pub tree_hashes: Arc<Mutex<HashMap<String, String>>>,
 
     /// Whether the per-directory build task should bother recording this build's `tree_hashes`
-    /// at all. `stack`'s optimized path needs the map (to stamp shards' rollups afterward); every
-    /// other caller (`park`'s plain `build_tree_from_inventory`, in particular) discards it
-    /// immediately, so populating it there would only pay a lock and a clone per directory for a
-    /// value nobody ever reads. Set once at construction, read (never mutated) by every parallel
-    /// task, so no lock is needed.
+    /// at all. `stack`'s optimized path needs the map (to stamp shards' rollups afterward);
+    /// `build_tree_from_inventory` (the plain, disk-reading, immediately-writing form nothing in
+    /// this workspace calls internally anymore, `park` included — see its doc comment) is the one
+    /// caller that sets this `false`, since it has no use for the map at all. `park`'s own tree
+    /// build goes through `build_tree_from_inventory_deferred` like `stack`'s does, which always
+    /// tracks the map (and simply discards it immediately, unlike `stack`). Set once at
+    /// construction, read (never mutated) by every parallel task, so no lock is needed.
     pub track_tree_hashes: bool,
 
     /// The rollup-skip plan's verbatim injections: for a directory key whose task graph was

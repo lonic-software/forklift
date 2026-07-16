@@ -21,7 +21,7 @@ use crate::util::{file_utils, inventory_utils, object_utils};
 const FILENAME_METADATA_SUFFIX: &str = ".metadata";
 
 /// Build (and store) tree objects from the inventory, bottom-up: one tree object per
-/// inventoried directory. This is the first half of stacking a parcel.
+/// inventoried directory.
 ///
 /// * Entries staged for removal (`Deleted`) are excluded — that is how a staged removal
 ///   becomes an actual removal in the next parcel.
@@ -29,6 +29,15 @@ const FILENAME_METADATA_SUFFIX: &str = ".metadata";
 ///   except the warehouse root.
 /// * Ancestor directories that have no shard of their own (e.g. only `src/a` was ever
 ///   loaded) are synthesized so the chain root → `src` → `a` exists in the tree.
+///
+/// The plain, disk-reading, immediately-writing form — every object it builds pays its own
+/// atomic-write barrier, and it has no way to compare against a head for the rollup-based skip.
+/// Nothing in this workspace calls it anymore: `stack` and `park` (DESIGN.html §5.0 D item 10,
+/// finding #3) both went through [`build_tree_from_inventory_deferred`] instead, once `park`
+/// picked up the same batched-write/rollup-skip treatment `stack` already had. Kept as a public,
+/// simpler entry point for a caller that genuinely wants an unbatched, un-skipped build (a
+/// one-off script, a test) without assembling a [`inventory_utils::PreparedInventory`] and a
+/// [`file_utils::WriteBatch`] just to throw both away immediately after.
 ///
 /// # Returns
 /// * `Ok(Some(TreeItem))` - The root tree (its hash set, all tree objects stored).
@@ -45,11 +54,10 @@ pub async fn build_tree_from_inventory() -> Result<Option<TreeItem>, String> {
         return Ok(None);
     };
 
-    // No head to compare rollups against here (this caller — `park` — never needs the skip; see
-    // `build_tree_from_inventory_deferred` for `stack`'s optimized path), so no skip is
-    // attempted: every directory is read and rebuilt exactly as before stage 2 existed. This
-    // caller also has no use for the per-directory tree hashes `stack` stamps rollups with
-    // afterward, so `track_tree_hashes` is `false` — nothing here would ever read them.
+    // No head to compare rollups against (no caller of this plain form has one on hand — see the
+    // doc comment above), so no skip is attempted: every directory is read and rebuilt exactly as
+    // before stage 2 existed. Nothing here would ever read the per-directory tree hashes `stack`'s
+    // optimized path stamps rollups with afterward, so `track_tree_hashes` is `false`.
     let (root, _tree_hashes, _untouched) =
         build_tree_from_inventory_core(&metadata, ShardSource::Disk, ObjectSink::Immediate, None, false).await?;
 
@@ -60,10 +68,14 @@ pub async fn build_tree_from_inventory() -> Result<Option<TreeItem>, String> {
 /// [`inventory_utils::PreparedInventory`] snapshot instead of the disk, and stages every built
 /// tree object's write into `batch` instead of writing (and fsyncing) it immediately.
 ///
-/// Used by `stack` (`stack_utils::stack_parcel`): the snapshot is the single read+parse pass
-/// shared with the conflict check and the post-stack cleanup (§ perf), and the batch turns the
-/// per-object fsync pairs this build would otherwise pay (one per built directory) into one
-/// barrier the caller runs after this returns (see [`file_utils::WriteBatch`]).
+/// Used by `stack` (`stack_utils::stack_parcel`) and `park` push (`park::park_changes`,
+/// DESIGN.html §5.0 D item 10, finding #3). `stack`'s `prepared` snapshot is the single
+/// read+parse pass shared with the conflict check and the post-stack cleanup (§ perf); `park`
+/// reads its own fresh snapshot instead (it has no other step to share it with), taken after its
+/// working-directory refresh so it reflects the just-rehashed state. Either way, `batch` turns
+/// the per-object fsync pairs this build would otherwise pay (one per built directory) into one
+/// barrier the caller runs after this returns (see [`file_utils::WriteBatch`]) — for `park`, the
+/// same batch its own parcel object joins too, so the whole push is one barrier.
 ///
 /// Also applies the rollup-based skip (DESIGN.html §5.0 D item 8, stage 2) when `head_root_tree_hash`
 /// is given: a directory whose shard's rollup already matches the corresponding head subtree

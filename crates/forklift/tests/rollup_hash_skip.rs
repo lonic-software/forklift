@@ -583,3 +583,47 @@ fn a_shard_that_vanishes_out_from_under_load_still_invalidates_its_ancestors() {
     let resolved = forklift_core::util::tree_utils::resolve_subtree_hash(&tree_hash, "a/b/c").unwrap();
     assert!(resolved.is_none(), "the stacked tree must not contain the deleted subtree \"a/b/c\"");
 }
+
+// -------------------------------------------------------------------------------------------
+// `park` regression (DESIGN.html §5.0 D item 10, finding #3): `park`'s tree build used to call
+// `tree_utils::build_tree_from_inventory` (no head to compare rollups against, so no skip was
+// ever possible on this path) instead of `build_tree_from_inventory_deferred`, unlike `stack`.
+// This pins that `park` now gets the same rollup-based skip `stack` already had.
+// -------------------------------------------------------------------------------------------
+
+#[test]
+fn park_gets_the_rollup_based_skip_stack_already_had() {
+    let warehouse = Warehouse::new("park-rollup-skip", false);
+    warehouse.prepare();
+
+    warehouse.write_file("subtree_a/file.txt", "a v1\n");
+    warehouse.write_file("subtree_b/deep/file.txt", "b v1\n");
+    warehouse.run_ok(&["load", "."]);
+    warehouse.run_ok(&["stack", "base"]);
+
+    let rollup_before = shard_rollup(&warehouse, "subtree_b/deep");
+    assert!(rollup_before.is_some(), "subtree_b/deep must be stamped after the base stack");
+
+    // Touch only subtree_a, and park without an intervening explicit `load` — `park`'s own
+    // working-directory refresh (`refresh_tracked_entries`) stages tracked changes itself.
+    warehouse.write_file("subtree_a/file.txt", "a v2\n");
+
+    let mut command = warehouse.command(&["park"]);
+    command.env("FORKLIFT_DEBUG_ROLLUP_SKIP_COUNT", "1");
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "park failed: {}", String::from_utf8_lossy(&output.stderr));
+
+    // The debug counter is the ground truth that the skip actually fired for `park`'s tree
+    // build, not just that the resulting parked parcel happens to be correct.
+    assert!(skip_count(&output) >= 1,
+        "park's tree build must skip the untouched subtree_b/deep subtree, exactly like stack's does");
+
+    // subtree_b/deep's rollup must still name the same (unchanged) subtree hash. `park` always
+    // rewrites every shard from the head tree at the end (resetting the warehouse back to head),
+    // so this is not "untouched bytes on disk" the way the stack regression above checks it —
+    // but the value stamped by that reset is the subtree's tree hash either way, so an unchanged
+    // subtree stamps back to the exact same rollup regardless of whether the skip fired.
+    let rollup_after = shard_rollup(&warehouse, "subtree_b/deep");
+    assert_eq!(rollup_before, rollup_after,
+        "an untouched subtree's rollup must be the same value before and after a park");
+}

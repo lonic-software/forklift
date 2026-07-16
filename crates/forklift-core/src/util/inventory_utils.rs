@@ -672,17 +672,36 @@ pub enum ShardOutcome {
 /// A task for building an inventory file for a given directory.
 /// When encountering a subdirectory, a new task is created to build the inventory for that directory.
 ///
-/// Never writes to disk itself: it only *decides* this directory's [`ShardOutcome`] (or that
-/// nothing changed at all, in which case it decides nothing) and records that decision — plus,
-/// for a real content change, this directory's ancestor keys — in the shared
-/// [`InventoryBuilderContext`], for `create_inventory_for_directory`'s single-threaded join
-/// point to publish once every task has run. This is deliberate: this walker is fire-and-forget
-/// concurrent (a directory's task fires off its subdirectories' tasks and returns without
-/// waiting for them), so writing — and, worse, invalidating ancestors — directly from here would
-/// need the same cross-task synchronization every other writer's funnel
+/// Never writes *shard content* to disk itself: it only *decides* this directory's
+/// [`ShardOutcome`] (or that nothing changed at all, in which case it decides nothing) and
+/// records that decision — plus, for a real content change, this directory's ancestor keys — in
+/// the shared [`InventoryBuilderContext`], for `create_inventory_for_directory`'s single-threaded
+/// join point to publish once every task has run. This is deliberate: this walker is
+/// fire-and-forget concurrent (a directory's task fires off its subdirectories' tasks and returns
+/// without waiting for them), so writing — and, worse, invalidating ancestors — directly from
+/// here would need the same cross-task synchronization every other writer's funnel
 /// ([`write_shard_mutation`]) uses, one durability barrier at a time. Deferring the decision to
 /// a join point instead turns the whole walk into at most two barriers total, and needs no lock
 /// at all: nothing concurrent ever touches another task's key.
+///
+/// A changed or brand-new *small* file's blob is the one exception (DESIGN.html §5.0 D item 10,
+/// finding #1): its content is content-addressed and its write is staged (not fsynced) via
+/// [`file_utils::WriteBatch::stage`] into `context.batch` — the same batch, and the same
+/// join-point barrier, the shard content above is later published through — instead of paying
+/// its own atomic-write barrier per file. This is safe to do straight from a concurrent task
+/// (unlike a shard's content): `WriteBatch::stage` is documented safe for concurrent callers, and
+/// two tasks staging the same hash just stage the same bytes twice (the second stage is later
+/// deduped by `finish`'s rename, which simply overwrites the first with byte-identical content).
+/// Staging blobs into `context.batch` guarantees they land in the very same barrier as the shard
+/// content that references them — durable no later than the shard becomes visible, never later.
+///
+/// A large (chunked) file's recipe and chunks are a separate, still-unbatched exception this
+/// finding does not touch: `object_utils::ingest_file`'s `IngestMode::Store` path stores each of
+/// them immediately (`flush_chunk_batch`/the recipe's own `store()`), still from within this same
+/// concurrent task. Out of scope here — chunking has its own design (§9.4b) and its own
+/// parallelism (`fanout_utils::fanout_map`, not this walk's per-directory `TaskExecutor`) — and
+/// `build_item_and_object_for_file` only ever returns a blob (the `Option<LooseObject>` above) for
+/// a small file to begin with; a chunked file's `object` is always `None` here.
 ///
 /// # Arguments
 /// * `context`         - The task context.
@@ -782,11 +801,15 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
                             // self-healing: a blob that went missing from the object
                             // store comes back on the next re-load. A chunked file's objects
                             // were already stored during ingest (`object` is `None`).
+                            //
+                            // Staged, not stored immediately (DESIGN.html §5.0 D item 10, finding
+                            // #1): see `context.batch`'s and this task's own doc comments for why
+                            // staging straight from a concurrent task is safe here.
                             FileVerdict::UnchangedByHash(fresh, object)
                                 | FileVerdict::Modified(fresh, object) => {
                                 any_entry_rebuilt = true;
                                 if let Some(mut object) = object {
-                                    object.store()?;
+                                    object.store_deferred(&context.batch)?;
                                 }
                                 fresh
                             }
@@ -794,7 +817,7 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
                     }
                     None => {
                         any_entry_rebuilt = true;
-                        build_inventory_item_from_file(&entry.path(), name.as_str(), item_type)?
+                        build_inventory_item_from_file_deferred(&entry.path(), name.as_str(), item_type, &context.batch)?
                     }
                 };
 
@@ -1013,9 +1036,16 @@ fn directory_has_no_untracked_content(key: &str, ignored_paths: Arc<Vec<Regex>>)
 /// staged removals. Untracked files are deliberately left alone — this is `park`'s way of
 /// staging the whole work in progress without swallowing untracked content.
 ///
+/// If deciding a shard's new content fails partway through (an unreadable file, a corrupt
+/// shard), every shard decided *before* the failure is still published — the same
+/// keep-whatever-the-walk-managed resilience `create_inventory_for_directory` gives `load`
+/// (see its own doc comment). A retry after fixing the problem only has to redo the shards from
+/// the failure onward, not the whole tracked set.
+///
 /// # Returns
 /// * `Ok(())`      - If the refresh completed.
-/// * `Err(String)` - If a shard or file could not be processed.
+/// * `Err(String)` - If a shard or file could not be processed; every shard decided before the
+///                   failure was still published (see above).
 pub fn refresh_tracked_entries() -> Result<(), String> {
     let (_, metadata_opt) = file_utils::retrieve_inventory_metadata_or_none()?;
 
@@ -1023,78 +1053,138 @@ pub fn refresh_tracked_entries() -> Result<(), String> {
         return Ok(());
     };
 
+    // Pass 1 (DESIGN.html §5.0 D item 10, finding #3): decide every shard's new content without
+    // writing any of it yet. Every rebuilt file's blob is staged into one shared batch instead of
+    // paying its own atomic-write barrier — the same collapse `load`'s join point already applies
+    // (see `build_inventory_item_from_file_deferred`) — turning what used to be up to one barrier
+    // per *changed file* into one barrier for the whole refresh.
+    let blob_batch = file_utils::WriteBatch::new();
+    let mut decisions: Vec<(&str, std::path::PathBuf, Inventory, bool, bool)> = Vec::new();
+
+    // The first failure hit while deciding a shard, if any — recorded instead of propagated
+    // immediately (see the function's own doc comment on why: everything decided before this
+    // point must still reach Pass 2 below, exactly as it would have under the old per-shard,
+    // immediate-write loop this replaced).
+    let mut result: Result<(), String> = Ok(());
+
     for entry in &metadata {
         let key = metadata_entry_to_key(entry);
 
-        let (shard_path, bytes_opt) = file_utils::retrieve_inventory_or_none_by_key(key)?;
+        let decision = (|| -> Result<Option<(std::path::PathBuf, Inventory, bool, bool)>, String> {
+            let (shard_path, bytes_opt) = file_utils::retrieve_inventory_or_none_by_key(key)?;
 
-        let Some(bytes) = bytes_opt else {
-            continue;
-        };
-
-        let shard_mtime = file_utils::get_symlink_metadata_for_path(&shard_path).ok()
-            .and_then(|m| file_utils::get_content_modification_timestamp_for_file(&m).ok())
-            .unwrap_or(0);
-
-        let mut inventory = parser::inventory::inventory_parser::parse_inventory(&bytes)
-            .map_err(|e| format!("Error while parsing the inventory of folder \"{}\": {}", key, e))?;
-
-        let names: Vec<String> = inventory.get_items().map(|(name, _)| name.clone()).collect();
-        let mut changed = false;
-        // Whether any entry's *effective* content (hash/type/state) actually changed, as
-        // opposed to only its stat fields going stale (e.g. a re-save with identical bytes).
-        // Only a real content change invalidates the rollup — see `write_shard_mutation`.
-        let mut content_changed = false;
-
-        for name in names {
-            let item = inventory.get_item_by_name(&name).unwrap();
-
-            if item.state == InventoryItemState::Deleted {
-                continue;
-            }
-
-            let file_path = if key.is_empty() {
-                std::path::PathBuf::from(&name)
-            } else {
-                std::path::PathBuf::from(format!("{}/{}", key, name))
+            let Some(bytes) = bytes_opt else {
+                return Ok(None);
             };
 
-            let Ok(metadata) = file_utils::get_symlink_metadata_for_path(&file_path) else {
-                // The file is gone from disk: its removal becomes staged.
-                inventory.mark_item_deleted(&name);
+            let shard_mtime = file_utils::get_symlink_metadata_for_path(&shard_path).ok()
+                .and_then(|m| file_utils::get_content_modification_timestamp_for_file(&m).ok())
+                .unwrap_or(0);
+
+            let mut inventory = parser::inventory::inventory_parser::parse_inventory(&bytes)
+                .map_err(|e| format!("Error while parsing the inventory of folder \"{}\": {}", key, e))?;
+
+            let names: Vec<String> = inventory.get_items().map(|(name, _)| name.clone()).collect();
+            let mut changed = false;
+            // Whether any entry's *effective* content (hash/type/state) actually changed, as
+            // opposed to only its stat fields going stale (e.g. a re-save with identical bytes).
+            // Only a real content change invalidates the rollup — see `write_shard_mutation`.
+            let mut content_changed = false;
+
+            for name in names {
+                let item = inventory.get_item_by_name(&name).unwrap();
+
+                if item.state == InventoryItemState::Deleted {
+                    continue;
+                }
+
+                let file_path = if key.is_empty() {
+                    std::path::PathBuf::from(&name)
+                } else {
+                    std::path::PathBuf::from(format!("{}/{}", key, name))
+                };
+
+                let Ok(metadata) = file_utils::get_symlink_metadata_for_path(&file_path) else {
+                    // The file is gone from disk: its removal becomes staged.
+                    inventory.mark_item_deleted(&name);
+                    changed = true;
+                    content_changed = true;
+                    continue;
+                };
+
+                let item_type = file_utils::get_type_of_dir_entry(&metadata);
+
+                if is_entry_unchanged(&item, &metadata, item_type, &file_path, shard_mtime) {
+                    continue;
+                }
+
+                // The entry is rebuilt even when only the stat data went stale (same
+                // content), so the refreshed shard keeps the fast path warm. Staged, not stored
+                // immediately — see the batch comment above.
+                let rebuilt = build_inventory_item_from_file_deferred(&file_path, &name, item_type, &blob_batch)?;
                 changed = true;
-                content_changed = true;
-                continue;
-            };
 
-            let item_type = file_utils::get_type_of_dir_entry(&metadata);
+                if rebuilt.hash != item.hash || rebuilt.item_type != item.item_type || rebuilt.state != item.state {
+                    content_changed = true;
+                }
 
-            if is_entry_unchanged(&item, &metadata, item_type, &file_path, shard_mtime) {
-                continue;
+                inventory.add_item(rebuilt);
             }
 
-            // The entry is rebuilt even when only the stat data went stale (same
-            // content), so the refreshed shard keeps the fast path warm.
-            let rebuilt = build_inventory_item_from_file(&file_path, &name, item_type)?;
-            changed = true;
+            Ok(changed.then_some((shard_path, inventory, content_changed, changed)))
+        })();
 
-            if rebuilt.hash != item.hash || rebuilt.item_type != item.item_type || rebuilt.state != item.state {
-                content_changed = true;
-            }
-
-            inventory.add_item(rebuilt);
-        }
-
-        if content_changed {
-            write_shard_mutation(key, &mut inventory)?;
-        } else if changed {
-            // Only stat data went stale: the tree `stack` would build from this shard is
-            // unchanged, so its (and its ancestors') rollup stays valid as-is.
-            save_inventory(&inventory, &shard_path)?;
+        match decision {
+            Ok(Some((shard_path, inventory, content_changed, changed))) =>
+                decisions.push((key, shard_path, inventory, content_changed, changed)),
+            Ok(None) => {}
+            // Matches the old loop's own behavior: a shard's failure stops the walk right there
+            // (never proceeds to a later shard in metadata order) — only *what happens to
+            // already-decided shards* changes here, not which shards get a chance to be decided.
+            Err(e) => { result = Err(e); break; }
         }
     }
 
-    Ok(())
+    // Barrier: every rebuilt file's blob decided above is durable now. This must complete before
+    // any shard rewrite below becomes visible — a published shard's entries may carry one of
+    // these blobs' hashes, and a blob referenced by a published shard must be durable no later
+    // than the shard becomes visible (exactly the invariant `load`'s join point preserves for the
+    // same reason).
+    //
+    // A failure here is different from a per-shard decide failure above: `WriteBatch::finish`
+    // best-effort removes every staged temp before returning `Err` (its own doc comment), so on
+    // this path *none* of `decisions`' blobs actually made it to disk — publishing any of them in
+    // Pass 2 would durably reference a blob that never arrived. Every decision is dropped instead
+    // of published; the caller sees this error (or the earlier per-shard one, whichever came
+    // first) and a retry starts over.
+    if let Err(e) = blob_batch.finish() {
+        return if result.is_ok() { Err(e) } else { result };
+    }
+
+    // Pass 2: publish each shard's new content, now that every blob it might reference is
+    // durable. Still one write (or, for a real content change, `write_shard_mutation`'s own
+    // two-barrier ancestor-clear-then-content funnel) per *shard* — collapsing that across shards
+    // into a single batched join point is the shared multi-mutation primitive future work
+    // (DESIGN.html §5.0 D item 10, findings #2/#4) needs; what this pass already removes is the
+    // barrier that used to scale with the number of *changed files*, not shards.
+    for (key, shard_path, mut inventory, content_changed, changed) in decisions {
+        let write_result = if content_changed {
+            write_shard_mutation(key, &mut inventory)
+        } else if changed {
+            // Only stat data went stale: the tree `stack` would build from this shard is
+            // unchanged, so its (and its ancestors') rollup stays valid as-is.
+            save_inventory(&inventory, &shard_path)
+        } else {
+            Ok(())
+        };
+
+        if let Err(e) = write_result {
+            if result.is_ok() { result = Err(e); }
+            break;
+        }
+    }
+
+    result
 }
 
 /// A single read-and-parse pass over every registered inventory shard.
@@ -1105,9 +1195,14 @@ pub fn refresh_tracked_entries() -> Result<(), String> {
 /// full O(shard count) passes over the same on-disk state per stacked parcel). See
 /// `stack_utils::stack_parcel`: it builds this once, checks conflicts on it (still strictly
 /// before any warehouse mutation — parse-then-check-then-write is preserved), threads it into
-/// the tree build, and reuses it again for the post-stack cleanup's rewrite decision. Every
-/// other caller of the three originals (`park`, in particular) is unaffected: it still reads
-/// fresh, exactly as before.
+/// the tree build, and reuses it again for the post-stack cleanup's rewrite decision.
+///
+/// `park` push (`park::park_changes`, DESIGN.html §5.0 D item 10, finding #3) also builds one now
+/// — its own, single-use snapshot (it has no second or third step to share it with, unlike
+/// `stack`) — for the same reason: `build_tree_from_inventory_deferred` needs a
+/// `PreparedInventory` to read shard content from. `park` checks `has_conflict_entries_in` on its
+/// own snapshot immediately after building it, exactly like `stack_parcel` does, before the
+/// snapshot's possibly-incomplete `shards` map (see below) is ever consumed by the tree build.
 ///
 /// Held only for the duration of one `stack_parcel` call — the same transient window
 /// `build_tree_from_inventory`'s own parallel read pass already held the parsed shards for, so
@@ -1796,6 +1891,37 @@ pub fn build_inventory_item_from_file(path: &Path,
 
     if let Some(mut object) = object {
         object.store()?;
+    }
+
+    Ok(item)
+}
+
+/// Like [`build_inventory_item_from_file`], but stages the file's blob into `batch` (see
+/// [`file_utils::WriteBatch`]) instead of writing and fsyncing it immediately (DESIGN.html §5.0 D
+/// item 10, finding #1). Used by every caller that rebuilds several files in one operation
+/// (`load`'s parallel walk, `park`'s working-directory refresh), so what used to be one
+/// atomic-write barrier per file collapses into the caller's own shared batch.
+///
+/// # Arguments
+/// * `path`      - The path of the file.
+/// * `name`      - The name of the file.
+/// * `item_type` - The type of the directory entry.
+/// * `batch`     - Where the file's blob (if any) is staged.
+///
+/// # Returns
+/// * `Ok(InventoryItem)` - The inventory item for the file. Its blob, if any, is staged but not
+///                         yet durable — the caller must call `batch.finish()` (and it must
+///                         return `Ok`) before anything may depend on it.
+/// * `Err(String)`       - The error message if the inventory item could not be created or its
+///                         blob could not be staged.
+pub fn build_inventory_item_from_file_deferred(path: &Path,
+                                               name: &str,
+                                               item_type: DirEntryType,
+                                               batch: &file_utils::WriteBatch) -> Result<InventoryItem, String> {
+    let (item, object) = build_item_and_object_for_file(path, name, item_type, IngestMode::Store)?;
+
+    if let Some(mut object) = object {
+        object.store_deferred(batch)?;
     }
 
     Ok(item)
