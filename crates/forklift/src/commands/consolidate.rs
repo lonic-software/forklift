@@ -464,11 +464,30 @@ fn inventory_lookup(path: &str) -> Result<Option<InventoryItem>, String> {
 /// the batch's combined `clear_keys`, or a mid-barrier I/O error). The old per-action immediate
 /// funnel could only ever leave *one* action's file diverged from its shard this way (the one
 /// whose own `write_shard_mutation` call failed — every action after it in the loop never even ran);
-/// this batch can leave many. Not data loss (the caller's error message below tells the operator
-/// how to reconcile, and `load .` — or `restore`/`park` as appropriate — always converges the
-/// inventory to whatever the working directory actually holds), but a real widening of the
-/// "working directory and inventory can disagree after a failure" surface that batching
-/// introduces here, worth documenting rather than glossing over.
+/// this batch can leave many. Not data loss (nothing here destroys anything — every real change is
+/// either already sitting in the working directory or still recoverable from the pre-merge head),
+/// but a real widening of the "working directory and inventory can disagree after a failure"
+/// surface that batching introduces here, worth documenting rather than glossing over.
+///
+/// **Recovery is two commands, in this order, not one** (PR B review finding #3 — an earlier
+/// version of the caller's error message below recommended `load .` alone, which is actively
+/// self-defeating: `load .` stages the half-applied working directory, and the resulting non-empty
+/// staged diff then makes `ensure_warehouse_is_clean` *refuse* the very retry the message told the
+/// operator to attempt). `publish()` can leave the *inventory* itself diverged from head too, not
+/// only the working directory — `ShardMutationBatch::publish`'s own contract (DESIGN.html §5.0 D
+/// item 10, finding #1) means a phase B failure may still have durably published a real prefix of
+/// this call's decided shards, so `restore .` alone (which only reverts the working directory to
+/// match whatever the *inventory* currently holds) is not sufficient in general — it would leave
+/// those already-published shards' merge content staged, which still fails
+/// `ensure_warehouse_is_clean` on retry. The order that actually always works: `restore --staged
+/// .` first (unconditionally rebuilds every shard from the pallet head, regardless of whatever
+/// partial state `publish()` left behind — see `restore_staged`'s own doc comment), *then*
+/// `restore .` (now safe: with the inventory back at head, this rewrites the working directory to
+/// match it exactly). Both steps are cheap, always-available, and require no reconciliation
+/// beyond themselves; a subsequent `consolidate`/`cherry-pick` retry starts from a genuinely clean
+/// warehouse and, on success, records a proper multi-parent merge — unlike `load .` followed by a
+/// plain `stack`, which would silently commit the recovered content as an ordinary single-parent
+/// parcel with the target pallet recorded as never merged.
 pub(crate) fn apply_merge_actions(actions: &[MergeAction]) -> Result<Vec<String>, String> {
     let mut conflict_paths: Vec<String> = Vec::new();
     let mut batch = inventory_utils::ShardMutationBatch::new();
@@ -500,9 +519,11 @@ pub(crate) fn apply_merge_actions(actions: &[MergeAction]) -> Result<Vec<String>
 
     if let Err(e) = result {
         return Err(format!(
-            "{}\nThe merge did not complete: some of its working-directory writes may have \
-            already landed without being staged. Run \"load .\" to reconcile the inventory with \
-            what's actually on disk, inspect the result with \"stocktake\"/\"diff\", then retry.",
+            "{}\nThe merge did not complete: some of its working-directory writes (and possibly \
+            some of their shard content too) may have already landed without the merge as a \
+            whole being staged. To recover: run \"restore --staged .\" (resets the inventory to \
+            the pallet head) followed by \"restore .\" (rewrites the working directory to match) \
+            — in that order — then retry.",
             e
         ));
     }

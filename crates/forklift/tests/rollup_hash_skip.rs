@@ -888,7 +888,16 @@ fn apply_merge_actions_collapses_two_actions_in_the_same_shard_into_one_correct_
 // realistic way this batch's own failure path actually triggers.
 #[cfg(unix)]
 #[test]
-fn consolidate_recovers_via_load_after_a_batch_publish_failure_from_an_unwritable_inventory_root() {
+fn consolidate_recovers_via_restore_after_a_batch_publish_failure_from_an_unwritable_inventory_root() {
+    // Regression (PR B review finding #3): the failure message used to recommend "load ." then
+    // "retry" — but "load ." *stages* the half-applied working directory, and the resulting
+    // non-empty staged diff then makes `ensure_warehouse_is_clean` *refuse* the very retry the
+    // message told the operator to attempt. Following that advice literally could only ever reach
+    // a `stack`, never a real retried `consolidate` — silently recording the merge as never having
+    // happened (a single-parent parcel with "feature" left unmerged in the DAG). This test follows
+    // the *corrected* message's advice literally, end to end: `restore --staged .` (reset the
+    // inventory to head) then `restore .` (rewrite the working directory to match), then an actual
+    // retried `consolidate feature`, asserting it completes as a genuine two-parent merge.
     let warehouse = Warehouse::new("consolidate-batch-publish-failure-recovery", false);
     warehouse.prepare();
 
@@ -902,12 +911,16 @@ fn consolidate_recovers_via_load_after_a_batch_publish_failure_from_an_unwritabl
     warehouse.write_file("dirA/dirB/file.txt", "deep v2 (feature)\n");
     warehouse.write_file("dirA/direct.txt", "direct v2 (feature)\n");
     warehouse.run_ok(&["load", "."]);
-    warehouse.run_ok(&["stack", "feature work"]);
+    let feature_stack = warehouse.run_ok(&["--json", "stack", "feature work"]);
+    let feature_head = serde_json::from_slice::<serde_json::Value>(&feature_stack.stdout).unwrap()
+        ["data"]["parcel"].as_str().unwrap().to_string();
 
     warehouse.run_ok(&["shift", "main"]);
     warehouse.write_file("sibling.txt", "sibling v2 (main)\n");
     warehouse.run_ok(&["load", "."]);
-    warehouse.run_ok(&["stack", "main work"]);
+    let main_stack = warehouse.run_ok(&["--json", "stack", "main work"]);
+    let main_head = serde_json::from_slice::<serde_json::Value>(&main_stack.stdout).unwrap()
+        ["data"]["parcel"].as_str().unwrap().to_string();
 
     // The root shard's own inventory folder, read-only: `ensure_warehouse_is_clean`'s pre-check
     // (read-only itself) still passes cleanly, but `apply_merge_actions`' own
@@ -933,8 +946,10 @@ fn consolidate_recovers_via_load_after_a_batch_publish_failure_from_an_unwritabl
 
     assert!(!merge.status.success(), "the merge must fail: its root shard's folder is unwritable");
     let stderr = String::from_utf8_lossy(&merge.stderr);
-    assert!(stderr.contains("load"),
-        "the failure must tell the operator to run \"load .\" to reconcile: {}", stderr);
+    assert!(stderr.contains("restore --staged .") && stderr.contains("restore ."),
+        "the failure must tell the operator the actual working recovery sequence: {}", stderr);
+    assert!(!stderr.contains("Run \"load .\" to reconcile"),
+        "the failure must no longer recommend the self-defeating \"load .\" advice: {}", stderr);
 
     // The working-directory writes already landed despite the batch publish failure — exactly
     // the wider blast radius this finding is about, not data loss: the real content is right
@@ -942,22 +957,52 @@ fn consolidate_recovers_via_load_after_a_batch_publish_failure_from_an_unwritabl
     assert_eq!(std::fs::read_to_string(warehouse.root.join("dirA/dirB/file.txt")).unwrap(), "deep v2 (feature)\n");
     assert_eq!(std::fs::read_to_string(warehouse.root.join("dirA/direct.txt")).unwrap(), "direct v2 (feature)\n");
 
-    // The recommended recovery: "load ." reconciles the inventory with the working directory
-    // from scratch, regardless of why they diverged.
-    warehouse.run_ok(&["load", "."]);
+    // The recommended recovery, followed literally: reset the inventory to head first...
+    warehouse.run_ok(&["restore", "--staged", "."]);
+    // ...then rewrite the working directory to match it — undoing the half-applied merge.
+    warehouse.run_ok(&["restore", "."]);
 
-    // The merge's real content is now correctly staged — nothing was lost, just deferred.
-    let staged = warehouse.run_ok(&["--json", "diff", "--staged"]);
-    let staged_value: serde_json::Value = serde_json::from_slice(&staged.stdout).unwrap();
-    let staged_files = staged_value["data"]["files"].as_array().unwrap();
-    assert!(staged_files.iter().any(|f| f["path"] == "dirA/dirB/file.txt"),
-        "the recovered load must stage the merge's real deep change: {}", staged_value);
-    assert!(staged_files.iter().any(|f| f["path"] == "dirA/direct.txt"),
-        "the recovered load must stage the merge's real direct change: {}", staged_value);
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("dirA/dirB/file.txt")).unwrap(), "deep v1\n",
+        "restore must revert the half-merged file back to head's content");
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("dirA/direct.txt")).unwrap(), "direct v1\n",
+        "restore must revert the half-merged file back to head's content");
 
-    // The store stays fully usable: stacking the recovered state succeeds cleanly.
-    warehouse.run_ok(&["stack", "recovered after unwritable-root failure"]);
+    let after_restore = warehouse.run_ok(&["--json", "stocktake"]);
+    let after_restore_value: serde_json::Value = serde_json::from_slice(&after_restore.stdout).unwrap();
+    assert_eq!(after_restore_value["data"]["staged_count"], 0,
+        "the warehouse must be genuinely clean before the retry: {}", after_restore_value);
+
+    // The actual retry the message promises now works — this is the point of the fix.
+    warehouse.run_ok(&["consolidate", "feature"]);
+
+    // The merge's real content is present in the final result.
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("dirA/dirB/file.txt")).unwrap(), "deep v2 (feature)\n");
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("dirA/direct.txt")).unwrap(), "direct v2 (feature)\n");
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("sibling.txt")).unwrap(), "sibling v2 (main)\n");
+
+    // And — unlike "load ." followed by a plain "stack" — it is recorded as a genuine two-parent
+    // consolidation, not an ordinary single-parent parcel with "feature" left unmerged.
+    let entries = warehouse.run_ok(&["--json", "history"]);
+    let entries_value: serde_json::Value = serde_json::from_slice(&entries.stdout).unwrap();
+    let entries_array = entries_value["data"]["entries"].as_array().unwrap();
+    let merge_entry = entries_array.iter()
+        .find(|entry| !entry["consolidates"].as_array().map(|a| a.is_empty()).unwrap_or(true))
+        .unwrap_or_else(|| panic!("the retried consolidate must produce a real merge parcel: {}", entries_value));
+
+    let parents = merge_entry["parents"].as_array().unwrap();
+    assert_eq!(parents.len(), 2, "a real consolidation has two parents: {}", merge_entry);
+    assert_eq!(
+        parents[0].as_str().unwrap(), main_head,
+        "the base parent must be the current pallet's own prior head: {}", merge_entry
+    );
+    assert_eq!(
+        parents[1].as_str().unwrap(), feature_head,
+        "the second parent must be the merged-in pallet's head: {}", merge_entry
+    );
+
     let clean = warehouse.run_ok(&["--json", "stocktake"]);
     let clean_value: serde_json::Value = serde_json::from_slice(&clean.stdout).unwrap();
     assert_eq!(clean_value["data"]["staged_count"], 0);
 }
+
+// -------------------------------------------------------------------------------------------
