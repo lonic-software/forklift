@@ -314,6 +314,36 @@ pub fn stage_removal(path: &WarehousePath) -> Result<(), String> {
     stage_removal_for_file(path)
 }
 
+/// Which of `create_inventory_for_directory`'s visited directories should be registered in
+/// inventory metadata, given every directory this walk visited (`new_inventory_paths`), what it
+/// decided for each (`outcomes`), and whether `publish_shard_outcomes` ever actually ran
+/// (`phase_a_b_attempted` — `create_inventory_for_directory`'s own `blob_batch_published`).
+///
+/// When phase A/B ran, every visited key is safe to register regardless of the outcome: one with
+/// no outcome was already correct and durable from before this walk, untouched either way; one
+/// *with* an outcome that did not end up durable this round is still safe (`publish_shard_outcomes`
+/// already registered it itself, for the same reason — see its own doc comment). A key whose
+/// shard *did* durably land must never be excluded here just because some other key in the same
+/// walk failed — that was this join point's original bug.
+///
+/// When phase A/B never even ran (a blob-batch failure with no itemized missing-blob list, so
+/// nothing decided this round could possibly be durable), a key *with* an outcome is excluded:
+/// its content is known for certain to have never been staged, so registering it would only ever
+/// create a permanently unmaterialized "phantom" metadata entry until a future load visits it
+/// fresh — never wrong (a metadata-driven reader always treats a listed-but-missing shard as
+/// empty/stale, see `PreparedInventory::shards`'s own doc comment), but needlessly imprecise when
+/// excluding it is exactly as cheap and matches what is actually true. A key with no outcome is
+/// untouched by phase A/B either way and is always safe to register.
+fn keys_to_register_after_walk(new_inventory_paths: &BTreeSet<String>,
+                               outcomes: &BTreeMap<String, ShardOutcome>,
+                               phase_a_b_attempted: bool) -> BTreeSet<String> {
+    if phase_a_b_attempted {
+        new_inventory_paths.clone()
+    } else {
+        new_inventory_paths.iter().filter(|key| !outcomes.contains_key(key.as_str())).cloned().collect()
+    }
+}
+
 /// Create an inventory for the specified directory (and all subdirectories).
 ///
 /// If the build fails halfway, the inventories that were already written are kept (and
@@ -467,15 +497,10 @@ pub async fn create_inventory_for_directory(path: &WarehousePath) -> Result<(), 
         }
     }
 
-    // Every directory this walk visited is safe to (re-)register regardless of what happened
-    // above: one with no outcome was already correct and durable from before this walk, untouched
-    // either way; one *with* an outcome that did not end up durable this round is still safe to
-    // register (`publish_shard_outcomes` already did so itself, for the same reason) — every
-    // metadata-driven reader treats a listed shard that is missing or unchanged as empty/stale,
-    // never an error, so this can only ever surface more of what genuinely exists on disk. A key
-    // whose shard *did* durably land must never be excluded here just because some other key in
-    // the same walk failed — that was this join point's original bug.
-    let keys_to_add: BTreeSet<String> = context.new_inventory_paths.lock().await.clone();
+    let keys_to_add: BTreeSet<String> = {
+        let new_inventory_paths = context.new_inventory_paths.lock().await;
+        keys_to_register_after_walk(&new_inventory_paths, &outcomes, blob_batch_published)
+    };
 
     if let Err(e) = result {
         // Register every inventory that was actually published, even on failure, so the metadata
@@ -860,7 +885,15 @@ fn drop_outcomes_referencing_missing_blobs(outcomes: &mut BTreeMap<String, Shard
             ShardOutcome::Carry(inventory, _) | ShardOutcome::Changed(inventory, _) => inventory,
         };
 
-        let references_missing = inventory.get_items().any(|(_, item)| missing_hashes.contains(&item.hash));
+        // A `Deleted` tombstone entry retains its old hash (`mark_item_deleted` only flips
+        // `state`, see its own doc comment) — that hash names content this outcome no longer
+        // references at all (a staged removal writes nothing), so it must never trigger a drop on
+        // its own. Skipping it also matters for precision, not just correctness: two entirely
+        // unrelated files can share a content hash (a coincidental duplicate, or the same bytes
+        // recreated elsewhere), so counting a tombstone's stale hash could otherwise drop an
+        // outcome that has nothing to do with the blob that actually failed.
+        let references_missing = inventory.get_items()
+            .any(|(_, item)| item.state != InventoryItemState::Deleted && missing_hashes.contains(&item.hash));
 
         if references_missing {
             dropped.insert(key.clone());
@@ -2372,17 +2405,31 @@ fn carry_over_missing_entries_as_deleted(old_inventory: &Inventory, new_inventor
 /// Update the inventory metadata file (a text file that contains the paths of all
 /// inventoried directories, sorted alphabetically) in a single write.
 ///
+/// A no-op — no read, no write — when both sets are empty; skips the *write* (but still reads,
+/// to compute the comparison) when applying them changes nothing on disk (every key to add is
+/// already present, every key to remove is already absent). This matters now that a single
+/// logical operation can call this more than once — `create_inventory_for_directory`'s join point
+/// registers `outcomes`' own keys once (inside `publish_shard_outcomes`) and then its own broader
+/// visited/stale set again — so the common case (a steady-state re-load where every visited
+/// directory was already registered from before) costs one read and zero writes for the second
+/// call instead of a full, redundant rewrite of a file nothing here actually changes.
+///
 /// # Arguments
 /// * `keys_to_add`    - Warehouse path keys of directories to register.
 /// * `keys_to_remove` - Warehouse path keys of directories to remove.
 ///
 /// # Returns
-/// * `Ok(())`      - If the metadata was successfully updated.
+/// * `Ok(())`      - If the metadata was successfully updated (or already matched).
 /// * `Err(String)` - If an error occurred while updating the metadata.
 fn update_inventory_metadata(keys_to_add: &BTreeSet<String>,
                              keys_to_remove: &BTreeSet<String>) -> Result<(), String> {
+    if keys_to_add.is_empty() && keys_to_remove.is_empty() {
+        return Ok(());
+    }
+
     let (metadata_path, metadata_opt) = file_utils::retrieve_inventory_metadata_or_none()?;
-    let mut metadata = metadata_opt.unwrap_or(BTreeSet::new());
+    let before = metadata_opt.unwrap_or_default();
+    let mut metadata = before.clone();
 
     for key in keys_to_add {
         metadata.insert(key_to_metadata_entry(key));
@@ -2390,6 +2437,10 @@ fn update_inventory_metadata(keys_to_add: &BTreeSet<String>,
 
     for key in keys_to_remove {
         metadata.remove(&key_to_metadata_entry(key));
+    }
+
+    if metadata == before {
+        return Ok(());
     }
 
     write_metadata_to_file(&metadata_path, &metadata)
@@ -2844,6 +2895,54 @@ mod tests {
     }
 
     #[test]
+    fn keys_to_register_after_walk_registers_everything_visited_when_phase_a_b_ran() {
+        let mut visited: BTreeSet<String> = BTreeSet::new();
+        visited.insert("".to_string());
+        visited.insert("a".to_string());
+        visited.insert("untouched".to_string());
+
+        let mut outcomes: BTreeMap<String, ShardOutcome> = BTreeMap::new();
+        outcomes.insert("a".to_string(),
+            ShardOutcome::Changed(Inventory::new(), std::time::SystemTime::now()));
+        // "untouched" has no outcome (visited, but nothing to write) and "" has no outcome either
+        // — both must still be registered, exactly like "a".
+
+        let registered = keys_to_register_after_walk(&visited, &outcomes, true);
+
+        assert_eq!(registered, visited,
+            "when phase A/B ran, every visited key is safe to register regardless of outcome");
+    }
+
+    #[test]
+    fn keys_to_register_after_walk_excludes_decided_keys_when_phase_a_b_never_ran() {
+        // Regression: a plain (non-leaked) blob-batch failure skips phase A/B entirely — nothing
+        // decided this round could possibly be durable. A brand-new directory's key must not be
+        // registered in that specific case (it would only ever create a permanently
+        // unmaterialized "phantom" metadata entry), while a visited directory with no outcome
+        // (untouched by this walk's decisions either way) still must be.
+        let mut visited: BTreeSet<String> = BTreeSet::new();
+        visited.insert("".to_string());
+        visited.insert("new-dir".to_string());
+        visited.insert("untouched".to_string());
+
+        let mut outcomes: BTreeMap<String, ShardOutcome> = BTreeMap::new();
+        outcomes.insert("new-dir".to_string(),
+            ShardOutcome::Changed(Inventory::new(), std::time::SystemTime::now()));
+
+        let registered = keys_to_register_after_walk(&visited, &outcomes, false);
+
+        assert!(!registered.contains("new-dir"),
+            "a key whose only outcome never got a chance to publish must not be registered: {:?}",
+            registered);
+        assert!(registered.contains("untouched"),
+            "a visited key with no outcome is unaffected by phase A/B and must still be \
+            registered: {:?}", registered);
+        assert!(registered.contains(""),
+            "the root has no outcome here either (nothing decided for it), so — like \
+            \"untouched\" — it must still be registered: {:?}", registered);
+    }
+
+    #[test]
     fn carry_over_marks_missing_entries_as_deleted() {
         let mut old_inventory = Inventory::new();
         old_inventory.add_item(item("kept.txt", 1, InventoryItemState::Normal));
@@ -2980,6 +3079,58 @@ mod tests {
         let (_, bytes) = file_utils::retrieve_inventory_or_none_by_key(key).unwrap();
         let inventory = parser::inventory::inventory_parser::parse_inventory(&bytes.unwrap()).unwrap();
         inventory.get_rollup_hash().cloned()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_inventory_metadata_skips_the_write_when_nothing_actually_changes() {
+        // A single logical operation can now call this more than once for the same round
+        // (`create_inventory_for_directory`'s join point registers `outcomes`' own keys once
+        // inside `publish_shard_outcomes`, then its own broader visited/stale set again) — the
+        // common case (every key already registered from before) must cost zero writes for the
+        // second call, not a redundant full rewrite of a file nothing here actually changes.
+        //
+        // Proven directly, not by mtime comparison (which coarse filesystem timestamp
+        // granularity could pass even if a real rewrite happened within the same second): the
+        // metadata file is made read-only after its initial write, so any *attempted* write
+        // (even one producing byte-identical content) would fail with a permission error. A
+        // no-op call succeeding here proves the write was genuinely skipped, not just silently
+        // reproduced the same bytes.
+        let _scratch = Scratch::new("update-inventory-metadata-skips-noop-write");
+
+        let mut already_there: BTreeSet<String> = BTreeSet::new();
+        already_there.insert(key_to_metadata_entry("a"));
+        already_there.insert(key_to_metadata_entry("b"));
+        let (metadata_path, _) = file_utils::retrieve_inventory_metadata_or_none().unwrap();
+        std::fs::create_dir_all(metadata_path.parent().unwrap()).unwrap();
+        write_metadata_to_file(&metadata_path, &already_there).unwrap();
+
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&metadata_path, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        // Re-adding a key that is already present, and removing a key that is already absent —
+        // applying this changes nothing about the resulting set. If this attempted a real write,
+        // it would fail (`EACCES`) against the now-read-only file.
+        let mut keys_to_add: BTreeSet<String> = BTreeSet::new();
+        keys_to_add.insert("a".to_string());
+        let mut keys_to_remove: BTreeSet<String> = BTreeSet::new();
+        keys_to_remove.insert("never-registered".to_string());
+
+        let result = update_inventory_metadata(&keys_to_add, &keys_to_remove);
+
+        std::fs::set_permissions(&metadata_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        result.expect("a no-op update (nothing actually added or removed) must not attempt a write");
+
+        // A genuine change still writes through normally (now that the file is writable again).
+        let mut real_add: BTreeSet<String> = BTreeSet::new();
+        real_add.insert("c".to_string());
+        update_inventory_metadata(&real_add, &BTreeSet::new()).unwrap();
+
+        let (_, metadata_opt) = file_utils::retrieve_inventory_metadata_or_none().unwrap();
+        let metadata = metadata_opt.unwrap();
+        assert!(metadata.contains(&key_to_metadata_entry("c")),
+            "a genuine addition must still be applied: {:?}", metadata);
     }
 
     #[test]
@@ -3369,6 +3520,44 @@ mod tests {
         let (_, a_bytes) = file_utils::retrieve_inventory_or_none_by_key("a").unwrap();
         assert!(a_bytes.is_none(),
             "\"a\"'s shard must not be published referencing a blob that never landed");
+    }
+
+    #[test]
+    fn drop_outcomes_referencing_missing_blobs_ignores_a_deleted_tombstones_stale_hash() {
+        // Regression: `mark_item_deleted` keeps a tombstone entry's old hash, only flipping its
+        // `state` to `Deleted` (see its own doc comment). A staged removal references no blob at
+        // all — but a naive scan that does not check `state` would still match that stale hash
+        // against `missing_hashes`, coincidentally dropping an outcome whose only "reference" to
+        // the missing blob is content that used to exist and is now just being removed. Two
+        // outcomes here share the same "missing" hash: "a" only through a `Deleted` tombstone
+        // (must survive), "b" through a genuinely live entry (must still be dropped).
+        let missing_hash = "b".repeat(64);
+        let mut missing_hashes: BTreeSet<String> = BTreeSet::new();
+        missing_hashes.insert(missing_hash.clone());
+
+        let mut tombstone = item("gone.txt", 1, InventoryItemState::Deleted);
+        tombstone.hash = missing_hash.clone();
+        let mut outcome_a = Inventory::new();
+        outcome_a.add_item(tombstone);
+        outcome_a.add_item(item("kept.txt", 2, InventoryItemState::Normal));
+
+        let mut live_reference = item("live.txt", 3, InventoryItemState::Normal);
+        live_reference.hash = missing_hash.clone();
+        let mut outcome_b = Inventory::new();
+        outcome_b.add_item(live_reference);
+
+        let mut outcomes: BTreeMap<String, ShardOutcome> = BTreeMap::new();
+        outcomes.insert("a".to_string(), ShardOutcome::Changed(outcome_a, std::time::SystemTime::now()));
+        outcomes.insert("b".to_string(), ShardOutcome::Changed(outcome_b, std::time::SystemTime::now()));
+
+        let dropped = drop_outcomes_referencing_missing_blobs(&mut outcomes, &missing_hashes);
+
+        assert_eq!(dropped, BTreeSet::from(["b".to_string()]),
+            "only \"b\" (a genuine live reference) should be dropped, not \"a\" (only a stale \
+            tombstone hash): dropped = {:?}", dropped);
+        assert!(outcomes.contains_key("a"),
+            "\"a\"'s outcome must survive — its only match was a Deleted tombstone's stale hash");
+        assert!(!outcomes.contains_key("b"), "\"b\"'s outcome must still be dropped");
     }
 
     #[test]
