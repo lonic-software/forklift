@@ -776,16 +776,57 @@ impl WriteBatch {
     /// sees it directly, and a caller reusing a `WriteBatch` for a later round already treats
     /// each `finish` as its own barrier.
     ///
+    /// Refuses to run the barrier at all if some path was [`reserve_final_path`](Self::reserve_final_path)'d
+    /// but never actually staged (post-merge review, finding B): the winner of a reservation is
+    /// trusted to go on and stage it, but a fallible step between winning and staging (in
+    /// [`crate::model::object::loose_object::LooseObject::store_deferred`]: `compress()`, or the
+    /// write itself) can fail after the reservation is already recorded. Every other caller for
+    /// that same path already saw `reserve_final_path` return `false` and, reading that as
+    /// "someone else is staging this," staged nothing of their own — so without this check
+    /// `finish` would happily publish a batch whose `pending` is silently missing an entry the
+    /// reservation set promised existed, and a caller downstream (a shard naming that path's
+    /// hash) would end up referencing a blob that was never written. Deliberately *not* fixed by
+    /// releasing the reservation on the failing caller's error path instead: a concurrent second
+    /// occurrence can lose the race (and commit to "already staged, nothing to do") *before* the
+    /// first occurrence's failure ever releases anything, so releasing alone cannot undo a
+    /// decision another caller already made. Checking here, once, after every producer for this
+    /// batch has necessarily already run, catches the mismatch regardless of timing — without
+    /// weakening `reserve_final_path`'s one-winner guarantee or reintroducing the redundant
+    /// compress-and-stage race it exists to prevent.
+    ///
     /// # Returns
     /// * `Ok(())`      - Every staged write is durable and visible at its final path.
-    /// * `Err(String)` - A write or rename failed; every staged temp for this batch was
-    ///                   best-effort removed before returning (nothing survives to leak).
+    /// * `Err(String)` - A write or rename failed, or a reserved path was never staged; every
+    ///                   staged temp for this batch was best-effort removed before returning.
     pub fn finish(&self) -> Result<(), String> {
-        let pending = {
+        let (pending, leaked) = {
             let mut state = self.state.lock().expect("write batch lock poisoned");
+            let pending = std::mem::take(&mut state.pending);
+
+            let staged_paths: std::collections::HashSet<&Path> =
+                pending.iter().map(|(_, final_path)| final_path.as_path()).collect();
+            let leaked: Vec<PathBuf> = state.final_paths.iter()
+                .filter(|reserved| !staged_paths.contains(reserved.as_path()))
+                .cloned()
+                .collect();
+
             state.final_paths.clear();
-            std::mem::take(&mut state.pending)
+            (pending, leaked)
         };
+
+        if !leaked.is_empty() {
+            for (temp, _) in &pending {
+                let _ = std::fs::remove_file(temp);
+            }
+            return Err(format!(
+                "Error: {} final path(s) were reserved but never staged — a fallible step between \
+                reservation and staging must have failed (any concurrent or later caller for the \
+                same path would have read the reservation as already handled and staged nothing of \
+                its own either); refusing to publish this batch: {}",
+                leaked.len(),
+                leaked.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>().join(", "),
+            ));
+        }
 
         if pending.is_empty() {
             return Ok(());

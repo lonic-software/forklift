@@ -232,4 +232,60 @@ mod tests {
         batch.finish().unwrap();
         drop(scratch);
     }
+
+    /// Regression (post-merge review of PR #61's finding #2 fix, finding B): `store_deferred`
+    /// reserves the final path *before* the two fallible steps that actually fulfil it
+    /// (`compress()`, then `write_object_to_file_deferred`). If a caller wins the reservation and
+    /// then hits a fallible step, the reservation stays "won" forever with nothing ever pushed
+    /// into `pending` — reproduced here directly via `reserve_final_path` (the exact primitive
+    /// `store_deferred` uses internally), which faithfully stands in for "task 1 reserved, then a
+    /// fallible step failed" without needing to actually force `compress()` or the write itself
+    /// to error.
+    ///
+    /// A second occurrence of the *same* content then loses the race (`reserve_final_path`
+    /// returns `false`), reads that as "already staged," and returns `Ok` without staging
+    /// anything of its own either — exactly what a concurrent or later task hitting the same hash
+    /// does in the real walk. Pre-fix, `finish()` had no way to notice the mismatch: `pending` is
+    /// empty for this hash, so it would return `Ok`, and a caller downstream could publish a
+    /// shard naming a blob that was never actually written. `finish()` must now refuse instead.
+    #[test]
+    fn finish_fails_loudly_when_a_reservation_was_never_staged() {
+        let scratch = Scratch::new("leaked-reservation");
+
+        let content = vec![0x99u8; 4000];
+        let batch = file_utils::WriteBatch::new();
+
+        // "Task 1": wins the reservation for this content's hash, then (as if `compress()` or
+        // the write itself had failed) never goes on to actually stage it.
+        let (path, file_name) = {
+            let object = LooseObjectBuilder::build_blob(&Blob { content: content.clone() });
+            file_utils::get_path_for_object(&object.hash).unwrap()
+        };
+        let mut final_path = std::path::PathBuf::from(&path);
+        final_path.push(&file_name);
+        assert!(batch.reserve_final_path(&final_path),
+            "the simulated first occurrence must win the reservation");
+
+        // "Task 2": the same content arriving afterward, losing the race against the still-live
+        // (never released, never fulfilled) reservation above.
+        let mut second = LooseObjectBuilder::build_blob(&Blob { content });
+        let (_, staged) = second.store_deferred(&batch).unwrap();
+        assert!(!staged,
+            "a second occurrence must lose the race exactly like the real concurrent interleaving");
+
+        let error = match batch.finish() {
+            Ok(()) => panic!(
+                "finish() must refuse to publish a batch that leaked a reservation nobody ever \
+                staged, not silently succeed"),
+            Err(e) => e,
+        };
+        assert!(error.contains(&*final_path.to_string_lossy()),
+            "the error should name the leaked reservation's path: {error}");
+
+        // Nothing was ever durably published for this hash — the whole point of refusing.
+        assert!(!file_utils::does_object_exist(&second.hash).unwrap(),
+            "the object must not exist on disk after a refused finish()");
+
+        drop(scratch);
+    }
 }
