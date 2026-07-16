@@ -116,6 +116,18 @@ fn restore_worktree(path: &WarehousePath) -> Result<(), String> {
 
 /// Restore every tracked file of a directory (and its subdirectories) from the inventory.
 ///
+/// Every file's working-directory write happens immediately (unfsynced, same as always), but its
+/// refreshed inventory entry is only *decided* here — collected into one shared
+/// [`inventory_utils::ShardMutationBatch`] instead of paying `update_shard`'s full two-barrier
+/// funnel per file (DESIGN.html §5.0 D item 10, finding #4). Several files in the same shard
+/// collapse into one read-modify-write of it, published once at the end.
+///
+/// If a file's restore fails partway through (an unreadable or missing blob), every file decided
+/// before the failure is still published — the same keep-whatever-was-decided resilience
+/// `refresh_tracked_entries` gives a per-shard failure (see its own doc comment): under the old
+/// per-file immediate-write loop this replaced, every prior file was already durably applied by
+/// the time a later one failed, so this preserves that same guarantee under batching.
+///
 /// # Arguments
 /// * `key` - The warehouse path key of the directory.
 ///
@@ -129,8 +141,13 @@ fn restore_worktree_directory(key: &str) -> Result<(), String> {
     let prefix = if key.is_empty() { String::new() } else { format!("{}/", key) };
     let mut restored_any = false;
     let mut restored_count = 0usize;
+    let mut batch = inventory_utils::ShardMutationBatch::new();
 
-    for entry in &metadata {
+    // `result` accumulates the *first* failure — see the function's own doc comment for why this,
+    // rather than propagating immediately, matters here.
+    let mut result: Result<(), String> = Ok(());
+
+    'shards: for entry in &metadata {
         let shard_key = inventory_utils::metadata_entry_to_key(entry);
 
         let is_in_subtree = key.is_empty()
@@ -143,24 +160,45 @@ fn restore_worktree_directory(key: &str) -> Result<(), String> {
 
         restored_any = true;
 
-        let (_, shard_bytes) = file_utils::retrieve_inventory_or_none_by_key(shard_key)?;
+        let (_, shard_bytes) = match file_utils::retrieve_inventory_or_none_by_key(shard_key) {
+            Ok(bytes_opt) => bytes_opt,
+            Err(e) => { result = Err(e); break 'shards; }
+        };
 
         let Some(bytes) = shard_bytes else {
             continue;
         };
 
-        let inventory = forklift_core::parser::inventory::inventory_parser::parse_inventory(&bytes)
-            .map_err(|e| format!("Error while parsing the inventory of folder \"{}\": {}", shard_key, e))?;
+        let inventory = match forklift_core::parser::inventory::inventory_parser::parse_inventory(&bytes) {
+            Ok(inventory) => inventory,
+            Err(e) => {
+                result = Err(format!("Error while parsing the inventory of folder \"{}\": {}", shard_key, e));
+                break 'shards;
+            }
+        };
 
         for (name, item) in inventory.get_items() {
             if item.state == InventoryItemState::Deleted {
                 continue;
             }
 
-            restore_file_and_refresh_entry(shard_key, name, &item.hash, item.item_type)?;
+            if let Err(e) = restore_file_and_refresh_entry_into(&mut batch, shard_key, name, &item.hash, item.item_type) {
+                result = Err(e);
+                break 'shards;
+            }
+
             restored_count += 1;
         }
     }
+
+    // Every file decided above becomes durable now, through the shared join point. Attempted
+    // even after a mid-loop failure, exactly like `refresh_tracked_entries`'s identical
+    // resilience contract, for the same reason.
+    if let Err(e) = batch.publish() {
+        if result.is_ok() { result = Err(e); }
+    }
+
+    result?;
 
     if !restored_any {
         return Err(format!(
@@ -190,13 +228,7 @@ fn restore_file_and_refresh_entry(parent_key: &str,
                                   name: &str,
                                   hash: &str,
                                   item_type: DirEntryType) -> Result<(), String> {
-    let file_path = if parent_key.is_empty() {
-        name.to_string()
-    } else {
-        format!("{}/{}", parent_key, name)
-    };
-
-    shift_utils::write_tracked_file(&file_path, hash, item_type)?;
+    let file_path = materialize_restored_file(parent_key, name, hash, item_type)?;
 
     let refreshed = inventory_utils::build_inventory_item_from_stat(
         std::path::Path::new(&file_path),
@@ -209,6 +241,45 @@ fn restore_file_and_refresh_entry(parent_key: &str,
         inventory.add_item(refreshed);
         Ok(())
     })
+}
+
+/// Like [`restore_file_and_refresh_entry`], but stages the refreshed entry into `batch` (see
+/// [`inventory_utils::ShardMutationBatch`]) instead of writing it immediately.
+fn restore_file_and_refresh_entry_into(batch: &mut inventory_utils::ShardMutationBatch,
+                                       parent_key: &str,
+                                       name: &str,
+                                       hash: &str,
+                                       item_type: DirEntryType) -> Result<(), String> {
+    let file_path = materialize_restored_file(parent_key, name, hash, item_type)?;
+
+    let refreshed = inventory_utils::build_inventory_item_from_stat(
+        std::path::Path::new(&file_path),
+        name,
+        hash.to_string(),
+        item_type,
+    )?;
+
+    batch.update(parent_key, |inventory| {
+        inventory.add_item(refreshed);
+        Ok(())
+    })
+}
+
+/// Write one tracked file's content from its blob into the working directory (unfsynced, same as
+/// every other working-directory write) and return its warehouse path.
+fn materialize_restored_file(parent_key: &str,
+                             name: &str,
+                             hash: &str,
+                             item_type: DirEntryType) -> Result<String, String> {
+    let file_path = if parent_key.is_empty() {
+        name.to_string()
+    } else {
+        format!("{}/{}", parent_key, name)
+    };
+
+    shift_utils::write_tracked_file(&file_path, hash, item_type)?;
+
+    Ok(file_path)
 }
 
 /// Reset the inventory entries of the given path to the pallet head (unstage). The

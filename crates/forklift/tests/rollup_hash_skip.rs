@@ -695,3 +695,169 @@ fn park_never_restamps_a_stale_rollup_over_a_same_pass_ancestor_clear() {
 // shard right after `refresh_tracked_entries` returns, so a shard's mtime observed after a full
 // `park` command reflects that later, unrelated rewrite — not what this refresh itself published.
 // That dedicated test calls `refresh_tracked_entries` directly instead.
+
+// -------------------------------------------------------------------------------------------
+// Regressions for the batched merge/replay funnel (DESIGN.html §5.0 D item 10, findings #2/#4):
+// `apply_merge_action` (consolidate/cherry-pick), `restore <dir>`'s plain replay and `park pop`'s
+// replay all used to pay `update_shard`/`stage_file_entry_from_stat`'s full two-barrier funnel
+// per action/file — now routed through `inventory_utils::ShardMutationBatch`, the same shared
+// join-point primitive `load` and `park`'s working-directory refresh already use. The shape that
+// bit PR A's round-2 review (finding #1) was a multi-decision batch where one decision's ancestor
+// is *another* decision's own shard, decided in an order the ancestor-clearing logic must not
+// depend on. These pin that shape specifically for the merge path.
+// -------------------------------------------------------------------------------------------
+
+#[test]
+fn consolidate_clears_every_ancestor_rollup_across_a_batch_where_one_actions_ancestor_is_another_actions_own_shard() {
+    let warehouse = Warehouse::new("consolidate-batch-ancestor-clear", false);
+    warehouse.prepare();
+
+    // "dirA" is the immediate ancestor of "dirA/dirB" — the shape the finding #1 repro needs: a
+    // single merge batch must touch both a nested shard *and* that shard's own parent directly.
+    // "zzz/deep" is a *second*, unrelated nested change whose own intermediate ancestor ("zzz")
+    // is never itself directly touched by anything — sorted after "dirA/dirB" in every BTreeMap
+    // key order this batch could iterate in, so a clear-keys computation that only accounted for
+    // the *first*-processed decision (rather than every decision in the batch) would silently
+    // leave "zzz" carrying a stale rollup.
+    warehouse.write_file("dirA/dirB/deep.txt", "deep v1\n");
+    warehouse.write_file("dirA/direct.txt", "direct v1\n");
+    warehouse.write_file("zzz/deep/leaf.txt", "leaf v1\n");
+    warehouse.write_file("conflict.txt", "conflict v1\n");
+    warehouse.write_file("sibling/other.txt", "sibling v1\n");
+    warehouse.run_ok(&["load", "."]);
+    warehouse.run_ok(&["stack", "base"]);
+
+    assert!(shard_rollup(&warehouse, "dirA").is_some(), "\"dirA\" must be stamped after the base stack");
+    assert!(shard_rollup(&warehouse, "dirA/dirB").is_some(), "\"dirA/dirB\" must be stamped after the base stack");
+    assert!(shard_rollup(&warehouse, "zzz").is_some(), "\"zzz\" must be stamped after the base stack");
+
+    // Diverge: feature changes both the nested file and dirA's own direct file, the unrelated
+    // deep "zzz" file, plus the line that will conflict.
+    warehouse.run_ok(&["palletize", "feature"]);
+    warehouse.write_file("dirA/dirB/deep.txt", "deep v2 (feature)\n");
+    warehouse.write_file("dirA/direct.txt", "direct v2 (feature)\n");
+    warehouse.write_file("zzz/deep/leaf.txt", "leaf v2 (feature)\n");
+    warehouse.write_file("conflict.txt", "feature version\n");
+    warehouse.run_ok(&["load", "."]);
+    warehouse.run_ok(&["stack", "feature work"]);
+
+    // Main diverges independently: an unrelated sibling edit (so dirA/dirA-dirB's rollups stay
+    // exactly as the base stack left them going into the merge) and a conflicting edit to the
+    // same single-line file feature also touched, so the merge below cannot auto-stack — it
+    // stops right after `apply_merge_actions`, leaving the batch's own decisions directly
+    // inspectable instead of immediately overwritten by a following stack's own rollup stamping.
+    warehouse.run_ok(&["shift", "main"]);
+    warehouse.write_file("sibling/other.txt", "sibling v2 (main)\n");
+    warehouse.write_file("conflict.txt", "main version\n");
+    warehouse.run_ok(&["load", "."]);
+    warehouse.run_ok(&["stack", "main work"]);
+
+    let sibling_rollup_before_merge = shard_rollup(&warehouse, "sibling");
+    assert!(sibling_rollup_before_merge.is_some(), "\"sibling\" must be stamped after main's own stack");
+
+    let merge = warehouse.run(&["consolidate", "feature"]);
+    assert!(merge.status.success(), "consolidate must report conflicts, not fail outright: {}",
+        String::from_utf8_lossy(&merge.stderr));
+    let merge_stdout = String::from_utf8_lossy(&merge.stdout).to_string();
+    assert!(merge_stdout.contains("conflict"), "the merge must report the conflict.txt conflict: {}", merge_stdout);
+
+    // The batch's own decisions, inspectable now because the conflict stopped the auto-stack:
+    // every ancestor of a real content change must be cleared, whether or not that ancestor was
+    // *also* directly touched by another action in the very same batch.
+    assert_eq!(shard_rollup(&warehouse, "dirA/dirB"), None,
+        "the directly-touched nested shard must have its own rollup cleared");
+    assert_eq!(shard_rollup(&warehouse, "dirA"), None,
+        "\"dirA\" must be cleared: it is both an ancestor of the dirA/dirB change *and* the \
+         target of its own direct-file action in the same batch");
+    assert_eq!(shard_rollup(&warehouse, ""), None, "the root must be cleared as an ancestor of both changes");
+    assert_eq!(shard_rollup(&warehouse, "zzz"), None,
+        "\"zzz\" must be cleared too: an ancestor of a *different*, unrelated change in the same \
+         batch that is never itself directly touched by any action");
+
+    // An unrelated shard the merge batch never touched must be completely unaffected.
+    assert_eq!(shard_rollup(&warehouse, "sibling"), sibling_rollup_before_merge,
+        "an unrelated shard outside the merge's diff must keep exactly the rollup it had going in");
+
+    // Not just rollup bookkeeping: the actual content the batch decided must be present and
+    // correct on disk — a wrongly-restamped-then-skipped ancestor is exactly what would have let
+    // one of these two changes go missing.
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("dirA/dirB/deep.txt")).unwrap(), "deep v2 (feature)\n");
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("dirA/direct.txt")).unwrap(), "direct v2 (feature)\n");
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("zzz/deep/leaf.txt")).unwrap(), "leaf v2 (feature)\n");
+
+    // Resolve the conflict and complete the consolidation with an ordinary stack.
+    warehouse.write_file("conflict.txt", "resolved\n");
+    warehouse.run_ok(&["load", "conflict.txt"]);
+    warehouse.run_ok(&["stack", "resolve conflict"]);
+
+    // The completing stack's own cleanup restamps every shard against the newly-committed tree —
+    // confirm it lands on the *correct* (post-merge) tree, not a value derived from a rollup the
+    // merge batch should have cleared but didn't.
+    let head_tree = warehouse.head_tree_hash("main");
+    let dira_hash;
+    let dira_dirb_hash;
+    {
+        let _scope = forklift_core::globals::StorageRootScope::enter(&warehouse.root);
+        dira_hash = forklift_core::util::tree_utils::resolve_subtree_hash(&head_tree, "dirA").unwrap().unwrap();
+        dira_dirb_hash = forklift_core::util::tree_utils::resolve_subtree_hash(&head_tree, "dirA/dirB").unwrap().unwrap();
+    }
+
+    assert_eq!(shard_rollup(&warehouse, "dirA"), Some(dira_hash),
+        "\"dirA\"'s rollup after the completing stack must match the real, merged tree");
+    assert_eq!(shard_rollup(&warehouse, "dirA/dirB"), Some(dira_dirb_hash),
+        "\"dirA/dirB\"'s rollup after the completing stack must match the real, merged tree");
+
+    // Final belt-and-braces: a stocktake must agree byte-for-byte whether the rollup skip is
+    // forced off or left on — the same equivalence property every other rollup regression in
+    // this file checks, applied to the just-completed merge.
+    let mut off_command = warehouse.command(&["--json", "stocktake"]);
+    off_command.env("FORKLIFT_DISABLE_ROLLUP_SKIP", "1");
+    let off_output = off_command.output().unwrap();
+    assert!(off_output.status.success());
+    let on_output = warehouse.run_ok(&["--json", "stocktake"]);
+    let on_value: serde_json::Value = serde_json::from_slice(&on_output.stdout).unwrap();
+    let off_value: serde_json::Value = serde_json::from_slice(&off_output.stdout).unwrap();
+    assert_eq!(on_value, off_value, "stocktake after the merge must agree whether the skip is active or not");
+}
+
+#[test]
+fn apply_merge_actions_collapses_two_actions_in_the_same_shard_into_one_correct_read_modify_write() {
+    // Same-shard collapse (DESIGN.html §5.0 D item 10, implementation note): a delete and a
+    // take-theirs both landing in "dirA" must both survive in the final shard, not have one
+    // clobber the other via a lost read-modify-write.
+    let warehouse = Warehouse::new("consolidate-same-shard-collapse", false);
+    warehouse.prepare();
+
+    warehouse.write_file("dirA/keep.txt", "keep v1\n");
+    warehouse.write_file("dirA/removed.txt", "removed v1\n");
+    warehouse.run_ok(&["load", "."]);
+    warehouse.run_ok(&["stack", "base"]);
+
+    warehouse.run_ok(&["palletize", "feature"]);
+    // Feature adds a brand-new file in "dirA" and deletes another existing one — two distinct
+    // merge actions ("dirA/new.txt" TakeTheirs, "dirA/removed.txt" Delete) that both target the
+    // very same shard key ("dirA").
+    warehouse.write_file("dirA/new.txt", "new v1\n");
+    std::fs::remove_file(warehouse.root.join("dirA/removed.txt")).unwrap();
+    warehouse.run_ok(&["load", "."]);
+    warehouse.run_ok(&["stack", "feature work"]);
+
+    warehouse.run_ok(&["shift", "main"]);
+    warehouse.write_file("sibling.txt", "sibling v1\n");
+    warehouse.run_ok(&["load", "."]);
+    warehouse.run_ok(&["stack", "main work"]);
+
+    let merge = warehouse.run(&["consolidate", "feature"]);
+    assert!(merge.status.success(), "consolidate must succeed cleanly (no overlapping changes): {}",
+        String::from_utf8_lossy(&merge.stderr));
+
+    // Both of "dirA"'s actions must have landed: the new file present, the removed file gone,
+    // and the untouched file in the same shard still present.
+    assert!(warehouse.root.join("dirA/new.txt").exists(), "the take-theirs addition must survive the collapse");
+    assert!(!warehouse.root.join("dirA/removed.txt").exists(), "the delete must survive the collapse");
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("dirA/keep.txt")).unwrap(), "keep v1\n",
+        "an untouched entry in the same shard must be unaffected by the collapse");
+
+    let status = String::from_utf8_lossy(&warehouse.run(&["stocktake"]).stdout).to_string();
+    assert!(status.contains("matches"), "the warehouse must report clean after the merge: {}", status);
+}

@@ -439,31 +439,67 @@ fn inventory_lookup(path: &str) -> Result<Option<InventoryItem>, String> {
 /// write is about to turn into a directory) is emptied — and, via `apply_merge_action`'s
 /// parent-chain cleanup, itself removed — before that write lands. Writing first would
 /// otherwise fail (`EISDIR`/`EEXIST`) for a tracked type flip in either direction.
+///
+/// Every action's working-directory write (unfsynced, same as always) happens immediately, but
+/// its shard mutation (and, for `Merged`, its new blob) is only *decided* here — collected into
+/// one shared [`inventory_utils::ShardMutationBatch`] instead of paying `update_shard`'s full
+/// two-barrier funnel per action (DESIGN.html §5.0 D item 10, finding #2). Deletes and
+/// non-deletes both accumulate into the very same batch, in the same two-pass order as before, so
+/// two actions touching the same directory (say, a delete and a take-theirs of different files in
+/// it) still collapse into one read-modify-write of that shard, applied in the same
+/// deletes-then-writes order the working-directory side already requires.
+///
+/// If an action's decision step fails partway through (an unreadable source object, a corrupt
+/// shard), every action decided *before* the failure is still published — the same
+/// keep-whatever-was-decided resilience `refresh_tracked_entries` gives a per-shard failure (see
+/// its own doc comment): under the old per-action immediate-write loop this replaced, every prior
+/// action was already durably applied by the time a later one failed, so this preserves that same
+/// user-visible guarantee under batching instead of silently regressing to all-or-nothing.
 pub(crate) fn apply_merge_actions(actions: &[MergeAction]) -> Result<Vec<String>, String> {
     let mut conflict_paths: Vec<String> = Vec::new();
+    let mut batch = inventory_utils::ShardMutationBatch::new();
 
-    for action in actions {
-        if matches!(action, MergeAction::Delete { .. }) {
-            apply_merge_action(action, &mut conflict_paths)?;
+    // `result` accumulates the *first* failure — see the function's own doc comment for why this,
+    // rather than propagating immediately, matters here.
+    let mut result: Result<(), String> = Ok(());
+
+    'passes: for deletes_pass in [true, false] {
+        for action in actions {
+            if matches!(action, MergeAction::Delete { .. }) != deletes_pass {
+                continue;
+            }
+
+            if let Err(e) = apply_merge_action(action, &mut conflict_paths, &mut batch) {
+                result = Err(e);
+                break 'passes;
+            }
         }
     }
 
-    for action in actions {
-        if !matches!(action, MergeAction::Delete { .. }) {
-            apply_merge_action(action, &mut conflict_paths)?;
-        }
+    // Every action decided above — whether or not the whole pass finished — becomes durable now,
+    // through the shared join point (blob barrier, then phase A ancestor clears, then phase B
+    // shard content). Attempted even after a mid-loop failure, exactly like
+    // `refresh_tracked_entries`'s identical resilience contract, for the same reason.
+    if let Err(e) = batch.publish() {
+        if result.is_ok() { result = Err(e); }
     }
+
+    result?;
 
     Ok(conflict_paths)
 }
 
-/// Apply one merge action to the working directory and the inventory. Shared with
-/// `cherry-pick`, which applies a parcel's diff through the same `MergeAction`s.
-pub(crate) fn apply_merge_action(action: &MergeAction, conflict_paths: &mut Vec<String>) -> Result<(), String> {
+/// Apply one merge action to the working directory immediately, and stage its inventory
+/// mutation (and, for `Merged`, its new blob) into `batch` instead of writing either
+/// immediately. Shared with `cherry-pick`, which applies a parcel's diff through the same
+/// `MergeAction`s.
+pub(crate) fn apply_merge_action(action: &MergeAction,
+                                 conflict_paths: &mut Vec<String>,
+                                 batch: &mut inventory_utils::ShardMutationBatch) -> Result<(), String> {
     match action {
         MergeAction::TakeTheirs { path, hash, item_type, .. } => {
             shift_utils::write_tracked_file(path, hash, *item_type)?;
-            inventory_utils::stage_file_entry_from_stat(path, hash.clone(), *item_type)
+            inventory_utils::stage_file_entry_from_stat_into(batch, path, hash.clone(), *item_type)
         }
 
         MergeAction::Delete { path } => {
@@ -475,7 +511,7 @@ pub(crate) fn apply_merge_action(action: &MergeAction, conflict_paths: &mut Vec<
 
             let (parent_key, name) = split_path(path);
 
-            inventory_utils::update_shard(parent_key, |inventory| {
+            batch.update(parent_key, |inventory| {
                 inventory.remove_item_by_name(name);
                 Ok(())
             })?;
@@ -497,13 +533,15 @@ pub(crate) fn apply_merge_action(action: &MergeAction, conflict_paths: &mut Vec<
         MergeAction::Merged { path, content, item_type } => {
             write_merged_file(path, content, *item_type)?;
 
-            // The merged content is new — store its blob so the next stack can point at it. A
+            // The merged content is new — stage its blob into the batch's own blob barrier so the
+            // next stack can point at it (DESIGN.html §5.0 D item 10, finding #7: durable before
+            // any shard content that might reference it, never stored immediately here). A
             // three-way merge only ever runs on plain text files, so a `Merged` result is always
             // a plain blob, never chunked.
             let mut object = LooseObjectBuilder::build_blob(&Blob { content: content.clone() });
-            object.store()?;
+            object.store_deferred(batch.blob_batch())?;
 
-            inventory_utils::stage_file_entry_from_stat(path, object.hash, *item_type)
+            inventory_utils::stage_file_entry_from_stat_into(batch, path, object.hash, *item_type)
         }
 
         MergeAction::Conflict { path, content, entry_hash, item_type } => {
@@ -525,7 +563,7 @@ pub(crate) fn apply_merge_action(action: &MergeAction, conflict_paths: &mut Vec<
             );
             entry.state = InventoryItemState::FirstParentConflict;
 
-            inventory_utils::update_shard(parent_key, |inventory| {
+            batch.update(parent_key, move |inventory| {
                 inventory.add_item(entry);
                 Ok(())
             })?;

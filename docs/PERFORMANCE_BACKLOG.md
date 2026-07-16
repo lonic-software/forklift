@@ -219,15 +219,19 @@ until then this is the store working as designed, not a bug.
 
 ### e. Durability-barrier audit (write-batching sweep)
 
-**Status: audit complete (2026-07-15, on main @ 18a04f9); findings 1 and 3 shipped
-(PR A, 2026-07-16), then hardened by a second, multi-agent review of PR A itself
-(2026-07-16 — 10 findings, all resolved: #1 data-loss fixed, #2 dedupe fixed, #3
-docs corrected against a verified `gc` mitigation, #4 invariant comment fixed, #5
-`park`'s read-phase parallelism restored, #6 mtime-anchoring fixed, #7 blob/shard
-ordering fixed for `load` (refuted for `park`, verified separate barrier), #8 dead
-`Mutex` traffic removed, #9 dead code deleted, #10 barrier-count now asserted by a
-test); findings 2 and 4 (the shared multi-mutation join-point primitive) still
-queued for PR B.**
+**Status: complete (2026-07-16), demand-gated finding 5 excepted.** Audit finished
+2026-07-15 (on main @ 18a04f9); findings 1 and 3 shipped (PR A, 2026-07-16), then
+hardened by a second, multi-agent review of PR A itself (2026-07-16 — 10 findings,
+all resolved: #1 data-loss fixed, #2 dedupe fixed, #3 docs corrected against a
+verified `gc` mitigation, #4 invariant comment fixed, #5 `park`'s read-phase
+parallelism restored, #6 mtime-anchoring fixed, #7 blob/shard ordering fixed for
+`load` (refuted for `park`, verified separate barrier), #8 dead `Mutex` traffic
+removed, #9 dead code deleted, #10 barrier-count now asserted by a test); findings
+2 and 4 (the shared multi-mutation join-point primitive) shipped in PR B
+(2026-07-16), which also closed out PR A's recorded leftover — see finding 3's own
+entry below, it turned out to already be fixed as a side effect of round 2's
+finding #1 fix, just never re-verified with a real assertion until PR B did so.
+Finding 5 stays demand-gated (untimed, small, rare operations).
 Three unrelated pieces of work had converged on the same cost in short succession —
 quick-win #3's `stack` fsync batching, the rollup-hash work's two rounds of
 shard-write batching, and PR #59's benchmark verification surfacing unbatched-barrier
@@ -274,12 +278,39 @@ itself as well as the findings.
      first occurrence of a given hash in a batch ever stages anything; a 50-occurrence regression
      test (`store_deferred_dedupes_repeated_identical_content_within_one_batch`) failed with 50
      staged temps before the fix, passes with exactly 1 after.
-2. **`consolidate`/cherry-pick's per-merge-action funnel** (`apply_merge_action`) —
-   measured ~9.1 ms/action; a 50-action merge is ≈570 ms, confirming this doc's
-   original ~100-barrier prediction. Needs the phased join-point shape (a shared
-   phase-A ancestor-clears sub-barrier, a shared phase-B content-writes
-   sub-barrier; the two phases must never merge into one). Medium risk — the
-   busiest write path — so needs adversarial review. Queued for PR B.
+2. **FIXED (PR B). `consolidate`/cherry-pick's per-merge-action funnel**
+   (`apply_merge_action`) — measured ~9.1–10.7 ms/action; a 50-action merge was
+   ≈534–570 ms, confirming this doc's original ~100-barrier prediction. Fixed with
+   `inventory_utils::ShardMutationBatch`, a new type built directly on
+   `publish_shard_outcomes` (extracted from `load`'s join point in PR A's review
+   round 2, already shared by `park`'s `refresh_tracked_entries`) — the third
+   producer, not a third bespoke implementation. Every merge action's
+   working-directory write still happens immediately (unfsynced, unchanged), but
+   its shard mutation is only *decided*, collapsed per touched shard key in
+   memory, and published once for the whole `apply_merge_actions` call: a shared
+   blob barrier (a `Merged` action's freshly built blob, staged via
+   `LooseObject::store_deferred` instead of the old immediate `store()`), then a
+   shared phase-A ancestor-clears barrier, then a shared phase-B content-writes
+   barrier — the exact phased shape this finding originally called for, and the
+   two phases are never merged into one (`publish_shard_outcomes`'s own
+   contract). Every touched shard is unconditionally published as
+   `ShardOutcome::Changed` — matching `write_shard_mutation`'s existing
+   always-invalidate contract exactly (no new carry-forward-the-rollup
+   optimization), which also means the finding #1 (round-2) hazard — a carried
+   rollup restamped over a same-batch ancestor clear — cannot recur here by
+   construction: there is no `Carry` outcome on this path to restamp. Same-shard
+   collapse (several actions touching one directory, e.g. a delete and a
+   take-theirs of different files in it) folds into one read-modify-write, not N
+   rewrites sharing a barrier. A mid-batch decision failure still publishes every
+   action decided before it, mirroring `refresh_tracked_entries`'s
+   keep-whatever-was-decided resilience. Measured (this box, release build,
+   synthetic 8-directory corpus, 7-run median): 50 actions **534 ms → 114 ms**
+   (≈4.7×, ~10.7→2.3 ms/action); a 30-action cherry-pick **342 ms → 85 ms**
+   (≈4.0×). Barrier count: **constant 11** for both a 5-action and a 50-action
+   merge across the same 5 directories (`consolidate_pays_a_constant_number_of_barriers_regardless_of_action_count`)
+   — the completing `stack`'s own barriers (tree batch, cleanup stamp, parcel
+   object, ref move, signature) make up most of the 11; the merge-action funnel
+   itself contributes at most 3 (blob, phase A, phase B) regardless of N.
 3. **FIXED (PR A, hardened by review round 2). `park` push** — ~8.9 ms/changed file
    across three unbatched layers: the per-file blob store inside
    `refresh_tracked_entries`, the per-directory tree-object store inside
@@ -346,12 +377,35 @@ itself as well as the findings.
      themselves. So even in the crash window where some of those objects might not all be durable,
      nothing durable ever references them yet (confirmed by code inspection: `write_parked` and
      `sign_utils::store_parcel_signature` are both outside `batch`).
-   * The per-*shard* (not per-object) mutation funnel inside `refresh_tracked_entries` still pays
-     one barrier per touched-directory-that-needs-an-ancestor-clear — that collapse needs the same
-     shared multi-mutation join-point primitive as findings 2/4, so a change that touches many
-     distinct directories still costs more than one that touches a few; queued for PR B.
-4. **`restore <dir>` (plain) and `park pop`** — ~9.2–9.6 ms/file; same join-point
-   primitive as #2, bundles with it. Queued for PR B.
+   * **PR A's recorded leftover, RESOLVED (turned out already fixed, PR B just verified it).**
+     This entry originally read: "the per-*shard* (not per-object) mutation funnel inside
+     `refresh_tracked_entries` still pays one barrier per touched-directory-that-needs-an-ancestor-clear
+     ... queued for PR B." Checked at the start of PR B's own work: `refresh_tracked_entries` was
+     already routed through `publish_shard_outcomes` for round-2 finding #1's fix, and that
+     function batches *every* shard this whole call decided into one shared phase-A/phase-B pair —
+     not one pair per directory. Confirmed empirically (`FORKLIFT_DEBUG_BARRIER_COUNT=1`, fixed
+     5-directory corpus, this box): `park` push pays a **constant 6 barriers** whether 1 or 10
+     files change per directory (5 or 50 files total) — it was never actually O(directories) after
+     round 2 landed; the doc note describing it as a leftover simply wasn't updated when finding #1's
+     fix incidentally closed it too. PR B adds the missing assertion,
+     `park_push_and_pop_both_pay_a_constant_number_of_barriers_regardless_of_file_count`, so this is
+     no longer a manual measurement.
+4. **FIXED (PR B). `restore <dir>` (plain) and `park pop`** — measured ~9.2–9.6 ms/file (this
+   box: 9.17–9.19 ms/file on the synthetic corpus below), same order as this doc's original
+   estimate. Both routed through the same `inventory_utils::ShardMutationBatch` as finding 2:
+   `restore`'s directory replay stages each restored file's refreshed entry
+   (`restore_file_and_refresh_entry_into`) instead of calling `update_shard` per file; `park
+   pop`'s replay stages each re-applied op's entry the same way. Neither path stores a new blob
+   (both replay already-known, already-stored content), so their batch pays at most two barriers
+   — phase A, phase B — never three. Measured (this box, release build, synthetic 8-directory
+   corpus, 7-run median): `restore .` over 48 dirtied files **441 ms → 38 ms** (≈11.6×,
+   ~9.2→0.8 ms/file); `park pop` over 48 files **440 ms → 39 ms** (≈11.3×, ~9.2→0.8 ms/file).
+   Barrier count: **constant 2** for both commands whether 1 or 10 files change per directory (5
+   or 50 files total) — `restore_directory_pays_a_constant_number_of_barriers_regardless_of_file_count`,
+   folded into the same `park_push_and_pop_both_pay_a_constant_number_of_barriers_regardless_of_file_count`
+   test for the pop half. `park` push itself, over the same corpus, is unaffected either way (see
+   finding 3's leftover entry above): **83 ms → 82 ms**, within noise — expected, since its own
+   funnel was already batched before PR B started.
 5. **`remove <dir>`'s per-shard loop and commit-graph multi-shard writes** —
    untimed, small, rare operations; demand-gated.
 
@@ -478,10 +532,13 @@ CONFIRMED, cleanup — `barrier_count` existed but nothing asserted on it; now b
 `load_pays_a_constant_number_of_barriers_regardless_of_changed_file_count` (see
 "Barrier-count sanity" above) and gated by `fsync_enabled()` to match the work it counts.
 
-**Recommended implementation packaging.** PR A (shipped) = findings 1+3 (low risk).
-PR B (queued) = findings 2+4 (one shared multi-mutation join-point primitive +
-adversarial review), plus the residual per-shard funnel finding 3 left behind.
-Finding 5 is demand-gated.
+**Recommended implementation packaging (as executed).** PR A (shipped 2026-07-16) =
+findings 1+3 (low risk). PR B (shipped 2026-07-16) = findings 2+4, using one shared
+multi-mutation join-point primitive (`ShardMutationBatch`, built on `load`/`park`'s
+existing `publish_shard_outcomes`) across three producers — `apply_merge_action`,
+`restore <dir>`'s replay, `park pop`'s replay — plus adversarial review; finding
+3's "leftover" turned out to already be closed by round 2's finding #1 fix, so PR B
+only needed to add the missing assertion for it. Finding 5 stays demand-gated.
 
 ---
 

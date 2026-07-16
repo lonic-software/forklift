@@ -764,3 +764,733 @@ fn load_pays_a_constant_number_of_barriers_regardless_of_changed_file_count() {
     // above without proving anything about batching actually happening.
     assert!(count_1 > 0, "the counter must observe real barrier work, got {count_1}");
 }
+
+// -------------------------------------------------------------------------------------------
+// Barrier-count assertions for the batched merge/replay funnel (DESIGN.html §5.0 D item 10,
+// findings #2/#4): `consolidate`'s per-merge-action funnel, `restore <dir>`'s plain replay and
+// `park pop`'s replay all now route through `inventory_utils::ShardMutationBatch`. Each of these
+// mirrors `load_pays_a_constant_number_of_barriers_regardless_of_changed_file_count` above:
+// touching more *files within the same set of directories* must not raise the barrier count.
+// -------------------------------------------------------------------------------------------
+
+/// One `consolidate` run merging `actions_per_dir` take-theirs actions in each of a fixed set of
+/// directories into the current pallet, with `FORKLIFT_DEBUG_BARRIER_COUNT=1` set — returns the
+/// barrier count that run paid.
+fn consolidate_barrier_count_for(actions_per_dir: usize) -> u64 {
+    let area = Area::new(&format!("consolidate-barrier-count-{}", actions_per_dir));
+    let warehouse = area.warehouse();
+
+    const DIR_COUNT: usize = 5;
+
+    for dir in 0..DIR_COUNT {
+        let dir_path = warehouse.join(format!("dir{dir}"));
+        std::fs::create_dir_all(&dir_path).unwrap();
+        for f in 0..actions_per_dir {
+            std::fs::write(dir_path.join(format!("file{f}.txt")), format!("v1 {dir} {f}\n")).unwrap();
+        }
+    }
+
+    assert!(area.run(&["prepare"]).status.success());
+    assert!(area.run(&["config", "operator.name", "barrier@forklift"]).status.success());
+    assert!(area.run(&["config", "operator.identifier", "barrier@forklift"]).status.success());
+    assert!(area.run(&["load", "."]).status.success());
+    assert!(area.run(&["stack", "base"]).status.success());
+
+    // Feature changes every file in every directory — `actions_per_dir * DIR_COUNT` take-theirs
+    // actions once merged, but always the same `DIR_COUNT` distinct shards.
+    assert!(area.run(&["palletize", "feature"]).status.success());
+    for dir in 0..DIR_COUNT {
+        let dir_path = warehouse.join(format!("dir{dir}"));
+        for f in 0..actions_per_dir {
+            std::fs::write(dir_path.join(format!("file{f}.txt")), format!("v2 {dir} {f}\n")).unwrap();
+        }
+    }
+    assert!(area.run(&["load", "."]).status.success());
+    assert!(area.run(&["stack", "feature work"]).status.success());
+
+    // Main diverges independently, touching none of the DIR_COUNT directories — the merge below
+    // is a clean, conflict-free take-theirs of every changed file.
+    assert!(area.run(&["shift", "main"]).status.success());
+    std::fs::write(warehouse.join("unrelated.txt"), "unrelated v1\n").unwrap();
+    assert!(area.run(&["load", "."]).status.success());
+    assert!(area.run(&["stack", "main work"]).status.success());
+
+    let mut command = area.command(&["consolidate", "feature"]);
+    command.env("FORKLIFT_DEBUG_BARRIER_COUNT", "1");
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "consolidate failed: {}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("stacked merge parcel"), "the merge must be clean, not conflicting: {stdout}");
+
+    barrier_count(&output)
+}
+
+/// DESIGN.html §5.0 D item 10, finding #2: `apply_merge_action`'s per-action funnel now
+/// publishes every action's shard mutation (and any new blob) through one shared
+/// `ShardMutationBatch` instead of a full two-barrier `write_shard_mutation` call per action — a
+/// 50-action merge across 5 directories must pay the same barrier count as a 5-action merge
+/// across the same 5 directories.
+#[test]
+fn consolidate_pays_a_constant_number_of_barriers_regardless_of_action_count() {
+    let count_1 = consolidate_barrier_count_for(1);
+    let count_10 = consolidate_barrier_count_for(10);
+
+    assert_eq!(count_1, count_10,
+        "consolidate's barrier count must not scale with the number of merge actions: {count_1} \
+         for 1 action/directory (5 actions total), {count_10} for 10 actions/directory (50 \
+         actions total) — the same 5 directories touched either way");
+
+    assert!(count_1 > 0, "the counter must observe real barrier work, got {count_1}");
+}
+
+/// One `restore .` run over a fixed set of directories, each holding `files_per_dir`
+/// already-tracked files that are all given real, unstaged (dirty working-directory) edits
+/// before the measured `restore .`, with `FORKLIFT_DEBUG_BARRIER_COUNT=1` set — returns the
+/// barrier count that run paid.
+fn restore_directory_barrier_count_for(files_per_dir: usize) -> u64 {
+    let area = Area::new(&format!("restore-barrier-count-{}", files_per_dir));
+    let warehouse = area.warehouse();
+
+    const DIR_COUNT: usize = 5;
+
+    for dir in 0..DIR_COUNT {
+        let dir_path = warehouse.join(format!("dir{dir}"));
+        std::fs::create_dir_all(&dir_path).unwrap();
+        for f in 0..files_per_dir {
+            std::fs::write(dir_path.join(format!("file{f}.txt")), format!("v1 {dir} {f}\n")).unwrap();
+        }
+    }
+
+    assert!(area.run(&["prepare"]).status.success());
+    assert!(area.run(&["config", "operator.name", "barrier@forklift"]).status.success());
+    assert!(area.run(&["config", "operator.identifier", "barrier@forklift"]).status.success());
+    assert!(area.run(&["load", "."]).status.success());
+    assert!(area.run(&["stack", "base"]).status.success());
+
+    // Dirty every tracked file (unstaged edits) — `restore .` discards these back to the staged
+    // (== head, right after the stack above) content.
+    for dir in 0..DIR_COUNT {
+        let dir_path = warehouse.join(format!("dir{dir}"));
+        for f in 0..files_per_dir {
+            std::fs::write(dir_path.join(format!("file{f}.txt")), format!("dirty {dir} {f}\n")).unwrap();
+        }
+    }
+
+    let mut command = area.command(&["restore", "."]);
+    command.env("FORKLIFT_DEBUG_BARRIER_COUNT", "1");
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "restore failed: {}", String::from_utf8_lossy(&output.stderr));
+
+    barrier_count(&output)
+}
+
+/// DESIGN.html §5.0 D item 10, finding #4: `restore <dir>`'s plain replay now publishes every
+/// restored file's refreshed inventory entry through one shared `ShardMutationBatch` instead of
+/// a full two-barrier `update_shard` call per file.
+#[test]
+fn restore_directory_pays_a_constant_number_of_barriers_regardless_of_file_count() {
+    let count_1 = restore_directory_barrier_count_for(1);
+    let count_10 = restore_directory_barrier_count_for(10);
+
+    assert_eq!(count_1, count_10,
+        "restore .'s barrier count must not scale with the number of restored files: {count_1} \
+         for 1 file/directory (5 files total), {count_10} for 10 files/directory (50 files \
+         total) — the same 5 directories touched either way");
+
+    assert!(count_1 > 0, "the counter must observe real barrier work, got {count_1}");
+}
+
+/// One `park` push, then `park pop`, over a fixed set of directories, each holding
+/// `files_per_dir` already-tracked files that are all given real content changes before both
+/// calls — returns `(park_push_barrier_count, park_pop_barrier_count)`, each measured with
+/// `FORKLIFT_DEBUG_BARRIER_COUNT=1` set on that specific call.
+fn park_push_and_pop_barrier_counts_for(files_per_dir: usize) -> (u64, u64) {
+    let area = Area::new(&format!("park-barrier-count-{}", files_per_dir));
+    let warehouse = area.warehouse();
+
+    const DIR_COUNT: usize = 5;
+
+    for dir in 0..DIR_COUNT {
+        let dir_path = warehouse.join(format!("dir{dir}"));
+        std::fs::create_dir_all(&dir_path).unwrap();
+        for f in 0..files_per_dir {
+            std::fs::write(dir_path.join(format!("file{f}.txt")), format!("v1 {dir} {f}\n")).unwrap();
+        }
+    }
+
+    assert!(area.run(&["prepare"]).status.success());
+    assert!(area.run(&["config", "operator.name", "barrier@forklift"]).status.success());
+    assert!(area.run(&["config", "operator.identifier", "barrier@forklift"]).status.success());
+    assert!(area.run(&["load", "."]).status.success());
+    assert!(area.run(&["stack", "base"]).status.success());
+
+    for dir in 0..DIR_COUNT {
+        let dir_path = warehouse.join(format!("dir{dir}"));
+        for f in 0..files_per_dir {
+            std::fs::write(dir_path.join(format!("file{f}.txt")), format!("v2 {dir} {f}\n")).unwrap();
+        }
+    }
+
+    let mut push_command = area.command(&["park"]);
+    push_command.env("FORKLIFT_DEBUG_BARRIER_COUNT", "1");
+    let push_output = push_command.output().unwrap();
+    assert!(push_output.status.success(), "park failed: {}", String::from_utf8_lossy(&push_output.stderr));
+    let push_count = barrier_count(&push_output);
+
+    let mut pop_command = area.command(&["park", "pop"]);
+    pop_command.env("FORKLIFT_DEBUG_BARRIER_COUNT", "1");
+    let pop_output = pop_command.output().unwrap();
+    assert!(pop_output.status.success(), "park pop failed: {}", String::from_utf8_lossy(&pop_output.stderr));
+    let pop_count = barrier_count(&pop_output);
+
+    (push_count, pop_count)
+}
+
+/// DESIGN.html §5.0 D item 10, finding #4 (`park pop`) and the PR A leftover it queued for PR B
+/// (`park` push's own `refresh_tracked_entries` funnel): `park pop`'s replay now publishes every
+/// re-applied file's shard mutation through one shared `ShardMutationBatch`, and `park` push's
+/// own `refresh_tracked_entries` call — already routed through the same
+/// `ShardOutcome`/`publish_shard_outcomes` join point `load` uses since PR A's round-2 review
+/// fix — is confirmed here to already pay a constant barrier count too (the backlog's "one
+/// barrier per touched directory" note predates that fix; this test replaces the manual
+/// measurement with a real assertion).
+#[test]
+fn park_push_and_pop_both_pay_a_constant_number_of_barriers_regardless_of_file_count() {
+    let (push_1, pop_1) = park_push_and_pop_barrier_counts_for(1);
+    let (push_10, pop_10) = park_push_and_pop_barrier_counts_for(10);
+
+    assert_eq!(push_1, push_10,
+        "park push's barrier count must not scale with the number of changed files: {push_1} for \
+         1 file/directory (5 files total), {push_10} for 10 files/directory (50 files total) — \
+         the same 5 directories touched either way");
+    assert_eq!(pop_1, pop_10,
+        "park pop's barrier count must not scale with the number of changed files: {pop_1} for 1 \
+         file/directory (5 files total), {pop_10} for 10 files/directory (50 files total) — the \
+         same 5 directories touched either way");
+
+    assert!(push_1 > 0, "the push counter must observe real barrier work, got {push_1}");
+    assert!(pop_1 > 0, "the pop counter must observe real barrier work, got {pop_1}");
+}
+
+// -------------------------------------------------------------------------------------------
+// SIGKILL crash-consistency spreads for the batched merge/replay funnel (DESIGN.html §5.0 D
+// item 10, findings #2/#4). What a hard kill *can* prove: no shard is left durably referencing a
+// missing/torn object, the store stays usable (`assert_consistent`), and a rollup never sits
+// stale-valid above content the batch actually changed (checked via the skip on/off equivalence
+// this file uses throughout — a real divergence there means a rollup wrongly survived a crash).
+// What a hard kill structurally *cannot* prove: `run_write_barrier`'s directory-fsync *ordering*
+// (`touched_parents` is a `BTreeSet`, so `.forklift/inventory/` fsyncs before `.forklift/objects/`
+// within one barrier) — a process kill leaves every rename that already happened kernel-visible
+// regardless of fsync order, so an ordering hazard between two *separate* barriers (the blob
+// barrier finishing before the shard-content barrier even stages, DESIGN.html §5.0 D item 10,
+// finding #7) is verified by code inspection instead (see `ShardMutationBatch::publish`'s own doc
+// comment: the blob batch's `finish()` is a hard `?` before phase A/B are ever staged), exactly
+// as PR A's own finding #7 fix was.
+// -------------------------------------------------------------------------------------------
+
+/// Time a few uninterrupted `consolidate` runs and return the slowest — the merge counterpart of
+/// [`calibrate_park_duration`]. Each sample re-diverges from scratch (a uniquely-named feature
+/// pallet with real edits across every directory, main advanced independently by an unrelated
+/// file) before timing the merge itself, since `consolidate` only runs `apply_merge_actions` at
+/// all on a genuine, non-fast-forward divergence.
+fn calibrate_consolidate_duration(area: &Area, dirs: &[PathBuf], base_line: &str, label: &str, samples: usize) -> Duration {
+    area.clear_stale_lock();
+    let mut slowest = Duration::ZERO;
+
+    for i in 0..samples {
+        let feature = format!("{label}-feature-{i}");
+        assert!(area.run(&["palletize", &feature]).status.success());
+        for (d, dir) in dirs.iter().enumerate() {
+            for f in 0..2 {
+                rewrite_corpus(&dir.join(format!("file{f}.dat")), base_line, &format!("{label} feature {i} {d} {f}"));
+            }
+        }
+        assert!(area.run(&["load", "."]).status.success());
+        assert!(area.run(&["stack", &format!("{label} feature work {i}")]).status.success());
+
+        assert!(area.run(&["shift", "main"]).status.success());
+        std::fs::write(area.warehouse().join(format!("unrelated-{label}-{i}.txt")), format!("unrelated {i}\n")).unwrap();
+        assert!(area.run(&["load", "."]).status.success());
+        assert!(area.run(&["stack", &format!("{label} main work {i}")]).status.success());
+
+        let start = Instant::now();
+        let merge = area.run(&["consolidate", &feature]);
+        let elapsed = start.elapsed();
+        assert!(merge.status.success(), "calibration consolidate failed: {}", String::from_utf8_lossy(&merge.stderr));
+
+        slowest = slowest.max(elapsed);
+    }
+
+    slowest
+}
+
+/// Run one spread of kills against `consolidate`, asserting store consistency after every one.
+/// Every iteration re-diverges a fresh feature pallet the same way calibration does, spawns
+/// `consolidate` and kills it mid-flight, then heals with a plain `stack` — which picks up and
+/// completes an in-progress consolidation exactly like the CLI would (`stack_parcel` reads
+/// `.forklift/consolidation` itself), or simply commits whatever partial content
+/// `apply_merge_actions` managed to publish before the kill as an ordinary parcel if the kill
+/// landed before consolidation state was ever written. Either outcome is durability-safe; this
+/// test does not require the *specific* two-parent-merge shape to survive every kill, only that
+/// nothing is corrupted and every reachable object still reads back.
+///
+/// Returns how many iterations produced a completed, ref-advancing write (the durable path was
+/// actually exercised, not just "killed before anything").
+fn run_consolidate_kill_spread(
+    area: &Area,
+    dirs: &[PathBuf],
+    base_line: &str,
+    delays: &[Duration],
+    tag: &str,
+) -> usize {
+    let mut advanced = 0usize;
+
+    for (i, delay) in delays.iter().enumerate() {
+        area.clear_stale_lock();
+        area.assert_consistent(&format!("after consolidate {tag} kill #{i}"));
+
+        // Heal whatever the *previous* iteration's kill left behind before diverging again.
+        let heal = area.run(&["stack", &format!("{tag} heal {i}")]);
+        let heal_stderr = String::from_utf8_lossy(&heal.stderr).to_lowercase();
+        assert!(heal.status.success() || heal_stderr.contains("nothing to stack"),
+            "consolidate {tag} kill #{i}: healing stack failed: {}", String::from_utf8_lossy(&heal.stderr));
+
+        let feature = format!("{tag}-feature-{i}");
+        assert!(area.run(&["palletize", &feature]).status.success(), "palletize failed for {feature}");
+        for (d, dir) in dirs.iter().enumerate() {
+            for f in 0..2 {
+                rewrite_corpus(&dir.join(format!("file{f}.dat")), base_line, &format!("{tag} feature {i} {d} {f}"));
+            }
+        }
+        assert!(area.run(&["load", "."]).status.success());
+        assert!(area.run(&["stack", &format!("{tag} feature work {i}")]).status.success());
+
+        assert!(area.run(&["shift", "main"]).status.success());
+        std::fs::write(area.warehouse().join(format!("unrelated-{tag}-{i}.txt")), format!("unrelated {i}\n")).unwrap();
+        assert!(area.run(&["load", "."]).status.success());
+        assert!(area.run(&["stack", &format!("{tag} main work {i}")]).status.success());
+
+        let before = current_head(&area.warehouse());
+
+        let mut child = area.command(&["consolidate", &feature])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+
+        std::thread::sleep(*delay);
+
+        let _ = child.kill(); // a no-op if it already finished
+        let _ = child.wait();
+
+        area.clear_stale_lock();
+
+        // Complete (or no-op past) whatever the kill left behind.
+        let finish = area.run(&["stack", &format!("{tag} finish {i}")]);
+        let finish_stderr = String::from_utf8_lossy(&finish.stderr).to_lowercase();
+        assert!(finish.status.success() || finish_stderr.contains("nothing to stack"),
+            "consolidate {tag} kill #{i}: completing stack failed: {}", String::from_utf8_lossy(&finish.stderr));
+
+        if current_head(&area.warehouse()) != before {
+            advanced += 1;
+        }
+    }
+
+    advanced
+}
+
+/// Extends the crash-consistency spine to `consolidate`'s batched merge-action funnel
+/// (DESIGN.html §5.0 D item 10, finding #2): every merge action's shard mutation (and any new
+/// blob a `Merged` action stages) is now decided in memory and published once through
+/// `inventory_utils::ShardMutationBatch` instead of one `write_shard_mutation` call per action.
+/// SIGKILL `consolidate` at a spread of delays straddling its write window; after every kill,
+/// heal and re-diverge, and at the end run the same skip on/off equivalence check
+/// [`Twin::assert_equivalent`] uses elsewhere in this crate — a real divergence there would mean
+/// a crash left a stale-valid rollup sitting above content a merge actually changed — plus a
+/// final `export-git` sharp check for a torn or missing referenced object.
+#[test]
+fn killing_consolidate_midway_never_corrupts_the_store_or_leaves_a_stale_rollup() {
+    let area = Area::new("consolidate");
+    let warehouse = area.warehouse();
+
+    let base_line = "the quick brown fox jumps over the lazy dog\n";
+    let mut dirs: Vec<PathBuf> = Vec::new();
+
+    for dir in 0..3 {
+        let dir_path = warehouse.join(format!("dir{dir}"));
+        std::fs::create_dir_all(&dir_path).unwrap();
+        for f in 0..2 {
+            std::fs::write(dir_path.join(format!("file{f}.dat")), base_line.repeat(4_000)).unwrap();
+        }
+        dirs.push(dir_path);
+    }
+
+    assert!(area.run(&["prepare"]).status.success());
+    assert!(area.run(&["config", "operator.name", "crash@forklift"]).status.success());
+    assert!(area.run(&["config", "operator.identifier", "crash@forklift"]).status.success());
+    assert!(area.run(&["load", "."]).status.success());
+    assert!(area.run(&["stack", "base"]).status.success());
+
+    const DELAY_COUNT: usize = 14;
+
+    let measured_1 = calibrate_consolidate_duration(&area, &dirs, base_line, "calibration-1", 2);
+    let delays_1 = kill_delay_spread(measured_1, DELAY_COUNT, 0.02, 1.30);
+
+    let mut advanced = run_consolidate_kill_spread(&area, &dirs, base_line, &delays_1, "a");
+
+    let mut measured_2 = None;
+    let mut delays_2 = None;
+    if advanced == 0 {
+        let measured = calibrate_consolidate_duration(&area, &dirs, base_line, "calibration-2", 2);
+        let delays = kill_delay_spread(measured, DELAY_COUNT, 0.0, 2.5);
+        advanced += run_consolidate_kill_spread(&area, &dirs, base_line, &delays, "b");
+        measured_2 = Some(measured);
+        delays_2 = Some(delays);
+    }
+
+    area.clear_stale_lock();
+    area.assert_consistent("final");
+
+    // The sharp rollup check: forcing the skip off must produce byte-identical stocktake output
+    // to leaving it on — a crash that left a stale-valid rollup above genuinely changed content
+    // would make the skip-on path silently under-report.
+    let mut off_command = area.command(&["--json", "stocktake"]);
+    off_command.env("FORKLIFT_DISABLE_ROLLUP_SKIP", "1");
+    let off_output = off_command.output().unwrap();
+    assert!(off_output.status.success());
+    let on_output = area.run(&["--json", "stocktake"]);
+    assert!(on_output.status.success());
+    let on_value: serde_json::Value = serde_json::from_slice(&on_output.stdout).unwrap();
+    let off_value: serde_json::Value = serde_json::from_slice(&off_output.stdout).unwrap();
+    assert_eq!(on_value, off_value,
+        "stocktake after the crash spread must agree whether the rollup skip is active or not");
+
+    let export_dir = area.root.join("git-export");
+    let export = area.run(&["export-git", export_dir.to_str().unwrap()]);
+    assert!(export.status.success(),
+        "export-git must read every committed object without a torn or missing one, stderr: {}",
+        String::from_utf8_lossy(&export.stderr));
+
+    assert!(advanced >= 1,
+        "no consolidate-or-heal ever advanced the head across {} attempt(s) — the write window \
+         was never exercised. attempt 1: measured {measured_1:?} uninterrupted, tried delays \
+         {delays_1:?}.{}",
+        if measured_2.is_some() { 2 } else { 1 },
+        match (measured_2, delays_2) {
+            (Some(m), Some(d)) => format!(" attempt 2: measured {m:?} uninterrupted, tried delays {d:?}."),
+            _ => String::new(),
+        });
+}
+
+/// Time a few uninterrupted `restore .` runs over a dirtied corpus and return the slowest.
+fn calibrate_restore_duration(area: &Area, files: &[PathBuf], base_line: &str, label: &str, samples: usize) -> Duration {
+    area.clear_stale_lock();
+    let mut slowest = Duration::ZERO;
+
+    for i in 0..samples {
+        for file in files {
+            rewrite_corpus(file, base_line, &format!("{label} dirty {i}"));
+        }
+
+        let start = Instant::now();
+        let restore = area.run(&["restore", "."]);
+        let elapsed = start.elapsed();
+        assert!(restore.status.success(), "calibration restore failed: {}", String::from_utf8_lossy(&restore.stderr));
+
+        slowest = slowest.max(elapsed);
+    }
+
+    slowest
+}
+
+/// Run one spread of kills against `restore .`, asserting store consistency after every one —
+/// the `restore` counterpart of [`run_load_kill_spread`]. Every iteration dirties every tracked
+/// file (unstaged edits) before spawning `restore .`; after the kill, an uninterrupted `restore .`
+/// heals whatever was left mid-flight before the next iteration's dirtying (so leftover partial
+/// state never carries over as ambiguity).
+fn run_restore_kill_spread(
+    area: &Area,
+    files: &[PathBuf],
+    base_line: &str,
+    delays: &[Duration],
+    tag: &str,
+) -> usize {
+    let mut completed = 0usize;
+
+    for (i, delay) in delays.iter().enumerate() {
+        area.clear_stale_lock();
+        area.assert_consistent(&format!("after restore {tag} kill #{i}"));
+
+        for file in files {
+            rewrite_corpus(file, base_line, &format!("{tag} {i}"));
+        }
+
+        let mut child = area.command(&["restore", "."])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+
+        std::thread::sleep(*delay);
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        area.clear_stale_lock();
+
+        let heal = area.run(&["restore", "."]);
+        assert!(heal.status.success(), "restore {tag} kill #{i}: healing restore failed: {}",
+            String::from_utf8_lossy(&heal.stderr));
+
+        // Every restored file must exactly match the staged (head) content once healed — the
+        // sharp per-file check that a torn shard write, not just a process exit code, would fail.
+        for file in files {
+            let content = std::fs::read_to_string(file).unwrap();
+            assert!(content.starts_with(base_line), "{tag} kill #{i}: {file:?} did not heal to staged content");
+        }
+
+        completed += 1;
+    }
+
+    completed
+}
+
+/// Extends the crash-consistency spine to `restore <dir>`'s batched replay (DESIGN.html §5.0 D
+/// item 10, finding #4): every restored file's refreshed inventory entry is now decided in
+/// memory and published once per touched shard through `inventory_utils::ShardMutationBatch`,
+/// instead of one `update_shard` call per file. SIGKILL `restore .` at a spread of delays; after
+/// every kill, heal with an uninterrupted `restore .` and confirm every file converges to the
+/// correct staged content, then run the same skip on/off rollup equivalence check the
+/// `consolidate` crash test above does.
+#[test]
+fn killing_restore_directory_midway_never_corrupts_the_store_or_leaves_a_stale_rollup() {
+    let area = Area::new("restore");
+    let warehouse = area.warehouse();
+
+    let base_line = "the quick brown fox jumps over the lazy dog\n";
+    let mut files: Vec<PathBuf> = Vec::new();
+
+    for dir in 0..4 {
+        let dir_path = warehouse.join(format!("dir{dir}"));
+        std::fs::create_dir_all(&dir_path).unwrap();
+        for f in 0..3 {
+            let file = dir_path.join(format!("file{f}.dat"));
+            std::fs::write(&file, base_line.repeat(8_000)).unwrap();
+            files.push(file);
+        }
+    }
+
+    assert!(area.run(&["prepare"]).status.success());
+    assert!(area.run(&["config", "operator.name", "crash@forklift"]).status.success());
+    assert!(area.run(&["config", "operator.identifier", "crash@forklift"]).status.success());
+    assert!(area.run(&["load", "."]).status.success());
+    assert!(area.run(&["stack", "base"]).status.success());
+
+    const DELAY_COUNT: usize = 18;
+
+    let measured = calibrate_restore_duration(&area, &files, base_line, "calibration", 3);
+    let delays = kill_delay_spread(measured, DELAY_COUNT, 0.02, 1.30);
+
+    let completed = run_restore_kill_spread(&area, &files, base_line, &delays, "a");
+    assert!(completed >= 1, "no restore-then-heal iteration ran at all");
+
+    area.clear_stale_lock();
+    area.assert_consistent("final");
+
+    let mut off_command = area.command(&["--json", "stocktake"]);
+    off_command.env("FORKLIFT_DISABLE_ROLLUP_SKIP", "1");
+    let off_output = off_command.output().unwrap();
+    assert!(off_output.status.success());
+    let on_output = area.run(&["--json", "stocktake"]);
+    assert!(on_output.status.success());
+    let on_value: serde_json::Value = serde_json::from_slice(&on_output.stdout).unwrap();
+    let off_value: serde_json::Value = serde_json::from_slice(&off_output.stdout).unwrap();
+    assert_eq!(on_value, off_value,
+        "stocktake after the crash spread must agree whether the rollup skip is active or not");
+
+    let export_dir = area.root.join("git-export");
+    let export = area.run(&["export-git", export_dir.to_str().unwrap()]);
+    assert!(export.status.success(),
+        "export-git must read every committed object without a torn or missing one, stderr: {}",
+        String::from_utf8_lossy(&export.stderr));
+}
+
+/// Time a few uninterrupted `park pop` runs (each preceded by an uninterrupted `park` push of a
+/// fresh change) and return the slowest.
+fn calibrate_park_pop_duration(area: &Area, files: &[PathBuf], base_line: &str, label: &str, samples: usize) -> Duration {
+    area.clear_stale_lock();
+    let mut slowest = Duration::ZERO;
+
+    for i in 0..samples {
+        for file in files {
+            rewrite_corpus(file, base_line, &format!("{label} {i}"));
+        }
+        let park = area.run(&["park"]);
+        assert!(park.status.success(), "calibration park failed: {}", String::from_utf8_lossy(&park.stderr));
+
+        let start = Instant::now();
+        let pop = area.run(&["park", "pop"]);
+        let elapsed = start.elapsed();
+        assert!(pop.status.success(), "calibration park pop failed: {}", String::from_utf8_lossy(&pop.stderr));
+
+        // Settle back to a clean, unparked state before the next sample (or the kill loop):
+        // stack the popped change so the next park push has a clean base to work from.
+        assert!(area.run(&["stack", &format!("{label} settle {i}")]).status.success());
+
+        slowest = slowest.max(elapsed);
+    }
+
+    slowest
+}
+
+/// Run one spread of kills against `park pop`, asserting store consistency after every one. Each
+/// iteration pushes a fresh, uninterrupted park first (so there is always exactly one parked
+/// parcel to pop), then kills the pop itself.
+fn run_park_pop_kill_spread(
+    area: &Area,
+    files: &[PathBuf],
+    base_line: &str,
+    warehouse: &Path,
+    delays: &[Duration],
+    tag: &str,
+) -> usize {
+    let mut popped = 0usize;
+
+    for (i, delay) in delays.iter().enumerate() {
+        area.clear_stale_lock();
+        area.assert_consistent(&format!("after park-pop {tag} kill #{i}"));
+
+        // If the previous iteration's kill landed before `parked.pop()`/`write_parked` (the
+        // batch published but the parked-list record never advanced — see `pop_parked`'s doc
+        // comment: this window is idempotent-safe, a retry just redecides the same diff), finish
+        // it now with an uninterrupted pop before pushing this iteration's fresh change.
+        if parked_count(warehouse) > 0 {
+            let finish = area.run(&["park", "pop"]);
+            assert!(finish.status.success(),
+                "park-pop {tag} kill #{i}: finishing a leftover parked parcel failed: {}",
+                String::from_utf8_lossy(&finish.stderr));
+            assert!(area.run(&["stack", &format!("{tag} settle-leftover {i}")]).status.success()
+                || parked_count(warehouse) == 0);
+        }
+
+        for file in files {
+            rewrite_corpus(file, base_line, &format!("{tag} {i}"));
+        }
+        let park = area.run(&["park"]);
+        assert!(park.status.success(), "park-pop {tag} kill #{i}: park push failed: {}",
+            String::from_utf8_lossy(&park.stderr));
+
+        let mut child = area.command(&["park", "pop"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+
+        std::thread::sleep(*delay);
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        area.clear_stale_lock();
+
+        if parked_count(warehouse) == 0 {
+            // The pop completed durably (or there was nothing left to kill mid-flight).
+            popped += 1;
+        } else {
+            // Finish it with an uninterrupted pop so the store ends this iteration in a known,
+            // clean (unparked) state for the next one.
+            let finish = area.run(&["park", "pop"]);
+            assert!(finish.status.success(), "park-pop {tag} kill #{i}: healing pop failed: {}",
+                String::from_utf8_lossy(&finish.stderr));
+        }
+
+        // Stack the re-applied change so the next iteration starts from a clean, unparked base —
+        // "nothing to stack" is fine (an interrupted-then-healed pop can legitimately leave the
+        // exact same content already staged as a no-op against head in some kill windows).
+        let settle = area.run(&["stack", &format!("{tag} settle {i}")]);
+        let settle_stderr = String::from_utf8_lossy(&settle.stderr).to_lowercase();
+        assert!(settle.status.success() || settle_stderr.contains("nothing to stack"),
+            "park-pop {tag} kill #{i}: settling stack failed: {}", String::from_utf8_lossy(&settle.stderr));
+    }
+
+    popped
+}
+
+/// Extends the crash-consistency spine to `park pop`'s batched replay (DESIGN.html §5.0 D item
+/// 10, finding #4): every re-applied op's shard mutation is now decided in memory and published
+/// once per touched shard through `inventory_utils::ShardMutationBatch`, instead of one
+/// `stage_file_entry_from_stat`/`update_shard` call per op. SIGKILL `park pop` at a spread of
+/// delays straddling its write window; `pop_parked`'s diff is recomputed fresh from immutable
+/// parcel/tree hashes on every call, so a kill before `parked.pop()`/`write_parked` durably
+/// advances is safe to simply retry (see `run_park_pop_kill_spread`'s doc comment) — this test
+/// still asserts full store consistency and the rollup equivalence check after every kill.
+#[test]
+fn killing_park_pop_midway_never_corrupts_the_store_or_leaves_a_stale_rollup() {
+    let area = Area::new("park-pop");
+    let warehouse = area.warehouse();
+
+    let base_line = "the quick brown fox jumps over the lazy dog\n";
+    let mut files: Vec<PathBuf> = Vec::new();
+
+    for dir in 0..4 {
+        let dir_path = warehouse.join(format!("dir{dir}"));
+        std::fs::create_dir_all(&dir_path).unwrap();
+        for f in 0..3 {
+            let file = dir_path.join(format!("file{f}.dat"));
+            std::fs::write(&file, base_line.repeat(8_000)).unwrap();
+            files.push(file);
+        }
+    }
+
+    assert!(area.run(&["prepare"]).status.success());
+    assert!(area.run(&["config", "operator.name", "crash@forklift"]).status.success());
+    assert!(area.run(&["config", "operator.identifier", "crash@forklift"]).status.success());
+    assert!(area.run(&["load", "."]).status.success());
+    assert!(area.run(&["stack", "base"]).status.success());
+
+    const DELAY_COUNT: usize = 16;
+
+    let measured_1 = calibrate_park_pop_duration(&area, &files, base_line, "calibration-1", 2);
+    let delays_1 = kill_delay_spread(measured_1, DELAY_COUNT, 0.02, 1.30);
+
+    let mut popped = run_park_pop_kill_spread(&area, &files, base_line, &warehouse, &delays_1, "a");
+
+    let mut measured_2 = None;
+    let mut delays_2 = None;
+    if popped == 0 {
+        let measured = calibrate_park_pop_duration(&area, &files, base_line, "calibration-2", 2);
+        let delays = kill_delay_spread(measured, DELAY_COUNT, 0.0, 2.5);
+        popped += run_park_pop_kill_spread(&area, &files, base_line, &warehouse, &delays, "b");
+        measured_2 = Some(measured);
+        delays_2 = Some(delays);
+    }
+
+    area.clear_stale_lock();
+    area.assert_consistent("final");
+
+    let mut off_command = area.command(&["--json", "stocktake"]);
+    off_command.env("FORKLIFT_DISABLE_ROLLUP_SKIP", "1");
+    let off_output = off_command.output().unwrap();
+    assert!(off_output.status.success());
+    let on_output = area.run(&["--json", "stocktake"]);
+    assert!(on_output.status.success());
+    let on_value: serde_json::Value = serde_json::from_slice(&on_output.stdout).unwrap();
+    let off_value: serde_json::Value = serde_json::from_slice(&off_output.stdout).unwrap();
+    assert_eq!(on_value, off_value,
+        "stocktake after the crash spread must agree whether the rollup skip is active or not");
+
+    let export_dir = area.root.join("git-export");
+    let export = area.run(&["export-git", export_dir.to_str().unwrap()]);
+    assert!(export.status.success(),
+        "export-git must read every committed object without a torn or missing one, stderr: {}",
+        String::from_utf8_lossy(&export.stderr));
+
+    assert!(popped >= 1,
+        "no park-pop ever completed cleanly across {} attempt(s) — the write window was never \
+         exercised. attempt 1: measured {measured_1:?} uninterrupted, tried delays {delays_1:?}.{}",
+        if measured_2.is_some() { 2 } else { 1 },
+        match (measured_2, delays_2) {
+            (Some(m), Some(d)) => format!(" attempt 2: measured {m:?} uninterrupted, tried delays {d:?}."),
+            _ => String::new(),
+        });
+}

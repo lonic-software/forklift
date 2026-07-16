@@ -257,12 +257,26 @@ pub fn pop_parked() -> Result<(), String> {
         ));
     }
 
-    for op in &ops {
-        shift_utils::apply_file_op(op)?;
+    // Every op's working-directory write happens immediately (unfsynced, same as always), but its
+    // shard mutation is only *decided* here — collected into one shared
+    // `inventory_utils::ShardMutationBatch` instead of paying `stage_file_entry_from_stat`'s/
+    // `update_shard`'s full two-barrier funnel per op (DESIGN.html §5.0 D item 10, finding #4).
+    // Several ops in the same shard collapse into one read-modify-write of it, published once at
+    // the end. If an op's decision step fails partway through, every op decided before the
+    // failure is still published — see `apply_merge_actions`'s identical resilience contract for
+    // the same reasoning.
+    let mut batch = inventory_utils::ShardMutationBatch::new();
+    let mut result: Result<(), String> = Ok(());
 
-        match op {
+    for op in &ops {
+        if let Err(e) = shift_utils::apply_file_op(op) {
+            result = Err(e);
+            break;
+        }
+
+        let decision = match op {
             FileOp::Write { path, hash, item_type, .. } => {
-                inventory_utils::stage_file_entry_from_stat(path, hash.clone(), *item_type)?;
+                inventory_utils::stage_file_entry_from_stat_into(&mut batch, path, hash.clone(), *item_type)
             }
             FileOp::Remove { path } => {
                 let (parent_key, name) = match path.rsplit_once('/') {
@@ -270,13 +284,24 @@ pub fn pop_parked() -> Result<(), String> {
                     None => ("", path.as_str()),
                 };
 
-                inventory_utils::update_shard(parent_key, |inventory| {
+                batch.update(parent_key, |inventory| {
                     inventory.mark_item_deleted(name);
                     Ok(())
-                })?;
+                })
             }
+        };
+
+        if let Err(e) = decision {
+            result = Err(e);
+            break;
         }
     }
+
+    if let Err(e) = batch.publish() {
+        if result.is_ok() { result = Err(e); }
+    }
+
+    result?;
 
     shift_utils::remove_empty_directories(&removed_dirs);
 

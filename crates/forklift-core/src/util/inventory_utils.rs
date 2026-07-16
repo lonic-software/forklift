@@ -1545,6 +1545,182 @@ pub fn update_shard(key: &str,
     update_inventory_metadata(&new_keys, &BTreeSet::new())
 }
 
+/// A batch of shard mutations decided in memory across several logical steps of one operation
+/// (a merge's per-action funnel — `apply_merge_action` — or a plain-replay loop — `restore
+/// <dir>`, `park pop`), collapsed so that N steps touching the same shard read-modify-write it
+/// exactly once, and published once through the same [`publish_shard_outcomes`] join point
+/// `load`'s walk and `park`'s working-directory refresh (`refresh_tracked_entries`) already use
+/// (DESIGN.html §5.0 D item 10, findings #2/#4).
+///
+/// Every shard this batch touches is always published as [`ShardOutcome::Changed`] — matching
+/// [`write_shard_mutation`]'s existing, unconditional "this shard's effective content changed"
+/// contract exactly. Every caller this type replaces (`update_shard`, `stage_file_entry_from_stat`,
+/// both thin wrappers around `write_shard_mutation`) already treated *every* mutation as a real
+/// content change, whether or not the entry's hash actually differed from before (e.g. `restore`
+/// re-materializing a file whose staged hash never changed still went through the same
+/// unconditional-invalidate path). This batch preserves that bit-for-bit: no new
+/// carry-forward-the-rollup optimization is introduced here — that would be a behavior change
+/// beyond batching the barrier, out of scope for this primitive. Only the *cost* of the barrier
+/// this content change already paid is shared across every shard the whole operation touches.
+///
+/// A blob a mutation's new content references (a three-way-merged file's freshly built blob, in
+/// `apply_merge_action`'s `Merged` case) must be staged into [`blob_batch`](Self::blob_batch)
+/// rather than stored immediately — [`publish`](Self::publish) finishes it as its own barrier,
+/// strictly before any shard content is staged, exactly like `load`'s and `park`'s own
+/// blob-batch/shard-content ordering (DESIGN.html §5.0 D item 10, finding #7).
+pub struct ShardMutationBatch {
+    /// Warehouse path key → the in-memory inventory this batch has decided for it so far.
+    shards: BTreeMap<String, Inventory>,
+
+    /// Warehouse path key → the instant this batch *first* touched it — captured before that
+    /// first mutation is applied, never updated by a later mutation of the same key. Anchors the
+    /// shard's eventually-published mtime (see [`publish`](Self::publish)) to the earliest,
+    /// most conservative instant available, exactly like `load`'s and `park`'s join points anchor
+    /// `ShardOutcome::verified_at` (DESIGN.html §5.0 D item 10, finding #6) — never "now" at
+    /// publish time, which would let a file rewritten later in this same batch's processing (or
+    /// concurrently, by something else) satisfy `is_entry_unchanged`'s racily-clean guard on a
+    /// now-stale cached hash. A second or later mutation of the same key in this batch may itself
+    /// happen after this instant, which is the conservative direction: it can only ever cost an
+    /// extra rehash on a future scan, never a wrongly-trusted one.
+    first_touched_at: BTreeMap<String, std::time::SystemTime>,
+
+    /// Every blob a mutation's new content might reference, staged (not yet durable) — see the
+    /// type's own doc comment.
+    blob_batch: file_utils::WriteBatch,
+}
+
+impl ShardMutationBatch {
+    /// Create a new, empty batch.
+    pub fn new() -> Self {
+        ShardMutationBatch {
+            shards: BTreeMap::new(),
+            first_touched_at: BTreeMap::new(),
+            blob_batch: file_utils::WriteBatch::new(),
+        }
+    }
+
+    /// The blob batch every staged object write for this operation should join instead of
+    /// storing immediately — see the type's own doc comment for why (finding #7's ordering rule).
+    pub fn blob_batch(&self) -> &file_utils::WriteBatch {
+        &self.blob_batch
+    }
+
+    /// Apply `change` to the shard at `key`: the first call for a given `key` in this batch loads
+    /// it fresh from disk (or starts a new, empty one if no shard exists there yet — exactly like
+    /// [`update_shard`]); every later call for the same `key` mutates the very same in-memory
+    /// copy — the same-shard collapse this type exists for (DESIGN.html §5.0 D item 10,
+    /// implementation note) — instead of a fresh read-modify-write per call.
+    ///
+    /// # Returns
+    /// * `Ok(())`      - The mutation was applied (in memory only; nothing is durable yet).
+    /// * `Err(String)` - The shard could not be read or parsed, or `change` itself failed.
+    pub fn update(&mut self,
+                  key: &str,
+                  change: impl FnOnce(&mut Inventory) -> Result<(), String>) -> Result<(), String> {
+        if !self.shards.contains_key(key) {
+            let (_, bytes_opt) = file_utils::retrieve_inventory_or_none_by_key(key)?;
+
+            let inventory = match bytes_opt {
+                Some(bytes) => parser::inventory::inventory_parser::parse_inventory(&bytes)
+                    .map_err(|e| format!("Error while parsing the inventory of folder \"{}\": {}", key, e))?,
+                None => Inventory::new(),
+            };
+
+            self.first_touched_at.insert(key.to_string(), std::time::SystemTime::now());
+            self.shards.insert(key.to_string(), inventory);
+        }
+
+        change(self.shards.get_mut(key).expect("just inserted above"))
+    }
+
+    /// Publish every shard mutation decided so far through the shared join point: the blob batch
+    /// becomes durable first (its own barrier, strictly before any shard content is staged), then
+    /// every ancestor this batch's touched shards invalidate is cleared (phase A), then every
+    /// touched shard's new content is written (phase B) — the exact two-phase ordering
+    /// [`write_shard_mutation`] gives a single shard, now shared across every shard this whole
+    /// batch touched. Every touched key is (re-)registered in the inventory metadata once this
+    /// returns `Ok` (one shared rewrite of the metadata file, instead of one per key — mirroring
+    /// [`update_shard`]'s own per-call registration).
+    ///
+    /// A no-op (no blob barrier, no phase A/B, no metadata rewrite) when nothing was ever staged
+    /// or mutated — a caller with an empty action list can call this unconditionally.
+    ///
+    /// # Returns
+    /// * `Ok(())`      - Every decided mutation (and its ancestor clears) is durable.
+    /// * `Err(String)` - The blob batch, phase A or phase B failed; nothing this batch decided is
+    ///                   published (mirrors `publish_shard_outcomes`'s own all-or-nothing
+    ///                   per-call contract — a caller that wants to retry must redo the decisions,
+    ///                   not assume any of them landed).
+    pub fn publish(self) -> Result<(), String> {
+        // Phase 0: every blob a decided mutation's content might reference becomes durable now,
+        // in its own barrier — strictly before any shard content below is even staged
+        // (DESIGN.html §5.0 D item 10, finding #7; see `publish_shard_outcomes`'s doc comment for
+        // why the two must not share one batch). A failure here means some of this batch's blobs
+        // may be durable and others not (`WriteBatch::finish`'s rename loop returns on the first
+        // failure — finding #4), so — exactly like `create_inventory_for_directory`'s identical
+        // phase-0 gating — nothing this batch decided is published this round on a blob failure.
+        self.blob_batch.finish()?;
+
+        if self.shards.is_empty() {
+            return Ok(());
+        }
+
+        let mut clear_keys: BTreeSet<String> = BTreeSet::new();
+        let mut outcomes: BTreeMap<String, ShardOutcome> = BTreeMap::new();
+
+        for (key, mut inventory) in self.shards {
+            clear_keys.extend(ancestor_keys_root_first(&key));
+            inventory.set_rollup_hash(None);
+
+            let verified_at = self.first_touched_at.get(&key).copied()
+                .unwrap_or_else(std::time::SystemTime::now);
+
+            outcomes.insert(key, ShardOutcome::Changed(inventory, verified_at));
+        }
+
+        publish_shard_outcomes(&clear_keys, &mut outcomes)?;
+
+        let touched_keys: BTreeSet<String> = outcomes.keys().cloned().collect();
+
+        update_inventory_metadata(&touched_keys, &BTreeSet::new())
+    }
+}
+
+impl Default for ShardMutationBatch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Like [`stage_file_entry_from_stat`], but stages the mutation into `batch` (see
+/// [`ShardMutationBatch`]) instead of writing it immediately.
+///
+/// # Arguments
+/// * `batch`     - The batch to stage this mutation into.
+/// * `path`      - The warehouse path of the file.
+/// * `hash`      - The blob or recipe hash of the file's content.
+/// * `item_type` - The authoritative entry type (from the tree / merge action).
+///
+/// # Returns
+/// * `Ok(())`      - If the entry was staged into `batch`.
+/// * `Err(String)` - If the file's metadata could not be gathered.
+pub fn stage_file_entry_from_stat_into(batch: &mut ShardMutationBatch,
+                                       path: &str,
+                                       hash: String,
+                                       item_type: DirEntryType) -> Result<(), String> {
+    let (parent_key, name) = match path.rsplit_once(file_utils::PATH_SEPARATOR_CHAR) {
+        Some((parent, name)) => (parent, name),
+        None => ("", path),
+    };
+
+    let entry = build_inventory_item_from_stat(Path::new(path), name, hash, item_type)?;
+
+    batch.update(parent_key, |inventory| {
+        inventory.add_item(entry);
+        Ok(())
+    })
+}
+
 /// Replace the staging area below the given directory with the given shards: the existing
 /// inventory folders under the key are removed, the given shards are written, and the
 /// metadata file is updated accordingly. Used by `restore --staged` to reset a subtree of
@@ -2614,6 +2790,62 @@ mod tests {
     fn set_mtime(path: &Path, mtime: std::time::SystemTime) {
         let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
         file.set_modified(mtime).unwrap();
+    }
+
+    #[test]
+    fn shard_mutation_batch_anchors_each_shards_published_mtime_at_its_own_first_touch() {
+        // DESIGN.html §5.0 D item 10, finding #6 (generalized to the batched merge/replay
+        // funnel, findings #2/#4): a shard decided *early* in a batch must not have its published
+        // mtime advanced to "now" at the whole batch's publish time — that would widen
+        // `is_entry_unchanged`'s racily-clean trust window for every entry in it, exactly the bug
+        // that hit `refresh_tracked_entries`'s pass-1/pass-2 split. `ShardMutationBatch` anchors
+        // each shard's mtime at `first_touched_at` — captured the moment `update` first touches
+        // that key, never later. Pin this with a manufactured, measurable gap between two
+        // shards' first touches: the earlier one's published mtime must reflect *its own* touch
+        // time, not the later one's (or, worse, the moment `publish` itself runs).
+        let _scratch = Scratch::new("shard-mutation-batch-mtime-anchor");
+
+        let mut batch = ShardMutationBatch::new();
+
+        let before_first_touch = std::time::SystemTime::now();
+        batch.update("aaa", |inventory| {
+            inventory.add_item(item("file.txt", 1, InventoryItemState::Normal));
+            Ok(())
+        }).unwrap();
+        let after_first_touch = std::time::SystemTime::now();
+
+        // A real, measurable gap — long enough that a wall-clock second boundary is crossed with
+        // overwhelming probability, so a mistaken "now at publish" stamp is never mistaken for
+        // the correct "now at first touch" one by coincidental rounding.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        batch.update("zzz", |inventory| {
+            inventory.add_item(item("file.txt", 1, InventoryItemState::Normal));
+            Ok(())
+        }).unwrap();
+
+        // More work between the second touch and publish, so a bug that stamped every shard with
+        // "now at publish" would be caught for *both* keys, not just the first.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        batch.publish().unwrap();
+
+        let aaa_mtime = file_utils::get_symlink_metadata_for_path(&file_utils::get_inventory_data_path_for_key("aaa"))
+            .unwrap().modified().unwrap();
+        let zzz_mtime = file_utils::get_symlink_metadata_for_path(&file_utils::get_inventory_data_path_for_key("zzz"))
+            .unwrap().modified().unwrap();
+
+        assert!(aaa_mtime >= before_first_touch && aaa_mtime <= after_first_touch,
+            "\"aaa\"'s published mtime must fall within its own first-touch window, not a later \
+             one: got {aaa_mtime:?}, expected within [{before_first_touch:?}, {after_first_touch:?}]");
+
+        // The two shards' published mtimes must themselves be clearly separated — proving
+        // "zzz" was NOT stamped with "aaa"'s (earlier) timestamp either, the other direction a
+        // bug in the per-shard anchor bookkeeping could take.
+        let gap = zzz_mtime.duration_since(aaa_mtime).unwrap_or_default();
+        assert!(gap >= std::time::Duration::from_millis(900),
+            "\"zzz\"'s published mtime ({zzz_mtime:?}) must be measurably later than \"aaa\"'s \
+             ({aaa_mtime:?}) — each shard must carry its own first-touch instant, not a shared one");
     }
 
     #[test]
