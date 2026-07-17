@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
-use tokio::sync::Mutex;
+use std::sync::Mutex;
 use crate::types::task::Task;
 
 pub struct BaseTaskContext<O, E> {
@@ -23,6 +23,16 @@ pub struct BaseTaskContext<O, E> {
 
     /// Used to store the error value.
     /// When a worker encounters an error, it will set this value.
+    ///
+    /// Deliberately `std::sync::Mutex`, not `tokio::sync::Mutex`: every critical section that
+    /// takes this lock is a synchronous two-line store, never held across an `.await`. Using
+    /// tokio's Mutex here would put a fresh await point in `worker`'s failure path — one that
+    /// `abort_all`'s pending cancellation could land on before the value/flag are stored,
+    /// silently losing a valued failure (see `TaskExecutor::execute`'s doc and `worker`'s
+    /// failure-branch comment). A guard from this Mutex held across an `.await` would fail to
+    /// compile in a worker future (`MutexGuard` is `!Send`, and worker futures must be `Send`),
+    /// so nothing here needs runtime enforcement — but keep the critical sections synchronous
+    /// regardless if this type ever changes.
     pub error_value: Arc<Mutex<Option<E>>>,
 }
 
