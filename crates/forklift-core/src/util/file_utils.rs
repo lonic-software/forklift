@@ -647,13 +647,57 @@ fn fsync_dir_data(dir: &Path) -> Result<(), String> {
 ///
 /// The caller must not let anything that *depends on* a staged write's visibility (most
 /// importantly: a ref pointing at a batched object) run until `finish` has returned `Ok` —
-/// batching does not make the batch's renames atomic as a set (a crash mid-`finish` can still
-/// leave some entries published and others not, exactly like `BulkStoreSession` — see its doc
-/// comment), it only amortizes the fsyncs. `stack_utils::stack_parcel` relies on this: it never
+/// batching does not make the batch's renames atomic as a set, it only amortizes the fsyncs.
+/// A crash mid-`finish` can leave some entries published and others not (exactly like
+/// `BulkStoreSession` — see its doc comment), and a `finish` that *returns* an error partway
+/// through its rename loop has the same shape: entries renamed before the failure are visible
+/// (though never promised durable), later ones are not, and no record is kept of which is
+/// which. `stack_utils::stack_parcel` relies on the `Ok`-gating: it never
 /// batches the pallet-head ref write itself, and only calls `set_pallet_head` after the batch
 /// covering every object the parcel references has already finished successfully.
 pub struct WriteBatch {
     state: std::sync::Mutex<WriteBatchState>,
+}
+
+/// Why [`WriteBatch::finish_detailed`] failed. Both variants share `finish`'s one failure
+/// contract — the whole batch is already discarded (every staged temp removed, `pending` and the
+/// reservation set drained) by the time either is returned, and nothing staged in it can be
+/// published later. The variants differ only in what is *known* about the filesystem afterward.
+#[derive(Debug)]
+pub enum WriteBatchFailure {
+    /// One or more final paths were [`reserve_final_path`](WriteBatch::reserve_final_path)'d but
+    /// never staged — see [`finish`](WriteBatch::finish)'s doc comment for how that happens and
+    /// why publishing anyway would silently corrupt whatever names the missing path. Caught
+    /// *before* [`run_write_barrier`] ever runs, so unlike [`Other`](Self::Other) this variant
+    /// does promise nothing in the batch was renamed: the filesystem is untouched except that
+    /// every staged temp was already removed — discarded exactly like every other failed finish,
+    /// never held back for reuse.
+    ///
+    /// `missing` names exactly the reserved-but-never-staged final paths (sorted). It exists so
+    /// a caller can *invalidate the decisions* that depend on those paths (a hash it planned to
+    /// reference, a dedupe choice recorded elsewhere) before re-staging everything from source.
+    /// It is not a partial-publish affordance: the staged temps are already gone by the time
+    /// this is returned, so there is nothing left to selectively publish.
+    LeakedReservations {
+        message: String,
+        missing: Vec<PathBuf>,
+    },
+
+    /// Any other failure (a temp fsync, a rename, or a directory sync partway through the
+    /// barrier). Renames earlier in the batch may already be visible and later ones never ran,
+    /// with no record of which is which — there is nothing itemized to recover around; the only
+    /// safe reading is "this batch did not publish."
+    Other(String),
+}
+
+impl WriteBatchFailure {
+    /// The human-readable message, regardless of variant — what [`WriteBatch::finish`] returns.
+    pub fn into_message(self) -> String {
+        match self {
+            WriteBatchFailure::LeakedReservations { message, .. } => message,
+            WriteBatchFailure::Other(message) => message,
+        }
+    }
 }
 
 /// The mutable state behind one lock, so [`WriteBatch::reserve_final_path`] and every `stage`
@@ -776,16 +820,85 @@ impl WriteBatch {
     /// sees it directly, and a caller reusing a `WriteBatch` for a later round already treats
     /// each `finish` as its own barrier.
     ///
+    /// Refuses to run the barrier at all if some path was
+    /// [`reserve_final_path`](Self::reserve_final_path)'d but never actually staged: the winner
+    /// of a reservation is trusted to go on and stage it, but a fallible step between winning
+    /// and staging (in [`crate::model::object::loose_object::LooseObject::store_deferred`]:
+    /// `compress()`, or the write itself) can fail after the reservation is already recorded.
+    /// Every other caller for that same path already saw `reserve_final_path` return `false`
+    /// and, reading that as "someone else is staging this," staged nothing of its own — so
+    /// without this check `finish` would happily publish a batch whose `pending` is silently
+    /// missing an entry the reservation set promised existed, and a caller downstream (a shard
+    /// naming that path's hash) would end up referencing a blob that was never written.
+    /// Deliberately *not* fixed by releasing the reservation on the failing caller's error path
+    /// instead: a concurrent second occurrence can lose the race (and commit to "already staged,
+    /// nothing to do") *before* the first occurrence's failure ever releases anything, so
+    /// releasing alone cannot undo a decision another caller already made. Checking here, once,
+    /// after every producer for this batch has necessarily already run, catches the mismatch
+    /// regardless of timing — without weakening `reserve_final_path`'s one-winner guarantee or
+    /// reintroducing the redundant compress-and-stage race it exists to prevent.
+    ///
     /// # Returns
     /// * `Ok(())`      - Every staged write is durable and visible at its final path.
-    /// * `Err(String)` - A write or rename failed; every staged temp for this batch was
-    ///                   best-effort removed before returning (nothing survives to leak).
+    /// * `Err(String)` - A reserved path was never staged, or a write, fsync, or rename failed.
+    ///                   Either way the batch is dead: every remaining staged temp was
+    ///                   best-effort removed before returning, so nothing staged here survives
+    ///                   to be published later. Renames that ran before an in-flight failure may
+    ///                   already be visible (the type-level doc comment: renames are not atomic
+    ///                   as a set) — the caller must treat the whole batch as unpublished and
+    ///                   re-stage from source, exactly as it would after a crash.
     pub fn finish(&self) -> Result<(), String> {
-        let pending = {
+        self.finish_detailed().map_err(WriteBatchFailure::into_message)
+    }
+
+    /// Like [`finish`](Self::finish), but reports *why* the batch failed instead of collapsing
+    /// every failure into one opaque message — see [`WriteBatchFailure`]. `finish` is a thin
+    /// wrapper over this, so every guarantee documented there — and every caveat: a failed call
+    /// discards the entire batch, and nothing staged in it survives to be published later —
+    /// holds identically here.
+    ///
+    /// The distinction exists for callers that record decisions against paths they reserve:
+    /// [`WriteBatchFailure::LeakedReservations`] names exactly which promised paths will now
+    /// never land, which is what such a caller needs to invalidate the decisions depending on
+    /// them before it re-stages the batch from source. It is not — and cannot be — a
+    /// partial-recovery lever; see the variant's own doc comment.
+    ///
+    /// # Returns
+    /// * `Ok(())`                 - Every staged write is durable and visible at its final path.
+    /// * `Err(WriteBatchFailure)` - See the variants' own doc comments.
+    pub fn finish_detailed(&self) -> Result<(), WriteBatchFailure> {
+        let (pending, leaked) = {
             let mut state = self.state.lock().expect("write batch lock poisoned");
+            let pending = std::mem::take(&mut state.pending);
+
+            let staged_paths: std::collections::HashSet<&Path> =
+                pending.iter().map(|(_, final_path)| final_path.as_path()).collect();
+            // Sorted so `missing` (and the message built from it) is deterministic — the
+            // reservation set itself iterates in hash order.
+            let mut leaked: Vec<PathBuf> = state.final_paths.iter()
+                .filter(|reserved| !staged_paths.contains(reserved.as_path()))
+                .cloned()
+                .collect();
+            leaked.sort();
+
             state.final_paths.clear();
-            std::mem::take(&mut state.pending)
+            (pending, leaked)
         };
+
+        if !leaked.is_empty() {
+            for (temp, _) in &pending {
+                let _ = std::fs::remove_file(temp);
+            }
+            let message = format!(
+                "Error: {} final path(s) were reserved but never staged — a fallible step between \
+                reservation and staging must have failed (any concurrent or later caller for the \
+                same path would have read the reservation as already handled and staged nothing of \
+                its own either); refusing to publish this batch: {}",
+                leaked.len(),
+                leaked.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>().join(", "),
+            );
+            return Err(WriteBatchFailure::LeakedReservations { message, missing: leaked });
+        }
 
         if pending.is_empty() {
             return Ok(());
@@ -795,7 +908,7 @@ impl WriteBatch {
             for (temp, _) in &pending {
                 let _ = std::fs::remove_file(temp);
             }
-            return Err(error);
+            return Err(WriteBatchFailure::Other(error));
         }
 
         Ok(())
@@ -2032,6 +2145,162 @@ mod tests {
         // must win again — the first round is over and published.
         assert!(batch.reserve_final_path(&target),
             "a path must be reservable again after the batch that staged it has finished");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn finish_refuses_a_batch_with_a_leaked_reservation_and_discards_its_staged_temps() {
+        // The reservation set is a promise list: a path reserved but never staged means some
+        // producer failed between winning the reservation and staging, while every other
+        // producer for that path already stood down. Publishing the rest anyway would let a
+        // downstream caller durably name a blob that was never written — `finish` must refuse
+        // the whole batch instead, and (like every failed finish) discard what was staged.
+        let temp = std::env::temp_dir().join(format!("forklift-writebatch-leak-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+
+        let leaked = temp.join("promised-but-never-staged");
+        let staged = temp.join("staged-fine");
+        let batch = WriteBatch::new();
+        assert!(batch.reserve_final_path(&leaked));
+        batch.stage(&staged, b"complete content").unwrap();
+
+        let error = batch.finish().unwrap_err();
+        assert!(error.contains("promised-but-never-staged"),
+            "the error must name the leaked path, got: {}", error);
+
+        // The leak is caught before the barrier: nothing was renamed, and the staged temp is
+        // gone — the batch is discarded wholesale, not held for selective publishing.
+        assert!(!staged.exists(), "a leaked reservation must keep the whole batch unpublished");
+        let leftovers: Vec<_> = std::fs::read_dir(&temp).unwrap().filter_map(|e| e.ok()).collect();
+        assert!(leftovers.is_empty(), "a failed finish must remove every staged temp, found {:?}",
+            leftovers.iter().map(|e| e.file_name()).collect::<Vec<_>>());
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn finish_detailed_names_exactly_the_leaked_paths_in_sorted_order() {
+        // `missing` is the diagnostic half of the leak contract: it must list precisely the
+        // reserved-but-never-staged paths (a caller invalidates decisions depending on them
+        // before re-staging), sorted so the report is deterministic, and never include paths
+        // that were actually staged.
+        let temp = std::env::temp_dir().join(format!("forklift-writebatch-leak-detail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+
+        let leaked_z = temp.join("zzz-leaked");
+        let leaked_a = temp.join("aaa-leaked");
+        let staged = temp.join("mmm-staged");
+        let batch = WriteBatch::new();
+        assert!(batch.reserve_final_path(&leaked_z));
+        assert!(batch.reserve_final_path(&leaked_a));
+        batch.stage(&staged, b"content").unwrap();
+
+        match batch.finish_detailed().unwrap_err() {
+            WriteBatchFailure::LeakedReservations { missing, message } => {
+                assert_eq!(missing, vec![leaked_a.clone(), leaked_z.clone()],
+                    "missing must be exactly the never-staged paths, sorted");
+                assert!(message.contains("aaa-leaked") && message.contains("zzz-leaked"));
+                assert!(!message.contains("mmm-staged"),
+                    "a path that was actually staged must not be reported as missing");
+            }
+            WriteBatchFailure::Other(message) => {
+                panic!("a leaked reservation must be its own variant, got Other: {}", message);
+            }
+        }
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn a_leaked_reservation_fails_finish_even_when_nothing_was_staged() {
+        // The empty-`pending` early return must not outrank the leak check: a batch whose only
+        // producer failed before staging anything still made a promise it cannot keep.
+        let batch = WriteBatch::new();
+        assert!(batch.reserve_final_path(Path::new("/warehouse/.forklift/objects/ab/cdef")));
+
+        assert!(batch.finish().is_err(),
+            "a reservation with nothing staged at all must still refuse to finish");
+
+        // The failure drained the reservation set with everything else, so the batch is clean
+        // for a full retry: a second finish (with nothing re-staged) is an ordinary empty Ok.
+        batch.finish().unwrap();
+    }
+
+    #[test]
+    fn a_failed_finish_leaves_the_batch_ready_for_a_full_restage_retry() {
+        // Recovery under the one contract there is: after any failed finish nothing staged
+        // survives, so a retry re-stages *everything* from source — which requires the failure
+        // to have drained the reservation set too, or the retry's own `reserve_final_path`
+        // would read the dead round's reservations as "already handled" and stand down again.
+        let temp = std::env::temp_dir().join(format!("forklift-writebatch-retry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+
+        let flaky = temp.join("failed-first-round");
+        let steady = temp.join("staged-both-rounds");
+        let batch = WriteBatch::new();
+        assert!(batch.reserve_final_path(&flaky));
+        batch.stage(&steady, b"round one").unwrap();
+        batch.finish().unwrap_err();
+
+        assert!(batch.reserve_final_path(&flaky),
+            "a retry must be able to win the reservation the failed round left behind");
+        batch.stage(&flaky, b"second round, staged this time").unwrap();
+        batch.stage(&steady, b"round two").unwrap();
+        batch.finish().unwrap();
+
+        assert_eq!(std::fs::read(&flaky).unwrap(), b"second round, staged this time");
+        assert_eq!(std::fs::read(&steady).unwrap(), b"round two");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn a_rename_failure_partway_discards_the_batch_but_earlier_renames_stay_visible() {
+        // The honest half of the failure contract: the rename loop stops at the first failure,
+        // so an entry renamed *before* it is already visible (never promised durable) — a failed
+        // finish means "treat the whole batch as unpublished," not "nothing became visible."
+        // What it does promise: every remaining temp is removed, nothing staged survives to be
+        // published later.
+        let temp = std::env::temp_dir().join(format!("forklift-writebatch-partway-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+
+        let first = temp.join("renamed-before-the-failure");
+        let blocked = temp.join("rename-target-blocked");
+        let batch = WriteBatch::new();
+        batch.stage(&first, b"landed").unwrap();
+        batch.stage(&blocked, b"never lands").unwrap();
+
+        // Sabotage the second rename: a non-empty directory at its final path makes the rename
+        // fail on every platform, after the first entry's rename already succeeded.
+        std::fs::create_dir_all(blocked.join("occupant")).unwrap();
+
+        match batch.finish_detailed().unwrap_err() {
+            WriteBatchFailure::Other(message) => {
+                assert!(message.contains("rename-target-blocked"),
+                    "the error must name the failing rename, got: {}", message);
+            }
+            WriteBatchFailure::LeakedReservations { message, .. } => {
+                panic!("a barrier failure must not read as a leaked reservation: {}", message);
+            }
+        }
+
+        assert_eq!(std::fs::read(&first).unwrap(), b"landed",
+            "an entry renamed before the failure stays visible — the set is not atomic");
+        assert!(blocked.is_dir(), "the blocked entry must not have been published");
+
+        // Every temp is gone: the visible-first entry's was consumed by its rename, the blocked
+        // entry's was removed by the failure path.
+        let temps: Vec<_> = std::fs::read_dir(&temp).unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(temps.is_empty(), "a failed finish must remove every remaining temp, found {:?}",
+            temps.iter().map(|e| e.file_name()).collect::<Vec<_>>());
 
         std::fs::remove_dir_all(&temp).ok();
     }
