@@ -1361,9 +1361,8 @@ async fn fetch_missing_signatures(client: &RemoteClient,
 
     // Routed through the same `join_all` every other coordinator in this module uses, rather
     // than a second, hand-rolled copy of its join/drain loop — see `join_all`'s doc for the
-    // not-return-while-writing guarantee this gets for free (`sign_utils::store_raw_parcel_signature`
-    // has no await between reading the fetched bytes and finishing the write, same shape as the
-    // object-transfer paths).
+    // not-return-while-writing guarantee this gets for free; `sign_utils::store_raw_parcel_signature`
+    // is one of the two store helpers that guarantee names.
     join_all(tasks).await.map(|counts| counts.into_iter().sum())
 }
 
@@ -1947,12 +1946,14 @@ async fn join_all<T: Send + 'static>(mut tasks: JoinSet<Result<T, String>>) -> R
 
 /// Abort and drain every task still in `tasks`. This is the other half of the invariant
 /// [`join_all`] needs: a coordinating call must never return while a task pool it spawned is
-/// still running — the general shape of the gap being closed here, not one specific to this
-/// module. `abort_all` only *signals* cancellation, and tokio can only land that signal at a
-/// task's next await point — a task already past its network fetch and inside this module's
-/// synchronous, non-yielding store helpers (no await between reading the fetched bytes and
-/// finishing the write) keeps running regardless, so the signal alone is not enough. Draining
-/// here, before the caller returns whatever error it already has, is what closes that gap.
+/// still running — the same class of gap
+/// [`crate::model::task::TaskExecutor::execute`] closes at the worker-pool level (see its doc for
+/// the full guarantee), not one specific to this module. `abort_all` only *signals* cancellation,
+/// and tokio can only land that signal at a task's next await point — a task already past its
+/// network fetch and inside this module's synchronous, non-yielding store helpers (see
+/// [`join_all`]'s doc for which two, and why) keeps running regardless, so the signal alone is
+/// not enough. Draining here, before the caller returns whatever error it already has, is what
+/// closes that gap.
 ///
 /// Most results are discarded: a cancelled join (the abort actually landing), an ordinary task
 /// error, even a late success — the caller already has its first error, and first error wins. A
@@ -1978,8 +1979,8 @@ async fn drain_remaining<T: Send + 'static>(mut tasks: JoinSet<T>) -> Option<Str
 
     while let Some(result) = tasks.join_next().await {
         if let Err(join_error) = result {
-            if join_error.is_panic() {
-                panics.push(panic_payload_message(join_error));
+            if let Ok(payload) = join_error.try_into_panic() {
+                panics.push(panic_payload_message(payload));
             }
         }
     }
@@ -1999,21 +2000,13 @@ async fn drain_remaining<T: Send + 'static>(mut tasks: JoinSet<T>) -> Option<Str
 /// [`drain_remaining`]. `&str` and `String` cover every panic this codebase raises (a bare
 /// `panic!("literal")` or a formatted `panic!("{}", ...)`); anything else falls back to a fixed
 /// placeholder rather than losing the fact that a panic happened at all.
-fn panic_payload_message(join_error: tokio::task::JoinError) -> String {
-    match join_error.try_into_panic() {
-        Ok(payload) => {
-            if let Some(message) = payload.downcast_ref::<&str>() {
-                message.to_string()
-            } else if let Some(message) = payload.downcast_ref::<String>() {
-                message.clone()
-            } else {
-                "panic with a non-string payload".to_string()
-            }
-        }
-        // `try_into_panic` only fails for a non-panic `JoinError` (cancelled), which the
-        // `is_panic()` check above already excluded — unreachable in practice. The fallback keeps
-        // this function total rather than relying on that invariant with an `unwrap`.
-        Err(_) => "panic".to_string(),
+fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        message.to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "panic with a non-string payload".to_string()
     }
 }
 
@@ -3639,14 +3632,14 @@ mod tests {
     // coordinator in this module routes through — fetching objects, fetching signature sidecars,
     // and both upload paths — so the tests below, exercising `join_all`/`drain_remaining`
     // directly, structurally cover all of them, including the two real task bodies that motivate
-    // the fix: `object_utils::store_object_bytes` and `sign_utils::store_raw_parcel_signature`,
-    // both of which have no await point between reading the fetched bytes and finishing the
-    // write. The tests reproduce that exact shape with `std::thread::sleep` — never
-    // `tokio::time::sleep`, which would give cancellation somewhere to land — gated by atomic
-    // flags so a sibling is provably resident, and provably past whatever it is waiting on,
-    // before the task driving each scenario proceeds. Needs a real second worker thread to mean
-    // anything, unlike this file's other tests: a `current_thread` runtime could never run the
-    // sleeping task and a spin-wait concurrently.
+    // the fix: `object_utils::store_object_bytes` and `sign_utils::store_raw_parcel_signature`
+    // (see `join_all`'s doc for the exact no-await shape they share that motivates this). The
+    // tests reproduce that shape with `std::thread::sleep` — never `tokio::time::sleep`, which
+    // would give cancellation somewhere to land — gated by atomic flags so a sibling is provably
+    // resident, and provably past whatever it is waiting on, before the task driving each
+    // scenario proceeds. Needs a real second worker thread to mean anything, unlike this file's
+    // other tests: a `current_thread` runtime could never run the sleeping task and a spin-wait
+    // concurrently.
     // -----------------------------------------------------------------------------------
 
     /// Multi-thread runtime shared by the drain/join tests below — a real second worker thread is
@@ -3681,24 +3674,25 @@ mod tests {
 
     /// Spawns into `tasks` the "unyielding sibling" shape shared by every test below — mirroring
     /// the two real task bodies `join_all`/`drain_remaining` guard
-    /// (`object_utils::store_object_bytes` and `sign_utils::store_raw_parcel_signature`), which
-    /// have no await point between reading the fetched bytes and finishing the write. Sets
-    /// `started` as soon as it is first polled — these bare spawned bodies have no other await
-    /// point, so `abort_all` (which can only cancel a task suspended at one) cancels a
-    /// never-polled task outright; `started` is what proves this sibling's first, and only, poll
-    /// has begun, i.e. it is already inside its uninterruptible synchronous body, before whatever
-    /// follows happens. If `gate` is given, blocking-waits (`spin_until`, never an `.await`) for
-    /// that flag next — ordering this sibling's unyielding stretch after whatever the caller gates
-    /// on without opening a new await point for `abort_all` to land in — then blocks its worker
-    /// thread for 300ms with `std::thread::sleep`, sets `completed`, and finally hands off to
+    /// (`object_utils::store_object_bytes` and `sign_utils::store_raw_parcel_signature`; see
+    /// `join_all`'s doc for the exact no-await shape being mirrored here). Sets `started` as soon
+    /// as it is first polled — these bare spawned bodies have no other await point, so
+    /// `abort_all` (which can only cancel a task suspended at one) cancels a never-polled task
+    /// outright; `started` is what proves this sibling's first, and only, poll has begun, i.e. it
+    /// is already inside its uninterruptible synchronous body, before whatever follows happens.
+    /// If `gate` is given, blocking-waits (`spin_until`, never an `.await`) for that flag next —
+    /// ordering this sibling's unyielding stretch after whatever the caller gates on without
+    /// opening a new await point for `abort_all` to land in — then blocks its worker thread for
+    /// `unyielding_duration` with `std::thread::sleep`, sets `completed`, and finally hands off to
     /// `finish` to produce the task's result (an ordinary value, an error, or a panic). From
-    /// `started` to `finish`, this body never awaits: the gate and the 300ms stretch are both
-    /// synchronous, so the whole thing is one uninterruptible run once it starts.
+    /// `started` to `finish`, this body never awaits: the gate and the sleep are both synchronous,
+    /// so the whole thing is one uninterruptible run once it starts.
     fn spawn_unyielding_sibling<T: Send + 'static>(
         tasks: &mut JoinSet<T>,
         started: Arc<std::sync::atomic::AtomicBool>,
         completed: Arc<std::sync::atomic::AtomicBool>,
         gate: Option<(Arc<std::sync::atomic::AtomicBool>, Arc<std::sync::atomic::AtomicBool>)>,
+        unyielding_duration: std::time::Duration,
         finish: impl FnOnce() -> T + Send + 'static,
     ) {
         tasks.spawn(async move {
@@ -3708,7 +3702,7 @@ mod tests {
                 spin_until(|| flag.load(std::sync::atomic::Ordering::SeqCst), &starved);
             }
 
-            std::thread::sleep(std::time::Duration::from_millis(300));
+            std::thread::sleep(unyielding_duration);
             completed.store(true, std::sync::atomic::Ordering::SeqCst);
             finish()
         });
@@ -3751,7 +3745,14 @@ mod tests {
 
         runtime.block_on(async {
             let mut tasks: JoinSet<()> = JoinSet::new();
-            spawn_unyielding_sibling(&mut tasks, Arc::clone(&started), Arc::clone(&completed), None, || ());
+            spawn_unyielding_sibling(
+                &mut tasks,
+                Arc::clone(&started),
+                Arc::clone(&completed),
+                None,
+                std::time::Duration::from_millis(300),
+                || (),
+            );
 
             // Waits until the sibling is confirmed started — i.e. its one and only poll has
             // begun, putting it inside the unyielding sleep, the only place a cancellation signal
@@ -3776,13 +3777,17 @@ mod tests {
     /// past its network fetch and inside the synchronous write, and a second failure surfacing
     /// only during the drain must never override the first one already captured.
     ///
-    /// The ordering between the two failures is not left to a wall-clock race: `first_returned` is
-    /// set by the fast sibling immediately before it returns its own error, and the slow sibling
-    /// only starts its 300ms unyielding stretch *after* observing that flag — so the slow
-    /// sibling's error cannot even exist until the fast sibling's error is already sitting in the
-    /// `JoinSet`, long before the slow sibling's subsequent sleep elapses. `join_next` order among
-    /// simultaneously-*ready* tasks is otherwise unspecified, which is exactly what this ordering
-    /// avoids relying on.
+    /// The ordering is enforced up to a wide scheduling margin, not absolutely: `first_returned`
+    /// is set by the fast sibling immediately *before* it returns its own error, so at flag-set
+    /// time that error is not yet sitting in the `JoinSet` — the future only completes, landing
+    /// the result, a hair later when that poll returns. The slow sibling only starts its 1s
+    /// unyielding stretch *after* observing the flag, which puts the fast error's *readiness*
+    /// well ahead of the slow one's — but `join_next`'s order among simultaneously-ready results
+    /// is unspecified, and nothing observable from outside `join_all` marks the moment the fast
+    /// error is actually *consumed* by the coordinator. Full determinism is therefore impossible
+    /// to guarantee from here: a coordinator stalled longer than the 1s window could still see
+    /// both results ready and pick either first. The margin makes that failure mode practically
+    /// unreachable, not theoretically impossible.
     #[test]
     fn join_all_drains_a_synchronous_sibling_before_surfacing_the_first_error() {
         let runtime = build_drain_test_runtime();
@@ -3800,6 +3805,7 @@ mod tests {
                 Arc::clone(&started),
                 Arc::clone(&completed),
                 Some((Arc::clone(&first_returned), Arc::clone(&starved))),
+                std::time::Duration::from_secs(1),
                 // A late failure: proves the drain does not let a second error overwrite the
                 // first one `join_all` already captured — first error wins.
                 || Err("late boom".to_string()),
@@ -3830,9 +3836,11 @@ mod tests {
     /// The panic-evidence half of the drain contract (see `drain_remaining`'s doc): the drain must
     /// not silently discard a sibling's panic — it must be appended to the error `join_all`
     /// already captured, never substituted for it, so the panic leaves evidence instead of
-    /// vanishing (this crate's core never prints on its own). Same ordering discipline as the
-    /// test above: `first_returned` gates the panicking sibling's unyielding stretch so its panic
-    /// cannot even exist until the fast sibling's "boom" is already captured.
+    /// vanishing (this crate's core never prints on its own). Same ordering discipline, and the
+    /// same scheduling-margin caveat, as the test above: `first_returned` gates the panicking
+    /// sibling's unyielding stretch so its panic cannot even become *ready* until after the fast
+    /// sibling's "boom" does — not a guarantee that "boom" has already been *consumed* by the
+    /// coordinator by then.
     ///
     /// The panic below prints via the default panic hook as part of this test's output —
     /// expected, not a test-harness failure.
@@ -3855,6 +3863,7 @@ mod tests {
                 Arc::clone(&started),
                 Arc::clone(&completed),
                 Some((Arc::clone(&first_returned), Arc::clone(&starved))),
+                std::time::Duration::from_secs(1),
                 || panic!("{}", PANIC_MESSAGE),
             );
 
