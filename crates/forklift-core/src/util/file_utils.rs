@@ -466,6 +466,18 @@ impl BulkStoreSession {
     /// `true` on success below: on the error path the registry slot and every temp are already
     /// gone, so `Drop`'s own abort pass (see below) just finds nothing left to do.
     ///
+    /// A rename failure partway through step 3 gets one more thing done before it returns: every
+    /// directory step 3 already touched is best-effort fsynced right there (step 4's own work,
+    /// run early over the prefix that exists so far), *before* the error propagates — see
+    /// [`run_write_barrier`]. Without that, an entry renamed before the failure is visible but not
+    /// durable; a later retry would see it via `does_object_exist` and skip restaging it, and a
+    /// subsequent power loss could then drop its directory entry entirely — a durable reference to
+    /// an object that no longer exists. This narrows the caller's "renamed-but-maybe-not-durable"
+    /// exposure to exactly one place: when *every* rename in step 3 succeeds and it is step 4's
+    /// own trailing sync that fails (see `run_write_barrier`) — there the whole batch is visible,
+    /// but directories past whichever one failed to sync are only best-effort attempted, not
+    /// proven durable.
+    ///
     /// Unlike the *pack* folder, the loose store has no sweeper *dedicated* to `.tmp` names
     /// (`pack_utils` has one, for its own `.compact-*.tmp` staging files — see
     /// `remove_stale_temp_files`) — but a loose-store temp left behind by a hard kill (rather
@@ -500,9 +512,7 @@ impl BulkStoreSession {
         }
 
         if let Err(error) = run_write_barrier(&pending) {
-            for (temp, _) in &pending {
-                let _ = std::fs::remove_file(temp);
-            }
+            discard_staged_temps(&pending);
             return Err(error);
         }
 
@@ -513,7 +523,8 @@ impl BulkStoreSession {
 /// The four-step durability barrier shared by [`BulkStoreSession`] and [`WriteBatch`] — see
 /// [`BulkStoreSession::finish`]'s doc comment for the exact steps and the crash analysis. Kept
 /// as a free function (not tied to either type) so both share exactly one implementation of the
-/// crash-safety-critical ordering instead of risking it drifting between two copies.
+/// crash-safety-critical ordering instead of risking it drifting between two copies — including
+/// the rename-failure fix below, which now applies to both callers identically.
 fn run_write_barrier(pending: &[(PathBuf, PathBuf)]) -> Result<(), String> {
     if fsync_enabled() {
         for (temp, _) in pending {
@@ -525,10 +536,37 @@ fn run_write_barrier(pending: &[(PathBuf, PathBuf)]) -> Result<(), String> {
     }
 
     let mut touched_parents: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut first_renamed: Option<&Path> = None;
     for (temp, final_path) in pending {
-        std::fs::rename(temp, final_path).map_err(|e| format!(
-            "Error while moving file into place at \"{}\": {}", final_path.to_string_lossy(), e
-        ))?;
+        if let Err(e) = std::fs::rename(temp, final_path) {
+            let rename_error = format!(
+                "Error while moving file into place at \"{}\": {}", final_path.to_string_lossy(), e
+            );
+
+            // Everything renamed above is already visible but, without this, its directory
+            // entries would not yet be durable — a later retry sees these names via
+            // `does_object_exist` and skips restaging them, so a power loss between here and the
+            // next successful barrier could drop the dentry for an object no code path will ever
+            // write again. Best-effort only, and skipped when nothing renamed yet
+            // (`touched_parents` empty — the first rename itself is what failed, so there is
+            // nothing to sync and no already-existing file to borrow for the macOS device flush).
+            if fsync_enabled() && !touched_parents.is_empty() {
+                if let Some(flush_via) = first_renamed {
+                    if let Err(sync_error) = sync_touched_directories(&touched_parents, flush_via) {
+                        return Err(format!(
+                            "{} (additionally, failed to sync the directories of entries already \
+                            renamed before this failure: {})", rename_error, sync_error
+                        ));
+                    }
+                }
+            }
+
+            return Err(rename_error);
+        }
+
+        if first_renamed.is_none() {
+            first_renamed = Some(final_path.as_path());
+        }
         if let Some(parent) = final_path.parent() {
             if !parent.as_os_str().is_empty() {
                 touched_parents.insert(parent.to_path_buf());
@@ -541,7 +579,10 @@ fn run_write_barrier(pending: &[(PathBuf, PathBuf)]) -> Result<(), String> {
         // ran) and is an ordinary file, safely opened write-mode by `macos_flush_device_cache` —
         // unlike a directory, which `OpenOptions::write(true).open` refuses with `EISDIR` on
         // macOS. Reusing it here (rather than any of `touched_parents`) is what lets the
-        // directory half of the flush share `macos_flush_device_cache` unchanged.
+        // directory half of the flush share `macos_flush_device_cache` unchanged. Unlike the
+        // early sync above, a failure here has nothing earlier to fall back to reporting — every
+        // rename in this batch already succeeded, so this is the batch's only remaining step and
+        // its error propagates directly.
         sync_touched_directories(&touched_parents, &pending[0].1)?;
     }
 
@@ -618,6 +659,21 @@ fn fsync_dir_data(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Best-effort removes every staged temp still referenced by `pending` — the cleanup a failed or
+/// aborted batch needs so nothing it staged survives to be discovered later. Shared by
+/// [`BulkStoreSession`]'s and [`WriteBatch`]'s failure and abort paths so the invariant ("a batch
+/// that will never publish leaves no temp behind") has exactly one implementation instead of
+/// several copies that could drift.
+///
+/// Ignores per-file errors: an entry already consumed by its own rename (see
+/// [`run_write_barrier`]) simply fails removal with `NotFound`, which is not a problem here —
+/// that entry is durably published, not leaked.
+fn discard_staged_temps(pending: &[(PathBuf, PathBuf)]) {
+    for (temp, _) in pending {
+        let _ = std::fs::remove_file(temp);
+    }
+}
+
 /// A local, explicitly-scoped write batch — the same deferred-publish idea as
 /// [`BulkStoreSession`] (see its doc comment for the full crash analysis, which applies here
 /// unchanged), but passed by the caller instead of intercepted through the process-wide
@@ -649,55 +705,15 @@ fn fsync_dir_data(dir: &Path) -> Result<(), String> {
 /// importantly: a ref pointing at a batched object) run until `finish` has returned `Ok` —
 /// batching does not make the batch's renames atomic as a set, it only amortizes the fsyncs.
 /// A crash mid-`finish` can leave some entries published and others not (exactly like
-/// `BulkStoreSession` — see its doc comment), and a `finish` that *returns* an error partway
-/// through its rename loop has the same shape: entries renamed before the failure are visible
-/// (though never promised durable), later ones are not, and no record is kept of which is
-/// which. `stack_utils::stack_parcel` relies on the `Ok`-gating: it never
+/// `BulkStoreSession` — see its doc comment), and a `finish` that *returns* an error has a
+/// similar shape, though what is durable afterward depends on exactly which step failed — see
+/// `finish`'s `# Returns` for the breakdown. In every case no record is kept of which entries
+/// these are, so the caller must treat the whole batch as unpublished regardless.
+/// `stack_utils::stack_parcel` relies on the `Ok`-gating: it never
 /// batches the pallet-head ref write itself, and only calls `set_pallet_head` after the batch
 /// covering every object the parcel references has already finished successfully.
 pub struct WriteBatch {
     state: std::sync::Mutex<WriteBatchState>,
-}
-
-/// Why [`WriteBatch::finish_detailed`] failed. Both variants share `finish`'s one failure
-/// contract — the whole batch is already discarded (every staged temp removed, `pending` and the
-/// reservation set drained) by the time either is returned, and nothing staged in it can be
-/// published later. The variants differ only in what is *known* about the filesystem afterward.
-#[derive(Debug)]
-pub enum WriteBatchFailure {
-    /// One or more final paths were [`reserve_final_path`](WriteBatch::reserve_final_path)'d but
-    /// never staged — see [`finish`](WriteBatch::finish)'s doc comment for how that happens and
-    /// why publishing anyway would silently corrupt whatever names the missing path. Caught
-    /// *before* [`run_write_barrier`] ever runs, so unlike [`Other`](Self::Other) this variant
-    /// does promise nothing in the batch was renamed: the filesystem is untouched except that
-    /// every staged temp was already removed — discarded exactly like every other failed finish,
-    /// never held back for reuse.
-    ///
-    /// `missing` names exactly the reserved-but-never-staged final paths (sorted). It exists so
-    /// a caller can *invalidate the decisions* that depend on those paths (a hash it planned to
-    /// reference, a dedupe choice recorded elsewhere) before re-staging everything from source.
-    /// It is not a partial-publish affordance: the staged temps are already gone by the time
-    /// this is returned, so there is nothing left to selectively publish.
-    LeakedReservations {
-        message: String,
-        missing: Vec<PathBuf>,
-    },
-
-    /// Any other failure (a temp fsync, a rename, or a directory sync partway through the
-    /// barrier). Renames earlier in the batch may already be visible and later ones never ran,
-    /// with no record of which is which — there is nothing itemized to recover around; the only
-    /// safe reading is "this batch did not publish."
-    Other(String),
-}
-
-impl WriteBatchFailure {
-    /// The human-readable message, regardless of variant — what [`WriteBatch::finish`] returns.
-    pub fn into_message(self) -> String {
-        match self {
-            WriteBatchFailure::LeakedReservations { message, .. } => message,
-            WriteBatchFailure::Other(message) => message,
-        }
-    }
 }
 
 /// The mutable state behind one lock, so [`WriteBatch::reserve_final_path`] and every `stage`
@@ -711,6 +727,15 @@ struct WriteBatchState {
     /// Every final path staged (or reserved) into this batch so far — see
     /// [`WriteBatch::reserve_final_path`].
     final_paths: std::collections::HashSet<PathBuf>,
+
+    /// Final paths that won their [`WriteBatch::reserve_final_path`] call but have not (yet, or
+    /// ever) been staged — exactly the leak set [`WriteBatch::finish`] refuses to publish
+    /// through. A winning reservation inserts here; `stage`/`stage_with_mtime` removes here (a
+    /// no-op if the path was never reserved — i.e. staged directly, without going through
+    /// `reserve_final_path` first). Maintained incrementally rather than recomputed from
+    /// `final_paths` and `pending` on every `finish` call, so a successful finish — the common
+    /// case — costs nothing proportional to the batch's size to check.
+    reserved_not_staged: std::collections::HashSet<PathBuf>,
 }
 
 impl WriteBatch {
@@ -738,6 +763,7 @@ impl WriteBatch {
 
         let mut state = self.state.lock().expect("write batch lock poisoned");
         state.final_paths.insert(file_path.to_path_buf());
+        state.reserved_not_staged.remove(file_path);
         state.pending.push((temp_path, file_path.to_path_buf()));
 
         Ok(())
@@ -776,6 +802,7 @@ impl WriteBatch {
 
         let mut state = self.state.lock().expect("write batch lock poisoned");
         state.final_paths.insert(file_path.to_path_buf());
+        state.reserved_not_staged.remove(file_path);
         state.pending.push((temp_path, file_path.to_path_buf()));
 
         Ok(())
@@ -800,10 +827,18 @@ impl WriteBatch {
     /// use) so two threads reserving the same path at the same instant can never both "win" —
     /// unlike a separate check-then-stage, which would leave a real (if narrow) race window.
     /// Reserving a path does not itself stage anything; the winning caller is still responsible
-    /// for calling `stage`/`stage_with_mtime` afterward (which records the same path into this
-    /// same set again — a harmless re-insert).
+    /// for calling `stage`/`stage_with_mtime` afterward (which records the same path into
+    /// `final_paths` again — a harmless re-insert — and clears it from the leak set below).
+    ///
+    /// A win also adds `final_path` to `reserved_not_staged` — the set
+    /// [`finish`](Self::finish) checks to catch a winner that never followed through.
     pub fn reserve_final_path(&self, final_path: &Path) -> bool {
-        self.state.lock().expect("write batch lock poisoned").final_paths.insert(final_path.to_path_buf())
+        let mut state = self.state.lock().expect("write batch lock poisoned");
+        let won = state.final_paths.insert(final_path.to_path_buf());
+        if won {
+            state.reserved_not_staged.insert(final_path.to_path_buf());
+        }
+        won
     }
 
     /// The barrier: fsync every staged write's bytes, then — only once every byte is durable —
@@ -820,6 +855,16 @@ impl WriteBatch {
     /// sees it directly, and a caller reusing a `WriteBatch` for a later round already treats
     /// each `finish` as its own barrier.
     ///
+    /// Must only be called once every producer that may
+    /// [`reserve_final_path`](Self::reserve_final_path) or [`stage`](Self::stage) into this batch
+    /// for this round has actually finished running — the leak check below cannot distinguish a
+    /// producer that is merely between winning a reservation and completing its stage from one
+    /// that failed outright, so calling `finish` while producers are still in flight can misread
+    /// a live, in-progress write as a leak and discard an otherwise-healthy batch. Every current
+    /// caller already joins its workers before calling `finish`, so this holds today; it would
+    /// matter directly if a future caller ever ran a periodic or bounded mid-walk flush of an
+    /// `Arc`-shared batch without that join.
+    ///
     /// Refuses to run the barrier at all if some path was
     /// [`reserve_final_path`](Self::reserve_final_path)'d but never actually staged: the winner
     /// of a reservation is trusted to go on and stage it, but a fallible step between winning
@@ -834,70 +879,60 @@ impl WriteBatch {
     /// instead: a concurrent second occurrence can lose the race (and commit to "already staged,
     /// nothing to do") *before* the first occurrence's failure ever releases anything, so
     /// releasing alone cannot undo a decision another caller already made. Checking here, once,
-    /// after every producer for this batch has necessarily already run, catches the mismatch
-    /// regardless of timing — without weakening `reserve_final_path`'s one-winner guarantee or
-    /// reintroducing the redundant compress-and-stage race it exists to prevent.
+    /// under the precondition above, catches the mismatch regardless of timing — without
+    /// weakening `reserve_final_path`'s one-winner guarantee or reintroducing the redundant
+    /// compress-and-stage race it exists to prevent.
+    ///
+    /// The check itself is `reserved_not_staged`, maintained incrementally rather than
+    /// recomputed here: every winning `reserve_final_path` call adds to it, every
+    /// `stage`/`stage_with_mtime` call removes from it, so by the time `finish` runs it already
+    /// holds exactly the promises nothing fulfilled — an O(1) empty check on the common,
+    /// successful path, not a diff over the whole batch recomputed on every call.
     ///
     /// # Returns
     /// * `Ok(())`      - Every staged write is durable and visible at its final path.
-    /// * `Err(String)` - A reserved path was never staged, or a write, fsync, or rename failed.
-    ///                   Either way the batch is dead: every remaining staged temp was
-    ///                   best-effort removed before returning, so nothing staged here survives
-    ///                   to be published later. Renames that ran before an in-flight failure may
-    ///                   already be visible (the type-level doc comment: renames are not atomic
-    ///                   as a set) — the caller must treat the whole batch as unpublished and
-    ///                   re-stage from source, exactly as it would after a crash.
+    /// * `Err(String)` - A reserved path was never staged, or a temp-fsync, rename, or
+    ///                   directory-sync step of the barrier failed. Either way the batch is dead:
+    ///                   every remaining staged temp was best-effort removed before returning, so
+    ///                   nothing staged here survives to be published later — but what is already
+    ///                   on disk depends on which step failed. A leaked reservation is caught
+    ///                   before the barrier ever runs, so nothing in this batch was renamed. A
+    ///                   temp-fsync failure means the same: no rename has happened yet, so no
+    ///                   final path is visible. A rename failure means every entry renamed before
+    ///                   it is visible, and its directory was already best-effort fsynced before
+    ///                   this error returned — that prefix is no less durable than the same crash
+    ///                   at the same point would leave it (see [`run_write_barrier`]). A failure
+    ///                   in the barrier's own trailing directory sync (every rename already
+    ///                   succeeded) means every entry is visible, but directory durability past
+    ///                   the one that failed to sync is only best-effort, not proven. In every
+    ///                   case there is no per-path record of which case applies — the caller must
+    ///                   treat the whole batch as unpublished and re-stage from source, exactly as
+    ///                   it would after a crash.
     pub fn finish(&self) -> Result<(), String> {
-        self.finish_detailed().map_err(WriteBatchFailure::into_message)
-    }
-
-    /// Like [`finish`](Self::finish), but reports *why* the batch failed instead of collapsing
-    /// every failure into one opaque message — see [`WriteBatchFailure`]. `finish` is a thin
-    /// wrapper over this, so every guarantee documented there — and every caveat: a failed call
-    /// discards the entire batch, and nothing staged in it survives to be published later —
-    /// holds identically here.
-    ///
-    /// The distinction exists for callers that record decisions against paths they reserve:
-    /// [`WriteBatchFailure::LeakedReservations`] names exactly which promised paths will now
-    /// never land, which is what such a caller needs to invalidate the decisions depending on
-    /// them before it re-stages the batch from source. It is not — and cannot be — a
-    /// partial-recovery lever; see the variant's own doc comment.
-    ///
-    /// # Returns
-    /// * `Ok(())`                 - Every staged write is durable and visible at its final path.
-    /// * `Err(WriteBatchFailure)` - See the variants' own doc comments.
-    pub fn finish_detailed(&self) -> Result<(), WriteBatchFailure> {
         let (pending, leaked) = {
             let mut state = self.state.lock().expect("write batch lock poisoned");
             let pending = std::mem::take(&mut state.pending);
-
-            let staged_paths: std::collections::HashSet<&Path> =
-                pending.iter().map(|(_, final_path)| final_path.as_path()).collect();
-            // Sorted so `missing` (and the message built from it) is deterministic — the
-            // reservation set itself iterates in hash order.
-            let mut leaked: Vec<PathBuf> = state.final_paths.iter()
-                .filter(|reserved| !staged_paths.contains(reserved.as_path()))
-                .cloned()
-                .collect();
-            leaked.sort();
-
+            let leaked = std::mem::take(&mut state.reserved_not_staged);
             state.final_paths.clear();
             (pending, leaked)
         };
 
         if !leaked.is_empty() {
-            for (temp, _) in &pending {
-                let _ = std::fs::remove_file(temp);
-            }
+            discard_staged_temps(&pending);
+            // Sorted so the message is deterministic — `reserved_not_staged` itself iterates in
+            // hash order.
+            let mut leaked: Vec<PathBuf> = leaked.into_iter().collect();
+            leaked.sort();
             let message = format!(
-                "Error: {} final path(s) were reserved but never staged — a fallible step between \
-                reservation and staging must have failed (any concurrent or later caller for the \
-                same path would have read the reservation as already handled and staged nothing of \
-                its own either); refusing to publish this batch: {}",
+                "Error while finishing a write batch: {} final path(s) were reserved but never \
+                staged — a fallible step between reservation and staging must have failed (any \
+                concurrent or later caller for the same path would have read the reservation as \
+                already handled and staged nothing of its own either); refusing to publish this \
+                batch: {}",
                 leaked.len(),
                 leaked.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>().join(", "),
             );
-            return Err(WriteBatchFailure::LeakedReservations { message, missing: leaked });
+            return Err(message);
         }
 
         if pending.is_empty() {
@@ -905,10 +940,8 @@ impl WriteBatch {
         }
 
         if let Err(error) = run_write_barrier(&pending) {
-            for (temp, _) in &pending {
-                let _ = std::fs::remove_file(temp);
-            }
-            return Err(WriteBatchFailure::Other(error));
+            discard_staged_temps(&pending);
+            return Err(error);
         }
 
         Ok(())
@@ -929,10 +962,8 @@ impl Drop for WriteBatch {
     /// case leaks nothing either — the durability invariant holds trivially, since nothing
     /// staged here was ever published.
     fn drop(&mut self) {
-        if let Ok(mut state) = self.state.lock() {
-            for (temp, _) in state.pending.drain(..) {
-                let _ = std::fs::remove_file(&temp);
-            }
+        if let Ok(state) = self.state.lock() {
+            discard_staged_temps(&state.pending);
         }
     }
 }
@@ -973,9 +1004,7 @@ impl Drop for BulkStoreSession {
         }
         if let Ok(mut registry) = bulk_session_registry().lock() {
             if let Some(pending) = registry.take() {
-                for (temp, _) in pending {
-                    let _ = std::fs::remove_file(&temp);
-                }
+                discard_staged_temps(&pending);
             }
         }
     }
@@ -2181,35 +2210,44 @@ mod tests {
     }
 
     #[test]
-    fn finish_detailed_names_exactly_the_leaked_paths_in_sorted_order() {
-        // `missing` is the diagnostic half of the leak contract: it must list precisely the
-        // reserved-but-never-staged paths (a caller invalidates decisions depending on them
-        // before re-staging), sorted so the report is deterministic, and never include paths
-        // that were actually staged.
+    fn finish_names_exactly_the_leaked_paths_in_sorted_order() {
+        // The error message is the diagnostic half of the leak contract: it must name precisely
+        // the reserved-but-never-staged paths (a caller invalidates decisions depending on them
+        // before re-staging), in sorted order so the report is deterministic, and never a path
+        // that was actually staged.
+        //
+        // Eight leaked paths, not two: the leak set is a `HashSet`, so its iteration order is
+        // randomized per process — with only two entries, an implementation that forgot to sort
+        // would still produce a message in the "right" order about half the time. Enough entries
+        // make that false pass vanishingly unlikely (well under 1 in 8! by chance).
         let temp = std::env::temp_dir().join(format!("forklift-writebatch-leak-detail-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
 
-        let leaked_z = temp.join("zzz-leaked");
-        let leaked_a = temp.join("aaa-leaked");
+        let names = ["zzz", "yyy", "xxx", "www", "vvv", "uuu", "ttt", "sss"];
+        let leaked: Vec<_> = names.iter().map(|n| temp.join(format!("{}-leaked", n))).collect();
         let staged = temp.join("mmm-staged");
+
         let batch = WriteBatch::new();
-        assert!(batch.reserve_final_path(&leaked_z));
-        assert!(batch.reserve_final_path(&leaked_a));
+        for path in &leaked {
+            assert!(batch.reserve_final_path(path));
+        }
         batch.stage(&staged, b"content").unwrap();
 
-        match batch.finish_detailed().unwrap_err() {
-            WriteBatchFailure::LeakedReservations { missing, message } => {
-                assert_eq!(missing, vec![leaked_a.clone(), leaked_z.clone()],
-                    "missing must be exactly the never-staged paths, sorted");
-                assert!(message.contains("aaa-leaked") && message.contains("zzz-leaked"));
-                assert!(!message.contains("mmm-staged"),
-                    "a path that was actually staged must not be reported as missing");
-            }
-            WriteBatchFailure::Other(message) => {
-                panic!("a leaked reservation must be its own variant, got Other: {}", message);
-            }
-        }
+        let error = batch.finish().unwrap_err();
+
+        let mut expected_order: Vec<String> =
+            leaked.iter().map(|p| p.to_string_lossy().to_string()).collect();
+        expected_order.sort();
+        let positions: Vec<usize> = expected_order.iter()
+            .map(|p| error.find(p.as_str())
+                .unwrap_or_else(|| panic!("the error must name every leaked path, missing {}: {}", p, error)))
+            .collect();
+        assert!(positions.windows(2).all(|w| w[0] < w[1]),
+            "leaked paths must appear in the message in sorted order, got: {}", error);
+
+        assert!(!error.contains("mmm-staged"),
+            "a path that was actually staged must not be reported as missing");
 
         std::fs::remove_dir_all(&temp).ok();
     }
@@ -2261,10 +2299,12 @@ mod tests {
     #[test]
     fn a_rename_failure_partway_discards_the_batch_but_earlier_renames_stay_visible() {
         // The honest half of the failure contract: the rename loop stops at the first failure,
-        // so an entry renamed *before* it is already visible (never promised durable) — a failed
-        // finish means "treat the whole batch as unpublished," not "nothing became visible."
-        // What it does promise: every remaining temp is removed, nothing staged survives to be
-        // published later.
+        // so an entry renamed *before* it is already visible — a failed finish means "treat the
+        // whole batch as unpublished," not "nothing became visible." What it does promise: every
+        // remaining temp is removed, nothing staged survives to be published later, and (see
+        // `run_write_barrier`'s fix for the data-loss window this closes) the directory of every
+        // entry renamed before the failure is best-effort fsynced before this call returns —
+        // not just visible, but no less durable than the same crash point would leave it.
         let temp = std::env::temp_dir().join(format!("forklift-writebatch-partway-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
@@ -2279,15 +2319,9 @@ mod tests {
         // fail on every platform, after the first entry's rename already succeeded.
         std::fs::create_dir_all(blocked.join("occupant")).unwrap();
 
-        match batch.finish_detailed().unwrap_err() {
-            WriteBatchFailure::Other(message) => {
-                assert!(message.contains("rename-target-blocked"),
-                    "the error must name the failing rename, got: {}", message);
-            }
-            WriteBatchFailure::LeakedReservations { message, .. } => {
-                panic!("a barrier failure must not read as a leaked reservation: {}", message);
-            }
-        }
+        let error = batch.finish().unwrap_err();
+        assert!(error.contains("rename-target-blocked"),
+            "the error must name the failing rename, got: {}", error);
 
         assert_eq!(std::fs::read(&first).unwrap(), b"landed",
             "an entry renamed before the failure stays visible — the set is not atomic");

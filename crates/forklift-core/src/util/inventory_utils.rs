@@ -347,18 +347,27 @@ pub async fn create_inventory_for_directory(path: &WarehousePath) -> Result<(), 
     // batch and still give that ordering.
     //
     // A failure here is different from every other failure this join point tolerates: this batch
-    // covers *every* blob the whole walk decided, and `WriteBatch::finish`'s rename loop returns
-    // on the *first* failure (see `write_shard_mutation`'s doc comment on why that is not
-    // all-or-nothing — DESIGN.html §5.0 D item 10, finding #4) — so on an error here some blobs
-    // this batch covers may be durable and others not, with no per-hash way to tell which from
-    // outside `WriteBatch`. Publishing any shard content below could then durably name a blob
-    // that never actually landed. So a failure here — unlike the walk's own failure, which still
-    // publishes whatever it *did* decide — skips phase A/B entirely (`blob_batch_published`
-    // below): nothing this walk decided is published this round, and a retry starts over. Still
-    // strictly better than the pre-batching baseline, where a torn single-object write could only
-    // ever cost that one file, never an entire load — this failure mode is rare (disk-level I/O
-    // errors), and losing a whole walk's *decisions* (not their eventual content — nothing here
-    // is destructive) to a retry is a fair trade for closing finding #7.
+    // covers *every* blob the whole walk decided, and `WriteBatch::finish` can fail two distinct
+    // ways, neither of which leaves a per-hash way to tell which blobs actually landed. It can
+    // refuse the whole batch before anything is renamed — some path a worker reserved (see
+    // `LooseObject::store_deferred`) was never staged, because the fallible step between winning
+    // that reservation and finishing the write failed; every other occurrence of that same
+    // content already saw the reservation lost and staged nothing itself, so nothing in this
+    // batch names that blob (see `WriteBatch::finish`'s doc comment). Or its rename loop can run
+    // partway and then hit its own failure (see `write_shard_mutation`'s doc comment on why that
+    // is not all-or-nothing — DESIGN.html §5.0 D item 10, finding #4), leaving some blobs this
+    // batch covers durable and others not. Either way, publishing any shard content below could
+    // then durably name a blob that never actually landed. So a failure here — unlike the walk's
+    // own failure, which still publishes whatever it *did* decide — skips phase A/B entirely
+    // (`blob_batch_published` below): nothing this walk decided is published this round, and a
+    // retry starts over. Still strictly better than the pre-batching baseline, where a torn
+    // single-object write could only ever cost that one file, never an entire load — both failure
+    // modes are rare (a leaked reservation means some other fallible step failed first; a partial
+    // rename means disk-level I/O errors), and losing a whole walk's *decisions* (not their
+    // eventual content — nothing here is destructive) to a retry is a fair trade for closing
+    // finding #7. The blast radius is deliberate: one failed producer anywhere in the walk means
+    // the whole pass publishes nothing, because the missing blob could be named by any shard's
+    // decision, not just the one whose producer failed.
     let mut blob_batch_published = true;
 
     if let Err(e) = context.blob_batch.finish() {
@@ -1238,13 +1247,16 @@ pub fn refresh_tracked_entries() -> Result<(), String> {
     // the blob must already be durable — not merely staged — before that shard's rename can land.
     //
     // A failure here skips `publish_shard_outcomes` entirely, rather than the "keep whatever was
-    // decided" resilience the decide loop above gives a per-shard failure: `WriteBatch::finish`'s
-    // rename loop returns on the *first* failure (see `write_shard_mutation`'s doc comment on why
-    // that is not all-or-nothing — finding #4), so on an error here some of this pass's blobs may
-    // be durable and others not, with no per-hash way to tell which from outside `WriteBatch`.
-    // Publishing any shard content below could then durably name a blob that never actually
-    // landed — see `create_inventory_for_directory`'s identical phase-0 gating for the same
-    // reasoning in more detail.
+    // decided" resilience the decide loop above gives a per-shard failure. Two distinct causes
+    // land here, both with the same outcome: `WriteBatch::finish` can refuse the whole batch
+    // before anything is renamed — some path a worker reserved was never staged (see
+    // `WriteBatch::finish`'s doc comment) — or its rename loop can run partway and then hit its
+    // own failure (see `write_shard_mutation`'s doc comment on why that is not all-or-nothing —
+    // finding #4), leaving some of this pass's blobs durable and others not. Either way there is
+    // no per-hash way to tell which from outside `WriteBatch`, and publishing any shard content
+    // below could durably name a blob that never actually landed — see
+    // `create_inventory_for_directory`'s identical phase-0 gating for the same reasoning in more
+    // detail.
     let blob_batch_published = match blob_batch.finish() {
         Ok(()) => true,
         Err(e) => { if result.is_ok() { result = Err(e); } false }
