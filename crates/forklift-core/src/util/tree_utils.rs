@@ -29,8 +29,8 @@ const FILENAME_METADATA_SUFFIX: &str = ".metadata";
 /// * Ancestor directories that have no shard of their own (e.g. only `src/a` was ever
 ///   loaded) are synthesized so the chain root → `src` → `a` exists in the tree.
 ///
-/// Used by `stack` (`stack_utils::stack_parcel`) and `park` push (`park::park_changes`,
-/// DESIGN.html §5.0 D item 10, finding #3). `stack`'s `prepared` snapshot is the single
+/// Used by `stack` (`stack_utils::stack_parcel`) and `park` push (`park::park_changes`).
+/// `stack`'s `prepared` snapshot is the single
 /// read+parse pass shared with the conflict check and the post-stack cleanup (§ perf); `park`
 /// reads its own fresh snapshot instead (it has no other step to share it with), taken after its
 /// working-directory refresh so it reflects the just-rehashed state. Either way, `batch` turns
@@ -62,7 +62,7 @@ const FILENAME_METADATA_SUFFIX: &str = ".metadata";
 /// * `track_tree_hashes`    - Whether the caller will actually consult the returned tree-hash
 ///                            map — see [`TreeBuilderContext::track_tree_hashes`]. `stack` passes
 ///                            `true` (it stamps shards' rollups from the map afterward); `park`
-///                            passes `false` (DESIGN.html §5.0 D item 10, finding #8) — it
+///                            passes `false` — it
 ///                            overwrites every shard from head right after this returns
 ///                            (`inventory_utils::replace_all_inventories`), so the map would be
 ///                            discarded unread, and every one of the build's per-directory tasks

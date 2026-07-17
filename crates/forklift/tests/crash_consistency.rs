@@ -363,7 +363,7 @@ fn calibrate_load_duration(area: &Area, files: &[PathBuf], base_line: &str, labe
 /// entries, so a second `load .` would not necessarily re-touch (or heal) a shard a first,
 /// interrupted `load .` already made durable and visible. `stack` itself never verifies a blob's
 /// existence (it only carries hashes forward into tree entries), so the sharp check is deferred
-/// to a final `export-git` after the whole spread (DESIGN.html §5.0 D item 10, finding #1) —
+/// to a final `export-git` after the whole spread (DESIGN.html §5.0 D item 10) —
 /// see the caller.
 ///
 /// Returns how many iterations produced a completed `stack` (the signal that this iteration's
@@ -427,8 +427,8 @@ fn run_load_kill_spread(
     stacked
 }
 
-/// Extends the crash-consistency spine to `load`'s parallel per-directory walk (DESIGN.html §5.0
-/// D item 10, finding #1): every changed file's blob is now staged into the walk's own shared
+/// Extends the crash-consistency spine to `load`'s parallel per-directory walk: every changed
+/// file's blob is now staged into the walk's own shared
 /// batch (`InventoryBuilderContext::batch`) instead of paying its own atomic-write barrier, and
 /// that same batch is what the walk's single-threaded join point later publishes shard content
 /// through — so a blob and the shard that references it can land in the very same durability
@@ -442,8 +442,8 @@ fn killing_load_midway_never_leaves_a_shard_referencing_a_missing_or_torn_blob()
     let area = Area::new("load");
     let warehouse = area.warehouse();
 
-    // Several directories with several files each: `load`'s walk (DESIGN.html §5.0 D item 10,
-    // finding #1) runs one concurrent task per directory, each staging its own changed files'
+    // Several directories with several files each: `load`'s walk runs one concurrent task per
+    // directory, each staging its own changed files'
     // blobs into the same shared batch — this corpus shape is what actually exercises that
     // concurrency, unlike `stack`'s crash test above (a single flat file is enough there, since
     // `stack`'s object write concurrency comes from its tree build, not this walk).
@@ -557,7 +557,7 @@ fn parked_count(warehouse: &Path) -> usize {
 /// When an iteration's `park` did commit, this pops it right back — a real read of every tree and
 /// blob the parcel references (`shift_utils::diff_trees`/`apply_file_op` walk the tree and
 /// materialize every file's content), the sharp check that a torn or missing object referenced by
-/// the newly committed parcel fails loudly on (DESIGN.html §5.0 D item 10, finding #3). When it
+/// the newly committed parcel fails loudly on. When it
 /// did not commit, `park`'s reset-to-head step (the only thing that touches the working
 /// directory's tracked file *content*) never ran — it only ever runs after the parked-list write
 /// already succeeded — so the working directory still holds this iteration's rewritten content
@@ -612,8 +612,8 @@ fn run_park_kill_spread(
     parked
 }
 
-/// Extends the crash-consistency spine to `park` push's own object batch (DESIGN.html §5.0 D
-/// item 10, finding #3): every tree object and the parcel object are now staged into one shared
+/// Extends the crash-consistency spine to `park` push's own object batch: every tree object and
+/// the parcel object are now staged into one shared
 /// `WriteBatch`, finished once before the signature sidecar and the parked-list record — the same
 /// pattern `stack`'s crash test above already covers for `stack`, applied here to `park`'s own
 /// distinct code path (and `refresh_tracked_entries`'s own separate blob batch, finished before
@@ -743,10 +743,10 @@ fn load_barrier_count_for(files_per_dir: usize) -> u64 {
     barrier_count(&output)
 }
 
-/// DESIGN.html §5.0 D item 10, finding #10: `file_utils::barrier_count` exists so a test can
+/// `file_utils::barrier_count` exists so a test can
 /// prove a burst of writes actually collapsed to a constant number of barriers, not just that
 /// the resulting state happens to be correct. This is that test for `load`'s join point
-/// (findings #1/#7's fix restructured it into three barriers — a blob barrier, an
+/// (batching blobs and shard content restructured it into three barriers — a blob barrier, an
 /// ancestor-clear barrier, and a shard-content barrier — still a constant number regardless of
 /// how many files changed within the touched directories, not one that scales with the changed
 /// file count the way the pre-batching baseline did).

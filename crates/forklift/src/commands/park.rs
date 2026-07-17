@@ -46,7 +46,7 @@ pub async fn park_changes() -> Result<(), String> {
 
     // Stage the whole work in progress: modified tracked files are rehashed, deleted
     // tracked files become staged removals. Untracked files stay untracked. Its own blob
-    // stores are already batched internally (DESIGN.html §5.0 D item 10, finding #3).
+    // stores are already batched internally (DESIGN.html §5.0 D item 10).
     inventory_utils::refresh_tracked_entries()?;
 
     // In a scoped (sparse) bay the dock only materializes the in-scope subtree(s); splice it
@@ -60,7 +60,7 @@ pub async fn park_changes() -> Result<(), String> {
 
     // Every tree object below (and, further down, the parcel object) is staged into `batch`
     // instead of fsynced immediately — one durability barrier for the whole push instead of one
-    // per object (DESIGN.html §5.0 D item 10, finding #3). Nothing may depend on a staged
+    // per object. Nothing may depend on a staged
     // object's durability or visibility until `batch.finish()` below returns `Ok` — see
     // `stack_utils::stack_parcel`'s identical batch, which this mirrors.
     let batch = std::sync::Arc::new(file_utils::WriteBatch::new());
@@ -90,14 +90,14 @@ pub async fn park_changes() -> Result<(), String> {
     // has: a directory whose shard's rollup already matches the corresponding head subtree hash
     // is never hashed or (re)stored — its subtree is spliced into its parent verbatim by hash
     // instead of walked and rebuilt. Its shard *is* still fully read and parsed, by
-    // `prepare_stack_inventory` above, not just peeked past its header (DESIGN.html §5.0 D item
-    // 10, finding #5): the skip plan reads every candidate's rollup out of that already-parsed
+    // `prepare_stack_inventory` above, not just peeked past its header: the skip plan reads
+    // every candidate's rollup out of that already-parsed
     // `prepared` snapshot (an in-memory lookup), which is what makes `prepare_stack_inventory`'s
     // own read+parse pass worth parallelizing — it is real, unavoidable work here, not a header
     // peek a skip could make disappear. The per-directory tree hashes this call also returns are
     // `stack`-only bookkeeping (for stamping rollups after a successful stack) — `park`
     // immediately overwrites every shard from head a few lines down (`replace_all_inventories`),
-    // so it passes `track_tree_hashes: false` (DESIGN.html §5.0 D item 10, finding #8) instead of
+    // so it passes `track_tree_hashes: false` instead of
     // making every one of the build's per-directory tasks pay a `Mutex` acquisition to populate a
     // map nobody reads; the untouched-key set is discarded for the same reason.
     let (partial_root, _tree_hashes, _untouched) = tree_utils::build_tree_from_inventory_deferred(

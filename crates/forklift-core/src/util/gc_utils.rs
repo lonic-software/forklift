@@ -547,7 +547,7 @@ mod tests {
         assert!(loose_path(&garbage).exists(), "gc must delete nothing when the live set cannot be computed");
     }
 
-    /// DESIGN.html §5.0 D item 10, finding #3: a `WriteBatch`-staged write that never reaches
+    /// A `WriteBatch`-staged write that never reaches
     /// `finish()` (the exact shape a SIGKILL mid-`load` leaves behind, now that a whole walk's
     /// blobs share one batch instead of each paying its own immediate barrier) leaves a stray
     /// `<hash>.tmp<pid>-<n>` temp in an object fan-out folder. `compact` never touches it
@@ -579,7 +579,7 @@ mod tests {
         assert_eq!(stats.deleted, 1);
     }
 
-    /// The other half of the finding #3 claim above: a temp stranded by a *very recent* kill is
+    /// The other half of the claim above: a temp stranded by a *very recent* kill is
     /// exactly as protected as any other young, unreferenced object — `gc` cannot (and does not
     /// try to) tell "an in-flight write's temp, still needed" apart from "a stranded batch temp,
     /// safe to reclaim" any better than it can for an ordinary loose object, and applies the same

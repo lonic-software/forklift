@@ -488,7 +488,7 @@ impl BulkStoreSession {
     /// special-casing needed (see `gc_utils`'s own
     /// `gc_sweeps_a_stranded_write_batch_temp_past_the_grace_period` test). This is the same
     /// reclaiming path every other crashed single-file write already relied on before batching
-    /// existed (DESIGN.html §5.0 D item 10, finding #3) — batching only widens *how much* can be
+    /// existed — batching only widens *how much* can be
     /// staged in one still-unfinished barrier, not *whether* an abandoned temp is ever reclaimed.
     pub fn finish(mut self) -> Result<(), String> {
         self.run_barrier()?;
@@ -814,7 +814,7 @@ impl WriteBatch {
     /// with the same path, which must *not* stage it again.
     ///
     /// This is the dedupe [`crate::model::object::loose_object::LooseObject::store_deferred`]
-    /// needs (DESIGN.html §5.0 D item 10, finding #2): [`does_object_exist`] alone only sees
+    /// needs: [`does_object_exist`] alone only sees
     /// packs and already-*renamed* final paths, never a write staged earlier in the very same
     /// batch (its final name does not exist yet — that is the whole point of batching). Without
     /// this, every repeated occurrence of the same content hash in one batched walk would
@@ -2096,8 +2096,8 @@ mod tests {
 
     #[test]
     fn reserve_final_path_wins_exactly_once_then_loses_forever() {
-        // The dedupe primitive `LooseObject::store_deferred` needs (DESIGN.html §5.0 D item 10,
-        // finding #2): the first caller to reserve a given final path gets `true` (it owns
+        // The dedupe primitive `LooseObject::store_deferred` needs: the first caller to reserve
+        // a given final path gets `true` (it owns
         // staging that path); every later call for the same path — even after the winner has
         // gone on to actually stage it — gets `false`.
         let batch = WriteBatch::new();
