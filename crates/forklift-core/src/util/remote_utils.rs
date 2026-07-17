@@ -1359,22 +1359,12 @@ async fn fetch_missing_signatures(client: &RemoteClient,
         });
     }
 
-    let mut fetched = 0usize;
-
-    // The coordinating call must not return while a sibling task's body may still be writing a
-    // sidecar (`sign_utils::store_raw_parcel_signature` has no await between reading the fetched
-    // bytes and finishing the write) — see `drain_remaining` below.
-    while let Some(result) = tasks.join_next().await {
-        match result.map_err(|e| format!("A transfer task failed: {}", e)).and_then(|inner| inner) {
-            Ok(count) => fetched += count,
-            Err(first_error) => {
-                drain_remaining(tasks).await;
-                return Err(first_error);
-            }
-        }
-    }
-
-    Ok(fetched)
+    // Routed through the same `join_all` every other coordinator in this module uses, rather
+    // than a second, hand-rolled copy of its join/drain loop — see `join_all`'s doc for the
+    // not-return-while-writing guarantee this gets for free (`sign_utils::store_raw_parcel_signature`
+    // has no await between reading the fetched bytes and finishing the write, same shape as the
+    // object-transfer paths).
+    join_all(tasks).await.map(|counts| counts.into_iter().sum())
 }
 
 /// Lift one pallet: negotiate the missing objects, upload them (and the new parcels'
@@ -1698,7 +1688,7 @@ async fn upload_objects(client: &RemoteClient, hashes: &[String]) -> Result<(), 
         });
     }
 
-    join_all(tasks).await
+    join_all(tasks).await.map(|_| ())
 }
 
 /// Refuse a lift whose commit would need more than one paginated batch (§9.4b Stage 3, W3) when
@@ -1814,7 +1804,7 @@ async fn upload_to_targets(client: &RemoteClient,
         });
     }
 
-    join_all(tasks).await
+    join_all(tasks).await.map(|_| ())
 }
 
 /// Commit a staged lift session, paginating the hash lists and retrying each batch with bounded
@@ -1921,37 +1911,110 @@ fn build_commit_batches(control_plane: &[String],
     batches
 }
 
-/// Await every task of a set, surfacing the first failure. The coordinating call must not
-/// return while a sibling task's body may still be writing (`object_utils::store_object_bytes`
-/// has no await between reading the fetched bytes and finishing the write) — see
-/// [`drain_remaining`].
-async fn join_all(mut tasks: JoinSet<Result<(), String>>) -> Result<(), String> {
+/// Await every task of a set, surfacing the first failure and discarding the rest — first error
+/// wins, so a later, possibly less actionable failure (e.g. one surfaced only by best-effort
+/// cleanup after the real one) never overwrites the first. Generic over the task payload `T` so
+/// every coordinator in this module — fetching objects, fetching signature sidecars, and both
+/// upload paths — routes through this one implementation instead of each hand-rolling its own
+/// copy of this loop.
+///
+/// The coordinating call must not return while a sibling task's body may still be writing
+/// (`object_utils::store_object_bytes` and `sign_utils::store_raw_parcel_signature` both have no
+/// await between reading the fetched bytes and finishing the write) — see [`drain_remaining`],
+/// which this delegates to on the error path. Any panic evidence [`drain_remaining`] observed
+/// while draining is appended to the first error below, never substituted for it.
+///
+/// This guarantee holds only while the returned future is polled to completion: wrapping this
+/// call in `tokio::time::timeout` or a `select!` branch can drop the `JoinSet` without draining
+/// it, reinstating the race this function exists to close.
+async fn join_all<T: Send + 'static>(mut tasks: JoinSet<Result<T, String>>) -> Result<Vec<T>, String> {
+    let mut results: Vec<T> = Vec::new();
+
     while let Some(result) = tasks.join_next().await {
-        if let Err(first_error) =
-            result.map_err(|e| format!("A transfer task failed: {}", e)).and_then(|inner| inner)
-        {
-            drain_remaining(tasks).await;
-            return Err(first_error);
+        match result.map_err(|e| format!("A transfer task failed: {}", e)).and_then(|inner| inner) {
+            Ok(value) => results.push(value),
+            Err(first_error) => {
+                return Err(match drain_remaining(tasks).await {
+                    Some(panic_note) => format!("{} (additionally, {})", first_error, panic_note),
+                    None => first_error,
+                });
+            }
         }
     }
 
-    Ok(())
+    Ok(results)
 }
 
-/// Abort and drain every task still in `tasks`, discarding every result. This is the other half
-/// of the invariant [`join_all`] and [`fetch_missing_signatures`] both need: a coordinating call
-/// must never return while a transfer task's body may still be writing to disk. `abort_all` only
-/// *signals* cancellation, and tokio can only land that signal at a task's next await point — a
-/// task already past its network fetch and inside this module's synchronous, non-yielding store
-/// helpers (no await between reading the fetched bytes and finishing the write) keeps running
-/// regardless, so the signal alone is not enough. Draining here, before the caller returns
-/// whatever error it already has, is what closes the gap — the same gap
-/// [`crate::model::task::TaskExecutor::execute`] closes for the worker pool. Every later result
-/// (a cancelled join from the abort actually landing, a panic, a plain task error, even a late
-/// success) is discarded: the caller already has its first error, and first error wins.
-async fn drain_remaining<T: Send + 'static>(mut tasks: JoinSet<T>) {
+/// Abort and drain every task still in `tasks`. This is the other half of the invariant
+/// [`join_all`] needs: a coordinating call must never return while a task pool it spawned is
+/// still running — the general shape of the gap being closed here, not one specific to this
+/// module. `abort_all` only *signals* cancellation, and tokio can only land that signal at a
+/// task's next await point — a task already past its network fetch and inside this module's
+/// synchronous, non-yielding store helpers (no await between reading the fetched bytes and
+/// finishing the write) keeps running regardless, so the signal alone is not enough. Draining
+/// here, before the caller returns whatever error it already has, is what closes that gap.
+///
+/// Most results are discarded: a cancelled join (the abort actually landing), an ordinary task
+/// error, even a late success — the caller already has its first error, and first error wins. A
+/// *panic* is the one exception: this crate's core never prints on its own, so a sibling's panic
+/// during the drain window must not simply vanish. Every `JoinError` for which
+/// [`tokio::task::JoinError::is_panic`] is true has its payload collected into a compact summary
+/// and returned — for the caller to append to the error it already has, parenthetically, never to
+/// substitute for it: the first error observed remains the one a caller of [`join_all`] acts on,
+/// with the panic evidence riding along as context, not replacing it. `Some` combined note if one
+/// or more siblings panicked, `None` if nothing did.
+///
+/// `tokio::task::JoinSet::shutdown` is deliberately not used here even though it is documented as
+/// exactly `abort_all` followed by draining every result: it discards those results outright,
+/// which is incompatible with collecting the panic evidence described above.
+///
+/// Like [`join_all`], this guarantee holds only while the returned future is polled to
+/// completion — a `timeout` or `select!` around the caller can drop `tasks` before this drain
+/// ever runs.
+async fn drain_remaining<T: Send + 'static>(mut tasks: JoinSet<T>) -> Option<String> {
     tasks.abort_all();
-    while tasks.join_next().await.is_some() {}
+
+    let mut panics: Vec<String> = Vec::new();
+
+    while let Some(result) = tasks.join_next().await {
+        if let Err(join_error) = result {
+            if join_error.is_panic() {
+                panics.push(panic_payload_message(join_error));
+            }
+        }
+    }
+
+    if panics.is_empty() {
+        None
+    } else if panics.len() == 1 {
+        Some(format!("a sibling task panicked during the drain: {}", panics[0]))
+    } else {
+        Some(format!(
+            "{} sibling tasks panicked during the drain: {}", panics.len(), panics.join("; ")
+        ))
+    }
+}
+
+/// Best-effort extraction of a human-readable message from a task's panic payload for
+/// [`drain_remaining`]. `&str` and `String` cover every panic this codebase raises (a bare
+/// `panic!("literal")` or a formatted `panic!("{}", ...)`); anything else falls back to a fixed
+/// placeholder rather than losing the fact that a panic happened at all.
+fn panic_payload_message(join_error: tokio::task::JoinError) -> String {
+    match join_error.try_into_panic() {
+        Ok(payload) => {
+            if let Some(message) = payload.downcast_ref::<&str>() {
+                message.to_string()
+            } else if let Some(message) = payload.downcast_ref::<String>() {
+                message.clone()
+            } else {
+                "panic with a non-string payload".to_string()
+            }
+        }
+        // `try_into_panic` only fails for a non-panic `JoinError` (cancelled), which the
+        // `is_panic()` check above already excluded — unreachable in practice. The fallback keeps
+        // this function total rather than relying on that invariant with an `unwrap`.
+        Err(_) => "panic".to_string(),
+    }
 }
 
 /// What the trust/office synchronization of a lower/franchise did.
@@ -3571,15 +3634,108 @@ mod tests {
 
     // -----------------------------------------------------------------------------------
     // `join_all` / `drain_remaining`: a transfer task's body must not still be running once the
-    // coordinating call has returned an error. `object_utils::store_object_bytes` and
-    // `sign_utils::store_raw_parcel_signature` (the two real task bodies this guards) have no
-    // await point between reading the fetched bytes and finishing the write, so these tests
-    // reproduce that exact shape with `std::thread::sleep` — never `tokio::time::sleep`, which
-    // would give cancellation somewhere to land — gated by an atomic start flag so the sibling
-    // is provably already inside the unyielding "write" before the failing task resolves. Needs
-    // a real second worker thread to mean anything, unlike this file's other tests: a
-    // `current_thread` runtime could never run the sleeping task and the spin-wait concurrently.
+    // coordinating call has returned an error, and a sibling's panic during the drain window must
+    // leave evidence rather than vanish. `join_all` is the single implementation every
+    // coordinator in this module routes through — fetching objects, fetching signature sidecars,
+    // and both upload paths — so the tests below, exercising `join_all`/`drain_remaining`
+    // directly, structurally cover all of them, including the two real task bodies that motivate
+    // the fix: `object_utils::store_object_bytes` and `sign_utils::store_raw_parcel_signature`,
+    // both of which have no await point between reading the fetched bytes and finishing the
+    // write. The tests reproduce that exact shape with `std::thread::sleep` — never
+    // `tokio::time::sleep`, which would give cancellation somewhere to land — gated by atomic
+    // flags so a sibling is provably resident, and provably past whatever it is waiting on,
+    // before the task driving each scenario proceeds. Needs a real second worker thread to mean
+    // anything, unlike this file's other tests: a `current_thread` runtime could never run the
+    // sleeping task and a spin-wait concurrently.
     // -----------------------------------------------------------------------------------
+
+    /// Multi-thread runtime shared by the drain/join tests below — a real second worker thread is
+    /// what lets an unyielding sibling and whatever gates on it actually run concurrently; see the
+    /// section note above for why a `current_thread` runtime could never exercise this.
+    fn build_drain_test_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap()
+    }
+
+    /// Bounded *blocking* spin-wait shared by the tests below for a condition set by another
+    /// concurrently-resident task's body — e.g. "has the sibling started" or "has the fast task
+    /// already returned its error". Deliberately synchronous (`std::thread::sleep`, never
+    /// `tokio::time::sleep`), mirroring `model::task`'s test helper of the same name and
+    /// rationale: an `.await` here would itself be an await point, and used inside the
+    /// "unyielding sibling" below, that would reopen exactly the cancellation window these tests
+    /// exist to rule out (`abort_all` can only land at an await point — a blocking poll has none).
+    /// Polls `cond` every 5ms for up to 10s so a real regression times out the test instead of
+    /// hanging CI; on timeout, sets `starved` rather than asserting directly, so a degenerate
+    /// schedule fails loudly with an environment-attributed message (asserted by the caller after
+    /// the fact) instead of one that would wrongly implicate the code under test.
+    fn spin_until(cond: impl Fn() -> bool, starved: &std::sync::atomic::AtomicBool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+
+        while !cond() {
+            if std::time::Instant::now() >= deadline {
+                starved.store(true, std::sync::atomic::Ordering::SeqCst);
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// Spawns into `tasks` the "unyielding sibling" shape shared by every test below — mirroring
+    /// the two real task bodies `join_all`/`drain_remaining` guard
+    /// (`object_utils::store_object_bytes` and `sign_utils::store_raw_parcel_signature`), which
+    /// have no await point between reading the fetched bytes and finishing the write. Sets
+    /// `started` as soon as it is first polled — these bare spawned bodies have no other await
+    /// point, so `abort_all` (which can only cancel a task suspended at one) cancels a
+    /// never-polled task outright; `started` is what proves this sibling's first, and only, poll
+    /// has begun, i.e. it is already inside its uninterruptible synchronous body, before whatever
+    /// follows happens. If `gate` is given, blocking-waits (`spin_until`, never an `.await`) for
+    /// that flag next — ordering this sibling's unyielding stretch after whatever the caller gates
+    /// on without opening a new await point for `abort_all` to land in — then blocks its worker
+    /// thread for 300ms with `std::thread::sleep`, sets `completed`, and finally hands off to
+    /// `finish` to produce the task's result (an ordinary value, an error, or a panic). From
+    /// `started` to `finish`, this body never awaits: the gate and the 300ms stretch are both
+    /// synchronous, so the whole thing is one uninterruptible run once it starts.
+    fn spawn_unyielding_sibling<T: Send + 'static>(
+        tasks: &mut JoinSet<T>,
+        started: Arc<std::sync::atomic::AtomicBool>,
+        completed: Arc<std::sync::atomic::AtomicBool>,
+        gate: Option<(Arc<std::sync::atomic::AtomicBool>, Arc<std::sync::atomic::AtomicBool>)>,
+        finish: impl FnOnce() -> T + Send + 'static,
+    ) {
+        tasks.spawn(async move {
+            started.store(true, std::sync::atomic::Ordering::SeqCst);
+
+            if let Some((flag, starved)) = gate {
+                spin_until(|| flag.load(std::sync::atomic::Ordering::SeqCst), &starved);
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            completed.store(true, std::sync::atomic::Ordering::SeqCst);
+            finish()
+        });
+    }
+
+    /// Spawns into `tasks` the "fast" sibling shared by the error-path tests below: blocking-waits
+    /// (`spin_until`) for `gate` (the unyielding sibling's start), then immediately stores
+    /// `signal` (if given) right before producing `finish` — so a later wait on `signal` orders
+    /// itself after this task's own completion, not merely after its start.
+    fn spawn_fast_sibling<T: Send + 'static>(
+        tasks: &mut JoinSet<T>,
+        gate: (Arc<std::sync::atomic::AtomicBool>, Arc<std::sync::atomic::AtomicBool>),
+        signal: Option<Arc<std::sync::atomic::AtomicBool>>,
+        finish: impl FnOnce() -> T + Send + 'static,
+    ) {
+        let (flag, starved) = gate;
+
+        tasks.spawn(async move {
+            spin_until(|| flag.load(std::sync::atomic::Ordering::SeqCst), &starved);
+
+            if let Some(signal) = signal {
+                signal.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+
+            finish()
+        });
+    }
 
     /// The extracted drain in isolation: `drain_remaining` must not return while a sibling is
     /// still inside synchronous, non-yielding work. `abort_all` only *signals* cancellation, and
@@ -3587,37 +3743,29 @@ mod tests {
     /// and the end of its body keeps running regardless (see `drain_remaining`'s doc comment).
     #[test]
     fn drain_remaining_waits_out_a_sibling_stuck_in_synchronous_work() {
-        let runtime =
-            tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
+        let runtime = build_drain_test_runtime();
 
         let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let starved = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         runtime.block_on(async {
             let mut tasks: JoinSet<()> = JoinSet::new();
+            spawn_unyielding_sibling(&mut tasks, Arc::clone(&started), Arc::clone(&completed), None, || ());
 
-            {
-                let started = Arc::clone(&started);
-                let completed = Arc::clone(&completed);
-                tasks.spawn(async move {
-                    started.store(true, std::sync::atomic::Ordering::SeqCst);
-                    std::thread::sleep(std::time::Duration::from_millis(300));
-                    completed.store(true, std::sync::atomic::Ordering::SeqCst);
-                });
-            }
-
-            // Bounded spin-wait so a real regression times out this test instead of hanging CI,
-            // until the sibling above is confirmed to have started — i.e. past its only await
-            // point and inside the unyielding sleep — before draining.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            while !started.load(std::sync::atomic::Ordering::SeqCst) {
-                assert!(std::time::Instant::now() < deadline, "timed out waiting for the sibling to start");
-                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-            }
+            // Waits until the sibling is confirmed started — i.e. its one and only poll has
+            // begun, putting it inside the unyielding sleep, the only place a cancellation signal
+            // could ever land for it — before draining.
+            spin_until(|| started.load(std::sync::atomic::Ordering::SeqCst), &starved);
 
             drain_remaining(tasks).await;
         });
 
+        assert!(
+            !starved.load(std::sync::atomic::Ordering::SeqCst),
+            "test environment starved the sibling (it never started within the deadline) — not a \
+             drain bug"
+        );
         assert!(
             completed.load(std::sync::atomic::Ordering::SeqCst),
             "drain_remaining must not return while a sibling's synchronous body may still be running"
@@ -3627,53 +3775,118 @@ mod tests {
     /// `join_all`'s actual error path: a fast failure must not cut off a sibling that is already
     /// past its network fetch and inside the synchronous write, and a second failure surfacing
     /// only during the drain must never override the first one already captured.
+    ///
+    /// The ordering between the two failures is not left to a wall-clock race: `first_returned` is
+    /// set by the fast sibling immediately before it returns its own error, and the slow sibling
+    /// only starts its 300ms unyielding stretch *after* observing that flag — so the slow
+    /// sibling's error cannot even exist until the fast sibling's error is already sitting in the
+    /// `JoinSet`, long before the slow sibling's subsequent sleep elapses. `join_next` order among
+    /// simultaneously-*ready* tasks is otherwise unspecified, which is exactly what this ordering
+    /// avoids relying on.
     #[test]
     fn join_all_drains_a_synchronous_sibling_before_surfacing_the_first_error() {
-        let runtime =
-            tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
+        let runtime = build_drain_test_runtime();
 
         let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first_returned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let starved = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let result = runtime.block_on(async {
             let mut tasks: JoinSet<Result<(), String>> = JoinSet::new();
 
-            {
-                let started = Arc::clone(&started);
-                let completed = Arc::clone(&completed);
-                tasks.spawn(async move {
-                    started.store(true, std::sync::atomic::Ordering::SeqCst);
-                    std::thread::sleep(std::time::Duration::from_millis(300));
-                    completed.store(true, std::sync::atomic::Ordering::SeqCst);
+            spawn_unyielding_sibling(
+                &mut tasks,
+                Arc::clone(&started),
+                Arc::clone(&completed),
+                Some((Arc::clone(&first_returned), Arc::clone(&starved))),
+                // A late failure: proves the drain does not let a second error overwrite the
+                // first one `join_all` already captured — first error wins.
+                || Err("late boom".to_string()),
+            );
 
-                    // A late failure: proves the drain does not let a second error overwrite the
-                    // first one `join_all` already captured — first error wins.
-                    Err("late boom".to_string())
-                });
-            }
-
-            {
-                let started = Arc::clone(&started);
-                tasks.spawn(async move {
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-                    while !started.load(std::sync::atomic::Ordering::SeqCst) {
-                        assert!(
-                            std::time::Instant::now() < deadline,
-                            "timed out waiting for the sibling to start"
-                        );
-                        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-                    }
-                    Err("boom".to_string())
-                });
-            }
+            spawn_fast_sibling(
+                &mut tasks,
+                (Arc::clone(&started), Arc::clone(&starved)),
+                Some(Arc::clone(&first_returned)),
+                || Err("boom".to_string()),
+            );
 
             join_all(tasks).await
         });
 
+        assert!(
+            !starved.load(std::sync::atomic::Ordering::SeqCst),
+            "test environment starved a sibling (a wait never observed its condition within the \
+             deadline) — not a join_all bug"
+        );
         assert_eq!(result, Err("boom".to_string()), "the first-observed failure wins, not the late one");
         assert!(
             completed.load(std::sync::atomic::Ordering::SeqCst),
             "join_all must not return while the sibling's synchronous body may still be running"
+        );
+    }
+
+    /// The panic-evidence half of the drain contract (see `drain_remaining`'s doc): the drain must
+    /// not silently discard a sibling's panic — it must be appended to the error `join_all`
+    /// already captured, never substituted for it, so the panic leaves evidence instead of
+    /// vanishing (this crate's core never prints on its own). Same ordering discipline as the
+    /// test above: `first_returned` gates the panicking sibling's unyielding stretch so its panic
+    /// cannot even exist until the fast sibling's "boom" is already captured.
+    ///
+    /// The panic below prints via the default panic hook as part of this test's output —
+    /// expected, not a test-harness failure.
+    #[test]
+    fn join_all_appends_panic_evidence_from_the_drain_window_without_losing_the_first_error() {
+        const PANIC_MESSAGE: &str = "sibling panic evidence for the drain-window test";
+
+        let runtime = build_drain_test_runtime();
+
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first_returned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let starved = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let result = runtime.block_on(async {
+            let mut tasks: JoinSet<Result<(), String>> = JoinSet::new();
+
+            spawn_unyielding_sibling(
+                &mut tasks,
+                Arc::clone(&started),
+                Arc::clone(&completed),
+                Some((Arc::clone(&first_returned), Arc::clone(&starved))),
+                || panic!("{}", PANIC_MESSAGE),
+            );
+
+            spawn_fast_sibling(
+                &mut tasks,
+                (Arc::clone(&started), Arc::clone(&starved)),
+                Some(Arc::clone(&first_returned)),
+                || Err("boom".to_string()),
+            );
+
+            join_all(tasks).await
+        });
+
+        assert!(
+            !starved.load(std::sync::atomic::Ordering::SeqCst),
+            "test environment starved a sibling (a wait never observed its condition within the \
+             deadline) — not a panic-evidence bug"
+        );
+        assert!(
+            completed.load(std::sync::atomic::Ordering::SeqCst),
+            "join_all must not return before the panicking sibling's synchronous body finishes \
+             running"
+        );
+
+        let error = result.expect_err("join_all must surface the first error, not the sibling's panic");
+        assert!(
+            error.starts_with("boom"),
+            "the first-observed failure must lead the message, got: {}", error
+        );
+        assert!(
+            error.contains(PANIC_MESSAGE),
+            "the sibling's panic evidence must be appended to the first error, got: {}", error
         );
     }
 }
