@@ -1361,8 +1361,17 @@ async fn fetch_missing_signatures(client: &RemoteClient,
 
     let mut fetched = 0usize;
 
+    // The coordinating call must not return while a sibling task's body may still be writing a
+    // sidecar (`sign_utils::store_raw_parcel_signature` has no await between reading the fetched
+    // bytes and finishing the write) — see `drain_remaining` below.
     while let Some(result) = tasks.join_next().await {
-        fetched += result.map_err(|e| format!("A transfer task failed: {}", e))??;
+        match result.map_err(|e| format!("A transfer task failed: {}", e)).and_then(|inner| inner) {
+            Ok(count) => fetched += count,
+            Err(first_error) => {
+                drain_remaining(tasks).await;
+                return Err(first_error);
+            }
+        }
     }
 
     Ok(fetched)
@@ -1912,13 +1921,37 @@ fn build_commit_batches(control_plane: &[String],
     batches
 }
 
-/// Await every task of a set, surfacing the first failure.
+/// Await every task of a set, surfacing the first failure. The coordinating call must not
+/// return while a sibling task's body may still be writing (`object_utils::store_object_bytes`
+/// has no await between reading the fetched bytes and finishing the write) — see
+/// [`drain_remaining`].
 async fn join_all(mut tasks: JoinSet<Result<(), String>>) -> Result<(), String> {
     while let Some(result) = tasks.join_next().await {
-        result.map_err(|e| format!("A transfer task failed: {}", e))??;
+        if let Err(first_error) =
+            result.map_err(|e| format!("A transfer task failed: {}", e)).and_then(|inner| inner)
+        {
+            drain_remaining(tasks).await;
+            return Err(first_error);
+        }
     }
 
     Ok(())
+}
+
+/// Abort and drain every task still in `tasks`, discarding every result. This is the other half
+/// of the invariant [`join_all`] and [`fetch_missing_signatures`] both need: a coordinating call
+/// must never return while a transfer task's body may still be writing to disk. `abort_all` only
+/// *signals* cancellation, and tokio can only land that signal at a task's next await point — a
+/// task already past its network fetch and inside this module's synchronous, non-yielding store
+/// helpers (no await between reading the fetched bytes and finishing the write) keeps running
+/// regardless, so the signal alone is not enough. Draining here, before the caller returns
+/// whatever error it already has, is what closes the gap — the same gap
+/// [`crate::model::task::TaskExecutor::execute`] closes for the worker pool. Every later result
+/// (a cancelled join from the abort actually landing, a panic, a plain task error, even a late
+/// success) is discarded: the caller already has its first error, and first error wins.
+async fn drain_remaining<T: Send + 'static>(mut tasks: JoinSet<T>) {
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
 }
 
 /// What the trust/office synchronization of a lower/franchise did.
@@ -3534,5 +3567,113 @@ mod tests {
         assert_eq!(remote.batch_hits(), 0, "chunks never route through the batch endpoint");
         assert_eq!(remote.hits_for(&format!("/v1/objects/{}", chunk_a.hash)), 1);
         assert_eq!(remote.hits_for(&format!("/v1/objects/{}", chunk_b.hash)), 1);
+    }
+
+    // -----------------------------------------------------------------------------------
+    // `join_all` / `drain_remaining`: a transfer task's body must not still be running once the
+    // coordinating call has returned an error. `object_utils::store_object_bytes` and
+    // `sign_utils::store_raw_parcel_signature` (the two real task bodies this guards) have no
+    // await point between reading the fetched bytes and finishing the write, so these tests
+    // reproduce that exact shape with `std::thread::sleep` — never `tokio::time::sleep`, which
+    // would give cancellation somewhere to land — gated by an atomic start flag so the sibling
+    // is provably already inside the unyielding "write" before the failing task resolves. Needs
+    // a real second worker thread to mean anything, unlike this file's other tests: a
+    // `current_thread` runtime could never run the sleeping task and the spin-wait concurrently.
+    // -----------------------------------------------------------------------------------
+
+    /// The extracted drain in isolation: `drain_remaining` must not return while a sibling is
+    /// still inside synchronous, non-yielding work. `abort_all` only *signals* cancellation, and
+    /// tokio can only land that signal at an await point — a task with none between where it is
+    /// and the end of its body keeps running regardless (see `drain_remaining`'s doc comment).
+    #[test]
+    fn drain_remaining_waits_out_a_sibling_stuck_in_synchronous_work() {
+        let runtime =
+            tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
+
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        runtime.block_on(async {
+            let mut tasks: JoinSet<()> = JoinSet::new();
+
+            {
+                let started = Arc::clone(&started);
+                let completed = Arc::clone(&completed);
+                tasks.spawn(async move {
+                    started.store(true, std::sync::atomic::Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    completed.store(true, std::sync::atomic::Ordering::SeqCst);
+                });
+            }
+
+            // Bounded spin-wait so a real regression times out this test instead of hanging CI,
+            // until the sibling above is confirmed to have started — i.e. past its only await
+            // point and inside the unyielding sleep — before draining.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !started.load(std::sync::atomic::Ordering::SeqCst) {
+                assert!(std::time::Instant::now() < deadline, "timed out waiting for the sibling to start");
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+
+            drain_remaining(tasks).await;
+        });
+
+        assert!(
+            completed.load(std::sync::atomic::Ordering::SeqCst),
+            "drain_remaining must not return while a sibling's synchronous body may still be running"
+        );
+    }
+
+    /// `join_all`'s actual error path: a fast failure must not cut off a sibling that is already
+    /// past its network fetch and inside the synchronous write, and a second failure surfacing
+    /// only during the drain must never override the first one already captured.
+    #[test]
+    fn join_all_drains_a_synchronous_sibling_before_surfacing_the_first_error() {
+        let runtime =
+            tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
+
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let result = runtime.block_on(async {
+            let mut tasks: JoinSet<Result<(), String>> = JoinSet::new();
+
+            {
+                let started = Arc::clone(&started);
+                let completed = Arc::clone(&completed);
+                tasks.spawn(async move {
+                    started.store(true, std::sync::atomic::Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    completed.store(true, std::sync::atomic::Ordering::SeqCst);
+
+                    // A late failure: proves the drain does not let a second error overwrite the
+                    // first one `join_all` already captured — first error wins.
+                    Err("late boom".to_string())
+                });
+            }
+
+            {
+                let started = Arc::clone(&started);
+                tasks.spawn(async move {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                    while !started.load(std::sync::atomic::Ordering::SeqCst) {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "timed out waiting for the sibling to start"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                    }
+                    Err("boom".to_string())
+                });
+            }
+
+            join_all(tasks).await
+        });
+
+        assert_eq!(result, Err("boom".to_string()), "the first-observed failure wins, not the late one");
+        assert!(
+            completed.load(std::sync::atomic::Ordering::SeqCst),
+            "join_all must not return while the sibling's synchronous body may still be running"
+        );
     }
 }
