@@ -275,6 +275,29 @@ async fn worker<O: Send, E: Clone + Send>(context: Arc<BaseTaskContext<O, E>>) -
 /// count tracks `num_cpus::get()`), CI runners are multi-core, and a hard failure on a low-core
 /// box would misattribute an environment limit to the code under test rather than reporting it as
 /// what it actually is.
+///
+/// Every test below that needs a second task concurrently resident alongside its initial task
+/// sends that second task with `context.send_task(...)` from the *test body*, before calling
+/// `executor.execute(...)` — never from inside the initial task's own poll (see
+/// [`TaskContext::send_task`]'s doc for the general hazard this sidesteps). The two are not
+/// equivalent here for a tokio-specific reason: a task sent from inside another task's poll wakes
+/// a parked worker, and tokio places a task woken from thread N into thread N's own LIFO slot,
+/// which no other thread can steal from. Every initial task below then blocks its own thread
+/// synchronously (in `spin_until`), so if it were also the one doing the sending, the woken
+/// worker would sit in that unpollable slot for as long as the sending task's thread stayed
+/// blocked — measured, on an earlier version of these tests that sent from inside the initial
+/// task, at the full 10-second `spin_until` deadline, reproducing 26/30 and 9/30 observed
+/// failures at 2 and 3 workers respectively. A `tokio::task::yield_now().await` inserted between
+/// the send and the spin was measured insufficient (4/30 still failing at 2 workers, 7/30 at 3):
+/// with a second slow/sibling task sent right after the first, the sending thread re-enters its
+/// own unyielding `std::thread::sleep` before the yield reliably gives the runtime a chance to
+/// clear the first woken worker's LIFO slot, so the trap still lands often enough to matter.
+/// Sending every second task before `execute` avoids the wake path entirely: it is
+/// already sitting in the shared channel when the workers spawn, so every worker's first
+/// `recv_async` poll finds a task directly, with no wake and no LIFO slot involved. `send_task`
+/// is `TaskContext`'s public API, and `task_counter` already accounts for a task sent ahead of
+/// `execute`'s own initial send (see `TaskContext::send_task`'s doc) — this is a legitimate call
+/// site, not a workaround.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,8 +384,9 @@ mod tests {
     /// without touching the object store: `slow_tasks` "slow" tasks record that they started,
     /// then block their worker's OS thread for a fixed duration with `std::thread::sleep` (never
     /// `tokio::time::sleep`, which would give cancellation somewhere to land), then record that
-    /// they completed. A third task enqueues those, then uses `spin_until` to block until all of
-    /// them are confirmed started — guaranteeing they are already past their only await point
+    /// they completed. They are pre-sent to `context` below, before `execute` is even called (see
+    /// the module doc above for why); the failing task passed to `execute` only `spin_until`s all
+    /// of them are confirmed started — guaranteeing they are already past their only await point
     /// (`recv_async`), and so inside the unyielding sleep, before anything can be cancelled — and
     /// only then fails.
     ///
@@ -371,6 +395,15 @@ mod tests {
     /// keep running past the call, racing the caller. With the fix, `execute` waits for every
     /// worker to actually terminate, so every slow task always reaches "completed" first, and the
     /// failing task's error value survives intact.
+    ///
+    /// `completed_at_fail` is a vacuity probe, not a timing assumption: the failing task snapshots
+    /// how many slow tasks had already finished at the instant it decides to fail, before
+    /// `execute`'s main loop can even react. If that snapshot were not strictly less than
+    /// `slow_tasks`, every slow task would already be done by the time the drain starts, the
+    /// drain would have nothing left to wait for, and the run below would pass without having
+    /// exercised the fix at all. Asserting this directly means non-vacuity is enforced by the
+    /// test, not derived by reasoning about scheduling — reasoning that has been wrong more than
+    /// once in this file's history.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn execute_does_not_return_while_a_worker_is_still_running_synchronous_work() {
         // See `sufficient_workers`: the failing task and every slow task must be concurrently
@@ -382,41 +415,49 @@ mod tests {
         let context = Arc::new(TestContext::<()>::new());
         let started = Arc::new(AtomicUsize::new(0));
         let completed = Arc::new(AtomicUsize::new(0));
+        let completed_at_fail = Arc::new(AtomicUsize::new(0));
         let starved = Arc::new(AtomicBool::new(false));
 
-        let failing_task: Task<(), ()> = {
-            let context = Arc::clone(&context);
+        // Pre-send every slow task before `execute` is called — see the module doc above for why
+        // this, not a send from inside the failing task's own poll, is required to avoid starving
+        // a woken worker in a non-stealable LIFO slot for the length of the spin-wait below.
+        for _ in 0..slow_tasks {
             let started = Arc::clone(&started);
             let completed = Arc::clone(&completed);
+
+            let slow_task: Task<(), ()> = Box::pin(async move {
+                started.fetch_add(1, Ordering::SeqCst);
+
+                // Synchronous, non-yielding "work" with no await point between the start and
+                // completion markers — mirrors `compress()` on a multi-MB blob. Cancellation
+                // cannot land anywhere inside this call.
+                std::thread::sleep(Duration::from_millis(300));
+
+                completed.fetch_add(1, Ordering::SeqCst);
+
+                Ok(())
+            });
+
+            context.send_task(slow_task).expect("send_task must succeed for the slow tasks");
+        }
+
+        let failing_task: Task<(), ()> = {
+            let started = Arc::clone(&started);
+            let completed = Arc::clone(&completed);
+            let completed_at_fail = Arc::clone(&completed_at_fail);
             let starved = Arc::clone(&starved);
 
             Box::pin(async move {
-                for _ in 0..slow_tasks {
-                    let started = Arc::clone(&started);
-                    let completed = Arc::clone(&completed);
-
-                    let slow_task: Task<(), ()> = Box::pin(async move {
-                        started.fetch_add(1, Ordering::SeqCst);
-
-                        // Synchronous, non-yielding "work" with no await point between the start
-                        // and completion markers — mirrors `compress()` on a multi-MB blob.
-                        // Cancellation cannot land anywhere inside this call.
-                        std::thread::sleep(Duration::from_millis(300));
-
-                        completed.fetch_add(1, Ordering::SeqCst);
-
-                        Ok(())
-                    });
-
-                    context.send_task(slow_task).expect("send_task must succeed for the slow tasks");
-                }
-
                 // Bounded so a real regression times out this test instead of hanging CI forever;
                 // waits until every slow task is confirmed to have started — i.e. past
                 // `recv_async` and inside the unyielding sleep — before this task fails.
                 if !spin_until(|| started.load(Ordering::SeqCst) >= slow_tasks, &starved) {
                     return Err(());
                 }
+
+                // Vacuity probe — see this test's doc comment. Snapshot before failing, so the
+                // count reflects what the drain will actually have to wait for.
+                completed_at_fail.store(completed.load(Ordering::SeqCst), Ordering::SeqCst);
 
                 Err(())
             })
@@ -429,6 +470,11 @@ mod tests {
             !starved.load(Ordering::SeqCst),
             "test environment starved the workers (not every slow task got scheduled \
              concurrently with the failing task within the deadline) — not a drain bug"
+        );
+        assert!(
+            completed_at_fail.load(Ordering::SeqCst) < slow_tasks,
+            "every slow task had already finished before the failure fired — the drain had \
+             nothing to wait for this run; environment stall, not a drain bug"
         );
         assert_eq!(
             result,
@@ -448,15 +494,16 @@ mod tests {
     /// actionable error, e.g. one surfaced by best-effort cleanup after the real failure, must
     /// never overwrite the earlier, more actionable one).
     ///
-    /// Task `X` enqueues task `Y`, `spin_until`s `Y` has provably started, then fails immediately
-    /// with error `1`. `Y` sleeps briefly (unyielding `std::thread::sleep`, never
-    /// `tokio::time::sleep`) so it is genuinely still mid-work when `X`'s failure breaks the main
-    /// loop, then itself `spin_until`s `error_occurred` before failing with error `2` — so `Y`'s
-    /// failure is deterministically ordered *after* `X`'s value is already stored, not merely
-    /// likely to be by wall-clock margin (no scheduler preemption can invert it). Without the
-    /// first-error-wins guard in `worker`, `Y`'s later, drain-window failure would still
-    /// deterministically overwrite `X`'s value on every run — this is not a race to catch, `Y` is
-    /// made to always lose, so the bug is 100% reproducible.
+    /// Task `Y` is pre-sent to `context` below, before `execute` is even called (see the module
+    /// doc above for why); task `X`, passed to `execute`, only `spin_until`s `Y` has provably
+    /// started, then fails immediately with error `1`. `Y` sleeps briefly (unyielding
+    /// `std::thread::sleep`, never `tokio::time::sleep`) so it is genuinely still mid-work when
+    /// `X`'s failure breaks the main loop, then itself `spin_until`s `error_occurred` before
+    /// failing with error `2` — so `Y`'s failure is deterministically ordered *after* `X`'s value
+    /// is already stored, not merely likely to be by wall-clock margin (no scheduler preemption
+    /// can invert it). Without the first-error-wins guard in `worker`, `Y`'s later, drain-window
+    /// failure would still deterministically overwrite `X`'s value on every run — this is not a
+    /// race to catch, `Y` is made to always lose, so the bug is 100% reproducible.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn execute_reports_the_first_task_failure_not_the_last() {
         // Both X and Y must be concurrently resident (X spin-waits on Y having started), so at
@@ -467,40 +514,41 @@ mod tests {
         let y_started = Arc::new(AtomicBool::new(false));
         let starved = Arc::new(AtomicBool::new(false));
 
-        let task_x: Task<(), u8> = {
+        // Pre-send Y before calling `execute` — see the module doc above for why this, not a
+        // send from inside X's own poll, is required.
+        let task_y: Task<(), u8> = {
             let context = Arc::clone(&context);
             let y_started = Arc::clone(&y_started);
             let starved = Arc::clone(&starved);
 
             Box::pin(async move {
-                let task_y: Task<(), u8> = {
-                    let context = Arc::clone(&context);
-                    let y_started = Arc::clone(&y_started);
-                    let starved = Arc::clone(&starved);
+                y_started.store(true, Ordering::SeqCst);
 
-                    Box::pin(async move {
-                        y_started.store(true, Ordering::SeqCst);
+                // Short, unyielding "work" — mirrors `compress()` — so Y is genuinely still
+                // mid-task when X's failure (below) breaks `execute`'s main loop.
+                std::thread::sleep(Duration::from_millis(50));
 
-                        // Short, unyielding "work" — mirrors `compress()` — so Y is genuinely
-                        // still mid-task when X's failure (below) breaks `execute`'s main loop.
-                        std::thread::sleep(Duration::from_millis(50));
+                // Wait until X's failure is observably recorded before failing, so Y's failure
+                // is deterministically ordered after X's value is stored — not merely likely to
+                // be by wall-clock margin.
+                if !spin_until(
+                    || context.get_base_context().error_occurred.load(Ordering::SeqCst),
+                    &starved,
+                ) {
+                    return Err(2u8);
+                }
 
-                        // Wait until X's failure is observably recorded before failing, so Y's
-                        // failure is deterministically ordered after X's value is stored — not
-                        // merely likely to be by wall-clock margin.
-                        if !spin_until(
-                            || context.get_base_context().error_occurred.load(Ordering::SeqCst),
-                            &starved,
-                        ) {
-                            return Err(2u8);
-                        }
+                Err(2u8)
+            })
+        };
 
-                        Err(2u8)
-                    })
-                };
+        context.send_task(task_y).expect("send_task must succeed for task Y");
 
-                context.send_task(task_y).expect("send_task must succeed for task Y");
+        let task_x: Task<(), u8> = {
+            let y_started = Arc::clone(&y_started);
+            let starved = Arc::clone(&starved);
 
+            Box::pin(async move {
                 if !spin_until(|| y_started.load(Ordering::SeqCst), &starved) {
                     return Err(1u8);
                 }
@@ -536,13 +584,21 @@ mod tests {
     /// `std::sync::Mutex` (see `BaseTaskContext`) makes the critical section a synchronous
     /// two-line store with no await point at all, closing the window.
     ///
-    /// `X` `spin_until`s `Y` has provably started, then panics — a panic carries no `E`, so if it
-    /// were the only recorded failure, `execute` would return `Err(None)`. `Y` sleeps (unyielding
-    /// `std::thread::sleep`) long enough to still be running when `X`'s panic reaches the main
-    /// loop and breaks it, then fails with a distinguishable value — guaranteed to land during the
-    /// post-abort drain, exactly the window the fixed lock needs to cross without an await point.
-    /// Asserting `execute` returns `Err(Some(Y_VALUE))`, not `Err(None)`, proves Y's valued
-    /// failure survives even though the *first* failure observed (X's) was a valueless panic.
+    /// `Y` is pre-sent to `context` below, before `execute` is even called (see the module doc
+    /// above for why). `X`, passed to `execute`, only `spin_until`s `Y` has provably started,
+    /// then panics — a panic carries no `E`, so if it were the only recorded failure, `execute`
+    /// would return `Err(None)`. `Y` sleeps (unyielding `std::thread::sleep`) long enough to still
+    /// be running when `X`'s panic reaches the main loop and breaks it, then fails with a
+    /// distinguishable value — guaranteed to land during the post-abort drain, exactly the window
+    /// the fixed lock needs to cross without an await point. Asserting `execute` returns
+    /// `Err(Some(Y_VALUE))`, not `Err(None)`, proves Y's valued failure survives even though the
+    /// *first* failure observed (X's) was a valueless panic.
+    ///
+    /// `y_failed_at_panic` is this test's vacuity probe (see the join test's doc comment above
+    /// for the general rationale): X snapshots whether Y has already failed at the instant X
+    /// decides to panic. If Y had already failed by then, Y's failure would have landed in
+    /// `execute`'s main loop rather than the drain window this test targets, and the run below
+    /// would pass without ever exercising the race under test.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn execute_preserves_a_drain_window_failure_value_after_a_sibling_panics() {
         // X and Y must be concurrently resident (X spin-waits on Y having started, then panics
@@ -554,36 +610,47 @@ mod tests {
 
         let context = Arc::new(TestContext::<u8>::new());
         let y_started = Arc::new(AtomicBool::new(false));
+        let y_failed = Arc::new(AtomicBool::new(false));
+        let y_failed_at_panic = Arc::new(AtomicBool::new(false));
         let starved = Arc::new(AtomicBool::new(false));
 
-        let task_x: Task<(), u8> = {
-            let context = Arc::clone(&context);
+        // Pre-send Y before calling `execute` — see the module doc above for why this, not a
+        // send from inside X's own poll, is required.
+        let task_y: Task<(), u8> = {
             let y_started = Arc::clone(&y_started);
+            let y_failed = Arc::clone(&y_failed);
+
+            Box::pin(async move {
+                y_started.store(true, Ordering::SeqCst);
+
+                // Synchronous, non-yielding "work" — mirrors `compress()`. X's panic (below)
+                // will already have broken `execute`'s main loop well before this wakes up, so
+                // this failure is guaranteed to land during the post-abort drain — exactly the
+                // window the fixed `error_value` lock needs to cross without an await point.
+                std::thread::sleep(Duration::from_millis(300));
+
+                y_failed.store(true, Ordering::SeqCst);
+
+                Err(Y_VALUE)
+            })
+        };
+
+        context.send_task(task_y).expect("send_task must succeed for task Y");
+
+        let task_x: Task<(), u8> = {
+            let y_started = Arc::clone(&y_started);
+            let y_failed = Arc::clone(&y_failed);
+            let y_failed_at_panic = Arc::clone(&y_failed_at_panic);
             let starved = Arc::clone(&starved);
 
             Box::pin(async move {
-                let task_y: Task<(), u8> = {
-                    let y_started = Arc::clone(&y_started);
-
-                    Box::pin(async move {
-                        y_started.store(true, Ordering::SeqCst);
-
-                        // Synchronous, non-yielding "work" — mirrors `compress()`. X's panic
-                        // (below) will already have broken `execute`'s main loop well before this
-                        // wakes up, so this failure is guaranteed to land during the post-abort
-                        // drain — exactly the window the fixed `error_value` lock needs to cross
-                        // without an await point.
-                        std::thread::sleep(Duration::from_millis(300));
-
-                        Err(Y_VALUE)
-                    })
-                };
-
-                context.send_task(task_y).expect("send_task must succeed for task Y");
-
                 if !spin_until(|| y_started.load(Ordering::SeqCst), &starved) {
                     return Err(0u8);
                 }
+
+                // Vacuity probe — see this test's doc comment. Snapshot before panicking, so it
+                // reflects Y's state at the instant the drain-window race actually starts.
+                y_failed_at_panic.store(y_failed.load(Ordering::SeqCst), Ordering::SeqCst);
 
                 panic!(
                     "task X: intentional panic to exercise the panic-then-drain-window-failure \
@@ -600,6 +667,11 @@ mod tests {
             !starved.load(Ordering::SeqCst),
             "test environment starved the workers (task Y never started concurrently with task \
              X within the deadline) — not the race under test"
+        );
+        assert!(
+            !y_failed_at_panic.load(Ordering::SeqCst),
+            "Y had already finished before X's panic fired — the drain-window race this test \
+             exercises never happened this run; environment stall, not a bug"
         );
         assert_eq!(
             result,
