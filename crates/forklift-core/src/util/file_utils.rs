@@ -547,9 +547,12 @@ fn run_write_barrier(pending: &[(PathBuf, PathBuf)]) -> Result<(), String> {
             // entries would not yet be durable — a later retry sees these names via
             // `does_object_exist` and skips restaging them, so a power loss between here and the
             // next successful barrier could drop the dentry for an object no code path will ever
-            // write again. Best-effort only, and skipped when nothing renamed yet
-            // (`touched_parents` empty — the first rename itself is what failed, so there is
-            // nothing to sync and no already-existing file to borrow for the macOS device flush).
+            // write again. `sync_touched_directories` attempts every directory in
+            // `touched_parents` regardless of an earlier one's failure (see its own doc comment),
+            // so this reaches the whole touched prefix, not just as much of it as succeeds before
+            // the first per-directory failure. Skipped when nothing renamed yet (`touched_parents`
+            // empty — the first rename itself is what failed, so there is nothing to sync and no
+            // already-existing file to borrow for the macOS device flush).
             if fsync_enabled() && !touched_parents.is_empty() {
                 if let Some(flush_via) = first_renamed {
                     if let Err(sync_error) = sync_touched_directories(&touched_parents, flush_via) {
@@ -582,7 +585,10 @@ fn run_write_barrier(pending: &[(PathBuf, PathBuf)]) -> Result<(), String> {
         // directory half of the flush share `macos_flush_device_cache` unchanged. Unlike the
         // early sync above, a failure here has nothing earlier to fall back to reporting — every
         // rename in this batch already succeeded, so this is the batch's only remaining step and
-        // its error propagates directly.
+        // its error propagates directly. Like the early sync, every directory in
+        // `touched_parents` is attempted here regardless of an earlier one's failure (see
+        // `sync_touched_directories`'s own doc comment) — a caller catching this error still had
+        // every reachable directory fsynced, not just a prefix.
         sync_touched_directories(&touched_parents, &pending[0].1)?;
     }
 
@@ -609,6 +615,13 @@ fn run_write_barrier(pending: &[(PathBuf, PathBuf)]) -> Result<(), String> {
 /// shared device flush — the same aggregation [`run_write_barrier`] already applies to file data,
 /// applied here to directory *entries* instead.
 ///
+/// Best-effort across the whole set: every directory in `touched_parents` is attempted even after
+/// an earlier one fails — a caller catching the returned error still needs as much of the batch
+/// made durable as the filesystem will allow, not just a prefix ending at the first failure. Only
+/// the *first* failure is returned (a `Result<(), String>` has room for exactly one); the macOS
+/// device flush is still attempted once at least one directory was, but its own error only
+/// surfaces when no per-directory fsync already failed.
+///
 /// # Arguments
 /// * `touched_parents` - Every distinct directory a rename just landed in.
 /// * `flush_via`       - A regular file (a final, already-renamed path) to open write-mode for
@@ -620,21 +633,105 @@ fn run_write_barrier(pending: &[(PathBuf, PathBuf)]) -> Result<(), String> {
 /// non-Unix half of this is a no-op, matching `sync_dir`'s own no-op there.
 #[cfg(unix)]
 fn sync_touched_directories(touched_parents: &BTreeSet<PathBuf>, flush_via: &Path) -> Result<(), String> {
+    let mut first_error: Option<String> = None;
     for parent in touched_parents {
-        fsync_dir_data(parent)?;
+        if let Err(e) = fsync_dir_data(parent) {
+            first_error.get_or_insert(e);
+        }
     }
 
     #[cfg(target_os = "macos")]
     if !touched_parents.is_empty() {
-        macos_flush_device_cache(flush_via)?;
+        if let Err(e) = macos_flush_device_cache(flush_via) {
+            first_error.get_or_insert(e);
+        }
     }
 
-    Ok(())
+    match first_error {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 #[cfg(not(unix))]
 fn sync_touched_directories(_touched_parents: &BTreeSet<PathBuf>, _flush_via: &Path) -> Result<(), String> {
     Ok(())
+}
+
+/// Process-wide count of directory fsyncs [`fsync_dir_data`] actually performed — the
+/// directory-sync counterpart of [`BARRIER_COUNT`], incremented once per directory whose entry
+/// changes were confirmed durable (not once per [`sync_touched_directories`] call, which may sync
+/// several directories in one barrier). Declared unconditionally so [`dir_sync_count`] needs no
+/// `cfg` at any call site; on non-Unix targets `fsync_dir_data` does not exist (there is no
+/// directory handle to fsync there — see [`sync_dir`]'s doc comment for the same point), so the
+/// counter simply never advances on those targets and the accessor always reads back whatever it
+/// started at.
+///
+/// Not a performance feature: a cheap, always-on observability hook that lets a test prove a
+/// barrier actually reached the filesystem for a given directory, rather than only checking the
+/// resulting file state — which plain, unsynced `rename` would produce identically.
+static DIR_SYNC_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The current value of the process-wide directory-fsync counter — see [`DIR_SYNC_COUNT`].
+pub fn dir_sync_count() -> u64 {
+    DIR_SYNC_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only fault injection for [`fsync_dir_data`]: records every directory path it is
+    /// asked to sync, in call order, and can be armed to fail for paths containing a given
+    /// substring instead of touching the filesystem. Thread-local because unit tests run
+    /// concurrently on separate threads while a given `WriteBatch::finish`/`run_write_barrier`
+    /// call always runs entirely on its caller's thread — one test's arming can never be
+    /// observed by another's.
+    static DIR_SYNC_FAULT: std::cell::RefCell<DirSyncFaultState> =
+        const { std::cell::RefCell::new(DirSyncFaultState { attempted: Vec::new(), fail_needle: None }) };
+}
+
+#[cfg(test)]
+struct DirSyncFaultState {
+    attempted: Vec<PathBuf>,
+    fail_needle: Option<String>,
+}
+
+/// RAII scope for [`DIR_SYNC_FAULT`]: both construction and `Drop` reset this thread's state, so
+/// neither a stale guard from a previous test on a reused thread, nor this guard's own arming
+/// once the test that created it is done, can bleed into another test.
+#[cfg(test)]
+struct DirSyncFaultGuard;
+
+#[cfg(test)]
+impl DirSyncFaultGuard {
+    /// Record every directory `fsync_dir_data` is asked to sync; fail none of them.
+    fn recording() -> Self {
+        DIR_SYNC_FAULT.with(|f| *f.borrow_mut() = DirSyncFaultState { attempted: Vec::new(), fail_needle: None });
+        DirSyncFaultGuard
+    }
+
+    /// Record every directory, and fail (with a distinctive error, no filesystem access) any
+    /// whose path contains `needle`.
+    fn failing(needle: &str) -> Self {
+        DIR_SYNC_FAULT.with(|f| *f.borrow_mut() = DirSyncFaultState {
+            attempted: Vec::new(),
+            fail_needle: Some(needle.to_string()),
+        });
+        DirSyncFaultGuard
+    }
+}
+
+#[cfg(test)]
+impl Drop for DirSyncFaultGuard {
+    fn drop(&mut self) {
+        DIR_SYNC_FAULT.with(|f| *f.borrow_mut() = DirSyncFaultState { attempted: Vec::new(), fail_needle: None });
+    }
+}
+
+/// The directories [`fsync_dir_data`] has been asked to sync on this thread since the current
+/// [`DirSyncFaultGuard`] was armed, in call order.
+#[cfg(test)]
+fn dir_sync_attempts() -> Vec<PathBuf> {
+    DIR_SYNC_FAULT.with(|f| f.borrow().attempted.clone())
 }
 
 /// Fsync one directory's pending entry changes (e.g. a rename into it) to the drive — the
@@ -647,6 +744,17 @@ fn sync_touched_directories(_touched_parents: &BTreeSet<PathBuf>, _flush_via: &P
 fn fsync_dir_data(dir: &Path) -> Result<(), String> {
     use std::os::unix::io::AsRawFd;
 
+    #[cfg(test)]
+    if let Some(injected) = DIR_SYNC_FAULT.with(|f| {
+        let mut f = f.borrow_mut();
+        f.attempted.push(dir.to_path_buf());
+        f.fail_needle.as_deref()
+            .filter(|needle| dir.to_string_lossy().contains(needle))
+            .map(|_| format!("injected directory-sync failure for \"{}\"", dir.to_string_lossy()))
+    }) {
+        return Err(injected);
+    }
+
     let file = std::fs::File::open(dir)
         .map_err(|e| format!("Error while opening directory \"{}\" to sync it: {}", dir.to_string_lossy(), e))?;
 
@@ -656,6 +764,7 @@ fn fsync_dir_data(dir: &Path) -> Result<(), String> {
         ));
     }
 
+    DIR_SYNC_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
 
@@ -754,12 +863,23 @@ impl WriteBatch {
     /// touches the shared list, so concurrent callers never contend on anything but the final,
     /// pointer-cheap push.
     ///
+    /// If the write itself fails after the temp file was created, the temp is best-effort removed
+    /// before the error returns: this path never reaches `pending`, so neither a later `finish`'s
+    /// [`discard_staged_temps`] nor `Drop`'s would ever see it to clean it up — and, unlike a
+    /// stranded temp inside an object fan-out folder (which `gc`'s reachability sweep eventually
+    /// reclaims regardless, see [`BulkStoreSession::finish`]'s doc comment), a temp staged into
+    /// some other directory (an inventory folder, via [`stage_with_mtime`](Self::stage_with_mtime))
+    /// has no sweeper of its own at all.
+    ///
     /// # Returns
     /// * `Ok(())`      - If the write was staged.
     /// * `Err(String)` - If the temp file could not be created or written.
     pub fn stage(&self, file_path: &Path, content: &[u8]) -> Result<(), String> {
         let temp_path = temp_path_for(file_path)?;
-        create_and_write_file(&temp_path, content)?;
+        if let Err(e) = create_and_write_file(&temp_path, content) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(e);
+        }
 
         let mut state = self.state.lock().expect("write batch lock poisoned");
         state.final_paths.insert(file_path.to_path_buf());
@@ -785,6 +905,11 @@ impl WriteBatch {
     /// window: a crash between the rename becoming durable and the mtime fix-up would durably
     /// publish the wrong (advanced) mtime.
     ///
+    /// A failure after the temp file was created — from the write itself or from `set_modified` —
+    /// best-effort removes the temp before the error returns, for the same reason [`stage`](Self::stage)
+    /// does (see its doc comment): this path never reaches `pending`, so nothing else will ever
+    /// clean it up.
+    ///
     /// # Returns
     /// * `Ok(())`      - The write was staged, with its temp file's mtime already set.
     /// * `Err(String)` - If the temp file could not be created, written, or have its
@@ -794,11 +919,20 @@ impl WriteBatch {
                             content: &[u8],
                             mtime: std::time::SystemTime) -> Result<(), String> {
         let temp_path = temp_path_for(file_path)?;
-        let file = create_and_write_file(&temp_path, content)?;
+        let file = match create_and_write_file(&temp_path, content) {
+            Ok(file) => file,
+            Err(e) => {
+                let _ = std::fs::remove_file(&temp_path);
+                return Err(e);
+            }
+        };
 
-        file.set_modified(mtime).map_err(|e| format!(
-            "Error while setting the modification time of \"{}\": {}", temp_path.to_string_lossy(), e
-        ))?;
+        if let Err(e) = file.set_modified(mtime) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(format!(
+                "Error while setting the modification time of \"{}\": {}", temp_path.to_string_lossy(), e
+            ));
+        }
 
         let mut state = self.state.lock().expect("write batch lock poisoned");
         state.final_paths.insert(file_path.to_path_buf());
@@ -860,10 +994,12 @@ impl WriteBatch {
     /// for this round has actually finished running — the leak check below cannot distinguish a
     /// producer that is merely between winning a reservation and completing its stage from one
     /// that failed outright, so calling `finish` while producers are still in flight can misread
-    /// a live, in-progress write as a leak and discard an otherwise-healthy batch. Every current
-    /// caller already joins its workers before calling `finish`, so this holds today; it would
-    /// matter directly if a future caller ever ran a periodic or bounded mid-walk flush of an
-    /// `Arc`-shared batch without that join.
+    /// a live, in-progress write as a leak and discard an otherwise-healthy batch. A caller that
+    /// fans producers out across tasks or threads must actually wait for every one of them to
+    /// complete before calling `finish` — an abort that only signals cancellation, without
+    /// waiting for the signal to be observed and every producer to stop, does not satisfy this:
+    /// a producer still running between a won reservation and its stage is indistinguishable from
+    /// one that failed outright.
     ///
     /// Refuses to run the barrier at all if some path was
     /// [`reserve_final_path`](Self::reserve_final_path)'d but never actually staged: the winner
@@ -906,8 +1042,12 @@ impl WriteBatch {
     ///                   succeeded) means every entry is visible, but directory durability past
     ///                   the one that failed to sync is only best-effort, not proven. In every
     ///                   case there is no per-path record of which case applies — the caller must
-    ///                   treat the whole batch as unpublished and re-stage from source, exactly as
-    ///                   it would after a crash.
+    ///                   treat the whole batch as unpublished. A failed `finish` can also leave
+    ///                   names visible whose directory entries are not proven durable (the
+    ///                   trailing-sync case above); a retry that dedupes via [`does_object_exist`]
+    ///                   will see such a name and treat it as already stored. Callers whose retry
+    ///                   correctness depends on visible-implies-durable must not rely on that
+    ///                   after a failed `finish`.
     pub fn finish(&self) -> Result<(), String> {
         let (pending, leaked) = {
             let mut state = self.state.lock().expect("write batch lock poisoned");
@@ -962,8 +1102,8 @@ impl Drop for WriteBatch {
     /// case leaks nothing either — the durability invariant holds trivially, since nothing
     /// staged here was ever published.
     fn drop(&mut self) {
-        if let Ok(state) = self.state.lock() {
-            discard_staged_temps(&state.pending);
+        if let Ok(mut state) = self.state.lock() {
+            discard_staged_temps(&std::mem::take(&mut state.pending));
         }
     }
 }
@@ -2345,7 +2485,11 @@ mod tests {
         // *distinct* touched parent, not just the first — exercised here transitively: staging
         // writes into three separate directories and confirming `finish` still publishes every
         // one of them (not just the ones sharing a directory with the last-written file, which is
-        // the case a bug that only synced one directory would miss).
+        // the case a bug that only synced one directory would miss). Content/visibility alone
+        // cannot tell a real fsync from a bug that dropped it (plain `rename` produces the same
+        // file state either way), so on Unix (where `fsync_dir_data` exists — see its own doc
+        // comment) this also asserts against its attempt log and `DIR_SYNC_COUNT` that every
+        // directory was actually handed to the kernel, not just renamed into.
         let temp = std::env::temp_dir().join(format!("forklift-writebatch-multidir-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
@@ -2369,12 +2513,172 @@ mod tests {
             assert!(!target.exists(), "nothing may be visible before finish");
         }
 
+        #[cfg(unix)]
+        let _guard = DirSyncFaultGuard::recording();
+        #[cfg(unix)]
+        let count_before = dir_sync_count();
+
         batch.finish().unwrap();
 
         for (target, content) in &targets {
             assert!(target.exists(), "finish must publish every directory's staged write");
             assert_eq!(std::fs::read_to_string(target).unwrap(), *content);
         }
+
+        #[cfg(unix)]
+        {
+            let attempts = dir_sync_attempts();
+            for dir in &dirs {
+                assert!(attempts.contains(dir),
+                    "every touched directory must actually be fsynced, missing {:?} from attempts {:?}",
+                    dir, attempts);
+            }
+            assert!(dir_sync_count() >= count_before + dirs.len() as u64,
+                "the directory-fsync counter must advance by at least one per distinct directory");
+        }
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    // The rest of this module exercises `run_write_barrier`'s directory-sync steps directly
+    // through `fsync_dir_data`'s test-only fault injection (`DirSyncFaultGuard`,
+    // `dir_sync_attempts`, `dir_sync_count`) — see their doc comments. All Unix-only: that
+    // injection point does not exist on non-Unix targets (`fsync_dir_data` doesn't either), and
+    // `fsync_enabled()` is on throughout this test binary (nothing in it ever sets
+    // `FORKLIFT_FSYNC`, unlike the separate `write_batch_fsync_off` integration test binary), so
+    // every `fsync_dir_data` call below is live rather than vacuously skipped.
+
+    #[test]
+    #[cfg(unix)]
+    fn a_rename_failure_syncs_the_directories_already_touched_before_returning() {
+        // The headline fix this module exists to pin down: on a rename failure partway through
+        // the barrier, every directory a rename has *already* landed in is fsynced before the
+        // error returns (`run_write_barrier`'s early-sync block) — without it, an entry renamed
+        // just before the failure would be visible but not durable, and a later retry would skip
+        // restaging it via `does_object_exist` (see `finish`'s `# Returns`). Two directories, not
+        // one: the touched-but-not-yet-failing entry must live in a directory of its own for this
+        // to distinguish "the early sync ran" from "the file just happens to be on disk".
+        let temp = std::env::temp_dir().join(format!("forklift-writebatch-earlysync-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+
+        let dir_a = temp.join("dir-a");
+        let dir_b = temp.join("dir-b");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+
+        let landed = dir_a.join("landed");
+        let blocked = dir_b.join("blocked");
+
+        let batch = WriteBatch::new();
+        batch.stage(&landed, b"landed").unwrap();
+        batch.stage(&blocked, b"never lands").unwrap();
+
+        // Sabotage the second rename exactly like the existing partway test: a non-empty
+        // directory already at the final path fails `rename` on every platform.
+        std::fs::create_dir_all(blocked.join("occupant")).unwrap();
+
+        let _guard = DirSyncFaultGuard::recording();
+        let count_before = dir_sync_count();
+
+        let error = batch.finish().unwrap_err();
+        assert!(error.contains("blocked"), "the error must name the failing rename, got: {}", error);
+
+        let attempts = dir_sync_attempts();
+        assert!(attempts.contains(&dir_a),
+            "the directory of the entry already renamed before the failure must be fsynced \
+            before finish returns, attempts: {:?}", attempts);
+        assert!(dir_sync_count() > count_before,
+            "at least one directory fsync must actually have happened before the error returned");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_batch_finish_still_syncs_every_directory_after_one_fails() {
+        // `sync_touched_directories` must be best-effort across the whole set (its doc comment,
+        // and the two call sites in `run_write_barrier`): a directory whose own fsync fails must
+        // not stop the others from being attempted. Three directories with the middle one armed
+        // to fail proves the loop does not stop at the first failure — a `?`-short-circuit would
+        // leave the last directory never attempted at all.
+        let temp = std::env::temp_dir().join(format!("forklift-writebatch-besteffort-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+
+        let dirs: Vec<_> = ["alpha", "beta", "gamma"].iter().map(|name| temp.join(name)).collect();
+        for dir in &dirs {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+
+        let batch = WriteBatch::new();
+        let targets: Vec<_> = dirs.iter().map(|dir| dir.join("object")).collect();
+        for target in &targets {
+            batch.stage(target, b"content").unwrap();
+        }
+
+        // Every rename below succeeds — only the middle directory's *fsync* is sabotaged, so this
+        // exercises the barrier's trailing sync (step 4), not the rename loop.
+        let _guard = DirSyncFaultGuard::failing("beta");
+
+        let error = batch.finish().unwrap_err();
+        assert!(error.contains("injected directory-sync failure"),
+            "the error must surface the injected fsync failure, got: {}", error);
+
+        let attempts = dir_sync_attempts();
+        for dir in &dirs {
+            assert!(attempts.contains(dir),
+                "every touched directory must be attempted even after another one failed, \
+                missing {:?} from attempts {:?}", dir, attempts);
+        }
+
+        // The renames themselves already succeeded (only the directory fsync was sabotaged), so
+        // every entry is visible despite the failed `finish` — matching `finish`'s `# Returns`
+        // for the trailing-sync-failure case.
+        for target in &targets {
+            assert!(target.exists(), "a trailing directory-sync failure must not un-rename anything");
+        }
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_rename_failure_leads_the_error_even_when_the_early_sync_also_fails() {
+        // Precedence: when a rename fails *and* the resulting early directory-sync also fails,
+        // the rename error must lead the combined message (with the sync error appended), never
+        // the other way around — `run_write_barrier`'s format string bakes this in
+        // (`rename_error` first, `sync_error` parenthetically after), and a caller matching on
+        // error text must see the rename failure it actually needs to react to up front.
+        let temp = std::env::temp_dir().join(format!("forklift-writebatch-precedence-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+
+        let dir_a = temp.join("dir-a");
+        let dir_b = temp.join("dir-b");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+
+        let landed = dir_a.join("landed");
+        let blocked = dir_b.join("blocked");
+
+        let batch = WriteBatch::new();
+        batch.stage(&landed, b"landed").unwrap();
+        batch.stage(&blocked, b"never lands").unwrap();
+        std::fs::create_dir_all(blocked.join("occupant")).unwrap();
+
+        // Arm the early sync itself to fail for the one directory it will actually attempt.
+        let _guard = DirSyncFaultGuard::failing("dir-a");
+
+        let error = batch.finish().unwrap_err();
+
+        let rename_pos = error.find("Error while moving file into place")
+            .unwrap_or_else(|| panic!("the rename error must be present, got: {}", error));
+        let sync_pos = error.find("injected directory-sync failure")
+            .unwrap_or_else(|| panic!("the appended sync error must be present, got: {}", error));
+        assert!(rename_pos < sync_pos,
+            "the rename error must lead the message, with the sync error appended after it, got: {}", error);
+        assert_eq!(rename_pos, 0, "the rename error must be at the very start of the message, got: {}", error);
 
         std::fs::remove_dir_all(&temp).ok();
     }
