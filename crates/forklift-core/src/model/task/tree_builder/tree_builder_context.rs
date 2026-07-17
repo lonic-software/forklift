@@ -46,7 +46,7 @@ pub struct TreeBuilderContext {
 
     /// Whether the per-directory build task should bother recording this build's `tree_hashes`
     /// at all. `stack`'s optimized path needs the map (to stamp shards' rollups afterward);
-    /// `park` passes `false` — it discards the map
+    /// `park` (DESIGN.html §5.0 D item 10, finding #8) passes `false` — it discards the map
     /// immediately (it overwrites every shard from head right afterward, see `park::park_changes`)
     /// but, before this flag existed, still paid the Mutex traffic of every one of its thousands
     /// of per-directory tasks recording into a map nobody read. Set once at construction, read

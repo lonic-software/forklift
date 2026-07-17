@@ -585,7 +585,7 @@ fn a_shard_that_vanishes_out_from_under_load_still_invalidates_its_ancestors() {
 }
 
 // -------------------------------------------------------------------------------------------
-// `park` regression (DESIGN.html §5.0 D item 10): `park`'s tree build used to call
+// `park` regression (DESIGN.html §5.0 D item 10, finding #3): `park`'s tree build used to call
 // `tree_utils::build_tree_from_inventory` (no head to compare rollups against, so no skip was
 // ever possible on this path) instead of `build_tree_from_inventory_deferred`, unlike `stack`.
 // This pins that `park` now gets the same rollup-based skip `stack` already had.

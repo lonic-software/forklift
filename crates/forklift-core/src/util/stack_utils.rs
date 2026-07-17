@@ -124,7 +124,7 @@ pub async fn stack_parcel(description: Option<String>) -> Result<(String, String
     };
 
     // `track_tree_hashes: true` — the per-key hashes below are read to stamp shards' rollups
-    // after a successful stack (`park`'s own call passes
+    // after a successful stack (DESIGN.html §5.0 D item 10, finding #8; `park`'s own call passes
     // `false`, since it discards the map immediately instead).
     let (partial_root, tree_hashes, untouched_keys) = tree_utils::build_tree_from_inventory_deferred(
         &prepared, &batch, head_root_hash.as_deref(), &scope, true,
