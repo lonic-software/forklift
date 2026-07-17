@@ -65,11 +65,32 @@ where
     /// into: its `finish` drains the batch's staged set, so it must never run concurrently with a
     /// task still staging.
     ///
+    /// This guarantee holds only for a future that is polled to completion. Dropping this
+    /// method's future part-way through — e.g. wrapping the call in `tokio::time::timeout` or
+    /// racing it in a `select!` against another branch — drops the internal `JoinSet` before the
+    /// drain loop runs, which aborts every worker *without* draining their join results. That
+    /// reinstates exactly the task-outlives-the-call race this guarantee exists to remove: a task
+    /// can still be running after the caller has moved on. Callers must not timeout-wrap or race
+    /// `execute`.
+    ///
     /// This guarantee has a cost: the return is gated on the *slowest* non-yielding task body
     /// still running when the drain starts. A task stuck indefinitely in synchronous work (e.g. a
     /// write against a stalled mount) blocks `execute` indefinitely along with it — there is
     /// deliberately no timeout on the drain, because returning early is exactly the unsoundness
     /// this guarantee exists to remove.
+    ///
+    /// A corollary worth stating as a hard rule: once any task fails, every task still sitting in
+    /// the queue is guaranteed to never be dequeued — `worker` exits as soon as it observes
+    /// `error_occurred`, and `abort_all` cancels every worker still parked at `recv_async` waiting
+    /// for one. A task body that synchronously waits (no `.await`) for a sibling task it enqueued
+    /// — e.g. spin-waiting on a flag the sibling only sets once it runs — can therefore spin
+    /// forever if that sibling never gets scheduled before a failure, and this method's drain
+    /// waits for exactly that spin to finish: `execute` hangs. No task shipped in this codebase
+    /// does this today (the write-reservation losers in `LooseObject::store_deferred` skip their
+    /// own work rather than block on the winner), but nothing here forbids it, so: **task bodies
+    /// must never synchronously wait on the progress of another task in the same executor
+    /// round.** (The bounded, deadline-escaping spin-waits in this file's own tests are the
+    /// permitted shape — they give up and report starvation instead of waiting unconditionally.)
     ///
     /// # Arguments
     /// * `task` - The task to execute.
@@ -117,13 +138,10 @@ where
         // as there are no more tasks to be executed.
         worker_join_set.abort_all();
 
-        // `abort_all` only *signals* cancellation; a worker parked at the `recv_async` await
-        // point in the loop below lands it immediately, but a worker inside synchronous,
-        // non-yielding work (e.g. mid-`compress()` on a multi-MB blob) does not — it keeps
-        // running until that work finishes on its own. Drain every worker's join result so this
-        // method cannot return while a task body is still executing: callers finalize resources
-        // shared with workers (e.g. `WriteBatch::finish`) right after `execute` returns, and that
-        // is only sound if nothing is still writing to them.
+        // `abort_all` only signals cancellation — see this method's doc comment for why that
+        // means a worker can still be mid-task here. Drain every worker's join result before
+        // returning so this method cannot hand control back to the caller while a task body is
+        // still executing.
         while let Some(drain_result) = worker_join_set.join_next().await {
             match drain_result {
                 // Expected: `abort_all` cancels every worker still parked at `recv_async`, and a
@@ -133,8 +151,14 @@ where
                 Err(ref join_error) if join_error.is_cancelled() => {}
                 // `JoinError` is exhaustively cancelled-or-panicked, so anything not caught above
                 // is a worker that panicked after the main loop already broke out (e.g. two
-                // workers panicked back-to-back). Same rationale as the main loop's panic arm: a
-                // panicked build must not read as success.
+                // workers panicked back-to-back). On every currently reachable path
+                // `error_occurred` is already `true` by the time we get here: a panic that broke
+                // the main loop above stores the flag before `break`ing, and an `Ok(Err(_))` that
+                // broke it comes from `worker`'s failure branch, which stores the flag before
+                // returning (`is_finished` implies no worker is still in flight to panic here at
+                // all). This store is not load-bearing on any path today; it is kept defensively
+                // so a future restructuring of the main loop cannot silently let a drain-window
+                // panic read as success.
                 Err(_) => {
                     base_context.error_occurred.store(true, Ordering::SeqCst);
                 }
@@ -153,7 +177,12 @@ where
 
         // Check if an error occurred. If so, return the error.
         if base_context.error_occurred.load(Ordering::SeqCst) {
-            let error = base_context.error_value.lock().await;
+            // `error_value` is a `std::sync::Mutex` (see `BaseTaskContext`); a poisoned lock here
+            // means some earlier holder of this same lock panicked mid-store, which given the
+            // critical sections are two-line stores would itself be exceptional — recover the
+            // guard rather than let that panic propagate and mask whichever `E` was already
+            // recorded before the poisoning store.
+            let error = base_context.error_value.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
             return Err(error.as_ref().cloned());
         }
@@ -199,8 +228,19 @@ async fn worker<O: Send, E: Clone + Send>(context: Arc<BaseTaskContext<O, E>>) -
                     // or not this one's value won the race to be recorded. Store the value (when
                     // it wins) before setting the flag: readers of the flag must be able to rely
                     // on the value being present once the flag is set.
+                    //
+                    // This critical section must stay yield-free: `error_value` is a
+                    // `std::sync::Mutex` specifically so this store has no `.await` in it. After
+                    // `abort_all`, tokio can land a pending cancellation at *any* await point a
+                    // worker next reaches — including one it wasn't parked at when `abort_all`
+                    // ran, from lock contention or even uncontended coop-budget exhaustion. A
+                    // `tokio::sync::Mutex` here would put exactly such an await point between a
+                    // task failing and its value being recorded: a worker cancelled inside it
+                    // would join as a plain (benign-looking) cancellation, its failure's value
+                    // never stored and `error_occurred` never set — silently downgrading a valued
+                    // failure to `execute` returning `Err(None)`.
                     {
-                        let mut error_value = context.error_value.lock().await;
+                        let mut error_value = context.error_value.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                         if error_value.is_none() {
                             *error_value = Some(e);
                         }
@@ -228,6 +268,13 @@ async fn worker<O: Send, E: Clone + Send>(context: Arc<BaseTaskContext<O, E>>) -
     }
 }
 
+/// Several scenarios below need at least 2 (or 3) concurrently-resident `TaskExecutor` workers
+/// to reproduce the timing they exercise — see `sufficient_workers`. On a box with fewer logical
+/// CPUs than a scenario needs, those tests print why and skip (green) instead of failing. That
+/// residual is accepted deliberately, not overlooked: this is a parallelism-first project (worker
+/// count tracks `num_cpus::get()`), CI runners are multi-core, and a hard failure on a low-core
+/// box would misattribute an environment limit to the code under test rather than reporting it as
+/// what it actually is.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,23 +328,49 @@ mod tests {
         Some(workers)
     }
 
+    /// Bounded blocking spin-wait shared by the tests below that need a task body to
+    /// synchronously (no `.await`) wait on a condition set by another concurrently-resident task
+    /// — e.g. "has the sibling task started" or "has the main loop recorded a failure yet". This
+    /// is the one place in this file where a task deliberately waits on another task's progress;
+    /// unlike the pattern `TaskExecutor::execute`'s doc now forbids in production task bodies, it
+    /// is bounded and reports timeout as a distinct, non-panicking failure (`starved`) instead of
+    /// hanging or waiting unconditionally.
+    ///
+    /// Polls `cond` every 5ms for up to 10s. Returns `true` as soon as `cond` is observed true;
+    /// on timeout, sets `starved` and returns `false` instead of panicking — a panic here happens
+    /// inside a `TaskExecutor` worker, which `JoinSet` converts into an ordinary `Err` rather than
+    /// a test-harness panic, so it would otherwise surface only as an unrelated assertion failing
+    /// downstream, wrongly implicating the code under test instead of the environment.
+    fn spin_until(cond: impl Fn() -> bool, starved: &AtomicBool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+
+        while !cond() {
+            if Instant::now() >= deadline {
+                starved.store(true, Ordering::SeqCst);
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        true
+    }
+
     /// `execute` must not return while a worker is still running synchronous, non-yielding work —
     /// the real case being `LooseObject::store_deferred`'s `compress()`, which has no await point
     /// between winning a write reservation and finishing its write. This reproduces that shape
     /// without touching the object store: `slow_tasks` "slow" tasks record that they started,
     /// then block their worker's OS thread for a fixed duration with `std::thread::sleep` (never
     /// `tokio::time::sleep`, which would give cancellation somewhere to land), then record that
-    /// they completed. A third task enqueues those, then blocking-spin-waits until all of them
-    /// are confirmed started — guaranteeing they are already past their only await point
+    /// they completed. A third task enqueues those, then uses `spin_until` to block until all of
+    /// them are confirmed started — guaranteeing they are already past their only await point
     /// (`recv_async`), and so inside the unyielding sleep, before anything can be cancelled — and
     /// only then fails.
     ///
-    /// If `execute` returned as soon as the failure was observed (the bug this guards), the slow
-    /// tasks would be signaled to abort mid-sleep but keep running past the call, racing the
-    /// caller; with a real workload the caller can finalize shared state (e.g.
-    /// `WriteBatch::finish`) while a task is still writing to it. With the fix, `execute` waits
-    /// for every worker to actually terminate, so every slow task always reaches "completed"
-    /// first.
+    /// If `execute` returned as soon as the failure was observed (the bug this guards — see the
+    /// method's doc comment for why `abort_all` alone does not stop these slow tasks), they would
+    /// keep running past the call, racing the caller. With the fix, `execute` waits for every
+    /// worker to actually terminate, so every slow task always reaches "completed" first, and the
+    /// failing task's error value survives intact.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn execute_does_not_return_while_a_worker_is_still_running_synchronous_work() {
         // See `sufficient_workers`: the failing task and every slow task must be concurrently
@@ -338,22 +411,11 @@ mod tests {
                     context.send_task(slow_task).expect("send_task must succeed for the slow tasks");
                 }
 
-                // Blocking spin-wait, bounded so a real regression times out this test instead of
-                // hanging CI forever, until every slow task is confirmed to have started — i.e.
-                // past `recv_async` and inside the unyielding sleep — before this task fails. On
-                // timeout, record it in `starved` and return instead of asserting: a panic here
-                // happens inside a `TaskExecutor` worker, which `JoinSet` converts into an
-                // ordinary `Err` rather than a test-harness panic, so it would otherwise surface
-                // only as the unrelated `completed`-count assertion below failing — wrongly
-                // implicating the drain instead of the environment.
-                let deadline = Instant::now() + Duration::from_secs(10);
-
-                while started.load(Ordering::SeqCst) < slow_tasks {
-                    if Instant::now() >= deadline {
-                        starved.store(true, Ordering::SeqCst);
-                        return Err(());
-                    }
-                    std::thread::sleep(Duration::from_millis(5));
+                // Bounded so a real regression times out this test instead of hanging CI forever;
+                // waits until every slow task is confirmed to have started — i.e. past
+                // `recv_async` and inside the unyielding sleep — before this task fails.
+                if !spin_until(|| started.load(Ordering::SeqCst) >= slow_tasks, &starved) {
+                    return Err(());
                 }
 
                 Err(())
@@ -368,7 +430,11 @@ mod tests {
             "test environment starved the workers (not every slow task got scheduled \
              concurrently with the failing task within the deadline) — not a drain bug"
         );
-        assert!(result.is_err(), "the failing task's error must propagate");
+        assert_eq!(
+            result,
+            Err(Some(())),
+            "the failing task's error must propagate with its value intact"
+        );
         assert_eq!(
             completed.load(Ordering::SeqCst),
             slow_tasks,
@@ -382,15 +448,15 @@ mod tests {
     /// actionable error, e.g. one surfaced by best-effort cleanup after the real failure, must
     /// never overwrite the earlier, more actionable one).
     ///
-    /// Task `X` enqueues task `Y`, spin-waits (blocking, same idiom and starvation guard as
-    /// `execute_does_not_return_while_a_worker_is_still_running_synchronous_work`) until `Y` has
-    /// provably started, then fails immediately with error `1`. `Y` then blocks its worker in
-    /// synchronous, non-yielding work (never `tokio::time::sleep`) before failing with error `2`
-    /// — guaranteed to land during `execute`'s post-abort drain, since `X`'s failure already
-    /// breaks the main loop long before `Y`'s sleep finishes. Without the first-error-wins guard
-    /// in `worker`, `Y`'s later, drain-window failure would deterministically overwrite `X`'s
-    /// value on every run (the drain always waits for `Y` to finish) — this is not a race to
-    /// catch, `Y` always loses the wall-clock race to finish, so the bug is 100% reproducible.
+    /// Task `X` enqueues task `Y`, `spin_until`s `Y` has provably started, then fails immediately
+    /// with error `1`. `Y` sleeps briefly (unyielding `std::thread::sleep`, never
+    /// `tokio::time::sleep`) so it is genuinely still mid-work when `X`'s failure breaks the main
+    /// loop, then itself `spin_until`s `error_occurred` before failing with error `2` — so `Y`'s
+    /// failure is deterministically ordered *after* `X`'s value is already stored, not merely
+    /// likely to be by wall-clock margin (no scheduler preemption can invert it). Without the
+    /// first-error-wins guard in `worker`, `Y`'s later, drain-window failure would still
+    /// deterministically overwrite `X`'s value on every run — this is not a race to catch, `Y` is
+    /// made to always lose, so the bug is 100% reproducible.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn execute_reports_the_first_task_failure_not_the_last() {
         // Both X and Y must be concurrently resident (X spin-waits on Y having started), so at
@@ -408,16 +474,26 @@ mod tests {
 
             Box::pin(async move {
                 let task_y: Task<(), u8> = {
+                    let context = Arc::clone(&context);
                     let y_started = Arc::clone(&y_started);
+                    let starved = Arc::clone(&starved);
 
                     Box::pin(async move {
                         y_started.store(true, Ordering::SeqCst);
 
-                        // Synchronous, non-yielding "work" — mirrors `compress()`. `X` will
-                        // already have failed and broken `execute`'s main loop well before this
-                        // wakes up, so this failure is guaranteed to land during the post-abort
-                        // drain, after `X`'s value is already recorded.
-                        std::thread::sleep(Duration::from_millis(300));
+                        // Short, unyielding "work" — mirrors `compress()` — so Y is genuinely
+                        // still mid-task when X's failure (below) breaks `execute`'s main loop.
+                        std::thread::sleep(Duration::from_millis(50));
+
+                        // Wait until X's failure is observably recorded before failing, so Y's
+                        // failure is deterministically ordered after X's value is stored — not
+                        // merely likely to be by wall-clock margin.
+                        if !spin_until(
+                            || context.get_base_context().error_occurred.load(Ordering::SeqCst),
+                            &starved,
+                        ) {
+                            return Err(2u8);
+                        }
 
                         Err(2u8)
                     })
@@ -425,17 +501,8 @@ mod tests {
 
                 context.send_task(task_y).expect("send_task must succeed for task Y");
 
-                // Same bounded, non-panicking spin-wait idiom as the join test above, and for the
-                // same reason: a panic here is a `TaskExecutor` worker panic, which `JoinSet`
-                // turns into an ordinary `Err` rather than a test-harness failure.
-                let deadline = Instant::now() + Duration::from_secs(10);
-
-                while !y_started.load(Ordering::SeqCst) {
-                    if Instant::now() >= deadline {
-                        starved.store(true, Ordering::SeqCst);
-                        return Err(1u8);
-                    }
-                    std::thread::sleep(Duration::from_millis(5));
+                if !spin_until(|| y_started.load(Ordering::SeqCst), &starved) {
+                    return Err(1u8);
                 }
 
                 Err(1u8)
@@ -448,12 +515,97 @@ mod tests {
         assert!(
             !starved.load(Ordering::SeqCst),
             "test environment starved the workers (task Y never started concurrently with task \
-             X within the deadline) — not a first-error-wins bug"
+             X within the deadline, or never observed X's recorded failure) — not a \
+             first-error-wins bug"
         );
         assert_eq!(
             result,
             Err(Some(1)),
             "the first failure observed (X's) must win over Y's later, drain-window failure"
+        );
+    }
+
+    /// Regression test for a fixed cancellation-window race in `worker`'s task-failure branch: it
+    /// used to acquire `error_value`'s lock with a `tokio::sync::Mutex` `.await` between a task
+    /// failing and its value/flag being stored. After `abort_all` runs, tokio can land a pending
+    /// cancellation at *any* await point a worker next reaches — including a lock acquisition it
+    /// was not parked at when `abort_all` was called, from lock contention or even uncontended
+    /// coop-budget exhaustion — so a worker landing in that gap could be cancelled before it ever
+    /// stored its (distinguishable, valued) failure, and `execute` would report `Err(None)`
+    /// despite a valued failure having actually occurred. Swapping `error_value` to a
+    /// `std::sync::Mutex` (see `BaseTaskContext`) makes the critical section a synchronous
+    /// two-line store with no await point at all, closing the window.
+    ///
+    /// `X` `spin_until`s `Y` has provably started, then panics — a panic carries no `E`, so if it
+    /// were the only recorded failure, `execute` would return `Err(None)`. `Y` sleeps (unyielding
+    /// `std::thread::sleep`) long enough to still be running when `X`'s panic reaches the main
+    /// loop and breaks it, then fails with a distinguishable value — guaranteed to land during the
+    /// post-abort drain, exactly the window the fixed lock needs to cross without an await point.
+    /// Asserting `execute` returns `Err(Some(Y_VALUE))`, not `Err(None)`, proves Y's valued
+    /// failure survives even though the *first* failure observed (X's) was a valueless panic.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn execute_preserves_a_drain_window_failure_value_after_a_sibling_panics() {
+        // X and Y must be concurrently resident (X spin-waits on Y having started, then panics
+        // while Y is still sleeping), so at least 2 workers are required — see
+        // `sufficient_workers`.
+        let Some(_workers) = sufficient_workers(2) else { return };
+
+        const Y_VALUE: u8 = 9;
+
+        let context = Arc::new(TestContext::<u8>::new());
+        let y_started = Arc::new(AtomicBool::new(false));
+        let starved = Arc::new(AtomicBool::new(false));
+
+        let task_x: Task<(), u8> = {
+            let context = Arc::clone(&context);
+            let y_started = Arc::clone(&y_started);
+            let starved = Arc::clone(&starved);
+
+            Box::pin(async move {
+                let task_y: Task<(), u8> = {
+                    let y_started = Arc::clone(&y_started);
+
+                    Box::pin(async move {
+                        y_started.store(true, Ordering::SeqCst);
+
+                        // Synchronous, non-yielding "work" — mirrors `compress()`. X's panic
+                        // (below) will already have broken `execute`'s main loop well before this
+                        // wakes up, so this failure is guaranteed to land during the post-abort
+                        // drain — exactly the window the fixed `error_value` lock needs to cross
+                        // without an await point.
+                        std::thread::sleep(Duration::from_millis(300));
+
+                        Err(Y_VALUE)
+                    })
+                };
+
+                context.send_task(task_y).expect("send_task must succeed for task Y");
+
+                if !spin_until(|| y_started.load(Ordering::SeqCst), &starved) {
+                    return Err(0u8);
+                }
+
+                panic!(
+                    "task X: intentional panic to exercise the panic-then-drain-window-failure \
+                     race (expected in the test log — the panic is this test's scenario, not a \
+                     test-harness failure)"
+                );
+            })
+        };
+
+        let executor = TaskExecutor::new(Arc::clone(&context));
+        let result = executor.execute(task_x).await;
+
+        assert!(
+            !starved.load(Ordering::SeqCst),
+            "test environment starved the workers (task Y never started concurrently with task \
+             X within the deadline) — not the race under test"
+        );
+        assert_eq!(
+            result,
+            Err(Some(Y_VALUE)),
+            "Y's valued failure must survive the drain-window cancellation race even though the \
+             first failure observed (X's) was a valueless panic"
         );
     }
 }
