@@ -133,12 +133,16 @@ where
     ///
     /// # Returns
     /// * `Ok(())`       - Every task ran to completion without error.
-    /// * `Err(Some(e))` - The first task failure observed; `e` is that failure's error value. A
-    ///                    later failure (its worker may still have been running unyielding work
-    ///                    during the drain above) sets the same failure state but never
-    ///                    overwrites this value — see `worker`'s error branch.
-    /// * `Err(None)`    - An error occurred with no associated value: either the initial task
-    ///                    could not be enqueued, or a worker panicked (a panic carries no `E`).
+    /// * `Err(Some(e))` - At least one task failed with a value; `e` is the first such value
+    ///                    recorded. A later valued failure (its worker may still have been running
+    ///                    unyielding work during the drain above) sets the same failure state but
+    ///                    never overwrites this value — see `worker`'s error branch. A worker may
+    ///                    *also* have panicked: a panic carries no `E`, so it does not displace a
+    ///                    valued failure here — but the default panic hook still prints it to
+    ///                    stderr, so a valued return never hides that a panic happened.
+    /// * `Err(None)`    - A failure occurred but no task carried a value: either the initial task
+    ///                    could not be enqueued, or every failure was a panic (a panic carries no
+    ///                    `E`).
     pub async fn execute(&self, task: Task<O, E>) -> Result<(), Option<E>> {
         let num_workers = self.worker_count();
         let base_context = self.context.get_base_context();
