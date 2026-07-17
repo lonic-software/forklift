@@ -22,6 +22,11 @@ where
 {
     context: Arc<ContextType>,
     _marker: std::marker::PhantomData<(OkType, ErrType)>,
+    /// Test-only worker-count override — see [`Self::with_workers`]. Not present in a
+    /// production build at all: `cfg(test)`, not `pub` visibility, is the actual boundary that
+    /// keeps this out of production, since visibility alone cannot stop an in-crate caller.
+    #[cfg(test)]
+    worker_override: Option<usize>,
 }
 
 impl<O, E, C> TaskExecutor<O, E, C>
@@ -42,6 +47,37 @@ where
         Self {
             context,
             _marker: std::marker::PhantomData,
+            #[cfg(test)]
+            worker_override: None,
+        }
+    }
+
+    /// Test-only alternate constructor: pins the exact worker count [`execute`](Self::execute)
+    /// spawns, bypassing `num_cpus::get()`.
+    ///
+    /// Not exposed outside `#[cfg(test)]`, deliberately: it has no production caller — every
+    /// real caller wants worker count to track the host's logical CPUs, which is exactly what
+    /// the default path (`Self::new`) still does — and this codebase's review history has
+    /// repeatedly cut public surface that exists for a single test rather than an actual
+    /// production need. Gating on `cfg(test)` (not just leaving it `pub` and unused) keeps that
+    /// true structurally: this method, and the field behind it, are not compiled into a
+    /// production build at all.
+    ///
+    /// Lets the `execute_*` tests below pin a small, fixed number of concurrently-resident
+    /// workers so their concurrency scenarios are reproducible on any host's tokio runtime,
+    /// instead of depending on `num_cpus::get()` — which used to gate whether a scenario could
+    /// even run on a given machine, and at low counts made the LIFO-slot race those tests guard
+    /// against far more likely to also starve the test itself (see `mod tests`'s doc comment).
+    ///
+    /// # Arguments
+    /// * `context` - The task context (same as [`Self::new`]).
+    /// * `workers` - The exact worker count `execute` will spawn; clamped to at least 1.
+    #[cfg(test)]
+    pub fn with_workers(context: Arc<C>, workers: usize) -> Self {
+        Self {
+            context,
+            _marker: std::marker::PhantomData,
+            worker_override: Some(workers.max(1)),
         }
     }
 
@@ -104,7 +140,7 @@ where
     /// * `Err(None)`    - An error occurred with no associated value: either the initial task
     ///                    could not be enqueued, or a worker panicked (a panic carries no `E`).
     pub async fn execute(&self, task: Task<O, E>) -> Result<(), Option<E>> {
-        let num_workers = num_cpus::get();
+        let num_workers = self.worker_count();
         let base_context = self.context.get_base_context();
         let mut worker_join_set = JoinSet::new();
 
@@ -189,6 +225,23 @@ where
 
         Ok(())
     }
+
+    /// The number of workers [`execute`](Self::execute) spawns. Its own method so `execute`'s
+    /// body reads identically regardless of `cfg(test)`; only this helper's implementation
+    /// differs, and the production variant below is textually the same expression `execute` used
+    /// before [`Self::with_workers`] existed — the override path is additive, not a behavior
+    /// change on the default constructor.
+    #[cfg(test)]
+    fn worker_count(&self) -> usize {
+        self.worker_override.unwrap_or_else(num_cpus::get)
+    }
+
+    /// The number of workers [`execute`](Self::execute) spawns: the host's logical CPU count,
+    /// read fresh on every call — there is no test-only override in a production build.
+    #[cfg(not(test))]
+    fn worker_count(&self) -> usize {
+        num_cpus::get()
+    }
 }
 
 /// A worker. It receives tasks from the task queue in the context and executes them.
@@ -225,9 +278,14 @@ async fn worker<O: Send, E: Clone + Send>(context: Arc<BaseTaskContext<O, E>>) -
                     // already broke the main loop — would deterministically overwrite a more
                     // actionable earlier error with a later, possibly generic one. The flag below
                     // is still set unconditionally: every failure must still stop the run, whether
-                    // or not this one's value won the race to be recorded. Store the value (when
-                    // it wins) before setting the flag: readers of the flag must be able to rely
-                    // on the value being present once the flag is set.
+                    // or not this one's value won the race to be recorded. Storing the value
+                    // before setting the flag only guarantees this branch's own pair is never
+                    // torn: no reader can observe this store's flag as true while its value is
+                    // not yet visible. It is not a guarantee that the flag always comes with a
+                    // value — the main loop's and drain's panic arms set only the flag, never
+                    // `error_value` — so a reader must still handle flag-true/value-None; see the
+                    // drain's `Ok(_)` comment, and `execute`'s post-drain read, which already does
+                    // (returning `Err(None)` in that case).
                     //
                     // This critical section must stay yield-free: `error_value` is a
                     // `std::sync::Mutex` specifically so this store has no `.await` in it. After
@@ -268,13 +326,14 @@ async fn worker<O: Send, E: Clone + Send>(context: Arc<BaseTaskContext<O, E>>) -
     }
 }
 
-/// Several scenarios below need at least 2 (or 3) concurrently-resident `TaskExecutor` workers
-/// to reproduce the timing they exercise — see `sufficient_workers`. On a box with fewer logical
-/// CPUs than a scenario needs, those tests print why and skip (green) instead of failing. That
-/// residual is accepted deliberately, not overlooked: this is a parallelism-first project (worker
-/// count tracks `num_cpus::get()`), CI runners are multi-core, and a hard failure on a low-core
-/// box would misattribute an environment limit to the code under test rather than reporting it as
-/// what it actually is.
+/// Every scenario below pins its worker count via [`TaskExecutor::with_workers`] instead of
+/// letting it track `num_cpus::get()` (an earlier version of these tests depended on the host
+/// having enough logical CPUs to host each scenario's concurrency, printing why and skipping
+/// otherwise; that skip path no longer exists, superseded by pinning). Worker futures are
+/// ordinary tokio tasks competing for this file's `worker_threads = 8` preemptive runtime, so a
+/// small pinned worker count is concurrently resident on any host these tests run on — the number
+/// of logical CPUs was never actually the binding constraint on these scenarios, only the size
+/// `execute` used to derive its spawn count from was.
 ///
 /// Every test below that needs a second task concurrently resident alongside its initial task
 /// sends that second task with `context.send_task(...)` from the *test body*, before calling
@@ -322,33 +381,6 @@ mod tests {
         fn get_base_context(&self) -> Arc<BaseTaskContext<(), E>> {
             Arc::clone(&self.base)
         }
-    }
-
-    /// `execute` spawns exactly `num_cpus::get()` workers — independent of the tokio runtime's
-    /// own OS thread pool size, which only bounds how many of those workers' blocking sections
-    /// can run concurrently, not how many exist. That worker count is the real ceiling on how
-    /// many tasks a test can keep concurrently resident (in flight) at once: each worker is its
-    /// own loop pulling one task at a time from the shared queue, so with fewer workers than a
-    /// scenario needs, the "extra" tasks simply queue behind however many workers do exist,
-    /// serializing what the test assumed would run in parallel — or, if a task spin-waits on
-    /// another task that can never be dequeued (every worker already busy with something that
-    /// itself never yields), starving it outright. Returns `None` (after printing why) when the
-    /// box hosting the test has fewer than `min_workers` logical CPUs, so a low-core machine
-    /// skips the scenario cleanly instead of hanging or failing for an environmental reason a
-    /// bare assertion failure would misattribute to the code under test.
-    fn sufficient_workers(min_workers: usize) -> Option<usize> {
-        let workers = num_cpus::get();
-
-        if workers < min_workers {
-            eprintln!(
-                "skipping: {workers} logical CPU(s) available, need at least {min_workers} for \
-                 this scenario's concurrently-resident `TaskExecutor` workers"
-            );
-
-            return None;
-        }
-
-        Some(workers)
     }
 
     /// Bounded blocking spin-wait shared by the tests below that need a task body to
@@ -399,18 +431,18 @@ mod tests {
     /// `completed_at_fail` is a vacuity probe, not a timing assumption: the failing task snapshots
     /// how many slow tasks had already finished at the instant it decides to fail, before
     /// `execute`'s main loop can even react. If that snapshot were not strictly less than
-    /// `slow_tasks`, every slow task would already be done by the time the drain starts, the
+    /// `SLOW_TASKS`, every slow task would already be done by the time the drain starts, the
     /// drain would have nothing left to wait for, and the run below would pass without having
     /// exercised the fix at all. Asserting this directly means non-vacuity is enforced by the
     /// test, not derived by reasoning about scheduling — reasoning that has been wrong more than
     /// once in this file's history.
+    ///
+    /// Pins 3 workers via `TaskExecutor::with_workers` — see the module doc above for why a
+    /// pinned count, not `num_cpus::get()`, is what makes this scenario's 3 concurrently-resident
+    /// tasks (1 failing + `SLOW_TASKS`) reproducible on any host.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn execute_does_not_return_while_a_worker_is_still_running_synchronous_work() {
-        // See `sufficient_workers`: the failing task and every slow task must be concurrently
-        // resident, so at least 2 workers are required (1 failing + 1 slow); a third slow task
-        // is only added when there is a worker to spare for it.
-        let Some(workers) = sufficient_workers(2) else { return };
-        let slow_tasks: usize = if workers >= 3 { 2 } else { 1 };
+        const SLOW_TASKS: usize = 2;
 
         let context = Arc::new(TestContext::<()>::new());
         let started = Arc::new(AtomicUsize::new(0));
@@ -421,7 +453,7 @@ mod tests {
         // Pre-send every slow task before `execute` is called — see the module doc above for why
         // this, not a send from inside the failing task's own poll, is required to avoid starving
         // a woken worker in a non-stealable LIFO slot for the length of the spin-wait below.
-        for _ in 0..slow_tasks {
+        for _ in 0..SLOW_TASKS {
             let started = Arc::clone(&started);
             let completed = Arc::clone(&completed);
 
@@ -451,7 +483,7 @@ mod tests {
                 // Bounded so a real regression times out this test instead of hanging CI forever;
                 // waits until every slow task is confirmed to have started — i.e. past
                 // `recv_async` and inside the unyielding sleep — before this task fails.
-                if !spin_until(|| started.load(Ordering::SeqCst) >= slow_tasks, &starved) {
+                if !spin_until(|| started.load(Ordering::SeqCst) >= SLOW_TASKS, &starved) {
                     return Err(());
                 }
 
@@ -463,7 +495,7 @@ mod tests {
             })
         };
 
-        let executor = TaskExecutor::new(Arc::clone(&context));
+        let executor = TaskExecutor::with_workers(Arc::clone(&context), 3);
         let result = executor.execute(failing_task).await;
 
         assert!(
@@ -472,7 +504,7 @@ mod tests {
              concurrently with the failing task within the deadline) — not a drain bug"
         );
         assert!(
-            completed_at_fail.load(Ordering::SeqCst) < slow_tasks,
+            completed_at_fail.load(Ordering::SeqCst) < SLOW_TASKS,
             "every slow task had already finished before the failure fired — the drain had \
              nothing to wait for this run; environment stall, not a drain bug"
         );
@@ -483,7 +515,7 @@ mod tests {
         );
         assert_eq!(
             completed.load(Ordering::SeqCst),
-            slow_tasks,
+            SLOW_TASKS,
             "every slow task must run to completion before `execute` returns, not be cut off mid-sleep"
         );
     }
@@ -504,12 +536,11 @@ mod tests {
     /// can invert it). Without the first-error-wins guard in `worker`, `Y`'s later, drain-window
     /// failure would still deterministically overwrite `X`'s value on every run — this is not a
     /// race to catch, `Y` is made to always lose, so the bug is 100% reproducible.
+    ///
+    /// Pins 3 workers via `TaskExecutor::with_workers` for consistency with the other two tests
+    /// in this file (only 2 — X and Y concurrently resident — are actually needed here).
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn execute_reports_the_first_task_failure_not_the_last() {
-        // Both X and Y must be concurrently resident (X spin-waits on Y having started), so at
-        // least 2 workers are required — see `sufficient_workers`.
-        let Some(_workers) = sufficient_workers(2) else { return };
-
         let context = Arc::new(TestContext::<u8>::new());
         let y_started = Arc::new(AtomicBool::new(false));
         let starved = Arc::new(AtomicBool::new(false));
@@ -557,7 +588,7 @@ mod tests {
             })
         };
 
-        let executor = TaskExecutor::new(Arc::clone(&context));
+        let executor = TaskExecutor::with_workers(Arc::clone(&context), 3);
         let result = executor.execute(task_x).await;
 
         assert!(
@@ -599,13 +630,11 @@ mod tests {
     /// decides to panic. If Y had already failed by then, Y's failure would have landed in
     /// `execute`'s main loop rather than the drain window this test targets, and the run below
     /// would pass without ever exercising the race under test.
+    ///
+    /// Pins 3 workers via `TaskExecutor::with_workers` for consistency with the other two tests
+    /// in this file (only 2 — X and Y concurrently resident — are actually needed here).
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn execute_preserves_a_drain_window_failure_value_after_a_sibling_panics() {
-        // X and Y must be concurrently resident (X spin-waits on Y having started, then panics
-        // while Y is still sleeping), so at least 2 workers are required — see
-        // `sufficient_workers`.
-        let Some(_workers) = sufficient_workers(2) else { return };
-
         const Y_VALUE: u8 = 9;
 
         let context = Arc::new(TestContext::<u8>::new());
@@ -660,7 +689,7 @@ mod tests {
             })
         };
 
-        let executor = TaskExecutor::new(Arc::clone(&context));
+        let executor = TaskExecutor::with_workers(Arc::clone(&context), 3);
         let result = executor.execute(task_x).await;
 
         assert!(
