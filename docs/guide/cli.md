@@ -178,6 +178,13 @@ is incremental — unchanged files are recognized by their stat data and never
 re-read. `load` (like every mutating command) holds the warehouse lock while it
 runs, so two forklift processes never interleave.
 
+`load` records a small marker (beside the inventory) before it starts walking, and
+clears it only once that walk finishes cleanly — so a load that fails partway (or is
+interrupted outright, e.g. a crash) leaves it behind. `stack` checks for this marker
+and refuses while one is present (see below), rather than silently commit whatever
+happened to make it into the inventory. Re-running `load` over the same path (once
+the problem is fixed) clears it.
+
 ### `unload` — unstage (`ul`)
 
 ```sh
@@ -269,7 +276,10 @@ state. If a consolidation is in progress, `stack` completes it. On a warehouse
 where trust is established, `stack` also signs the parcel (see
 [Identity, signing, and agents](#7-identity-signing-and-agents)).
 
-`stack` requires staged changes — it refuses to create an empty parcel.
+`stack` requires staged changes — it refuses to create an empty parcel. It also
+refuses if a previous `load` over the affected path never finished cleanly
+(`incomplete_load`, exit 20) — see the note under `load` above; re-run that `load`,
+then stack again.
 
 ### Large files
 

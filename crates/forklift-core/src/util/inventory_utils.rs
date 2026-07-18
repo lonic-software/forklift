@@ -14,7 +14,7 @@ use crate::model::task::inventory_builder::inventory_builder_task::InventoryBuil
 use crate::model::task::TaskExecutor;
 use crate::parser;
 use crate::traits::task_context::TaskContext;
-use crate::util::{fanout_utils, file_utils, object_utils};
+use crate::util::{fanout_utils, file_utils, load_guard_utils, object_utils};
 use crate::util::object_utils::IngestMode;
 use crate::util::path_utils::WarehousePath;
 
@@ -253,6 +253,14 @@ fn inventory_content_matches(a: &Inventory, b: &Inventory) -> bool {
 /// Add a file or directory to its corresponding inventory.
 /// If no inventory exists for the given directory, a new inventory file will be created.
 ///
+/// This is `load`'s tree-walk entry point, so it is where the incomplete-load guard
+/// (`load_guard_utils`) brackets the walk: a marker naming `path` is durably recorded *before*
+/// anything below mutates the staging area, and cleared only once the walk below returns `Ok`
+/// (best-effort, and only if `path` covers whatever the marker still names — see
+/// `load_guard_utils::mark_load_completed`). A load that returns `Err`, or one that is killed
+/// outright before it ever gets the chance to, both leave the marker in place; `stack` refuses
+/// while it is.
+///
 /// # Arguments
 /// * `path` - The path of the file or directory to add to the inventory.
 ///
@@ -260,6 +268,8 @@ fn inventory_content_matches(a: &Inventory, b: &Inventory) -> bool {
 /// * `Ok(())`      - If the operation was successful.
 /// * `Err(String)` - If there was an error.
 pub async fn add_changes_to_inventory(path: &WarehousePath) -> Result<(), String> {
+    load_guard_utils::mark_load_started(path.as_key())?;
+
     let is_directory = file_utils::is_directory(&path.to_fs_path())?;
 
     if is_directory {
@@ -267,6 +277,8 @@ pub async fn add_changes_to_inventory(path: &WarehousePath) -> Result<(), String
     } else {
         add_file_to_inventory(path)?;
     }
+
+    load_guard_utils::mark_load_completed(path.as_key());
 
     Ok(())
 }

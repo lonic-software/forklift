@@ -157,6 +157,13 @@ refusal_codes! {
     /// size, nesting depth, leaf count, `in`-array length, glob length). One code for all of them:
     /// every case is "the query you asked for is not acceptable as written."
     QueryPredicateInvalid => "query_predicate_invalid",
+
+    /// `stack` was asked to durably commit the staged inventory while a `load` that started but
+    /// never finished cleanly (a mid-walk crash, or an error return partway through) is still
+    /// recorded (`load_guard_utils`): the staged content may be missing whatever that load never
+    /// got to. Refuses rather than silently publish an incomplete parcel; the remedy is always
+    /// the same cheap re-load.
+    IncompleteLoad => "incomplete_load",
 }
 
 impl RefusalCode {

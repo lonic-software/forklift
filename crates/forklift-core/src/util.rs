@@ -33,6 +33,7 @@ pub mod byte_utils;
 pub mod lcs;
 pub mod tree_utils;
 pub mod inventory_utils;
+pub mod load_guard_utils;
 pub mod path_utils;
 pub mod remote_utils;
 pub mod hook_utils;
