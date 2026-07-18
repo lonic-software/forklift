@@ -781,7 +781,9 @@ struct StreamOutcome {
 ///                   A directory-sync failure specifically leaves the object visible at
 ///                   `final_path` with its directory entry not proven durable — once activated,
 ///                   that is recorded as a taint over exactly that path (see
-///                   [`file_utils::sync_dir_or_taint`]).
+///                   [`file_utils::sync_dir_or_taint`]). A later
+///                   `heal_utils::heal_if_tainted` call restages exactly that path and clears the
+///                   taint once it is durable again.
 pub fn store_object_stream(claimed_hash: &str,
                            reader: &mut impl Read,
                            expected_len: u64) -> Result<bool, String> {

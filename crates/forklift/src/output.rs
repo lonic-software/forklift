@@ -16,7 +16,7 @@
 use std::sync::OnceLock;
 use serde::Serialize;
 use forklift_core::error::{CoreError, RefusalCode};
-use forklift_core::util::{load_guard_utils, merge_utils, query_utils, scope_utils};
+use forklift_core::util::{heal_utils, load_guard_utils, merge_utils, query_utils, scope_utils};
 
 /// The output schema version, carried on every JSON envelope as `forklift_json`.
 /// It changes only when the envelope or a command's `data` shape changes
@@ -295,6 +295,11 @@ error_codes! {
     /// (`load_guard_utils`): committing the staged inventory now could silently produce an
     /// incomplete result.
     IncompleteLoad,
+
+    /// The automatic entry-heal (`heal_utils`) hit a durability taint it could not resolve on its
+    /// own (a vanished, unreadable, or corrupt object, or a torn taint record) and refused rather
+    /// than silently trust unproven state.
+    DurabilityTaint,
 }
 
 impl ErrorCode {
@@ -319,6 +324,7 @@ impl ErrorCode {
             ErrorCode::QueryPredicateInvalid => query_utils::CODE_QUERY_PREDICATE_INVALID,
             ErrorCode::EmptyHistory => "empty_history",
             ErrorCode::IncompleteLoad => load_guard_utils::CODE_INCOMPLETE_LOAD,
+            ErrorCode::DurabilityTaint => heal_utils::CODE_DURABILITY_TAINT,
         }
     }
 
@@ -345,6 +351,7 @@ impl ErrorCode {
             ErrorCode::QueryPredicateInvalid => 18,
             ErrorCode::EmptyHistory => 19,
             ErrorCode::IncompleteLoad => 20,
+            ErrorCode::DurabilityTaint => 21,
         }
     }
 
@@ -386,6 +393,9 @@ impl ErrorCode {
             ErrorCode::IncompleteLoad =>
                 "\"stack\" or \"park\" refused because a \"load\" that never finished cleanly is \
                  still recorded",
+            ErrorCode::DurabilityTaint =>
+                "A durability taint could not be auto-healed (a vanished, unreadable, or \
+                 corrupt path, or a torn taint record)",
         }
     }
 
@@ -409,6 +419,7 @@ impl ErrorCode {
             RefusalCode::CommitPaginationUnsupported => ErrorCode::CommitPaginationUnsupported,
             RefusalCode::QueryPredicateInvalid => ErrorCode::QueryPredicateInvalid,
             RefusalCode::IncompleteLoad => ErrorCode::IncompleteLoad,
+            RefusalCode::DurabilityTaint => ErrorCode::DurabilityTaint,
         }
     }
 }
@@ -577,6 +588,7 @@ mod tests {
             RefusalCode::OversizedTransportUnsupported,
             RefusalCode::CommitPaginationUnsupported,
             RefusalCode::IncompleteLoad,
+            RefusalCode::DurabilityTaint,
         ] {
             // Hostile interpolated text, carried across a String segment (the shim), then classified.
             let framed: String = CoreError::refusal(code, "a\u{1f}path", "a\u{1f}step").into();
@@ -608,6 +620,7 @@ mod tests {
             (RefusalCode::CommitPaginationUnsupported, "commit_pagination_unsupported", 16),
             (RefusalCode::QueryPredicateInvalid, "query_predicate_invalid", 18),
             (RefusalCode::IncompleteLoad, "incomplete_load", 20),
+            (RefusalCode::DurabilityTaint, "durability_taint", 21),
         ];
 
         for (code, code_str, exit) in table {

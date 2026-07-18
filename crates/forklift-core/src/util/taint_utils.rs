@@ -6,8 +6,11 @@
 //! This module is the primitive only: recording a taint and reading one back, plus a
 //! process-local in-memory gate that gives an *activated* process an immediate belt against
 //! trusting existence under a root it just tainted. Nothing here decides *when* a taint should
-//! fire (that is every post-rename directory-sync call site's job), and nothing here heals —
-//! [`remove_taint_files`] is the primitive a future heal clears taints with, not a heal itself.
+//! fire (every post-rename directory-sync call site does, via `file_utils`'s
+//! `sync_dir_or_taint`/`sync_result_or_taint`), and nothing here heals —
+//! [`remove_taint_files`] and [`clear_gate`] are the primitives
+//! [`heal_utils::heal_if_tainted`](crate::util::heal_utils::heal_if_tainted) clears a resolved
+//! taint with, not a heal themselves; the restage logic and the entry chokepoint live there.
 //!
 //! ## Activation
 //!
@@ -33,8 +36,10 @@
 //!
 //! ## What this module does not do
 //!
-//! No wiring into any write path (no fire site calls [`record_taint`] yet), no CLI-visible
-//! recovery verb, no heal. Those are later slices built on top of this primitive.
+//! No restage logic and no entry chokepoint (see
+//! [`heal_utils`](crate::util::heal_utils) for both), and no CLI-visible recovery verb for the
+//! cases the automatic entry-heal cannot resolve on its own (a later slice, built on top of
+//! [`heal_utils::heal_if_tainted`](crate::util::heal_utils::heal_if_tainted)'s refusal).
 
 use std::collections::BTreeSet;
 use std::fs::OpenOptions;
@@ -349,13 +354,9 @@ pub fn gate_check(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Clear the gate for `root`, if one is standing. `pub(crate)` — this is the primitive a future
-/// heal clears the in-memory belt with once it has durably resolved the taint on disk; nothing
-/// in this stage calls it outside tests.
-// No wiring exists yet (no heal in this stage — see the module doc comment), so this has no
-// non-test caller until then; the lint would otherwise flag an intentionally forward-looking
-// primitive as unused.
-#[allow(dead_code)]
+/// Clear the gate for `root`, if one is standing. `pub(crate)` — this is the primitive
+/// [`heal_utils::heal_if_tainted`](crate::util::heal_utils::heal_if_tainted) clears the in-memory
+/// belt with once it has durably resolved the taint on disk.
 pub(crate) fn clear_gate(root: &Path) {
     gate_state().lock().expect("taint gate lock poisoned").remove(&gate_key(root));
 }
@@ -456,19 +457,15 @@ fn parse_taint_content(bytes: &[u8]) -> (BTreeSet<PathBuf>, bool) {
 }
 
 /// Delete every taint file under `root`'s taint directory, then fsync the directory so the
-/// removals are themselves durable. `pub(crate)` — the primitive a future heal clears taints
-/// with once it has durably resolved every recorded path; nothing in this stage calls it outside
-/// tests. Not gated by activation: unlike recording or checking, deleting is only ever reached
-/// through a heal an activated process itself drives, so gating here would be redundant, not
-/// protective.
+/// removals are themselves durable. `pub(crate)` — the primitive
+/// [`heal_utils::heal_if_tainted`](crate::util::heal_utils::heal_if_tainted) clears taints with
+/// once it has durably restaged every recorded path (see that function's doc comment). Not gated
+/// by activation: unlike recording or checking, deleting is only ever reached through a heal an
+/// activated process itself drives, so gating here would be redundant, not protective.
 ///
 /// # Returns
 /// * `Ok(())`      - The taint directory was absent, empty, or successfully cleared.
 /// * `Err(String)` - A taint file could not be removed, or the directory fsync failed.
-// No wiring exists yet (no heal in this stage — see the module doc comment), so this has no
-// non-test caller until then; the lint would otherwise flag an intentionally forward-looking
-// primitive as unused.
-#[allow(dead_code)]
 pub(crate) fn remove_taint_files(root: &Path) -> Result<(), String> {
     let taint_dir = root.join(TAINT_DIR_NAME);
     if !taint_dir.exists() {
@@ -489,6 +486,49 @@ pub(crate) fn remove_taint_files(root: &Path) -> Result<(), String> {
     }
 
     file_utils::sync_dir(&taint_dir)
+}
+
+/// The path of any one regular taint file under `root`'s taint directory — used by
+/// [`heal_utils::heal_if_tainted`](crate::util::heal_utils::heal_if_tainted) as the write-mode-
+/// openable regular file its post-restage macOS device flush needs (a directory cannot be opened
+/// write-mode; see `file_utils::macos_flush_device_cache`'s doc comment). Which file is returned
+/// is unspecified when more than one exists — the flush is drive-wide, so any one of them serves
+/// equally.
+///
+/// # Returns
+/// * `Ok(Some(path))` - A taint file exists; `path` is one of them (unspecified which).
+/// * `Ok(None)`       - The taint directory is absent or holds no regular file.
+/// * `Err(String)`    - The taint directory exists but could not be read.
+pub(crate) fn any_taint_file_path(root: &Path) -> Result<Option<PathBuf>, String> {
+    let taint_dir = root.join(TAINT_DIR_NAME);
+    if !taint_dir.exists() {
+        return Ok(None);
+    }
+
+    let entries = std::fs::read_dir(&taint_dir)
+        .map_err(|e| format!("Error while reading taint directory \"{}\": {}", taint_dir.to_string_lossy(), e))?;
+
+    for entry in entries {
+        let entry = entry
+            .map_err(|e| format!("Error while reading taint directory \"{}\": {}", taint_dir.to_string_lossy(), e))?;
+        let path = entry.path();
+        if path.is_file() {
+            return Ok(Some(path));
+        }
+    }
+
+    Ok(None)
+}
+
+/// The path of the taint directory under a given warehouse root, independent of any active
+/// process-wide storage-root scope — for a caller that already knows the target warehouse's root
+/// directly rather than through the ambient scope [`record_taint`]/[`read_taints`] resolve
+/// against (a test driving `forklift` as a spawned subprocess, whose own working directory has
+/// nothing to do with the warehouse being exercised — the same need `load_guard_utils::
+/// marker_path_under` serves for the incomplete-load marker). Assumes a plain, non-bay warehouse
+/// layout (`<root>/.forklift/taint/...`), which is all such a caller ever drives.
+pub fn taint_dir_path_under(warehouse_root: &Path) -> PathBuf {
+    warehouse_root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT).join(TAINT_DIR_NAME)
 }
 
 #[cfg(test)]

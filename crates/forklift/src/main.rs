@@ -49,6 +49,16 @@ fn run() {
 /// The real entry point: parses arguments, wires up the pager and passphrase provider, and is
 /// the top-level error handler for the [`forklift`] function it wraps.
 async fn async_main() {
+    // Activate the durability-taint machinery for the rest of this process — unconditionally,
+    // before argument dispatch, regardless of which command runs. This is safe to do even for a
+    // command that never touches a warehouse (`version`, `help`): every other function this
+    // switch affects (`taint_utils::record_taint`/`gate_check`/`read_taints`,
+    // `heal_utils::heal_if_tainted`) is itself a no-op until a storage root is actually resolved.
+    // The CLI may activate because it also wires the heal below — `forklift-server` does neither
+    // (see `taint_utils`'s module doc comment on the all-or-nothing activation rule): activating
+    // the taint write/gate without ever healing would be strictly worse than today's baseline.
+    forklift_core::util::taint_utils::activate();
+
     // Clap owns the argument errors (usage, suggestions, exit code 2); everything past
     // parsing reports through the Err path below with a deterministic exit code (§7.8).
     let cli = Cli::parse();
@@ -92,9 +102,24 @@ async fn async_main() {
     }
 }
 
-/// The main forklift process: enter the warehouse, take the lock when the command
-/// mutates, then dispatch. Warehouse entry and locking carry classified errors so an
-/// agent can branch (§7.8); a command's own error is generic unless it says otherwise.
+/// The main forklift process: enter the warehouse, heal a standing durability taint, take the
+/// lock when the command mutates, then dispatch. Warehouse entry and locking carry classified
+/// errors so an agent can branch (§7.8); a command's own error is generic unless it says
+/// otherwise.
+///
+/// The storage-scope entry-heal ([`forklift_core::util::heal_utils::heal_if_tainted`]) runs once
+/// here, immediately after [`warehouse_utils::enter_warehouse`] resolves the storage root (bay
+/// redirects included) and before any other line of this process may consult
+/// `does_object_exist` or dispatch to a command handler — this is the single chokepoint every
+/// `requires_warehouse()` command passes through exactly once per invocation, covering all of
+/// them uniformly, including read-only ones — no command is exempt yet. (A future recovery verb
+/// will need its own exemption, to stay reachable while a taint stands and resolve it; nothing
+/// here carves that out today.) This is deliberately unlike
+/// `load_guard_utils::check_no_incomplete_load`, which is called individually from inside
+/// `stack`'s and `park`'s own handlers — a taint can leave a *durable reference* pointing at
+/// unproven bytes if left unhealed before *any* command trusts existence, not just the two that
+/// durably commit staged inventory, so a single early chokepoint (rather than a per-command guard
+/// sprinkled at each write site) is what the trust-gating invariant actually needs.
 ///
 /// # Arguments
 /// * `cli` - The parsed command line.
@@ -109,6 +134,8 @@ async fn forklift(cli: Cli) -> Result<(), ForkliftError> {
             message,
             "Run \"forklift prepare\" to create a warehouse here, or change into one."
         ))?;
+
+        forklift_core::util::heal_utils::heal_if_tainted()?;
     }
 
     // Mutating commands hold the warehouse lock for their whole runtime, so two forklift

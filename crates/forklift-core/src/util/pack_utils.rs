@@ -698,6 +698,8 @@ struct StagedTransportPack {
 ///                                because an identical layout was already published) is visible
 ///                                but its directory entries are not proven durable — once
 ///                                activated, that is recorded as a taint over exactly those paths.
+///                                A later `heal_utils::heal_if_tainted` call restages exactly
+///                                those paths and clears the taint once they are durable again.
 pub(crate) fn import_transport_packs<R: Read>(reader: &mut R,
                                                sections: &[(u64, u64)])
                                                -> Result<TransportImportStats, String> {
@@ -1381,7 +1383,9 @@ struct WindowEntry {
 ///                        (`new_pack_files`) visible but not proven durable, and — once activated
 ///                        — records that as a taint; either that or a standing taint found on the
 ///                        re-check both abort before the loose-source/old-pack removal sweep below
-///                        ever runs.
+///                        ever runs. A later `heal_utils::heal_if_tainted` call restages exactly
+///                        the affected paths and clears the taint once they are durable again —
+///                        `compact`'s own destructive sweep stays refused until then either way.
 pub fn compact(all: bool, redelta: bool) -> Result<CompactStats, String> {
     let pack_folder = pack_folder();
     file_utils::create_folder_if_not_exists(&pack_folder)?;

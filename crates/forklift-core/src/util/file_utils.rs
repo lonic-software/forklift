@@ -197,6 +197,30 @@ pub fn get_path_for_object(hash: &str) -> Result<(String, String), String> {
     Ok((path, hash[OBJECT_HASH_FOLDER_PATH_CHARACTERS..].to_string()))
 }
 
+/// Recover the object hash a loose object's final on-disk path encodes — the exact inverse of
+/// [`get_path_for_object`]. Used by [`heal_utils`](crate::util::heal_utils) to tell a loose
+/// object apart from every other kind of path a taint can record (a pack data/index file, an
+/// inventory shard): only a loose object's path has this exact `<2 hex chars>/<rest>` shape, so
+/// `Some` here is also the signal that a content-hash re-check is possible (and required) before
+/// restaging — see [`heal_utils::restage_object`](crate::util::heal_utils::restage_object).
+///
+/// # Returns
+/// * `Some(String)` - The hash, if `path`'s last two components have the `<2 hex chars>/<rest>`
+///                     fan-out shape [`get_path_for_object`] produces.
+/// * `None`         - `path` does not have that shape (not an object path, or corrupt).
+pub fn hash_from_object_path(path: &Path) -> Option<String> {
+    let file_name = path.file_name()?.to_str()?;
+    let folder_name = path.parent()?.file_name()?.to_str()?;
+
+    if folder_name.len() != OBJECT_HASH_FOLDER_PATH_CHARACTERS {
+        return None;
+    }
+
+    let candidate = format!("{}{}", folder_name, file_name);
+
+    candidate.bytes().all(|b| b.is_ascii_hexdigit()).then_some(candidate)
+}
+
 /// Whether writes fsync for durability. Durable by default; set `FORKLIFT_FSYNC` to `0`, `off`,
 /// `false`, or `no` to skip every fsync — a throughput escape hatch for bulk, disposable work
 /// (large imports, test fixtures, CI) where a mid-run crash just means re-running the whole
@@ -465,8 +489,11 @@ fn write_and_sync_file(path: &Path, content: &[u8]) -> Result<(), String> {
 /// counter — its `.stream.tmp` infix (vs. this function's plain `.tmp`) is deliberately
 /// different so the two paths can never collide on the same temp name even if both counters
 /// reach the same numeric value at the same moment (two independent counters offer no such
-/// guarantee on their own).
-fn temp_path_for(file_path: &Path) -> Result<PathBuf, String> {
+/// guarantee on their own). `pub(crate)` so [`heal_utils`](crate::util::heal_utils)'s restage
+/// primitive shares the exact same uniqueness discipline for its own fresh temp name, rather
+/// than reimplementing it — restaging never routes through `write_file_atomically` itself (see
+/// that module's no-self-trip rule), but there is no reason its temp-naming should differ.
+pub(crate) fn temp_path_for(file_path: &Path) -> Result<PathBuf, String> {
     static TEMP_FILE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let write_id = TEMP_FILE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
@@ -951,8 +978,13 @@ fn dir_sync_attempts() -> Vec<PathBuf> {
 /// this platform (`EISDIR`), and POSIX `fsync` works on a read-only descriptor regardless (see
 /// [`open_for_sync`]'s doc comment for the same point about files, where a write-mode open is
 /// chosen only for Windows' sake — moot here, since this function is Unix-only).
+///
+/// `pub(crate)` so [`heal_utils`](crate::util::heal_utils)'s entry-heal can fsync a batch of
+/// restaged objects' distinct parent directories directly — the same raw primitive
+/// [`sync_touched_directories`] uses, never the taint-aware [`sync_dir_or_taint`] wrapper (whose
+/// own success re-check would refuse while the very taint the heal is resolving still stands).
 #[cfg(unix)]
-fn fsync_dir_data(dir: &Path) -> Result<(), String> {
+pub(crate) fn fsync_dir_data(dir: &Path) -> Result<(), String> {
     use std::os::unix::io::AsRawFd;
 
     #[cfg(test)]
@@ -1271,7 +1303,11 @@ impl WriteBatch {
     ///                   of those directory-sync failures record a durability taint for exactly the
     ///                   affected final paths (see [`taint_after_sync_failure`]), which
     ///                   [`does_object_exist`]'s own gate then refuses to answer past rather than
-    ///                   silently trusting.
+    ///                   silently trusting. In an activated process a later
+    ///                   [`heal_utils::heal_if_tainted`](crate::util::heal_utils::heal_if_tainted)
+    ///                   call (run automatically at the CLI's storage-scope entry) restages exactly
+    ///                   those paths and clears the taint once every one of them is proven durable
+    ///                   again.
     pub fn finish(&self) -> Result<(), String> {
         let (pending, leaked) = {
             let mut state = self.state.lock().expect("write batch lock poisoned");
@@ -1418,8 +1454,13 @@ fn fsync_data(path: &Path) -> Result<(), String> {
 /// flush, which [`fsync_data`] deliberately does not pay per file. The flush is drive-wide, not
 /// file-specific, so running it on any one of the batch's files covers every write already
 /// queued there by [`fsync_data`].
+///
+/// `pub(crate)` so [`heal_utils`](crate::util::heal_utils)'s entry-heal can share this exact
+/// primitive for its own post-restage flush (via a taint file, or a small anchor file for a
+/// directory on a different volume — see that module's doc comment) instead of duplicating the
+/// raw `fcntl` call.
 #[cfg(target_os = "macos")]
-fn macos_flush_device_cache(path: &Path) -> Result<(), String> {
+pub(crate) fn macos_flush_device_cache(path: &Path) -> Result<(), String> {
     use std::os::unix::io::AsRawFd;
 
     let file = open_for_sync(path)?;
@@ -1736,9 +1777,11 @@ pub fn get_inventory_data_path_for_key(key: &str) -> PathBuf {
 /// [`taint_utils::gate_check`]: the process-local, per-root belt that trips while a taint *this
 /// process* has recorded (or seen recorded) for the root is still standing. That is
 /// intentionally the weakest of the taint design's layers — it does not see a sibling process's
-/// taint — the stronger, disk-backed checks are a future storage-scope entry-heal, plus every
-/// write path's own re-check on its sync's success path (see [`sync_result_or_taint`]) before it
-/// may report `Ok`. A no-op unless [`taint_utils::activate`] has been called in this process.
+/// taint — the stronger, disk-backed checks are the CLI's storage-scope entry-heal
+/// ([`heal_utils::heal_if_tainted`](crate::util::heal_utils::heal_if_tainted), run once per
+/// command before this function is ever reachable), plus every write path's own re-check on its
+/// sync's success path (see [`sync_result_or_taint`]) before it may report `Ok`. A no-op unless
+/// [`taint_utils::activate`] has been called in this process.
 ///
 /// # Arguments
 /// * `hash` - The hash of the object to check.
@@ -2189,6 +2232,52 @@ mod tests {
         assert_eq!(retrieve_object_by_hash(&hash).unwrap(), content);
 
         std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn hash_from_object_path_round_trips_with_get_path_for_object() {
+        // The inverse `hash_from_object_path` exists to recover: a taint records final paths, and
+        // the heal needs the hash a loose object's own path claims in order to verify it — a wrong
+        // answer here (a hash that does not actually match the path, or a path that should decode
+        // but returns `None`) would either skip a verification that should have run or wrongly
+        // reject a genuine object path.
+        for hash in ["a".repeat(64), "0123456789abcdef".repeat(4), "f".repeat(65), "1".repeat(3)] {
+            let (folder, file_name) = get_path_for_object(&hash).unwrap();
+            let mut final_path = PathBuf::from(&folder);
+            final_path.push(&file_name);
+
+            assert_eq!(hash_from_object_path(&final_path), Some(hash.clone()),
+                "must recover the exact hash \"{hash}\" that produced this path");
+        }
+    }
+
+    #[test]
+    fn hash_from_object_path_rejects_a_shape_get_path_for_object_never_produces() {
+        // Any path that does not have the fan-out shape (a 2-hex-char folder, then the rest of
+        // the hash) must decode to `None`, not silently produce a garbage hash that could then
+        // coincidentally (or maliciously) match a real item's recorded hash — this is exactly the
+        // signal `heal_utils::restage_object` uses to skip hash verification for a non-loose-object
+        // recorded path (a pack file, an inventory shard), so a false `Some` there would wrongly
+        // demand a hash match from content that was never hash-addressed in the first place.
+        let cases: Vec<PathBuf> = vec![
+            PathBuf::from("/some/warehouse/.forklift/objects/ab/cdef"), // well-formed control case, see below
+            PathBuf::from("/some/warehouse/.forklift/objects/a/bcdef"), // 1-char folder, not 2
+            PathBuf::from("/some/warehouse/.forklift/objects/abc/def"), // 3-char folder, not 2
+            PathBuf::from("/some/warehouse/.forklift/objects/zz/cdef"), // non-hex folder
+            PathBuf::from("/some/warehouse/.forklift/objects/ab/cdeg"), // non-hex filename
+            PathBuf::from("no-parent-at-all"),
+            PathBuf::from("/"),
+        ];
+
+        // The control case (a genuinely well-formed path) must still decode correctly — proves
+        // the other cases are rejected for their specific shape defect, not by some overly broad
+        // check that rejects everything.
+        assert_eq!(hash_from_object_path(&cases[0]), Some("abcdef".to_string()));
+
+        for path in &cases[1..] {
+            assert_eq!(hash_from_object_path(path), None,
+                "must reject {path:?} instead of returning a garbage hash");
+        }
     }
 
     #[test]
@@ -3009,6 +3098,75 @@ mod tests {
         ].into_iter().collect();
         assert_eq!(state.recorded, expected,
             "the taint must record exactly the batch's final paths, root-relative");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_batched_trailing_sync_failure_is_healed_by_restaging_both_final_paths() {
+        // The entry-heal, driven end to end from a real `WriteBatch` trailing-sync failure (the
+        // batched fire-site class, distinct from `heal_utils`'s own tests which mostly drive the
+        // immediate path and hand-planted taint files). Mutation: skip the restage in
+        // `heal_utils::heal_if_tainted` (fsync the parent directories without rewriting the
+        // dentries first) — this test still catches it via the inode check, since the taint would
+        // still clear (the fsync itself succeeds) but neither file's dentry would actually change.
+        let _serial = lock_taint_activation();
+        taint_utils::activate();
+
+        let temp = std::env::temp_dir().join(format!("forklift-heal-batched-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+        let forklift = forklift_root();
+
+        let alpha = forklift.join("objects").join("aa").join("alpha-object");
+        let beta = forklift.join("objects").join("bb").join("beta-object");
+        std::fs::create_dir_all(alpha.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(beta.parent().unwrap()).unwrap();
+
+        let batch = WriteBatch::new();
+        batch.stage(&alpha, b"alpha content").unwrap();
+        batch.stage(&beta, b"beta content").unwrap();
+
+        let inode_alpha_before = std::fs::metadata(&alpha).map(|m| m.ino()).ok();
+        let inode_beta_before = std::fs::metadata(&beta).map(|m| m.ino()).ok();
+        assert!(inode_alpha_before.is_none() && inode_beta_before.is_none(),
+            "neither final path may exist before the batch runs");
+
+        {
+            let _guard = DirSyncFaultGuard::failing("bb");
+            batch.finish().unwrap_err();
+        }
+
+        assert!(alpha.exists() && beta.exists(), "both renames landed before the trailing sync failed");
+        assert!(!taint_utils::read_taints(&forklift).unwrap().recorded.is_empty());
+
+        let inode_alpha_before = std::fs::metadata(&alpha).unwrap().ino();
+        let inode_beta_before = std::fs::metadata(&beta).unwrap().ino();
+        let dir_syncs_before = dir_sync_count();
+
+        crate::util::heal_utils::heal_if_tainted().expect("a clean batched restage must heal");
+
+        assert!(dir_sync_count() >= dir_syncs_before + 2,
+            "both distinct parent directories must be fsynced by the heal");
+
+        assert_ne!(std::fs::metadata(&alpha).unwrap().ino(), inode_alpha_before,
+            "mutation check: alpha's dentry must actually be rewritten, not just fsynced");
+        assert_ne!(std::fs::metadata(&beta).unwrap().ino(), inode_beta_before,
+            "mutation check: beta's dentry must actually be rewritten, not just fsynced");
+
+        assert_eq!(std::fs::read(&alpha).unwrap(), b"alpha content");
+        assert_eq!(std::fs::read(&beta).unwrap(), b"beta content");
+
+        assert!(taint_utils::read_taints(&forklift).unwrap().recorded.is_empty(),
+            "the taint files must be gone once every recorded path healed");
+        assert!(taint_utils::gate_check(&forklift).is_ok(), "the gate must be cleared");
+
+        // The command proceeds: a fresh write under the now-healed root succeeds cleanly.
+        let after_heal_dir = forklift.join("objects").join("cc");
+        std::fs::create_dir_all(&after_heal_dir).unwrap();
+        assert!(write_file_atomically(&after_heal_dir.join("after-heal"), b"ok").is_ok());
 
         std::fs::remove_dir_all(&temp).ok();
     }
