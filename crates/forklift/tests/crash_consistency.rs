@@ -369,6 +369,15 @@ fn calibrate_load_duration(area: &Area, files: &[PathBuf], base_line: &str, labe
 /// Returns how many iterations produced a completed `stack` (the signal that this iteration's
 /// kill left something a later step could — and did — build on, not just "killed before
 /// anything").
+///
+/// The incomplete-load guard (`load_guard_utils`) durably marks a load's root the instant it
+/// starts — before this test's kill ever lands — precisely so a killed `load` is caught even
+/// though it never got to report an error; a real `stack` now refuses on exactly the state this
+/// function deliberately builds on. That marker is a different concern from the one under test
+/// here (inventory completeness, not object/blob durability), so it is removed by hand — not
+/// healed by a re-load, which the comment above already rules out for a different reason — right
+/// before each iteration's direct `stack`, to keep exercising the same torn/missing-blob check
+/// this test always has.
 fn run_load_kill_spread(
     area: &Area,
     files: &[PathBuf],
@@ -402,8 +411,14 @@ fn run_load_kill_spread(
         let _ = child.wait();
 
         // 4. Build directly on whatever the (possibly interrupted) load left behind — no healing
-        //    re-load first (see the doc comment above for why).
+        //    re-load first (see the doc comment above for why). The incomplete-load marker a
+        //    killed load leaves behind is a different, orthogonal concern (see the function's own
+        //    doc comment) — removed by hand so `stack` still reaches the torn/missing-blob check
+        //    this test exists for, instead of refusing on the marker before ever getting there.
         area.clear_stale_lock();
+        let _ = std::fs::remove_file(
+            area.warehouse().join(".forklift").join("inventory").join("incomplete-load")
+        );
 
         let stack = area.run(&["stack", &format!("{commit_tag} commit {i}")]);
         let stderr_lower = String::from_utf8_lossy(&stack.stderr).to_lowercase();
