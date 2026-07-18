@@ -291,8 +291,9 @@ error_codes! {
     /// alone, so it is classified here directly rather than as a `forklift-core` `RefusalCode`.
     EmptyHistory,
 
-    /// `stack` refused because a `load` that never finished cleanly is still recorded
-    /// (`load_guard_utils`): stacking now could silently commit an incomplete inventory.
+    /// `stack` or `park` refused because a `load` that never finished cleanly is still recorded
+    /// (`load_guard_utils`): committing the staged inventory now could silently produce an
+    /// incomplete result.
     IncompleteLoad,
 }
 
@@ -383,7 +384,8 @@ impl ErrorCode {
             ErrorCode::EmptyHistory =>
                 "\"history\" was asked to walk a pallet that has nothing stacked on it yet",
             ErrorCode::IncompleteLoad =>
-                "\"stack\" refused because a \"load\" that never finished cleanly is still recorded",
+                "\"stack\" or \"park\" refused because a \"load\" that never finished cleanly is \
+                 still recorded",
         }
     }
 

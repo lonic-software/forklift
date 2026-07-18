@@ -64,7 +64,8 @@ pub async fn stack_parcel(description: Option<String>) -> Result<(String, String
     // The cheapest possible pre-check runs first: a `load` that started but never finished
     // cleanly (crashed mid-walk, or returned an error) leaves a marker behind
     // (`load_guard_utils`), and stacking now could silently commit an incomplete inventory as a
-    // durable parcel. Refuses before even resolving the operator identity below.
+    // durable parcel. Refuses before even resolving the operator identity below. `park`'s push
+    // carries the identical check for the identical reason — see its own doc comment.
     load_guard_utils::check_no_incomplete_load()?;
 
     // The operator identity is resolved before any work happens, so a missing

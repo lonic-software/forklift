@@ -158,11 +158,11 @@ refusal_codes! {
     /// every case is "the query you asked for is not acceptable as written."
     QueryPredicateInvalid => "query_predicate_invalid",
 
-    /// `stack` was asked to durably commit the staged inventory while a `load` that started but
-    /// never finished cleanly (a mid-walk crash, or an error return partway through) is still
-    /// recorded (`load_guard_utils`): the staged content may be missing whatever that load never
-    /// got to. Refuses rather than silently publish an incomplete parcel; the remedy is always
-    /// the same cheap re-load.
+    /// `stack` or `park` was asked to durably commit the staged inventory while a `load` that
+    /// started but never finished cleanly (a mid-walk crash, or an error return partway through)
+    /// is still recorded (`load_guard_utils`): the staged content may be missing whatever that
+    /// load never got to. Refuses rather than silently publish an incomplete parcel; the remedy
+    /// is always the same cheap re-load, or abandoning the load with `restore --staged`.
     IncompleteLoad => "incomplete_load",
 }
 
