@@ -9,7 +9,7 @@ that affects it (a new error code, or a `--json` output struct).
 
 Every `forklift` failure carries a stable `code` (in the `--json` error envelope) and the process exits with the matching deterministic status, so a script or an agent branches without parsing prose. `2` is reserved for clap's own argument/usage errors; `0` is success. Both tables are generated from the single `ErrorCode` enum in `crates/forklift/src/output.rs` — see `docs/guide/cli.md` for how a script is meant to use them.
 
-Exit code 17 is reserved for a parked feature and is not yet assigned to any code.
+Exit code 17 is reserved for a future feature and is not yet assigned to any code.
 
 | `code` | exit | Meaning |
 |---|---|---|
@@ -30,5 +30,5 @@ Exit code 17 is reserved for a parked feature and is not yet assigned to any cod
 | `commit_pagination_unsupported` | 16 | A lift needs a paginated commit (many objects) and the remote doesn't support it yet |
 | `query_predicate_invalid` | 18 | A "query" predicate is malformed or exceeds a fixed bound |
 | `empty_history` | 19 | "history" was asked to walk a pallet that has nothing stacked on it yet |
-| `incomplete_load` | 20 | "stack" refused because a "load" that never finished cleanly is still recorded |
+| `incomplete_load` | 20 | "stack" or "park" refused because a "load" that never finished cleanly is still recorded |
 

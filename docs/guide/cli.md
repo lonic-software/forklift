@@ -180,10 +180,15 @@ runs, so two forklift processes never interleave.
 
 `load` records a small marker (beside the inventory) before it starts walking, and
 clears it only once that walk finishes cleanly — so a load that fails partway (or is
-interrupted outright, e.g. a crash) leaves it behind. `stack` checks for this marker
-and refuses while one is present (see below), rather than silently commit whatever
-happened to make it into the inventory. Re-running `load` over the same path (once
-the problem is fixed) clears it.
+interrupted outright, e.g. a crash) leaves it behind. Several independent failed loads
+over different paths are all recorded at once — healing one never silently clears
+another. `stack` and `park` both check for these markers and refuse while any is
+present (see below), rather than silently commit whatever happened to make it into the
+inventory. Two remedies clear an affected marker: re-running `load` over the same
+path, or `restore --staged` (or `unload`) over a path that covers it — the second one
+abandons the incomplete load instead of finishing it. Any command that resets the
+whole staging area (`shift`, `park`'s own reset back to the pallet head, and the
+like) clears every recorded marker at once, the same way.
 
 ### `unload` — unstage (`ul`)
 
@@ -277,9 +282,10 @@ where trust is established, `stack` also signs the parcel (see
 [Identity, signing, and agents](#7-identity-signing-and-agents)).
 
 `stack` requires staged changes — it refuses to create an empty parcel. It also
-refuses if a previous `load` over the affected path never finished cleanly
-(`incomplete_load`, exit 20) — see the note under `load` above; re-run that `load`,
-then stack again.
+refuses if a previous `load` over any recorded path never finished cleanly
+(`incomplete_load`, exit 20) — see the note under `load` above; either re-run the
+named `load`(s), or `restore --staged` the affected path(s) to abandon them, then
+stack again.
 
 ### Large files
 
@@ -843,6 +849,11 @@ forklift park pop         # re-apply the most recent parked changes (staged) and
 parcel and resets the warehouse to the pallet head (untracked files are left
 alone). `park pop` re-applies the most recent parked changes as a clean re-apply
 — it must be popped onto the head it was parked on, or it reports a conflict.
+
+`park`'s push durably commits the staged inventory into a parked parcel, exactly
+like `stack` commits into a stacked one — so it refuses under the same
+`incomplete_load` guard (see the note under `load` above) if a previous `load`
+never finished cleanly.
 
 ---
 
