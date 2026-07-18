@@ -3426,15 +3426,28 @@ fn restore_staged_of_a_narrower_path_does_not_heal_a_broader_recorded_root() {
     std::fs::set_permissions(&blocked_path, std::fs::Permissions::from_mode(0o644)).unwrap();
 }
 
-/// The vacuous corner of the same recovery path: a virgin warehouse's very first load fails
-/// entirely inside one directory (its only file is unreadable, so that directory never gets a
-/// shard at all) while a sibling directory succeeds. Abandoning the failed directory via
+/// The vacuous corner of the same recovery path: a directory whose only file is unreadable never
+/// gets a shard at all (its own per-directory task publishes nothing — see
+/// `load_guard_utils::clear_recorded_involving`'s doc comment). Abandoning it via
 /// `restore --staged` has nothing to reset (it was never staged) and nothing to abandon (nothing
 /// landed there) — it must succeed as a heal-no-op instead of failing with "neither in the
 /// inventory nor in the pallet head" while leaving the marker (and the guard) stuck forever. See
 /// `restore_staged_of_a_narrower_path_does_not_heal_a_broader_recorded_root` above for the
 /// guard: restoring a path that *does* carry real staged content keeps today's ordinary
 /// real-restore behavior (the marker survives) rather than taking this no-op path.
+///
+/// The survivor directory ("good") is staged by its own prior, cleanly-succeeding `load` — never
+/// by the same failing `load .` this test provokes. A sibling directory under one `load .` is
+/// walked as a separate, concurrently-scheduled task (`TaskExecutor`); once `bigdir`'s task
+/// fails, every worker stops dequeuing new tasks and any task still sitting in the queue —
+/// `good`'s, if it had not yet been picked up — is never run at all (see `TaskExecutor::execute`'s
+/// doc comment: "once any task fails, every task still sitting in the queue is guaranteed to
+/// never be dequeued"). Whether `good`'s task wins that race before `bigdir`'s failure lands is
+/// scheduling-dependent (worker count, runtime load) and must never be load-bearing in a test.
+/// Pre-staging `good` sidesteps it entirely and stays correct regardless of how the *second*,
+/// failing walk schedules its siblings: a failed (or never-run) task can only ever publish
+/// nothing for its own directory, never erase an already-durable one — the same property
+/// `clear_recorded_involving`'s doc comment proves for the vacuous-heal itself.
 #[cfg(unix)]
 #[test]
 fn restore_staged_of_a_vacuous_failed_directory_heals_as_a_no_op() {
@@ -3444,7 +3457,12 @@ fn restore_staged_of_a_vacuous_failed_directory_heals_as_a_no_op() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
 
+    // The survivor is durably staged by its own clean load, before the failing one below ever
+    // runs — see the doc comment above for why this, not concurrent sibling scheduling, is what
+    // this test relies on.
     warehouse.write_file("good/ok.txt", "fine\n");
+    assert_success(&warehouse.run(&["load", "good"]));
+
     warehouse.write_file("bigdir/blocked.txt", "unreadable\n");
     let blocked_path = warehouse.root.join("bigdir").join("blocked.txt");
     std::fs::set_permissions(&blocked_path, std::fs::Permissions::from_mode(0o000)).unwrap();
