@@ -1955,6 +1955,12 @@ async fn join_all<T: Send + 'static>(mut tasks: JoinSet<Result<T, String>>) -> R
 /// not enough. Draining here, before the caller returns whatever error it already has, is what
 /// closes that gap.
 ///
+/// Deliberately not unified with `TaskExecutor::execute`'s drain despite the resemblance: that
+/// one is a worker-pool loop reporting a panic into the executor's shared error state, this one
+/// is a one-shot task-set drain folding panic evidence into a returned message — different
+/// levels, and the shape they share is only a handful of lines, too little to justify an
+/// abstraction that would cost more than the duplication it removes.
+///
 /// Most results are discarded: a cancelled join (the abort actually landing), an ordinary task
 /// error, even a late success — the caller already has its first error, and first error wins. A
 /// *panic* is the one exception: this crate's core never prints on its own, so a sibling's panic
@@ -3787,7 +3793,12 @@ mod tests {
     /// error is actually *consumed* by the coordinator. Full determinism is therefore impossible
     /// to guarantee from here: a coordinator stalled longer than the 1s window could still see
     /// both results ready and pick either first. The margin makes that failure mode practically
-    /// unreachable, not theoretically impossible.
+    /// unreachable, not theoretically impossible. Full causal gating — blocking the slow
+    /// sibling's unyielding stretch until the fast error is actually *consumed* inside
+    /// `join_all`, not merely returned — was considered and declined: consumption is only
+    /// observable via a test-only hook inside `join_all`/`drain_remaining`, and the global armed
+    /// state and cross-test serialization such a hook would need outweigh the sub-observable race
+    /// it would close.
     #[test]
     fn join_all_drains_a_synchronous_sibling_before_surfacing_the_first_error() {
         let runtime = build_drain_test_runtime();
@@ -3826,6 +3837,23 @@ mod tests {
             "test environment starved a sibling (a wait never observed its condition within the \
              deadline) — not a join_all bug"
         );
+        // The margin makes it merely unreachable, not impossible (see the doc comment above): if
+        // `join_next` did surface the late sibling's error, that is either the coordinator
+        // stalled past the 1s window (both results were ready, and join order among ready
+        // results is unspecified — a scheduling artifact, not this test's concern) or a genuine
+        // first-error-wins regression in `join_all` — the two are indistinguishable from a single
+        // run. A one-off failure here is almost certainly the former; rerun to check. A failure
+        // that reproduces persistently is the latter and should be treated as a real regression,
+        // not dismissed as flake.
+        if result == Err("late boom".to_string()) {
+            panic!(
+                "join_next surfaced the late sibling's error (\"late boom\") instead of the fast \
+                 sibling's (\"boom\"); either the coordinator stalled past the late sibling's 1s \
+                 window (environment — see this test's doc comment) or first-error-wins \
+                 regressed in join_all (code) — rerun to tell them apart; a persistent failure is \
+                 the code."
+            );
+        }
         assert_eq!(result, Err("boom".to_string()), "the first-observed failure wins, not the late one");
         assert!(
             completed.load(std::sync::atomic::Ordering::SeqCst),
@@ -3889,6 +3917,22 @@ mod tests {
         );
 
         let error = result.expect_err("join_all must surface the first error, not the sibling's panic");
+
+        // Same reorder caveat as the "drains a synchronous sibling" test above (see its doc
+        // comment for the full reasoning): if the panicking sibling's failure led instead of
+        // "boom", that is either the coordinator stalled past the 1s window (environment) or
+        // first-error-wins regressed (code) — indistinguishable from a single run, so rerun
+        // before concluding which; a persistent failure is the code.
+        if !error.starts_with("boom") {
+            panic!(
+                "join_next surfaced the panicking sibling's failure before the fast sibling's \
+                 \"boom\" (got: {}); either the coordinator stalled past the panicking sibling's \
+                 1s window (environment — see the doc comment on the sibling test above) or \
+                 first-error-wins regressed in join_all (code) — rerun to tell them apart; a \
+                 persistent failure is the code.",
+                error
+            );
+        }
         assert!(
             error.starts_with("boom"),
             "the first-observed failure must lead the message, got: {}", error
