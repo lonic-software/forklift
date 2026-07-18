@@ -5,8 +5,8 @@ use crate::model::operator::Operator;
 use crate::model::parcel::Parcel;
 use crate::model::parcel_action::ParcelAction;
 use crate::util::{
-    cherry_pick_utils, config_utils, file_utils, inventory_utils, merge_utils, object_utils,
-    office_utils, pallet_utils, scope_utils, sign_utils, tree_utils,
+    cherry_pick_utils, config_utils, file_utils, inventory_utils, load_guard_utils, merge_utils,
+    object_utils, office_utils, pallet_utils, scope_utils, sign_utils, tree_utils,
 };
 
 /// Resolve the key a parcel must be signed with: `None` while trust is not established,
@@ -61,6 +61,13 @@ pub fn resolve_signing_key(operator: &Operator) -> Result<Option<String>, String
 /// * `Err(String)`          - If there is nothing to stack, the operator identity is not
 ///                            configured, conflicts are unresolved, or an operation failed.
 pub async fn stack_parcel(description: Option<String>) -> Result<(String, String), String> {
+    // The cheapest possible pre-check runs first: a `load` that started but never finished
+    // cleanly (crashed mid-walk, or returned an error) leaves a marker behind
+    // (`load_guard_utils`), and stacking now could silently commit an incomplete inventory as a
+    // durable parcel. Refuses before even resolving the operator identity below. `park`'s push
+    // carries the identical check for the identical reason — see its own doc comment.
+    load_guard_utils::check_no_incomplete_load()?;
+
     // The operator identity is resolved before any work happens, so a missing
     // configuration aborts the stack before objects are written.
     let operator = config_utils::get_operator()?;

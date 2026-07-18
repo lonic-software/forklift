@@ -3124,6 +3124,451 @@ fn history_on_an_unborn_pallet_reports_the_empty_history_code() {
     assert!(value["error"]["message"].as_str().unwrap().contains("nothing stacked"));
 }
 
+/// The path of the incomplete-load marker file in a plain (non-bay) test warehouse — see
+/// `load_guard_utils::marker_path_under`.
+fn incomplete_load_marker_path(warehouse: &TestWarehouse) -> PathBuf {
+    forklift_core::util::load_guard_utils::marker_path_under(&warehouse.root)
+}
+
+#[cfg(unix)]
+#[test]
+fn a_load_that_hits_an_unreadable_file_leaves_a_marker_and_stack_refuses() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let warehouse = TestWarehouse::new("incomplete-load-unreadable");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    warehouse.write_file("dir/readable.txt", "fine\n");
+    warehouse.write_file("dir/blocked.txt", "unreadable\n");
+    std::fs::set_permissions(
+        warehouse.root.join("dir").join("blocked.txt"),
+        std::fs::Permissions::from_mode(0o000),
+    ).unwrap();
+
+    // The load fails partway (the unreadable file), but siblings it already published stay
+    // staged (see `create_inventory_for_directory`'s doc comment) — this test only cares that
+    // the load reports failure and the marker survives it.
+    let load = warehouse.run(&["load", "."]);
+    assert!(!load.status.success(), "a load hitting an unreadable file must fail");
+
+    assert!(
+        incomplete_load_marker_path(&warehouse).exists(),
+        "a failed load must leave the incomplete-load marker behind"
+    );
+
+    let stacked = warehouse.run(&["stack", "attempt", "--json"]);
+    assert_eq!(stacked.status.code(), Some(20));
+    let value = json(&stacked);
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["error"]["code"], "incomplete_load");
+    assert!(
+        value["error"]["message"].as_str().unwrap().contains("./"),
+        "the message names the recorded (root) path: {}", value["error"]["message"]
+    );
+    assert!(value["error"]["next_step"].as_str().unwrap().contains("forklift load"));
+
+    // Clean up so the warehouse's Drop can remove the directory without surprises.
+    std::fs::set_permissions(
+        warehouse.root.join("dir").join("blocked.txt"),
+        std::fs::Permissions::from_mode(0o644),
+    ).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_clean_reload_of_the_same_root_clears_the_marker_and_stack_succeeds() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let warehouse = TestWarehouse::new("incomplete-load-heals");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    warehouse.write_file("dir/readable.txt", "fine\n");
+    warehouse.write_file("dir/blocked.txt", "unreadable\n");
+    let blocked_path = warehouse.root.join("dir").join("blocked.txt");
+    std::fs::set_permissions(&blocked_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    assert!(!warehouse.run(&["load", "."]).status.success());
+    assert!(incomplete_load_marker_path(&warehouse).exists());
+
+    // Fix the file and re-load the same root: the marker must clear, and stack must succeed.
+    std::fs::set_permissions(&blocked_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert_success(&warehouse.run(&["load", "."]));
+
+    assert!(
+        !incomplete_load_marker_path(&warehouse).exists(),
+        "a clean re-load of the same root must clear the marker"
+    );
+    assert_success(&warehouse.run(&["stack", "clean"]));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_narrower_clean_load_does_not_heal_a_broader_failed_root() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let warehouse = TestWarehouse::new("incomplete-load-narrower");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    warehouse.write_file("dir/readable.txt", "fine\n");
+    warehouse.write_file("dir/blocked.txt", "unreadable\n");
+    warehouse.write_file("other/ok.txt", "unrelated\n");
+    let blocked_path = warehouse.root.join("dir").join("blocked.txt");
+    std::fs::set_permissions(&blocked_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    // A whole-warehouse load fails: the marker records the root ("./"), not just "dir".
+    assert!(!warehouse.run(&["load", "."]).status.success());
+    assert!(incomplete_load_marker_path(&warehouse).exists());
+
+    // A narrower, unrelated, and fully clean load must not clear the broader marker.
+    assert_success(&warehouse.run(&["load", "other"]));
+    assert!(
+        incomplete_load_marker_path(&warehouse).exists(),
+        "a narrower clean load must not clear a broader failed root's marker"
+    );
+
+    let stacked = warehouse.run(&["stack", "attempt", "--json"]);
+    assert_eq!(stacked.status.code(), Some(20));
+    assert_eq!(json(&stacked)["error"]["code"], "incomplete_load");
+
+    std::fs::set_permissions(&blocked_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+}
+
+#[test]
+fn a_hand_written_marker_refuses_stack_even_without_a_reported_load_failure() {
+    // Simulates a load killed outright (a crash, SIGKILL, power loss) partway through its walk:
+    // the marker was durably written at load *start* (see `load_guard_utils`'s doc comment on
+    // why), but the process never got the chance to report an error — nothing was ever printed.
+    // Writing the marker by hand reproduces exactly that on-disk state without needing a real
+    // kill.
+    let warehouse = TestWarehouse::new("incomplete-load-simulated-crash");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    warehouse.write_file("a.txt", "x\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "first"]));
+
+    warehouse.write_file("a.txt", "changed\n");
+    assert_success(&warehouse.run(&["load", "."]));
+
+    let marker_path = incomplete_load_marker_path(&warehouse);
+    std::fs::create_dir_all(marker_path.parent().unwrap()).unwrap();
+    std::fs::write(&marker_path, "./\n").unwrap();
+
+    let stacked = warehouse.run(&["stack", "second", "--json"]);
+    assert_eq!(stacked.status.code(), Some(20));
+    let value = json(&stacked);
+    assert_eq!(value["error"]["code"], "incomplete_load");
+    assert!(value["error"]["message"].as_str().unwrap().contains("./"));
+}
+
+/// Two independent loads, over disjoint subtrees, each fail. A single-path marker could only
+/// ever name one of them — healing that one would (wrongly) clear the guard entirely, leaving
+/// the other's half-staged content free for `stack` to silently commit. The set-based marker
+/// must keep refusing, naming whichever root is still outstanding, until *both* are healed.
+#[cfg(unix)]
+#[test]
+fn two_disjoint_failed_loads_both_stay_recorded_until_each_heals() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let warehouse = TestWarehouse::new("incomplete-load-two-disjoint");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    warehouse.write_file("dirfirst/ok.txt", "fine\n");
+    warehouse.write_file("dirfirst/blocked.txt", "unreadable\n");
+    warehouse.write_file("dirsecond/ok.txt", "fine\n");
+    warehouse.write_file("dirsecond/blocked.txt", "unreadable\n");
+
+    let first_blocked = warehouse.root.join("dirfirst").join("blocked.txt");
+    let second_blocked = warehouse.root.join("dirsecond").join("blocked.txt");
+    std::fs::set_permissions(&first_blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    std::fs::set_permissions(&second_blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    // Two independent, disjoint loads, each fails on its own unreadable file.
+    assert!(!warehouse.run(&["load", "dirfirst"]).status.success());
+    assert!(!warehouse.run(&["load", "dirsecond"]).status.success());
+    assert!(incomplete_load_marker_path(&warehouse).exists());
+
+    // Both roots are recorded: stack names both.
+    let stacked = warehouse.run(&["stack", "attempt", "--json"]);
+    assert_eq!(stacked.status.code(), Some(20));
+    let message = json(&stacked)["error"]["message"].as_str().unwrap().to_string();
+    assert!(message.contains("dirfirst"), "names the first outstanding root: {}", message);
+    assert!(message.contains("dirsecond"), "names the second outstanding root: {}", message);
+
+    // Healing only "dirfirst" must not clear "dirsecond" — stack still refuses.
+    std::fs::set_permissions(&first_blocked, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert_success(&warehouse.run(&["load", "dirfirst"]));
+
+    let stacked = warehouse.run(&["stack", "attempt", "--json"]);
+    assert_eq!(stacked.status.code(), Some(20));
+    let message = json(&stacked)["error"]["message"].as_str().unwrap().to_string();
+    assert!(!message.contains("dirfirst"), "dirfirst healed, must not still be named: {}", message);
+    assert!(message.contains("dirsecond"), "dirsecond still outstanding: {}", message);
+
+    // Healing "dirsecond" too clears the guard entirely.
+    std::fs::set_permissions(&second_blocked, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert_success(&warehouse.run(&["load", "dirsecond"]));
+    assert!(!incomplete_load_marker_path(&warehouse).exists());
+    assert_success(&warehouse.run(&["stack", "clean"]));
+}
+
+/// `park`'s push durably commits the staged inventory into a parked parcel exactly like `stack`
+/// commits into a stacked one — it must refuse under the same guard, not just preserve the
+/// marker through an otherwise-successful push/pop.
+#[test]
+fn park_push_refuses_on_an_incomplete_load_exactly_like_stack() {
+    let warehouse = TestWarehouse::new("incomplete-load-park");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    warehouse.write_file("a.txt", "x\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "first"]));
+
+    warehouse.write_file("a.txt", "changed\n");
+    assert_success(&warehouse.run(&["load", "."]));
+
+    // Simulate the marker a real interrupted load would leave (see the hand-written-marker test
+    // above for why this is a faithful stand-in).
+    let marker_path = incomplete_load_marker_path(&warehouse);
+    std::fs::write(&marker_path, "./\n").unwrap();
+
+    let parked = warehouse.run(&["park", "--json"]);
+    assert_eq!(parked.status.code(), Some(20));
+    assert_eq!(json(&parked)["error"]["code"], "incomplete_load");
+
+    // Healing the load lets park proceed normally.
+    assert_success(&warehouse.run(&["load", "."]));
+    assert!(!marker_path.exists());
+    assert_success(&warehouse.run(&["park"]));
+}
+
+/// Re-running `load` is real work an operator may not always want to redo; abandoning an
+/// incomplete load by resetting it to head must also be a clean, working recovery path.
+#[cfg(unix)]
+#[test]
+fn restore_staged_over_the_recorded_root_heals_the_marker() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let warehouse = TestWarehouse::new("incomplete-load-restore-heals");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    warehouse.write_file("dir/ok.txt", "fine\n");
+    warehouse.write_file("dir/blocked.txt", "unreadable\n");
+    let blocked_path = warehouse.root.join("dir").join("blocked.txt");
+    std::fs::set_permissions(&blocked_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    // A whole-warehouse load fails: the marker records the root ("./").
+    assert!(!warehouse.run(&["load", "."]).status.success());
+    assert!(incomplete_load_marker_path(&warehouse).exists());
+
+    let stacked = warehouse.run(&["stack", "attempt", "--json"]);
+    assert_eq!(stacked.status.code(), Some(20));
+
+    // "restore --staged ." fully covers the recorded root — this abandons the incomplete load
+    // (rather than healing it by re-reading the files) but is an equally valid remedy: the
+    // guard's own next_step names it explicitly.
+    assert_success(&warehouse.run(&["restore", "--staged", "."]));
+    assert!(
+        !incomplete_load_marker_path(&warehouse).exists(),
+        "restore --staged over the recorded root must heal the marker"
+    );
+
+    // A fresh, clean load now stacks normally.
+    std::fs::set_permissions(&blocked_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    warehouse.write_file("clean.txt", "clean\n");
+    assert_success(&warehouse.run(&["load", "clean.txt"]));
+    assert_success(&warehouse.run(&["stack", "clean"]));
+}
+
+/// The conservative half of the same recovery path: a staging reset must only heal the marker
+/// for the region it actually rebuilt from a known-good source — a reset of a narrower,
+/// unrelated path must never silently clear a broader recorded root it never touched.
+#[cfg(unix)]
+#[test]
+fn restore_staged_of_a_narrower_path_does_not_heal_a_broader_recorded_root() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let warehouse = TestWarehouse::new("incomplete-load-restore-partial");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    // An initial clean stack establishes a head with a real, shard-backed directory.
+    warehouse.write_file("existing/a.txt", "a\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base"]));
+
+    // A later whole-warehouse load fails on an unrelated unreadable file: the marker records
+    // the root ("./"), not just the directory that actually failed.
+    warehouse.write_file("blocked.txt", "unreadable\n");
+    let blocked_path = warehouse.root.join("blocked.txt");
+    std::fs::set_permissions(&blocked_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    assert!(!warehouse.run(&["load", "."]).status.success());
+    assert!(incomplete_load_marker_path(&warehouse).exists());
+
+    // Restoring only "existing" (already consistent with head) does not cover the broader
+    // recorded root ("./") — the marker survives.
+    assert_success(&warehouse.run(&["restore", "--staged", "existing"]));
+    assert!(
+        incomplete_load_marker_path(&warehouse).exists(),
+        "restoring a narrower path must not heal a broader recorded root"
+    );
+
+    let stacked = warehouse.run(&["stack", "attempt", "--json"]);
+    assert_eq!(stacked.status.code(), Some(20));
+
+    std::fs::set_permissions(&blocked_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+}
+
+/// The vacuous corner of the same recovery path: a directory whose only file is unreadable never
+/// gets a shard at all (its own per-directory task publishes nothing — see
+/// `load_guard_utils::clear_recorded_under`'s doc comment). Abandoning it via `restore --staged`
+/// has nothing to reset (it was never staged) and nothing to abandon (nothing landed there) — it
+/// must succeed as a heal-no-op instead of failing with "neither in the inventory nor in the
+/// pallet head" while leaving the marker (and the guard) stuck forever. See
+/// `restore_staged_of_a_narrower_path_does_not_heal_a_broader_recorded_root` above for the
+/// guard: restoring a path that *does* carry real staged content keeps today's ordinary
+/// real-restore behavior (the marker survives) rather than taking this no-op path.
+///
+/// Deliberately `load bigdir` — never `load .` — so the recorded root is `bigdir` itself, exactly
+/// matching what this test then restores. A heal may only ever clear a recorded root its own
+/// validation actually covers (see `load_guard_utils::clear_recorded_under`'s governing
+/// invariant); the reverse — clearing a broader record because a narrower, unrelated path under
+/// it happens to be empty — is the live regression
+/// `restore_staged_of_an_unrelated_path_never_clears_a_broader_recorded_root` below exists to
+/// keep closed. This shape also, as a side effect, has no sibling task to race: `bigdir` is the
+/// *only* directory `load bigdir` ever walks, so unlike an earlier version of this test, nothing
+/// here depends on `TaskExecutor` scheduling. The survivor directory ("good") is still staged by
+/// its own separate, prior `load` — simply so `stack` below has something to commit once `bigdir`
+/// is healed away, not to avoid a race.
+#[cfg(unix)]
+#[test]
+fn restore_staged_of_a_vacuous_failed_directory_heals_as_a_no_op() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let warehouse = TestWarehouse::new("incomplete-load-restore-vacuous");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    warehouse.write_file("good/ok.txt", "fine\n");
+    assert_success(&warehouse.run(&["load", "good"]));
+
+    warehouse.write_file("bigdir/blocked.txt", "unreadable\n");
+    let blocked_path = warehouse.root.join("bigdir").join("blocked.txt");
+    std::fs::set_permissions(&blocked_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    // Loading exactly "bigdir" records the marker at "bigdir" itself — not the broader "./" a
+    // whole-warehouse `load .` would have recorded.
+    assert!(!warehouse.run(&["load", "bigdir"]).status.success());
+    assert!(incomplete_load_marker_path(&warehouse).exists());
+
+    let restored = warehouse.run(&["restore", "--staged", "bigdir", "--json"]);
+    assert_success(&restored);
+    let value = json(&restored);
+    assert!(
+        value["data"]["message"].as_str().unwrap().contains("Nothing was staged"),
+        "reports the heal-no-op: {}", value
+    );
+
+    assert!(
+        !incomplete_load_marker_path(&warehouse).exists(),
+        "restoring the vacuous failed directory must clear its own recorded root"
+    );
+
+    assert_success(&warehouse.run(&["stack", "clean"]));
+
+    std::fs::set_permissions(&blocked_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+}
+
+/// The blocker this fix closes: a heal may only ever clear a recorded root its own validation
+/// actually covered — never a *broader* one that merely happens to cover the validated path in
+/// the other direction (see `load_guard_utils::clear_recorded_under`'s governing invariant).
+/// `data` is staged by its own prior, unrelated clean load; the later `load .` fails, recording
+/// the whole root ("./") — `data`'s already-durable content is untouched, but whatever the walk
+/// never reached is still genuinely missing from staging. Restoring an unrelated, nonexistent
+/// path with nothing staged under it must never be read as "the whole recorded root is now
+/// accounted for": that restore validated only itself, nothing about the rest of "./". If it
+/// cleared "./" anyway, a subsequent `stack` would silently commit a tree missing whatever the
+/// failed walk never reached — exactly the silent-incomplete-commit class this whole guard exists
+/// to prevent, reopened through its own heal path.
+#[cfg(unix)]
+#[test]
+fn restore_staged_of_an_unrelated_path_never_clears_a_broader_recorded_root() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let warehouse = TestWarehouse::new("incomplete-load-restore-unrelated");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    warehouse.write_file("data/real.txt", "real content\n");
+    assert_success(&warehouse.run(&["load", "data"]));
+
+    warehouse.write_file("blocked.txt", "unreadable\n");
+    let blocked_path = warehouse.root.join("blocked.txt");
+    std::fs::set_permissions(&blocked_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    assert!(!warehouse.run(&["load", "."]).status.success());
+    assert!(incomplete_load_marker_path(&warehouse).exists());
+
+    // Restoring a totally unrelated, nonexistent path (nothing staged under it either) must
+    // never clear the broader "./" record — this restore validated nothing about "./" beyond
+    // "typo-path" itself. The command may error or no-op (it currently errors, the same
+    // "neither in the inventory nor in the pallet head" a genuinely unrelated path always gets);
+    // either is fine — the marker surviving is what this test actually checks.
+    let _ = warehouse.run(&["restore", "--staged", "typo-path"]);
+    assert!(
+        incomplete_load_marker_path(&warehouse).exists(),
+        "restoring an unrelated path must never clear a broader recorded root"
+    );
+
+    let stacked = warehouse.run(&["stack", "attempt", "--json"]);
+    assert_eq!(stacked.status.code(), Some(20));
+
+    std::fs::set_permissions(&blocked_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+}
+
+/// A hand-corrupted marker must never become the very thing its own remedy is blocked on —
+/// `load` (the write side) self-heals by overwriting it — but a `stack` about to durably commit
+/// (the check side) must fail closed rather than silently treat unreadable content as "nothing
+/// recorded", and must point at a recovery path.
+#[test]
+fn a_malformed_marker_self_heals_on_load_but_refuses_stack_conservatively() {
+    let warehouse = TestWarehouse::new("incomplete-load-malformed");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    warehouse.write_file("a.txt", "x\n");
+
+    let marker_path = incomplete_load_marker_path(&warehouse);
+    std::fs::create_dir_all(marker_path.parent().unwrap()).unwrap();
+
+    // Hand-corrupt the marker (invalid UTF-8 — never producible by this module itself). The
+    // write side self-heals: load overwrites it with fresh, readable content and proceeds.
+    std::fs::write(&marker_path, [0xFF, 0xFE, 0x00, 0xFF]).unwrap();
+    assert_success(&warehouse.run(&["load", "a.txt"]));
+    assert_success(&warehouse.run(&["stack", "first"]));
+
+    // Corrupt it again, with no load in between this time: the check side must refuse
+    // conservatively rather than silently treat unreadable content as "nothing recorded", and
+    // point at a recovery path.
+    std::fs::write(&marker_path, [0xFF, 0xFE, 0x00, 0xFF]).unwrap();
+
+    let stacked = warehouse.run(&["stack", "second", "--json"]);
+    assert_eq!(stacked.status.code(), Some(20));
+    let value = json(&stacked);
+    assert_eq!(value["error"]["code"], "incomplete_load");
+    assert!(
+        value["error"]["next_step"].as_str().unwrap().contains("restore"),
+        "points at a recovery path: {:?}", value["error"]
+    );
+}
+
 #[test]
 fn stocktake_summary_reports_counts_without_the_per_path_lists() {
     let warehouse = TestWarehouse::new("json-summary");

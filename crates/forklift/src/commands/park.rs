@@ -6,8 +6,8 @@ use forklift_core::model::parcel_action::ParcelAction;
 use forklift_core::util::shift_utils::FileOp;
 use serde::Serialize;
 use forklift_core::util::{
-    config_utils, file_utils, inventory_utils, merge_utils, object_utils, pallet_utils, park_utils,
-    scope_utils, shift_utils, sign_utils, stack_utils, tree_utils,
+    config_utils, file_utils, inventory_utils, load_guard_utils, merge_utils, object_utils,
+    pallet_utils, park_utils, scope_utils, shift_utils, sign_utils, stack_utils, tree_utils,
 };
 use crate::output::{self, CommandOutput};
 
@@ -18,6 +18,14 @@ use crate::output::{self, CommandOutput};
 /// parked parcel and reset the warehouse to the pallet head. Untracked files are left
 /// alone.
 pub async fn park_changes() -> Result<(), String> {
+    // The cheapest possible pre-check runs first, exactly like `stack_utils::stack_parcel`'s
+    // identical guard: `park` builds a tree straight from the staged inventory and durably
+    // commits it as a parked parcel below (a real commit-to-history event, not just a working-
+    // directory snapshot — popping it later re-stages the content, but the parcel itself is
+    // already permanent) — so it must refuse exactly like `stack` while a load that started but
+    // never finished cleanly is still recorded (`load_guard_utils`).
+    load_guard_utils::check_no_incomplete_load()?;
+
     let operator = config_utils::get_operator()?;
 
     // Parked parcels are parcels: once trust is established they are signed too.

@@ -7,7 +7,7 @@ use forklift_core::enums::dir_entry_type::DirEntryType;
 use forklift_core::model::diff::Diff;
 use forklift_core::model::inventory::Inventory;
 use forklift_core::model::tree_item::TreeItem;
-use forklift_core::util::path_utils::WarehousePath;
+use forklift_core::util::path_utils::{self, WarehousePath};
 use forklift_core::util::scope_utils::{self, MaterializationScope, ScopeClass};
 use forklift_core::util::stocktake_utils::ChangeKind;
 use forklift_core::util::{
@@ -642,18 +642,10 @@ fn change_label(change: &stocktake_utils::Change) -> String {
 
 /// Check whether a reported path falls under the filter path (or there is no filter).
 fn is_within(path: &str, filter: Option<&WarehousePath>) -> bool {
-    let Some(filter) = filter else {
-        return true;
-    };
-
-    if filter.is_root() {
-        return true;
+    match filter {
+        None => true,
+        Some(filter) => path_utils::covers(filter.as_key(), path),
     }
-
-    let key = filter.as_key();
-
-    path == key || (path.starts_with(key)
-        && path[key.len()..].starts_with(file_utils::PATH_SEPARATOR_CHAR))
 }
 
 /// Get the staged content of a tracked file: its inventory entry's blob.

@@ -369,6 +369,15 @@ fn calibrate_load_duration(area: &Area, files: &[PathBuf], base_line: &str, labe
 /// Returns how many iterations produced a completed `stack` (the signal that this iteration's
 /// kill left something a later step could — and did — build on, not just "killed before
 /// anything").
+///
+/// The incomplete-load guard (`load_guard_utils`) durably marks a load's root the instant it
+/// starts — before this test's kill ever lands — precisely so a killed `load` is caught even
+/// though it never got to report an error; a real `stack` now refuses on exactly the state this
+/// function deliberately builds on. That marker is a different concern from the one under test
+/// here (inventory completeness, not object/blob durability), so it is removed by hand — not
+/// healed by a re-load, which the comment above already rules out for a different reason — right
+/// before each iteration's direct `stack`, to keep exercising the same torn/missing-blob check
+/// this test always has.
 fn run_load_kill_spread(
     area: &Area,
     files: &[PathBuf],
@@ -402,8 +411,14 @@ fn run_load_kill_spread(
         let _ = child.wait();
 
         // 4. Build directly on whatever the (possibly interrupted) load left behind — no healing
-        //    re-load first (see the doc comment above for why).
+        //    re-load first (see the doc comment above for why). The incomplete-load marker a
+        //    killed load leaves behind is a different, orthogonal concern (see the function's own
+        //    doc comment) — removed by hand so `stack` still reaches the torn/missing-blob check
+        //    this test exists for, instead of refusing on the marker before ever getting there.
         area.clear_stale_lock();
+        let _ = std::fs::remove_file(
+            forklift_core::util::load_guard_utils::marker_path_under(&area.warehouse())
+        );
 
         let stack = area.run(&["stack", &format!("{commit_tag} commit {i}")]);
         let stderr_lower = String::from_utf8_lossy(&stack.stderr).to_lowercase();
@@ -763,4 +778,64 @@ fn load_pays_a_constant_number_of_barriers_regardless_of_changed_file_count() {
     // Sanity: the counter is not just always zero, which would trivially "pass" the equality
     // above without proving anything about batching actually happening.
     assert!(count_1 > 0, "the counter must observe real barrier work, got {count_1}");
+}
+
+/// The incomplete-load marker (`load_guard_utils`) must ride a load's own first durable barrier
+/// instead of paying a second, standalone one. For a directory `load`
+/// with real content to publish, that first barrier is the walk's blob-publish batch (Phase 0 —
+/// see `inventory_utils::create_inventory_for_directory`'s doc comment), so folding the marker in
+/// costs nothing: this fixture's own join point already pays exactly two barriers (blob-publish,
+/// then shard-content), with or without the marker.
+///
+/// The exact count is pinned, not just cross-checked for equality like the test above, because
+/// equality alone cannot catch a regression that adds a *constant* extra barrier to every run —
+/// exactly what a reintroduced standalone marker write would do. Verified by hand against this
+/// fixture: reintroducing a standalone, immediately-written marker call (e.g. a bare
+/// `marker_utils::add` at the top of `inventory_utils::add_changes_to_inventory`, undoing the
+/// fold) raises this to 3.
+#[test]
+fn a_small_directory_load_pays_no_extra_barrier_for_the_incomplete_load_marker() {
+    let area = Area::new("barrier-pin-directory");
+    let warehouse = area.warehouse();
+
+    std::fs::create_dir_all(warehouse.join("dir0")).unwrap();
+    std::fs::write(warehouse.join("dir0").join("file0.txt"), "v1\n").unwrap();
+
+    assert!(area.run(&["prepare"]).status.success());
+    assert!(area.run(&["config", "operator.name", "barrier@forklift"]).status.success());
+    assert!(area.run(&["config", "operator.identifier", "barrier@forklift"]).status.success());
+
+    let mut command = area.command(&["load", "."]);
+    command.env("FORKLIFT_DEBUG_BARRIER_COUNT", "1");
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "load failed: {}", String::from_utf8_lossy(&output.stderr));
+
+    assert_eq!(barrier_count(&output), 2);
+}
+
+/// The single-file `load` counterpart of the pin above. A single-file load never builds a
+/// walk-wide blob batch (see `inventory_utils::add_file_to_inventory`'s doc comment — there is no
+/// walk, just this one file), so the marker instead folds into the loaded file's own
+/// shard-content publish (`inventory_utils::write_shard_mutation_with_extra`). A root-level file
+/// has no ancestor rollup to clear, so that shard write is this load's only real barrier — with
+/// or without the marker.
+///
+/// Verified by hand: reintroducing a standalone marker write raises this to 3.
+#[test]
+fn a_small_single_file_load_pays_no_extra_barrier_for_the_incomplete_load_marker() {
+    let area = Area::new("barrier-pin-file");
+    let warehouse = area.warehouse();
+
+    std::fs::write(warehouse.join("a.txt"), "v1\n").unwrap();
+
+    assert!(area.run(&["prepare"]).status.success());
+    assert!(area.run(&["config", "operator.name", "barrier@forklift"]).status.success());
+    assert!(area.run(&["config", "operator.identifier", "barrier@forklift"]).status.success());
+
+    let mut command = area.command(&["load", "a.txt"]);
+    command.env("FORKLIFT_DEBUG_BARRIER_COUNT", "1");
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "load failed: {}", String::from_utf8_lossy(&output.stderr));
+
+    assert_eq!(barrier_count(&output), 2);
 }

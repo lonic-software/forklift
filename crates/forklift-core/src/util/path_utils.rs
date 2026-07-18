@@ -1,6 +1,41 @@
 use std::path::{Component, Path, PathBuf};
 use crate::util::warehouse_utils;
 
+/// Whether `ancestor` "covers" `key` under the warehouse's subtree-membership rule: `ancestor`
+/// is `key` itself, a strict ancestor of it (`key` starts with `"{ancestor}/"`), or the empty
+/// key (the warehouse root, which covers everything). Both arguments are raw path keys, not
+/// [`WarehousePath`] instances, because every current caller already holds one as a `&str` (an
+/// inventory metadata entry, or a recorded marker path) rather than a freshly-normalized path —
+/// forcing a `WarehousePath` round-trip at each call site would just re-validate input that was
+/// already normalized once, upstream.
+///
+/// The one subtree-membership test shared by every walk that needs to know "is this key at or
+/// under this path": the incomplete-load marker's covers-based update rule
+/// (`load_guard_utils`), `load`'s dirty-inventory-path pass (`inventory_utils`), and `restore`'s
+/// directory walk all use this single predicate instead of each hand-rolling their own copy of
+/// the same three-way check.
+///
+/// No-alloc by construction (every call site here runs in a per-entry loop over a metadata
+/// listing, so an allocating comparison would scale with entry count for no reason): the
+/// `"{ancestor}/"` prefix this checks for is never actually built — instead, `key` is confirmed
+/// to be strictly longer than `ancestor`, share `ancestor`'s exact bytes as a prefix, and have a
+/// literal `/` at the one index right past that prefix. `key.as_bytes()[ancestor.len()]` is
+/// always a valid, in-bounds index whenever that check runs, since the `&&` short-circuits on the
+/// length comparison first.
+///
+/// # Arguments
+/// * `ancestor` - The candidate ancestor-or-self key.
+/// * `key`      - The key being tested.
+pub fn covers(ancestor: &str, key: &str) -> bool {
+    if ancestor.is_empty() || key == ancestor {
+        return true;
+    }
+
+    key.len() > ancestor.len()
+        && key.starts_with(ancestor)
+        && key.as_bytes()[ancestor.len()] == b'/'
+}
+
 /// A normalized path inside the warehouse, relative to the warehouse root.
 ///
 /// Invariants:
@@ -224,5 +259,23 @@ mod tests {
         let root = WarehousePath::from_user_input(".").unwrap();
         assert_eq!(root.child("src").as_key(), "src");
         assert_eq!(root.child("src").child("util").as_key(), "src/util");
+    }
+
+    #[test]
+    fn the_empty_ancestor_covers_everything() {
+        assert!(covers("", ""));
+        assert!(covers("", "src"));
+        assert!(covers("", "src/api"));
+    }
+
+    #[test]
+    fn a_key_covers_itself_and_its_descendants_but_not_its_ancestors_or_siblings() {
+        assert!(covers("src", "src"));
+        assert!(covers("src", "src/api"));
+        assert!(covers("src", "src/api/mod.rs"));
+
+        assert!(!covers("src/api", "src"));
+        assert!(!covers("src", "src-other"));
+        assert!(!covers("src/a", "src/b"));
     }
 }

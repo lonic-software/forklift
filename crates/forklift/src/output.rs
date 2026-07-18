@@ -16,7 +16,7 @@
 use std::sync::OnceLock;
 use serde::Serialize;
 use forklift_core::error::{CoreError, RefusalCode};
-use forklift_core::util::{merge_utils, query_utils, scope_utils};
+use forklift_core::util::{load_guard_utils, merge_utils, query_utils, scope_utils};
 
 /// The output schema version, carried on every JSON envelope as `forklift_json`.
 /// It changes only when the envelope or a command's `data` shape changes
@@ -290,6 +290,11 @@ error_codes! {
     /// history to show. Head-only (there is no parcel graph to enter) and scoped to `history`
     /// alone, so it is classified here directly rather than as a `forklift-core` `RefusalCode`.
     EmptyHistory,
+
+    /// `stack` or `park` refused because a `load` that never finished cleanly is still recorded
+    /// (`load_guard_utils`): committing the staged inventory now could silently produce an
+    /// incomplete result.
+    IncompleteLoad,
 }
 
 impl ErrorCode {
@@ -313,6 +318,7 @@ impl ErrorCode {
             ErrorCode::CommitPaginationUnsupported => scope_utils::CODE_COMMIT_PAGINATION_UNSUPPORTED,
             ErrorCode::QueryPredicateInvalid => query_utils::CODE_QUERY_PREDICATE_INVALID,
             ErrorCode::EmptyHistory => "empty_history",
+            ErrorCode::IncompleteLoad => load_guard_utils::CODE_INCOMPLETE_LOAD,
         }
     }
 
@@ -338,6 +344,7 @@ impl ErrorCode {
             // 17 stays reserved for the parked conflicts design — never assign it.
             ErrorCode::QueryPredicateInvalid => 18,
             ErrorCode::EmptyHistory => 19,
+            ErrorCode::IncompleteLoad => 20,
         }
     }
 
@@ -376,6 +383,9 @@ impl ErrorCode {
                 "A \"query\" predicate is malformed or exceeds a fixed bound",
             ErrorCode::EmptyHistory =>
                 "\"history\" was asked to walk a pallet that has nothing stacked on it yet",
+            ErrorCode::IncompleteLoad =>
+                "\"stack\" or \"park\" refused because a \"load\" that never finished cleanly is \
+                 still recorded",
         }
     }
 
@@ -398,6 +408,7 @@ impl ErrorCode {
             RefusalCode::OversizedTransportUnsupported => ErrorCode::OversizedTransportUnsupported,
             RefusalCode::CommitPaginationUnsupported => ErrorCode::CommitPaginationUnsupported,
             RefusalCode::QueryPredicateInvalid => ErrorCode::QueryPredicateInvalid,
+            RefusalCode::IncompleteLoad => ErrorCode::IncompleteLoad,
         }
     }
 }
@@ -565,6 +576,7 @@ mod tests {
             RefusalCode::ChunkedTransportUnsupported,
             RefusalCode::OversizedTransportUnsupported,
             RefusalCode::CommitPaginationUnsupported,
+            RefusalCode::IncompleteLoad,
         ] {
             // Hostile interpolated text, carried across a String segment (the shim), then classified.
             let framed: String = CoreError::refusal(code, "a\u{1f}path", "a\u{1f}step").into();
@@ -594,6 +606,8 @@ mod tests {
             (RefusalCode::ChunkedTransportUnsupported, "chunked_transport_unsupported", 14),
             (RefusalCode::OversizedTransportUnsupported, "oversized_transport_unsupported", 15),
             (RefusalCode::CommitPaginationUnsupported, "commit_pagination_unsupported", 16),
+            (RefusalCode::QueryPredicateInvalid, "query_predicate_invalid", 18),
+            (RefusalCode::IncompleteLoad, "incomplete_load", 20),
         ];
 
         for (code, code_str, exit) in table {

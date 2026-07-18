@@ -22,8 +22,7 @@ pub fn render_errors() -> String {
          `0` is success. Both tables are generated from the single `ErrorCode` enum in \
          `crates/forklift/src/output.rs` — see `docs/guide/cli.md` for how a script is meant to \
          use them.\n\n\
-         Exit codes 17 and 18 are reserved for future features and are not yet assigned to any \
-         code.\n\n",
+         Exit code 17 is reserved for a future feature and is not yet assigned to any code.\n\n",
     );
     out.push_str("| `code` | exit | Meaning |\n");
     out.push_str("|---|---|---|\n");

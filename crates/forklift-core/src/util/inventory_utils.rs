@@ -14,7 +14,7 @@ use crate::model::task::inventory_builder::inventory_builder_task::InventoryBuil
 use crate::model::task::TaskExecutor;
 use crate::parser;
 use crate::traits::task_context::TaskContext;
-use crate::util::{fanout_utils, file_utils, object_utils};
+use crate::util::{fanout_utils, file_utils, load_guard_utils, object_utils, path_utils};
 use crate::util::object_utils::IngestMode;
 use crate::util::path_utils::WarehousePath;
 
@@ -178,12 +178,63 @@ pub fn clear_ancestor_rollups(key: &str) -> Result<(), String> {
 /// * `Ok(())`      - Every ancestor was invalidated and the shard was written.
 /// * `Err(String)` - If an ancestor or this shard could not be read, parsed or written.
 pub fn write_shard_mutation(key: &str, inventory: &mut Inventory) -> Result<(), String> {
+    write_shard_mutation_with_extra(key, inventory, None)
+}
+
+/// Like [`write_shard_mutation`], but when `extra` is `Some((path, content))`, additionally
+/// publishes that one other, unrelated file as part of *this shard's own* content-write barrier
+/// (the second of the two phases `write_shard_mutation` documents — never the ancestor-clear
+/// phase, which must stay a separate, earlier barrier for the ordering reasons its own doc
+/// comment gives, and which `extra` has no ordering relationship with at all).
+///
+/// This exists so a caller with exactly one other small file it needs durable no later than this
+/// shard's own write can fold it in instead of paying a second, standalone barrier —
+/// `inventory_utils::add_file_to_inventory` folding in `load_guard_utils`'s incomplete-load
+/// marker is the motivating (and, so far, only) case: a single-file `load` has no walk-wide blob
+/// batch to ride (unlike a directory `load` — see `create_inventory_for_directory`'s doc
+/// comment), so this shard's own write is that load's first, and only, durable mutation. Folding
+/// `extra` in here — rather than into the ancestor-clear phase — is what keeps this zero-cost:
+/// that phase is a no-op (no barrier at all) whenever `key` has no ancestor with a rollup to
+/// clear, which is the common case before a first `stack`; forcing a barrier there just to carry
+/// `extra` would reintroduce exactly the extra barrier this exists to avoid.
+///
+/// # Arguments
+/// * `key`       - The warehouse path key of the shard being written.
+/// * `inventory` - The new content (see [`write_shard_mutation`]).
+/// * `extra`     - An optional extra `(path, content)` to publish in the same barrier as this
+///                 shard's own content. `None` behaves exactly like [`write_shard_mutation`].
+///
+/// # Returns
+/// * `Ok(())`      - Every ancestor was invalidated, and the shard (and `extra`, if given) was
+///                   written.
+/// * `Err(String)` - If an ancestor, the shard, or `extra` could not be read, parsed or written.
+pub fn write_shard_mutation_with_extra(key: &str,
+                                       inventory: &mut Inventory,
+                                       extra: Option<(&Path, &[u8])>) -> Result<(), String> {
     let _guard = SHARD_MUTATION_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
     clear_ancestors_batched(key)?;
 
     inventory.set_rollup_hash(None);
-    save_inventory(inventory, &file_utils::get_inventory_data_path_for_key(key))
+    let shard_path = file_utils::get_inventory_data_path_for_key(key);
+
+    let Some((extra_path, extra_content)) = extra else {
+        return save_inventory(inventory, &shard_path);
+    };
+
+    let bytes = ensure_inventory_folder_and_build(inventory, &shard_path)?;
+
+    let batch = file_utils::WriteBatch::new();
+    batch.stage(&shard_path, &bytes)?;
+
+    if let Some(parent) = extra_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            file_utils::create_folder_if_not_exists(parent)?;
+        }
+    }
+    batch.stage(extra_path, extra_content)?;
+
+    batch.finish()
 }
 
 /// Process-wide count of rollup-based skips actually applied (DESIGN.html §5.0 D item 8, stage
@@ -253,6 +304,15 @@ fn inventory_content_matches(a: &Inventory, b: &Inventory) -> bool {
 /// Add a file or directory to its corresponding inventory.
 /// If no inventory exists for the given directory, a new inventory file will be created.
 ///
+/// This is `load`'s tree-walk entry point, so it is where the incomplete-load guard
+/// (`load_guard_utils`) brackets the walk: `create_inventory_for_directory` and
+/// `add_file_to_inventory` each durably record a marker naming `path` *before* anything they do
+/// mutates the staging area (folded into their own first durable barrier — see each function's
+/// doc comment), cleared only once the walk below returns `Ok` (best-effort, and only if `path`
+/// covers whatever the marker still names — see `load_guard_utils::mark_load_completed`). A load
+/// that returns `Err`, or one that is killed outright before it ever gets the chance to, both
+/// leave the marker in place; `stack` and `park` refuse while any is.
+///
 /// # Arguments
 /// * `path` - The path of the file or directory to add to the inventory.
 ///
@@ -267,6 +327,8 @@ pub async fn add_changes_to_inventory(path: &WarehousePath) -> Result<(), String
     } else {
         add_file_to_inventory(path)?;
     }
+
+    load_guard_utils::mark_load_completed(path.as_key());
 
     Ok(())
 }
@@ -314,6 +376,20 @@ pub fn stage_removal(path: &WarehousePath) -> Result<(), String> {
 /// failure. Either way, re-running the load after fixing the problem completes the inventory —
 /// nothing already published on disk is ever destroyed by a later, failed pass.
 ///
+/// The incomplete-load marker for `path` rides this walk's own first durable barrier (Phase 0
+/// below) instead of paying a second, standalone one — see `load_guard_utils`'s doc comment
+/// (folding section) for the general argument. Staging it here, before the walk even begins,
+/// costs nothing durability-wise: `WriteBatch::stage` only creates an as-yet-invisible temp file
+/// (not itself a durable mutation), and nothing below is durable until `blob_batch.finish()`
+/// (Phase 0) returns `Ok`. Two outcomes, both consistent: something between here and Phase 0
+/// fails first (`get_ignored_paths`, `populate_dirty_inventory_paths`, or the walk itself) —
+/// `context` (and the marker's still-unpublished temp with it) is simply dropped, exactly as
+/// invisible as before this call, and nothing else from this load became durable either; or
+/// Phase 0 is reached and runs — which it always does once the walk has been attempted,
+/// regardless of whether the walk itself succeeded (see Phase 0's own comment below) — so the
+/// marker is never left staged-but-unpublished by a code path that also durably published
+/// something else from this load.
+///
 /// # Arguments
 /// * `path` - The path to the directory.
 ///
@@ -322,6 +398,9 @@ pub fn stage_removal(path: &WarehousePath) -> Result<(), String> {
 /// * `Err(String)` - If an error occurred while creating the inventory.
 pub async fn create_inventory_for_directory(path: &WarehousePath) -> Result<(), String> {
     let context = Arc::new(InventoryBuilderContext::new());
+
+    load_guard_utils::stage_start_marker(&context.blob_batch, path.as_key())?;
+
     let executor = TaskExecutor::new(Arc::clone(&context));
     let ignored_paths = file_utils::get_ignored_paths()?;
 
@@ -533,17 +612,12 @@ async fn populate_dirty_inventory_paths(context: &InventoryBuilderContext,
         return Ok(());
     };
 
-    let subtree_prefix = format!("{}/", path.as_key());
     let mut dirty = context.dirty_inventory_paths.lock().await;
 
     for entry in metadata {
         let key = metadata_entry_to_key(&entry);
 
-        let is_in_subtree = path.is_root()
-            || key == path.as_key()
-            || key.starts_with(&subtree_prefix);
-
-        if is_in_subtree {
+        if path_utils::covers(path.as_key(), key) {
             dirty.insert(key.to_string());
         }
     }
@@ -581,12 +655,12 @@ fn stage_removal_for_directory(path: &WarehousePath) -> Result<(), String> {
     keys.insert(path.as_key().to_string());
 
     if let Some(metadata) = metadata_opt {
-        let subtree_prefix = format!("{}/", path.as_key());
-
         for entry in &metadata {
             let key = metadata_entry_to_key(entry);
 
-            if path.is_root() || key.starts_with(&subtree_prefix) {
+            // `path`'s own key is already inserted above; `covers` matching it again here too
+            // (the self case) is a harmless no-op re-insert into the same set.
+            if path_utils::covers(path.as_key(), key) {
                 keys.insert(key.to_string());
             }
         }
@@ -1582,8 +1656,13 @@ pub fn update_shard(key: &str,
 
 /// Replace the staging area below the given directory with the given shards: the existing
 /// inventory folders under the key are removed, the given shards are written, and the
-/// metadata file is updated accordingly. Used by `restore --staged` to reset a subtree of
-/// the inventory to the pallet head.
+/// metadata file is updated accordingly. Used by `restore --staged` (and `unload`) to reset a
+/// subtree of the inventory to the pallet head.
+///
+/// The subtree at `key` is now rebuilt wholesale from `shards` — a known-good source — so any
+/// incomplete-load marker `key` covers no longer describes a real gap; see
+/// `load_guard_utils::clear_recorded_under`'s doc comment. A marker only partially overlapping
+/// `key` is left alone (conservative — part of that region may still be genuinely incomplete).
 ///
 /// # Arguments
 /// * `key`    - The warehouse path key of the subtree to replace (`""` for everything).
@@ -1612,15 +1691,9 @@ pub fn replace_subtree_inventories(key: &str,
     let (metadata_path, metadata_opt) = file_utils::retrieve_inventory_metadata_or_none()?;
     let mut metadata = metadata_opt.unwrap_or_default();
 
-    if key.is_empty() {
-        metadata.clear();
-    } else {
-        let prefix = format!("{}/", key);
-        metadata.retain(|entry| {
-            let entry_key = metadata_entry_to_key(entry);
-            entry_key != key && !entry_key.starts_with(&prefix)
-        });
-    }
+    // `path_utils::covers("", _)` is always true, so this one predicate already subsumes the
+    // former separate `key.is_empty()` case (drop everything) without a special-cased branch.
+    metadata.retain(|entry| !path_utils::covers(key, metadata_entry_to_key(entry)));
 
     // One durability barrier for the whole replacement burst instead of one per shard
     // (DESIGN.html §5.0 D item 8, stage 2b) — every shard here carries a caller-computed,
@@ -1635,13 +1708,23 @@ pub fn replace_subtree_inventories(key: &str,
 
     batch.finish()?;
 
-    write_metadata_to_file(&metadata_path, &metadata)
+    write_metadata_to_file(&metadata_path, &metadata)?;
+
+    load_guard_utils::clear_recorded_under(key);
+
+    Ok(())
 }
 
 /// Replace the whole staging area with the given shards: the existing inventory folders
 /// are removed, the given shards are written, and the metadata file is rewritten to list
 /// exactly their directories. Used when `shift` repopulates the inventory from the target
-/// pallet's tree.
+/// pallet's tree, `park`'s push resets to the pallet head, a `consolidate` fast-forward
+/// repopulates from the target pallet, `import-git` checks out its initial branch, and
+/// `lower`/`franchise` materialize a fetched tree (`shift_utils::materialize_tree`).
+///
+/// The whole staging area is now rebuilt wholesale from `shards` — a known-good source — so
+/// every previously recorded incomplete-load root is now moot; see
+/// `load_guard_utils::clear_all_recorded`'s doc comment.
 ///
 /// # Arguments
 /// * `shards` - Warehouse path key → inventory, for every tracked directory.
@@ -1674,7 +1757,11 @@ pub fn replace_all_inventories(shards: &std::collections::BTreeMap<String, Inven
 
     let (metadata_path, _) = file_utils::retrieve_inventory_metadata_or_none()?;
 
-    write_metadata_to_file(&metadata_path, &metadata)
+    write_metadata_to_file(&metadata_path, &metadata)?;
+
+    load_guard_utils::clear_all_recorded();
+
+    Ok(())
 }
 
 /// Clean up the staged state after a parcel was stacked: the parcel consumed every staged
@@ -2204,7 +2291,16 @@ fn add_file_to_inventory(path: &WarehousePath) -> Result<(), String> {
 
     inventory.add_item(item);
 
-    write_shard_mutation(parent.as_key(), &mut inventory)?;
+    // The incomplete-load marker for `path` rides this shard's own content-write barrier
+    // (below) instead of paying a second, standalone one — this load's first (and only) durable
+    // mutation is this very shard write, so folding the marker into it is free. See
+    // `load_guard_utils`'s doc comment (folding section) and `write_shard_mutation_with_extra`'s
+    // own doc comment for the crash-ordering argument.
+    let marker_path = load_guard_utils::marker_path();
+    let marker_bytes = load_guard_utils::pending_start_marker(path.as_key());
+    let extra = marker_bytes.as_deref().map(|bytes| (marker_path.as_path(), bytes));
+
+    write_shard_mutation_with_extra(parent.as_key(), &mut inventory, extra)?;
 
     let mut new_items: BTreeSet<String> = BTreeSet::new();
     new_items.insert(parent.as_key().to_string());
