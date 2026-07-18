@@ -303,9 +303,16 @@ pub fn stage_removal(path: &WarehousePath) -> Result<(), String> {
 
 /// Create an inventory for the specified directory (and all subdirectories).
 ///
-/// If the build fails halfway, the inventories that were already written are kept (and
-/// registered in the metadata file), so previously loaded, unrelated inventories are never
-/// destroyed. Re-running the load after fixing the problem completes the inventory.
+/// A failure while deciding one directory's content does not cost the whole walk by itself:
+/// whatever every other task decided is still published (and registered in the metadata file),
+/// so previously loaded, unrelated inventories are never destroyed. But every blob this walk
+/// stages shares one batch, and a producer that fails between winning a blob's reservation and
+/// finishing its write leaks that reservation — `WriteBatch::finish` then refuses to publish the
+/// *whole* batch, so nothing this walk decided is published this round (see the phase-0 comment
+/// in the function body for the full reasoning). A producer that fails before ever winning a
+/// reservation leaks nothing and only costs its own shard's decision, same as any other per-shard
+/// failure. Either way, re-running the load after fixing the problem completes the inventory —
+/// nothing already published on disk is ever destroyed by a later, failed pass.
 ///
 /// # Arguments
 /// * `path` - The path to the directory.
@@ -446,12 +453,20 @@ pub async fn create_inventory_for_directory(path: &WarehousePath) -> Result<(), 
     // exact ordering. Only attempted when phase 0 (the blob barrier above) fully succeeded — see
     // its own doc comment for why a blob-batch failure must not let any shard content publish at
     // all. A failure in either phase A or phase B here is folded into `result` instead of
-    // propagated immediately: every ancestor clear (or shard) staged before the failure never got
-    // renamed (a batch's `finish` fsyncs every staged temp before renaming any of them, so a
-    // failure anywhere in it durably renames nothing), so `phase_b_published` (gating metadata
-    // registration below) is correctly `false` on any failure here — the shards phase A was
-    // clearing were already registered from before this walk, so failing to clear them costs
-    // only a few lost skips next time, never a wrong one (see `stage_rollup_clear`'s doc comment).
+    // propagated immediately, and `phase_b_published` (gating metadata registration below) is set
+    // `false` on any failure in either phase — but a batch's `finish` failing does not mean
+    // nothing it staged was renamed (see its own `# Returns`): a rename partway through leaves
+    // every entry renamed before it visible, and the barrier's own trailing directory sync failing
+    // (every rename already succeeded — see `run_write_barrier`) leaves the whole batch visible,
+    // with only directory durability left unproven. For phase A that is harmless either way — the
+    // shards it clears were already registered from before this walk, so a clear landing or not
+    // costs only a few lost rollup skips next time, never a wrong one (see `stage_rollup_clear`'s
+    // doc comment). For phase B it is not: a rename or trailing-sync failure partway through
+    // publishing new shard content can leave one or more of those shards durably visible on disk
+    // while `phase_b_published` is still `false` — `keys_to_add` below then excludes exactly those
+    // keys from `update_inventory_metadata`, so a freshly published directory can sit on disk,
+    // correct and durable, yet go unregistered and invisible to stocktake until some later pass
+    // redecides and republishes it.
     let phase_b_published = if blob_batch_published {
         match publish_shard_outcomes(&clear_keys, &mut outcomes) {
             Ok(()) => true,
@@ -1115,15 +1130,22 @@ fn directory_has_no_untracked_content(key: &str, ignored_paths: Arc<Vec<Regex>>)
 /// batch).
 ///
 /// If deciding a shard's new content fails partway through (an unreadable file, a corrupt
-/// shard), every shard decided *before* the failure is still published — the same
-/// keep-whatever-the-walk-managed resilience `create_inventory_for_directory` gives `load`
-/// (see its own doc comment). A retry after fixing the problem only has to redo the shards from
-/// the failure onward, not the whole tracked set.
+/// shard), that failure alone does not cost the whole pass: every shard decided *before* it is
+/// still handed to the publish step below, the same keep-whatever-was-decided resilience
+/// `create_inventory_for_directory` gives `load` (see its own doc comment). But every rebuilt
+/// file's blob this pass stages shares one batch, and if finishing that batch fails — including
+/// the leaked-reservation case where a producer won a reservation but never finished staging it —
+/// `WriteBatch::finish` refuses to publish the whole batch (see the blob-batch comment below), so
+/// nothing this pass decided is published, not just the shards decided after that failure. A
+/// retry after a decide-loop failure only has to redo the shards from the failure onward; a retry
+/// after a blob-batch failure has to redo the whole tracked set.
 ///
 /// # Returns
 /// * `Ok(())`      - If the refresh completed.
-/// * `Err(String)` - If a shard or file could not be processed; every shard decided before the
-///                   failure was still published (see above).
+/// * `Err(String)` - If a shard or file could not be processed, or the blob batch failed to
+///                   publish. Every shard decided before a decide-loop failure was still handed
+///                   to the publish step; a blob-batch failure instead publishes nothing from
+///                   this pass — see the doc comment above.
 pub fn refresh_tracked_entries() -> Result<(), String> {
     let (_, metadata_opt) = file_utils::retrieve_inventory_metadata_or_none()?;
 
