@@ -338,6 +338,22 @@ pub enum Command {
         action: Option<HaulAction>,
     },
 
+    /// Resolve a standing durability taint automated recovery could not clear on its own
+    #[command(
+        long_about = "Resolve a standing durability taint (\"durability_taint\" refusals, exit \
+                      21): a write's final path(s) were left visible after a failed durability \
+                      sync, and the automatic entry-heal every command runs could not restage \
+                      every one of them on its own. This verb runs the deeper recovery pass — \
+                      restage whatever it can, then walk every durable ref source (pallet heads, \
+                      parked work, tags, and staged inventory shards) to tell a vanished-but-\
+                      never-referenced object (safe to drop) from one something still points at \
+                      (reported, with remedies). A torn taint (its own record was cut short by a \
+                      crash) cannot be resolved this way at all and needs a heavyweight recovery \
+                      instead. Exits 0 once every recorded path is resolved; exits 21, with the \
+                      taint left standing on exactly what remains, otherwise."
+    )]
+    Heal,
+
     /// Print the command list, or detailed help about one command
     #[command(visible_alias = "h")]
     Help {
@@ -1484,6 +1500,7 @@ impl Command {
                 | Command::Diff { .. }
                 | Command::Expand { .. }
                 | Command::ExportGit { .. }
+                | Command::Heal
                 | Command::History { .. }
                 | Command::ImportGit { .. }
                 | Command::Lift
@@ -1512,6 +1529,33 @@ impl Command {
         )
     }
 
+    /// Whether this command must skip the entry-heal chokepoint
+    /// ([`forklift_core::util::heal_utils::heal_if_tainted`]) instead of refusing behind it while
+    /// a durability taint stands.
+    ///
+    /// Exactly two commands are exempt, both because refusing behind the very chokepoint they
+    /// exist to resolve or diagnose would be circular:
+    ///
+    /// * `heal` — the recovery verb the taint's own refusal message names as the next step
+    ///   (`heal_utils::DURABILITY_TAINT_NEXT_STEP`). If it were itself blocked by the chokepoint
+    ///   it promises to resolve, a standing taint would have no way out at all.
+    /// * `audit` — a read-only diagnostic. It verifies signatures and (optionally) re-hashes
+    ///   present content; it never writes an object, a ref, or a taint file itself, so trusting
+    ///   an existence check while a taint stands carries none of the "durable reference to
+    ///   unproven bytes" risk the chokepoint exists to prevent (see
+    ///   `commands::audit::handle_command` — every path through it is a read).
+    ///
+    /// Every other command keeps refusing. This is the one place that decides the exemption, so
+    /// it stays greppable and independently testable — see `cli.rs`'s own tests and
+    /// `tests/cli.rs`'s `heal`/`audit`-while-tainted integration coverage.
+    ///
+    /// # Returns
+    /// * `true`  - The chokepoint must be bypassed for this command.
+    /// * `false` - The command refuses normally while a taint stands.
+    pub fn bypasses_taint_heal(&self) -> bool {
+        matches!(self, Command::Heal | Command::Audit { .. })
+    }
+
     /// Check whether the command mutates the warehouse (inventory, refs, objects) and
     /// therefore has to hold the warehouse lock while it runs (see `WarehouseLock`).
     ///
@@ -1527,6 +1571,7 @@ impl Command {
                 | Command::Consolidate { .. }
                 | Command::Deliver { .. }
                 | Command::Expand { .. }
+                | Command::Heal
                 | Command::ImportGit { .. }
                 | Command::Load { .. }
                 | Command::Lower

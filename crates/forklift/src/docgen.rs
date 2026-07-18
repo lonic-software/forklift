@@ -178,6 +178,7 @@ fn command_schemas(name: &str) -> Option<Vec<(&'static str, schemars::Schema)>> 
         "export-git" => commands::export_git::__docgen_schemas(),
         "franchise" => commands::franchise::__docgen_schemas(),
         "haul" => commands::haul::__docgen_schemas(),
+        "heal" => commands::heal::__docgen_schemas(),
         "history" => commands::history::__docgen_schemas(),
         "query" => commands::query::__docgen_schemas(),
         "import-git" => commands::import_git::__docgen_schemas(),

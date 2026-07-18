@@ -1167,6 +1167,42 @@ in the human view, a one-line tip) appears once the store was bulk-ingested (`im
 franchise's bundle install) and clears once a `compact --all --redelta` pass has run
 (see [`--redelta`](#compact--pack-the-object-store)).
 
+### `heal` — resolve a standing durability taint
+
+```sh
+forklift heal
+```
+
+You will rarely see this: after certain rare write failures (a directory-sync error right
+after every file in a batch was already renamed into place — the one window a crash could
+still lose a dentry a durable reference points at), the affected paths are recorded and every
+command refuses with a machine-coded `durability_taint` error (exit 21) until it is resolved.
+Before you ever need `heal` by hand, the very next command usually resolves it silently on its
+own — an automatic check at the start of every command restages whatever it can prove is
+still good.
+
+Run `forklift heal` when a command keeps refusing with `durability_taint`. It repeats that
+same restage pass and, for whatever it still cannot resolve on its own, walks every pallet
+head, parked change, tag, and staged file to work out whether the affected object is still
+needed by anything:
+
+- **Nothing was actually lost, or what vanished is not needed by anything anymore** — `heal`
+  clears the taint and reports what it restaged or dropped. Exit 0; go on with what you were
+  doing.
+- **Something is genuinely gone, and something still needs it** — `heal` reports exactly what,
+  with the remedies that apply: re-fetch it from a configured remote (`lower`/`franchise`), or
+  reproduce it by re-running whatever created it if the content still exists in your working
+  tree (`load` then `stack`). The taint stays standing on exactly that remainder, and every
+  other command keeps refusing (exit 21) until it is dealt with.
+- **The record of what was affected is itself incomplete** (a crash cut off the record before
+  it named everything) — `heal` cannot safely guess the scope and refuses outright, naming the
+  same heavyweight options (re-fetch, reproduce, or accept the loss). This is rare — it needs a
+  second, unrelated crash on top of the original failure.
+
+`heal` and the read-only `audit` are the only two commands that run while a taint is standing —
+every other command refuses first, precisely so nothing durable is ever recorded on top of
+unproven state.
+
 ---
 
 ## 9. Configuration reference
@@ -1298,6 +1334,7 @@ what you've `load`ed — it doesn't stage for you). `diff`, `restore`, `tag`, `s
 | `bay` | | Parallel working directories (add / list / remove) |
 | `compact` | | Pack the loose object store into dense pack files |
 | `store` | | Report object-store health (loose vs packed, sizes, maintenance due) |
+| `heal` | | Resolve a standing durability taint automated recovery could not clear |
 | `conflicts` | | List unresolved conflicts |
 | `park` | `pa` | Stash / list / pop work in progress |
 | `franchise` | `fr` | Clone a remote warehouse (`--only` for a sparse clone) |

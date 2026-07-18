@@ -1,19 +1,22 @@
-//! The durable-taint entry-heal: the automatic, common-case repair that runs once at every
-//! storage-scope entry and either clears a standing taint (see `taint_utils`) or refuses with a
-//! machine-coded error naming exactly what it could not resolve.
+//! The durable-taint entry-heal (DESIGN.html §3.1.1): the automatic, common-case repair that
+//! runs once at every storage-scope entry and either clears a standing taint (see `taint_utils`)
+//! or refuses with a machine-coded error naming exactly what it could not resolve.
 //!
 //! ## Scope
 //!
-//! This module owns two things: [`restage_object`], the per-path redo-the-write primitive, and
-//! [`heal_if_tainted`], the chokepoint that drives it over every path a taint recorded. It does
-//! **not** own a CLI-visible recovery verb, the closure walk over durable ref sources, or any
-//! remedy (refetch/restage-from-worktree/abandon) for a case it cannot auto-heal — those are a
-//! later slice, built on top of the refusal this module produces. When entry-heal meets a case it
-//! cannot resolve itself (a vanished object, one that fails to read back, one whose content no
-//! longer matches its own hash, or a torn taint record), it refuses loudly with
-//! [`RefusalCode::DurabilityTaint`] and leaves the taint standing exactly as it found it — a
-//! future recovery verb, built on top of this refusal, is what gives it remedies; this module's
-//! job ends at the refusal.
+//! This module owns three things: [`restage_object`], the per-path redo-the-write primitive,
+//! [`heal_if_tainted`], the automatic chokepoint that drives it over every path a taint
+//! recorded, and — `pub(crate)`, for [`recovery_utils`](crate::util::recovery_utils) to build on
+//! — [`RestageAttempt`]/[`attempt_restage_all`]/[`finish_clean_heal`], the same restage-and-
+//! categorize machinery factored out so the `forklift heal` recovery verb can drive it directly
+//! instead of only reading `heal_if_tainted`'s refusal string. This module does **not** own the
+//! closure walk over durable ref sources or any remedy (refetch/restage-from-worktree/abandon)
+//! for a case it cannot auto-heal — that is `recovery_utils`, built on top of what this module
+//! exposes. When entry-heal meets a case it cannot resolve itself (a vanished object, one that
+//! fails to read back, one whose content no longer matches its own hash, or a torn taint
+//! record), it refuses loudly with [`RefusalCode::DurabilityTaint`] and leaves the taint
+//! standing exactly as it found it — `forklift heal`, built on top of this refusal, is what
+//! gives it remedies; this module's own automatic pass ends at the refusal.
 //!
 //! ## The no-self-trip rule
 //!
@@ -54,9 +57,8 @@ use std::os::unix::fs::MetadataExt;
 pub const CODE_DURABILITY_TAINT: &str = RefusalCode::DurabilityTaint.as_str();
 
 /// The recovery step every `durability_taint` refusal names — one shared constant so the message
-/// (and the generated docs built from it), and the actual `heal` verb once it lands, cannot drift
-/// apart on the command name. The verb itself does not exist yet (see the module doc comment) —
-/// until it does, this string is a promise the codebase has made and must keep.
+/// (and the generated docs built from it) and the actual `forklift heal` verb
+/// ([`recovery_utils`](crate::util::recovery_utils)) never drift apart on the command name.
 pub const DURABILITY_TAINT_NEXT_STEP: &str =
     "Run \"forklift heal\" to see what still needs attention and resolve it.";
 
@@ -235,34 +237,89 @@ pub fn heal_if_tainted() -> Result<(), CoreError> {
         return Ok(());
     }
 
-    let mut restaged: BTreeSet<PathBuf> = BTreeSet::new();
-    let mut vanished: BTreeSet<PathBuf> = BTreeSet::new();
-    let mut unreadable: Vec<(PathBuf, String)> = Vec::new();
-    let mut hash_mismatch: BTreeSet<PathBuf> = BTreeSet::new();
-    let mut restage_failed: Vec<(PathBuf, String)> = Vec::new();
+    let attempt = attempt_restage_all(&root, &state.recorded);
 
-    for relative in &state.recorded {
-        match restage_object(&root, relative) {
-            Ok(RestageOutcome::Restaged) => { restaged.insert(relative.clone()); }
-            Ok(RestageOutcome::Vanished) => { vanished.insert(relative.clone()); }
-            Ok(RestageOutcome::Unreadable(e)) => { unreadable.push((relative.clone(), e)); }
-            Ok(RestageOutcome::HashMismatch) => { hash_mismatch.insert(relative.clone()); }
-            Err(e) => { restage_failed.push((relative.clone(), e)); }
+    if !attempt.all_clean() {
+        return Err(unhealable_refusal(
+            &root, &attempt.vanished, &attempt.unreadable, &attempt.hash_mismatch, &attempt.restage_failed,
+        ));
+    }
+
+    finish_clean_heal(&root, &attempt.restaged).map_err(|e| sync_failure_refusal(&root, &e))
+}
+
+/// The outcome of restaging every path in a recorded taint set — the shared core of
+/// [`heal_if_tainted`]'s automatic entry-heal and the recovery verb's deeper analysis
+/// ([`recovery_utils`](crate::util::recovery_utils)), which needs the categorized breakdown
+/// `heal_if_tainted` itself only turns straight into a refusal message. Every recorded path is
+/// attempted regardless of an earlier one's verdict (best-effort, mirroring
+/// `sync_touched_directories`'s own discipline) — a caller learns everything this attempt found,
+/// not just the first problem.
+#[derive(Default)]
+pub(crate) struct RestageAttempt {
+    /// Present, verified (where verifiable), and freshly rewritten.
+    pub(crate) restaged: BTreeSet<PathBuf>,
+    /// Absent on read-back (`ENOENT`) — see [`RestageOutcome::Vanished`].
+    pub(crate) vanished: BTreeSet<PathBuf>,
+    /// Present but the read-back itself failed — see [`RestageOutcome::Unreadable`], paired with
+    /// the read error.
+    pub(crate) unreadable: Vec<(PathBuf, String)>,
+    /// A loose object whose read-back content does not address to its own path's hash — see
+    /// [`RestageOutcome::HashMismatch`].
+    pub(crate) hash_mismatch: BTreeSet<PathBuf>,
+    /// The content read back and verified clean, but the restage *write* itself failed — an
+    /// operational failure of the heal's own machinery, paired with the write error.
+    pub(crate) restage_failed: Vec<(PathBuf, String)>,
+}
+
+impl RestageAttempt {
+    /// Whether every recorded path restaged cleanly — the condition under which
+    /// [`heal_if_tainted`] may proceed to [`finish_clean_heal`].
+    pub(crate) fn all_clean(&self) -> bool {
+        self.vanished.is_empty() && self.unreadable.is_empty()
+            && self.hash_mismatch.is_empty() && self.restage_failed.is_empty()
+    }
+}
+
+/// Attempt [`restage_object`] on every path in `recorded`, categorizing each verdict — see
+/// [`RestageAttempt`].
+pub(crate) fn attempt_restage_all(root: &Path, recorded: &BTreeSet<PathBuf>) -> RestageAttempt {
+    let mut attempt = RestageAttempt::default();
+
+    for relative in recorded {
+        match restage_object(root, relative) {
+            Ok(RestageOutcome::Restaged) => { attempt.restaged.insert(relative.clone()); }
+            Ok(RestageOutcome::Vanished) => { attempt.vanished.insert(relative.clone()); }
+            Ok(RestageOutcome::Unreadable(e)) => { attempt.unreadable.push((relative.clone(), e)); }
+            Ok(RestageOutcome::HashMismatch) => { attempt.hash_mismatch.insert(relative.clone()); }
+            Err(e) => { attempt.restage_failed.push((relative.clone(), e)); }
         }
     }
 
-    if !vanished.is_empty() || !unreadable.is_empty() || !hash_mismatch.is_empty() || !restage_failed.is_empty() {
-        return Err(unhealable_refusal(&root, &vanished, &unreadable, &hash_mismatch, &restage_failed));
-    }
+    attempt
+}
 
+/// The common tail of a fully successful heal, shared by [`heal_if_tainted`] (every recorded path
+/// restaged) and the recovery verb (every path restaged, or otherwise resolved by its deeper
+/// analysis): fsync every distinct parent directory `restaged` touched, plus the macOS device
+/// flush, then durably clear the taint and the in-memory gate. Only once this whole sequence
+/// succeeds may a caller report the taint fully healed — a failure partway (the sync/flush step)
+/// must leave the taint standing exactly as it was, which is why this does not itself remove
+/// anything on an `Err`.
+///
+/// # Returns
+/// * `Ok(())`      - The restaged paths are durable and the taint is now fully cleared.
+/// * `Err(String)` - The post-restage sync/flush, or clearing the taint files, failed. The taint
+///                   is left standing (whatever `restaged` was, remains unproven durable).
+pub(crate) fn finish_clean_heal(root: &Path, restaged: &BTreeSet<PathBuf>) -> Result<(), String> {
     let parents: BTreeSet<PathBuf> = restaged.iter()
         .filter_map(|relative| root.join(relative).parent().map(Path::to_path_buf))
         .collect();
 
-    sync_restaged_parents(&root, &parents).map_err(|e| sync_failure_refusal(&root, &e))?;
+    sync_restaged_parents(root, &parents)?;
 
-    taint_utils::remove_taint_files(&root).map_err(|e| sync_failure_refusal(&root, &e))?;
-    taint_utils::clear_gate(&root);
+    taint_utils::remove_taint_files(root)?;
+    taint_utils::clear_gate(root);
 
     Ok(())
 }
@@ -273,8 +330,14 @@ pub fn heal_if_tainted() -> Result<(), CoreError> {
 /// no-self-trip reason [`rewrite_dentry`] documents. Best-effort across every directory (mirroring
 /// `sync_touched_directories`): every one is attempted even after an earlier failure, and only the
 /// first error is returned.
+///
+/// `pub(crate)` — the recovery verb ([`recovery_utils`](crate::util::recovery_utils)) also calls
+/// this directly, standalone from [`finish_clean_heal`]'s bundle, for the partial-clear case: a
+/// subset of a taint's recorded paths restaged cleanly while others still need the closure walk,
+/// and the restaged subset's durability must never wait on how that deeper analysis turns out —
+/// see that module's doc comment.
 #[cfg(unix)]
-fn sync_restaged_parents(root: &Path, parents: &BTreeSet<PathBuf>) -> Result<(), String> {
+pub(crate) fn sync_restaged_parents(root: &Path, parents: &BTreeSet<PathBuf>) -> Result<(), String> {
     let mut first_error: Option<String> = None;
 
     for parent in parents {
@@ -298,7 +361,7 @@ fn sync_restaged_parents(root: &Path, parents: &BTreeSet<PathBuf>) -> Result<(),
 }
 
 #[cfg(not(unix))]
-fn sync_restaged_parents(_root: &Path, _parents: &BTreeSet<PathBuf>) -> Result<(), String> {
+pub(crate) fn sync_restaged_parents(_root: &Path, _parents: &BTreeSet<PathBuf>) -> Result<(), String> {
     // Windows has no directory handle to fsync at all (see `file_utils::sync_dir`'s doc comment)
     // and the taint mechanism never fires there in the first place (`sync_touched_directories` is
     // a no-op on non-Unix) — so there is never a taint for this function to be reached with.

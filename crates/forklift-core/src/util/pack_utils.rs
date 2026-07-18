@@ -44,11 +44,14 @@ use crate::util::{
 /// The folder under the object store that holds packs.
 const PACK_FOLDER_NAME: &str = "pack";
 
-/// The extension of a pack's data file (concatenated object blobs).
-const PACK_DATA_EXTENSION: &str = "pack";
+/// The extension of a pack's data file (concatenated object blobs). `pub(crate)` so the
+/// durability-taint recovery walk (`recovery_utils`) can recognize a recorded taint path as a
+/// pack file without duplicating the literal.
+pub(crate) const PACK_DATA_EXTENSION: &str = "pack";
 
-/// The extension of a pack's index file (sorted hash → offset/length records).
-const PACK_INDEX_EXTENSION: &str = "idx";
+/// The extension of a pack's index file (sorted hash → offset/length records). `pub(crate)` for
+/// the same reason as [`PACK_DATA_EXTENSION`].
+pub(crate) const PACK_INDEX_EXTENSION: &str = "idx";
 
 /// Magic + version prefixing a pack data file (so a truncated or foreign file is rejected).
 const PACK_DATA_MAGIC: &[u8; 8] = b"FORKPACK";
@@ -463,8 +466,10 @@ fn registry() -> &'static Mutex<HashMap<String, Arc<Vec<LoadedPack>>>> {
     PACK_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// The pack folder for the active warehouse's object store.
-fn pack_folder() -> PathBuf {
+/// The pack folder for the active warehouse's object store. `pub(crate)` so the durability-taint
+/// recovery walk (`recovery_utils`) can recognize a recorded taint path as living under it,
+/// without duplicating the folder layout.
+pub(crate) fn pack_folder() -> PathBuf {
     PathBuf::from(file_utils::get_path_objects_root()).join(PACK_FOLDER_NAME)
 }
 
@@ -1270,6 +1275,40 @@ pub fn find_hashes_with_prefix(prefix: &str) -> Result<Vec<String>, String> {
     }
 
     Ok(matches)
+}
+
+/// Enumerate every object hash a pack index file names, reading it directly off disk and
+/// independent of the warehouse-wide pack registry ([`loaded_packs`]).
+///
+/// Used by the durability-taint recovery walk (`recovery_utils`) when a taint recorded a pack
+/// **data** file as a final path and its restage found the data file vanished: the index sibling
+/// (if it survives) is the only record of what that pack held, so its hashes become the closure
+/// walk's search targets — a hash from here that turns out to still be present elsewhere (another
+/// pack, or loose) is not actually lost; one that is not present *and* is referenced from a
+/// durable ref is the dangling case the walk reports.
+///
+/// Deliberately does not call [`load_pack_pair`] (which also maps and validates the *data* file —
+/// exactly the file this is reached because is missing) or go through [`loaded_packs`]'s
+/// registry/cache (which would fail to load the whole pack set over one missing pair). Only the
+/// index header shape is validated ([`parse_index_header`]); [`validate_index_records`]'s
+/// data-length cross-check is skipped since there is no data file to check against — this
+/// function's only job is the hash list, not full structural validation.
+///
+/// # Returns
+/// * `Ok(Vec<String>)` - Every hex hash the index names, in its stored (sorted) order.
+/// * `Err(String)`      - The index file could not be read, or is corrupt / an unrecognized format.
+pub(crate) fn hashes_in_index_file(index_path: &Path) -> Result<Vec<String>, String> {
+    let index = std::fs::read(index_path)
+        .map_err(|e| format!("Error while reading pack index \"{}\": {}", index_path.to_string_lossy(), e))?;
+    let (count, _version) = parse_index_header(&index, index_path)?;
+
+    let mut hashes = Vec::with_capacity(count);
+    for position in 0..count {
+        let record = INDEX_HEADER_LEN + position * INDEX_RECORD_LEN;
+        hashes.push(sign_utils::to_hex(&index[record..record + HASH_LEN]));
+    }
+
+    Ok(hashes)
 }
 
 /// Whether any pack holds the object with the given hash. The existence fallback for

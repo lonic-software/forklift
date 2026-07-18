@@ -112,14 +112,15 @@ async fn async_main() {
 /// redirects included) and before any other line of this process may consult
 /// `does_object_exist` or dispatch to a command handler — this is the single chokepoint every
 /// `requires_warehouse()` command passes through exactly once per invocation, covering all of
-/// them uniformly, including read-only ones — no command is exempt yet. (A future recovery verb
-/// will need its own exemption, to stay reachable while a taint stands and resolve it; nothing
-/// here carves that out today.) This is deliberately unlike
-/// `load_guard_utils::check_no_incomplete_load`, which is called individually from inside
-/// `stack`'s and `park`'s own handlers — a taint can leave a *durable reference* pointing at
-/// unproven bytes if left unhealed before *any* command trusts existence, not just the two that
-/// durably commit staged inventory, so a single early chokepoint (rather than a per-command guard
-/// sprinkled at each write site) is what the trust-gating invariant actually needs.
+/// them uniformly, including read-only ones, **except the two named by
+/// [`Command::bypasses_taint_heal`]** (`heal` and `audit` — see that method's doc comment for
+/// why: refusing behind the very chokepoint a command exists to resolve or diagnose would be
+/// circular). This is deliberately unlike `load_guard_utils::check_no_incomplete_load`, which is
+/// called individually from inside `stack`'s and `park`'s own handlers — a taint can leave a
+/// *durable reference* pointing at unproven bytes if left unhealed before *any* command trusts
+/// existence, not just the two that durably commit staged inventory, so a single early chokepoint
+/// (rather than a per-command guard sprinkled at each write site) is what the trust-gating
+/// invariant actually needs.
 ///
 /// # Arguments
 /// * `cli` - The parsed command line.
@@ -135,7 +136,9 @@ async fn forklift(cli: Cli) -> Result<(), ForkliftError> {
             "Run \"forklift prepare\" to create a warehouse here, or change into one."
         ))?;
 
-        forklift_core::util::heal_utils::heal_if_tainted()?;
+        if !cli.command.bypasses_taint_heal() {
+            forklift_core::util::heal_utils::heal_if_tainted()?;
+        }
     }
 
     // Mutating commands hold the warehouse lock for their whole runtime, so two forklift
@@ -205,6 +208,7 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
         Command::Narrow { paths } => commands::narrow::handle_command(paths).await,
         Command::Franchise { url, directory, pallet, token, only } =>
             commands::franchise::handle_command(&url, &directory, pallet, token, only).await,
+        Command::Heal => commands::heal::handle_command(),
         Command::History { revision, class, limit, after, oneline } => commands::history::handle_command(revision, class, limit, after, oneline).await,
         Command::Query { revisions, from, class, unsupervised, supervisor, signer, author_after, author_before, merges, no_merges, grep, model, tool, tag, touches, verify: _, recorded, r#where, limit, after, oneline } =>
             commands::query::handle_command(commands::query::QueryArgs {

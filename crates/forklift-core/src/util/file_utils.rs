@@ -1811,6 +1811,37 @@ pub fn does_object_exist(hash: &str) -> Result<bool, String> {
         .map_err(|e| format!("Error while checking if object exists: {}", e))
 }
 
+/// The gate-free sibling of [`does_object_exist`]: checks a hash's raw presence (packed, or a
+/// loose dentry) without ever consulting [`taint_utils::gate_check`].
+///
+/// Every ordinary caller must go through the gated form — trusting a bare "yes" for dedupe *is*
+/// the soundness question a standing taint puts in doubt. The one sanctioned exception is the
+/// durability-taint recovery walk itself (`heal_utils`/`recovery_utils`): it runs precisely while
+/// a taint may be standing under this root, so a gate-consulting presence check would refuse on
+/// its very first call and the walk could never complete — the very thing it exists to resolve.
+/// It is safe here because the walk never trusts this answer as proof of durability or records a
+/// reference off the back of it; it only decides whether one *already-known-suspect* hash (the
+/// taint's own recorded vanished path, or a hash a vanished pack's surviving index once claimed)
+/// is genuinely absent — worth chasing through the closure walk — or was a false alarm (present
+/// after all, e.g. it was repacked since the taint fired). That is presence-as-a-fact for a
+/// read-only walk, not existence-as-proof-of-durability for a write path — the distinction the
+/// gate exists to police.
+///
+/// # Returns
+/// * `Ok(true)`    - The object is present (packed or loose).
+/// * `Ok(false)`   - Neither a pack nor the loose fan-out path holds it.
+/// * `Err(String)` - The pack registry or the loose path could not be checked.
+pub fn raw_object_present(hash: &str) -> Result<bool, String> {
+    if crate::util::pack_utils::is_in_packs(hash)? {
+        return Ok(true);
+    }
+
+    let (path, file_name) = get_path_for_object(hash)?;
+    let file_path = path.add(PATH_SEPARATOR).add(&file_name);
+
+    std::fs::exists(&file_path).map_err(|e| format!("Error while checking if object exists: {}", e))
+}
+
 /// Get the UTF-8 encoded name of a file or directory.
 ///
 /// # Arguments

@@ -6884,3 +6884,188 @@ fn a_torn_taint_exits_21_and_survives() {
     assert_eq!(json(&status)["error"]["code"], "durability_taint");
     assert!(dir.join("taint-1-0").exists(), "a torn taint file must survive the refusal");
 }
+
+/// Every regular taint file's recorded lines, unioned (dropping the `END` terminator) — used to
+/// inspect exactly what a recovery attempt left standing.
+fn recorded_taint_paths(warehouse: &TestWarehouse) -> Vec<String> {
+    let dir = taint_dir_path(warehouse);
+    if !dir.exists() {
+        return Vec::new();
+    }
+
+    let mut paths = Vec::new();
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let entry = entry.unwrap();
+        if !entry.path().is_file() {
+            continue;
+        }
+        let content = std::fs::read_to_string(entry.path()).unwrap();
+        paths.extend(content.lines().filter(|line| *line != "END").map(|line| line.to_string()));
+    }
+    paths
+}
+
+/// The root-relative loose-object path (`objects/<2 hex>/<rest>`) a hash lives at — the exact
+/// inverse `taint_utils::to_root_relative`/`file_utils::get_path_for_object` use, hand-derived
+/// here so these tests can plant/inspect a taint without reaching into `forklift-core` privates.
+fn loose_object_relative_path(hash: &str) -> String {
+    format!("objects/{}/{}", &hash[..2], &hash[2..])
+}
+
+#[test]
+fn heal_reaches_a_tainted_root_and_clears_a_vanished_unreferenced_object() {
+    // The chokepoint exemption, proven the mutation-killing way: if `Command::bypasses_taint_heal`
+    // did not exempt `heal`, this run would be blocked at the entry chokepoint and refuse with
+    // `heal_if_tainted`'s own conservative "vanished: ..." refusal (exit 21, nothing cleared).
+    // With the exemption wired, `heal` reaches its own recovery logic, walks every durable ref
+    // source, finds the fabricated hash referenced by nothing at all, and clears — exit 0. The
+    // two outcomes are observably different (exit code, and whether the taint survives), so this
+    // one test kills the "exemption missing" mutation without needing a second one.
+    let warehouse = TestWarehouse::new("heal-clears-unreferenced");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    let fake_hash = "1".repeat(64);
+    let relative = loose_object_relative_path(&fake_hash);
+    plant_taint(&warehouse, &[&relative]);
+
+    let status = warehouse.run(&["heal", "--json"]);
+    assert_success(&status);
+    let value = json(&status);
+    assert_eq!(value["data"]["was_tainted"], true);
+    assert!(
+        value["data"]["resolved"].as_array().unwrap().iter().any(|v| v == &fake_hash),
+        "the fabricated hash must be reported resolved (absent and unreferenced): {}", value
+    );
+
+    assert!(!taint_dir_path(&warehouse).exists() || recorded_taint_paths(&warehouse).is_empty(),
+        "the taint must be fully cleared");
+
+    // The warehouse is fully usable again, including the mutating write path a taint exists to
+    // protect — not just a read-only command.
+    warehouse.write_file("src/app.rs", "after heal");
+    assert_success(&warehouse.run(&["load", "src/app.rs"]));
+    assert_success(&warehouse.run(&["stack", "after heal"]));
+}
+
+#[test]
+fn heal_reports_a_vanished_but_referenced_object_and_everything_still_refuses() {
+    let warehouse = TestWarehouse::new("heal-reports-referenced");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    warehouse.write_file("src/app.rs", "referenced content");
+    assert_success(&warehouse.run(&["load", "src/app.rs"]));
+    let stack_out = warehouse.run(&["stack", "referenced parcel"]);
+    assert_success(&stack_out);
+    let parcel_hash = extract_parcel_hash(&stack_out);
+
+    // The pallet head is a durable ref by construction, so vanishing (and taining) its own
+    // parcel object is the simplest "still referenced" case: it is the walk's own root.
+    let relative = loose_object_relative_path(&parcel_hash);
+    std::fs::remove_file(warehouse.root.join(".forklift").join(&relative)).unwrap();
+    plant_taint(&warehouse, &[&relative]);
+
+    let status = warehouse.run(&["heal", "--json"]);
+    assert_eq!(status.status.code(), Some(21));
+    let value = json(&status);
+    assert_eq!(value["error"]["code"], "durability_taint");
+    assert!(
+        value["error"]["message"].as_str().unwrap().contains("vanished and still referenced"),
+        "unexpected message: {}", value
+    );
+    // Machine-coded remedies, not an exitless refusal.
+    let next_step = value["error"]["next_step"].as_str().unwrap();
+    assert!(next_step.contains("forklift lower") || value["error"]["message"].as_str().unwrap().contains("forklift lower"));
+
+    assert!(recorded_taint_paths(&warehouse).contains(&relative),
+        "the taint must survive with the still-dangling path recorded");
+
+    // Every ordinary command still refuses too — the taint was never lifted — including the
+    // mutating write path (`stack`) a taint exists specifically to protect. The chokepoint runs
+    // before a command dispatches, so `stack` refuses here regardless of staged content.
+    let blocked_read = warehouse.run(&["stocktake", "--json"]);
+    assert_eq!(blocked_read.status.code(), Some(21));
+    assert_eq!(json(&blocked_read)["error"]["code"], "durability_taint");
+
+    let blocked_stack = warehouse.run(&["stack", "should not land", "--json"]);
+    assert_eq!(blocked_stack.status.code(), Some(21));
+    assert_eq!(json(&blocked_stack)["error"]["code"], "durability_taint");
+}
+
+#[test]
+fn heal_partial_clear_leaves_exactly_the_unresolved_remainder_recorded() {
+    let warehouse = TestWarehouse::new("heal-partial-clear");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    warehouse.write_file("src/app.rs", "referenced content");
+    assert_success(&warehouse.run(&["load", "src/app.rs"]));
+    let stack_out = warehouse.run(&["stack", "referenced parcel"]);
+    assert_success(&stack_out);
+    let parcel_hash = extract_parcel_hash(&stack_out);
+    let referenced_relative = loose_object_relative_path(&parcel_hash);
+    std::fs::remove_file(warehouse.root.join(".forklift").join(&referenced_relative)).unwrap();
+
+    let fake_hash = "2".repeat(64);
+    let unreferenced_relative = loose_object_relative_path(&fake_hash);
+
+    plant_taint(&warehouse, &[&referenced_relative, &unreferenced_relative]);
+
+    let status = warehouse.run(&["heal", "--json"]);
+    assert_eq!(status.status.code(), Some(21));
+
+    // Exactly the unresolved remainder is recorded afterwards — the resolved (unreferenced)
+    // path must be gone, the still-dangling one must remain, and nothing extra appears.
+    let remaining = recorded_taint_paths(&warehouse);
+    assert_eq!(remaining, vec![referenced_relative.clone()],
+        "the remainder must be exactly the still-dangling path, no more and no less");
+}
+
+#[test]
+fn audit_runs_while_tainted() {
+    // The second chokepoint exemption: `audit` is a read-only diagnostic and must reach its own
+    // logic instead of being blocked by the entry-heal chokepoint. Proven by observing an error
+    // that is NOT the chokepoint's `durability_taint` refusal — a fresh, un-enrolled warehouse's
+    // `audit` refuses for a different, audit-specific reason ("trust is not established"),
+    // which it can only report if it actually ran.
+    let warehouse = TestWarehouse::new("audit-runs-while-tainted");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    plant_taint(&warehouse, &[&loose_object_relative_path(&"3".repeat(64))]);
+
+    let status = warehouse.run(&["audit", "--json"]);
+    assert_ne!(status.status.code(), Some(21),
+        "audit must bypass the taint chokepoint, not inherit its exit code");
+    let value = json(&status);
+    assert_eq!(value["ok"], false);
+    assert_ne!(value["error"]["code"], "durability_taint");
+}
+
+#[test]
+fn heal_on_a_torn_taint_names_heavyweight_recovery_and_survives() {
+    let warehouse = TestWarehouse::new("heal-torn");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    let dir = taint_dir_path(&warehouse);
+    std::fs::create_dir_all(&dir).unwrap();
+    // No terminator line: torn by construction.
+    std::fs::write(dir.join("taint-1-0"), b"objects/ab/cdef\n").unwrap();
+
+    let status = warehouse.run(&["heal", "--json"]);
+    assert_eq!(status.status.code(), Some(21));
+    let value = json(&status);
+    assert_eq!(value["error"]["code"], "durability_taint");
+    let message = value["error"]["message"].as_str().unwrap();
+    assert!(message.contains("torn") || message.to_lowercase().contains("incomplete"),
+        "the message must name the torn/unknown-scope condition: {}", message);
+    let next_step = value["error"]["next_step"].as_str().unwrap();
+    assert!(
+        next_step.contains("re-fetch") && next_step.contains("re-run") && next_step.contains("accept the loss"),
+        "the heavyweight exits must be named: {}", next_step
+    );
+
+    assert!(dir.join("taint-1-0").exists(), "a torn taint file must survive a heal attempt too");
+}

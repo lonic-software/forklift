@@ -359,6 +359,7 @@ fn build_args(name: &str, arguments: &Value) -> Result<Vec<String>, String> {
             args.push(require("path")?);
         }
         "undo" => args.push("undo".to_string()),
+        "heal" => args.push("heal".to_string()),
         "lift" => args.push("lift".to_string()),
         "lower" => args.push("lower".to_string()),
         "office_list" => args.push("office".to_string()),
@@ -622,6 +623,8 @@ fn tool_definitions() -> Value {
         tool("restore", "Restore a path from the inventory (or, with staged=true, unstage it).",
             object(json!({ "path": string, "staged": boolean }), json!(["path"]))),
         tool("undo", "Undo the last stack on the current pallet: move the head to the parent, keeping the changes staged (like git reset --soft HEAD~1). Refuses merge parcels.",
+            object(json!({}), json!([]))),
+        tool("heal", "Resolve a standing durability taint (durability_taint refusals, exit 21) that automatic recovery could not clear on its own: restage what it can, then walk every durable ref source to tell a vanished-but-unreferenced object (dropped) from one still referenced (reported, with remedies). A torn taint cannot be resolved this way and needs heavyweight recovery instead.",
             object(json!({}), json!([]))),
         tool("lift", "Push the current pallet's new parcels to the configured remote.",
             object(json!({}), json!([]))),

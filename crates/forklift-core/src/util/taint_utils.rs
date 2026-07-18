@@ -1,7 +1,8 @@
-//! The durable taint-record primitive: after a write's final names are visible but the
-//! directory entries recording them (or their own bytes) could not be proven durable, this
-//! module lets the failing write record exactly which final object paths are suspect, so a
-//! later heal knows precisely what to redo instead of re-verifying a whole storage root.
+//! The durable taint-record primitive (DESIGN.html §3.1.1): after a write's final names are
+//! visible but the directory entries recording them (or their own bytes) could not be proven
+//! durable, this module lets the failing write record exactly which final object paths are
+//! suspect, so a later heal knows precisely what to redo instead of re-verifying a whole storage
+//! root.
 //!
 //! This module is the primitive only: recording a taint and reading one back, plus a
 //! process-local in-memory gate that gives an *activated* process an immediate belt against
@@ -36,10 +37,11 @@
 //!
 //! ## What this module does not do
 //!
-//! No restage logic and no entry chokepoint (see
-//! [`heal_utils`](crate::util::heal_utils) for both), and no CLI-visible recovery verb for the
-//! cases the automatic entry-heal cannot resolve on its own (a later slice, built on top of
-//! [`heal_utils::heal_if_tainted`](crate::util::heal_utils::heal_if_tainted)'s refusal).
+//! No restage logic and no entry chokepoint (see [`heal_utils`](crate::util::heal_utils) for
+//! both), and no closure walk or CLI-visible recovery verb for the cases the automatic entry-heal
+//! cannot resolve on its own — that is
+//! [`recovery_utils`](crate::util::recovery_utils), built on top of
+//! [`heal_utils::heal_if_tainted`](crate::util::heal_utils::heal_if_tainted)'s refusal.
 
 use std::collections::BTreeSet;
 use std::fs::OpenOptions;
@@ -483,6 +485,68 @@ pub(crate) fn remove_taint_files(root: &Path) -> Result<(), String> {
             std::fs::remove_file(&path)
                 .map_err(|e| format!("Error while removing taint file \"{}\": {}", path.to_string_lossy(), e))?;
         }
+    }
+
+    file_utils::sync_dir(&taint_dir)
+}
+
+/// Replace every taint file under `root`'s taint directory with a single new one recording
+/// exactly `remainder` — the partial-clear primitive the recovery verb
+/// ([`recovery_utils`](crate::util::recovery_utils)) uses when some recorded paths resolved
+/// (restaged, or vanished-and-unreferenced) on a heal attempt and others did not: the taint must
+/// afterwards record exactly the unresolved remainder, never the original full set (which would
+/// re-report already-resolved paths forever) and never nothing (which would silently drop the
+/// paths still genuinely in doubt).
+///
+/// Crash-safe by construction, the same way [`record_taint`] itself is: the old file set is
+/// enumerated *first*, the replacement is durably written via the exact same exclusive-create +
+/// fsync + terminator routine [`record_taint`]'s own write uses ([`write_taint_file`] — reused
+/// directly, not reimplemented), and only once that succeeds are the old files removed. There is
+/// therefore never a window where the remainder is unrecorded on disk: a crash before the new
+/// file's write completes leaves the original (larger, still-correct, if now stale-in-places)
+/// taint set standing; a crash after leaves exactly the new, smaller set. `remainder` empty is the
+/// full-clear case and is delegated to [`remove_taint_files`] directly — no empty taint file is
+/// ever written for "nothing left to record."
+///
+/// Does not touch the in-memory gate ([`gate_check`]) either way: clearing it is the caller's call
+/// once it knows whether the *whole* taint (not just this replacement step) is resolved — see
+/// [`remove_taint_files`]'s doc comment for the same division of responsibility.
+///
+/// # Returns
+/// * `Ok(())`      - The taint directory now records exactly `remainder` (or is empty/absent, if
+///                   `remainder` was empty).
+/// * `Err(String)` - The new file could not be durably written (the old taint files are left
+///                   completely untouched — the original, larger set still stands, never
+///                   partially deleted before a replacement is durable), or an old file could not
+///                   be removed after the replacement succeeded.
+pub(crate) fn replace_taint_with_remainder(root: &Path, remainder: &BTreeSet<PathBuf>) -> Result<(), String> {
+    if remainder.is_empty() {
+        return remove_taint_files(root);
+    }
+
+    let taint_dir = root.join(TAINT_DIR_NAME);
+
+    // Enumerate the old files *before* writing anything, so the deletion loop below removes
+    // exactly the set that predates the replacement — never the file the replacement itself just
+    // created (which, thanks to the O_EXCL suffix scheme, can never collide with one of these
+    // names anyway, but this ordering makes the invariant true by construction, not by luck).
+    let old_files: Vec<PathBuf> = if taint_dir.exists() {
+        std::fs::read_dir(&taint_dir)
+            .map_err(|e| format!("Error while reading taint directory \"{}\": {}", taint_dir.to_string_lossy(), e))?
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| path.is_file())
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    write_taint_file(root, remainder)?;
+
+    for old in old_files {
+        std::fs::remove_file(&old).map_err(|e| format!(
+            "Error while removing a superseded taint file \"{}\": {}", old.to_string_lossy(), e
+        ))?;
     }
 
     file_utils::sync_dir(&taint_dir)
