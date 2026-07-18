@@ -1,10 +1,25 @@
 //! The incomplete-load guard: `load` can fail partway through a directory walk (a per-shard
 //! failure keeps the siblings that already published; some failure modes publish nothing at
-//! all), and a subsequent `stack` would otherwise silently commit the incomplete staged
-//! inventory into a durable parcel — a wrong result indistinguishable from a correct one. This
-//! module closes that: a small durable marker recorded at the *start* of every load, cleared
-//! only once that same load (or a later one covering the same root) completes cleanly. `stack`
-//! refuses while a marker is present (see [`check_no_incomplete_load`]).
+//! all), and a subsequent `stack` or `park` would otherwise silently commit the incomplete
+//! staged inventory into a durable parcel — a wrong result indistinguishable from a correct one.
+//! This module closes that: durable markers recorded at the *start* of every load, cleared only
+//! once that load (or a later operation that makes the same region consistent again) resolves
+//! them. `stack` and `park` both refuse while any marker is present (see
+//! [`check_no_incomplete_load`]).
+//!
+//! Built on [`marker_utils`], the generic durable path-**set** primitive: this module owns only
+//! the load-specific meaning of "a path is recorded" (an outstanding, possibly-incomplete load
+//! rooted there) and where the marker file lives; every read/write/antichain concern is
+//! `marker_utils`'s.
+//!
+//! ## Why a set, not a single path
+//!
+//! Two unrelated loads can each fail independently — `load src/a` fails, then (before it is
+//! healed) `load src/b` fails too. Those are two disjoint incomplete regions; recording only one
+//! at a time would either lose track of the first or never record the second, either way leaving
+//! the other's staged (or half-staged) content unguarded. `marker_utils`'s set, and its
+//! antichain-maintaining [`marker_utils::add`], handle this: both roots are recorded
+//! side by side, and each is only cleared by an operation that actually covers it.
 //!
 //! ## Why the marker is written at load *start*, not on failure
 //!
@@ -19,41 +34,79 @@
 //!
 //! The marker lives beside the inventory metadata file — directly under
 //! [`file_utils::get_path_inventory_root`] (the bay-local staging root), a **sibling** of the
-//! `inv_`-prefixed shard tree, never inside it. Every operation that wipes the staging area
-//! wholesale (`inventory_utils::replace_all_inventories`, used by `park`'s push, and
-//! `inventory_utils::replace_subtree_inventories` with an empty key, used by `restore --staged`
-//! at the root) does so with `remove_dir_all` on that `inv_` subtree specifically — never on
-//! the inventory root folder itself — so none of them can delete the marker in passing.
+//! `inv_`-prefixed shard tree, never inside it. Every operation that replaces staging wholesale
+//! or by subtree (`inventory_utils::replace_all_inventories`, `inventory_utils::
+//! replace_subtree_inventories`) removes only that `inv_` subtree specifically — never the
+//! inventory root folder itself — so none of them can delete the marker in passing; those same
+//! two functions are also where this module's clearing side of the contract is wired in (see
+//! [`clear_recorded_under`] and [`clear_all_recorded`]).
+//!
+//! ## Folding the marker's durability into a load's own barrier
+//!
+//! Recording a marker via a standalone [`file_utils::write_file_atomically`] call pays its own
+//! durability barrier — on a platform where that barrier is expensive (macOS's `F_FULLFSYNC`),
+//! doing this on every load roughly doubles the durability wait of a small one. The marker does
+//! not need its own barrier: it only needs to be durable no later than the load's own first real
+//! durable mutation, so folding it into that mutation's existing barrier is free.
+//!
+//! [`pending_start_marker`] computes the bytes a caller needs to durably publish (or `None` when
+//! nothing needs to change) without writing them, so the caller can stage them into whatever
+//! `WriteBatch` its own first barrier already uses ([`stage_start_marker`] does this directly
+//! for a caller with a `WriteBatch` in hand):
+//! * `inventory_utils::create_inventory_for_directory` (a directory `load`) stages it into the
+//!   walk's own blob-publish batch, the walk's first durable mutation — see that function's own
+//!   doc comment for the crash-ordering argument.
+//! * `inventory_utils::add_file_to_inventory` (a single-file `load`) folds it into the loaded
+//!   file's own shard-content publish via `inventory_utils::write_shard_mutation_with_extra` —
+//!   that shard write is this path's first (and only) durable mutation.
+//!
+//! Crash analysis: a crash before either of those barriers commits leaves the marker's write
+//! unpublished (an invisible staged temp — see `file_utils::WriteBatch::stage`) exactly like
+//! every other write that barrier covers, and staging is unchanged either way — consistent. A
+//! crash after the barrier commits makes the marker durable together with (never after) whatever
+//! else that barrier published, so a load interrupted right past that point is still caught. In
+//! neither case can the marker's absence and a durable staging mutation from the same load ever
+//! disagree.
 //!
 //! ## Clearing scope
 //!
-//! The marker records a single warehouse path key: the root of whichever load(s) might still be
-//! incomplete. Every read-modify-write of it follows one rule: a load rooted at `R` may only
-//! touch a marker recorded at `P` when `R` *covers* `P` (`R` is `P` itself or a strict ancestor
-//! of it — see [`covers`]; the empty key, the warehouse root, covers everything).
+//! Every read-modify-write of the recorded set follows one rule, enforced by `marker_utils`: an
+//! operation covering region `R` (see [`path_utils::covers`]) may only remove a recorded root
+//! `P` when `R` covers `P` — clearing a root an operation did not actually re-verify (or
+//! re-establish from a known-good source) would let a real incomplete region go unguarded.
 //!
-//! * **At load start** ([`mark_load_started`]): no marker yet → write one for `R`. A marker
-//!   already recorded at `P`, with `R` covering `P` → overwrite with `R` — still conservative,
-//!   since `R` is at least as broad as `P`, so recording `R` alone still covers the old
-//!   incomplete region. A marker at `P` that `R` does *not* cover (`P` is broader, or the two
-//!   are unrelated) → leave it untouched: the marker is a single path, not a set, so it cannot
-//!   always name two disjoint incomplete regions at once, but it must never *lose* the one it
-//!   already has. `stack` still refuses either way — worst case it names the older path instead
-//!   of the newer one.
-//! * **At clean completion** ([`mark_load_completed`]): read whatever is currently recorded;
-//!   clear it only if this load's root covers it (this load's walk fully re-verified everything
-//!   the marker was protecting). A narrower, or disjoint, load leaves it alone — it never healed
-//!   the broader failure.
+//! * **At load start** ([`mark_load_started`], [`pending_start_marker`]): recording `R` absorbs
+//!   (drops) any narrower already-recorded root `R` covers — see `marker_utils`'s antichain
+//!   invariant.
+//! * **At clean completion** ([`mark_load_completed`]): every recorded root the completed load's
+//!   own root covers is cleared. A narrower, or disjoint, load leaves everything else alone — it
+//!   never re-walked what it does not cover.
+//! * **At a staging reset** ([`clear_recorded_under`], [`clear_all_recorded`]): `restore
+//!   --staged <path>` (and `unload`) rebuild exactly the subtree at `<path>` from the pallet
+//!   head, so every recorded root that subtree covers is now known-consistent — call
+//!   [`clear_recorded_under`]. `shift`, `park`'s post-push reset, a `consolidate` fast-forward,
+//!   `import-git`'s initial checkout, and `lower`/`franchise`'s materialization all replace the
+//!   *entire* staging area from a known-good tree — call [`clear_all_recorded`]. Both are wired
+//!   once, inside `inventory_utils::replace_subtree_inventories` and `inventory_utils::
+//!   replace_all_inventories` respectively, so every caller of either gets this for free.
 //!
-//! Removal is best-effort ([`mark_load_completed`] swallows every error): a marker that
-//! resurrects after a crash right after a successful removal fails in the safe direction —
-//! `stack` refuses, and the remedy is one cheap re-load — so a failed unlink here is not itself
-//! a load failure.
+//! Removal is always best-effort (`marker_utils::remove_covered_by`/`clear` swallow every
+//! error): a marker that resurrects after a crash right after a successful removal fails in the
+//! safe direction — the next check still refuses, and the remedy is one cheap re-load or
+//! `restore --staged`.
+//!
+//! ## Malformed marker
+//!
+//! Write-side ([`mark_load_started`] and friends) and check-side ([`check_no_incomplete_load`])
+//! deliberately disagree about what a malformed marker means — see `marker_utils`'s doc comment
+//! for why: a load must never be the thing its own remedy is blocked on, so it self-heals by
+//! overwriting; a `stack`/`park` about to durably commit must never treat "I could not read this"
+//! as "nothing is recorded", so it refuses.
 
-use std::path::PathBuf;
-use chrono::Utc;
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 use crate::error::{CoreError, RefusalCode};
-use crate::util::file_utils;
+use crate::util::{file_utils, marker_utils};
 
 /// The name of the incomplete-load marker file (kept beside the inventory metadata file — see
 /// the module doc comment on why this placement is safe against a whole-staging-area wipe).
@@ -63,106 +116,88 @@ const FILE_NAME_INCOMPLETE_LOAD_MARKER: &str = "incomplete-load";
 /// same convention `scope_utils` and `query_utils` use for their own codes).
 pub const CODE_INCOMPLETE_LOAD: &str = RefusalCode::IncompleteLoad.as_str();
 
-/// A recorded incomplete-load marker.
-struct Marker {
-    /// The warehouse path key of the load root that may still be incomplete.
-    path: String,
-    /// When that load started (RFC 3339; informational only, shown in the refusal message).
-    started_at: String,
-}
-
-/// The path of the incomplete-load marker file.
-fn marker_path() -> PathBuf {
+/// The path of the incomplete-load marker file, resolved against the active storage-root scope
+/// (see [`file_utils::get_path_inventory_root`]) — this process's view of where it lives.
+pub fn marker_path() -> PathBuf {
     PathBuf::from(file_utils::get_path_inventory_root()).join(FILE_NAME_INCOMPLETE_LOAD_MARKER)
 }
 
-/// Whether `root` "covers" `key` — `root` is `key` itself or a strict ancestor of it (the empty
-/// key, the warehouse root, covers everything). The same subtree-membership test
-/// `inventory_utils::populate_dirty_inventory_paths` and `restore`'s directory walk both use for
-/// "is this key at or under this path".
-fn covers(root: &str, key: &str) -> bool {
-    root.is_empty() || key == root || key.starts_with(&format!("{}/", root))
-}
-
-/// Read the current marker, if any.
-///
-/// # Returns
-/// * `Ok(Some(Marker))` - A marker is recorded.
-/// * `Ok(None)`         - No marker is recorded.
-/// * `Err(String)`      - The marker file exists but could not be read or is malformed.
-fn read_marker() -> Result<Option<Marker>, String> {
-    let path = marker_path();
-
-    if !path.exists() {
-        return Ok(None);
-    }
-
-    let content = std::fs::read_to_string(&path)
-        .map_err(|e| format!("Error while reading \"{}\": {}", path.to_string_lossy(), e))?;
-
-    let mut lines = content.lines();
-    let (Some(marker_path_line), Some(started_at)) = (lines.next(), lines.next()) else {
-        return Err(format!(
-            "The incomplete-load marker \"{}\" is malformed; fix it by hand (or remove it and \
-            re-run \"forklift load\" over the affected path).",
-            path.to_string_lossy()
-        ));
-    };
-
-    Ok(Some(Marker { path: marker_path_line.to_string(), started_at: started_at.to_string() }))
-}
-
-/// Write the marker for `root_key`, unconditionally — callers decide whether to call this (see
-/// [`mark_load_started`]).
-fn write_marker(root_key: &str) -> Result<(), String> {
-    file_utils::create_folder_if_not_exists(&PathBuf::from(file_utils::get_path_inventory_root()))?;
-
-    let content = format!("{}\n{}\n", root_key, Utc::now().to_rfc3339());
-    file_utils::write_file_atomically(&marker_path(), content.as_bytes())
-}
-
-/// Remove the marker file, best-effort (a missing file, or a failed removal, is not an error —
-/// see the module doc comment).
-fn clear_marker() {
-    let _ = std::fs::remove_file(marker_path());
+/// The path of the incomplete-load marker file under a given warehouse root, independent of any
+/// active process-wide storage-root scope — for a caller that already knows the target
+/// warehouse's root directly rather than through the ambient scope [`marker_path`] resolves
+/// against (a test driving `forklift` as a spawned subprocess, whose own working directory has
+/// nothing to do with the warehouse being exercised). Assumes a plain, non-bay warehouse layout
+/// (`<root>/.forklift/inventory/...`), which is all such a caller ever drives.
+pub fn marker_path_under(warehouse_root: &Path) -> PathBuf {
+    warehouse_root
+        .join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)
+        .join(crate::globals::FOLDER_NAME_INVENTORY_ROOT)
+        .join(FILE_NAME_INCOMPLETE_LOAD_MARKER)
 }
 
 /// Record that a load rooted at `root_key` is starting, durably, before any staging mutation —
-/// see the module doc comment for the crash-safety rationale and the covers-based update rule.
+/// see the module doc comment for the crash-safety rationale. Writes immediately (its own
+/// durability barrier) — see [`pending_start_marker`] for a caller that wants to fold this write
+/// into a batch it already controls instead.
 ///
 /// # Arguments
 /// * `root_key` - The warehouse path key of the load's root (the normalized `load` argument).
 ///
 /// # Returns
-/// * `Ok(())`      - The marker was written, or an existing broader-or-equal one was kept as is.
-/// * `Err(String)` - The marker could not be read or written.
+/// * `Ok(())`      - The marker now covers `root_key` (freshly recorded, or already did).
+/// * `Err(String)` - The marker could not be written.
 pub fn mark_load_started(root_key: &str) -> Result<(), String> {
-    let should_write = match read_marker()? {
-        None => true,
-        Some(existing) => covers(root_key, &existing.path),
-    };
-
-    if should_write {
-        write_marker(root_key)?;
-    }
-
-    Ok(())
+    marker_utils::add(&marker_path(), root_key)
 }
 
-/// Record that the load rooted at `root_key` completed cleanly: clears the marker if (and only
-/// if) `root_key` covers whatever is currently recorded — see the module doc comment. Best-effort
-/// throughout, including the read: a marker this cannot make sense of is left in place rather
-/// than risk clearing state a real failure still needs, and a failed removal never fails the
-/// load that already succeeded.
+/// Compute the marker write a load rooted at `root_key` needs to durably publish, without
+/// performing it — see the module doc comment's folding section.
+///
+/// # Returns
+/// * `Some(bytes)` - `root_key` is not yet covered by what is recorded; stage this content at
+///                   [`marker_path`] as part of the caller's own first durable barrier.
+/// * `None`        - `root_key` is already covered by what is recorded; nothing to stage.
+pub fn pending_start_marker(root_key: &str) -> Option<Vec<u8>> {
+    marker_utils::pending_add(&marker_path(), root_key)
+}
+
+/// Stage the marker write (if any) for `root_key` into `batch` instead of writing it immediately
+/// — see the module doc comment's folding section. A no-op (nothing staged) when `root_key` is
+/// already covered by what is recorded.
+///
+/// The caller is responsible for calling `batch.finish()`; nothing staged here is durable until
+/// that returns `Ok`.
+pub fn stage_start_marker(batch: &file_utils::WriteBatch, root_key: &str) -> Result<(), String> {
+    marker_utils::add_deferred(batch, &marker_path(), root_key)
+}
+
+/// Record that the load rooted at `root_key` completed cleanly: clears every recorded root
+/// `root_key` covers — see the module doc comment's clearing-scope section. Best-effort
+/// throughout (including a marker this cannot make sense of, which is left in place rather than
+/// risk clearing state a real failure still needs) — a failed removal never fails the load that
+/// already succeeded.
 ///
 /// # Arguments
 /// * `root_key` - The warehouse path key of the load that just completed cleanly.
 pub fn mark_load_completed(root_key: &str) {
-    let Ok(Some(existing)) = read_marker() else { return };
+    clear_recorded_under(root_key);
+}
 
-    if covers(root_key, &existing.path) {
-        clear_marker();
-    }
+/// Record that region `root_key` is now known-consistent — because a load rooted there just
+/// finished cleanly, or because some other operation rebuilt exactly that subtree from a
+/// known-good source (`restore --staged`, `unload`). Clears every recorded root `root_key`
+/// covers; a root only partially overlapping `root_key` is left alone — see the module doc
+/// comment's clearing-scope section. Best-effort (see [`mark_load_completed`]'s doc comment).
+pub fn clear_recorded_under(root_key: &str) {
+    marker_utils::remove_covered_by(&marker_path(), root_key);
+}
+
+/// Record that the *entire* staging area is now known-consistent — every operation that replaces
+/// staging wholesale from a known-good tree (`shift`, `park`'s post-push reset, a `consolidate`
+/// fast-forward, `import-git`'s initial checkout, `lower`/`franchise`'s materialization) calls
+/// this once it has finished. Best-effort (see [`mark_load_completed`]'s doc comment).
+pub fn clear_all_recorded() {
+    marker_utils::clear(&marker_path());
 }
 
 /// Display a warehouse path key the way user-facing messages spell the warehouse root.
@@ -170,33 +205,94 @@ fn display_path(key: &str) -> &str {
     if key.is_empty() { "./" } else { key }
 }
 
-/// Build the `incomplete_load` refusal naming the recorded path and when that load started.
-fn incomplete_load_refusal(marker: &Marker) -> CoreError {
-    let path = display_path(&marker.path);
-    let next_step = format!("Run \"forklift load {}\" again, then stack.", path);
+/// Format up to a handful of recorded roots for a message, with a count for the rest.
+fn format_roots(recorded: &BTreeSet<String>) -> String {
+    const SHOWN: usize = 3;
+
+    let mut description = recorded.iter()
+        .take(SHOWN)
+        .map(|key| display_path(key))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    if recorded.len() > SHOWN {
+        description.push_str(&format!(", and {} more", recorded.len() - SHOWN));
+    }
+
+    description
+}
+
+/// Build the `incomplete_load` refusal naming the recorded root(s).
+fn incomplete_load_refusal(recorded: &BTreeSet<String>) -> CoreError {
+    let description = if recorded.len() == 1 {
+        format!("The load of \"{}\"", display_path(recorded.iter().next().expect("len == 1")))
+    } else {
+        format!("{} loads ({})", recorded.len(), format_roots(recorded))
+    };
+
+    let next_step = if recorded.len() == 1 {
+        let path = display_path(recorded.iter().next().expect("len == 1"));
+        format!(
+            "Run \"forklift load {}\" again, or \"forklift restore --staged {}\" to abandon it.",
+            path, path
+        )
+    } else {
+        format!(
+            "Re-run \"forklift load\" over each affected path ({}), or \"forklift restore \
+            --staged <path>\" to abandon it, for each.",
+            format_roots(recorded)
+        )
+    };
 
     CoreError::refusal(
         RefusalCode::IncompleteLoad,
         format!(
-            "The last load of \"{}\" (started {}) did not finish; stacking now could commit an \
-            incomplete inventory. {}",
-            path, marker.started_at, next_step
+            "{} did not finish cleanly; committing the staged inventory now could produce an \
+            incomplete result. {}",
+            description, next_step
         ),
         next_step,
     )
 }
 
-/// Refuse if an incomplete load is recorded. Called by `stack` before any warehouse mutation
-/// (alongside its other pre-checks — see `stack_utils::stack_parcel`).
+/// Build the `incomplete_load` refusal for a marker that could not be read at all — see the
+/// module doc comment's malformed-marker section for why the check side refuses here rather than
+/// treating this as "nothing recorded".
+fn malformed_marker_refusal(read_error: &str) -> CoreError {
+    let path = marker_path();
+    let next_step = format!(
+        "Fix or remove \"{}\" by hand, or run \"forklift restore --staged <path>\" over the \
+        affected area, then try again.",
+        path.to_string_lossy()
+    );
+
+    CoreError::refusal(
+        RefusalCode::IncompleteLoad,
+        format!(
+            "The incomplete-load marker could not be read ({}); treating this warehouse as \
+            having an incomplete load rather than risk committing an incomplete result. {}",
+            read_error, next_step
+        ),
+        next_step,
+    )
+}
+
+/// Refuse if an incomplete load is recorded. Called by `stack` and `park`'s push before any
+/// warehouse mutation (alongside their other pre-checks — see `stack_utils::stack_parcel` and
+/// `park::park_changes`) — both durably commit the staged inventory into a parcel, so both must
+/// never do so while a load might still be incomplete.
 ///
 /// # Returns
-/// * `Ok(())`         - No incomplete load is recorded; stacking may proceed.
-/// * `Err(CoreError)` - An `incomplete_load` refusal naming the recorded path, or the marker
-///                      could not be read.
+/// * `Ok(())`         - No incomplete load is recorded; committing may proceed.
+/// * `Err(CoreError)` - An `incomplete_load` refusal naming the recorded root(s), or — if the
+///                      marker exists but could not be read — refusing conservatively rather
+///                      than risk treating unreadable state as "nothing recorded" (see the
+///                      module doc comment's malformed-marker section).
 pub fn check_no_incomplete_load() -> Result<(), CoreError> {
-    match read_marker().map_err(CoreError::Other)? {
-        Some(marker) => Err(incomplete_load_refusal(&marker)),
-        None => Ok(()),
+    match marker_utils::read(&marker_path()) {
+        Ok(recorded) if recorded.is_empty() => Ok(()),
+        Ok(recorded) => Err(incomplete_load_refusal(&recorded)),
+        Err(read_error) => Err(malformed_marker_refusal(&read_error)),
     }
 }
 
@@ -247,12 +343,12 @@ mod tests {
     }
 
     #[test]
-    fn a_new_broader_load_overwrites_a_narrower_recorded_marker() {
-        let temp = temp_warehouse("broader-overwrite");
+    fn a_new_broader_load_absorbs_a_narrower_recorded_marker() {
+        let temp = temp_warehouse("broader-absorb");
         let _scope = StorageRootScope::enter(&temp);
 
         mark_load_started("src/api").unwrap();
-        mark_load_started("src").unwrap(); // covers the old marker's root — overwrites
+        mark_load_started("src").unwrap(); // covers the old marker's root — absorbs it
 
         mark_load_completed("src"); // now covers the (updated) recorded root — clears
         assert!(check_no_incomplete_load().is_ok());
@@ -260,31 +356,121 @@ mod tests {
         std::fs::remove_dir_all(&temp).ok();
     }
 
+    /// Two disjoint failed loads must both be recorded — a single-path marker could only ever
+    /// name one, silently leaving the other's staged (or
+    /// half-staged) content unguarded. `stack` (proxied here by `check_no_incomplete_load`)
+    /// must keep refusing, naming the still-outstanding root, until *both* heal.
     #[test]
-    fn a_disjoint_new_load_does_not_overwrite_an_unrelated_recorded_marker() {
+    fn two_disjoint_failed_loads_are_both_recorded_until_each_heals() {
         let temp = temp_warehouse("disjoint");
         let _scope = StorageRootScope::enter(&temp);
 
         mark_load_started("src/a").unwrap();
-        mark_load_started("src/b").unwrap(); // does not cover "src/a" — leaves it recorded
+        mark_load_started("src/b").unwrap(); // does not cover "src/a" — both recorded
 
         let error = check_no_incomplete_load().unwrap_err();
         match error {
             CoreError::Refusal { message, .. } => {
-                assert!(message.contains("src/a"), "keeps naming the original root: {}", message);
+                assert!(message.contains("src/a"), "names the first root: {}", message);
+                assert!(message.contains("src/b"), "names the second root: {}", message);
             }
             other => panic!("expected a refusal, got {:?}", other),
         }
+
+        // Healing only "src/a" must not clear "src/b".
+        mark_load_completed("src/a");
+        let error = check_no_incomplete_load().unwrap_err();
+        match error {
+            CoreError::Refusal { message, .. } => {
+                assert!(!message.contains("src/a"), "src/a healed, must not still be named: {}", message);
+                assert!(message.contains("src/b"), "src/b still outstanding: {}", message);
+            }
+            other => panic!("expected a refusal, got {:?}", other),
+        }
+
+        // Healing "src/b" too clears the guard entirely.
+        mark_load_completed("src/b");
+        assert!(check_no_incomplete_load().is_ok());
 
         std::fs::remove_dir_all(&temp).ok();
     }
 
     #[test]
-    fn no_marker_means_stack_is_never_refused() {
+    fn no_marker_means_committing_is_never_refused() {
         let temp = temp_warehouse("no-marker");
         let _scope = StorageRootScope::enter(&temp);
 
         assert!(check_no_incomplete_load().is_ok());
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// A malformed marker never blocks the load that would fix it (self-heals by overwriting),
+    /// but a check about to durably commit refuses conservatively rather than treat unreadable
+    /// state as "nothing recorded".
+    #[test]
+    fn a_malformed_marker_self_heals_on_write_but_refuses_the_check() {
+        let temp = temp_warehouse("malformed");
+        let _scope = StorageRootScope::enter(&temp);
+
+        std::fs::create_dir_all(marker_path().parent().unwrap()).unwrap();
+        std::fs::write(marker_path(), [0xFF, 0xFE, 0x00, 0xFF]).unwrap(); // never valid UTF-8
+
+        // The check side must fail closed, never silently pass.
+        let error = check_no_incomplete_load().unwrap_err();
+        assert!(matches!(error, CoreError::Refusal { code: RefusalCode::IncompleteLoad, .. }));
+
+        // The write side self-heals: a load over the malformed marker proceeds and records
+        // fresh, readable content.
+        mark_load_started("src").unwrap();
+        let error = check_no_incomplete_load().unwrap_err();
+        match error {
+            CoreError::Refusal { message, .. } => assert!(message.contains("src")),
+            other => panic!("expected a refusal, got {:?}", other),
+        }
+
+        mark_load_completed("src");
+        assert!(check_no_incomplete_load().is_ok());
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn clear_recorded_under_a_partial_overlap_leaves_a_broader_root_alone() {
+        let temp = temp_warehouse("partial-overlap");
+        let _scope = StorageRootScope::enter(&temp);
+
+        mark_load_started("src").unwrap();
+        clear_recorded_under("src/sub"); // does not cover "src" (its own ancestor)
+
+        assert!(check_no_incomplete_load().is_err());
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn clear_all_recorded_clears_every_root_regardless_of_overlap() {
+        let temp = temp_warehouse("clear-all");
+        let _scope = StorageRootScope::enter(&temp);
+
+        mark_load_started("src/a").unwrap();
+        mark_load_started("docs").unwrap();
+
+        clear_all_recorded();
+        assert!(check_no_incomplete_load().is_ok());
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn pending_start_marker_is_none_when_already_covered_and_some_otherwise() {
+        let temp = temp_warehouse("pending");
+        let _scope = StorageRootScope::enter(&temp);
+
+        assert!(pending_start_marker("src").is_some());
+        mark_load_started("src").unwrap();
+        assert!(pending_start_marker("src/api").is_none(), "already covered by \"src\"");
+        assert!(pending_start_marker("docs").is_some(), "disjoint from \"src\"");
 
         std::fs::remove_dir_all(&temp).ok();
     }

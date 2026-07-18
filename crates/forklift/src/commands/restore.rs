@@ -3,7 +3,7 @@ use forklift_core::enums::dir_entry_type::DirEntryType;
 use forklift_core::enums::inventory_item_state::InventoryItemState;
 use forklift_core::model::inventory::Inventory;
 use forklift_core::model::tree_item::TreeItem;
-use forklift_core::util::path_utils::WarehousePath;
+use forklift_core::util::path_utils::{self, WarehousePath};
 use forklift_core::util::scope_utils::{self, MaterializationScope, ScopeClass};
 use forklift_core::util::{file_utils, inventory_utils, object_utils, pallet_utils, shift_utils, tree_utils};
 use crate::output;
@@ -126,18 +126,13 @@ fn restore_worktree_directory(key: &str) -> Result<(), String> {
     let (_, metadata_opt) = file_utils::retrieve_inventory_metadata_or_none()?;
     let metadata = metadata_opt.unwrap_or_default();
 
-    let prefix = if key.is_empty() { String::new() } else { format!("{}/", key) };
     let mut restored_any = false;
     let mut restored_count = 0usize;
 
     for entry in &metadata {
         let shard_key = inventory_utils::metadata_entry_to_key(entry);
 
-        let is_in_subtree = key.is_empty()
-            || shard_key == key
-            || shard_key.starts_with(&prefix);
-
-        if !is_in_subtree {
+        if !path_utils::covers(key, shard_key) {
             continue;
         }
 
