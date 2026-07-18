@@ -5,7 +5,9 @@ use forklift_core::model::inventory::Inventory;
 use forklift_core::model::tree_item::TreeItem;
 use forklift_core::util::path_utils::{self, WarehousePath};
 use forklift_core::util::scope_utils::{self, MaterializationScope, ScopeClass};
-use forklift_core::util::{file_utils, inventory_utils, object_utils, pallet_utils, shift_utils, tree_utils};
+use forklift_core::util::{
+    file_utils, inventory_utils, load_guard_utils, object_utils, pallet_utils, shift_utils, tree_utils,
+};
 use crate::output;
 
 /// A resolved entry of the pallet head's tree.
@@ -211,12 +213,22 @@ fn restore_file_and_refresh_entry(parent_key: &str,
 /// next comparison against the working directory rehashes them.
 ///
 /// # Arguments
+/// A path that is neither in the inventory nor in the pallet head is ordinarily an error — but
+/// when it is also entangled with a recorded incomplete-load root (`load_guard_utils`) and has
+/// zero staged entries anywhere beneath it, there is nothing to reset (nothing is there) and
+/// nothing to abandon (nothing landed) — only the record to clear. See
+/// `load_guard_utils::clear_recorded_involving`'s doc comment for the soundness argument this
+/// vacuous-heal case relies on. A path with no marker involvement, or with real staged content
+/// somewhere beneath it, keeps the ordinary error.
+///
+/// # Arguments
 /// * `path`    - The path to unstage.
 /// * `command` - The invoked command's name, for the output envelope.
 ///
 /// # Returns
-/// * `Ok(())`      - If the unstage completed.
-/// * `Err(String)` - If the path exists neither in the inventory nor in the head.
+/// * `Ok(())`      - If the unstage completed (including the vacuous-heal no-op case above).
+/// * `Err(String)` - If the path exists neither in the inventory nor in the head, and is not a
+///                   vacuous-heal case.
 fn restore_staged(path: &WarehousePath, command: &str) -> Result<(), String> {
     let pallet = pallet_utils::get_current_pallet_name()?;
     let head = pallet_utils::get_pallet_head(&pallet)?;
@@ -275,6 +287,32 @@ fn restore_staged(path: &WarehousePath, command: &str) -> Result<(), String> {
         }
         Some(HeadEntry::Tree { .. }) => unreachable!("directories are handled above"),
         None => {
+            // Before treating this as the ordinary "neither in inventory nor head" refusal:
+            // if literally nothing is staged anywhere under `path` (as either a lone file entry
+            // in its parent's shard, or a directory subtree), abandoning it is a no-op — the
+            // only real effect left to have is clearing whatever recorded incomplete-load root
+            // this path is entangled with, if any. `nothing_staged_under` is worth paying even
+            // when no marker turns out to be involved (`healed` then comes back empty and this
+            // falls through to the unchanged ordinary path below) — it is a metadata scan plus,
+            // at most, a few small shard reads, not proportional to warehouse size.
+            if nothing_staged_under(path)? {
+                let healed = load_guard_utils::clear_recorded_involving(path.as_key());
+
+                if !healed.is_empty() {
+                    let roots = healed.iter()
+                        .map(|key| format!("\"{}\"", if key.is_empty() { "./" } else { key }))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+
+                    output::message(command, format!(
+                        "Nothing was staged under \"{}\"; cleared the incomplete-load record for {}.",
+                        path.as_key(), roots
+                    ));
+
+                    return Ok(());
+                }
+            }
+
             let mut removed = false;
 
             inventory_utils::update_shard(parent.as_key(), |inventory| {
@@ -294,6 +332,53 @@ fn restore_staged(path: &WarehousePath, command: &str) -> Result<(), String> {
     output::message(command, format!("Unstaged \"{}\".", path.as_key()));
 
     Ok(())
+}
+
+/// Whether literally nothing is staged under `path`, checked both ways `path` could name
+/// something: as a plain file entry inside its parent's shard, or as a directory whose subtree
+/// (its own shard, or any nested one) carries at least one entry (of *any* state, including
+/// `Deleted` — a staged removal is still real staged content, not nothing).
+///
+/// # Returns
+/// * `Ok(true)`    - Nothing is staged under `path`, in either sense.
+/// * `Ok(false)`   - A parent-shard file entry, or at least one entry in some covered shard,
+///                   exists.
+/// * `Err(String)` - A shard could not be read or parsed.
+fn nothing_staged_under(path: &WarehousePath) -> Result<bool, String> {
+    if !path.is_root() {
+        let (parent, file_name) = path.split_parent()?;
+        let (_, bytes_opt) = file_utils::retrieve_inventory_or_none_by_key(parent.as_key())?;
+
+        if let Some(bytes) = bytes_opt {
+            let inventory = forklift_core::parser::inventory::inventory_parser::parse_inventory(&bytes)?;
+
+            if inventory.get_item_by_name(&file_name).is_some() {
+                return Ok(false);
+            }
+        }
+    }
+
+    let (_, metadata_opt) = file_utils::retrieve_inventory_metadata_or_none()?;
+    let Some(metadata) = metadata_opt else { return Ok(true) };
+
+    for entry in &metadata {
+        let shard_key = inventory_utils::metadata_entry_to_key(entry);
+
+        if !path_utils::covers(path.as_key(), shard_key) {
+            continue;
+        }
+
+        let (_, bytes_opt) = file_utils::retrieve_inventory_or_none_by_key(shard_key)?;
+
+        let Some(bytes) = bytes_opt else { continue };
+        let inventory = forklift_core::parser::inventory::inventory_parser::parse_inventory(&bytes)?;
+
+        if inventory.get_items_count() > 0 {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
 }
 
 /// Build stale-stat inventory shards for a head subtree (see `build_stale_inventory_item`).

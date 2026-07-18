@@ -229,7 +229,7 @@ pub fn write_shard_mutation_with_extra(key: &str,
 
     if let Some(parent) = extra_path.parent() {
         if !parent.as_os_str().is_empty() {
-            file_utils::create_folder_if_not_exists(&parent.to_path_buf())?;
+            file_utils::create_folder_if_not_exists(parent)?;
         }
     }
     batch.stage(extra_path, extra_content)?;

@@ -188,7 +188,9 @@ inventory. Two remedies clear an affected marker: re-running `load` over the sam
 path, or `restore --staged` (or `unload`) over a path that covers it — the second one
 abandons the incomplete load instead of finishing it. Any command that resets the
 whole staging area (`shift`, `park`'s own reset back to the pallet head, and the
-like) clears every recorded marker at once, the same way.
+like) clears every recorded marker at once, the same way. A directory that failed
+before anything of its own ever got staged has nothing to reset — `restore --staged`
+over it still succeeds, as a no-op that just clears the marker.
 
 ### `unload` — unstage (`ul`)
 

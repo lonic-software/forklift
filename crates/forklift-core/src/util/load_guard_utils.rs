@@ -89,11 +89,17 @@
 //!   *entire* staging area from a known-good tree — call [`clear_all_recorded`]. Both are wired
 //!   once, inside `inventory_utils::replace_subtree_inventories` and `inventory_utils::
 //!   replace_all_inventories` respectively, so every caller of either gets this for free.
+//! * **At a vacuous `restore --staged`** ([`clear_recorded_involving`]): a target path that is
+//!   neither in the inventory nor in the pallet head is ordinarily a plain error — but when it
+//!   also has zero staged entries anywhere beneath it, there is no subtree to rebuild at all, and
+//!   the rule above (only clear what an operation covers) is too narrow: a recorded root
+//!   *broader* than the target is just as moot as one narrower. See
+//!   [`clear_recorded_involving`]'s own doc comment for the soundness argument.
 //!
-//! Removal is always best-effort (`marker_utils::remove_covered_by`/`clear` swallow every
-//! error): a marker that resurrects after a crash right after a successful removal fails in the
-//! safe direction — the next check still refuses, and the remedy is one cheap re-load or
-//! `restore --staged`.
+//! Removal is always best-effort (`marker_utils::remove_covered_by`/`remove_involving`/`clear`
+//! swallow every error): a marker that resurrects after a crash right after a successful removal
+//! fails in the safe direction — the next check still refuses, and the remedy is one cheap
+//! re-load or `restore --staged`.
 //!
 //! ## Malformed marker
 //!
@@ -190,6 +196,41 @@ pub fn mark_load_completed(root_key: &str) {
 /// comment's clearing-scope section. Best-effort (see [`mark_load_completed`]'s doc comment).
 pub fn clear_recorded_under(root_key: &str) {
     marker_utils::remove_covered_by(&marker_path(), root_key);
+}
+
+/// Record that `target_key` has nothing at all staged under it — for `restore --staged`'s
+/// vacuous-heal special case (see `restore::restore_staged`'s doc comment): a target path that
+/// would otherwise be neither in the inventory nor in the pallet head, but turns out to have zero
+/// staged entries anywhere beneath it once the caller checks.
+///
+/// Clears every recorded root that stands in a `covers` relationship with `target_key` in
+/// *either* direction — not just the ones `target_key` covers ([`clear_recorded_under`]'s
+/// narrower rule, which only handles a reset that *rebuilt* a subtree from a known-good source).
+/// A recorded root only exists to protect against a load that decided *some* of a region's
+/// content but not all of it — a partial, inconsistent aggregate a `stack`/`park` must not
+/// silently commit. Two properties of the load path rule that out for a region with zero staged
+/// entries:
+/// * A per-directory load task is atomic: it either fully decides and publishes that one
+///   directory's own shard, or (on any error partway through its own file list) publishes
+///   nothing for it at all — never a partial shard missing some of its own entries (see
+///   `inventory_utils::build_inventory`'s per-entry loop, gated end-to-end by `?`).
+/// * The pass that could otherwise erase a directory's *pre-existing* entries (treating a
+///   still-"dirty" shard as gone and marking every entry deleted) only ever runs after a fully
+///   successful walk (`inventory_utils::create_inventory_for_directory`'s `if result.is_ok()`
+///   gate) — a failed load never reaches it, so it can never erase content it did not fully
+///   re-process.
+///
+/// Together: if every shard at or under `target_key` has zero entries right now, no failed load
+/// published anything there, and nothing pre-existed there to have been partially updated —
+/// there is no partial state anywhere in `target_key`'s region for any covering-or-covered
+/// recorded root to be protecting. Best-effort (see [`mark_load_completed`]'s doc comment).
+///
+/// # Returns
+/// The recorded root(s) actually cleared — empty when `target_key` was not entangled with any
+/// recorded root at all, the signal a caller uses to fall back to its ordinary, unrelated-path
+/// handling instead of reporting a heal.
+pub fn clear_recorded_involving(target_key: &str) -> BTreeSet<String> {
+    marker_utils::remove_involving(&marker_path(), target_key)
 }
 
 /// Record that the *entire* staging area is now known-consistent — every operation that replaces

@@ -162,6 +162,30 @@ pub fn remove_covered_by(path: &Path, by: &str) {
     }
 }
 
+/// Remove every recorded entry that stands in a [`covers`](path_utils::covers) relationship with
+/// `target` in *either* direction — the entry covers `target`, or `target` covers the entry —
+/// durably, best-effort (same failure-direction contract as [`remove_covered_by`]).
+///
+/// # Returns
+/// The entries actually removed (empty if none were, including on a read failure — same
+/// best-effort contract as [`remove_covered_by`]) — for a caller that wants to report which
+/// record(s) it healed. Computed against whatever was actually read, so it reflects reality even
+/// if the eventual write then fails (that failure still leaves the marker exactly as it was, per
+/// the module doc comment — this return value describes what *should* have changed, matching
+/// [`remove_covered_by`]'s own best-effort framing).
+pub fn remove_involving(path: &Path, target: &str) -> BTreeSet<String> {
+    let Ok(existing) = read(path) else { return BTreeSet::new() };
+
+    let (removed, kept): (BTreeSet<String>, BTreeSet<String>) = existing.into_iter()
+        .partition(|recorded| path_utils::covers(recorded, target) || path_utils::covers(target, recorded));
+
+    if !removed.is_empty() {
+        let _ = write_bytes_or_clear(path, &kept);
+    }
+
+    removed
+}
+
 /// Unconditionally clear the marker, best-effort — see [`remove_covered_by`]'s doc comment on
 /// why failures are swallowed here too.
 pub fn clear(path: &Path) {
@@ -189,7 +213,7 @@ fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
 fn ensure_parent_folder(path: &Path) -> Result<(), String> {
     match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() =>
-            file_utils::create_folder_if_not_exists(&parent.to_path_buf()).map(|_| ()),
+            file_utils::create_folder_if_not_exists(parent).map(|_| ()),
         _ => Ok(()),
     }
 }
@@ -272,6 +296,36 @@ mod tests {
         remove_covered_by(&path, ""); // the empty key covers everything
         assert!(!path.exists());
         assert_eq!(read(&path).unwrap(), BTreeSet::new());
+    }
+
+    #[test]
+    fn remove_involving_removes_a_broader_entry_that_covers_the_target() {
+        let path = scratch("involving-broader");
+        add(&path, "").unwrap(); // the whole warehouse
+
+        let removed = remove_involving(&path, "bigdir"); // "" covers "bigdir"
+        assert_eq!(removed, BTreeSet::from(["".to_string()]));
+        assert_eq!(read(&path).unwrap(), BTreeSet::new());
+    }
+
+    #[test]
+    fn remove_involving_removes_a_narrower_entry_the_target_covers() {
+        let path = scratch("involving-narrower");
+        add(&path, "src/api").unwrap();
+
+        let removed = remove_involving(&path, "src"); // "src" covers "src/api"
+        assert_eq!(removed, BTreeSet::from(["src/api".to_string()]));
+        assert_eq!(read(&path).unwrap(), BTreeSet::new());
+    }
+
+    #[test]
+    fn remove_involving_leaves_disjoint_entries_alone() {
+        let path = scratch("involving-disjoint");
+        add(&path, "docs").unwrap();
+
+        let removed = remove_involving(&path, "src"); // neither covers the other
+        assert!(removed.is_empty());
+        assert_eq!(read(&path).unwrap(), BTreeSet::from(["docs".to_string()]));
     }
 
     #[test]

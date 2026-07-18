@@ -3426,6 +3426,50 @@ fn restore_staged_of_a_narrower_path_does_not_heal_a_broader_recorded_root() {
     std::fs::set_permissions(&blocked_path, std::fs::Permissions::from_mode(0o644)).unwrap();
 }
 
+/// The vacuous corner of the same recovery path: a virgin warehouse's very first load fails
+/// entirely inside one directory (its only file is unreadable, so that directory never gets a
+/// shard at all) while a sibling directory succeeds. Abandoning the failed directory via
+/// `restore --staged` has nothing to reset (it was never staged) and nothing to abandon (nothing
+/// landed there) — it must succeed as a heal-no-op instead of failing with "neither in the
+/// inventory nor in the pallet head" while leaving the marker (and the guard) stuck forever. See
+/// `restore_staged_of_a_narrower_path_does_not_heal_a_broader_recorded_root` above for the
+/// guard: restoring a path that *does* carry real staged content keeps today's ordinary
+/// real-restore behavior (the marker survives) rather than taking this no-op path.
+#[cfg(unix)]
+#[test]
+fn restore_staged_of_a_vacuous_failed_directory_heals_as_a_no_op() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let warehouse = TestWarehouse::new("incomplete-load-restore-vacuous");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    warehouse.write_file("good/ok.txt", "fine\n");
+    warehouse.write_file("bigdir/blocked.txt", "unreadable\n");
+    let blocked_path = warehouse.root.join("bigdir").join("blocked.txt");
+    std::fs::set_permissions(&blocked_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    assert!(!warehouse.run(&["load", "."]).status.success());
+    assert!(incomplete_load_marker_path(&warehouse).exists());
+
+    let restored = warehouse.run(&["restore", "--staged", "bigdir", "--json"]);
+    assert_success(&restored);
+    let value = json(&restored);
+    assert!(
+        value["data"]["message"].as_str().unwrap().contains("Nothing was staged"),
+        "reports the heal-no-op: {}", value
+    );
+
+    assert!(
+        !incomplete_load_marker_path(&warehouse).exists(),
+        "restoring the vacuous failed directory must clear the recorded root"
+    );
+
+    assert_success(&warehouse.run(&["stack", "clean"]));
+
+    std::fs::set_permissions(&blocked_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+}
+
 /// A hand-corrupted marker must never become the very thing its own remedy is blocked on —
 /// `load` (the write side) self-heals by overwriting it — but a `stack` about to durably commit
 /// (the check side) must fail closed rather than silently treat unreadable content as "nothing
