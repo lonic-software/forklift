@@ -11,6 +11,7 @@ use regex::Regex;
 use crate::enums::dir_entry_type::DirEntryType;
 use crate::globals::{bay_root, forklift_root, FOLDER_NAME_GRAPH_ROOT, FOLDER_NAME_INVENTORY_ROOT, FOLDER_NAME_OBJECTS_ROOT};
 use crate::util::byte_utils;
+use crate::util::taint_utils;
 
 /// The number of characters in an object hash that are used for creating the folders.
 /// The remaining characters are used for the file name.
@@ -249,6 +250,18 @@ pub fn sync_dir(dir: &Path) -> Result<(), String> {
         if !fsync_enabled() {
             return Ok(());
         }
+
+        #[cfg(test)]
+        if let Some(injected) = SYNC_DIR_FAULT.with(|f| {
+            let mut f = f.borrow_mut();
+            f.attempted.push(dir.to_path_buf());
+            f.fail_needle.as_deref()
+                .filter(|needle| dir.to_string_lossy().contains(needle))
+                .map(|_| format!("injected directory-sync failure for \"{}\"", dir.to_string_lossy()))
+        }) {
+            return Err(injected);
+        }
+
         std::fs::File::open(dir)
             .and_then(|handle| handle.sync_all())
             .map_err(|e| format!("Error while syncing directory \"{}\": {}", dir.to_string_lossy(), e))
@@ -257,6 +270,160 @@ pub fn sync_dir(dir: &Path) -> Result<(), String> {
     {
         let _ = dir;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only fault injection for [`sync_dir`] itself (the single-directory case — the
+    /// immediate write path's own sync and the pack write's own sync both call it directly,
+    /// unlike the batched barrier's aggregated [`sync_touched_directories`], which has its own
+    /// separate rig, [`DIR_SYNC_FAULT`]). Same shape as that rig: records every directory path
+    /// it is asked to sync, in call order, and can be armed to fail for paths containing a given
+    /// substring instead of touching the filesystem. `pub(crate)`-visible guard/accessor below so
+    /// `pack_utils`'s tests (a different module, same crate, same `--cfg test` unit-test binary)
+    /// can drive it too.
+    static SYNC_DIR_FAULT: std::cell::RefCell<DirSyncFaultState> =
+        const { std::cell::RefCell::new(DirSyncFaultState { attempted: Vec::new(), fail_needle: None }) };
+}
+
+/// RAII scope for [`SYNC_DIR_FAULT`]: both construction and `Drop` reset this thread's state, so
+/// neither a stale guard from a previous test on a reused thread, nor this guard's own arming
+/// once the test that created it is done, can bleed into another test. `pub(crate)` for the same
+/// cross-module reason as [`SYNC_DIR_FAULT`] itself.
+#[cfg(test)]
+pub(crate) struct SyncDirFaultGuard;
+
+#[cfg(test)]
+impl SyncDirFaultGuard {
+    /// Record every directory [`sync_dir`] is asked to sync; fail none of them.
+    pub(crate) fn recording() -> Self {
+        SYNC_DIR_FAULT.with(|f| *f.borrow_mut() = DirSyncFaultState { attempted: Vec::new(), fail_needle: None });
+        SyncDirFaultGuard
+    }
+
+    /// Record every directory, and fail (with a distinctive error, no filesystem access) any
+    /// whose path contains `needle`.
+    pub(crate) fn failing(needle: &str) -> Self {
+        SYNC_DIR_FAULT.with(|f| *f.borrow_mut() = DirSyncFaultState {
+            attempted: Vec::new(),
+            fail_needle: Some(needle.to_string()),
+        });
+        SyncDirFaultGuard
+    }
+}
+
+#[cfg(test)]
+impl Drop for SyncDirFaultGuard {
+    fn drop(&mut self) {
+        SYNC_DIR_FAULT.with(|f| *f.borrow_mut() = DirSyncFaultState { attempted: Vec::new(), fail_needle: None });
+    }
+}
+
+/// The directories [`sync_dir`] has been asked to sync on this thread since the current
+/// [`SyncDirFaultGuard`] was armed, in call order.
+#[cfg(test)]
+pub(crate) fn sync_dir_attempts() -> Vec<PathBuf> {
+    SYNC_DIR_FAULT.with(|f| f.borrow().attempted.clone())
+}
+
+/// The single routine every post-rename directory-sync failure point in this store reports
+/// through: given the already-attempted `Result` of syncing the directory (or directories) a
+/// rename just landed in, and the exact FINAL object paths — never a temp, never a parent, the
+/// schema [`taint_utils::record_taint`] expects — whose durability that sync was supposed to
+/// prove:
+///
+/// - On failure: records a taint for `final_paths` and returns the sync error, with the taint
+///   write's own failure (if any) appended, never substituted — the same append-never-substitute
+///   discipline [`run_write_barrier`]'s rename-failure path already uses for its own combined
+///   error (see [`taint_after_sync_failure`]).
+/// - On success: the durable-taint re-check — refuses if a taint happens to already be standing
+///   for the storage root that owns `final_paths`, so a caller only reports `Ok` once both the
+///   sync and the re-check have passed (see [`taint_recheck`]). Every recorder that durably
+///   records a reference off the back of this call (a pallet head, a parked-list entry) must
+///   write that reference only after this returns `Ok`.
+///
+/// Both halves are no-ops beyond returning `sync_result` unchanged on failure, or always
+/// `Ok(())` on success — unless [`taint_utils::activate`] has been called in this process: both
+/// [`taint_utils::record_taint`] and [`taint_utils::read_taints`] (which the re-check goes
+/// through) gate themselves on activation, so an unactivated process sees no behavior change
+/// from this routine's existence at all.
+fn sync_result_or_taint(sync_result: Result<(), String>, final_paths: &[&Path]) -> Result<(), String> {
+    match sync_result {
+        Ok(()) => taint_recheck(final_paths),
+        Err(sync_error) => Err(taint_after_sync_failure(sync_error, final_paths)),
+    }
+}
+
+/// Convenience form of [`sync_result_or_taint`] for the common single-directory case: syncs
+/// `dir` and folds the result through the same taint-or-recheck decision. `pub(crate)` so the
+/// pack write's own directory sync (`pack_utils`) can share it; the immediate write path below
+/// uses it directly.
+pub(crate) fn sync_dir_or_taint(dir: &Path, final_paths: &[&Path]) -> Result<(), String> {
+    sync_result_or_taint(sync_dir(dir), final_paths)
+}
+
+/// Record a taint for `final_paths` after a directory sync just failed, folding the taint
+/// write's own failure (if any) into the returned message — appended after the original sync
+/// error, never in its place, so a caller always sees the failure that actually blocked its
+/// write first. A no-op recording (the original error returns unchanged) unless
+/// [`taint_utils::activate`] has been called in this process — see
+/// [`taint_utils::record_taint`]'s own doc comment.
+fn taint_after_sync_failure(sync_error: String, final_paths: &[&Path]) -> String {
+    match taint_utils::record_taint(final_paths) {
+        Ok(()) => sync_error,
+        Err(taint_error) => format!(
+            "{} (additionally, failed to record a durability taint for the affected object(s): {})",
+            sync_error, taint_error
+        ),
+    }
+}
+
+/// The durable-taint re-check on a directory sync's success path: refuse if a taint is already
+/// standing for the storage root that owns `final_paths` — closing the window between a failed
+/// sync elsewhere (this process's own earlier failure, or a sibling process's, since this reads
+/// the durable taint files rather than only the in-memory gate [`taint_utils::gate_check`]
+/// covers) and this call's own success. A recorder must not durably reference anything this call
+/// covered until it has returned `Ok`.
+///
+/// Skipped silently — the same scope tolerance [`taint_utils::record_taint`] documents — when no
+/// storage root resolves, or `final_paths` are not actually under one (the shape a bare-path
+/// unit test's paths take, having never entered a storage-root scope at all): there is no
+/// warehouse whose taint state this call could sensibly consult. A no-op — always `Ok(())` —
+/// unless [`taint_utils::activate`] has been called in this process: [`taint_utils::read_taints`]
+/// gates itself on activation, so this inherits that without a separate check, and in the
+/// overwhelmingly common case (no taint directory at all) it costs one `stat`.
+fn taint_recheck(final_paths: &[&Path]) -> Result<(), String> {
+    let Some(root) = resolve_taint_root(final_paths) else {
+        return Ok(());
+    };
+
+    let state = taint_utils::read_taints(&root)?;
+    if state.recorded.is_empty() && !state.torn {
+        return Ok(());
+    }
+
+    Err(format!(
+        "{} under \"{}\"; existence cannot be trusted here until it is healed.",
+        taint_utils::GATE_TAINT_MARKER, root.to_string_lossy()
+    ))
+}
+
+/// Resolve the storage root that should own every path in `final_paths`, mirroring
+/// [`taint_utils::record_taint`]'s own resolution and all-or-nothing scope tolerance: `None`
+/// when `final_paths` is empty, or when any single path is not actually under [`forklift_root`]
+/// — the shape a bare-path unit test's own paths take — in which case there is no root whose
+/// taint state a caller could sensibly consult.
+fn resolve_taint_root(final_paths: &[&Path]) -> Option<PathBuf> {
+    if final_paths.is_empty() {
+        return None;
+    }
+
+    let root = forklift_root();
+    if final_paths.iter().all(|path| path.strip_prefix(&root).is_ok()) {
+        Some(root)
+    } else {
+        None
     }
 }
 
@@ -324,8 +491,17 @@ fn temp_path_for(file_path: &Path) -> Result<PathBuf, String> {
 /// * `content`   - The content to write.
 ///
 /// # Returns
-/// * `Ok(())`      - If the file was written successfully.
-/// * `Err(String)` - If an error occurred while writing the file.
+/// * `Ok(())`      - The file was written, renamed into place, and its directory entry's own
+///                   durability was proven — including the taint re-check below, if
+///                   `taint_utils::activate` has been called in this process (see
+///                   `sync_dir_or_taint`); an unactivated process sees no change here.
+/// * `Err(String)` - Either the write/rename itself failed (nothing is visible at `file_path`),
+///                   or the rename succeeded but the following directory sync failed — `file_path`
+///                   is then visible with its directory entry's durability unproven, and (once
+///                   activated) that fact is recorded as a taint; or the directory sync itself
+///                   succeeded but a taint was already standing for this root, in which case
+///                   `file_path`'s directory entry was never re-attempted and the caller must not
+///                   trust it as durable.
 pub fn write_file_atomically(file_path: &Path, content: &[u8]) -> Result<(), String> {
     let temporary_file_path = temp_path_for(file_path)?;
 
@@ -350,17 +526,21 @@ pub fn write_file_atomically(file_path: &Path, content: &[u8]) -> Result<(), Str
     )?;
 
     // The rename is only durable once the directory entry recording the new name is on disk;
-    // otherwise a power loss can undo it even though the file's bytes were already synced.
+    // otherwise a power loss can undo it even though the file's bytes were already synced. A
+    // sync failure here taints `file_path`; a sync success is re-checked against any taint
+    // already standing for this root before this function may report `Ok` — see
+    // `sync_dir_or_taint`.
     match file_path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => sync_dir(parent)?,
+        Some(parent) if !parent.as_os_str().is_empty() => sync_dir_or_taint(parent, &[file_path])?,
         _ => (),
     };
 
-    // Counted only once every step above has actually succeeded — see `BARRIER_COUNT`'s doc
-    // comment ("one per *completed* barrier"). A caller that hit the `?` above already got the
-    // error; nothing durable was left half-finished for this counter to over-report. Gated by
-    // `fsync_enabled` like the fsync/directory-sync steps above: with fsync off, this rename paid
-    // no durability wait at all, so it is not the barrier the counter exists to measure.
+    // Counted only once every step above — including the taint re-check — has actually
+    // succeeded — see `BARRIER_COUNT`'s doc comment ("one per *completed* barrier"). A caller
+    // that hit the `?` above already got the error; nothing durable was left half-finished for
+    // this counter to over-report. Gated by `fsync_enabled` like the fsync/directory-sync steps
+    // above: with fsync off, this rename paid no durability wait at all, so it is not the
+    // barrier the counter exists to measure.
     if fsync_enabled() {
         BARRIER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
@@ -481,7 +661,13 @@ impl BulkStoreSession {
     /// macOS only queues the write to the drive, and the shared device-cache flush that actually
     /// confers durability runs afterward and has its own error suppressed once an earlier
     /// per-directory error is already recorded (see [`sync_touched_directories`]'s doc comment).
+    /// Both of those two remaining cases now record a durability taint for exactly the final paths
+    /// left in that unproven state, and a directory sync that *succeeds* is re-checked against any
+    /// taint already standing for this root before this function may return `Ok` — see
+    /// `sync_result_or_taint` — though both halves stay dormant (no taint file, no re-check, no
+    /// behavior change at all) unless `taint_utils::activate` has been called in this process.
     ///
+
     /// Unlike the *pack* folder, the loose store has no sweeper *dedicated* to `.tmp` names
     /// (`pack_utils` has one, for its own `.compact-*.tmp` staging files — see
     /// `remove_stale_temp_files`) — but a loose-store temp left behind by a hard kill (rather
@@ -541,6 +727,10 @@ fn run_write_barrier(pending: &[(PathBuf, PathBuf)]) -> Result<(), String> {
 
     let mut touched_parents: BTreeSet<PathBuf> = BTreeSet::new();
     let mut first_renamed: Option<&Path> = None;
+    // Every final path successfully renamed so far, in rename order — the visible prefix a
+    // rename failure below must taint (never the whole batch: entries after the failure never
+    // became visible at all).
+    let mut renamed_finals: Vec<&Path> = Vec::new();
     for (temp, final_path) in pending {
         if let Err(e) = std::fs::rename(temp, final_path) {
             let rename_error = format!(
@@ -560,6 +750,11 @@ fn run_write_barrier(pending: &[(PathBuf, PathBuf)]) -> Result<(), String> {
             if fsync_enabled() && !touched_parents.is_empty() {
                 if let Some(flush_via) = first_renamed {
                     if let Err(sync_error) = sync_touched_directories(&touched_parents, flush_via) {
+                        // Taints exactly `renamed_finals` — the visible prefix — never the
+                        // entries after the failure, which never became visible. Appends (never
+                        // substitutes) the taint write's own failure, if any — see
+                        // `taint_after_sync_failure`.
+                        let sync_error = taint_after_sync_failure(sync_error, &renamed_finals);
                         return Err(format!(
                             "{} (additionally, failed to sync the directories of entries already \
                             renamed before this failure: {})", rename_error, sync_error
@@ -574,6 +769,7 @@ fn run_write_barrier(pending: &[(PathBuf, PathBuf)]) -> Result<(), String> {
         if first_renamed.is_none() {
             first_renamed = Some(final_path.as_path());
         }
+        renamed_finals.push(final_path.as_path());
         if let Some(parent) = final_path.parent() {
             if !parent.as_os_str().is_empty() {
                 touched_parents.insert(parent.to_path_buf());
@@ -594,16 +790,21 @@ fn run_write_barrier(pending: &[(PathBuf, PathBuf)]) -> Result<(), String> {
         // `sync_touched_directories`'s own doc comment) — a caller catching this error still had
         // every reachable directory *attempted*, not just a prefix (only the first failure is
         // reported, so a later directory may also have failed its own fsync).
-        sync_touched_directories(&touched_parents, &pending[0].1)?;
+        //
+        // Every rename above ran, so on failure this taints the batch's full set of final paths
+        // (`renamed_finals` now covers every entry in `pending`); on success it re-checks for a
+        // standing taint before this function may return `Ok` — see `sync_result_or_taint`.
+        sync_result_or_taint(sync_touched_directories(&touched_parents, &pending[0].1), &renamed_finals)?;
     }
 
     // One barrier no matter how many files `pending` covers — see `BARRIER_COUNT`'s doc comment.
-    // Counted only here, after every step above has actually succeeded (every failure path above
-    // already returned past this point): both callers only ever reach this function with a
-    // non-empty `pending` (each checks first), so this never double-counts an
-    // empty `finish()` that had nothing staged, and never counts a barrier that failed partway.
-    // Gated by `fsync_enabled`, exactly like steps 1-2 and 4 above: with fsync off, the rename
-    // loop (step 3) is the only work that actually ran, and it paid no durability wait to amortize.
+    // Counted only here, after every step above — including the taint re-check just above — has
+    // actually succeeded (every failure path above already returned past this point): both
+    // callers only ever reach this function with a non-empty `pending` (each checks first), so
+    // this never double-counts an empty `finish()` that had nothing staged, and never counts a
+    // barrier that failed partway. Gated by `fsync_enabled`, exactly like steps 1-2 and 4 above:
+    // with fsync off, the rename loop (step 3) is the only work that actually ran, and it paid no
+    // durability wait to amortize.
     if fsync_enabled() {
         BARRIER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
@@ -1039,7 +1240,11 @@ impl WriteBatch {
     /// successful path, not a diff over the whole batch recomputed on every call.
     ///
     /// # Returns
-    /// * `Ok(())`      - Every staged write is durable and visible at its final path.
+    /// * `Ok(())`      - Every staged write is durable and visible at its final path, and (once
+    ///                   [`taint_utils::activate`] has been called in this process) no durability
+    ///                   taint was found standing for this batch's storage root on the re-check
+    ///                   that runs right before this returns — see [`sync_result_or_taint`]. An
+    ///                   unactivated process skips that re-check entirely.
     /// * `Err(String)` - A reserved path was never staged, or a temp-fsync, rename, or
     ///                   directory-sync step of the barrier failed. Either way the batch is dead:
     ///                   every remaining staged temp was best-effort removed before returning, so
@@ -1058,10 +1263,15 @@ impl WriteBatch {
     ///                   record of which case applies — the caller must
     ///                   treat the whole batch as unpublished. A failed `finish` can also leave
     ///                   names visible whose directory entries are not proven durable (the
-    ///                   trailing-sync case above); a retry that dedupes via [`does_object_exist`]
-    ///                   will see such a name and treat it as already stored. Callers whose retry
-    ///                   correctness depends on visible-implies-durable must not rely on that
-    ///                   after a failed `finish`.
+    ///                   trailing-sync case above, and the rename-failure case's own visible
+    ///                   prefix); a retry that dedupes via [`does_object_exist`] will see such a
+    ///                   name and treat it as already stored. Callers whose retry correctness
+    ///                   depends on visible-implies-durable must not rely on that after a failed
+    ///                   `finish` unless [`taint_utils::activate`] has been called: activated, both
+    ///                   of those directory-sync failures record a durability taint for exactly the
+    ///                   affected final paths (see [`taint_after_sync_failure`]), which
+    ///                   [`does_object_exist`]'s own gate then refuses to answer past rather than
+    ///                   silently trusting.
     pub fn finish(&self) -> Result<(), String> {
         let (pending, leaked) = {
             let mut state = self.state.lock().expect("write batch lock poisoned");
@@ -1515,18 +1725,40 @@ pub fn get_inventory_data_path_for_key(key: &str) -> PathBuf {
 
 /// Check if an object with the given hash exists.
 ///
+/// A pack-registry hit answers `true` with **no** taint-gate check at all, deliberately: the
+/// registry is process-local memory, reloaded from disk only at process startup (and on a
+/// reload-on-miss — see [`read_object_uncached`]), so a crash that could have lost a pack's
+/// dentry also clears whatever this process's registry remembers about it. There is no stale
+/// in-memory "yes" here that could outlive the crash it would need to survive, so the taint gate
+/// (which exists precisely to catch such a stale "yes") has nothing to add on that path.
+///
+/// Only past that shortcut — a loose-path answer — does this consult
+/// [`taint_utils::gate_check`]: the process-local, per-root belt that trips while a taint *this
+/// process* has recorded (or seen recorded) for the root is still standing. That is
+/// intentionally the weakest of the taint design's layers — it does not see a sibling process's
+/// taint — the stronger, disk-backed checks are a future storage-scope entry-heal, plus every
+/// write path's own re-check on its sync's success path (see [`sync_result_or_taint`]) before it
+/// may report `Ok`. A no-op unless [`taint_utils::activate`] has been called in this process.
+///
 /// # Arguments
 /// * `hash` - The hash of the object to check.
 ///
 /// # Returns
 /// * `Ok(true)`    - If the object exists.
 /// * `Ok(false)`   - If the object does not exist.
-/// * `Err(String)` - If an error occurred while checking if the object exists.
+/// * `Err(String)` - If an error occurred while checking if the object exists, or (loose-path
+///                   only, and only once activated) a durability taint is standing for this
+///                   root — never a false "does not exist" in that case.
 pub fn does_object_exist(hash: &str) -> Result<bool, String> {
-    // Packs first: a resident-index lookup is syscall-free, so a packed object needs no stat.
+    // Packs first: a resident-index lookup is syscall-free, so a packed object needs no stat —
+    // and, as this function's own doc comment explains, no taint-gate check either.
     if crate::util::pack_utils::is_in_packs(hash)? {
         return Ok(true);
     }
+
+    // A standing taint means a loose-path "yes" cannot be trusted until it is healed — refuse
+    // rather than silently answering as if nothing had happened.
+    taint_utils::gate_check(&forklift_root())?;
 
     // Otherwise it may be loose (written but not yet packed).
     let (path, file_name) = get_path_for_object(hash)?;
@@ -1984,6 +2216,24 @@ mod tests {
         std::fs::write(temp.join("entry"), b"x").unwrap();
 
         assert!(sync_dir(&temp).is_ok(), "fsync of an existing directory should succeed");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sync_dir_fault_guard_recording_mode_observes_without_failing() {
+        // Pins `SyncDirFaultGuard`'s own "recording" mode (mirrors `DirSyncFaultGuard`'s and
+        // `taint_utils::TaintFaultGuard`'s equivalents): the sync still succeeds, and the
+        // attempted path is still observable.
+        let temp = std::env::temp_dir()
+            .join(format!("forklift-syncdir-fault-recording-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+
+        let _guard = SyncDirFaultGuard::recording();
+        assert!(sync_dir(&temp).is_ok(), "a successful sync must still succeed while only recording");
+        assert_eq!(sync_dir_attempts(), vec![temp.clone()], "the attempted path must still be observed");
 
         std::fs::remove_dir_all(&temp).ok();
     }
@@ -2701,6 +2951,320 @@ mod tests {
         assert!(rename_pos < sync_pos,
             "the rename error must lead the message, with the sync error appended after it, got: {}", error);
         assert_eq!(rename_pos, 0, "the rename error must be at the very start of the message, got: {}", error);
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    // Durable-taint wiring tests: `sync_result_or_taint`/`sync_dir_or_taint`/`taint_after_sync_failure`/
+    // `taint_recheck` at every fire site, plus the `does_object_exist` gate. Every test that needs
+    // to observe activation (on OR deliberately off) shares `taint_utils::ACTIVATION_TEST_LOCK` —
+    // the same lock `taint_utils`'s own tests use — via `lock_taint_activation` below, following
+    // `taint_utils`'s own tests' pattern: `ACTIVATED` is process-global, so two tests toggling it
+    // concurrently would race without a shared lock. A test whose paths never enter a `StorageRootScope` is
+    // unaffected by activation regardless (see `record_taint`'s scope-tolerance doc comment) —
+    // which is why every *other* test in this module, none of which touch this lock, stays safe
+    // even if some other test elsewhere in this binary has already activated the process.
+
+    fn lock_taint_activation() -> std::sync::MutexGuard<'static, ()> {
+        taint_utils::ACTIVATION_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_batch_trailing_sync_failure_taints_the_batchs_final_paths_once_activated() {
+        // Fire-site a(i): every rename in the batch ran, but the barrier's own trailing directory
+        // sync then failed. Reverting the `sync_result_or_taint` wiring in `run_write_barrier`'s
+        // trailing-sync step back to a bare `sync_touched_directories(...)?` call kills this test:
+        // no taint file would exist to read back.
+        let _serial = lock_taint_activation();
+        taint_utils::activate();
+
+        let temp = std::env::temp_dir().join(format!("forklift-taint-trailing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+        let forklift = forklift_root();
+
+        let alpha = forklift.join("objects").join("aa").join("alpha-object");
+        let beta = forklift.join("objects").join("bb").join("beta-object");
+        std::fs::create_dir_all(alpha.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(beta.parent().unwrap()).unwrap();
+
+        let batch = WriteBatch::new();
+        batch.stage(&alpha, b"alpha content").unwrap();
+        batch.stage(&beta, b"beta content").unwrap();
+
+        let _guard = DirSyncFaultGuard::failing("bb");
+        let error = batch.finish().unwrap_err();
+        assert!(error.contains("injected directory-sync failure"), "got: {}", error);
+
+        // Both renames landed — only the trailing fsync failed — so both are visible but unproven.
+        assert!(alpha.exists() && beta.exists());
+
+        let state = taint_utils::read_taints(&forklift).unwrap();
+        assert!(!state.torn, "a freshly recorded taint must not read as torn");
+        let expected: BTreeSet<PathBuf> = [
+            PathBuf::from("objects/aa/alpha-object"),
+            PathBuf::from("objects/bb/beta-object"),
+        ].into_iter().collect();
+        assert_eq!(state.recorded, expected,
+            "the taint must record exactly the batch's final paths, root-relative");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_batch_early_sync_failure_after_a_rename_failure_taints_only_the_visible_prefix() {
+        // Fire-site a(ii): a rename failure whose own early sync (over the renames that already
+        // landed) also fails. Only the prefix that actually became visible before the failure may
+        // be tainted, never the entry whose rename never ran. Reverting `renamed_finals` back to
+        // tainting the *whole* `pending` set (or dropping the `taint_after_sync_failure` call
+        // entirely) kills this test either way — the first by making `blocked-object` appear in
+        // `recorded`, the second by leaving `recorded` empty.
+        let _serial = lock_taint_activation();
+        taint_utils::activate();
+
+        let temp = std::env::temp_dir().join(format!("forklift-taint-earlysync-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+        let forklift = forklift_root();
+
+        let landed = forklift.join("objects").join("aa").join("landed-object");
+        let blocked = forklift.join("objects").join("bb").join("blocked-object");
+        std::fs::create_dir_all(landed.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(blocked.parent().unwrap()).unwrap();
+
+        let batch = WriteBatch::new();
+        batch.stage(&landed, b"landed").unwrap();
+        batch.stage(&blocked, b"never lands").unwrap();
+
+        // Sabotage the second rename: a non-empty directory at its final path fails `rename` on
+        // every platform, after the first entry's rename already succeeded.
+        std::fs::create_dir_all(blocked.join("occupant")).unwrap();
+
+        // Arm the early sync itself to fail for the one directory it will actually attempt
+        // ("aa" — `landed` is already renamed by the time the second rename fails).
+        let _guard = DirSyncFaultGuard::failing("aa");
+
+        let error = batch.finish().unwrap_err();
+        assert!(error.contains("blocked-object"), "got: {}", error);
+
+        let state = taint_utils::read_taints(&forklift).unwrap();
+        let expected: BTreeSet<PathBuf> = [PathBuf::from("objects/aa/landed-object")].into_iter().collect();
+        assert_eq!(state.recorded, expected,
+            "only the visible prefix may be tainted, never an entry that was never renamed");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_file_atomically_dir_sync_failure_taints_the_single_final_path_once_activated() {
+        // Fire-site b: `write_file_atomically`'s own immediate-path directory sync. Reverting the
+        // `sync_dir_or_taint` wiring back to a bare `sync_dir(parent)?` call kills this test.
+        let _serial = lock_taint_activation();
+        taint_utils::activate();
+
+        let temp = std::env::temp_dir().join(format!("forklift-taint-immediate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+        let forklift = forklift_root();
+
+        let target = forklift.join("objects").join("cc").join("immediate-object");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+
+        let _guard = SyncDirFaultGuard::failing("cc");
+        let error = write_file_atomically(&target, b"content").unwrap_err();
+        assert!(error.contains("injected directory-sync failure"), "got: {}", error);
+
+        assert!(target.exists(), "the rename must have landed before the directory sync failed");
+
+        let state = taint_utils::read_taints(&forklift).unwrap();
+        let expected: BTreeSet<PathBuf> = [PathBuf::from("objects/cc/immediate-object")].into_iter().collect();
+        assert_eq!(state.recorded, expected,
+            "the taint must record exactly the single final path, root-relative");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn write_batch_finish_refuses_when_a_taint_is_already_standing_once_activated() {
+        // The success-path re-check: a taint file already standing for the root (simulating a
+        // sibling write's earlier failure, or a crash survivor) must fail a batch whose own sync
+        // succeeds cleanly. Reverting the `taint_recheck` call inside
+        // `sync_result_or_taint` (i.e. returning `Ok(())` unconditionally on sync success) kills
+        // this test.
+        let _serial = lock_taint_activation();
+        taint_utils::activate();
+
+        let temp = std::env::temp_dir().join(format!("forklift-taint-recheck-batch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+        let forklift = forklift_root();
+
+        // Hand-write a complete taint file under this root, mirroring `taint_utils`'s own format
+        // (a crash-survivor / sibling-process taint neither this batch nor this process caused).
+        let taint_dir = forklift.join("taint");
+        std::fs::create_dir_all(&taint_dir).unwrap();
+        std::fs::write(taint_dir.join("taint-99999-0"), b"objects/zz/preexisting\nEND\n").unwrap();
+
+        let target = forklift.join("objects").join("dd").join("fresh-object");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+
+        let batch = WriteBatch::new();
+        batch.stage(&target, b"content").unwrap();
+        let error = batch.finish().unwrap_err();
+        assert!(error.contains(taint_utils::GATE_TAINT_MARKER),
+            "the refusal must be machine-recognizable, got: {}", error);
+
+        // The write itself (rename + directory sync) already succeeded — only the re-check
+        // refuses to let the caller report `Ok`.
+        assert!(target.exists(), "the write itself must have landed; only the re-check refuses");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn write_file_atomically_refuses_when_a_taint_is_already_standing_once_activated() {
+        // Same shape as the `WriteBatch` re-check test above, but for the immediate path — every
+        // fire site must inherit the same re-check, not just the batched one (see
+        // `sync_dir_or_taint`'s doc comment).
+        let _serial = lock_taint_activation();
+        taint_utils::activate();
+
+        let temp = std::env::temp_dir()
+            .join(format!("forklift-taint-recheck-immediate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+        let forklift = forklift_root();
+
+        let taint_dir = forklift.join("taint");
+        std::fs::create_dir_all(&taint_dir).unwrap();
+        std::fs::write(taint_dir.join("taint-99999-0"), b"objects/zz/preexisting\nEND\n").unwrap();
+
+        let target = forklift.join("objects").join("ee").join("fresh-object");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+
+        let error = write_file_atomically(&target, b"content").unwrap_err();
+        assert!(error.contains(taint_utils::GATE_TAINT_MARKER), "got: {}", error);
+        assert!(target.exists(), "the write itself must have landed; only the re-check refuses");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn does_object_exist_refuses_a_loose_check_while_tainted_but_still_answers_pack_hits() {
+        // The existence gate's documented ordering: a pack-registry hit answers with no gate
+        // check at all (the registry is process-local memory that a crash also clears); only the
+        // loose-path fallback consults the gate. Reverting the `taint_utils::gate_check` call in
+        // `does_object_exist` kills the loose-refusal half of this test; moving the gate check
+        // *before* the pack-registry lookup would kill the pack-hit half.
+        let _serial = lock_taint_activation();
+        taint_utils::activate();
+
+        let temp = std::env::temp_dir().join(format!("forklift-taint-gate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+        let forklift = forklift_root();
+
+        // A packed object, packed *before* the gate ever trips.
+        let packed_content = vec![0x22u8; 500];
+        let packed_hash = blake3::hash(&packed_content).to_hex().to_string();
+        let compressed = zstd::encode_all(packed_content.as_slice(), 0).unwrap();
+        let (folder, file_name) = get_path_for_object(&packed_hash).unwrap();
+        write_object_to_file(Path::new(&folder), &file_name, compressed).unwrap();
+        crate::util::pack_utils::compact(false, false).unwrap();
+
+        // A loose object, written *after* compaction so it stays loose.
+        let loose_content = vec![0x33u8; 500];
+        let loose_hash = blake3::hash(&loose_content).to_hex().to_string();
+        let compressed = zstd::encode_all(loose_content.as_slice(), 0).unwrap();
+        let (folder, file_name) = get_path_for_object(&loose_hash).unwrap();
+        write_object_to_file(Path::new(&folder), &file_name, compressed).unwrap();
+
+        assert!(does_object_exist(&loose_hash).unwrap(), "sanity: unblocked, the loose object answers true");
+
+        // Trip the in-memory gate for this root the same way a failing write would.
+        let unrelated = forklift.join("objects").join("ff").join("unrelated");
+        taint_utils::record_taint(&[unrelated.as_path()]).unwrap();
+
+        let error = does_object_exist(&loose_hash).unwrap_err();
+        assert!(error.contains(taint_utils::GATE_TAINT_MARKER),
+            "a loose-path check must refuse while the gate is standing, got: {}", error);
+
+        assert!(does_object_exist(&packed_hash).unwrap(),
+            "a pack-registry hit must still answer `true` regardless of the gate");
+
+        taint_utils::clear_gate(&forklift);
+        assert!(does_object_exist(&loose_hash).unwrap(), "clearing the gate must restore a normal answer");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn taint_wiring_is_a_no_op_end_to_end_when_never_activated() {
+        // The activation test for the wiring layer itself: with `taint_utils::activate` never
+        // called (forced back to the unactivated state under the shared lock, in case an earlier
+        // test elsewhere in this binary already activated the process), every fire site above —
+        // and the existence gate — must behave exactly as it did before this feature existed: no
+        // taint directory ever created, no re-check ever performed, no gate ever trips. This is
+        // the regression proof for the wiring layer: every one of `record_taint`/`read_taints`/
+        // `gate_check` already gates itself on activation (`taint_utils`'s own tests pin that);
+        // this test pins that the *wiring* added here never bypasses that gating or activates the
+        // machinery itself.
+        let _serial = lock_taint_activation();
+        taint_utils::reset_activation_for_test();
+
+        let temp = std::env::temp_dir().join(format!("forklift-taint-baseline-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+        let forklift = forklift_root();
+
+        // A real directory-sync failure, batched — must fail the batch but leave no taint trace.
+        let alpha = forklift.join("objects").join("aa").join("alpha-object");
+        let beta = forklift.join("objects").join("bb").join("beta-object");
+        std::fs::create_dir_all(alpha.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(beta.parent().unwrap()).unwrap();
+
+        let batch = WriteBatch::new();
+        batch.stage(&alpha, b"alpha content").unwrap();
+        batch.stage(&beta, b"beta content").unwrap();
+
+        {
+            let _guard = DirSyncFaultGuard::failing("bb");
+            let error = batch.finish().unwrap_err();
+            assert!(error.contains("injected directory-sync failure"), "got: {}", error);
+        }
+
+        assert!(!forklift.join("taint").exists(),
+            "an unactivated process must never create a taint directory, even after a real \
+            directory-sync failure");
+
+        // The existence gate must never trip.
+        let content = vec![0x44u8; 500];
+        let hash = blake3::hash(&content).to_hex().to_string();
+        let compressed = zstd::encode_all(content.as_slice(), 0).unwrap();
+        let (folder, file_name) = get_path_for_object(&hash).unwrap();
+        write_object_to_file(Path::new(&folder), &file_name, compressed).unwrap();
+        assert!(does_object_exist(&hash).unwrap(), "an unactivated gate check must never refuse");
+
+        // And a hand-written (pre-existing) taint file must not be honored by the re-check either.
+        let taint_dir = forklift.join("taint");
+        std::fs::create_dir_all(&taint_dir).unwrap();
+        std::fs::write(taint_dir.join("taint-1-0"), b"objects/zz/preexisting\nEND\n").unwrap();
+
+        let target = forklift.join("objects").join("cc").join("fresh-object");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        write_file_atomically(&target, b"content").unwrap();
+        assert!(target.exists(), "an unactivated re-check must never refuse a clean sync");
 
         std::fs::remove_dir_all(&temp).ok();
     }

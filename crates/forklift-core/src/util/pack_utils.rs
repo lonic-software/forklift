@@ -2742,6 +2742,11 @@ pub struct StoreIngest {
     objects: usize,
     deltas: usize,
     packs: usize,
+    /// Every pack's two final paths (data + index), across every rollover this ingest has
+    /// published so far. `finish`'s own trailing directory sync covers all of them in one call
+    /// (no intermediate rollover syncs its own directory separately — see `finish`), so this is
+    /// exactly the set a failure there must taint.
+    finalized_files: Vec<PathBuf>,
 }
 
 impl StoreIngest {
@@ -2757,6 +2762,7 @@ impl StoreIngest {
             objects: 0,
             deltas: 0,
             packs: 0,
+            finalized_files: Vec::new(),
         })
     }
 
@@ -2811,12 +2817,27 @@ impl StoreIngest {
     }
 
     /// Publish the final pack and make everything ingested visible to readers. Refs pointing at
-    /// ingested objects must only be written after this returns.
+    /// ingested objects must only be written after this returns `Ok`.
+    ///
+    /// # Returns
+    /// * `Ok(IngestStats)` - Every finalized pack's directory entries are durable and, once
+    ///                       [`taint_utils::activate`](crate::util::taint_utils::activate) has
+    ///                       been called in this process, no durability taint was found standing
+    ///                       for this root on the re-check that runs right before this returns
+    ///                       (see `sync_dir_or_taint`). An unactivated process skips that
+    ///                       re-check entirely.
+    /// * `Err(String)`     - A pack write, `finalize`, or the trailing directory sync failed. On
+    ///                       the directory-sync failure specifically, every pack finalized during
+    ///                       this ingest (`finalized_files`, data + index paths, across every
+    ///                       rollover) is visible but its directory entries are not proven
+    ///                       durable — once activated, that is recorded as a taint over exactly
+    ///                       those paths (see `taint_after_sync_failure`).
     pub fn finish(mut self) -> Result<IngestStats, String> {
         self.finish_current()?;
 
         if self.packs > 0 {
-            file_utils::sync_dir(&self.folder)?;
+            let final_paths: Vec<&Path> = self.finalized_files.iter().map(PathBuf::as_path).collect();
+            file_utils::sync_dir_or_taint(&self.folder, &final_paths)?;
             invalidate_cache();
             // This is exactly the shape `--redelta` densifies: objects appended straight into
             // packs, one path/window at a time, never seeing similarity across the whole store.
@@ -2869,7 +2890,8 @@ impl StoreIngest {
         let Some(writer) = self.writer.take() else {
             return Ok(());
         };
-        writer.finalize()?;
+        let finalized = writer.finalize()?;
+        self.finalized_files.extend(finalized.files);
         self.packs += 1;
         Ok(())
     }
@@ -3194,6 +3216,47 @@ mod tests {
         let stats = ingest.finish().unwrap();
         assert_eq!(stats.objects, 0);
         assert_eq!(stats.packs, 0, "an empty ingest must not publish an empty pack");
+    }
+
+    /// Fire-site c (the design's durable-taint wiring): `StoreIngest::finish`'s own trailing
+    /// directory sync. Reverting the `file_utils::sync_dir_or_taint` wiring in `finish` back to a
+    /// bare `file_utils::sync_dir(&self.folder)?` call kills this test — no taint file would
+    /// exist to read back.
+    #[test]
+    #[cfg(unix)]
+    fn store_ingest_finish_dir_sync_failure_taints_the_finalized_pack_files() {
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+        use crate::model::blob::Blob;
+        use crate::util::taint_utils;
+        use crate::util::file_utils::SyncDirFaultGuard;
+
+        let _serial = taint_utils::ACTIVATION_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        taint_utils::activate();
+
+        let temp = std::env::temp_dir().join(format!("forklift-ingest-taint-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+        let forklift = crate::globals::forklift_root();
+
+        let object = LooseObjectBuilder::build_blob(&Blob { content: b"pack taint content".to_vec() });
+        let mut ingest = StoreIngest::new().unwrap();
+        assert_eq!(ingest.store(&object).unwrap(), IngestStored::Full);
+
+        let _guard = SyncDirFaultGuard::failing("pack");
+        let error = match ingest.finish() {
+            Err(e) => e,
+            Ok(_) => panic!("a blocked pack directory must fail `finish`'s trailing sync"),
+        };
+        assert!(error.contains("injected directory-sync failure"), "got: {}", error);
+
+        let state = taint_utils::read_taints(&forklift).unwrap();
+        assert!(!state.recorded.is_empty(), "a pack directory-sync failure must record a taint");
+        for path in &state.recorded {
+            assert!(path.starts_with("objects/pack"), "expected a pack path, got {:?}", path);
+        }
+
+        std::fs::remove_dir_all(&temp).ok();
     }
 
     #[test]

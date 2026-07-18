@@ -73,6 +73,26 @@ pub fn activate() {
     ACTIVATED.store(true, Ordering::SeqCst);
 }
 
+/// Serializes every test — in this module or anywhere else in the crate — that touches
+/// [`ACTIVATED`] or the gate map: both are process-global state (see the module doc comment's
+/// activation section), so a test asserting the *unactivated* behavior would otherwise race a
+/// concurrently running test that has already called [`activate`]. `pub(crate)` (rather than
+/// nested inside this module's own `#[cfg(test)] mod tests`) so other modules' tests that also
+/// need to observe the unactivated state (`file_utils`'s taint-wiring tests) serialize through
+/// this exact same lock instead of a second, independent one that would not actually exclude
+/// anything. Recovers from a poisoned lock (a prior test panicking while holding it) rather than
+/// cascading a panic into every later test.
+#[cfg(test)]
+pub(crate) static ACTIVATION_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// Reset the process-global activation switch for a test that needs to observe the unactivated
+/// state. Test-only: production code has exactly one direction, [`activate`]. `pub(crate)` for
+/// the same cross-module reason as [`ACTIVATION_TEST_LOCK`].
+#[cfg(test)]
+pub(crate) fn reset_activation_for_test() {
+    ACTIVATED.store(false, Ordering::SeqCst);
+}
+
 fn is_activated() -> bool {
     ACTIVATED.load(Ordering::SeqCst)
 }
@@ -476,13 +496,8 @@ mod tests {
     use super::*;
     use crate::globals::StorageRootScope;
 
-    /// Serializes every test that touches [`ACTIVATED`] or the gate map: both are process-global
-    /// state (by design — see the module doc comment's activation section), so a test asserting
-    /// the *unactivated* behavior would otherwise race a concurrently running test that has
-    /// already called [`activate`]. Recovers from a poisoned lock (a prior test panicking while
-    /// holding it) rather than cascading a panic into every later test.
-    static ACTIVATION_TEST_LOCK: Mutex<()> = Mutex::new(());
-
+    /// This module's own tests share [`super::ACTIVATION_TEST_LOCK`] (via the glob import above)
+    /// with every other module's activation-sensitive tests — see its doc comment.
     fn lock_activation() -> std::sync::MutexGuard<'static, ()> {
         ACTIVATION_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -493,12 +508,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
-    }
-
-    /// Reset the process-global activation switch for a test that needs to observe the
-    /// unactivated state. Test-only: production code has exactly one direction, [`activate`].
-    fn reset_activation_for_test() {
-        ACTIVATED.store(false, Ordering::SeqCst);
     }
 
     #[test]
