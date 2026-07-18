@@ -146,38 +146,32 @@ pub fn add_deferred(batch: &file_utils::WriteBatch, path: &Path, key: &str) -> R
 
 /// Remove every recorded entry covered by `by`, durably, best-effort (see the module doc
 /// comment's durability section): a marker this cannot make sense of, or a failed write, is left
-/// exactly as it was. Never fails the caller — there is nothing meaningful to return that a
-/// caller could act on differently, since the safe fallback (the marker survives) is already
-/// exactly what happens.
-pub fn remove_covered_by(path: &Path, by: &str) {
-    let Ok(existing) = read(path) else { return };
-
-    let updated: BTreeSet<String> = existing.iter()
-        .filter(|recorded| !path_utils::covers(by, recorded))
-        .cloned()
-        .collect();
-
-    if updated.len() != existing.len() {
-        let _ = write_bytes_or_clear(path, &updated);
-    }
-}
-
-/// Remove every recorded entry that stands in a [`covers`](path_utils::covers) relationship with
-/// `target` in *either* direction — the entry covers `target`, or `target` covers the entry —
-/// durably, best-effort (same failure-direction contract as [`remove_covered_by`]).
+/// exactly as it was.
+///
+/// **Governing invariant, load-bearing for every caller of this function (including future
+/// consumers of this primitive, not just the incomplete-load guard): a heal may only clear what
+/// its own validation actually covered — never a record that reaches *beyond* `by`.** `by` names
+/// the exact region the caller has already established is safe to consider resolved (rebuilt
+/// from a known-good source, confirmed to hold nothing outstanding, whatever the caller's own
+/// proof is); only a recorded entry *at or under* `by` is provably covered by that same proof. A
+/// recorded entry `by` does *not* cover may extend into territory the caller never validated at
+/// all — clearing it anyway would silently launder an unverified region as resolved. (An earlier
+/// version of this primitive also cleared a broader entry that happened to cover `by`, on the
+/// theory that `by` alone was cause enough — that direction is unsound in general: `by` having
+/// nothing outstanding proves nothing about the *rest* of a broader record's region, which the
+/// caller never looked at. Removed; this is the one safe direction.)
 ///
 /// # Returns
-/// The entries actually removed (empty if none were, including on a read failure — same
-/// best-effort contract as [`remove_covered_by`]) — for a caller that wants to report which
-/// record(s) it healed. Computed against whatever was actually read, so it reflects reality even
-/// if the eventual write then fails (that failure still leaves the marker exactly as it was, per
-/// the module doc comment — this return value describes what *should* have changed, matching
-/// [`remove_covered_by`]'s own best-effort framing).
-pub fn remove_involving(path: &Path, target: &str) -> BTreeSet<String> {
+/// The entries actually removed (empty if none were, including on a read failure — best-effort,
+/// see above) — for a caller that wants to report which record(s) it healed. Computed against
+/// whatever was actually read, so it reflects reality even if the eventual write then fails (that
+/// failure still leaves the marker exactly as it was) — this return value describes what
+/// *should* have changed.
+pub fn remove_covered_by(path: &Path, by: &str) -> BTreeSet<String> {
     let Ok(existing) = read(path) else { return BTreeSet::new() };
 
     let (removed, kept): (BTreeSet<String>, BTreeSet<String>) = existing.into_iter()
-        .partition(|recorded| path_utils::covers(recorded, target) || path_utils::covers(target, recorded));
+        .partition(|recorded| path_utils::covers(by, recorded));
 
     if !removed.is_empty() {
         let _ = write_bytes_or_clear(path, &kept);
@@ -275,7 +269,8 @@ mod tests {
         add(&path, "src/b").unwrap();
         add(&path, "docs").unwrap();
 
-        remove_covered_by(&path, "src"); // covers "src/a" and "src/b", not "docs"
+        let removed = remove_covered_by(&path, "src"); // covers "src/a" and "src/b", not "docs"
+        assert_eq!(removed, BTreeSet::from(["src/a".to_string(), "src/b".to_string()]));
         assert_eq!(read(&path).unwrap(), BTreeSet::from(["docs".to_string()]));
     }
 
@@ -284,8 +279,23 @@ mod tests {
         let path = scratch("partial-overlap");
         add(&path, "src").unwrap();
 
-        remove_covered_by(&path, "src/sub"); // does not cover "src" (its own ancestor)
+        let removed = remove_covered_by(&path, "src/sub"); // does not cover "src" (its own ancestor)
+        assert!(removed.is_empty());
         assert_eq!(read(&path).unwrap(), BTreeSet::from(["src".to_string()]));
+    }
+
+    /// The regression this fix closes: `by` covering only a narrow slice of a *broader* recorded
+    /// entry must never clear that broader entry — `by`'s own validation never looked at the rest
+    /// of its region. See [`remove_covered_by`]'s doc comment for the invariant this proves (a
+    /// heal clears exactly what it validated, never more).
+    #[test]
+    fn remove_covered_by_never_clears_a_broader_entry_that_covers_by_instead() {
+        let path = scratch("never-broader");
+        add(&path, "").unwrap(); // the whole warehouse
+
+        let removed = remove_covered_by(&path, "bigdir"); // "" covers "bigdir", not the reverse
+        assert!(removed.is_empty(), "must not clear a broader entry: {:?}", removed);
+        assert_eq!(read(&path).unwrap(), BTreeSet::from(["".to_string()]));
     }
 
     #[test]
@@ -293,39 +303,10 @@ mod tests {
         let path = scratch("remove-all");
         add(&path, "src").unwrap();
 
-        remove_covered_by(&path, ""); // the empty key covers everything
+        let removed = remove_covered_by(&path, ""); // the empty key covers everything
+        assert_eq!(removed, BTreeSet::from(["src".to_string()]));
         assert!(!path.exists());
         assert_eq!(read(&path).unwrap(), BTreeSet::new());
-    }
-
-    #[test]
-    fn remove_involving_removes_a_broader_entry_that_covers_the_target() {
-        let path = scratch("involving-broader");
-        add(&path, "").unwrap(); // the whole warehouse
-
-        let removed = remove_involving(&path, "bigdir"); // "" covers "bigdir"
-        assert_eq!(removed, BTreeSet::from(["".to_string()]));
-        assert_eq!(read(&path).unwrap(), BTreeSet::new());
-    }
-
-    #[test]
-    fn remove_involving_removes_a_narrower_entry_the_target_covers() {
-        let path = scratch("involving-narrower");
-        add(&path, "src/api").unwrap();
-
-        let removed = remove_involving(&path, "src"); // "src" covers "src/api"
-        assert_eq!(removed, BTreeSet::from(["src/api".to_string()]));
-        assert_eq!(read(&path).unwrap(), BTreeSet::new());
-    }
-
-    #[test]
-    fn remove_involving_leaves_disjoint_entries_alone() {
-        let path = scratch("involving-disjoint");
-        add(&path, "docs").unwrap();
-
-        let removed = remove_involving(&path, "src"); // neither covers the other
-        assert!(removed.is_empty());
-        assert_eq!(read(&path).unwrap(), BTreeSet::from(["docs".to_string()]));
     }
 
     #[test]

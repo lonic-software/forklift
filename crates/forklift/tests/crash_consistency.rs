@@ -790,8 +790,9 @@ fn load_pays_a_constant_number_of_barriers_regardless_of_changed_file_count() {
 /// The exact count is pinned, not just cross-checked for equality like the test above, because
 /// equality alone cannot catch a regression that adds a *constant* extra barrier to every run —
 /// exactly what a reintroduced standalone marker write would do. Verified by hand against this
-/// fixture: reintroducing a standalone `load_guard_utils::mark_load_started` call at the top of
-/// `inventory_utils::add_changes_to_inventory` (undoing the fold) raises this to 3.
+/// fixture: reintroducing a standalone, immediately-written marker call (e.g. a bare
+/// `marker_utils::add` at the top of `inventory_utils::add_changes_to_inventory`, undoing the
+/// fold) raises this to 3.
 #[test]
 fn a_small_directory_load_pays_no_extra_barrier_for_the_incomplete_load_marker() {
     let area = Area::new("barrier-pin-directory");

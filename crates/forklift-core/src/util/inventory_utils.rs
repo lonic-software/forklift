@@ -629,12 +629,12 @@ fn stage_removal_for_directory(path: &WarehousePath) -> Result<(), String> {
     keys.insert(path.as_key().to_string());
 
     if let Some(metadata) = metadata_opt {
-        let subtree_prefix = format!("{}/", path.as_key());
-
         for entry in &metadata {
             let key = metadata_entry_to_key(entry);
 
-            if path.is_root() || key.starts_with(&subtree_prefix) {
+            // `path`'s own key is already inserted above; `covers` matching it again here too
+            // (the self case) is a harmless no-op re-insert into the same set.
+            if path_utils::covers(path.as_key(), key) {
                 keys.insert(key.to_string());
             }
         }
@@ -1656,15 +1656,9 @@ pub fn replace_subtree_inventories(key: &str,
     let (metadata_path, metadata_opt) = file_utils::retrieve_inventory_metadata_or_none()?;
     let mut metadata = metadata_opt.unwrap_or_default();
 
-    if key.is_empty() {
-        metadata.clear();
-    } else {
-        let prefix = format!("{}/", key);
-        metadata.retain(|entry| {
-            let entry_key = metadata_entry_to_key(entry);
-            entry_key != key && !entry_key.starts_with(&prefix)
-        });
-    }
+    // `path_utils::covers("", _)` is always true, so this one predicate already subsumes the
+    // former separate `key.is_empty()` case (drop everything) without a special-cased branch.
+    metadata.retain(|entry| !path_utils::covers(key, metadata_entry_to_key(entry)));
 
     // One durability barrier for the whole replacement burst instead of one per shard
     // (DESIGN.html §5.0 D item 8, stage 2b) — every shard here carries a caller-computed,

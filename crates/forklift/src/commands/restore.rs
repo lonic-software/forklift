@@ -162,7 +162,7 @@ fn restore_worktree_directory(key: &str) -> Result<(), String> {
     if !restored_any {
         return Err(format!(
             "No inventory found for folder \"{}\".",
-            if key.is_empty() { "./" } else { key }
+            load_guard_utils::display_path(key)
         ));
     }
 
@@ -212,13 +212,15 @@ fn restore_file_and_refresh_entry(parent_key: &str,
 /// working directory is not touched; the reset entries carry zeroed stat data, so the
 /// next comparison against the working directory rehashes them.
 ///
-/// # Arguments
 /// A path that is neither in the inventory nor in the pallet head is ordinarily an error — but
-/// when it is also entangled with a recorded incomplete-load root (`load_guard_utils`) and has
-/// zero staged entries anywhere beneath it, there is nothing to reset (nothing is there) and
-/// nothing to abandon (nothing landed) — only the record to clear. See
-/// `load_guard_utils::clear_recorded_involving`'s doc comment for the soundness argument this
-/// vacuous-heal case relies on. A path with no marker involvement, or with real staged content
+/// when it also has zero staged entries anywhere beneath it, there is nothing to reset (nothing
+/// is there) and nothing to abandon (nothing landed) — only whatever recorded incomplete-load
+/// root `path` itself covers, if any, to clear. See `load_guard_utils::clear_recorded_under`'s
+/// doc comment for the soundness argument this vacuous-heal case relies on. The governing rule is
+/// the same one every other heal in this codebase follows: **this may only clear a recorded root
+/// `path` itself covers — never a broader one that merely happens to cover `path`.** `path`
+/// having nothing staged proves nothing about a broader recorded region beyond it, which this
+/// check never looked at. A path with no marker involvement, or with real staged content
 /// somewhere beneath it, keeps the ordinary error.
 ///
 /// # Arguments
@@ -267,7 +269,7 @@ fn restore_staged(path: &WarehousePath, command: &str) -> Result<(), String> {
 
         output::message(command, format!(
             "Unstaged \"{}\" (inventory reset to the pallet head).",
-            if path.is_root() { "./" } else { path.as_key() }
+            load_guard_utils::display_path(path.as_key())
         ));
 
         return Ok(());
@@ -291,16 +293,21 @@ fn restore_staged(path: &WarehousePath, command: &str) -> Result<(), String> {
             // if literally nothing is staged anywhere under `path` (as either a lone file entry
             // in its parent's shard, or a directory subtree), abandoning it is a no-op — the
             // only real effect left to have is clearing whatever recorded incomplete-load root
-            // this path is entangled with, if any. `nothing_staged_under` is worth paying even
-            // when no marker turns out to be involved (`healed` then comes back empty and this
-            // falls through to the unchanged ordinary path below) — it is a metadata scan plus,
-            // at most, a few small shard reads, not proportional to warehouse size.
+            // `path` *itself covers* (never a broader one merely entangled with `path` — this
+            // check only ever validated `path`'s own subtree, so that is the only region it may
+            // ever clear; see `load_guard_utils::clear_recorded_under`'s doc comment). Calling
+            // the very same function `restore --staged`'s ordinary directory-reset branch above
+            // already relies on is deliberate: it is the one place this invariant is enforced,
+            // not a rule this call site has to uphold on its own. `nothing_staged_under` is worth
+            // paying even when no marker turns out to be involved (`healed` then comes back empty
+            // and this falls through to the unchanged ordinary path below) — it is a metadata
+            // scan plus, at most, a few small shard reads, not proportional to warehouse size.
             if nothing_staged_under(path)? {
-                let healed = load_guard_utils::clear_recorded_involving(path.as_key());
+                let healed = load_guard_utils::clear_recorded_under(path.as_key());
 
                 if !healed.is_empty() {
                     let roots = healed.iter()
-                        .map(|key| format!("\"{}\"", if key.is_empty() { "./" } else { key }))
+                        .map(|key| format!("\"{}\"", load_guard_utils::display_path(key)))
                         .collect::<Vec<_>>()
                         .join(", ");
 

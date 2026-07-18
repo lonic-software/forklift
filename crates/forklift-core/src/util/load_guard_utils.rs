@@ -70,12 +70,17 @@
 //!
 //! ## Clearing scope
 //!
-//! Every read-modify-write of the recorded set follows one rule, enforced by `marker_utils`: an
-//! operation covering region `R` (see [`path_utils::covers`]) may only remove a recorded root
-//! `P` when `R` covers `P` — clearing a root an operation did not actually re-verify (or
-//! re-establish from a known-good source) would let a real incomplete region go unguarded.
+//! Every read-modify-write of the recorded set follows one rule, enforced by `marker_utils`, with
+//! no exception anywhere in this module: an operation whose own validation covers region `R` (see
+//! [`path_utils::covers`]) may only remove a recorded root `P` when `R` covers `P` — never a
+//! broader `P` that merely happens to cover `R` in the other direction. `R` being fully accounted
+//! for proves nothing about the rest of a broader `P`'s region, which the operation never looked
+//! at; clearing it anyway would silently launder an unverified region as resolved. (An earlier
+//! version of [`clear_recorded_under`]'s underlying primitive also cleared in that other
+//! direction, on the theory that a *target* having nothing outstanding was cause enough on its
+//! own — live regression, since fixed: see `marker_utils::remove_covered_by`'s doc comment.)
 //!
-//! * **At load start** ([`mark_load_started`], [`pending_start_marker`]): recording `R` absorbs
+//! * **At load start** ([`pending_start_marker`], [`stage_start_marker`]): recording `R` absorbs
 //!   (drops) any narrower already-recorded root `R` covers — see `marker_utils`'s antichain
 //!   invariant.
 //! * **At clean completion** ([`mark_load_completed`]): every recorded root the completed load's
@@ -84,30 +89,28 @@
 //! * **At a staging reset** ([`clear_recorded_under`], [`clear_all_recorded`]): `restore
 //!   --staged <path>` (and `unload`) rebuild exactly the subtree at `<path>` from the pallet
 //!   head, so every recorded root that subtree covers is now known-consistent — call
-//!   [`clear_recorded_under`]. `shift`, `park`'s post-push reset, a `consolidate` fast-forward,
-//!   `import-git`'s initial checkout, and `lower`/`franchise`'s materialization all replace the
-//!   *entire* staging area from a known-good tree — call [`clear_all_recorded`]. Both are wired
-//!   once, inside `inventory_utils::replace_subtree_inventories` and `inventory_utils::
+//!   [`clear_recorded_under`]. The same call also covers `restore --staged`'s vacuous case (a
+//!   target neither in the inventory nor the head, but with zero staged entries anywhere beneath
+//!   it either — see `restore::restore_staged`'s doc comment): the region it validated is exactly
+//!   `<path>`'s own subtree, so the same "only what `R` covers" rule already gives the right
+//!   answer with no separate function needed. `shift`, `park`'s post-push reset, a `consolidate`
+//!   fast-forward, `import-git`'s initial checkout, and `lower`/`franchise`'s materialization all
+//!   replace the *entire* staging area from a known-good tree — call [`clear_all_recorded`]. Both
+//!   are wired once, inside `inventory_utils::replace_subtree_inventories` and `inventory_utils::
 //!   replace_all_inventories` respectively, so every caller of either gets this for free.
-//! * **At a vacuous `restore --staged`** ([`clear_recorded_involving`]): a target path that is
-//!   neither in the inventory nor in the pallet head is ordinarily a plain error — but when it
-//!   also has zero staged entries anywhere beneath it, there is no subtree to rebuild at all, and
-//!   the rule above (only clear what an operation covers) is too narrow: a recorded root
-//!   *broader* than the target is just as moot as one narrower. See
-//!   [`clear_recorded_involving`]'s own doc comment for the soundness argument.
 //!
-//! Removal is always best-effort (`marker_utils::remove_covered_by`/`remove_involving`/`clear`
-//! swallow every error): a marker that resurrects after a crash right after a successful removal
-//! fails in the safe direction — the next check still refuses, and the remedy is one cheap
-//! re-load or `restore --staged`.
+//! Removal is always best-effort (`marker_utils::remove_covered_by`/`clear` swallow every error):
+//! a marker that resurrects after a crash right after a successful removal fails in the safe
+//! direction — the next check still refuses, and the remedy is one cheap re-load or
+//! `restore --staged`.
 //!
 //! ## Malformed marker
 //!
-//! Write-side ([`mark_load_started`] and friends) and check-side ([`check_no_incomplete_load`])
-//! deliberately disagree about what a malformed marker means — see `marker_utils`'s doc comment
-//! for why: a load must never be the thing its own remedy is blocked on, so it self-heals by
-//! overwriting; a `stack`/`park` about to durably commit must never treat "I could not read this"
-//! as "nothing is recorded", so it refuses.
+//! Write-side ([`pending_start_marker`], [`stage_start_marker`]) and check-side
+//! ([`check_no_incomplete_load`]) deliberately disagree about what a malformed marker means — see
+//! `marker_utils`'s doc comment for why: a load must never be the thing its own remedy is blocked
+//! on, so it self-heals by overwriting; a `stack`/`park` about to durably commit must never treat
+//! "I could not read this" as "nothing is recorded", so it refuses.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -139,21 +142,6 @@ pub fn marker_path_under(warehouse_root: &Path) -> PathBuf {
         .join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)
         .join(crate::globals::FOLDER_NAME_INVENTORY_ROOT)
         .join(FILE_NAME_INCOMPLETE_LOAD_MARKER)
-}
-
-/// Record that a load rooted at `root_key` is starting, durably, before any staging mutation —
-/// see the module doc comment for the crash-safety rationale. Writes immediately (its own
-/// durability barrier) — see [`pending_start_marker`] for a caller that wants to fold this write
-/// into a batch it already controls instead.
-///
-/// # Arguments
-/// * `root_key` - The warehouse path key of the load's root (the normalized `load` argument).
-///
-/// # Returns
-/// * `Ok(())`      - The marker now covers `root_key` (freshly recorded, or already did).
-/// * `Err(String)` - The marker could not be written.
-pub fn mark_load_started(root_key: &str) -> Result<(), String> {
-    marker_utils::add(&marker_path(), root_key)
 }
 
 /// Compute the marker write a load rooted at `root_key` needs to durably publish, without
@@ -190,47 +178,23 @@ pub fn mark_load_completed(root_key: &str) {
 }
 
 /// Record that region `root_key` is now known-consistent — because a load rooted there just
-/// finished cleanly, or because some other operation rebuilt exactly that subtree from a
-/// known-good source (`restore --staged`, `unload`). Clears every recorded root `root_key`
-/// covers; a root only partially overlapping `root_key` is left alone — see the module doc
-/// comment's clearing-scope section. Best-effort (see [`mark_load_completed`]'s doc comment).
-pub fn clear_recorded_under(root_key: &str) {
-    marker_utils::remove_covered_by(&marker_path(), root_key);
-}
-
-/// Record that `target_key` has nothing at all staged under it — for `restore --staged`'s
-/// vacuous-heal special case (see `restore::restore_staged`'s doc comment): a target path that
-/// would otherwise be neither in the inventory nor in the pallet head, but turns out to have zero
-/// staged entries anywhere beneath it once the caller checks.
+/// finished cleanly, because some other operation rebuilt exactly that subtree from a known-good
+/// source (`restore --staged`, `unload`), or because `restore --staged`'s vacuous-heal case (see
+/// `restore::restore_staged`'s doc comment) has already confirmed `root_key`'s own subtree has
+/// zero staged entries anywhere beneath it — that confirmation *is* `root_key`'s validation, so
+/// the same "only clear what was actually validated" rule applies unchanged.
 ///
-/// Clears every recorded root that stands in a `covers` relationship with `target_key` in
-/// *either* direction — not just the ones `target_key` covers ([`clear_recorded_under`]'s
-/// narrower rule, which only handles a reset that *rebuilt* a subtree from a known-good source).
-/// A recorded root only exists to protect against a load that decided *some* of a region's
-/// content but not all of it — a partial, inconsistent aggregate a `stack`/`park` must not
-/// silently commit. Two properties of the load path rule that out for a region with zero staged
-/// entries:
-/// * A per-directory load task is atomic: it either fully decides and publishes that one
-///   directory's own shard, or (on any error partway through its own file list) publishes
-///   nothing for it at all — never a partial shard missing some of its own entries (see
-///   `inventory_utils::build_inventory`'s per-entry loop, gated end-to-end by `?`).
-/// * The pass that could otherwise erase a directory's *pre-existing* entries (treating a
-///   still-"dirty" shard as gone and marking every entry deleted) only ever runs after a fully
-///   successful walk (`inventory_utils::create_inventory_for_directory`'s `if result.is_ok()`
-///   gate) — a failed load never reaches it, so it can never erase content it did not fully
-///   re-process.
-///
-/// Together: if every shard at or under `target_key` has zero entries right now, no failed load
-/// published anything there, and nothing pre-existed there to have been partially updated —
-/// there is no partial state anywhere in `target_key`'s region for any covering-or-covered
-/// recorded root to be protecting. Best-effort (see [`mark_load_completed`]'s doc comment).
+/// Clears every recorded root `root_key` covers; a root only partially overlapping `root_key`, or
+/// *broader* than it, is left alone even if `root_key` itself is fully accounted for — see the
+/// module doc comment's clearing-scope section for why the broader direction is never safe.
+/// Best-effort (see [`mark_load_completed`]'s doc comment).
 ///
 /// # Returns
-/// The recorded root(s) actually cleared — empty when `target_key` was not entangled with any
-/// recorded root at all, the signal a caller uses to fall back to its ordinary, unrelated-path
-/// handling instead of reporting a heal.
-pub fn clear_recorded_involving(target_key: &str) -> BTreeSet<String> {
-    marker_utils::remove_involving(&marker_path(), target_key)
+/// The recorded root(s) actually cleared — empty when `root_key` did not cover any recorded root
+/// at all (a caller like `restore --staged`'s vacuous-heal case uses this to fall back to its
+/// ordinary, unrelated-path handling instead of reporting a heal).
+pub fn clear_recorded_under(root_key: &str) -> BTreeSet<String> {
+    marker_utils::remove_covered_by(&marker_path(), root_key)
 }
 
 /// Record that the *entire* staging area is now known-consistent — every operation that replaces
@@ -241,8 +205,10 @@ pub fn clear_all_recorded() {
     marker_utils::clear(&marker_path());
 }
 
-/// Display a warehouse path key the way user-facing messages spell the warehouse root.
-fn display_path(key: &str) -> &str {
+/// Display a warehouse path key the way user-facing messages spell the warehouse root — the one
+/// place this codebase's `""`-means-root convention becomes the string a user actually reads, so
+/// every caller shares it instead of re-implementing the same `is_empty` check.
+pub fn display_path(key: &str) -> &str {
     if key.is_empty() { "./" } else { key }
 }
 
@@ -349,12 +315,22 @@ mod tests {
         temp
     }
 
+    /// Record a load start the same way every real caller does — there is no standalone,
+    /// immediately-writing entry point in production code (both `load` paths fold this into
+    /// their own first durable barrier; see the module doc comment's folding section) — so this
+    /// drives the tests below through that same deferred path instead of a test-only shortcut.
+    fn start_load(root_key: &str) {
+        let batch = file_utils::WriteBatch::new();
+        stage_start_marker(&batch, root_key).unwrap();
+        batch.finish().unwrap();
+    }
+
     #[test]
     fn a_clean_load_of_the_same_root_clears_its_own_marker() {
         let temp = temp_warehouse("same-root");
         let _scope = StorageRootScope::enter(&temp);
 
-        mark_load_started("src").unwrap();
+        start_load("src");
         assert!(check_no_incomplete_load().is_err());
 
         mark_load_completed("src");
@@ -368,7 +344,7 @@ mod tests {
         let temp = temp_warehouse("narrower");
         let _scope = StorageRootScope::enter(&temp);
 
-        mark_load_started("").unwrap(); // a whole-warehouse load starts (and never finishes)
+        start_load(""); // a whole-warehouse load starts (and never finishes)
         mark_load_completed("src"); // a narrower, unrelated load finishes cleanly afterward
 
         let error = check_no_incomplete_load().unwrap_err();
@@ -388,8 +364,8 @@ mod tests {
         let temp = temp_warehouse("broader-absorb");
         let _scope = StorageRootScope::enter(&temp);
 
-        mark_load_started("src/api").unwrap();
-        mark_load_started("src").unwrap(); // covers the old marker's root — absorbs it
+        start_load("src/api");
+        start_load("src"); // covers the old marker's root — absorbs it
 
         mark_load_completed("src"); // now covers the (updated) recorded root — clears
         assert!(check_no_incomplete_load().is_ok());
@@ -406,8 +382,8 @@ mod tests {
         let temp = temp_warehouse("disjoint");
         let _scope = StorageRootScope::enter(&temp);
 
-        mark_load_started("src/a").unwrap();
-        mark_load_started("src/b").unwrap(); // does not cover "src/a" — both recorded
+        start_load("src/a");
+        start_load("src/b"); // does not cover "src/a" — both recorded
 
         let error = check_no_incomplete_load().unwrap_err();
         match error {
@@ -463,7 +439,7 @@ mod tests {
 
         // The write side self-heals: a load over the malformed marker proceeds and records
         // fresh, readable content.
-        mark_load_started("src").unwrap();
+        start_load("src");
         let error = check_no_incomplete_load().unwrap_err();
         match error {
             CoreError::Refusal { message, .. } => assert!(message.contains("src")),
@@ -481,7 +457,7 @@ mod tests {
         let temp = temp_warehouse("partial-overlap");
         let _scope = StorageRootScope::enter(&temp);
 
-        mark_load_started("src").unwrap();
+        start_load("src");
         clear_recorded_under("src/sub"); // does not cover "src" (its own ancestor)
 
         assert!(check_no_incomplete_load().is_err());
@@ -494,8 +470,8 @@ mod tests {
         let temp = temp_warehouse("clear-all");
         let _scope = StorageRootScope::enter(&temp);
 
-        mark_load_started("src/a").unwrap();
-        mark_load_started("docs").unwrap();
+        start_load("src/a");
+        start_load("docs");
 
         clear_all_recorded();
         assert!(check_no_incomplete_load().is_ok());
@@ -509,7 +485,7 @@ mod tests {
         let _scope = StorageRootScope::enter(&temp);
 
         assert!(pending_start_marker("src").is_some());
-        mark_load_started("src").unwrap();
+        start_load("src");
         assert!(pending_start_marker("src/api").is_none(), "already covered by \"src\"");
         assert!(pending_start_marker("docs").is_some(), "disjoint from \"src\"");
 

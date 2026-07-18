@@ -15,11 +15,25 @@ use crate::util::warehouse_utils;
 /// directory walk all use this single predicate instead of each hand-rolling their own copy of
 /// the same three-way check.
 ///
+/// No-alloc by construction (every call site here runs in a per-entry loop over a metadata
+/// listing, so an allocating comparison would scale with entry count for no reason): the
+/// `"{ancestor}/"` prefix this checks for is never actually built — instead, `key` is confirmed
+/// to be strictly longer than `ancestor`, share `ancestor`'s exact bytes as a prefix, and have a
+/// literal `/` at the one index right past that prefix. `key.as_bytes()[ancestor.len()]` is
+/// always a valid, in-bounds index whenever that check runs, since the `&&` short-circuits on the
+/// length comparison first.
+///
 /// # Arguments
 /// * `ancestor` - The candidate ancestor-or-self key.
 /// * `key`      - The key being tested.
 pub fn covers(ancestor: &str, key: &str) -> bool {
-    ancestor.is_empty() || key == ancestor || key.starts_with(&format!("{}/", ancestor))
+    if ancestor.is_empty() || key == ancestor {
+        return true;
+    }
+
+    key.len() > ancestor.len()
+        && key.starts_with(ancestor)
+        && key.as_bytes()[ancestor.len()] == b'/'
 }
 
 /// A normalized path inside the warehouse, relative to the warehouse root.
