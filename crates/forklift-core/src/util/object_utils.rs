@@ -770,9 +770,18 @@ struct StreamOutcome {
 /// * `expected_len` - The exact number of bytes the record declares (for the truncation check).
 ///
 /// # Returns
-/// * `Ok(true)`    - The object was verified and stored.
+/// * `Ok(true)`    - The object was verified, stored, and — once
+///                   [`taint_utils::activate`](crate::util::taint_utils::activate) has been
+///                   called in this process — no durability taint was found standing for this
+///                   root on the re-check that runs right before this returns (see
+///                   [`file_utils::sync_dir_or_taint`]). An unactivated process skips that
+///                   re-check entirely.
 /// * `Ok(false)`   - The object was already present (temp discarded, nothing written).
 /// * `Err(String)` - On a short/truncated stream, a hash mismatch, an over-ceiling chunk, or I/O.
+///                   A directory-sync failure specifically leaves the object visible at
+///                   `final_path` with its directory entry not proven durable — once activated,
+///                   that is recorded as a taint over exactly that path (see
+///                   [`file_utils::sync_dir_or_taint`]).
 pub fn store_object_stream(claimed_hash: &str,
                            reader: &mut impl Read,
                            expected_len: u64) -> Result<bool, String> {
@@ -834,11 +843,16 @@ pub fn store_object_stream(claimed_hash: &str,
 
     // Promote atomically. The temp file's bytes were already fsynced in `stream_to_temp`, so the
     // rename can never publish a name whose contents never reached disk; fsync the directory so the
-    // rename itself survives power loss (mirrors `file_utils::write_file_atomically`).
+    // rename itself survives power loss (mirrors `file_utils::write_file_atomically`). A sync
+    // failure taints `final_path` (the same fire-site class `write_file_atomically`'s own
+    // immediate branch belongs to — this path exists only because it cannot reuse that function's
+    // temp-naming scheme, not because its durability contract differs); a sync success is
+    // re-checked against any taint already standing for this root before this function may report
+    // `Ok(true)` — see `file_utils::sync_dir_or_taint`.
     let final_path = folder_path.join(&file_name);
     std::fs::rename(&temp_path, &final_path)
         .map_err(|e| format!("Error while moving a streamed object into place: {}", e))?;
-    file_utils::sync_dir(folder_path)?;
+    file_utils::sync_dir_or_taint(folder_path, &[final_path.as_path()])?;
 
     Ok(true)
 }
@@ -1420,6 +1434,50 @@ mod tests {
         let mut reader = std::io::Cursor::new(raw.clone());
         let stored = store_object_stream(&object.hash, &mut reader, raw.len() as u64).unwrap();
         assert!(!stored, "an already-present object is skipped");
+    }
+
+    /// Fire-site d (durable-taint wiring): `store_object_stream`'s own promote-then-sync — the
+    /// same fire-site class `write_file_atomically`'s immediate branch belongs to, wired through
+    /// the same shared helper. Reverting `file_utils::sync_dir_or_taint` back to a bare
+    /// `file_utils::sync_dir(folder_path)?` call kills this test: no taint file would exist to
+    /// read back.
+    #[test]
+    #[cfg(unix)]
+    fn store_object_stream_dir_sync_failure_taints_the_single_final_path_once_activated() {
+        use crate::util::taint_utils;
+        use crate::util::file_utils::SyncDirFaultGuard;
+
+        let _serial = taint_utils::ACTIVATION_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        taint_utils::activate();
+
+        let scratch = Scratch::new("stream-taint");
+        let forklift = crate::globals::forklift_root();
+
+        let content = vec![0x77u8; STREAM_STORE_THRESHOLD_BYTES + 10_000];
+        let object = LooseObjectBuilder::build_blob(&Blob { content });
+        let raw = object.content.clone();
+
+        // Needle on this object's own shard folder (`objects/<2-hex-prefix>`) — unique enough not
+        // to collide with the scratch root's own name.
+        let needle = format!("objects{}{}", std::path::MAIN_SEPARATOR, &object.hash[0..2]);
+        let _guard = SyncDirFaultGuard::failing(&needle);
+
+        let mut reader = std::io::Cursor::new(raw.clone());
+        let error = store_object_stream(&object.hash, &mut reader, raw.len() as u64)
+            .expect_err("a blocked directory sync must fail the promote");
+        assert!(error.contains("injected directory-sync failure"), "got: {}", error);
+
+        let (folder, file_name) = file_utils::get_path_for_object(&object.hash).unwrap();
+        let final_path = std::path::Path::new(&folder).join(&file_name);
+        assert!(final_path.exists(), "the rename must have landed before the directory sync failed");
+
+        let state = taint_utils::read_taints(&forklift).unwrap();
+        let expected: std::collections::BTreeSet<PathBuf> =
+            [final_path.strip_prefix(&forklift).unwrap().to_path_buf()].into_iter().collect();
+        assert_eq!(state.recorded, expected,
+            "the taint must record exactly the single final path, root-relative");
+
+        drop(scratch);
     }
 
     /// A streamed object whose bytes do not match the claimed hash is refused, nothing lands, and

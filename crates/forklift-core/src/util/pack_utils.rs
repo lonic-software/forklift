@@ -684,6 +684,20 @@ struct StagedTransportPack {
 /// The exists/rename publication sequence assumes no *concurrent* importer of the same store:
 /// `franchise` targets a directory it just created, and every other pack writer runs under the
 /// store lock (`compact`) or warehouse lock.
+///
+/// # Returns
+/// * `Ok(TransportImportStats)` - Every renamed pack pair's directory entries are durable and,
+///                                once [`taint_utils::activate`](crate::util::taint_utils::activate)
+///                                has been called in this process, no durability taint was found
+///                                standing for this root on the re-check that runs right before
+///                                this returns (see `file_utils::sync_dir_or_taint`). An
+///                                unactivated process skips that re-check entirely.
+/// * `Err(String)`                - A section, a pack, a sync, or the trailing directory sync
+///                                failed. On the trailing directory-sync failure specifically,
+///                                every pack pair actually renamed *this run* (never a pair kept
+///                                because an identical layout was already published) is visible
+///                                but its directory entries are not proven durable — once
+///                                activated, that is recorded as a taint over exactly those paths.
 pub(crate) fn import_transport_packs<R: Read>(reader: &mut R,
                                                sections: &[(u64, u64)])
                                                -> Result<TransportImportStats, String> {
@@ -752,6 +766,11 @@ pub(crate) fn import_transport_packs<R: Read>(reader: &mut R,
             sync_file(&pair.index_path, "bundle pack index")?;
         }
 
+        // Every final path actually renamed this run — never the `(true, true)` case's paths,
+        // which are kept exactly as they already stood and never renamed — so the trailing sync
+        // below taints exactly what it just made visible-but-unproven, not the whole install.
+        let mut published_this_run: Vec<PathBuf> = Vec::new();
+
         for pair in &staged {
             let index = std::fs::read(&pair.index_path)
                 .map_err(|e| format!("Error while reading a verified bundle pack index: {}", e))?;
@@ -773,6 +792,8 @@ pub(crate) fn import_transport_packs<R: Read>(reader: &mut R,
                         .map_err(|e| format!("Error while publishing bundle pack data: {}", e))?;
                     std::fs::rename(&pair.index_path, &index_final)
                         .map_err(|e| format!("Error while publishing bundle pack index: {}", e))?;
+                    published_this_run.push(data_final.clone());
+                    published_this_run.push(index_final.clone());
                 }
                 (false, true) => {
                     // An index without data is reader-visible corruption. Remove the stale commit
@@ -783,17 +804,25 @@ pub(crate) fn import_transport_packs<R: Read>(reader: &mut R,
                         .map_err(|e| format!("Error while publishing bundle pack data: {}", e))?;
                     std::fs::rename(&pair.index_path, &index_final)
                         .map_err(|e| format!("Error while publishing bundle pack index: {}", e))?;
+                    published_this_run.push(data_final.clone());
+                    published_this_run.push(index_final.clone());
                 }
                 (false, false) => {
                     std::fs::rename(&pair.data_path, &data_final)
                         .map_err(|e| format!("Error while publishing bundle pack data: {}", e))?;
                     std::fs::rename(&pair.index_path, &index_final)
                         .map_err(|e| format!("Error while publishing bundle pack index: {}", e))?;
+                    published_this_run.push(data_final.clone());
+                    published_this_run.push(index_final.clone());
                 }
             }
         }
 
-        file_utils::sync_dir(&folder)?;
+        // A sync failure taints exactly `published_this_run`; a sync success is re-checked
+        // against any taint already standing for this root before this function may report `Ok`
+        // — see `file_utils::sync_dir_or_taint`.
+        let published_refs: Vec<&Path> = published_this_run.iter().map(PathBuf::as_path).collect();
+        file_utils::sync_dir_or_taint(&folder, &published_refs)?;
         invalidate_cache();
         // A native bundle installs whole packs verbatim from the far end's own bulk ingest —
         // the same undensified shape `--redelta` exists to fix.
@@ -1341,8 +1370,18 @@ struct WindowEntry {
 /// * `redelta` - Re-delta every live packed object instead of copying it verbatim (see above).
 ///
 /// # Returns
-/// * `Ok(CompactStats)` - What was packed and removed.
-/// * `Err(String)`      - If enumeration, writing, or deletion failed.
+/// * `Ok(CompactStats)` - What was packed and removed. Every new pack's directory entries are
+///                        durable and, once [`taint_utils::activate`](crate::util::taint_utils::activate)
+///                        has been called in this process, no durability taint was found standing
+///                        for this root on the re-check that runs right before the destructive
+///                        sweep below is allowed to proceed (see `file_utils::sync_dir_or_taint`).
+///                        An unactivated process skips that re-check entirely.
+/// * `Err(String)`      - If enumeration, writing, or deletion failed. A new-pack directory-sync
+///                        failure specifically leaves every pack finalized this run
+///                        (`new_pack_files`) visible but not proven durable, and — once activated
+///                        — records that as a taint; either that or a standing taint found on the
+///                        re-check both abort before the loose-source/old-pack removal sweep below
+///                        ever runs.
 pub fn compact(all: bool, redelta: bool) -> Result<CompactStats, String> {
     let pack_folder = pack_folder();
     file_utils::create_folder_if_not_exists(&pack_folder)?;
@@ -1658,9 +1697,15 @@ pub fn compact(all: bool, redelta: bool) -> Result<CompactStats, String> {
     // that the renames created are themselves only durable once the pack folder is fsynced. Do it
     // once here (a single sync covers every rename this run made) before anything is deleted, so a
     // power loss between the sweep below and that metadata reaching disk cannot lose a pack whose
-    // loose sources are already gone — the "durable" half of durable-before-destructive.
+    // loose sources are already gone — the "durable" half of durable-before-destructive. A sync
+    // failure taints `new_pack_files` (never the loose sources or old packs, which this sync says
+    // nothing about); a sync success is re-checked against any taint already standing for this
+    // root, and — since that check runs inside `sync_dir_or_taint`, still behind this `?` — a
+    // taint found standing aborts here too, before the destructive sweep below ever runs. Durable-
+    // before-destructive therefore means "durable *and no taint standing*," not durable alone.
     if !new_pack_files.is_empty() {
-        file_utils::sync_dir(&pack_folder)?;
+        let new_pack_refs: Vec<&Path> = new_pack_files.iter().map(PathBuf::as_path).collect();
+        file_utils::sync_dir_or_taint(&pack_folder, &new_pack_refs)?;
     }
 
     // Every new pack is durable — only now remove the originals: the loose files that were
@@ -3259,6 +3304,62 @@ mod tests {
         std::fs::remove_dir_all(&temp).ok();
     }
 
+    /// Fire-site e (durable-taint wiring): `import_transport_packs`'s own trailing directory
+    /// sync — the same fire-site class as `StoreIngest::finish` above (a rename-then-sync
+    /// publishing new pack pairs, feeding `does_object_exist`), reached from the far end of a
+    /// network transfer rather than a local ingest. Reverting the `file_utils::sync_dir_or_taint`
+    /// wiring back to a bare `file_utils::sync_dir(&folder)?` call kills this test.
+    #[test]
+    #[cfg(unix)]
+    fn import_transport_packs_dir_sync_failure_taints_the_published_pack_files() {
+        use crate::util::taint_utils;
+        use crate::util::file_utils::SyncDirFaultGuard;
+
+        let _serial = taint_utils::ACTIVATION_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        taint_utils::activate();
+
+        let temp = std::env::temp_dir().join(format!("forklift-transport-taint-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+        let forklift = crate::globals::forklift_root();
+
+        // Build one native pack pair in a throwaway staging folder — `import_transport_packs`
+        // takes a byte *stream* (as a network transfer would deliver), not a folder, so this
+        // just produces the bytes it will read.
+        let staging = temp.join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        let mut builder = TransportPackBuilder::new(&staging).unwrap();
+        let content = b"import-transport-taint content".to_vec();
+        let hash = blake3::hash(&content).to_hex().to_string();
+        builder.append_full(&hash, &content).unwrap();
+        let artifacts = builder.finish().unwrap();
+        assert_eq!(artifacts.len(), 1, "one full record must finalize into exactly one pack pair");
+
+        let data_bytes = std::fs::read(&artifacts[0].data_path).unwrap();
+        let index_bytes = std::fs::read(&artifacts[0].index_path).unwrap();
+        let sections = vec![(data_bytes.len() as u64, index_bytes.len() as u64)];
+        let mut combined = data_bytes;
+        combined.extend_from_slice(&index_bytes);
+        let mut reader = std::io::Cursor::new(combined);
+
+        let _guard = SyncDirFaultGuard::failing("pack");
+        let error = match import_transport_packs(&mut reader, &sections) {
+            Err(e) => e,
+            Ok(_) => panic!("a blocked pack directory must fail the trailing sync"),
+        };
+        assert!(error.contains("injected directory-sync failure"), "got: {}", error);
+
+        let state = taint_utils::read_taints(&forklift).unwrap();
+        assert!(!state.recorded.is_empty(),
+            "a transport-pack install directory-sync failure must record a taint");
+        for path in &state.recorded {
+            assert!(path.starts_with("objects/pack"), "expected a pack path, got {:?}", path);
+        }
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
     #[test]
     fn compact_packs_loose_objects_and_reads_them_back() {
         let temp = std::env::temp_dir().join(format!("forklift-pack-test-{}", std::process::id()));
@@ -3297,6 +3398,86 @@ mod tests {
         let absent = blake3::hash(b"absent").to_hex().to_string();
         assert!(!is_in_packs(&absent).unwrap());
         assert!(retrieve_from_packs(&absent).unwrap().is_none());
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// Fire-site f (durable-taint wiring): `compact`'s own new-pack directory sync — the last of
+    /// the three write paths added to the durable-taint wiring. Reverting the
+    /// `file_utils::sync_dir_or_taint` wiring back to a bare `file_utils::sync_dir(&pack_folder)?`
+    /// call kills the taint half of this test; making the destructive sweep below run
+    /// unconditionally (moving it ahead of the `?`, or dropping the `?` on the sync call) kills
+    /// the durable-before-destructive half — the loose source would then be gone despite the
+    /// new pack's own directory entry never having been proven durable.
+    #[test]
+    #[cfg(unix)]
+    fn compact_new_pack_dir_sync_failure_taints_the_new_packs_and_skips_the_destructive_sweep() {
+        use crate::util::taint_utils;
+        use crate::util::file_utils::SyncDirFaultGuard;
+
+        let _serial = taint_utils::ACTIVATION_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        taint_utils::activate();
+
+        let temp = std::env::temp_dir().join(format!("forklift-compact-taint-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+        let forklift = crate::globals::forklift_root();
+
+        let content = b"compact-taint content".to_vec();
+        let hash = blake3::hash(&content).to_hex().to_string();
+        store_loose(&hash, &content);
+
+        let (folder, file_name) = file_utils::get_path_for_object(&hash).unwrap();
+        let loose_path = Path::new(&folder).join(&file_name);
+        assert!(loose_path.exists(), "sanity: the loose source exists before compacting");
+
+        let _guard = SyncDirFaultGuard::failing("pack");
+        let error = match compact(false, false) {
+            Err(e) => e,
+            Ok(_) => panic!("a blocked pack directory must fail compact's new-pack sync"),
+        };
+        assert!(error.contains("injected directory-sync failure"), "got: {}", error);
+
+        // Durable-before-destructive, extended: the destructive sweep (removing packed loose
+        // sources) must never run when the new pack's own directory entry was not proven durable
+        // — a standing taint (or the sync failure that caused it) blocks it exactly like an
+        // unsynced pack always has.
+        assert!(loose_path.exists(),
+            "compact must not remove a loose source before its new pack's directory sync succeeds");
+
+        let state = taint_utils::read_taints(&forklift).unwrap();
+        assert!(!state.recorded.is_empty(), "a new-pack directory-sync failure must record a taint");
+        for path in &state.recorded {
+            assert!(path.starts_with("objects/pack"), "expected a pack path, got {:?}", path);
+        }
+
+        drop(_guard);
+        taint_utils::remove_taint_files(&forklift).unwrap();
+
+        // The second, more precise half of the durable-before-destructive claim: even with the
+        // directory sync itself succeeding cleanly (no fault armed below), a taint standing from
+        // *something else* must still block the sweep — the re-check runs before `Ok`, not the
+        // sync alone.
+        let content_b = b"compact-taint content, round two".to_vec();
+        let hash_b = blake3::hash(&content_b).to_hex().to_string();
+        store_loose(&hash_b, &content_b);
+        let (folder_b, file_name_b) = file_utils::get_path_for_object(&hash_b).unwrap();
+        let loose_path_b = Path::new(&folder_b).join(&file_name_b);
+        assert!(loose_path_b.exists(), "sanity: the second loose source exists before compacting");
+
+        let taint_dir = forklift.join("taint");
+        std::fs::create_dir_all(&taint_dir).unwrap();
+        std::fs::write(taint_dir.join("taint-99999-0"), b"objects/zz/preexisting\nEND\n").unwrap();
+
+        let error = match compact(false, false) {
+            Err(e) => e,
+            Ok(_) => panic!("a standing taint must fail compact's re-check even with a clean sync"),
+        };
+        assert!(error.contains(taint_utils::GATE_TAINT_MARKER), "got: {}", error);
+        assert!(loose_path_b.exists(),
+            "compact must not remove a loose source while a taint is standing, even with a \
+            clean directory sync");
 
         std::fs::remove_dir_all(&temp).ok();
     }
