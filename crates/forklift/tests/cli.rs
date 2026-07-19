@@ -5388,6 +5388,15 @@ fn a_mutating_command_runs_maintenance_when_due() {
     );
 }
 
+// The finding #1 fix (`run_if_due` no longer swallows a `compact` failure that left a durability
+// taint standing) is covered where it now lives, without a fault hook in the load-bearing
+// `sync_dir` primitive: `commands::maintenance::tests::
+// report_maintenance_outcome_surfaces_exactly_when_a_real_taint_is_left_standing` (the decision,
+// against a real recorded taint) and `output::tests::
+// the_standing_taint_warning_names_the_code_and_the_heal_remedy_in_both_modes` (the warning text,
+// both output modes) — both in `crates/forklift/src/`, since the `forklift` crate is a plain
+// binary (no `lib` target `tests/cli.rs` could link a unit under test from).
+
 // ---------------------------------------------------------------------------------------------
 // The densify suggestion: `import-git`'s pack-direct path (and a franchise's native bundle
 // install) can only ever see per-path/per-window similarity on the way in, unlike a plain
