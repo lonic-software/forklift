@@ -2525,4 +2525,162 @@ mod tests {
 
         std::fs::remove_dir_all(&root).ok();
     }
+
+    // ---- Multi-bay ref-pointer resurrection audit (design memo §10.3) ----
+    //
+    // §10.3's claim: `forklift heal` verbatim-restaging a tainted pallet ref pointer could
+    // silently revert a concurrent, legitimate head move in another bay (the ref file has no
+    // compare-and-swap — `pallet_utils::set_pallet_head_in` is a plain `write_file_atomically`).
+    // The two tests below settle what `restage_object` actually does with a recorded ref path,
+    // constructed deterministically (no real concurrency needed — see each test's own comment
+    // for why the sequencing alone decides the outcome, with no timing dependence at all).
+
+    /// Hand-write a complete (non-torn) taint file recording `paths` — the terminated counterpart
+    /// of [`plant_torn_taint`] above, mirroring `heal_utils::tests::plant_taint`'s on-disk format
+    /// exactly (this module already has the torn variant; this is the "clean, well-formed record"
+    /// shape the §10.3 tests below need).
+    fn plant_complete_taint(forklift_root: &Path, paths: &[&str]) {
+        let taint_dir = forklift_root.join("taint");
+        std::fs::create_dir_all(&taint_dir).unwrap();
+        let mut content = String::new();
+        for path in paths {
+            content.push_str(path);
+            content.push('\n');
+        }
+        content.push_str("END\n");
+        std::fs::write(taint_dir.join("taint-77777-0"), content).unwrap();
+    }
+
+    /// (§10.3, mechanism check 1 — the literal claim) Taint a pallet ref pointer while it holds
+    /// V0; advance the head to V1 via an ordinary, successful `set_pallet_head_in` call (standing
+    /// in for a legitimate `stack`/`lift` in another bay, sharing the same ref file); then run
+    /// `heal`. If §10.3's mechanism is right, `heal`'s verbatim restage of the taint's recorded
+    /// path resurrects V0 and the head silently reverts.
+    ///
+    /// No timing is needed to settle this, because `restage_object` (`heal_utils.rs`) never
+    /// stores or replays a byte *snapshot* — it re-reads whatever is CURRENTLY at the recorded
+    /// path when `heal` actually runs and rewrites exactly those bytes fresh (see its own doc
+    /// comment: "reads them back... then writes them fresh"). The taint schema itself records
+    /// only the *path*, never a payload (`taint_utils`'s module doc comment, "Format" section: one
+    /// line per path, no bytes). So whichever value is *durably current* at the path when `heal`
+    /// runs is what survives — the sequencing below (V0, taint, THEN V1, THEN heal) already forces
+    /// the interleaving the claim needs (V1 written after the taint, before heal) with no race at
+    /// all: if this reverts to V0 it will revert to V0 every single run, deterministically.
+    ///
+    /// Mutation: make `restage_object` special-case a ref-shaped path by restoring some stored
+    /// snapshot of V0 instead of re-reading the live file → `head_after` comes back V0 → red.
+    ///
+    /// **Surprise found while building this fixture, worth flagging on its own:**
+    /// `pallet_utils::set_pallet_head`'s own write (`write_file_atomically`) already refuses to
+    /// report success while ANY taint stands anywhere under the root — `file_utils::
+    /// taint_recheck` runs after this write's own rename *and* directory sync both succeed, and
+    /// unconditionally errors if `taint_utils::read_taints` finds anything recorded at all,
+    /// regardless of path. So the "advance to V1" call below returns `Err`, even though — because
+    /// that check runs strictly after the rename already landed — the ref file's bytes on disk
+    /// are already durably V1 by the time the error is returned. A real `stack`/`lift` driving
+    /// this same call would see (and presumably report) failure despite the head having actually
+    /// already moved; this test does not chase that quirk further, but does not paper over it by
+    /// pretending the call succeeds either.
+    #[test]
+    fn heal_restaging_a_tainted_pallet_ref_never_reverts_a_later_legitimate_head_move() {
+        use crate::globals::StorageRootScope;
+
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        let root = std::env::temp_dir()
+            .join(format!("forklift-recovery-utils-ref-resurrection-overwrite-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let _scope = StorageRootScope::enter(&root);
+        let forklift = forklift_root();
+
+        let v0 = "0".repeat(64);
+        let v1 = "1".repeat(64);
+
+        // V0: the value standing at the moment of the (simulated) failed post-rename directory
+        // sync for this ref's own write.
+        pallet_utils::set_pallet_head("main", &v0).unwrap();
+
+        // The taint records the ref's *path* only ("pallets/main") — see this test's own doc
+        // comment on why that already rules out a stored-snapshot mechanism.
+        plant_complete_taint(&forklift, &["pallets/main"]);
+
+        // Bay B's forward progress: an ordinary head move to V1, through the exact same
+        // `write_file_atomically`-backed primitive any real pallet-advancing command uses —
+        // simulating a legitimate `stack`/`lift` elsewhere while this (unrelated-content) taint
+        // still stands. This call itself returns `Err` (see the "surprise" note above) — the
+        // rename to V1 lands first, and only the trailing, blanket taint-recheck then refuses —
+        // so the call is deliberately not `.unwrap()`-ed here; what matters for this test is the
+        // durable on-disk value it leaves behind, confirmed next.
+        let _ = pallet_utils::set_pallet_head("main", &v1);
+        assert_eq!(pallet_utils::get_pallet_head("main").unwrap().unwrap(), v1,
+            "sanity: the rename to V1 must have physically landed despite the call's own Err");
+
+        let outcome = run_heal().expect("a present, readable, non-content-addressed path restages cleanly");
+        assert!(outcome.was_tainted);
+        assert!(outcome.restaged.iter().any(|p| p == "pallets/main"),
+            "the ref path must actually go through the restage path this test is auditing: {:?}", outcome.restaged);
+
+        let head_after = pallet_utils::get_pallet_head("main").unwrap().unwrap();
+        assert_eq!(head_after, v1,
+            "heal must never revert a ref pointer to a stale recorded value: restage_object \
+            rewrites whatever bytes it reads back from the CURRENT file at heal time, and the \
+            taint schema records only the path, never a byte snapshot — so V1 (written after the \
+            taint, before heal ran) survives untouched, exactly like restaging any other file \
+            that was legitimately overwritten in place after it was tainted");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// (§10.3, mechanism check 2 — the delete variant) The complementary case to the test above:
+    /// if, instead of being overwritten in place, the tainted ref path is *removed* before heal
+    /// runs (the shape that actually matters for a delete-vs-restage race, symmetric to §10.2's
+    /// pack scenario), `restage_object`'s `ENOENT` branch has no hash to fall back on for a
+    /// non-loose-shaped path (`file_utils::hash_from_object_path` returns `None` for "pallets/
+    /// main") — it reports `Vanished` unconditionally, never recreating the file. One level up,
+    /// `recovery_utils::resolve_the_rest` cannot even classify a bare ref path as an object hash
+    /// to run its absent-and-unreferenced closure walk over (`classify_vanished` falls through to
+    /// `VanishedClass::Unrecognized` — not `Loose`, not `Shard`, not pack-shaped) — the vanished
+    /// ref path goes straight into the dangling remainder, unconditionally.
+    ///
+    /// So a deleted ref pointer is never silently resurrected either — the failure mode this
+    /// variant actually has is the opposite of §10.3's feared silent data loss: a permanently
+    /// dangling, unresolvable-by-heal remainder (worse UX, but not a silent revert).
+    #[test]
+    fn heal_never_recreates_a_tainted_pallet_ref_whose_path_was_since_deleted() {
+        use crate::globals::StorageRootScope;
+
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        let root = std::env::temp_dir()
+            .join(format!("forklift-recovery-utils-ref-resurrection-delete-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let _scope = StorageRootScope::enter(&root);
+        let forklift = forklift_root();
+
+        pallet_utils::set_pallet_head("main", &"0".repeat(64)).unwrap();
+        plant_complete_taint(&forklift, &["pallets/main"]);
+
+        // The ref file vanishes entirely (e.g. a pallet removed from under the taint) before heal
+        // ever runs.
+        std::fs::remove_file(forklift.join("pallets").join("main")).unwrap();
+
+        let error = run_heal()
+            .expect_err("a vanished, unrecognized-shape recorded path must not silently clear");
+        assert_durability_taint(&error, &["pallets/main"]);
+
+        // The critical negative: the file was never recreated by heal.
+        assert!(!forklift.join("pallets").join("main").exists(),
+            "heal must never recreate a vanished, non-object-shaped recorded path — it has no \
+            bytes to restage and no hash to fall back on, unlike a vanished loose object");
+
+        let state = taint_utils::read_taints(&forklift).unwrap();
+        assert!(state.recorded.contains(&PathBuf::from("pallets/main")),
+            "the vanished ref path must survive as an unresolved (unrecognized-shape) remainder");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
 }

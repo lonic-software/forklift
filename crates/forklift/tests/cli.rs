@@ -7412,3 +7412,178 @@ fn entry_heal_still_restages_a_content_addressed_object_inline_with_no_escalatio
     assert!(!taint_dir_path(&warehouse).exists() || recorded_taint_paths(&warehouse).is_empty(),
         "the taint must be fully cleared by the inline restage");
 }
+
+// ---- Multi-bay durable-taint soundness audit (design memo §10.2/§10.3) ----
+//
+// `forklift heal` (the recovery verb) only ever takes the CURRENT bay's own (bay-local)
+// `WarehouseLock` — never the warehouse-global `StoreLock` that serializes destructive object-
+// store maintenance (`compact`) against itself. The two tests below settle, deterministically,
+// what that lock-scope gap actually means in a multi-bay warehouse (one shared object store,
+// shared refs, one lock file per bay): first that the lock scopes genuinely do not intersect,
+// then — the actual crux — whether the one dangerous case that gap enables (heal verbatim-
+// restaging a pack `compact` physically deleted) causes real harm or is inert duplication.
+
+#[test]
+fn heal_is_never_serialized_against_another_bays_warehouse_lock_or_the_shared_store_lock() {
+    // §10.2's static claim: `WarehouseLock::acquire()` locks `bay_root().join("lock")` — bay-
+    // local — while `compact` (`pack_utils.rs`) additionally takes the warehouse-global
+    // `StoreLock` (`forklift_root().join("store.lock")`) right before it deletes a superseded
+    // pack. `forklift heal` (`recovery_utils.rs`/`heal_utils.rs`/`commands/heal.rs`) never
+    // references `StoreLock` at all — grep-confirmed, not just asserted here.
+    //
+    // Proven deterministically, with no real second process and no timing dependency: hand-
+    // plant BOTH lock files a concurrent `compact` in another bay would be holding at the exact
+    // instant it is about to delete a superseded pack (its own bay's lock, taken first via the
+    // ordinary `requires_warehouse_lock()` dispatch, then the shared store lock), and show
+    // `forklift heal` in THIS (different) bay still runs to completion — clearing a real taint —
+    // regardless. If `heal` ever acquired either lock, this run would fail (`WarehouseLocked`,
+    // or a store-lock contention error) instead of succeeding.
+    //
+    // Mutation: make `heal`'s dispatch also acquire `StoreLock` (or route it through bay B's
+    // lock file instead of its own) → this run fails instead of clearing the taint → red.
+    let warehouse = TestWarehouse::new("heal-lock-scope");
+    warehouse.write_file("code.txt", "v1\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    // A bay can only be opened once the pallet it checks out has something stacked.
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "initial"]));
+
+    // Bay B: a second bay sharing this warehouse's object store and refs.
+    let bay_dir = warehouse.home.join("bay-other");
+    assert_success(&warehouse.run(&["bay", "add", "other", bay_dir.to_str().unwrap()]));
+
+    // Simulate bay B's `compact` mid-flight, holding both locks it takes in sequence: its own
+    // (bay-local) `WarehouseLock`...
+    let bay_b_lock = warehouse.root.join(".forklift/bays/other/lock");
+    std::fs::write(&bay_b_lock, "99999\n").unwrap();
+    // ...and the shared `StoreLock`, acquired right before the destructive old-pack sweep.
+    let store_lock = warehouse.root.join(".forklift/store.lock");
+    std::fs::write(&store_lock, "99999\n").unwrap();
+
+    // A real taint for bay A's heal to resolve, so a successful run below is not vacuous: a
+    // fabricated, never-existing loose-object hash — the same "absent and unreferenced" fixture
+    // as `heal_reaches_a_tainted_root_and_clears_a_vanished_unreferenced_object`.
+    let fake_hash = "7".repeat(64);
+    plant_taint(&warehouse, &[&loose_object_relative_path(&fake_hash)]);
+
+    // Run `forklift heal` in the MAIN tree (bay A — its own `WarehouseLock` lives at
+    // ".forklift/lock", a file distinct from bay B's ".forklift/bays/other/lock").
+    let status = warehouse.run(&["heal", "--json"]);
+    assert_success(&status);
+    let value = json(&status);
+    assert_eq!(value["data"]["was_tainted"], true);
+    assert!(
+        value["data"]["resolved"].as_array().unwrap().iter().any(|v| v == &fake_hash),
+        "bay A's heal must actually run its recovery logic (not merely happen to exit 0): {}", value
+    );
+
+    // Both hand-planted lock files are untouched: bay A's heal neither waited on nor cleared
+    // either one — proof it never contended for bay B's lock or the shared store lock.
+    assert!(bay_b_lock.exists(), "bay B's own lock file must be untouched by bay A's heal");
+    assert!(store_lock.exists(), "the shared store lock must be untouched by bay A's heal");
+
+    std::fs::remove_file(&bay_b_lock).unwrap();
+    std::fs::remove_file(&store_lock).unwrap();
+}
+
+/// Every `.pack` data file currently present under a warehouse's pack folder, sorted.
+fn pack_data_files(warehouse: &TestWarehouse) -> Vec<PathBuf> {
+    let pack_dir = warehouse.root.join(".forklift/objects/pack");
+    if !pack_dir.exists() {
+        return Vec::new();
+    }
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&pack_dir).unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("pack"))
+        .collect();
+    files.sort();
+    files
+}
+
+#[test]
+fn heal_resurrecting_a_compact_superseded_pack_only_duplicates_content_the_new_pack_already_has() {
+    // §10.2's actual-harm question, isolated from the concurrency mechanism (already pinned
+    // above): a full repack (`compact --all`) writes a new, content-distinct pack and physically
+    // deletes the old one it superseded. If `heal` verbatim-restages the old pack's bytes back
+    // AFTER that delete — the one thing its missing `StoreLock` no longer prevents — does the
+    // resurrected pack (a) reintroduce something the store meant to be gone / break a pack-index
+    // invariant / corrupt anything, or (b) merely duplicate content the new pack already has?
+    //
+    // The resurrection itself is constructed by direct sequencing, not a real race (per the
+    // determinism requirement): `heal_utils::restage_object` performs zero validation on a non-
+    // content-addressed path (a `.pack`/`.idx` file is never hash-verified, only loose objects
+    // are — see its own doc comment) — it just rewrites, verbatim, whatever bytes it read. So
+    // writing the pre-repack bytes back to the pre-repack path by hand produces a byte-for-byte
+    // identical on-disk end state to whatever a real heal-vs-compact interleaving would have left
+    // behind, with no need to reproduce the exact timing.
+    let warehouse = TestWarehouse::new("pack-resurrection-harm");
+    warehouse.write_file("a.txt", "first parcel content\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "parcel one"]));
+
+    // Pack parcel one's loose objects into a first pack (P1).
+    assert_success(&warehouse.run(&["compact"]));
+    let packs_after_first_compact = pack_data_files(&warehouse);
+    assert_eq!(packs_after_first_compact.len(), 1, "sanity: exactly one pack after the first compact");
+    let p1_data = packs_after_first_compact[0].clone();
+    let p1_index = p1_data.with_extension("idx");
+    let p1_data_bytes = std::fs::read(&p1_data).unwrap();
+    let p1_index_bytes = std::fs::read(&p1_index).unwrap();
+
+    // More content, still on the SAME pallet history — parcel one's objects stay fully live,
+    // reachable from the (advancing) pallet head.
+    warehouse.write_file("a.txt", "first parcel content\nsecond parcel content\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "parcel two"]));
+
+    // A full repack: every reachable object (parcel one's included) consolidates into ONE new,
+    // content-distinct pack; P1 — now fully redundant — is physically deleted.
+    assert_success(&warehouse.run(&["compact", "--all"]));
+    assert!(!p1_data.exists(), "sanity: the repack physically deleted the superseded pack");
+    assert!(!p1_index.exists(), "sanity: the repack physically deleted the superseded index");
+    let packs_after_repack = pack_data_files(&warehouse);
+    assert_eq!(packs_after_repack.len(), 1, "sanity: the repack consolidated into one new pack");
+    assert_ne!(packs_after_repack[0], p1_data, "sanity: the new pack is a distinct, differently-named file");
+
+    // Baselines, taken after the repack, before the resurrection.
+    let content_before = stdout(&warehouse.run(&["show", "main:a.txt"]));
+    let history_before = stdout(&warehouse.run(&["history"]));
+    assert_success(&warehouse.run(&["stocktake"]));
+
+    // THE RESURRECTION: P1's exact pre-repack bytes, written back to its exact pre-repack path,
+    // after the repack has already deleted it and published the new pack in its place.
+    std::fs::write(&p1_data, &p1_data_bytes).unwrap();
+    std::fs::write(&p1_index, &p1_index_bytes).unwrap();
+    assert_eq!(pack_data_files(&warehouse).len(), 2,
+        "sanity: the store now holds both the new pack and the resurrected old one");
+
+    // (a) No corruption: every read observes byte-identical content and history to before the
+    // resurrection — the resurrected pack is not consulted for anything the new pack already
+    // answers, and its presence does not confuse object resolution.
+    assert_eq!(stdout(&warehouse.run(&["show", "main:a.txt"])), content_before,
+        "resurrecting the old pack must not change what a read returns");
+    assert_eq!(stdout(&warehouse.run(&["history"])), history_before);
+    assert_success(&warehouse.run(&["stocktake"]));
+
+    // (b) Self-healing: an ordinary command touching the object store still runs clean with the
+    // duplicate pack present...
+    assert_success(&warehouse.run(&["compact"]));
+    // ...and a SECOND full repack independently re-derives the same live set and physically
+    // removes the resurrected duplicate again — the same "supersede and delete" logic the first
+    // repack ran, applied to whatever packs currently exist, with no special-casing needed for a
+    // duplicate. This is the evidence for "benign, self-correcting gc-food," not merely an
+    // assumption: the resurrected pack does not survive the next maintenance pass.
+    assert_success(&warehouse.run(&["compact", "--all"]));
+    assert!(!p1_data.exists(),
+        "a later repack must clean up the resurrected duplicate pack again — it is inert, \
+        self-correcting duplication, not a permanent or escalating problem");
+    assert!(!p1_index.exists());
+    assert_eq!(pack_data_files(&warehouse).len(), 1);
+
+    // Content is still perfectly readable after the cleanup.
+    assert_eq!(stdout(&warehouse.run(&["show", "main:a.txt"])), content_before);
+}
