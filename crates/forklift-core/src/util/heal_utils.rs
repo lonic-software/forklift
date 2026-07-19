@@ -328,7 +328,7 @@ pub(crate) fn finish_clean_heal(
         .filter_map(|relative| root.join(relative).parent().map(Path::to_path_buf))
         .collect();
 
-    sync_restaged_parents(root, &parents)?;
+    sync_restaged_parents(&parents)?;
 
     taint_utils::remove_taint_files(root, taint_files)?;
     taint_utils::clear_gate(root);
@@ -349,13 +349,7 @@ pub(crate) fn finish_clean_heal(
 /// and the restaged subset's durability must never wait on how that deeper analysis turns out —
 /// see that module's doc comment.
 #[cfg(unix)]
-pub(crate) fn sync_restaged_parents(root: &Path, parents: &BTreeSet<PathBuf>) -> Result<(), String> {
-    // Unused on every platform since the macOS device flush moved to grouping `parents` by their
-    // own `st_dev` (see `flush_device_caches`) rather than resolving a taint file under `root` to
-    // flush through — kept as a parameter for signature stability across this function's other
-    // caller (`recovery_utils::run`).
-    let _ = root;
-
+pub(crate) fn sync_restaged_parents(parents: &BTreeSet<PathBuf>) -> Result<(), String> {
     let mut first_error: Option<String> = None;
 
     for parent in parents {
@@ -377,7 +371,7 @@ pub(crate) fn sync_restaged_parents(root: &Path, parents: &BTreeSet<PathBuf>) ->
 }
 
 #[cfg(not(unix))]
-pub(crate) fn sync_restaged_parents(_root: &Path, _parents: &BTreeSet<PathBuf>) -> Result<(), String> {
+pub(crate) fn sync_restaged_parents(_parents: &BTreeSet<PathBuf>) -> Result<(), String> {
     // Windows has no directory handle to fsync at all (see `file_utils::sync_dir`'s doc comment)
     // and the taint mechanism never fires there in the first place (`sync_touched_directories` is
     // a no-op on non-Unix) — so there is never a taint for this function to be reached with.
@@ -894,7 +888,7 @@ mod tests {
         let parent = forklift.join(&relative).parent().unwrap().to_path_buf();
         let parents: BTreeSet<PathBuf> = [parent].into_iter().collect();
 
-        sync_restaged_parents(&forklift, &parents)
+        sync_restaged_parents(&parents)
             .expect("the post-restage flush must succeed even with no taint file left to flush through");
     }
 

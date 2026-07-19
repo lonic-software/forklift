@@ -144,7 +144,7 @@ pub fn run() -> Result<HealOutcome, CoreError> {
         let parents: BTreeSet<PathBuf> = attempt.restaged.iter()
             .filter_map(|relative| root.join(relative).parent().map(Path::to_path_buf))
             .collect();
-        heal_utils::sync_restaged_parents(&root, &parents).map_err(|e| sync_failure_refusal(&root, &e))?;
+        heal_utils::sync_restaged_parents(&parents).map_err(|e| sync_failure_refusal(&root, &e))?;
     }
 
     resolve_the_rest(&root, &state.recorded, &attempt, &state.files)
@@ -368,9 +368,14 @@ struct WalkRoots {
 /// delete. The parked-parcels/consolidation portion of that shared root list is not duplicated
 /// here — both this function and `collect_live_set` call
 /// [`bay_utils::collect_bay_scoped_parcel_roots`] for it, so the two can never drift apart on
-/// that portion by construction; **a future edit adding a new bay-local ref source should still
-/// re-check both callers of the shared helper, and re-check the other function's root list for
-/// anything not routed through it (tags, shards, the trust anchor).**
+/// that portion by construction. That helper takes the bay dirs as a parameter rather than
+/// enumerating them itself specifically so a caller that also needs those dirs for something
+/// else — this function, for staged inventory shards — can enumerate them once
+/// ([`bay_utils::all_bay_state_dirs`]) and feed the same `Vec` to both the helper and its own
+/// extra loop, instead of `bay_utils::list_bays` running twice per heal. **A future edit adding a
+/// new bay-local ref source should still re-check both callers of the shared helper, and re-check
+/// the other function's root list for anything not routed through it (tags, shards, the trust
+/// anchor).**
 ///
 /// The undo journal is deliberately excluded from **both** walks (parity, not an oversight): an
 /// entry there records history for `undo`/`redo`, never a live reference a future write would
@@ -393,15 +398,18 @@ fn collect_walk_roots() -> Result<WalkRoots, String> {
         parcels.push(tag.tag.subject);
     }
 
-    // Bay-local sources, read across every bay — see this function's doc comment. Parked
+    // Bay-local sources, read across every bay — see this function's doc comment. One
+    // `all_bay_state_dirs` enumeration, fed to both the shared parked/consolidation helper and
+    // this function's own staged-shard loop, so `list_bays` runs exactly once per heal. Parked
     // parcels and in-progress-consolidation `their_head` are the portion shared with gc's live
     // set — see `bay_utils::collect_bay_scoped_parcel_roots`'s doc comment for the shared-helper
     // rationale and the fail-closed-on-an-unreadable-bay-source contract (by design, not a bug).
     // Staged inventory shards are recovery-only (gc deliberately does not root them) and stay a
     // separate per-bay loop here.
-    parcels.extend(bay_utils::collect_bay_scoped_parcel_roots()?);
+    let bay_dirs = bay_utils::all_bay_state_dirs()?;
+    parcels.extend(bay_utils::collect_bay_scoped_parcel_roots(&bay_dirs)?);
 
-    for dir in bay_utils::all_bay_state_dirs()? {
+    for dir in &bay_dirs {
         walk_shard_files(&dir.join(FOLDER_NAME_INVENTORY_ROOT), &mut shard_referenced)?;
     }
 
@@ -489,28 +497,39 @@ fn walk_closure_for(targets: &BTreeSet<String>, roots: &WalkRoots) -> Result<BTr
     Ok(referenced)
 }
 
+/// Iterative, work-queue-driven — a parcel's spine tree can nest arbitrarily deep, and the
+/// obvious recursive shape (one stack frame per level) risks a stack overflow on a
+/// pathologically deep tree; see [`tests::walk_tree_survives_a_pathologically_deep_tree`]. Mirrors
+/// `gc_utils::collect_live_set`'s own `tree_queue: VecDeque` loop — same shape, same semantics,
+/// just applied here instead of there. `check_leaf`'s own descent (recipe → chunks) is one level
+/// deep, never further, so it stays recursion-free without needing this treatment.
 fn walk_tree(
     tree_hash: &str,
     targets: &BTreeSet<String>,
     referenced: &mut BTreeSet<String>,
     visited_trees: &mut HashSet<String>,
 ) -> Result<(), String> {
-    if targets.contains(tree_hash) {
-        referenced.insert(tree_hash.to_string());
-        return Ok(());
-    }
-    if !visited_trees.insert(tree_hash.to_string()) {
-        return Ok(());
-    }
+    let mut tree_queue: VecDeque<String> = VecDeque::new();
+    tree_queue.push_back(tree_hash.to_string());
 
-    let tree = object_utils::load_tree(tree_hash)?;
+    while let Some(tree_hash) = tree_queue.pop_front() {
+        if targets.contains(&tree_hash) {
+            referenced.insert(tree_hash);
+            continue;
+        }
+        if !visited_trees.insert(tree_hash.clone()) {
+            continue;
+        }
 
-    for (_, file) in tree.get_files() {
-        check_leaf(&file.hash, file.item_type, targets, referenced)?;
-    }
+        let tree = object_utils::load_tree(&tree_hash)?;
 
-    for (_, subtree) in tree.get_subtrees() {
-        walk_tree(&subtree.hash, targets, referenced, visited_trees)?;
+        for (_, file) in tree.get_files() {
+            check_leaf(&file.hash, file.item_type, targets, referenced)?;
+        }
+
+        for (_, subtree) in tree.get_subtrees() {
+            tree_queue.push_back(subtree.hash.clone());
+        }
     }
 
     Ok(())
@@ -696,6 +715,94 @@ mod tests {
         assert!(file_utils::dir_sync_attempts().is_empty(),
             "the closure walk must never run a durability barrier (caught via its trailing dir sync): {:?}",
             file_utils::dir_sync_attempts());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A pathologically deep parcel spine tree (a chain of `DEPTH` nested subtrees, one child
+    /// each) must not crash the closure walk. Before `walk_tree` was made iterative (an explicit
+    /// `VecDeque` work queue, mirroring `gc_utils::collect_live_set`'s own `tree_queue`), it
+    /// recursed once per subtree level — confirmed to overflow the default test-thread stack at
+    /// this depth: with `walk_tree`'s body temporarily reverted to its old recursive shape (one
+    /// `walk_tree` call inside the `for (_, subtree) in tree.get_subtrees()` loop instead of a
+    /// queue push) and this same test run in isolation, the process aborted outright — "thread
+    /// '...' has overflowed its stack", `SIGABRT`, `cargo test` reporting "process didn't exit
+    /// successfully" — not a normal `Err` a `#[should_panic]` could catch, an abnormal process
+    /// crash, which is the actual falsifier a stack-overflow bug produces (empirically confirmed
+    /// the recursive shape already dies somewhere between 1,000 and 2,000 levels on the machine
+    /// this was verified on). Re-applying the iterative fix makes the same test pass cleanly.
+    /// `DEPTH` here is ~25x that empirically-observed threshold — comfortably past it on any
+    /// plausible stack size — while the iterative version still finishes in low single-digit
+    /// seconds.
+    ///
+    /// Tree objects are written directly to their final on-disk path (`write_tree_object_fast`)
+    /// rather than through `LooseObject::store` (which fsyncs, and renames through a barrier,
+    /// per object): at `DEPTH` writes that per-object durability cost dominates real wall time
+    /// for no benefit this test needs — it is exercising `walk_tree`'s traversal, not any
+    /// write path's own durability, and toggling `FORKLIFT_FSYNC` would be a process-wide,
+    /// cross-test change this shared unit-test binary cannot risk. Mirrors the same fast,
+    /// direct-write shape `heal_utils::tests::write_loose_object` already uses for the same
+    /// reason.
+    #[test]
+    fn walk_tree_survives_a_pathologically_deep_tree() {
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+        use crate::globals::StorageRootScope;
+        use crate::model::parcel::Parcel;
+        use crate::model::tree_item::TreeItem;
+
+        fn write_tree_object_fast(tree: &TreeItem) -> String {
+            let mut object = LooseObjectBuilder::build_tree(tree);
+            let compressed = object.compress().unwrap();
+            let (folder, file_name) = file_utils::get_path_for_object(&object.hash).unwrap();
+            std::fs::create_dir_all(&folder).unwrap();
+            std::fs::write(PathBuf::from(&folder).join(&file_name), &compressed).unwrap();
+            object.hash.clone()
+        }
+
+        let dir = std::env::temp_dir()
+            .join(format!("forklift-recovery-utils-deep-tree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _scope = StorageRootScope::enter(&dir);
+
+        const DEPTH: usize = 50_000;
+        let target_hash = "9".repeat(64);
+
+        // Innermost tree: a single file entry naming the (absent) target hash — never actually
+        // stored as an object, since `check_leaf` only needs to check membership in `targets`
+        // against an entry's own hash, never read the entry's bytes.
+        let mut innermost = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        innermost.add_child(TreeItem::new(
+            "file.txt".to_string(), target_hash.clone(), DirEntryType::Normal,
+        ));
+        let mut current_hash = write_tree_object_fast(&innermost);
+
+        // Wrap it in `DEPTH` further levels, each with exactly one subtree child pointing at the
+        // previous level — the deep, narrow spine shape that blows a recursive walk's stack.
+        for i in 0..DEPTH {
+            let mut tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+            tree.add_child(TreeItem::new(
+                format!("child-{}", i), current_hash.clone(), DirEntryType::Tree,
+            ));
+            current_hash = write_tree_object_fast(&tree);
+        }
+
+        let parcel = Parcel {
+            tree_hash: current_hash,
+            parents: Vec::new(),
+            actions: Vec::new(),
+            description: Some("deep".to_string()),
+        };
+        let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
+        parcel_object.store().unwrap();
+        pallet_utils::set_pallet_head("main", &parcel_object.hash).unwrap();
+
+        let targets: BTreeSet<String> = [target_hash.clone()].into_iter().collect();
+        let referenced = closure_references_any(&targets)
+            .expect("the closure walk must complete without crashing on a deeply nested tree");
+
+        assert!(referenced.contains(&target_hash),
+            "the deeply nested leaf's target hash must still be found by the closure walk");
 
         std::fs::remove_dir_all(&dir).ok();
     }

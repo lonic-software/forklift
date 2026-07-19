@@ -85,6 +85,19 @@ const TAINT_FILENAME_SANITY_CAP: u32 = 10_000;
 /// standing" without string-matching the whole message.
 pub const GATE_TAINT_MARKER: &str = "a durability taint is standing";
 
+/// The one message both [`gate_check`] (the in-memory belt) and
+/// [`file_utils::taint_recheck`](crate::util::file_utils) (the durable re-check on a directory
+/// sync's success path) refuse with: a standing taint means existence under `root` cannot be
+/// trusted, whichever of the two mechanisms is the one that noticed. Shared so editing the
+/// wording in one can never silently leave the other stale. Always contains
+/// [`GATE_TAINT_MARKER`], per that constant's own doc comment.
+pub(crate) fn gate_standing_message(root: &Path) -> String {
+    format!(
+        "{} under \"{}\"; existence cannot be trusted here until it is healed.",
+        GATE_TAINT_MARKER, root.to_string_lossy()
+    )
+}
+
 /// The process-global activation switch — see the module doc comment's activation section.
 static ACTIVATED: AtomicBool = AtomicBool::new(false);
 
@@ -158,10 +171,10 @@ pub fn record_taint(final_paths: &[&Path]) -> Result<(), String> {
         return Ok(());
     }
 
-    let root = forklift_root();
-    let Some(relative_paths) = to_root_relative(&root, final_paths) else {
+    let Some(root) = resolve_root_for(final_paths) else {
         return Ok(());
     };
+    let relative_paths = to_root_relative(&root, final_paths);
 
     // Cheap and infallible: set first, so this process gates itself even if the write below
     // fails outright (see this function's doc comment).
@@ -170,12 +183,31 @@ pub fn record_taint(final_paths: &[&Path]) -> Result<(), String> {
     write_taint_file(&root, &relative_paths)
 }
 
-/// Strip `root` off every path in `final_paths`, returning `None` (rather than a partial result)
-/// if any single one is not actually under `root` — see [`record_taint`]'s doc comment on why an
-/// all-or-nothing skip, not a partial taint, is the right behavior for an unresolvable root.
-fn to_root_relative(root: &Path, final_paths: &[&Path]) -> Option<BTreeSet<PathBuf>> {
+/// The one resolution [`record_taint`] and
+/// [`file_utils::taint_recheck`](crate::util::file_utils) both key their all-or-nothing scope
+/// tolerance through, so the two sides can never drift apart into resolving "does this batch of
+/// paths belong to a root" two different ways.
+///
+/// `None` when `final_paths` is empty, or when any single path is not actually under
+/// [`forklift_root`] — the shape a bare-path unit test's own paths take, having never entered a
+/// storage-root scope at all — in which case there is no root whose taint state a caller could
+/// sensibly consult or record against. `Some(root)` — the resolved [`forklift_root`] — otherwise.
+pub(crate) fn resolve_root_for(final_paths: &[&Path]) -> Option<PathBuf> {
+    if final_paths.is_empty() {
+        return None;
+    }
+
+    let root = forklift_root();
+    final_paths.iter().all(|path| path.strip_prefix(&root).is_ok()).then_some(root)
+}
+
+/// Strip `root` off every path in `final_paths`. Only ever called once [`resolve_root_for`] has
+/// already confirmed every path in `final_paths` is under `root`, so every `strip_prefix` here is
+/// infallible in practice; `filter_map` is used defensively rather than to signal a real partial
+/// case.
+fn to_root_relative(root: &Path, final_paths: &[&Path]) -> BTreeSet<PathBuf> {
     final_paths.iter()
-        .map(|path| path.strip_prefix(root).ok().map(Path::to_path_buf))
+        .filter_map(|path| path.strip_prefix(root).ok().map(Path::to_path_buf))
         .collect()
 }
 
@@ -464,10 +496,7 @@ pub fn gate_check(root: &Path) -> Result<(), String> {
     }
 
     if gate_state().lock().expect("taint gate lock poisoned").contains(&gate_key(root)) {
-        return Err(format!(
-            "{} under \"{}\"; existence cannot be trusted here until it is healed.",
-            GATE_TAINT_MARKER, root.to_string_lossy()
-        ));
+        return Err(gate_standing_message(root));
     }
 
     Ok(())

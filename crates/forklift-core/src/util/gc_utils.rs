@@ -151,8 +151,12 @@ pub(crate) fn collect_live_set() -> Result<HashSet<String>, String> {
     // so both call the shared `bay_utils::collect_bay_scoped_parcel_roots` — see its doc comment
     // for the shared-helper rationale, the superset invariant this list must stay a subset of,
     // and the fail-closed contract on an unreadable bay source (by design, not a bug: re-check
-    // that doc comment before changing this list, and never make it skip-and-continue).
-    roots.extend(bay_utils::collect_bay_scoped_parcel_roots()?);
+    // that doc comment before changing this list, and never make it skip-and-continue). The
+    // helper takes the enumerated dirs rather than listing bays itself, so a caller that (like
+    // `collect_walk_roots`) needs the same dirs for another per-bay source too only lists bays
+    // once — this caller has no such second source today, but still enumerates once, up front.
+    let bay_dirs = bay_utils::all_bay_state_dirs()?;
+    roots.extend(bay_utils::collect_bay_scoped_parcel_roots(&bay_dirs)?);
 
     // A re-genesis anchor (§8.7) pins the replaced office chain as attested history;
     // the pin is a GC root, or the attested chain would be collected as unreachable.

@@ -166,10 +166,16 @@ pub fn all_bay_state_dirs() -> Result<Vec<PathBuf>, String> {
 
 /// The bay-scoped parcel roots shared by **both**
 /// [`recovery_utils::collect_walk_roots`](crate::util::recovery_utils::collect_walk_roots) and
-/// [`gc_utils::collect_live_set`](crate::util::gc_utils::collect_live_set): across every
-/// [`all_bay_state_dirs`] entry, that bay's parked parcels
-/// ([`park_utils::read_parked_in`]) plus its in-progress consolidation's `their_head`
-/// ([`merge_utils::read_consolidation_state_in`]), if any.
+/// [`gc_utils::collect_live_set`](crate::util::gc_utils::collect_live_set): across every entry of
+/// `dirs`, that bay's parked parcels ([`park_utils::read_parked_in`]) plus its in-progress
+/// consolidation's `their_head` ([`merge_utils::read_consolidation_state_in`]), if any.
+///
+/// Takes the already-enumerated `dirs` — normally the caller's own [`all_bay_state_dirs`] call —
+/// rather than calling [`all_bay_state_dirs`] itself: both callers need at least one *other*
+/// per-bay pass of their own over the same dirs (recovery additionally walks staged inventory
+/// shards; a future gc source could too), and a second internal enumeration here would mean
+/// `list_bays` runs twice per call for no reason. Passing the dirs in keeps this to exactly one
+/// enumeration per caller while still sharing the parked+consolidation logic itself.
 ///
 /// This loop used to be hand-duplicated in both callers. Extracted here so the two can never
 /// drift apart: recovery's walk roots must stay a *superset* of gc's live-set roots (see
@@ -193,18 +199,24 @@ pub fn all_bay_state_dirs() -> Result<Vec<PathBuf>, String> {
 /// the active one) closed in the first place. A malformed file in any bay legitimately blocks
 /// gc/heal until an operator fixes it; this trades availability for soundness on purpose.
 ///
+/// # Arguments
+/// * `dirs` - The bay-local state dirs to read, in order — normally the caller's own
+///            [`all_bay_state_dirs`] result, passed straight through so the bays folder is
+///            listed exactly once per caller even when the caller also needs `dirs` for
+///            something else.
+///
 /// # Returns
-/// * `Ok(Vec<String>)` - Every bay's parked-parcel hashes plus in-progress-consolidation
-///                        `their_head`, in `all_bay_state_dirs` order.
-/// * `Err(String)`      - The bays folder could not be listed, or some bay's `parked` or
-///                        `consolidation` file could not be read or was malformed — see above.
-pub fn collect_bay_scoped_parcel_roots() -> Result<Vec<String>, String> {
+/// * `Ok(Vec<String>)` - Every listed dir's parked-parcel hashes plus in-progress-consolidation
+///                        `their_head`, in `dirs` order.
+/// * `Err(String)`      - Some bay's `parked` or `consolidation` file could not be read or was
+///                        malformed — see above.
+pub fn collect_bay_scoped_parcel_roots(dirs: &[PathBuf]) -> Result<Vec<String>, String> {
     let mut roots: Vec<String> = Vec::new();
 
-    for dir in all_bay_state_dirs()? {
-        roots.extend(park_utils::read_parked_in(&dir)?);
+    for dir in dirs {
+        roots.extend(park_utils::read_parked_in(dir)?);
 
-        if let Some(consolidation) = merge_utils::read_consolidation_state_in(&dir)? {
+        if let Some(consolidation) = merge_utils::read_consolidation_state_in(dir)? {
             roots.push(consolidation.their_head);
         }
     }
@@ -263,7 +275,8 @@ mod tests {
         std::fs::write(bay_b_dir.join("parked"), format!("{}\n", parked_hash)).unwrap();
         std::fs::write(bay_b_dir.join("consolidation"), format!("{}\ntheir-pallet\n", consolidation_hash)).unwrap();
 
-        let roots = collect_bay_scoped_parcel_roots().unwrap();
+        let dirs = all_bay_state_dirs().unwrap();
+        let roots = collect_bay_scoped_parcel_roots(&dirs).unwrap();
 
         assert!(roots.contains(&parked_hash),
             "a non-active bay's parked parcel must be in the shared roots");

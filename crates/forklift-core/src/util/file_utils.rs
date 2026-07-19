@@ -418,7 +418,7 @@ fn taint_after_sync_failure(sync_error: String, final_paths: &[&Path]) -> String
 /// gates itself on activation, so this inherits that without a separate check, and in the
 /// overwhelmingly common case (no taint directory at all) it costs one `stat`.
 fn taint_recheck(final_paths: &[&Path]) -> Result<(), String> {
-    let Some(root) = resolve_taint_root(final_paths) else {
+    let Some(root) = taint_utils::resolve_root_for(final_paths) else {
         return Ok(());
     };
 
@@ -427,28 +427,7 @@ fn taint_recheck(final_paths: &[&Path]) -> Result<(), String> {
         return Ok(());
     }
 
-    Err(format!(
-        "{} under \"{}\"; existence cannot be trusted here until it is healed.",
-        taint_utils::GATE_TAINT_MARKER, root.to_string_lossy()
-    ))
-}
-
-/// Resolve the storage root that should own every path in `final_paths`, mirroring
-/// [`taint_utils::record_taint`]'s own resolution and all-or-nothing scope tolerance: `None`
-/// when `final_paths` is empty, or when any single path is not actually under [`forklift_root`]
-/// — the shape a bare-path unit test's own paths take — in which case there is no root whose
-/// taint state a caller could sensibly consult.
-fn resolve_taint_root(final_paths: &[&Path]) -> Option<PathBuf> {
-    if final_paths.is_empty() {
-        return None;
-    }
-
-    let root = forklift_root();
-    if final_paths.iter().all(|path| path.strip_prefix(&root).is_ok()) {
-        Some(root)
-    } else {
-        None
-    }
+    Err(taint_utils::gate_standing_message(&root))
 }
 
 /// Create `path` and write `content` to it, with no durability guarantee at all. Split out of
