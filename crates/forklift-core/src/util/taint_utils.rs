@@ -25,15 +25,30 @@
 //!
 //! ## Format
 //!
-//! One taint file per failed batch, under `<root>/taint/`, named `taint-<pid>-<counter>` and
-//! created with an exclusive create (never a rename-over — see [`record_taint`]'s doc comment
-//! for why). Content is the batch's final object paths, root-relative, one per line, followed by
-//! a terminator line (see [`TAINT_TERMINATOR`]). A file whose bytes end with that exact
-//! terminator line is complete; anything else — truncated by a crash mid-write, or simply absent
-//! — is **torn**: its parseable (fully newline-terminated) prefix still contributes recorded
-//! paths, since a real write only ever appends, but the file can no longer prove it named every
-//! path the failing batch touched. [`read_taints`] unions every file under the directory and
-//! reports `torn` if any one of them is.
+//! One taint file per failed batch, under `<root>/taint/`, named
+//! `taint-<pid>-<nonce_hex>-<counter>` and created with an exclusive create (never a rename-over —
+//! see [`record_taint`]'s doc comment for why). `<pid>` is this process's OS pid; `<nonce_hex>` is
+//! a random value drawn once, lazily, per process (never per file — see
+//! [`taint_filename_nonce`]); `<counter>` is a single process-global counter that only ever
+//! increases for as long as this process lives, however many taint files it creates or deletes in
+//! between (see [`create_taint_file`]). That combination makes a filename this process has ever
+//! used **unique-forever, even after the file itself is later deleted**: the counter never resets,
+//! so this process can never reissue a name it already handed out, and the nonce means a
+//! *different* process — even one that crashed and was replaced by a new one reusing the exact
+//! same `pid` — draws its own counter from an independent, practically-never-colliding space. This
+//! is load-bearing, not cosmetic: a heal that deletes taint files by the snapshot it read (see
+//! [`TaintState::files`]) is only actually safe if a name, once observed, can never later name a
+//! *different* file on disk — otherwise a healer holding a stale snapshot of `taint-P-0` could end
+//! up deleting a freshly re-recorded `taint-P-0` that has nothing to do with the one it read (the
+//! ABA hole a naive "restart the counter at 0 every call" scheme leaves open).
+//!
+//! Content is the batch's final object paths, root-relative, one per line, followed by a
+//! terminator line (see [`TAINT_TERMINATOR`]). A file whose bytes end with that exact terminator
+//! line is complete; anything else — truncated by a crash mid-write, or simply absent — is
+//! **torn**: its parseable (fully newline-terminated) prefix still contributes recorded paths,
+//! since a real write only ever appends, but the file can no longer prove it named every path the
+//! failing batch touched. [`read_taints`] unions every file under the directory and reports `torn`
+//! if any one of them is.
 //!
 //! ## What this module does not do
 //!
@@ -47,7 +62,7 @@ use std::collections::BTreeSet;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use crate::globals::forklift_root;
 use crate::util::file_utils;
@@ -206,16 +221,55 @@ fn write_taint_file(root: &Path, relative_paths: &BTreeSet<PathBuf>) -> Result<(
     Ok(())
 }
 
-/// Exclusive-create the next free `taint-<pid>-<counter>` file under `taint_dir`: `O_CREAT|O_EXCL`
-/// via [`std::fs::OpenOptions::create_new`], retrying with the next integer suffix on `EEXIST`
-/// (a crash survivor from an earlier process with the same `pid`, or a concurrent unlocked
-/// writer) rather than ever renaming over it — see [`record_taint`]'s doc comment: a crash
-/// survivor structurally cannot be overwritten by exclusive create, whatever its name.
+/// The process-global, never-reset source of the `<counter>` suffix in every taint filename this
+/// process creates — see the module doc comment's format section for why "never reset, even
+/// across a file's own deletion" (not just "unique among files that currently exist") is the
+/// property that makes a snapshot-scoped delete safe. `fetch_add` is the only operation ever
+/// performed on this counter, from [`create_taint_file`] alone; ordering among concurrent draws
+/// within this process does not matter, only that no two draws ever return the same value, which
+/// `Ordering::Relaxed` already guarantees for a plain monotonic counter.
+static TAINT_FILENAME_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// This process's own random nonce component of every taint filename it creates — drawn once,
+/// lazily, on first use, and reused for the rest of the process's life (never redrawn per file).
+/// Defends against the `<pid>` half of a filename repeating across processes — a crash survivor
+/// whose replacement process happens to reuse the exact same OS `pid` — see the module doc
+/// comment's format section.
+fn taint_filename_nonce() -> u64 {
+    static NONCE: OnceLock<u64> = OnceLock::new();
+    *NONCE.get_or_init(|| {
+        use std::hash::{BuildHasher, Hasher};
+        // `RandomState::new()` is itself independently seeded per construction (the standard
+        // library draws fresh OS entropy for it); folding in the pid and the current time on top
+        // costs nothing and removes any dependence on exactly how that seeding is implemented.
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u32(std::process::id());
+        if let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            hasher.write_u128(now.as_nanos());
+        }
+        hasher.finish()
+    })
+}
+
+/// Exclusive-create the next free `taint-<pid>-<nonce_hex>-<counter>` file under `taint_dir`:
+/// `O_CREAT|O_EXCL` via [`std::fs::OpenOptions::create_new`]. `<counter>` is drawn fresh from
+/// [`TAINT_FILENAME_COUNTER`] on every attempt — including every retry — never a locally-restarted
+/// `0..CAP` index, so a name this process has ever handed out (even one whose file has since been
+/// deleted) can never be handed out again: see the module doc comment's format section for why
+/// that "unique-forever" property is what makes a snapshot-scoped delete
+/// (`remove_taint_files`/`replace_taint_with_remainder`) safe. `EEXIST` on a given candidate (a
+/// crash survivor from an earlier process that reused this exact `pid` and independently drew a
+/// colliding nonce, or a same-process race on the freshly-drawn counter value some other way)
+/// retries with the next freshly-drawn counter value rather than ever renaming over it — see
+/// [`record_taint`]'s doc comment: a crash survivor structurally cannot be overwritten by exclusive
+/// create, whatever its name.
 fn create_taint_file(taint_dir: &Path) -> Result<(std::fs::File, PathBuf), String> {
     let pid = std::process::id();
+    let nonce = taint_filename_nonce();
 
-    for counter in 0..TAINT_FILENAME_SANITY_CAP {
-        let candidate = taint_dir.join(format!("taint-{}-{}", pid, counter));
+    for _ in 0..TAINT_FILENAME_SANITY_CAP {
+        let counter = TAINT_FILENAME_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let candidate = taint_dir.join(format!("taint-{}-{:016x}-{}", pid, nonce, counter));
         match OpenOptions::new().write(true).create_new(true).open(&candidate) {
             Ok(handle) => return Ok((handle, candidate)),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -318,6 +372,54 @@ fn gate_state() -> &'static Mutex<BTreeSet<PathBuf>> {
     GATE.get_or_init(|| Mutex::new(BTreeSet::new()))
 }
 
+/// Lock-free mirror of [`gate_state`]'s cardinality — exactly the number of roots currently
+/// gated. Exists only so [`gate_check`] can take a fast negative without taking the mutex on the
+/// overwhelmingly common "no gate is standing anywhere" path (a bulk import/dedup calling this
+/// from many threads per object checked would otherwise serialize entirely on that mutex for a
+/// belt that is almost never tripped).
+///
+/// Kept exactly consistent with the set by construction, never independently: [`set_gate`] and
+/// [`clear_gate`] adjust this *while still holding the same lock* as their `BTreeSet` mutation,
+/// and only when that mutation actually changed membership (`insert`/`remove`'s `bool` return) —
+/// never on every call, since both are idempotent (setting an already-set root, or clearing an
+/// already-clear one, must not drift the count). No other code path touches this counter.
+///
+/// **Why this is safe as a fast negative, and only a negative:** the mutex over the `BTreeSet`
+/// remains the sole source of truth for *membership* — this counter only ever answers "is the set
+/// empty," and only the zero case is trusted without the lock. Zero is reached exactly when the
+/// last `remove` that actually removed something ran (or before any `insert` ever has), which by
+/// construction is exactly when the set itself is empty; so observing zero here means the
+/// `BTreeSet` holds nothing for *any* root, and returning `Ok` without checking `root` in
+/// particular is correct — there is nothing in the set it could possibly contain. Whenever the
+/// count is nonzero, [`gate_check`] still takes the lock and runs the exact same per-root
+/// membership test as before this optimization existed, so a standing gate for one root is never
+/// missed and a check for an unrelated root is never falsely tripped — this counter never
+/// participates in that decision, only in whether to skip straight to `Ok` first.
+///
+/// **Ordering:** `Relaxed` on every access. This establishes no happens-before relationship, but
+/// none is needed beyond what already existed: `gate_check` already races a concurrent
+/// `set_gate`/`clear_gate` under the mutex-only design (a taint set by another thread a moment
+/// after this check reads may or may not be observed, exactly as today), so this fast path is not
+/// asked to make a promise the code it replaces didn't already decline to make. What it must not
+/// do — and does not — is report zero while the set is actually nonempty, and it cannot: the
+/// increment/decrement happen inside the same critical section as the mutation they mirror, so
+/// every observer of this counter sees a value consistent with *some* linearization point of the
+/// set's history, never a stale "empty" left over from before an insert that already completed.
+static GATE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Reset the process-global gate — both [`gate_state`]'s `BTreeSet` and its [`GATE_COUNT`] mirror
+/// — to guaranteed-empty. Test-only: this module's tests share this same process-global state
+/// (like [`ACTIVATED`]) across the whole test binary, and several existing tests intentionally
+/// leave a gate standing for their own (uniquely-named) root when they finish, so a test that
+/// needs to observe the true fast-path (`GATE_COUNT == 0`) cannot assume that starting from a
+/// fresh process. Callers still take [`ACTIVATION_TEST_LOCK`] first, same as every other
+/// gate-touching test.
+#[cfg(test)]
+fn reset_gate_for_test() {
+    gate_state().lock().expect("taint gate lock poisoned").clear();
+    GATE_COUNT.store(0, Ordering::Relaxed);
+}
+
 /// The one resolution [`record_taint`] (setting) and [`gate_check`] (checking) both key the gate
 /// through, so the two sides can never drift apart into resolving "the same root" two different
 /// ways. Identity today (both callers already hand in an already-resolved [`forklift_root`]
@@ -327,7 +429,13 @@ fn gate_key(root: &Path) -> PathBuf {
 }
 
 fn set_gate(root: &Path) {
-    gate_state().lock().expect("taint gate lock poisoned").insert(gate_key(root));
+    // Idempotent: setting an already-set root must not double-count. `insert`'s `bool` return
+    // (true only when the key was actually new) is exactly the signal — increment inside the
+    // same critical section as the mutation it mirrors, see [`GATE_COUNT`].
+    let inserted = gate_state().lock().expect("taint gate lock poisoned").insert(gate_key(root));
+    if inserted {
+        GATE_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Check whether `root` is gated: `Err` while a taint [`record_taint`] set for this root is
@@ -346,6 +454,15 @@ pub fn gate_check(root: &Path) -> Result<(), String> {
         return Ok(());
     }
 
+    // Fast negative, lock-free: no gate is standing for *any* root, so none can be standing for
+    // `root` in particular — skip the mutex entirely. See [`GATE_COUNT`] for why this is sound
+    // as a negative-only shortcut and why `Relaxed` is the right ordering for it. When the count
+    // is nonzero, fall through to the exact same locked membership test as before this
+    // optimization existed — this branch never itself decides membership.
+    if GATE_COUNT.load(Ordering::Relaxed) == 0 {
+        return Ok(());
+    }
+
     if gate_state().lock().expect("taint gate lock poisoned").contains(&gate_key(root)) {
         return Err(format!(
             "{} under \"{}\"; existence cannot be trusted here until it is healed.",
@@ -360,7 +477,13 @@ pub fn gate_check(root: &Path) -> Result<(), String> {
 /// [`heal_utils::heal_if_tainted`](crate::util::heal_utils::heal_if_tainted) clears the in-memory
 /// belt with once it has durably resolved the taint on disk.
 pub(crate) fn clear_gate(root: &Path) {
-    gate_state().lock().expect("taint gate lock poisoned").remove(&gate_key(root));
+    // Idempotent: clearing an already-clear root must not underflow. `remove`'s `bool` return
+    // (true only when a key was actually removed) is exactly the signal — decrement inside the
+    // same critical section as the mutation it mirrors, see [`GATE_COUNT`].
+    let removed = gate_state().lock().expect("taint gate lock poisoned").remove(&gate_key(root));
+    if removed {
+        GATE_COUNT.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// The union of every taint file recorded under a storage root.
@@ -376,6 +499,17 @@ pub struct TaintState {
     /// [`recorded`](Self::recorded) is a lower bound, never a proof of the full set the failing
     /// batch touched.
     pub torn: bool,
+
+    /// The exact absolute paths of every taint file this read actually consumed, captured at read
+    /// time — this is the snapshot a later deletion must be scoped to, never re-derived by
+    /// scanning the taint directory again at deletion time. Taint files are born concurrently, from
+    /// any process, at any time (even a read-only command can self-heal a commit-graph shard and
+    /// trip a taint); a heal that deletes "whatever the directory holds right now" instead of
+    /// "exactly what I read" can delete a taint a sibling process recorded after this read, losing
+    /// a real durability gap forever. [`remove_taint_files`] and
+    /// [`replace_taint_with_remainder`] take this set as their deletion scope for exactly that
+    /// reason — see their own doc comments.
+    pub files: Vec<PathBuf>,
 }
 
 /// Read and union every taint file under `root`'s taint directory. A no-op — always the empty,
@@ -420,6 +554,7 @@ pub fn read_taints(root: &Path) -> Result<TaintState, String> {
         let (file_recorded, file_torn) = parse_taint_content(&bytes);
         state.recorded.extend(file_recorded);
         state.torn |= file_torn;
+        state.files.push(path);
     }
 
     Ok(state)
@@ -458,55 +593,87 @@ fn parse_taint_content(bytes: &[u8]) -> (BTreeSet<PathBuf>, bool) {
     (recorded, true)
 }
 
-/// Delete every taint file under `root`'s taint directory, then fsync the directory so the
-/// removals are themselves durable. `pub(crate)` — the primitive
+/// Delete every path in `files`, tolerating each one already being gone (`NotFound` — a sibling
+/// healer racing against the same snapshot legitimately won, which is success here, not error),
+/// then fsync `root`'s taint directory so the removals are themselves durable (tolerating the
+/// directory itself being absent too — the sync is best-effort durability, not a correctness
+/// requirement once every file is already confirmed gone). Never re-scans the directory: `files`
+/// — always a caller's own [`TaintState::files`] snapshot — is the *entire* deletion scope, by
+/// construction. Shared by [`remove_taint_files`] and [`replace_taint_with_remainder`].
+fn delete_snapshot_and_sync(root: &Path, files: &[PathBuf]) -> Result<(), String> {
+    for path in files {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("Error while removing taint file \"{}\": {}", path.to_string_lossy(), e)),
+        }
+    }
+
+    let taint_dir = root.join(TAINT_DIR_NAME);
+    if !taint_dir.exists() {
+        return Ok(());
+    }
+
+    file_utils::sync_dir(&taint_dir)
+}
+
+/// Delete exactly the taint files named in `files` — a snapshot a caller captured earlier via
+/// [`read_taints`]'s [`TaintState::files`], never re-derived by scanning the taint directory again
+/// at deletion time — then fsync the directory so the removals are themselves durable.
+///
+/// **Why snapshot-scoped, not a rescan-and-delete-everything:** taint files are born concurrently,
+/// from any process, at any time (even a read-only command can self-heal a commit-graph shard and
+/// trip a taint) — the entry-heal that eventually calls this runs lock-free, before the warehouse
+/// lock. A version of this function that instead re-read the directory at deletion time would
+/// delete every file it found there, including one recorded by a *different* process after this
+/// heal's caller snapshotted its work — silently losing a real durability gap forever. Deleting
+/// exactly `files` makes that impossible: a taint recorded after the snapshot was taken is not in
+/// `files`, so it is never touched here, however concurrently it was born.
+///
+/// `pub(crate)` — the primitive
 /// [`heal_utils::heal_if_tainted`](crate::util::heal_utils::heal_if_tainted) clears taints with
 /// once it has durably restaged every recorded path (see that function's doc comment). Not gated
 /// by activation: unlike recording or checking, deleting is only ever reached through a heal an
 /// activated process itself drives, so gating here would be redundant, not protective.
 ///
 /// # Returns
-/// * `Ok(())`      - The taint directory was absent, empty, or successfully cleared.
-/// * `Err(String)` - A taint file could not be removed, or the directory fsync failed.
-pub(crate) fn remove_taint_files(root: &Path) -> Result<(), String> {
-    let taint_dir = root.join(TAINT_DIR_NAME);
-    if !taint_dir.exists() {
-        return Ok(());
-    }
-
-    let entries = std::fs::read_dir(&taint_dir)
-        .map_err(|e| format!("Error while reading taint directory \"{}\": {}", taint_dir.to_string_lossy(), e))?;
-
-    for entry in entries {
-        let entry = entry
-            .map_err(|e| format!("Error while reading taint directory \"{}\": {}", taint_dir.to_string_lossy(), e))?;
-        let path = entry.path();
-        if path.is_file() {
-            std::fs::remove_file(&path)
-                .map_err(|e| format!("Error while removing taint file \"{}\": {}", path.to_string_lossy(), e))?;
-        }
-    }
-
-    file_utils::sync_dir(&taint_dir)
+/// * `Ok(())`      - Every path in `files` was removed (or already absent — see
+///                   [`delete_snapshot_and_sync`]), and the directory sync succeeded.
+/// * `Err(String)` - A file in `files` could not be removed for a reason other than already being
+///                   gone, or the directory fsync failed.
+pub(crate) fn remove_taint_files(root: &Path, files: &[PathBuf]) -> Result<(), String> {
+    delete_snapshot_and_sync(root, files)
 }
 
-/// Replace every taint file under `root`'s taint directory with a single new one recording
-/// exactly `remainder` — the partial-clear primitive the recovery verb
-/// ([`recovery_utils`](crate::util::recovery_utils)) uses when some recorded paths resolved
-/// (restaged, or vanished-and-unreferenced) on a heal attempt and others did not: the taint must
-/// afterwards record exactly the unresolved remainder, never the original full set (which would
-/// re-report already-resolved paths forever) and never nothing (which would silently drop the
-/// paths still genuinely in doubt).
+/// Replace exactly the taint files named in `old_files` — a snapshot a caller captured earlier via
+/// [`read_taints`]'s [`TaintState::files`] — with a single new one recording exactly `remainder`:
+/// the partial-clear primitive the recovery verb ([`recovery_utils`](crate::util::recovery_utils))
+/// uses when some recorded paths resolved (restaged, or vanished-and-unreferenced) on a heal
+/// attempt and others did not. The taint must afterwards record exactly the unresolved remainder,
+/// never the original full set (which would re-report already-resolved paths forever) and never
+/// nothing (which would silently drop the paths still genuinely in doubt).
 ///
-/// Crash-safe by construction, the same way [`record_taint`] itself is: the old file set is
-/// enumerated *first*, the replacement is durably written via the exact same exclusive-create +
-/// fsync + terminator routine [`record_taint`]'s own write uses ([`write_taint_file`] — reused
-/// directly, not reimplemented), and only once that succeeds are the old files removed. There is
-/// therefore never a window where the remainder is unrecorded on disk: a crash before the new
-/// file's write completes leaves the original (larger, still-correct, if now stale-in-places)
-/// taint set standing; a crash after leaves exactly the new, smaller set. `remainder` empty is the
-/// full-clear case and is delegated to [`remove_taint_files`] directly — no empty taint file is
-/// ever written for "nothing left to record."
+/// **Snapshot-scoped, same as [`remove_taint_files`] and for the same reason:** `old_files` is
+/// deleted exactly as given, never by re-scanning the taint directory at deletion time — a taint
+/// recorded by a concurrent process after `old_files` was snapshotted (this closure walk can run
+/// for minutes) must never be swept just because it happened to be sitting in the directory when
+/// this function got around to deleting things.
+///
+/// Crash-safe by construction, the same way [`record_taint`] itself is: the replacement is durably
+/// written *first*, via the exact same exclusive-create + fsync + terminator routine
+/// [`record_taint`]'s own write uses ([`write_taint_file`] — reused directly, not reimplemented),
+/// and only once that succeeds are `old_files` removed. There is therefore never a window where the
+/// remainder is unrecorded on disk: a crash before the new file's write completes leaves the
+/// original (larger, still-correct, if now stale-in-places) taint set standing; a crash after
+/// leaves exactly the new, smaller set (plus, until the next heal's snapshot-scoped cleanup runs,
+/// whatever of `old_files` survived that crash). The freshly-written remainder file can never
+/// itself appear in `old_files` — the snapshot predates it (it was captured before this call even
+/// started), and [`create_taint_file`]'s unique-forever names guarantee no future name can ever
+/// collide with a past one — so writing before deleting is safe by construction, not by luck of
+/// ordering.
+///
+/// `remainder` empty is the full-clear case and is delegated to [`remove_taint_files`] directly —
+/// no empty taint file is ever written for "nothing left to record."
 ///
 /// Does not touch the in-memory gate ([`gate_check`]) either way: clearing it is the caller's call
 /// once it knows whether the *whole* taint (not just this replacement step) is resolved — see
@@ -514,74 +681,24 @@ pub(crate) fn remove_taint_files(root: &Path) -> Result<(), String> {
 ///
 /// # Returns
 /// * `Ok(())`      - The taint directory now records exactly `remainder` (or is empty/absent, if
-///                   `remainder` was empty).
-/// * `Err(String)` - The new file could not be durably written (the old taint files are left
-///                   completely untouched — the original, larger set still stands, never
-///                   partially deleted before a replacement is durable), or an old file could not
-///                   be removed after the replacement succeeded.
-pub(crate) fn replace_taint_with_remainder(root: &Path, remainder: &BTreeSet<PathBuf>) -> Result<(), String> {
+///                   `remainder` was empty), and `old_files` are gone (or were already gone — see
+///                   [`delete_snapshot_and_sync`]).
+/// * `Err(String)` - The new file could not be durably written (`old_files` are left completely
+///                   untouched — the original, larger set still stands, never partially deleted
+///                   before a replacement is durable), or a file in `old_files` could not be
+///                   removed for a reason other than already being gone.
+pub(crate) fn replace_taint_with_remainder(
+    root: &Path,
+    remainder: &BTreeSet<PathBuf>,
+    old_files: &[PathBuf],
+) -> Result<(), String> {
     if remainder.is_empty() {
-        return remove_taint_files(root);
+        return remove_taint_files(root, old_files);
     }
-
-    let taint_dir = root.join(TAINT_DIR_NAME);
-
-    // Enumerate the old files *before* writing anything, so the deletion loop below removes
-    // exactly the set that predates the replacement — never the file the replacement itself just
-    // created (which, thanks to the O_EXCL suffix scheme, can never collide with one of these
-    // names anyway, but this ordering makes the invariant true by construction, not by luck).
-    let old_files: Vec<PathBuf> = if taint_dir.exists() {
-        std::fs::read_dir(&taint_dir)
-            .map_err(|e| format!("Error while reading taint directory \"{}\": {}", taint_dir.to_string_lossy(), e))?
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.path())
-            .filter(|path| path.is_file())
-            .collect()
-    } else {
-        Vec::new()
-    };
 
     write_taint_file(root, remainder)?;
 
-    for old in old_files {
-        std::fs::remove_file(&old).map_err(|e| format!(
-            "Error while removing a superseded taint file \"{}\": {}", old.to_string_lossy(), e
-        ))?;
-    }
-
-    file_utils::sync_dir(&taint_dir)
-}
-
-/// The path of any one regular taint file under `root`'s taint directory — used by
-/// [`heal_utils::heal_if_tainted`](crate::util::heal_utils::heal_if_tainted) as the write-mode-
-/// openable regular file its post-restage macOS device flush needs (a directory cannot be opened
-/// write-mode; see `file_utils::macos_flush_device_cache`'s doc comment). Which file is returned
-/// is unspecified when more than one exists — the flush is drive-wide, so any one of them serves
-/// equally.
-///
-/// # Returns
-/// * `Ok(Some(path))` - A taint file exists; `path` is one of them (unspecified which).
-/// * `Ok(None)`       - The taint directory is absent or holds no regular file.
-/// * `Err(String)`    - The taint directory exists but could not be read.
-pub(crate) fn any_taint_file_path(root: &Path) -> Result<Option<PathBuf>, String> {
-    let taint_dir = root.join(TAINT_DIR_NAME);
-    if !taint_dir.exists() {
-        return Ok(None);
-    }
-
-    let entries = std::fs::read_dir(&taint_dir)
-        .map_err(|e| format!("Error while reading taint directory \"{}\": {}", taint_dir.to_string_lossy(), e))?;
-
-    for entry in entries {
-        let entry = entry
-            .map_err(|e| format!("Error while reading taint directory \"{}\": {}", taint_dir.to_string_lossy(), e))?;
-        let path = entry.path();
-        if path.is_file() {
-            return Ok(Some(path));
-        }
-    }
-
-    Ok(None)
+    delete_snapshot_and_sync(root, old_files)
 }
 
 /// The path of the taint directory under a given warehouse root, independent of any active
@@ -639,8 +756,21 @@ mod tests {
         assert_eq!(state.recorded, expected);
     }
 
+    /// The exact taint filename `read_taints`/`record_taint` most recently created under
+    /// `taint_dir` — used by tests that need to reason about the concrete `taint-<pid>-<nonce_hex>-
+    /// <counter>` shape without hardcoding a counter value, since [`TAINT_FILENAME_COUNTER`] is a
+    /// single process-global counter shared (and already advanced) by every other test in this
+    /// binary that has recorded a taint before this one ran.
+    fn only_taint_filename(taint_dir: &Path) -> String {
+        let names: Vec<String> = std::fs::read_dir(taint_dir).unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 1, "expected exactly one taint file under {:?}, found {:?}", taint_dir, names);
+        names.into_iter().next().unwrap()
+    }
+
     #[test]
-    fn a_preexisting_first_candidate_filename_forces_the_next_suffix_and_both_survive() {
+    fn a_preexisting_next_candidate_filename_forces_a_retry_and_both_survive() {
         // Pins the O_CREAT|O_EXCL crash-survivor guarantee (memo test 9's shape): a taint file
         // already occupying the exact name a fresh write would generate must never be
         // overwritten — the write takes the next counter suffix instead, and reading unions both.
@@ -651,29 +781,70 @@ mod tests {
         let _scope = StorageRootScope::enter(&root);
         let forklift = forklift_root();
         let taint_dir = forklift.join(TAINT_DIR_NAME);
-        std::fs::create_dir_all(&taint_dir).unwrap();
 
-        let pid = std::process::id();
-        let survivor_path = taint_dir.join(format!("taint-{}-0", pid));
+        // Learn this process's actual next filename shape by recording for real first — the
+        // process-global counter's absolute value depends on how many taint files earlier tests in
+        // this same test binary have already created, so this test cannot assume it starts at 0.
+        let first_object = forklift.join("objects").join("11").join("22334455");
+        record_taint(&[first_object.as_path()]).unwrap();
+        let first_name = only_taint_filename(&taint_dir);
+
+        // "taint-<pid>-<nonce_hex>-<counter>": split off the counter to learn the exact value this
+        // process just drew, so the very next draw (a single global, monotonic counter) can be
+        // preempted deterministically.
+        let (prefix, counter_str) = first_name.rsplit_once('-').expect("well-formed taint filename");
+        let counter: u64 = counter_str.parse().expect("counter suffix must be numeric");
+
+        let survivor_path = taint_dir.join(format!("{}-{}", prefix, counter + 1));
         let survivor_content = "objects/aa/survivor\nEND\n";
         std::fs::write(&survivor_path, survivor_content).unwrap();
 
-        let object_path = forklift.join("objects").join("11").join("22334455");
-        record_taint(&[object_path.as_path()]).unwrap();
+        let second_object = forklift.join("objects").join("22").join("33445566");
+        record_taint(&[second_object.as_path()]).unwrap();
 
         // The pre-existing file must be untouched, byte for byte.
         assert_eq!(std::fs::read_to_string(&survivor_path).unwrap(), survivor_content);
 
-        // The fresh write must have landed at the next suffix, not clobbered the survivor.
-        let next_path = taint_dir.join(format!("taint-{}-1", pid));
-        assert!(next_path.exists(), "the next counter suffix must be used when the first candidate exists");
+        // The fresh write must have skipped the occupied counter and landed at the next one.
+        let next_path = taint_dir.join(format!("{}-{}", prefix, counter + 2));
+        assert!(next_path.exists(), "the next counter value must be used when the immediate next candidate exists");
 
         let state = read_taints(&forklift).unwrap();
         assert!(!state.torn);
         assert!(state.recorded.contains(&PathBuf::from("objects/aa/survivor")),
             "the survivor's own recorded path must still be read back");
-        assert!(state.recorded.contains(&PathBuf::from("objects/11/22334455")),
+        assert!(state.recorded.contains(&PathBuf::from("objects/22/33445566")),
             "the fresh write's recorded path must be read back alongside the survivor");
+    }
+
+    #[test]
+    fn a_deleted_taint_filename_is_never_reissued_by_the_same_process() {
+        // Pins Part 1's load-bearing property: a filename this process has already used must never
+        // be handed out again, even after the file is deleted — the ABA hole a naive "restart the
+        // counter at 0 every call" scheme leaves open. Reverting the process-global monotonic
+        // counter back to a per-call `0..CAP` local index makes this go red: with the taint
+        // directory emptied by the deletion below, the very next call would again probe counter 0
+        // first (and succeed immediately, since nothing occupies it anymore), reproducing the
+        // exact first filename.
+        let _serial = lock_activation();
+        activate();
+
+        let root = scratch("unique-forever");
+        let _scope = StorageRootScope::enter(&root);
+        let forklift = forklift_root();
+        let taint_dir = forklift.join(TAINT_DIR_NAME);
+
+        let object_a = forklift.join("objects").join("aa").join("bb001122");
+        record_taint(&[object_a.as_path()]).unwrap();
+        let first_name = only_taint_filename(&taint_dir);
+        std::fs::remove_file(taint_dir.join(&first_name)).unwrap();
+
+        let object_b = forklift.join("objects").join("cc").join("dd003344");
+        record_taint(&[object_b.as_path()]).unwrap();
+        let second_name = only_taint_filename(&taint_dir);
+
+        assert_ne!(first_name, second_name,
+            "a filename this process has already used must never be reissued, even after deletion");
     }
 
     #[test]
@@ -812,7 +983,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_taint_files_clears_every_file_so_a_fresh_read_sees_nothing() {
+    fn remove_taint_files_clears_every_snapshotted_file_so_a_fresh_read_sees_nothing() {
         // Pins the future-heal primitive in isolation: after removal, a read sees the fully
         // empty, non-torn state again — the same state an untainted root reads as.
         let _serial = lock_activation();
@@ -824,13 +995,149 @@ mod tests {
         let object_path = forklift.join("objects").join("88").join("99001122");
 
         record_taint(&[object_path.as_path()]).unwrap();
-        assert!(!read_taints(&forklift).unwrap().recorded.is_empty());
+        let state = read_taints(&forklift).unwrap();
+        assert!(!state.recorded.is_empty());
 
-        remove_taint_files(&forklift).unwrap();
+        remove_taint_files(&forklift, &state.files).unwrap();
 
         let state = read_taints(&forklift).unwrap();
         assert!(state.recorded.is_empty() && !state.torn,
-            "every taint file must be gone after a clean removal");
+            "every snapshotted taint file must be gone after a clean removal");
+    }
+
+    #[test]
+    fn remove_taint_files_deletes_only_the_snapshot_sparing_a_concurrently_recorded_taint() {
+        // Pins Part 3: the core bug this whole fix exists for. `remove_taint_files` must delete
+        // exactly the snapshot a caller read earlier, never whatever the directory happens to hold
+        // at deletion time. Interleaving: activate -> record T1 -> read_taints (snapshot) ->
+        // record F2 (a *different* process's taint, born after the snapshot) -> remove using the
+        // stale snapshot. Reverting Part 3 (rescanning the directory at deletion time instead of
+        // deleting exactly `files`) deletes F2 too, going red.
+        let _serial = lock_activation();
+        activate();
+
+        let root = scratch("snapshot-scoped-remove");
+        let _scope = StorageRootScope::enter(&root);
+        let forklift = forklift_root();
+        let taint_dir = forklift.join(TAINT_DIR_NAME);
+
+        let object_t1 = forklift.join("objects").join("11").join("aa112233");
+        record_taint(&[object_t1.as_path()]).unwrap();
+
+        let snapshot = read_taints(&forklift).unwrap();
+        assert_eq!(snapshot.files.len(), 1, "sanity: exactly T1's file was read");
+
+        // A second taint recorded *after* the snapshot was taken — standing in for a sibling
+        // process's heal-triggering write racing this one.
+        let object_f2 = forklift.join("objects").join("22").join("bb223344");
+        record_taint(&[object_f2.as_path()]).unwrap();
+
+        remove_taint_files(&forklift, &snapshot.files).unwrap();
+
+        let remaining: Vec<_> = std::fs::read_dir(&taint_dir).unwrap().filter_map(|e| e.ok()).collect();
+        assert_eq!(remaining.len(), 1, "exactly the concurrently-recorded taint must survive, found {:?}",
+            remaining.iter().map(|e| e.file_name()).collect::<Vec<_>>());
+
+        let state = read_taints(&forklift).unwrap();
+        assert!(!state.recorded.contains(&PathBuf::from("objects/11/aa112233")),
+            "T1, named in the snapshot, must be gone after the snapshot-scoped removal");
+        assert!(state.recorded.contains(&PathBuf::from("objects/22/bb223344")),
+            "F2, recorded after the snapshot, must survive the removal completely untouched");
+    }
+
+    #[test]
+    fn remove_taint_files_tolerates_a_snapshotted_file_already_gone() {
+        // Pins the ENOENT-tolerance half of Part 3: a sibling healer racing the exact same
+        // snapshot may already have removed a file by the time this call gets to it — that is a
+        // legitimate race won, not an error. Reverting the `NotFound` tolerance (making any
+        // `remove_file` error propagate) turns this red.
+        let _serial = lock_activation();
+        activate();
+
+        let root = scratch("enoent-tolerant-remove");
+        let _scope = StorageRootScope::enter(&root);
+        let forklift = forklift_root();
+
+        let object_path = forklift.join("objects").join("33").join("cc334455");
+        record_taint(&[object_path.as_path()]).unwrap();
+
+        let snapshot = read_taints(&forklift).unwrap();
+        assert_eq!(snapshot.files.len(), 1);
+
+        // Out-of-band removal, standing in for a sibling healer that already won the race on this
+        // exact file.
+        std::fs::remove_file(&snapshot.files[0]).unwrap();
+
+        let _guard = file_utils::SyncDirFaultGuard::recording();
+        let result = remove_taint_files(&forklift, &snapshot.files);
+        assert!(result.is_ok(), "a file already gone from the snapshot must not be an error, got {:?}", result);
+        assert!(file_utils::sync_dir_attempts().contains(&forklift.join(TAINT_DIR_NAME)),
+            "the taint directory must still be synced even when every snapshotted file was already gone");
+    }
+
+    #[test]
+    fn replace_taint_with_remainder_is_snapshot_scoped_and_spares_a_concurrent_record() {
+        // Pins Part 4: the same snapshot-scoped-delete discipline as `remove_taint_files`, but for
+        // the partial-clear primitive, whose real caller (the closure walk in `recovery_utils`) can
+        // run for minutes between snapshotting and deleting. Reverting Part 4 (rescanning the
+        // directory for `old_files` instead of using exactly the given snapshot) deletes the
+        // concurrently-recorded F2 too, going red.
+        let _serial = lock_activation();
+        activate();
+
+        let root = scratch("snapshot-scoped-replace");
+        let _scope = StorageRootScope::enter(&root);
+        let forklift = forklift_root();
+
+        let object_t1 = forklift.join("objects").join("44").join("dd445566");
+        record_taint(&[object_t1.as_path()]).unwrap();
+
+        let snapshot = read_taints(&forklift).unwrap();
+        assert_eq!(snapshot.files.len(), 1);
+
+        let object_f2 = forklift.join("objects").join("55").join("ee556677");
+        record_taint(&[object_f2.as_path()]).unwrap();
+
+        let remainder: BTreeSet<PathBuf> = [PathBuf::from("objects/99/still-dangling")].into_iter().collect();
+        replace_taint_with_remainder(&forklift, &remainder, &snapshot.files).unwrap();
+
+        let state = read_taints(&forklift).unwrap();
+        assert!(!state.recorded.contains(&PathBuf::from("objects/44/dd445566")),
+            "T1, named in the snapshot, must be superseded by the replacement");
+        assert!(state.recorded.contains(&PathBuf::from("objects/99/still-dangling")),
+            "the new remainder must be recorded");
+        assert!(state.recorded.contains(&PathBuf::from("objects/55/ee556677")),
+            "F2, recorded after the snapshot, must survive the replacement completely untouched");
+    }
+
+    #[test]
+    fn replace_taint_with_remainder_empty_remainder_delegates_to_snapshot_scoped_removal() {
+        // The empty-`remainder` branch must delegate to the same snapshot-scoped
+        // `remove_taint_files`, not a rescan-and-delete-everything shortcut — otherwise a
+        // concurrently recorded taint would be lost via this branch even after Part 3/4 fixed the
+        // other two call shapes.
+        let _serial = lock_activation();
+        activate();
+
+        let root = scratch("replace-empty-remainder");
+        let _scope = StorageRootScope::enter(&root);
+        let forklift = forklift_root();
+
+        let object_t1 = forklift.join("objects").join("66").join("ff667788");
+        record_taint(&[object_t1.as_path()]).unwrap();
+
+        let snapshot = read_taints(&forklift).unwrap();
+        assert_eq!(snapshot.files.len(), 1);
+
+        let object_f2 = forklift.join("objects").join("77").join("00778899");
+        record_taint(&[object_f2.as_path()]).unwrap();
+
+        replace_taint_with_remainder(&forklift, &BTreeSet::new(), &snapshot.files).unwrap();
+
+        let state = read_taints(&forklift).unwrap();
+        assert!(!state.recorded.contains(&PathBuf::from("objects/66/ff667788")), "T1 must be gone");
+        assert!(state.recorded.contains(&PathBuf::from("objects/77/00778899")),
+            "F2, recorded after the snapshot, must survive an empty-remainder replacement untouched");
     }
 
     #[test]
@@ -849,5 +1156,142 @@ mod tests {
         let _fault = TaintFaultGuard::recording();
         record_taint(&[object_path.as_path()]).unwrap();
         assert_eq!(taint_write_attempts().len(), 1, "a successful write must still be observed");
+    }
+
+    // --- GATE_COUNT fast-path tests --------------------------------------------------------
+    //
+    // These pin the `gate_check` fast negative added on top of the mutex-only gate: a lock-free
+    // `GATE_COUNT` that must stay in exact lockstep with `gate_state`'s `BTreeSet` cardinality.
+    // Each test uses `reset_gate_for_test` first since the gate is process-global state shared
+    // with every other test in this file (several of which deliberately leave a gate standing),
+    // then asserts `GATE_COUNT` directly (not just `gate_check`'s return) where that is the only
+    // way to redden a miscount — an over-count is invisible to `gate_check`'s return value,
+    // because a nonzero count just falls through to the same exact locked membership test as
+    // before this optimization, so it can never itself produce a wrong answer, only waste a lock
+    // acquisition. Only an *under*-count (reaching zero while a gate genuinely still stands) can
+    // corrupt `gate_check`'s answer, so several of these tests assert the count itself to catch
+    // over-count bugs that a same-root `gate_check` call alone would never reveal.
+
+    #[test]
+    fn gate_check_takes_the_fast_path_when_no_gate_is_standing() {
+        // Item 1: nothing ever gated -> the count is zero and the fast path alone answers Ok.
+        let _serial = lock_activation();
+        activate();
+        reset_gate_for_test();
+
+        let root = scratch("gate-count-none");
+        assert_eq!(GATE_COUNT.load(Ordering::Relaxed), 0);
+        assert!(gate_check(&root).is_ok(), "an unset root must pass with no gate ever standing");
+    }
+
+    #[test]
+    fn gate_check_finds_a_standing_gate_for_its_own_root() {
+        // Item 2: a nonzero count still takes the lock and finds the exact root that was set.
+        // Reddens if the fast-path condition is inverted (e.g. `== 0` flipped to `!= 0`) or if
+        // `set_gate` fails to increment on a genuine insert.
+        let _serial = lock_activation();
+        activate();
+        reset_gate_for_test();
+
+        let root = scratch("gate-count-self");
+        set_gate(&root);
+        assert_eq!(GATE_COUNT.load(Ordering::Relaxed), 1, "a fresh set_gate must increment the count exactly once");
+        assert!(gate_check(&root).is_err(), "a standing gate for this exact root must still trip");
+    }
+
+    #[test]
+    fn gate_check_is_unaffected_by_a_standing_gate_on_a_different_root() {
+        // Item 3: a nonzero count does not make the fast path (or a sloppy slow path) over-trigger
+        // for a root that was never gated — the locked membership test is still exact per-root.
+        let _serial = lock_activation();
+        activate();
+        reset_gate_for_test();
+
+        let root_a = scratch("gate-count-diff-a");
+        let root_b = scratch("gate-count-diff-b");
+        set_gate(&root_a);
+        assert_eq!(GATE_COUNT.load(Ordering::Relaxed), 1);
+
+        assert!(gate_check(&root_b).is_ok(), "a disjoint root must pass even while another root is gated");
+        assert!(gate_check(&root_a).is_err(), "the gated root itself must still trip");
+    }
+
+    #[test]
+    fn clearing_the_only_standing_gate_restores_the_fast_path() {
+        // Item 4: set then clear -> the count returns to zero and the fast path answers Ok again.
+        let _serial = lock_activation();
+        activate();
+        reset_gate_for_test();
+
+        let root = scratch("gate-count-clear");
+        set_gate(&root);
+        clear_gate(&root);
+        assert_eq!(GATE_COUNT.load(Ordering::Relaxed), 0, "clearing the only standing gate must bring the count back to zero");
+        assert!(gate_check(&root).is_ok(), "clearing the only standing gate must restore a passing check");
+    }
+
+    #[test]
+    fn a_duplicate_set_gate_does_not_inflate_the_count() {
+        // Item 5 (double-set half): set_gate is idempotent, so setting an already-set root a
+        // second time must not increment again. Reddens if someone implements the increment as
+        // "on every set_gate call" rather than gated on `BTreeSet::insert`'s `true` return — that
+        // bug leaves the count stuck at 1 after the single real `clear_gate` below, which this
+        // test catches by asserting the count directly (gate_check(root) alone would still read
+        // Ok in that buggy case, via the slow path finding the root genuinely absent — it would
+        // not redden).
+        let _serial = lock_activation();
+        activate();
+        reset_gate_for_test();
+
+        let root = scratch("gate-count-double-set");
+        set_gate(&root);
+        set_gate(&root);
+        assert_eq!(GATE_COUNT.load(Ordering::Relaxed), 1,
+            "a duplicate set_gate on an already-set root must not inflate the count");
+
+        clear_gate(&root);
+        assert_eq!(GATE_COUNT.load(Ordering::Relaxed), 0,
+            "the single real clear must bring the count back to zero, proving the duplicate set never incremented it");
+        assert!(gate_check(&root).is_ok());
+    }
+
+    #[test]
+    fn a_duplicate_clear_gate_does_not_underflow_the_count() {
+        // Item 5 (double-clear mirror): clear_gate is idempotent, so clearing an already-clear (or
+        // never-set) root must never decrement. Reddens if the decrement is not gated on
+        // `BTreeSet::remove`'s `true` return — that bug underflows the `AtomicUsize` (wraps to a
+        // huge nonzero value under `fetch_sub`, since atomics wrap rather than panic even in
+        // debug builds), which this test catches directly via the count assertion.
+        let _serial = lock_activation();
+        activate();
+        reset_gate_for_test();
+
+        let root = scratch("gate-count-double-clear");
+        clear_gate(&root);
+        clear_gate(&root);
+        assert_eq!(GATE_COUNT.load(Ordering::Relaxed), 0, "clearing an unset root must never decrement the count");
+        assert!(gate_check(&root).is_ok());
+    }
+
+    #[test]
+    fn clearing_an_unset_root_does_not_erode_a_different_standing_gate() {
+        // The dangerous shape of an ungated decrement: clearing a root that was *never* set must
+        // not erode the count contributed by a *different*, genuinely standing gate down to zero
+        // — that would send `gate_check` for the still-tainted root down the fast path to a false
+        // `Ok`. This is the one miscount class that a same-root `gate_check` call cannot catch on
+        // its own (see this section's header comment), so it is asserted on both the count and
+        // the still-tainted root's `gate_check` result.
+        let _serial = lock_activation();
+        activate();
+        reset_gate_for_test();
+
+        let root_a = scratch("gate-count-erosion-a");
+        let root_b_never_set = scratch("gate-count-erosion-b");
+        set_gate(&root_a);
+        clear_gate(&root_b_never_set);
+
+        assert_eq!(GATE_COUNT.load(Ordering::Relaxed), 1,
+            "clearing a root that was never gated must not erode a different root's standing gate");
+        assert!(gate_check(&root_a).is_err(), "the genuinely standing gate must still trip, not be skipped via the fast path");
     }
 }

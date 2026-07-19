@@ -185,6 +185,9 @@ async fn merge(id: &str) -> Result<(), String> {
         return Err("The working directory has uncommitted changes; commit or restore them before merging.".to_string());
     }
 
+    // The "already merged" shortcut above only ever touches the `@haul` meta-pallet
+    // (`haul_utils::record_merged`), never the working inventory, so it needs no exemption. Past
+    // this point the incomplete-load guard lives inside `merge_head_into_current` itself.
     match consolidate::merge_head_into_current(&current, &target_head, &haul.head, &haul.source, true).await? {
         MergeStatus::Merged(parcel) => {
             haul_utils::record_merged(&haul.id, &parcel, &actor, &signing_key_id)?;

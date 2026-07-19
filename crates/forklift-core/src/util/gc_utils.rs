@@ -2,9 +2,9 @@
 //!
 //! A failed or abandoned lift leaves verified objects with no ref pointing at them.
 //! The collector marks everything reachable from the GC roots — every pallet head,
-//! plus the parked parcels and an in-progress consolidation, when those local states
-//! exist — and sweeps the rest, with an mtime grace period protecting the objects of
-//! in-flight lifts.
+//! plus every bay's parked parcels and in-progress consolidation, when those local
+//! states exist — and sweeps the rest, with an mtime grace period protecting the
+//! objects of in-flight lifts.
 //!
 //! The mark walk is presence-tolerant: a store can legitimately hold only some of a
 //! parcel's paths — an out-of-scope subtree is sealed by a hash the signed parcel commits
@@ -18,7 +18,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::time::SystemTime;
-use crate::util::{audit_utils, file_utils, merge_utils, object_utils, pallet_utils, park_utils};
+use crate::util::{audit_utils, bay_utils, file_utils, object_utils, pallet_utils};
 
 /// What a collection did.
 pub struct GcStats {
@@ -142,11 +142,17 @@ pub(crate) fn collect_live_set() -> Result<HashSet<String>, String> {
         roots.push(head);
     }
 
-    roots.extend(park_utils::read_parked()?);
-
-    if let Some(consolidation) = merge_utils::read_consolidation_state()? {
-        roots.push(consolidation.their_head);
-    }
+    // Parked parcels and an in-progress consolidation are bay-local
+    // (`.forklift/bays/<name>/…`; the main tree keeps them directly under `.forklift/`), so gc
+    // must read every bay's state, not just the active one — otherwise a `gc`/`compact --all`
+    // run from the main tree would delete an object only a *different* bay's parked or
+    // in-progress-consolidation state still references (present-tense data loss, not merely a
+    // stale record). This is the same per-bay loop `recovery_utils::collect_walk_roots` needs,
+    // so both call the shared `bay_utils::collect_bay_scoped_parcel_roots` — see its doc comment
+    // for the shared-helper rationale, the superset invariant this list must stay a subset of,
+    // and the fail-closed contract on an unreadable bay source (by design, not a bug: re-check
+    // that doc comment before changing this list, and never make it skip-and-continue).
+    roots.extend(bay_utils::collect_bay_scoped_parcel_roots()?);
 
     // A re-genesis anchor (§8.7) pins the replaced office chain as attested history;
     // the pin is a GC root, or the attested chain would be collected as unreachable.
@@ -545,6 +551,75 @@ mod tests {
         let result = collect_garbage(0);
         assert!(result.is_err(), "a present-but-corrupt object must surface as an error, not be tolerated");
         assert!(loose_path(&garbage).exists(), "gc must delete nothing when the live set cannot be computed");
+    }
+
+    /// (v) The gc half of the bay-scoping bug: `collect_live_set` used to read only the active
+    /// bay's `parked`/`consolidation` state (`bay_root()`, which with no active bay resolves to
+    /// `forklift_root()` itself — never a *named* bay's state dir) — a parcel parked in a
+    /// different bay was invisible to gc, and `collect_garbage`/`compact --all` run from the
+    /// main tree deleted its otherwise-unreferenced objects. Present-tense data loss (worse than
+    /// the recovery walk's under-count: nothing has to crash first), not merely a stale taint
+    /// record. Pins the per-bay loop over `bay_utils::all_bay_state_dirs` in `collect_live_set`.
+    /// Red without it: the blob below is reachable from **no** pallet head — only bay "b"'s
+    /// parked file (planted directly, by path, mirroring how `collect_live_set` itself only ever
+    /// reads paths) — so a pre-fix `collect_garbage(0)` run from the main scope deletes it.
+    #[test]
+    fn gc_keeps_an_object_referenced_only_by_another_bays_parked_parcel() {
+        let _scratch = Scratch::new("gc-bay-scoped-parked");
+
+        // A real parcel over a real tree/blob, stored but reachable from no pallet head at all —
+        // its only reference is bay "b"'s parked file.
+        let blob = store_blob("only bay b's parked parcel reaches me\n");
+        let tree = store_tree(&[("f.txt", &blob, DirEntryType::Normal)]);
+        let parcel = {
+            let parcel = Parcel { tree_hash: tree.clone(), parents: Vec::new(), actions: Vec::new(), description: None };
+            let mut object = LooseObjectBuilder::build_parcel(&parcel);
+            object.store().unwrap();
+            object.hash
+        };
+
+        let bay_b_dir = bay_utils::bay_state_dir("b");
+        std::fs::create_dir_all(&bay_b_dir).unwrap();
+        std::fs::write(bay_b_dir.join("parked"), format!("{}\n", parcel)).unwrap();
+
+        // Run from the MAIN scope (no active bay) — gc must still see bay "b"'s parked parcel.
+        let stats = collect_garbage(0).expect("gc must tolerate another bay's parked parcel");
+
+        assert_eq!(stats.deleted, 0, "nothing reachable only through bay b's parked parcel may be deleted");
+        assert!(loose_path(&blob).exists(), "a blob referenced only by another bay's parked parcel must survive gc");
+        assert!(loose_path(&tree).exists(), "a tree referenced only by another bay's parked parcel must survive gc");
+        assert!(loose_path(&parcel).exists(), "a parcel parked only in another bay must survive gc");
+    }
+
+    /// Regression lock for the fail-closed contract on `bay_utils::collect_bay_scoped_parcel_roots`
+    /// (see its doc comment): a malformed `parked` file in a *non-active* bay must make
+    /// `collect_garbage`/`collect_live_set` fail outright and delete nothing — never silently
+    /// skip the unreadable bay and reclaim garbage anyway, which would re-open the exact
+    /// under-counting bug the bay-scope fix closed (a bay's still-live object swept because its
+    /// ref source could not be proven to exclude it). Red if `read_parked_in`'s `?` in
+    /// `collect_bay_scoped_parcel_roots` (crates/forklift-core/src/util/bay_utils.rs) were ever
+    /// changed to skip-and-continue on an `Err` instead of propagating it.
+    #[test]
+    fn gc_fails_closed_and_deletes_nothing_on_an_unreadable_bay_parked_file() {
+        let _scratch = Scratch::new("gc-bay-unreadable-parked");
+
+        // A real piece of garbage that a skip-and-continue bug would wrongly let gc collect.
+        let garbage = store_blob("would be wrongly collected if the bad bay were skipped\n");
+        assert!(loose_path(&garbage).exists());
+
+        // Bay "b"'s `parked` file is malformed (not 64 hex chars) — `read_parked_in` errors on it.
+        let bay_b_dir = bay_utils::bay_state_dir("b");
+        std::fs::create_dir_all(&bay_b_dir).unwrap();
+        std::fs::write(bay_b_dir.join("parked"), b"not-a-valid-hash\n").unwrap();
+
+        let live_set_result = collect_live_set();
+        assert!(live_set_result.is_err(),
+            "an unreadable/malformed bay ref source must fail the live-set computation, not be skipped");
+
+        let gc_result = collect_garbage(0);
+        assert!(gc_result.is_err(), "gc must refuse rather than reclaim when a bay's ref source is unreadable");
+        assert!(loose_path(&garbage).exists(),
+            "gc must delete nothing when the live set could not be computed, even unrelated garbage");
     }
 
     /// DESIGN.html §5.0 D item 10, finding #3: a `WriteBatch`-staged write that never reaches

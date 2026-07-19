@@ -245,7 +245,7 @@ pub fn heal_if_tainted() -> Result<(), CoreError> {
         ));
     }
 
-    finish_clean_heal(&root, &attempt.restaged).map_err(|e| sync_failure_refusal(&root, &e))
+    finish_clean_heal(&root, &attempt.restaged, &state.files).map_err(|e| sync_failure_refusal(&root, &e))
 }
 
 /// The outcome of restaging every path in a recorded taint set — the shared core of
@@ -307,18 +307,30 @@ pub(crate) fn attempt_restage_all(root: &Path, recorded: &BTreeSet<PathBuf>) -> 
 /// must leave the taint standing exactly as it was, which is why this does not itself remove
 /// anything on an `Err`.
 ///
+/// `taint_files` is the exact snapshot the caller's own [`taint_utils::read_taints`] call returned
+/// (its `TaintState::files`) — threaded straight through to [`taint_utils::remove_taint_files`],
+/// never re-derived by scanning the taint directory here. That snapshot is what makes the removal
+/// safe under concurrency: it names precisely the files this heal is entitled to delete, so a
+/// taint a sibling process records after the read (taint files are born concurrently, from any
+/// process, at any time — even a read-only command can self-heal a commit-graph shard and trip
+/// one) is never swept just because it happened to land in the directory before this cleanup ran.
+///
 /// # Returns
 /// * `Ok(())`      - The restaged paths are durable and the taint is now fully cleared.
 /// * `Err(String)` - The post-restage sync/flush, or clearing the taint files, failed. The taint
 ///                   is left standing (whatever `restaged` was, remains unproven durable).
-pub(crate) fn finish_clean_heal(root: &Path, restaged: &BTreeSet<PathBuf>) -> Result<(), String> {
+pub(crate) fn finish_clean_heal(
+    root: &Path,
+    restaged: &BTreeSet<PathBuf>,
+    taint_files: &[PathBuf],
+) -> Result<(), String> {
     let parents: BTreeSet<PathBuf> = restaged.iter()
         .filter_map(|relative| root.join(relative).parent().map(Path::to_path_buf))
         .collect();
 
     sync_restaged_parents(root, &parents)?;
 
-    taint_utils::remove_taint_files(root)?;
+    taint_utils::remove_taint_files(root, taint_files)?;
     taint_utils::clear_gate(root);
 
     Ok(())
@@ -338,6 +350,12 @@ pub(crate) fn finish_clean_heal(root: &Path, restaged: &BTreeSet<PathBuf>) -> Re
 /// see that module's doc comment.
 #[cfg(unix)]
 pub(crate) fn sync_restaged_parents(root: &Path, parents: &BTreeSet<PathBuf>) -> Result<(), String> {
+    // Unused on every platform since the macOS device flush moved to grouping `parents` by their
+    // own `st_dev` (see `flush_device_caches`) rather than resolving a taint file under `root` to
+    // flush through — kept as a parameter for signature stability across this function's other
+    // caller (`recovery_utils::run`).
+    let _ = root;
+
     let mut first_error: Option<String> = None;
 
     for parent in parents {
@@ -352,10 +370,8 @@ pub(crate) fn sync_restaged_parents(root: &Path, parents: &BTreeSet<PathBuf>) ->
 
     #[cfg(target_os = "macos")]
     if !parents.is_empty() {
-        flush_device_caches(root, parents)?;
+        flush_device_caches(parents)?;
     }
-    #[cfg(not(target_os = "macos"))]
-    let _ = root;
 
     Ok(())
 }
@@ -368,31 +384,26 @@ pub(crate) fn sync_restaged_parents(_root: &Path, _parents: &BTreeSet<PathBuf>) 
     Ok(())
 }
 
-/// The macOS device-cache flush after a clean restage pass: one shared flush via a taint file
-/// (guaranteed to already exist and be a regular, write-mode-openable file — see
-/// `file_utils::macos_flush_device_cache`'s doc comment on why a directory cannot serve this
-/// role), plus the cross-volume fallback (memo-documented `st_dev` anchor rule): any restaged
-/// parent whose device differs from the taint file's own gets its own tiny anchor-file flush,
-/// since `F_FULLFSYNC` only reaches the drive the flushed file descriptor actually sits on.
+/// The macOS device-cache flush after a clean restage pass. Never depends on any taint file
+/// existing — a concurrent heal (in another process, or this very call's own caller, whose
+/// snapshot-scoped `taint_utils::remove_taint_files` may run moments after this) can leave the
+/// taint directory completely empty by the time this runs, and that must never turn a genuinely
+/// successful restage into a spurious failure. Instead: group `parents` by their own `st_dev`
+/// (memo-documented anchor rule — `F_FULLFSYNC` only reaches the drive the flushed file
+/// descriptor actually sits on) and flush each *distinct* device exactly once, via
+/// [`flush_via_anchor`] on one representative parent per device. `parents` are object-store shard
+/// directories (`objects/<2-hex>/`) or the `objects/pack/` directory — [`flush_via_anchor`] never
+/// creates its anchor file inside one of these; see its own doc comment for why.
 #[cfg(target_os = "macos")]
-fn flush_device_caches(root: &Path, parents: &BTreeSet<PathBuf>) -> Result<(), String> {
-    let taint_file = taint_utils::any_taint_file_path(root)?.ok_or_else(|| {
-        "Internal error: the heal reached its post-restage flush step with no taint file left to \
-        flush through.".to_string()
-    })?;
-
-    file_utils::macos_flush_device_cache(&taint_file)?;
-
-    let taint_dev = std::fs::metadata(&taint_file).map_err(|e| format!(
-        "Error while checking the device of \"{}\": {}", taint_file.to_string_lossy(), e
-    ))?.dev();
+fn flush_device_caches(parents: &BTreeSet<PathBuf>) -> Result<(), String> {
+    let mut seen_devices: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
     for parent in parents {
         let parent_dev = std::fs::metadata(parent).map_err(|e| format!(
             "Error while checking the device of \"{}\": {}", parent.to_string_lossy(), e
         ))?.dev();
 
-        if parent_dev != taint_dev {
+        if seen_devices.insert(parent_dev) {
             flush_via_anchor(parent)?;
         }
     }
@@ -402,26 +413,62 @@ fn flush_device_caches(root: &Path, parents: &BTreeSet<PathBuf>) -> Result<(), S
 
 /// Cross-volume fallback: `parent` sits on a different drive than the taint file the shared flush
 /// in [`flush_device_caches`] just used, so that flush never reached it. Creates a tiny anchor
-/// file directly inside `parent`, flushes *its* drive via the same
-/// [`file_utils::macos_flush_device_cache`] primitive, then removes the anchor — the anchor's own
-/// dentry durability is irrelevant (it is transient plumbing, never data anything else reads); only
-/// the device-wide flush it triggers matters. Any failure here — including the anchor's own
-/// create — is a heal failure for `parent`'s drive, exactly like an `EIO` from its directory
-/// fsync would be: this function never reports success having flushed only the taint file's own
-/// drive.
+/// file in [`anchor_parent_dir`] — same device as `parent`, but never inside `parent` itself when
+/// `parent` is an object-store shard directory (or the `objects/pack/` directory) — flushes *its*
+/// drive via the same [`file_utils::macos_flush_device_cache`] primitive, then removes the anchor
+/// — the anchor's own dentry durability is irrelevant (it is transient plumbing, never data
+/// anything else reads); only the device-wide flush it triggers matters. Any failure here —
+/// including the anchor's own create — is a heal failure for `parent`'s drive, exactly like an
+/// `EIO` from its directory fsync would be: this function never reports success having flushed
+/// only the taint file's own drive.
+///
+/// The anchor must not land inside `parent` when `parent` is a shard directory: `gc`'s sweep
+/// (`gc_utils.rs:54-71`) enumerates every non-`.sig` entry inside `objects/<2-hex>/` as a
+/// candidate object (`hash = <shard-prefix> + <file-name>`) and, past the grace period,
+/// `remove_file`s whichever of those it does not find live — a `.forklift-heal-anchor-*` file
+/// sitting in a shard dir during the tiny window it exists would be misparsed as an object and,
+/// worst case, swept out from under a concurrent gc/audit walker's own reads. See
+/// [`anchor_parent_dir`] for where it goes instead.
 #[cfg(target_os = "macos")]
 fn flush_via_anchor(parent: &Path) -> Result<(), String> {
     static ANCHOR_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let id = ANCHOR_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-    let anchor = parent.join(format!(".forklift-heal-anchor-{}-{}", std::process::id(), id));
+    let anchor = anchor_parent_dir(parent)
+        .join(format!(".forklift-heal-anchor-{}-{}", std::process::id(), id));
 
     let result = std::fs::write(&anchor, []).map_err(|e| format!(
-        "Error while creating a cross-volume flush anchor in \"{}\": {}", parent.to_string_lossy(), e
+        "Error while creating a cross-volume flush anchor near \"{}\": {}", parent.to_string_lossy(), e
     )).and_then(|()| file_utils::macos_flush_device_cache(&anchor));
 
     let _ = std::fs::remove_file(&anchor);
     result
+}
+
+/// Where [`flush_via_anchor`] creates its anchor file for a given restaged parent: one directory
+/// up from `parent` when it has one, else `parent` itself (only possible if `parent` were a root,
+/// which a restaged path's parent — always at least `objects/<shard>` — never is in practice).
+///
+/// This satisfies both constraints an anchor location needs:
+/// - **Same device as `parent`**, so `F_FULLFSYNC` on the anchor's fd actually reaches the drive
+///   `parent` sits on (the whole point of the flush). Moving up one level stays on the same
+///   filesystem here because forklift itself lays out the object-store hierarchy as plain
+///   subdirectories of `objects/` (`objects/<2-hex>/`, `objects/pack/`) — never as separate mount
+///   points — so there is no mount boundary between a shard dir and its parent to cross.
+/// - **Not swept by a concurrent object walker.** `parent` is always either an `objects/<2-hex>/`
+///   shard directory or `objects/pack/`; going up one level lands in `objects/` itself. gc's sweep
+///   (`gc_utils.rs:57-72`) only *descends into* entries of `objects/` whose name is exactly
+///   [`file_utils::OBJECT_HASH_FOLDER_PATH_CHARACTERS`] hex digits (skipping the pack folder and
+///   anything else) — and even before that name check, it skips any entry that is not a directory
+///   at all (`gc_utils.rs:60-62`), which a plain anchor file always is. So an anchor sitting
+///   directly in `objects/` is invisible to that sweep both as a folder to walk into and as a file
+///   to inspect.
+///
+/// Factored out from [`flush_via_anchor`] so a test can pin the anchor's location without needing
+/// to catch a file that exists for only a few microseconds mid-flush.
+#[cfg(target_os = "macos")]
+fn anchor_parent_dir(parent: &Path) -> &Path {
+    parent.parent().unwrap_or(parent)
 }
 
 fn torn_refusal(root: &Path) -> CoreError {
@@ -810,5 +857,101 @@ mod tests {
         let relative = path.strip_prefix(&forklift).unwrap();
         let outcome = restage_object(&forklift, relative).unwrap();
         assert_eq!(outcome, RestageOutcome::HashMismatch);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_flush_survives_every_taint_file_being_emptied_before_the_flush_runs() {
+        // Pins Part 5: the post-restage macOS flush must never depend on any taint file still
+        // existing. In the real sequence `finish_clean_heal` empties the taint directory *after*
+        // this flush runs, but a *sibling* process's own heal (or recovery-verb closure walk) can
+        // just as easily have already cleared every taint file under this root by the time this
+        // call executes — entry-heal runs lock-free, before the warehouse lock. Reverting Part 5
+        // (resolving a taint file via `any_taint_file_path` to flush through) turns this into a
+        // spurious "Internal error" refusal even though the actual restage succeeded cleanly.
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        let root = scratch("macos-flush-emptied-taint-dir");
+        let _scope = StorageRootScope::enter(&root);
+        let forklift = forklift_root();
+
+        let content = b"a genuine loose object to restage for the macOS flush test";
+        let (_hash, relative) = write_loose_object(&forklift, content);
+        plant_taint(&forklift, &[relative.to_string_lossy().as_ref()]);
+
+        let outcome = restage_object(&forklift, &relative).unwrap();
+        assert_eq!(outcome, RestageOutcome::Restaged, "sanity: the restage itself must succeed");
+
+        // Empty the taint directory *before* the flush — simulating a concurrent heal that already
+        // cleared it by the time this flush step runs.
+        let taint_dir = forklift.join("taint");
+        for entry in std::fs::read_dir(&taint_dir).unwrap() {
+            std::fs::remove_file(entry.unwrap().path()).unwrap();
+        }
+        assert!(std::fs::read_dir(&taint_dir).unwrap().next().is_none(), "sanity: no taint file remains");
+
+        let parent = forklift.join(&relative).parent().unwrap().to_path_buf();
+        let parents: BTreeSet<PathBuf> = [parent].into_iter().collect();
+
+        sync_restaged_parents(&forklift, &parents)
+            .expect("the post-restage flush must succeed even with no taint file left to flush through");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn flush_anchor_lands_in_the_objects_root_never_inside_a_shard_dir() {
+        // Pins the anchor-location fix directly: `anchor_parent_dir` must place the anchor one
+        // level up from a restaged parent, not inside it. `parent` here mirrors the real shape
+        // `flush_device_caches` groups by device — an `objects/<2-hex>/` shard dir — so this is
+        // exactly the case gc's sweep (`gc_utils.rs:54-71`) walks and would misparse a foreign
+        // file inside as an object. Reverting to `parent` itself (the pre-fix behavior) reddens
+        // this: `anchor_parent_dir` would then equal `shard_dir`, tripping the `assert_ne!` and
+        // the `assert_eq!` against the objects root both.
+        let shard_dir = Path::new("/warehouse/.forklift/objects/ab");
+        let anchor_dir = anchor_parent_dir(shard_dir);
+
+        assert_eq!(anchor_dir, Path::new("/warehouse/.forklift/objects"),
+            "the anchor must land in the objects/ root, one level up from the shard dir");
+        assert_ne!(anchor_dir, shard_dir,
+            "the anchor must never be placed inside the shard dir gc's sweep walks");
+
+        // Same check for the other real caller shape: the `objects/pack/` directory.
+        let pack_dir = Path::new("/warehouse/.forklift/objects/pack");
+        assert_eq!(anchor_parent_dir(pack_dir), Path::new("/warehouse/.forklift/objects"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_flush_after_a_real_restage_leaves_no_foreign_file_in_the_shard_dir() {
+        // End-to-end companion to `flush_anchor_lands_in_the_objects_root_never_inside_a_shard_dir`:
+        // drives a real restage + flush over a genuine loose object and asserts the shard
+        // directory holds only the object itself afterward — never a
+        // `.forklift-heal-anchor-*` name a concurrent gc/audit walker could trip over. (The
+        // anchor's own lifetime is a handful of microseconds, so this does not by itself catch a
+        // mid-flight foreign-file window the way the pure-function test above does; it does
+        // confirm the flush leaves the shard dir in the expected clean state.)
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        let root = scratch("macos-flush-no-foreign-file");
+        let _scope = StorageRootScope::enter(&root);
+        let forklift = forklift_root();
+
+        let content = b"a genuine loose object for the no-foreign-file-in-shard-dir check";
+        let (_hash, relative) = write_loose_object(&forklift, content);
+        plant_taint(&forklift, &[relative.to_string_lossy().as_ref()]);
+
+        heal_if_tainted().expect("a verified loose object must heal");
+
+        let shard_dir = forklift.join(&relative).parent().unwrap().to_path_buf();
+        let entries: Vec<String> = std::fs::read_dir(&shard_dir).unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+
+        for name in &entries {
+            assert!(!name.starts_with(".forklift-heal-anchor-"),
+                "a heal anchor must never be left behind in the object shard dir: {:?}", entries);
+        }
     }
 }

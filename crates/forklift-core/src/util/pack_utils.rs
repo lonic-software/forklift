@@ -3496,7 +3496,7 @@ mod tests {
         }
 
         drop(_guard);
-        taint_utils::remove_taint_files(&forklift).unwrap();
+        taint_utils::remove_taint_files(&forklift, &state.files).unwrap();
 
         // The second, more precise half of the durable-before-destructive claim: even with the
         // directory sync itself succeeding cleanly (no fault armed below), a taint standing from

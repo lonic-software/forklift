@@ -937,12 +937,12 @@ struct DirSyncFaultState {
 /// neither a stale guard from a previous test on a reused thread, nor this guard's own arming
 /// once the test that created it is done, can bleed into another test.
 #[cfg(test)]
-struct DirSyncFaultGuard;
+pub(crate) struct DirSyncFaultGuard;
 
 #[cfg(test)]
 impl DirSyncFaultGuard {
     /// Record every directory `fsync_dir_data` is asked to sync; fail none of them.
-    fn recording() -> Self {
+    pub(crate) fn recording() -> Self {
         DIR_SYNC_FAULT.with(|f| *f.borrow_mut() = DirSyncFaultState { attempted: Vec::new(), fail_needle: None });
         DirSyncFaultGuard
     }
@@ -968,7 +968,7 @@ impl Drop for DirSyncFaultGuard {
 /// The directories [`fsync_dir_data`] has been asked to sync on this thread since the current
 /// [`DirSyncFaultGuard`] was armed, in call order.
 #[cfg(test)]
-fn dir_sync_attempts() -> Vec<PathBuf> {
+pub(crate) fn dir_sync_attempts() -> Vec<PathBuf> {
     DIR_SYNC_FAULT.with(|f| f.borrow().attempted.clone())
 }
 

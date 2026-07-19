@@ -18,14 +18,19 @@
 //! pack data/index file, or an inventory shard — the three shapes the taint schema can ever
 //! record) and, for the object-shaped ones, checks whether the object it names is genuinely absent
 //! (present elsewhere — another pack, or loose — is not a loss) and, if so, whether *any* durable
-//! ref source still reaches it: pallet heads (both namespaces), parked parcels, tag subjects, and
-//! staged inventory shards **enumerated from the files on disk**, never the registration ledger
-//! (`inventory_utils::write_metadata_to_file` is a non-atomic, unsynced `std::fs::write` that is
-//! blind to a published-but-unregistered shard — the phase-B wart; a walk that trusted it could
-//! silently miss a real dangling reference). An object no live ref reaches is safe to drop from the
-//! taint — the same "absent + unreachable" shape a plain crash already leaves unhealed today,
-//! which the ordinary retry-and-restage path handles without this module's help. An object a live
-//! ref *does* still reach is reported, machine-coded, with the remedies that actually exist for it.
+//! ref source still reaches it: pallet heads (both namespaces), every bay's parked parcels, tag
+//! subjects, every bay's in-progress consolidation (its `their_head`), the trust anchor's adopted
+//! head (a re-genesis pin, §8.7), and every bay's staged inventory shards **enumerated from the
+//! files on disk**, never the registration ledger (`inventory_utils::write_metadata_to_file` is a
+//! non-atomic, unsynced `std::fs::write` that is blind to a published-but-unregistered shard — the
+//! phase-B wart; a walk that trusted it could silently miss a real dangling reference). The taint
+//! is over the *shared* object store, so every bay-local source is read across every bay
+//! (`bay_utils::all_bay_state_dirs`), never just the active one — see
+//! [`collect_walk_roots`]'s own doc comment for why. An object no live ref reaches is safe to drop
+//! from the taint — the same "absent + unreachable" shape a plain crash already leaves unhealed
+//! today, which the ordinary retry-and-restage path handles without this module's help. An object
+//! a live ref *does* still reach is reported, machine-coded, with the remedies that actually exist
+//! for it.
 //!
 //! The walk is **read-only by construction**: every object read goes through [`object_utils`]'s
 //! plain loaders (`load_parcel`/`load_tree`/`recipe_chunk_hashes`), which never call
@@ -51,8 +56,11 @@ use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use crate::enums::dir_entry_type::DirEntryType;
 use crate::error::{CoreError, RefusalCode};
-use crate::globals::forklift_root;
-use crate::util::{file_utils, heal_utils, object_utils, pack_utils, pallet_utils, park_utils, remote_utils, tag_utils, taint_utils};
+use crate::globals::{forklift_root, FOLDER_NAME_INVENTORY_ROOT};
+use crate::util::{
+    bay_utils, file_utils, heal_utils, object_utils, office_utils, pack_utils,
+    pallet_utils, remote_utils, tag_utils, taint_utils,
+};
 
 /// How many dangling references a refusal message names individually before summarizing the
 /// rest as "(and N more)" — mirrors `audit_utils::MAX_NAMED_MISSING_CHUNKS`'s reasoning: a pack
@@ -120,7 +128,8 @@ pub fn run() -> Result<HealOutcome, CoreError> {
     let attempt = heal_utils::attempt_restage_all(&root, &state.recorded);
 
     if attempt.all_clean() {
-        heal_utils::finish_clean_heal(&root, &attempt.restaged).map_err(|e| sync_failure_refusal(&root, &e))?;
+        heal_utils::finish_clean_heal(&root, &attempt.restaged, &state.files)
+            .map_err(|e| sync_failure_refusal(&root, &e))?;
         return Ok(HealOutcome {
             was_tainted: true,
             restaged: display_paths(attempt.restaged.iter()),
@@ -138,17 +147,24 @@ pub fn run() -> Result<HealOutcome, CoreError> {
         heal_utils::sync_restaged_parents(&root, &parents).map_err(|e| sync_failure_refusal(&root, &e))?;
     }
 
-    resolve_the_rest(&root, &state.recorded, &attempt)
+    resolve_the_rest(&root, &state.recorded, &attempt, &state.files)
 }
 
 /// The deeper analysis: classify every path [`heal_utils::attempt_restage_all`] could not
 /// restage, run the closure walk over whatever turned out to be genuinely missing, and rewrite
 /// the taint to record exactly what remains dangling. Split out of [`run`] only for readability —
 /// still called exactly once per invocation.
+///
+/// `taint_files` is [`run`]'s own `state.files` — the snapshot [`taint_utils::read_taints`]
+/// returned before this whole analysis (including the closure walk, which can run for minutes)
+/// began. It is threaded straight through to [`taint_utils::replace_taint_with_remainder`] so the
+/// eventual rewrite deletes exactly the files that predate this call, never whatever the taint
+/// directory holds by the time the walk finally finishes — see that function's doc comment.
 fn resolve_the_rest(
     root: &Path,
     recorded: &BTreeSet<PathBuf>,
     attempt: &heal_utils::RestageAttempt,
+    taint_files: &[PathBuf],
 ) -> Result<HealOutcome, CoreError> {
     let mut remainder: BTreeSet<PathBuf> = BTreeSet::new();
     let mut dangling_lines: Vec<String> = Vec::new();
@@ -268,7 +284,8 @@ fn resolve_the_rest(
         ));
     }
 
-    taint_utils::replace_taint_with_remainder(root, &remainder).map_err(|e| sync_failure_refusal(root, &e))?;
+    taint_utils::replace_taint_with_remainder(root, &remainder, taint_files)
+        .map_err(|e| sync_failure_refusal(root, &e))?;
 
     if remainder.is_empty() {
         taint_utils::clear_gate(root);
@@ -319,41 +336,83 @@ fn classify_vanished(relative: &Path) -> VanishedClass {
 /// the registration ledger) — see the module doc comment.
 struct WalkRoots {
     /// Parcel hashes to walk ancestry-and-tree-closure from: every pallet head (both namespaces),
-    /// every parked parcel, and every tag's subject parcel.
+    /// every bay's parked parcels, every tag's subject parcel, every bay's in-progress
+    /// consolidation `their_head`, and the trust anchor's adopted head (if any).
     parcels: Vec<String>,
-    /// Object hashes a staged inventory shard references directly (never through a parcel), with
-    /// the entry's type (so a chunked file's recipe is still descended into for its chunks).
+    /// Object hashes a staged inventory shard (of any bay) references directly (never through a
+    /// parcel), with the entry's type (so a chunked file's recipe is still descended into for its
+    /// chunks).
     shard_referenced: Vec<(String, DirEntryType)>,
 }
 
+/// Collect every durable ref source's roots — see [`WalkRoots`].
+///
+/// **Warehouse-scale, not bay-scale.** The taint this walk exists to resolve is over the
+/// *shared* object store (`forklift_root()`, invariant across every bay) — objects and pallet
+/// refs are shared, but a bay's parked parcels, staged inventory shards and in-progress
+/// consolidation are bay-*local* (`.forklift/bays/<name>/…`; the main tree keeps them directly
+/// under `.forklift/`). Answering "is this shared object still referenced by *anything*
+/// durable" from only the active bay's local state would under-count references and could clear
+/// the taint on (and later let `gc` delete) an object a *different* bay still needs — silent
+/// data loss. So every bay-local source below is read across every bay
+/// (`bay_utils::all_bay_state_dirs`), never just the active one.
+///
+/// **Invariant with [`gc_utils::collect_live_set`](crate::util::gc_utils::collect_live_set):**
+/// this walk's roots must stay a *superset* of gc's live-set roots (every pallet head, every
+/// bay's parked parcels, every bay's in-progress consolidation `their_head`, and the shared
+/// trust-anchor `adopts`) — plus every tag's subject and every bay's staged inventory shards,
+/// sources gc deliberately does not root (tags are not a gc root today; an unstacked staged
+/// shard is a pre-existing, accepted gc design choice, not a bug this walk needs to match). If
+/// gc ever treats an object as live, this walk must never call the same object safe to drop —
+/// otherwise `forklift heal` could clear a taint over an object `forklift gc` would refuse to
+/// delete. The parked-parcels/consolidation portion of that shared root list is not duplicated
+/// here — both this function and `collect_live_set` call
+/// [`bay_utils::collect_bay_scoped_parcel_roots`] for it, so the two can never drift apart on
+/// that portion by construction; **a future edit adding a new bay-local ref source should still
+/// re-check both callers of the shared helper, and re-check the other function's root list for
+/// anything not routed through it (tags, shards, the trust anchor).**
+///
+/// The undo journal is deliberately excluded from **both** walks (parity, not an oversight): an
+/// entry there records history for `undo`/`redo`, never a live reference a future write would
+/// resurrect from it.
+///
+/// Staged inventory shards are enumerated by walking the shard **files on disk**, never the
+/// registration ledger (`inventory_utils::write_metadata_to_file`'s plain, unsynced
+/// `std::fs::write`, which is blind to a shard published but never registered — the phase-B
+/// wart §3.2 calls out by name; a walk that trusted the ledger could silently miss a real
+/// dangling reference).
 fn collect_walk_roots() -> Result<WalkRoots, String> {
     let mut parcels: Vec<String> = Vec::new();
+    let mut shard_referenced: Vec<(String, DirEntryType)> = Vec::new();
 
     for (_, head) in pallet_utils::all_pallet_refs()? {
         parcels.push(head);
     }
 
-    parcels.extend(park_utils::read_parked()?);
-
     for tag in tag_utils::read_tags()? {
         parcels.push(tag.tag.subject);
     }
 
-    let shard_referenced = collect_shard_referenced_hashes()?;
+    // Bay-local sources, read across every bay — see this function's doc comment. Parked
+    // parcels and in-progress-consolidation `their_head` are the portion shared with gc's live
+    // set — see `bay_utils::collect_bay_scoped_parcel_roots`'s doc comment for the shared-helper
+    // rationale and the fail-closed-on-an-unreadable-bay-source contract (by design, not a bug).
+    // Staged inventory shards are recovery-only (gc deliberately does not root them) and stay a
+    // separate per-bay loop here.
+    parcels.extend(bay_utils::collect_bay_scoped_parcel_roots()?);
+
+    for dir in bay_utils::all_bay_state_dirs()? {
+        walk_shard_files(&dir.join(FOLDER_NAME_INVENTORY_ROOT), &mut shard_referenced)?;
+    }
+
+    // The trust anchor is shared (warehouse-global): read once, not per bay.
+    if let Some(anchor) = office_utils::read_trust_anchor()? {
+        if let Some(adopts) = anchor.adopts {
+            parcels.push(adopts);
+        }
+    }
 
     Ok(WalkRoots { parcels, shard_referenced })
-}
-
-/// Every hash a staged inventory shard references, enumerated by walking the shard **files on
-/// disk** — never the registration ledger (`inventory_utils::write_metadata_to_file`'s plain,
-/// unsynced `std::fs::write`, which is blind to a shard published but never registered — the
-/// phase-B wart §3.2 calls out by name). Scoped to the active bay (the same scope every other
-/// inventory reader in this codebase operates within — inventory is bay-local,
-/// `file_utils::get_path_inventory_root`).
-fn collect_shard_referenced_hashes() -> Result<Vec<(String, DirEntryType)>, String> {
-    let mut hashes = Vec::new();
-    walk_shard_files(&file_utils::get_inventory_folder_for_key(""), &mut hashes)?;
-    Ok(hashes)
 }
 
 fn walk_shard_files(folder: &Path, hashes: &mut Vec<(String, DirEntryType)>) -> Result<(), String> {
@@ -585,16 +644,239 @@ mod tests {
         // never persist anything, however many (or few) targets it is asked about, and however
         // many ref roots exist. Mutation: route the walk through a persisting `graph_utils` entry
         // point (or any write path) → red.
-        let barriers_before = file_utils::barrier_count();
-        let dir_syncs_before = file_utils::dir_sync_count();
+        //
+        // Enters a real scope with a real ref source (a pallet head over a real, stored tree) so
+        // the walk actually runs against something — with no scope entered at all (the previous
+        // shape of this test), the walk read nothing and the assertion below was vacuous: it
+        // would still pass with the walk routed through a barrier, as long as that code path was
+        // never reached because there was nothing to walk.
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+        use crate::globals::StorageRootScope;
+        use crate::model::parcel::Parcel;
+        use crate::model::tree_item::TreeItem;
+
+        let dir = std::env::temp_dir()
+            .join(format!("forklift-recovery-utils-walk-readonly-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _scope = StorageRootScope::enter(&dir);
+
+        let tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        let mut tree_object = LooseObjectBuilder::build_tree(&tree);
+        tree_object.store().unwrap();
+
+        let parcel = Parcel {
+            tree_hash: tree_object.hash.clone(),
+            parents: Vec::new(),
+            actions: Vec::new(),
+            description: Some("base".to_string()),
+        };
+        let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
+        parcel_object.store().unwrap();
+        pallet_utils::set_pallet_head("main", &parcel_object.hash).unwrap();
+
+        // Thread-local sync recorders, NOT the process-wide `barrier_count()`/`dir_sync_count()`:
+        // those are global atomics a test on another thread bumps mid-walk, which made this test
+        // flaky under parallel `cargo test`. A durability barrier always ends by fsyncing its
+        // touched directories, and an immediate / graph-self-heal write fsyncs via `sync_dir`, so
+        // "no directory sync attempted on THIS thread during the walk" is equivalent to "no barrier
+        // ran" — with zero cross-test pollution. Armed here, after the setup writes above, so only
+        // the walk's own (non-)syncs are recorded; both guards RAII-reset on drop.
+        let _sync_dir_guard = file_utils::SyncDirFaultGuard::recording();
+        let _barrier_dir_guard = file_utils::DirSyncFaultGuard::recording();
 
         let targets: BTreeSet<String> = ["a".repeat(64), "b".repeat(64)].into_iter().collect();
-        let _ = closure_references_any(&targets);
+        let referenced = closure_references_any(&targets)
+            .expect("the walk must succeed against a real, readable ref source");
+        assert!(referenced.is_empty(), "neither target hash is actually referenced");
 
-        assert_eq!(file_utils::barrier_count(), barriers_before,
-            "the closure walk must never run a durability barrier");
-        assert_eq!(file_utils::dir_sync_count(), dir_syncs_before,
-            "the closure walk must never fsync a directory");
+        assert!(file_utils::sync_dir_attempts().is_empty(),
+            "the closure walk must never fsync a directory (immediate / graph-self-heal path): {:?}",
+            file_utils::sync_dir_attempts());
+        assert!(file_utils::dir_sync_attempts().is_empty(),
+            "the closure walk must never run a durability barrier (caught via its trailing dir sync): {:?}",
+            file_utils::dir_sync_attempts());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// (i) A staged shard planted in bay "b" (never the active bay — no bay context is entered;
+    /// every read here is path-based) references a target hash the closure walk must still find.
+    /// Pins `collect_walk_roots`'s per-bay staged-shard enumeration. Red without it: the
+    /// pre-fix walk only ever read the active bay's inventory (`bay_root()`, which with no
+    /// active bay is `forklift_root()` itself — never bay "b"'s), so the shard planted here was
+    /// invisible and `referenced` would come back empty.
+    #[test]
+    fn walk_finds_a_staged_shard_in_a_non_active_bay() {
+        use crate::builder::inventory::InventoryBuilder;
+        use crate::enums::inventory_item_state::InventoryItemState;
+        use crate::globals::StorageRootScope;
+        use crate::model::inventory::{Inventory, InventoryItem};
+
+        let dir = std::env::temp_dir()
+            .join(format!("forklift-recovery-utils-bay-shard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _scope = StorageRootScope::enter(&dir);
+
+        let target_hash = "d".repeat(64);
+
+        let mut inventory = Inventory::new();
+        inventory.add_item(InventoryItem {
+            metadata_change_timestamp: 0,
+            content_change_timestamp: 0,
+            device: 0,
+            inode: 0,
+            item_type: DirEntryType::Normal,
+            user_id: 0,
+            group_id: 0,
+            file_size: 0,
+            hash: target_hash.clone(),
+            file_name_length: "file.txt".len() as u64,
+            state: InventoryItemState::Normal,
+            name: "file.txt".to_string(),
+        });
+        let bytes = InventoryBuilder::build(&inventory);
+
+        // Bay "b"'s staged inventory, planted directly by path — mirrors the real on-disk shape
+        // (`<bay-state-dir>/inventory/inv_/data`) without ever entering a bay context.
+        let shard_path = bay_utils::bay_state_dir("b")
+            .join(FOLDER_NAME_INVENTORY_ROOT)
+            .join(file_utils::PREFIX_INVENTORY_FOLDER)
+            .join(file_utils::FILE_NAME_INVENTORY_DATA);
+        std::fs::create_dir_all(shard_path.parent().unwrap()).unwrap();
+        std::fs::write(&shard_path, bytes).unwrap();
+
+        let targets: BTreeSet<String> = [target_hash.clone()].into_iter().collect();
+        let referenced = closure_references_any(&targets).unwrap();
+
+        assert!(referenced.contains(&target_hash),
+            "a shard staged in a non-active bay must still be found by the closure walk");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// (ii) A parked hash planted in bay "b"'s `parked` file must still be found. Pins
+    /// `collect_walk_roots`'s per-bay `read_parked_in` enumeration. Red without it: the pre-fix
+    /// walk called `park_utils::read_parked()` once, scoped to the active bay only, so bay "b"'s
+    /// parked hash was never a root.
+    #[test]
+    fn walk_finds_a_parked_hash_in_a_non_active_bay() {
+        use crate::globals::StorageRootScope;
+
+        let dir = std::env::temp_dir()
+            .join(format!("forklift-recovery-utils-bay-parked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _scope = StorageRootScope::enter(&dir);
+
+        let target_hash = "e".repeat(64);
+
+        let bay_b_dir = bay_utils::bay_state_dir("b");
+        std::fs::create_dir_all(&bay_b_dir).unwrap();
+        std::fs::write(bay_b_dir.join("parked"), format!("{}\n", target_hash)).unwrap();
+
+        let targets: BTreeSet<String> = [target_hash.clone()].into_iter().collect();
+        let referenced = closure_references_any(&targets).unwrap();
+
+        assert!(referenced.contains(&target_hash),
+            "a parked hash in a non-active bay must still be found by the closure walk");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Regression lock for the fail-closed contract on
+    /// `bay_utils::collect_bay_scoped_parcel_roots` (see its doc comment): a malformed `parked`
+    /// file in a *non-active* bay must make the closure walk (and so `run`, `forklift heal`) fail
+    /// outright, never silently skip the unreadable bay and proceed as if it had no references —
+    /// that would re-open the exact under-counting bug the bay-scope fix closed. Red if
+    /// `read_parked_in`'s `?` in `collect_bay_scoped_parcel_roots`
+    /// (crates/forklift-core/src/util/bay_utils.rs) were ever changed to skip-and-continue on an
+    /// `Err` instead of propagating it.
+    #[test]
+    fn walk_fails_closed_on_an_unreadable_bay_parked_file() {
+        use crate::globals::StorageRootScope;
+
+        let dir = std::env::temp_dir()
+            .join(format!("forklift-recovery-utils-bay-unreadable-parked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _scope = StorageRootScope::enter(&dir);
+
+        // Bay "b"'s `parked` file is malformed (not 64 hex chars) — `read_parked_in` errors on it.
+        let bay_b_dir = bay_utils::bay_state_dir("b");
+        std::fs::create_dir_all(&bay_b_dir).unwrap();
+        std::fs::write(bay_b_dir.join("parked"), b"not-a-valid-hash\n").unwrap();
+
+        let targets: BTreeSet<String> = ["a".repeat(64)].into_iter().collect();
+        let result = closure_references_any(&targets);
+
+        assert!(result.is_err(),
+            "an unreadable/malformed bay ref source must fail the closure walk, not be skipped");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// (iii) A consolidation `their_head` planted in bay "b"'s `consolidation` file must still be
+    /// found. Pins `collect_walk_roots`'s addition of the consolidation source (per-bay). Red
+    /// without it: pre-fix, `collect_walk_roots` never read consolidation state at all — this
+    /// source did not exist in the walk yet.
+    #[test]
+    fn walk_finds_a_consolidation_their_head_in_a_non_active_bay() {
+        use crate::globals::StorageRootScope;
+
+        let dir = std::env::temp_dir()
+            .join(format!("forklift-recovery-utils-bay-consolidation-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _scope = StorageRootScope::enter(&dir);
+
+        let target_hash = "f".repeat(64);
+
+        let bay_b_dir = bay_utils::bay_state_dir("b");
+        std::fs::create_dir_all(&bay_b_dir).unwrap();
+        std::fs::write(bay_b_dir.join("consolidation"), format!("{}\ntheir-pallet\n", target_hash)).unwrap();
+
+        let targets: BTreeSet<String> = [target_hash.clone()].into_iter().collect();
+        let referenced = closure_references_any(&targets).unwrap();
+
+        assert!(referenced.contains(&target_hash),
+            "a consolidation their_head in a non-active bay must still be found by the closure walk");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// (iv) A trust-anchor `adopts` hash (shared, warehouse-global — no bay involved) must still
+    /// be found. Pins `collect_walk_roots`'s addition of the trust-anchor source. Red without it:
+    /// pre-fix, `collect_walk_roots` never read the trust anchor at all.
+    #[test]
+    fn walk_finds_a_trust_anchor_adopts_hash() {
+        use crate::globals::StorageRootScope;
+        use crate::util::office_utils::{self, TrustAnchor};
+
+        let dir = std::env::temp_dir()
+            .join(format!("forklift-recovery-utils-trust-adopts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        let _scope = StorageRootScope::enter(&dir);
+
+        let target_hash = "1".repeat(64);
+
+        office_utils::write_trust_anchor(&TrustAnchor {
+            genesis: "0".repeat(64),
+            enabled_at: 0,
+            boundary: Vec::new(),
+            prior_genesis: None,
+            adopts: Some(target_hash.clone()),
+        }).unwrap();
+
+        let targets: BTreeSet<String> = [target_hash.clone()].into_iter().collect();
+        let referenced = closure_references_any(&targets).unwrap();
+
+        assert!(referenced.contains(&target_hash),
+            "a trust-anchor adopts hash must be found by the closure walk (a re-genesis GC root)");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -706,6 +706,67 @@ fn optimistic_lift_auto_merges_a_disjoint_divergence_but_stops_on_overlap() {
     assert_eq!(area.read_file("b/shared.txt"), "from b\n"); // untouched — no half-merge
 }
 
+/// The optimistic auto-merge (`lift::try_auto_merge`) calls the same shared
+/// `merge_head_into_current` `consolidate` and `cherry-pick` do: it writes real merge output
+/// into the working inventory and only afterwards records consolidation state
+/// (`.forklift/consolidation`), before ever reaching `stack_utils::stack_parcel`'s own late
+/// guard. The up-front guard added at the call site in `lift::try_auto_merge` must refuse
+/// before any of that runs: reverting it makes the state-file assertion below go red, exactly
+/// like the `consolidate`/`cherry-pick`/`haul merge` cases in `cli.rs`.
+#[test]
+fn optimistic_lift_refuses_on_an_incomplete_load_before_writing_consolidation_state() {
+    let area = TestArea::new("optimistic-incomplete-load");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "a", &server.url);
+    area.write_file("a/shared.txt", "base\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "initial"]));
+    assert_success(&area.forklift("a", &["office", "enroll"]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    assert_success(&area.forklift(".", &["franchise", &server.url, "b"]));
+
+    // A publishes a change to a file only it touches.
+    area.write_file("a/from_a.txt", "a\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "a's file"]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    // B, still at the base, stacks a disjoint change of its own — the remote has diverged, and
+    // the change is disjoint, so an ordinary lift would auto-merge (optimistic lift, §7.7).
+    area.write_file("b/from_b.txt", "b\n");
+    assert_success(&area.forklift("b", &["load", "."]));
+    assert_success(&area.forklift("b", &["stack", "b's file"]));
+
+    // Simulate a load killed outright partway through its walk in B's warehouse (see
+    // `load_guard_utils::marker_path_under`'s doc comment for why this is a faithful stand-in
+    // for a real interrupted load, driven through a spawned `forklift` subprocess).
+    let marker_path = forklift_core::util::load_guard_utils::marker_path_under(&area.path("b"));
+    std::fs::write(&marker_path, "./\n").unwrap();
+
+    let lifted = area.forklift("b", &["--json", "lift"]);
+    assert!(!lifted.status.success(), "the lift must refuse, not auto-merge over an incomplete load");
+    assert_eq!(lifted.status.code(), Some(20));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&lifted)).unwrap();
+    assert_eq!(value["error"]["code"], "incomplete_load");
+
+    // The auto-merge must not have gotten far enough to write its own in-progress state, or to
+    // apply anything to the working directory.
+    assert!(
+        !area.path("b/.forklift/consolidation").exists(),
+        "the optimistic auto-merge's consolidation state must not be written while an \
+        incomplete load is outstanding"
+    );
+    assert!(!area.path("b/from_a.txt").exists(), "the auto-merge must not have applied anything");
+
+    // Healing the load lets the lift auto-merge normally.
+    std::fs::remove_file(&marker_path).unwrap();
+    let healed = area.forklift("b", &["lift"]);
+    assert_success(&healed);
+    assert!(stdout(&healed).contains("auto-merged"), "{}", stdout(&healed));
+}
+
 #[test]
 fn manifest_syncs_across_remotes_and_merges_when_diverged() {
     let area = TestArea::new("manifest-remote");

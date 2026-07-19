@@ -3348,6 +3348,151 @@ fn park_push_refuses_on_an_incomplete_load_exactly_like_stack() {
     assert_success(&warehouse.run(&["park"]));
 }
 
+/// `consolidate`'s three-way merge writes real output into the working inventory and only
+/// afterwards records that a consolidation is in progress (`.forklift/consolidation`), well
+/// before it ever reaches `stack_utils::stack_parcel`'s own guard — so, unlike `stack` and
+/// `park`, a late failure there used to leave that state written behind it. The guard added
+/// up front in `consolidate::handle_command` must refuse before `merge_head_into_current`
+/// touches anything: reverting it makes the state-file assertion below go red, because the
+/// merge and its state write both run to completion before the *late* guard (still inside
+/// `stack_parcel`) finally fires.
+#[test]
+fn consolidate_refuses_on_an_incomplete_load_before_writing_consolidation_state() {
+    let warehouse = TestWarehouse::new("incomplete-load-consolidate");
+    warehouse.write_file("file.txt", "one\ntwo\nthree\nfour\nfive\n");
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base"]));
+
+    // Diverge with non-overlapping changes so the merge would otherwise complete cleanly.
+    assert_success(&warehouse.run(&["palletize", "feature"]));
+    warehouse.write_file("file.txt", "one\ntwo\nthree\nfour\nFIVE\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "feature work"]));
+
+    assert_success(&warehouse.run(&["shift", "main"]));
+    warehouse.write_file("file.txt", "ONE\ntwo\nthree\nfour\nfive\n");
+    assert_success(&warehouse.run(&["load", "file.txt"]));
+    assert_success(&warehouse.run(&["stack", "main work"]));
+
+    // Simulate a load killed outright partway through its walk (see the hand-written-marker
+    // test above for why this is a faithful stand-in).
+    let marker_path = incomplete_load_marker_path(&warehouse);
+    std::fs::write(&marker_path, "./\n").unwrap();
+
+    let consolidated = warehouse.run(&["consolidate", "feature", "--json"]);
+    assert_eq!(consolidated.status.code(), Some(20));
+    assert_eq!(json(&consolidated)["error"]["code"], "incomplete_load");
+
+    assert!(
+        !warehouse.root.join(".forklift/consolidation").exists(),
+        "consolidation state must not be written while an incomplete load is outstanding"
+    );
+    assert_eq!(
+        std::fs::read_to_string(warehouse.root.join("file.txt")).unwrap(),
+        "ONE\ntwo\nthree\nfour\nfive\n",
+        "the merge must not have applied anything either"
+    );
+
+    // Healing the load lets the consolidation proceed normally.
+    std::fs::remove_file(&marker_path).unwrap();
+    assert_success(&warehouse.run(&["consolidate", "feature"]));
+}
+
+/// `cherry-pick` applies a merge into the working inventory and only afterwards records its own
+/// in-progress state (`.forklift/cherry-pick`), before it ever reaches
+/// `stack_utils::stack_parcel`'s own guard. The guard added up front in
+/// `cherry_pick::handle_command` must refuse before any of that runs: reverting it makes the
+/// state-file assertion below go red, exactly like the `consolidate` case above.
+#[test]
+fn cherry_pick_refuses_on_an_incomplete_load_before_writing_state() {
+    let warehouse = TestWarehouse::new("incomplete-load-cherry-pick");
+    warehouse.write_file("f.txt", "base\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base"]));
+
+    assert_success(&warehouse.run(&["palletize", "feature"]));
+    warehouse.write_file("feat.txt", "feature file\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    let source = extract_parcel_hash(&warehouse.run(&["stack", "feature work"]));
+
+    assert_success(&warehouse.run(&["shift", "main"]));
+
+    // Simulate a load killed outright partway through its walk.
+    let marker_path = incomplete_load_marker_path(&warehouse);
+    std::fs::write(&marker_path, "./\n").unwrap();
+
+    let picked = warehouse.run(&["cherry-pick", &source, "--json"]);
+    assert_eq!(picked.status.code(), Some(20));
+    assert_eq!(json(&picked)["error"]["code"], "incomplete_load");
+
+    assert!(
+        !warehouse.root.join(".forklift/cherry-pick").exists(),
+        "cherry-pick state must not be written while an incomplete load is outstanding"
+    );
+    assert!(!warehouse.root.join("feat.txt").exists(), "the pick must not have applied anything");
+
+    // Healing the load lets the cherry-pick proceed normally.
+    std::fs::remove_file(&marker_path).unwrap();
+    assert_success(&warehouse.run(&["cherry-pick", &source]));
+}
+
+/// `haul merge` calls the same shared `merge_head_into_current` consolidate and cherry-pick do:
+/// it writes real merge output into the working inventory and only afterwards records
+/// consolidation state (`.forklift/consolidation`), before ever reaching
+/// `stack_utils::stack_parcel`'s own late guard. The up-front guard added at the call site in
+/// `haul::merge` must refuse before any of that runs: reverting it makes the state-file
+/// assertion below go red, exactly like the `consolidate` and `cherry-pick` cases above.
+#[test]
+fn haul_merge_refuses_on_an_incomplete_load_before_writing_consolidation_state() {
+    let warehouse = TestWarehouse::new("incomplete-load-haul");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    warehouse.write_file("base.txt", "base\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["office", "enroll"]));
+
+    assert_success(&warehouse.run(&["palletize", "feature"]));
+    warehouse.write_file("feature.txt", "feat\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "feature work"]));
+    assert_success(&warehouse.run(&["shift", "main"]));
+
+    assert_success(&warehouse.run(&[
+        "haul", "open", "--target", "main", "--source", "feature", "--title", "Add feature", "-m", "please review",
+    ]));
+    let id = json(&warehouse.run(&["haul", "list", "--json"]))["data"]["hauls"][0]["id"]
+        .as_str().unwrap().to_string();
+
+    // Simulate a load killed outright partway through its walk.
+    let marker_path = incomplete_load_marker_path(&warehouse);
+    std::fs::write(&marker_path, "./\n").unwrap();
+
+    let merged = warehouse.run(&["haul", "merge", &id, "--json"]);
+    assert_eq!(merged.status.code(), Some(20));
+    assert_eq!(json(&merged)["error"]["code"], "incomplete_load");
+
+    assert!(
+        !warehouse.root.join(".forklift/consolidation").exists(),
+        "the haul merge's consolidation state must not be written while an incomplete load is \
+        outstanding"
+    );
+    assert!(!warehouse.root.join("feature.txt").exists(), "the merge must not have applied anything");
+    assert_eq!(
+        json(&warehouse.run(&["haul", "show", &id, "--json"]))["data"]["status"], "open",
+        "the haul must stay open — it was never actually merged"
+    );
+
+    // Healing the load lets the haul merge normally.
+    std::fs::remove_file(&marker_path).unwrap();
+    assert_success(&warehouse.run(&["haul", "merge", &id]));
+}
+
 /// Re-running `load` is real work an operator may not always want to redo; abandoning an
 /// incomplete load by resetting it to head must also be a clean, working recovery path.
 #[cfg(unix)]
