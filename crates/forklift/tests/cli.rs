@@ -7121,9 +7121,19 @@ fn heal_reports_a_vanished_but_referenced_object_and_everything_still_refuses() 
         value["error"]["message"].as_str().unwrap().contains("vanished and still referenced"),
         "unexpected message: {}", value
     );
+    // No remote is configured here, so `heal` never attempts the §3.2 heal-driven refetch —
+    // the message says so honestly, and (post-§3.2) never tells the operator to run a fetch by
+    // hand ("forklift lower" is no longer named — see `recovery_utils::HEAVYWEIGHT_EXITS`'s doc
+    // comment for why that would now be false prose).
+    assert!(
+        value["error"]["message"].as_str().unwrap().contains("no remote is configured"),
+        "unexpected message: {}", value
+    );
+    assert!(!value["error"]["message"].as_str().unwrap().contains("forklift lower"));
     // Machine-coded remedies, not an exitless refusal.
     let next_step = value["error"]["next_step"].as_str().unwrap();
-    assert!(next_step.contains("forklift lower") || value["error"]["message"].as_str().unwrap().contains("forklift lower"));
+    assert!(next_step.contains("franchise") && next_step.contains("accept the loss"));
+    assert!(!next_step.contains("forklift lower"));
 
     assert!(recorded_taint_paths(&warehouse).contains(&relative),
         "the taint must survive with the still-dangling path recorded");
@@ -7210,9 +7220,14 @@ fn heal_on_a_torn_taint_names_heavyweight_recovery_and_survives() {
         "the message must name the torn/unknown-scope condition: {}", message);
     let next_step = value["error"]["next_step"].as_str().unwrap();
     assert!(
-        next_step.contains("re-fetch") && next_step.contains("re-run") && next_step.contains("accept the loss"),
+        next_step.contains("franchise") && next_step.contains("re-run") && next_step.contains("accept the loss"),
         "the heavyweight exits must be named: {}", next_step
     );
+    // Torn is unfixed by this slice (still refuses immediately, before any heal-driven refetch
+    // could run) — so, unlike a resolved dangling remainder, this text must never claim a fetch
+    // was actually attempted; it never names "forklift lower" as a manual command either (see
+    // `recovery_utils::HEAVYWEIGHT_EXITS`'s doc comment).
+    assert!(!next_step.contains("forklift lower"));
 
     assert!(dir.join("taint-1-0").exists(), "a torn taint file must survive a heal attempt too");
 }

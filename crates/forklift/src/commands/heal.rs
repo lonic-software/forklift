@@ -17,8 +17,8 @@ use crate::output::{self, CommandOutput};
 /// # Returns
 /// * `Ok(())`      - Nothing was tainted, or the taint is now fully cleared.
 /// * `Err(String)` - A `durability_taint` refusal (torn, or an unresolved dangling reference).
-pub fn handle_command() -> Result<(), String> {
-    let outcome = recovery_utils::run().map_err(String::from)?;
+pub async fn handle_command() -> Result<(), String> {
+    let outcome = recovery_utils::run().await.map_err(String::from)?;
 
     output::emit("heal", &HealReport {
         was_tainted: outcome.was_tainted,

@@ -86,6 +86,58 @@
 //! record exactly the unresolved remainder — [`taint_utils::replace_taint_with_remainder`] is the
 //! crash-safe primitive that makes that true without ever leaving a window where the remainder is
 //! unrecorded on disk.
+//!
+//! ## Heal-driven refetch (§3.2) — closing the `forklift lower` wedge
+//!
+//! Before this existed, a vanished-still-referenced remainder was reported with a refusal that
+//! named `forklift lower` as the remedy — but `lower` is not exempt from the entry-heal
+//! chokepoint (only `Heal`/`Audit` are), so running the very command the message suggested hit
+//! the same taint and refused before `lower` ever reached its own fetch. The remedy was
+//! unreachable: a wedge.
+//!
+//! [`resolve_the_rest`] closes it by driving the fetch itself, from inside this locked verb,
+//! reusing `lower`'s own fetch machinery ([`attempt_heal_driven_refetch`]) rather than shelling
+//! out to `lower` or reimplementing a transport. That function runs **two** passes, not one — a
+//! first draft that only reused [`remote_utils::fetch_history_scoped`]/[`remote_utils::
+//! fetch_history`] (the exact functions `lower.rs` calls) was found, by actually reproducing the
+//! wedge end to end, to leave the wedge's own motivating case unrecovered: those functions never
+//! re-descend into a parcel's tree once that parcel is judged already-complete (reachable from a
+//! local ref) — exactly the state of the *current*, already-published pallet head, the common
+//! case. See [`attempt_heal_driven_refetch`]'s own doc comment for the full reasoning and the
+//! second, targeted pass ([`remote_utils::fetch_missing_objects`]) that closes it.
+//!
+//! - **D1 (breadth).** Every pallet's remote head is walked (pass 1), not just the current
+//!   pallet's — a vanished hash may be *referenced* only from a different pallet's not-yet-
+//!   locally-known history, which the walk needs to bring in for the reference check below to be
+//!   accurate; and every remainder candidate hash is also fetched directly (pass 2), regardless of
+//!   which pallet(s) reference it. Cost is bounded by what is actually missing: every fetch
+//!   primitive dedups against what is already present.
+//! - **D2 (packed landing).** The post-fetch check reuses the exact same
+//!   [`file_utils::raw_object_present`] (packed-or-loose) predicate the raw-presence filter above
+//!   already uses — a remote that serves an object *packed* satisfies it even though the taint
+//!   recorded a *loose* path; a packed object is itself content-addressed and index-verified, so
+//!   accepting it never weakens what "recovered" means.
+//! - **D3 (all-or-nothing, never a false clear).** Nothing here ever decides "recovered" from
+//!   whether the fetch call itself returned `Ok` — [`attempt_heal_driven_refetch`]'s own outcome
+//!   ([`RemoteConsultation`]) only ever feeds [`remedy_text`]'s wording, so a residual refusal
+//!   never overclaims what this run established. Every remainder hash (ordinary or corrupt) is
+//!   independently re-verified via `raw_object_present` after the fetch attempt, whether that
+//!   attempt errored, hit a diverged pallet, or ran clean — a hash the fetch did not actually
+//!   restore is never cleared, and one that a sibling pallet's history happened to also carry
+//!   clears exactly the same way an ordinary present object would.
+//! - **D4 (force-fetch a corrupt remainder entry).** An ordinary fetch dedups against *present*
+//!   objects, so a corrupt-but-present recorded path (`attempt.hash_mismatch`) would never be
+//!   re-fetched — `does_object_exist` already says "yes". Before the fetch runs,
+//!   [`resolve_the_rest`] deletes that corrupt loose dentry (delete-then-fetch): the object is
+//!   transiently absent for the rest of this call, which is fine — `heal` holds the warehouse
+//!   lock throughout — and the ordinary dedup-aware fetch then pulls a good copy in exactly like
+//!   any other vanished candidate. A genuinely vanished (not corrupt) candidate needs no deletion.
+//!
+//! **Scope boundary, stated honestly:** this recovers only objects a configured remote actually
+//! has. An object that vanished *before* it was ever published (lifted) has no remote copy to
+//! find — it stays in the remainder, and franchise / reproduce / accept-loss remain its only
+//! exits (see [`HEAVYWEIGHT_EXITS`]). A torn taint's scope is unknown, so it is never routed
+//! through this refetch at all — it still refuses immediately, unchanged (a later slice's job).
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -94,7 +146,7 @@ use crate::error::{CoreError, RefusalCode};
 use crate::globals::{forklift_root, FOLDER_NAME_INVENTORY_ROOT};
 use crate::util::{
     bay_utils, file_utils, heal_utils, object_utils, office_utils, pack_utils,
-    pallet_utils, remote_utils, tag_utils, taint_utils,
+    pallet_utils, remote_utils, scope_utils, tag_utils, taint_utils,
 };
 
 /// How many dangling references a refusal message names individually before summarizing the
@@ -103,15 +155,22 @@ use crate::util::{
 /// lines, and a handful is enough for an operator (or an agent) to act on.
 const MAX_NAMED_DANGLING: usize = 16;
 
-/// The heavyweight exits named in a torn-taint or every-remedy-exhausted refusal: the same three
-/// classes the design settles on (§3.2) — refetch, reproduce, or accept the loss — stated once so
-/// the wording never drifts between the two refusal sites that need it.
-const HEAVYWEIGHT_EXITS: &str = "re-fetch this warehouse's objects from a configured remote \
-    (\"forklift lower\", or \"forklift franchise\" for a fresh clone), reproduce them by \
-    re-running whatever operation created them if their content still exists in your working \
-    tree (\"forklift load\" then \"forklift stack\"), or accept the loss — Forklift has no \
-    in-tool way to drop a single dangling reference yet, so an object neither remedy reaches \
-    stays lost until one of those two applies.";
+/// The heavyweight exits named in a torn-taint or every-remedy-exhausted refusal, stated once so
+/// the wording never drifts between the two refusal sites that need it (`torn_refusal`,
+/// `dangling_refusal`). Deliberately never names "forklift lower" as a manual remedy: for a
+/// non-torn taint, `run`/`resolve_the_rest` already drives that exact fetch itself, inside this
+/// locked verb, *before* this text is ever reached (see [`attempt_heal_driven_refetch`]) — naming
+/// it here would be false prose, since the very re-run this message would suggest is either
+/// redundant (already tried) or, pre-fix, unreachable (the wedge this behavior exists to close).
+/// A torn taint never reaches the heal-driven refetch at all (still refused immediately,
+/// unchanged) — "franchise a fresh clone" is named instead because it is the one remedy that is
+/// never blocked by *this* warehouse's own taint, torn or not, since it never re-enters it.
+const HEAVYWEIGHT_EXITS: &str = "franchise a fresh clone from a configured remote if one still \
+    has what is missing (\"forklift franchise\"), reproduce it by re-running whatever operation \
+    created it if its content still exists in your working tree (\"forklift load\" then \
+    \"forklift stack\"), or accept the loss — Forklift has no in-tool way to drop a single \
+    dangling reference yet, so an object neither remedy reaches stays lost until one of those \
+    two applies.";
 
 /// What running `forklift heal` accomplished, on a full clear (see [`run`]'s `Ok` case). An
 /// unresolved remainder is reported as an [`Err(CoreError)`](CoreError) instead — see [`run`].
@@ -150,7 +209,7 @@ impl HealOutcome {
 ///                       dangling after the walk. The taint is rewritten to record exactly the
 ///                       unresolved remainder (never the original full set, never nothing) and the
 ///                       gate is left standing.
-pub fn run() -> Result<HealOutcome, CoreError> {
+pub async fn run() -> Result<HealOutcome, CoreError> {
     let root = forklift_root();
     let state = taint_utils::read_taints(&root).map_err(|e| read_failure_refusal(&root, &e))?;
 
@@ -185,7 +244,7 @@ pub fn run() -> Result<HealOutcome, CoreError> {
         heal_utils::sync_restaged_parents(&parents).map_err(|e| sync_failure_refusal(&root, &e))?;
     }
 
-    resolve_the_rest(&root, &state.recorded, &attempt, &state.files)
+    resolve_the_rest(&root, &state.recorded, &attempt, &state.files).await
 }
 
 /// The deeper analysis: classify every path [`heal_utils::attempt_restage_all`] could not
@@ -198,7 +257,7 @@ pub fn run() -> Result<HealOutcome, CoreError> {
 /// began. It is threaded straight through to [`taint_utils::replace_taint_with_remainder`] so the
 /// eventual rewrite deletes exactly the files that predate this call, never whatever the taint
 /// directory holds by the time the walk finally finishes — see that function's doc comment.
-fn resolve_the_rest(
+async fn resolve_the_rest(
     root: &Path,
     recorded: &BTreeSet<PathBuf>,
     attempt: &heal_utils::RestageAttempt,
@@ -207,16 +266,56 @@ fn resolve_the_rest(
     let mut remainder: BTreeSet<PathBuf> = BTreeSet::new();
     let mut dangling_lines: Vec<String> = Vec::new();
 
+    // §3.2 D4: a corrupt-present recorded path is force-fetch-eligible when a remote is
+    // configured — computed up front (cheap, local, no network) since the hash-mismatch
+    // classification below needs it. With no remote, a corrupt entry behaves exactly as before
+    // this slice: straight to the remainder, its bytes left untouched (deleting them would be
+    // pure data loss with no possible recovery).
+    let remote_configured = remote_utils::RemoteClient::from_config().is_ok();
+
     for (relative, error) in &attempt.unreadable {
         remainder.insert(relative.clone());
         dangling_lines.push(format!("unreadable: \"{}\" ({})", relative.to_string_lossy(), error));
     }
+
+    // D4: force-fetch bridge. `corrupt_candidates` collects exactly the entries this run will
+    // attempt to recover via delete-then-fetch; anything not in it (no remote configured, or a
+    // hash-mismatch path with no shape `hash_from_object_path` recognizes — unreachable in
+    // practice, see `restage_object`'s `HashMismatch` verdict) commits straight to the remainder
+    // below, unchanged from before this slice.
+    let mut corrupt_candidates: BTreeMap<String, PathBuf> = BTreeMap::new();
     for relative in &attempt.hash_mismatch {
-        remainder.insert(relative.clone());
-        dangling_lines.push(format!(
-            "corrupt (content does not match its own hash): \"{}\"", relative.to_string_lossy()
-        ));
+        match (remote_configured, file_utils::hash_from_object_path(relative)) {
+            (true, Some(hash)) => {
+                // Delete-then-fetch (D4): force the corrupt object to genuinely vanish so the
+                // ordinary fetch's dedup (`does_object_exist`) does not skip it as "already
+                // present" — see the module doc comment. Safe under the lock `heal` holds
+                // throughout: the object is transiently absent, never observed by anything else.
+                // Load-bearing for correctness, not just for the fetch's own dedup: skipping it
+                // was confirmed (by reverting this exact block) to make the post-check below a
+                // false clear, not merely a missed recovery — `raw_object_present`'s loose branch
+                // is a bare `fs::exists`, so a corrupt-but-still-present dentry left in place
+                // would itself read back as "present" and get reported resolved with the corrupt
+                // bytes never actually replaced.
+                if let Err(e) = std::fs::remove_file(root.join(relative)) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        return Err(sync_failure_refusal(root, &format!(
+                            "could not remove the corrupt copy of \"{}\" to make way for a \
+                            re-fetched good one: {}", relative.to_string_lossy(), e
+                        )));
+                    }
+                }
+                corrupt_candidates.insert(hash, relative.clone());
+            }
+            _ => {
+                remainder.insert(relative.clone());
+                dangling_lines.push(format!(
+                    "corrupt (content does not match its own hash): \"{}\"", relative.to_string_lossy()
+                ));
+            }
+        }
     }
+
     for (relative, error) in &attempt.restage_failed {
         remainder.insert(relative.clone());
         dangling_lines.push(format!("could not be restaged: \"{}\" ({})", relative.to_string_lossy(), error));
@@ -274,8 +373,34 @@ fn resolve_the_rest(
         }
     }
 
+    // §3.2: heal drives the fetch itself, inside this locked verb, reusing `lower`'s own fetch
+    // machinery — the wedge fix (see the module doc comment). Runs once, ahead of the raw-
+    // presence filter below, so a hash recovered this way is indistinguishable from one that was
+    // merely present elsewhere all along — one classification pass, not two. Every candidate this
+    // run might still be able to close is named up front (ordinary vanished-and-possibly-
+    // referenced hashes, and D4's force-vanished corrupt ones) — `attempt_heal_driven_refetch`
+    // needs the exact set for its targeted fetch (D1-gap bridge, see its own doc comment).
+    let candidate_hashes: Vec<String> = loose_candidates.keys()
+        .chain(pack_candidates.keys())
+        .chain(corrupt_candidates.keys())
+        .cloned()
+        .collect();
+
+    let consultation = if !remote_configured {
+        RemoteConsultation::NotConfigured
+    } else if candidate_hashes.is_empty() {
+        // Nothing a fetch could help with this round (e.g. every remaining recorded path is
+        // `unreadable`/`restage_failed`, never object-shaped) — skip the network entirely.
+        RemoteConsultation::ConsultedCleanly
+    } else {
+        attempt_heal_driven_refetch(&candidate_hashes).await
+    };
+
     // Raw-presence filter: a candidate present elsewhere (another pack, or loose) was never
-    // actually lost — only what remains absent everywhere needs the closure walk at all.
+    // actually lost — only what remains absent everywhere needs the closure walk at all. This is
+    // also §3.2 D3's actual safety net: whether a hash just got fetched, was already present, or
+    // the fetch attempt above errored/skipped it entirely, this is the one check that decides
+    // "recovered" — never the fetch call's own `Ok`/`Err`.
     let mut truly_missing: BTreeSet<String> = BTreeSet::new();
     // I4: a pack-recovered path was never rewritten and never entered `attempt.vanished` in the
     // first place (`restage_object` resolved it directly) — it belongs in `resolved` alongside
@@ -292,8 +417,6 @@ fn resolve_the_rest(
 
     let referenced = closure_references_any(&truly_missing).map_err(|e| walk_failure_refusal(root, &e))?;
 
-    let remote_configured = remote_utils::RemoteClient::from_config().is_ok();
-
     for hash in &truly_missing {
         if referenced.contains(hash) {
             if let Some(path) = loose_candidates.get(hash) {
@@ -307,10 +430,34 @@ fn resolve_the_rest(
                 }
             }
             dangling_lines.push(format!(
-                "vanished and still referenced: \"{}\" ({})", hash, remedy_text(remote_configured)
+                "vanished and still referenced: \"{}\" ({})", hash, remedy_text(consultation)
             ));
         } else {
             resolved.push(hash.clone());
+        }
+    }
+
+    // D4: re-verify each corrupt candidate the exact same way (`raw_object_present`, packed-or-
+    // loose) — sound here specifically because its corrupt dentry was deleted above, before the
+    // fetch ran: the loose path can only be occupied again by freshly fetched, hash-verified
+    // bytes, or a pack hit, never by the original corrupt bytes. Unlike the ordinary vanished
+    // set, a corrupt candidate is never exonerated by "unreferenced" — this mirrors the verb's
+    // existing corrupt-is-always-remainder-until-recovered rule; only a genuine recovery (a good
+    // copy landed) clears it, regardless of what the closure walk would say about reachability.
+    for (hash, relative) in &corrupt_candidates {
+        let recovered = match file_utils::raw_object_present(hash) {
+            Ok(present) => present,
+            Err(e) => return Err(walk_failure_refusal(root, &e)),
+        };
+
+        if recovered {
+            resolved.push(relative.to_string_lossy().into_owned());
+        } else {
+            remainder.insert(relative.clone());
+            dangling_lines.push(format!(
+                "corrupt (content does not match its own hash): \"{}\" ({})",
+                relative.to_string_lossy(), remedy_text(consultation)
+            ));
         }
     }
 
@@ -731,21 +878,129 @@ fn check_leaf(
     Ok(())
 }
 
-/// The remedies that actually exist for a vanished-and-referenced object — see
-/// [`HEAVYWEIGHT_EXITS`]'s doc comment for why "abandon" is never named here: no ref class this
-/// walk covers (a pallet head, a parked parcel, a tag subject) has an in-tool command to drop it.
-fn remedy_text(remote_configured: bool) -> &'static str {
-    if remote_configured {
-        "re-fetch it from the configured remote (\"forklift lower\"), or reproduce it by \
-        re-running the operation that created it if its content still exists in your working \
-        tree (\"forklift load\" then \"forklift stack\") — there is no in-tool way to abandon a \
-        single dangling reference yet"
-    } else {
-        "no remote is configured for this warehouse; reproduce it by re-running the operation \
-        that created it if its content still exists in your working tree (\"forklift load\" \
-        then \"forklift stack\") — there is no in-tool way to abandon a single dangling \
-        reference yet"
+/// Whether, and how cleanly, [`attempt_heal_driven_refetch`] actually consulted a configured
+/// remote this run — feeds [`remedy_text`] so a residual refusal never overclaims what this
+/// specific attempt established (the no-false-prose rule). Never gates *whether* a hash is
+/// treated as recovered — see the module doc comment's D3 note — only the wording of what to do
+/// about one that stayed missing.
+#[derive(Clone, Copy)]
+enum RemoteConsultation {
+    /// No remote is configured for this warehouse at all.
+    NotConfigured,
+    /// A remote is configured, the handshake succeeded, and every pallet's fetch (best-effort)
+    /// completed without error — whatever is still missing afterward, the remote genuinely lacks
+    /// too, at least as of this run.
+    ConsultedCleanly,
+    /// A remote is configured, but the handshake or at least one pallet's fetch failed this run —
+    /// a hash still missing below was not necessarily *confirmed* absent upstream, only not yet
+    /// recovered; retrying once connectivity is restored may still help.
+    ConsultedWithErrors,
+}
+
+/// The remedies that actually exist for a vanished-and-referenced (or still-corrupt) object —
+/// see [`HEAVYWEIGHT_EXITS`]'s doc comment for why "abandon" is never named here: no ref class
+/// this walk covers (a pallet head, a parked parcel, a tag subject) has an in-tool command to
+/// drop it. Unlike before §3.2, this never tells the operator to run a fetch by hand — `heal`
+/// already tried one itself (see [`attempt_heal_driven_refetch`]) before this text is ever
+/// reached; `consultation` says only how much weight that attempt's silence carries.
+fn remedy_text(consultation: RemoteConsultation) -> &'static str {
+    match consultation {
+        RemoteConsultation::NotConfigured =>
+            "no remote is configured for this warehouse; reproduce it by re-running the \
+            operation that created it if its content still exists in your working tree \
+            (\"forklift load\" then \"forklift stack\") — there is no in-tool way to abandon a \
+            single dangling reference yet",
+        RemoteConsultation::ConsultedCleanly =>
+            "this heal already checked the configured remote automatically and it does not have \
+            this object either; reproduce it by re-running the operation that created it if its \
+            content still exists in your working tree (\"forklift load\" then \"forklift \
+            stack\") — there is no in-tool way to abandon a single dangling reference yet",
+        RemoteConsultation::ConsultedWithErrors =>
+            "this heal tried to check the configured remote automatically but could not complete \
+            that check this run; re-run \"forklift heal\" once connectivity is restored, or \
+            reproduce it by re-running the operation that created it if its content still exists \
+            in your working tree (\"forklift load\" then \"forklift stack\") — there is no \
+            in-tool way to abandon a single dangling reference yet",
     }
+}
+
+/// §3.2 D1/D3/D4: the heal-driven refetch. Two passes, both needed — see the "empirically found"
+/// note below, which is why this is *not* a bare call to `fetch_history_scoped` as first drafted.
+///
+/// **Pass 1 — every pallet's remote head** ([`remote_utils::fetch_history_scoped`]/
+/// [`remote_utils::fetch_history`], the exact functions `lower.rs:78`/`adopt_meta_pallets` call;
+/// meta pallets unscoped, mirroring `adopt_meta_pallets` — their own audit reads full content, so
+/// a sparse fetch scope must never prune them). Its job is **not primarily to land
+/// `candidate_hashes`' own bytes** — it is to bring each pallet's *actual, current* history
+/// locally up to date before the caller's `closure_references_any` runs, so that check sees every
+/// pallet's real history rather than a stale local ref: without this, a hash referenced only from
+/// a pallet's not-yet-locally-known newer history could be misclassified "unreferenced" (safe to
+/// drop) purely because this warehouse never looked far enough. A pallet whose remote head has
+/// diverged from its local counterpart (`lower.rs:89-97`'s own check) needs no special-case skip
+/// here: unlike `lower`, this function never calls `set_pallet_head` or merges anything — it only
+/// ever stores content-addressed objects, so there is no ref-move decision for divergence to gate.
+///
+/// **Pass 2 — a direct, targeted fetch of `candidate_hashes`** ([`remote_utils::
+/// fetch_missing_objects`], `pub(crate)` specifically for this). **Empirically found to be
+/// required, not belt-and-suspenders:** `fetch_history`/`fetch_history_scoped` bound their walk at
+/// any parcel already reachable from a local ref (`is_known_complete`) and, once a parcel is
+/// judged "complete," never re-descend into *its own* tree to re-verify or re-fetch an
+/// individually-vanished blob/tree/recipe/chunk — confirmed by reproducing the wedge exactly as
+/// §1.1 describes it (delete a blob referenced by the *current*, already-lifted pallet head,
+/// taint it, run `heal`): pass 1 alone left it in the remainder, because the current pallet's own
+/// remote head was already "known complete" and its tree was never re-walked. A direct
+/// hash-addressed `GET /v1/objects/{hash}` is deliberately path-blind server-side
+/// (`forklift-server`'s own doc comment on `get_object`), so it finds and verifies an object
+/// regardless of which pallet(s) reference it or whether their closure is already considered
+/// complete — closing exactly this gap. This is also how a D4 force-vanished corrupt candidate is
+/// actually recovered (its containing parcel is typically already "complete" too).
+///
+/// Best-effort and read/store-only throughout: a failure in either pass for one pallet or the
+/// targeted batch never aborts the rest, and nothing here ever calls `set_pallet_head` or merges a
+/// pallet. Whether anything is actually recovered is decided afterward, uniformly, by the caller's
+/// own `raw_object_present` recheck — never by this function's return value (§3.2 D3, see the
+/// module doc comment); `RemoteConsultation` only ever feeds [`remedy_text`]'s wording.
+async fn attempt_heal_driven_refetch(candidate_hashes: &[String]) -> RemoteConsultation {
+    let Ok(client) = remote_utils::RemoteClient::from_config() else {
+        return RemoteConsultation::NotConfigured;
+    };
+
+    let mut clean = true;
+
+    match client.fetch_info().await {
+        Ok(info) => {
+            let fetch_scope = match scope_utils::read_fetch_scope() {
+                Ok(scope) => scope,
+                Err(_) => {
+                    clean = false;
+                    scope_utils::MaterializationScope::full()
+                }
+            };
+
+            for (wire, remote_head) in &info.pallets {
+                let fetched = match wire.strip_prefix(pallet_utils::META_QUALIFIER) {
+                    Some(_) => remote_utils::fetch_history(&client, remote_head).await,
+                    None => remote_utils::fetch_history_scoped(&client, remote_head, &fetch_scope).await,
+                };
+
+                if fetched.is_err() {
+                    clean = false;
+                }
+            }
+        }
+        // Unreachable remote, protocol mismatch, etc. — pass 2 below still gets a chance (it may
+        // fail too, or may not, depending on what actually broke); either way the caller's own
+        // presence recheck is what decides "recovered" (D3), never this function's outcome.
+        Err(_) => clean = false,
+    }
+
+    if !candidate_hashes.is_empty()
+        && remote_utils::fetch_missing_objects(&client, candidate_hashes).await.is_err()
+    {
+        clean = false;
+    }
+
+    if clean { RemoteConsultation::ConsultedCleanly } else { RemoteConsultation::ConsultedWithErrors }
 }
 
 fn display_paths<'a>(paths: impl Iterator<Item = &'a PathBuf>) -> Vec<String> {

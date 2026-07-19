@@ -1181,10 +1181,25 @@ fn is_known_complete(hash: &str, complete_heads: &[String]) -> Result<bool, Stri
 /// Fetch (concurrently) the objects of the given hashes that are missing locally.
 /// Every downloaded object is hash-verified by `store_object_bytes` before it lands.
 ///
+/// `pub(crate)` (not just a private helper of this module's own history walks): §3.2's
+/// heal-driven refetch (`recovery_utils::attempt_heal_driven_refetch`) also calls this directly,
+/// for a *targeted*, hash-addressed fetch of exactly the recorded hashes a taint's remainder
+/// names — deliberately bypassing `fetch_history`/`fetch_history_scoped`'s own "already reachable
+/// from a local ref" bound (see that function's doc comment): that bound is sound for their own
+/// purpose (skip re-walking a closure a ref already proves complete) but means neither ever
+/// re-verifies or re-fetches one specific object inside an otherwise-already-complete parcel —
+/// exactly the shape a vanished-but-still-referenced object recorded against the *current*,
+/// already-published pallet head takes. A direct `GET /v1/objects/{hash}` is deliberately
+/// path-blind server-side (`forklift-server`'s own `get_object` doc comment) and so finds an
+/// object regardless of which pallet(s) reference it or whether their closure is already
+/// considered complete — this function already IS that primitive (the history walks above call
+/// it per-wave), just never previously called with a caller-chosen, non-walk-discovered hash
+/// list.
+///
 /// # Returns
 /// * `Ok(usize)`   - How many objects were fetched.
 /// * `Err(String)` - If a transfer or verification failed.
-async fn fetch_missing_objects(client: &RemoteClient, hashes: &[String]) -> Result<usize, String> {
+pub(crate) async fn fetch_missing_objects(client: &RemoteClient, hashes: &[String]) -> Result<usize, String> {
     let mut missing: Vec<String> = Vec::new();
 
     for hash in hashes {

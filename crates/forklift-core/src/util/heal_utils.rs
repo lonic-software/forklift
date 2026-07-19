@@ -1104,7 +1104,8 @@ mod tests {
         let relative_str = relative.to_string_lossy().into_owned();
         plant_taint(&forklift, &[relative_str.as_str()]);
 
-        let outcome = recovery_utils::run()
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let outcome = runtime.block_on(recovery_utils::run())
             .expect("the heal verb must also clear a pack-recovered path, not refuse it");
         assert!(outcome.was_tainted);
         assert!(outcome.resolved.iter().any(|entry| entry == &relative_str),

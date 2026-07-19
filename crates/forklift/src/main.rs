@@ -227,7 +227,7 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
         Command::Narrow { paths } => commands::narrow::handle_command(paths).await,
         Command::Franchise { url, directory, pallet, token, only } =>
             commands::franchise::handle_command(&url, &directory, pallet, token, only).await,
-        Command::Heal => commands::heal::handle_command(),
+        Command::Heal => commands::heal::handle_command().await,
         Command::History { revision, class, limit, after, oneline } => commands::history::handle_command(revision, class, limit, after, oneline).await,
         Command::Query { revisions, from, class, unsupervised, supervisor, signer, author_after, author_before, merges, no_merges, grep, model, tool, tag, touches, verify: _, recorded, r#where, limit, after, oneline } =>
             commands::query::handle_command(commands::query::QueryArgs {

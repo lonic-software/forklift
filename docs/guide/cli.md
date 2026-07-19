@@ -1184,19 +1184,23 @@ still good.
 Run `forklift heal` when a command keeps refusing with `durability_taint`. It repeats that
 same restage pass and, for whatever it still cannot resolve on its own, walks every pallet
 head, parked change, tag, and staged file to work out whether the affected object is still
-needed by anything:
+needed by anything. If a remote is configured, `heal` also tries fetching from it itself, right
+here, before giving up on anything — you never need to run `lower` by hand for this (and it
+would not help: `lower` is subject to the very same taint check, so it would just hit the same
+refusal before ever reaching its own fetch):
 
 - **Nothing was actually lost, or what vanished is not needed by anything anymore** — `heal`
   clears the taint and reports what it restaged or dropped. Exit 0; go on with what you were
   doing.
 - **Something is genuinely gone, and something still needs it** — `heal` reports exactly what,
-  with the remedies that apply: re-fetch it from a configured remote (`lower`/`franchise`), or
-  reproduce it by re-running whatever created it if the content still exists in your working
-  tree (`load` then `stack`). The taint stays standing on exactly that remainder, and every
-  other command keeps refusing (exit 21) until it is dealt with.
+  with the remedies left once its own fetch attempt has already run: franchise a fresh clone
+  from a configured remote if one might still have it, or reproduce it by re-running whatever
+  created it if the content still exists in your working tree (`load` then `stack`). The taint
+  stays standing on exactly that remainder, and every other command keeps refusing (exit 21)
+  until it is dealt with.
 - **The record of what was affected is itself incomplete** (a crash cut off the record before
   it named everything) — `heal` cannot safely guess the scope and refuses outright, naming the
-  same heavyweight options (re-fetch, reproduce, or accept the loss). This is rare — it needs a
+  same heavyweight options (franchise, reproduce, or accept the loss). This is rare — it needs a
   second, unrelated crash on top of the original failure.
 
 `heal` and the read-only `audit` are the only two commands that run while a taint is standing —
