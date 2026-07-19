@@ -7201,35 +7201,95 @@ fn audit_runs_while_tainted() {
 }
 
 #[test]
-fn heal_on_a_torn_taint_names_heavyweight_recovery_and_survives() {
-    let warehouse = TestWarehouse::new("heal-torn");
+fn heal_on_a_torn_taint_over_an_intact_store_rescans_and_clears() {
+    // §8.3 (I5): a torn taint (unknown scope) is no longer a permanent brick — `forklift heal`
+    // runs a directory-driven, store-wide rescan and, finding nothing genuinely dangling, clears
+    // it — exit 0, same as an ordinary healable taint. CLI-level proof that `recovery_utils::run`
+    // is actually wired to rescan torn rather than refuse it immediately (the pre-§8.3 shape,
+    // still pinned unit-side by `recovery_utils::tests::torn_taint_over_a_fully_intact_store_
+    // rescans_and_clears` and, for entry-heal specifically, `heal_utils::tests::
+    // a_torn_taint_refuses_immediately_and_survives`).
+    let warehouse = TestWarehouse::new("heal-torn-intact");
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
+
+    warehouse.write_file("src/app.rs", "intact content, never torn-tainted itself");
+    assert_success(&warehouse.run(&["load", "src/app.rs"]));
+    assert_success(&warehouse.run(&["stack", "intact parcel"]));
 
     let dir = taint_dir_path(&warehouse);
     std::fs::create_dir_all(&dir).unwrap();
     // No terminator line: torn by construction.
-    std::fs::write(dir.join("taint-1-0"), b"objects/ab/cdef\n").unwrap();
+    std::fs::write(dir.join("taint-1-0"), b"").unwrap();
+
+    let status = warehouse.run(&["heal", "--json"]);
+    assert_success(&status);
+    let value = json(&status);
+    assert_eq!(value["data"]["was_tainted"], true);
+
+    assert!(!taint_dir_path(&warehouse).exists() || recorded_taint_paths(&warehouse).is_empty(),
+        "the taint must be fully cleared, including the torn file itself");
+
+    // The warehouse is fully usable again, including the mutating write path a taint exists to
+    // protect.
+    warehouse.write_file("src/more.rs", "after the torn rescan");
+    assert_success(&warehouse.run(&["load", "src/more.rs"]));
+    assert_success(&warehouse.run(&["stack", "after torn rescan"]));
+}
+
+#[test]
+fn heal_on_a_torn_taint_with_a_dangling_reference_rescans_into_a_named_remainder() {
+    // §8.3 (I5): a torn taint whose surviving recorded prefix does not name the dangling object,
+    // over a store that genuinely has one, must not clear — the rescan turns the unknown scope
+    // into a known, honest remainder naming exactly what is still dangling, and the taint is left
+    // standing (no longer torn) for the operator (or a future `forklift heal`) to resolve. Also
+    // pins the updated refusal prose: it must no longer claim a "heavyweight recovery" that does
+    // not exist, and must not tell the operator to run a fetch by hand ("forklift lower").
+    let warehouse = TestWarehouse::new("heal-torn-dangling");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    warehouse.write_file("src/app.rs", "referenced content");
+    assert_success(&warehouse.run(&["load", "src/app.rs"]));
+    let stack_out = warehouse.run(&["stack", "referenced parcel"]);
+    assert_success(&stack_out);
+    let parcel_hash = extract_parcel_hash(&stack_out);
+
+    // The pallet head is a durable ref by construction — vanishing its own parcel object is the
+    // simplest genuinely-dangling fixture.
+    let relative = loose_object_relative_path(&parcel_hash);
+    std::fs::remove_file(warehouse.root.join(".forklift").join(&relative)).unwrap();
+
+    // Torn, and its surviving prefix deliberately does NOT mention the vanished parcel — proving
+    // the rescan finds it by walking ref sources (§8.1's targetless enumerator), not by trusting
+    // the torn record's own (lower-bound, untrusted) recorded set.
+    let dir = taint_dir_path(&warehouse);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("taint-1-0"), b"objects/aa/an-unrelated-surviving-line\n").unwrap();
 
     let status = warehouse.run(&["heal", "--json"]);
     assert_eq!(status.status.code(), Some(21));
     let value = json(&status);
     assert_eq!(value["error"]["code"], "durability_taint");
     let message = value["error"]["message"].as_str().unwrap();
-    assert!(message.contains("torn") || message.to_lowercase().contains("incomplete"),
-        "the message must name the torn/unknown-scope condition: {}", message);
-    let next_step = value["error"]["next_step"].as_str().unwrap();
-    assert!(
-        next_step.contains("franchise") && next_step.contains("re-run") && next_step.contains("accept the loss"),
-        "the heavyweight exits must be named: {}", next_step
-    );
-    // Torn is unfixed by this slice (still refuses immediately, before any heal-driven refetch
-    // could run) — so, unlike a resolved dangling remainder, this text must never claim a fetch
-    // was actually attempted; it never names "forklift lower" as a manual command either (see
-    // `recovery_utils::HEAVYWEIGHT_EXITS`'s doc comment).
-    assert!(!next_step.contains("forklift lower"));
+    assert!(message.contains("torn"), "the message must still name the torn origin: {}", message);
+    assert!(message.contains(&parcel_hash) && message.contains("genuinely dangling"),
+        "the message must name the dangling hash the rescan found: {}", message);
 
-    assert!(dir.join("taint-1-0").exists(), "a torn taint file must survive a heal attempt too");
+    let next_step = value["error"]["next_step"].as_str().unwrap();
+    assert!(next_step.contains("no longer torn") && next_step.contains("forklift heal"),
+        "the next step must direct to a plain re-run, now that the scope is known: {}", next_step);
+    assert!(next_step.contains("franchise") && next_step.contains("accept the loss"),
+        "the heavyweight exits must still be named for what a re-run cannot resolve: {}", next_step);
+    // No remote is configured, and the rescan itself never drives the §3.2 refetch (that is the
+    // *next* heal's job, against the now-known remainder) — "forklift lower" must never be named.
+    assert!(!next_step.contains("forklift lower"));
+    assert!(!message.contains("heavyweight recovery"),
+        "the torn refusal must never name a heavyweight recovery mode that does not exist: {}", message);
+
+    // The taint survives, no longer torn, recording exactly the dangling path.
+    assert_eq!(recorded_taint_paths(&warehouse), vec![relative],
+        "the remainder must name exactly the dangling parcel's path — not empty, not the whole store");
 }
 
 #[test]

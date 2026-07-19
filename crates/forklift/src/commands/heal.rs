@@ -18,7 +18,12 @@ use crate::output::{self, CommandOutput};
 /// * `Ok(())`      - Nothing was tainted, or the taint is now fully cleared.
 /// * `Err(String)` - A `durability_taint` refusal (torn, or an unresolved dangling reference).
 pub async fn handle_command() -> Result<(), String> {
-    let outcome = recovery_utils::run().await.map_err(String::from)?;
+    // A torn taint's rescan (§8.3) can take a while on a large or uncompacted store — it reports
+    // per-phase/per-count progress through this callback rather than staying silent. `human!` is
+    // itself a no-op under `--json` (progress is never part of the result document), and
+    // `forklift-core` never prints on its own (DESIGN.html §3.4) — this closure is the one bridge.
+    let outcome = recovery_utils::run(Some(&|line: &str| crate::human!("{}", line)))
+        .await.map_err(String::from)?;
 
     output::emit("heal", &HealReport {
         was_tainted: outcome.was_tainted,

@@ -1199,9 +1199,16 @@ refusal before ever reaching its own fetch):
   stays standing on exactly that remainder, and every other command keeps refusing (exit 21)
   until it is dealt with.
 - **The record of what was affected is itself incomplete** (a crash cut off the record before
-  it named everything) — `heal` cannot safely guess the scope and refuses outright, naming the
-  same heavyweight options (franchise, reproduce, or accept the loss). This is rare — it needs a
-  second, unrelated crash on top of the original failure.
+  it named everything) — this is rare; it needs a second, unrelated crash on top of the original
+  failure. `heal` no longer treats this as a dead end: it re-derives the full scope itself by
+  checking every object actually present in the warehouse and re-walking every pallet head,
+  parked change, tag, and staged file to see what is still needed, then records exactly what
+  came out dangling. This can take noticeably longer than the ordinary case (it is checking the
+  whole object store, not just the affected paths), and it prints progress as it goes. If nothing
+  turns out to be missing, the taint clears — exit 0, same as any other clean heal. If something
+  is genuinely gone and still needed, the taint stays standing on exactly that (no longer
+  incomplete) remainder; running `heal` again resolves it exactly like the "something is
+  genuinely gone" case above, including trying a configured remote.
 
 `heal` and the read-only `audit` are the only two commands that run while a taint is standing —
 every other command refuses first, precisely so nothing durable is ever recorded on top of

@@ -7,9 +7,12 @@
 //! This module owns three things: [`restage_object`], the per-path redo-the-write primitive,
 //! [`heal_if_tainted`], the automatic chokepoint that drives it over every path a taint
 //! recorded, and — `pub(crate)`, for [`recovery_utils`](crate::util::recovery_utils) to build on
-//! — [`RestageAttempt`]/[`attempt_restage_all`]/[`finish_clean_heal`], the same restage-and-
-//! categorize machinery factored out so the `forklift heal` recovery verb can drive it directly
-//! instead of only reading `heal_if_tainted`'s refusal string. This module does **not** own the
+//! — [`RestageAttempt`]/[`attempt_restage_all`]/[`attempt_restage_all_parallel`]/
+//! [`finish_clean_heal`], the same restage-and-categorize machinery factored out so the
+//! `forklift heal` recovery verb can drive it directly instead of only reading
+//! `heal_if_tainted`'s refusal string (the parallel form exists for the §8.3 torn rescan, whose
+//! candidate set is directory-driven and can be every loose object in the store — see its own
+//! doc comment). This module does **not** own the
 //! closure walk over durable ref sources or any remedy (refetch/restage-from-worktree/abandon)
 //! for a case it cannot auto-heal — that is `recovery_utils`, built on top of what this module
 //! exposes. When entry-heal meets a case it cannot resolve itself (a vanished object, one that
@@ -94,7 +97,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use crate::error::{CoreError, RefusalCode};
 use crate::globals::forklift_root;
-use crate::util::{file_utils, object_utils, taint_utils};
+use crate::util::{fanout_utils, file_utils, object_utils, taint_utils};
 
 #[cfg(target_os = "macos")]
 use std::os::unix::fs::MetadataExt;
@@ -412,17 +415,46 @@ pub(crate) fn attempt_restage_all(root: &Path, recorded: &BTreeSet<PathBuf>) -> 
     let mut attempt = RestageAttempt::default();
 
     for relative in recorded {
-        match restage_object(root, relative) {
-            Ok(RestageOutcome::Restaged) => { attempt.restaged.insert(relative.clone()); }
-            Ok(RestageOutcome::RecoveredPacked) => { attempt.recovered_packed.insert(relative.clone()); }
-            Ok(RestageOutcome::Vanished) => { attempt.vanished.insert(relative.clone()); }
-            Ok(RestageOutcome::Unreadable(e)) => { attempt.unreadable.push((relative.clone(), e)); }
-            Ok(RestageOutcome::HashMismatch) => { attempt.hash_mismatch.insert(relative.clone()); }
-            Err(e) => { attempt.restage_failed.push((relative.clone(), e)); }
-        }
+        let outcome = restage_object(root, relative);
+        categorize_restage_outcome(&mut attempt, relative.clone(), outcome);
     }
 
     attempt
+}
+
+/// The §8.3 torn-rescan's parallel counterpart of [`attempt_restage_all`]: same categorization,
+/// same [`restage_object`] discipline, fanned out over `fanout_utils::fanout_map` instead of a
+/// plain serial loop. Meant for the one caller (`recovery_utils`'s directory-driven torn rescan)
+/// whose candidate set can be *every* loose object in the store rather than a handful of recorded
+/// paths — restaging one path there never touches another's temp file or final name
+/// (`rewrite_dentry` names its temp per-path), so the batch is exactly the flat, independent-item
+/// shape `fanout_utils` documents itself as being for (and `crate::model::task::TaskExecutor`, built
+/// for tree recursion, is not). Every other caller keeps using the serial form — this is an
+/// addition, not a replacement.
+pub(crate) fn attempt_restage_all_parallel(root: &Path, recorded: &BTreeSet<PathBuf>) -> RestageAttempt {
+    let paths: Vec<PathBuf> = recorded.iter().cloned().collect();
+    let outcomes = fanout_utils::fanout_map(&paths, |relative| restage_object(root, relative));
+
+    let mut attempt = RestageAttempt::default();
+    for (relative, outcome) in paths.into_iter().zip(outcomes) {
+        categorize_restage_outcome(&mut attempt, relative, outcome);
+    }
+
+    attempt
+}
+
+/// The one categorization [`attempt_restage_all`] and [`attempt_restage_all_parallel`] both build
+/// their [`RestageAttempt`] from, so the serial and parallel forms can never drift on what a given
+/// [`RestageOutcome`] means.
+fn categorize_restage_outcome(attempt: &mut RestageAttempt, relative: PathBuf, outcome: Result<RestageOutcome, String>) {
+    match outcome {
+        Ok(RestageOutcome::Restaged) => { attempt.restaged.insert(relative); }
+        Ok(RestageOutcome::RecoveredPacked) => { attempt.recovered_packed.insert(relative); }
+        Ok(RestageOutcome::Vanished) => { attempt.vanished.insert(relative); }
+        Ok(RestageOutcome::Unreadable(e)) => { attempt.unreadable.push((relative, e)); }
+        Ok(RestageOutcome::HashMismatch) => { attempt.hash_mismatch.insert(relative); }
+        Err(e) => { attempt.restage_failed.push((relative, e)); }
+    }
 }
 
 /// The common tail of a fully successful heal, shared by [`heal_if_tainted`] (every recorded path
@@ -1105,7 +1137,7 @@ mod tests {
         plant_taint(&forklift, &[relative_str.as_str()]);
 
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        let outcome = runtime.block_on(recovery_utils::run())
+        let outcome = runtime.block_on(recovery_utils::run(None))
             .expect("the heal verb must also clear a pack-recovered path, not refuse it");
         assert!(outcome.was_tainted);
         assert!(outcome.resolved.iter().any(|entry| entry == &relative_str),
@@ -1137,6 +1169,50 @@ mod tests {
 
         let outcome = restage_object(&forklift, Path::new("objects/pack/does-not-exist.pack")).unwrap();
         assert_eq!(outcome, RestageOutcome::Vanished);
+    }
+
+    #[test]
+    fn attempt_restage_all_parallel_categorizes_identically_to_the_serial_form() {
+        // Guards the `categorize_restage_outcome` extraction (shared by `attempt_restage_all` and
+        // `attempt_restage_all_parallel`, see both doc comments): a mixed batch — one restaged
+        // loose object, one vanished path, one hash-mismatched loose object — must land in the
+        // exact same `RestageAttempt` buckets whichever form drives it. Mutation: diverge one
+        // form's categorization from the other (e.g. only the parallel form forgets
+        // `hash_mismatch`) → the two `RestageAttempt`s compare unequal → red.
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        let root = scratch("parallel-restage-parity");
+        let _scope = StorageRootScope::enter(&root);
+        let forklift = forklift_root();
+
+        let (_hash, good_relative) = write_loose_object(&forklift, b"a genuine loose object, parallel-restaged");
+
+        let mismatch_hash = "3".repeat(64);
+        let mismatched_bytes = zstd::encode_all(b"wrong content for this hash".as_slice(), 0).unwrap();
+        let (folder, file_name) = file_utils::get_path_for_object(&mismatch_hash).unwrap();
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(PathBuf::from(&folder).join(&file_name), &mismatched_bytes).unwrap();
+        let mismatch_relative = PathBuf::from("objects").join(&mismatch_hash[0..2]).join(&mismatch_hash[2..]);
+
+        let vanished_relative = PathBuf::from("objects/ab/deadbeef00");
+
+        let recorded: BTreeSet<PathBuf> = [good_relative.clone(), mismatch_relative.clone(), vanished_relative.clone()]
+            .into_iter().collect();
+
+        let serial = attempt_restage_all(&forklift, &recorded);
+        let parallel = attempt_restage_all_parallel(&forklift, &recorded);
+
+        assert_eq!(serial.restaged, parallel.restaged);
+        assert_eq!(serial.recovered_packed, parallel.recovered_packed);
+        assert_eq!(serial.vanished, parallel.vanished);
+        assert_eq!(serial.hash_mismatch, parallel.hash_mismatch);
+        assert_eq!(serial.unreadable.len(), parallel.unreadable.len());
+        assert_eq!(serial.restage_failed.len(), parallel.restage_failed.len());
+
+        assert!(serial.restaged.contains(&good_relative));
+        assert!(serial.hash_mismatch.contains(&mismatch_relative));
+        assert!(serial.vanished.contains(&vanished_relative));
     }
 
     #[test]
