@@ -39,10 +39,45 @@
 //! walk necessarily runs under) and never touch [`crate::util::graph_utils`]'s persisting entry
 //! points (`node`/`ensure` durably self-heal a commit-graph shard via `write_file_atomically` —
 //! exactly the kind of barrier-on-a-possibly-failing-device this recovery path must never risk).
-//! Presence of one already-known-suspect hash is checked with [`file_utils::raw_object_present`],
-//! the one sanctioned gate-free presence check — see its own doc comment for why bypassing the
-//! gate is safe specifically here. [`tests::closure_walk_never_touches_a_barrier_or_a_dir_sync`]
-//! is the actual enforcer, not this paragraph.
+//! Presence is checked with [`file_utils::raw_object_present`], the one sanctioned gate-free
+//! presence check — see its own doc comment for why bypassing the gate is safe specifically here.
+//! [`tests::closure_walk_never_touches_a_barrier_or_a_dir_sync`] is the actual enforcer, not this
+//! paragraph.
+//!
+//! ## Presence-tolerant descent (invariant I3)
+//!
+//! In a sparse/narrowed or shallow warehouse, an object this walk would otherwise need to descend
+//! into can be legitimately absent (sealed by a signed hash, never fetched) rather than lost. Every
+//! *descent* point in [`walk_closure_for`]/`walk_tree`/`check_leaf` — a parent parcel, a subtree,
+//! and a chunked leaf's recipe (the objects this walk would otherwise load and recurse through) —
+//! therefore checks [`file_utils::raw_object_present`] **after** that node's own targets-check (a
+//! vanished *target* must still be reported as referenced — see
+//! [`tests::a_vanished_pallet_head_that_is_itself_the_target_is_still_reported_referenced`]),
+//! **unconditionally in both modes below**, and on absence skips descending — it does **not**
+//! error. This is sound to *clear* on, not merely tolerate: `collect_walk_roots`'s own doc comment
+//! establishes that this walk's root set is a superset of
+//! [`crate::util::gc_utils::collect_live_set`]'s, so with identical tolerance any target this walk
+//! calls unreferenced is unreferenced under gc's smaller root set too — gc is already entitled to
+//! collect it, so a heal that instead kept it tainted forever would brick every command over an
+//! object the store's own collector calls garbage. A **present**-but-unloadable object still fails
+//! loud (the ordinary `?` after the presence check returns `true`) — tolerance is for absence only,
+//! never for corruption.
+//!
+//! A **terminal** leaf — a plain (blob) file entry, or one chunk hash out of a *present* recipe's
+//! chunk list — has no further descent to skip: the walk never loads a blob's or a chunk's bytes
+//! either way. Its presence check exists purely to *feed the sink* (see below), so it is gated on
+//! the sink actually being present (`Option::is_some`) and skipped — not merely no-opped, the
+//! syscall itself is skipped — when there is nothing to feed.
+//!
+//! The sink is `Option<&mut dyn FnMut(&str)>`: `None` for the common, targeted walk
+//! ([`closure_references_any`]) — descent-guard absences are simply skipped, and the (gated)
+//! terminal-leaf presence check never runs at all, so the targeted walk pays no per-leaf/per-chunk
+//! stat it has no use for. `Some(collector)` for the targetless enumerator
+//! ([`enumerate_absent_reachable`]) — every absence found, at every level including terminal
+//! leaves and chunks, is recorded. Both share [`walk_closure_for`]'s exact descent (one code path,
+//! two modes, so they can never drift apart); [`enumerate_absent_reachable`] additionally passes an
+//! **empty target set**, so every node's targets-check is vacuous and every node's descent-guard is
+//! actually reached.
 //!
 //! ## Partial clears
 //!
@@ -457,27 +492,97 @@ fn walk_shard_files(folder: &Path, hashes: &mut Vec<(String, DirEntryType)>) -> 
 /// Walk every durable ref source's closure looking for `targets`, returning the subset actually
 /// found referenced. Read-only: see the module doc comment and
 /// [`tests::closure_walk_never_touches_a_barrier_or_a_dir_sync`].
+///
+/// Presence-tolerant (I3) — see the module doc comment. Passes `None` for the sink: this call only
+/// ever cares whether a target is referenced, never which hashes the walk found absent along the
+/// way, and the `None` also gates off the terminal-leaf/chunk presence stats this call has no use
+/// for (the descent guards — parcel, subtree, chunked-leaf's recipe — still run regardless).
 pub(crate) fn closure_references_any(targets: &BTreeSet<String>) -> Result<BTreeSet<String>, String> {
     if targets.is_empty() {
         return Ok(BTreeSet::new());
     }
 
     let roots = collect_walk_roots()?;
-    walk_closure_for(targets, &roots)
+    walk_closure_for(targets, &roots, None)
 }
 
-fn walk_closure_for(targets: &BTreeSet<String>, roots: &WalkRoots) -> Result<BTreeSet<String>, String> {
+/// The targetless sibling of [`closure_references_any`]: enumerate every hash the walk finds
+/// raw-absent (a root ref itself, a parent parcel, a subtree boundary, an absent recipe, a raw-
+/// absent chunk under a present recipe, or a plain leaf), without ever descending past one. Built
+/// for a later slice (the torn-taint rescan, which needs a *targetless* enumerator — a torn taint
+/// has no `targets` set to drive [`closure_references_any`] with) and not wired into any command
+/// yet; implemented and tested now so this collecting path is exercised rather than dead code.
+///
+/// Shares [`walk_closure_for`]'s exact descent, with an **empty** target set — every node then
+/// falls through past its (vacuous) targets-check to its presence guard — and `Some` sink, which
+/// both collects every absence found and (per the module doc comment) turns on the terminal-
+/// leaf/chunk presence checks that [`closure_references_any`] skips entirely. Same descent, so this
+/// can never tolerate (or fail to tolerate) anything [`closure_references_any`] doesn't.
+///
+/// # Returns
+/// * `Ok(BTreeSet<String>)` - Every raw-absent hash the walk reached, recorded once each.
+/// * `Err(String)`          - A ref source could not be read, or a *present* object could not be
+///                            loaded (corrupt/unreadable) — the walk still fails loud on those.
+// Not called from production code yet (see the doc comment above) — only from this module's own
+// tests, which is exactly what this slice needs to prove the collecting path works. Silences the
+// otherwise-genuine `dead_code` lint on a non-test build; remove this attribute in the slice that
+// wires this into the torn-taint rescan.
+#[allow(dead_code)]
+pub(crate) fn enumerate_absent_reachable() -> Result<BTreeSet<String>, String> {
+    let roots = collect_walk_roots()?;
+    let empty_targets: BTreeSet<String> = BTreeSet::new();
+    let mut absent: BTreeSet<String> = BTreeSet::new();
+    {
+        let mut collecting_sink = |hash: &str| { absent.insert(hash.to_string()); };
+        walk_closure_for(&empty_targets, &roots, Some(&mut collecting_sink))?;
+    }
+    Ok(absent)
+}
+
+/// Re-borrow an `Option<&mut dyn FnMut(&str)>` for one call, without moving the original out of
+/// its owning local variable — needed because `Option<&mut dyn FnMut(&str)>` is used repeatedly
+/// across loop iterations and nested calls in [`walk_closure_for`]/`walk_tree`/`check_leaf`, and
+/// the generic `Option::as_deref_mut` does not shrink a `&mut &mut dyn Trait`'s lifetime down to
+/// just the one call the way this concrete, non-generic match does (a known reborrowing gap for
+/// generic `DerefMut` blanket impls over nested mutable references).
+fn reborrow_sink<'a>(sink: &'a mut Option<&mut dyn FnMut(&str)>) -> Option<&'a mut dyn FnMut(&str)> {
+    match sink {
+        Some(s) => Some(&mut **s),
+        None => None,
+    }
+}
+
+/// The shared descent core both [`closure_references_any`] and [`enumerate_absent_reachable`] call
+/// (I3, module doc comment). `sink`:
+/// * `None` — the targeted walk: a descent-guard absence (parcel/subtree/recipe) is simply skipped,
+///   and the terminal-leaf/chunk presence checks are skipped entirely (not merely no-opped) since
+///   nothing would consume their result.
+/// * `Some(collector)` — the enumerating walk: every absence found, at every level, is recorded via
+///   `collector`.
+///
+/// `targets` empty (as [`enumerate_absent_reachable`] passes) means every node's targets-check is
+/// vacuous, so the walk falls through to (and records at) every presence guard it meets.
+fn walk_closure_for(
+    targets: &BTreeSet<String>,
+    roots: &WalkRoots,
+    mut sink: Option<&mut dyn FnMut(&str)>,
+) -> Result<BTreeSet<String>, String> {
     let mut referenced: BTreeSet<String> = BTreeSet::new();
     let mut visited_trees: HashSet<String> = HashSet::new();
 
     for (hash, item_type) in &roots.shard_referenced {
-        check_leaf(hash, *item_type, targets, &mut referenced)?;
+        check_leaf(hash, *item_type, targets, &mut referenced, reborrow_sink(&mut sink))?;
     }
 
     let mut visited_parcels: HashSet<String> = HashSet::new();
     let mut queue: VecDeque<String> = roots.parcels.iter().cloned().collect();
 
     while let Some(hash) = queue.pop_front() {
+        // Targets-check FIRST: a vanished hash that is itself a root ref (a pallet head, a parked
+        // parcel, a tag subject, …) is still a genuine reference to it — the presence guard below
+        // must never pre-empt this, or a root reference to a raw-absent target would be silently
+        // dropped instead of reported. See
+        // [`tests::a_vanished_pallet_head_that_is_itself_the_target_is_still_reported_referenced`].
         if targets.contains(&hash) {
             referenced.insert(hash);
             continue;
@@ -485,9 +590,17 @@ fn walk_closure_for(targets: &BTreeSet<String>, roots: &WalkRoots) -> Result<BTr
         if !visited_parcels.insert(hash.clone()) {
             continue;
         }
+        // Presence-tolerant (I3): a parent parcel reached by ancestry can be legitimately absent
+        // (sparse/shallow/narrowed) — record it via `sink` (if any) and stop; do not enqueue its
+        // parents, since an absent parcel's own parent list cannot be read. Unconditional in both
+        // modes — this is a descent guard, not a sink-feeding-only stat.
+        if !file_utils::raw_object_present(&hash)? {
+            if let Some(s) = reborrow_sink(&mut sink) { s(&hash); }
+            continue;
+        }
 
         let parcel = object_utils::load_parcel(&hash)?;
-        walk_tree(&parcel.tree_hash, targets, &mut referenced, &mut visited_trees)?;
+        walk_tree(&parcel.tree_hash, targets, &mut referenced, &mut visited_trees, reborrow_sink(&mut sink))?;
 
         for parent in parcel.parents {
             queue.push_back(parent);
@@ -508,11 +621,15 @@ fn walk_tree(
     targets: &BTreeSet<String>,
     referenced: &mut BTreeSet<String>,
     visited_trees: &mut HashSet<String>,
+    mut sink: Option<&mut dyn FnMut(&str)>,
 ) -> Result<(), String> {
     let mut tree_queue: VecDeque<String> = VecDeque::new();
     tree_queue.push_back(tree_hash.to_string());
 
     while let Some(tree_hash) = tree_queue.pop_front() {
+        // Targets-check FIRST — same reasoning as `walk_closure_for`'s parcel queue: a vanished
+        // hash that is itself a hunted target is a reference, and must be reported as one even
+        // though it is raw-absent.
         if targets.contains(&tree_hash) {
             referenced.insert(tree_hash);
             continue;
@@ -520,11 +637,25 @@ fn walk_tree(
         if !visited_trees.insert(tree_hash.clone()) {
             continue;
         }
+        // Presence-tolerant (I3): a sealed subtree boundary in a sparse/shallow warehouse is
+        // legitimately absent — record it (if a sink is listening) and stop; nothing beneath it is
+        // locally knowable (the store invariant a warehouse never holds a child without its parent
+        // tree, mirrored from `gc_utils::collect_live_set`'s own tree descent). Unconditional in
+        // both modes — a descent guard, not a sink-feeding-only stat.
+        // Presence-tolerant (I3): a sealed subtree boundary in a sparse/shallow warehouse is
+        // legitimately absent — record it (if a sink is listening) and stop; nothing beneath it is
+        // locally knowable (the store invariant a warehouse never holds a child without its parent
+        // tree, mirrored from `gc_utils::collect_live_set`'s own tree descent). Unconditional in
+        // both modes — a descent guard, not a sink-feeding-only stat.
+        if !file_utils::raw_object_present(&tree_hash)? {
+            if let Some(s) = reborrow_sink(&mut sink) { s(&tree_hash); }
+            continue;
+        }
 
         let tree = object_utils::load_tree(&tree_hash)?;
 
         for (_, file) in tree.get_files() {
-            check_leaf(&file.hash, file.item_type, targets, referenced)?;
+            check_leaf(&file.hash, file.item_type, targets, referenced, reborrow_sink(&mut sink))?;
         }
 
         for (_, subtree) in tree.get_subtrees() {
@@ -538,22 +669,56 @@ fn walk_tree(
 /// Check one leaf entry (a tree's file entry, or a staged shard's item): if its own hash is a
 /// target, record it; otherwise, for a chunked file, descend into its recipe's chunk list looking
 /// for a target chunk hash (a chunk is reachable only *through* its recipe, never directly).
+///
+/// Presence-tolerant (I3): a **chunked** leaf's recipe can itself be raw-absent (sparse/shallow) —
+/// its chunks are then locally absent too (mirrors `gc_utils::mark_recipe_chunks_live`), so an
+/// absent recipe is recorded (if a sink is listening) and its chunk list is never fetched. This
+/// recipe-presence guard is a real descent guard (skips the `recipe_chunk_hashes` load) and runs
+/// **unconditionally in both modes**, exactly like the parcel/subtree guards.
+///
+/// The two *terminal* checks below it are different in kind: a **present** recipe's individual
+/// chunk hashes, and a **plain** (blob) leaf's own hash, are never loaded by this walk either way
+/// (only ever compared against `targets`) — there is no descent for a presence check to gate. So
+/// each is gated on `sink.is_some()` and skipped entirely (not merely no-opped — the
+/// `raw_object_present` syscall itself is skipped) for the targeted walk
+/// ([`closure_references_any`], `sink: None`), and only actually runs for the enumerator
+/// ([`enumerate_absent_reachable`], `sink: Some(_)`) — see the module doc comment.
 fn check_leaf(
     hash: &str,
     item_type: DirEntryType,
     targets: &BTreeSet<String>,
     referenced: &mut BTreeSet<String>,
+    mut sink: Option<&mut dyn FnMut(&str)>,
 ) -> Result<(), String> {
     if targets.contains(hash) {
         referenced.insert(hash.to_string());
-        return Ok(()); // Absent — nothing to descend into.
+        return Ok(());
     }
 
     if item_type.is_chunked() {
+        if !file_utils::raw_object_present(hash)? {
+            if let Some(s) = reborrow_sink(&mut sink) { s(hash); }
+            return Ok(());
+        }
         for chunk in object_utils::recipe_chunk_hashes(hash)? {
+            // Targets-check first (same reasoning as every other node): a target chunk is
+            // recorded as referenced regardless of mode.
             if targets.contains(&chunk) {
-                referenced.insert(chunk);
+                referenced.insert(chunk.clone());
             }
+            // Enumerating-mode only (gated on the sink, not merely no-opped): the targeted walk
+            // never needs a chunk's raw presence, only whether it is a target (handled above).
+            if let Some(s) = reborrow_sink(&mut sink) {
+                if !file_utils::raw_object_present(&chunk)? {
+                    s(&chunk);
+                }
+            }
+        }
+    } else if let Some(s) = reborrow_sink(&mut sink) {
+        // Enumerating-mode only, same reasoning: a plain leaf's bytes are never loaded by this
+        // walk either way.
+        if !file_utils::raw_object_present(hash)? {
+            s(hash);
         }
     }
 
@@ -715,6 +880,316 @@ mod tests {
         assert!(file_utils::dir_sync_attempts().is_empty(),
             "the closure walk must never run a durability barrier (caught via its trailing dir sync): {:?}",
             file_utils::dir_sync_attempts());
+
+        // The enumerating mode (`enumerate_absent_reachable`, the §8.3 hook) shares the exact same
+        // descent — pin that it is equally read-only, not just the no-op-sink mode above. Same
+        // recording guards, still armed; any sync attempt from either call would show up here.
+        let absent = enumerate_absent_reachable()
+            .expect("the enumerating walk must succeed against a real, readable ref source");
+        assert!(absent.is_empty(), "nothing in this fixture is raw-absent");
+
+        assert!(file_utils::sync_dir_attempts().is_empty(),
+            "the enumerating walk must never fsync a directory either: {:?}",
+            file_utils::sync_dir_attempts());
+        assert!(file_utils::dir_sync_attempts().is_empty(),
+            "the enumerating walk must never run a durability barrier either: {:?}",
+            file_utils::dir_sync_attempts());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Shared fixture for the I3 (presence-tolerant descent) tests: a pallet head "main" whose
+    /// parcel's spine tree has exactly one subtree child pointing at a hash that is never actually
+    /// stored anywhere (`absent_subtree_hash`) — the present-parent / absent-child boundary shape
+    /// §8.1 exists to tolerate (a sealed hash committed to a signed tree, never fetched into this
+    /// warehouse). Must be called after a `StorageRootScope` is entered. Returns the absent
+    /// subtree's hash.
+    fn plant_present_parent_with_absent_subtree_boundary() -> String {
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+        use crate::model::parcel::Parcel;
+        use crate::model::tree_item::TreeItem;
+
+        let absent_subtree_hash = "a".repeat(64);
+
+        let mut root_tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        root_tree.add_child(TreeItem::new(
+            "sub".to_string(), absent_subtree_hash.clone(), DirEntryType::Tree,
+        ));
+        let mut tree_object = LooseObjectBuilder::build_tree(&root_tree);
+        tree_object.store().unwrap();
+
+        let parcel = Parcel {
+            tree_hash: tree_object.hash.clone(),
+            parents: Vec::new(),
+            actions: Vec::new(),
+            description: Some("boundary".to_string()),
+        };
+        let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
+        parcel_object.store().unwrap();
+        pallet_utils::set_pallet_head("main", &parcel_object.hash).unwrap();
+
+        absent_subtree_hash
+    }
+
+    /// (I3, test 1) A target only theoretically reachable *through* an absent subtree boundary
+    /// must be reported unreferenced, and the walk must complete without erroring on that boundary
+    /// — the tolerant-descent behavior this slice adds. `target_hash` can never actually be linked
+    /// from the absent subtree (there are no bytes to link from), which is exactly the point: the
+    /// walk cannot know, and must not assume, anything about what an absent object might have
+    /// pointed to — it just stops at the boundary. Mutation: revert `walk_tree`'s presence guard
+    /// (recovery_utils.rs, before `object_utils::load_tree`) back to a bare `?` on
+    /// `load_tree(&tree_hash)` → `load_tree` errors on the absent subtree (object does not exist)
+    /// → `closure_references_any` returns `Err` → `.expect(...)` panics → red.
+    #[test]
+    fn tolerant_walk_clears_a_target_only_reachable_through_an_absent_subtree_boundary() {
+        use crate::globals::StorageRootScope;
+
+        let dir = std::env::temp_dir()
+            .join(format!("forklift-recovery-utils-i3-boundary-clears-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _scope = StorageRootScope::enter(&dir);
+
+        plant_present_parent_with_absent_subtree_boundary();
+
+        let target_hash = "b".repeat(64);
+        let targets: BTreeSet<String> = [target_hash.clone()].into_iter().collect();
+
+        let referenced = closure_references_any(&targets)
+            .expect("a sealed/absent subtree boundary must be skipped, not fail the whole walk");
+        assert!(!referenced.contains(&target_hash),
+            "T is not actually reachable — its only theoretical path runs through the absent subtree");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// (I3, test 2 — gc-consistency) Pins the superset invariant `collect_walk_roots`'s doc
+    /// comment establishes: on the exact same boundary fixture as the test above, `gc_utils`'s
+    /// independently-implemented live-set walk must also treat the unreachable target as excluded.
+    /// If heal's tolerance (this module) ever diverges from gc's own presence tolerance
+    /// (`gc_utils::collect_live_set`), this reddens — heal must never clear (or keep tainted) an
+    /// object gc disagrees about.
+    #[test]
+    fn gc_consistency_pins_the_same_absent_subtree_boundary() {
+        use crate::globals::StorageRootScope;
+
+        let dir = std::env::temp_dir()
+            .join(format!("forklift-recovery-utils-i3-gc-consistency-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _scope = StorageRootScope::enter(&dir);
+
+        plant_present_parent_with_absent_subtree_boundary();
+
+        let target_hash = "b".repeat(64);
+        let targets: BTreeSet<String> = [target_hash.clone()].into_iter().collect();
+        let referenced = closure_references_any(&targets).unwrap();
+        assert!(!referenced.contains(&target_hash));
+
+        let live = crate::util::gc_utils::collect_live_set().unwrap();
+        assert!(!live.contains(&target_hash),
+            "gc's own live set must also exclude a target only reachable through an absent \
+            subtree boundary — heal's root set is a superset of gc's, so anything heal's \
+            tolerant walk calls unreferenced must be unreferenced under gc's smaller root set too");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// (I3, test 3 — targets-before-presence) A vanished object that is itself a hunted target
+    /// (here, a pallet head whose parcel was never actually stored) must still be reported
+    /// referenced: a root reference to a raw-absent object is a genuine reference, and the
+    /// presence guard must never pre-empt the targets-check that catches it. Mutation: swap the
+    /// order in `walk_closure_for`'s parcel-queue loop so the `raw_object_present` guard runs
+    /// *before* `targets.contains(&hash)` → the vanished target is skipped via `sink` and `continue`
+    /// before ever being checked against `targets` → `referenced` does not contain it → red.
+    #[test]
+    fn a_vanished_pallet_head_that_is_itself_the_target_is_still_reported_referenced() {
+        use crate::globals::StorageRootScope;
+
+        let dir = std::env::temp_dir()
+            .join(format!("forklift-recovery-utils-i3-targets-before-presence-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _scope = StorageRootScope::enter(&dir);
+
+        let vanished_head_hash = "e".repeat(64);
+        pallet_utils::set_pallet_head("main", &vanished_head_hash).unwrap();
+
+        let targets: BTreeSet<String> = [vanished_head_hash.clone()].into_iter().collect();
+        let referenced = closure_references_any(&targets).unwrap();
+
+        assert!(referenced.contains(&vanished_head_hash),
+            "a vanished pallet head that is itself a hunted target must still be reported referenced");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// (I3, test 4 — present-but-corrupt still fails loud) A pallet head naming a hash that IS
+    /// present on disk (`raw_object_present` → true) but whose stored bytes do not actually hash to
+    /// it — present-but-unloadable, the opposite case from raw-absent. The presence guard must
+    /// never turn this into a silent skip: once presence says "yes," the walk still runs the
+    /// ordinary `?` load, and a corrupt object still fails the whole walk loudly, exactly as it did
+    /// before this slice (and exactly as `gc_utils` still fails loud on a present-but-corrupt
+    /// object after its own presence check).
+    #[test]
+    fn a_present_but_corrupt_pallet_head_fails_the_walk_loudly() {
+        use crate::globals::StorageRootScope;
+
+        let dir = std::env::temp_dir()
+            .join(format!("forklift-recovery-utils-i3-corrupt-fails-loud-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _scope = StorageRootScope::enter(&dir);
+
+        let corrupt_hash = "f".repeat(64);
+        let mismatched_bytes = zstd::encode_all(
+            b"these bytes do not correspond to corrupt_hash".as_slice(), 0,
+        ).unwrap();
+        let (folder, file_name) = file_utils::get_path_for_object(&corrupt_hash).unwrap();
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(PathBuf::from(&folder).join(&file_name), &mismatched_bytes).unwrap();
+
+        pallet_utils::set_pallet_head("main", &corrupt_hash).unwrap();
+
+        // Unrelated, non-empty (an empty `targets` set short-circuits before the walk ever runs).
+        let targets: BTreeSet<String> = ["1".repeat(64)].into_iter().collect();
+        let result = closure_references_any(&targets);
+
+        assert!(result.is_err(),
+            "a present-but-corrupt object must fail the walk loudly, never be silently skipped");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// (I3, test 9 — enumerating mode) On the same present-parent/absent-subtree boundary fixture
+    /// as tests 1–2, `enumerate_absent_reachable` (the targetless, collecting-sink sibling) must
+    /// record exactly the boundary subtree's own hash, and nothing beneath it — it must never
+    /// descend past an absent node no matter which mode drives the shared walk core. Mutation:
+    /// remove the `continue` after the presence-guard `sink` call in `walk_tree` (i.e. keep
+    /// recording but still fall through to `load_tree`) → either an `Err` (load fails on the
+    /// absent hash) or, if the mutation instead skipped the guard, spurious hashes from
+    /// "descending" into content that was never there → this test reddens either way.
+    #[test]
+    fn enumerate_absent_reachable_records_the_boundary_and_nothing_beneath_it() {
+        use crate::globals::StorageRootScope;
+
+        let dir = std::env::temp_dir()
+            .join(format!("forklift-recovery-utils-i3-enumerate-boundary-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _scope = StorageRootScope::enter(&dir);
+
+        let absent_subtree_hash = plant_present_parent_with_absent_subtree_boundary();
+
+        let absent = enumerate_absent_reachable()
+            .expect("the enumerator must not error on a sealed/absent subtree boundary");
+
+        assert!(absent.contains(&absent_subtree_hash),
+            "the absent subtree boundary itself must be recorded by the collecting sink");
+        assert_eq!(absent.len(), 1,
+            "nothing beneath the absent boundary may be recorded — it must never be descended \
+            into: {:?}", absent);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Shared fixture for the chunked-leaf tests below: a pallet head "main" whose parcel's spine
+    /// tree has one `NormalChunked` file entry naming a recipe that IS stored (present), with one
+    /// chunk in its list. The chunk object itself is never stored — its hash is only ever compared
+    /// (as a target) or presence-checked (in enumerating mode), never loaded, so this is a valid,
+    /// realistic fixture either way. Must be called after a `StorageRootScope` is entered. Returns
+    /// the chunk's hash.
+    fn plant_present_recipe_with_one_chunk() -> String {
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+        use crate::model::parcel::Parcel;
+        use crate::model::recipe::{Recipe, RecipeChunk};
+        use crate::model::tree_item::TreeItem;
+
+        let chunk_hash = "9".repeat(64);
+        let chunk_size = 10u64;
+
+        let recipe = Recipe {
+            // Never verified by this walk (or by gc) — any 64-hex value is fine here.
+            content_hash: "0".repeat(64),
+            total_size: chunk_size,
+            chunks: vec![RecipeChunk { hash: chunk_hash.clone(), size: chunk_size }],
+        };
+        let mut recipe_object = LooseObjectBuilder::build_recipe(&recipe);
+        recipe_object.store().unwrap();
+
+        let mut root_tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        root_tree.add_child(TreeItem::new(
+            "big.bin".to_string(), recipe_object.hash.clone(), DirEntryType::NormalChunked,
+        ));
+        let mut tree_object = LooseObjectBuilder::build_tree(&root_tree);
+        tree_object.store().unwrap();
+
+        let parcel = Parcel {
+            tree_hash: tree_object.hash.clone(),
+            parents: Vec::new(),
+            actions: Vec::new(),
+            description: Some("chunked".to_string()),
+        };
+        let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
+        parcel_object.store().unwrap();
+        pallet_utils::set_pallet_head("main", &parcel_object.hash).unwrap();
+
+        chunk_hash
+    }
+
+    /// (I3 refinement — per-chunk enumeration) `enumerate_absent_reachable` must record a raw-
+    /// absent chunk hash out of a *present* recipe's chunk list, not just an absent recipe itself.
+    /// Mutation: remove the per-chunk `raw_object_present`+sink check inside `check_leaf`'s chunked
+    /// branch (the `if let Some(s) = reborrow_sink(&mut sink) { ... }` block after the recipe is
+    /// confirmed present) → the chunk is compared against `targets` (empty, so never matches) and
+    /// otherwise ignored → `absent` does not contain it → red. This is exactly the data-loss shape
+    /// the coordinator flagged: a future §8.3 torn rescan would then lose this chunk from the
+    /// remainder.
+    #[test]
+    fn enumerate_absent_reachable_records_an_absent_chunk_under_a_present_recipe() {
+        use crate::globals::StorageRootScope;
+
+        let dir = std::env::temp_dir()
+            .join(format!("forklift-recovery-utils-i3-enumerate-absent-chunk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _scope = StorageRootScope::enter(&dir);
+
+        let chunk_hash = plant_present_recipe_with_one_chunk();
+
+        let absent = enumerate_absent_reachable()
+            .expect("the enumerator must not error on a present recipe with an absent chunk");
+
+        assert!(absent.contains(&chunk_hash),
+            "a raw-absent chunk under a present recipe must be recorded by the collecting sink: {:?}",
+            absent);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// (I3 refinement — gating non-regression) `closure_references_any` must still find a target
+    /// chunk hash under a present recipe after the leaf/chunk presence checks were gated off for
+    /// the targeted walk (`sink: None`) — the gating must only skip the *presence* stat, never the
+    /// *targets* comparison the walk exists to answer. Mutation: gate the targets-check itself
+    /// (instead of just the presence check) on `sink.is_some()` → the target chunk is never
+    /// compared and `referenced` comes back empty → red.
+    #[test]
+    fn closure_references_any_still_finds_a_target_chunk_under_a_present_recipe() {
+        use crate::globals::StorageRootScope;
+
+        let dir = std::env::temp_dir()
+            .join(format!("forklift-recovery-utils-i3-target-chunk-noregress-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _scope = StorageRootScope::enter(&dir);
+
+        let chunk_hash = plant_present_recipe_with_one_chunk();
+
+        let targets: BTreeSet<String> = [chunk_hash.clone()].into_iter().collect();
+        let referenced = closure_references_any(&targets).unwrap();
+
+        assert!(referenced.contains(&chunk_hash),
+            "a target chunk hash under a present recipe must still be found by the targeted walk");
 
         std::fs::remove_dir_all(&dir).ok();
     }
