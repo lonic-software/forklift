@@ -3121,6 +3121,13 @@ mod tests {
         // `heal_utils::heal_if_tainted` (fsync the parent directories without rewriting the
         // dentries first) — this test still catches it via the inode check, since the taint would
         // still clear (the fsync itself succeeds) but neither file's dentry would actually change.
+        //
+        // Both entries are genuine loose objects (real hash, real zstd-compressed content) rather
+        // than mnemonic non-hex filenames ("alpha-object"/"beta-object", this test's own shape
+        // before this slice): `heal_if_tainted` now gates its restage on content-addressability
+        // (I1/I2, `heal_utils`'s module doc comment) *before* attempting anything, so a taint over
+        // a path `hash_from_object_path` does not recognize would escalate instead of healing —
+        // this test needs the common, content-addressed case that must still heal inline.
         let _serial = lock_taint_activation();
         taint_utils::activate();
 
@@ -3130,14 +3137,23 @@ mod tests {
         let _scope = StorageRootScope::enter(&temp);
         let forklift = forklift_root();
 
-        let alpha = forklift.join("objects").join("aa").join("alpha-object");
-        let beta = forklift.join("objects").join("bb").join("beta-object");
-        std::fs::create_dir_all(alpha.parent().unwrap()).unwrap();
-        std::fs::create_dir_all(beta.parent().unwrap()).unwrap();
+        let alpha_content = b"a genuine loose alpha object for the batched restage-heal test";
+        let beta_content = b"a genuine loose beta object for the batched restage-heal test";
+        let alpha_hash = blake3::hash(alpha_content).to_hex().to_string();
+        let beta_hash = blake3::hash(beta_content).to_hex().to_string();
+        let alpha_compressed = zstd::encode_all(&alpha_content[..], 0).unwrap();
+        let beta_compressed = zstd::encode_all(&beta_content[..], 0).unwrap();
+
+        let (alpha_folder, alpha_file) = get_path_for_object(&alpha_hash).unwrap();
+        let (beta_folder, beta_file) = get_path_for_object(&beta_hash).unwrap();
+        std::fs::create_dir_all(&alpha_folder).unwrap();
+        std::fs::create_dir_all(&beta_folder).unwrap();
+        let alpha = PathBuf::from(&alpha_folder).join(&alpha_file);
+        let beta = PathBuf::from(&beta_folder).join(&beta_file);
 
         let batch = WriteBatch::new();
-        batch.stage(&alpha, b"alpha content").unwrap();
-        batch.stage(&beta, b"beta content").unwrap();
+        batch.stage(&alpha, &alpha_compressed).unwrap();
+        batch.stage(&beta, &beta_compressed).unwrap();
 
         let inode_alpha_before = std::fs::metadata(&alpha).map(|m| m.ino()).ok();
         let inode_beta_before = std::fs::metadata(&beta).map(|m| m.ino()).ok();
@@ -3145,7 +3161,10 @@ mod tests {
             "neither final path may exist before the batch runs");
 
         {
-            let _guard = DirSyncFaultGuard::failing("bb");
+            // The needle is beta's own real shard prefix (derived from its real hash, not a
+            // hardcoded folder name) — guaranteed to match beta's directory regardless of what
+            // either hash actually is.
+            let _guard = DirSyncFaultGuard::failing(&beta_hash[..2]);
             batch.finish().unwrap_err();
         }
 
@@ -3166,8 +3185,10 @@ mod tests {
         assert_ne!(std::fs::metadata(&beta).unwrap().ino(), inode_beta_before,
             "mutation check: beta's dentry must actually be rewritten, not just fsynced");
 
-        assert_eq!(std::fs::read(&alpha).unwrap(), b"alpha content");
-        assert_eq!(std::fs::read(&beta).unwrap(), b"beta content");
+        let restaged_alpha = std::fs::read(&alpha).unwrap();
+        assert_eq!(zstd::stream::decode_all(restaged_alpha.as_slice()).unwrap(), alpha_content);
+        let restaged_beta = std::fs::read(&beta).unwrap();
+        assert_eq!(zstd::stream::decode_all(restaged_beta.as_slice()).unwrap(), beta_content);
 
         assert!(taint_utils::read_taints(&forklift).unwrap().recorded.is_empty(),
             "the taint files must be gone once every recorded path healed");

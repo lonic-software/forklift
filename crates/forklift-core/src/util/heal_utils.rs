@@ -18,6 +18,34 @@
 //! standing exactly as it found it — `forklift heal`, built on top of this refusal, is what
 //! gives it remedies; this module's own automatic pass ends at the refusal.
 //!
+//! ## The entry-heal safety boundary (I1/I2)
+//!
+//! [`heal_if_tainted`] is the lock-free chokepoint that runs on (almost) every command, including
+//! read-only ones that never take [`crate::util::lock_utils::WarehouseLock`] — so it must never
+//! rewrite a recorded path a lock-holding writer could legitimately be deleting or replacing at
+//! the same moment (a `stack` consuming a staged inventory shard; a `compact --all` dropping a
+//! superseded pack). [`restage_object`] hash-verifies a **loose object** before rewriting it
+//! (content-addressed: the bytes it reads back are proven to be the bytes the path's own name
+//! claims, so a lock-free rewrite is race-benign — worst case a duplicate loose copy, ordinary gc
+//! food); for anything else this taint schema can record — a pack data/index file, an inventory
+//! shard `data` file, or any other non-object final path a fire site can taint (a pallet ref
+//! pointer, a bay/park/journal/commit-graph/sign/office file, …) — it cannot verify anything and
+//! just rewrites the bytes it found, verbatim. That verbatim rewrite is exactly the unsound shape:
+//! it can resurrect bytes a concurrent lock-holder legitimately deleted moments earlier.
+//!
+//! So [`heal_if_tainted`] gates on **content-addressability alone** ([`is_content_addressed`], the
+//! same [`file_utils::hash_from_object_path`] check [`restage_object`] already uses to choose its
+//! own hash-verify-vs-verbatim branch — one predicate, not a per-path special case): if the
+//! standing taint's recorded set contains *any* path this returns `false` for, the whole taint
+//! escalates — refused with [`RefusalCode::DurabilityTaint`], directing the operator to
+//! `forklift heal` — before [`attempt_restage_all`] is even called, rather than partially
+//! restaging the content-addressed subset lock-free and leaving the rest standing. `forklift heal`
+//! (`recovery_utils::run`, built on the very same [`attempt_restage_all`]/[`restage_object`]) is
+//! unaffected by this gate — it runs under the warehouse lock, so a verbatim rewrite there is
+//! serialized against whatever legitimately touched the path, and it restages every shape exactly
+//! as before this boundary existed. (Content-addressed, present, restageable paths still heal
+//! inline through [`heal_if_tainted`] unchanged — the common case this whole mechanism exists for.)
+//!
 //! ## The no-self-trip rule
 //!
 //! [`restage_object`]'s own write (see [`rewrite_dentry`]) and [`heal_if_tainted`]'s own
@@ -206,26 +234,36 @@ fn write_and_sync_temp(temp_path: &Path, content: &[u8]) -> Result<(), String> {
 ///   could clear the taint while an un-recorded path is still unproven. Refuses immediately,
 ///   before touching anything; the taint is left exactly as found. Unknown scope is never
 ///   auto-healed — that is the heavier recovery path's job.
-/// - **Otherwise**, every recorded path is restaged (see [`restage_object`]), best-effort across
-///   the whole set (every path is attempted regardless of an earlier one's verdict, mirroring
-///   `sync_touched_directories`'s own best-effort discipline — a caller learns everything this
-///   attempt found, not just the first problem). If every single one restaged cleanly, their
-///   distinct parent directories are fsynced and (macOS only) the device cache is flushed once
-///   (see [`sync_restaged_parents`]); only then are the taint files removed and the in-memory gate
-///   cleared. If *any* path came back [`Vanished`](RestageOutcome::Vanished),
-///   [`Unreadable`](RestageOutcome::Unreadable), or [`HashMismatch`](RestageOutcome::HashMismatch),
-///   or failed to restage due to an operational error, the whole heal refuses — the taint stands,
-///   nothing is cleared, and the refusal lists every affected path under its own verdict. A
-///   partial restage (some paths rewritten, others not) is safe to leave as-is: restaging is
-///   idempotent, so the next heal attempt simply repeats the already-restaged ones too.
+/// - **A non-content-addressed path in the remainder** (the entry-heal safety boundary, I1/I2 —
+///   see the module doc comment): checked over the *whole* recorded set via
+///   [`is_content_addressed`], before [`attempt_restage_all`] is even called. If any recorded path
+///   is not a loose object this call could hash-verify, the entire taint escalates — refuses with
+///   [`RefusalCode::DurabilityTaint`], directing the operator to `forklift heal` — rather than
+///   restaging the content-addressed subset lock-free and leaving the rest standing. Nothing is
+///   read or rewritten in this case; the taint is left exactly as found, for `forklift heal` (which
+///   holds the warehouse lock) to resolve in full.
+/// - **Otherwise** (every recorded path is content-addressed), every one is restaged (see
+///   [`restage_object`]), best-effort across the whole set (every path is attempted regardless of
+///   an earlier one's verdict, mirroring `sync_touched_directories`'s own best-effort discipline —
+///   a caller learns everything this attempt found, not just the first problem). If every single
+///   one restaged cleanly, their distinct parent directories are fsynced and (macOS only) the
+///   device cache is flushed once (see [`sync_restaged_parents`]); only then are the taint files
+///   removed and the in-memory gate cleared. If *any* path came back
+///   [`Vanished`](RestageOutcome::Vanished), [`Unreadable`](RestageOutcome::Unreadable), or
+///   [`HashMismatch`](RestageOutcome::HashMismatch), or failed to restage due to an operational
+///   error, the whole heal refuses — the taint stands, nothing is cleared, and the refusal lists
+///   every affected path under its own verdict. A partial restage (some paths rewritten, others
+///   not) is safe to leave as-is: restaging is idempotent, so the next heal attempt simply repeats
+///   the already-restaged ones too.
 ///
 /// # Returns
 /// * `Ok(())`         - Not activated, no taint was standing, or every recorded path restaged and
 ///                      the result was made durable — the taint is now cleared.
 /// * `Err(CoreError)` - A [`RefusalCode::DurabilityTaint`] refusal: the taint could not be
-///                      resolved automatically (torn, or one or more paths in an unhealable
-///                      state), or the taint directory itself could not be read. The taint is left
-///                      standing in every case.
+///                      resolved automatically (torn, its remainder contains a path this call
+///                      cannot hash-verify, or one or more content-addressed paths are in an
+///                      unhealable state), or the taint directory itself could not be read. The
+///                      taint is left standing in every case.
 pub fn heal_if_tainted() -> Result<(), CoreError> {
     let root = forklift_root();
     let state = taint_utils::read_taints(&root).map_err(|e| read_failure_refusal(&root, &e))?;
@@ -237,6 +275,20 @@ pub fn heal_if_tainted() -> Result<(), CoreError> {
         return Ok(());
     }
 
+    // I1/I2 (the entry-heal safety boundary — see the module doc comment): a path this call
+    // cannot hash-verify must never be rewritten lock-free. Gated on the whole recorded set,
+    // before any restage is attempted, so a mixed taint escalates entirely rather than partially
+    // restaging the content-addressed subset here and leaving the rest for `forklift heal` to
+    // finish — one predicate, checked once, not a per-path branch threaded through the restage
+    // loop below.
+    let non_content_addressed: BTreeSet<PathBuf> = state.recorded.iter()
+        .filter(|path| !is_content_addressed(path))
+        .cloned()
+        .collect();
+    if !non_content_addressed.is_empty() {
+        return Err(escalation_refusal(&root, &non_content_addressed));
+    }
+
     let attempt = attempt_restage_all(&root, &state.recorded);
 
     if !attempt.all_clean() {
@@ -246,6 +298,23 @@ pub fn heal_if_tainted() -> Result<(), CoreError> {
     }
 
     finish_clean_heal(&root, &attempt.restaged, &state.files).map_err(|e| sync_failure_refusal(&root, &e))
+}
+
+/// Whether a taint's recorded final path is content-addressed — a loose object [`restage_object`]
+/// can hash-verify before rewriting it (see [`RestageOutcome`]). The one predicate that gates
+/// [`heal_if_tainted`]'s restage (I1/I2, see the module doc comment): the same
+/// [`file_utils::hash_from_object_path`] check `restage_object` already uses to pick its own
+/// hash-verify-vs-verbatim branch, reused here rather than reimplemented, so the two can never
+/// drift apart on what counts as "content-addressed."
+///
+/// `false` covers everything this taint schema can otherwise record: a pack data/index file, an
+/// inventory shard `data` file, or any other non-object final path a `write_file_atomically`-backed
+/// fire site can taint (a pallet ref pointer, a bay/park/journal/commit-graph/sign/office file, …).
+/// [`attempt_restage_all`]/[`restage_object`] themselves are unaffected by this predicate — the
+/// `forklift heal` verb calls them directly, under the warehouse lock, for every shape — it is
+/// consulted only in [`heal_if_tainted`], which is the one caller that ever runs lock-free.
+fn is_content_addressed(relative_path: &Path) -> bool {
+    file_utils::hash_from_object_path(relative_path).is_some()
 }
 
 /// The outcome of restaging every path in a recorded taint set — the shared core of
@@ -478,6 +547,23 @@ fn torn_refusal(root: &Path) -> CoreError {
     )
 }
 
+/// The I1/I2 escalation refusal: the standing taint's recorded set contains at least one path
+/// [`is_content_addressed`] rejects, so [`heal_if_tainted`] refuses without attempting any restage
+/// at all — see that function's doc comment and the module doc comment's boundary section.
+fn escalation_refusal(root: &Path, non_content_addressed: &BTreeSet<PathBuf>) -> CoreError {
+    CoreError::refusal(
+        RefusalCode::DurabilityTaint,
+        format!(
+            "{} under \"{}\": {} recorded path(s) cannot be hash-verified before a lock-free \
+            rewrite, so entry-heal cannot restage them safely — a concurrent lock-holding writer \
+            could legitimately be deleting or replacing the same path: {}. {}",
+            taint_utils::GATE_TAINT_MARKER, root.to_string_lossy(), non_content_addressed.len(),
+            format_paths(non_content_addressed.iter()), DURABILITY_TAINT_NEXT_STEP
+        ),
+        DURABILITY_TAINT_NEXT_STEP,
+    )
+}
+
 fn read_failure_refusal(root: &Path, error: &str) -> CoreError {
     CoreError::refusal(
         RefusalCode::DurabilityTaint,
@@ -633,15 +719,21 @@ mod tests {
     }
 
     #[test]
-    fn a_hand_written_complete_taint_naming_a_present_non_object_path_is_healed() {
-        // Crash-before-heal simulation over a non-content-addressed recorded path (a pack/shard
-        // stand-in): no hash check is possible, so this exercises the "restage bytes as read,
-        // verbatim" branch. The mutation this catches: a heal that only fsyncs without rewriting
-        // would leave the same inode behind.
+    fn entry_heal_escalates_a_present_non_object_path_rather_than_restaging_it_lock_free() {
+        // I1/I2 (the entry-heal safety boundary): a non-content-addressed recorded path (a
+        // pack/shard stand-in) can never be hash-verified, so `heal_if_tainted` must not rewrite
+        // it lock-free — a concurrent lock-holding writer could legitimately be deleting or
+        // replacing this exact path (the §1.2 race). It refuses instead, before attempting any
+        // restage at all, and leaves the taint (and the file) exactly as found. The `forklift
+        // heal` verb still restages this same shape, under the lock — see
+        // `attempt_restage_all_still_restages_a_present_non_object_path_verbatim`, the direct
+        // successor of what this test used to assert before this boundary existed. Mutation: let
+        // `heal_if_tainted` fall through to `attempt_restage_all` regardless of shape → this
+        // becomes `Ok`, the inode changes, and the taint clears → every assertion below reddens.
         let _serial = lock_activation();
         taint_utils::activate();
 
-        let root = scratch("non-object-restage");
+        let root = scratch("non-object-escalates");
         let _scope = StorageRootScope::enter(&root);
         let forklift = forklift_root();
 
@@ -655,11 +747,63 @@ mod tests {
 
         plant_taint(&forklift, &["objects/pack/fake.pack"]);
 
+        let error = heal_if_tainted()
+            .expect_err("a non-content-addressed recorded path must never auto-heal lock-free");
+        assert_durability_taint(&error, &["objects/pack/fake.pack", "forklift heal"]);
+
+        #[cfg(unix)]
+        {
+            let inode_after = std::fs::metadata(&pack_file).unwrap().ino();
+            assert_eq!(inode_before, inode_after,
+                "the dentry must never be rewritten lock-free for a non-content-addressed path");
+        }
+
+        assert_eq!(
+            std::fs::read(&pack_file).unwrap(), b"not a real pack, just bytes to restage",
+            "the bytes must be untouched — escalation never attempts a rewrite"
+        );
+
+        assert!(!taint_utils::read_taints(&forklift).unwrap().recorded.is_empty(),
+            "the taint must survive — escalation never clears it");
+    }
+
+    #[test]
+    fn attempt_restage_all_still_restages_a_present_non_object_path_verbatim() {
+        // The `forklift heal` verb (`recovery_utils::run`) calls `attempt_restage_all` directly,
+        // under the warehouse lock, and must still restage every shape exactly as before this
+        // slice's entry-heal boundary — this pins that the shared primitive itself is untouched;
+        // only `heal_if_tainted`'s own gate changed (see the escalation test above). Mutation: a
+        // heal that only fsyncs without rewriting the dentry would leave the same inode behind.
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        let root = scratch("non-object-restage-verbatim");
+        let _scope = StorageRootScope::enter(&root);
+        let forklift = forklift_root();
+
+        let pack_dir = forklift.join("objects").join("pack");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        let pack_file = pack_dir.join("fake.pack");
+        std::fs::write(&pack_file, b"not a real pack, just bytes to restage").unwrap();
+
+        #[cfg(unix)]
+        let inode_before = std::fs::metadata(&pack_file).unwrap().ino();
+
+        let recorded: BTreeSet<PathBuf> =
+            [PathBuf::from("objects/pack/fake.pack")].into_iter().collect();
         let dir_syncs_before = file_utils::dir_sync_count();
-        heal_if_tainted().expect("a present, readable, non-content-addressed path must heal");
+        let attempt = attempt_restage_all(&forklift, &recorded);
+
+        assert!(attempt.all_clean(), "a present, readable, non-content-addressed path restages cleanly");
+        assert!(attempt.restaged.contains(Path::new("objects/pack/fake.pack")));
+
+        sync_restaged_parents(&attempt.restaged.iter()
+            .filter_map(|relative| forklift.join(relative).parent().map(Path::to_path_buf))
+            .collect()
+        ).expect("syncing the restaged parent must succeed");
 
         assert!(file_utils::dir_sync_count() > dir_syncs_before,
-            "the heal must fsync the restaged file's parent directory");
+            "the restage's parent-directory sync must actually run");
 
         #[cfg(unix)]
         {
@@ -672,9 +816,6 @@ mod tests {
             std::fs::read(&pack_file).unwrap(), b"not a real pack, just bytes to restage",
             "the bytes themselves must be restaged verbatim"
         );
-
-        assert!(taint_utils::read_taints(&forklift).unwrap().recorded.is_empty());
-        assert!(taint_utils::gate_check(&forklift).is_ok());
     }
 
     #[test]
@@ -731,10 +872,14 @@ mod tests {
         let root = scratch("vanished");
         let _scope = StorageRootScope::enter(&root);
         let forklift = forklift_root();
-        plant_taint(&forklift, &["objects/zz/doesnotexist"]);
+        // A valid-hex, loose-object-shaped placeholder (not the old "objects/zz/doesnotexist" —
+        // "zz" is not hex, so `is_content_addressed` would now escalate it before ever attempting
+        // a restage; this fixture must be genuinely content-addressed to exercise the `Vanished`
+        // verdict below rather than I1/I2's escalation path).
+        plant_taint(&forklift, &["objects/ab/cdef"]);
 
         let error = heal_if_tainted().unwrap_err();
-        assert_durability_taint(&error, &["vanished", "objects/zz/doesnotexist"]);
+        assert_durability_taint(&error, &["vanished", "objects/ab/cdef"]);
 
         assert!(!taint_utils::read_taints(&forklift).unwrap().recorded.is_empty(),
             "the taint must survive an unhealable verdict");
@@ -750,13 +895,17 @@ mod tests {
         let _scope = StorageRootScope::enter(&root);
         let forklift = forklift_root();
 
-        let blocked_dir = forklift.join("objects").join("bl");
+        // A valid-hex, loose-object-shaped path (not the old "objects/bl/ocked-content-shape" —
+        // "bl" + "ocked-content-shape" contains non-hex letters, so `is_content_addressed` would
+        // now escalate it before ever attempting a read; this fixture must be genuinely
+        // content-addressed to exercise the `Unreadable` verdict below).
+        let blocked_dir = forklift.join("objects").join("de");
         std::fs::create_dir_all(&blocked_dir).unwrap();
-        let blocked_file = blocked_dir.join("ocked-content-shape");
+        let blocked_file = blocked_dir.join("adbeef");
         std::fs::write(&blocked_file, b"secret").unwrap();
         std::fs::set_permissions(&blocked_file, std::fs::Permissions::from_mode(0o000)).unwrap();
 
-        plant_taint(&forklift, &["objects/bl/ocked-content-shape"]);
+        plant_taint(&forklift, &["objects/de/adbeef"]);
 
         let error = heal_if_tainted().unwrap_err();
         assert_durability_taint(&error, &["unreadable"]);

@@ -6974,7 +6974,9 @@ fn a_tainted_root_exits_21_with_the_durability_taint_code() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
 
-    plant_taint(&warehouse, &["objects/zz/doesnotexist"]);
+    // A valid-hex, loose-object-shaped path (not a "zz"-style placeholder — non-hex would now
+    // escalate under I1/I2 instead of exercising the `Vanished` verdict this test pins).
+    plant_taint(&warehouse, &[&loose_object_relative_path(&"9".repeat(64))]);
 
     let status = warehouse.run(&["stocktake", "--json"]);
     assert_eq!(status.status.code(), Some(21));
@@ -7213,4 +7215,125 @@ fn heal_on_a_torn_taint_names_heavyweight_recovery_and_survives() {
     );
 
     assert!(dir.join("taint-1-0").exists(), "a torn taint file must survive a heal attempt too");
+}
+
+#[test]
+fn a_mutating_command_reports_the_lock_before_the_taint_when_both_apply() {
+    // The §3.3 reorder (I2's mutating half, `main.rs`): a mutating command must acquire the
+    // warehouse lock BEFORE its own entry-heal runs, so a lock-*waiting* command can never restage
+    // concurrently with the current lock-holder's own deletions. Observable here without real
+    // concurrency, using the same hand-simulated "another process holds the lock" technique as
+    // `mutating_commands_respect_the_warehouse_lock`, combined with a standing, unhealable taint:
+    // if entry-heal still ran first (the pre-reorder order), it would refuse with
+    // `durability_taint` (exit 21) before the lock is ever checked; after the reorder, the lock
+    // check runs first and reports `WarehouseLocked` instead. A read-only command is unaffected
+    // either way, since it never takes the lock — asserted below for contrast.
+    //
+    // Mutation: restore `heal_if_tainted()` to run before `WarehouseLock::acquire()` in
+    // `main.rs`'s `forklift()` → the mutating command below reports `durability_taint` instead of
+    // the lock message → red.
+    let warehouse = TestWarehouse::new("reorder-lock-before-heal");
+    warehouse.write_file("file.txt", "content\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    // A valid-hex, loose-object-shaped, never-written path: an unhealable ("vanished") taint that
+    // would refuse with exit 21 if entry-heal ever got to run.
+    plant_taint(&warehouse, &["objects/ab/cdef"]);
+    std::fs::write(warehouse.root.join(".forklift/lock"), "12345\n").unwrap();
+
+    // Mutating: the lock wins the race — `WarehouseLocked`, not `durability_taint`.
+    let locked = warehouse.run(&["load", "."]);
+    assert!(!locked.status.success());
+    assert!(stderr(&locked).contains("locked by another forklift process"),
+        "a mutating command must report the lock before its own entry-heal runs, got: {}",
+        stderr(&locked));
+
+    // Read-only: unaffected by the lock (it never takes it) — the taint still wins, unchanged.
+    let read_only = warehouse.run(&["stocktake", "--json"]);
+    assert_eq!(read_only.status.code(), Some(21));
+    assert_eq!(json(&read_only)["error"]["code"], "durability_taint");
+
+    std::fs::remove_file(warehouse.root.join(".forklift/lock")).unwrap();
+}
+
+#[test]
+fn entry_heal_escalates_a_non_content_addressed_taint_instead_of_restaging_it_lock_free() {
+    // I1/I2: `heal_if_tainted` (lock-free here, since `stocktake` is read-only) must never
+    // restage a recorded path it cannot hash-verify — a `.pack`-shaped path stands in for the
+    // class of non-content-addressed final paths this taint schema can record (a pack file, an
+    // inventory shard `data` file, a pallet ref pointer, …). It escalates to `forklift heal`
+    // instead of rewriting the file lock-free. `heal` itself, under the warehouse lock, still
+    // restages this same shape — proving this is an entry-heal-only boundary, not a blanket
+    // refusal to ever heal a non-object path.
+    //
+    // Mutation: let `heal_if_tainted` fall through to its ordinary restage for a non-content-
+    // addressed path too → the `stocktake` below exits 0 (having rewritten the pack file
+    // lock-free) instead of 21, and its inode changes → red.
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+
+    let warehouse = TestWarehouse::new("escalation-non-object");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    let pack_dir = warehouse.root.join(".forklift/objects/pack");
+    std::fs::create_dir_all(&pack_dir).unwrap();
+    let pack_file = pack_dir.join("fake.pack");
+    std::fs::write(&pack_file, b"not a real pack, just bytes").unwrap();
+    let bytes_before = std::fs::read(&pack_file).unwrap();
+    #[cfg(unix)]
+    let inode_before = std::fs::metadata(&pack_file).unwrap().ino();
+
+    plant_taint(&warehouse, &["objects/pack/fake.pack"]);
+
+    let status = warehouse.run(&["stocktake", "--json"]);
+    assert_eq!(status.status.code(), Some(21));
+    let value = json(&status);
+    assert_eq!(value["error"]["code"], "durability_taint");
+    assert!(value["error"]["next_step"].as_str().unwrap().contains("forklift heal"));
+
+    // The file must be untouched — no lock-free rewrite, not even an idempotent one.
+    assert_eq!(std::fs::read(&pack_file).unwrap(), bytes_before);
+    #[cfg(unix)]
+    assert_eq!(std::fs::metadata(&pack_file).unwrap().ino(), inode_before,
+        "the dentry must never be rewritten lock-free for a non-content-addressed path");
+
+    assert!(recorded_taint_paths(&warehouse).contains(&"objects/pack/fake.pack".to_string()),
+        "the taint must survive escalation");
+
+    // The heal verb, under the lock, DOES restage this same shape.
+    let heal_status = warehouse.run(&["heal", "--json"]);
+    assert_success(&heal_status);
+    assert!(recorded_taint_paths(&warehouse).is_empty(), "heal must clear the taint");
+}
+
+#[test]
+fn entry_heal_still_restages_a_content_addressed_object_inline_with_no_escalation() {
+    // I1 non-regression (the common case this whole mechanism exists for): a taint over a
+    // present, hash-verifiable loose object must still heal inline, lock-free, on the very next
+    // read-only command — no escalation, no exit 21.
+    //
+    // Mutation: escalate on every recorded path regardless of shape (drop the
+    // `is_content_addressed` gate, or invert it) → `stocktake` below exits 21 instead of
+    // succeeding → red.
+    let warehouse = TestWarehouse::new("entry-heal-loose-object-noregression");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    warehouse.write_file("src/app.rs", "content for the loose-object heal");
+    assert_success(&warehouse.run(&["load", "src/app.rs"]));
+    let stack_out = warehouse.run(&["stack", "loose object for heal"]);
+    assert_success(&stack_out);
+    let parcel_hash = extract_parcel_hash(&stack_out);
+    let relative = loose_object_relative_path(&parcel_hash);
+
+    // Taint the object without touching its bytes — it is present and hash-correct.
+    plant_taint(&warehouse, &[&relative]);
+
+    let status = warehouse.run(&["stocktake", "--json"]);
+    assert_success(&status);
+
+    assert!(!taint_dir_path(&warehouse).exists() || recorded_taint_paths(&warehouse).is_empty(),
+        "the taint must be fully cleared by the inline restage");
 }

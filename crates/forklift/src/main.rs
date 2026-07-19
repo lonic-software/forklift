@@ -102,25 +102,40 @@ async fn async_main() {
     }
 }
 
-/// The main forklift process: enter the warehouse, heal a standing durability taint, take the
-/// lock when the command mutates, then dispatch. Warehouse entry and locking carry classified
+/// The main forklift process: enter the warehouse, take the lock when the command mutates, heal
+/// a standing durability taint, then dispatch. Warehouse entry and locking carry classified
 /// errors so an agent can branch (§7.8); a command's own error is generic unless it says
 /// otherwise.
 ///
 /// The storage-scope entry-heal ([`forklift_core::util::heal_utils::heal_if_tainted`]) runs once
-/// here, immediately after [`warehouse_utils::enter_warehouse`] resolves the storage root (bay
-/// redirects included) and before any other line of this process may consult
-/// `does_object_exist` or dispatch to a command handler — this is the single chokepoint every
-/// `requires_warehouse()` command passes through exactly once per invocation, covering all of
-/// them uniformly, including read-only ones, **except the two named by
-/// [`Command::bypasses_taint_heal`]** (`heal` and `audit` — see that method's doc comment for
-/// why: refusing behind the very chokepoint a command exists to resolve or diagnose would be
+/// here, after [`warehouse_utils::enter_warehouse`] resolves the storage root (bay redirects
+/// included) and — for a mutating command — after the warehouse lock is acquired, and before any
+/// other line of this process may consult `does_object_exist` or dispatch to a command handler —
+/// this is the single chokepoint every `requires_warehouse()` command passes through exactly once
+/// per invocation, covering all of them uniformly, including read-only ones, **except the two
+/// named by [`Command::bypasses_taint_heal`]** (`heal` and `audit` — see that method's doc comment
+/// for why: refusing behind the very chokepoint a command exists to resolve or diagnose would be
 /// circular). This is deliberately unlike `load_guard_utils::check_no_incomplete_load`, which is
 /// called individually from inside `stack`'s and `park`'s own handlers — a taint can leave a
 /// *durable reference* pointing at unproven bytes if left unhealed before *any* command trusts
 /// existence, not just the two that durably commit staged inventory, so a single early chokepoint
 /// (rather than a per-command guard sprinkled at each write site) is what the trust-gating
 /// invariant actually needs.
+///
+/// **Lock-then-heal for mutating commands (the design memo's §3.3 reorder, closing half of the
+/// §1.2 restage-vs-live-writer race).** [`Command::requires_warehouse_lock`] commands acquire
+/// [`lock_utils::WarehouseLock`] *before* entry-heal runs, not after: a lock-*waiting* mutating
+/// command must never restage a recorded path concurrently with the current lock-holder's own
+/// deletions (e.g. a `stack` consuming a staged inventory shard, or a `compact --all` dropping a
+/// superseded pack) — after this reorder it can't, because it only reaches entry-heal once it
+/// *is* the lock-holder, the same way `heal` itself has always healed under the lock it holds. A
+/// read-only command never takes this lock at all, so its entry-heal still runs lock-free exactly
+/// as before; what makes *that* half of the race safe is `heal_if_tainted`'s own boundary (I1/I2,
+/// `heal_utils`'s module doc comment): it restages only a content-addressed object it can
+/// hash-verify, and escalates anything else to `forklift heal` rather than rewriting it lock-free.
+/// **Behavioral change:** a tainted-and-locked warehouse now reports `WarehouseLocked` before the
+/// `durability_taint` refusal for a mutating command (previously the taint could win that race);
+/// a read-only command is unaffected either way, since it never takes the lock.
 ///
 /// # Arguments
 /// * `cli` - The parsed command line.
@@ -129,6 +144,10 @@ async fn async_main() {
 /// * `Ok(())`             - If the process completes successfully.
 /// * `Err(ForkliftError)` - A classified failure (code + message + optional next step).
 async fn forklift(cli: Cli) -> Result<(), ForkliftError> {
+    // Held for the mutating case (see the doc comment above); stays `None` for a read-only
+    // command, which never takes the warehouse lock at all.
+    let mut _lock: Option<lock_utils::WarehouseLock> = None;
+
     if cli.command.requires_warehouse() {
         warehouse_utils::enter_warehouse().map_err(|message| ForkliftError::new(
             ErrorCode::NotAWarehouse,
@@ -136,22 +155,22 @@ async fn forklift(cli: Cli) -> Result<(), ForkliftError> {
             "Run \"forklift prepare\" to create a warehouse here, or change into one."
         ))?;
 
+        // Mutating commands hold the warehouse lock for their whole runtime, so two forklift
+        // processes can never interleave writes to the staging area or the pallet refs — and
+        // (see the doc comment above) so a lock-waiting command's own entry-heal never races the
+        // lock-holder's deletions.
+        if cli.command.requires_warehouse_lock() {
+            _lock = Some(lock_utils::WarehouseLock::acquire().map_err(|message| ForkliftError::new(
+                ErrorCode::WarehouseLocked,
+                message,
+                "Wait for the other forklift process to finish, or clear a stale lock as instructed."
+            ))?);
+        }
+
         if !cli.command.bypasses_taint_heal() {
             forklift_core::util::heal_utils::heal_if_tainted()?;
         }
     }
-
-    // Mutating commands hold the warehouse lock for their whole runtime, so two forklift
-    // processes can never interleave writes to the staging area or the pallet refs.
-    let _lock = if cli.command.requires_warehouse_lock() {
-        Some(lock_utils::WarehouseLock::acquire().map_err(|message| ForkliftError::new(
-            ErrorCode::WarehouseLocked,
-            message,
-            "Wait for the other forklift process to finish, or clear a stale lock as instructed."
-        ))?)
-    } else {
-        None
-    };
 
     // Snapshot the pre-operation state for journaled commands (§7.8), so `undo` can
     // reverse this operation. Best-effort throughout: a journaling problem must never
