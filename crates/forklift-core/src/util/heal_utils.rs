@@ -60,6 +60,25 @@
 //! ([`file_utils::fsync_dir_data`]) plus (macOS only) one raw device flush
 //! ([`file_utils::macos_flush_device_cache`]). None of those consult or set a taint.
 //!
+//! ## Pack-aware restage (I4)
+//!
+//! A vanished **loose-shaped** recorded path (`file_utils::hash_from_object_path` recognizes it) is
+//! not necessarily lost: `compact` legitimately repacks a loose object (deleting the loose copy) or
+//! `compact --all` drops a now-redundant loose copy once the object survives packed, and either one
+//! can race a taint's own restage attempt. Before [`restage_object`] reports
+//! [`Vanished`](RestageOutcome::Vanished) for such a path, it checks whether the hash the path's own
+//! name encodes is present in a pack via [`file_utils::raw_object_present`] — the same gate-free,
+//! packed-or-loose predicate the `forklift heal` verb's own vanished-classification already uses
+//! (`recovery_utils.rs`'s `truly_missing` filter) to decide a recorded object is not actually lost.
+//! Reusing that one predicate, rather than a second hand-rolled pack check, is what keeps the two
+//! tiers from drifting on what counts as "recovered" for a recorded loose path. A pack hit is
+//! [`RecoveredPacked`](RestageOutcome::RecoveredPacked): sound because a pack's own index membership
+//! is itself a content-addressed check, and a pack whose own durability failed carries its own taint
+//! (`sync_dir_or_taint`, `file_utils.rs`) — there is nothing left for a loose rewrite to prove. A
+//! vanished **pack-/shard-shaped** path has no hash to check (`hash_from_object_path` returns `None`
+//! for it) and falls straight through to `Vanished`, unchanged — I4 only ever widens what a loose-
+//! shaped path can resolve to.
+//!
 //! ## Soundness
 //!
 //! Restaging never trusts that the recorded path's *existing* bytes were ever durably flushed —
@@ -97,7 +116,15 @@ pub(crate) enum RestageOutcome {
     /// was freshly rewritten (new temp, fsynced, renamed over the same final name).
     Restaged,
 
-    /// The recorded path no longer exists (`ENOENT` on the read back) — not an error, a verdict:
+    /// The recorded path was a vanished **loose-shaped** path (`ENOENT`), but the hash it encoded
+    /// is present in a pack (I4, see the module doc comment) — already durable, content-addressed,
+    /// and nothing to rewrite. Counts as clean toward [`RestageAttempt::all_clean`], but — unlike
+    /// [`Restaged`](Self::Restaged) — must never be folded into the parent-directory sync set: no
+    /// dentry was written at this path for a sync to make durable.
+    RecoveredPacked,
+
+    /// The recorded path no longer exists (`ENOENT` on the read back), and — for a loose-shaped
+    /// path — the hash it encoded is not present in a pack either (see [`RecoveredPacked`](Self::RecoveredPacked)):
     /// a later recovery pass resolves whether that is expected (the object is reachable from
     /// nowhere durable) or a real loss.
     Vanished,
@@ -152,7 +179,28 @@ pub(crate) fn restage_object(root: &Path, relative_path: &Path) -> Result<Restag
 
     let bytes = match std::fs::read(&final_path) {
         Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(RestageOutcome::Vanished),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // I4 (pack-aware restage, see the module doc comment): a vanished *loose-shaped* path
+            // may simply have been repacked (`compact`) or dropped as a now-redundant loose copy
+            // (`compact --all`) — the object itself can still be durable, just not at this exact
+            // dentry. Check via `file_utils::raw_object_present`, the same gate-free packed-or-loose
+            // predicate the `forklift heal` verb's own vanished-classification already uses
+            // (`recovery_utils.rs`'s `truly_missing` filter), before concluding the object is
+            // actually gone — one shared predicate, not two that could drift. A vanished pack-/
+            // shard-shaped path has no hash to check (`hash_from_object_path` returns `None`) and
+            // falls straight through to `Vanished`, unchanged.
+            return match file_utils::hash_from_object_path(&final_path) {
+                Some(hash) => match file_utils::raw_object_present(&hash) {
+                    Ok(true) => Ok(RestageOutcome::RecoveredPacked),
+                    Ok(false) => Ok(RestageOutcome::Vanished),
+                    Err(e) => Ok(RestageOutcome::Unreadable(format!(
+                        "Error while checking whether \"{}\" survives in a pack: {}",
+                        final_path.to_string_lossy(), e
+                    ))),
+                },
+                None => Ok(RestageOutcome::Vanished),
+            };
+        }
         Err(e) => return Ok(RestageOutcome::Unreadable(format!(
             "Error while reading \"{}\" back to restage it: {}", final_path.to_string_lossy(), e
         ))),
@@ -328,7 +376,12 @@ fn is_content_addressed(relative_path: &Path) -> bool {
 pub(crate) struct RestageAttempt {
     /// Present, verified (where verifiable), and freshly rewritten.
     pub(crate) restaged: BTreeSet<PathBuf>,
-    /// Absent on read-back (`ENOENT`) — see [`RestageOutcome::Vanished`].
+    /// A vanished loose-shaped path whose hash survives in a pack (I4) — see
+    /// [`RestageOutcome::RecoveredPacked`]. Deliberately kept separate from `restaged`: nothing was
+    /// written for these, so they must never be folded into a parent-directory sync set.
+    pub(crate) recovered_packed: BTreeSet<PathBuf>,
+    /// Absent on read-back (`ENOENT`), and — for a loose-shaped path — its hash is not present in a
+    /// pack either — see [`RestageOutcome::Vanished`].
     pub(crate) vanished: BTreeSet<PathBuf>,
     /// Present but the read-back itself failed — see [`RestageOutcome::Unreadable`], paired with
     /// the read error.
@@ -342,8 +395,11 @@ pub(crate) struct RestageAttempt {
 }
 
 impl RestageAttempt {
-    /// Whether every recorded path restaged cleanly — the condition under which
-    /// [`heal_if_tainted`] may proceed to [`finish_clean_heal`].
+    /// Whether every recorded path restaged cleanly (or, for a pack-recovered path, needed no
+    /// rewrite at all — I4) — the condition under which [`heal_if_tainted`] may proceed to
+    /// [`finish_clean_heal`]. `recovered_packed` is deliberately absent from this check: it is
+    /// already a clean outcome by construction (see [`RestageOutcome::RecoveredPacked`]), not a
+    /// fourth failure category to gate on.
     pub(crate) fn all_clean(&self) -> bool {
         self.vanished.is_empty() && self.unreadable.is_empty()
             && self.hash_mismatch.is_empty() && self.restage_failed.is_empty()
@@ -358,6 +414,7 @@ pub(crate) fn attempt_restage_all(root: &Path, recorded: &BTreeSet<PathBuf>) -> 
     for relative in recorded {
         match restage_object(root, relative) {
             Ok(RestageOutcome::Restaged) => { attempt.restaged.insert(relative.clone()); }
+            Ok(RestageOutcome::RecoveredPacked) => { attempt.recovered_packed.insert(relative.clone()); }
             Ok(RestageOutcome::Vanished) => { attempt.vanished.insert(relative.clone()); }
             Ok(RestageOutcome::Unreadable(e)) => { attempt.unreadable.push((relative.clone(), e)); }
             Ok(RestageOutcome::HashMismatch) => { attempt.hash_mismatch.insert(relative.clone()); }
@@ -637,6 +694,7 @@ mod tests {
     use super::*;
     use crate::globals::StorageRootScope;
     use crate::util::taint_utils::{ACTIVATION_TEST_LOCK, reset_activation_for_test};
+    use crate::util::{pack_utils, recovery_utils};
 
     #[cfg(unix)]
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -978,6 +1036,105 @@ mod tests {
         let forklift = forklift_root();
 
         let outcome = restage_object(&forklift, Path::new("objects/zz/never-written")).unwrap();
+        assert_eq!(outcome, RestageOutcome::Vanished);
+    }
+
+    #[test]
+    fn a_vanished_loose_path_recovered_by_a_pack_clears_via_entry_heal() {
+        // I4 (memo §8.5 test 5): `compact` legitimately repacks a loose object out from under a
+        // standing taint's recorded loose path — deleting the loose copy and landing the exact
+        // same bytes, content-addressed, in a pack. Entry-heal must treat that as recovered, not
+        // refuse it as `Vanished` (exit 21). Mutation: remove the pack check in `restage_object`'s
+        // ENOENT branch (revert to a bare `return Ok(RestageOutcome::Vanished)`) → this taint
+        // never clears → `heal_if_tainted` refuses → `.expect` panics → red.
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        let root = scratch("pack-aware-restage");
+        let _scope = StorageRootScope::enter(&root);
+        let forklift = forklift_root();
+
+        let content = b"an object that will be repacked out from under its own taint";
+        let (hash, relative) = write_loose_object(&forklift, content);
+
+        // Repack while nothing is tainted yet (`compact` itself is gated on a clean existence
+        // check, so it must run *before* the taint below is planted): deletes the loose copy,
+        // lands the object in a pack instead.
+        let stats = pack_utils::compact(false, false).expect("compact must succeed");
+        assert_eq!(stats.objects_packed, 1, "sanity: exactly the one object got packed");
+        assert!(!forklift.join(&relative).exists(), "sanity: the loose copy is gone after compact");
+        assert!(pack_utils::is_in_packs(&hash).unwrap(), "sanity: the object now lives in a pack");
+
+        // Hand-plant the taint (bypassing `taint_utils::record_taint`, exactly like every other
+        // fixture in this module) naming the now-repacked loose path — simulating a taint
+        // recorded for this path before the repack made the loose dentry moot.
+        let relative_str = relative.to_string_lossy().into_owned();
+        plant_taint(&forklift, &[relative_str.as_str()]);
+
+        heal_if_tainted().expect("a vanished loose path recovered by a pack must clear, not refuse");
+
+        assert!(taint_utils::read_taints(&forklift).unwrap().recorded.is_empty(),
+            "the taint must be fully cleared");
+        assert!(taint_utils::gate_check(&forklift).is_ok());
+    }
+
+    #[test]
+    fn the_heal_verb_also_clears_a_vanished_loose_path_recovered_by_a_pack() {
+        // Verb-parity companion (memo §8.5 test 5's second half): the exact same fixture as
+        // `a_vanished_loose_path_recovered_by_a_pack_clears_via_entry_heal`, driven through
+        // `recovery_utils::run` (the locked verb) instead of `heal_if_tainted` (lock-free entry-
+        // heal). Both tiers call `restage_object`, and both classify "vanished, present in a
+        // pack" through the same `file_utils::raw_object_present` predicate — the verb's own
+        // `truly_missing` filter (recovery_utils.rs) and entry-heal's I4 check can never drift on
+        // this fixture, so this must already pass without any verb-side code change.
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        let root = scratch("pack-aware-restage-verb-parity");
+        let _scope = StorageRootScope::enter(&root);
+        let forklift = forklift_root();
+
+        let content = b"a second object, recovered the same way, through the locked verb this time";
+        let (hash, relative) = write_loose_object(&forklift, content);
+
+        // Same ordering constraint as the entry-heal test above: repack before the taint exists.
+        pack_utils::compact(false, false).expect("compact must succeed");
+        assert!(pack_utils::is_in_packs(&hash).unwrap(), "sanity: the object now lives in a pack");
+
+        let relative_str = relative.to_string_lossy().into_owned();
+        plant_taint(&forklift, &[relative_str.as_str()]);
+
+        let outcome = recovery_utils::run()
+            .expect("the heal verb must also clear a pack-recovered path, not refuse it");
+        assert!(outcome.was_tainted);
+        assert!(outcome.resolved.iter().any(|entry| entry == &relative_str),
+            "the pack-recovered path must be reported resolved, never silently dropped: {:?}",
+            outcome.resolved);
+
+        assert!(taint_utils::read_taints(&forklift).unwrap().recorded.is_empty(),
+            "the taint must be fully cleared");
+    }
+
+    #[test]
+    fn restage_object_still_reports_vanished_for_a_missing_pack_shaped_path() {
+        // I4 non-regression (memo §8.5 test 6): a vanished `.pack`-shaped recorded path has no
+        // hash to check against packs at all (`file_utils::hash_from_object_path` returns `None`
+        // for it), so it must fall straight through to `Vanished`, exactly as before I4. (A
+        // *present* non-object path already escalates before `restage_object` is ever called for
+        // it — see `entry_heal_escalates_a_present_non_object_path_rather_than_restaging_it_lock_free`;
+        // this pins `restage_object` itself for the vanished case, so a future change to its
+        // ENOENT branch cannot accidentally start "recovering" a pack-shaped path.) Mutation:
+        // widen the I4 pack check to run regardless of `hash_from_object_path`'s shape (e.g. hash
+        // some derived string for any vanished path) → this could spuriously return
+        // `RecoveredPacked` → red.
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        let root = scratch("pack-shaped-still-vanishes");
+        let _scope = StorageRootScope::enter(&root);
+        let forklift = forklift_root();
+
+        let outcome = restage_object(&forklift, Path::new("objects/pack/does-not-exist.pack")).unwrap();
         assert_eq!(outcome, RestageOutcome::Vanished);
     }
 

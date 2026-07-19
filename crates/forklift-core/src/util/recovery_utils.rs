@@ -122,8 +122,9 @@ pub struct HealOutcome {
     /// Recorded paths that were present, verified, and freshly rewritten.
     pub restaged: Vec<String>,
     /// Recorded paths (loose-object or pack-derived hashes, or a vanished shard's own path)
-    /// resolved without a rewrite: proven absent *and* unreferenced by the closure walk, or (for
-    /// a shard) a staging concern that carries no object-trust risk at all.
+    /// resolved without a rewrite: proven absent *and* unreferenced by the closure walk, present
+    /// in a pack despite a vanished loose dentry (I4, `heal_utils::RestageOutcome::RecoveredPacked`),
+    /// or (for a shard) a staging concern that carries no object-trust risk at all.
     pub resolved: Vec<String>,
     /// Advisory notes that never block clearing — currently, the "re-run the load" remedy note
     /// for each vanished inventory shard.
@@ -168,7 +169,9 @@ pub fn run() -> Result<HealOutcome, CoreError> {
         return Ok(HealOutcome {
             was_tainted: true,
             restaged: display_paths(attempt.restaged.iter()),
-            resolved: Vec::new(),
+            // I4: a pack-recovered path was never rewritten — it belongs in `resolved`, exactly
+            // like a vanished-and-unreferenced hash, not in `restaged`.
+            resolved: display_paths(attempt.recovered_packed.iter()),
             notes: Vec::new(),
         });
     }
@@ -274,7 +277,10 @@ fn resolve_the_rest(
     // Raw-presence filter: a candidate present elsewhere (another pack, or loose) was never
     // actually lost — only what remains absent everywhere needs the closure walk at all.
     let mut truly_missing: BTreeSet<String> = BTreeSet::new();
-    let mut resolved: Vec<String> = Vec::new();
+    // I4: a pack-recovered path was never rewritten and never entered `attempt.vanished` in the
+    // first place (`restage_object` resolved it directly) — it belongs in `resolved` alongside
+    // the vanished-and-unreferenced hashes this loop finds below, not in `remainder`.
+    let mut resolved: Vec<String> = display_paths(attempt.recovered_packed.iter());
 
     for hash in loose_candidates.keys().chain(pack_candidates.keys()) {
         match file_utils::raw_object_present(hash) {
