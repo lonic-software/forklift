@@ -156,7 +156,11 @@ pub(crate) fn collect_live_set() -> Result<HashSet<String>, String> {
     // `collect_walk_roots`) needs the same dirs for another per-bay source too only lists bays
     // once — this caller has no such second source today, but still enumerates once, up front.
     let bay_dirs = bay_utils::all_bay_state_dirs()?;
-    roots.extend(bay_utils::collect_bay_scoped_parcel_roots(&bay_dirs)?);
+    // FailClosed, unconditionally — this feeds a sweep that deletes objects, so an incompletely
+    // known live set must abort rather than under-count. See `bay_utils::BayReadPolicy`'s own doc
+    // comment for the full reasoning and why `forklift heal`'s own call site (`recovery_utils::
+    // collect_walk_roots`) is allowed to differ.
+    roots.extend(bay_utils::collect_bay_scoped_parcel_roots(&bay_dirs, bay_utils::BayReadPolicy::FailClosed)?.roots);
 
     // A re-genesis anchor (§8.7) pins the replaced office chain as attested history;
     // the pin is a GC root, or the attested chain would be collected as unreachable.

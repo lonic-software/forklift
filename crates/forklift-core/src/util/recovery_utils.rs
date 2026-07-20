@@ -258,8 +258,9 @@ pub struct HealOutcome {
     /// in a pack despite a vanished loose dentry (I4, `heal_utils::RestageOutcome::RecoveredPacked`),
     /// or (for a shard) a staging concern that carries no object-trust risk at all.
     pub resolved: Vec<String>,
-    /// Advisory notes that never block clearing — currently, the "re-run the load" remedy note
-    /// for each vanished inventory shard.
+    /// Advisory notes that never block clearing: the "re-run the load" remedy note for each
+    /// vanished inventory shard, and a note for each bay whose local state could not be read this
+    /// run (see `collect_walk_roots`'s `Tolerate` policy) naming the bay and how to clean it up.
     pub notes: Vec<String>,
 }
 
@@ -480,7 +481,18 @@ async fn resolve_the_rest(
         .collect();
 
     let consultation = if !remote_configured {
-        RemoteConsultation::NotConfigured
+        // `remote_configured` is `false` for two different reasons `RemoteClient::from_config`
+        // conflates into one `Err`: genuinely nothing set, or something set but unusable (a
+        // config read/parse error, or a URL `RemoteClient::new` rejects). Telling them apart
+        // (`remote_utils::is_configured`) matters here specifically: reporting the second as the
+        // first steers a user with a real, merely broken remote toward the heavyweight remedies
+        // (franchise / reproduce / accept the loss) for an object that remote may still actually
+        // have, once whatever is wrong with its config is fixed.
+        if remote_utils::RemoteClient::is_configured() {
+            RemoteConsultation::ConsultedWithErrors
+        } else {
+            RemoteConsultation::NotConfigured
+        }
     } else if candidate_hashes.is_empty() {
         // Nothing a fetch could help with this round (e.g. every remaining recorded path is
         // `unreadable`/`restage_failed`, never object-shaped) — skip the network entirely.
@@ -508,7 +520,8 @@ async fn resolve_the_rest(
         }
     }
 
-    let referenced = closure_references_any(&truly_missing).map_err(|e| walk_failure_refusal(root, &e))?;
+    let walk = closure_references_any(&truly_missing).map_err(|e| walk_failure_refusal(root, &e))?;
+    let referenced = &walk.hashes;
 
     for hash in &truly_missing {
         if referenced.contains(hash) {
@@ -564,6 +577,10 @@ async fn resolve_the_rest(
             relative.to_string_lossy()
         ));
     }
+    // Any bay `collect_walk_roots` had to skip (see `closure_references_any`'s doc comment) — the
+    // walk above still ran and still decided every hash's fate, but only as completely as every
+    // *readable* bay could make it, so this is surfaced too rather than silently folded away.
+    notes.extend(walk.degraded_bays.clone());
 
     // `resolve_taints` owns the gate too now (DESIGN.html §3.1.1): it derives the clear/set
     // decision from what is actually left standing in the taint directory once this rewrite
@@ -687,10 +704,11 @@ fn rescan_torn_taint(
     // carve-out (see `enumerate_absent_reachable`'s own doc comment): a reachable node step 1
     // already proved corrupt is a recorded boundary, never re-loaded — without it, one corrupt
     // reachable tree would abort the whole rescan and re-brick torn (I5).
-    let referenced_absent = enumerate_absent_reachable(&corrupt_hashes)
+    let walk = enumerate_absent_reachable(&corrupt_hashes)
         .map_err(|e| rescan_failure_refusal(root, &e))?;
+    let referenced_absent = &walk.hashes;
 
-    for hash in &referenced_absent {
+    for hash in referenced_absent {
         let relative = loose_remainder_path(root, hash).map_err(|e| rescan_failure_refusal(root, &e))?;
         remainder.insert(relative);
         dangling_lines.push(format!("vanished and still referenced: \"{}\"", hash));
@@ -708,20 +726,25 @@ fn rescan_torn_taint(
 
     if remainder.is_empty() {
         report("torn durability taint: rescan complete, nothing left dangling — cleared.".to_string());
+        // A store-wide rescan can touch every object in the warehouse — listing each one
+        // individually (as the ordinary, small-scale restage/resolved lists do) would make this
+        // report itself unusably large. The counts are reported via `progress` above; this
+        // outcome's own lists stay a summary note instead.
+        let mut notes = vec![format!(
+            "a torn taint was resolved by a full store-wide rescan: {} loose object(s), {} \
+            pack file(s), and {} inventory shard file(s) were candidates, of which {} were \
+            (re)restaged; individual paths are not listed here to keep this report readable",
+            loose_count, packs_count, shards_count, restaged.len(),
+        )];
+        // Any bay `collect_walk_roots` had to skip this run — see `enumerate_absent_reachable`'s
+        // doc comment; same reasoning as `resolve_the_rest`'s own degraded-bay note.
+        notes.extend(walk.degraded_bays.clone());
+
         Ok(HealOutcome {
             was_tainted: true,
-            // A store-wide rescan can touch every object in the warehouse — listing each one
-            // individually (as the ordinary, small-scale restage/resolved lists do) would make
-            // this report itself unusably large. The counts are reported via `progress` above;
-            // this outcome's own lists stay a summary note instead.
             restaged: Vec::new(),
             resolved: Vec::new(),
-            notes: vec![format!(
-                "a torn taint was resolved by a full store-wide rescan: {} loose object(s), {} \
-                pack file(s), and {} inventory shard file(s) were candidates, of which {} were \
-                (re)restaged; individual paths are not listed here to keep this report readable",
-                loose_count, packs_count, shards_count, restaged.len(),
-            )],
+            notes,
         })
     } else {
         report(format!(
@@ -909,6 +932,11 @@ struct WalkRoots {
     /// parcel), with the entry's type (so a chunked file's recipe is still descended into for its
     /// chunks).
     shard_referenced: Vec<(String, DirEntryType)>,
+    /// Plain-language notes about any bay whose `parked`/`consolidation` state could not be read
+    /// this run (`bay_utils::BayReadPolicy::Tolerate` — see [`collect_walk_roots`]'s own doc
+    /// comment). Empty unless at least one bay had to be skipped; that bay simply contributes no
+    /// roots to `parcels` above.
+    degraded_bays: Vec<String>,
 }
 
 /// Collect every durable ref source's roots — see [`WalkRoots`].
@@ -943,6 +971,17 @@ struct WalkRoots {
 /// the other function's root list for anything not routed through it (tags, shards, the trust
 /// anchor).**
 ///
+/// **Tolerant, unlike `collect_live_set`.** This call passes [`bay_utils::BayReadPolicy::
+/// Tolerate`], not `FailClosed`: `forklift heal` never deletes anything (it restages and
+/// reports), and is the very command a standing taint tells users to run to recover, so a single
+/// unreadable bay must not brick it the way it must still brick a *deleting* sweep. An
+/// unreadable bay is skipped — it contributes no roots — and named in [`WalkRoots::
+/// degraded_bays`] instead of aborting the walk. This can only make the walk's answer more
+/// conservative (a hash only that bay referenced now reads as unreferenced and clears, rather
+/// than the walk refusing outright), never less — see `BayReadPolicy`'s own doc comment for why
+/// that is sound specifically because heal never deletes. `gc_utils::collect_live_set` keeps
+/// `FailClosed` unconditionally; do not change that call site to match this one.
+///
 /// The undo journal is deliberately excluded from **both** walks (parity, not an oversight): an
 /// entry there records history for `undo`/`redo`, never a live reference a future write would
 /// resurrect from it.
@@ -969,11 +1008,12 @@ fn collect_walk_roots() -> Result<WalkRoots, String> {
     // this function's own staged-shard loop, so `list_bays` runs exactly once per heal. Parked
     // parcels and in-progress-consolidation `their_head` are the portion shared with gc's live
     // set — see `bay_utils::collect_bay_scoped_parcel_roots`'s doc comment for the shared-helper
-    // rationale and the fail-closed-on-an-unreadable-bay-source contract (by design, not a bug).
-    // Staged inventory shards are recovery-only (gc deliberately does not root them) and stay a
-    // separate per-bay loop here.
+    // rationale. `Tolerate`, not `FailClosed` — see this function's own doc comment. Staged
+    // inventory shards are recovery-only (gc deliberately does not root them) and stay a separate
+    // per-bay loop here.
     let bay_dirs = bay_utils::all_bay_state_dirs()?;
-    parcels.extend(bay_utils::collect_bay_scoped_parcel_roots(&bay_dirs)?);
+    let bay_scope = bay_utils::collect_bay_scoped_parcel_roots(&bay_dirs, bay_utils::BayReadPolicy::Tolerate)?;
+    parcels.extend(bay_scope.roots);
 
     for dir in &bay_dirs {
         walk_shard_files(&dir.join(FOLDER_NAME_INVENTORY_ROOT), &mut shard_referenced)?;
@@ -986,7 +1026,7 @@ fn collect_walk_roots() -> Result<WalkRoots, String> {
         }
     }
 
-    Ok(WalkRoots { parcels, shard_referenced })
+    Ok(WalkRoots { parcels, shard_referenced, degraded_bays: bay_scope.degraded })
 }
 
 fn walk_shard_files(folder: &Path, hashes: &mut Vec<(String, DirEntryType)>) -> Result<(), String> {
@@ -1034,6 +1074,20 @@ fn walk_shard_data_files(folder: &Path, found: &mut Vec<PathBuf>) -> Result<(), 
     Ok(())
 }
 
+/// A closure walk's result, paired with any bay [`collect_walk_roots`] had to skip this run
+/// rather than abort on — see that function's own doc comment on its `Tolerate` policy.
+/// `degraded_bays` is empty unless at least one bay's state was unreadable; when it is not empty,
+/// `hashes` is only as complete as what every *readable* bay could contribute — never a reason to
+/// treat `hashes` itself as wrong, only as conservative.
+pub(crate) struct ClosureWalkResult {
+    /// [`closure_references_any`]: the subset of its `targets` actually found referenced.
+    /// [`enumerate_absent_reachable`]: every raw-absent (or corrupt-boundary) hash the walk
+    /// reached.
+    pub hashes: BTreeSet<String>,
+    /// Plain-language notes, one per degraded bay — see [`collect_walk_roots`]'s doc comment.
+    pub degraded_bays: Vec<String>,
+}
+
 /// Walk every durable ref source's closure looking for `targets`, returning the subset actually
 /// found referenced. Read-only: see the module doc comment and
 /// [`tests::closure_walk_never_touches_a_barrier_or_a_dir_sync`].
@@ -1042,9 +1096,9 @@ fn walk_shard_data_files(folder: &Path, found: &mut Vec<PathBuf>) -> Result<(), 
 /// ever cares whether a target is referenced, never which hashes the walk found absent along the
 /// way, and the `None` also gates off the terminal-leaf/chunk presence stats this call has no use
 /// for (the descent guards — parcel, subtree, chunked-leaf's recipe — still run regardless).
-pub(crate) fn closure_references_any(targets: &BTreeSet<String>) -> Result<BTreeSet<String>, String> {
+pub(crate) fn closure_references_any(targets: &BTreeSet<String>) -> Result<ClosureWalkResult, String> {
     if targets.is_empty() {
-        return Ok(BTreeSet::new());
+        return Ok(ClosureWalkResult { hashes: BTreeSet::new(), degraded_bays: Vec::new() });
     }
 
     let roots = collect_walk_roots()?;
@@ -1054,7 +1108,8 @@ pub(crate) fn closure_references_any(targets: &BTreeSet<String>) -> Result<BTree
     // corrupt reachable object must keep failing this walk loud, exactly as before the carve-out
     // existed — see `tests::a_present_but_corrupt_pallet_head_fails_the_walk_loudly`.
     let no_corrupt: BTreeSet<String> = BTreeSet::new();
-    walk_closure_for(targets, &roots, &no_corrupt, None)
+    let hashes = walk_closure_for(targets, &roots, &no_corrupt, None)?;
+    Ok(ClosureWalkResult { hashes, degraded_bays: roots.degraded_bays })
 }
 
 /// The targetless sibling of [`closure_references_any`]: enumerate every hash the walk finds
@@ -1078,14 +1133,14 @@ pub(crate) fn closure_references_any(targets: &BTreeSet<String>) -> Result<BTree
 /// no other caller yet, but the parameter is real, not vestigial — see `rescan_torn_taint`).
 ///
 /// # Returns
-/// * `Ok(BTreeSet<String>)` - Every raw-absent (or corrupt-boundary) hash the walk reached,
-///                            recorded once each.
+/// * `Ok(ClosureWalkResult)` - Every raw-absent (or corrupt-boundary) hash the walk reached,
+///                            recorded once each, plus any degraded-bay notes.
 /// * `Err(String)`          - A ref source could not be read, or a *present*, non-corrupt-boundary
 ///                            object could not be loaded (corrupt/unreadable) — the walk still
 ///                            fails loud on that, exactly as before the carve-out existed (I5: an
 ///                            anomalous corruption the caller could not pre-classify, above all
 ///                            one discovered only inside a pack).
-pub(crate) fn enumerate_absent_reachable(corrupt: &BTreeSet<String>) -> Result<BTreeSet<String>, String> {
+pub(crate) fn enumerate_absent_reachable(corrupt: &BTreeSet<String>) -> Result<ClosureWalkResult, String> {
     let roots = collect_walk_roots()?;
     let empty_targets: BTreeSet<String> = BTreeSet::new();
     let mut absent: BTreeSet<String> = BTreeSet::new();
@@ -1093,7 +1148,7 @@ pub(crate) fn enumerate_absent_reachable(corrupt: &BTreeSet<String>) -> Result<B
         let mut collecting_sink = |hash: &str| { absent.insert(hash.to_string()); };
         walk_closure_for(&empty_targets, &roots, corrupt, Some(&mut collecting_sink))?;
     }
-    Ok(absent)
+    Ok(ClosureWalkResult { hashes: absent, degraded_bays: roots.degraded_bays })
 }
 
 /// Re-borrow an `Option<&mut dyn FnMut(&str)>` for one call, without moving the original out of
@@ -1380,8 +1435,19 @@ fn remedy_text(consultation: RemoteConsultation) -> &'static str {
 /// own `raw_object_present` recheck — never by this function's return value (§3.2 D3, see the
 /// module doc comment); `RemoteConsultation` only ever feeds [`remedy_text`]'s wording.
 async fn attempt_heal_driven_refetch(candidate_hashes: &[String]) -> RemoteConsultation {
-    let Ok(client) = remote_utils::RemoteClient::from_config() else {
-        return RemoteConsultation::NotConfigured;
+    // In practice this function's own caller already filters out the "nothing configured" case
+    // before ever calling it (`resolve_the_rest`'s own `remote_configured` gate, fixed the same
+    // way — see its doc comment), so this `Err` branch mainly guards a config that broke *between*
+    // that check and this `.await` actually running. Same distinction either way: never conflate
+    // "configured but unusable" with "nothing configured" — see `remote_utils::is_configured`'s
+    // own doc comment.
+    let client = match remote_utils::RemoteClient::from_config() {
+        Ok(client) => client,
+        Err(_) => return if remote_utils::RemoteClient::is_configured() {
+            RemoteConsultation::ConsultedWithErrors
+        } else {
+            RemoteConsultation::NotConfigured
+        },
     };
 
     // Armed for the rest of this function — both passes below, and every `.await` inside them —
@@ -1600,7 +1666,8 @@ mod tests {
 
         let targets: BTreeSet<String> = ["a".repeat(64), "b".repeat(64)].into_iter().collect();
         let referenced = closure_references_any(&targets)
-            .expect("the walk must succeed against a real, readable ref source");
+            .expect("the walk must succeed against a real, readable ref source")
+            .hashes;
         assert!(referenced.is_empty(), "neither target hash is actually referenced");
 
         assert!(file_utils::sync_dir_attempts().is_empty(),
@@ -1614,7 +1681,8 @@ mod tests {
         // descent — pin that it is equally read-only, not just the no-op-sink mode above. Same
         // recording guards, still armed; any sync attempt from either call would show up here.
         let absent = enumerate_absent_reachable(&BTreeSet::new())
-            .expect("the enumerating walk must succeed against a real, readable ref source");
+            .expect("the enumerating walk must succeed against a real, readable ref source")
+            .hashes;
         assert!(absent.is_empty(), "nothing in this fixture is raw-absent");
 
         assert!(file_utils::sync_dir_attempts().is_empty(),
@@ -1685,7 +1753,8 @@ mod tests {
         let targets: BTreeSet<String> = [target_hash.clone()].into_iter().collect();
 
         let referenced = closure_references_any(&targets)
-            .expect("a sealed/absent subtree boundary must be skipped, not fail the whole walk");
+            .expect("a sealed/absent subtree boundary must be skipped, not fail the whole walk")
+            .hashes;
         assert!(!referenced.contains(&target_hash),
             "T is not actually reachable — its only theoretical path runs through the absent subtree");
 
@@ -1712,7 +1781,7 @@ mod tests {
 
         let target_hash = "b".repeat(64);
         let targets: BTreeSet<String> = [target_hash.clone()].into_iter().collect();
-        let referenced = closure_references_any(&targets).unwrap();
+        let referenced = closure_references_any(&targets).unwrap().hashes;
         assert!(!referenced.contains(&target_hash));
 
         let live = crate::util::gc_utils::collect_live_set().unwrap();
@@ -1745,7 +1814,7 @@ mod tests {
         pallet_utils::set_pallet_head("main", &vanished_head_hash).unwrap();
 
         let targets: BTreeSet<String> = [vanished_head_hash.clone()].into_iter().collect();
-        let referenced = closure_references_any(&targets).unwrap();
+        let referenced = closure_references_any(&targets).unwrap().hashes;
 
         assert!(referenced.contains(&vanished_head_hash),
             "a vanished pallet head that is itself a hunted target must still be reported referenced");
@@ -1811,7 +1880,8 @@ mod tests {
         let absent_subtree_hash = plant_present_parent_with_absent_subtree_boundary();
 
         let absent = enumerate_absent_reachable(&BTreeSet::new())
-            .expect("the enumerator must not error on a sealed/absent subtree boundary");
+            .expect("the enumerator must not error on a sealed/absent subtree boundary")
+            .hashes;
 
         assert!(absent.contains(&absent_subtree_hash),
             "the absent subtree boundary itself must be recorded by the collecting sink");
@@ -1887,7 +1957,8 @@ mod tests {
         let chunk_hash = plant_present_recipe_with_one_chunk();
 
         let absent = enumerate_absent_reachable(&BTreeSet::new())
-            .expect("the enumerator must not error on a present recipe with an absent chunk");
+            .expect("the enumerator must not error on a present recipe with an absent chunk")
+            .hashes;
 
         assert!(absent.contains(&chunk_hash),
             "a raw-absent chunk under a present recipe must be recorded by the collecting sink: {:?}",
@@ -1915,7 +1986,7 @@ mod tests {
         let chunk_hash = plant_present_recipe_with_one_chunk();
 
         let targets: BTreeSet<String> = [chunk_hash.clone()].into_iter().collect();
-        let referenced = closure_references_any(&targets).unwrap();
+        let referenced = closure_references_any(&targets).unwrap().hashes;
 
         assert!(referenced.contains(&chunk_hash),
             "a target chunk hash under a present recipe must still be found by the targeted walk");
@@ -2003,7 +2074,8 @@ mod tests {
 
         let targets: BTreeSet<String> = [target_hash.clone()].into_iter().collect();
         let referenced = closure_references_any(&targets)
-            .expect("the closure walk must complete without crashing on a deeply nested tree");
+            .expect("the closure walk must complete without crashing on a deeply nested tree")
+            .hashes;
 
         assert!(referenced.contains(&target_hash),
             "the deeply nested leaf's target hash must still be found by the closure walk");
@@ -2059,7 +2131,7 @@ mod tests {
         std::fs::write(&shard_path, bytes).unwrap();
 
         let targets: BTreeSet<String> = [target_hash.clone()].into_iter().collect();
-        let referenced = closure_references_any(&targets).unwrap();
+        let referenced = closure_references_any(&targets).unwrap().hashes;
 
         assert!(referenced.contains(&target_hash),
             "a shard staged in a non-active bay must still be found by the closure walk");
@@ -2088,7 +2160,7 @@ mod tests {
         std::fs::write(bay_b_dir.join("parked"), format!("{}\n", target_hash)).unwrap();
 
         let targets: BTreeSet<String> = [target_hash.clone()].into_iter().collect();
-        let referenced = closure_references_any(&targets).unwrap();
+        let referenced = closure_references_any(&targets).unwrap().hashes;
 
         assert!(referenced.contains(&target_hash),
             "a parked hash in a non-active bay must still be found by the closure walk");
@@ -2096,16 +2168,18 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Regression lock for the fail-closed contract on
-    /// `bay_utils::collect_bay_scoped_parcel_roots` (see its doc comment): a malformed `parked`
-    /// file in a *non-active* bay must make the closure walk (and so `run`, `forklift heal`) fail
-    /// outright, never silently skip the unreadable bay and proceed as if it had no references —
-    /// that would re-open the exact under-counting bug the bay-scope fix closed. Red if
-    /// `read_parked_in`'s `?` in `collect_bay_scoped_parcel_roots`
-    /// (crates/forklift-core/src/util/bay_utils.rs) were ever changed to skip-and-continue on an
-    /// `Err` instead of propagating it.
+    /// (fail-closed/tolerant split — design call) `closure_references_any` is `forklift heal`'s
+    /// own walk, and heal never deletes — so, unlike `gc_utils::collect_live_set` (still pinned
+    /// fail-closed by `gc_utils::tests::
+    /// gc_fails_closed_and_deletes_nothing_on_an_unreadable_bay_parked_file`), a malformed
+    /// `parked` file in a *non-active* bay must no longer abort this walk: it is skipped
+    /// (contributing no roots) and named in the returned degraded-bay notes instead. This
+    /// used to pin the opposite (fail-closed) behavior for this exact fixture, before the
+    /// tolerant/fail-closed split — see `bay_utils::BayReadPolicy`'s own doc comment for why the
+    /// two callers are allowed to differ. Red if `collect_walk_roots` ever went back to a single,
+    /// unconditionally-propagating `?` on `collect_bay_scoped_parcel_roots`'s result.
     #[test]
-    fn walk_fails_closed_on_an_unreadable_bay_parked_file() {
+    fn walk_tolerates_an_unreadable_bay_parked_file_and_names_it_degraded() {
         use crate::globals::StorageRootScope;
 
         let dir = std::env::temp_dir()
@@ -2120,10 +2194,14 @@ mod tests {
         std::fs::write(bay_b_dir.join("parked"), b"not-a-valid-hash\n").unwrap();
 
         let targets: BTreeSet<String> = ["a".repeat(64)].into_iter().collect();
-        let result = closure_references_any(&targets);
+        let walk = closure_references_any(&targets)
+            .expect("an unreadable bay must be skipped, never abort heal's closure walk");
 
-        assert!(result.is_err(),
-            "an unreadable/malformed bay ref source must fail the closure walk, not be skipped");
+        assert!(walk.hashes.is_empty(), "the unresolvable target is not (falsely) reported referenced");
+        assert_eq!(walk.degraded_bays.len(), 1, "exactly the one corrupt bay must be reported degraded");
+        assert!(walk.degraded_bays[0].contains("\"b\""), "the note must name the bay: {}", walk.degraded_bays[0]);
+        assert!(walk.degraded_bays[0].contains("forklift bay remove"),
+            "the note must name the in-tool cleanup route: {}", walk.degraded_bays[0]);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2149,7 +2227,7 @@ mod tests {
         std::fs::write(bay_b_dir.join("consolidation"), format!("{}\ntheir-pallet\n", target_hash)).unwrap();
 
         let targets: BTreeSet<String> = [target_hash.clone()].into_iter().collect();
-        let referenced = closure_references_any(&targets).unwrap();
+        let referenced = closure_references_any(&targets).unwrap().hashes;
 
         assert!(referenced.contains(&target_hash),
             "a consolidation their_head in a non-active bay must still be found by the closure walk");
@@ -2182,7 +2260,7 @@ mod tests {
         }).unwrap();
 
         let targets: BTreeSet<String> = [target_hash.clone()].into_iter().collect();
-        let referenced = closure_references_any(&targets).unwrap();
+        let referenced = closure_references_any(&targets).unwrap().hashes;
 
         assert!(referenced.contains(&target_hash),
             "a trust-anchor adopts hash must be found by the closure walk (a re-genesis GC root)");
@@ -2262,7 +2340,7 @@ mod tests {
         assert!(metadata.is_none(), "the registration ledger must stay untouched by this test");
 
         let targets: BTreeSet<String> = [target_hash.clone()].into_iter().collect();
-        let referenced = closure_references_any(&targets).unwrap();
+        let referenced = closure_references_any(&targets).unwrap().hashes;
 
         assert!(referenced.contains(&target_hash),
             "a shard-only reference (absent from the ledger) must still be found by the walk");
@@ -2706,6 +2784,164 @@ mod tests {
         let state = taint_utils::read_taints(&forklift).unwrap();
         assert!(state.recorded.contains(&PathBuf::from("pallets/main")),
             "the vanished ref path must survive as an unresolved (unrecognized-shape) remainder");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ---- Fail-closed/tolerant split on an unreadable bay (design call) ----
+
+    /// A single fixture pinning BOTH halves of the split this fix makes, on the exact same
+    /// corrupt bay: `forklift heal` (this crate's `run`, exercised end to end here — not just its
+    /// inner `closure_references_any`) must complete and report the degraded bay, because heal
+    /// never deletes anything and is the very command a standing taint tells users to run to
+    /// recover; `gc`/`compact`, which DO delete, must keep refusing outright on that same file,
+    /// because sweeping with an incompletely known live set risks real data loss.
+    ///
+    /// Revert the heal-side tolerance (`bay_utils::collect_walk_roots`'s call passing
+    /// `BayReadPolicy::Tolerate`) and this test's first half reddens (`run_heal()` returns `Err`
+    /// instead of a clean `Ok` naming bay "b"). Weaken either `gc_utils::collect_live_set`'s or
+    /// `pack_utils::compact`'s fail-closed policy and this test's second half reddens (`Ok` where
+    /// an `Err` is required) — so this test cannot pass by drifting either direction.
+    #[test]
+    fn heal_tolerates_a_corrupt_bay_while_gc_and_compact_still_refuse() {
+        use crate::globals::StorageRootScope;
+
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        let dir = std::env::temp_dir()
+            .join(format!("forklift-recovery-utils-heal-tolerates-gc-refuses-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _scope = StorageRootScope::enter(&dir);
+        let forklift = forklift_root();
+
+        // Bay "b"'s `parked` file is malformed — the exact same corrupt-file shape both halves of
+        // this fix are about.
+        let bay_b_dir = bay_utils::bay_state_dir("b");
+        std::fs::create_dir_all(&bay_b_dir).unwrap();
+        std::fs::write(bay_b_dir.join("parked"), b"not-a-valid-hash\n").unwrap();
+
+        // A genuinely vanished, genuinely unreferenced object recorded as tainted — the ordinary
+        // "resolved, taint clears" shape, so this run actually drives the closure walk (and so
+        // `collect_walk_roots`'s tolerance) rather than taking an early-return shortcut.
+        let vanished_hash = "9".repeat(64);
+        let vanished_path = loose_remainder_path(&forklift, &vanished_hash).unwrap();
+        plant_complete_taint(&forklift, &[vanished_path.to_str().unwrap()]);
+
+        let outcome = run_heal().expect(
+            "an unreadable bay must never abort forklift heal — it is the escape hatch users are \
+            told to run for a standing taint, and it never deletes anything"
+        );
+        assert!(outcome.was_tainted);
+        assert!(outcome.resolved.iter().any(|p| p.contains(&vanished_hash)),
+            "the vanished, unreferenced object must still resolve cleanly despite bay b being \
+            unreadable: {:?}", outcome.resolved);
+        assert!(outcome.notes.iter().any(|n| n.contains("\"b\"") && n.contains("forklift bay remove")),
+            "heal must name the degraded bay and its cleanup route in its notes: {:?}", outcome.notes);
+
+        // The other half: gc and compact must still refuse outright on the exact same corrupt
+        // file — never weakened by this fix. (The taint above is already cleared by the `run_heal`
+        // call, so this is testing the bay-read policy alone, not a leftover taint gate.)
+        let gc_result = crate::util::gc_utils::collect_garbage(0);
+        assert!(gc_result.is_err(), "gc must still fail closed on an unreadable bay's parked file");
+
+        // `compact --all` (`all: true`) is the variant that actually computes the live set
+        // (`collect_targets` only calls `collect_live_set` under `all` — an incremental compact
+        // never repacks against the live set at all, so it would not exercise this fail-closed
+        // path). This is `compact --all`'s own fail-closed check, unweakened by this fix.
+        let compact_all_result = pack_utils::compact(true, false);
+        assert!(compact_all_result.is_err(),
+            "compact --all must still fail closed on an unreadable bay's parked file");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- "not configured" vs "configured but unusable" (design call) ----
+
+    /// `RemoteClient::from_config()` returns the same `Err` shape for two different situations —
+    /// nothing is set, or something is set but unreadable/unparseable/unusable. Before this fix,
+    /// both `resolve_the_rest`'s `remote_configured` gate and `attempt_heal_driven_refetch`'s own
+    /// early return treated the two identically as "not configured," which steers a user whose
+    /// remote is merely *broken* toward the heavyweight remedies (franchise / reproduce / accept
+    /// the loss) — wording that overclaims when a fixable, real remote might still have the
+    /// object. This fixture makes the warehouse config file itself unparseable (not merely unset)
+    /// and asserts the refusal reports the remote as configured-but-unconsultable — reusing
+    /// [`RemoteConsultation::ConsultedWithErrors`]'s existing wording, never `NotConfigured`'s.
+    ///
+    /// Revert either fixed call site (`resolve_the_rest`'s `remote_configured` branch, or
+    /// `attempt_heal_driven_refetch`'s own `Err` branch) back to a bare `NotConfigured` return and
+    /// this reddens.
+    #[test]
+    fn heal_reports_a_broken_remote_config_as_unconsultable_not_unconfigured() {
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+        use crate::globals::StorageRootScope;
+        use crate::model::blob::Blob;
+        use crate::model::parcel::Parcel;
+        use crate::model::tree_item::TreeItem;
+        use crate::util::config_utils;
+
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        let root = std::env::temp_dir()
+            .join(format!("forklift-recovery-utils-broken-remote-config-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let _scope = StorageRootScope::enter(&root);
+        let forklift = forklift_root();
+
+        // A real, still-referenced object that vanishes — the ordinary "dangling, remote-refetch-
+        // eligible" shape needed to actually reach the `consultation`/`remedy_text` code path
+        // this fix touches (mirrors `torn_taint_dangling_remainder_names_exactly_the_
+        // referenced_absent_object`'s fixture, complete rather than torn).
+        let mut blob_object = LooseObjectBuilder::build_blob(&Blob { content: b"referenced content".to_vec() });
+        blob_object.store().unwrap();
+        let b_hash = blob_object.hash.clone();
+        let (folder, file_name) = file_utils::get_path_for_object(&b_hash).unwrap();
+        let b_absolute = PathBuf::from(&folder).join(&file_name);
+        let b_relative = b_absolute.strip_prefix(&forklift).unwrap().to_path_buf();
+
+        let mut root_tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        root_tree.add_child(TreeItem::new("b.txt".to_string(), b_hash.clone(), DirEntryType::Normal));
+        let mut tree_object = LooseObjectBuilder::build_tree(&root_tree);
+        tree_object.store().unwrap();
+
+        let parcel = Parcel {
+            tree_hash: tree_object.hash.clone(),
+            parents: Vec::new(),
+            actions: Vec::new(),
+            description: Some("references B".to_string()),
+        };
+        let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
+        parcel_object.store().unwrap();
+        pallet_utils::set_pallet_head("main", &parcel_object.hash).unwrap();
+
+        std::fs::remove_file(&b_absolute).unwrap();
+        plant_complete_taint(&forklift, &[b_relative.to_str().unwrap()]);
+
+        // A remote IS configured, in the sense that something real is on disk at `remote.url`'s
+        // scope — it just cannot be read: the warehouse config file itself is unparseable.
+        let config_folder = config_utils::get_warehouse_config_folder();
+        std::fs::create_dir_all(&config_folder).unwrap();
+        std::fs::write(config_folder.join("warehouse.toml"), "not valid toml {{{\n").unwrap();
+
+        let error = run_heal().expect_err(
+            "a genuinely dangling reference must not clear just because the remote config is broken"
+        );
+        assert_durability_taint(&error, &[b_hash.as_str()]);
+
+        let message = match &error {
+            CoreError::Refusal { message, .. } => message.clone(),
+            other => panic!("expected a DurabilityTaint refusal, got {:?}", other),
+        };
+        assert!(!message.contains("no remote is configured"),
+            "a broken (but real) remote config must never be reported as though nothing were \
+            configured: {}", message);
+        assert!(message.contains(
+            "tried to check the configured remote automatically but could not complete that check"
+        ), "a broken remote config must be reported as consulted-but-failed, not silently \
+            misclassified as unconfigured: {}", message);
 
         std::fs::remove_dir_all(&root).ok();
     }

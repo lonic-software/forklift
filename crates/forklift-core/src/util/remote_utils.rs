@@ -337,7 +337,10 @@ impl RemoteClient {
     ///
     /// # Returns
     /// * `Ok(RemoteClient)` - The client.
-    /// * `Err(String)`      - If no remote is configured.
+    /// * `Err(String)`      - No remote is configured, *or* a remote is configured but the
+    ///                        client could not be built from it (its config could not be read,
+    ///                        or its URL is unusable) — [`is_configured`] tells the two apart
+    ///                        for a caller that needs to, without inspecting this message.
     pub fn from_config() -> Result<RemoteClient, String> {
         let url = config_utils::get_effective_value(config_utils::KEY_REMOTE_URL)?
             .map(|(value, _)| value)
@@ -351,6 +354,26 @@ impl RemoteClient {
             .map(|(value, _)| value);
 
         RemoteClient::new(&url, token)
+    }
+
+    /// Whether a remote URL is configured at all for this warehouse — independent of whether
+    /// [`RemoteClient::from_config`] could actually *build* a client from it. A malformed
+    /// `remote.url`/`remote.token` config read, or a URL [`RemoteClient::new`] rejects, still
+    /// counts as "configured" here: something is set, it is just broken.
+    ///
+    /// Exists so a caller that gets `Err` from [`from_config`](RemoteClient::from_config) can
+    /// tell "nothing is configured" apart from "something is configured but could not be
+    /// consulted" without parsing that `Err`'s message — `forklift heal`'s own remote-driven
+    /// refetch (`recovery_utils::attempt_heal_driven_refetch`) is the caller this exists for: the
+    /// two cases call for different remedies (a genuinely absent remote has no in-tool fetch to
+    /// retry; a broken-but-real one might still be recoverable once it is fixed), and reporting
+    /// the second as the first sends a user toward heavier remedies — franchise, reproduce, or
+    /// accepting the loss — for an object the remote may still actually have. A read failure here
+    /// (the same class `from_config` itself would also hit) is treated as "configured": it is
+    /// certainly not "nothing is set," and erring toward the less alarming classification is the
+    /// right default for what is, either way, only wording.
+    pub fn is_configured() -> bool {
+        !matches!(config_utils::get_effective_value(config_utils::KEY_REMOTE_URL), Ok(None))
     }
 
     /// The base URL of the remote.
