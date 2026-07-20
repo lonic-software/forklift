@@ -128,11 +128,16 @@
 //!   clears exactly the same way an ordinary present object would.
 //! - **D4 (force-fetch a corrupt remainder entry).** An ordinary fetch dedups against *present*
 //!   objects, so a corrupt-but-present recorded path (`attempt.hash_mismatch`) would never be
-//!   re-fetched — `does_object_exist` already says "yes". Before the fetch runs,
-//!   [`resolve_the_rest`] deletes that corrupt loose dentry (delete-then-fetch): the object is
-//!   transiently absent for the rest of this call, which is fine — `heal` holds the warehouse
-//!   lock throughout — and the ordinary dedup-aware fetch then pulls a good copy in exactly like
-//!   any other vanished candidate. A genuinely vanished (not corrupt) candidate needs no deletion.
+//!   re-fetched through the shared fetch path — `does_object_exist` already says "yes". Rather
+//!   than deleting the corrupt dentry to force it "missing" (which would lose the object outright
+//!   if the fetch that was supposed to replace it then failed — an offline or merely unreachable
+//!   remote, not just a hostile one, gets there easily), [`resolve_the_rest`] routes every
+//!   corrupt candidate down a dedicated fetch
+//!   ([`remote_utils::fetch_corrupt_replacements`]) that never consults that dedup filter at all.
+//!   A verified good copy replaces the corrupt bytes with one atomic rename
+//!   (`object_utils::force_store_object_bytes` → `write_file_atomically`) — at every instant the
+//!   path holds either the old or the new bytes, never neither. A genuinely vanished (not
+//!   corrupt) candidate still travels the ordinary dedup-aware fetch, unchanged.
 //!
 //! **Scope boundary, stated honestly:** this recovers only objects a configured remote actually
 //! has. An object that vanished *before* it was ever published (lifted) has no remote copy to
@@ -364,9 +369,12 @@ async fn resolve_the_rest(
 
     // §3.2 D4: a corrupt-present recorded path is force-fetch-eligible when a remote is
     // configured — computed up front (cheap, local, no network) since the hash-mismatch
-    // classification below needs it. With no remote, a corrupt entry behaves exactly as before
-    // this slice: straight to the remainder, its bytes left untouched (deleting them would be
-    // pure data loss with no possible recovery).
+    // classification below needs it. This is never what decides whether the object's bytes are
+    // touched (nothing here deletes anything — see the module doc comment); it only decides
+    // whether a corrupt candidate is worth handing to `attempt_heal_driven_refetch` at all versus
+    // going straight to the remainder with the plain "no remote" wording. A remote that is
+    // configured but unreachable still takes this branch — the dedicated fetch below simply fails
+    // and the recheck (also below) finds the bytes exactly as they were.
     let remote_configured = remote_utils::RemoteClient::from_config().is_ok();
 
     for (relative, error) in &attempt.unreadable {
@@ -375,32 +383,17 @@ async fn resolve_the_rest(
     }
 
     // D4: force-fetch bridge. `corrupt_candidates` collects exactly the entries this run will
-    // attempt to recover via delete-then-fetch; anything not in it (no remote configured, or a
-    // hash-mismatch path with no shape `hash_from_object_path` recognizes — unreachable in
-    // practice, see `restage_object`'s `HashMismatch` verdict) commits straight to the remainder
-    // below, unchanged from before this slice.
+    // attempt to recover via the dedicated corrupt-candidate fetch
+    // (`remote_utils::fetch_corrupt_replacements`, see the module doc comment); anything not in
+    // it (no remote configured, or a hash-mismatch path with no shape `hash_from_object_path`
+    // recognizes — unreachable in practice, see `restage_object`'s `HashMismatch` verdict) commits
+    // straight to the remainder below. Nothing here deletes the corrupt dentry: it stays exactly
+    // as it is until (and unless) a verified good copy is ready to supersede it in one atomic
+    // rename.
     let mut corrupt_candidates: BTreeMap<String, PathBuf> = BTreeMap::new();
     for relative in &attempt.hash_mismatch {
         match (remote_configured, file_utils::hash_from_object_path(relative)) {
             (true, Some(hash)) => {
-                // Delete-then-fetch (D4): force the corrupt object to genuinely vanish so the
-                // ordinary fetch's dedup (`does_object_exist`) does not skip it as "already
-                // present" — see the module doc comment. Safe under the lock `heal` holds
-                // throughout: the object is transiently absent, never observed by anything else.
-                // Load-bearing for correctness, not just for the fetch's own dedup: skipping it
-                // was confirmed (by reverting this exact block) to make the post-check below a
-                // false clear, not merely a missed recovery — `raw_object_present`'s loose branch
-                // is a bare `fs::exists`, so a corrupt-but-still-present dentry left in place
-                // would itself read back as "present" and get reported resolved with the corrupt
-                // bytes never actually replaced.
-                if let Err(e) = std::fs::remove_file(root.join(relative)) {
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        return Err(sync_failure_refusal(root, &format!(
-                            "could not remove the corrupt copy of \"{}\" to make way for a \
-                            re-fetched good one: {}", relative.to_string_lossy(), e
-                        )));
-                    }
-                }
                 corrupt_candidates.insert(hash, relative.clone());
             }
             _ => {
@@ -472,15 +465,18 @@ async fn resolve_the_rest(
     // §3.2: heal drives the fetch itself, inside this locked verb, reusing `lower`'s own fetch
     // machinery — the wedge fix (see the module doc comment). Runs once, ahead of the raw-
     // presence filter below, so a hash recovered this way is indistinguishable from one that was
-    // merely present elsewhere all along — one classification pass, not two. Every candidate this
-    // run might still be able to close is named up front (ordinary vanished-and-possibly-
-    // referenced hashes, and D4's force-vanished corrupt ones) — `attempt_heal_driven_refetch`
-    // needs the exact set for its targeted fetch (D1-gap bridge, see its own doc comment).
+    // merely present elsewhere all along — one classification pass, not two. `candidate_hashes`
+    // names every ordinary vanished-and-possibly-referenced hash this run might still be able to
+    // close — `attempt_heal_driven_refetch` needs the exact set for its targeted fetch (D1-gap
+    // bridge, see its own doc comment). D4's corrupt candidates are named separately
+    // (`corrupt_candidates`' own keys): they must never enter `candidate_hashes` and travel
+    // `fetch_missing_objects` — see the module doc comment for why that path is the wrong one for
+    // an object that is present but wrong.
     let candidate_hashes: Vec<String> = loose_candidates.keys()
         .chain(pack_candidates.keys())
-        .chain(corrupt_candidates.keys())
         .cloned()
         .collect();
+    let corrupt_hashes: Vec<String> = corrupt_candidates.keys().cloned().collect();
 
     let consultation = if !remote_configured {
         // `remote_configured` is `false` for two different reasons `RemoteClient::from_config`
@@ -495,12 +491,12 @@ async fn resolve_the_rest(
         } else {
             RemoteConsultation::NotConfigured
         }
-    } else if candidate_hashes.is_empty() {
+    } else if candidate_hashes.is_empty() && corrupt_hashes.is_empty() {
         // Nothing a fetch could help with this round (e.g. every remaining recorded path is
         // `unreadable`/`restage_failed`, never object-shaped) — skip the network entirely.
         RemoteConsultation::ConsultedCleanly
     } else {
-        attempt_heal_driven_refetch(&candidate_hashes).await
+        attempt_heal_driven_refetch(&candidate_hashes, &corrupt_hashes).await
     };
 
     // Raw-presence filter: a candidate present elsewhere (another pack, or loose) was never
@@ -553,15 +549,22 @@ async fn resolve_the_rest(
         }
     }
 
-    // D4: re-verify each corrupt candidate the exact same way (`raw_object_present`, packed-or-
-    // loose) — sound here specifically because its corrupt dentry was deleted above, before the
-    // fetch ran: the loose path can only be occupied again by freshly fetched, hash-verified
-    // bytes, or a pack hit, never by the original corrupt bytes. Unlike the ordinary vanished
-    // set, a corrupt candidate is never exonerated by "unreferenced" — this mirrors the verb's
-    // existing corrupt-is-always-remainder-until-recovered rule; only a genuine recovery (a good
-    // copy landed) clears it, regardless of what the closure walk would say about reachability.
+    // D4: re-verify each corrupt candidate by **content**, not presence. The corrupt dentry is
+    // never deleted above, so unlike the ordinary vanished set's `raw_object_present` check, a
+    // bare "something exists at this path" is not evidence of anything here: on an unreachable or
+    // failed fetch, the original corrupt bytes are still sitting exactly where they were, and a
+    // presence-only recheck would read them back as "recovered" — a false clear that reports the
+    // object fixed while its corrupt bytes are untouched, strictly worse than the honest refusal
+    // this recheck exists to give. `corrupt_candidate_content_verified` reads the loose file back,
+    // decompresses it, and hash-verifies it via the same content-addressing predicate
+    // (`object_utils::verify_object_bytes`) `force_store_object_bytes` used to accept it in the
+    // first place — one predicate, not two that could disagree about the same file. Unlike the
+    // ordinary vanished set, a corrupt candidate is never exonerated by "unreferenced" — this
+    // mirrors the verb's existing corrupt-is-always-remainder-until-recovered rule; only a genuine
+    // recovery (a good copy landed) clears it, regardless of what the closure walk would say about
+    // reachability.
     for (hash, relative) in &corrupt_candidates {
-        let recovered = match file_utils::raw_object_present(hash) {
+        let recovered = match corrupt_candidate_content_verified(hash) {
             Ok(present) => present,
             Err(e) => return Err(walk_failure_refusal(root, &e)),
         };
@@ -612,6 +615,43 @@ async fn resolve_the_rest(
     } else {
         Err(dangling_refusal(root, &dangling_lines, &walk.degraded_bays))
     }
+}
+
+/// D4's corrupt-candidate recheck (DESIGN.html §3.1.1): content, not presence. Mirrors
+/// [`file_utils::raw_object_present`]'s packed-first shortcut — a pack hit's own read path already
+/// verifies content, so it is trusted as-is — but the loose branch reads the file back,
+/// decompresses it, and hash-verifies it via [`object_utils::verify_object_bytes`] instead of a
+/// bare existence check. That difference from `raw_object_present` is load-bearing here
+/// specifically: a corrupt candidate's dentry is never deleted before its fetch runs (see the
+/// module doc comment), so a stale corrupt file can genuinely be sitting at the path when this
+/// runs, and a presence-only check cannot tell it apart from a freshly landed good one.
+///
+/// # Returns
+/// * `Ok(true)`    - The object is present and, for a loose dentry, its content hash-verifies.
+/// * `Ok(false)`   - Nothing is at the path, or a loose file's content does not hash-verify.
+/// * `Err(String)` - The pack registry or the loose file could not be read.
+fn corrupt_candidate_content_verified(hash: &str) -> Result<bool, String> {
+    if pack_utils::is_in_packs(hash)? {
+        return Ok(true);
+    }
+
+    let (folder, file_name) = file_utils::get_path_for_object(hash)?;
+    let absolute = Path::new(&folder).join(&file_name);
+
+    let compressed = match std::fs::read(&absolute) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(format!(
+            "Error while reading \"{}\" to verify its content: {}", absolute.to_string_lossy(), e
+        )),
+    };
+
+    let decompressed = match zstd::stream::decode_all(compressed.as_slice()) {
+        Ok(decompressed) => decompressed,
+        Err(_) => return Ok(false),
+    };
+
+    Ok(object_utils::verify_object_bytes(hash, &decompressed).is_ok())
 }
 
 /// Record `hash`'s recorded taint path(s) — its loose path, or its pack data file plus
@@ -1464,8 +1504,9 @@ fn remedy_text(consultation: RemoteConsultation) -> &'static str {
     }
 }
 
-/// §3.2 D1/D3/D4: the heal-driven refetch. Two passes, both needed — see the "empirically found"
-/// note below, which is why this is *not* a bare call to `fetch_history_scoped` as first drafted.
+/// §3.2 D1/D3/D4: the heal-driven refetch. Three passes, all best-effort — see the "empirically
+/// found" note below (pass 2) and the module doc comment (pass 3), which is why this is *not* a
+/// bare call to `fetch_history_scoped` as first drafted.
 ///
 /// **Pass 1 — every pallet's remote head** ([`remote_utils::fetch_history_scoped`]/
 /// [`remote_utils::fetch_history`], the exact functions `lower.rs:78`/`adopt_meta_pallets` call;
@@ -1492,15 +1533,24 @@ fn remedy_text(consultation: RemoteConsultation) -> &'static str {
 /// hash-addressed `GET /v1/objects/{hash}` is deliberately path-blind server-side
 /// (`forklift-server`'s own doc comment on `get_object`), so it finds and verifies an object
 /// regardless of which pallet(s) reference it or whether their closure is already considered
-/// complete — closing exactly this gap. This is also how a D4 force-vanished corrupt candidate is
-/// actually recovered (its containing parcel is typically already "complete" too).
+/// complete — closing exactly this gap. `candidate_hashes` never includes a D4 corrupt candidate —
+/// see pass 3.
 ///
-/// Best-effort and read/store-only throughout: a failure in either pass for one pallet or the
-/// targeted batch never aborts the rest, and nothing here ever calls `set_pallet_head` or merges a
-/// pallet. Whether anything is actually recovered is decided afterward, uniformly, by the caller's
-/// own `raw_object_present` recheck — never by this function's return value (§3.2 D3, see the
-/// module doc comment); `RemoteConsultation` only ever feeds [`remedy_text`]'s wording.
-async fn attempt_heal_driven_refetch(candidate_hashes: &[String]) -> RemoteConsultation {
+/// **Pass 3 — the dedicated D4 corrupt-candidate fetch of `corrupt_hashes`**
+/// ([`remote_utils::fetch_corrupt_replacements`]). Deliberately a separate call from pass 2, not
+/// folded into the same `candidate_hashes` list: a corrupt-but-present hash would be silently
+/// skipped by `fetch_missing_objects`'s own dedup filter (it already answers "present"), so routing
+/// it there would recover nothing — see the module doc comment for the full reasoning.
+///
+/// Best-effort and read/store-only throughout: a failure in any one pass, for one pallet, or for
+/// one hash in the targeted batches, never aborts the rest, and nothing here ever calls
+/// `set_pallet_head` or merges a pallet. Whether anything is actually recovered is decided
+/// afterward, uniformly, by the caller's own recheck — never by this function's return value (§3.2
+/// D3, see the module doc comment); `RemoteConsultation` only ever feeds [`remedy_text`]'s wording.
+async fn attempt_heal_driven_refetch(
+    candidate_hashes: &[String],
+    corrupt_hashes: &[String],
+) -> RemoteConsultation {
     // In practice this function's own caller already filters out the "nothing configured" case
     // before ever calling it (`resolve_the_rest`'s own `remote_configured` gate, fixed the same
     // way — see its doc comment), so this `Err` branch mainly guards a config that broke *between*
@@ -1555,6 +1605,12 @@ async fn attempt_heal_driven_refetch(candidate_hashes: &[String]) -> RemoteConsu
 
     if !candidate_hashes.is_empty()
         && remote_utils::fetch_missing_objects(&client, candidate_hashes).await.is_err()
+    {
+        clean = false;
+    }
+
+    if !corrupt_hashes.is_empty()
+        && remote_utils::fetch_corrupt_replacements(&client, corrupt_hashes).await.is_err()
     {
         clean = false;
     }
@@ -1728,6 +1784,7 @@ fn walk_failure_refusal(root: &Path, error: &str) -> CoreError {
 mod tests {
     use super::*;
     use crate::util::file_utils;
+    use std::collections::HashMap;
 
     #[test]
     fn closure_walk_never_touches_a_barrier_or_a_dir_sync() {
@@ -2719,6 +2776,286 @@ mod tests {
         assert_eq!(state.recorded, expected,
             "the remainder must name exactly the two corrupt objects — nothing more (never the \
             whole store — the walk must not have aborted), nothing less (never empty)");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ---- D4 (force-fetch a corrupt remainder entry): reachable vs. unreachable remote ----
+    //
+    // DESIGN.html §3.1.1: a corrupt loose object's dentry is never deleted before its
+    // replacement is fetched (see `resolve_the_rest`'s own doc comment). These pin both
+    // directions: an unreachable remote must never destroy the corrupt bytes it could not
+    // replace, and a reachable one actually serving the real bytes must genuinely recover the
+    // object — content-verified, not merely "something is at the path again."
+
+    /// A minimal HTTP endpoint serving exactly `GET /v1/objects/{hash}` from a fixed table of
+    /// hash → bytes — everything the D4 positive-path tests below need from a "remote," and
+    /// nothing else (no handshake, no batch endpoint): `fetch_corrupt_replacements` only ever
+    /// issues per-hash loose `GET`s, never a batch/bundle request. Same raw-TCP-listener,
+    /// thread-per-connection pattern `remote_utils`'s own test fakes use — written fresh here
+    /// because those are private to that module's own `#[cfg(test)]` mod.
+    fn start_object_remote(objects: HashMap<String, Vec<u8>>) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let objects = std::sync::Arc::new(objects);
+
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                let objects = std::sync::Arc::clone(&objects);
+                std::thread::spawn(move || handle_object_remote_request(stream, &objects));
+            }
+        });
+
+        url
+    }
+
+    /// Handle exactly one connection for [`start_object_remote`].
+    fn handle_object_remote_request(mut stream: std::net::TcpStream, objects: &HashMap<String, Vec<u8>>) {
+        use std::io::{Read, Write};
+
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let header_end = loop {
+            if let Some(position) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                break position + 4;
+            }
+            match stream.read(&mut chunk) {
+                Ok(0) => return,
+                Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+                Err(_) => return,
+            }
+        };
+
+        let head = String::from_utf8_lossy(&buffer[..header_end]).to_string();
+        let Some(start_line) = head.lines().next() else { return };
+        let path = start_line.split_whitespace().nth(1).unwrap_or("");
+
+        let found = path.strip_prefix("/v1/objects/").and_then(|hash| objects.get(hash));
+
+        match found {
+            Some(bytes) => {
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                    Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    bytes.len()
+                );
+                let _ = stream.write_all(bytes);
+            }
+            None => {
+                let _ = write!(stream, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            }
+        }
+        let _ = stream.flush();
+    }
+
+    /// (D4 negative, loose path) One corrupt object, a remote that is configured but genuinely
+    /// unreachable (`TcpListener` bound then immediately dropped without accepting — a
+    /// deterministic, immediate `ECONNREFUSED`; the literal `127.0.0.1`, never `localhost`, which
+    /// would add a spurious `::1` attempt). Mutation: restore the unconditional `remove_file`
+    /// this fix deletes — the corrupt bytes vanish before the failed fetch even runs, so the
+    /// "still present, byte-for-byte" assertion below goes red.
+    #[test]
+    fn d4_unreachable_remote_never_destroys_a_single_corrupt_object() {
+        use crate::enums::config_scope::ConfigScope;
+        use crate::globals::StorageRootScope;
+        use crate::util::config_utils;
+
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        let root = std::env::temp_dir()
+            .join(format!("forklift-recovery-utils-d4-offline-one-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let _scope = StorageRootScope::enter(&root);
+        let forklift = forklift_root();
+
+        let hash = "a".repeat(64);
+        let relative = write_corrupt_loose_object(&forklift, &hash);
+        let before = std::fs::read(forklift.join(&relative)).unwrap();
+
+        // Configure the remote and run heal immediately after dropping the listener — narrows
+        // (does not eliminate) the ephemeral-port-reuse window; the assertions below hold
+        // regardless of *why* the fetch failed.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        config_utils::set_value(config_utils::KEY_REMOTE_URL, &url, ConfigScope::Warehouse).unwrap();
+
+        plant_complete_taint(&forklift, &[relative.to_string_lossy().as_ref()]);
+
+        let error = run_heal()
+            .expect_err("an unrecovered corrupt object must never let the taint clear");
+        assert_durability_taint(&error, &[
+            "corrupt (content does not match its own hash)",
+            relative.to_string_lossy().as_ref(),
+        ]);
+
+        let after = std::fs::read(forklift.join(&relative)).unwrap();
+        assert_eq!(before, after,
+            "the corrupt object's bytes must be byte-for-byte untouched when the fetch that was \
+            supposed to replace them never even connected");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// (D4 negative, two objects) The same claim with two corrupt objects at once — before this
+    /// fix, two-or-more travelled `fetch_missing_objects`'s batch/bundle branch; D4 candidates now
+    /// never enter that function at all, but the shape is still worth pinning independently of
+    /// the single-object case. Both objects must survive an unreachable remote untouched.
+    #[test]
+    fn d4_unreachable_remote_never_destroys_two_corrupt_objects() {
+        use crate::enums::config_scope::ConfigScope;
+        use crate::globals::StorageRootScope;
+        use crate::util::config_utils;
+
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        let root = std::env::temp_dir()
+            .join(format!("forklift-recovery-utils-d4-offline-two-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let _scope = StorageRootScope::enter(&root);
+        let forklift = forklift_root();
+
+        let hash_a = "a".repeat(64);
+        let hash_b = "b".repeat(64);
+        let relative_a = write_corrupt_loose_object(&forklift, &hash_a);
+        let relative_b = write_corrupt_loose_object(&forklift, &hash_b);
+        let before_a = std::fs::read(forklift.join(&relative_a)).unwrap();
+        let before_b = std::fs::read(forklift.join(&relative_b)).unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        config_utils::set_value(config_utils::KEY_REMOTE_URL, &url, ConfigScope::Warehouse).unwrap();
+
+        plant_complete_taint(&forklift, &[
+            relative_a.to_string_lossy().as_ref(),
+            relative_b.to_string_lossy().as_ref(),
+        ]);
+
+        let error = run_heal()
+            .expect_err("neither unrecovered corrupt object may let the taint clear");
+        assert_durability_taint(&error, &[
+            relative_a.to_string_lossy().as_ref(),
+            relative_b.to_string_lossy().as_ref(),
+        ]);
+
+        assert_eq!(before_a, std::fs::read(forklift.join(&relative_a)).unwrap(),
+            "the first corrupt object's bytes must be untouched");
+        assert_eq!(before_b, std::fs::read(forklift.join(&relative_b)).unwrap(),
+            "the second corrupt object's bytes must be untouched");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// (D4 positive, one object) A remote that is actually reachable and has the real bytes: the
+    /// corrupt object must be genuinely recovered — content-verifying afterwards, and its path
+    /// named in the outcome's `resolved` list. Mutation: revert `force_store_object_bytes` back
+    /// to the gated `store_object_bytes` — the presence gate sees the (still corrupt) object as
+    /// already "there" and discards the freshly fetched good bytes, so this test goes red.
+    #[test]
+    fn d4_reachable_remote_recovers_a_single_corrupt_object() {
+        use crate::enums::config_scope::ConfigScope;
+        use crate::globals::StorageRootScope;
+        use crate::util::config_utils;
+
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        let root = std::env::temp_dir()
+            .join(format!("forklift-recovery-utils-d4-online-one-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let _scope = StorageRootScope::enter(&root);
+        let forklift = forklift_root();
+
+        let good_content = b"the genuinely correct content for this object".to_vec();
+        let hash = object_utils::hash_object_bytes(&good_content);
+        let relative = write_corrupt_loose_object(&forklift, &hash);
+
+        let mut objects = HashMap::new();
+        objects.insert(hash.clone(), good_content.clone());
+        let url = start_object_remote(objects);
+        config_utils::set_value(config_utils::KEY_REMOTE_URL, &url, ConfigScope::Warehouse).unwrap();
+
+        plant_complete_taint(&forklift, &[relative.to_string_lossy().as_ref()]);
+
+        let outcome = run_heal()
+            .expect("a corrupt object a reachable remote actually has must be recovered");
+        let relative_display = relative.to_string_lossy().into_owned();
+        assert!(outcome.resolved.iter().any(|r| r == &relative_display),
+            "the recovered object's path must be named in `resolved`: {:?}", outcome.resolved);
+
+        let stored = std::fs::read(forklift.join(&relative)).unwrap();
+        let decompressed = zstd::stream::decode_all(stored.as_slice()).unwrap();
+        assert_eq!(decompressed, good_content, "the stored bytes must now be the real content");
+        object_utils::verify_object_bytes(&hash, &decompressed)
+            .expect("the on-disk bytes must content-verify against the object's own hash");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// (D4 positive, two objects — the partial-bypass witness) Two corrupt objects, both actually
+    /// recoverable. §6 of the design settled on this as the one test in the plan that reddens
+    /// under a *partial* gate bypass — an implementation that removes the delete but bypasses
+    /// only the fetch-side filter (or only the store-side gate) can still make a single corrupt
+    /// object look recovered by accident in some shapes, but not two independently force-stored
+    /// objects landing correctly at once.
+    #[test]
+    fn d4_reachable_remote_recovers_two_corrupt_objects() {
+        use crate::enums::config_scope::ConfigScope;
+        use crate::globals::StorageRootScope;
+        use crate::util::config_utils;
+
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        let root = std::env::temp_dir()
+            .join(format!("forklift-recovery-utils-d4-online-two-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let _scope = StorageRootScope::enter(&root);
+        let forklift = forklift_root();
+
+        let good_a = b"the first genuinely correct object's content".to_vec();
+        let good_b = b"the second genuinely correct object's content".to_vec();
+        let hash_a = object_utils::hash_object_bytes(&good_a);
+        let hash_b = object_utils::hash_object_bytes(&good_b);
+        let relative_a = write_corrupt_loose_object(&forklift, &hash_a);
+        let relative_b = write_corrupt_loose_object(&forklift, &hash_b);
+
+        let mut objects = HashMap::new();
+        objects.insert(hash_a.clone(), good_a.clone());
+        objects.insert(hash_b.clone(), good_b.clone());
+        let url = start_object_remote(objects);
+        config_utils::set_value(config_utils::KEY_REMOTE_URL, &url, ConfigScope::Warehouse).unwrap();
+
+        plant_complete_taint(&forklift, &[
+            relative_a.to_string_lossy().as_ref(),
+            relative_b.to_string_lossy().as_ref(),
+        ]);
+
+        let outcome = run_heal()
+            .expect("both corrupt objects a reachable remote actually has must be recovered");
+        let display_a = relative_a.to_string_lossy().into_owned();
+        let display_b = relative_b.to_string_lossy().into_owned();
+        assert!(outcome.resolved.iter().any(|r| r == &display_a), "{:?}", outcome.resolved);
+        assert!(outcome.resolved.iter().any(|r| r == &display_b), "{:?}", outcome.resolved);
+
+        for (relative, hash, good) in [
+            (&relative_a, &hash_a, &good_a),
+            (&relative_b, &hash_b, &good_b),
+        ] {
+            let stored = std::fs::read(forklift.join(relative)).unwrap();
+            let decompressed = zstd::stream::decode_all(stored.as_slice()).unwrap();
+            assert_eq!(&decompressed, good);
+            object_utils::verify_object_bytes(hash, &decompressed).unwrap();
+        }
 
         std::fs::remove_dir_all(&root).ok();
     }

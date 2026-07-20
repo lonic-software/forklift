@@ -1356,6 +1356,50 @@ async fn fetch_loose_objects(client: &RemoteClient, missing: &[String]) -> Resul
     Ok(missing.len())
 }
 
+/// D4's dedicated corrupt-candidate fetch (DESIGN.html §3.1.1): one loose `GET` per flagged hash,
+/// verified and force-stored via [`object_utils::force_store_object_bytes`] — the corrupt copy is
+/// superseded by an atomic rename, never deleted first.
+///
+/// Deliberately never routes through [`fetch_missing_objects`]: that function's own dedup filter
+/// (`file_utils::does_object_exist`) answers "yes" for a corrupt-but-present dentry, so a flagged
+/// hash would simply never be requested, and — on its batch/bundle path — the post-batch presence
+/// recheck would read the still-corrupt file back as "delivered" even when nothing actually
+/// landed and the store gate discarded it. Sending flagged hashes down this dedicated path instead
+/// of the shared one makes both of those failure modes unreachable by construction rather than
+/// requiring every gate along the shared path to be bypassed correctly.
+///
+/// All `flagged` hashes are assumed corrupt-but-present; every one is fetched and force-stored
+/// regardless of what `does_object_exist` would say about it.
+///
+/// # Returns
+/// * `Ok(usize)`   - How many corrupt objects were fetched and force-stored.
+/// * `Err(String)` - If a transfer, verification, or store failed for any of them.
+pub(crate) async fn fetch_corrupt_replacements(client: &RemoteClient, flagged: &[String]) -> Result<usize, String> {
+    let semaphore = Arc::new(Semaphore::new(CONCURRENT_TRANSFERS));
+    let mut tasks: JoinSet<Result<(), String>> = JoinSet::new();
+
+    for hash in flagged {
+        let client = client.clone();
+        let hash = hash.clone();
+        let semaphore = Arc::clone(&semaphore);
+
+        tasks.spawn(async move {
+            let _permit = semaphore.acquire().await
+                .map_err(|_| "The transfer pool was closed unexpectedly.".to_string())?;
+
+            let bytes = client.fetch_object(&hash).await?;
+
+            object_utils::force_store_object_bytes(&hash, &bytes)?;
+
+            Ok(())
+        });
+    }
+
+    join_all(tasks).await?;
+
+    Ok(flagged.len())
+}
+
 /// Fetch (concurrently) the signature sidecars of the given parcels, where the sidecar
 /// is missing locally. Unsigned parcels (no sidecar on the remote either) are fine.
 ///
