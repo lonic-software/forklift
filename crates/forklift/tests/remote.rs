@@ -4008,6 +4008,107 @@ fn heal_driven_refetch_recovers_every_object_when_more_than_one_is_missing() {
     assert_success(&area.forklift("dev", &["stocktake"]));
 }
 
+// The self-trip bug's *other* direction (see the module-level §3.2 doc comment on
+// `attempt_heal_driven_refetch`): pass 1 (`fetch_history`/`fetch_history_scoped`, run to bring
+// each pallet's real history locally up to date before the closure walk runs) stores every
+// history object it fetches through the identical taint-recheck-gated path pass 2 does. This
+// direction is strictly worse than the multi-object test above — that one over-refuses (loud,
+// exit 21 on a recoverable object); this one silently drops a durable-taint guarantee: an
+// ancestor commit pass 1 fails to restore makes the closure walk's presence-tolerant descent
+// (I3 — a missing parent parcel is skipped, not treated as an error) skip straight past it, so a
+// leaf referenced *only* through that ancestor's tree is misclassified unreferenced and cleared
+// even though it is still genuinely dangling.
+#[test]
+fn heal_pass_one_restoring_a_missing_ancestor_keeps_the_closure_walk_from_falsely_clearing_a_still_referenced_leaf() {
+    // Deterministic fixture, one pallet ("main"), two lifts:
+    //   H1 (parent: none)  — tree has a.txt -> the leaf hash under test.
+    //   H2 (parent: H1)    — a.txt is gone from the tree; c.txt (unrelated) takes its place.
+    // The leaf is referenced *only* through H1's tree, never H2's — so the closure walk can only
+    // find it by walking H2's ancestry back into H1.
+    //
+    // Both H1 and H2 (the parcel/commit objects themselves, not their trees or blobs) are then
+    // deleted locally. Deleting only H1 is not enough to exercise pass 1 at all:
+    // `fetch_history`'s own "already known complete" bound (`is_known_complete`) checks the
+    // *current* pallet head (H2) first, and since H2 is dev's own exact local ref, a present H2
+    // is judged complete on the spot — its own parcel is never even loaded to discover H1 as a
+    // parent, so the walk never reaches H1 to notice it is missing. Deleting H2 too makes the
+    // walk's very first frontier node fail its presence check, forcing it to actually fetch H2,
+    // load its parcel, and cascade into checking (and, once the fix's guard is armed, restoring)
+    // H1 — the same call shape `fetch_missing_objects` and `import_bundle_bytes` use elsewhere,
+    // just reached through history discovery instead of a direct hash target. Neither H1 nor H2
+    // was ever locally re-fetched before this `heal` run — this is genuinely pass 1's own
+    // restoration, not something already sitting on disk.
+    //
+    // The leaf itself is deleted from *both* sides — locally and from the server's own object
+    // store (`object_store_path(&area, "server-root", ...)`, the same direct-server-deletion
+    // idiom `heal_driven_refetch_clears_only_the_hash_the_remote_actually_has` above uses) — so
+    // it is genuinely, permanently unrecoverable regardless of pass 1 or pass 2. That isolates
+    // exactly the thing this test pins: not whether the leaf's *bytes* come back (they never can
+    // here), but whether the closure walk correctly reports it still referenced (dangling) rather
+    // than wrongly clearing it because an ancestor it needed to walk through never made it back.
+    //
+    // Mutation: revert the `SelfTripExemptionGuard` early-return in `taint_recheck` → H2's own
+    // store self-trips against the leaf's still-standing taint; `fetch_history`'s wave-fetch `?`
+    // aborts before `load_parcel(H2)` is ever called, so H1 is never even attempted → the closure
+    // walk hits H2 (present, restored despite the `Err` — the bytes land before the recheck
+    // refuses), descends into H1 (absent, I3-tolerated: skipped, not erred), never finds the
+    // leaf's reference → the leaf is wrongly reported resolved and the taint clears → red.
+    let area = TestArea::new("heal-pass1-ancestry");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/a.txt", "the leaf: referenced only by the older ancestor's tree\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base with the leaf"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    let h1 = pallet_head(&area, "dev", "main");
+    let leaf = path_object_hash(&area, "dev", &h1, "a.txt");
+
+    std::fs::remove_file(area.path("dev/a.txt")).unwrap();
+    area.write_file("dev/c.txt", "unrelated newer content\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "drop the leaf, add something else"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    let h2 = pallet_head(&area, "dev", "main");
+    assert_ne!(h1, h2, "the second lift must have actually moved the head");
+
+    // The ancestry object under test — present on the remote (dev pushed it via the first lift),
+    // genuinely absent locally going into the run.
+    std::fs::remove_file(object_store_path(&area, "dev", &h1)).unwrap();
+    // The current head must go missing too — see the doc comment above on why, or pass 1 never
+    // even looks at H1.
+    std::fs::remove_file(object_store_path(&area, "dev", &h2)).unwrap();
+
+    // The leaf: unrecoverable from either side, on purpose (see the doc comment above).
+    std::fs::remove_file(object_store_path(&area, "dev", &leaf)).unwrap();
+    std::fs::remove_file(object_store_path(&area, "server-root", &leaf)).unwrap();
+
+    let relative_leaf = loose_object_relative_path(&leaf);
+    // Planted on disk via the durable-taint helper, not through the in-process gate — same
+    // discipline as the other tests in this file.
+    plant_taint(&area, "dev", &[&relative_leaf]);
+
+    let status = area.forklift("dev", &["--json", "heal"]);
+    assert_eq!(status.status.code(), Some(21),
+        "the leaf is genuinely unrecoverable and still referenced through H1's restored \
+        ancestry — heal must report it dangling, never clear it: {}", stdout(&status));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&status)).unwrap();
+    assert_eq!(value["error"]["code"], "durability_taint");
+    assert!(value["error"]["message"].as_str().unwrap().contains(&leaf),
+        "the still-dangling leaf must be named: {}", value);
+
+    // Not falsely cleared: the leaf's own taint is still standing, exactly as recorded.
+    assert_eq!(recorded_taint_paths(&area, "dev"), vec![relative_leaf],
+        "the leaf's taint must still stand — a false clear would leave this empty");
+
+    // The ancestor pass 1 needed to restore for the closure walk to see the leaf's reference at
+    // all: confirm it actually landed, proving this is pass 1's own doing, not luck.
+    assert!(object_present(&area, "dev", &h1), "pass 1 must have restored the missing ancestor");
+    assert!(object_present(&area, "dev", &h2), "pass 1 must have restored the current head too");
+}
+
 #[test]
 fn heal_driven_refetch_treats_a_locally_repacked_object_as_recovered() {
     // §3.2 D2: the post-fetch presence check must accept "present in a pack" as recovered for a

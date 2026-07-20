@@ -3483,6 +3483,76 @@ mod tests {
     }
 
     #[test]
+    fn self_trip_exemption_guard_is_visible_from_a_second_os_thread_it_never_armed() {
+        // Pins the design's most-defended choice: `SELF_TRIP_EXEMPTION_COUNT` must be a
+        // process-global `AtomicUsize`, not a `thread_local!`. Production needs this because a
+        // refetch's stores do not all run on the thread that armed the guard — `JoinSet` tasks and
+        // wherever the async runtime happens to poll a future both land on worker threads the
+        // arming call never touched (see `SelfTripExemptionGuard`'s own doc comment). Test 2 above
+        // arms, writes, and drops all on one thread, so it passes identically under a
+        // `thread_local!` implementation; it cannot tell the two designs apart. This test can:
+        // it arms the guard on the main thread, then does the write from a second, explicitly
+        // constructed `std::thread::spawn` thread — the same call shape a `JoinSet` task or a
+        // polled future uses in production, just driven by construction instead of by scheduler
+        // luck. Deliberately not a yield/retry loop waiting for thread ids to diverge: that
+        // mechanism can *hang* rather than merely flake, under a `current_thread`-flavor test
+        // runtime or a `worker_threads = 1` CI pin (tokio's LIFO fast-path can keep a
+        // freshly-spawned task on the very worker that spawned it, with no bound on the wait).
+        //
+        // Mutation: this is the test that reddens if `SELF_TRIP_EXEMPTION_COUNT` is changed from
+        // an `AtomicUsize` to a `thread_local!` — the child thread's runtime would then see an
+        // unarmed (zero) counter and the write below would wrongly refuse.
+        let _serial = lock_taint_activation();
+        taint_utils::activate();
+
+        let temp = std::env::temp_dir().join(format!("forklift-taint-exemption-cross-thread-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+        let forklift = forklift_root();
+
+        let taint_dir = forklift.join("taint");
+        std::fs::create_dir_all(&taint_dir).unwrap();
+        std::fs::write(taint_dir.join("taint-99999-0"), b"objects/zz/preexisting\nEND\n").unwrap();
+
+        let target = forklift.join("objects").join("hh").join("fresh-object");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+
+        // Armed on the main thread. Held across the spawn/join below so it is still armed for
+        // the entire lifetime of the child thread's own write.
+        let _guard = SelfTripExemptionGuard::new();
+
+        let child_temp = temp.clone();
+        let child_target = target.clone();
+        let child_result = std::thread::spawn(move || {
+            // `StorageRootScope` is thread-local by design (unlike the exemption counter this
+            // test pins) — the child thread must enter its own scope onto the same root so
+            // `taint_recheck`'s `resolve_root_for` resolves the same taint directory the main
+            // thread just populated, or the write would trivially succeed by skipping the taint
+            // check entirely rather than by being exempted from it.
+            let _child_scope = StorageRootScope::enter(&child_temp);
+
+            // `new_current_thread`, not the default multithreaded builder: this reproduces the
+            // exact call shape production uses (a sync store call driven from inside a polled
+            // async task on a worker thread), on a runtime this test constructs and controls
+            // rather than one whose scheduling could vary.
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async { write_file_atomically(&child_target, b"content") })
+        })
+        .join()
+        .expect("the child thread must not panic");
+
+        child_result.expect(
+            "a write from a different OS thread must still be exempted while the guard \
+             armed on the main thread is held — the exemption counter must be process-global");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
     fn does_object_exist_refuses_a_loose_check_while_tainted_but_still_answers_pack_hits() {
         // The existence gate's documented ordering: a pack-registry hit answers with no gate
         // check at all (the registry is process-local memory that a crash also clears); only the
