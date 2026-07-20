@@ -1,6 +1,8 @@
 use serde::Serialize;
 use forklift_core::util::cherry_pick_utils::{self, CherryPickState};
-use forklift_core::util::{merge_utils, object_utils, office_utils, pallet_utils, stack_utils};
+use forklift_core::util::{
+    load_guard_utils, merge_utils, object_utils, office_utils, pallet_utils, stack_utils,
+};
 use crate::commands::consolidate;
 use crate::output::{self, CommandOutput};
 
@@ -22,6 +24,14 @@ use crate::output::{self, CommandOutput};
 /// * `Err(String)` - If there is nothing to pick, the warehouse is dirty, or an operation
 ///                   failed.
 pub async fn handle_command(revision: &str, message: Option<String>) -> Result<(), String> {
+    // The cheapest possible pre-check runs first, exactly like `stack_utils::stack_parcel`'s and
+    // `park::park_changes`'s identical guard: a pick applies a merge into the working inventory
+    // below and durably commits the result as a new parcel — and, before that, records its own
+    // in-progress state (`.forklift/cherry-pick`) — so it must refuse before any of that happens
+    // while a load that started but never finished cleanly is still recorded
+    // (`load_guard_utils`).
+    load_guard_utils::check_no_incomplete_load()?;
+
     // A pick applies a diff (the merge machinery) into the working directory, which could
     // touch out-of-scope paths a scoped bay never materialized, so it refuses here.
     crate::commands::scope::refuse_in_scoped_bay(

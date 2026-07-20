@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use crate::enums::dir_entry_type::DirEntryType;
 use crate::globals::bay_root;
 use crate::util::scope_utils::{self, MaterializationScope, ScopeClass};
@@ -40,14 +40,20 @@ fn get_consolidation_state_path() -> PathBuf {
     bay_root().join(FILE_NAME_CONSOLIDATION)
 }
 
-/// Read the consolidation state, if a consolidation is in progress.
+/// Read the consolidation state from a specific bay-local state dir, independent of the active
+/// bay. For a caller enumerating every bay's state — see `bay_utils::all_bay_state_dirs` — never
+/// just the active one; [`read_consolidation_state`] is this, scoped to the active bay.
+///
+/// # Arguments
+/// * `dir` - The bay-local state dir to read: the main tree's own `forklift_root()`, or a named
+///           bay's `bay_utils::bay_state_dir`.
 ///
 /// # Returns
 /// * `Ok(Some(ConsolidationState))` - The state of the consolidation in progress.
 /// * `Ok(None)`                     - If no consolidation is in progress.
 /// * `Err(String)`                  - If the state file exists but is malformed.
-pub fn read_consolidation_state() -> Result<Option<ConsolidationState>, String> {
-    let path = get_consolidation_state_path();
+pub fn read_consolidation_state_in(dir: &Path) -> Result<Option<ConsolidationState>, String> {
+    let path = dir.join(FILE_NAME_CONSOLIDATION);
 
     if !path.exists() {
         return Ok(None);
@@ -71,6 +77,16 @@ pub fn read_consolidation_state() -> Result<Option<ConsolidationState>, String> 
     }
 
     Ok(Some(ConsolidationState { their_head, their_pallet }))
+}
+
+/// Read the consolidation state of the active bay, if a consolidation is in progress.
+///
+/// # Returns
+/// * `Ok(Some(ConsolidationState))` - The state of the consolidation in progress.
+/// * `Ok(None)`                     - If no consolidation is in progress.
+/// * `Err(String)`                  - If the state file exists but is malformed.
+pub fn read_consolidation_state() -> Result<Option<ConsolidationState>, String> {
+    read_consolidation_state_in(&bay_root())
 }
 
 /// Write the consolidation state (atomically).

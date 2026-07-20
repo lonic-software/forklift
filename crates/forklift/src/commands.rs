@@ -29,6 +29,7 @@ pub mod version;
 pub mod help;
 pub mod export_git;
 pub mod haul;
+pub mod heal;
 pub mod history;
 pub mod import_git;
 pub mod prepare;

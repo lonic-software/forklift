@@ -11,6 +11,8 @@
 
 use std::sync::Mutex;
 use forklift_core::util::file_utils::{write_file_atomically, BulkStoreSession};
+use forklift_core::globals::StorageRootScope;
+use forklift_core::util::taint_utils;
 
 /// Only this file's tests open a `BulkStoreSession` (exactly one may be active at a time), and
 /// this binary still runs its tests on multiple threads — so they still need to take turns.
@@ -153,4 +155,62 @@ fn a_failed_finish_removes_every_staged_temp_and_publishes_nothing() {
     session.finish().unwrap();
 
     std::fs::remove_dir_all(&temp).ok();
+}
+
+/// `BulkStoreSession::finish` (the second caller of the shared `run_write_barrier`, alongside
+/// `WriteBatch::finish` — see `file_utils`'s own unit tests for that half) must taint its batch's
+/// final paths on a trailing directory-sync failure exactly the same way. `file_utils`'s
+/// test-only fault-injection rig (`DirSyncFaultGuard`) is `#[cfg(test)]`-private to that module's
+/// own unit-test build, unreachable from here — an integration-test binary links the crate as an
+/// ordinary external dependent, compiled *without* `--cfg test` for the library itself — so this
+/// uses a *real* fault instead: a directory chmod'd to `0o300` (write+execute, no read) still
+/// accepts a `rename` into it (needs only write+execute) but fails the following
+/// `File::open(dir)` used to fsync it (needs read) — this was verified against this exact
+/// standard-library call shape before relying on it here. Runs only as a non-root user (root
+/// bypasses Unix permission checks entirely, which would make the sabotage silently do nothing).
+#[cfg(unix)]
+#[test]
+fn a_trailing_directory_sync_failure_through_bulk_store_session_records_a_taint() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipping: running as root, which bypasses the permission-based fault this test relies on");
+        return;
+    }
+
+    let _guard = lock_session();
+    let root = std::env::temp_dir().join(format!("forklift-bulk-taint-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+
+    taint_utils::activate();
+    let _scope = StorageRootScope::enter(&root);
+    let forklift = forklift_core::globals::forklift_root();
+
+    let blocked_dir = forklift.join("objects").join("bb");
+    std::fs::create_dir_all(&blocked_dir).unwrap();
+    let target = blocked_dir.join("blocked-object");
+
+    let session = BulkStoreSession::open().unwrap();
+    write_file_atomically(&target, b"content").unwrap();
+    assert!(!target.exists(), "nothing may be visible before finish");
+
+    // Block read access on the directory *after* staging — the rename inside `finish` still
+    // needs only write+execute (present), but the trailing `fsync_dir_data` open needs read
+    // (now absent).
+    std::fs::set_permissions(&blocked_dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+
+    let result = session.finish();
+
+    // Restore permissions immediately, before any assertion can panic and skip cleanup.
+    std::fs::set_permissions(&blocked_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(result.is_err(), "a blocked directory must fail the trailing sync");
+    assert!(target.exists(), "the rename itself must have landed before the directory sync failed");
+
+    let state = taint_utils::read_taints(&forklift).unwrap();
+    assert!(state.recorded.contains(&std::path::PathBuf::from("objects/bb/blocked-object")),
+        "the batch's final path must be recorded as tainted, got {:?}", state.recorded);
+
+    std::fs::remove_dir_all(&root).ok();
 }

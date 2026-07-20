@@ -394,3 +394,13 @@ Example session:
   `--json` / `mcp`. Progress chatter is suppressed; the result is a single document.
 * Human output is untouched by all of this — the same commands print prose without
   `--json`, byte-for-byte as before.
+* A mutating command that triggers background auto-maintenance (git's `gc --auto`
+  equivalent — see `maintenance.auto`) can leave a durability taint standing if that
+  maintenance's own directory sync fails, even though the command's own work already
+  succeeded (`ok: true`, exit 0). That case is surfaced on **stderr** — never stdout, so the
+  one-document invariant above still holds — as a single-line JSON object:
+  `{ "forklift_json": "2", "warning": "durability_taint", "message": "…", "next_step":
+  "Run \"forklift heal\" …" }`. A script or agent that wants to catch this should also read
+  stderr, not just check the exit code; the taint is enforced regardless on the very next
+  command's entry-heal chokepoint (`durability_taint`, exit 21) until `forklift heal`
+  resolves it.

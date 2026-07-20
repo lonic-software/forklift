@@ -3,7 +3,8 @@ use forklift_core::error::CoreError;
 use forklift_core::enums::config_scope::ConfigScope;
 use forklift_core::util::remote_utils::{LiftResult, RemoteClient};
 use forklift_core::util::{
-    config_utils, file_utils, merge_utils, object_utils, pallet_utils, remote_utils, scope_utils,
+    config_utils, file_utils, merge_utils, object_utils, pallet_utils,
+    remote_utils, scope_utils,
 };
 use crate::commands::consolidate::{self, MergeStatus};
 use crate::output::{self, CommandOutput};
@@ -159,6 +160,10 @@ async fn try_auto_merge(client: &RemoteClient,
         return Ok(false);
     }
 
+    // Unlike `consolidate`, this path has no fast-forward branch to exempt — reaching here
+    // already means a genuine, unresolved divergence (checked above), so every path past this
+    // point is the same real merge, and the incomplete-load guard lives inside
+    // `merge_head_into_current` itself.
     match consolidate::merge_head_into_current(pallet, head, remote_head, "remote", false).await? {
         MergeStatus::Merged(_) => Ok(true),
         MergeStatus::Conflicts(_) => Ok(false),

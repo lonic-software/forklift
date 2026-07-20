@@ -706,6 +706,67 @@ fn optimistic_lift_auto_merges_a_disjoint_divergence_but_stops_on_overlap() {
     assert_eq!(area.read_file("b/shared.txt"), "from b\n"); // untouched — no half-merge
 }
 
+/// The optimistic auto-merge (`lift::try_auto_merge`) calls the same shared
+/// `merge_head_into_current` `consolidate` and `cherry-pick` do: it writes real merge output
+/// into the working inventory and only afterwards records consolidation state
+/// (`.forklift/consolidation`), before ever reaching `stack_utils::stack_parcel`'s own late
+/// guard. The up-front guard added at the call site in `lift::try_auto_merge` must refuse
+/// before any of that runs: reverting it makes the state-file assertion below go red, exactly
+/// like the `consolidate`/`cherry-pick`/`haul merge` cases in `cli.rs`.
+#[test]
+fn optimistic_lift_refuses_on_an_incomplete_load_before_writing_consolidation_state() {
+    let area = TestArea::new("optimistic-incomplete-load");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "a", &server.url);
+    area.write_file("a/shared.txt", "base\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "initial"]));
+    assert_success(&area.forklift("a", &["office", "enroll"]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    assert_success(&area.forklift(".", &["franchise", &server.url, "b"]));
+
+    // A publishes a change to a file only it touches.
+    area.write_file("a/from_a.txt", "a\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "a's file"]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    // B, still at the base, stacks a disjoint change of its own — the remote has diverged, and
+    // the change is disjoint, so an ordinary lift would auto-merge (optimistic lift, §7.7).
+    area.write_file("b/from_b.txt", "b\n");
+    assert_success(&area.forklift("b", &["load", "."]));
+    assert_success(&area.forklift("b", &["stack", "b's file"]));
+
+    // Simulate a load killed outright partway through its walk in B's warehouse (see
+    // `load_guard_utils::marker_path_under`'s doc comment for why this is a faithful stand-in
+    // for a real interrupted load, driven through a spawned `forklift` subprocess).
+    let marker_path = forklift_core::util::load_guard_utils::marker_path_under(&area.path("b"));
+    std::fs::write(&marker_path, "./\n").unwrap();
+
+    let lifted = area.forklift("b", &["--json", "lift"]);
+    assert!(!lifted.status.success(), "the lift must refuse, not auto-merge over an incomplete load");
+    assert_eq!(lifted.status.code(), Some(20));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&lifted)).unwrap();
+    assert_eq!(value["error"]["code"], "incomplete_load");
+
+    // The auto-merge must not have gotten far enough to write its own in-progress state, or to
+    // apply anything to the working directory.
+    assert!(
+        !area.path("b/.forklift/consolidation").exists(),
+        "the optimistic auto-merge's consolidation state must not be written while an \
+        incomplete load is outstanding"
+    );
+    assert!(!area.path("b/from_a.txt").exists(), "the auto-merge must not have applied anything");
+
+    // Healing the load lets the lift auto-merge normally.
+    std::fs::remove_file(&marker_path).unwrap();
+    let healed = area.forklift("b", &["lift"]);
+    assert_success(&healed);
+    assert!(stdout(&healed).contains("auto-merged"), "{}", stdout(&healed));
+}
+
 #[test]
 fn manifest_syncs_across_remotes_and_merges_when_diverged() {
     let area = TestArea::new("manifest-remote");
@@ -3725,4 +3786,519 @@ fn the_subtree_endpoint_refuses_an_oversized_closure_and_the_client_falls_back()
     let result = runtime.block_on(client.fetch_subtree(&head, "big"));
     assert!(result.is_ok(), "an over-cap subtree must not be a client error: {:?}", result.err());
     assert!(result.unwrap().is_none(), "an over-cap subtree signals fallback, exactly like a 404");
+}
+
+// ---------------------------------------------------------------------------------------------
+// §3.2 — heal-driven refetch: `forklift heal` fetches from a configured remote itself, inside
+// the locked verb, to close the "forklift lower" wedge (a vanished-still-referenced object's
+// only named remedy was blocked by the very chokepoint the refusal fired from). See
+// `recovery_utils`'s module doc comment (the "Heal-driven refetch" section) for the design; the
+// two-pass mechanism (`attempt_heal_driven_refetch`) is documented on that function directly,
+// including the empirical finding that a bare `fetch_history_scoped` reuse does not actually
+// recover the wedge's own motivating shape.
+// ---------------------------------------------------------------------------------------------
+
+/// The path of the taint directory in a warehouse under the area — the remote-harness
+/// counterpart of `cli.rs`'s `taint_dir_path` (that file drives a `TestWarehouse`, this one a
+/// `TestArea` directory; the on-disk layout `taint_dir_path_under` resolves is identical either
+/// way).
+fn taint_dir_path(area: &TestArea, dir: &str) -> PathBuf {
+    forklift_core::util::taint_utils::taint_dir_path_under(&area.path(dir))
+}
+
+/// Hand-plant a complete (non-torn) taint file recording `paths` — a crash-before-heal
+/// simulation, mirroring `cli.rs`'s helper of the same name.
+fn plant_taint(area: &TestArea, dir: &str, paths: &[&str]) {
+    let dir_path = taint_dir_path(area, dir);
+    std::fs::create_dir_all(&dir_path).unwrap();
+    let mut content = String::new();
+    for path in paths {
+        content.push_str(path);
+        content.push('\n');
+    }
+    content.push_str("END\n");
+    std::fs::write(dir_path.join("taint-1-0"), content).unwrap();
+}
+
+/// Every regular taint file's recorded lines, unioned (dropping the `END` terminator) — used to
+/// inspect exactly what a recovery attempt left standing.
+fn recorded_taint_paths(area: &TestArea, dir: &str) -> Vec<String> {
+    let dir_path = taint_dir_path(area, dir);
+    if !dir_path.exists() {
+        return Vec::new();
+    }
+
+    let mut paths = Vec::new();
+    for entry in std::fs::read_dir(&dir_path).unwrap() {
+        let entry = entry.unwrap();
+        if !entry.path().is_file() {
+            continue;
+        }
+        let content = std::fs::read_to_string(entry.path()).unwrap();
+        paths.extend(content.lines().filter(|line| *line != "END").map(|line| line.to_string()));
+    }
+    paths
+}
+
+/// The root-relative loose-object path (`objects/<2 hex>/<rest>`) a hash lives at.
+fn loose_object_relative_path(hash: &str) -> String {
+    format!("objects/{}/{}", &hash[..2], &hash[2..])
+}
+
+#[test]
+fn heal_driven_refetch_recovers_a_dangling_object_the_remote_has() {
+    // The wedge itself (memo §1.1): before this slice, this exact scenario refused naming
+    // "forklift lower" as the remedy — but `lower` hits the same taint and refuses before it
+    // ever reaches its own fetch. `heal` must now drive the fetch itself and clear.
+    //
+    // This fixture is deliberately the "already fully published, nothing has changed since"
+    // shape: the blob vanishes from the *current* pallet's own, already-lifted head. A first
+    // draft of this feature that only reused `fetch_history_scoped` was found — by reproducing
+    // exactly this scenario by hand — to NOT recover this shape at all: that walk never
+    // re-descends into a parcel's tree once the parcel is judged already complete (reachable
+    // from a local ref), which the current pallet's own unchanged head always is. See
+    // `attempt_heal_driven_refetch`'s doc comment for the fix (a second, targeted pass).
+    //
+    // Mutation: remove the heal-driven refetch (make `resolve_the_rest` skip
+    // `attempt_heal_driven_refetch`, always treating the remote as unconfigured) → `heal`
+    // refuses on the recoverable object (exit 21) → red.
+    let area = TestArea::new("heal-refetch-wedge");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/a.txt", "hello, this is durable content\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base parcel"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    let head = pallet_head(&area, "dev", "main");
+    let blob = path_object_hash(&area, "dev", &head, "a.txt");
+    let relative = loose_object_relative_path(&blob);
+
+    std::fs::remove_file(object_store_path(&area, "dev", &blob)).unwrap();
+    plant_taint(&area, "dev", &[&relative]);
+
+    let status = area.forklift("dev", &["--json", "heal"]);
+    assert_success(&status);
+    let value: serde_json::Value = serde_json::from_str(&stdout(&status)).unwrap();
+    assert_eq!(value["data"]["was_tainted"], true);
+    assert!(
+        value["data"]["resolved"].as_array().unwrap().iter().any(|entry| entry == &blob),
+        "the recovered hash must be reported resolved: {}", value
+    );
+
+    assert!(recorded_taint_paths(&area, "dev").is_empty(), "the taint must be fully cleared");
+    assert!(object_present(&area, "dev", &blob), "the blob must actually be back on disk");
+
+    // The warehouse is fully usable again, including the write path the taint exists to protect.
+    assert_success(&area.forklift("dev", &["stocktake"]));
+}
+
+#[test]
+fn heal_driven_refetch_clears_only_the_hash_the_remote_actually_has() {
+    // §3.2 D3: a remainder over two hashes, the remote genuinely has only one — `heal` must
+    // clear exactly the recoverable one and leave the other exactly as dangling, never
+    // optimistically clearing the whole taint just because *a* fetch succeeded.
+    //
+    // Mutation: clear the whole remainder once any fetch attempt returns without a hard error,
+    // instead of re-verifying each hash independently via `raw_object_present` → the still-
+    // missing hash is silently dropped from the taint → red.
+    let area = TestArea::new("heal-refetch-partial");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/a.txt", "recoverable content\n");
+    area.write_file("dev/b.txt", "unrecoverable content\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "two files"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    let head = pallet_head(&area, "dev", "main");
+    let blob_a = path_object_hash(&area, "dev", &head, "a.txt");
+    let blob_b = path_object_hash(&area, "dev", &head, "b.txt");
+
+    // The remote's own copy of b is gone too — genuinely unrecoverable, unlike a.
+    std::fs::remove_file(object_store_path(&area, "server-root", &blob_b)).unwrap();
+
+    std::fs::remove_file(object_store_path(&area, "dev", &blob_a)).unwrap();
+    std::fs::remove_file(object_store_path(&area, "dev", &blob_b)).unwrap();
+
+    let relative_a = loose_object_relative_path(&blob_a);
+    let relative_b = loose_object_relative_path(&blob_b);
+    plant_taint(&area, "dev", &[&relative_a, &relative_b]);
+
+    let status = area.forklift("dev", &["--json", "heal"]);
+    assert_eq!(status.status.code(), Some(21));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&status)).unwrap();
+    assert_eq!(value["error"]["code"], "durability_taint");
+    assert!(
+        value["error"]["message"].as_str().unwrap().contains(&blob_b),
+        "the still-dangling hash must be named: {}", value
+    );
+
+    // Exactly b's path remains recorded; a's is gone — no more, no less.
+    assert_eq!(recorded_taint_paths(&area, "dev"), vec![relative_b.clone()],
+        "the remainder must be exactly the one unrecovered hash");
+
+    assert!(object_present(&area, "dev", &blob_a), "the recoverable object must actually be back");
+    assert!(!object_present(&area, "dev", &blob_b), "the genuinely-unrecoverable object stays gone");
+}
+
+// Heal's own refetch stores go through the ordinary write path, which self-trips
+// `taint_recheck`'s standing-taint success re-check, because the taint being healed stands for
+// the entire run. With exactly one missing object the first (and only) store's `Err` is masked
+// by `resolve_the_rest`'s unconditional `raw_object_present` recheck (D3), so
+// `heal_driven_refetch_clears_only_the_hash_the_remote_actually_has` above never exercises the
+// N≥2 path. This test does — it pins `SelfTripExemptionGuard` (a process-global RAII counter
+// consulted only in `taint_recheck`'s success arm), armed for the whole of
+// `attempt_heal_driven_refetch`.
+#[test]
+fn heal_driven_refetch_recovers_every_object_when_more_than_one_is_missing() {
+    // The batch path's `import_bundle_bytes` stores its records one at a time, each with its own
+    // `?` — the first object's store self-trips `taint_recheck` against the still-standing taint
+    // and the `Err` aborts the whole call before the second object is even attempted.
+    // `resolve_the_rest`'s recovery verdict is decided by a post-fetch `raw_object_present`
+    // recheck regardless of the fetch call's own `Ok`/`Err`, so whichever object *did* land is
+    // still correctly reported recovered — the bug is invisible with only one missing object,
+    // which is exactly the shape of the test above. With two, only one lands.
+    //
+    // Mutation: revert `SelfTripExemptionGuard` (or arm it somewhere that does not span both
+    // `attempt_heal_driven_refetch` passes and every store inside them) → one of the two objects
+    // self-trips its own success re-check and is reported still dangling → red.
+    let area = TestArea::new("heal-refetch-multi");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/a.txt", "first recoverable content\n");
+    area.write_file("dev/b.txt", "second recoverable content\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "two files"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    let head = pallet_head(&area, "dev", "main");
+    let blob_a = path_object_hash(&area, "dev", &head, "a.txt");
+    let blob_b = path_object_hash(&area, "dev", &head, "b.txt");
+
+    // Both blobs are genuinely gone locally — the remote (which received both via `lift`) is
+    // the only thing that can restore them.
+    std::fs::remove_file(object_store_path(&area, "dev", &blob_a)).unwrap();
+    std::fs::remove_file(object_store_path(&area, "dev", &blob_b)).unwrap();
+
+    let relative_a = loose_object_relative_path(&blob_a);
+    let relative_b = loose_object_relative_path(&blob_b);
+    // Planted on disk via the durable-taint helper, not through the in-process gate —
+    // `gate_check` is deliberately left unexempted by the fix, so this test must not accidentally
+    // depend on gate behavior to reproduce the bug.
+    plant_taint(&area, "dev", &[&relative_a, &relative_b]);
+
+    let status = area.forklift("dev", &["--json", "heal"]);
+    assert_success(&status);
+    let value: serde_json::Value = serde_json::from_str(&stdout(&status)).unwrap();
+    let resolved = value["data"]["resolved"].as_array().unwrap();
+    assert!(resolved.iter().any(|entry| entry == &blob_a),
+        "the first recoverable hash must be reported resolved: {}", value);
+    assert!(resolved.iter().any(|entry| entry == &blob_b),
+        "the second recoverable hash must be reported resolved too, not just the first: {}", value);
+
+    assert!(recorded_taint_paths(&area, "dev").is_empty(), "the taint must be fully cleared");
+    assert!(object_present(&area, "dev", &blob_a), "the first object must actually be back on disk");
+    assert!(object_present(&area, "dev", &blob_b), "the second object must actually be back on disk");
+
+    // The warehouse is fully usable again, including the write path the taint exists to protect.
+    assert_success(&area.forklift("dev", &["stocktake"]));
+}
+
+// The self-trip bug's *other* direction (see the module-level §3.2 doc comment on
+// `attempt_heal_driven_refetch`): pass 1 (`fetch_history`/`fetch_history_scoped`, run to bring
+// each pallet's real history locally up to date before the closure walk runs) stores every
+// history object it fetches through the identical taint-recheck-gated path pass 2 does. This
+// direction is strictly worse than the multi-object test above — that one over-refuses (loud,
+// exit 21 on a recoverable object); this one silently drops a durable-taint guarantee: an
+// ancestor commit pass 1 fails to restore makes the closure walk's presence-tolerant descent
+// (I3 — a missing parent parcel is skipped, not treated as an error) skip straight past it, so a
+// leaf referenced *only* through that ancestor's tree is misclassified unreferenced and cleared
+// even though it is still genuinely dangling.
+#[test]
+fn heal_pass_one_restoring_a_missing_ancestor_keeps_the_closure_walk_from_falsely_clearing_a_still_referenced_leaf() {
+    // Deterministic fixture, one pallet ("main"), two lifts:
+    //   H1 (parent: none)  — tree has a.txt -> the leaf hash under test.
+    //   H2 (parent: H1)    — a.txt is gone from the tree; c.txt (unrelated) takes its place.
+    // The leaf is referenced *only* through H1's tree, never H2's — so the closure walk can only
+    // find it by walking H2's ancestry back into H1.
+    //
+    // Both H1 and H2 (the parcel/commit objects themselves, not their trees or blobs) are then
+    // deleted locally. Deleting only H1 is not enough to exercise pass 1 at all:
+    // `fetch_history`'s own "already known complete" bound (`is_known_complete`) checks the
+    // *current* pallet head (H2) first, and since H2 is dev's own exact local ref, a present H2
+    // is judged complete on the spot — its own parcel is never even loaded to discover H1 as a
+    // parent, so the walk never reaches H1 to notice it is missing. Deleting H2 too makes the
+    // walk's very first frontier node fail its presence check, forcing it to actually fetch H2,
+    // load its parcel, and cascade into checking (and, once the fix's guard is armed, restoring)
+    // H1 — the same call shape `fetch_missing_objects` and `import_bundle_bytes` use elsewhere,
+    // just reached through history discovery instead of a direct hash target. Neither H1 nor H2
+    // was ever locally re-fetched before this `heal` run — this is genuinely pass 1's own
+    // restoration, not something already sitting on disk.
+    //
+    // The leaf itself is deleted from *both* sides — locally and from the server's own object
+    // store (`object_store_path(&area, "server-root", ...)`, the same direct-server-deletion
+    // idiom `heal_driven_refetch_clears_only_the_hash_the_remote_actually_has` above uses) — so
+    // it is genuinely, permanently unrecoverable regardless of pass 1 or pass 2. That isolates
+    // exactly the thing this test pins: not whether the leaf's *bytes* come back (they never can
+    // here), but whether the closure walk correctly reports it still referenced (dangling) rather
+    // than wrongly clearing it because an ancestor it needed to walk through never made it back.
+    //
+    // Mutation: revert the `SelfTripExemptionGuard` early-return in `taint_recheck` → H2's own
+    // store self-trips against the leaf's still-standing taint; `fetch_history`'s wave-fetch `?`
+    // aborts before `load_parcel(H2)` is ever called, so H1 is never even attempted → the closure
+    // walk hits H2 (present, restored despite the `Err` — the bytes land before the recheck
+    // refuses), descends into H1 (absent, I3-tolerated: skipped, not erred), never finds the
+    // leaf's reference → the leaf is wrongly reported resolved and the taint clears → red.
+    let area = TestArea::new("heal-pass1-ancestry");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/a.txt", "the leaf: referenced only by the older ancestor's tree\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base with the leaf"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    let h1 = pallet_head(&area, "dev", "main");
+    let leaf = path_object_hash(&area, "dev", &h1, "a.txt");
+
+    std::fs::remove_file(area.path("dev/a.txt")).unwrap();
+    area.write_file("dev/c.txt", "unrelated newer content\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "drop the leaf, add something else"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    let h2 = pallet_head(&area, "dev", "main");
+    assert_ne!(h1, h2, "the second lift must have actually moved the head");
+
+    // The ancestry object under test — present on the remote (dev pushed it via the first lift),
+    // genuinely absent locally going into the run.
+    std::fs::remove_file(object_store_path(&area, "dev", &h1)).unwrap();
+    // The current head must go missing too — see the doc comment above on why, or pass 1 never
+    // even looks at H1.
+    std::fs::remove_file(object_store_path(&area, "dev", &h2)).unwrap();
+
+    // The leaf: unrecoverable from either side, on purpose (see the doc comment above).
+    std::fs::remove_file(object_store_path(&area, "dev", &leaf)).unwrap();
+    std::fs::remove_file(object_store_path(&area, "server-root", &leaf)).unwrap();
+
+    let relative_leaf = loose_object_relative_path(&leaf);
+    // Planted on disk via the durable-taint helper, not through the in-process gate — same
+    // discipline as the other tests in this file.
+    plant_taint(&area, "dev", &[&relative_leaf]);
+
+    let status = area.forklift("dev", &["--json", "heal"]);
+    assert_eq!(status.status.code(), Some(21),
+        "the leaf is genuinely unrecoverable and still referenced through H1's restored \
+        ancestry — heal must report it dangling, never clear it: {}", stdout(&status));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&status)).unwrap();
+    assert_eq!(value["error"]["code"], "durability_taint");
+    assert!(value["error"]["message"].as_str().unwrap().contains(&leaf),
+        "the still-dangling leaf must be named: {}", value);
+
+    // Not falsely cleared: the leaf's own taint is still standing, exactly as recorded.
+    assert_eq!(recorded_taint_paths(&area, "dev"), vec![relative_leaf],
+        "the leaf's taint must still stand — a false clear would leave this empty");
+
+    // The ancestor pass 1 needed to restore for the closure walk to see the leaf's reference at
+    // all: confirm it actually landed, proving this is pass 1's own doing, not luck.
+    assert!(object_present(&area, "dev", &h1), "pass 1 must have restored the missing ancestor");
+    assert!(object_present(&area, "dev", &h2), "pass 1 must have restored the current head too");
+}
+
+#[test]
+fn heal_driven_refetch_treats_a_locally_repacked_object_as_recovered() {
+    // §3.2 D2: the post-fetch presence check must accept "present in a pack" as recovered for a
+    // recorded *loose* path, not just a bare loose read-back. A remote-fetched object always
+    // lands loose on the client regardless of how the remote itself stores it (the wire format
+    // is one compressed blob either way), so the shape D2 actually protects is local: an object
+    // `compact` repacked out from under a standing taint's recorded loose path — the pre-existing
+    // I4 mechanism (`file_utils::raw_object_present`, packed-or-loose) `resolve_the_rest`'s
+    // raw-presence filter already used before this slice. This test drives it with a remote
+    // configured (unlike the equivalent `heal_utils.rs` unit test), pinning that §3.2's new
+    // refetch step does not regress it.
+    //
+    // Mutation: weaken the raw-presence filter to a bare loose read-back (drop the pack check) →
+    // the object re-reports "vanished" → red.
+    let area = TestArea::new("heal-refetch-packed");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/a.txt", "content that gets repacked locally\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base parcel"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    let head = pallet_head(&area, "dev", "main");
+    let blob = path_object_hash(&area, "dev", &head, "a.txt");
+    let relative = loose_object_relative_path(&blob);
+
+    // Repack while nothing is tainted yet — `compact` needs a clean existence check.
+    assert_success(&area.forklift("dev", &["compact"]));
+    assert!(!object_store_path(&area, "dev", &blob).exists(),
+        "sanity: the loose copy is gone after compact");
+
+    plant_taint(&area, "dev", &[&relative]);
+
+    let status = area.forklift("dev", &["--json", "heal"]);
+    assert_success(&status);
+    let value: serde_json::Value = serde_json::from_str(&stdout(&status)).unwrap();
+    // A `RecoveredPacked` verdict (I4) is reported by its recorded *path*, not its bare hash
+    // (`recovery_utils::HealOutcome.resolved` formats `attempt.recovered_packed` — a set of
+    // `PathBuf`s — via `display_paths`; contrast the ordinary vanished-and-unreferenced case
+    // reported by hash in the other tests in this file). It also resolves via `run`'s own
+    // `attempt.all_clean()` fast path here (restage_object's own I4 check catches it before
+    // `resolve_the_rest` even runs), which is why the mutation for this test lives in
+    // `heal_utils::restage_object`'s ENOENT branch, not `resolve_the_rest`'s raw-presence filter
+    // — this test's own contribution is confirming that fast path still fires correctly with a
+    // remote configured and the new refetch machinery wired in around it.
+    assert!(
+        value["data"]["resolved"].as_array().unwrap().iter().any(|entry| entry == &relative),
+        "the pack-recovered path must be reported resolved: {}", value
+    );
+    assert!(recorded_taint_paths(&area, "dev").is_empty(), "the taint must be fully cleared");
+}
+
+#[test]
+fn heal_driven_refetch_leaves_the_taint_intact_on_a_failed_fetch() {
+    // §3.2 D3: a fetch that errors (here, an unreachable remote — the same deterministic
+    // failure shape `expand_recovers_after_an_unreachable_remote_leaves_the_scope_unchanged`
+    // uses, no real network flakiness) must leave the remainder exactly as it was; `heal` must
+    // never partial-clear on the strength of merely having *attempted* a fetch.
+    //
+    // Mutation: treat "the fetch attempt ran without a hard panic" as grounds to clear, instead
+    // of re-confirming each candidate hash via `raw_object_present` → the taint clears despite
+    // nothing having actually landed → red.
+    let area = TestArea::new("heal-refetch-unreachable");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/a.txt", "content the remote genuinely has\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base parcel"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    let head = pallet_head(&area, "dev", "main");
+    let blob = path_object_hash(&area, "dev", &head, "a.txt");
+    let relative = loose_object_relative_path(&blob);
+
+    std::fs::remove_file(object_store_path(&area, "dev", &blob)).unwrap();
+
+    // Point at an unreachable remote (a closed local port) so the fetch itself fails, before any
+    // taint exists yet — planting the taint against an already-broken remote configuration.
+    assert_success(&area.forklift("dev", &["config", "remote.url", "http://127.0.0.1:9"]));
+    plant_taint(&area, "dev", &[&relative]);
+
+    let status = area.forklift("dev", &["--json", "heal"]);
+    assert_eq!(status.status.code(), Some(21));
+
+    assert_eq!(recorded_taint_paths(&area, "dev"), vec![relative],
+        "the remainder must be exactly unchanged — nothing was actually recovered");
+    assert!(!object_store_path(&area, "dev", &blob).exists(),
+        "nothing was actually fetched by the failed attempt");
+}
+
+#[test]
+fn heal_driven_refetch_recovers_a_hash_referenced_only_by_a_non_current_pallet() {
+    // §3.2 D1: heal must not restrict its recovery to the current pallet's own history — a
+    // vanished hash can be referenced only by a *different*, non-current pallet's published
+    // head (the closure walk already treats every pallet head as a durable ref root; the
+    // refetch must reach as far as that walk does).
+    //
+    // Mutation: remove the heal-driven refetch entirely → the object belongs to neither the
+    // current pallet's tree nor anything else this warehouse would otherwise fetch → `heal`
+    // refuses → red. (In this implementation the targeted, hash-addressed second pass is what
+    // actually recovers it — see `attempt_heal_driven_refetch`'s doc comment: it fetches by hash
+    // directly, so it does not need to know which pallet a hash belongs to at all, which
+    // subsumes rather than narrows D1's own "every pallet head" goal.)
+    let area = TestArea::new("heal-refetch-cross-pallet");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/main.txt", "main content\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "main parcel"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    // A second, published pallet: its head is a durable ref (a closure-walk root) exactly like
+    // `main`'s, but it is never the *current* pallet when `heal` runs below.
+    assert_success(&area.forklift("dev", &["palletize", "other"]));
+    area.write_file("dev/other.txt", "other content\n");
+    assert_success(&area.forklift("dev", &["load", "other.txt"]));
+    assert_success(&area.forklift("dev", &["stack", "other parcel"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    let other_head = pallet_head(&area, "dev", "other");
+    let other_blob = path_object_hash(&area, "dev", &other_head, "other.txt");
+    let relative = loose_object_relative_path(&other_blob);
+
+    // Back to `main` before the object vanishes — `heal` runs from here, not from `other`.
+    assert_success(&area.forklift("dev", &["shift", "main"]));
+
+    std::fs::remove_file(object_store_path(&area, "dev", &other_blob)).unwrap();
+    plant_taint(&area, "dev", &[&relative]);
+
+    let status = area.forklift("dev", &["--json", "heal"]);
+    assert_success(&status);
+    let value: serde_json::Value = serde_json::from_str(&stdout(&status)).unwrap();
+    assert!(
+        value["data"]["resolved"].as_array().unwrap().iter().any(|entry| entry == &other_blob),
+        "a hash referenced only by a non-current pallet must still be recovered: {}", value
+    );
+    assert!(recorded_taint_paths(&area, "dev").is_empty());
+}
+
+#[test]
+fn heal_driven_refetch_force_fetches_a_corrupt_present_object() {
+    // §3.2 D4: a corrupt-present recorded path (bytes present, but wrong — a hash mismatch) is
+    // never picked up by an ordinary dedup-aware fetch, since `does_object_exist` already says
+    // "yes" for it. `heal` must delete-then-fetch it: force it to genuinely vanish first, so the
+    // ordinary fetch then pulls a good copy in behind it.
+    //
+    // Mutation: skip the delete-then-fetch bridge (attempt the refetch with the corrupt bytes
+    // still in place) → the dedup check skips it as "already present" → it never gets a chance
+    // to recover and stays in the remainder, still corrupt → red.
+    let area = TestArea::new("heal-refetch-corrupt");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    let genuine_content = "the genuine content, already published to the remote\n";
+    area.write_file("dev/a.txt", genuine_content);
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base parcel"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    let head = pallet_head(&area, "dev", "main");
+    let blob = path_object_hash(&area, "dev", &head, "a.txt");
+    let relative = loose_object_relative_path(&blob);
+    let object_path = object_store_path(&area, "dev", &blob);
+
+    // Corrupt the local copy in place (not valid zstd at all) — the remote's own copy is
+    // untouched and good.
+    std::fs::write(&object_path, b"not the real compressed bytes at all").unwrap();
+
+    plant_taint(&area, "dev", &[&relative]);
+
+    let status = area.forklift("dev", &["--json", "heal"]);
+    assert_success(&status);
+    let value: serde_json::Value = serde_json::from_str(&stdout(&status)).unwrap();
+    // A recovered D4 corrupt candidate is reported by its recorded *path* (see
+    // `resolve_the_rest`'s corrupt-candidate loop, which pushes `relative`, not the hash —
+    // mirroring the `shard_vanished`/`RecoveredPacked` convention, not the ordinary
+    // vanished-and-unreferenced one).
+    assert!(
+        value["data"]["resolved"].as_array().unwrap().iter().any(|entry| entry == &relative),
+        "the force-fetched path must be reported resolved: {}", value
+    );
+    assert!(recorded_taint_paths(&area, "dev").is_empty(), "the taint must be fully cleared");
+
+    // The good content is actually back — not merely "present", but correct.
+    let content = {
+        let _scope = forklift_core::globals::StorageRootScope::enter(&area.path("dev"));
+        forklift_core::util::object_utils::load_blob(&blob).expect("the restored object must load").content
+    };
+    assert_eq!(content, genuine_content.as_bytes());
 }

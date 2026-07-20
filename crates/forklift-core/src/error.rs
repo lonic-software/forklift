@@ -164,6 +164,13 @@ refusal_codes! {
     /// load never got to. Refuses rather than silently publish an incomplete parcel; the remedy
     /// is always the same cheap re-load, or abandoning the load with `restore --staged`.
     IncompleteLoad => "incomplete_load",
+
+    /// The storage-scope entry-heal (`heal_utils`) found a durability taint it could not resolve
+    /// automatically: a write's final path(s) were left visible after a failed durability sync
+    /// (or a later re-check found one already standing) and, on this attempt, one or more of them
+    /// vanished, failed to read back, no longer matched their own content hash, or the taint's own
+    /// record was itself incomplete (torn). The taint is left standing in every case.
+    DurabilityTaint => "durability_taint",
 }
 
 impl RefusalCode {

@@ -1314,6 +1314,52 @@ A command not listed here either reports only the generic human-message shape `{
 }
 ```
 
+## `heal`
+
+### `HealReport`
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The result of a `heal` run that fully resolved (or found nothing to resolve).",
+  "properties": {
+    "notes": {
+      "description": "Advisory notes that never blocked clearing — currently, the \"re-run the load\" remedy for\neach vanished inventory shard in `resolved`.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "resolved": {
+      "description": "Recorded paths (or hashes) resolved without a rewrite: proven absent and unreferenced by\nthe closure walk, or a vanished inventory shard (a staging concern, never an object-trust\none — see `notes`).",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "restaged": {
+      "description": "Recorded paths that were present, verified, and freshly rewritten.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "was_tainted": {
+      "description": "Whether a durability taint was actually standing (an already-healthy warehouse reports\n`false`, with every other list empty).",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "was_tainted",
+    "restaged",
+    "resolved",
+    "notes"
+  ],
+  "title": "HealReport",
+  "type": "object"
+}
+```
+
 ## `history`
 
 ### `History`

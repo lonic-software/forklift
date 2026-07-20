@@ -337,7 +337,10 @@ impl RemoteClient {
     ///
     /// # Returns
     /// * `Ok(RemoteClient)` - The client.
-    /// * `Err(String)`      - If no remote is configured.
+    /// * `Err(String)`      - No remote is configured, *or* a remote is configured but the
+    ///                        client could not be built from it (its config could not be read,
+    ///                        or its URL is unusable) — [`is_configured`] tells the two apart
+    ///                        for a caller that needs to, without inspecting this message.
     pub fn from_config() -> Result<RemoteClient, String> {
         let url = config_utils::get_effective_value(config_utils::KEY_REMOTE_URL)?
             .map(|(value, _)| value)
@@ -351,6 +354,26 @@ impl RemoteClient {
             .map(|(value, _)| value);
 
         RemoteClient::new(&url, token)
+    }
+
+    /// Whether a remote URL is configured at all for this warehouse — independent of whether
+    /// [`RemoteClient::from_config`] could actually *build* a client from it. A malformed
+    /// `remote.url`/`remote.token` config read, or a URL [`RemoteClient::new`] rejects, still
+    /// counts as "configured" here: something is set, it is just broken.
+    ///
+    /// Exists so a caller that gets `Err` from [`from_config`](RemoteClient::from_config) can
+    /// tell "nothing is configured" apart from "something is configured but could not be
+    /// consulted" without parsing that `Err`'s message — `forklift heal`'s own remote-driven
+    /// refetch (`recovery_utils::attempt_heal_driven_refetch`) is the caller this exists for: the
+    /// two cases call for different remedies (a genuinely absent remote has no in-tool fetch to
+    /// retry; a broken-but-real one might still be recoverable once it is fixed), and reporting
+    /// the second as the first sends a user toward heavier remedies — franchise, reproduce, or
+    /// accepting the loss — for an object the remote may still actually have. A read failure here
+    /// (the same class `from_config` itself would also hit) is treated as "configured": it is
+    /// certainly not "nothing is set," and erring toward the less alarming classification is the
+    /// right default for what is, either way, only wording.
+    pub fn is_configured() -> bool {
+        !matches!(config_utils::get_effective_value(config_utils::KEY_REMOTE_URL), Ok(None))
     }
 
     /// The base URL of the remote.
@@ -1181,10 +1204,25 @@ fn is_known_complete(hash: &str, complete_heads: &[String]) -> Result<bool, Stri
 /// Fetch (concurrently) the objects of the given hashes that are missing locally.
 /// Every downloaded object is hash-verified by `store_object_bytes` before it lands.
 ///
+/// `pub(crate)` (not just a private helper of this module's own history walks): §3.2's
+/// heal-driven refetch (`recovery_utils::attempt_heal_driven_refetch`) also calls this directly,
+/// for a *targeted*, hash-addressed fetch of exactly the recorded hashes a taint's remainder
+/// names — deliberately bypassing `fetch_history`/`fetch_history_scoped`'s own "already reachable
+/// from a local ref" bound (see that function's doc comment): that bound is sound for their own
+/// purpose (skip re-walking a closure a ref already proves complete) but means neither ever
+/// re-verifies or re-fetches one specific object inside an otherwise-already-complete parcel —
+/// exactly the shape a vanished-but-still-referenced object recorded against the *current*,
+/// already-published pallet head takes. A direct `GET /v1/objects/{hash}` is deliberately
+/// path-blind server-side (`forklift-server`'s own `get_object` doc comment) and so finds an
+/// object regardless of which pallet(s) reference it or whether their closure is already
+/// considered complete — this function already IS that primitive (the history walks above call
+/// it per-wave), just never previously called with a caller-chosen, non-walk-discovered hash
+/// list.
+///
 /// # Returns
 /// * `Ok(usize)`   - How many objects were fetched.
 /// * `Err(String)` - If a transfer or verification failed.
-async fn fetch_missing_objects(client: &RemoteClient, hashes: &[String]) -> Result<usize, String> {
+pub(crate) async fn fetch_missing_objects(client: &RemoteClient, hashes: &[String]) -> Result<usize, String> {
     let mut missing: Vec<String> = Vec::new();
 
     for hash in hashes {

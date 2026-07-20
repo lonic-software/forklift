@@ -3348,6 +3348,151 @@ fn park_push_refuses_on_an_incomplete_load_exactly_like_stack() {
     assert_success(&warehouse.run(&["park"]));
 }
 
+/// `consolidate`'s three-way merge writes real output into the working inventory and only
+/// afterwards records that a consolidation is in progress (`.forklift/consolidation`), well
+/// before it ever reaches `stack_utils::stack_parcel`'s own guard — so, unlike `stack` and
+/// `park`, a late failure there used to leave that state written behind it. The guard added
+/// up front in `consolidate::handle_command` must refuse before `merge_head_into_current`
+/// touches anything: reverting it makes the state-file assertion below go red, because the
+/// merge and its state write both run to completion before the *late* guard (still inside
+/// `stack_parcel`) finally fires.
+#[test]
+fn consolidate_refuses_on_an_incomplete_load_before_writing_consolidation_state() {
+    let warehouse = TestWarehouse::new("incomplete-load-consolidate");
+    warehouse.write_file("file.txt", "one\ntwo\nthree\nfour\nfive\n");
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base"]));
+
+    // Diverge with non-overlapping changes so the merge would otherwise complete cleanly.
+    assert_success(&warehouse.run(&["palletize", "feature"]));
+    warehouse.write_file("file.txt", "one\ntwo\nthree\nfour\nFIVE\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "feature work"]));
+
+    assert_success(&warehouse.run(&["shift", "main"]));
+    warehouse.write_file("file.txt", "ONE\ntwo\nthree\nfour\nfive\n");
+    assert_success(&warehouse.run(&["load", "file.txt"]));
+    assert_success(&warehouse.run(&["stack", "main work"]));
+
+    // Simulate a load killed outright partway through its walk (see the hand-written-marker
+    // test above for why this is a faithful stand-in).
+    let marker_path = incomplete_load_marker_path(&warehouse);
+    std::fs::write(&marker_path, "./\n").unwrap();
+
+    let consolidated = warehouse.run(&["consolidate", "feature", "--json"]);
+    assert_eq!(consolidated.status.code(), Some(20));
+    assert_eq!(json(&consolidated)["error"]["code"], "incomplete_load");
+
+    assert!(
+        !warehouse.root.join(".forklift/consolidation").exists(),
+        "consolidation state must not be written while an incomplete load is outstanding"
+    );
+    assert_eq!(
+        std::fs::read_to_string(warehouse.root.join("file.txt")).unwrap(),
+        "ONE\ntwo\nthree\nfour\nfive\n",
+        "the merge must not have applied anything either"
+    );
+
+    // Healing the load lets the consolidation proceed normally.
+    std::fs::remove_file(&marker_path).unwrap();
+    assert_success(&warehouse.run(&["consolidate", "feature"]));
+}
+
+/// `cherry-pick` applies a merge into the working inventory and only afterwards records its own
+/// in-progress state (`.forklift/cherry-pick`), before it ever reaches
+/// `stack_utils::stack_parcel`'s own guard. The guard added up front in
+/// `cherry_pick::handle_command` must refuse before any of that runs: reverting it makes the
+/// state-file assertion below go red, exactly like the `consolidate` case above.
+#[test]
+fn cherry_pick_refuses_on_an_incomplete_load_before_writing_state() {
+    let warehouse = TestWarehouse::new("incomplete-load-cherry-pick");
+    warehouse.write_file("f.txt", "base\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base"]));
+
+    assert_success(&warehouse.run(&["palletize", "feature"]));
+    warehouse.write_file("feat.txt", "feature file\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    let source = extract_parcel_hash(&warehouse.run(&["stack", "feature work"]));
+
+    assert_success(&warehouse.run(&["shift", "main"]));
+
+    // Simulate a load killed outright partway through its walk.
+    let marker_path = incomplete_load_marker_path(&warehouse);
+    std::fs::write(&marker_path, "./\n").unwrap();
+
+    let picked = warehouse.run(&["cherry-pick", &source, "--json"]);
+    assert_eq!(picked.status.code(), Some(20));
+    assert_eq!(json(&picked)["error"]["code"], "incomplete_load");
+
+    assert!(
+        !warehouse.root.join(".forklift/cherry-pick").exists(),
+        "cherry-pick state must not be written while an incomplete load is outstanding"
+    );
+    assert!(!warehouse.root.join("feat.txt").exists(), "the pick must not have applied anything");
+
+    // Healing the load lets the cherry-pick proceed normally.
+    std::fs::remove_file(&marker_path).unwrap();
+    assert_success(&warehouse.run(&["cherry-pick", &source]));
+}
+
+/// `haul merge` calls the same shared `merge_head_into_current` consolidate and cherry-pick do:
+/// it writes real merge output into the working inventory and only afterwards records
+/// consolidation state (`.forklift/consolidation`), before ever reaching
+/// `stack_utils::stack_parcel`'s own late guard. The up-front guard added at the call site in
+/// `haul::merge` must refuse before any of that runs: reverting it makes the state-file
+/// assertion below go red, exactly like the `consolidate` and `cherry-pick` cases above.
+#[test]
+fn haul_merge_refuses_on_an_incomplete_load_before_writing_consolidation_state() {
+    let warehouse = TestWarehouse::new("incomplete-load-haul");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    warehouse.write_file("base.txt", "base\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["office", "enroll"]));
+
+    assert_success(&warehouse.run(&["palletize", "feature"]));
+    warehouse.write_file("feature.txt", "feat\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "feature work"]));
+    assert_success(&warehouse.run(&["shift", "main"]));
+
+    assert_success(&warehouse.run(&[
+        "haul", "open", "--target", "main", "--source", "feature", "--title", "Add feature", "-m", "please review",
+    ]));
+    let id = json(&warehouse.run(&["haul", "list", "--json"]))["data"]["hauls"][0]["id"]
+        .as_str().unwrap().to_string();
+
+    // Simulate a load killed outright partway through its walk.
+    let marker_path = incomplete_load_marker_path(&warehouse);
+    std::fs::write(&marker_path, "./\n").unwrap();
+
+    let merged = warehouse.run(&["haul", "merge", &id, "--json"]);
+    assert_eq!(merged.status.code(), Some(20));
+    assert_eq!(json(&merged)["error"]["code"], "incomplete_load");
+
+    assert!(
+        !warehouse.root.join(".forklift/consolidation").exists(),
+        "the haul merge's consolidation state must not be written while an incomplete load is \
+        outstanding"
+    );
+    assert!(!warehouse.root.join("feature.txt").exists(), "the merge must not have applied anything");
+    assert_eq!(
+        json(&warehouse.run(&["haul", "show", &id, "--json"]))["data"]["status"], "open",
+        "the haul must stay open — it was never actually merged"
+    );
+
+    // Healing the load lets the haul merge normally.
+    std::fs::remove_file(&marker_path).unwrap();
+    assert_success(&warehouse.run(&["haul", "merge", &id]));
+}
+
 /// Re-running `load` is real work an operator may not always want to redo; abandoning an
 /// incomplete load by resetting it to head must also be a clean, working recovery path.
 #[cfg(unix)]
@@ -5243,6 +5388,15 @@ fn a_mutating_command_runs_maintenance_when_due() {
     );
 }
 
+// The finding #1 fix (`run_if_due` no longer swallows a `compact` failure that left a durability
+// taint standing) is covered where it now lives, without a fault hook in the load-bearing
+// `sync_dir` primitive: `commands::maintenance::tests::
+// report_maintenance_outcome_surfaces_exactly_when_a_real_taint_is_left_standing` (the decision,
+// against a real recorded taint) and `output::tests::
+// the_standing_taint_warning_names_the_code_and_the_heal_remedy_in_both_modes` (the warning text,
+// both output modes) — both in `crates/forklift/src/`, since the `forklift` crate is a plain
+// binary (no `lib` target `tests/cli.rs` could link a unit under test from).
+
 // ---------------------------------------------------------------------------------------------
 // The densify suggestion: `import-git`'s pack-direct path (and a franchise's native bundle
 // install) can only ever see per-path/per-window similarity on the way in, unlike a plain
@@ -6795,4 +6949,650 @@ fn diff_empty_token_lists_every_file_of_a_root_parcel_as_added() {
     // The reverse direction: main vs nothing removes everything.
     let reversed = stdout(&warehouse.run(&["diff", "main", ":empty"]));
     assert!(reversed.contains("removed: src/app.rs"), "unexpected diff output: {}", reversed);
+}
+
+/// The path of the taint directory in a plain (non-bay) test warehouse — see
+/// `taint_utils::taint_dir_path_under`.
+fn taint_dir_path(warehouse: &TestWarehouse) -> PathBuf {
+    forklift_core::util::taint_utils::taint_dir_path_under(&warehouse.root)
+}
+
+/// Hand-plant a complete (non-torn) taint file recording `paths` — a crash-before-heal
+/// simulation, the same technique `a_hand_written_marker_refuses_stack_even_without_a_reported_load_failure`
+/// uses for the incomplete-load marker.
+fn plant_taint(warehouse: &TestWarehouse, paths: &[&str]) {
+    let dir = taint_dir_path(warehouse);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut content = String::new();
+    for path in paths {
+        content.push_str(path);
+        content.push('\n');
+    }
+    content.push_str("END\n");
+    std::fs::write(dir.join("taint-1-0"), content).unwrap();
+}
+
+#[test]
+fn a_tainted_root_exits_21_with_the_durability_taint_code() {
+    // A taint the entry-heal cannot auto-heal (the recorded object never existed) must refuse
+    // every warehouse command with the machine-coded `durability_taint` error and exit 21 — the
+    // CLI-level proof that `main.rs`'s chokepoint is actually wired, mirroring how
+    // `a_hand_written_marker_refuses_stack_even_without_a_reported_load_failure` proves
+    // `incomplete_load`'s exit 20 the same way.
+    let warehouse = TestWarehouse::new("durability-taint-vanished");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    // A valid-hex, loose-object-shaped path (not a "zz"-style placeholder — non-hex would now
+    // escalate under I1/I2 instead of exercising the `Vanished` verdict this test pins).
+    plant_taint(&warehouse, &[&loose_object_relative_path(&"9".repeat(64))]);
+
+    let status = warehouse.run(&["stocktake", "--json"]);
+    assert_eq!(status.status.code(), Some(21));
+    let value = json(&status);
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["error"]["code"], "durability_taint");
+    assert!(
+        value["error"]["message"].as_str().unwrap().contains("vanished"),
+        "the message names the unhealable verdict: {}", value["error"]["message"]
+    );
+    assert!(value["error"]["next_step"].as_str().unwrap().contains("forklift heal"));
+
+    // The taint survives the refusal — nothing was silently cleared.
+    assert!(taint_dir_path(&warehouse).join("taint-1-0").exists());
+}
+
+#[test]
+fn a_clean_taint_heals_automatically_and_the_command_proceeds() {
+    // The common case this whole mechanism exists for: a crash-before-heal taint over a still-
+    // present, still-correct object heals silently at the next command's entry, with no user-
+    // visible effect beyond the command succeeding.
+    let warehouse = TestWarehouse::new("durability-taint-heals");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    // A real loose object this warehouse already wrote (from `prepare`'s own bootstrap, or a
+    // trivial load+stack) makes a legitimate target: use a load+stack to get one on disk, then
+    // hand-plant a taint over its own working directory's parent instead of guessing an object
+    // hash — simpler and just as effective is proving the *absence* of any taint dir is what a
+    // fresh warehouse starts with, then that a present taint dir with zero entries (the
+    // "torn-free, nothing recorded" edge the entry-heal treats as a cheap Ok) does not block
+    // anything either.
+    assert!(!taint_dir_path(&warehouse).exists(), "a fresh warehouse must start untainted");
+
+    std::fs::create_dir_all(taint_dir_path(&warehouse)).unwrap();
+    assert_success(&warehouse.run(&["stocktake"]));
+}
+
+#[test]
+fn a_torn_taint_exits_21_and_survives() {
+    let warehouse = TestWarehouse::new("durability-taint-torn");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    let dir = taint_dir_path(&warehouse);
+    std::fs::create_dir_all(&dir).unwrap();
+    // No terminator line: torn by construction.
+    std::fs::write(dir.join("taint-1-0"), b"objects/ab/cdef\n").unwrap();
+
+    let status = warehouse.run(&["stocktake", "--json"]);
+    assert_eq!(status.status.code(), Some(21));
+    assert_eq!(json(&status)["error"]["code"], "durability_taint");
+    assert!(dir.join("taint-1-0").exists(), "a torn taint file must survive the refusal");
+}
+
+/// Every regular taint file's recorded lines, unioned (dropping the `END` terminator) — used to
+/// inspect exactly what a recovery attempt left standing.
+fn recorded_taint_paths(warehouse: &TestWarehouse) -> Vec<String> {
+    let dir = taint_dir_path(warehouse);
+    if !dir.exists() {
+        return Vec::new();
+    }
+
+    let mut paths = Vec::new();
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let entry = entry.unwrap();
+        if !entry.path().is_file() {
+            continue;
+        }
+        let content = std::fs::read_to_string(entry.path()).unwrap();
+        paths.extend(content.lines().filter(|line| *line != "END").map(|line| line.to_string()));
+    }
+    paths
+}
+
+/// The root-relative loose-object path (`objects/<2 hex>/<rest>`) a hash lives at — the exact
+/// inverse `taint_utils::to_root_relative`/`file_utils::get_path_for_object` use, hand-derived
+/// here so these tests can plant/inspect a taint without reaching into `forklift-core` privates.
+fn loose_object_relative_path(hash: &str) -> String {
+    format!("objects/{}/{}", &hash[..2], &hash[2..])
+}
+
+#[test]
+fn heal_reaches_a_tainted_root_and_clears_a_vanished_unreferenced_object() {
+    // The chokepoint exemption, proven the mutation-killing way: if `Command::bypasses_taint_heal`
+    // did not exempt `heal`, this run would be blocked at the entry chokepoint and refuse with
+    // `heal_if_tainted`'s own conservative "vanished: ..." refusal (exit 21, nothing cleared).
+    // With the exemption wired, `heal` reaches its own recovery logic, walks every durable ref
+    // source, finds the fabricated hash referenced by nothing at all, and clears — exit 0. The
+    // two outcomes are observably different (exit code, and whether the taint survives), so this
+    // one test kills the "exemption missing" mutation without needing a second one.
+    let warehouse = TestWarehouse::new("heal-clears-unreferenced");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    let fake_hash = "1".repeat(64);
+    let relative = loose_object_relative_path(&fake_hash);
+    plant_taint(&warehouse, &[&relative]);
+
+    let status = warehouse.run(&["heal", "--json"]);
+    assert_success(&status);
+    let value = json(&status);
+    assert_eq!(value["data"]["was_tainted"], true);
+    assert!(
+        value["data"]["resolved"].as_array().unwrap().iter().any(|v| v == &fake_hash),
+        "the fabricated hash must be reported resolved (absent and unreferenced): {}", value
+    );
+
+    assert!(!taint_dir_path(&warehouse).exists() || recorded_taint_paths(&warehouse).is_empty(),
+        "the taint must be fully cleared");
+
+    // The warehouse is fully usable again, including the mutating write path a taint exists to
+    // protect — not just a read-only command.
+    warehouse.write_file("src/app.rs", "after heal");
+    assert_success(&warehouse.run(&["load", "src/app.rs"]));
+    assert_success(&warehouse.run(&["stack", "after heal"]));
+}
+
+#[test]
+fn heal_reports_a_vanished_but_referenced_object_and_everything_still_refuses() {
+    let warehouse = TestWarehouse::new("heal-reports-referenced");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    warehouse.write_file("src/app.rs", "referenced content");
+    assert_success(&warehouse.run(&["load", "src/app.rs"]));
+    let stack_out = warehouse.run(&["stack", "referenced parcel"]);
+    assert_success(&stack_out);
+    let parcel_hash = extract_parcel_hash(&stack_out);
+
+    // The pallet head is a durable ref by construction, so vanishing (and taining) its own
+    // parcel object is the simplest "still referenced" case: it is the walk's own root.
+    let relative = loose_object_relative_path(&parcel_hash);
+    std::fs::remove_file(warehouse.root.join(".forklift").join(&relative)).unwrap();
+    plant_taint(&warehouse, &[&relative]);
+
+    let status = warehouse.run(&["heal", "--json"]);
+    assert_eq!(status.status.code(), Some(21));
+    let value = json(&status);
+    assert_eq!(value["error"]["code"], "durability_taint");
+    assert!(
+        value["error"]["message"].as_str().unwrap().contains("vanished and still referenced"),
+        "unexpected message: {}", value
+    );
+    // No remote is configured here, so `heal` never attempts the §3.2 heal-driven refetch —
+    // the message says so honestly, and (post-§3.2) never tells the operator to run a fetch by
+    // hand ("forklift lower" is no longer named — see `recovery_utils::HEAVYWEIGHT_EXITS`'s doc
+    // comment for why that would now be false prose).
+    assert!(
+        value["error"]["message"].as_str().unwrap().contains("no remote is configured"),
+        "unexpected message: {}", value
+    );
+    assert!(!value["error"]["message"].as_str().unwrap().contains("forklift lower"));
+    // Machine-coded remedies, not an exitless refusal.
+    let next_step = value["error"]["next_step"].as_str().unwrap();
+    assert!(next_step.contains("franchise") && next_step.contains("accept the loss"));
+    assert!(!next_step.contains("forklift lower"));
+
+    assert!(recorded_taint_paths(&warehouse).contains(&relative),
+        "the taint must survive with the still-dangling path recorded");
+
+    // Every ordinary command still refuses too — the taint was never lifted — including the
+    // mutating write path (`stack`) a taint exists specifically to protect. The chokepoint runs
+    // before a command dispatches, so `stack` refuses here regardless of staged content.
+    let blocked_read = warehouse.run(&["stocktake", "--json"]);
+    assert_eq!(blocked_read.status.code(), Some(21));
+    assert_eq!(json(&blocked_read)["error"]["code"], "durability_taint");
+
+    let blocked_stack = warehouse.run(&["stack", "should not land", "--json"]);
+    assert_eq!(blocked_stack.status.code(), Some(21));
+    assert_eq!(json(&blocked_stack)["error"]["code"], "durability_taint");
+}
+
+#[test]
+fn heal_partial_clear_leaves_exactly_the_unresolved_remainder_recorded() {
+    let warehouse = TestWarehouse::new("heal-partial-clear");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    warehouse.write_file("src/app.rs", "referenced content");
+    assert_success(&warehouse.run(&["load", "src/app.rs"]));
+    let stack_out = warehouse.run(&["stack", "referenced parcel"]);
+    assert_success(&stack_out);
+    let parcel_hash = extract_parcel_hash(&stack_out);
+    let referenced_relative = loose_object_relative_path(&parcel_hash);
+    std::fs::remove_file(warehouse.root.join(".forklift").join(&referenced_relative)).unwrap();
+
+    let fake_hash = "2".repeat(64);
+    let unreferenced_relative = loose_object_relative_path(&fake_hash);
+
+    plant_taint(&warehouse, &[&referenced_relative, &unreferenced_relative]);
+
+    let status = warehouse.run(&["heal", "--json"]);
+    assert_eq!(status.status.code(), Some(21));
+
+    // Exactly the unresolved remainder is recorded afterwards — the resolved (unreferenced)
+    // path must be gone, the still-dangling one must remain, and nothing extra appears.
+    let remaining = recorded_taint_paths(&warehouse);
+    assert_eq!(remaining, vec![referenced_relative.clone()],
+        "the remainder must be exactly the still-dangling path, no more and no less");
+}
+
+#[test]
+fn audit_runs_while_tainted() {
+    // The second chokepoint exemption: `audit` is a read-only diagnostic and must reach its own
+    // logic instead of being blocked by the entry-heal chokepoint. Proven by observing an error
+    // that is NOT the chokepoint's `durability_taint` refusal — a fresh, un-enrolled warehouse's
+    // `audit` refuses for a different, audit-specific reason ("trust is not established"),
+    // which it can only report if it actually ran.
+    let warehouse = TestWarehouse::new("audit-runs-while-tainted");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    plant_taint(&warehouse, &[&loose_object_relative_path(&"3".repeat(64))]);
+
+    let status = warehouse.run(&["audit", "--json"]);
+    assert_ne!(status.status.code(), Some(21),
+        "audit must bypass the taint chokepoint, not inherit its exit code");
+    let value = json(&status);
+    assert_eq!(value["ok"], false);
+    assert_ne!(value["error"]["code"], "durability_taint");
+}
+
+#[test]
+fn heal_on_a_torn_taint_over_an_intact_store_rescans_and_clears() {
+    // §8.3 (I5): a torn taint (unknown scope) is no longer a permanent brick — `forklift heal`
+    // runs a directory-driven, store-wide rescan and, finding nothing genuinely dangling, clears
+    // it — exit 0, same as an ordinary healable taint. CLI-level proof that `recovery_utils::run`
+    // is actually wired to rescan torn rather than refuse it immediately (the pre-§8.3 shape,
+    // still pinned unit-side by `recovery_utils::tests::torn_taint_over_a_fully_intact_store_
+    // rescans_and_clears` and, for entry-heal specifically, `heal_utils::tests::
+    // a_torn_taint_refuses_immediately_and_survives`).
+    let warehouse = TestWarehouse::new("heal-torn-intact");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    warehouse.write_file("src/app.rs", "intact content, never torn-tainted itself");
+    assert_success(&warehouse.run(&["load", "src/app.rs"]));
+    assert_success(&warehouse.run(&["stack", "intact parcel"]));
+
+    let dir = taint_dir_path(&warehouse);
+    std::fs::create_dir_all(&dir).unwrap();
+    // No terminator line: torn by construction.
+    std::fs::write(dir.join("taint-1-0"), b"").unwrap();
+
+    let status = warehouse.run(&["heal", "--json"]);
+    assert_success(&status);
+    let value = json(&status);
+    assert_eq!(value["data"]["was_tainted"], true);
+
+    assert!(!taint_dir_path(&warehouse).exists() || recorded_taint_paths(&warehouse).is_empty(),
+        "the taint must be fully cleared, including the torn file itself");
+
+    // The warehouse is fully usable again, including the mutating write path a taint exists to
+    // protect.
+    warehouse.write_file("src/more.rs", "after the torn rescan");
+    assert_success(&warehouse.run(&["load", "src/more.rs"]));
+    assert_success(&warehouse.run(&["stack", "after torn rescan"]));
+}
+
+#[test]
+fn heal_on_a_torn_taint_with_a_dangling_reference_rescans_into_a_named_remainder() {
+    // §8.3 (I5): a torn taint whose surviving recorded prefix does not name the dangling object,
+    // over a store that genuinely has one, must not clear — the rescan turns the unknown scope
+    // into a known, honest remainder naming exactly what is still dangling, and the taint is left
+    // standing (no longer torn) for the operator (or a future `forklift heal`) to resolve. Also
+    // pins the updated refusal prose: it must no longer claim a "heavyweight recovery" that does
+    // not exist, and must not tell the operator to run a fetch by hand ("forklift lower").
+    let warehouse = TestWarehouse::new("heal-torn-dangling");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    warehouse.write_file("src/app.rs", "referenced content");
+    assert_success(&warehouse.run(&["load", "src/app.rs"]));
+    let stack_out = warehouse.run(&["stack", "referenced parcel"]);
+    assert_success(&stack_out);
+    let parcel_hash = extract_parcel_hash(&stack_out);
+
+    // The pallet head is a durable ref by construction — vanishing its own parcel object is the
+    // simplest genuinely-dangling fixture.
+    let relative = loose_object_relative_path(&parcel_hash);
+    std::fs::remove_file(warehouse.root.join(".forklift").join(&relative)).unwrap();
+
+    // Torn, and its surviving prefix deliberately does NOT mention the vanished parcel — proving
+    // the rescan finds it by walking ref sources (§8.1's targetless enumerator), not by trusting
+    // the torn record's own (lower-bound, untrusted) recorded set.
+    let dir = taint_dir_path(&warehouse);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("taint-1-0"), b"objects/aa/an-unrelated-surviving-line\n").unwrap();
+
+    let status = warehouse.run(&["heal", "--json"]);
+    assert_eq!(status.status.code(), Some(21));
+    let value = json(&status);
+    assert_eq!(value["error"]["code"], "durability_taint");
+    let message = value["error"]["message"].as_str().unwrap();
+    assert!(message.contains("torn"), "the message must still name the torn origin: {}", message);
+    assert!(message.contains(&parcel_hash) && message.contains("genuinely dangling"),
+        "the message must name the dangling hash the rescan found: {}", message);
+
+    let next_step = value["error"]["next_step"].as_str().unwrap();
+    assert!(next_step.contains("no longer torn") && next_step.contains("forklift heal"),
+        "the next step must direct to a plain re-run, now that the scope is known: {}", next_step);
+    assert!(next_step.contains("franchise") && next_step.contains("accept the loss"),
+        "the heavyweight exits must still be named for what a re-run cannot resolve: {}", next_step);
+    // No remote is configured, and the rescan itself never drives the §3.2 refetch (that is the
+    // *next* heal's job, against the now-known remainder) — "forklift lower" must never be named.
+    assert!(!next_step.contains("forklift lower"));
+    assert!(!message.contains("heavyweight recovery"),
+        "the torn refusal must never name a heavyweight recovery mode that does not exist: {}", message);
+
+    // The taint survives, no longer torn, recording exactly the dangling path.
+    assert_eq!(recorded_taint_paths(&warehouse), vec![relative],
+        "the remainder must name exactly the dangling parcel's path — not empty, not the whole store");
+}
+
+#[test]
+fn a_mutating_command_reports_the_lock_before_the_taint_when_both_apply() {
+    // The §3.3 reorder (I2's mutating half, `main.rs`): a mutating command must acquire the
+    // warehouse lock BEFORE its own entry-heal runs, so a lock-*waiting* command can never restage
+    // concurrently with the current lock-holder's own deletions. Observable here without real
+    // concurrency, using the same hand-simulated "another process holds the lock" technique as
+    // `mutating_commands_respect_the_warehouse_lock`, combined with a standing, unhealable taint:
+    // if entry-heal still ran first (the pre-reorder order), it would refuse with
+    // `durability_taint` (exit 21) before the lock is ever checked; after the reorder, the lock
+    // check runs first and reports `WarehouseLocked` instead. A read-only command is unaffected
+    // either way, since it never takes the lock — asserted below for contrast.
+    //
+    // Mutation: restore `heal_if_tainted()` to run before `WarehouseLock::acquire()` in
+    // `main.rs`'s `forklift()` → the mutating command below reports `durability_taint` instead of
+    // the lock message → red.
+    let warehouse = TestWarehouse::new("reorder-lock-before-heal");
+    warehouse.write_file("file.txt", "content\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    // A valid-hex, loose-object-shaped, never-written path: an unhealable ("vanished") taint that
+    // would refuse with exit 21 if entry-heal ever got to run.
+    plant_taint(&warehouse, &["objects/ab/cdef"]);
+    std::fs::write(warehouse.root.join(".forklift/lock"), "12345\n").unwrap();
+
+    // Mutating: the lock wins the race — `WarehouseLocked`, not `durability_taint`.
+    let locked = warehouse.run(&["load", "."]);
+    assert!(!locked.status.success());
+    assert!(stderr(&locked).contains("locked by another forklift process"),
+        "a mutating command must report the lock before its own entry-heal runs, got: {}",
+        stderr(&locked));
+
+    // Read-only: unaffected by the lock (it never takes it) — the taint still wins, unchanged.
+    let read_only = warehouse.run(&["stocktake", "--json"]);
+    assert_eq!(read_only.status.code(), Some(21));
+    assert_eq!(json(&read_only)["error"]["code"], "durability_taint");
+
+    std::fs::remove_file(warehouse.root.join(".forklift/lock")).unwrap();
+}
+
+#[test]
+fn entry_heal_escalates_a_non_content_addressed_taint_instead_of_restaging_it_lock_free() {
+    // I1/I2: `heal_if_tainted` (lock-free here, since `stocktake` is read-only) must never
+    // restage a recorded path it cannot hash-verify — a `.pack`-shaped path stands in for the
+    // class of non-content-addressed final paths this taint schema can record (a pack file, an
+    // inventory shard `data` file, a pallet ref pointer, …). It escalates to `forklift heal`
+    // instead of rewriting the file lock-free. `heal` itself, under the warehouse lock, still
+    // restages this same shape — proving this is an entry-heal-only boundary, not a blanket
+    // refusal to ever heal a non-object path.
+    //
+    // Mutation: let `heal_if_tainted` fall through to its ordinary restage for a non-content-
+    // addressed path too → the `stocktake` below exits 0 (having rewritten the pack file
+    // lock-free) instead of 21, and its inode changes → red.
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+
+    let warehouse = TestWarehouse::new("escalation-non-object");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    let pack_dir = warehouse.root.join(".forklift/objects/pack");
+    std::fs::create_dir_all(&pack_dir).unwrap();
+    let pack_file = pack_dir.join("fake.pack");
+    std::fs::write(&pack_file, b"not a real pack, just bytes").unwrap();
+    let bytes_before = std::fs::read(&pack_file).unwrap();
+    #[cfg(unix)]
+    let inode_before = std::fs::metadata(&pack_file).unwrap().ino();
+
+    plant_taint(&warehouse, &["objects/pack/fake.pack"]);
+
+    let status = warehouse.run(&["stocktake", "--json"]);
+    assert_eq!(status.status.code(), Some(21));
+    let value = json(&status);
+    assert_eq!(value["error"]["code"], "durability_taint");
+    assert!(value["error"]["next_step"].as_str().unwrap().contains("forklift heal"));
+
+    // The file must be untouched — no lock-free rewrite, not even an idempotent one.
+    assert_eq!(std::fs::read(&pack_file).unwrap(), bytes_before);
+    #[cfg(unix)]
+    assert_eq!(std::fs::metadata(&pack_file).unwrap().ino(), inode_before,
+        "the dentry must never be rewritten lock-free for a non-content-addressed path");
+
+    assert!(recorded_taint_paths(&warehouse).contains(&"objects/pack/fake.pack".to_string()),
+        "the taint must survive escalation");
+
+    // The heal verb, under the lock, DOES restage this same shape.
+    let heal_status = warehouse.run(&["heal", "--json"]);
+    assert_success(&heal_status);
+    assert!(recorded_taint_paths(&warehouse).is_empty(), "heal must clear the taint");
+}
+
+#[test]
+fn entry_heal_still_restages_a_content_addressed_object_inline_with_no_escalation() {
+    // I1 non-regression (the common case this whole mechanism exists for): a taint over a
+    // present, hash-verifiable loose object must still heal inline, lock-free, on the very next
+    // read-only command — no escalation, no exit 21.
+    //
+    // Mutation: escalate on every recorded path regardless of shape (drop the
+    // `is_content_addressed` gate, or invert it) → `stocktake` below exits 21 instead of
+    // succeeding → red.
+    let warehouse = TestWarehouse::new("entry-heal-loose-object-noregression");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    warehouse.write_file("src/app.rs", "content for the loose-object heal");
+    assert_success(&warehouse.run(&["load", "src/app.rs"]));
+    let stack_out = warehouse.run(&["stack", "loose object for heal"]);
+    assert_success(&stack_out);
+    let parcel_hash = extract_parcel_hash(&stack_out);
+    let relative = loose_object_relative_path(&parcel_hash);
+
+    // Taint the object without touching its bytes — it is present and hash-correct.
+    plant_taint(&warehouse, &[&relative]);
+
+    let status = warehouse.run(&["stocktake", "--json"]);
+    assert_success(&status);
+
+    assert!(!taint_dir_path(&warehouse).exists() || recorded_taint_paths(&warehouse).is_empty(),
+        "the taint must be fully cleared by the inline restage");
+}
+
+// ---- Multi-bay durable-taint soundness audit (design memo §10.2/§10.3) ----
+//
+// `forklift heal` (the recovery verb) only ever takes the CURRENT bay's own (bay-local)
+// `WarehouseLock` — never the warehouse-global `StoreLock` that serializes destructive object-
+// store maintenance (`compact`) against itself. The two tests below settle, deterministically,
+// what that lock-scope gap actually means in a multi-bay warehouse (one shared object store,
+// shared refs, one lock file per bay): first that the lock scopes genuinely do not intersect,
+// then — the actual crux — whether the one dangerous case that gap enables (heal verbatim-
+// restaging a pack `compact` physically deleted) causes real harm or is inert duplication.
+
+#[test]
+fn heal_is_never_serialized_against_another_bays_warehouse_lock_or_the_shared_store_lock() {
+    // §10.2's static claim: `WarehouseLock::acquire()` locks `bay_root().join("lock")` — bay-
+    // local — while `compact` (`pack_utils.rs`) additionally takes the warehouse-global
+    // `StoreLock` (`forklift_root().join("store.lock")`) right before it deletes a superseded
+    // pack. `forklift heal` (`recovery_utils.rs`/`heal_utils.rs`/`commands/heal.rs`) never
+    // references `StoreLock` at all — grep-confirmed, not just asserted here.
+    //
+    // Proven deterministically, with no real second process and no timing dependency: hand-
+    // plant BOTH lock files a concurrent `compact` in another bay would be holding at the exact
+    // instant it is about to delete a superseded pack (its own bay's lock, taken first via the
+    // ordinary `requires_warehouse_lock()` dispatch, then the shared store lock), and show
+    // `forklift heal` in THIS (different) bay still runs to completion — clearing a real taint —
+    // regardless. If `heal` ever acquired either lock, this run would fail (`WarehouseLocked`,
+    // or a store-lock contention error) instead of succeeding.
+    //
+    // Mutation: make `heal`'s dispatch also acquire `StoreLock` (or route it through bay B's
+    // lock file instead of its own) → this run fails instead of clearing the taint → red.
+    let warehouse = TestWarehouse::new("heal-lock-scope");
+    warehouse.write_file("code.txt", "v1\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    // A bay can only be opened once the pallet it checks out has something stacked.
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "initial"]));
+
+    // Bay B: a second bay sharing this warehouse's object store and refs.
+    let bay_dir = warehouse.home.join("bay-other");
+    assert_success(&warehouse.run(&["bay", "add", "other", bay_dir.to_str().unwrap()]));
+
+    // Simulate bay B's `compact` mid-flight, holding both locks it takes in sequence: its own
+    // (bay-local) `WarehouseLock`...
+    let bay_b_lock = warehouse.root.join(".forklift/bays/other/lock");
+    std::fs::write(&bay_b_lock, "99999\n").unwrap();
+    // ...and the shared `StoreLock`, acquired right before the destructive old-pack sweep.
+    let store_lock = warehouse.root.join(".forklift/store.lock");
+    std::fs::write(&store_lock, "99999\n").unwrap();
+
+    // A real taint for bay A's heal to resolve, so a successful run below is not vacuous: a
+    // fabricated, never-existing loose-object hash — the same "absent and unreferenced" fixture
+    // as `heal_reaches_a_tainted_root_and_clears_a_vanished_unreferenced_object`.
+    let fake_hash = "7".repeat(64);
+    plant_taint(&warehouse, &[&loose_object_relative_path(&fake_hash)]);
+
+    // Run `forklift heal` in the MAIN tree (bay A — its own `WarehouseLock` lives at
+    // ".forklift/lock", a file distinct from bay B's ".forklift/bays/other/lock").
+    let status = warehouse.run(&["heal", "--json"]);
+    assert_success(&status);
+    let value = json(&status);
+    assert_eq!(value["data"]["was_tainted"], true);
+    assert!(
+        value["data"]["resolved"].as_array().unwrap().iter().any(|v| v == &fake_hash),
+        "bay A's heal must actually run its recovery logic (not merely happen to exit 0): {}", value
+    );
+
+    // Both hand-planted lock files are untouched: bay A's heal neither waited on nor cleared
+    // either one — proof it never contended for bay B's lock or the shared store lock.
+    assert!(bay_b_lock.exists(), "bay B's own lock file must be untouched by bay A's heal");
+    assert!(store_lock.exists(), "the shared store lock must be untouched by bay A's heal");
+
+    std::fs::remove_file(&bay_b_lock).unwrap();
+    std::fs::remove_file(&store_lock).unwrap();
+}
+
+/// Every `.pack` data file currently present under a warehouse's pack folder, sorted.
+fn pack_data_files(warehouse: &TestWarehouse) -> Vec<PathBuf> {
+    let pack_dir = warehouse.root.join(".forklift/objects/pack");
+    if !pack_dir.exists() {
+        return Vec::new();
+    }
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&pack_dir).unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("pack"))
+        .collect();
+    files.sort();
+    files
+}
+
+#[test]
+fn heal_resurrecting_a_compact_superseded_pack_only_duplicates_content_the_new_pack_already_has() {
+    // §10.2's actual-harm question, isolated from the concurrency mechanism (already pinned
+    // above): a full repack (`compact --all`) writes a new, content-distinct pack and physically
+    // deletes the old one it superseded. If `heal` verbatim-restages the old pack's bytes back
+    // AFTER that delete — the one thing its missing `StoreLock` no longer prevents — does the
+    // resurrected pack (a) reintroduce something the store meant to be gone / break a pack-index
+    // invariant / corrupt anything, or (b) merely duplicate content the new pack already has?
+    //
+    // The resurrection itself is constructed by direct sequencing, not a real race (per the
+    // determinism requirement): `heal_utils::restage_object` performs zero validation on a non-
+    // content-addressed path (a `.pack`/`.idx` file is never hash-verified, only loose objects
+    // are — see its own doc comment) — it just rewrites, verbatim, whatever bytes it read. So
+    // writing the pre-repack bytes back to the pre-repack path by hand produces a byte-for-byte
+    // identical on-disk end state to whatever a real heal-vs-compact interleaving would have left
+    // behind, with no need to reproduce the exact timing.
+    let warehouse = TestWarehouse::new("pack-resurrection-harm");
+    warehouse.write_file("a.txt", "first parcel content\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "parcel one"]));
+
+    // Pack parcel one's loose objects into a first pack (P1).
+    assert_success(&warehouse.run(&["compact"]));
+    let packs_after_first_compact = pack_data_files(&warehouse);
+    assert_eq!(packs_after_first_compact.len(), 1, "sanity: exactly one pack after the first compact");
+    let p1_data = packs_after_first_compact[0].clone();
+    let p1_index = p1_data.with_extension("idx");
+    let p1_data_bytes = std::fs::read(&p1_data).unwrap();
+    let p1_index_bytes = std::fs::read(&p1_index).unwrap();
+
+    // More content, still on the SAME pallet history — parcel one's objects stay fully live,
+    // reachable from the (advancing) pallet head.
+    warehouse.write_file("a.txt", "first parcel content\nsecond parcel content\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "parcel two"]));
+
+    // A full repack: every reachable object (parcel one's included) consolidates into ONE new,
+    // content-distinct pack; P1 — now fully redundant — is physically deleted.
+    assert_success(&warehouse.run(&["compact", "--all"]));
+    assert!(!p1_data.exists(), "sanity: the repack physically deleted the superseded pack");
+    assert!(!p1_index.exists(), "sanity: the repack physically deleted the superseded index");
+    let packs_after_repack = pack_data_files(&warehouse);
+    assert_eq!(packs_after_repack.len(), 1, "sanity: the repack consolidated into one new pack");
+    assert_ne!(packs_after_repack[0], p1_data, "sanity: the new pack is a distinct, differently-named file");
+
+    // Baselines, taken after the repack, before the resurrection.
+    let content_before = stdout(&warehouse.run(&["show", "main:a.txt"]));
+    let history_before = stdout(&warehouse.run(&["history"]));
+    assert_success(&warehouse.run(&["stocktake"]));
+
+    // THE RESURRECTION: P1's exact pre-repack bytes, written back to its exact pre-repack path,
+    // after the repack has already deleted it and published the new pack in its place.
+    std::fs::write(&p1_data, &p1_data_bytes).unwrap();
+    std::fs::write(&p1_index, &p1_index_bytes).unwrap();
+    assert_eq!(pack_data_files(&warehouse).len(), 2,
+        "sanity: the store now holds both the new pack and the resurrected old one");
+
+    // (a) No corruption: every read observes byte-identical content and history to before the
+    // resurrection — the resurrected pack is not consulted for anything the new pack already
+    // answers, and its presence does not confuse object resolution.
+    assert_eq!(stdout(&warehouse.run(&["show", "main:a.txt"])), content_before,
+        "resurrecting the old pack must not change what a read returns");
+    assert_eq!(stdout(&warehouse.run(&["history"])), history_before);
+    assert_success(&warehouse.run(&["stocktake"]));
+
+    // (b) Self-healing: an ordinary command touching the object store still runs clean with the
+    // duplicate pack present...
+    assert_success(&warehouse.run(&["compact"]));
+    // ...and a SECOND full repack independently re-derives the same live set and physically
+    // removes the resurrected duplicate again — the same "supersede and delete" logic the first
+    // repack ran, applied to whatever packs currently exist, with no special-casing needed for a
+    // duplicate. This is the evidence for "benign, self-correcting gc-food," not merely an
+    // assumption: the resurrected pack does not survive the next maintenance pass.
+    assert_success(&warehouse.run(&["compact", "--all"]));
+    assert!(!p1_data.exists(),
+        "a later repack must clean up the resurrected duplicate pack again — it is inert, \
+        self-correcting duplication, not a permanent or escalating problem");
+    assert!(!p1_index.exists());
+    assert_eq!(pack_data_files(&warehouse).len(), 1);
+
+    // Content is still perfectly readable after the cleanup.
+    assert_eq!(stdout(&warehouse.run(&["show", "main:a.txt"])), content_before);
 }

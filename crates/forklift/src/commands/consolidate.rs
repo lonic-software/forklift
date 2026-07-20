@@ -7,8 +7,8 @@ use forklift_core::model::inventory::InventoryItem;
 use forklift_core::util::merge_utils::{ConsolidationState, MergeAction};
 use forklift_core::util::stocktake_utils::ChangeKind;
 use forklift_core::util::{
-    inventory_utils, merge_utils, object_utils, office_utils, pallet_utils, scope_utils,
-    shift_utils, stack_utils, stocktake_utils,
+    inventory_utils, load_guard_utils, merge_utils, object_utils, office_utils, pallet_utils,
+    scope_utils, shift_utils, stack_utils, stocktake_utils,
 };
 use crate::output::{self, CommandOutput};
 
@@ -90,6 +90,11 @@ pub async fn handle_command(target: &str) -> Result<(), String> {
         return Ok(());
     }
 
+    // The fast-forward and up-to-date branches above return before this point and are done with
+    // the warehouse (fast-forward wholesale-replaces the inventory from a known-good tree, which
+    // is one of the recognized self-heals — see `load_guard_utils`'s clearing-scope section — so
+    // it must never be blocked); the incomplete-load guard for the genuine-merge path below lives
+    // inside `merge_head_into_current` itself, covering every caller (consolidate/haul/lift).
     match merge_head_into_current(&current, &our_head, &their_head, target, true).await? {
         MergeStatus::Merged(hash) =>
             output::emit("consolidate", &ConsolidateReport::merged(&current, target, &hash)),
@@ -245,6 +250,17 @@ pub(crate) async fn merge_head_into_current(current: &str,
                                             their_head: &str,
                                             their_label: &str,
                                             apply_conflicts: bool) -> Result<MergeStatus, String> {
+    // This function writes real merge output into the working inventory and only afterwards
+    // records that a consolidation is in progress, before ever reaching `stack_utils::stack_parcel`'s
+    // own guard. A `load` that started but never finished cleanly leaves a marker
+    // (`load_guard_utils`) behind; merging on top of that could silently commit an incomplete
+    // staged inventory. Refuses here, before anything is written — every caller (`consolidate`,
+    // `haul`'s merge, `lift`'s optimistic auto-merge) routes through this one function, and each
+    // caller's fast-forward/up-to-date/already-merged branches return before ever reaching it, so
+    // they are correctly not guarded. `stack`/`park` carry the identical check for the identical
+    // reason (see `stack_utils::stack_parcel`'s doc comment).
+    load_guard_utils::check_no_incomplete_load()?;
+
     let our_tree_hash = object_utils::load_parcel(our_head)?.tree_hash;
     let their_tree_hash = object_utils::load_parcel(their_head)?.tree_hash;
 

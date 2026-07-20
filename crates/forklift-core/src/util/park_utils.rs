@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use crate::globals::bay_root;
 use crate::util::file_utils;
 
@@ -13,13 +13,20 @@ fn get_parked_path() -> PathBuf {
     bay_root().join(FILE_NAME_PARKED)
 }
 
-/// Read the parked parcel hashes (oldest first).
+/// Read the parked parcel hashes (oldest first) from a specific bay-local state dir, independent
+/// of the active bay. For a caller enumerating every bay's state — see
+/// `bay_utils::all_bay_state_dirs` — never just the active one; [`read_parked`] is this, scoped
+/// to the active bay.
+///
+/// # Arguments
+/// * `dir` - The bay-local state dir to read: the main tree's own `forklift_root()`, or a named
+///           bay's `bay_utils::bay_state_dir`.
 ///
 /// # Returns
 /// * `Ok(Vec<String>)` - The parked parcel hashes.
 /// * `Err(String)`     - If the file exists but could not be read or holds invalid data.
-pub fn read_parked() -> Result<Vec<String>, String> {
-    let path = get_parked_path();
+pub fn read_parked_in(dir: &Path) -> Result<Vec<String>, String> {
+    let path = dir.join(FILE_NAME_PARKED);
 
     if !path.exists() {
         return Ok(Vec::new());
@@ -44,6 +51,15 @@ pub fn read_parked() -> Result<Vec<String>, String> {
     }
 
     Ok(hashes)
+}
+
+/// Read the parked parcel hashes (oldest first) of the active bay.
+///
+/// # Returns
+/// * `Ok(Vec<String>)` - The parked parcel hashes.
+/// * `Err(String)`     - If the file exists but could not be read or holds invalid data.
+pub fn read_parked() -> Result<Vec<String>, String> {
+    read_parked_in(&bay_root())
 }
 
 /// Write the parked parcel hashes (atomically).

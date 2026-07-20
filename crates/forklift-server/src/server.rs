@@ -1870,6 +1870,48 @@ mod tests {
     use forklift_core::util::{office_utils, scope_utils, warehouse_utils};
     use forklift_core::util::office_utils::{IdentityClass, OfficeState, Role, TrustAnchor, UserRecord};
 
+    /// The durable-taint machinery (module `taint_utils` in `forklift_core`) is activation-gated
+    /// all-or-nothing: a process that taints or gates existence checks without ever healing them
+    /// is strictly worse than today's baseline (a permanent in-process wedge, or a disk taint
+    /// nobody consumes — see that module's doc comment). `forklift-server` does not wire the
+    /// entry-heal (a long-lived, multi-warehouse process needs a per-request chokepoint of its own
+    /// design, scoped out as a follow-up — see the design memo's server section), so it must never
+    /// call that module's activation entry point either. A compile-time grep is cheap and precise
+    /// here: the whole crate is two files, and the forbidden call is an exact, unmistakable
+    /// string — this fails the moment either file starts calling it, without needing a runtime
+    /// scenario. (Deliberately not spelled with its own `::` path syntax anywhere in this doc
+    /// comment or the test below — see the test body for why.)
+    #[test]
+    fn this_crate_never_activates_the_durable_taint_machinery() {
+        // The forbidden calls are assembled at runtime from separate pieces, never written as one
+        // contiguous "module::function" token anywhere in this file — including in comments and
+        // string literals — because `include_str!("server.rs")` below necessarily embeds this
+        // very test's own source, and a literal needle here would trip over itself.
+        let activate_needle = ["taint_utils", "activate"].join("::");
+        let heal_needle = ["heal_utils", "heal_if_tainted"].join("::");
+
+        let main_rs = include_str!("main.rs");
+        let server_rs = include_str!("server.rs");
+
+        for (name, source) in [("main.rs", main_rs), ("server.rs", server_rs)] {
+            assert!(
+                !source.contains(&activate_needle),
+                "{} must never activate the durable-taint machinery — forklift-server has not \
+                wired the entry-heal, so activating half the taint machinery would be strictly \
+                worse than today's baseline (see taint_utils's module doc comment)",
+                name
+            );
+            assert!(
+                !source.contains(&heal_needle),
+                "{} must never call the entry-heal while this crate never activates the taint \
+                machinery — an unactivated call is currently harmless (a documented no-op), but \
+                wiring it in without activation would be misleading dead code implying a \
+                guarantee this crate does not provide",
+                name
+            );
+        }
+    }
+
     /// A classified refusal a core operation raised reaches this head as a sentinel-framed message;
     /// `error_body` threads its stable code and next step onto the wire (additive) with the de-framed
     /// human text in `error` — the raw frame never leaks (fixing the latent leak where a framed

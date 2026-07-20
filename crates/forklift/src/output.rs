@@ -16,7 +16,7 @@
 use std::sync::OnceLock;
 use serde::Serialize;
 use forklift_core::error::{CoreError, RefusalCode};
-use forklift_core::util::{load_guard_utils, merge_utils, query_utils, scope_utils};
+use forklift_core::util::{heal_utils, load_guard_utils, merge_utils, query_utils, scope_utils};
 
 /// The output schema version, carried on every JSON envelope as `forklift_json`.
 /// It changes only when the envelope or a command's `data` shape changes
@@ -295,6 +295,11 @@ error_codes! {
     /// (`load_guard_utils`): committing the staged inventory now could silently produce an
     /// incomplete result.
     IncompleteLoad,
+
+    /// The automatic entry-heal (`heal_utils`) hit a durability taint it could not resolve on its
+    /// own (a vanished, unreadable, or corrupt object, or a torn taint record) and refused rather
+    /// than silently trust unproven state.
+    DurabilityTaint,
 }
 
 impl ErrorCode {
@@ -319,6 +324,7 @@ impl ErrorCode {
             ErrorCode::QueryPredicateInvalid => query_utils::CODE_QUERY_PREDICATE_INVALID,
             ErrorCode::EmptyHistory => "empty_history",
             ErrorCode::IncompleteLoad => load_guard_utils::CODE_INCOMPLETE_LOAD,
+            ErrorCode::DurabilityTaint => heal_utils::CODE_DURABILITY_TAINT,
         }
     }
 
@@ -345,6 +351,7 @@ impl ErrorCode {
             ErrorCode::QueryPredicateInvalid => 18,
             ErrorCode::EmptyHistory => 19,
             ErrorCode::IncompleteLoad => 20,
+            ErrorCode::DurabilityTaint => 21,
         }
     }
 
@@ -386,6 +393,9 @@ impl ErrorCode {
             ErrorCode::IncompleteLoad =>
                 "\"stack\" or \"park\" refused because a \"load\" that never finished cleanly is \
                  still recorded",
+            ErrorCode::DurabilityTaint =>
+                "A durability taint could not be auto-healed (a vanished, unreadable, or \
+                 corrupt path, or a torn taint record)",
         }
     }
 
@@ -409,6 +419,7 @@ impl ErrorCode {
             RefusalCode::CommitPaginationUnsupported => ErrorCode::CommitPaginationUnsupported,
             RefusalCode::QueryPredicateInvalid => ErrorCode::QueryPredicateInvalid,
             RefusalCode::IncompleteLoad => ErrorCode::IncompleteLoad,
+            RefusalCode::DurabilityTaint => ErrorCode::DurabilityTaint,
         }
     }
 }
@@ -484,6 +495,59 @@ impl From<String> for ForkliftError {
         }
 
         ForkliftError::from(CoreError::from(message))
+    }
+}
+
+/// Surface a durability taint left standing by best-effort background auto-maintenance
+/// (`commands::maintenance::run_if_due`) — after the triggering command's own work has already
+/// succeeded and its result envelope (if any) has already printed. This is *not* the triggering
+/// command's own result: it must never be folded into `data`, and it must never appear on
+/// stdout, or `--json` stdout would stop being exactly one JSON document (see this module's own
+/// doc comment and `docs/MACHINE_INTERFACE.md`). But [`human!`] is a no-op under `--json`, so a
+/// bare human-only warning would be invisible to exactly the consumer most likely to need it — an
+/// agent that just saw the triggering command exit 0 and has no way to know a *later*, unrelated
+/// command may exit 21 (`durability_taint`) for a reason it never caused. This codebase has no
+/// existing machine-visible side-channel for a non-fatal diagnostic (the closest precedent,
+/// `import-git`'s per-command `warnings` field, is baked into that command's own `data` before it
+/// ever emits — not available here, since `run_if_due` runs after the triggering command's own
+/// `output::emit`/`output::message` call already printed). Stderr, structured the same way in
+/// both modes, is the least-bad channel available: never shares stdout, so the invariant above
+/// holds, and a `--json` consumer that also captures stderr gets a real JSON object instead of
+/// prose to grep.
+///
+/// `gate_message` is the exact string [`heal_utils`]'s taint machinery
+/// (`taint_utils::gate_check`) returned — reused verbatim, never rebuilt, so this warning can
+/// never drift from the wording the entry-heal chokepoint's own `durability_taint` refusal uses
+/// for the very same taint.
+pub fn warn_standing_taint(gate_message: &str) {
+    eprintln!("{}", standing_taint_warning_text(mode(), gate_message));
+}
+
+/// The pure half of [`warn_standing_taint`]: builds the exact text for a given mode without
+/// touching stderr (or anything else) — split out purely so a test can assert on the produced
+/// message/code/next_step directly, in both `Human` and `Json` shapes, without capturing the
+/// process's real stderr. [`warn_standing_taint`] is the only production caller; its own
+/// behavior (what actually reaches stderr for a real run) is unchanged by this split.
+fn standing_taint_warning_text(mode: OutputMode, gate_message: &str) -> String {
+    match mode {
+        OutputMode::Human => format!(
+            "Warning: {} Left standing by automatic background maintenance; the command above \
+             already completed successfully. {}",
+            gate_message, heal_utils::DURABILITY_TAINT_NEXT_STEP
+        ),
+        OutputMode::Json => {
+            let envelope = serde_json::json!({
+                "forklift_json": SCHEMA_VERSION,
+                "warning": heal_utils::CODE_DURABILITY_TAINT,
+                "message": gate_message,
+                "next_step": heal_utils::DURABILITY_TAINT_NEXT_STEP,
+            });
+
+            serde_json::to_string(&envelope).unwrap_or_else(|_| format!(
+                "{{\"forklift_json\":\"{}\",\"warning\":\"{}\"}}",
+                SCHEMA_VERSION, heal_utils::CODE_DURABILITY_TAINT
+            ))
+        }
     }
 }
 
@@ -577,6 +641,7 @@ mod tests {
             RefusalCode::OversizedTransportUnsupported,
             RefusalCode::CommitPaginationUnsupported,
             RefusalCode::IncompleteLoad,
+            RefusalCode::DurabilityTaint,
         ] {
             // Hostile interpolated text, carried across a String segment (the shim), then classified.
             let framed: String = CoreError::refusal(code, "a\u{1f}path", "a\u{1f}step").into();
@@ -608,6 +673,7 @@ mod tests {
             (RefusalCode::CommitPaginationUnsupported, "commit_pagination_unsupported", 16),
             (RefusalCode::QueryPredicateInvalid, "query_predicate_invalid", 18),
             (RefusalCode::IncompleteLoad, "incomplete_load", 20),
+            (RefusalCode::DurabilityTaint, "durability_taint", 21),
         ];
 
         for (code, code_str, exit) in table {
@@ -629,5 +695,32 @@ mod tests {
         assert_eq!(error.code.exit_code(), 19);
         assert_eq!(error.message, "nothing stacked yet");
         assert!(error.next_step.is_none());
+    }
+
+    /// The standing-taint warning (`commands::maintenance::run_if_due`'s surfacing of a taint
+    /// left behind by a failed auto-maintenance `compact`) in both output modes: `Human` prose
+    /// names the marker and the `forklift heal` remedy; `Json` carries the same information as a
+    /// self-describing object (`forklift_json`/`warning`/`message`/`next_step`) rather than prose
+    /// a machine consumer would have to parse. Both must always name the remedy — the whole point
+    /// of this warning existing is that a consumer (human or agent) knows what to do next.
+    #[test]
+    fn the_standing_taint_warning_names_the_code_and_the_heal_remedy_in_both_modes() {
+        let gate_message = "a durability taint is standing under \"/warehouse/.forklift\"; \
+            existence cannot be trusted here until it is healed.";
+
+        let human = standing_taint_warning_text(OutputMode::Human, gate_message);
+        assert!(human.contains(gate_message), "human text: {}", human);
+        assert!(human.contains("forklift heal"), "human text: {}", human);
+
+        let json_text = standing_taint_warning_text(OutputMode::Json, gate_message);
+        let value: serde_json::Value = serde_json::from_str(&json_text)
+            .unwrap_or_else(|e| panic!("json warning is not valid JSON ({}): {}", e, json_text));
+        assert_eq!(value["forklift_json"], SCHEMA_VERSION);
+        assert_eq!(value["warning"], heal_utils::CODE_DURABILITY_TAINT);
+        assert_eq!(value["message"], gate_message);
+        assert!(
+            value["next_step"].as_str().unwrap().contains("forklift heal"),
+            "next_step: {}", value["next_step"]
+        );
     }
 }
