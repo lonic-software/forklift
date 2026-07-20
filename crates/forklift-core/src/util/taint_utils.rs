@@ -1238,6 +1238,10 @@ mod tests {
         let _guard = file_utils::SyncDirFaultGuard::recording();
         let result = remove_taint_files(&forklift, &snapshot.files);
         assert!(result.is_ok(), "a file already gone from the snapshot must not be an error, got {:?}", result);
+        // `sync_dir` is a documented no-op on non-Unix (`file_utils::sync_dir`), so the fault-
+        // recording rig behind `sync_dir_attempts` never records there — this assertion only
+        // holds on Unix.
+        #[cfg(unix)]
         assert!(file_utils::sync_dir_attempts().contains(&forklift.join(TAINT_DIR_NAME)),
             "the taint directory must still be synced even when every snapshotted file was already gone");
     }

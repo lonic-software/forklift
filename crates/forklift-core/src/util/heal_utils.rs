@@ -894,6 +894,7 @@ mod tests {
 
         let recorded: BTreeSet<PathBuf> =
             [PathBuf::from("objects/pack/fake.pack")].into_iter().collect();
+        #[cfg(unix)]
         let dir_syncs_before = file_utils::dir_sync_count();
         let attempt = attempt_restage_all(&forklift, &recorded);
 
@@ -905,11 +906,15 @@ mod tests {
             .collect()
         ).expect("syncing the restaged parent must succeed");
 
-        assert!(file_utils::dir_sync_count() > dir_syncs_before,
-            "the restage's parent-directory sync must actually run");
-
+        // `sync_dir` is a documented no-op on non-Unix (`file_utils::sync_dir`), so the fault-
+        // recording rig behind `dir_sync_count` never records there — the directory-sync
+        // assertion below only holds on Unix. The inode-rewrite check is Unix-only for the same
+        // reason `inode_before` above is: `MetadataExt::ino` does not exist on non-Unix targets.
         #[cfg(unix)]
         {
+            assert!(file_utils::dir_sync_count() > dir_syncs_before,
+                "the restage's parent-directory sync must actually run");
+
             let inode_after = std::fs::metadata(&pack_file).unwrap().ino();
             assert_ne!(inode_before, inode_after,
                 "mutation check: the dentry must actually be rewritten, not just fsynced");

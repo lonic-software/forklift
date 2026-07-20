@@ -2480,7 +2480,18 @@ mod tests {
             CoreError::Refusal { code, message, .. } => {
                 assert_eq!(*code, RefusalCode::DurabilityTaint, "wrong code, message: {}", message);
                 for &needle in contains {
-                    assert!(message.contains(needle), "expected {:?} in message: {}", needle, message);
+                    // The refusal message renders paths with the platform's native separator
+                    // (built via `PathBuf`/`Display`), while the durable taint record itself is
+                    // always canonical `/` (see `taint_utils`'s format section). A needle built
+                    // from a relative path's `Display`/`to_string_lossy` therefore comes out
+                    // mixed on Windows (`objects/ff\ffff...`) against a fully native message
+                    // (`objects\ff\ffff...`). Both are display-only strings, so normalize both
+                    // sides to `/` before comparing — but keep the panic output showing the
+                    // original, un-normalized strings so a real failure stays readable.
+                    let normalized_message = message.replace('\\', "/");
+                    let normalized_needle = needle.replace('\\', "/");
+                    assert!(normalized_message.contains(&normalized_needle),
+                        "expected {:?} in message: {}", needle, message);
                 }
             }
             other => panic!("expected a DurabilityTaint refusal, got {:?}", other),
