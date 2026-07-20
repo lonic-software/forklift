@@ -114,18 +114,19 @@
 //!   which pallet(s) reference it. Cost is bounded by what is actually missing: every fetch
 //!   primitive dedups against what is already present.
 //! - **D2 (packed landing).** The post-fetch check reuses the exact same
-//!   [`file_utils::raw_object_present`] (packed-or-loose) predicate the raw-presence filter above
-//!   already uses — a remote that serves an object *packed* satisfies it even though the taint
-//!   recorded a *loose* path; a packed object is itself content-addressed and index-verified, so
-//!   accepting it never weakens what "recovered" means.
+//!   [`file_utils::read_object_classified`] core the ordinary read path is itself expressed
+//!   through — a remote that serves an object *packed* satisfies it (`Verified`) even though the
+//!   taint recorded a *loose* path; a packed object is itself content-addressed and index-verified,
+//!   so accepting it never weakens what "recovered" means.
 //! - **D3 (all-or-nothing, never a false clear).** Nothing here ever decides "recovered" from
 //!   whether the fetch call itself returned `Ok` — [`attempt_heal_driven_refetch`]'s own outcome
 //!   ([`RemoteConsultation`]) only ever feeds [`remedy_text`]'s wording, so a residual refusal
 //!   never overclaims what this run established. Every remainder hash (ordinary or corrupt) is
-//!   independently re-verified via `raw_object_present` after the fetch attempt, whether that
+//!   independently re-verified via `read_object_classified` after the fetch attempt, whether that
 //!   attempt errored, hit a diverged pallet, or ran clean — a hash the fetch did not actually
-//!   restore is never cleared, and one that a sibling pallet's history happened to also carry
-//!   clears exactly the same way an ordinary present object would.
+//!   restore is never cleared (only `Verified` clears it — a subsequent ordinary read of it would
+//!   actually succeed), and one that a sibling pallet's history happened to also carry clears
+//!   exactly the same way an ordinary present object would.
 //! - **D4 (force-fetch a corrupt remainder entry).** An ordinary fetch dedups against *present*
 //!   objects, so a corrupt-but-present recorded path (`attempt.hash_mismatch`) would never be
 //!   re-fetched through the shared fetch path — `does_object_exist` already says "yes". Rather
@@ -499,21 +500,39 @@ async fn resolve_the_rest(
         attempt_heal_driven_refetch(&candidate_hashes, &corrupt_hashes).await
     };
 
-    // Raw-presence filter: a candidate present elsewhere (another pack, or loose) was never
-    // actually lost — only what remains absent everywhere needs the closure walk at all. This is
-    // also §3.2 D3's actual safety net: whether a hash just got fetched, was already present, or
-    // the fetch attempt above errored/skipped it entirely, this is the one check that decides
-    // "recovered" — never the fetch call's own `Ok`/`Err`.
+    // Classifying-read filter (DESIGN.html §3.1.1): a candidate present elsewhere (another pack,
+    // or loose) was never actually lost — only what an ordinary read could not actually serve
+    // needs the closure walk at all. This is also §3.2 D3's actual safety net: whether a hash just
+    // got fetched, was already present, or the fetch attempt above errored/skipped it entirely,
+    // this is the one check that decides "recovered" — never the fetch call's own `Ok`/`Err`. Built
+    // on [`file_utils::read_object_classified`] — the same core the ordinary read path itself is
+    // expressed through, rather than a bespoke presence check that could disagree with it — so a
+    // hash only ever counts as recovered here when a subsequent ordinary read of it would actually
+    // succeed.
     let mut truly_missing: BTreeSet<String> = BTreeSet::new();
+    // Every `truly_missing` hash the classifying read found present-but-unreadable (rather than
+    // genuinely absent), keyed by the exact reason a subsequent ordinary read of it would fail —
+    // threaded into the dangling line below if the hash ends up in the remainder, so the refusal
+    // never falls back to the generic "vanished" wording for a hash that is not actually vanished
+    // at all, just unreadable where it sits.
+    let mut unverifiable_reasons: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     // I4: a pack-recovered path was never rewritten and never entered `attempt.vanished` in the
     // first place (`restage_object` resolved it directly) — it belongs in `resolved` alongside
     // the vanished-and-unreferenced hashes this loop finds below, not in `remainder`.
     let mut resolved: Vec<String> = display_paths(attempt.recovered_packed.iter());
 
     for hash in loose_candidates.keys().chain(pack_candidates.keys()) {
-        match file_utils::raw_object_present(hash) {
-            Ok(true) => resolved.push(hash.clone()),
-            Ok(false) => { truly_missing.insert(hash.clone()); }
+        match file_utils::read_object_classified(hash) {
+            Ok(file_utils::StoreReadOutcome::Verified(_)) => resolved.push(hash.clone()),
+            Ok(file_utils::StoreReadOutcome::Absent) => { truly_missing.insert(hash.clone()); }
+            Ok(file_utils::StoreReadOutcome::Unverifiable(reason)) => {
+                // Present, but an ordinary read of it would fail — never a false "recovered"
+                // (never `resolved`), but also not distinguishable from a genuine vanish for the
+                // closure walk's own "still referenced" question below, so it travels the same
+                // `truly_missing` path — see this loop's own comment on why that is sound.
+                truly_missing.insert(hash.clone());
+                unverifiable_reasons.insert(hash.clone(), reason);
+            }
             Err(e) => return Err(walk_failure_refusal(root, &e)),
         }
     }
@@ -532,51 +551,81 @@ async fn resolve_the_rest(
     for hash in &truly_missing {
         if referenced.contains(hash) {
             mark_still_dangling(hash, &loose_candidates, &pack_candidates, recorded, &mut remainder);
-            dangling_lines.push(format!(
-                "vanished and still referenced: \"{}\" ({})", hash, remedy_text(consultation)
-            ));
+            dangling_lines.push(match unverifiable_reasons.get(hash) {
+                // Present, but an ordinary read fails on it — quote the mechanical failure, never
+                // the "vanished" wording (see the module doc comment's message-honesty rule).
+                Some(reason) => format!(
+                    "cannot be read back verified: \"{}\" ({}; {})", hash, reason, remedy_text(consultation)
+                ),
+                None => format!(
+                    "vanished and still referenced: \"{}\" ({})", hash, remedy_text(consultation)
+                ),
+            });
         } else if roots_incomplete {
             mark_still_dangling(hash, &loose_candidates, &pack_candidates, recorded, &mut remainder);
-            dangling_lines.push(format!(
-                "vanished, and this run could not confirm it is safe to drop: \"{}\" (at least \
-                one bay's saved state could not be read this run, so not every reference to it \
-                could be checked — see the note below for which bay and how to fix it, then \
-                re-run \"forklift heal\")",
-                hash
-            ));
+            dangling_lines.push(match unverifiable_reasons.get(hash) {
+                Some(reason) => format!(
+                    "cannot be read back verified, and this run could not confirm it is safe to \
+                    drop: \"{}\" ({}; at least one bay's saved state could not be read this run, \
+                    so not every reference to it could be checked — see the note below for which \
+                    bay and how to fix it, then re-run \"forklift heal\")",
+                    hash, reason
+                ),
+                None => format!(
+                    "vanished, and this run could not confirm it is safe to drop: \"{}\" (at least \
+                    one bay's saved state could not be read this run, so not every reference to it \
+                    could be checked — see the note below for which bay and how to fix it, then \
+                    re-run \"forklift heal\")",
+                    hash
+                ),
+            });
         } else {
             resolved.push(hash.clone());
         }
     }
 
-    // D4: re-verify each corrupt candidate by **content**, not presence. The corrupt dentry is
-    // never deleted above, so unlike the ordinary vanished set's `raw_object_present` check, a
-    // bare "something exists at this path" is not evidence of anything here: on an unreachable or
-    // failed fetch, the original corrupt bytes are still sitting exactly where they were, and a
-    // presence-only recheck would read them back as "recovered" — a false clear that reports the
-    // object fixed while its corrupt bytes are untouched, strictly worse than the honest refusal
-    // this recheck exists to give. `corrupt_candidate_content_verified` reads the loose file back,
-    // decompresses it, and hash-verifies it via the same content-addressing predicate
-    // (`object_utils::verify_object_bytes`) `force_store_object_bytes` used to accept it in the
-    // first place — one predicate, not two that could disagree about the same file. Unlike the
+    // D4: re-verify each corrupt candidate by **content**, not presence — built directly on
+    // [`file_utils::read_object_classified`], the same core the ordinary read path is expressed
+    // through (DESIGN.html §3.1.1). The corrupt dentry is never deleted above, so unlike the
+    // ordinary vanished set's classifying-read check, a bare "something is at this path" is not
+    // evidence of anything here: on an unreachable or failed fetch, the original corrupt bytes are
+    // still sitting exactly where they were, and a presence-only recheck would read them back as
+    // "recovered" — a false clear that reports the object fixed while its corrupt bytes are
+    // untouched, strictly worse than the honest refusal this recheck exists to give.
+    // `read_object_classified` decides `Verified` only on an actual content-hash match (packed or
+    // loose) — one predicate, not a second one that could disagree about the same file. Unlike the
     // ordinary vanished set, a corrupt candidate is never exonerated by "unreferenced" — this
     // mirrors the verb's existing corrupt-is-always-remainder-until-recovered rule; only a genuine
-    // recovery (a good copy landed) clears it, regardless of what the closure walk would say about
-    // reachability.
+    // recovery (a good copy landed, `Verified`) clears it, regardless of what the closure walk
+    // would say about reachability.
     for (hash, relative) in &corrupt_candidates {
-        let recovered = match corrupt_candidate_content_verified(hash) {
-            Ok(present) => present,
+        match file_utils::read_object_classified(hash) {
+            Ok(file_utils::StoreReadOutcome::Verified(_)) => {
+                resolved.push(relative.to_string_lossy().into_owned());
+            }
+            Ok(file_utils::StoreReadOutcome::Unverifiable(reason)) => {
+                // Present, but an ordinary read fails on it — the mechanical failure, never the
+                // fixed "corrupt (content does not match its own hash)" wording: that phrase is
+                // reserved for a verdict actually downstream of a hash-compare on these bytes,
+                // which a failed decompression or an unreconstructable delta chain never reached.
+                remainder.insert(relative.clone());
+                dangling_lines.push(format!(
+                    "cannot be read back verified: \"{}\" ({}; {})",
+                    relative.to_string_lossy(), reason, remedy_text(consultation)
+                ));
+            }
+            Ok(file_utils::StoreReadOutcome::Absent) => {
+                // No fetch landed a copy, and the corrupt dentry itself is now simply gone (a
+                // concurrent `compact`/gc could have swept it) — honestly neither "still corrupt"
+                // nor "recovered": nothing durable backs this hash at all right now.
+                remainder.insert(relative.clone());
+                dangling_lines.push(format!(
+                    "no longer present at its recorded address, and this run's refetch did not \
+                    land a verified copy: \"{}\" ({})",
+                    relative.to_string_lossy(), remedy_text(consultation)
+                ));
+            }
             Err(e) => return Err(walk_failure_refusal(root, &e)),
-        };
-
-        if recovered {
-            resolved.push(relative.to_string_lossy().into_owned());
-        } else {
-            remainder.insert(relative.clone());
-            dangling_lines.push(format!(
-                "corrupt (content does not match its own hash): \"{}\" ({})",
-                relative.to_string_lossy(), remedy_text(consultation)
-            ));
         }
     }
 
@@ -615,55 +664,6 @@ async fn resolve_the_rest(
     } else {
         Err(dangling_refusal(root, &dangling_lines, &walk.degraded_bays))
     }
-}
-
-/// D4's corrupt-candidate recheck (DESIGN.html §3.1.1): content, not presence. Unlike
-/// [`file_utils::raw_object_present`]'s packed-first shortcut (a bare index-membership check,
-/// trusted as-is because that function only needs to tell "genuinely absent" apart from "a false
-/// alarm — repacked since the taint fired"), this recheck cannot stop at membership: a corrupt
-/// candidate's dentry is never deleted before its fetch runs (see the module doc comment), so a
-/// stale corrupt loose file — or, for the same reason, a pack record whose data does not verify —
-/// can genuinely be sitting where this looks when it runs, and index/dentry presence alone cannot
-/// tell that apart from a freshly landed good copy. So both branches read the bytes back and
-/// hash-verify them: the pack branch via [`pack_utils::retrieve_from_packs`] (which decompresses,
-/// reconstructs any delta chain, and calls [`object_utils::verify_object_bytes`] itself — the same
-/// verification the ordinary read path performs), the loose branch by decompressing and calling
-/// `verify_object_bytes` directly.
-///
-/// # Returns
-/// * `Ok(true)`    - The object is present and its content hash-verifies (packed or loose).
-/// * `Ok(false)`   - Nothing is at the path, or its content does not hash-verify.
-/// * `Err(String)` - The pack registry could not be loaded, or the loose file could not be read.
-fn corrupt_candidate_content_verified(hash: &str) -> Result<bool, String> {
-    // `is_in_packs` first: a pure index-membership check, so its `Err` stays reserved for a
-    // registry-level failure (packs could not be loaded at all) — the pack-side analogue of the
-    // loose branch's "could not tell" `Err` below. Once membership is confirmed, `retrieve_from_packs`
-    // is the actual content-verifying read; if *that* fails (bad decompression, an unreconstructable
-    // delta chain, or a hash mismatch), the record is present but does not verify — decisive, not
-    // an unknown — so it is folded into `Ok(false)` rather than aborting this whole recheck walk
-    // over one bad candidate, mirroring how the loose branch below folds a decompression failure
-    // into `Ok(false)` instead of propagating it.
-    if pack_utils::is_in_packs(hash)? {
-        return Ok(matches!(pack_utils::retrieve_from_packs(hash), Ok(Some(_))));
-    }
-
-    let (folder, file_name) = file_utils::get_path_for_object(hash)?;
-    let absolute = Path::new(&folder).join(&file_name);
-
-    let compressed = match std::fs::read(&absolute) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(format!(
-            "Error while reading \"{}\" to verify its content: {}", absolute.to_string_lossy(), e
-        )),
-    };
-
-    let decompressed = match zstd::stream::decode_all(compressed.as_slice()) {
-        Ok(decompressed) => decompressed,
-        Err(_) => return Ok(false),
-    };
-
-    Ok(object_utils::verify_object_bytes(hash, &decompressed).is_ok())
 }
 
 /// Record `hash`'s recorded taint path(s) — its loose path, or its pack data file plus
@@ -2928,7 +2928,8 @@ mod tests {
         let error = run_heal()
             .expect_err("an unrecovered corrupt object must never let the taint clear");
         assert_durability_taint(&error, &[
-            "corrupt (content does not match its own hash)",
+            "cannot be read back verified",
+            "content-addressing violated",
             relative.to_string_lossy().as_ref(),
         ]);
 
@@ -3181,15 +3182,15 @@ mod tests {
     /// (D4, pack-side content check) A corrupt candidate's hash is a *hit* in a pack index, but
     /// the pack's own record for it can never be reconstructed (a delta against a base object that
     /// exists nowhere) — so its content can never be verified either. Index membership alone
-    /// (`pack_utils::is_in_packs`) says "present"; only actually reading the record
-    /// (`pack_utils::retrieve_from_packs`) can tell a genuine recovery apart from a stale corrupt
-    /// dentry sitting next to an unrelated, unreadable pack hit. The remote is configured but
-    /// unreachable (as in the offline D4 tests above), so nothing here can be fixed by a fetch —
-    /// the recheck below is the only thing that can decide the outcome. Mutation: revert
-    /// `corrupt_candidate_content_verified`'s pack branch back to a bare `is_in_packs` check — it
-    /// trusts the index hit alone, reports "recovered" without ever reading the record, and this
-    /// test goes red (the taint incorrectly clears even though the loose file is still corrupt
-    /// garbage and the pack record cannot be reconstructed).
+    /// (`pack_utils::is_in_packs`) says "present"; only actually reading the record through
+    /// [`file_utils::read_object_classified`] can tell a genuine recovery apart from a stale
+    /// corrupt dentry sitting next to an unrelated, unreadable pack hit. The remote is configured
+    /// but unreachable (as in the offline D4 tests above), so nothing here can be fixed by a fetch
+    /// — the recheck below is the only thing that can decide the outcome. Mutation: revert the
+    /// corrupt-candidate recheck in `resolve_the_rest` back to a bare `pack_utils::is_in_packs`
+    /// membership check — it trusts the index hit alone, reports "recovered" without ever reading
+    /// the record, and this test goes red (the taint incorrectly clears even though the loose file
+    /// is still corrupt garbage and the pack record cannot be reconstructed).
     #[test]
     fn d4_pack_hit_whose_content_does_not_verify_is_never_reported_recovered() {
         use crate::enums::config_scope::ConfigScope;
@@ -3229,12 +3230,202 @@ mod tests {
         let error = run_heal()
             .expect_err("a pack hit whose record cannot be reconstructed must never be reported recovered");
         assert_durability_taint(&error, &[
-            "corrupt (content does not match its own hash)",
+            "cannot be read back verified",
             relative.to_string_lossy().as_ref(),
         ]);
+        // The failure never actually reached a hash-compare on this hash's own bytes — the delta
+        // base itself could not be read — so the refusal must never claim the fixed "corrupt
+        // (content does not match its own hash)" wording (message honesty, DESIGN.html §3.1.1).
+        if let CoreError::Refusal { message, .. } = &error {
+            assert!(!message.contains("corrupt (content does not match its own hash)"),
+                "must not claim a hash-compare that never happened: {}", message);
+        }
 
         let after = std::fs::read(forklift.join(&relative)).unwrap();
         assert_eq!(before, after, "the still-corrupt loose object's bytes must be untouched");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// (DESIGN.html §3.1.1 — the classifying-read core) H's recorded loose taint path is
+    /// genuinely vanished (nothing was ever written there); H's *only* copy anywhere is a pack
+    /// delta record whose base was never stored, so it can never actually be reconstructed — an
+    /// ordinary read of H can never succeed. H is referenced from a real pallet head's tree.
+    /// Before this fix, the truly-missing filter in `resolve_the_rest` (recovery_utils.rs, the
+    /// loop just above `mark_still_dangling`) asked only whether H was present in *some* pack's
+    /// index (`file_utils::raw_object_present`, a bare membership check) — true here — and
+    /// reported H recovered without ever reading it back: a taint over an object nothing can
+    /// actually serve silently cleared. This test is RED against the pre-fix code (confirmed and
+    /// reported separately, not asserted here — the fixture is unchanged either way). After the
+    /// fix, `file_utils::read_object_classified` decides `Unverifiable` for H (present, but an
+    /// ordinary read fails), so it stays dangling and the refusal names the actual reconstruction
+    /// failure rather than the generic "vanished" wording. Mutation: revert the truly-missing loop
+    /// back to `file_utils::raw_object_present` → this test goes red again (the taint incorrectly
+    /// clears, `run_heal()` returns `Ok`).
+    #[test]
+    fn a_vanished_loose_path_whose_only_pack_record_cannot_reconstruct_is_never_reported_recovered() {
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+        use crate::globals::StorageRootScope;
+        use crate::model::parcel::Parcel;
+        use crate::model::tree_item::TreeItem;
+        use crate::util::pack_utils::TransportPackBuilder;
+
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        let root = std::env::temp_dir()
+            .join(format!("forklift-recovery-utils-514-vanished-unreconstructable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let _scope = StorageRootScope::enter(&root);
+        let forklift = forklift_root();
+
+        let h_hash = "c".repeat(64);
+        let (folder, file_name) = file_utils::get_path_for_object(&h_hash).unwrap();
+        let h_absolute = PathBuf::from(&folder).join(&file_name);
+        let h_relative = h_absolute.strip_prefix(&forklift).unwrap().to_path_buf();
+        // H is never written loose at all — genuinely vanished from the moment the taint fires,
+        // not merely deleted after the fact.
+
+        // H's only copy: a pack delta record against a base that was never stored anywhere —
+        // reconstruction (and so an ordinary read) can never succeed, even though index membership
+        // alone says "present." Built *before* anything below stores a loose object: a `store()`
+        // dedup check is itself the pack registry's first load in this fresh scratch root, and
+        // that load result stays cached (nothing here calls `compact`, the only thing that would
+        // invalidate it) — so the pack must exist before the first such load or `is_in_packs`
+        // would keep answering from a stale, pre-pack snapshot for the rest of this test.
+        let never_stored_base = "d".repeat(64);
+        let mut builder = TransportPackBuilder::new(&pack_utils::pack_folder()).unwrap();
+        builder.append_delta(&h_hash, &never_stored_base, 10, b"not a real delta payload").unwrap();
+        builder.finish().unwrap();
+        assert!(pack_utils::is_in_packs(&h_hash).unwrap(), "sanity: H is a pack membership hit");
+        assert!(pack_utils::retrieve_from_packs(&h_hash).is_err(),
+            "sanity: H's record cannot actually be reconstructed");
+
+        let mut root_tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        root_tree.add_child(TreeItem::new("h.txt".to_string(), h_hash.clone(), DirEntryType::Normal));
+        let mut tree_object = LooseObjectBuilder::build_tree(&root_tree);
+        tree_object.store().unwrap();
+
+        let parcel = Parcel {
+            tree_hash: tree_object.hash.clone(),
+            parents: Vec::new(),
+            actions: Vec::new(),
+            description: Some("references H".to_string()),
+        };
+        let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
+        parcel_object.store().unwrap();
+        pallet_utils::set_pallet_head("main", &parcel_object.hash).unwrap();
+
+        plant_complete_taint(&forklift, &[h_relative.to_string_lossy().as_ref()]);
+
+        let error = run_heal().expect_err(
+            "a vanished loose path whose only pack record cannot reconstruct must never be reported recovered"
+        );
+        assert_durability_taint(&error, &["cannot be read back verified", h_hash.as_str()]);
+
+        let state = taint_utils::read_taints(&forklift).unwrap();
+        assert!(!state.recorded.is_empty(), "the taint must survive — H was never actually recovered");
+        assert!(state.recorded.contains(&h_relative));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// (DESIGN.html §3.1.1) The classifying read core must never fall through from a failed pack
+    /// read to the loose store — even when a perfectly good loose copy sits at the exact recorded
+    /// path. Fixture: H's only pack record is a delta against a base that was never stored
+    /// (unreconstructable); H's own loose fan-out path simultaneously holds a *verified-good* copy
+    /// of H, written directly at that path (`store_object_bytes`'s dedup gate would skip the write
+    /// once H is already a pack member, so this bypasses it — exactly what the spec calls for).
+    ///
+    /// `resolve_the_rest` is driven directly here (bypassing `attempt_restage_all`, via a
+    /// hand-built [`heal_utils::RestageAttempt`] whose `hash_mismatch` set names H's own path) —
+    /// the shape a real taint would only reach this way if a remote is configured (§3.2 D4's
+    /// corrupt-candidate path). This isolates exactly the recheck's own pack→loose question:
+    /// `attempt_restage_all` itself never runs here, so nothing about *how* H's path was classified
+    /// initially can confound what the recheck alone decides once it runs. The remote is configured
+    /// but unreachable, so nothing here can be fixed by a fetch.
+    ///
+    /// Mutation that must redden: add a pack→loose fall-through inside `read_object_classified`
+    /// (serve the good loose copy once the pack resolve fails) — H would be reported `resolved`,
+    /// the taint would clear, `run_heal` (via this direct call) would return `Ok`, and this test's
+    /// `.expect_err` would panic.
+    #[test]
+    fn no_pack_to_loose_fall_through_even_with_a_good_loose_copy_present() {
+        use crate::enums::config_scope::ConfigScope;
+        use crate::globals::StorageRootScope;
+        use crate::util::config_utils;
+        use crate::util::pack_utils::TransportPackBuilder;
+
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        let root = std::env::temp_dir()
+            .join(format!("forklift-recovery-utils-no-pack-loose-fallthrough-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let _scope = StorageRootScope::enter(&root);
+        let forklift = forklift_root();
+
+        let good_content = b"a perfectly good copy of H, sitting right where the fan-out path says";
+        let h_hash = object_utils::hash_object_bytes(good_content);
+        let (folder, file_name) = file_utils::get_path_for_object(&h_hash).unwrap();
+        std::fs::create_dir_all(&folder).unwrap();
+        let h_absolute = PathBuf::from(&folder).join(&file_name);
+        // Written directly at the fan-out path (not through `store_object_bytes`, whose dedup
+        // gate would skip the write once H is a pack member) — a real, verified-good loose copy.
+        let compressed = zstd::encode_all(good_content.as_slice(), 0).unwrap();
+        std::fs::write(&h_absolute, &compressed).unwrap();
+        let h_relative = h_absolute.strip_prefix(&forklift).unwrap().to_path_buf();
+
+        // H's only pack record: a delta against a base that was never stored — unreconstructable.
+        let never_stored_base = "b".repeat(64);
+        let mut builder = TransportPackBuilder::new(&pack_utils::pack_folder()).unwrap();
+        builder.append_delta(&h_hash, &never_stored_base, 10, b"not a real delta payload").unwrap();
+        builder.finish().unwrap();
+        assert!(pack_utils::is_in_packs(&h_hash).unwrap(), "sanity: H is a pack membership hit");
+        assert!(pack_utils::retrieve_from_packs(&h_hash).is_err(),
+            "sanity: H's pack record cannot actually be reconstructed");
+
+        // Read-path witness: the ordinary read must fail even though a good loose copy sits right
+        // there — this is `read_object_uncached`'s own pre-existing packs-first behavior, and
+        // `read_object_classified` must agree with it exactly (that agreement is the whole point).
+        let ordinary_read = file_utils::retrieve_object_by_hash_uncached(&h_hash);
+        assert!(ordinary_read.is_err(), "the ordinary read must never silently prefer the good \
+            loose copy once pack membership with a failed resolve is established");
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        config_utils::set_value(config_utils::KEY_REMOTE_URL, &url, ConfigScope::Warehouse).unwrap();
+
+        let mut attempt = heal_utils::RestageAttempt::default();
+        attempt.hash_mismatch.insert(h_relative.clone());
+
+        plant_complete_taint(&forklift, &[h_relative.to_string_lossy().as_ref()]);
+        let state = taint_utils::read_taints(&forklift).unwrap();
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let error = runtime
+            .block_on(resolve_the_rest(&forklift, &state.recorded, &attempt, &state.files))
+            .expect_err("a corrupt candidate whose only pack record cannot reconstruct must never \
+                clear, even though a good loose copy sits at its own path");
+
+        // The corrupt-candidate recheck names the recorded *path* in its dangling line (not the
+        // bare hash — see `resolve_the_rest`'s corrupt-candidate loop), and the reason it carries
+        // must be the actual reconstruction failure (naming the missing delta base), never a
+        // silent read of H's own good loose bytes.
+        assert_durability_taint(&error, &[
+            "cannot be read back verified", "entity not found",
+            h_relative.to_string_lossy().as_ref(),
+        ]);
+        if let CoreError::Refusal { message, .. } = &error {
+            assert!(!message.contains("corrupt (content does not match its own hash)"),
+                "must not claim a hash-compare that never happened: {}", message);
+        }
+
+        let after_state = taint_utils::read_taints(&forklift).unwrap();
+        assert!(!after_state.recorded.is_empty(), "the taint must survive — H was never actually recovered");
 
         std::fs::remove_dir_all(&root).ok();
     }

@@ -1114,8 +1114,8 @@ fn decode_full_transport_record(record: &[u8], hash: &str) -> Result<Vec<u8>, St
 }
 
 /// Retrieve the decompressed bytes of an object from the packs, or `None` if no pack holds
-/// it. The read fallback for `file_utils::retrieve_object_by_hash` when the loose file is
-/// absent.
+/// it. `file_utils::read_object_uncached`/`read_object_classified` consult this *first* — packs
+/// are the common case at scale, not a fallback for when the loose file is absent.
 ///
 /// # Arguments
 /// * `hash` - The hex hash of the object.

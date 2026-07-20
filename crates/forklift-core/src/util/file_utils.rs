@@ -1625,21 +1625,74 @@ pub fn retrieve_object_by_hash_uncached(hash: &str) -> Result<Vec<u8>, String> {
     read_object_uncached(hash)
 }
 
-/// Read an object's decompressed bytes straight from the store, without consulting the read
-/// cache. The uncached body of [`retrieve_object_by_hash`].
+/// The classified outcome of [`read_object_classified`] — the one shape every taint recheck (see
+/// `recovery_utils`/`heal_utils`) is built from, so a recheck can never disagree with what an
+/// ordinary read of the same hash would actually do.
+pub(crate) enum StoreReadOutcome {
+    /// The ordinary read succeeds; the bytes hash to the address.
+    Verified(Vec<u8>),
+    /// Neither packs nor loose hold it, even after the read path's own reload-on-miss retry.
+    Absent,
+    /// Something is at the address, but the ordinary read fails on it — this carries the exact
+    /// error the read path would surface for it. Decisive, not an unknown: a subsequent ordinary
+    /// read of this hash *will* fail the same way.
+    Unverifiable(String),
+}
+
+/// The classifying read core (DESIGN.html §3.1.1): the single predicate [`read_object_uncached`]
+/// and every durability-taint recheck are both expressed through, so a recheck can never drift
+/// from what an ordinary read of the same hash would actually do — see [`read_object_uncached`],
+/// which is written as a plain match over this function's result rather than a parallel
+/// implementation. A prior recheck predicate that merely *resembled* the read path (rather than
+/// being it) was found, more than once, to disagree with it on an edge case — this function is
+/// the structural fix: there is only one read implementation now.
 ///
-/// Packs are consulted *first*: locating an object in a pack is a syscall-free binary search of
-/// the resident index, so once a warehouse is compacted (the common case at scale — most objects
-/// are packed) a read is served without the guaranteed-to-fail loose `open` it used to pay on
-/// every packed object. The loose store is the fallback for an object written but not yet packed.
-fn read_object_uncached(hash: &str) -> Result<Vec<u8>, String> {
-    // Packs first (free index lookup, then one positional read on a cached handle).
-    // Pack reads are content-verified inside `pack_utils::resolve_record`.
-    if let Some(bytes) = crate::util::pack_utils::retrieve_from_packs(hash)? {
-        return Ok(bytes);
+/// Mirrors [`read_object_uncached`]'s own shape branch for branch (packs first, then loose, with
+/// the same reload-on-miss retry) — see that function's doc comment for why packs are consulted
+/// first.
+///
+/// **There is no pack→loose fall-through.** Once a hash is confirmed a pack member
+/// ([`pack_utils::is_in_packs`]), a failure to *resolve* that record
+/// ([`pack_utils::retrieve_from_packs`] returning `Err`) is [`StoreReadOutcome::Unverifiable`],
+/// never a reason to go check the loose store instead. This looks like it could be an omission —
+/// "the pack copy is bad, isn't the loose copy worth a try?" — but it is deliberate and has
+/// already been "fixed" the wrong way once: an object that lives in a pack has no independent
+/// loose copy in the common (compacted) case, so falling through would either find nothing (a
+/// wasted stat) or, worse, find a stale/unrelated loose file at that path and clear a taint on an
+/// object the ordinary read path can never actually serve — a false clear, strictly worse than
+/// leaving the taint standing. [`read_object_uncached`] has never had this fall-through either
+/// (see its own doc comment); this function must not grow one on its behalf.
+///
+/// # Returns
+/// * `Ok(StoreReadOutcome)` - See [`StoreReadOutcome`].
+/// * `Err(String)`          - The store itself could not be consulted at all (the pack registry
+///                            failed to load, or the loose read hit an I/O error that is neither
+///                            `NotFound` nor content-shaped) — an environment failure, unknown
+///                            rather than decisive: it says nothing about whether a subsequent
+///                            ordinary read would succeed or fail.
+pub(crate) fn read_object_classified(hash: &str) -> Result<StoreReadOutcome, String> {
+    // Packs first (mirrors `read_object_uncached`): a resident-index membership check is
+    // syscall-free, so it is the environment channel (`?`) here — its only `Err` is a registry
+    // load failure, never anything about this particular hash.
+    if crate::util::pack_utils::is_in_packs(hash)? {
+        match crate::util::pack_utils::retrieve_from_packs(hash) {
+            Ok(Some(bytes)) => return Ok(StoreReadOutcome::Verified(bytes)),
+            // Membership was confirmed a moment ago but the resolve now comes back empty — only
+            // reachable via a registry reload racing between the two calls (`compact` invalidating
+            // the cache mid-check). Not the pack→loose fall-through the doc comment above
+            // forbids: nothing here failed to resolve a *located* record, so falling into the
+            // ordinary loose branch below is the same "try the other place, once" reload-on-miss
+            // discipline `read_object_uncached` already applies on a loose miss.
+            Ok(None) => {}
+            // A located record that fails to resolve (bad decompression, an unreconstructable
+            // delta chain, a hash mismatch) is decisive, not an unknown — a subsequent ordinary
+            // read of this hash will fail the exact same way, since it is the exact same call.
+            Err(e) => return Ok(StoreReadOutcome::Unverifiable(e)),
+        }
     }
 
-    // Loose fallback: a freshly written object not yet swept into a pack.
+    // Loose fallback: a freshly written object not yet swept into a pack, or (the `Ok(None)`
+    // race above) a pack membership check whose confirmed-a-moment-ago record already moved on.
     let (path, file_name) = get_path_for_object(hash)?;
     let file_path = path.add(PATH_SEPARATOR).add(&file_name);
 
@@ -1650,22 +1703,56 @@ fn read_object_uncached(hash: &str) -> Result<Vec<u8>, String> {
             // live server) the pack registry can predate an external `compact` that moved this
             // object into a new pack and swept its loose source — so reload the registry once and
             // retry the packs before concluding the object is gone (reload-on-miss).
-            if let Some(bytes) = crate::util::pack_utils::retrieve_from_packs_reloading(hash)? {
-                return Ok(bytes);
-            }
-            return Err(format!("Error while reading object from file \"{}\": {}", file_path, error));
+            return Ok(match crate::util::pack_utils::retrieve_from_packs_reloading(hash) {
+                Ok(Some(bytes)) => StoreReadOutcome::Verified(bytes),
+                Ok(None) => StoreReadOutcome::Absent,
+                Err(e) => StoreReadOutcome::Unverifiable(e),
+            });
         }
         Err(error) => return Err(format!("Error while reading object from file \"{}\": {}", file_path, error)),
     };
 
-    let bytes = zstd::stream::decode_all(compressed.as_slice())
-        .map_err(|e| format!("Error while decompressing object: {}", e))?;
+    let bytes = match zstd::stream::decode_all(compressed.as_slice()) {
+        Ok(bytes) => bytes,
+        Err(e) => return Ok(StoreReadOutcome::Unverifiable(format!("Error while decompressing object: {}", e))),
+    };
 
     // Same content-addressing guarantee the pack path enforces: a corrupt loose file fails the
     // read rather than silently returning wrong bytes.
-    crate::util::object_utils::verify_object_bytes(hash, &bytes)?;
+    Ok(match crate::util::object_utils::verify_object_bytes(hash, &bytes) {
+        Ok(()) => StoreReadOutcome::Verified(bytes),
+        Err(e) => StoreReadOutcome::Unverifiable(e),
+    })
+}
 
-    Ok(bytes)
+/// Read an object's decompressed bytes straight from the store, without consulting the read
+/// cache. The uncached body of [`retrieve_object_by_hash`].
+///
+/// Packs are consulted *first*: locating an object in a pack is a syscall-free binary search of
+/// the resident index, so once a warehouse is compacted (the common case at scale — most objects
+/// are packed) a read is served without the guaranteed-to-fail loose `open` it used to pay on
+/// every packed object. The loose store is the fallback for an object written but not yet packed.
+///
+/// A plain match over [`read_object_classified`] — not a parallel implementation of its own —
+/// which is what makes disagreement between an ordinary read and a taint recheck built on the
+/// same core structurally impossible (DESIGN.html §3.1.1).
+fn read_object_uncached(hash: &str) -> Result<Vec<u8>, String> {
+    match read_object_classified(hash)? {
+        StoreReadOutcome::Verified(bytes) => Ok(bytes),
+        StoreReadOutcome::Unverifiable(e) => Err(e),
+        StoreReadOutcome::Absent => {
+            // The same NotFound-shaped message the read path has always produced for this case —
+            // reconstructed here (rather than carried on the `Absent` variant, which is bare by
+            // design) since nothing about the message depends on which of the two `Absent`
+            // sources in `read_object_classified` produced it.
+            let (path, file_name) = get_path_for_object(hash)?;
+            let file_path = path.add(PATH_SEPARATOR).add(&file_name);
+            Err(format!(
+                "Error while reading object from file \"{}\": {}",
+                file_path, std::io::Error::from(std::io::ErrorKind::NotFound)
+            ))
+        }
+    }
 }
 
 /// The read cache's byte budget. When the live generation reaches it, it is retired to the
@@ -3665,5 +3752,101 @@ mod tests {
         assert!(target.exists(), "an unactivated re-check must never refuse a clean sync");
 
         std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// Falsifying test (DESIGN.html §3.1.1): [`read_object_classified`]'s outcome class must agree
+    /// with [`retrieve_object_by_hash_uncached`]'s (the ordinary read path's) success/failure
+    /// across every shape the store can hand back — a genuinely verified object (loose or packed),
+    /// a present-but-unreadable one (loose content that does not hash-verify; a packed delta whose
+    /// base was never stored), and one genuinely absent everywhere. This is the structural
+    /// guarantee the whole module doc comment on [`read_object_classified`] rests on: since
+    /// [`read_object_uncached`] is written as a plain match over this function's own result, the
+    /// two can never disagree *by construction* — this test pins that contract so a future edit
+    /// that reintroduces two independent implementations (rather than one core plus a match) is
+    /// caught here rather than trusted on faith. Mutation: reorder the branches in either
+    /// `read_object_classified` or `read_object_uncached` (e.g. check loose before packs in one but
+    /// not the other) → at least one case's classified/ordinary pairing disagrees → red.
+    #[test]
+    fn read_object_classified_agrees_with_the_ordinary_read_across_every_shape() {
+        use crate::util::pack_utils::TransportPackBuilder;
+
+        #[derive(Debug, Clone, Copy)]
+        enum Shape { VerifiedLoose, CorruptLoose, PackedGood, PackedUnreconstructable, Absent }
+
+        for shape in [
+            Shape::VerifiedLoose, Shape::CorruptLoose, Shape::PackedGood,
+            Shape::PackedUnreconstructable, Shape::Absent,
+        ] {
+            let temp = std::env::temp_dir()
+                .join(format!("forklift-classified-agreement-{:?}-{}", shape, std::process::id()));
+            let _ = std::fs::remove_dir_all(&temp);
+            std::fs::create_dir_all(&temp).unwrap();
+            let _scope = StorageRootScope::enter(&temp);
+
+            let hash = match shape {
+                Shape::VerifiedLoose => {
+                    let content = b"a genuinely verified loose object";
+                    let hash = blake3::hash(content).to_hex().to_string();
+                    let (folder, file_name) = get_path_for_object(&hash).unwrap();
+                    std::fs::create_dir_all(&folder).unwrap();
+                    let compressed = zstd::encode_all(content.as_slice(), 0).unwrap();
+                    write_object_to_file(Path::new(&folder), &file_name, compressed).unwrap();
+                    hash
+                }
+                Shape::CorruptLoose => {
+                    let hash = "1".repeat(64);
+                    let mismatched = zstd::encode_all(
+                        b"these bytes do not hash to the claimed address".as_slice(), 0,
+                    ).unwrap();
+                    let (folder, file_name) = get_path_for_object(&hash).unwrap();
+                    write_object_to_file(Path::new(&folder), &file_name, mismatched).unwrap();
+                    hash
+                }
+                Shape::PackedGood => {
+                    let content = b"a genuinely verified packed object";
+                    let hash = blake3::hash(content).to_hex().to_string();
+                    let mut builder = TransportPackBuilder::new(&crate::util::pack_utils::pack_folder()).unwrap();
+                    builder.append_full(&hash, content.as_slice()).unwrap();
+                    builder.finish().unwrap();
+                    hash
+                }
+                Shape::PackedUnreconstructable => {
+                    let hash = "2".repeat(64);
+                    let never_stored_base = "3".repeat(64);
+                    let mut builder = TransportPackBuilder::new(&crate::util::pack_utils::pack_folder()).unwrap();
+                    builder.append_delta(&hash, &never_stored_base, 10, b"not a real delta payload").unwrap();
+                    builder.finish().unwrap();
+                    hash
+                }
+                Shape::Absent => "4".repeat(64),
+            };
+
+            let classified = read_object_classified(&hash)
+                .unwrap_or_else(|e| panic!("[{:?}] the store itself must be consultable: {}", shape, e));
+            let ordinary = retrieve_object_by_hash_uncached(&hash);
+
+            match shape {
+                Shape::VerifiedLoose | Shape::PackedGood => {
+                    assert!(matches!(classified, StoreReadOutcome::Verified(_)),
+                        "[{:?}] expected Verified", shape);
+                    assert!(ordinary.is_ok(),
+                        "[{:?}] classified Verified but the ordinary read failed: {:?}", shape, ordinary);
+                }
+                Shape::CorruptLoose | Shape::PackedUnreconstructable => {
+                    assert!(matches!(classified, StoreReadOutcome::Unverifiable(_)),
+                        "[{:?}] expected Unverifiable, got a different classification", shape);
+                    assert!(ordinary.is_err(),
+                        "[{:?}] classified Unverifiable but the ordinary read succeeded", shape);
+                }
+                Shape::Absent => {
+                    assert!(matches!(classified, StoreReadOutcome::Absent),
+                        "[{:?}] expected Absent, got a different classification", shape);
+                    assert!(ordinary.is_err(),
+                        "[{:?}] classified Absent but the ordinary read succeeded", shape);
+                }
+            }
+
+            std::fs::remove_dir_all(&temp).ok();
+        }
     }
 }
