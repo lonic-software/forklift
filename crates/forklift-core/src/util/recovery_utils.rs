@@ -129,15 +129,10 @@
 //! - **D4 (force-fetch a corrupt remainder entry).** An ordinary fetch dedups against *present*
 //!   objects, so a corrupt-but-present recorded path (`attempt.hash_mismatch`) would never be
 //!   re-fetched — `does_object_exist` already says "yes". Before the fetch runs,
-//!   [`resolve_the_rest`] moves that corrupt loose dentry aside into a same-folder quarantine name
-//!   (quarantine-then-fetch, never a bare delete): the object is transiently absent from
-//!   its real path for the rest of this call, which is fine — `heal` holds the warehouse lock
-//!   throughout — and the ordinary dedup-aware fetch then pulls a good copy in exactly like any
-//!   other vanished candidate. Once this candidate's fate is decided, the quarantine copy is
-//!   either removed (a good copy landed) or renamed straight back (it did not) — a remote that
-//!   turns out unreachable this run must never cost the user the corrupt-but-present bytes they
-//!   started with, only the deletion this replaces could. A genuinely vanished (not corrupt)
-//!   candidate needs no quarantine at all.
+//!   [`resolve_the_rest`] deletes that corrupt loose dentry (delete-then-fetch): the object is
+//!   transiently absent for the rest of this call, which is fine — `heal` holds the warehouse
+//!   lock throughout — and the ordinary dedup-aware fetch then pulls a good copy in exactly like
+//!   any other vanished candidate. A genuinely vanished (not corrupt) candidate needs no deletion.
 //!
 //! **Scope boundary, stated honestly:** this recovers only objects a configured remote actually
 //! has. An object that vanished *before* it was ever published (lifted) has no remote copy to
@@ -380,62 +375,32 @@ async fn resolve_the_rest(
     }
 
     // D4: force-fetch bridge. `corrupt_candidates` collects exactly the entries this run will
-    // attempt to recover via quarantine-then-fetch; anything not in it (no remote configured, or a
+    // attempt to recover via delete-then-fetch; anything not in it (no remote configured, or a
     // hash-mismatch path with no shape `hash_from_object_path` recognizes — unreachable in
     // practice, see `restage_object`'s `HashMismatch` verdict) commits straight to the remainder
     // below, unchanged from before this slice.
-    //
-    // `remote_configured` above is local-only (no network) — it says a URL is *set*, not
-    // that the remote actually answers. The corrupt copy used to be destroyed
-    // (`remove_file`) purely on that local check, before any fetch was attempted: if the
-    // configured remote turned out unreachable (offline, VPN down, a 503), the corrupt-but-present
-    // bytes were gone and the refetch below then failed too, leaving the object worse off than
-    // when heal started — absent and unrecoverable, instead of merely corrupt. `quarantined` maps
-    // each corrupt object's real, absolute path to where its bytes were moved aside — restored to
-    // that real path below if the fetch cannot land a good copy, removed if it can. **Invariant:
-    // running `forklift heal` against an unreachable remote must never leave the user with less
-    // than they started with** — a corrupt-but-present object may end this run corrupt-but-present
-    // again (exactly what the no-remote path already leaves behind), or genuinely recovered, but
-    // never genuinely gone.
-    let mut quarantined: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
     let mut corrupt_candidates: BTreeMap<String, PathBuf> = BTreeMap::new();
     for relative in &attempt.hash_mismatch {
         match (remote_configured, file_utils::hash_from_object_path(relative)) {
             (true, Some(hash)) => {
-                // Quarantine-then-fetch (D4): move the corrupt object aside — never
-                // destroy it — so the ordinary fetch's dedup (`does_object_exist`) does not skip
-                // it as "already present" (see the module doc comment) while still leaving a way
-                // back to exactly these bytes if the fetch cannot recover a good copy. Safe under
-                // the lock `heal` holds throughout: the object is transiently absent from its real
-                // path, never observed by anything else. The quarantine name reuses
-                // `file_utils::temp_path_for`'s own `.tmp<pid>-<n>` convention, in the same
-                // fan-out folder as the object itself — the exact shape every scanner that walks
-                // the object store already treats as staging debris and skips (`pack_utils`'s
-                // loose-object enumeration for `compact`, and this module's own
-                // `walk_loose_object_paths` for the §8.3 torn rescan), so it can never be
-                // mistaken for a real object while it exists. Load-bearing for correctness, not
-                // just for the fetch's own dedup: leaving the corrupt dentry in place at its real
-                // path was confirmed (by reverting this exact block) to make the post-check below
-                // a false clear, not merely a missed recovery — `raw_object_present`'s loose
-                // branch is a bare `fs::exists`, so a corrupt-but-still-present dentry there would
-                // itself read back as "present" and get reported resolved with the corrupt bytes
-                // never actually replaced.
-                let original_absolute = root.join(relative);
-                let quarantine_absolute = file_utils::temp_path_for(&original_absolute)
-                    .map_err(|e| sync_failure_refusal(root, &format!(
-                        "could not prepare a quarantine path for the corrupt copy of \"{}\": {}",
-                        relative.to_string_lossy(), e
-                    )))?;
-
-                match std::fs::rename(&original_absolute, &quarantine_absolute) {
-                    Ok(()) => { quarantined.insert(original_absolute, quarantine_absolute); }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(sync_failure_refusal(root, &format!(
-                        "could not move the corrupt copy of \"{}\" aside to make way for a \
-                        re-fetched good one: {}", relative.to_string_lossy(), e
-                    ))),
+                // Delete-then-fetch (D4): force the corrupt object to genuinely vanish so the
+                // ordinary fetch's dedup (`does_object_exist`) does not skip it as "already
+                // present" — see the module doc comment. Safe under the lock `heal` holds
+                // throughout: the object is transiently absent, never observed by anything else.
+                // Load-bearing for correctness, not just for the fetch's own dedup: skipping it
+                // was confirmed (by reverting this exact block) to make the post-check below a
+                // false clear, not merely a missed recovery — `raw_object_present`'s loose branch
+                // is a bare `fs::exists`, so a corrupt-but-still-present dentry left in place
+                // would itself read back as "present" and get reported resolved with the corrupt
+                // bytes never actually replaced.
+                if let Err(e) = std::fs::remove_file(root.join(relative)) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        return Err(sync_failure_refusal(root, &format!(
+                            "could not remove the corrupt copy of \"{}\" to make way for a \
+                            re-fetched good one: {}", relative.to_string_lossy(), e
+                        )));
+                    }
                 }
-
                 corrupt_candidates.insert(hash, relative.clone());
             }
             _ => {
@@ -589,8 +554,8 @@ async fn resolve_the_rest(
     }
 
     // D4: re-verify each corrupt candidate the exact same way (`raw_object_present`, packed-or-
-    // loose) — sound here specifically because its corrupt dentry was moved aside above, before
-    // the fetch ran: the loose path can only be occupied again by freshly fetched, hash-verified
+    // loose) — sound here specifically because its corrupt dentry was deleted above, before the
+    // fetch ran: the loose path can only be occupied again by freshly fetched, hash-verified
     // bytes, or a pack hit, never by the original corrupt bytes. Unlike the ordinary vanished
     // set, a corrupt candidate is never exonerated by "unreferenced" — this mirrors the verb's
     // existing corrupt-is-always-remainder-until-recovered rule; only a genuine recovery (a good
@@ -600,39 +565,6 @@ async fn resolve_the_rest(
             Ok(present) => present,
             Err(e) => return Err(walk_failure_refusal(root, &e)),
         };
-
-        // Settle this candidate's quarantined bytes (if it was actually quarantined —
-        // `quarantined` omits an entry whose original file was already gone by the time the
-        // rename above ran) before deciding this hash's own fate, so a crash between the two can
-        // never observe a candidate marked recovered/dangling with its quarantine copy still
-        // sitting unaccounted for.
-        if let Some(quarantine_absolute) = quarantined.get(&root.join(relative)) {
-            if recovered {
-                // A good copy landed at the object's real path (freshly fetched, or already
-                // present in a pack) — the quarantined corrupt bytes are no longer needed.
-                if let Err(e) = std::fs::remove_file(quarantine_absolute) {
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        return Err(sync_failure_refusal(root, &format!(
-                            "recovered \"{}\", but could not remove its quarantined corrupt copy \
-                            \"{}\": {}", relative.to_string_lossy(),
-                            quarantine_absolute.to_string_lossy(), e
-                        )));
-                    }
-                }
-            } else {
-                // The invariant this fix exists for: heal must never leave the user with less
-                // than they started with. No good copy landed (no remote, an unreachable one, or
-                // a reachable one that simply does not have it) — restore the quarantined bytes
-                // so the object goes back to being corrupt-but-present, exactly the state the
-                // no-remote path already leaves behind, rather than genuinely gone.
-                if let Err(e) = std::fs::rename(quarantine_absolute, root.join(relative)) {
-                    return Err(sync_failure_refusal(root, &format!(
-                        "could not restore the quarantined corrupt copy of \"{}\": {}",
-                        relative.to_string_lossy(), e
-                    )));
-                }
-            }
-        }
 
         if recovered {
             resolved.push(relative.to_string_lossy().into_owned());
