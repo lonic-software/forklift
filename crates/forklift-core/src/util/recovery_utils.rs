@@ -83,9 +83,10 @@
 //!
 //! A recovery attempt commonly resolves *some* recorded paths (restaged, or proven
 //! vanished-and-unreferenced) while others remain genuinely dangling. The taint afterwards must
-//! record exactly the unresolved remainder — [`taint_utils::replace_taint_with_remainder`] is the
-//! crash-safe primitive that makes that true without ever leaving a window where the remainder is
-//! unrecorded on disk.
+//! record exactly the unresolved remainder — [`taint_utils::resolve_taints`] is the crash-safe
+//! primitive that makes that true without ever leaving a window where the remainder is unrecorded
+//! on disk, and that also brings the in-memory gate into agreement with whatever is left standing
+//! once that rewrite lands (never derived from `remainder` alone — see its own doc comment).
 //!
 //! ## Heal-driven refetch (§3.2) — closing the `forklift lower` wedge
 //!
@@ -185,13 +186,13 @@
 //!    step 1 could not see (it never hash-verifies pack *contents* — only pack dentries move
 //!    verbatim) still fails this walk loud, exactly as it always has: an anomalous,
 //!    deeper-than-torn integrity problem, not a silent brick.
-//! 3. **[`taint_utils::replace_taint_with_remainder`]** with the union of step 2's referenced-
-//!    absent hashes and step 1's corrupt hashes, each encoded as its loose fan-out path
+//! 3. **[`taint_utils::resolve_taints`]** with the union of step 2's referenced-absent hashes and
+//!    step 1's corrupt hashes, each encoded as its loose fan-out path
 //!    ([`file_utils::get_path_for_object`]) — the same path shape [`classify_vanished`] round-trips
 //!    back to `Loose(hash)` on the *next* (now non-torn) `forklift heal` run, so the existing
 //!    dangling machinery and §3.2's refetch pick it up exactly like any other remainder, with no
-//!    new schema or re-entry logic. Empty → clear the gate, fully resolved. Non-empty → refuse
-//!    (see [`torn_rescan_dangling_refusal`]), naming exactly what remains.
+//!    new schema or re-entry logic. Empty → the gate clears too (owned by the same call). Non-empty
+//!    → refuse (see [`torn_rescan_dangling_refusal`]), naming exactly what remains.
 //!
 //! **Invariant I5:** `forklift heal` on a torn taint terminates in a well-formed remainder
 //! (possibly empty) — or fails loud only on an anomalous corruption a hash-verify cannot
@@ -300,6 +301,15 @@ pub async fn run(progress: Option<&dyn Fn(&str)>) -> Result<HealOutcome, CoreErr
         return rescan_torn_taint(&root, &state.files, progress);
     }
     if state.recorded.is_empty() {
+        // Companion fix (DESIGN.html §3.1.1): "nothing recorded" says nothing about the gate — a
+        // durable write that failed *after* `record_taint`'s own `set_gate` succeeded can leave
+        // the gate standing over an empty directory. Route through the same gate-owning primitive
+        // rather than returning directly, so that stray gate is reconciled against disk (cleared,
+        // since nothing is actually standing) instead of persisting for the rest of this process's
+        // life. Empty remainder, empty snapshot: there is no file-level work to do here, only the
+        // gate sync.
+        taint_utils::resolve_taints(&root, &BTreeSet::new(), &[])
+            .map_err(|e| sync_failure_refusal(&root, &e))?;
         return Ok(HealOutcome::nothing());
     }
 
@@ -337,9 +347,9 @@ pub async fn run(progress: Option<&dyn Fn(&str)>) -> Result<HealOutcome, CoreErr
 ///
 /// `taint_files` is [`run`]'s own `state.files` — the snapshot [`taint_utils::read_taints`]
 /// returned before this whole analysis (including the closure walk, which can run for minutes)
-/// began. It is threaded straight through to [`taint_utils::replace_taint_with_remainder`] so the
-/// eventual rewrite deletes exactly the files that predate this call, never whatever the taint
-/// directory holds by the time the walk finally finishes — see that function's doc comment.
+/// began. It is threaded straight through to [`taint_utils::resolve_taints`] so the eventual
+/// rewrite deletes exactly the files that predate this call, never whatever the taint directory
+/// holds by the time the walk finally finishes — see that function's doc comment.
 async fn resolve_the_rest(
     root: &Path,
     recorded: &BTreeSet<PathBuf>,
@@ -555,11 +565,15 @@ async fn resolve_the_rest(
         ));
     }
 
-    taint_utils::replace_taint_with_remainder(root, &remainder, taint_files)
+    // `resolve_taints` owns the gate too now (DESIGN.html §3.1.1): it derives the clear/set
+    // decision from what is actually left standing in the taint directory once this rewrite
+    // lands, not from `remainder` alone — a mid-run store failure elsewhere in this same call
+    // (the heal-driven refetch just above, fully awaited) can leave a fresh taint file standing
+    // even when `remainder` itself comes back empty, and that fresh file must keep the gate set.
+    taint_utils::resolve_taints(root, &remainder, taint_files)
         .map_err(|e| sync_failure_refusal(root, &e))?;
 
     if remainder.is_empty() {
-        taint_utils::clear_gate(root);
         Ok(HealOutcome {
             was_tainted: true,
             restaged: display_paths(attempt.restaged.iter()),
@@ -574,7 +588,7 @@ async fn resolve_the_rest(
 /// §8.3 (I5): resolve a torn taint via a directory-driven, store-wide rescan — see the module doc
 /// comment's "Torn rescan" section for the full design. One atomic contract: `old_files` (the
 /// torn snapshot [`run`]'s own [`taint_utils::read_taints`] call captured) is replaced only at the
-/// very end, via [`taint_utils::replace_taint_with_remainder`] — so a crash anywhere in this
+/// very end, via [`taint_utils::resolve_taints`] — so a crash anywhere in this
 /// function leaves the original torn record standing exactly as it was, and a rerun simply redoes
 /// whatever restaging already happened (idempotent, never lossy).
 ///
@@ -682,13 +696,17 @@ fn rescan_torn_taint(
         dangling_lines.push(format!("vanished and still referenced: \"{}\"", hash));
     }
 
-    // Step 3: replace the torn record with exactly this remainder. Replaced only now, at the very
-    // end — see this function's own doc comment on crash-safety.
-    taint_utils::replace_taint_with_remainder(root, &remainder, old_files)
+    // Step 3: replace the torn record with exactly this remainder, and let the same call
+    // reconcile the gate against whatever is left standing on disk (see `resolve_taints`'s own
+    // doc comment) — no in-process refetch precedes this call (§1.2), so the gate would clear
+    // exactly the same way an unconditional clear-on-empty-remainder did before this fix, but
+    // going through the shared primitive means a future change here never has to re-derive that
+    // reasoning on its own. Replaced only now, at the very end — see this function's own doc
+    // comment on crash-safety.
+    taint_utils::resolve_taints(root, &remainder, old_files)
         .map_err(|e| sync_failure_refusal(root, &e))?;
 
     if remainder.is_empty() {
-        taint_utils::clear_gate(root);
         report("torn durability taint: rescan complete, nothing left dangling — cleared.".to_string());
         Ok(HealOutcome {
             was_tainted: true,
@@ -715,7 +733,7 @@ fn rescan_torn_taint(
 }
 
 /// Encode an object hash as its loose fan-out path, root-relative — the shape
-/// [`taint_utils::replace_taint_with_remainder`] records and [`classify_vanished`] round-trips
+/// [`taint_utils::resolve_taints`] records and [`classify_vanished`] round-trips
 /// back to `VanishedClass::Loose` on the next (now non-torn) heal run. `Err` only if `hash` is not
 /// a well-formed object hash (never actually the case for a hash [`enumerate_absent_reachable`]
 /// enumerated — every one came from a real parsed reference — but propagated rather than
@@ -1420,7 +1438,7 @@ fn display_paths<'a>(paths: impl Iterator<Item = &'a PathBuf>) -> Vec<String> {
 /// complete — an operational failure of the rescan's own machinery, distinct from the rescan
 /// completing and finding a genuine dangling remainder (see [`torn_rescan_dangling_refusal`]).
 /// The torn record is left standing untouched (the rescan never reached
-/// [`taint_utils::replace_taint_with_remainder`]), so a rerun starts the rescan over from
+/// [`taint_utils::resolve_taints`]), so a rerun starts the rescan over from
 /// scratch — safe, since step 1's restaging is idempotent.
 fn rescan_failure_refusal(root: &Path, error: &str) -> CoreError {
     CoreError::refusal(

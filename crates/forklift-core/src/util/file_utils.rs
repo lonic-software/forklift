@@ -3596,7 +3596,10 @@ mod tests {
         assert!(does_object_exist(&packed_hash).unwrap(),
             "a pack-registry hit must still answer `true` regardless of the gate");
 
-        taint_utils::clear_gate(&forklift);
+        // `test_clear_gate`, not the production `resolve_taints`, deliberately: this isolates
+        // `does_object_exist`'s gate consultation from taint-file state — the taint file the
+        // `record_taint` call above wrote for `unrelated` is left standing on disk on purpose.
+        taint_utils::test_clear_gate(&forklift);
         assert!(does_object_exist(&loose_hash).unwrap(), "clearing the gate must restore a normal answer");
 
         std::fs::remove_dir_all(&temp).ok();

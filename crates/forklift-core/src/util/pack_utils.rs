@@ -3496,7 +3496,11 @@ mod tests {
         }
 
         drop(_guard);
-        taint_utils::remove_taint_files(&forklift, &state.files).unwrap();
+        // `test_remove_taint_files`, not the production `resolve_taints`, deliberately: this
+        // clears the durable taint files while leaving the in-memory gate exactly as `compact`'s
+        // own internal failure path set it, because the next assertion (a second, hand-planted
+        // taint file below) pins the durable-file re-check path, not the gate.
+        taint_utils::test_remove_taint_files(&forklift, &state.files).unwrap();
 
         // The second, more precise half of the durable-before-destructive claim: even with the
         // directory sync itself succeeding cleanly (no fault armed below), a taint standing from

@@ -159,8 +159,8 @@ mod tests {
 
         // No cleanup of the gate/taint file: `root` is this test's own unique scratch directory
         // (never reused by another test), so leaving it gated for the rest of this process's life
-        // cannot affect anything else — `clear_gate` is `pub(crate)` in `forklift-core` and not
-        // reachable from here regardless (the entry-heal chokepoint, not a test, is the intended
-        // caller).
+        // cannot affect anything else — the gate-clear primitive is module-private inside
+        // `forklift-core`'s `taint_utils` and not reachable from here regardless (the entry-heal
+        // chokepoint, not a test, is the intended caller).
     }
 }

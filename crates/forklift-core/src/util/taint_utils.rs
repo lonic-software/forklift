@@ -9,9 +9,15 @@
 //! trusting existence under a root it just tainted. Nothing here decides *when* a taint should
 //! fire (every post-rename directory-sync call site does, via `file_utils`'s
 //! `sync_dir_or_taint`/`sync_result_or_taint`), and nothing here heals —
-//! [`remove_taint_files`] and [`clear_gate`] are the primitives
+//! [`resolve_taints`] is the primitive
 //! [`heal_utils::heal_if_tainted`](crate::util::heal_utils::heal_if_tainted) clears a resolved
 //! taint with, not a heal themselves; the restage logic and the entry chokepoint live there.
+//! `resolve_taints` owns both halves of that clear — the durable taint files on disk and the
+//! in-memory gate — deriving the gate decision from what is actually standing in the taint
+//! directory at the moment of the call, never from a caller's own belief about what it just
+//! resolved (DESIGN.html §3.1.1). The two functions that only ever touch one half
+//! (`clear_gate`, `remove_taint_files`) are deliberately not exported even within the crate: a
+//! caller that needs to clear a taint has exactly one door, this one.
 //!
 //! ## Activation
 //!
@@ -289,7 +295,7 @@ fn taint_filename_nonce() -> u64 {
 /// `0..CAP` index, so a name this process has ever handed out (even one whose file has since been
 /// deleted) can never be handed out again: see the module doc comment's format section for why
 /// that "unique-forever" property is what makes a snapshot-scoped delete
-/// (`remove_taint_files`/`replace_taint_with_remainder`) safe. `EEXIST` on a given candidate (a
+/// (`remove_taint_files`/`resolve_taints`) safe. `EEXIST` on a given candidate (a
 /// crash survivor from an earlier process that reused this exact `pid` and independently drew a
 /// colliding nonce, or a same-process race on the freshly-drawn counter value some other way)
 /// retries with the next freshly-drawn counter value rather than ever renaming over it — see
@@ -502,10 +508,14 @@ pub fn gate_check(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Clear the gate for `root`, if one is standing. `pub(crate)` — this is the primitive
-/// [`heal_utils::heal_if_tainted`](crate::util::heal_utils::heal_if_tainted) clears the in-memory
-/// belt with once it has durably resolved the taint on disk.
-pub(crate) fn clear_gate(root: &Path) {
+/// Clear the gate for `root`, if one is standing. Module-private, on purpose, the same model
+/// [`set_gate`] already uses: the only sound way to clear a gate is in the same breath as
+/// checking what the taint directory actually holds, which is exactly what [`resolve_taints`]
+/// does — a caller outside this module (or a future addition inside it that skipped
+/// `resolve_taints`) has no way to reach this half of the clear on its own. See
+/// [`test_clear_gate`] for the one sanctioned exception (test fixtures that isolate the gate from
+/// the durable half on purpose).
+fn clear_gate(root: &Path) {
     // Idempotent: clearing an already-clear root must not underflow. `remove`'s `bool` return
     // (true only when a key was actually removed) is exactly the signal — decrement inside the
     // same critical section as the mutation it mirrors, see [`GATE_COUNT`].
@@ -535,9 +545,8 @@ pub struct TaintState {
     /// any process, at any time (even a read-only command can self-heal a commit-graph shard and
     /// trip a taint); a heal that deletes "whatever the directory holds right now" instead of
     /// "exactly what I read" can delete a taint a sibling process recorded after this read, losing
-    /// a real durability gap forever. [`remove_taint_files`] and
-    /// [`replace_taint_with_remainder`] take this set as their deletion scope for exactly that
-    /// reason — see their own doc comments.
+    /// a real durability gap forever. [`resolve_taints`] takes this set as its deletion scope for
+    /// exactly that reason — see its own doc comment.
     pub files: Vec<PathBuf>,
 }
 
@@ -628,7 +637,7 @@ fn parse_taint_content(bytes: &[u8]) -> (BTreeSet<PathBuf>, bool) {
 /// directory itself being absent too — the sync is best-effort durability, not a correctness
 /// requirement once every file is already confirmed gone). Never re-scans the directory: `files`
 /// — always a caller's own [`TaintState::files`] snapshot — is the *entire* deletion scope, by
-/// construction. Shared by [`remove_taint_files`] and [`replace_taint_with_remainder`].
+/// construction. Shared by [`remove_taint_files`] and [`resolve_taints`].
 fn delete_snapshot_and_sync(root: &Path, files: &[PathBuf]) -> Result<(), String> {
     for path in files {
         match std::fs::remove_file(path) {
@@ -659,34 +668,63 @@ fn delete_snapshot_and_sync(root: &Path, files: &[PathBuf]) -> Result<(), String
 /// exactly `files` makes that impossible: a taint recorded after the snapshot was taken is not in
 /// `files`, so it is never touched here, however concurrently it was born.
 ///
-/// `pub(crate)` — the primitive
-/// [`heal_utils::heal_if_tainted`](crate::util::heal_utils::heal_if_tainted) clears taints with
-/// once it has durably restaged every recorded path (see that function's doc comment). Not gated
-/// by activation: unlike recording or checking, deleting is only ever reached through a heal an
-/// activated process itself drives, so gating here would be redundant, not protective.
+/// Module-private, on purpose — see [`clear_gate`]'s doc comment for why. [`resolve_taints`] is
+/// the one production caller, once it has durably restaged (or otherwise resolved) every recorded
+/// path; it also owns clearing the in-memory gate, which this function deliberately does not
+/// touch. Not gated by activation: unlike recording or checking, deleting is only ever reached
+/// through a heal an activated process itself drives, so gating here would be redundant, not
+/// protective. See [`test_remove_taint_files`] for the one sanctioned test-only exception.
 ///
 /// # Returns
 /// * `Ok(())`      - Every path in `files` was removed (or already absent — see
 ///                   [`delete_snapshot_and_sync`]), and the directory sync succeeded.
 /// * `Err(String)` - A file in `files` could not be removed for a reason other than already being
 ///                   gone, or the directory fsync failed.
-pub(crate) fn remove_taint_files(root: &Path, files: &[PathBuf]) -> Result<(), String> {
+fn remove_taint_files(root: &Path, files: &[PathBuf]) -> Result<(), String> {
     delete_snapshot_and_sync(root, files)
 }
 
+/// Test-only accessor for [`remove_taint_files`] — see that function's and [`clear_gate`]'s doc
+/// comments for why the real functions are module-private. `#[cfg(test)]` rather than
+/// `pub(crate)`: the wrapper does not exist in a production binary at all, so it cannot become a
+/// second door production code could grow to reach either half of the clear through. Exists only
+/// because `pack_utils`'s own test suite needs to isolate the durable-file half from the
+/// in-memory gate on purpose (its next assertion pins the durable re-check path, not the gate) —
+/// see that test for the full reasoning.
+#[cfg(test)]
+pub(crate) fn test_remove_taint_files(root: &Path, files: &[PathBuf]) -> Result<(), String> {
+    remove_taint_files(root, files)
+}
+
+/// Test-only accessor for [`clear_gate`] — see [`test_remove_taint_files`] for why this shape
+/// (`#[cfg(test)] pub(crate)`, not a widened production visibility) is the sanctioned exception.
+/// Exists only because `file_utils`'s own test suite needs to isolate the gate from taint-file
+/// state on purpose (an "unrelated" taint file is left standing on disk deliberately, to prove
+/// `does_object_exist`'s gate consultation is independent of it) — see that test for the full
+/// reasoning.
+#[cfg(test)]
+pub(crate) fn test_clear_gate(root: &Path) {
+    clear_gate(root)
+}
+
 /// Replace exactly the taint files named in `old_files` — a snapshot a caller captured earlier via
-/// [`read_taints`]'s [`TaintState::files`] — with a single new one recording exactly `remainder`:
-/// the partial-clear primitive the recovery verb ([`recovery_utils`](crate::util::recovery_utils))
-/// uses when some recorded paths resolved (restaged, or vanished-and-unreferenced) on a heal
-/// attempt and others did not. The taint must afterwards record exactly the unresolved remainder,
-/// never the original full set (which would re-report already-resolved paths forever) and never
-/// nothing (which would silently drop the paths still genuinely in doubt).
+/// [`read_taints`]'s [`TaintState::files`] — with a single new one recording exactly `remainder`,
+/// then bring the in-memory gate for `root` into agreement with whatever the taint directory
+/// actually holds once that durable work is done. The one primitive every heal-shaped verb clears
+/// (or partially clears) a taint through — see the module doc comment and DESIGN.html §3.1.1.
 ///
-/// **Snapshot-scoped, same as [`remove_taint_files`] and for the same reason:** `old_files` is
-/// deleted exactly as given, never by re-scanning the taint directory at deletion time — a taint
-/// recorded by a concurrent process after `old_files` was snapshotted (this closure walk can run
-/// for minutes) must never be swept just because it happened to be sitting in the directory when
-/// this function got around to deleting things.
+/// **The durable half** (unchanged from this function's own history): the taint must afterwards
+/// record exactly the unresolved remainder, never the original full set (which would re-report
+/// already-resolved paths forever) and never nothing (which would silently drop the paths still
+/// genuinely in doubt). `remainder` empty is the full-clear case and is delegated to
+/// [`remove_taint_files`] directly — no empty taint file is ever written for "nothing left to
+/// record."
+///
+/// **Snapshot-scoped, same reason as [`remove_taint_files`]:** `old_files` is deleted exactly as
+/// given, never by re-scanning the taint directory at deletion time — a taint recorded by a
+/// concurrent process after `old_files` was snapshotted (this closure walk can run for minutes)
+/// must never be swept just because it happened to be sitting in the directory when this function
+/// got around to deleting things.
 ///
 /// Crash-safe by construction, the same way [`record_taint`] itself is: the replacement is durably
 /// written *first*, via the exact same exclusive-create + fsync + terminator routine
@@ -701,33 +739,81 @@ pub(crate) fn remove_taint_files(root: &Path, files: &[PathBuf]) -> Result<(), S
 /// collide with a past one — so writing before deleting is safe by construction, not by luck of
 /// ordering.
 ///
-/// `remainder` empty is the full-clear case and is delegated to [`remove_taint_files`] directly —
-/// no empty taint file is ever written for "nothing left to record."
-///
-/// Does not touch the in-memory gate ([`gate_check`]) either way: clearing it is the caller's call
-/// once it knows whether the *whole* taint (not just this replacement step) is resolved — see
-/// [`remove_taint_files`]'s doc comment for the same division of responsibility.
+/// **The gate half — what makes this different from the function it replaced.** A caller's own
+/// `remainder` says only what *this run* believes it resolved; it says nothing about a taint
+/// recorded by something else in this same run (a mid-heal store failure, born after `old_files`
+/// was snapshotted) or about a gate left standing with nothing on disk (a durable write that
+/// failed after `record_taint`'s own `set_gate` already succeeded). So once the file-level work
+/// above lands, this lists the taint directory the same way [`read_taints`] does (`path.is_file()`
+/// filter; an absent directory reads as empty) and syncs the gate to match: cleared iff nothing
+/// remains, set iff anything does — in both directions, never clear-only, so a taint this process
+/// has "seen recorded" (not just recorded itself) is still reflected, per [`gate_check`]'s own
+/// documented semantics. **Fails closed on a directory-read error:** the gate is left exactly as
+/// it was, and the error propagates — a listing failure is never read as "must be empty, clear
+/// anyway."
 ///
 /// # Returns
 /// * `Ok(())`      - The taint directory now records exactly `remainder` (or is empty/absent, if
-///                   `remainder` was empty), and `old_files` are gone (or were already gone — see
-///                   [`delete_snapshot_and_sync`]).
+///                   `remainder` was empty), `old_files` are gone (or were already gone — see
+///                   [`delete_snapshot_and_sync`]), and the in-memory gate for `root` matches what
+///                   is now on disk.
 /// * `Err(String)` - The new file could not be durably written (`old_files` are left completely
 ///                   untouched — the original, larger set still stands, never partially deleted
-///                   before a replacement is durable), or a file in `old_files` could not be
-///                   removed for a reason other than already being gone.
-pub(crate) fn replace_taint_with_remainder(
+///                   before a replacement is durable), a file in `old_files` could not be removed
+///                   for a reason other than already being gone, or the post-write directory
+///                   listing that decides the gate failed (the gate is left unchanged in this
+///                   case too — see above).
+pub(crate) fn resolve_taints(
     root: &Path,
     remainder: &BTreeSet<PathBuf>,
     old_files: &[PathBuf],
 ) -> Result<(), String> {
     if remainder.is_empty() {
-        return remove_taint_files(root, old_files);
+        remove_taint_files(root, old_files)?;
+    } else {
+        write_taint_file(root, remainder)?;
+        delete_snapshot_and_sync(root, old_files)?;
     }
 
-    write_taint_file(root, remainder)?;
+    sync_gate_with_disk(root)
+}
 
-    delete_snapshot_and_sync(root, old_files)
+/// The gate half of [`resolve_taints`], split out for its own reasoning: lists `root`'s taint
+/// directory the same way [`read_taints`] does (`path.is_file()` filter; an absent directory reads
+/// as empty), then sets or clears the in-memory gate to match — see [`resolve_taints`]'s own doc
+/// comment for the full contract, including the fail-closed behavior on a listing error.
+fn sync_gate_with_disk(root: &Path) -> Result<(), String> {
+    if any_taint_file_present(root)? {
+        set_gate(root);
+    } else {
+        clear_gate(root);
+    }
+
+    Ok(())
+}
+
+/// Whether at least one taint file is standing under `root`'s taint directory right now — the
+/// exact `path.is_file()` filter [`read_taints`] applies, with an absent directory reading as
+/// `false`, but without paying for parsing or unioning any file's contents: [`sync_gate_with_disk`]
+/// only needs presence, never what a taint file records.
+fn any_taint_file_present(root: &Path) -> Result<bool, String> {
+    let taint_dir = root.join(TAINT_DIR_NAME);
+    if !taint_dir.exists() {
+        return Ok(false);
+    }
+
+    let entries = std::fs::read_dir(&taint_dir)
+        .map_err(|e| format!("Error while reading taint directory \"{}\": {}", taint_dir.to_string_lossy(), e))?;
+
+    for entry in entries {
+        let entry = entry
+            .map_err(|e| format!("Error while reading taint directory \"{}\": {}", taint_dir.to_string_lossy(), e))?;
+        if entry.path().is_file() {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
 }
 
 /// The path of the taint directory under a given warehouse root, independent of any active
@@ -1105,7 +1191,7 @@ mod tests {
     }
 
     #[test]
-    fn replace_taint_with_remainder_is_snapshot_scoped_and_spares_a_concurrent_record() {
+    fn resolve_taints_is_snapshot_scoped_and_spares_a_concurrent_record() {
         // Pins Part 4: the same snapshot-scoped-delete discipline as `remove_taint_files`, but for
         // the partial-clear primitive, whose real caller (the closure walk in `recovery_utils`) can
         // run for minutes between snapshotting and deleting. Reverting Part 4 (rescanning the
@@ -1128,7 +1214,7 @@ mod tests {
         record_taint(&[object_f2.as_path()]).unwrap();
 
         let remainder: BTreeSet<PathBuf> = [PathBuf::from("objects/99/still-dangling")].into_iter().collect();
-        replace_taint_with_remainder(&forklift, &remainder, &snapshot.files).unwrap();
+        resolve_taints(&forklift, &remainder, &snapshot.files).unwrap();
 
         let state = read_taints(&forklift).unwrap();
         assert!(!state.recorded.contains(&PathBuf::from("objects/44/dd445566")),
@@ -1140,7 +1226,7 @@ mod tests {
     }
 
     #[test]
-    fn replace_taint_with_remainder_empty_remainder_delegates_to_snapshot_scoped_removal() {
+    fn resolve_taints_empty_remainder_delegates_to_snapshot_scoped_removal() {
         // The empty-`remainder` branch must delegate to the same snapshot-scoped
         // `remove_taint_files`, not a rescan-and-delete-everything shortcut — otherwise a
         // concurrently recorded taint would be lost via this branch even after Part 3/4 fixed the
@@ -1161,7 +1247,7 @@ mod tests {
         let object_f2 = forklift.join("objects").join("77").join("00778899");
         record_taint(&[object_f2.as_path()]).unwrap();
 
-        replace_taint_with_remainder(&forklift, &BTreeSet::new(), &snapshot.files).unwrap();
+        resolve_taints(&forklift, &BTreeSet::new(), &snapshot.files).unwrap();
 
         let state = read_taints(&forklift).unwrap();
         assert!(!state.recorded.contains(&PathBuf::from("objects/66/ff667788")), "T1 must be gone");
@@ -1185,6 +1271,200 @@ mod tests {
         let _fault = TaintFaultGuard::recording();
         record_taint(&[object_path.as_path()]).unwrap();
         assert_eq!(taint_write_attempts().len(), 1, "a successful write must still be observed");
+    }
+
+    // --- `resolve_taints`'s gate-owning contract (DESIGN.html §3.1.1) ----------------------
+    //
+    // The gate-clear-on-empty-remainder shape used to be split across a snapshot-scoped durable
+    // half (this module) and a root-wide, unconditional gate clear (each call site). A taint
+    // recorded mid-run, after the caller's own snapshot, had its file correctly spared but its
+    // gate wrongly wiped anyway. `resolve_taints` collapses both halves into one call that derives
+    // the gate decision from the taint directory itself, at the moment of the call — the tests
+    // below pin that directly, plus the companion fix for a gate left standing with nothing on
+    // disk.
+
+    #[test]
+    fn resolve_taints_leaves_the_gate_standing_when_a_fresh_taint_lands_after_the_snapshot() {
+        // TEST A: pins the false-clear direction — the defect this whole fix exists for. A run
+        // that believes it resolved everything (`remainder` empty) must not clear the gate over a
+        // taint file that landed *after* its own snapshot was taken but *before* this call —
+        // standing in for a mid-heal store failure elsewhere in the same run. Reverting to the old
+        // unconditional-clear-on-empty-remainder shape (delete the snapshot, then unconditionally
+        // clear the gate, without ever consulting the directory) turns the gate assertion red; T2
+        // surviving on disk is already covered by
+        // `resolve_taints_is_snapshot_scoped_and_spares_a_concurrent_record`.
+        let _serial = lock_activation();
+        activate();
+
+        let root = scratch("resolve-taints-false-clear");
+        let _scope = StorageRootScope::enter(&root);
+        let forklift = forklift_root();
+
+        let object_t1 = forklift.join("objects").join("aa").join("11223344");
+        record_taint(&[object_t1.as_path()]).unwrap();
+        let snapshot = read_taints(&forklift).unwrap();
+        assert_eq!(snapshot.files.len(), 1, "sanity: exactly T1's file was read");
+
+        // Standing in for a mid-heal store failure landing after the snapshot but before the
+        // resolve call — the exact interleaving `resolve_the_rest` can hit (§1 of the fix design).
+        let object_t2 = forklift.join("objects").join("bb").join("55667788");
+        record_taint(&[object_t2.as_path()]).unwrap();
+
+        resolve_taints(&forklift, &BTreeSet::new(), &snapshot.files).unwrap();
+
+        assert!(gate_check(&forklift).is_err(),
+            "T2's taint file is still standing on disk, so the gate must still be standing too");
+        let state = read_taints(&forklift).unwrap();
+        assert!(state.recorded.contains(&PathBuf::from("objects/bb/55667788")),
+            "T2 must survive the snapshot-scoped removal completely untouched");
+    }
+
+    #[test]
+    fn resolve_taints_clears_a_gate_left_standing_with_nothing_on_disk() {
+        // TEST C: the two-way sync and the companion fix's target state. A gate can be left
+        // standing with nothing on disk when `record_taint`'s own write fails *after* `set_gate`
+        // already succeeded (its own doc comment: that ordering is load-bearing). Reproduced here
+        // via `TaintFaultGuard::failing` — an existing, already-shipped `#[cfg(test)]` fault guard
+        // (see its own doc comment above), not a new backdoor: it fails `sync_taint_file`, so
+        // `record_taint`'s `set_gate` succeeds and its subsequent write fails, leaving exactly the
+        // gate-standing-with-nothing-on-disk state this test targets. Calling `resolve_taints`
+        // with an empty remainder *and* an empty snapshot models the companion fix's own
+        // early-return call shape (§2.1; Tests D1/D2 below pin the actual call sites).
+        //
+        // A clear-only primitive (never syncing the "set" direction) would already pass this
+        // exact assertion, so this test's real job is pinning that the gate step is never
+        // skipped outright — an easy short-circuit to introduce by accident once `remainder` and
+        // `old_files` are both empty (there is nothing to delete, so it can look safe to return
+        // early before ever consulting the directory for the gate decision). Reverting
+        // `resolve_taints` to skip `sync_gate_with_disk` on that empty/empty shape turns this red.
+        let _serial = lock_activation();
+        activate();
+
+        let root = scratch("resolve-taints-stray-gate");
+        let _scope = StorageRootScope::enter(&root);
+        let forklift = forklift_root();
+        let object_path = forklift.join("objects").join("cc").join("99001122");
+
+        let fault = TaintFaultGuard::failing("taint-");
+        record_taint(&[object_path.as_path()]).unwrap_err();
+        drop(fault);
+
+        assert!(gate_check(&forklift).is_err(), "sanity: the gate is standing with nothing on disk");
+        assert!(read_taints(&forklift).unwrap().recorded.is_empty(),
+            "sanity: the failed write left no taint file behind");
+
+        resolve_taints(&forklift, &BTreeSet::new(), &[]).unwrap();
+
+        assert!(gate_check(&forklift).is_ok(),
+            "the gate must clear despite never having been set by a successful record");
+    }
+
+    #[test]
+    fn run_clears_a_stray_gate_on_its_own_nothing_recorded_early_return() {
+        // TEST D1: pins the site-level wiring for `recovery_utils::run`'s "nothing recorded" early
+        // return (§2.1), not just a `resolve_taints` call shaped like it (Test C covers the
+        // primitive alone). Same stray-gate fixture as Test C, then drives the real `run` entry
+        // point via a `current_thread` runtime — mirroring `recovery_utils::tests::run_heal`.
+        // Reverting §2.1's routing back to a bare `return Ok(HealOutcome::nothing())` at
+        // `recovery_utils.rs`'s "nothing recorded" branch turns the gate assertion red: the gate
+        // stays standing after `run` reports "nothing to heal."
+        let _serial = lock_activation();
+        activate();
+
+        let root = scratch("run-clears-stray-gate");
+        let _scope = StorageRootScope::enter(&root);
+        let forklift = forklift_root();
+        let object_path = forklift.join("objects").join("dd").join("11223344");
+
+        let fault = TaintFaultGuard::failing("taint-");
+        record_taint(&[object_path.as_path()]).unwrap_err();
+        drop(fault);
+
+        assert!(gate_check(&forklift).is_err(), "sanity: the gate is standing with nothing on disk");
+        assert!(read_taints(&forklift).unwrap().recorded.is_empty(),
+            "sanity: `run` must see an empty recorded set, the same empty-state shape \
+            `heal_if_tainted_is_a_cheap_ok_when_nothing_is_recorded` fixtures directly");
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let outcome = runtime.block_on(crate::util::recovery_utils::run(None));
+        assert!(outcome.is_ok(), "an empty-but-stray-gated root must still report a clean 'nothing to heal'");
+
+        assert!(gate_check(&forklift).is_ok(), "the stray gate must be cleared by run's early return");
+    }
+
+    #[test]
+    fn heal_if_tainted_clears_a_stray_gate_on_its_own_nothing_recorded_early_return() {
+        // TEST D2: the same pin as D1, for `heal_utils::heal_if_tainted`'s own early return
+        // (`heal_utils.rs:325-327`) instead of `run`'s. Reverting that routing back to a bare
+        // `return Ok(())` turns the gate assertion red the same way.
+        let _serial = lock_activation();
+        activate();
+
+        let root = scratch("heal-if-tainted-clears-stray-gate");
+        let _scope = StorageRootScope::enter(&root);
+        let forklift = forklift_root();
+        let object_path = forklift.join("objects").join("ee").join("55667788");
+
+        let fault = TaintFaultGuard::failing("taint-");
+        record_taint(&[object_path.as_path()]).unwrap_err();
+        drop(fault);
+
+        assert!(gate_check(&forklift).is_err(), "sanity: the gate is standing with nothing on disk");
+        assert!(read_taints(&forklift).unwrap().recorded.is_empty());
+
+        crate::util::heal_utils::heal_if_tainted()
+            .expect("an empty-but-stray-gated root must still report ok");
+
+        assert!(gate_check(&forklift).is_ok(),
+            "the stray gate must be cleared by heal_if_tainted's own early return");
+    }
+
+    #[test]
+    fn resolve_taints_fails_closed_and_leaves_the_gate_standing_on_a_directory_read_error() {
+        // TEST E: §2 item 1's fail-closed clause — on a directory-read error, the gate is left
+        // exactly as it was, never guessed. A permission-based fixture cannot isolate this: this
+        // function's own inherited durable-file work already calls `file_utils::sync_dir` on the
+        // taint directory unconditionally (whenever it exists), and `sync_dir` opens the
+        // directory with `std::fs::File::open` — the same read bit `std::fs::read_dir` needs — so
+        // a `chmod`'d-unreadable directory trips that earlier step and this function never reaches
+        // the new gate-decision code at all (verified empirically on this machine: `chmod 300`
+        // makes both `ls` and a plain `open(O_RDONLY)` fail identically).
+        //
+        // The fixture that actually isolates it: replace the taint directory with a plain regular
+        // file at the identical path. Opening a regular file `O_RDONLY` and `fsync`-ing it
+        // succeeds (so `sync_dir`'s call during the durable-file-work phase succeeds trivially,
+        // same as on a real, empty directory), while `read_dir` on a regular file fails
+        // deterministically with "not a directory" — cleanly separating the two steps, with no
+        // race and no production fault hook. Not unix-specific: `std::fs::read_dir` returns `Err`
+        // on a non-directory path on every target, and `sync_dir` is already a no-op on non-unix
+        // targets, so the durable-file-work phase trivially succeeds on Windows regardless of what
+        // sits at that path.
+        let _serial = lock_activation();
+        activate();
+
+        let root = scratch("resolve-taints-fail-closed");
+        let _scope = StorageRootScope::enter(&root);
+        let forklift = forklift_root();
+        let object_path = forklift.join("objects").join("ff").join("00998877");
+
+        record_taint(&[object_path.as_path()]).unwrap();
+        assert!(gate_check(&forklift).is_err(), "sanity: the gate is standing before the swap");
+
+        let taint_dir = forklift.join(TAINT_DIR_NAME);
+        std::fs::remove_dir_all(&taint_dir).unwrap();
+        std::fs::write(&taint_dir, b"not a directory").unwrap();
+
+        // Empty remainder *and* empty `old_files`, deliberately: a non-empty `old_files` would
+        // make the durable-file-work phase's own `std::fs::remove_file` calls fail with their own
+        // "not a directory" error — a different, already-covered failure mode, not the one this
+        // test targets.
+        let result = resolve_taints(&forklift, &BTreeSet::new(), &[]);
+        assert!(result.is_err(), "a directory-read error must surface as an error, not be swallowed");
+
+        assert!(gate_check(&forklift).is_err(),
+            "the gate must be left exactly as it was — still standing — never guessed clear");
+
+        std::fs::remove_file(&taint_dir).unwrap();
     }
 
     // --- GATE_COUNT fast-path tests --------------------------------------------------------

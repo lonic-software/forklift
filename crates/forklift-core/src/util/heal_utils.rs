@@ -277,7 +277,10 @@ fn write_and_sync_temp(temp_path: &Path, content: &[u8]) -> Result<(), String> {
 ///
 /// A no-op — `Ok(())`, nothing read, nothing written — unless [`taint_utils::activate`] has been
 /// called in this process (inherited from [`taint_utils::read_taints`]'s own activation gate): an
-/// unactivated process has no taint to see in the first place.
+/// unactivated process has no taint to see in the first place. Once activated, even the "nothing
+/// recorded" case makes one further call, to [`taint_utils::resolve_taints`] — reconciling a
+/// stray in-memory gate against the (confirmed-empty) taint directory, per its own companion-fix
+/// doc comment, rather than trusting whatever gate state this process happened to inherit.
 ///
 /// When a taint is standing:
 /// - **Torn** (`state.torn`, see `taint_utils`'s module doc comment): its recorded scope is a
@@ -298,8 +301,9 @@ fn write_and_sync_temp(temp_path: &Path, content: &[u8]) -> Result<(), String> {
 ///   an earlier one's verdict, mirroring `sync_touched_directories`'s own best-effort discipline —
 ///   a caller learns everything this attempt found, not just the first problem). If every single
 ///   one restaged cleanly, their distinct parent directories are fsynced and (macOS only) the
-///   device cache is flushed once (see [`sync_restaged_parents`]); only then are the taint files
-///   removed and the in-memory gate cleared. If *any* path came back
+///   device cache is flushed once (see [`sync_restaged_parents`]); only then is
+///   [`taint_utils::resolve_taints`] called to remove the taint files and sync the in-memory gate.
+///   If *any* path came back
 ///   [`Vanished`](RestageOutcome::Vanished), [`Unreadable`](RestageOutcome::Unreadable), or
 ///   [`HashMismatch`](RestageOutcome::HashMismatch), or failed to restage due to an operational
 ///   error, the whole heal refuses — the taint stands, nothing is cleared, and the refusal lists
@@ -323,6 +327,15 @@ pub fn heal_if_tainted() -> Result<(), CoreError> {
         return Err(torn_refusal(&root));
     }
     if state.recorded.is_empty() {
+        // Companion fix (DESIGN.html §3.1.1): "nothing recorded" says nothing about the gate — a
+        // durable write that failed *after* `record_taint`'s own `set_gate` succeeded can leave
+        // the gate standing over an empty directory. Route through the same gate-owning primitive
+        // rather than returning directly, so that stray gate is reconciled against disk (cleared,
+        // since nothing is actually standing) instead of persisting for the rest of this process's
+        // life. Empty remainder, empty snapshot: there is no file-level work to do here, only the
+        // gate sync.
+        taint_utils::resolve_taints(&root, &BTreeSet::new(), &[])
+            .map_err(|e| sync_failure_refusal(&root, &e))?;
         return Ok(());
     }
 
@@ -466,12 +479,15 @@ fn categorize_restage_outcome(attempt: &mut RestageAttempt, relative: PathBuf, o
 /// anything on an `Err`.
 ///
 /// `taint_files` is the exact snapshot the caller's own [`taint_utils::read_taints`] call returned
-/// (its `TaintState::files`) — threaded straight through to [`taint_utils::remove_taint_files`],
-/// never re-derived by scanning the taint directory here. That snapshot is what makes the removal
-/// safe under concurrency: it names precisely the files this heal is entitled to delete, so a
-/// taint a sibling process records after the read (taint files are born concurrently, from any
-/// process, at any time — even a read-only command can self-heal a commit-graph shard and trip
-/// one) is never swept just because it happened to land in the directory before this cleanup ran.
+/// (its `TaintState::files`) — threaded straight through to [`taint_utils::resolve_taints`] (called
+/// here with an empty remainder — every recorded path restaged cleanly, so nothing survives to
+/// re-record), never re-derived by scanning the taint directory here. That snapshot is what makes
+/// the removal safe under concurrency: it names precisely the files this heal is entitled to
+/// delete, so a taint a sibling process records after the read (taint files are born concurrently,
+/// from any process, at any time — even a read-only command can self-heal a commit-graph shard and
+/// trip one) is never swept just because it happened to land in the directory before this cleanup
+/// ran. The same call also brings the in-memory gate into agreement with whatever `resolve_taints`
+/// finds actually standing once that removal lands — see its own doc comment.
 ///
 /// # Returns
 /// * `Ok(())`      - The restaged paths are durable and the taint is now fully cleared.
@@ -488,10 +504,7 @@ pub(crate) fn finish_clean_heal(
 
     sync_restaged_parents(&parents)?;
 
-    taint_utils::remove_taint_files(root, taint_files)?;
-    taint_utils::clear_gate(root);
-
-    Ok(())
+    taint_utils::resolve_taints(root, &BTreeSet::new(), taint_files)
 }
 
 /// Fsync every distinct parent directory a successful restage pass touched, then (macOS only)
@@ -538,7 +551,7 @@ pub(crate) fn sync_restaged_parents(_parents: &BTreeSet<PathBuf>) -> Result<(), 
 
 /// The macOS device-cache flush after a clean restage pass. Never depends on any taint file
 /// existing — a concurrent heal (in another process, or this very call's own caller, whose
-/// snapshot-scoped `taint_utils::remove_taint_files` may run moments after this) can leave the
+/// snapshot-scoped `taint_utils::resolve_taints` may run moments after this) can leave the
 /// taint directory completely empty by the time this runs, and that must never turn a genuinely
 /// successful restage into a spurious failure. Instead: group `parents` by their own `st_dev`
 /// (memo-documented anchor rule — `F_FULLFSYNC` only reaches the drive the flushed file
@@ -1234,6 +1247,43 @@ mod tests {
         let relative = path.strip_prefix(&forklift).unwrap();
         let outcome = restage_object(&forklift, relative).unwrap();
         assert_eq!(outcome, RestageOutcome::HashMismatch);
+    }
+
+    #[test]
+    fn finish_clean_heal_leaves_the_gate_standing_when_a_fresh_taint_lands_after_the_snapshot() {
+        // TEST B (DESIGN.html §3.1.1): the same false-clear defect as `taint_utils`'s own
+        // `resolve_taints_leaves_the_gate_standing_when_a_fresh_taint_lands_after_the_snapshot`
+        // (Test A), but pinning the site-level wiring — does `finish_clean_heal` actually route
+        // through `resolve_taints` — separately from the primitive's own correctness. Calling
+        // `finish_clean_heal` directly with `restaged = BTreeSet::new()` makes
+        // `sync_restaged_parents` a no-op, so this needs no real restage fixture. Reverting
+        // `finish_clean_heal` back to its own `remove_taint_files` + unconditional `clear_gate`
+        // pair turns the gate assertion red.
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        let root = scratch("finish-clean-heal-false-clear");
+        let _scope = StorageRootScope::enter(&root);
+        let forklift = forklift_root();
+
+        let object_t1 = forklift.join("objects").join("11").join("aabbccdd");
+        taint_utils::record_taint(&[object_t1.as_path()]).unwrap();
+        let snapshot = taint_utils::read_taints(&forklift).unwrap();
+        assert_eq!(snapshot.files.len(), 1, "sanity: exactly T1's file was read");
+
+        // Standing in for a mid-run store failure that lands after the snapshot but before this
+        // call — the same shape `resolve_the_rest`'s own heal-driven refetch can hit.
+        let object_t2 = forklift.join("objects").join("22").join("eeff0011");
+        taint_utils::record_taint(&[object_t2.as_path()]).unwrap();
+
+        finish_clean_heal(&forklift, &BTreeSet::new(), &snapshot.files)
+            .expect("finish_clean_heal must succeed: the durable file work has nothing to fail on");
+
+        assert!(taint_utils::gate_check(&forklift).is_err(),
+            "T2's taint file is still standing on disk, so the gate must still be standing too");
+        let state = taint_utils::read_taints(&forklift).unwrap();
+        assert!(state.recorded.contains(&PathBuf::from("objects/22/eeff0011")),
+            "T2 must survive finish_clean_heal's snapshot-scoped removal completely untouched");
     }
 
     #[cfg(target_os = "macos")]
