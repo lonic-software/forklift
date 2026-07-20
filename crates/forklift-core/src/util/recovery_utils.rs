@@ -3040,7 +3040,7 @@ mod tests {
     }
 
     /// (D4 positive, two objects — the partial-bypass witness) Two corrupt objects, both actually
-    /// recoverable. §6 of the design settled on this as the one test in the plan that reddens
+    /// recoverable. This is the case that reddens
     /// under a *partial* gate bypass — an implementation that removes the delete but bypasses
     /// only the fetch-side filter (or only the store-side gate) can still make a single corrupt
     /// object look recovered by accident in some shapes, but not two independently force-stored
