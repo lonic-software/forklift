@@ -479,7 +479,7 @@ async fn resolve_the_rest(
         .collect();
     let corrupt_hashes: Vec<String> = corrupt_candidates.keys().cloned().collect();
 
-    let consultation = if !remote_configured {
+    let (consultation, corrupt_failures) = if !remote_configured {
         // `remote_configured` is `false` for two different reasons `RemoteClient::from_config`
         // conflates into one `Err`: genuinely nothing set, or something set but unusable (a
         // config read/parse error, or a URL `RemoteClient::new` rejects). Telling them apart
@@ -487,15 +487,16 @@ async fn resolve_the_rest(
         // first steers a user with a real, merely broken remote toward the heavyweight remedies
         // (franchise / reproduce / accept the loss) for an object that remote may still actually
         // have, once whatever is wrong with its config is fixed.
-        if remote_utils::RemoteClient::is_configured() {
+        let consultation = if remote_utils::RemoteClient::is_configured() {
             RemoteConsultation::ConsultedWithErrors
         } else {
             RemoteConsultation::NotConfigured
-        }
+        };
+        (consultation, BTreeMap::new())
     } else if candidate_hashes.is_empty() && corrupt_hashes.is_empty() {
         // Nothing a fetch could help with this round (e.g. every remaining recorded path is
         // `unreadable`/`restage_failed`, never object-shaped) — skip the network entirely.
-        RemoteConsultation::ConsultedCleanly
+        (RemoteConsultation::ConsultedCleanly, BTreeMap::new())
     } else {
         attempt_heal_driven_refetch(&candidate_hashes, &corrupt_hashes).await
     };
@@ -599,6 +600,13 @@ async fn resolve_the_rest(
     // recovery (a good copy landed, `Verified`) clears it, regardless of what the closure walk
     // would say about reachability.
     for (hash, relative) in &corrupt_candidates {
+        // `corrupt_failures` names, per hash, why *this run's own* dedicated refetch
+        // (`remote_utils::fetch_corrupt_replacements`, threaded up through
+        // `attempt_heal_driven_refetch`) did not land a copy for it — additive detail folded into
+        // the dangling line below, never a substitute for `remedy_text(consultation)`'s own
+        // general guidance. Absent whenever pass 3 never ran for this hash, recovered it, or lost
+        // its own attribution to a task panic (see `fetch_corrupt_replacements`'s own doc).
+        let refetch_failure = corrupt_failures.get(hash);
         match file_utils::read_object_classified(hash) {
             Ok(file_utils::StoreReadOutcome::Verified(_)) => {
                 resolved.push(relative.to_string_lossy().into_owned());
@@ -609,21 +617,36 @@ async fn resolve_the_rest(
                 // reserved for a verdict actually downstream of a hash-compare on these bytes,
                 // which a failed decompression or an unreconstructable delta chain never reached.
                 remainder.insert(relative.clone());
-                dangling_lines.push(format!(
-                    "cannot be read back verified: \"{}\" ({}; {})",
-                    relative.to_string_lossy(), reason, remedy_text(consultation)
-                ));
+                dangling_lines.push(match refetch_failure {
+                    Some(fetch_error) => format!(
+                        "cannot be read back verified: \"{}\" ({}; {}; the automatic refetch of \
+                        this object failed: {})",
+                        relative.to_string_lossy(), reason, remedy_text(consultation), fetch_error
+                    ),
+                    None => format!(
+                        "cannot be read back verified: \"{}\" ({}; {})",
+                        relative.to_string_lossy(), reason, remedy_text(consultation)
+                    ),
+                });
             }
             Ok(file_utils::StoreReadOutcome::Absent) => {
                 // No fetch landed a copy, and the corrupt dentry itself is now simply gone (a
                 // concurrent `compact`/gc could have swept it) — honestly neither "still corrupt"
                 // nor "recovered": nothing durable backs this hash at all right now.
                 remainder.insert(relative.clone());
-                dangling_lines.push(format!(
-                    "no longer present at its recorded address, and this run's refetch did not \
-                    land a verified copy: \"{}\" ({})",
-                    relative.to_string_lossy(), remedy_text(consultation)
-                ));
+                dangling_lines.push(match refetch_failure {
+                    Some(fetch_error) => format!(
+                        "no longer present at its recorded address, and this run's refetch did not \
+                        land a verified copy: \"{}\" ({}; the automatic refetch of this object \
+                        failed: {})",
+                        relative.to_string_lossy(), remedy_text(consultation), fetch_error
+                    ),
+                    None => format!(
+                        "no longer present at its recorded address, and this run's refetch did not \
+                        land a verified copy: \"{}\" ({})",
+                        relative.to_string_lossy(), remedy_text(consultation)
+                    ),
+                });
             }
             Err(e) => return Err(walk_failure_refusal(root, &e)),
         }
@@ -1559,10 +1582,17 @@ fn remedy_text(consultation: RemoteConsultation) -> &'static str {
 /// `set_pallet_head` or merges a pallet. Whether anything is actually recovered is decided
 /// afterward, uniformly, by the caller's own recheck — never by this function's return value (§3.2
 /// D3, see the module doc comment); `RemoteConsultation` only ever feeds [`remedy_text`]'s wording.
+///
+/// # Returns
+/// `(RemoteConsultation, BTreeMap<String, String>)` — the wording selector (unchanged by this
+/// return value's second half), and every `corrupt_hashes` entry pass 3 could not recover mapped
+/// to its own failure reason ([`remote_utils::fetch_corrupt_replacements`]'s own per-hash detail,
+/// threaded straight through). Empty whenever pass 3 never ran (no corrupt candidates this round)
+/// or recovered every one of them.
 async fn attempt_heal_driven_refetch(
     candidate_hashes: &[String],
     corrupt_hashes: &[String],
-) -> RemoteConsultation {
+) -> (RemoteConsultation, BTreeMap<String, String>) {
     // In practice this function's own caller already filters out the "nothing configured" case
     // before ever calling it (`resolve_the_rest`'s own `remote_configured` gate, fixed the same
     // way — see its doc comment), so this `Err` branch mainly guards a config that broke *between*
@@ -1571,11 +1601,11 @@ async fn attempt_heal_driven_refetch(
     // own doc comment.
     let client = match remote_utils::RemoteClient::from_config() {
         Ok(client) => client,
-        Err(_) => return if remote_utils::RemoteClient::is_configured() {
+        Err(_) => return (if remote_utils::RemoteClient::is_configured() {
             RemoteConsultation::ConsultedWithErrors
         } else {
             RemoteConsultation::NotConfigured
-        },
+        }, BTreeMap::new()),
     };
 
     // Armed for the rest of this function — both passes below, and every `.await` inside them —
@@ -1621,13 +1651,18 @@ async fn attempt_heal_driven_refetch(
         clean = false;
     }
 
-    if !corrupt_hashes.is_empty()
-        && remote_utils::fetch_corrupt_replacements(&client, corrupt_hashes).await.is_err()
-    {
-        clean = false;
+    let mut corrupt_failures: BTreeMap<String, String> = BTreeMap::new();
+    if !corrupt_hashes.is_empty() {
+        let (recovered, failures) =
+            remote_utils::fetch_corrupt_replacements(&client, corrupt_hashes).await;
+        if recovered != corrupt_hashes.len() {
+            clean = false;
+        }
+        corrupt_failures = failures;
     }
 
-    if clean { RemoteConsultation::ConsultedCleanly } else { RemoteConsultation::ConsultedWithErrors }
+    let consultation = if clean { RemoteConsultation::ConsultedCleanly } else { RemoteConsultation::ConsultedWithErrors };
+    (consultation, corrupt_failures)
 }
 
 fn display_paths<'a>(paths: impl Iterator<Item = &'a PathBuf>) -> Vec<String> {
@@ -2807,42 +2842,106 @@ mod tests {
     /// thread-per-connection pattern `remote_utils`'s own test fakes use — written fresh here
     /// because those are private to that module's own `#[cfg(test)]` mod.
     fn start_object_remote(objects: HashMap<String, Vec<u8>>) -> String {
-        start_object_remote_with_delay(objects, None)
+        start_object_remote_with_gate(objects, None)
     }
 
-    /// Same fake as [`start_object_remote`], but with an artificial delay inserted before
-    /// responding to one specific hash — the timing lever
-    /// `d4_mixed_remote_recovers_the_served_object_despite_the_unserved_ones_failure` needs to make
-    /// the race in defect 2 (an aborted sibling task) actually land instead of racing it: the
-    /// delayed hash's fetch is still parked awaiting the response (a genuine await point) at the
-    /// moment a sibling's fast 404 fails and (under the pre-fix, abort-on-first-error `join_all`)
-    /// triggers `abort_all`.
-    fn start_object_remote_with_delay(
+    /// The synchronisation gate [`start_object_remote_with_gate`]'s fake remote uses to hold back
+    /// one hash's response until it has actually observed a *different* hash's request landing.
+    /// Replaces a fixed sleep as the race window
+    /// `d4_mixed_remote_recovers_the_served_object_despite_the_unserved_ones_failure` needs: a
+    /// fixed sleep is a load-dependent lower bound only — on a slow enough machine the 404 request
+    /// it is meant to wait for may not even have arrived by the time the sleep expires, letting the
+    /// pre-fix, abort-on-first-error `join_all` win the race and the test pass for the wrong
+    /// reason. Waiting for the request to actually be *observed*, rather than for a fixed duration
+    /// to elapse, removes that specific load-dependent weakening.
+    ///
+    /// This does not make the test fully deterministic, and no claim to the contrary belongs here:
+    /// the residual window, even with the gate, is "the client processes the 404 and calls
+    /// `abort_all`" versus "the server writes the served hash's 200 response" — an ordering only
+    /// tokio's own task-abort scheduling could pin, and hooking that scheduler is out of bounds for
+    /// this test. [`GATE_RELEASE_TAIL`] below is that residual window's only mitigation, and it
+    /// runs in the *strengthening* direction only: under the mutation (abort-on-first-error) a fast
+    /// abort can still occasionally beat the tail and let the test pass when it should fail, but
+    /// the reverse never happens — with the fix in place nothing here ever aborts anything, so
+    /// there is nothing left for the tail to race and the test is never flaky when the code under
+    /// test is actually correct.
+    struct ResponseGate {
+        unserved_seen: std::sync::Mutex<bool>,
+        condvar: std::sync::Condvar,
+    }
+
+    impl ResponseGate {
+        fn new() -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                unserved_seen: std::sync::Mutex::new(false),
+                condvar: std::sync::Condvar::new(),
+            })
+        }
+
+        /// Called from the thread handling the signalling hash's own request, once its request is
+        /// parsed — "observed", not "responded to": the gate exists to prove the request arrived,
+        /// not to serialize the two responses.
+        fn signal(&self) {
+            let mut seen = self.unserved_seen.lock().unwrap_or_else(|p| p.into_inner());
+            *seen = true;
+            self.condvar.notify_all();
+        }
+
+        /// A bounded wait: a gate that is never signalled (the paired request never arrives — a
+        /// fixture bug, not the scenario this test means to exercise) must fail loudly, not hang
+        /// this test forever.
+        fn wait(&self) {
+            let seen = self.unserved_seen.lock().unwrap_or_else(|p| p.into_inner());
+            let (_guard, result) = self.condvar
+                .wait_timeout_while(seen, std::time::Duration::from_secs(5), |seen| !*seen)
+                .unwrap_or_else(|p| p.into_inner());
+            assert!(!result.timed_out(),
+                "the gate's paired request never arrived within the 5s bound — the fake remote \
+                would otherwise hang this test forever");
+        }
+    }
+
+    /// Held after the gate releases, before the served hash's response is actually written — the
+    /// only mitigation for the residual, un-pinnable race described in [`ResponseGate`]'s own doc.
+    const GATE_RELEASE_TAIL: std::time::Duration = std::time::Duration::from_millis(50);
+
+    /// Ties [`ResponseGate`] to the two hashes it mediates between: `signal_hash`'s request opens
+    /// the gate, `served_hash`'s response waits on it.
+    struct GatedResponse {
+        served_hash: String,
+        signal_hash: String,
+        gate: std::sync::Arc<ResponseGate>,
+    }
+
+    /// Same fake as [`start_object_remote`], but optionally holds back one hash's response until
+    /// another hash's request has actually been observed — see [`ResponseGate`]'s own doc for why
+    /// and what residual race remains.
+    fn start_object_remote_with_gate(
         objects: HashMap<String, Vec<u8>>,
-        delayed: Option<(String, std::time::Duration)>,
+        gated: Option<GatedResponse>,
     ) -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let objects = std::sync::Arc::new(objects);
-        let delayed = std::sync::Arc::new(delayed);
+        let gated = std::sync::Arc::new(gated);
 
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { continue };
                 let objects = std::sync::Arc::clone(&objects);
-                let delayed = std::sync::Arc::clone(&delayed);
-                std::thread::spawn(move || handle_object_remote_request(stream, &objects, &delayed));
+                let gated = std::sync::Arc::clone(&gated);
+                std::thread::spawn(move || handle_object_remote_request(stream, &objects, &gated));
             }
         });
 
         url
     }
 
-    /// Handle exactly one connection for [`start_object_remote`]/[`start_object_remote_with_delay`].
+    /// Handle exactly one connection for [`start_object_remote`]/[`start_object_remote_with_gate`].
     fn handle_object_remote_request(
         mut stream: std::net::TcpStream,
         objects: &HashMap<String, Vec<u8>>,
-        delayed: &Option<(String, std::time::Duration)>,
+        gated: &Option<GatedResponse>,
     ) {
         use std::io::{Read, Write};
 
@@ -2864,9 +2963,13 @@ mod tests {
         let path = start_line.split_whitespace().nth(1).unwrap_or("");
         let requested_hash = path.strip_prefix("/v1/objects/").unwrap_or("");
 
-        if let Some((slow_hash, delay)) = delayed {
-            if slow_hash == requested_hash {
-                std::thread::sleep(*delay);
+        if let Some(gated) = gated {
+            if gated.signal_hash == requested_hash {
+                gated.gate.signal();
+            }
+            if gated.served_hash == requested_hash {
+                gated.gate.wait();
+                std::thread::sleep(GATE_RELEASE_TAIL);
             }
         }
 
@@ -3105,10 +3208,13 @@ mod tests {
     /// every flagged hash as an independent task; one hash's 404 must never cancel a sibling's task
     /// before it force-stores its own recovered bytes. Pins that: the served object is genuinely
     /// recovered (content-verifies, cleared from the taint) even though the run as a whole still
-    /// refuses (the unserved object legitimately remains dangling). Mutation: revert
-    /// `fetch_corrupt_replacements` to the shared `join_all` (abort-the-rest on first error) — the
-    /// served object's task can be cancelled mid-fetch by the 404'd sibling's failure, so it stays
-    /// corrupt and this test goes red.
+    /// refuses (the unserved object legitimately remains dangling, now naming its own fetch
+    /// failure — see the assertion below). Mutation: revert `fetch_corrupt_replacements` to the
+    /// shared `join_all` (abort-the-rest on first error) — the served object's task can be
+    /// cancelled mid-fetch by the 404'd sibling's failure, so it stays corrupt and this test goes
+    /// red. A second, independent mutation this test also pins: collapse `fetch_corrupt_replacements`'s
+    /// per-hash failure map back to a joined string (or drop it entirely) — the "own fetch failure"
+    /// assertion below goes red even though the recovery assertions above it stay green.
     #[test]
     fn d4_mixed_remote_recovers_the_served_object_despite_the_unserved_ones_failure() {
         use crate::enums::config_scope::ConfigScope;
@@ -3136,15 +3242,17 @@ mod tests {
 
         let mut objects = HashMap::new();
         objects.insert(hash_served.clone(), good_served.clone());
-        // The served hash's response is deliberately delayed: its fetch must still be parked on
-        // an actual await point (awaiting the HTTP response) at the moment the unserved hash's
-        // fast 404 fails — the exact window a pre-fix, abort-on-first-error `join_all` would use
-        // to cancel it before it force-stores. Without the delay this test would only pass by
-        // scheduling luck (both fetches racing to finish before the abort could land).
-        let url = start_object_remote_with_delay(
-            objects,
-            Some((hash_served.clone(), std::time::Duration::from_millis(300))),
-        );
+        // The served hash's response is held back by the gate until the fake remote has actually
+        // observed the unserved hash's request — its fetch must still be parked on an actual
+        // await point (awaiting the HTTP response) at the moment the unserved hash's 404 fails —
+        // the exact window a pre-fix, abort-on-first-error `join_all` would use to cancel it
+        // before it force-stores. See `ResponseGate`'s own doc for why this is not a fully
+        // deterministic wait and what residual race remains even with it.
+        let url = start_object_remote_with_gate(objects, Some(GatedResponse {
+            served_hash: hash_served.clone(),
+            signal_hash: hash_unserved.clone(),
+            gate: ResponseGate::new(),
+        }));
         config_utils::set_value(config_utils::KEY_REMOTE_URL, &url, ConfigScope::Warehouse).unwrap();
 
         plant_complete_taint(&forklift, &[
@@ -3155,6 +3263,13 @@ mod tests {
         let error = run_heal()
             .expect_err("the unserved object's persisting corruption must keep the run refusing");
         assert_durability_taint(&error, &[relative_unserved.to_string_lossy().as_ref()]);
+        // The unserved object's own dangling line must carry its own fetch failure, not just the
+        // generic remote-consultation wording — pins `fetch_corrupt_replacements`'s per-hash
+        // failure map actually reaching the refusal text.
+        assert_durability_taint(&error, &[
+            "the automatic refetch of this object failed",
+            "404",
+        ]);
 
         // The served object must be genuinely recovered on disk...
         let stored = std::fs::read(forklift.join(&relative_served)).unwrap();
