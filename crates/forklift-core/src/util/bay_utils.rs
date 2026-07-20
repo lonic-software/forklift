@@ -167,26 +167,38 @@ pub fn all_bay_state_dirs() -> Result<Vec<PathBuf>, String> {
 /// How [`collect_bay_scoped_parcel_roots`] treats a bay whose `parked`/`consolidation` state
 /// cannot be read.
 ///
-/// The two callers need different answers to "what happens when one bay's state is corrupt,"
-/// because they differ in what they do with the result:
+/// **The real property, stated plainly (a previous version of this comment got it backwards):**
+/// skipping an unreadable bay can only *narrow* the root set this call returns — an object
+/// referenced only through that one bay's parked parcels or in-progress consolidation now looks
+/// unreferenced, because the reference that would have named it is simply missing. A narrower
+/// root set makes any caller's "not referenced" verdict *less* trustworthy, never more — it is
+/// the opposite of conservative.
+///
 /// [`gc_utils::collect_live_set`](crate::util::gc_utils::collect_live_set) feeds a sweep that
 /// *deletes* objects, so an incompletely known live set risks real, permanent data loss —
 /// [`FailClosed`](BayReadPolicy::FailClosed) is the only sound choice there, and stays the
-/// unconditional policy at that call site. [`recovery_utils::collect_walk_roots`]
-/// (`crate::util::recovery_utils::collect_walk_roots`) feeds `forklift heal`, which never
-/// deletes anything — it restages and reports — so [`Tolerate`](BayReadPolicy::Tolerate) lets
-/// heal keep running with that one bay's roots simply missing, rather than bricking the very
-/// command a standing taint tells users to run to recover. A skipped bay can only make heal's
-/// walk *more* conservative (more likely to report a hash as still dangling that a wider root
-/// set would have cleared), never less — it can never turn a genuinely-referenced object into
-/// "safe to drop," since nothing here deletes on that verdict either way.
+/// unconditional policy at that call site.
+///
+/// [`recovery_utils::collect_walk_roots`] (`crate::util::recovery_utils::collect_walk_roots`)
+/// feeds `forklift heal`, which never deletes an *object* on the strength of this result — but it
+/// does delete something else once it decides a hash is safe to drop: the durable taint record
+/// that is, for a genuinely lost object, the *only* remaining trace that it ever went missing.
+/// [`Tolerate`](BayReadPolicy::Tolerate) lets heal keep running with that one bay's roots simply
+/// missing, rather than bricking the very command a standing taint tells users to run to recover —
+/// but that is a license to keep making progress (restage what is present, report the bay by
+/// name), never a license to clear anything on the strength of the narrower result. **A caller
+/// using `Tolerate` must independently refuse to treat any "not referenced" verdict from a run
+/// with a non-empty [`BayScopeOutcome::degraded`] as proof of anything** — see
+/// `recovery_utils::resolve_the_rest`'s and `recovery_utils::rescan_torn_taint`'s own handling of
+/// their walk's `degraded_bays` for how that plays out at each call site.
 pub enum BayReadPolicy {
     /// Abort the whole call on the first unreadable bay — see this enum's doc comment. Required
     /// wherever the result feeds a destructive sweep.
     FailClosed,
     /// Skip an unreadable bay (it contributes no roots) and record a plain-language note about it
-    /// in [`BayScopeOutcome::degraded`] instead of aborting. Sound only for a caller that never
-    /// deletes anything on the strength of this result.
+    /// in [`BayScopeOutcome::degraded`] instead of aborting. Sound only for a caller that treats a
+    /// non-empty [`BayScopeOutcome::degraded`] as "this run's negative answers are not proof" and
+    /// refuses to clear or delete anything — object *or* durable record — on their strength.
     Tolerate,
 }
 
@@ -230,8 +242,11 @@ pub struct BayScopeOutcome {
 /// be read cannot be proven *not* to reference some object, and skipping it to keep a *sweep*
 /// going would silently under-count references — exactly the data-loss bug the bay-scope fix
 /// (reading every bay instead of just the active one) closed in the first place. Heal's call
-/// site passes `Tolerate`: it never deletes, so trading a possibly-wider root set for staying
-/// runnable is safe there — see [`BayReadPolicy`]'s own doc comment for the full reasoning.
+/// site passes `Tolerate` so it can keep running past that same unreadable bay instead of
+/// refusing outright — but the root set that produces is *narrower*, never wider, so it is never
+/// by itself license to clear anything; the caller must still treat every hash this narrower walk
+/// could not prove referenced as unproven, not safe, whenever a bay was actually skipped — see
+/// [`BayReadPolicy`]'s own doc comment for the full reasoning.
 ///
 /// # Arguments
 /// * `dirs`   - The bay-local state dirs to read, in order — normally the caller's own

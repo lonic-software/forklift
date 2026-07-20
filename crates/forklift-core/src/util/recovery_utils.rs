@@ -129,10 +129,15 @@
 //! - **D4 (force-fetch a corrupt remainder entry).** An ordinary fetch dedups against *present*
 //!   objects, so a corrupt-but-present recorded path (`attempt.hash_mismatch`) would never be
 //!   re-fetched — `does_object_exist` already says "yes". Before the fetch runs,
-//!   [`resolve_the_rest`] deletes that corrupt loose dentry (delete-then-fetch): the object is
-//!   transiently absent for the rest of this call, which is fine — `heal` holds the warehouse
-//!   lock throughout — and the ordinary dedup-aware fetch then pulls a good copy in exactly like
-//!   any other vanished candidate. A genuinely vanished (not corrupt) candidate needs no deletion.
+//!   [`resolve_the_rest`] moves that corrupt loose dentry aside into a same-folder quarantine name
+//!   (quarantine-then-fetch, never a bare delete): the object is transiently absent from
+//!   its real path for the rest of this call, which is fine — `heal` holds the warehouse lock
+//!   throughout — and the ordinary dedup-aware fetch then pulls a good copy in exactly like any
+//!   other vanished candidate. Once this candidate's fate is decided, the quarantine copy is
+//!   either removed (a good copy landed) or renamed straight back (it did not) — a remote that
+//!   turns out unreachable this run must never cost the user the corrupt-but-present bytes they
+//!   started with, only the deletion this replaces could. A genuinely vanished (not corrupt)
+//!   candidate needs no quarantine at all.
 //!
 //! **Scope boundary, stated honestly:** this recovers only objects a configured remote actually
 //! has. An object that vanished *before* it was ever published (lifted) has no remote copy to
@@ -196,11 +201,13 @@
 //!
 //! **Invariant I5:** `forklift heal` on a torn taint terminates in a well-formed remainder
 //! (possibly empty) — or fails loud only on an anomalous corruption a hash-verify cannot
-//! pre-classify (above all, corruption *inside* a pack) — never a silent brick. **Entry-heal's own
-//! torn refusal is completely unchanged** (`heal_utils::heal_if_tainted`, `state.torn` still
-//! refuses immediately, lock-free, directing to `forklift heal`) — only this locked verb rescans;
-//! doing so lock-free would be exactly the unsound, non-content-addressed restage I1/I2 exist to
-//! forbid, at store-wide scale.
+//! pre-classify (above all, corruption *inside* a pack), or on a bay whose state could not be read
+//! this run (see [`torn_rescan_degraded_refusal`]) — never a silent brick, and never a
+//! *quiet* replacement of the honest "unknown scope" torn record with a known-but-possibly-
+//! incomplete one. **Entry-heal's own torn refusal is completely unchanged**
+//! (`heal_utils::heal_if_tainted`, `state.torn` still refuses immediately, lock-free, directing to
+//! `forklift heal`) — only this locked verb rescans; doing so lock-free would be exactly the
+//! unsound, non-content-addressed restage I1/I2 exist to forbid, at store-wide scale.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -373,32 +380,62 @@ async fn resolve_the_rest(
     }
 
     // D4: force-fetch bridge. `corrupt_candidates` collects exactly the entries this run will
-    // attempt to recover via delete-then-fetch; anything not in it (no remote configured, or a
+    // attempt to recover via quarantine-then-fetch; anything not in it (no remote configured, or a
     // hash-mismatch path with no shape `hash_from_object_path` recognizes — unreachable in
     // practice, see `restage_object`'s `HashMismatch` verdict) commits straight to the remainder
     // below, unchanged from before this slice.
+    //
+    // `remote_configured` above is local-only (no network) — it says a URL is *set*, not
+    // that the remote actually answers. The corrupt copy used to be destroyed
+    // (`remove_file`) purely on that local check, before any fetch was attempted: if the
+    // configured remote turned out unreachable (offline, VPN down, a 503), the corrupt-but-present
+    // bytes were gone and the refetch below then failed too, leaving the object worse off than
+    // when heal started — absent and unrecoverable, instead of merely corrupt. `quarantined` maps
+    // each corrupt object's real, absolute path to where its bytes were moved aside — restored to
+    // that real path below if the fetch cannot land a good copy, removed if it can. **Invariant:
+    // running `forklift heal` against an unreachable remote must never leave the user with less
+    // than they started with** — a corrupt-but-present object may end this run corrupt-but-present
+    // again (exactly what the no-remote path already leaves behind), or genuinely recovered, but
+    // never genuinely gone.
+    let mut quarantined: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
     let mut corrupt_candidates: BTreeMap<String, PathBuf> = BTreeMap::new();
     for relative in &attempt.hash_mismatch {
         match (remote_configured, file_utils::hash_from_object_path(relative)) {
             (true, Some(hash)) => {
-                // Delete-then-fetch (D4): force the corrupt object to genuinely vanish so the
-                // ordinary fetch's dedup (`does_object_exist`) does not skip it as "already
-                // present" — see the module doc comment. Safe under the lock `heal` holds
-                // throughout: the object is transiently absent, never observed by anything else.
-                // Load-bearing for correctness, not just for the fetch's own dedup: skipping it
-                // was confirmed (by reverting this exact block) to make the post-check below a
-                // false clear, not merely a missed recovery — `raw_object_present`'s loose branch
-                // is a bare `fs::exists`, so a corrupt-but-still-present dentry left in place
-                // would itself read back as "present" and get reported resolved with the corrupt
-                // bytes never actually replaced.
-                if let Err(e) = std::fs::remove_file(root.join(relative)) {
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        return Err(sync_failure_refusal(root, &format!(
-                            "could not remove the corrupt copy of \"{}\" to make way for a \
-                            re-fetched good one: {}", relative.to_string_lossy(), e
-                        )));
-                    }
+                // Quarantine-then-fetch (D4): move the corrupt object aside — never
+                // destroy it — so the ordinary fetch's dedup (`does_object_exist`) does not skip
+                // it as "already present" (see the module doc comment) while still leaving a way
+                // back to exactly these bytes if the fetch cannot recover a good copy. Safe under
+                // the lock `heal` holds throughout: the object is transiently absent from its real
+                // path, never observed by anything else. The quarantine name reuses
+                // `file_utils::temp_path_for`'s own `.tmp<pid>-<n>` convention, in the same
+                // fan-out folder as the object itself — the exact shape every scanner that walks
+                // the object store already treats as staging debris and skips (`pack_utils`'s
+                // loose-object enumeration for `compact`, and this module's own
+                // `walk_loose_object_paths` for the §8.3 torn rescan), so it can never be
+                // mistaken for a real object while it exists. Load-bearing for correctness, not
+                // just for the fetch's own dedup: leaving the corrupt dentry in place at its real
+                // path was confirmed (by reverting this exact block) to make the post-check below
+                // a false clear, not merely a missed recovery — `raw_object_present`'s loose
+                // branch is a bare `fs::exists`, so a corrupt-but-still-present dentry there would
+                // itself read back as "present" and get reported resolved with the corrupt bytes
+                // never actually replaced.
+                let original_absolute = root.join(relative);
+                let quarantine_absolute = file_utils::temp_path_for(&original_absolute)
+                    .map_err(|e| sync_failure_refusal(root, &format!(
+                        "could not prepare a quarantine path for the corrupt copy of \"{}\": {}",
+                        relative.to_string_lossy(), e
+                    )))?;
+
+                match std::fs::rename(&original_absolute, &quarantine_absolute) {
+                    Ok(()) => { quarantined.insert(original_absolute, quarantine_absolute); }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(sync_failure_refusal(root, &format!(
+                        "could not move the corrupt copy of \"{}\" aside to make way for a \
+                        re-fetched good one: {}", relative.to_string_lossy(), e
+                    ))),
                 }
+
                 corrupt_candidates.insert(hash, relative.clone());
             }
             _ => {
@@ -522,21 +559,29 @@ async fn resolve_the_rest(
 
     let walk = closure_references_any(&truly_missing).map_err(|e| walk_failure_refusal(root, &e))?;
     let referenced = &walk.hashes;
+    // A degraded bay (see `collect_walk_roots`'s own doc comment) makes this walk's root
+    // set narrower than the warehouse's real one, which makes its "not referenced" answer *less*
+    // trustworthy, never more. A run in which any bay was skipped this way must not let that
+    // narrowed negative answer authorize dropping a taint entry — every hash below that this walk
+    // did not positively find referenced still cannot be told apart from one whose only reference
+    // lived in exactly the bay that got skipped, so it stays in the remainder too, unproven rather
+    // than resolved.
+    let roots_incomplete = !walk.degraded_bays.is_empty();
 
     for hash in &truly_missing {
         if referenced.contains(hash) {
-            if let Some(path) = loose_candidates.get(hash) {
-                remainder.insert(path.clone());
-            }
-            if let Some(pack_path) = pack_candidates.get(hash) {
-                remainder.insert(pack_path.clone());
-                let index_relative = pack_path.with_extension(pack_utils::PACK_INDEX_EXTENSION);
-                if recorded.contains(&index_relative) {
-                    remainder.insert(index_relative);
-                }
-            }
+            mark_still_dangling(hash, &loose_candidates, &pack_candidates, recorded, &mut remainder);
             dangling_lines.push(format!(
                 "vanished and still referenced: \"{}\" ({})", hash, remedy_text(consultation)
+            ));
+        } else if roots_incomplete {
+            mark_still_dangling(hash, &loose_candidates, &pack_candidates, recorded, &mut remainder);
+            dangling_lines.push(format!(
+                "vanished, and this run could not confirm it is safe to drop: \"{}\" (at least \
+                one bay's saved state could not be read this run, so not every reference to it \
+                could be checked — see the note below for which bay and how to fix it, then \
+                re-run \"forklift heal\")",
+                hash
             ));
         } else {
             resolved.push(hash.clone());
@@ -544,8 +589,8 @@ async fn resolve_the_rest(
     }
 
     // D4: re-verify each corrupt candidate the exact same way (`raw_object_present`, packed-or-
-    // loose) — sound here specifically because its corrupt dentry was deleted above, before the
-    // fetch ran: the loose path can only be occupied again by freshly fetched, hash-verified
+    // loose) — sound here specifically because its corrupt dentry was moved aside above, before
+    // the fetch ran: the loose path can only be occupied again by freshly fetched, hash-verified
     // bytes, or a pack hit, never by the original corrupt bytes. Unlike the ordinary vanished
     // set, a corrupt candidate is never exonerated by "unreferenced" — this mirrors the verb's
     // existing corrupt-is-always-remainder-until-recovered rule; only a genuine recovery (a good
@@ -555,6 +600,39 @@ async fn resolve_the_rest(
             Ok(present) => present,
             Err(e) => return Err(walk_failure_refusal(root, &e)),
         };
+
+        // Settle this candidate's quarantined bytes (if it was actually quarantined —
+        // `quarantined` omits an entry whose original file was already gone by the time the
+        // rename above ran) before deciding this hash's own fate, so a crash between the two can
+        // never observe a candidate marked recovered/dangling with its quarantine copy still
+        // sitting unaccounted for.
+        if let Some(quarantine_absolute) = quarantined.get(&root.join(relative)) {
+            if recovered {
+                // A good copy landed at the object's real path (freshly fetched, or already
+                // present in a pack) — the quarantined corrupt bytes are no longer needed.
+                if let Err(e) = std::fs::remove_file(quarantine_absolute) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        return Err(sync_failure_refusal(root, &format!(
+                            "recovered \"{}\", but could not remove its quarantined corrupt copy \
+                            \"{}\": {}", relative.to_string_lossy(),
+                            quarantine_absolute.to_string_lossy(), e
+                        )));
+                    }
+                }
+            } else {
+                // The invariant this fix exists for: heal must never leave the user with less
+                // than they started with. No good copy landed (no remote, an unreachable one, or
+                // a reachable one that simply does not have it) — restore the quarantined bytes
+                // so the object goes back to being corrupt-but-present, exactly the state the
+                // no-remote path already leaves behind, rather than genuinely gone.
+                if let Err(e) = std::fs::rename(quarantine_absolute, root.join(relative)) {
+                    return Err(sync_failure_refusal(root, &format!(
+                        "could not restore the quarantined corrupt copy of \"{}\": {}",
+                        relative.to_string_lossy(), e
+                    )));
+                }
+            }
+        }
 
         if recovered {
             resolved.push(relative.to_string_lossy().into_owned());
@@ -577,10 +655,12 @@ async fn resolve_the_rest(
             relative.to_string_lossy()
         ));
     }
-    // Any bay `collect_walk_roots` had to skip (see `closure_references_any`'s doc comment) — the
-    // walk above still ran and still decided every hash's fate, but only as completely as every
-    // *readable* bay could make it, so this is surfaced too rather than silently folded away.
-    notes.extend(walk.degraded_bays.clone());
+    // Any bay `collect_walk_roots` had to skip can *never* reach here with `remainder`
+    // empty — `roots_incomplete` above forces every hash the walk could not positively clear into
+    // `remainder`, so a non-empty `walk.degraded_bays` always implies a non-empty `remainder`,
+    // i.e. the `Err` branch below. `notes` (the `Ok`-only outcome) therefore never needs the
+    // degraded-bay notes folded in here; the `Err` branch passes them to `dangling_refusal`
+    // instead, since that is the only branch a degraded run can actually take.
 
     // `resolve_taints` owns the gate too now (DESIGN.html §3.1.1): it derives the clear/set
     // decision from what is actually left standing in the taint directory once this rewrite
@@ -598,7 +678,32 @@ async fn resolve_the_rest(
             notes,
         })
     } else {
-        Err(dangling_refusal(root, &dangling_lines))
+        Err(dangling_refusal(root, &dangling_lines, &walk.degraded_bays))
+    }
+}
+
+/// Record `hash`'s recorded taint path(s) — its loose path, or its pack data file plus
+/// (if separately recorded) that pack's index — into `remainder`. Shared by both branches in
+/// [`resolve_the_rest`]'s truly-missing loop that must keep a hash dangling: one where the
+/// closure walk positively found it still referenced, and one where the walk's root set was
+/// incomplete this run and so could not positively clear it either way — see that loop's own
+/// comment for why the two are treated identically once either applies.
+fn mark_still_dangling(
+    hash: &str,
+    loose_candidates: &BTreeMap<String, PathBuf>,
+    pack_candidates: &BTreeMap<String, PathBuf>,
+    recorded: &BTreeSet<PathBuf>,
+    remainder: &mut BTreeSet<PathBuf>,
+) {
+    if let Some(path) = loose_candidates.get(hash) {
+        remainder.insert(path.clone());
+    }
+    if let Some(pack_path) = pack_candidates.get(hash) {
+        remainder.insert(pack_path.clone());
+        let index_relative = pack_path.with_extension(pack_utils::PACK_INDEX_EXTENSION);
+        if recorded.contains(&index_relative) {
+            remainder.insert(index_relative);
+        }
     }
 }
 
@@ -708,6 +813,30 @@ fn rescan_torn_taint(
         .map_err(|e| rescan_failure_refusal(root, &e))?;
     let referenced_absent = &walk.hashes;
 
+    // A degraded bay (see `collect_walk_roots`'s own doc comment) narrows this
+    // enumeration's root set, so an object referenced only through that one bay's parked parcels
+    // or in-progress consolidation is invisible to it — it would simply never appear in
+    // `referenced_absent`, never enter `remainder`, and (unlike the ordinary, non-torn pipeline's
+    // per-candidate `roots_incomplete` fallback in `resolve_the_rest`) there is no narrower
+    // "unproven" set to fall back to here: a torn taint's entire point is that its true scope is
+    // unknown, and this rescan's whole job is turning that into a *known* one. It must not do so
+    // on a root set it already knows is incomplete — that would silently replace an honest
+    // "unknown, treat everything as suspect" record with a dishonest "known, but actually missing
+    // an entry" one, which is exactly as permanent a loss as clearing outright. So the original
+    // torn record is left completely untouched (this function's own crash-safety contract already
+    // covers "nothing replaced yet") and this run refuses, naming the bay that must be fixed or
+    // removed before a rescan can honestly complete. Whatever step 1 already restaged above is
+    // still durable on disk regardless — restaging never depends on bay roots — only the taint
+    // record's own scope decision waits for a clean rescan.
+    if !walk.degraded_bays.is_empty() {
+        report(
+            "torn durability taint: the rescan could not finish verifying every reference \
+            because at least one bay's saved state could not be read; the torn record is left \
+            standing.".to_string()
+        );
+        return Err(torn_rescan_degraded_refusal(root, restaged.len(), &walk.degraded_bays));
+    }
+
     for hash in referenced_absent {
         let relative = loose_remainder_path(root, hash).map_err(|e| rescan_failure_refusal(root, &e))?;
         remainder.insert(relative);
@@ -730,15 +859,15 @@ fn rescan_torn_taint(
         // individually (as the ordinary, small-scale restage/resolved lists do) would make this
         // report itself unusably large. The counts are reported via `progress` above; this
         // outcome's own lists stay a summary note instead.
-        let mut notes = vec![format!(
+        // `walk.degraded_bays` is guaranteed empty by this point — the guard above already
+        // returned early otherwise — so there is no degraded-bay note left to fold in here; a
+        // rescan can only reach this `Ok` branch once every bay's state was actually readable.
+        let notes = vec![format!(
             "a torn taint was resolved by a full store-wide rescan: {} loose object(s), {} \
             pack file(s), and {} inventory shard file(s) were candidates, of which {} were \
             (re)restaged; individual paths are not listed here to keep this report readable",
             loose_count, packs_count, shards_count, restaged.len(),
         )];
-        // Any bay `collect_walk_roots` had to skip this run — see `enumerate_absent_reachable`'s
-        // doc comment; same reasoning as `resolve_the_rest`'s own degraded-bay note.
-        notes.extend(walk.degraded_bays.clone());
 
         Ok(HealOutcome {
             was_tainted: true,
@@ -972,15 +1101,20 @@ struct WalkRoots {
 /// anchor).**
 ///
 /// **Tolerant, unlike `collect_live_set`.** This call passes [`bay_utils::BayReadPolicy::
-/// Tolerate`], not `FailClosed`: `forklift heal` never deletes anything (it restages and
-/// reports), and is the very command a standing taint tells users to run to recover, so a single
-/// unreadable bay must not brick it the way it must still brick a *deleting* sweep. An
-/// unreadable bay is skipped — it contributes no roots — and named in [`WalkRoots::
-/// degraded_bays`] instead of aborting the walk. This can only make the walk's answer more
-/// conservative (a hash only that bay referenced now reads as unreferenced and clears, rather
-/// than the walk refusing outright), never less — see `BayReadPolicy`'s own doc comment for why
-/// that is sound specifically because heal never deletes. `gc_utils::collect_live_set` keeps
-/// `FailClosed` unconditionally; do not change that call site to match this one.
+/// Tolerate`], not `FailClosed`: `forklift heal` is the very command a standing taint tells
+/// users to run to recover, so a single unreadable bay must not brick the whole invocation the
+/// way it must still brick a *deleting* sweep. An unreadable bay is skipped — it contributes no
+/// roots — and named in [`WalkRoots::degraded_bays`] instead of aborting the walk.
+///
+/// **This narrows the root set, which makes the walk's "not referenced" answer *less*
+/// trustworthy, never more** — a hash only the skipped bay referenced now looks unreferenced,
+/// when in fact it is not. Every caller of this walk (through [`closure_references_any`] or
+/// [`enumerate_absent_reachable`]) must treat a non-empty [`WalkRoots::degraded_bays`] /
+/// [`ClosureWalkResult::degraded_bays`] as "this run's negative answers are not proof" and must
+/// not clear or drop anything — object or durable taint record — on their strength; see
+/// [`resolve_the_rest`]'s `roots_incomplete` handling and [`rescan_torn_taint`]'s own
+/// degraded-bay guard for where that rule is actually enforced. `gc_utils::collect_live_set`
+/// keeps `FailClosed` unconditionally; do not change that call site to match this one.
 ///
 /// The undo journal is deliberately excluded from **both** walks (parity, not an oversight): an
 /// entry there records history for `undo`/`redo`, never a live reference a future write would
@@ -1520,6 +1654,30 @@ fn rescan_failure_refusal(root: &Path, error: &str) -> CoreError {
     )
 }
 
+/// The store-wide rescan ran and restaged whatever it legitimately could, but at least one
+/// bay's saved state could not be read, so step 2's enumeration cannot be trusted to have found
+/// every reference — see [`rescan_torn_taint`]'s own comment at its degraded-bay guard for the
+/// full reasoning. The torn record is left completely untouched, distinct from
+/// [`rescan_failure_refusal`] (an operational failure of the rescan's own machinery) even though
+/// both leave the record standing the same way: this one is not a failure to *run* the rescan, it
+/// is a deliberate refusal to *trust* what it found.
+fn torn_rescan_degraded_refusal(root: &Path, restaged_count: usize, degraded: &[String]) -> CoreError {
+    CoreError::refusal(
+        RefusalCode::DurabilityTaint,
+        format!(
+            "{} under \"{}\": its record is torn, and this run's store-wide rescan restaged {} \
+            file(s) but could not finish checking every reference, because: {} The torn record \
+            is left standing rather than replaced with a scan this run already knows is \
+            incomplete.",
+            taint_utils::GATE_TAINT_MARKER, root.to_string_lossy(), restaged_count,
+            degraded.join(" "),
+        ),
+        "Fix or remove the named bay's state, then run \"forklift heal\" again — the rescan \
+        restages idempotently and simply starts over; it can only replace the torn record once \
+        every bay is readable.",
+    )
+}
+
 /// §8.3 (I5): the store-wide rescan completed and turned the torn record's unknown scope into a
 /// known one, but at least one reference in that known scope is still genuinely dangling. The
 /// taint by this point already records exactly this remainder (no longer torn) — see
@@ -1551,7 +1709,13 @@ fn torn_rescan_dangling_refusal(root: &Path, lines: &[String]) -> CoreError {
     CoreError::refusal(RefusalCode::DurabilityTaint, message, next_step)
 }
 
-fn dangling_refusal(root: &Path, lines: &[String]) -> CoreError {
+/// `degraded`: the plain-language notes for every bay `collect_walk_roots` had to skip
+/// this run (see [`bay_utils::BayReadPolicy::Tolerate`]) — empty on the common path. When
+/// non-empty, at least one line in `lines` may be there only because this run could not prove it
+/// unreferenced (not because it definitely still is), so the message says so plainly and points
+/// at the actual fix (repair or remove the named bay) rather than only the heavyweight exits,
+/// which do not apply to a hash that may turn out fine once every bay is readable again.
+fn dangling_refusal(root: &Path, lines: &[String], degraded: &[String]) -> CoreError {
     let named: Vec<&String> = lines.iter().take(MAX_NAMED_DANGLING).collect();
     let overflow = lines.len().saturating_sub(named.len());
 
@@ -1563,12 +1727,28 @@ fn dangling_refusal(root: &Path, lines: &[String]) -> CoreError {
     if overflow > 0 {
         message.push_str(&format!(" (and {} more)", overflow));
     }
+    if !degraded.is_empty() {
+        message.push_str(&format!(
+            " This run could not fully check every reference, because: {}",
+            degraded.join(" ")
+        ));
+    }
 
-    let next_step = format!(
-        "Every dangling reference needs a heavyweight resolution: {} Re-run \"forklift heal\" \
-        once you have resolved what you can; it reports exactly what is left.",
-        HEAVYWEIGHT_EXITS
-    );
+    let next_step = if degraded.is_empty() {
+        format!(
+            "Every dangling reference needs a heavyweight resolution: {} Re-run \"forklift heal\" \
+            once you have resolved what you can; it reports exactly what is left.",
+            HEAVYWEIGHT_EXITS
+        )
+    } else {
+        format!(
+            "At least one of these could not be conclusively checked because a bay's saved state \
+            could not be read this run — fix or remove that bay (see above), then re-run \
+            \"forklift heal\"; it may resolve on its own once every bay is readable. Whatever is \
+            still dangling after that needs a heavyweight resolution: {}",
+            HEAVYWEIGHT_EXITS
+        )
+    };
 
     CoreError::refusal(RefusalCode::DurabilityTaint, message, next_step)
 }
@@ -2792,16 +2972,29 @@ mod tests {
 
     /// A single fixture pinning BOTH halves of the split this fix makes, on the exact same
     /// corrupt bay: `forklift heal` (this crate's `run`, exercised end to end here — not just its
-    /// inner `closure_references_any`) must complete and report the degraded bay, because heal
-    /// never deletes anything and is the very command a standing taint tells users to run to
-    /// recover; `gc`/`compact`, which DO delete, must keep refusing outright on that same file,
-    /// because sweeping with an incompletely known live set risks real data loss.
+    /// inner `closure_references_any`) must still RUN past the unreadable bay — restaging what it
+    /// can and reporting the bay by name — rather than bricking outright with an opaque failure,
+    /// the way it did before this fix. `gc`/`compact`, which DO delete, must keep refusing
+    /// outright on that same file, because sweeping with an incompletely known live set risks
+    /// real data loss.
+    ///
+    /// A follow-up correction on this same fixture: heal itself must NOT clear the taint
+    /// here. A genuinely vanished object cannot be positively proven unreferenced while any bay's
+    /// state is unreadable — even one, like this fixture's, that has nothing to do with the
+    /// object in question — because heal has no general way to tell "this hash's only possible
+    /// reference lived in the bay I could not read" apart from "it definitely does not." "Ran but
+    /// refused, naming the bay" is the correct outcome; "bricked with no usable detail" is not —
+    /// this fixture pins the difference, not merely "heal returns `Ok`."
     ///
     /// Revert the heal-side tolerance (`bay_utils::collect_walk_roots`'s call passing
-    /// `BayReadPolicy::Tolerate`) and this test's first half reddens (`run_heal()` returns `Err`
-    /// instead of a clean `Ok` naming bay "b"). Weaken either `gc_utils::collect_live_set`'s or
-    /// `pack_utils::compact`'s fail-closed policy and this test's second half reddens (`Ok` where
-    /// an `Err` is required) — so this test cannot pass by drifting either direction.
+    /// `BayReadPolicy::Tolerate`) and the first assertion below reddens differently: `run_heal()`
+    /// still returns `Err`, but the message loses the bay's name and its cleanup route (it
+    /// becomes the old, generic "the recovery walk ... could not complete" refusal instead).
+    /// Revert the fail-closed-verdict fix (`resolve_the_rest`'s `roots_incomplete` branch) and the
+    /// same assertion reddens the other way: `run_heal()` returns `Ok`, clearing the taint.
+    /// Weaken either `gc_utils::collect_live_set`'s or `pack_utils::compact`'s fail-closed policy
+    /// and the final two assertions redden (`Ok` where an `Err` is required) — so this test cannot
+    /// pass by drifting in any of these three directions.
     #[test]
     fn heal_tolerates_a_corrupt_bay_while_gc_and_compact_still_refuse() {
         use crate::globals::StorageRootScope;
@@ -2822,27 +3015,32 @@ mod tests {
         std::fs::create_dir_all(&bay_b_dir).unwrap();
         std::fs::write(bay_b_dir.join("parked"), b"not-a-valid-hash\n").unwrap();
 
-        // A genuinely vanished, genuinely unreferenced object recorded as tainted — the ordinary
-        // "resolved, taint clears" shape, so this run actually drives the closure walk (and so
-        // `collect_walk_roots`'s tolerance) rather than taking an early-return shortcut.
+        // A genuinely vanished object recorded as tainted, unrelated to bay "b"'s own state — so
+        // this run actually drives the closure walk (and so `collect_walk_roots`'s tolerance)
+        // rather than taking an early-return shortcut.
         let vanished_hash = "9".repeat(64);
         let vanished_path = loose_remainder_path(&forklift, &vanished_hash).unwrap();
         plant_complete_taint(&forklift, &[vanished_path.to_str().unwrap()]);
 
-        let outcome = run_heal().expect(
-            "an unreadable bay must never abort forklift heal — it is the escape hatch users are \
-            told to run for a standing taint, and it never deletes anything"
+        let error = run_heal().expect_err(
+            "with any bay's state unreadable this run, heal must never clear a taint on the \
+            strength of a narrowed root set — even for an object this specific bay has nothing to \
+            do with, since heal cannot tell that in general"
         );
-        assert!(outcome.was_tainted);
-        assert!(outcome.resolved.iter().any(|p| p.contains(&vanished_hash)),
-            "the vanished, unreferenced object must still resolve cleanly despite bay b being \
-            unreadable: {:?}", outcome.resolved);
-        assert!(outcome.notes.iter().any(|n| n.contains("\"b\"") && n.contains("forklift bay remove")),
-            "heal must name the degraded bay and its cleanup route in its notes: {:?}", outcome.notes);
+        assert_durability_taint(&error, &[vanished_hash.as_str(), "\"b\"", "forklift bay remove"]);
+
+        // The critical positive: heal still RAN — it did not brick on the unreadable bay the way
+        // it did before this fix (which failed the whole closure walk outright with no usable
+        // detail). The refusal above already proves it named the bay and the cleanup route; here,
+        // the taint record itself must still be on disk, complete (not torn), and still naming
+        // the object — a well-formed remainder, not a wedge.
+        let state = taint_utils::read_taints(&forklift).unwrap();
+        assert!(!state.torn, "heal's own rewrite must leave a complete, non-torn remainder");
+        assert!(state.recorded.contains(&vanished_path),
+            "the unproven object must still be named in the remainder: {:?}", state.recorded);
 
         // The other half: gc and compact must still refuse outright on the exact same corrupt
-        // file — never weakened by this fix. (The taint above is already cleared by the `run_heal`
-        // call, so this is testing the bay-read policy alone, not a leftover taint gate.)
+        // file — never weakened by this fix.
         let gc_result = crate::util::gc_utils::collect_garbage(0);
         assert!(gc_result.is_err(), "gc must still fail closed on an unreadable bay's parked file");
 
@@ -2853,6 +3051,100 @@ mod tests {
         let compact_all_result = pack_utils::compact(true, false);
         assert!(compact_all_result.is_err(),
             "compact --all must still fail closed on an unreadable bay's parked file");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The core Fix-A regression fixture — the sharper version of the one above, and the one that
+    /// actually demonstrates permanent data loss rather than an overly broad refusal. Bay "b"'s
+    /// `parked` file has the vanished object's own hash as its first (otherwise valid) line,
+    /// followed by a malformed second line that makes `read_parked_in` reject the *whole* file —
+    /// so the walk never sees that hash as a root at all, exactly as if bay "b" had simply never
+    /// existed. Bay "b" is therefore the object's *only* durable reference.
+    ///
+    /// Before this fix, a narrower root set (missing exactly this one reference) made the walk's
+    /// "not referenced" answer come back positive, not refused — so heal would call the object
+    /// safe to drop and durably delete the only remaining record that it was ever missing. Once
+    /// bay "b" is later repaired, nothing durable points back at the loss anymore: gone for good.
+    ///
+    /// Revert the fail-closed-verdict fix (`resolve_the_rest`'s `roots_incomplete` branch, letting
+    /// the `else` arm fall through to an unconditional `resolved.push`) and this reddens:
+    /// `run_heal()` returns `Ok`, clearing the taint over the still-referenced-in-principle object.
+    #[test]
+    fn heal_must_not_clear_a_taint_whose_only_reference_lived_in_a_degraded_bay() {
+        use crate::globals::StorageRootScope;
+
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        let dir = std::env::temp_dir()
+            .join(format!("forklift-recovery-utils-degraded-bay-sole-ref-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _scope = StorageRootScope::enter(&dir);
+        let forklift = forklift_root();
+
+        let vanished_hash = "9".repeat(64);
+
+        // Bay "b" is the *only* durable reference to `vanished_hash` — and its own file is
+        // corrupt, so that one reference is unreadable along with the rest of the file.
+        let bay_b_dir = bay_utils::bay_state_dir("b");
+        std::fs::create_dir_all(&bay_b_dir).unwrap();
+        std::fs::write(bay_b_dir.join("parked"), format!("{}\nnot-a-valid-hash\n", vanished_hash)).unwrap();
+
+        let vanished_path = loose_remainder_path(&forklift, &vanished_hash).unwrap();
+        plant_complete_taint(&forklift, &[vanished_path.to_str().unwrap()]);
+
+        let error = run_heal().expect_err(
+            "a degraded bay must never authorize clearing a taint — a narrower root set can only \
+            make the walk's negative answer less trustworthy, never more"
+        );
+        assert_durability_taint(&error, &[vanished_hash.as_str(), "\"b\"", "forklift bay remove"]);
+
+        let state = taint_utils::read_taints(&forklift).unwrap();
+        assert!(state.recorded.contains(&vanished_path),
+            "the object must still be named in the remainder after this run: {:?}", state.recorded);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// §8.3's degraded-bay counterpart: a torn taint's rescan must refuse rather than silently
+    /// downgrade "unknown scope" into a known-but-possibly-incomplete one when a bay's state
+    /// cannot be read this run — see `rescan_torn_taint`'s own degraded-bay guard for why there is
+    /// no narrower "unproven" remainder to fall back to here, unlike the ordinary (non-torn)
+    /// pipeline `heal_must_not_clear_a_taint_whose_only_reference_lived_in_a_degraded_bay` pins.
+    ///
+    /// Revert the degraded-bay guard in `rescan_torn_taint` (the early `Err` return on a non-empty
+    /// `walk.degraded_bays`) and this reddens: the rescan proceeds, finds nothing referenced-and-
+    /// absent (bay "b" being the only would-be source), and clears the torn taint outright.
+    #[test]
+    fn torn_rescan_leaves_the_record_standing_when_a_bay_is_degraded() {
+        use crate::globals::StorageRootScope;
+
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        let dir = std::env::temp_dir()
+            .join(format!("forklift-recovery-utils-torn-rescan-degraded-bay-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _scope = StorageRootScope::enter(&dir);
+        let forklift = forklift_root();
+
+        let bay_b_dir = bay_utils::bay_state_dir("b");
+        std::fs::create_dir_all(&bay_b_dir).unwrap();
+        std::fs::write(bay_b_dir.join("parked"), b"not-a-valid-hash\n").unwrap();
+
+        plant_torn_taint(&forklift, &[]);
+
+        let error = run_heal().expect_err(
+            "a torn taint's rescan must refuse rather than downgrade to a known-but-possibly-\
+            incomplete remainder while a bay's state is unreadable"
+        );
+        assert_durability_taint(&error, &["\"b\"", "forklift bay remove", "torn"]);
+
+        let state = taint_utils::read_taints(&forklift).unwrap();
+        assert!(state.torn, "the original torn record must be left standing, untouched");
 
         std::fs::remove_dir_all(&dir).ok();
     }

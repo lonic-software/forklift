@@ -4302,3 +4302,60 @@ fn heal_driven_refetch_force_fetches_a_corrupt_present_object() {
     };
     assert_eq!(content, genuine_content.as_bytes());
 }
+
+#[test]
+fn heal_driven_refetch_leaves_a_corrupt_objects_bytes_present_when_the_remote_is_unreachable() {
+    // `resolve_the_rest`'s D4 force-fetch bridge used to delete a corrupt-but-present
+    // object's bytes before any fetch was attempted, on nothing but a local "is a URL configured"
+    // check (`RemoteClient::from_config().is_ok()` — no network, per its own doc comment). If the
+    // configured remote turned out unreachable (closed port, VPN down, a 503), the corrupt bytes
+    // were already gone and the refetch below then failed too: the object went from "corrupt but
+    // present, possibly salvageable" to "absent and unrecoverable" — strictly worse than doing
+    // nothing. This pins the fixed invariant: running `forklift heal` against an unreachable
+    // remote must never leave the user with less than they started with.
+    //
+    // Mutation: revert the quarantine-then-restore machinery in `resolve_the_rest` back to an
+    // unconditional `remove_file` before the fetch attempt → the corrupt object's bytes are gone
+    // by the time this test checks for them → red.
+    let area = TestArea::new("heal-refetch-corrupt-unreachable");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    let genuine_content = "the genuine content, already published to the remote\n";
+    area.write_file("dev/a.txt", genuine_content);
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base parcel"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    let head = pallet_head(&area, "dev", "main");
+    let blob = path_object_hash(&area, "dev", &head, "a.txt");
+    let relative = loose_object_relative_path(&blob);
+    let object_path = object_store_path(&area, "dev", &blob);
+
+    // Corrupt the local copy in place (not valid zstd at all) — the remote's own copy would still
+    // be good, but this run can never reach it to find out.
+    let corrupt_bytes: &[u8] = b"not the real compressed bytes at all";
+    std::fs::write(&object_path, corrupt_bytes).unwrap();
+
+    // Point at an unreachable remote (a closed local port) — configured, so `remote_configured`
+    // reads `true`, but it never actually answers. The same deterministic failure shape
+    // `heal_driven_refetch_leaves_the_taint_intact_on_a_failed_fetch` uses.
+    assert_success(&area.forklift("dev", &["config", "remote.url", "http://127.0.0.1:9"]));
+    plant_taint(&area, "dev", &[&relative]);
+
+    let status = area.forklift("dev", &["--json", "heal"]);
+    assert_eq!(status.status.code(), Some(21));
+
+    assert_eq!(recorded_taint_paths(&area, "dev"), vec![relative],
+        "the corrupt object was never recovered — it must still be named in the remainder");
+
+    // The critical positive: the corrupt bytes are still there afterward — not merely "some file
+    // exists at that path," but the *exact original* bytes, proving the quarantine-and-restore
+    // round trip does not itself lose or truncate anything.
+    assert!(object_path.exists(),
+        "a heal run against an unreachable remote must never leave the user with less than they \
+        started with — the corrupt-but-present object must still be present afterward");
+    let bytes_after = std::fs::read(&object_path).unwrap();
+    assert_eq!(bytes_after, corrupt_bytes,
+        "the restored bytes must be byte-identical to what was there before this heal run");
+}
