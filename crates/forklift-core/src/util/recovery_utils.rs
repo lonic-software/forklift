@@ -617,22 +617,34 @@ async fn resolve_the_rest(
     }
 }
 
-/// D4's corrupt-candidate recheck (DESIGN.html §3.1.1): content, not presence. Mirrors
-/// [`file_utils::raw_object_present`]'s packed-first shortcut — a pack hit's own read path already
-/// verifies content, so it is trusted as-is — but the loose branch reads the file back,
-/// decompresses it, and hash-verifies it via [`object_utils::verify_object_bytes`] instead of a
-/// bare existence check. That difference from `raw_object_present` is load-bearing here
-/// specifically: a corrupt candidate's dentry is never deleted before its fetch runs (see the
-/// module doc comment), so a stale corrupt file can genuinely be sitting at the path when this
-/// runs, and a presence-only check cannot tell it apart from a freshly landed good one.
+/// D4's corrupt-candidate recheck (DESIGN.html §3.1.1): content, not presence. Unlike
+/// [`file_utils::raw_object_present`]'s packed-first shortcut (a bare index-membership check,
+/// trusted as-is because that function only needs to tell "genuinely absent" apart from "a false
+/// alarm — repacked since the taint fired"), this recheck cannot stop at membership: a corrupt
+/// candidate's dentry is never deleted before its fetch runs (see the module doc comment), so a
+/// stale corrupt loose file — or, for the same reason, a pack record whose data does not verify —
+/// can genuinely be sitting where this looks when it runs, and index/dentry presence alone cannot
+/// tell that apart from a freshly landed good copy. So both branches read the bytes back and
+/// hash-verify them: the pack branch via [`pack_utils::retrieve_from_packs`] (which decompresses,
+/// reconstructs any delta chain, and calls [`object_utils::verify_object_bytes`] itself — the same
+/// verification the ordinary read path performs), the loose branch by decompressing and calling
+/// `verify_object_bytes` directly.
 ///
 /// # Returns
-/// * `Ok(true)`    - The object is present and, for a loose dentry, its content hash-verifies.
-/// * `Ok(false)`   - Nothing is at the path, or a loose file's content does not hash-verify.
-/// * `Err(String)` - The pack registry or the loose file could not be read.
+/// * `Ok(true)`    - The object is present and its content hash-verifies (packed or loose).
+/// * `Ok(false)`   - Nothing is at the path, or its content does not hash-verify.
+/// * `Err(String)` - The pack registry could not be loaded, or the loose file could not be read.
 fn corrupt_candidate_content_verified(hash: &str) -> Result<bool, String> {
+    // `is_in_packs` first: a pure index-membership check, so its `Err` stays reserved for a
+    // registry-level failure (packs could not be loaded at all) — the pack-side analogue of the
+    // loose branch's "could not tell" `Err` below. Once membership is confirmed, `retrieve_from_packs`
+    // is the actual content-verifying read; if *that* fails (bad decompression, an unreconstructable
+    // delta chain, or a hash mismatch), the record is present but does not verify — decisive, not
+    // an unknown — so it is folded into `Ok(false)` rather than aborting this whole recheck walk
+    // over one bad candidate, mirroring how the loose branch below folds a decompression failure
+    // into `Ok(false)` instead of propagating it.
     if pack_utils::is_in_packs(hash)? {
-        return Ok(true);
+        return Ok(matches!(pack_utils::retrieve_from_packs(hash), Ok(Some(_))));
     }
 
     let (folder, file_name) = file_utils::get_path_for_object(hash)?;
@@ -2795,23 +2807,43 @@ mod tests {
     /// thread-per-connection pattern `remote_utils`'s own test fakes use — written fresh here
     /// because those are private to that module's own `#[cfg(test)]` mod.
     fn start_object_remote(objects: HashMap<String, Vec<u8>>) -> String {
+        start_object_remote_with_delay(objects, None)
+    }
+
+    /// Same fake as [`start_object_remote`], but with an artificial delay inserted before
+    /// responding to one specific hash — the timing lever
+    /// `d4_mixed_remote_recovers_the_served_object_despite_the_unserved_ones_failure` needs to make
+    /// the race in defect 2 (an aborted sibling task) actually land instead of racing it: the
+    /// delayed hash's fetch is still parked awaiting the response (a genuine await point) at the
+    /// moment a sibling's fast 404 fails and (under the pre-fix, abort-on-first-error `join_all`)
+    /// triggers `abort_all`.
+    fn start_object_remote_with_delay(
+        objects: HashMap<String, Vec<u8>>,
+        delayed: Option<(String, std::time::Duration)>,
+    ) -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let objects = std::sync::Arc::new(objects);
+        let delayed = std::sync::Arc::new(delayed);
 
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { continue };
                 let objects = std::sync::Arc::clone(&objects);
-                std::thread::spawn(move || handle_object_remote_request(stream, &objects));
+                let delayed = std::sync::Arc::clone(&delayed);
+                std::thread::spawn(move || handle_object_remote_request(stream, &objects, &delayed));
             }
         });
 
         url
     }
 
-    /// Handle exactly one connection for [`start_object_remote`].
-    fn handle_object_remote_request(mut stream: std::net::TcpStream, objects: &HashMap<String, Vec<u8>>) {
+    /// Handle exactly one connection for [`start_object_remote`]/[`start_object_remote_with_delay`].
+    fn handle_object_remote_request(
+        mut stream: std::net::TcpStream,
+        objects: &HashMap<String, Vec<u8>>,
+        delayed: &Option<(String, std::time::Duration)>,
+    ) {
         use std::io::{Read, Write};
 
         let mut buffer = Vec::new();
@@ -2830,8 +2862,15 @@ mod tests {
         let head = String::from_utf8_lossy(&buffer[..header_end]).to_string();
         let Some(start_line) = head.lines().next() else { return };
         let path = start_line.split_whitespace().nth(1).unwrap_or("");
+        let requested_hash = path.strip_prefix("/v1/objects/").unwrap_or("");
 
-        let found = path.strip_prefix("/v1/objects/").and_then(|hash| objects.get(hash));
+        if let Some((slow_hash, delay)) = delayed {
+            if slow_hash == requested_hash {
+                std::thread::sleep(*delay);
+            }
+        }
+
+        let found = objects.get(requested_hash);
 
         match found {
             Some(bytes) => {
@@ -3056,6 +3095,146 @@ mod tests {
             assert_eq!(&decompressed, good);
             object_utils::verify_object_bytes(hash, &decompressed).unwrap();
         }
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// (D4, mixed reachable remote — the partial-recovery witness) Two corrupt objects, one remote
+    /// that serves the first's real bytes and 404s the second. `fetch_corrupt_replacements` fetches
+    /// every flagged hash as an independent task; one hash's 404 must never cancel a sibling's task
+    /// before it force-stores its own recovered bytes. Pins that: the served object is genuinely
+    /// recovered (content-verifies, cleared from the taint) even though the run as a whole still
+    /// refuses (the unserved object legitimately remains dangling). Mutation: revert
+    /// `fetch_corrupt_replacements` to the shared `join_all` (abort-the-rest on first error) — the
+    /// served object's task can be cancelled mid-fetch by the 404'd sibling's failure, so it stays
+    /// corrupt and this test goes red.
+    #[test]
+    fn d4_mixed_remote_recovers_the_served_object_despite_the_unserved_ones_failure() {
+        use crate::enums::config_scope::ConfigScope;
+        use crate::globals::StorageRootScope;
+        use crate::util::config_utils;
+
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        let root = std::env::temp_dir()
+            .join(format!("forklift-recovery-utils-d4-mixed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let _scope = StorageRootScope::enter(&root);
+        let forklift = forklift_root();
+
+        let good_served = b"the object the remote actually has".to_vec();
+        let hash_served = object_utils::hash_object_bytes(&good_served);
+        let relative_served = write_corrupt_loose_object(&forklift, &hash_served);
+
+        // Never inserted into the remote's table, so `handle_object_remote_request` 404s it.
+        let hash_unserved = "c".repeat(64);
+        let relative_unserved = write_corrupt_loose_object(&forklift, &hash_unserved);
+        let before_unserved = std::fs::read(forklift.join(&relative_unserved)).unwrap();
+
+        let mut objects = HashMap::new();
+        objects.insert(hash_served.clone(), good_served.clone());
+        // The served hash's response is deliberately delayed: its fetch must still be parked on
+        // an actual await point (awaiting the HTTP response) at the moment the unserved hash's
+        // fast 404 fails — the exact window a pre-fix, abort-on-first-error `join_all` would use
+        // to cancel it before it force-stores. Without the delay this test would only pass by
+        // scheduling luck (both fetches racing to finish before the abort could land).
+        let url = start_object_remote_with_delay(
+            objects,
+            Some((hash_served.clone(), std::time::Duration::from_millis(300))),
+        );
+        config_utils::set_value(config_utils::KEY_REMOTE_URL, &url, ConfigScope::Warehouse).unwrap();
+
+        plant_complete_taint(&forklift, &[
+            relative_served.to_string_lossy().as_ref(),
+            relative_unserved.to_string_lossy().as_ref(),
+        ]);
+
+        let error = run_heal()
+            .expect_err("the unserved object's persisting corruption must keep the run refusing");
+        assert_durability_taint(&error, &[relative_unserved.to_string_lossy().as_ref()]);
+
+        // The served object must be genuinely recovered on disk...
+        let stored = std::fs::read(forklift.join(&relative_served)).unwrap();
+        let decompressed = zstd::stream::decode_all(stored.as_slice()).unwrap();
+        assert_eq!(decompressed, good_served, "the served object's stored bytes must now be the real content");
+        object_utils::verify_object_bytes(&hash_served, &decompressed)
+            .expect("the served object's on-disk bytes must content-verify");
+
+        // ...and reported resolved: cleared from the taint, leaving only the unserved object
+        // recorded — proof that the 404'd sibling's failure never cancelled this one's recovery.
+        let state = taint_utils::read_taints(&forklift).unwrap();
+        assert!(!state.torn);
+        let expected: BTreeSet<PathBuf> = [relative_unserved.clone()].into_iter().collect();
+        assert_eq!(state.recorded, expected,
+            "the served object must be cleared from the taint while the unserved one remains");
+
+        // The unserved object's bytes are untouched — never partially overwritten by a cancelled
+        // or otherwise incomplete fetch.
+        assert_eq!(before_unserved, std::fs::read(forklift.join(&relative_unserved)).unwrap(),
+            "the unserved object's bytes must be untouched");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// (D4, pack-side content check) A corrupt candidate's hash is a *hit* in a pack index, but
+    /// the pack's own record for it can never be reconstructed (a delta against a base object that
+    /// exists nowhere) — so its content can never be verified either. Index membership alone
+    /// (`pack_utils::is_in_packs`) says "present"; only actually reading the record
+    /// (`pack_utils::retrieve_from_packs`) can tell a genuine recovery apart from a stale corrupt
+    /// dentry sitting next to an unrelated, unreadable pack hit. The remote is configured but
+    /// unreachable (as in the offline D4 tests above), so nothing here can be fixed by a fetch —
+    /// the recheck below is the only thing that can decide the outcome. Mutation: revert
+    /// `corrupt_candidate_content_verified`'s pack branch back to a bare `is_in_packs` check — it
+    /// trusts the index hit alone, reports "recovered" without ever reading the record, and this
+    /// test goes red (the taint incorrectly clears even though the loose file is still corrupt
+    /// garbage and the pack record cannot be reconstructed).
+    #[test]
+    fn d4_pack_hit_whose_content_does_not_verify_is_never_reported_recovered() {
+        use crate::enums::config_scope::ConfigScope;
+        use crate::globals::StorageRootScope;
+        use crate::util::config_utils;
+        use crate::util::pack_utils::TransportPackBuilder;
+
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        let root = std::env::temp_dir()
+            .join(format!("forklift-recovery-utils-d4-pack-corrupt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let _scope = StorageRootScope::enter(&root);
+        let forklift = forklift_root();
+
+        let hash = "e".repeat(64);
+        let relative = write_corrupt_loose_object(&forklift, &hash);
+        let before = std::fs::read(forklift.join(&relative)).unwrap();
+
+        // A delta record against a base hash stored nowhere: `retrieve_from_packs(hash)` will
+        // locate this record (so `is_in_packs(hash)` is `true`) but fail to reconstruct it, since
+        // resolving the delta base is itself a store read that comes up empty.
+        let never_stored_base = "f".repeat(64);
+        let mut builder = TransportPackBuilder::new(&pack_utils::pack_folder()).unwrap();
+        builder.append_delta(&hash, &never_stored_base, 10, b"not a real delta payload").unwrap();
+        builder.finish().unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        config_utils::set_value(config_utils::KEY_REMOTE_URL, &url, ConfigScope::Warehouse).unwrap();
+
+        plant_complete_taint(&forklift, &[relative.to_string_lossy().as_ref()]);
+
+        let error = run_heal()
+            .expect_err("a pack hit whose record cannot be reconstructed must never be reported recovered");
+        assert_durability_taint(&error, &[
+            "corrupt (content does not match its own hash)",
+            relative.to_string_lossy().as_ref(),
+        ]);
+
+        let after = std::fs::read(forklift.join(&relative)).unwrap();
+        assert_eq!(before, after, "the still-corrupt loose object's bytes must be untouched");
 
         std::fs::remove_dir_all(&root).ok();
     }

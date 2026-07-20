@@ -1371,9 +1371,17 @@ async fn fetch_loose_objects(client: &RemoteClient, missing: &[String]) -> Resul
 /// All `flagged` hashes are assumed corrupt-but-present; every one is fetched and force-stored
 /// regardless of what `does_object_exist` would say about it.
 ///
+/// Deliberately routed through [`join_all_independent`], not the shared [`join_all`]: each
+/// flagged hash is an independent recovery attempt, and a 404 or a bad transfer on one hash must
+/// never cancel a sibling hash's task before it force-stores its own recovered bytes — `join_all`'s
+/// first-error-wins/abort-the-rest discipline is exactly wrong here (see that function's own doc
+/// for why it is right for its other callers, where the batch is one all-or-nothing unit).
+///
 /// # Returns
-/// * `Ok(usize)`   - How many corrupt objects were fetched and force-stored.
-/// * `Err(String)` - If a transfer, verification, or store failed for any of them.
+/// * `Ok(usize)`   - Every flagged hash fetched and force-stored; the count recovered.
+/// * `Err(String)` - At least one hash's transfer, verification, or store failed. Every *other*
+///   hash that succeeded was still fetched and durably force-stored — this `Err` only means the
+///   overall recheck is not fully clean, not that nothing landed.
 pub(crate) async fn fetch_corrupt_replacements(client: &RemoteClient, flagged: &[String]) -> Result<usize, String> {
     let semaphore = Arc::new(Semaphore::new(CONCURRENT_TRANSFERS));
     let mut tasks: JoinSet<Result<(), String>> = JoinSet::new();
@@ -1395,9 +1403,20 @@ pub(crate) async fn fetch_corrupt_replacements(client: &RemoteClient, flagged: &
         });
     }
 
-    join_all(tasks).await?;
+    let mut recovered = 0usize;
+    let mut failures: Vec<String> = Vec::new();
+    for outcome in join_all_independent(tasks).await {
+        match outcome {
+            Ok(()) => recovered += 1,
+            Err(e) => failures.push(e),
+        }
+    }
 
-    Ok(flagged.len())
+    if failures.is_empty() {
+        Ok(recovered)
+    } else {
+        Err(failures.join("; "))
+    }
 }
 
 /// Fetch (concurrently) the signature sidecars of the given parcels, where the sidecar
@@ -2024,6 +2043,28 @@ async fn join_all<T: Send + 'static>(mut tasks: JoinSet<Result<T, String>>) -> R
     }
 
     Ok(results)
+}
+
+/// Await every task of a set to its own natural completion, keeping each task's individual
+/// outcome instead of [`join_all`]'s first-error-wins/abort-the-rest — the counterpart for a
+/// caller whose tasks are independent recovery attempts rather than one all-or-nothing batch (its
+/// sole caller today, [`fetch_corrupt_replacements`], has the details on why that distinction
+/// matters there).
+///
+/// Because nothing here is ever aborted, this needs none of [`join_all`]/[`drain_remaining`]'s
+/// not-return-while-writing machinery: every task, including one whose sibling already failed,
+/// runs to completion on its own and is joined here, so `object_utils::force_store_object_bytes`
+/// never races a cancellation. A panicked task collapses into an `Err` in its own slot, the same
+/// shape a task's own `Err(String)` return takes — so a sibling panic is reported like any other
+/// per-hash failure, never silently dropped and never mistaken for a clean success.
+async fn join_all_independent<T: Send + 'static>(mut tasks: JoinSet<Result<T, String>>) -> Vec<Result<T, String>> {
+    let mut outcomes = Vec::new();
+
+    while let Some(result) = tasks.join_next().await {
+        outcomes.push(result.map_err(|e| format!("A transfer task failed: {}", e)).and_then(|inner| inner));
+    }
+
+    outcomes
 }
 
 /// Abort and drain every task still in `tasks`. This is the other half of the invariant
