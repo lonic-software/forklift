@@ -49,7 +49,12 @@
 //! ABA hole a naive "restart the counter at 0 every call" scheme leaves open).
 //!
 //! Content is the batch's final object paths, root-relative, one per line, followed by a
-//! terminator line (see [`TAINT_TERMINATOR`]). A file whose bytes end with that exact terminator
+//! terminator line (see [`TAINT_TERMINATOR`]). Each path's components are joined with `/` on
+//! every OS (see [`taint_record_line`]) — never the platform-native separator a bare
+//! `Path::to_string_lossy()` would produce (`\` on Windows) — because a taint file written on one
+//! platform must still parse into the exact same recorded paths on whatever platform later reads
+//! it back (DESIGN.html §3.1.1); a record keyed by native separator could not make that promise.
+//! A file whose bytes end with that exact terminator
 //! line is complete; anything else — truncated by a crash mid-write, or simply absent — is
 //! **torn**: its parseable (fully newline-terminated) prefix still contributes recorded paths,
 //! since a real write only ever appends, but the file can no longer prove it named every path the
@@ -217,6 +222,18 @@ fn to_root_relative(root: &Path, final_paths: &[&Path]) -> BTreeSet<PathBuf> {
         .collect()
 }
 
+/// Render one root-relative path as a taint record line: its components joined with `/`,
+/// regardless of the platform writing the record — see the module doc comment's format section
+/// for why. Deliberately a per-component join, not `path.to_string_lossy()` followed by a
+/// blanket `\`-to-`/` replace: a blanket replace would corrupt a Unix filename that legitimately
+/// contains a literal backslash, which is a valid path component on that platform.
+fn taint_record_line(path: &Path) -> String {
+    path.components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// The taint's own write routine — deliberately not [`file_utils::write_file_atomically`] (see
 /// [`record_taint`]'s doc comment on no re-entry). Exclusive-creates a fresh file under
 /// `<root>/taint/`, writes every recorded path plus the terminator, fsyncs the file's own bytes,
@@ -231,7 +248,7 @@ fn write_taint_file(root: &Path, relative_paths: &BTreeSet<PathBuf>) -> Result<(
 
     let mut content = String::new();
     for path in relative_paths {
-        content.push_str(&path.to_string_lossy());
+        content.push_str(&taint_record_line(path));
         content.push('\n');
     }
     content.push_str(TAINT_TERMINATOR);
@@ -847,6 +864,41 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn taint_record_line_never_carries_the_native_backslash_separator() {
+        // Pins the writer side of DESIGN.html §3.1.1's cross-platform-parse promise on the one
+        // platform where a bare `Path::to_string_lossy()` would actually differ from a
+        // component-join: Windows. Without `taint_record_line`'s per-component join, this line
+        // would contain `\` (the native separator `to_string_lossy` would have produced), which a
+        // record written elsewhere and read here would never match.
+        let root = PathBuf::from(r"C:\forklift-root");
+        let path = root.join("objects").join("ab").join("cdef0123456789abcdef0123456789abcdef01");
+        let relative = path.strip_prefix(&root).unwrap();
+
+        let line = taint_record_line(relative);
+
+        assert!(!line.contains('\\'), "taint record line must never contain a backslash, got {:?}", line);
+        assert_eq!(line, "objects/ab/cdef0123456789abcdef0123456789abcdef01");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn taint_record_line_preserves_a_literal_backslash_in_a_unix_component() {
+        // The cross-platform-meaningful pin: on Unix, `\` is just an ordinary filename byte, not
+        // a separator. A blanket string replace (`to_string_lossy().replace('\\', "/")`) would
+        // corrupt a component containing one; the per-component join in `taint_record_line` must
+        // not. This test goes red the moment anyone "simplifies" the join into a blanket replace.
+        let root = PathBuf::from("/forklift-root");
+        let path = root.join("objects").join(r"weird\name");
+        let relative = path.strip_prefix(&root).unwrap();
+
+        let line = taint_record_line(relative);
+
+        assert_eq!(line, r"objects/weird\name",
+            "a literal backslash inside a Unix path component must survive verbatim");
+    }
+
+    #[test]
     fn record_then_read_round_trips_the_exact_root_relative_set() {
         // Pins the round trip end to end: what is recorded is exactly what comes back, and a
         // freshly (and completely) written taint never reads as torn.
@@ -886,7 +938,7 @@ mod tests {
 
     #[test]
     fn a_preexisting_next_candidate_filename_forces_a_retry_and_both_survive() {
-        // Pins the O_CREAT|O_EXCL crash-survivor guarantee (memo test 9's shape): a taint file
+        // Pins the O_CREAT|O_EXCL crash-survivor guarantee (DESIGN.html §3.1.1): a taint file
         // already occupying the exact name a fresh write would generate must never be
         // overwritten — the write takes the next counter suffix instead, and reading unions both.
         let _serial = lock_activation();
