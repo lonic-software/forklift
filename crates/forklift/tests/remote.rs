@@ -3944,6 +3944,70 @@ fn heal_driven_refetch_clears_only_the_hash_the_remote_actually_has() {
     assert!(!object_present(&area, "dev", &blob_b), "the genuinely-unrecoverable object stays gone");
 }
 
+// Heal's own refetch stores go through the ordinary write path, which self-trips
+// `taint_recheck`'s standing-taint success re-check, because the taint being healed stands for
+// the entire run. With exactly one missing object the first (and only) store's `Err` is masked
+// by `resolve_the_rest`'s unconditional `raw_object_present` recheck (D3), so
+// `heal_driven_refetch_clears_only_the_hash_the_remote_actually_has` above never exercises the
+// N≥2 path. This test does — it pins `SelfTripExemptionGuard` (a process-global RAII counter
+// consulted only in `taint_recheck`'s success arm), armed for the whole of
+// `attempt_heal_driven_refetch`.
+#[test]
+fn heal_driven_refetch_recovers_every_object_when_more_than_one_is_missing() {
+    // The batch path's `import_bundle_bytes` stores its records one at a time, each with its own
+    // `?` — the first object's store self-trips `taint_recheck` against the still-standing taint
+    // and the `Err` aborts the whole call before the second object is even attempted.
+    // `resolve_the_rest`'s recovery verdict is decided by a post-fetch `raw_object_present`
+    // recheck regardless of the fetch call's own `Ok`/`Err`, so whichever object *did* land is
+    // still correctly reported recovered — the bug is invisible with only one missing object,
+    // which is exactly the shape of the test above. With two, only one lands.
+    //
+    // Mutation: revert `SelfTripExemptionGuard` (or arm it somewhere that does not span both
+    // `attempt_heal_driven_refetch` passes and every store inside them) → one of the two objects
+    // self-trips its own success re-check and is reported still dangling → red.
+    let area = TestArea::new("heal-refetch-multi");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/a.txt", "first recoverable content\n");
+    area.write_file("dev/b.txt", "second recoverable content\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "two files"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    let head = pallet_head(&area, "dev", "main");
+    let blob_a = path_object_hash(&area, "dev", &head, "a.txt");
+    let blob_b = path_object_hash(&area, "dev", &head, "b.txt");
+
+    // Both blobs are genuinely gone locally — the remote (which received both via `lift`) is
+    // the only thing that can restore them.
+    std::fs::remove_file(object_store_path(&area, "dev", &blob_a)).unwrap();
+    std::fs::remove_file(object_store_path(&area, "dev", &blob_b)).unwrap();
+
+    let relative_a = loose_object_relative_path(&blob_a);
+    let relative_b = loose_object_relative_path(&blob_b);
+    // Planted on disk via the durable-taint helper, not through the in-process gate —
+    // `gate_check` is deliberately left unexempted by the fix, so this test must not accidentally
+    // depend on gate behavior to reproduce the bug.
+    plant_taint(&area, "dev", &[&relative_a, &relative_b]);
+
+    let status = area.forklift("dev", &["--json", "heal"]);
+    assert_success(&status);
+    let value: serde_json::Value = serde_json::from_str(&stdout(&status)).unwrap();
+    let resolved = value["data"]["resolved"].as_array().unwrap();
+    assert!(resolved.iter().any(|entry| entry == &blob_a),
+        "the first recoverable hash must be reported resolved: {}", value);
+    assert!(resolved.iter().any(|entry| entry == &blob_b),
+        "the second recoverable hash must be reported resolved too, not just the first: {}", value);
+
+    assert!(recorded_taint_paths(&area, "dev").is_empty(), "the taint must be fully cleared");
+    assert!(object_present(&area, "dev", &blob_a), "the first object must actually be back on disk");
+    assert!(object_present(&area, "dev", &blob_b), "the second object must actually be back on disk");
+
+    // The warehouse is fully usable again, including the write path the taint exists to protect.
+    assert_success(&area.forklift("dev", &["stocktake"]));
+}
+
 #[test]
 fn heal_driven_refetch_treats_a_locally_repacked_object_as_recovered() {
     // §3.2 D2: the post-fetch presence check must accept "present in a pack" as recovered for a

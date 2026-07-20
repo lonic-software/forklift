@@ -403,12 +403,96 @@ fn taint_after_sync_failure(sync_error: String, final_paths: &[&Path]) -> String
     }
 }
 
+/// Process-global count of currently-armed [`SelfTripExemptionGuard`]s. A *counter*, not a bool,
+/// so nested arming (e.g. a future caller inside an already-armed scope) composes instead of one
+/// `Drop` clearing a still-needed exemption early. Consulted only by [`taint_recheck`]'s early
+/// check; see that function and the guard's own doc comment for what arming it does and does not
+/// make safe.
+static SELF_TRIP_EXEMPTION_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The no-self-trip exemption for heal's own refetch writes (extending `heal_utils`'s own
+/// "no-self-trip rule", see that module's doc comment, to the second heal-owned write path that
+/// was never brought under it when it was added — `forklift heal`'s remote refetch, which stores
+/// through the ordinary [`write_file_atomically`]/[`sync_dir_or_taint`] path while the very taint
+/// it is trying to resolve is still standing). While at least one guard is held, [`taint_recheck`]
+/// returns `Ok(())` immediately instead of reading the durable taint files — see that function.
+///
+/// Construct with [`SelfTripExemptionGuard::new`] and hold it for the guard's entire lifetime;
+/// `Drop` decrements the count automatically.
+///
+/// **Must be process-global, not thread-local.** A refetch's stores do not all run on the thread
+/// that armed this guard: `fetch_loose_objects`'s `JoinSet` tasks run on tokio worker threads, and
+/// `import_bundle_bytes` runs on whatever thread the async runtime happens to poll it on. A
+/// thread-local guard would not be visible to those threads, reproducing exactly the scheduling-
+/// dependent bug this exemption exists to remove. This assumes the CLI's tokio runtime is
+/// multithreaded, which is the default — a load-bearing assumption for anyone who later touches
+/// the runtime configuration.
+///
+/// **Single-writer-per-process precondition.** The counter is a bare count with no notion of
+/// *which* call armed it — deliberately, since that bareness is what lets it reach the worker
+/// threads above. That same bareness means that while armed, **every** store in this process —
+/// not just heal's — is exempted from the standing-taint refusal, because `taint_recheck` cannot
+/// tell one caller's store from another's. This is sound only because heal is the sole writer in
+/// the process for the guard's lifetime: no other operation in the same process may store objects
+/// while a heal-owned guard is armed. The shipped CLI satisfies this by construction (one command
+/// per process, so the armed window contains only heal's own stores).
+///
+/// Why the exemption stays sound under that precondition (see DESIGN.html §3.1.1 for the taint
+/// mechanism this reasons about): the exemption is process-local and purely in-memory, while the
+/// taint itself stays on disk for the whole armed window — a sibling process's own `taint_recheck`
+/// call still reads the standing durable taint files exactly as before, so nothing about this
+/// guard changes what a *different* process observes. And within this process, heal never records
+/// a durable reference off the strength of an exempted store's `Ok`: heal's own recovery verdict
+/// — which hashes are reported resolved and dropped from the taint's remainder — comes from a
+/// separate, unconditional presence recheck run after the fetch attempt, never from the store
+/// call's own return value, so the exemption changes which objects land on disk but not how
+/// "recovered" is decided.
+///
+/// If a future long-lived process ever runs heal concurrently with another store-issuing
+/// operation in the same process (for example a multi-tenant server holding one warehouse's heal
+/// open while a different request stores into another), the precondition above stops holding by
+/// construction, and this bare process-global counter would wrongly exempt that other operation's
+/// stores too. Before any such process shape ships, this exemption must be re-scoped from
+/// process-global to heal-invocation-scoped — e.g. a token threaded explicitly through the store
+/// calls one heal invocation makes, or a task-local propagated into the tasks it spawns — rather
+/// than a bare process-wide counter.
+///
+/// If `audit` (the other chokepoint-exempt verb) ever grows a repair-fetch of its own, it must
+/// arm this same guard rather than invent a parallel exemption.
+pub(crate) struct SelfTripExemptionGuard;
+
+impl SelfTripExemptionGuard {
+    /// Arm the exemption. Forward-looking tripwire, not present-tense enforcement: in the shipped
+    /// CLI this guard has exactly one call site, reached once per heal invocation, so nested or
+    /// concurrent arming cannot occur today and this assertion is dead code by construction. Its
+    /// value is catching the moment a second arming site is introduced — precisely the change that
+    /// would silently invalidate the single-writer-per-process precondition above. It catches only
+    /// nested/concurrent *arming*; it cannot catch, and does not attempt to catch, a non-heal
+    /// writer simply observing a nonzero counter from someone else's already-open guard (see this
+    /// type's own doc comment).
+    pub(crate) fn new() -> Self {
+        let previous_count = SELF_TRIP_EXEMPTION_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        debug_assert!(previous_count == 0, "SelfTripExemptionGuard armed while already armed");
+        SelfTripExemptionGuard
+    }
+}
+
+impl Drop for SelfTripExemptionGuard {
+    fn drop(&mut self) {
+        SELF_TRIP_EXEMPTION_COUNT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// The durable-taint re-check on a directory sync's success path: refuse if a taint is already
 /// standing for the storage root that owns `final_paths` — closing the window between a failed
 /// sync elsewhere (this process's own earlier failure, or a sibling process's, since this reads
 /// the durable taint files rather than only the in-memory gate [`taint_utils::gate_check`]
 /// covers) and this call's own success. A recorder must not durably reference anything this call
 /// covered until it has returned `Ok`.
+///
+/// Skipped early, before any taint file is read, while a [`SelfTripExemptionGuard`] is armed
+/// anywhere in this process — see that type's doc comment for what makes this sound (and the
+/// precondition it depends on).
 ///
 /// Skipped silently — the same scope tolerance [`taint_utils::record_taint`] documents — when no
 /// storage root resolves, or `final_paths` are not actually under one (the shape a bare-path
@@ -418,6 +502,10 @@ fn taint_after_sync_failure(sync_error: String, final_paths: &[&Path]) -> String
 /// gates itself on activation, so this inherits that without a separate check, and in the
 /// overwhelmingly common case (no taint directory at all) it costs one `stat`.
 fn taint_recheck(final_paths: &[&Path]) -> Result<(), String> {
+    if SELF_TRIP_EXEMPTION_COUNT.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+        return Ok(());
+    }
+
     let Some(root) = taint_utils::resolve_root_for(final_paths) else {
         return Ok(());
     };
@@ -3342,6 +3430,54 @@ mod tests {
         let error = write_file_atomically(&target, b"content").unwrap_err();
         assert!(error.contains(taint_utils::GATE_TAINT_MARKER), "got: {}", error);
         assert!(target.exists(), "the write itself must have landed; only the re-check refuses");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn self_trip_exemption_guard_suppresses_the_standing_taint_refusal_only_while_armed() {
+        // Pins the `SelfTripExemptionGuard` mechanism itself (the mechanism, not process-global
+        // scope across threads — see the remote.rs integration test for that): (a) unguarded, a
+        // taint standing for the root refuses the write via `taint_recheck`; (b) with the guard
+        // held, the identical write succeeds; (c) once the guard drops, the identical write
+        // refuses again — not a permanent bypass.
+        //
+        // Mutation: drop the early-return in `taint_recheck` (or arm the guard somewhere that
+        // does not actually reach `taint_recheck`) kills step (b) — the guarded write would
+        // refuse just like the unguarded ones. Mutation: make the guard's `Drop` a no-op kills
+        // step (c) — the post-drop write would wrongly keep succeeding.
+        let _serial = lock_taint_activation();
+        taint_utils::activate();
+
+        let temp = std::env::temp_dir().join(format!("forklift-taint-exemption-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+        let forklift = forklift_root();
+
+        let taint_dir = forklift.join("taint");
+        std::fs::create_dir_all(&taint_dir).unwrap();
+        std::fs::write(taint_dir.join("taint-99999-0"), b"objects/zz/preexisting\nEND\n").unwrap();
+
+        let target = forklift.join("objects").join("gg").join("fresh-object");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+
+        // (a) Unguarded: refuses.
+        let error = write_file_atomically(&target, b"content").unwrap_err();
+        assert!(error.contains(taint_utils::GATE_TAINT_MARKER),
+            "an unguarded write must refuse while a taint stands, got: {}", error);
+
+        // (b) Guarded: succeeds.
+        {
+            let _guard = SelfTripExemptionGuard::new();
+            write_file_atomically(&target, b"content").expect(
+                "a write made while the exemption guard is armed must succeed despite the standing taint");
+        }
+
+        // (c) Guard dropped: refuses again — not a permanent bypass.
+        let error = write_file_atomically(&target, b"content").unwrap_err();
+        assert!(error.contains(taint_utils::GATE_TAINT_MARKER),
+            "once the guard drops, the identical write must refuse again, got: {}", error);
 
         std::fs::remove_dir_all(&temp).ok();
     }

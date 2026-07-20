@@ -1366,6 +1366,14 @@ async fn attempt_heal_driven_refetch(candidate_hashes: &[String]) -> RemoteConsu
         return RemoteConsultation::NotConfigured;
     };
 
+    // Armed for the rest of this function — both passes below, and every `.await` inside them —
+    // so every store this refetch makes is exempt from `taint_recheck`'s standing-taint success
+    // re-check against the very taint this run is in the middle of healing (see
+    // `SelfTripExemptionGuard`'s own doc comment for why this must be process-global and the
+    // precondition it depends on). A zero-sized RAII guard held across `.await` points is fine
+    // here — it is not a lock, so it does not threaten the future's `Send`-ness.
+    let _self_trip_exemption = file_utils::SelfTripExemptionGuard::new();
+
     let mut clean = true;
 
     match client.fetch_info().await {
