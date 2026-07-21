@@ -382,6 +382,7 @@ fn count_pack_files() -> Result<usize, String> {
 }
 
 /// What a `compact` run did.
+#[derive(Debug)]
 pub struct CompactStats {
     /// Loose objects moved into packs.
     pub objects_packed: usize,
@@ -397,6 +398,12 @@ pub struct CompactStats {
 
     /// Total bytes written into the packs (delta-compressed where deltas were used).
     pub bytes_packed: u64,
+
+    /// Loose objects whose bytes did not decode, or did not hash to their own filename —
+    /// skipped rather than packed, and left on disk exactly as found. Never a write, never a
+    /// delete: the file stays in its best-recoverable (loose) state for `forklift audit`/`heal`
+    /// or a future re-fetch to deal with.
+    pub corrupt_skipped: usize,
 }
 
 /// A pack loaded for reading: its data file memory-mapped, plus its index bytes held resident
@@ -1499,6 +1506,7 @@ pub fn compact(all: bool, redelta: bool) -> Result<CompactStats, String> {
 
     let mut stats = CompactStats {
         objects_packed: 0, packs_written: 0, loose_removed: 0, deltas: 0, bytes_packed: 0,
+        corrupt_skipped: 0,
     };
     let mut writer: Option<PackWriter> = None;
 
@@ -1594,6 +1602,15 @@ pub fn compact(all: bool, redelta: bool) -> Result<CompactStats, String> {
         start = end;
 
         for (i, target) in batch.iter().enumerate() {
+            // A corrupt loose object (see `read_target`/`PrepSlot::CorruptLoose`): skip it before
+            // the chunk check and before a writer is ever fetched, exactly like the chunk-skip
+            // below — never packed, never deleted, never the reason an all-corrupt batch creates
+            // an empty pack.
+            if matches!(prepared[i], PrepSlot::CorruptLoose) {
+                stats.corrupt_skipped += 1;
+                continue;
+            }
+
             // Chunks are never packed or delta'd: leave the loose chunk file exactly where it is
             // (do not write it into a pack, do not mark it for deletion, do not seed the delta
             // window with it). Detected from the decompressed bytes already prepared for this
@@ -1601,7 +1618,7 @@ pub fn compact(all: bool, redelta: bool) -> Result<CompactStats, String> {
             // existing pack, so a `CopyRecord` never is one). This is checked before the writer is
             // fetched so an all-chunk batch never creates an empty pack.
             if matches!(target.source, Source::Loose(_))
-                && prepared[i].as_ref().is_some_and(|prep| is_chunk(&prep.raw)) {
+                && prepared[i].as_ready().is_some_and(|prep| is_chunk(&prep.raw)) {
                 continue;
             }
 
@@ -1641,7 +1658,9 @@ pub fn compact(all: bool, redelta: bool) -> Result<CompactStats, String> {
             // or winning delta at all: full.
             let is_chain_target = path_bases.base_of.contains_key(&target.hash);
 
-            let prep = prepared[i].take().expect("a non-copy target was prepared");
+            let PrepSlot::Ready(prep) = std::mem::take(&mut prepared[i]) else {
+                panic!("a non-copy, non-corrupt target must have a Ready prep slot")
+            };
 
             let loose_path = match &target.source {
                 Source::Loose(path) => Some(path.clone()),
@@ -1806,23 +1825,49 @@ pub fn compact(all: bool, redelta: bool) -> Result<CompactStats, String> {
     Ok(stats)
 }
 
+/// The outcome of reading and decompressing one target's bytes for [`prepare_target`]. A loose
+/// object's bytes may be corrupt (see [`PrepSlot::CorruptLoose`]); a `Reconstruct` target's
+/// bytes, once this returns `Bytes`, are already store-verified (`retrieve_object_by_hash`).
+enum ReadOutcome {
+    Bytes(Vec<u8>, Vec<u8>),
+    /// Loose only — see [`PrepSlot::CorruptLoose`].
+    CorruptLoose,
+}
+
 /// Read an object being *re-deltated* (a loose object, or one whose base is dropped): its
 /// decompressed bytes and its zstd blob (the full-record payload and the size guard). A loose
 /// object is read from its file; a to-reconstruct object comes through the object store.
-fn read_target(target: &PackTarget) -> Result<(Vec<u8>, Vec<u8>), String> {
+///
+/// This is the one ingress a loose object's bytes take into a pack (`enumerate_loose_objects`
+/// addresses it by *filename*, never by content — see the module doc), so it is also the one
+/// place that content is checked against that address: a decode failure or a hash mismatch is
+/// `CorruptLoose`, not an `Err` — corruption found here is pre-existing damage this run did not
+/// cause, and packing it under a hash it does not hash to would make it durable and outlive its
+/// last-recoverable loose form (deleted the moment its corrupt packed twin lands). `Reconstruct`
+/// and `CopyRecord` are unchanged: any failure there still aborts the whole compact (see
+/// `PrepSlot`'s doc comment for why that asymmetry is load-bearing).
+fn read_target(target: &PackTarget) -> Result<ReadOutcome, String> {
     match &target.source {
         Source::Loose(path) => {
             let compressed = std::fs::read(path)
                 .map_err(|e| format!("Error while reading loose object: {}", e))?;
-            let raw = zstd::stream::decode_all(compressed.as_slice())
-                .map_err(|e| format!("Error while decompressing a loose object: {}", e))?;
-            Ok((raw, compressed))
+
+            let raw = match zstd::stream::decode_all(compressed.as_slice()) {
+                Ok(raw) => raw,
+                Err(_) => return Ok(ReadOutcome::CorruptLoose),
+            };
+
+            if object_utils::verify_object_bytes(&sign_utils::to_hex(&target.hash), &raw).is_err() {
+                return Ok(ReadOutcome::CorruptLoose);
+            }
+
+            Ok(ReadOutcome::Bytes(raw, compressed))
         }
         Source::Reconstruct => {
             let raw = file_utils::retrieve_object_by_hash(&sign_utils::to_hex(&target.hash))?;
             let compressed = zstd::encode_all(raw.as_slice(), 0)
                 .map_err(|e| format!("Error while compressing a repacked object: {}", e))?;
-            Ok((raw, compressed))
+            Ok(ReadOutcome::Bytes(raw, compressed))
         }
         Source::CopyRecord { .. } => Err("a copied record is not re-deltated".to_string()),
     }
@@ -1845,11 +1890,41 @@ struct Prepared {
     path_delta: Option<([u8; HASH_LEN], Vec<u8>)>,
 }
 
+/// What [`prepare_target`] found for one target. Three states, distinct *by type* — unlike a
+/// `corrupt: bool` flag on [`Prepared`], the corrupt state is unappendable: nothing downstream
+/// can accidentally `append_*` empty or absent bytes under a corrupt object's hash, because
+/// there is no `Prepared` to reach for in that variant at all.
+#[derive(Default)]
+enum PrepSlot {
+    /// A `CopyRecord` — byte-copied verbatim on the sequential write path, so it needs no
+    /// preparation. Also what a `Ready` slot decays to once the main loop [`std::mem::take`]s
+    /// it (the post-take residue every prior slot in this run has already moved past).
+    #[default]
+    Copy,
+    /// A target ready to pack, with its bytes and any winning path delta.
+    Ready(Prepared),
+    /// A loose object whose bytes did not decode as zstd, or decoded but do not hash to the
+    /// address their filename claims — see `read_target`. The main loop skips it before ever
+    /// fetching a writer or touching the delta window: never packed, never deleted, left
+    /// exactly as found for `forklift audit`/`heal` or a future re-fetch.
+    CorruptLoose,
+}
+
+impl PrepSlot {
+    /// Borrow the prepared bytes, or `None` for `Copy`/`CorruptLoose`.
+    fn as_ready(&self) -> Option<&Prepared> {
+        match self {
+            PrepSlot::Ready(prep) => Some(prep),
+            PrepSlot::Copy | PrepSlot::CorruptLoose => None,
+        }
+    }
+}
+
 /// Prepare a batch of targets, fanning the (read + path-delta compress) across the cores. A
 /// `CopyRecord` target needs no preparation (it is byte-copied on the write path), so its slot
-/// is `None`. Results are positionally aligned with `batch`.
+/// is [`PrepSlot::Copy`]. Results are positionally aligned with `batch`.
 fn prepare_batch(batch: &[PackTarget],
-                 path_bases: &HashMap<[u8; HASH_LEN], [u8; HASH_LEN]>) -> Result<Vec<Option<Prepared>>, String> {
+                 path_bases: &HashMap<[u8; HASH_LEN], [u8; HASH_LEN]>) -> Result<Vec<PrepSlot>, String> {
     // Below this many objects the threads cost more than the reads/compressions they share.
     const PARALLEL_THRESHOLD: usize = 8;
 
@@ -1864,23 +1939,29 @@ fn prepare_batch(batch: &[PackTarget],
     // See `fanout_utils::fanout_map` for the fan-out idiom (chunking, worker count, and the
     // storage-scope re-entry every worker needs). It never short-circuits, so the
     // first-index error a serial `.collect()` would report is recovered by collecting the
-    // (order-preserved) results the same way here.
+    // (order-preserved) results the same way here. A corrupt loose object is now an `Ok`
+    // variant (`PrepSlot::CorruptLoose`), so only a genuine environment error still aborts the
+    // fan-out early.
     fanout_utils::fanout_map(batch, |target| prepare_target(target, path_bases))
         .into_iter()
         .collect()
 }
 
 /// Read one target and compute its path delta if one wins — the body of the parallel prep.
-/// A `CopyRecord` is `None` (it is copied verbatim on the sequential write path). The window
-/// fallback is *not* done here: it depends on the objects written just before, so it stays on
-/// the sequential path.
+/// A `CopyRecord` is [`PrepSlot::Copy`] (it is copied verbatim on the sequential write path); a
+/// corrupt loose object is [`PrepSlot::CorruptLoose`] (see `read_target`). The window fallback
+/// is *not* done here: it depends on the objects written just before, so it stays on the
+/// sequential path.
 fn prepare_target(target: &PackTarget,
-                  path_bases: &HashMap<[u8; HASH_LEN], [u8; HASH_LEN]>) -> Result<Option<Prepared>, String> {
+                  path_bases: &HashMap<[u8; HASH_LEN], [u8; HASH_LEN]>) -> Result<PrepSlot, String> {
     if matches!(target.source, Source::CopyRecord { .. }) {
-        return Ok(None);
+        return Ok(PrepSlot::Copy);
     }
 
-    let (raw, compressed) = read_target(target)?;
+    let (raw, compressed) = match read_target(target)? {
+        ReadOutcome::Bytes(raw, compressed) => (raw, compressed),
+        ReadOutcome::CorruptLoose => return Ok(PrepSlot::CorruptLoose),
+    };
 
     // Parcels are stored full, never delta'd (the history walk reads every parcel); an
     // over-large object is not delta'd either.
@@ -1904,7 +1985,7 @@ fn prepare_target(target: &PackTarget,
         }
     }
 
-    Ok(Some(Prepared { raw, compressed, deltable, path_delta }))
+    Ok(PrepSlot::Ready(Prepared { raw, compressed, deltable, path_delta }))
 }
 
 /// The result of [`collect_targets`]: what to pack, what a repack supersedes, and the packs a
@@ -3424,6 +3505,8 @@ mod tests {
         assert_eq!(stats.objects_packed, 3);
         assert_eq!(stats.packs_written, 1);
         assert_eq!(stats.loose_removed, 3);
+        // Regression guard: the corrupt-loose classifier must never fire on healthy objects.
+        assert_eq!(stats.corrupt_skipped, 0);
 
         // The loose files are gone...
         for hash in &hashes {
@@ -3441,6 +3524,168 @@ mod tests {
         let absent = blake3::hash(b"absent").to_hex().to_string();
         assert!(!is_in_packs(&absent).unwrap());
         assert!(retrieve_from_packs(&absent).unwrap().is_none());
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn compact_skips_a_loose_object_whose_content_does_not_hash_to_its_filename() {
+        // Pins P1 (the ingress invariant): nothing enters a pack under a hash it does not hash
+        // to. `enumerate_loose_objects` addresses a loose object by its *filename*; this test
+        // writes bytes at a good address that decode cleanly but hash to something else
+        // entirely (the class `object_utils::verify_object_bytes` exists to catch).
+        let temp = std::env::temp_dir().join(format!("forklift-pack-corrupt-loose-hash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+
+        // The plaintext must be neither chunk- nor parcel-shaped, or the chunk-skip (unrelated
+        // to this fix) would swallow it under a revert of the fix and this test would go falsely
+        // green. Self-checking rather than assumed.
+        let wrong_plaintext = b"wrong bytes entirely".to_vec();
+        assert!(!is_chunk(&wrong_plaintext) && !is_parcel(&wrong_plaintext),
+            "the corrupt plaintext must not look like a chunk or a parcel, or the chunk-skip masks this test");
+
+        // `good_hash` is a genuine hash (of content this test never actually stores) -- what
+        // matters is only that it is a valid, well-formed loose-object address whose file holds
+        // the wrong content.
+        let good_hash = blake3::hash(b"the content this address actually belongs to").to_hex().to_string();
+        let (folder, file_name) = file_utils::get_path_for_object(&good_hash).unwrap();
+        let corrupt_path = Path::new(&folder).join(&file_name);
+        let compressed = zstd::encode_all(wrong_plaintext.as_slice(), 0).unwrap();
+        file_utils::write_object_to_file(Path::new(&folder), &file_name, compressed).unwrap();
+
+        let genuine_content = b"a genuine sibling object".to_vec();
+        let genuine_hash = blake3::hash(&genuine_content).to_hex().to_string();
+        store_loose(&genuine_hash, &genuine_content);
+
+        let stats = compact(false, false).unwrap();
+
+        assert!(corrupt_path.exists(), "a corrupt loose object must be left in place, never deleted");
+        assert!(!is_in_packs(&good_hash).unwrap(),
+            "corrupt bytes must never enter a pack under an address they do not hash to");
+        assert_eq!(stats.corrupt_skipped, 1);
+
+        // The genuine sibling in the same batch is unaffected.
+        assert_eq!(stats.objects_packed, 1);
+        assert!(is_in_packs(&genuine_hash).unwrap());
+        assert_eq!(retrieve_from_packs(&genuine_hash).unwrap().unwrap(), genuine_content);
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn compact_skips_a_loose_object_that_does_not_even_decode_as_zstd() {
+        // Pins clause (a) (a decode failure is a skip, not an abort) and the auto-maintenance
+        // silent-fail for a standalone corrupt object: before this fix, one garbage loose object
+        // aborted the *entire* compact via `?` -- and auto-maintenance drops that error
+        // (`crates/forklift/src/commands/maintenance.rs`), so one bad file silently wedged
+        // background housekeeping for the whole store.
+        let temp = std::env::temp_dir().join(format!("forklift-pack-corrupt-loose-decode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+
+        // A valid 64-hex address (so it is enumerated as a loose object at all) whose file holds
+        // bytes that are not a zstd frame in the first place.
+        let garbage_hash = "a".repeat(64);
+        let (folder, file_name) = file_utils::get_path_for_object(&garbage_hash).unwrap();
+        let garbage_path = Path::new(&folder).join(&file_name);
+        file_utils::write_object_to_file(
+            Path::new(&folder), &file_name, b"not a zstd frame at all".to_vec()
+        ).unwrap();
+
+        let genuine_content = b"a second genuine object".to_vec();
+        let genuine_hash = blake3::hash(&genuine_content).to_hex().to_string();
+        store_loose(&genuine_hash, &genuine_content);
+
+        let result = compact(false, false);
+        assert!(result.is_ok(), "one corrupt loose object must not abort the whole compact, got {:?}", result);
+        let stats = result.unwrap();
+        assert_eq!(stats.corrupt_skipped, 1);
+
+        assert!(garbage_path.exists(), "the undecodable file must be left in place, never deleted");
+        assert!(!is_in_packs(&garbage_hash).unwrap());
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn compact_redelta_aborts_on_a_corrupt_packed_record_leaving_the_old_pack_in_place() {
+        // Pins I3: the corrupt-loose skip is scoped to loose objects only, never to a packed
+        // record reached through `Source::Reconstruct`. A corrupt loose object is a safe skip
+        // (the file survives, still fetchable); an already-packed live object hit by `--redelta`
+        // may have no other recoverable copy at all, so silently dropping it would be real data
+        // loss, not a safe skip. That path must still abort the whole compact.
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+        use crate::enums::dir_entry_type::DirEntryType;
+        use crate::model::blob::Blob;
+        use crate::model::parcel::Parcel;
+        use crate::model::tree_item::TreeItem;
+
+        let temp = std::env::temp_dir().join(format!("forklift-pack-redelta-abort-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+
+        // A minimal *reachable* history -- one blob, its tree, one parentless parcel, `main`'s
+        // head pointed at it -- so `compact --all`'s live-set walk (`gc_utils::collect_live_set`)
+        // keeps these objects instead of collecting them as garbage.
+        let mut blob = LooseObjectBuilder::build_blob(&Blob { content: b"a small tracked file\n".to_vec() });
+        blob.store().unwrap();
+
+        let mut tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        tree.add_child(TreeItem::new("file.txt".to_string(), blob.hash.clone(), DirEntryType::Normal));
+        let mut tree_object = LooseObjectBuilder::build_tree(&tree);
+        tree_object.store().unwrap();
+
+        let parcel = Parcel {
+            tree_hash: tree_object.hash.clone(),
+            parents: Vec::new(),
+            actions: Vec::new(),
+            description: Some("base".to_string()),
+        };
+        let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
+        parcel_object.store().unwrap();
+        pallet_utils::set_pallet_head("main", &parcel_object.hash).unwrap();
+
+        // Incremental compact: no live-set filtering, packs everything loose. This also runs
+        // `compact`'s own commit-graph build (unconditional, every call) over `main`'s new head,
+        // which reads (and process-globally caches) the parcel and tree bytes -- so the object
+        // this test corrupts below must be the blob: the one object in this fixture the graph
+        // build never reads, so the read cache is never warmed with its pre-corruption bytes and
+        // the corruption below is guaranteed to actually reach disk on the next read.
+        let stats = compact(false, false).unwrap();
+        assert_eq!(stats.objects_packed, 3);
+
+        let pack_path = std::fs::read_dir(pack_folder()).unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.extension().and_then(|e| e.to_str()) == Some(PACK_DATA_EXTENSION))
+            .expect("compact should have written one pack file");
+
+        // Locate the blob's own record (index lookup only -- never reads/decodes it, so this
+        // cannot itself warm the read cache) and flip a byte in its *data* region: past the
+        // record's 1-byte kind tag, i.e. inside its zstd payload, never in the pack header or
+        // the index.
+        let blob_hash_bytes = hash_to_bytes(&blob.hash).unwrap();
+        let (blob_offset, blob_len) = loaded_packs().unwrap().iter()
+            .find_map(|pack| pack.locate(&blob_hash_bytes))
+            .expect("the blob must be packed");
+
+        let mut data = std::fs::read(&pack_path).unwrap();
+        let flip_at = blob_offset as usize + 1;
+        assert!((flip_at as u64) < blob_offset + blob_len, "the flip must land inside the blob's own record");
+        data[flip_at] ^= 0xFF;
+        std::fs::write(&pack_path, &data).unwrap();
+        invalidate_cache();
+
+        // `--all --redelta` forces every live packed object through `Source::Reconstruct` (see
+        // `collect_targets`) -- the same path a dropped-base repack already uses -- never
+        // `Source::Loose`, so this can never become `CorruptLoose`.
+        let result = compact(true, true);
+        assert!(result.is_err(), "a corrupt packed record reached via Reconstruct must abort, not skip");
+        assert!(pack_path.exists(), "abort must precede old-pack removal -- the corrupt pack must survive");
 
         std::fs::remove_dir_all(&temp).ok();
     }
