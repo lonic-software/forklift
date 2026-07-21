@@ -1102,22 +1102,15 @@ fn resolve_incoming_object(hash: &[u8; HASH_LEN],
 /// transport role and use the ordinary read path; a new bundle writer never emits a full object
 /// above the import ceiling, so producing one byte beyond it is an immediate refusal.
 fn decode_full_transport_record(record: &[u8], hash: &str) -> Result<Vec<u8>, String> {
-    let mut decoder = zstd::stream::read::Decoder::new(record)
-        .map_err(|e| format!("Error while opening packed object {}: {}", hash, e))?;
-    let mut bytes = Vec::new();
-    decoder.by_ref()
-        .take(object_utils::MAX_OBJECT_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| format!("Error while decompressing packed object {}: {}", hash, e))?;
-
-    if bytes.len() > object_utils::MAX_OBJECT_BYTES {
-        return Err(format!(
+    object_utils::decode_object_bounded(record).map_err(|e| match e {
+        object_utils::BoundedDecodeError::Malformed(msg) => {
+            format!("Error while decompressing packed object {}: {}", hash, msg)
+        }
+        object_utils::BoundedDecodeError::OverCeiling => format!(
             "Packed object {} expands above the {}-byte object ceiling; refusing the bundle.",
             hash, object_utils::MAX_OBJECT_BYTES
-        ));
-    }
-
-    Ok(bytes)
+        ),
+    })
 }
 
 /// Retrieve the decompressed bytes of an object from the packs, or `None` if no pack holds
