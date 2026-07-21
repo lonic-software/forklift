@@ -534,7 +534,23 @@ async fn resolve_the_rest(
                 truly_missing.insert(hash.clone());
                 unverifiable_reasons.insert(hash.clone(), reason);
             }
-            Err(e) => return Err(walk_failure_refusal(root, &e)),
+            // A per-hash environment failure (a permissions error, a transient I/O error, or
+            // anything else `read_object_classified` cannot classify as verified/absent/corrupt)
+            // must not abort every OTHER candidate's check — the previous `raw_object_present`
+            // presence check this content-recheck replaced almost never errored, so this is new
+            // error surface: one unreadable candidate must not block recovery of every sibling in
+            // this same run. Same sibling-independence principle `join_all_independent` established
+            // on the fetch side (see that function's own doc comment). "Could not tell" must never
+            // read as "recovered": this hash goes straight to the remainder — never `resolved`, and
+            // never fed into the referenced/unreferenced closure walk below (its status genuinely
+            // could not be determined this run, so neither branch of that walk is entitled to clear
+            // it) — and the loop moves on to the next candidate instead of returning.
+            Err(e) => {
+                mark_still_dangling(hash, &loose_candidates, &pack_candidates, recorded, &mut remainder);
+                dangling_lines.push(format!(
+                    "could not be checked this run: \"{}\" ({})", hash, e
+                ));
+            }
         }
     }
 
@@ -648,7 +664,19 @@ async fn resolve_the_rest(
                     ),
                 });
             }
-            Err(e) => return Err(walk_failure_refusal(root, &e)),
+            // Same abort-surface class as the truly-missing loop above (see its own comment): a
+            // per-hash environment failure here must not cancel every OTHER corrupt candidate's
+            // recheck. "Could not tell" must never read as "recovered" — this candidate goes
+            // straight to the remainder (never `resolved`, and never treated as the distinct
+            // "corrupt (content does not match its own hash)"/"cannot be read back verified"
+            // verdicts above, which both imply a hash-compare actually ran), and the loop moves on
+            // to the next candidate instead of returning.
+            Err(e) => {
+                remainder.insert(relative.clone());
+                dangling_lines.push(format!(
+                    "could not be checked this run: \"{}\" ({})", relative.to_string_lossy(), e
+                ));
+            }
         }
     }
 
@@ -3542,6 +3570,198 @@ mod tests {
         let after_state = taint_utils::read_taints(&forklift).unwrap();
         assert!(!after_state.recorded.is_empty(), "the taint must survive — H was never actually recovered");
 
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// (FORK-45 finding #1) A per-candidate environment failure reading one recorded path back
+    /// during the content-recheck (`file_utils::read_object_classified`, built on `std::fs::read`)
+    /// must not abort the whole run: it must be treated as *that one candidate's* non-recovery,
+    /// while every sibling candidate is still resolved on its own merits — the same
+    /// sibling-independence principle `join_all_independent` established on the fetch side
+    /// (`remote_utils`, commit 3733024).
+    ///
+    /// Fixture: two vanished loose-shaped candidates, hand-fed into `resolve_the_rest` via a
+    /// hand-built `RestageAttempt` (bypassing `attempt_restage_all`, which already contains this
+    /// exact failure mode per-path — see `restage_object`'s own `Unreadable` handling — so this
+    /// isolates the *separate*, later content-recheck this function runs on its own). Candidate A
+    /// has no file anywhere and nothing references it — it must resolve cleanly. Candidate B's own
+    /// canonical fan-out path holds a file with its read permission bit stripped, so
+    /// `read_object_classified` hits a genuine (non-`NotFound`) I/O error for it alone.
+    ///
+    /// Mutation that must redden: revert the per-candidate `Err` handling in `resolve_the_rest`'s
+    /// truly-missing loop back to `Err(e) => return Err(walk_failure_refusal(root, &e))` → this
+    /// whole function returns before ever reaching candidate A, before the closure walk, and
+    /// before `taint_utils::resolve_taints` ever runs — so A's path is never dropped from the
+    /// taint (still `recorded` afterward) and the refusal message reverts to the generic
+    /// walk-wide wording instead of naming B specifically.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_candidate_does_not_abort_recovery_of_its_siblings() {
+        use crate::globals::StorageRootScope;
+        use std::os::unix::fs::PermissionsExt;
+
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        let root = std::env::temp_dir().join(format!(
+            "forklift-recovery-utils-unreadable-candidate-sibling-independence-{}", std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let _scope = StorageRootScope::enter(&root);
+        let forklift = forklift_root();
+
+        // Candidate A: genuinely absent everywhere, unreferenced by anything — must resolve.
+        let hash_a = "1".repeat(64);
+        let (folder_a, file_name_a) = file_utils::get_path_for_object(&hash_a).unwrap();
+        let absolute_a = PathBuf::from(&folder_a).join(&file_name_a);
+        let relative_a = absolute_a.strip_prefix(&forklift).unwrap().to_path_buf();
+
+        // Candidate B: a real file sits at its own canonical fan-out path, but with its read
+        // permission bit stripped — `read_object_classified` hits a genuine I/O error for it,
+        // distinct from `NotFound`.
+        let hash_b = "2".repeat(64);
+        let (folder_b, file_name_b) = file_utils::get_path_for_object(&hash_b).unwrap();
+        std::fs::create_dir_all(&folder_b).unwrap();
+        let absolute_b = PathBuf::from(&folder_b).join(&file_name_b);
+        std::fs::write(&absolute_b, b"irrelevant bytes, never actually read").unwrap();
+        std::fs::set_permissions(&absolute_b, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let relative_b = absolute_b.strip_prefix(&forklift).unwrap().to_path_buf();
+
+        let mut attempt = heal_utils::RestageAttempt::default();
+        attempt.vanished.insert(relative_a.clone());
+        attempt.vanished.insert(relative_b.clone());
+
+        plant_complete_taint(&forklift, &[
+            relative_a.to_string_lossy().as_ref(),
+            relative_b.to_string_lossy().as_ref(),
+        ]);
+        let state = taint_utils::read_taints(&forklift).unwrap();
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let error = runtime
+            .block_on(resolve_the_rest(&forklift, &state.recorded, &attempt, &state.files))
+            .expect_err("B's own read error must still leave it unrecovered");
+
+        // The refusal must name B specifically, by the per-candidate wording this fix introduces —
+        // never the generic, whole-walk-aborted wording `walk_failure_refusal` produces (that
+        // wording only belongs to a failure of the closure walk itself, not one candidate's read).
+        assert_durability_taint(&error, &["could not be checked this run", hash_b.as_str()]);
+        if let CoreError::Refusal { message, .. } = &error {
+            assert!(!message.contains("the recovery walk over this warehouse's durable references"),
+                "B's own read failure must never be reported as a whole-walk abort: {}", message);
+        }
+
+        let after_state = taint_utils::read_taints(&forklift).unwrap();
+        assert!(!after_state.recorded.contains(&relative_a),
+            "A must be resolved and dropped from the taint — its sibling's read failure must not \
+            block its own, independent recovery");
+        assert!(after_state.recorded.contains(&relative_b),
+            "B must stay dangling — its read outcome genuinely could not be determined this run, \
+            which must never read as \"recovered\"");
+
+        std::fs::set_permissions(&absolute_b, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// (FORK-45 finding #1, corrected scope) The corrupt-candidates loop has the identical
+    /// abort-surface bug the truly-missing loop above had: a per-hash environment failure
+    /// re-reading a corrupt candidate's own bytes back for the D4 recheck must not abort the
+    /// whole run either. Fixture: two corrupt-shaped candidates fed via a hand-built
+    /// `RestageAttempt.hash_mismatch`, with a remote configured but unreachable (so the
+    /// dedicated corrupt-fetch pass fails for both — same setup as
+    /// `no_pack_to_loose_fall_through_even_with_a_good_loose_copy_present` above). C's own
+    /// canonical fan-out path holds a file with its read permission stripped — a genuine,
+    /// non-`NotFound` I/O error from `read_object_classified`. D's own canonical fan-out path
+    /// holds a perfectly good, correctly-hashed object — `read_object_classified` reports it
+    /// `Verified`, so D must still resolve regardless of C's own read failure.
+    ///
+    /// Mutation that must redden: revert the corrupt-candidates loop's `Err` arm back to
+    /// `Err(e) => return Err(walk_failure_refusal(root, &e))` → the function returns before D is
+    /// ever checked, so D's path is never dropped from the taint, and the refusal message
+    /// reverts to the generic walk-wide wording instead of naming C specifically.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_corrupt_candidate_does_not_abort_recovery_of_its_siblings() {
+        use crate::enums::config_scope::ConfigScope;
+        use crate::globals::StorageRootScope;
+        use crate::util::config_utils;
+        use std::os::unix::fs::PermissionsExt;
+
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        let root = std::env::temp_dir().join(format!(
+            "forklift-recovery-utils-unreadable-corrupt-candidate-sibling-independence-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let _scope = StorageRootScope::enter(&root);
+        let forklift = forklift_root();
+
+        // Candidate C: a real file sits at its own canonical fan-out path, but with its read
+        // permission bit stripped — `read_object_classified` hits a genuine I/O error for it.
+        let hash_c = "3".repeat(64);
+        let (folder_c, file_name_c) = file_utils::get_path_for_object(&hash_c).unwrap();
+        std::fs::create_dir_all(&folder_c).unwrap();
+        let absolute_c = PathBuf::from(&folder_c).join(&file_name_c);
+        std::fs::write(&absolute_c, b"irrelevant bytes, never actually read").unwrap();
+        std::fs::set_permissions(&absolute_c, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let relative_c = absolute_c.strip_prefix(&forklift).unwrap().to_path_buf();
+
+        // Candidate D: a perfectly good, correctly-hashed object sits at its own canonical
+        // path — must still resolve regardless of C's own read failure.
+        let good_content = b"a perfectly good corrupt-candidate sibling, recovered independently";
+        let hash_d = object_utils::hash_object_bytes(good_content);
+        let (folder_d, file_name_d) = file_utils::get_path_for_object(&hash_d).unwrap();
+        std::fs::create_dir_all(&folder_d).unwrap();
+        let absolute_d = PathBuf::from(&folder_d).join(&file_name_d);
+        let compressed = zstd::encode_all(good_content.as_slice(), 0).unwrap();
+        std::fs::write(&absolute_d, &compressed).unwrap();
+        let relative_d = absolute_d.strip_prefix(&forklift).unwrap().to_path_buf();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        config_utils::set_value(config_utils::KEY_REMOTE_URL, &url, ConfigScope::Warehouse).unwrap();
+
+        let mut attempt = heal_utils::RestageAttempt::default();
+        attempt.hash_mismatch.insert(relative_c.clone());
+        attempt.hash_mismatch.insert(relative_d.clone());
+
+        plant_complete_taint(&forklift, &[
+            relative_c.to_string_lossy().as_ref(),
+            relative_d.to_string_lossy().as_ref(),
+        ]);
+        let state = taint_utils::read_taints(&forklift).unwrap();
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let error = runtime
+            .block_on(resolve_the_rest(&forklift, &state.recorded, &attempt, &state.files))
+            .expect_err("C's own read error must still leave it unrecovered");
+
+        // The refusal must name C specifically, by the per-candidate wording this fix
+        // introduces — never the generic, whole-walk-aborted wording `walk_failure_refusal`
+        // produces (that wording only belongs to a failure of the closure walk itself, not one
+        // corrupt candidate's recheck).
+        assert_durability_taint(&error, &[
+            "could not be checked this run", relative_c.to_string_lossy().as_ref(),
+        ]);
+        if let CoreError::Refusal { message, .. } = &error {
+            assert!(!message.contains("the recovery walk over this warehouse's durable references"),
+                "C's own read failure must never be reported as a whole-walk abort: {}", message);
+        }
+
+        let after_state = taint_utils::read_taints(&forklift).unwrap();
+        assert!(after_state.recorded.contains(&relative_c),
+            "C must stay dangling — its read outcome genuinely could not be determined this \
+            run, which must never read as \"recovered\"");
+        assert!(!after_state.recorded.contains(&relative_d),
+            "D must be resolved and dropped from the taint — its sibling's read failure must \
+            not block its own, independent recovery");
+
+        std::fs::set_permissions(&absolute_c, std::fs::Permissions::from_mode(0o644)).unwrap();
         std::fs::remove_dir_all(&root).ok();
     }
 
