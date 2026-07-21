@@ -91,8 +91,8 @@ impl Compacted {
     fn print_over_ceiling_skipped_note(&self) {
         if self.over_ceiling_skipped > 0 {
             println!(
-                "Skipped {} loose object{} larger than the 64 MiB object ceiling — left in place. \
-                Run 'forklift audit' to check the store.",
+                "Skipped {} loose object{} larger than the 64 MiB object ceiling — left loose and \
+                fully readable; this is expected for objects predating the ceiling, no action needed.",
                 self.over_ceiling_skipped,
                 if self.over_ceiling_skipped == 1 { "" } else { "s" },
             );

@@ -3341,6 +3341,38 @@ mod tests {
         file_utils::write_object_to_file(Path::new(&folder), &file_name, compressed).unwrap();
     }
 
+    /// Deterministic, non-trivially-compressible filler bytes (an LCG stream, not real
+    /// entropy) — repeat-free enough that zstd cannot compress it away for free the way it
+    /// would a run of zeros, so a path delta against a shared prefix of it is a meaningfully
+    /// smaller payload than compressing the same bytes standalone.
+    fn deterministic_fill(len: usize) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(len);
+        let mut state: u64 = 0x9E3779B97F4A7C15;
+        while buf.len() < len {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            buf.extend_from_slice(&state.to_le_bytes());
+        }
+        buf.truncate(len);
+        buf
+    }
+
+    /// Whether `hash`'s packed record is specifically a delta (`RECORD_DELTA`) — reads the
+    /// record's own kind byte directly, rather than inferring it from a whole-run delta count
+    /// (which a fixture with more than one delta-eligible pair can't attribute to any one of
+    /// them). `false` if the hash is not packed at all.
+    fn is_stored_as_delta(hash: &str) -> bool {
+        let Some(hash_bytes) = hash_to_bytes(hash) else { return false; };
+        let packs = loaded_packs().unwrap();
+        for pack in packs.iter() {
+            if let Some((offset, length)) = pack.locate(&hash_bytes) {
+                if let Ok(record) = pack.slice(offset, length) {
+                    return record.first() == Some(&RECORD_DELTA);
+                }
+            }
+        }
+        false
+    }
+
     /// The pack-direct import sink, end to end: full and delta records land in one published
     /// pack, read back byte-correct through the ordinary object path, with no loose files.
     #[test]
@@ -4309,6 +4341,114 @@ mod tests {
         // v2 still packs — full, since its path base could not be read verified — and reads
         // back byte-exact.
         assert!(is_in_packs(&blob_v2_hash).unwrap());
+        assert_eq!(retrieve_from_packs(&blob_v2_hash).unwrap().unwrap(), blob_v2_content);
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn compact_reconstructs_a_delta_whose_path_base_is_a_skipped_over_ceiling_giant() {
+        // Review finding on PR #75: `compute_path_bases` never checks object size, so a
+        // grandfathered over-ceiling giant is just as eligible a path-delta *base* as any other
+        // object at the same path — being skipped as a *target* (`PrepSlot::OverCeiling`, never
+        // packed) does not make it ineligible as someone else's base. Verified this is already
+        // safe: a base's bytes are fetched through `file_utils::retrieve_object_by_hash_shared`,
+        // which falls back to the loose read `file_utils.rs`'s `read_object_classified` — the
+        // *other* exempted, deliberately unbounded site (`zstd::stream::decode_all`, never
+        // `decode_object_bounded`), precisely so a grandfathered giant stays readable. That read
+        // is used both when `prepare_target` computes the delta at compact time and when
+        // `reconstruct_record`'s own delta branch resolves the same base at read time — so
+        // fetching a loose over-ceiling base for a path delta never hits the ceiling either way.
+        //
+        // This needs a real two-version history — a made-up base hash would never reach
+        // `compute_path_bases`'s real tree/parcel walk — built the same way
+        // `compact_falls_back_to_a_full_blob_when_its_delta_base_is_corrupt` does, but with a
+        // genuine, correctly-addressed over-ceiling giant as v1 instead of a corrupt one, and a
+        // v2 that shares a long prefix with it so the path delta actually wins (not a
+        // vacuous pass where v2 happens to pack full anyway).
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+        use crate::enums::dir_entry_type::DirEntryType;
+        use crate::model::blob::Blob;
+        use crate::model::parcel::Parcel;
+        use crate::model::tree_item::TreeItem;
+
+        let temp = std::env::temp_dir().join(format!("forklift-pack-over-ceiling-base-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+
+        // v1: "file.txt" holds a MAX_OBJECT_BYTES + 1 grandfathered giant, planted directly the
+        // way a pre-ceiling bundle import would have left it (the ordinary write path refuses to
+        // author one; `store_loose` bypasses that, exactly like the INV-4/INV-5 fixtures).
+        let giant_content = deterministic_fill(object_utils::MAX_OBJECT_BYTES + 1);
+        let giant_hash = blake3::hash(&giant_content).to_hex().to_string();
+        store_loose(&giant_hash, &giant_content);
+
+        let mut tree_v1 = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        tree_v1.add_child(TreeItem::new("file.txt".to_string(), giant_hash.clone(), DirEntryType::Normal));
+        let mut tree_v1_obj = LooseObjectBuilder::build_tree(&tree_v1);
+        tree_v1_obj.store().unwrap();
+
+        let mut parcel_v1_obj = LooseObjectBuilder::build_parcel(&Parcel {
+            tree_hash: tree_v1_obj.hash.clone(),
+            parents: Vec::new(),
+            actions: Vec::new(),
+            description: Some("v1".to_string()),
+        });
+        parcel_v1_obj.store().unwrap();
+
+        // v2: "file.txt" holds a small object sharing a long prefix with the giant (so a path
+        // delta against it is real and wins on size) plus a short unique tail.
+        // The shared bytes come from the *end* of the giant, not the start: a dictionary
+        // compressor treats the dictionary as if it immediately precedes the input, so content
+        // near its end is the cheapest to reference (closest in window distance) — a share from
+        // the far start of a 64 MiB dictionary may not be found as an economical match at all.
+        let mut small_content = giant_content[giant_content.len() - 200_000..].to_vec();
+        small_content.extend_from_slice(b"a short unique tail for version two");
+        let mut blob_v2 = LooseObjectBuilder::build_blob(&Blob { content: small_content });
+        blob_v2.store().unwrap();
+        let blob_v2_hash = blob_v2.hash.clone();
+        // The stored/hashed bytes (header + content), not the raw `Blob.content` passed in above
+        // — mirrors `compact_falls_back_to_a_full_blob_when_its_delta_base_is_corrupt`'s own
+        // `blob_v2_content` capture.
+        let blob_v2_content = blob_v2.content.clone();
+
+        let mut tree_v2 = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        tree_v2.add_child(TreeItem::new("file.txt".to_string(), blob_v2_hash.clone(), DirEntryType::Normal));
+        let mut tree_v2_obj = LooseObjectBuilder::build_tree(&tree_v2);
+        tree_v2_obj.store().unwrap();
+
+        let mut parcel_v2_obj = LooseObjectBuilder::build_parcel(&Parcel {
+            tree_hash: tree_v2_obj.hash.clone(),
+            parents: vec![parcel_v1_obj.hash.clone()],
+            actions: Vec::new(),
+            description: Some("v2".to_string()),
+        });
+        parcel_v2_obj.store().unwrap();
+
+        pallet_utils::set_pallet_head("main", &parcel_v2_obj.hash).unwrap();
+
+        let stats = compact(false, false).unwrap();
+
+        // The giant is skipped, not corrupt, and left loose exactly as INV-5 already pins in
+        // isolation.
+        assert_eq!(stats.over_ceiling_skipped, 1);
+        assert_eq!(stats.corrupt_skipped, 0, "a grandfathered giant used as someone else's base is still not corruption");
+        let (folder, file_name) = file_utils::get_path_for_object(&giant_hash).unwrap();
+        assert!(Path::new(&folder).join(&file_name).exists(), "the over-ceiling base must be left in place");
+        assert!(!is_in_packs(&giant_hash).unwrap());
+
+        // v2 specifically (not merely "some object in this run") won its path delta against the
+        // loose giant — checked by inspecting v2's own packed record kind directly, not by
+        // `stats.deltas` alone: the fixture's v1/v2 *trees* also delta against each other (a
+        // harmless, unrelated pair), so a whole-run delta count can't tell which pair actually
+        // produced it.
+        assert!(is_in_packs(&blob_v2_hash).unwrap());
+        assert!(is_stored_as_delta(&blob_v2_hash),
+            "v2 must be packed as a delta against the loose giant base, not full");
+
+        // And it reconstructs byte-exact: the delta-base fetch really did resolve the loose,
+        // over-ceiling base through the unbounded read path, rather than failing or aborting.
         assert_eq!(retrieve_from_packs(&blob_v2_hash).unwrap().unwrap(), blob_v2_content);
 
         std::fs::remove_dir_all(&temp).ok();
