@@ -404,6 +404,13 @@ pub struct CompactStats {
     /// delete: the file stays in its best-recoverable (loose) state for `forklift audit`/`heal`
     /// or a future re-fetch to deal with.
     pub corrupt_skipped: usize,
+
+    /// Loose objects whose decoded size would exceed the whole-object ceiling
+    /// ([`object_utils::MAX_OBJECT_BYTES`]) — grandfathered giants authored before the ceiling
+    /// existed, not corruption. Left loose forever rather than packed: a bounded decode cannot
+    /// produce the bytes to pack, and the loose read path stays unbounded so the object stays
+    /// fully readable.
+    pub over_ceiling_skipped: usize,
 }
 
 /// A pack loaded for reading: its data file memory-mapped, plus its index bytes held resident
@@ -1499,7 +1506,7 @@ pub fn compact(all: bool, redelta: bool) -> Result<CompactStats, String> {
 
     let mut stats = CompactStats {
         objects_packed: 0, packs_written: 0, loose_removed: 0, deltas: 0, bytes_packed: 0,
-        corrupt_skipped: 0,
+        corrupt_skipped: 0, over_ceiling_skipped: 0,
     };
     let mut writer: Option<PackWriter> = None;
 
@@ -1601,6 +1608,15 @@ pub fn compact(all: bool, redelta: bool) -> Result<CompactStats, String> {
             // an empty pack.
             if matches!(prepared[i], PrepSlot::CorruptLoose) {
                 stats.corrupt_skipped += 1;
+                continue;
+            }
+
+            // A loose object above the whole-object ceiling (see `read_target`/
+            // `PrepSlot::OverCeiling`): a grandfathered giant authored before the ceiling
+            // existed, not corruption. Skipped the same way and at the same point as
+            // `CorruptLoose` above — never packed, never deleted, left loose and readable.
+            if matches!(prepared[i], PrepSlot::OverCeiling) {
+                stats.over_ceiling_skipped += 1;
                 continue;
             }
 
@@ -1825,6 +1841,8 @@ enum ReadOutcome {
     Bytes(Vec<u8>, Vec<u8>),
     /// Loose only — see [`PrepSlot::CorruptLoose`].
     CorruptLoose,
+    /// Loose only — see [`PrepSlot::OverCeiling`].
+    OverCeiling,
 }
 
 /// Read an object being *re-deltated* (a loose object, or one whose base is dropped): its
@@ -1836,18 +1854,23 @@ enum ReadOutcome {
 /// place that content is checked against that address: a decode failure or a hash mismatch is
 /// `CorruptLoose`, not an `Err` — corruption found here is pre-existing damage this run did not
 /// cause, and packing it under a hash it does not hash to would make it durable and outlive its
-/// last-recoverable loose form (deleted the moment its corrupt packed twin lands). `Reconstruct`
-/// and `CopyRecord` are unchanged: any failure there still aborts the whole compact (see
-/// `PrepSlot`'s doc comment for why that asymmetry is load-bearing).
+/// last-recoverable loose form (deleted the moment its corrupt packed twin lands). A decode that
+/// would exceed the whole-object ceiling is `OverCeiling`, distinct from `CorruptLoose`: this
+/// object is not corrupt, it is a legitimate object authored before the ceiling existed (see
+/// [`object_utils::MAX_OBJECT_BYTES`]) — `compact` leaves it loose rather than claim a decode
+/// this ingress point deliberately refuses to finish. `Reconstruct` and `CopyRecord` are
+/// unchanged: any failure there still aborts the whole compact (see `PrepSlot`'s doc comment for
+/// why that asymmetry is load-bearing).
 fn read_target(target: &PackTarget) -> Result<ReadOutcome, String> {
     match &target.source {
         Source::Loose(path) => {
             let compressed = std::fs::read(path)
                 .map_err(|e| format!("Error while reading loose object: {}", e))?;
 
-            let raw = match zstd::stream::decode_all(compressed.as_slice()) {
+            let raw = match object_utils::decode_object_bounded(compressed.as_slice()) {
                 Ok(raw) => raw,
-                Err(_) => return Ok(ReadOutcome::CorruptLoose),
+                Err(object_utils::BoundedDecodeError::Malformed(_)) => return Ok(ReadOutcome::CorruptLoose),
+                Err(object_utils::BoundedDecodeError::OverCeiling) => return Ok(ReadOutcome::OverCeiling),
             };
 
             if object_utils::verify_object_bytes(&sign_utils::to_hex(&target.hash), &raw).is_err() {
@@ -1883,7 +1906,7 @@ struct Prepared {
     path_delta: Option<([u8; HASH_LEN], Vec<u8>)>,
 }
 
-/// What [`prepare_target`] found for one target. Three states, distinct *by type* — unlike a
+/// What [`prepare_target`] found for one target. Four states, distinct *by type* — unlike a
 /// `corrupt: bool` flag on [`Prepared`], the corrupt state is unappendable: nothing downstream
 /// can accidentally `append_*` empty or absent bytes under a corrupt object's hash, because
 /// there is no `Prepared` to reach for in that variant at all.
@@ -1901,14 +1924,19 @@ enum PrepSlot {
     /// fetching a writer or touching the delta window: never packed, never deleted, left
     /// exactly as found for `forklift audit`/`heal` or a future re-fetch.
     CorruptLoose,
+    /// A loose object whose decoded size would exceed [`object_utils::MAX_OBJECT_BYTES`] — a
+    /// grandfathered giant authored before that ceiling existed, not corruption (see
+    /// `read_target`). Skipped the same way `CorruptLoose` is: never packed, never deleted, left
+    /// loose and fully readable via the ordinary (unbounded) read path forever.
+    OverCeiling,
 }
 
 impl PrepSlot {
-    /// Borrow the prepared bytes, or `None` for `Copy`/`CorruptLoose`.
+    /// Borrow the prepared bytes, or `None` for `Copy`/`CorruptLoose`/`OverCeiling`.
     fn as_ready(&self) -> Option<&Prepared> {
         match self {
             PrepSlot::Ready(prep) => Some(prep),
-            PrepSlot::Copy | PrepSlot::CorruptLoose => None,
+            PrepSlot::Copy | PrepSlot::CorruptLoose | PrepSlot::OverCeiling => None,
         }
     }
 }
@@ -1942,9 +1970,9 @@ fn prepare_batch(batch: &[PackTarget],
 
 /// Read one target and compute its path delta if one wins — the body of the parallel prep.
 /// A `CopyRecord` is [`PrepSlot::Copy`] (it is copied verbatim on the sequential write path); a
-/// corrupt loose object is [`PrepSlot::CorruptLoose`] (see `read_target`). The window fallback
-/// is *not* done here: it depends on the objects written just before, so it stays on the
-/// sequential path.
+/// corrupt loose object is [`PrepSlot::CorruptLoose`], and an over-ceiling one is
+/// [`PrepSlot::OverCeiling`] (see `read_target`). The window fallback is *not* done here: it
+/// depends on the objects written just before, so it stays on the sequential path.
 fn prepare_target(target: &PackTarget,
                   path_bases: &HashMap<[u8; HASH_LEN], [u8; HASH_LEN]>) -> Result<PrepSlot, String> {
     if matches!(target.source, Source::CopyRecord { .. }) {
@@ -1954,6 +1982,7 @@ fn prepare_target(target: &PackTarget,
     let (raw, compressed) = match read_target(target)? {
         ReadOutcome::Bytes(raw, compressed) => (raw, compressed),
         ReadOutcome::CorruptLoose => return Ok(PrepSlot::CorruptLoose),
+        ReadOutcome::OverCeiling => return Ok(PrepSlot::OverCeiling),
     };
 
     // Parcels are stored full, never delta'd (the history walk reads every parcel); an
@@ -3606,6 +3635,38 @@ mod tests {
 
         assert!(garbage_path.exists(), "the undecodable file must be left in place, never deleted");
         assert!(!is_in_packs(&garbage_hash).unwrap());
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn compact_skips_a_correctly_addressed_over_ceiling_giant_loose_object() {
+        // INV-5 (site B wiring): a blob of MAX_OBJECT_BYTES + 1 zero bytes, stored at the exact
+        // fan-out path its own (uncompressed) content's hash encodes — a genuine, correctly-
+        // addressed object, not a corrupt one. It is not corruption (`corrupt_skipped` must stay
+        // 0), and it must never enter a pack: a bounded decode cannot produce the bytes to pack
+        // it in the first place. Mutation: revert *only* `read_target`'s Loose-branch mapping so
+        // `OverCeiling` folds back into decoding-and-packing (as it did before this fix) — the
+        // giant fully decodes, verifies, gets packed, and its loose file is swept once the pack
+        // is durable — every assertion below flips.
+        let temp = std::env::temp_dir().join(format!("forklift-pack-over-ceiling-loose-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+
+        let giant = vec![0u8; object_utils::MAX_OBJECT_BYTES + 1];
+        let giant_hash = blake3::hash(&giant).to_hex().to_string();
+        store_loose(&giant_hash, &giant);
+        let (folder, file_name) = file_utils::get_path_for_object(&giant_hash).unwrap();
+        let giant_path = Path::new(&folder).join(&file_name);
+
+        let stats = compact(false, false).unwrap();
+
+        assert_eq!(stats.over_ceiling_skipped, 1);
+        assert_eq!(stats.corrupt_skipped, 0, "a grandfathered giant is not corruption");
+        assert!(giant_path.exists(), "an over-ceiling loose object must be left in place, never deleted");
+        assert!(!is_in_packs(&giant_hash).unwrap(),
+            "a bounded decode must never produce the bytes to pack an over-ceiling object");
 
         std::fs::remove_dir_all(&temp).ok();
     }

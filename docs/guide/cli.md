@@ -1082,11 +1082,14 @@ than git's own 310 MB pack.** A loose object is removed only after the pack that
 durably written, and a delta is content-verified on read, so compacting can never lose or
 corrupt an object (interrupt it freely). Packs roll over at a size/count threshold, so no
 single pack grows unbounded. `--json` reports
-`{objects_packed, packs_written, loose_removed, deltas, bytes_packed, corrupt_skipped}`.
+`{objects_packed, packs_written, loose_removed, deltas, bytes_packed, corrupt_skipped,
+over_ceiling_skipped}`.
 If a loose object's bytes do not decode, or decode but do not hash to the address its filename
 promises, `compact` skips it and leaves it in place rather than packing or removing it;
 `corrupt_skipped` counts those. A nonzero count is worth investigating — run `forklift audit`
-to check the store.
+to check the store. A loose object larger than the 64 MiB object ceiling is skipped the same
+way, but it is not corrupt — it predates the ceiling — so it is counted separately as
+`over_ceiling_skipped` and left loose, fully readable, forever.
 
 `compact` also **builds the commit-graph** (`.forklift/graph/`) while it is here: a sharded,
 self-healing cache that gives each parcel a generation number — so ancestry checks
