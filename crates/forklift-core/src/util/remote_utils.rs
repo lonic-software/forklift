@@ -1356,6 +1356,92 @@ async fn fetch_loose_objects(client: &RemoteClient, missing: &[String]) -> Resul
     Ok(missing.len())
 }
 
+/// D4's dedicated corrupt-candidate fetch (DESIGN.html §3.1.1): one loose `GET` per flagged hash,
+/// verified and force-stored via [`object_utils::force_store_object_bytes`] — the corrupt copy is
+/// superseded by an atomic rename, never deleted first.
+///
+/// Deliberately never routes through [`fetch_missing_objects`]: that function's own dedup filter
+/// (`file_utils::does_object_exist`) answers "yes" for a corrupt-but-present dentry, so a flagged
+/// hash would simply never be requested, and — on its batch/bundle path — the post-batch presence
+/// recheck would read the still-corrupt file back as "delivered" even when nothing actually
+/// landed and the store gate discarded it. Sending flagged hashes down this dedicated path instead
+/// of the shared one makes both of those failure modes unreachable by construction rather than
+/// requiring every gate along the shared path to be bypassed correctly.
+///
+/// All `flagged` hashes are assumed corrupt-but-present; every one is fetched and force-stored
+/// regardless of what `does_object_exist` would say about it.
+///
+/// Deliberately routed through [`join_all_independent`], not the shared [`join_all`]: each
+/// flagged hash is an independent recovery attempt, and a 404 or a bad transfer on one hash must
+/// never cancel a sibling hash's task before it force-stores its own recovered bytes — `join_all`'s
+/// first-error-wins/abort-the-rest discipline is exactly wrong here (see that function's own doc
+/// for why it is right for its other callers, where the batch is one all-or-nothing unit).
+///
+/// # Returns
+/// `(usize, BTreeMap<String, String>)` — the count of `flagged` hashes actually fetched and
+/// force-stored, and every hash that was *not* among them mapped to its own transfer/verification/
+/// store failure, so a caller can quote the exact reason a specific hash's recovery failed instead
+/// of a joined, unattributed string. A hash present in `flagged` but accounted for by neither the
+/// count nor this map failed via a task panic: [`join_all_independent`]'s own per-outcome `Err` for
+/// a `JoinError` carries no hash to attribute it to (see [`HASH_ERROR_DELIMITER`]'s own doc for how
+/// an ordinary failure's `Err` does), so it is reflected only in the count coming up short. Every
+/// hash that succeeded was still fetched and durably force-stored regardless of what happened to
+/// any other hash in `flagged`.
+pub(crate) async fn fetch_corrupt_replacements(
+    client: &RemoteClient,
+    flagged: &[String],
+) -> (usize, BTreeMap<String, String>) {
+    let semaphore = Arc::new(Semaphore::new(CONCURRENT_TRANSFERS));
+    let mut tasks: JoinSet<Result<(), String>> = JoinSet::new();
+
+    for hash in flagged {
+        let client = client.clone();
+        let hash = hash.clone();
+        let semaphore = Arc::clone(&semaphore);
+
+        tasks.spawn(async move {
+            async {
+                let _permit = semaphore.acquire().await
+                    .map_err(|_| "The transfer pool was closed unexpectedly.".to_string())?;
+
+                let bytes = client.fetch_object(&hash).await?;
+
+                object_utils::force_store_object_bytes(&hash, &bytes)?;
+
+                Ok(())
+            }.await.map_err(|e: String| format!("{}{}{}", hash, HASH_ERROR_DELIMITER, e))
+        });
+    }
+
+    let mut recovered = 0usize;
+    let mut failures: BTreeMap<String, String> = BTreeMap::new();
+    for outcome in join_all_independent(tasks).await {
+        match outcome {
+            Ok(()) => recovered += 1,
+            // An ordinary per-hash failure carries its own hash, prefixed above — split it back
+            // off. A `JoinError` (panic), wrapped by `join_all_independent` itself into a generic
+            // "A transfer task failed: ..." string, never contains the delimiter and so is
+            // correctly left unattributed (see this function's own `# Returns` doc).
+            Err(combined) => {
+                if let Some((hash, message)) = combined.split_once(HASH_ERROR_DELIMITER) {
+                    if flagged.iter().any(|flagged_hash| flagged_hash == hash) {
+                        failures.insert(hash.to_string(), message.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    (recovered, failures)
+}
+
+/// A control character, never legitimate in a hash or in the human-readable transport errors this
+/// module produces, used only to prefix [`fetch_corrupt_replacements`]'s own per-task `Err` with
+/// the hash it belongs to — so a genuine per-hash failure still reaches [`join_all_independent`]
+/// as a real task-level `Err` (preserving the exact shape a revert to the shared [`join_all`] would
+/// abort on), while the hash rides along for the caller to split back off.
+const HASH_ERROR_DELIMITER: char = '\u{1}';
+
 /// Fetch (concurrently) the signature sidecars of the given parcels, where the sidecar
 /// is missing locally. Unsigned parcels (no sidecar on the remote either) are fine.
 ///
@@ -1980,6 +2066,28 @@ async fn join_all<T: Send + 'static>(mut tasks: JoinSet<Result<T, String>>) -> R
     }
 
     Ok(results)
+}
+
+/// Await every task of a set to its own natural completion, keeping each task's individual
+/// outcome instead of [`join_all`]'s first-error-wins/abort-the-rest — the counterpart for a
+/// caller whose tasks are independent recovery attempts rather than one all-or-nothing batch (its
+/// sole caller today, [`fetch_corrupt_replacements`], has the details on why that distinction
+/// matters there).
+///
+/// Because nothing here is ever aborted, this needs none of [`join_all`]/[`drain_remaining`]'s
+/// not-return-while-writing machinery: every task, including one whose sibling already failed,
+/// runs to completion on its own and is joined here, so `object_utils::force_store_object_bytes`
+/// never races a cancellation. A panicked task collapses into an `Err` in its own slot, the same
+/// shape a task's own `Err(String)` return takes — so a sibling panic is reported like any other
+/// per-hash failure, never silently dropped and never mistaken for a clean success.
+async fn join_all_independent<T: Send + 'static>(mut tasks: JoinSet<Result<T, String>>) -> Vec<Result<T, String>> {
+    let mut outcomes = Vec::new();
+
+    while let Some(result) = tasks.join_next().await {
+        outcomes.push(result.map_err(|e| format!("A transfer task failed: {}", e)).and_then(|inner| inner));
+    }
+
+    outcomes
 }
 
 /// Abort and drain every task still in `tasks`. This is the other half of the invariant
@@ -3979,5 +4087,44 @@ mod tests {
             error.contains(PANIC_MESSAGE),
             "the sibling's panic evidence must be appended to the first error, got: {}", error
         );
+    }
+
+    /// Pins [`join_all_independent`]'s own doc claim — a panicked sibling "is reported like any
+    /// other per-hash failure, never silently dropped and never mistaken for a clean success" —
+    /// which the tests above only exercise indirectly through [`join_all`]/[`drain_remaining`],
+    /// never through this function itself. Deterministic and hook-free: unlike `join_all`'s own
+    /// panic-evidence tests, nothing here is ever aborted or drained mid-flight, so there is no
+    /// scheduling-margin window to race — every task runs to its own natural completion and is
+    /// simply collected. Mutation: make the collecting loop `continue` on a `JoinError` instead of
+    /// recording it (silently dropping the panicked sibling instead of turning it into its own
+    /// `Err` slot) — this test goes red on both the outcome count and the "exactly one `Err`"
+    /// assertion below.
+    #[test]
+    fn join_all_independent_reports_a_panicked_sibling_as_its_own_err_alongside_two_oks() {
+        const PANIC_MESSAGE: &str = "sibling panic evidence for join_all_independent";
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+
+        let outcomes = runtime.block_on(async {
+            let mut tasks: JoinSet<Result<u32, String>> = JoinSet::new();
+            tasks.spawn(async { panic!("{}", PANIC_MESSAGE) });
+            tasks.spawn(async { Ok(1) });
+            tasks.spawn(async { Ok(2) });
+
+            join_all_independent(tasks).await
+        });
+
+        assert_eq!(outcomes.len(), 3, "every task's own outcome must come back, panicked or not");
+
+        let errors: Vec<&String> = outcomes.iter().filter_map(|o| o.as_ref().err()).collect();
+        assert_eq!(errors.len(), 1, "exactly one outcome must be the panicked sibling's own Err: {:?}", outcomes);
+        assert!(
+            errors[0].contains(PANIC_MESSAGE),
+            "the panicked sibling's Err must carry its own panic payload, got: {}", errors[0]
+        );
+
+        let mut oks: Vec<u32> = outcomes.into_iter().filter_map(|o| o.ok()).collect();
+        oks.sort();
+        assert_eq!(oks, vec![1, 2], "both ordinary siblings must still come back as clean successes");
     }
 }

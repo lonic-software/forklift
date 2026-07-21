@@ -591,6 +591,36 @@ pub(crate) fn validate_imported_object(claimed_hash: &str, bytes: &[u8]) -> Resu
 /// * `Ok(false)`   - If the object was already present (nothing written).
 /// * `Err(String)` - If the hash does not match the bytes, or the write failed.
 pub fn store_object_bytes(claimed_hash: &str, bytes: &[u8]) -> Result<bool, String> {
+    store_object_bytes_impl(claimed_hash, bytes, true)
+}
+
+/// The gate-free sibling of [`store_object_bytes`]: identical hash verification, ceilings,
+/// compression and atomic write, but never consults [`file_utils::does_object_exist`] first — so
+/// it overwrites whatever bytes are already at the object's path rather than skipping the write.
+/// A sibling entry point, not a flag on [`store_object_bytes`] itself: every existing caller of
+/// that function keeps its current dedup-on-presence behavior unchanged.
+///
+/// This exists for exactly one caller: the D4 corrupt-candidate refetch (DESIGN.html §3.1.1,
+/// [`remote_utils::fetch_corrupt_replacements`](crate::util::remote_utils::fetch_corrupt_replacements)).
+/// A corrupt loose dentry is never deleted before its replacement is fetched — deleting it would
+/// create a window with no copy at all if the fetch then failed. Instead, once a verified good
+/// copy is in hand, this function's call into [`file_utils::write_object_to_file`] (→
+/// `write_file_atomically`) supersedes the corrupt bytes with one atomic rename: at every instant
+/// the path holds either the old (corrupt) bytes or the new (verified) ones, never neither.
+///
+/// # Returns
+/// * `Ok(())`      - The object was verified and stored, replacing whatever was there before.
+/// * `Err(String)` - If the hash does not match the bytes, an object/chunk ceiling was exceeded,
+///                   or the write failed.
+pub(crate) fn force_store_object_bytes(claimed_hash: &str, bytes: &[u8]) -> Result<(), String> {
+    store_object_bytes_impl(claimed_hash, bytes, false).map(|_| ())
+}
+
+/// Shared body for [`store_object_bytes`] and [`force_store_object_bytes`]: the only difference
+/// between the two is whether the presence gate (`file_utils::does_object_exist`) is consulted
+/// before writing — everything else (hash check, ceilings, compression, the write itself) is one
+/// code path so the two can never silently drift apart.
+fn store_object_bytes_impl(claimed_hash: &str, bytes: &[u8], check_presence: bool) -> Result<bool, String> {
     let actual = hash_object_bytes(bytes);
 
     if actual != claimed_hash {
@@ -611,7 +641,7 @@ pub fn store_object_bytes(claimed_hash: &str, bytes: &[u8]) -> Result<bool, Stri
     // assembly memory bound would be far looser than the per-chunk ceiling explicit types buy.
     enforce_chunk_ceiling(claimed_hash, bytes)?;
 
-    if file_utils::does_object_exist(claimed_hash)? {
+    if check_presence && file_utils::does_object_exist(claimed_hash)? {
         return Ok(false);
     }
 
