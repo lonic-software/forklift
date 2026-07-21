@@ -1976,11 +1976,18 @@ fn prepare_target(target: &PackTarget,
             // copy the base blob out under the read-cache lock. The store read still takes hex
             // (the on-disk/wire address format); the map itself stays binary.
             let base_hex = sign_utils::to_hex(base);
-            let base_raw = file_utils::retrieve_object_by_hash_shared(&base_hex)?;
-            let payload = delta_utils::compress_delta(&base_raw, &raw)?;
+            // A base that cannot be read verified (corrupt loose bytes, or a transient store
+            // failure) must not abort the whole compact: path-delta selection is opportunistic
+            // compression, never a durability promise. Leave `path_delta` unset and fall through
+            // — a chain target with no winning delta packs full from its own already-verified
+            // `raw`. A genuinely failing store still aborts, just via the target's own read
+            // (`read_target`, above), not this base lookup.
+            if let Ok(base_raw) = file_utils::retrieve_object_by_hash_shared(&base_hex) {
+                let payload = delta_utils::compress_delta(&base_raw, &raw)?;
 
-            if payload.len() < compressed.len() {
-                path_delta = Some((*base, payload));
+                if payload.len() < compressed.len() {
+                    path_delta = Some((*base, payload));
+                }
             }
         }
     }
@@ -4161,6 +4168,94 @@ mod tests {
         // And the content is genuinely gone — not just re-pointed at.
         assert!(!is_in_packs(&blake3::hash(&content_a).to_hex().to_string()).unwrap());
         assert!(!is_in_packs(&blake3::hash(&content_b).to_hex().to_string()).unwrap());
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn compact_falls_back_to_a_full_blob_when_its_delta_base_is_corrupt() {
+        // Pins I4 (the corrupt-base fallback): a corrupt loose object that is *another*
+        // target's path-delta base must not abort the whole compact. This needs a real
+        // two-version history — a made-up "loose object with a made-up base hash" would never
+        // reach the fetch this test targets, since only `compute_path_bases`'s real tree/parcel
+        // walk populates the base map at all. So build one file changed across two parcels
+        // (v1 -> v2, `main` at v2) the way the store actually authors history, then corrupt
+        // v1's blob on disk (a valid zstd frame, wrong bytes — a hash mismatch, not a decode
+        // failure, so it exercises the same store-verified fetch the fix guards).
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+        use crate::enums::dir_entry_type::DirEntryType;
+        use crate::model::blob::Blob;
+        use crate::model::parcel::Parcel;
+        use crate::model::tree_item::TreeItem;
+
+        let temp = std::env::temp_dir().join(format!("forklift-pack-corrupt-base-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+
+        // v1: "file.txt" holds content A, in a parentless root parcel.
+        let mut blob_v1 = LooseObjectBuilder::build_blob(
+            &Blob { content: b"version one content of file.txt".to_vec() }
+        );
+        blob_v1.store().unwrap();
+        let blob_v1_hash = blob_v1.hash.clone();
+
+        let mut tree_v1 = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        tree_v1.add_child(TreeItem::new("file.txt".to_string(), blob_v1_hash.clone(), DirEntryType::Normal));
+        let mut tree_v1_obj = LooseObjectBuilder::build_tree(&tree_v1);
+        tree_v1_obj.store().unwrap();
+
+        let mut parcel_v1_obj = LooseObjectBuilder::build_parcel(&Parcel {
+            tree_hash: tree_v1_obj.hash.clone(),
+            parents: Vec::new(),
+            actions: Vec::new(),
+            description: Some("v1".to_string()),
+        });
+        parcel_v1_obj.store().unwrap();
+
+        // v2: "file.txt" holds content B, parented on v1 — its blob's path base is v1's blob.
+        let mut blob_v2 = LooseObjectBuilder::build_blob(
+            &Blob { content: b"version two content of file.txt, now different".to_vec() }
+        );
+        blob_v2.store().unwrap();
+        let blob_v2_hash = blob_v2.hash.clone();
+        let blob_v2_content = blob_v2.content.clone();
+
+        let mut tree_v2 = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        tree_v2.add_child(TreeItem::new("file.txt".to_string(), blob_v2_hash.clone(), DirEntryType::Normal));
+        let mut tree_v2_obj = LooseObjectBuilder::build_tree(&tree_v2);
+        tree_v2_obj.store().unwrap();
+
+        let mut parcel_v2_obj = LooseObjectBuilder::build_parcel(&Parcel {
+            tree_hash: tree_v2_obj.hash.clone(),
+            parents: vec![parcel_v1_obj.hash.clone()],
+            actions: Vec::new(),
+            description: Some("v2".to_string()),
+        });
+        parcel_v2_obj.store().unwrap();
+
+        pallet_utils::set_pallet_head("main", &parcel_v2_obj.hash).unwrap();
+
+        // Corrupt v1's blob loose file in place: a well-formed zstd frame (so it decodes) whose
+        // plaintext hashes to a different address (so it fails `verify_object_bytes`) — the
+        // hash-mismatch flavor of `PrepSlot::CorruptLoose`, not the decode-failure one.
+        let (folder, file_name) = file_utils::get_path_for_object(&blob_v1_hash).unwrap();
+        let wrong_bytes = zstd::encode_all(b"not the bytes that belong at this address".as_slice(), 0).unwrap();
+        file_utils::write_object_to_file(Path::new(&folder), &file_name, wrong_bytes).unwrap();
+
+        let stats = compact(false, false).unwrap();
+
+        // v1's blob is corrupt and is skipped, not packed — same invariant clause (a)/(b) pin,
+        // just reached as someone else's delta base this time.
+        assert_eq!(stats.corrupt_skipped, 1, "the corrupt path-base blob must be skipped, not abort the run");
+        let (folder, file_name) = file_utils::get_path_for_object(&blob_v1_hash).unwrap();
+        assert!(Path::new(&folder).join(&file_name).exists(), "the corrupt base must be left in place");
+        assert!(!is_in_packs(&blob_v1_hash).unwrap());
+
+        // v2 still packs — full, since its path base could not be read verified — and reads
+        // back byte-exact.
+        assert!(is_in_packs(&blob_v2_hash).unwrap());
+        assert_eq!(retrieve_from_packs(&blob_v2_hash).unwrap().unwrap(), blob_v2_content);
 
         std::fs::remove_dir_all(&temp).ok();
     }
