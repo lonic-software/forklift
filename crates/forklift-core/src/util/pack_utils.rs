@@ -3677,8 +3677,11 @@ mod tests {
         let flip_at = blob_offset as usize + 1;
         assert!((flip_at as u64) < blob_offset + blob_len, "the flip must land inside the blob's own record");
         data[flip_at] ^= 0xFF;
-        std::fs::write(&pack_path, &data).unwrap();
+        // Drop the mmap'd pack registry *before* rewriting the pack file: on Windows a file with a
+        // user-mapped section open cannot be written (os error 1224) — the same handle constraint
+        // `compact`'s own drop-before-delete guards against. `compact(true, true)` below reloads.
         invalidate_cache();
+        std::fs::write(&pack_path, &data).unwrap();
 
         // `--all --redelta` forces every live packed object through `Source::Reconstruct` (see
         // `collect_targets`) -- the same path a dropped-base repack already uses -- never
