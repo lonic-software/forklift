@@ -8,6 +8,9 @@ repository.workspace = true
 # Apache-2.0 after two years). Not the workspace MIT/Apache — see LICENSING.md.
 license-file = "../../LICENSE-FSL"
 
+[lints]
+workspace = true
+
 [dependencies]
 forklift-core = { workspace = true }
 blake3 = { workspace = true }

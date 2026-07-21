@@ -1,0 +1,3 @@
+disallowed-methods = [
+    { path = "zstd::stream::decode_all", reason = "unbounded decode of untrusted bytes; use object_utils::decode_object_bounded unless reading back bytes this store itself wrote — allow per-site with a justification" },
+]

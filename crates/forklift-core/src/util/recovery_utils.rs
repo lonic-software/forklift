@@ -3163,6 +3163,8 @@ mod tests {
             "the recovered object's path must be named in `resolved`: {:?}", outcome.resolved);
 
         let stored = std::fs::read(forklift.join(&relative)).unwrap();
+        // Trusted bytes: this test's own fixture content, read back to check the recovery.
+        #[allow(clippy::disallowed_methods)]
         let decompressed = zstd::stream::decode_all(stored.as_slice()).unwrap();
         assert_eq!(decompressed, good_content, "the stored bytes must now be the real content");
         object_utils::verify_object_bytes(&hash, &decompressed)
@@ -3223,6 +3225,8 @@ mod tests {
             (&relative_b, &hash_b, &good_b),
         ] {
             let stored = std::fs::read(forklift.join(relative)).unwrap();
+            // Trusted bytes: this test's own fixture content, read back to check the recovery.
+            #[allow(clippy::disallowed_methods)]
             let decompressed = zstd::stream::decode_all(stored.as_slice()).unwrap();
             assert_eq!(&decompressed, good);
             object_utils::verify_object_bytes(hash, &decompressed).unwrap();
@@ -3301,6 +3305,8 @@ mod tests {
 
         // The served object must be genuinely recovered on disk...
         let stored = std::fs::read(forklift.join(&relative_served)).unwrap();
+        // Trusted bytes: this test's own fixture content, read back to check the recovery.
+        #[allow(clippy::disallowed_methods)]
         let decompressed = zstd::stream::decode_all(stored.as_slice()).unwrap();
         assert_eq!(decompressed, good_served, "the served object's stored bytes must now be the real content");
         object_utils::verify_object_bytes(&hash_served, &decompressed)

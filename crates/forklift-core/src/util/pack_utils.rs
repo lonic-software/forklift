@@ -1219,6 +1219,10 @@ fn resolve_record(record: &[u8], version: u32, hash: &str) -> Result<Vec<u8>, St
 /// another pack, or itself a delta. The chain is bounded well below `MAX_RECONSTRUCT_DEPTH`,
 /// which guards only against a corrupt pack chaining without end.
 fn reconstruct_record(record: &[u8], version: u32, hash: &str) -> Result<Vec<u8>, String> {
+    // Trusted bytes: a local pack record is self-written or transport-verified (see
+    // `decode_full_transport_record`), and a grandfathered giant must stay readable — bounding
+    // this read would make a pre-existing over-ceiling packed object unreadable.
+    #[allow(clippy::disallowed_methods)]
     let decode_full = |blob: &[u8]| zstd::stream::decode_all(blob)
         .map_err(|e| format!("Error while decompressing packed object {}: {}", hash, e));
 

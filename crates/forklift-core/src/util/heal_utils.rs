@@ -964,6 +964,8 @@ mod tests {
 
         // The bytes still decompress to the original content — restaging never touches content.
         let restaged = std::fs::read(forklift.join(&relative)).unwrap();
+        // Trusted bytes: this test's own fixture content, read back to check the restage.
+        #[allow(clippy::disallowed_methods)]
         let decompressed = zstd::stream::decode_all(restaged.as_slice()).unwrap();
         assert_eq!(decompressed, content);
     }
