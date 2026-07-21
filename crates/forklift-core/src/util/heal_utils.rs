@@ -145,10 +145,11 @@ pub(crate) enum RestageOutcome {
 
     /// The recorded path is a loose object (its path has the fan-out shape
     /// [`file_utils::hash_from_object_path`] recognizes) whose read-back content does not address
-    /// to the hash its own path encodes — either because the bytes are corrupt, or because they
-    /// will not even decompress (folded into this verdict rather than [`Unreadable`](Self::Unreadable):
-    /// both mean the content cannot be trusted, and only a decompression failure is not, strictly,
-    /// a failure to *read*).
+    /// to the hash its own path encodes — either because the bytes are corrupt, because they will
+    /// not even decompress, or because decoding them would exceed
+    /// [`object_utils::MAX_OBJECT_BYTES`] (folded into this verdict rather than
+    /// [`Unreadable`](Self::Unreadable): all three mean the content cannot be trusted, and only a
+    /// decompression failure or an over-ceiling refusal is not, strictly, a failure to *read*).
     HashMismatch,
 }
 
@@ -225,7 +226,7 @@ pub(crate) fn restage_object(root: &Path, relative_path: &Path) -> Result<Restag
     };
 
     if let Some(expected_hash) = file_utils::hash_from_object_path(&final_path) {
-        match zstd::stream::decode_all(bytes.as_slice()) {
+        match object_utils::decode_object_bounded(bytes.as_slice()) {
             Ok(decompressed) => {
                 if object_utils::hash_object_bytes(&decompressed) != expected_hash {
                     return Ok(RestageOutcome::HashMismatch);
@@ -1350,6 +1351,31 @@ mod tests {
 
         let relative = path.strip_prefix(&forklift).unwrap();
         let outcome = restage_object(&forklift, relative).unwrap();
+        assert_eq!(outcome, RestageOutcome::HashMismatch);
+    }
+
+    #[test]
+    fn restage_object_reports_hash_mismatch_for_a_correctly_addressed_over_ceiling_giant() {
+        // INV-4 (site A wiring): a blob of MAX_OBJECT_BYTES + 1 zero bytes, written at the exact
+        // fan-out path its own (uncompressed) content's hash encodes — a genuine, correctly-
+        // addressed object, not a wrong-hash bomb. A wrong-hash bomb would report `HashMismatch`
+        // under both the bounded and the unbounded (`decode_all`) decode, so it could not
+        // discriminate the wiring; a correctly-addressed over-ceiling giant can only pass here
+        // because the bounded decode refuses to finish, not because the hash happens to be wrong.
+        // Mutation: revert this site's decode call from `object_utils::decode_object_bounded`
+        // back to `zstd::stream::decode_all` — the giant fully decodes, its hash matches its own
+        // path, and the outcome flips to `Restaged` — red.
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        let root = scratch("restage-over-ceiling-giant");
+        let _scope = StorageRootScope::enter(&root);
+        let forklift = forklift_root();
+
+        let giant = vec![0u8; object_utils::MAX_OBJECT_BYTES + 1];
+        let (_hash, relative) = write_loose_object(&forklift, &giant);
+
+        let outcome = restage_object(&forklift, &relative).unwrap();
         assert_eq!(outcome, RestageOutcome::HashMismatch);
     }
 
