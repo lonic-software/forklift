@@ -508,6 +508,12 @@ A command not listed here either reports only the generic human-message shape `{
       "minimum": 0,
       "type": "integer"
     },
+    "corrupt_skipped": {
+      "description": "Loose objects skipped because their bytes did not decode or did not hash to their\nfilename address; left in place rather than packed or removed.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
     "deltas": {
       "description": "Of the packed objects, how many were stored as deltas against a similar base.",
       "format": "uint",
@@ -539,7 +545,8 @@ A command not listed here either reports only the generic human-message shape `{
     "packs_written",
     "loose_removed",
     "deltas",
-    "bytes_packed"
+    "bytes_packed",
+    "corrupt_skipped"
   ],
   "title": "Compacted",
   "type": "object"
@@ -1324,7 +1331,7 @@ A command not listed here either reports only the generic human-message shape `{
   "description": "The result of a `heal` run that fully resolved (or found nothing to resolve).",
   "properties": {
     "notes": {
-      "description": "Advisory notes that never blocked clearing — currently, the \"re-run the load\" remedy for\neach vanished inventory shard in `resolved`.",
+      "description": "Advisory notes that never blocked clearing: the \"re-run the load\" remedy for each vanished\ninventory shard in `resolved`, and a note for each bay whose local state could not be\nread this run (skipped rather than blocking recovery) naming the bay and how to clean it up.",
       "items": {
         "type": "string"
       },

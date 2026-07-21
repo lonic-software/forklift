@@ -34,6 +34,7 @@ pub fn handle_command(all: bool, redelta: bool) -> Result<(), String> {
         loose_removed: stats.loose_removed,
         deltas: stats.deltas,
         bytes_packed: stats.bytes_packed,
+        corrupt_skipped: stats.corrupt_skipped,
     });
 
     Ok(())
@@ -60,6 +61,24 @@ pub(crate) struct Compacted {
 
     /// Total bytes written into the packs (delta-compressed where deltas were used).
     bytes_packed: u64,
+
+    /// Loose objects skipped because their bytes did not decode or did not hash to their
+    /// filename address; left in place rather than packed or removed.
+    corrupt_skipped: usize,
+}
+
+impl Compacted {
+    /// Warn about corrupt loose objects left in place, when there were any — shared by both
+    /// render paths (a store can have only corrupt loose objects and nothing else to pack).
+    fn print_corrupt_skipped_note(&self) {
+        if self.corrupt_skipped > 0 {
+            println!(
+                "Skipped {} corrupt loose object{} — left in place. Run 'forklift audit' to check the store.",
+                self.corrupt_skipped,
+                if self.corrupt_skipped == 1 { "" } else { "s" },
+            );
+        }
+    }
 }
 
 impl CommandOutput for Compacted {
@@ -71,6 +90,7 @@ impl CommandOutput for Compacted {
                 "Nothing to compact — the object store has no loose objects."
             };
             println!("{}", nothing);
+            self.print_corrupt_skipped_note();
             return;
         }
 
@@ -92,6 +112,8 @@ impl CommandOutput for Compacted {
             deltas,
             output::human_bytes(self.bytes_packed),
         );
+
+        self.print_corrupt_skipped_note();
     }
 }
 
