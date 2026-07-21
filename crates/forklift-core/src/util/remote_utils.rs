@@ -21,7 +21,7 @@ use crate::util::office_utils::OFFICE_PALLET_NAME;
 use crate::util::scope_utils::{self, MaterializationScope, ScopeClass};
 use crate::util::{
     bundle_utils, config_utils, file_utils, merge_utils, object_utils, office_utils,
-    pallet_utils, sign_utils,
+    pack_utils, pallet_utils, sign_utils,
 };
 
 /// How many object transfers run concurrently.
@@ -1368,8 +1368,17 @@ async fn fetch_loose_objects(client: &RemoteClient, missing: &[String]) -> Resul
 /// of the shared one makes both of those failure modes unreachable by construction rather than
 /// requiring every gate along the shared path to be bypassed correctly.
 ///
-/// All `flagged` hashes are assumed corrupt-but-present; every one is fetched and force-stored
-/// regardless of what `does_object_exist` would say about it.
+/// All `flagged` hashes are assumed corrupt-but-present in the *loose* store; the loose-presence
+/// half of `does_object_exist` is never consulted, for the reason above. The pack-presence half is
+/// a different question, though: a hash can be corrupt loose and — independently — already sitting
+/// good in a pack (e.g. packed once, then re-written loose and damaged after). Skipping *only* a
+/// pack hit ([`pack_utils::is_in_packs`]) costs nothing: it never answers "yes" for a corrupt-loose
+/// dentry (a pack's own index is a separate structure from the loose fan-out, so a loose-only
+/// corruption can't taint it), and it needs no taint-gate check either (see
+/// [`file_utils::does_object_exist`]'s own doc comment on why a pack hit is exempt). A pack hit
+/// skips the fetch and counts as recovered without writing a redundant loose duplicate; a check
+/// error is treated as "not packed" so the flagged hash still gets its forced re-fetch rather than
+/// silently skipping a genuine recovery.
 ///
 /// Deliberately routed through [`join_all_independent`], not the shared [`join_all`]: each
 /// flagged hash is an independent recovery attempt, and a 404 or a bad transfer on one hash must
@@ -1378,15 +1387,14 @@ async fn fetch_loose_objects(client: &RemoteClient, missing: &[String]) -> Resul
 /// for why it is right for its other callers, where the batch is one all-or-nothing unit).
 ///
 /// # Returns
-/// `(usize, BTreeMap<String, String>)` — the count of `flagged` hashes actually fetched and
-/// force-stored, and every hash that was *not* among them mapped to its own transfer/verification/
+/// `(usize, BTreeMap<String, String>)` — the count of `flagged` hashes now known good (either
+/// fetched and force-stored, or found already good in a pack and left alone — see the pack-only
+/// guard above), and every hash that was *not* among them mapped to its own transfer/verification/
 /// store failure, so a caller can quote the exact reason a specific hash's recovery failed instead
 /// of a joined, unattributed string. A hash present in `flagged` but accounted for by neither the
 /// count nor this map failed via a task panic: [`join_all_independent`]'s own per-outcome `Err` for
 /// a `JoinError` carries no hash to attribute it to (see [`HASH_ERROR_DELIMITER`]'s own doc for how
-/// an ordinary failure's `Err` does), so it is reflected only in the count coming up short. Every
-/// hash that succeeded was still fetched and durably force-stored regardless of what happened to
-/// any other hash in `flagged`.
+/// an ordinary failure's `Err` does), so it is reflected only in the count coming up short.
 pub(crate) async fn fetch_corrupt_replacements(
     client: &RemoteClient,
     flagged: &[String],
@@ -1401,6 +1409,14 @@ pub(crate) async fn fetch_corrupt_replacements(
 
         tasks.spawn(async move {
             async {
+                // Pack-only guard (see this function's own doc comment): a hash already good in a
+                // pack needs no re-fetch, regardless of what's wrong with its loose copy. A check
+                // error falls through to the ordinary fetch, so a broken presence check can never
+                // suppress a genuine recovery.
+                if pack_utils::is_in_packs(&hash).unwrap_or(false) {
+                    return Ok(());
+                }
+
                 let _permit = semaphore.acquire().await
                     .map_err(|_| "The transfer pool was closed unexpectedly.".to_string())?;
 
@@ -3775,6 +3791,89 @@ mod tests {
         assert_eq!(remote.batch_hits(), 0, "chunks never route through the batch endpoint");
         assert_eq!(remote.hits_for(&format!("/v1/objects/{}", chunk_a.hash)), 1);
         assert_eq!(remote.hits_for(&format!("/v1/objects/{}", chunk_b.hash)), 1);
+    }
+
+    /// FORK-45 finding #3: `fetch_corrupt_replacements` deliberately drops every presence check —
+    /// that's by design, so a flagged-corrupt hash always gets force-fetched even though the old
+    /// `does_object_exist` predicate would have called it "present". But `does_object_exist` was
+    /// really two checks bundled into one (packs, then a gated loose stat) — dropping the predicate
+    /// dropped both, and the pack half never had anything to do with the corrupt-loose problem this
+    /// function exists to solve. Pins: a hash already good in a *pack* is left alone (no network
+    /// hit, no redundant loose duplicate written), while a hash whose *loose* copy is corrupt is
+    /// still force-fetched and repaired — in the same call, so the pack-only guard can't be
+    /// satisfied by accidentally skipping every hash.
+    #[test]
+    fn fetch_corrupt_replacements_skips_a_pack_resident_hash_but_still_repairs_a_corrupt_loose_one() {
+        let _scratch = Scratch::new("corrupt-replacements-pack-guard");
+
+        // A hash already packed, correctly, before this call ever runs — the exact shape `compact`
+        // leaves behind: packed, and no longer loose at all. Written as a raw content-addressed
+        // object directly (mirroring `pack_utils`'s own `store_loose` test fixture) rather than via
+        // `LooseObjectBuilder`, so the hash is exactly `blake3(pack_resident_content)` and the fake
+        // remote below can serve those same raw bytes back under that hash.
+        let pack_resident_content = b"already packed and perfectly fine".to_vec();
+        let pack_resident_hash = blake3::hash(&pack_resident_content).to_hex().to_string();
+        let (resident_folder, resident_file_name) =
+            file_utils::get_path_for_object(&pack_resident_hash).unwrap();
+        file_utils::write_object_to_file(
+            std::path::Path::new(&resident_folder), &resident_file_name,
+            zstd::encode_all(pack_resident_content.as_slice(), 0).unwrap()
+        ).unwrap();
+        let stats = pack_utils::compact(false, false).unwrap();
+        assert_eq!(stats.objects_packed, 1, "the fixture object must actually land in a pack");
+        assert!(pack_utils::is_in_packs(&pack_resident_hash).unwrap(), "fixture precondition: packed");
+        let (pack_folder, pack_file_name) = file_utils::get_path_for_object(&pack_resident_hash).unwrap();
+        let pack_resident_loose_path = std::path::Path::new(&pack_folder).join(&pack_file_name);
+        assert!(!pack_resident_loose_path.exists(), "fixture precondition: no loose copy survives the compact");
+
+        // A hash whose loose dentry is corrupt (content does not hash to its own filename) — the
+        // shape `hash_mismatch` classifies as a D4 corrupt candidate upstream.
+        let genuine_content = b"the real bytes this hash belongs to".to_vec();
+        let corrupt_hash = blake3::hash(&genuine_content).to_hex().to_string();
+        let (corrupt_folder, corrupt_file_name) = file_utils::get_path_for_object(&corrupt_hash).unwrap();
+        let wrong_bytes = zstd::encode_all(b"not the genuine bytes at all".as_slice(), 0).unwrap();
+        file_utils::write_object_to_file(
+            std::path::Path::new(&corrupt_folder), &corrupt_file_name, wrong_bytes
+        ).unwrap();
+
+        // The remote serves genuine, correct bytes for *both* hashes — including the pack-resident
+        // one, so a revert that re-fetches it would find a "successful", non-erroring transfer
+        // (the failure mode the finding describes is wasted transfer + a redundant object, not a
+        // broken one).
+        let mut objects = HashMap::new();
+        objects.insert(pack_resident_hash.clone(), pack_resident_content.clone());
+        objects.insert(corrupt_hash.clone(), genuine_content.clone());
+        let remote = FakeOffloadingRemote::start(303, Vec::new(), objects);
+        let client = RemoteClient::new(&remote.url, None).unwrap();
+
+        let flagged = vec![pack_resident_hash.clone(), corrupt_hash.clone()];
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let (recovered, failures) = runtime.block_on(fetch_corrupt_replacements(&client, &flagged));
+
+        assert_eq!(failures, BTreeMap::new(), "neither hash should fail: {:?}", failures);
+        assert_eq!(recovered, 2, "both hashes must be accounted for as recovered");
+
+        // The pack-resident hash was never re-fetched...
+        assert_eq!(
+            remote.hits_for(&format!("/v1/objects/{}", pack_resident_hash)), 0,
+            "a pack-resident hash must not be re-fetched from the remote"
+        );
+        // ...and no redundant loose duplicate was written for it.
+        assert!(
+            !pack_resident_loose_path.exists(),
+            "a pack-resident hash must not gain a redundant loose duplicate"
+        );
+        assert!(pack_utils::is_in_packs(&pack_resident_hash).unwrap(), "still packed, untouched");
+
+        // The corrupt-loose hash, by contrast, was force-fetched and repaired.
+        assert_eq!(
+            remote.hits_for(&format!("/v1/objects/{}", corrupt_hash)), 1,
+            "a flagged-corrupt hash must still be force-fetched exactly once"
+        );
+        assert_eq!(
+            file_utils::retrieve_object_by_hash(&corrupt_hash).unwrap(), genuine_content,
+            "the corrupt loose copy must be superseded by the genuine bytes"
+        );
     }
 
     // -----------------------------------------------------------------------------------
