@@ -260,8 +260,11 @@ pub fn store_status() -> Result<StoreStatus, String> {
     // Packs: reuse the reader (mmaps each data file, holds each index resident). Per pack we
     // report its object count (the index), its delta count (the framed record kinds), and its
     // on-disk size (data file + index file, both already sized once loaded).
+    // Leg 1 (FORK-47) plumbs `PackSet`'s registry-independent load here so `store_status` no
+    // longer fails on a single orphaned pack pair, but does not yet surface `quarantined`/
+    // `unenumerable` in the census — that is a later leg (DESIGN.html §3.1.1).
     let mut packs = Vec::new();
-    for pack in load_packs_from_disk(&pack_folder())? {
+    for pack in load_packs_from_disk(&pack_folder())?.packs {
         let framed = pack.version >= FIRST_FRAMED_VERSION;
         let mut deltas = 0;
 
@@ -469,14 +472,75 @@ impl LoadedPack {
     }
 }
 
+/// A pack index that parsed cleanly but whose data file could not be loaded (missing, unmappable,
+/// or shape-mismatched against the index — see `load_pack_pair`) — an orphaned `.idx`. Its raw
+/// sorted index bytes and record count are kept exactly as [`LoadedPack`] would keep them, so
+/// membership ([`QuarantinedPack::contains`]) is the same binary search over resident bytes, no
+/// per-hash parse. `error` is `load_pack_pair`'s own failure message, reused verbatim in the
+/// `Unverifiable` wording a quarantine-named read produces (`file_utils::read_object_classified`).
+struct QuarantinedPack {
+    index_path: PathBuf,
+    index: Vec<u8>,
+    count: usize,
+    error: String,
+}
+
+impl QuarantinedPack {
+    /// Whether this quarantined index names `hash_bytes` — the same sorted binary search
+    /// [`LoadedPack::locate`] runs, but membership-only (there is no data file to resolve an
+    /// offset/length against).
+    fn contains(&self, hash_bytes: &[u8; HASH_LEN]) -> bool {
+        let mut low = 0usize;
+        let mut high = self.count;
+
+        while low < high {
+            let mid = low + (high - low) / 2;
+            let record = INDEX_HEADER_LEN + mid * INDEX_RECORD_LEN;
+            let record_hash = &self.index[record..record + HASH_LEN];
+
+            match record_hash.cmp(hash_bytes.as_slice()) {
+                std::cmp::Ordering::Less => low = mid + 1,
+                std::cmp::Ordering::Greater => high = mid,
+                std::cmp::Ordering::Equal => return true,
+            }
+        }
+
+        false
+    }
+}
+
+/// The pack registry's load-time outcome: every pack pair that loaded cleanly, plus the two
+/// broken shapes a loader must survive without failing the whole load (DESIGN.html §3.1.1,
+/// FORK-47) — an orphaned index (quarantined: enumerable, but unservable) and an index that could
+/// not even be parsed (unenumerable: its hash set is unknown). Presence and reads treat both as
+/// "as if the file were absent" *except* that a `quarantined`-named hash gets an honest
+/// `Unverifiable` instead of a bare `Absent` at the single gate that produces it (see
+/// `file_utils::read_object_classified`) — `unenumerable` is never consulted there (inert).
+struct PackSet {
+    /// Loaded pairs, sorted by file name (see `load_packs_from_disk`).
+    packs: Vec<LoadedPack>,
+    /// Index parses; data missing/unmappable/bad. Sorted by index file name for the same
+    /// deterministic-error-message reason `packs` is.
+    quarantined: Vec<QuarantinedPack>,
+    /// Index itself unreadable or corrupt: `(index_path, parse error)`. Its hash set is unknown,
+    /// so it can never gate a verdict — surfacing it is a future leg's job.
+    unenumerable: Vec<(PathBuf, String)>,
+}
+
+impl PackSet {
+    fn empty() -> PackSet {
+        PackSet { packs: Vec::new(), quarantined: Vec::new(), unenumerable: Vec::new() }
+    }
+}
+
 /// The read cache: each warehouse's object store maps to the packs loaded for it. Keyed by
 /// the objects-root path so one process serving several warehouse roots (the server, via a
 /// storage-root scope) never mixes their packs. Loaded once per root on first miss of the
 /// loose store; `compact` invalidates its own root's entry so a same-process read sees new
 /// packs.
-static PACK_REGISTRY: OnceLock<Mutex<HashMap<String, Arc<Vec<LoadedPack>>>>> = OnceLock::new();
+static PACK_REGISTRY: OnceLock<Mutex<HashMap<String, Arc<PackSet>>>> = OnceLock::new();
 
-fn registry() -> &'static Mutex<HashMap<String, Arc<Vec<LoadedPack>>>> {
+fn registry() -> &'static Mutex<HashMap<String, Arc<PackSet>>> {
     PACK_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -489,7 +553,7 @@ pub(crate) fn pack_folder() -> PathBuf {
 
 /// Read the packs for the active warehouse, loading and caching them on first use. The
 /// returned `Arc` lets a lookup search without holding the registry lock.
-fn loaded_packs() -> Result<Arc<Vec<LoadedPack>>, String> {
+fn loaded_packs() -> Result<Arc<PackSet>, String> {
     let key = file_utils::get_path_objects_root();
 
     if let Some(packs) = registry().lock().expect("the pack registry lock is poisoned").get(&key) {
@@ -502,6 +566,41 @@ fn loaded_packs() -> Result<Arc<Vec<LoadedPack>>, String> {
         .insert(key, Arc::clone(&packs));
 
     Ok(packs)
+}
+
+/// Whether `hash` is named only by a quarantined (data-missing) pack index — the honest-wording
+/// half of FORK-47's `Absent` gate (DESIGN.html §3.1.1): a hash a quarantined index names is not
+/// "no surviving index names this hash," so its ordinary read must say so rather than reading a
+/// bare, indistinguishable-from-never-existed `Absent`. Membership is a binary search over each
+/// quarantined index's resident sorted bytes ([`QuarantinedPack::contains`]) — no per-hash parse.
+///
+/// Consults [`loaded_packs`] (cache-warm in every caller today: this is only ever reached after a
+/// `retrieve_from_packs_reloading` call already populated it), never `unenumerable` — an
+/// unparseable index's hash set is unknown, so it must never gate a verdict (I4).
+///
+/// # Returns
+/// * `Ok(Some(message))` - `hash` is named by a quarantined index; `message` is ready to use as
+///   the [`file_utils::StoreReadOutcome::Unverifiable`] payload, naming the index file and its
+///   load error.
+/// * `Ok(None)`          - No quarantined index names `hash`.
+/// * `Err(String)`       - The pack registry itself could not be loaded.
+pub(crate) fn quarantine_reason(hash: &str) -> Result<Option<String>, String> {
+    let Some(hash_bytes) = hash_to_bytes(hash) else {
+        return Ok(None);
+    };
+
+    let pack_set = loaded_packs()?;
+
+    for quarantined in pack_set.quarantined.iter() {
+        if quarantined.contains(&hash_bytes) {
+            return Ok(Some(format!(
+                "named by pack index \"{}\" whose data file could not be loaded: {}",
+                quarantined.index_path.to_string_lossy(), quarantined.error
+            )));
+        }
+    }
+
+    Ok(None)
 }
 
 /// Forget the cached packs for the active warehouse, so the next read reloads them from
@@ -550,12 +649,27 @@ pub fn densify_pending() -> Result<bool, String> {
 
 /// Load every pack in `pack_folder` (its index resident, its data file left on disk for
 /// per-object reads). A missing pack folder is simply no packs.
-fn load_packs_from_disk(pack_folder: &Path) -> Result<Vec<LoadedPack>, String> {
+///
+/// A single broken pair no longer fails the whole load (FORK-47, DESIGN.html §3.1.1): a
+/// `load_pack_pair` failure re-attempts the registry-independent index parse alone (the same
+/// read-and-`parse_index_header` shape [`hashes_in_index_file`] uses, without ever touching the
+/// data file that just failed). If the index itself parses, the pair is orphaned rather than
+/// corrupt — its raw sorted bytes and `load_pack_pair`'s error are kept in `quarantined`, so a
+/// read for a hash it names can still say something honest (`quarantine_reason`) instead of a bare
+/// `Absent`. If the index does not parse either, it goes to `unenumerable` — its hash set is
+/// unknown, so (I4) it must never gate a verdict; it is inert until a future leg surfaces it.
+/// Only a `read_dir` failure on the pack folder itself (not `NotFound`) is still a whole-load
+/// `Err` — an environment failure, not a per-pack one.
+fn load_packs_from_disk(pack_folder: &Path) -> Result<PackSet, String> {
     let mut packs = Vec::new();
+    let mut quarantined = Vec::new();
+    let mut unenumerable = Vec::new();
 
     let entries = match std::fs::read_dir(pack_folder) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(packs),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(PackSet { packs, quarantined, unenumerable });
+        }
         Err(error) => return Err(format!(
             "Error while reading the pack folder \"{}\": {}", pack_folder.to_string_lossy(), error
         )),
@@ -570,15 +684,30 @@ fn load_packs_from_disk(pack_folder: &Path) -> Result<Vec<LoadedPack>, String> {
         }
 
         let data_path = path.with_extension(PACK_DATA_EXTENSION);
-        packs.push(load_pack_pair(&data_path, &path)?);
+
+        match load_pack_pair(&data_path, &path) {
+            Ok(pack) => packs.push(pack),
+            Err(pair_error) => match std::fs::read(&path) {
+                Ok(index) => match parse_index_header(&index, &path) {
+                    Ok((count, _version)) => {
+                        quarantined.push(QuarantinedPack { index_path: path, index, count, error: pair_error });
+                    }
+                    Err(parse_error) => unenumerable.push((path, parse_error)),
+                },
+                Err(read_error) => unenumerable.push((path.clone(), format!(
+                    "Error while reading pack index \"{}\": {}", path.to_string_lossy(), read_error
+                ))),
+            },
+        }
     }
 
     // `read_dir` order is platform-arbitrary (especially on Windows); a fixed, deterministic
     // enumeration order makes which error a multi-pack failure reports reproducible, and is what
     // lets a test pin the "broken copy enumerated first" case deterministically on every platform.
     packs.sort_by(|a, b| a.data_path.file_name().cmp(&b.data_path.file_name()));
+    quarantined.sort_by(|a, b| a.index_path.file_name().cmp(&b.index_path.file_name()));
 
-    Ok(packs)
+    Ok(PackSet { packs, quarantined, unenumerable })
 }
 
 /// Load one native pack/index pair and validate the structural contract shared by ordinary local
@@ -1173,7 +1302,7 @@ pub(crate) fn retrieve_from_packs(hash: &str) -> Result<PackRetrieval, String> {
 
     let mut first_error: Option<String> = None;
 
-    for pack in packs.iter() {
+    for pack in packs.packs.iter() {
         let Some((offset, length)) = pack.locate(&hash_bytes) else {
             continue;
         };
@@ -1330,7 +1459,7 @@ pub fn find_hashes_with_prefix(prefix: &str) -> Result<Vec<String>, String> {
     let packs = loaded_packs()?;
     let mut matches = Vec::new();
 
-    for pack in packs.iter() {
+    for pack in packs.packs.iter() {
         for index in 0..pack.count {
             let record = INDEX_HEADER_LEN + index * INDEX_RECORD_LEN;
             let hash = sign_utils::to_hex(&pack.index[record..record + HASH_LEN]);
@@ -1380,12 +1509,19 @@ pub(crate) fn hashes_in_index_file(index_path: &Path) -> Result<Vec<String>, Str
 /// Whether any pack holds the object with the given hash. The existence fallback for
 /// `file_utils::does_object_exist` when the loose file is absent.
 ///
+/// Answers from **loaded packs only** — a hash named only by a quarantined or unenumerable index
+/// (FORK-47, DESIGN.html §3.1.1) reads `false` here, never `true`. This is the safe polarity: every
+/// existing caller of this presence check (push/fetch dedup, prune, the closure walk) must treat
+/// an unservable hash as absent-and-worth-chasing, which is what lets heal *refetch and clear* it
+/// rather than silently skip it — flipping the polarity would make a quarantine-named hash
+/// permanently unhealable.
+///
 /// # Arguments
 /// * `hash` - The hex hash of the object.
 ///
 /// # Returns
-/// * `Ok(true)`    - If a pack holds the object.
-/// * `Ok(false)`   - If no pack holds it.
+/// * `Ok(true)`    - If a loaded pack holds the object.
+/// * `Ok(false)`   - If no loaded pack holds it.
 /// * `Err(String)` - If the packs could not be loaded.
 pub fn is_in_packs(hash: &str) -> Result<bool, String> {
     let Some(hash_bytes) = hash_to_bytes(hash) else {
@@ -1394,7 +1530,7 @@ pub fn is_in_packs(hash: &str) -> Result<bool, String> {
 
     let packs = loaded_packs()?;
 
-    Ok(packs.iter().any(|pack| pack.locate(&hash_bytes).is_some()))
+    Ok(packs.packs.iter().any(|pack| pack.locate(&hash_bytes).is_some()))
 }
 
 /// Where an object to pack comes from, and how to pack it.
@@ -1646,7 +1782,7 @@ pub fn compact(all: bool, redelta: bool) -> Result<CompactStats, String> {
                 continue;
             };
 
-            let base_depth = true_depth(base, &mut known_depth, &depth_packs)?;
+            let base_depth = true_depth(base, &mut known_depth, &depth_packs.packs)?;
             let planned_depth = base_depth + 1;
 
             if planned_depth <= MAX_DELTA_CHAIN {
@@ -1699,7 +1835,7 @@ pub fn compact(all: bool, redelta: bool) -> Result<CompactStats, String> {
             // is preserved, nothing is reconstructed or re-deltated. The bytes are a zero-copy
             // slice out of the source pack's mmap (framed case) rather than a fresh file read.
             if let Source::CopyRecord { pack_index, offset, len, framed, is_delta } = &target.source {
-                let record = framed_record(&source_packs[*pack_index], *offset, *len, *framed)?;
+                let record = framed_record(&source_packs.packs[*pack_index], *offset, *len, *framed)?;
                 let written = pack.append_raw_record(target.hash, &record)?;
                 stats.bytes_packed += written;
                 if *is_delta {
@@ -1818,7 +1954,7 @@ pub fn compact(all: bool, redelta: bool) -> Result<CompactStats, String> {
     // handle to it is still open, and `memmap2::Mmap` holds exactly such a handle. Before this
     // change, the equivalent per-record `File::open` in `read_pack_slice` was closed the instant
     // each copy finished, so no old pack was ever held open this late; keeping the whole-run
-    // `Arc<Vec<LoadedPack>>` for the mmap'd fast path must not silently change that. (POSIX needs
+    // `Arc<PackSet>` for the mmap'd fast path must not silently change that. (POSIX needs
     // no such care — unlinking an open-and-mapped file is always safe there — but this drop must
     // hold on every supported platform, not just the one this was measured on.)
     drop(source_packs);
@@ -2084,9 +2220,9 @@ struct CollectedTargets {
     /// Old pack files a repack supersedes (empty for an incremental `compact`).
     old_packs: Vec<PathBuf>,
     /// The existing packs, kept mapped for the run so every `Source::CopyRecord { pack_index,
-    /// .. }` in `targets` can borrow its record straight from `source_packs[pack_index]`'s mmap
-    /// (empty for an incremental `compact`, which has no `CopyRecord` targets).
-    source_packs: Arc<Vec<LoadedPack>>,
+    /// .. }` in `targets` can borrow its record straight from `source_packs.packs[pack_index]`'s
+    /// mmap (empty for an incremental `compact`, which has no `CopyRecord` targets).
+    source_packs: Arc<PackSet>,
 }
 
 /// The objects to pack and the old pack files a repack supersedes.
@@ -2118,7 +2254,7 @@ fn collect_targets(all: bool, redelta: bool) -> Result<CollectedTargets, String>
         return Ok(CollectedTargets {
             targets: enumerate_loose_objects()?,
             old_packs: Vec::new(),
-            source_packs: Arc::new(Vec::new()),
+            source_packs: Arc::new(PackSet::empty()),
         });
     }
 
@@ -2141,7 +2277,7 @@ fn collect_targets(all: bool, redelta: bool) -> Result<CollectedTargets, String>
     let packs = loaded_packs()?;
     let mut old_packs = Vec::new();
 
-    for (pack_index, pack) in packs.iter().enumerate() {
+    for (pack_index, pack) in packs.packs.iter().enumerate() {
         old_packs.push(pack.data_path.clone());
         old_packs.push(pack.data_path.with_extension(PACK_INDEX_EXTENSION));
 
@@ -3432,7 +3568,7 @@ mod tests {
     fn is_stored_as_delta(hash: &str) -> bool {
         let Some(hash_bytes) = hash_to_bytes(hash) else { return false; };
         let packs = loaded_packs().unwrap();
-        for pack in packs.iter() {
+        for pack in packs.packs.iter() {
             if let Some((offset, length)) = pack.locate(&hash_bytes) {
                 if let Ok(record) = pack.slice(offset, length) {
                     return record.first() == Some(&RECORD_DELTA);
@@ -3831,7 +3967,7 @@ mod tests {
         // record's 1-byte kind tag, i.e. inside its zstd payload, never in the pack header or
         // the index.
         let blob_hash_bytes = hash_to_bytes(&blob.hash).unwrap();
-        let (blob_offset, blob_len) = loaded_packs().unwrap().iter()
+        let (blob_offset, blob_len) = loaded_packs().unwrap().packs.iter()
             .find_map(|pack| pack.locate(&blob_hash_bytes))
             .expect("the blob must be packed");
 
@@ -4334,7 +4470,7 @@ mod tests {
         // Simulate the stale peer: poison this process's registry back to "no packs" even though
         // the pack is on disk and the loose file is gone. A naive read now misses on both paths.
         registry().lock().expect("registry lock")
-            .insert(file_utils::get_path_objects_root(), Arc::new(Vec::new()));
+            .insert(file_utils::get_path_objects_root(), Arc::new(PackSet::empty()));
 
         // The read must reload the registry on the miss and still return the object.
         assert_eq!(
@@ -4612,6 +4748,178 @@ mod tests {
         // And it reconstructs byte-exact: the delta-base fetch really did resolve the loose,
         // over-ceiling base through the unbounded read path, rather than failing or aborting.
         assert_eq!(packs_verified(&blob_v2_hash), blob_v2_content);
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// (I1, FORK-47, DESIGN.html §3.1.1) An orphaned pack pair — a parseable index whose data
+    /// file is missing — must not fail the whole registry load: an entirely unrelated pack's
+    /// hashes stay fully readable, and the orphan itself is quarantined (kept, not silently
+    /// dropped) rather than wedging every read behind one bad pair.
+    ///
+    /// Fixture: pack A holds X, pack B holds Y, each its own pack/index pair; delete B's `.pack`
+    /// and keep its `.idx` — the orphan shape.
+    ///
+    /// Revert: restore the bare `?` on `load_pack_pair` in `load_packs_from_disk` (drop the
+    /// quarantine fallback, back to `packs.push(load_pack_pair(&data_path, &path)?);`) → the
+    /// whole load fails on B's missing data file → X's read (which never touches B) also fails →
+    /// red.
+    #[test]
+    fn an_orphaned_pack_index_no_longer_fails_the_registry_load() {
+        use crate::util::file_utils::StoreReadOutcome;
+
+        let temp = std::env::temp_dir().join(format!("forklift-orphan-load-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+        let folder = pack_folder();
+
+        let x_content = b"pack A's object, unrelated to B's orphan".to_vec();
+        let x_hash = blake3::hash(&x_content).to_hex().to_string();
+        let mut builder_a = TransportPackBuilder::new(&folder).unwrap();
+        builder_a.append_full(&x_hash, &x_content).unwrap();
+        builder_a.finish().unwrap();
+
+        let y_content = b"pack B's object, about to be orphaned".to_vec();
+        let y_hash = blake3::hash(&y_content).to_hex().to_string();
+        let mut builder_b = TransportPackBuilder::new(&folder).unwrap();
+        builder_b.append_full(&y_hash, &y_content).unwrap();
+        let artifacts_b = builder_b.finish().unwrap();
+        assert_eq!(artifacts_b.len(), 1, "test fixture expects exactly one pack pair for B");
+        std::fs::remove_file(&artifacts_b[0].data_path).unwrap();
+
+        // X (an entirely unrelated pack) must still read, despite B's orphan.
+        match crate::util::file_utils::read_object_classified(&x_hash).unwrap() {
+            StoreReadOutcome::Verified(bytes) => assert_eq!(bytes, x_content),
+            StoreReadOutcome::Unverifiable(e) => panic!("expected X Verified, got Unverifiable: {}", e),
+            StoreReadOutcome::Absent => panic!("expected X Verified, got Absent"),
+        }
+
+        // The uncached load itself is `Ok`, with B quarantined and A loaded normally.
+        let loaded = load_packs_from_disk(&folder).expect("an orphaned pair must not fail the whole load");
+        assert_eq!(loaded.packs.len(), 1, "only A's pair loaded cleanly");
+        assert_eq!(loaded.quarantined.len(), 1, "B's orphaned index must be quarantined, not dropped");
+        assert!(loaded.unenumerable.is_empty(), "B's index parses fine; it is not unenumerable");
+
+        // `store` (the read-only census) must not be wedged either.
+        assert!(store_status().is_ok(), "store_status must survive an orphaned pack pair");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// (I2, FORK-47, DESIGN.html §3.1.1) A hash named only by a quarantined (data-missing) index
+    /// classifies `Unverifiable`, naming the index file — not a bare `Absent` indistinguishable
+    /// from a hash that never existed anywhere.
+    ///
+    /// Fixture: the same orphan shape as I1 — pack B holds Y, its `.pack` deleted, its `.idx`
+    /// survives — so Y is named only by B's now-quarantined index.
+    ///
+    /// Revert: drop the quarantine consult at the `Absent` gate (`read_object_classified`'s
+    /// `PackRetrieval::NotLocated` arm reverts to unconditional `Ok(StoreReadOutcome::Absent)`) →
+    /// Y classifies `Absent`, whose ordinary-read message is the generic NotFound wording — the
+    /// name assertions go red (an `Absent`-derived message never names an index file).
+    #[test]
+    fn a_hash_named_only_by_a_quarantined_index_is_unverifiable_and_names_the_index() {
+        use crate::util::file_utils::StoreReadOutcome;
+
+        let temp = std::env::temp_dir().join(format!("forklift-quarantine-read-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+        let folder = pack_folder();
+
+        let y_content = b"named only by a quarantined index".to_vec();
+        let y_hash = blake3::hash(&y_content).to_hex().to_string();
+        let mut builder = TransportPackBuilder::new(&folder).unwrap();
+        builder.append_full(&y_hash, &y_content).unwrap();
+        let artifacts = builder.finish().unwrap();
+        assert_eq!(artifacts.len(), 1, "test fixture expects exactly one pack pair");
+        let index_name = artifacts[0].index_path.file_name().unwrap().to_str().unwrap().to_string();
+        std::fs::remove_file(&artifacts[0].data_path).unwrap();
+
+        match crate::util::file_utils::read_object_classified(&y_hash).unwrap() {
+            StoreReadOutcome::Unverifiable(message) => assert!(
+                message.contains(&index_name),
+                "expected the Unverifiable message to name \"{}\", got: {}", index_name, message
+            ),
+            StoreReadOutcome::Verified(_) => panic!("a quarantine-named hash must never classify Verified"),
+            StoreReadOutcome::Absent => panic!(
+                "a quarantine-named hash must classify Unverifiable, not Absent (I2)"
+            ),
+        }
+
+        let error = file_utils::retrieve_object_by_hash_uncached(&y_hash)
+            .expect_err("a quarantine-named hash must not read successfully");
+        assert!(
+            error.contains(&index_name),
+            "expected the ordinary read's error to name \"{}\", got: {}", index_name, error
+        );
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// (I4, the read/presence half — FORK-47, DESIGN.html §3.1.1) An unenumerable (unparseable)
+    /// index is inert: it changes no read or presence verdict anywhere — a sibling pack keeps
+    /// serving, and a hash never stored anywhere still classifies `Absent`, never `Err`. (The
+    /// `store_status`/heal-warning surfacing half of I4 is a later leg; not asserted here.)
+    ///
+    /// Fixture: pack A holds X; pack B's `.idx` magic is corrupted in place (both of B's files
+    /// stay present, but its index no longer parses).
+    ///
+    /// Revert: make the `Absent` gate poison on any `unenumerable` entry (e.g. return `Err` when
+    /// `loaded_packs()?.unenumerable` is non-empty, ahead of the `quarantine_reason` consult) →
+    /// the never-stored hash's classified read becomes `Err` instead of `Absent` → red.
+    #[test]
+    fn an_unenumerable_index_is_inert() {
+        use crate::util::file_utils::StoreReadOutcome;
+
+        let temp = std::env::temp_dir().join(format!("forklift-unenumerable-inert-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+        let folder = pack_folder();
+
+        let x_content = b"pack A's object, unrelated to B's corrupt index".to_vec();
+        let x_hash = blake3::hash(&x_content).to_hex().to_string();
+        let mut builder_a = TransportPackBuilder::new(&folder).unwrap();
+        builder_a.append_full(&x_hash, &x_content).unwrap();
+        builder_a.finish().unwrap();
+
+        let y_content = b"pack B's object, about to become unenumerable".to_vec();
+        let y_hash = blake3::hash(&y_content).to_hex().to_string();
+        let mut builder_b = TransportPackBuilder::new(&folder).unwrap();
+        builder_b.append_full(&y_hash, &y_content).unwrap();
+        let artifacts_b = builder_b.finish().unwrap();
+        assert_eq!(artifacts_b.len(), 1, "test fixture expects exactly one pack pair for B");
+
+        // Corrupt B's index magic in place — both files present, but the index no longer parses.
+        let mut index_bytes = std::fs::read(&artifacts_b[0].index_path).unwrap();
+        index_bytes[0..8].copy_from_slice(b"NOTAPACK");
+        std::fs::write(&artifacts_b[0].index_path, &index_bytes).unwrap();
+
+        // A sibling pack keeps serving.
+        match crate::util::file_utils::read_object_classified(&x_hash).unwrap() {
+            StoreReadOutcome::Verified(bytes) => assert_eq!(bytes, x_content),
+            StoreReadOutcome::Unverifiable(e) => panic!("expected X Verified, got Unverifiable: {}", e),
+            StoreReadOutcome::Absent => panic!("expected X Verified, got Absent"),
+        }
+
+        // A hash never stored anywhere still classifies `Absent`, not `Err` — the unenumerable
+        // index must never poison the gate.
+        let never_stored = "e".repeat(64);
+        match crate::util::file_utils::read_object_classified(&never_stored).unwrap() {
+            StoreReadOutcome::Absent => {}
+            StoreReadOutcome::Verified(_) => panic!("a never-stored hash must never classify Verified"),
+            StoreReadOutcome::Unverifiable(e) => panic!(
+                "a never-stored hash must classify Absent, not Unverifiable (an unenumerable index must not poison it): {}", e
+            ),
+        }
+
+        // The uncached load places B in `unenumerable`, not `quarantined`, and A still loads.
+        let loaded = load_packs_from_disk(&folder).expect("an unparseable index must not fail the whole load");
+        assert_eq!(loaded.packs.len(), 1, "only A's pair loaded cleanly");
+        assert!(loaded.quarantined.is_empty(), "B's index does not parse; it cannot be quarantined");
+        assert_eq!(loaded.unenumerable.len(), 1, "B's unparseable index must be recorded as unenumerable");
 
         std::fs::remove_dir_all(&temp).ok();
     }
