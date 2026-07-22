@@ -1755,7 +1755,19 @@ pub(crate) fn read_object_classified(hash: &str) -> Result<StoreReadOutcome, Str
             // retry the packs before concluding the object is gone (reload-on-miss).
             return match crate::util::pack_utils::retrieve_from_packs_reloading(hash) {
                 Ok(PackRetrieval::Verified(bytes)) => Ok(StoreReadOutcome::Verified(bytes)),
-                Ok(PackRetrieval::NotLocated) => Ok(StoreReadOutcome::Absent),
+                // The single `Absent`-production site (FORK-47, DESIGN.html §3.1.1): gated
+                // against the *enumerable* quarantine set only (`quarantine_reason`, a binary
+                // search over each quarantined index's resident bytes — no per-hash parse, no
+                // extra reload since the registry was just warmed above). A hash a quarantined
+                // (data-missing) index names is not "no surviving index names this hash," so it
+                // must read `Unverifiable` naming that index rather than a bare `Absent`
+                // indistinguishable from never-existed. An *unenumerable* (unparseable) index is
+                // never consulted here — its hash set is unknown, so it can only ever change what
+                // gets surfaced (a later leg), never this verdict (I4).
+                Ok(PackRetrieval::NotLocated) => match crate::util::pack_utils::quarantine_reason(hash)? {
+                    Some(reason) => Ok(StoreReadOutcome::Unverifiable(reason)),
+                    None => Ok(StoreReadOutcome::Absent),
+                },
                 Ok(PackRetrieval::Failed(e)) => Ok(StoreReadOutcome::Unverifiable(e)),
                 // The reload itself could not consult the store at all — an environment unknown,
                 // not a decisive verdict about this hash, so it must propagate as `Err` rather

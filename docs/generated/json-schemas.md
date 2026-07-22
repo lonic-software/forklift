@@ -3319,6 +3319,24 @@ A command not listed here either reports only the generic human-message shape `{
       ],
       "type": "object"
     },
+    "PackIndexIssue": {
+      "description": "One entry in [`StoreReport::quarantined_packs`]/[`StoreReport::unenumerable_indexes`].",
+      "properties": {
+        "error": {
+          "description": "Why it could not be fully trusted.",
+          "type": "string"
+        },
+        "index_path": {
+          "description": "The index file's path.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "index_path",
+        "error"
+      ],
+      "type": "object"
+    },
     "PackReport": {
       "description": "One pack's line in the census.",
       "properties": {
@@ -3408,11 +3426,25 @@ A command not listed here either reports only the generic human-message shape `{
       },
       "type": "array"
     },
+    "quarantined_packs": {
+      "description": "Pack indexes that parsed but whose data file could not be loaded (FORK-47) — their\nobjects are quarantined, not lost: `forklift heal` can still refetch them. Empty on a\nhealthy store.",
+      "items": {
+        "$ref": "#/$defs/PackIndexIssue"
+      },
+      "type": "array"
+    },
     "total_bytes": {
       "description": "Loose + packed bytes — the object store's on-disk footprint.",
       "format": "uint64",
       "minimum": 0,
       "type": "integer"
+    },
+    "unenumerable_indexes": {
+      "description": "Pack index files that could not even be parsed (FORK-47) — move the file aside and\nre-run. Empty on a healthy store.",
+      "items": {
+        "$ref": "#/$defs/PackIndexIssue"
+      },
+      "type": "array"
     }
   },
   "required": [
@@ -3425,7 +3457,9 @@ A command not listed here either reports only the generic human-message shape `{
     "total_bytes",
     "packs",
     "maintenance",
-    "densify_suggested"
+    "densify_suggested",
+    "quarantined_packs",
+    "unenumerable_indexes"
   ],
   "title": "StoreReport",
   "type": "object"
