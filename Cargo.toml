@@ -13,6 +13,13 @@ edition = "2021"
 repository = "https://github.com/lonic-software/forklift"
 license = "MIT OR Apache-2.0"
 
+# The standing guard against an unbounded decode of untrusted bytes (FORK-45): a bare
+# `zstd::stream::decode_all` anywhere in the workspace is a hard build failure unless the
+# call site carries its own `#[allow(clippy::disallowed_methods)]` with a trusted-bytes
+# justification (see clippy.toml for the disallowed path and its reason).
+[workspace.lints.clippy]
+disallowed_methods = "deny"
+
 [workspace.dependencies]
 forklift-core = { path = "crates/forklift-core" }
 axum = "0.8"

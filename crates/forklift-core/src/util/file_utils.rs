@@ -1712,6 +1712,10 @@ pub(crate) fn read_object_classified(hash: &str) -> Result<StoreReadOutcome, Str
         Err(error) => return Err(format!("Error while reading object from file \"{}\": {}", file_path, error)),
     };
 
+    // Trusted bytes: a loose file is self-written from hash-verified plaintext, never foreign
+    // compressed bytes, and the grandfathered-giant contract requires this read to stay
+    // unbounded so a pre-existing over-ceiling object stays readable.
+    #[allow(clippy::disallowed_methods)]
     let bytes = match zstd::stream::decode_all(compressed.as_slice()) {
         Ok(bytes) => bytes,
         Err(e) => return Ok(StoreReadOutcome::Unverifiable(format!("Error while decompressing object: {}", e))),
@@ -3361,9 +3365,14 @@ mod tests {
             "mutation check: beta's dentry must actually be rewritten, not just fsynced");
 
         let restaged_alpha = std::fs::read(&alpha).unwrap();
-        assert_eq!(zstd::stream::decode_all(restaged_alpha.as_slice()).unwrap(), alpha_content);
+        // Trusted bytes: this test's own fixture content, read back to check the restage.
+        #[allow(clippy::disallowed_methods)]
+        let alpha_decoded = zstd::stream::decode_all(restaged_alpha.as_slice()).unwrap();
+        assert_eq!(alpha_decoded, alpha_content);
         let restaged_beta = std::fs::read(&beta).unwrap();
-        assert_eq!(zstd::stream::decode_all(restaged_beta.as_slice()).unwrap(), beta_content);
+        #[allow(clippy::disallowed_methods)]
+        let beta_decoded = zstd::stream::decode_all(restaged_beta.as_slice()).unwrap();
+        assert_eq!(beta_decoded, beta_content);
 
         assert!(taint_utils::read_taints(&forklift).unwrap().recorded.is_empty(),
             "the taint files must be gone once every recorded path healed");

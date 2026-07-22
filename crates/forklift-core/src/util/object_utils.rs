@@ -41,6 +41,46 @@ pub const STREAM_STORE_THRESHOLD_BYTES: usize = chunk_utils::MAX_CHUNK_BYTES;
 const _: () = assert!(MAX_OBJECT_BYTES > chunk_utils::CHUNK_THRESHOLD_BYTES);
 const _: () = assert!(MAX_OBJECT_BYTES > chunk_utils::MAX_CHUNK_BYTES);
 
+/// Why a bounded zstd decode of untrusted bytes failed.
+#[derive(Debug)]
+pub(crate) enum BoundedDecodeError {
+    /// Not a decodable zstd stream (corrupt, truncated, or not zstd).
+    Malformed(String),
+    /// Decoding produced a byte past `MAX_OBJECT_BYTES` — a bomb, or a grandfathered
+    /// over-ceiling object; indistinguishable without finishing the decode, which is
+    /// exactly what this refusal exists to avoid.
+    OverCeiling,
+}
+
+/// Decode a whole zstd frame from untrusted bytes, refusing to *produce* more than
+/// `MAX_OBJECT_BYTES` bytes. Store-wide policy for the sites that decode bytes the code has no
+/// reason to trust yet (unlike a loose file's own decode, which is safe-as-written because it
+/// only ever reads back what this store itself wrote).
+///
+/// Takes `impl Read` rather than `&[u8]`: a slice still implements `Read` at no cost to callers,
+/// and it is what makes the streaming property testable — a throttled, counting `Read` wrapper
+/// can prove the decoder stopped pulling input before the frame ended, instead of decoding it
+/// whole and checking the output length after the fact.
+///
+/// Read one byte past the declared ceiling: producing it is what proves the frame is over. A
+/// bare `take(MAX_OBJECT_BYTES)` cannot tell "decoded to exactly the ceiling" (legal) apart from
+/// "silently truncated at the ceiling" (an over-ceiling frame returned as plausible bytes).
+pub(crate) fn decode_object_bounded(compressed: impl Read) -> Result<Vec<u8>, BoundedDecodeError> {
+    let mut decoder = zstd::stream::read::Decoder::new(compressed)
+        .map_err(|e| BoundedDecodeError::Malformed(e.to_string()))?;
+    let mut bytes = Vec::new();
+    decoder.by_ref()
+        .take(MAX_OBJECT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| BoundedDecodeError::Malformed(e.to_string()))?;
+
+    if bytes.len() > MAX_OBJECT_BYTES {
+        return Err(BoundedDecodeError::OverCeiling);
+    }
+
+    Ok(bytes)
+}
+
 /// Push a new line character to the content.
 ///
 /// # Arguments
@@ -1642,5 +1682,80 @@ mod tests {
             }
         }
         count
+    }
+
+    /// A `Read` wrapper that hands out at most one byte per call and counts how many it has
+    /// handed out — the deterministic proof a decode stopped pulling input before the compressed
+    /// frame ended, without any fault hook.
+    ///
+    /// One byte at a time defeats `BufReader`'s normal behaviour of filling its whole internal
+    /// buffer (tens of KiB) from a single underlying read whenever that much is available: a
+    /// bomb frame's *compressed* representation is tiny (a genuine bomb is small on disk), so a
+    /// single eager fill would slurp the entire frame before decode output ever reaches the
+    /// ceiling, making "bytes consumed" trivially equal "frame length" regardless of whether the
+    /// decode is bounded. Throttling to one byte per call keeps input consumption in lockstep
+    /// with decode progress, so under-consumption reflects the decoder's real behaviour.
+    struct OneByteAtATime<'a> {
+        remaining: &'a [u8],
+        consumed: usize,
+    }
+
+    impl<'a> Read for OneByteAtATime<'a> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.remaining.is_empty() || buf.is_empty() {
+                return Ok(0);
+            }
+            buf[0] = self.remaining[0];
+            self.remaining = &self.remaining[1..];
+            self.consumed += 1;
+            Ok(1)
+        }
+    }
+
+    /// A zstd frame that decodes to exactly `len` zero bytes. Zeros RLE-compress to a few dozen
+    /// bytes regardless of `len`, so a fixture many times the ceiling stays cheap to build.
+    fn zstd_frame_of_zeros(len: u64) -> Vec<u8> {
+        zstd::stream::encode_all(std::io::repeat(0u8).take(len), 0)
+            .expect("encoding a repeat-byte source never fails")
+    }
+
+    #[test]
+    fn decode_object_bounded_stops_reading_a_bomb_before_the_frame_ends() {
+        // INV-1 (streaming cap, the central spike): a small frame that *would* decode to 4x the
+        // ceiling must be refused without the decoder ever consuming the whole compressed frame —
+        // that under-consumption is the deterministic proof the decode is bounded, not just its
+        // output.
+        let frame = zstd_frame_of_zeros(4 * MAX_OBJECT_BYTES as u64);
+        let mut throttled = OneByteAtATime { remaining: &frame, consumed: 0 };
+
+        let result = decode_object_bounded(&mut throttled);
+
+        assert!(matches!(result, Err(BoundedDecodeError::OverCeiling)),
+            "a bomb frame must be refused as over-ceiling");
+        assert!(throttled.consumed < frame.len(),
+            "the decoder must stop pulling input before the frame is fully consumed \
+            (consumed {} of {} bytes)", throttled.consumed, frame.len());
+    }
+
+    #[test]
+    fn decode_object_bounded_accepts_exactly_the_ceiling() {
+        // INV-2: the ceiling itself is legal — this is not an off-by-one refusal.
+        let frame = zstd_frame_of_zeros(MAX_OBJECT_BYTES as u64);
+
+        let bytes = decode_object_bounded(frame.as_slice()).expect("exactly-at-ceiling is Ok");
+
+        assert_eq!(bytes.len(), MAX_OBJECT_BYTES);
+    }
+
+    #[test]
+    fn decode_object_bounded_refuses_one_byte_over_the_ceiling() {
+        // INV-3 (the `+1` clause): one byte over must be refused outright, never silently
+        // truncated down to a plausible-looking Ok at the ceiling.
+        let frame = zstd_frame_of_zeros(MAX_OBJECT_BYTES as u64 + 1);
+
+        let result = decode_object_bounded(frame.as_slice());
+
+        assert!(matches!(result, Err(BoundedDecodeError::OverCeiling)),
+            "a frame one byte over the ceiling must be refused, not truncated to Ok");
     }
 }

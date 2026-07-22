@@ -532,6 +532,12 @@ A command not listed here either reports only the generic human-message shape `{
       "minimum": 0,
       "type": "integer"
     },
+    "over_ceiling_skipped": {
+      "description": "Loose objects skipped because decoding them would exceed the 64 MiB object ceiling —\nlegitimate objects authored before that ceiling existed, not corruption; left in place\nrather than packed or removed.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
     "packs_written": {
       "description": "Packs written (more than one when the set crossed a rollover threshold).",
       "format": "uint",
@@ -546,7 +552,8 @@ A command not listed here either reports only the generic human-message shape `{
     "loose_removed",
     "deltas",
     "bytes_packed",
-    "corrupt_skipped"
+    "corrupt_skipped",
+    "over_ceiling_skipped"
   ],
   "title": "Compacted",
   "type": "object"
