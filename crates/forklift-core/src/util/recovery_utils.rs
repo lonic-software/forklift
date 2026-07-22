@@ -316,8 +316,18 @@ impl HealOutcome {
 pub async fn run(progress: Option<&dyn Fn(&str)>) -> Result<HealOutcome, CoreError> {
     let root = forklift_root();
 
-    // Computed once, here, ahead of everything else — see this function's own doc comment.
-    let pack_warnings = pack_health_warning_lines().map_err(|e| read_failure_refusal(&root, &e))?;
+    // Computed once, here, ahead of everything else — see this function's own doc comment. An
+    // advisory step must degrade, never block, the recovery verb it decorates (code review
+    // finding 3): a transient failure reading the pack folder (e.g. a `read_dir` error that is
+    // not simply "no packs yet" — see `load_packs_from_disk`) must not refuse the whole heal run
+    // before it has even looked at the taint. Falls back to a single honest line instead, exactly
+    // the same "could not be checked this run" spirit `resolve_the_rest`'s own per-candidate
+    // sibling-independence already applies (PR #74) — an unknown is reported, never silently
+    // dropped, but never lets one advisory read block the recovery this function exists to run.
+    let pack_warnings = match pack_health_warning_lines() {
+        Ok(lines) => lines,
+        Err(e) => vec![format!("pack health could not be determined this run: {}", e)],
+    };
 
     match run_pass(&root, progress).await {
         Ok(mut outcome) => {
@@ -4623,6 +4633,57 @@ mod tests {
         assert!(message.contains("unrelated to this refusal"),
             "the pack-health warning must be in a clearly-separated section, never read as the \
             refusal's own cause: {}", message);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// (Code review finding 3) Pack-health gathering is advisory, decorating the recovery verb —
+    /// it must never itself block that verb: a transient failure reading the pack folder must
+    /// degrade to an honest fallback line, not refuse the whole heal run before it has even looked
+    /// at the taint.
+    ///
+    /// Fixture (portable, no fault hooks): the pack-folder path is a **regular file** instead of a
+    /// directory, so `std::fs::read_dir` fails with a real, non-`NotFound` error on every
+    /// platform — `load_packs_from_disk` cannot treat "not a directory" as "no packs yet". An
+    /// ordinary, present, ref-shaped taint (never itself touches the pack registry to restage)
+    /// gives heal real work to do independent of the broken pack folder.
+    ///
+    /// Revert: restore `pack_health_warning_lines().map_err(|e| read_failure_refusal(&root, &e))?`
+    /// in `run` (drop the degrade-to-fallback-line match) → heal refuses at entry, before ever
+    /// reading the taint → the "returns an outcome" assertion goes red.
+    #[test]
+    fn a_pack_folder_read_failure_degrades_heal_instead_of_refusing_it() {
+        use crate::globals::StorageRootScope;
+
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        let root = std::env::temp_dir()
+            .join(format!("forklift-recovery-utils-pack-folder-read-failure-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let _scope = StorageRootScope::enter(&root);
+        let forklift = forklift_root();
+
+        // The pack folder path is a regular file, not a directory — `read_dir` on it fails with a
+        // real error (never `NotFound`, so `load_packs_from_disk` cannot treat it as "no packs").
+        let pack_folder = pack_utils::pack_folder();
+        std::fs::create_dir_all(pack_folder.parent().unwrap()).unwrap();
+        std::fs::write(&pack_folder, b"not a directory").unwrap();
+
+        // An ordinary, present, ref-shaped taint — `restage_object` never queries the pack
+        // registry for a non-content-addressed path — so heal has real work to do, independent
+        // of the broken pack folder.
+        pallet_utils::set_pallet_head("main", &"0".repeat(64)).unwrap();
+        plant_complete_taint(&forklift, &["pallets/main"]);
+
+        let outcome = run_heal().expect(
+            "a broken pack folder is advisory-only; it must never refuse the recovery verb itself"
+        );
+        assert!(
+            outcome.notes.iter().any(|note| note.contains("pack health could not be determined this run")),
+            "the degrade fallback line must be reported, not silently dropped: {:?}", outcome.notes
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }

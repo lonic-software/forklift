@@ -4886,6 +4886,12 @@ mod tests {
     /// `PackRetrieval::NotLocated` arm reverts to unconditional `Ok(StoreReadOutcome::Absent)`) →
     /// Y classifies `Absent`, whose ordinary-read message is the generic NotFound wording — the
     /// name assertions go red (an `Absent`-derived message never names an index file).
+    ///
+    /// Also pins the negative half (code review finding 1): a hash the quarantined index does
+    /// *not* name must still classify `Absent`, not `Unverifiable` — `QuarantinedPack::contains`'s
+    /// binary search must never over-match. Mutation: hardwire `QuarantinedPack::contains` to
+    /// return `true` unconditionally → this half goes red (the never-stored hash below wrongly
+    /// classifies `Unverifiable` too).
     #[test]
     fn a_hash_named_only_by_a_quarantined_index_is_unverifiable_and_names_the_index() {
         use crate::util::file_utils::StoreReadOutcome;
@@ -4922,6 +4928,19 @@ mod tests {
             error.contains(&index_name),
             "expected the ordinary read's error to name \"{}\", got: {}", index_name, error
         );
+
+        // Negative membership (code review finding 1): a hash the quarantined index does NOT
+        // name must still classify `Absent` — a `QuarantinedPack::contains` over-match would
+        // wrongly turn every never-stored hash `Unverifiable` too.
+        let never_stored_hash = "9".repeat(64);
+        match crate::util::file_utils::read_object_classified(&never_stored_hash).unwrap() {
+            StoreReadOutcome::Absent => {}
+            StoreReadOutcome::Unverifiable(message) => panic!(
+                "a hash the quarantined index does not name must classify Absent, not \
+                Unverifiable (QuarantinedPack::contains over-matched): {}", message
+            ),
+            StoreReadOutcome::Verified(_) => panic!("a never-stored hash must never classify Verified"),
+        }
 
         std::fs::remove_dir_all(&temp).ok();
     }
