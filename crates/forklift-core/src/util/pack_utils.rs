@@ -210,6 +210,19 @@ pub struct PackSummary {
     pub bytes: u64,
 }
 
+/// One quarantined or unenumerable pack index in a [`StoreStatus`] census (FORK-47,
+/// DESIGN.html §3.1.1) — an operator-facing pairing of the index file's path and why the loader
+/// could not fully trust it. Shared shape for both `StoreStatus::quarantined_packs` (index parsed;
+/// its data file did not load — `error` is `load_pack_pair`'s failure) and
+/// `StoreStatus::unenumerable_indexes` (the index itself did not parse — `error` is
+/// `parse_index_header`'s failure); which list an entry is in is what tells the two apart.
+pub struct PackIndexProblem {
+    /// The index file's on-disk path.
+    pub index_path: String,
+    /// Why this index could not be fully trusted.
+    pub error: String,
+}
+
 /// A read-only snapshot of the object store's health, produced by [`store_status`]. Every
 /// count is exact — a full scan, unlike the sampled estimate the background auto-maintenance
 /// trigger ([`auto_compaction_action`]) uses to decide cheaply.
@@ -240,6 +253,15 @@ pub struct StoreStatus {
     /// native bundle install) and has not since been through a `compact --all --redelta` pass —
     /// see `mark_densify_pending`. A suggestion only; nothing ever acts on it automatically.
     pub densify_pending: bool,
+    /// Pack indexes that parsed but whose paired data file could not be loaded (FORK-47,
+    /// DESIGN.html §3.1.1) — the objects they name are quarantined, not lost: a read for one of
+    /// them classifies an honest `Unverifiable` naming this index (never a bare `Absent`), and
+    /// `forklift heal` can still refetch them from a configured remote. Empty on a healthy store.
+    pub quarantined_packs: Vec<PackIndexProblem>,
+    /// Pack index files that could not even be parsed (FORK-47, DESIGN.html §3.1.1) — their hash
+    /// set is unknown, so they are inert (never gate a read verdict) but worth fixing: move the
+    /// file aside and re-run. Empty on a healthy store.
+    pub unenumerable_indexes: Vec<PackIndexProblem>,
 }
 
 /// Take an exact, read-only census of the object store: how many objects are loose vs packed,
@@ -259,12 +281,13 @@ pub fn store_status() -> Result<StoreStatus, String> {
 
     // Packs: reuse the reader (mmaps each data file, holds each index resident). Per pack we
     // report its object count (the index), its delta count (the framed record kinds), and its
-    // on-disk size (data file + index file, both already sized once loaded).
-    // Leg 1 (FORK-47) plumbs `PackSet`'s registry-independent load here so `store_status` no
-    // longer fails on a single orphaned pack pair, but does not yet surface `quarantined`/
-    // `unenumerable` in the census — that is a later leg (DESIGN.html §3.1.1).
+    // on-disk size (data file + index file, both already sized once loaded). `PackSet`'s
+    // registry-independent load means a single orphaned or unparseable pack pair never fails this
+    // census (FORK-47, DESIGN.html §3.1.1) — both problem lists are surfaced below instead.
+    let PackSet { packs: loaded, quarantined, unenumerable } = load_packs_from_disk(&pack_folder())?;
+
     let mut packs = Vec::new();
-    for pack in load_packs_from_disk(&pack_folder())?.packs {
+    for pack in loaded {
         let framed = pack.version >= FIRST_FRAMED_VERSION;
         let mut deltas = 0;
 
@@ -303,6 +326,15 @@ pub fn store_status() -> Result<StoreStatus, String> {
     let incremental_due = loose_objects > loose_threshold;
     let repack_due = packs.len() > pack_threshold;
 
+    let quarantined_packs = quarantined.into_iter().map(|q| PackIndexProblem {
+        index_path: q.index_path.to_string_lossy().into_owned(),
+        error: q.error,
+    }).collect();
+    let unenumerable_indexes = unenumerable.into_iter().map(|(index_path, error)| PackIndexProblem {
+        index_path: index_path.to_string_lossy().into_owned(),
+        error,
+    }).collect();
+
     Ok(StoreStatus {
         loose_objects,
         loose_bytes,
@@ -316,6 +348,8 @@ pub fn store_status() -> Result<StoreStatus, String> {
         incremental_due,
         repack_due,
         densify_pending: densify_pending()?,
+        quarantined_packs,
+        unenumerable_indexes,
     })
 }
 
@@ -601,6 +635,40 @@ pub(crate) fn quarantine_reason(hash: &str) -> Result<Option<String>, String> {
     }
 
     Ok(None)
+}
+
+/// [`pack_health_snapshot`]'s result: every quarantined index's `(path, load error)` and every
+/// unenumerable index's `(path, parse error)`, as of one uncached load.
+pub(crate) struct PackHealthSnapshot {
+    pub quarantined: Vec<(PathBuf, String)>,
+    pub unenumerable: Vec<(PathBuf, String)>,
+}
+
+/// A point-in-time snapshot of the pack registry's two problem lists (FORK-47, DESIGN.html
+/// §3.1.1), loaded **uncached** — `load_packs_from_disk` directly, exactly the pattern
+/// [`store_status`] uses, reading nothing from and writing nothing to the shared registry
+/// [`loaded_packs`] caches. A report path (this one, and `store_status`) must never
+/// `invalidate_cache()` or otherwise perturb a live registry a concurrent read depends on; the
+/// residual staleness window — an index rotting between this call and whatever later reads it —
+/// is irreducible (the same window every other snapshot-then-act sequence in this crate has) and
+/// advisory-only: it can change a warning line, never a read verdict, since a verdict is decided
+/// fresh, per hash, by the read path itself at the moment it runs.
+///
+/// `forklift heal`'s recovery pass ([`crate::util::recovery_utils::run`]) calls this once at
+/// entry so a quarantined or unenumerable index is warned about on every run, independent of
+/// what (if anything) is actually tainted.
+///
+/// # Returns
+/// * `Ok(PackHealthSnapshot)` - The quarantined and unenumerable lists as of this call.
+/// * `Err(String)`            - The pack folder itself could not be enumerated (an environment
+///                              failure — see [`load_packs_from_disk`]).
+pub(crate) fn pack_health_snapshot() -> Result<PackHealthSnapshot, String> {
+    let PackSet { quarantined, unenumerable, .. } = load_packs_from_disk(&pack_folder())?;
+
+    Ok(PackHealthSnapshot {
+        quarantined: quarantined.into_iter().map(|q| (q.index_path, q.error)).collect(),
+        unenumerable,
+    })
 }
 
 /// Forget the cached packs for the active warehouse, so the next read reloads them from

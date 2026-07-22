@@ -267,8 +267,11 @@ pub struct HealOutcome {
     /// or (for a shard) a staging concern that carries no object-trust risk at all.
     pub resolved: Vec<String>,
     /// Advisory notes that never block clearing: the "re-run the load" remedy note for each
-    /// vanished inventory shard, and a note for each bay whose local state could not be read this
-    /// run (see `collect_walk_roots`'s `Tolerate` policy) naming the bay and how to clean it up.
+    /// vanished inventory shard, a note for each bay whose local state could not be read this run
+    /// (see `collect_walk_roots`'s `Tolerate` policy) naming the bay and how to clean it up, and
+    /// (FORK-47, DESIGN.html §3.1.1) one line per quarantined or unenumerable pack index this run
+    /// found — emitted unconditionally, whether or not this run's own taint touches it (see
+    /// [`run`]'s own doc comment).
     pub notes: Vec<String>,
 }
 
@@ -289,6 +292,19 @@ impl HealOutcome {
 /// macro, which is itself silent under `--json`. `None` is a legitimate, silent caller (every
 /// existing test, and any future caller that does not want status chatter).
 ///
+/// **Pack health surfacing (FORK-47, DESIGN.html §3.1.1).** Before anything else, this reads an
+/// uncached snapshot of the pack registry's quarantined/unenumerable indexes
+/// ([`pack_utils::pack_health_snapshot`]) and turns it into warning lines
+/// ([`pack_health_warning_lines`]) — computed exactly once per call, then folded into whichever
+/// `HealOutcome::notes` this run ends up producing (every `Ok` branch below and inside
+/// [`resolve_the_rest`]/[`rescan_torn_taint`]). This is unconditional: it does not matter whether
+/// anything is tainted this run, which candidates (if any) get walked, or whether any of them
+/// happens to name a hash the broken index also names — an operator with a quarantined or
+/// unenumerable pack index learns about it on every clean `forklift heal` run, not only when it
+/// happens to intersect that run's own taint. (An `Err` refusal path does not carry these notes —
+/// consistent with every other advisory note this module already produces, none of which survive
+/// into a refusal message either; the next successful run still reports them.)
+///
 /// # Returns
 /// * `Ok(HealOutcome)` - Nothing was tainted, or the taint is now **fully** cleared (every
 ///                       recorded path reached restaged, or vanished-and-unreferenced/a resolved
@@ -299,6 +315,10 @@ impl HealOutcome {
 ///                       never nothing) and the gate is left standing.
 pub async fn run(progress: Option<&dyn Fn(&str)>) -> Result<HealOutcome, CoreError> {
     let root = forklift_root();
+
+    // Computed once, here, ahead of everything else — see this function's own doc comment.
+    let pack_warnings = pack_health_warning_lines().map_err(|e| read_failure_refusal(&root, &e))?;
+
     let state = taint_utils::read_taints(&root).map_err(|e| read_failure_refusal(&root, &e))?;
 
     // §8.3 (I5): a torn taint's own recorded set is an untrusted lower bound, so it is never
@@ -307,7 +327,7 @@ pub async fn run(progress: Option<&dyn Fn(&str)>) -> Result<HealOutcome, CoreErr
     // (`heal_utils::heal_if_tainted`) is completely unaffected by this — it still refuses torn
     // immediately, lock-free; only this locked verb rescans.
     if state.torn {
-        return rescan_torn_taint(&root, &state.files, progress);
+        return rescan_torn_taint(&root, &state.files, progress, &pack_warnings);
     }
     if state.recorded.is_empty() {
         // Companion fix (DESIGN.html §3.1.1): "nothing recorded" says nothing about the gate — a
@@ -319,7 +339,7 @@ pub async fn run(progress: Option<&dyn Fn(&str)>) -> Result<HealOutcome, CoreErr
         // gate sync.
         taint_utils::resolve_taints(&root, &BTreeSet::new(), &[])
             .map_err(|e| sync_failure_refusal(&root, &e))?;
-        return Ok(HealOutcome::nothing());
+        return Ok(HealOutcome { notes: pack_warnings, ..HealOutcome::nothing() });
     }
 
     let attempt = heal_utils::attempt_restage_all(&root, &state.recorded);
@@ -333,7 +353,7 @@ pub async fn run(progress: Option<&dyn Fn(&str)>) -> Result<HealOutcome, CoreErr
             // I4: a pack-recovered path was never rewritten — it belongs in `resolved`, exactly
             // like a vanished-and-unreferenced hash, not in `restaged`.
             resolved: display_paths(attempt.recovered_packed.iter()),
-            notes: Vec::new(),
+            notes: pack_warnings,
         });
     }
 
@@ -346,7 +366,35 @@ pub async fn run(progress: Option<&dyn Fn(&str)>) -> Result<HealOutcome, CoreErr
         heal_utils::sync_restaged_parents(&parents).map_err(|e| sync_failure_refusal(&root, &e))?;
     }
 
-    resolve_the_rest(&root, &state.recorded, &attempt, &state.files).await
+    resolve_the_rest(&root, &state.recorded, &attempt, &state.files, &pack_warnings).await
+}
+
+/// Load an uncached snapshot of the pack registry's quarantined/unenumerable indexes
+/// ([`pack_utils::pack_health_snapshot`]) and render it into the warning lines [`run`] folds into
+/// `HealOutcome::notes`. Wording mirrors `quarantine_reason`'s own for the quarantined case (names
+/// the index and its data-load error); the unenumerable case is worded as its own remedy, since
+/// there is nothing to refetch — only the file itself to move aside.
+fn pack_health_warning_lines() -> Result<Vec<String>, String> {
+    let snapshot = pack_utils::pack_health_snapshot()?;
+    let mut lines = Vec::with_capacity(snapshot.quarantined.len() + snapshot.unenumerable.len());
+
+    for (index_path, error) in &snapshot.quarantined {
+        lines.push(format!(
+            "pack index \"{}\" could not be loaded ({}); the objects it names are quarantined — \
+            \"forklift heal\" can refetch them from a configured remote, and they will be reported \
+            dangling if they are still referenced and none is configured",
+            index_path.to_string_lossy(), error
+        ));
+    }
+    for (index_path, error) in &snapshot.unenumerable {
+        lines.push(format!(
+            "pack index \"{}\" could not be parsed ({}); objects it may have named cannot be \
+            distinguished from vanished ones — move the file aside and re-run",
+            index_path.to_string_lossy(), error
+        ));
+    }
+
+    Ok(lines)
 }
 
 /// The deeper analysis: classify every path [`heal_utils::attempt_restage_all`] could not
@@ -359,11 +407,15 @@ pub async fn run(progress: Option<&dyn Fn(&str)>) -> Result<HealOutcome, CoreErr
 /// began. It is threaded straight through to [`taint_utils::resolve_taints`] so the eventual
 /// rewrite deletes exactly the files that predate this call, never whatever the taint directory
 /// holds by the time the walk finally finishes — see that function's doc comment.
+///
+/// `pack_warnings` is [`run`]'s own pre-computed pack-health lines, folded verbatim into the
+/// success outcome's `notes` — see [`run`]'s own doc comment for why this is unconditional.
 async fn resolve_the_rest(
     root: &Path,
     recorded: &BTreeSet<PathBuf>,
     attempt: &heal_utils::RestageAttempt,
     taint_files: &[PathBuf],
+    pack_warnings: &[String],
 ) -> Result<HealOutcome, CoreError> {
     let mut remainder: BTreeSet<PathBuf> = BTreeSet::new();
     let mut dangling_lines: Vec<String> = Vec::new();
@@ -706,6 +758,7 @@ async fn resolve_the_rest(
         .map_err(|e| sync_failure_refusal(root, &e))?;
 
     if remainder.is_empty() {
+        notes.extend(pack_warnings.iter().cloned());
         Ok(HealOutcome {
             was_tainted: true,
             restaged: display_paths(attempt.restaged.iter()),
@@ -758,6 +811,7 @@ fn rescan_torn_taint(
     root: &Path,
     old_files: &[PathBuf],
     progress: Option<&dyn Fn(&str)>,
+    pack_warnings: &[String],
 ) -> Result<HealOutcome, CoreError> {
     let report = |line: String| { if let Some(f) = progress { f(&line); } };
 
@@ -897,12 +951,13 @@ fn rescan_torn_taint(
         // `walk.degraded_bays` is guaranteed empty by this point — the guard above already
         // returned early otherwise — so there is no degraded-bay note left to fold in here; a
         // rescan can only reach this `Ok` branch once every bay's state was actually readable.
-        let notes = vec![format!(
+        let mut notes = vec![format!(
             "a torn taint was resolved by a full store-wide rescan: {} loose object(s), {} \
             pack file(s), and {} inventory shard file(s) were candidates, of which {} were \
             (re)restaged; individual paths are not listed here to keep this report readable",
             loose_count, packs_count, shards_count, restaged.len(),
         )];
+        notes.extend(pack_warnings.iter().cloned());
 
         Ok(HealOutcome {
             was_tainted: true,
@@ -3561,7 +3616,7 @@ mod tests {
 
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let outcome = runtime
-            .block_on(resolve_the_rest(&forklift, &state.recorded, &attempt, &state.files))
+            .block_on(resolve_the_rest(&forklift, &state.recorded, &attempt, &state.files, &[]))
             .expect("H must be recovered — its verified loose copy is a genuine, servable \
                 substitute for its broken pack record");
 
@@ -3642,7 +3697,7 @@ mod tests {
 
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let error = runtime
-            .block_on(resolve_the_rest(&forklift, &state.recorded, &attempt, &state.files))
+            .block_on(resolve_the_rest(&forklift, &state.recorded, &attempt, &state.files, &[]))
             .expect_err("B's own read error must still leave it unrecovered");
 
         // The refusal must name B specifically, by the per-candidate wording this fix introduces —
@@ -3740,7 +3795,7 @@ mod tests {
 
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let error = runtime
-            .block_on(resolve_the_rest(&forklift, &state.recorded, &attempt, &state.files))
+            .block_on(resolve_the_rest(&forklift, &state.recorded, &attempt, &state.files, &[]))
             .expect_err("C's own read error must still leave it unrecovered");
 
         // The refusal must name C specifically, by the per-candidate wording this fix
@@ -4221,6 +4276,225 @@ mod tests {
             "tried to check the configured remote automatically but could not complete that check"
         ), "a broken remote config must be reported as consulted-but-failed, not silently \
             misclassified as unconfigured: {}", message);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ---- FORK-47 leg 2: pack-health surfacing + heal liveness (I4 surfacing half, I7) ----
+
+    /// (I4, surfacing half — DESIGN.html §3.1.1) An unenumerable (unparseable) pack index is not
+    /// only inert (leg 1's `pack_utils::tests::an_unenumerable_index_is_inert` pins that half) but
+    /// **surfaced**, unconditionally: `store` lists it with its parse error, and every clean
+    /// `forklift heal` run warns about it in `HealOutcome::notes` — even one whose own taint has
+    /// nothing to do with it (an ordinary, resolvable pallet-ref taint here).
+    ///
+    /// Reverts:
+    /// - Drop the `pack_health_snapshot`/`quarantine_reason` reads from `store_status` (route it
+    ///   back through `load_packs_from_disk(&pack_folder())?.packs` alone) → the
+    ///   `unenumerable_indexes` assertion goes red.
+    /// - Drop the `pack_health_warning_lines` call (or stop folding `pack_warnings` into the
+    ///   `attempt.all_clean()` branch's `notes`) → the heal-notes assertion goes red.
+    #[test]
+    fn an_unenumerable_pack_index_is_surfaced_by_store_status_and_every_heal_run() {
+        use crate::globals::StorageRootScope;
+
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        let root = std::env::temp_dir()
+            .join(format!("forklift-recovery-utils-unenumerable-surfacing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let _scope = StorageRootScope::enter(&root);
+        let forklift = forklift_root();
+
+        // A stray, unparseable index: no corresponding `.pack`, garbage where the magic belongs.
+        let pack_folder = pack_utils::pack_folder();
+        std::fs::create_dir_all(&pack_folder).unwrap();
+        let stray_index = pack_folder.join("stray-corrupt.idx");
+        std::fs::write(&stray_index, b"not a pack index, just garbage bytes").unwrap();
+        let stray_name = stray_index.file_name().unwrap().to_str().unwrap().to_string();
+
+        assert!(pack_utils::store_status().unwrap().unenumerable_indexes
+            .iter().any(|issue| issue.index_path.contains(&stray_name)),
+            "sanity: store_status must list the stray index as unenumerable before heal ever runs");
+
+        // An ordinary, unrelated, cleanly-resolvable taint (mirrors
+        // `heal_restaging_a_tainted_pallet_ref_never_reverts_a_later_legitimate_head_move`'s
+        // fixture) — present and readable, so `attempt.all_clean()` is true and `run` never even
+        // reaches the closure walk. The pack-health warning must still appear.
+        pallet_utils::set_pallet_head("main", &"0".repeat(64)).unwrap();
+        plant_complete_taint(&forklift, &["pallets/main"]);
+
+        let outcome = run_heal().expect("an ordinary, present, readable taint must clear cleanly");
+        assert!(outcome.notes.iter().any(|note| note.contains(&stray_name)),
+            "a clean heal run must still warn about the unrelated unenumerable index by name: {:?}",
+            outcome.notes);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **T7a** (I7) An orphaned pack pair no longer wedges the whole heal run: a sibling taint
+    /// (an intact, present loose-shaped path) still resolves cleanly, and the orphaned pack's own
+    /// hash is reported dangling with the quarantine wording naming its surviving index — never
+    /// the generic "could not be checked this run" the pre-leg-1 whole-registry-load failure
+    /// produced.
+    ///
+    /// Fixture: pack B holds Y (referenced from a real pallet head's tree, so it does not simply
+    /// resolve as unreferenced); the taint records B's `.pack` path *and* a genuinely present loose
+    /// object H's path. B's `.pack` is deleted (its `.idx` survives) — before anything in this
+    /// fixture ever touches the pack registry, so the very first load already sees the orphan (an
+    /// already-cached, already-mmap'd pack keeps serving through `remove_file` on POSIX; see the
+    /// sanity assertion below).
+    ///
+    /// Revert (leg 1's I1 quarantine fallback — restore the bare `?` on `load_pack_pair` in
+    /// `pack_utils::load_packs_from_disk`): the pack registry load itself now fails outright, so
+    /// `read_object_classified(Y)` returns `Err` (H is unaffected — a content-addressed path
+    /// restages directly, without ever consulting the registry) and Y's dangling line degrades to
+    /// "could not be checked this run" instead of naming the quarantined index → red.
+    #[test]
+    fn heal_resolves_siblings_and_names_the_orphan_instead_of_wedging() {
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+        use crate::globals::StorageRootScope;
+        use crate::model::blob::Blob;
+        use crate::model::parcel::Parcel;
+        use crate::model::tree_item::TreeItem;
+        use crate::util::pack_utils::TransportPackBuilder;
+
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        let root = std::env::temp_dir()
+            .join(format!("forklift-recovery-utils-t7a-orphan-sibling-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let _scope = StorageRootScope::enter(&root);
+        let forklift = forklift_root();
+
+        // Pack B holds Y — a lone full record in its own pack pair. Orphaned *immediately*,
+        // before anything below ever calls `does_object_exist`/`is_in_packs`: that call is the
+        // pack registry's first load in this fresh scratch root, and (on POSIX) an already-mmap'd
+        // pack keeps serving through a still-live cache entry even after its file is unlinked —
+        // see `pack_utils::compact`'s own "release the source packs' mmaps" comment. The orphan
+        // must exist before the *first* load, exactly like leg 1's own quarantine fixtures, or the
+        // cached registry never sees it and this test would silently exercise the wrong path.
+        let y_content = b"Y, B's only object, about to be orphaned".to_vec();
+        let y_hash = blake3::hash(&y_content).to_hex().to_string();
+        let mut builder = TransportPackBuilder::new(&pack_utils::pack_folder()).unwrap();
+        builder.append_full(&y_hash, &y_content).unwrap();
+        let artifacts = builder.finish().unwrap();
+        assert_eq!(artifacts.len(), 1, "test fixture expects exactly one pack pair for B");
+        let b_data_relative = artifacts[0].data_path.strip_prefix(&forklift).unwrap().to_path_buf();
+        let b_index_name = artifacts[0].index_path.file_name().unwrap().to_str().unwrap().to_string();
+        std::fs::remove_file(&artifacts[0].data_path).unwrap();
+
+        assert!(!pack_utils::is_in_packs(&y_hash).unwrap(),
+            "sanity: the very first registry load must already see B as quarantined, not loaded");
+
+        // Y is referenced from a real pallet head's tree — the "still referenced" shape that makes
+        // it land in the dangling remainder rather than clear as unreferenced.
+        let mut root_tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        root_tree.add_child(TreeItem::new("y.bin".to_string(), y_hash.clone(), DirEntryType::Normal));
+        let mut tree_object = LooseObjectBuilder::build_tree(&root_tree);
+        tree_object.store().unwrap();
+        let parcel = Parcel {
+            tree_hash: tree_object.hash.clone(),
+            parents: Vec::new(),
+            actions: Vec::new(),
+            description: Some("references Y".to_string()),
+        };
+        let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
+        parcel_object.store().unwrap();
+        pallet_utils::set_pallet_head("main", &parcel_object.hash).unwrap();
+
+        // The sibling: a genuinely present, intact loose object H — unrelated to Y, tainted
+        // alongside B's pack path so both are recorded in the same taint file.
+        let mut h_blob = LooseObjectBuilder::build_blob(&Blob { content: b"H, present and intact".to_vec() });
+        h_blob.store().unwrap();
+        let (h_folder, h_file_name) = file_utils::get_path_for_object(&h_blob.hash).unwrap();
+        let h_relative = PathBuf::from(&h_folder).join(&h_file_name)
+            .strip_prefix(&forklift).unwrap().to_path_buf();
+
+        plant_complete_taint(&forklift, &[
+            b_data_relative.to_str().unwrap(),
+            h_relative.to_str().unwrap(),
+        ]);
+
+        let error = run_heal().expect_err(
+            "Y is still referenced through B's now-orphaned pack, so the taint must not fully clear"
+        );
+
+        let message = match &error {
+            CoreError::Refusal { message, .. } => message.clone(),
+            other => panic!("expected a DurabilityTaint refusal, got {:?}", other),
+        };
+        assert!(message.contains(&y_hash), "the refusal must name Y: {}", message);
+        assert!(message.contains(&b_index_name),
+            "Y's dangling line must name B's surviving index, the quarantine wording (I2): {}", message);
+        assert!(!message.contains("could not be checked this run"),
+            "Y must never degrade to the generic could-not-be-checked wording once quarantined: {}", message);
+
+        // The sibling H actually resolved: the taint record left standing no longer names it.
+        let state = taint_utils::read_taints(&forklift).unwrap();
+        assert!(!state.recorded.contains(&h_relative),
+            "H (present, intact, unrelated to B) must have restaged cleanly and left the remainder");
+        assert!(state.recorded.contains(&b_data_relative),
+            "B's pack data path must remain the unresolved remainder");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **T7b** (I7, the Finding-1 discriminator) A stray, unparseable pack index sitting in the
+    /// store must never wedge an otherwise-ordinary heal run: a taint whose candidate is genuinely
+    /// vanished and unreferenced still clears, exactly as it would with no broken index present at
+    /// all.
+    ///
+    /// Fixture disjointness: the corrupt index never parses, so it cannot possibly *name* any
+    /// hash, including the candidate's — the discrimination below is purely poison-vs-no-poison,
+    /// never an accidental membership overlap.
+    ///
+    /// Revert (re-add an `Absent → Err` poison on any non-empty `unenumerable` set at the single
+    /// `Absent` gate in `file_utils::read_object_classified`): the candidate's classified read
+    /// becomes `Err`, `resolve_the_rest`'s truly-missing loop takes the `Err` arm ("could not be
+    /// checked this run") instead of `Absent`, the candidate never reaches the closure walk, and
+    /// the taint stands instead of clearing → `run_heal()` returns `Err` instead of `Ok` → red.
+    #[test]
+    fn a_stray_unparseable_index_never_wedges_heal() {
+        use crate::globals::StorageRootScope;
+
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        let root = std::env::temp_dir()
+            .join(format!("forklift-recovery-utils-t7b-stray-unenumerable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let _scope = StorageRootScope::enter(&root);
+        let forklift = forklift_root();
+
+        // A stray, unparseable index — unrelated to (and incapable of naming) the candidate below.
+        let pack_folder = pack_utils::pack_folder();
+        std::fs::create_dir_all(&pack_folder).unwrap();
+        std::fs::write(pack_folder.join("stray-corrupt.idx"), b"garbage, not a real index").unwrap();
+
+        // A candidate that is genuinely vanished (never written) and unreferenced by anything
+        // durable — the taint records its loose fan-out path directly, with nothing ever written
+        // there and no pallet/tree/tag/park/consolidation pointing at its hash.
+        let candidate_hash = "f".repeat(64);
+        let (folder, file_name) = file_utils::get_path_for_object(&candidate_hash).unwrap();
+        let candidate_relative = PathBuf::from(&folder).join(&file_name)
+            .strip_prefix(&forklift).unwrap().to_path_buf();
+        plant_complete_taint(&forklift, &[candidate_relative.to_str().unwrap()]);
+
+        let outcome = run_heal().expect(
+            "a vanished-and-unreferenced candidate must clear despite an unrelated unenumerable \
+            index — an unparseable index must never poison the Absent gate"
+        );
+        assert!(outcome.resolved.iter().any(|h| h == &candidate_hash),
+            "the candidate must resolve as vanished-and-unreferenced: {:?}", outcome.resolved);
+
+        let state = taint_utils::read_taints(&forklift).unwrap();
+        assert!(state.recorded.is_empty(), "the taint must be fully cleared");
 
         std::fs::remove_dir_all(&root).ok();
     }

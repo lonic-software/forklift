@@ -42,6 +42,23 @@ pub(crate) struct StoreReport {
     /// install) and would still benefit from a one-shot `compact --all --redelta` pass.
     /// Additive field; never acted on automatically.
     densify_suggested: bool,
+    /// Pack indexes that parsed but whose data file could not be loaded (FORK-47) — their
+    /// objects are quarantined, not lost: `forklift heal` can still refetch them. Empty on a
+    /// healthy store.
+    quarantined_packs: Vec<PackIndexIssue>,
+    /// Pack index files that could not even be parsed (FORK-47) — move the file aside and
+    /// re-run. Empty on a healthy store.
+    unenumerable_indexes: Vec<PackIndexIssue>,
+}
+
+/// One entry in [`StoreReport::quarantined_packs`]/[`StoreReport::unenumerable_indexes`].
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[derive(Serialize)]
+pub(crate) struct PackIndexIssue {
+    /// The index file's path.
+    index_path: String,
+    /// Why it could not be fully trusted.
+    error: String,
 }
 
 /// One pack's line in the census.
@@ -99,6 +116,14 @@ impl From<StoreStatus> for StoreReport {
                 repack_due: status.repack_due,
             },
             densify_suggested: status.densify_pending,
+            quarantined_packs: status.quarantined_packs.into_iter().map(|p| PackIndexIssue {
+                index_path: p.index_path,
+                error: p.error,
+            }).collect(),
+            unenumerable_indexes: status.unenumerable_indexes.into_iter().map(|p| PackIndexIssue {
+                index_path: p.index_path,
+                error: p.error,
+            }).collect(),
         }
     }
 }
@@ -146,6 +171,22 @@ impl CommandOutput for StoreReport {
         if self.densify_suggested {
             println!();
             println!("{}", output::DENSIFY_TIP);
+        }
+
+        // FORK-47: surfaced unconditionally whenever either list is non-empty — never silent.
+        if !self.quarantined_packs.is_empty() || !self.unenumerable_indexes.is_empty() {
+            println!();
+            println!("  pack problems:");
+            for issue in &self.quarantined_packs {
+                println!("    quarantined:   \"{}\" — {}", issue.index_path, issue.error);
+            }
+            for issue in &self.unenumerable_indexes {
+                println!("    unenumerable:  \"{}\" — {}", issue.index_path, issue.error);
+            }
+            println!(
+                "    quarantined objects are recoverable via \"forklift heal\"; an unenumerable \
+                index should be moved aside, then re-run."
+            );
         }
     }
 }

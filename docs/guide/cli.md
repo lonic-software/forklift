@@ -1168,11 +1168,20 @@ Object store
 
 `--json` reports `{loose_objects, loose_bytes, packed_objects, pack_files, deltas, pack_bytes,
 total_bytes, packs:[{id, objects, deltas, bytes}], maintenance:{auto, loose_threshold,
-pack_threshold, compaction_due, repack_due}, densify_suggested}` — every size an exact byte
-count. Nothing is written; run `compact` to act on what it reports. `densify_suggested` (and,
-in the human view, a one-line tip) appears once the store was bulk-ingested (`import-git` or a
-franchise's bundle install) and clears once a `compact --all --redelta` pass has run
-(see [`--redelta`](#compact--pack-the-object-store)).
+pack_threshold, compaction_due, repack_due}, densify_suggested, quarantined_packs, unenumerable_indexes}`
+— every size an exact byte count. Nothing is written; run `compact` to act on what it reports.
+`densify_suggested` (and, in the human view, a one-line tip) appears once the store was
+bulk-ingested (`import-git` or a franchise's bundle install) and clears once a `compact --all
+--redelta` pass has run (see [`--redelta`](#compact--pack-the-object-store)).
+
+`quarantined_packs` and `unenumerable_indexes` are ordinarily both empty. A pack pair loses its
+data file only in unusual circumstances (a file removed by hand, a partial restore); when that
+happens, `store` lists it under `quarantined_packs` — `[{index_path, error}]` — rather than
+failing the census: the objects it named are not lost, only unreachable through that copy, and
+`heal` can refetch them from a configured remote. `unenumerable_indexes` — the same `[{index_path,
+error}]` shape — lists any `.idx` file that could not even be parsed (its own magic/version/shape
+is wrong); its hash set is unknown, so nothing can be recovered through it automatically — move it
+aside and re-run. In the human view both appear as a `pack problems:` section, only when non-empty.
 
 ### `heal` — resolve a standing durability taint
 
@@ -1220,6 +1229,12 @@ refusal before ever reaching its own fetch):
 `heal` and the read-only `audit` are the only two commands that run while a taint is standing —
 every other command refuses first, precisely so nothing durable is ever recorded on top of
 unproven state.
+
+Every `heal` run also checks the pack registry for the same quarantined/unenumerable indexes
+`store` reports (see above) and prints a warning line for each one it finds — unconditionally,
+whether or not anything else was tainted this run, and whether or not that index is what caused
+the taint. A quarantined index's objects are left recoverable (`heal` can refetch them); an
+unenumerable one names the file to move aside.
 
 ---
 
