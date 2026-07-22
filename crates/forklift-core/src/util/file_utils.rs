@@ -1651,17 +1651,23 @@ pub(crate) enum StoreReadOutcome {
 /// the same reload-on-miss retry) — see that function's doc comment for why packs are consulted
 /// first.
 ///
-/// **There is no pack→loose fall-through.** Once a hash is confirmed a pack member
-/// ([`pack_utils::is_in_packs`]), a failure to *resolve* that record
-/// ([`pack_utils::retrieve_from_packs`] returning `Err`) is [`StoreReadOutcome::Unverifiable`],
-/// never a reason to go check the loose store instead. This looks like it could be an omission —
-/// "the pack copy is bad, isn't the loose copy worth a try?" — but it is deliberate and has
-/// already been "fixed" the wrong way once: an object that lives in a pack has no independent
-/// loose copy in the common (compacted) case, so falling through would either find nothing (a
-/// wasted stat) or, worse, find a stale/unrelated loose file at that path and clear a taint on an
-/// object the ordinary read path can never actually serve — a false clear, strictly worse than
-/// leaving the taint standing. [`read_object_uncached`] has never had this fall-through either
-/// (see its own doc comment); this function must not grow one on its behalf.
+/// **There is no *unverified* pack→loose fall-through.** Once a pack record for a hash fails to
+/// *resolve* ([`pack_utils::retrieve_from_packs`] returning [`pack_utils::PackRetrieval::Failed`]),
+/// the loose store is still tried — but only bytes that content-verify to the address
+/// ([`object_utils::verify_object_bytes`]) can turn that into [`StoreReadOutcome::Verified`]; a
+/// missing or unverifiable loose file leaves the pack failure as the terminal
+/// [`StoreReadOutcome::Unverifiable`]. This looks like it could be an omission — "the pack copy is
+/// bad, isn't the loose copy worth a try?" — and in an earlier, *unverified* form it was already
+/// "fixed" the wrong way once: an object that lives in a pack has no independent loose copy in the
+/// common (compacted) case, so a blind fall-through would either find nothing (a wasted stat) or,
+/// worse, find a stale/unrelated loose file at that path and clear a taint on an object the
+/// ordinary read path can never actually serve — a false clear, strictly worse than leaving the
+/// taint standing. The verification clause is what makes trying the loose store safe now: a
+/// stale/unrelated file at this hash's fan-out path cannot hash to this hash's own address, so it
+/// can only ever yield `Unverifiable`, never a false `Verified` — the fall-through can widen what
+/// gets served, never what gets accepted. [`read_object_uncached`] shares this exact behavior by
+/// construction (it is a plain match over this function's result, never a parallel
+/// implementation); this function's contract is the only place this needs stating.
 ///
 /// # Returns
 /// * `Ok(StoreReadOutcome)` - See [`StoreReadOutcome`].
@@ -1671,28 +1677,72 @@ pub(crate) enum StoreReadOutcome {
 ///                            rather than decisive: it says nothing about whether a subsequent
 ///                            ordinary read would succeed or fail.
 pub(crate) fn read_object_classified(hash: &str) -> Result<StoreReadOutcome, String> {
-    // Packs first (mirrors `read_object_uncached`): a resident-index membership check is
-    // syscall-free, so it is the environment channel (`?`) here — its only `Err` is a registry
-    // load failure, never anything about this particular hash.
-    if crate::util::pack_utils::is_in_packs(hash)? {
-        match crate::util::pack_utils::retrieve_from_packs(hash) {
-            Ok(Some(bytes)) => return Ok(StoreReadOutcome::Verified(bytes)),
-            // Membership was confirmed a moment ago but the resolve now comes back empty — only
-            // reachable via a registry reload racing between the two calls (`compact` invalidating
-            // the cache mid-check). Not the pack→loose fall-through the doc comment above
-            // forbids: nothing here failed to resolve a *located* record, so falling into the
-            // ordinary loose branch below is the same "try the other place, once" reload-on-miss
-            // discipline `read_object_uncached` already applies on a loose miss.
-            Ok(None) => {}
-            // A located record that fails to resolve (bad decompression, an unreconstructable
-            // delta chain, a hash mismatch) is decisive, not an unknown — a subsequent ordinary
-            // read of this hash will fail the exact same way, since it is the exact same call.
-            Err(e) => return Ok(StoreReadOutcome::Unverifiable(e)),
+    use crate::util::pack_utils::PackRetrieval;
+
+    // Packs first (mirrors `read_object_uncached`): one index pass tries every loaded pack that
+    // locates the hash, not merely the first (`retrieve_from_packs`'s own doc comment) — its `?`
+    // here is the environment channel, whose only `Err` is a registry load failure, never
+    // anything about this particular hash.
+    match crate::util::pack_utils::retrieve_from_packs(hash)? {
+        PackRetrieval::Verified(bytes) => return Ok(StoreReadOutcome::Verified(bytes)),
+        PackRetrieval::NotLocated => {}
+        PackRetrieval::Failed(pack_error) => {
+            // Every pack that located the hash failed to resolve it. A verified loose copy at
+            // this hash's own fan-out path legitimately wins here (see the doc comment above: no
+            // *unverified* fall-through, not no fall-through at all) — try it before giving up.
+            // Matched rather than `?`-propagated: a loose *I/O* error here is handled specially
+            // below, distinct from "loose absent or present-but-unverified".
+            match read_loose_if_verified(hash) {
+                Ok(Some(bytes)) => return Ok(StoreReadOutcome::Verified(bytes)),
+                Ok(None) => {
+                    // Neither the failed pack record nor the loose store served it. One reloading
+                    // pack retry (the same one-reload-max discipline the loose-miss branch below
+                    // already applies) closes the window against a stale cached registry, so a
+                    // good copy an external `compact` wrote into a new pack after this process
+                    // cached its pack set is not shadowed by this broken record forever. The
+                    // original pack error stays the primary, decisive reason either way — a
+                    // reload that cannot even load the registry does not get to replace a
+                    // decisive pack failure with a lesser environment unknown.
+                    // Note: the reload `invalidate_cache()`s and rebuilds the *whole* pack
+                    // registry, not just this one entry — a persistently-broken record read
+                    // repeatedly pays a full reload per read, not a one-time cost.
+                    // Cold/corruption-path only (a located record already failed to resolve
+                    // first), the same known reload-thrash class the loose-miss reload below
+                    // already carries (FORK-50).
+                    return Ok(match crate::util::pack_utils::retrieve_from_packs_reloading(hash) {
+                        Ok(PackRetrieval::Verified(bytes)) => StoreReadOutcome::Verified(bytes),
+                        _ => StoreReadOutcome::Unverifiable(pack_error),
+                    });
+                }
+                Err(loose_io) => {
+                    // The loose store itself could not be *consulted* (a genuine I/O error, not
+                    // NotFound) — an unconsulted location, not a verdict. Returning `Unverifiable`
+                    // here would claim "no servable copy exists" over a copy this read merely
+                    // failed to check, and that claim is exactly what clears taints
+                    // (`Unverifiable` → `truly_missing` → `resolved` once unreferenced). Still
+                    // attempt the one reloading pack retry first — a verified copy an external
+                    // `compact` wrote must still be served ("a read that can serve must serve");
+                    // only once that retry also fails to serve does this become an environment
+                    // `Err` carrying both causes, never discarding the pack error. This is
+                    // remainder-and-recheck-next-run, the right outcome for a transient I/O error,
+                    // and it matches the `NotLocated` path below, which already treats a
+                    // non-`NotFound` loose I/O error as environment `Err`. No deterministic
+                    // falsifier exists for this arm (it needs a loose file made unreadable behind
+                    // a broken pack record — a non-portable permission fixture; see the design's
+                    // own can't-build note), so this is comment-justified, not test-pinned.
+                    return match crate::util::pack_utils::retrieve_from_packs_reloading(hash) {
+                        Ok(PackRetrieval::Verified(bytes)) => Ok(StoreReadOutcome::Verified(bytes)),
+                        _ => Err(format!(
+                            "the loose store could not be consulted ({}) while deciding a hash \
+                            whose located pack record failed ({})", loose_io, pack_error
+                        )),
+                    };
+                }
+            }
         }
     }
 
-    // Loose fallback: a freshly written object not yet swept into a pack, or (the `Ok(None)`
-    // race above) a pack membership check whose confirmed-a-moment-ago record already moved on.
+    // Loose fallback: a freshly written object not yet swept into a pack, or genuinely absent.
     let (path, file_name) = get_path_for_object(hash)?;
     let file_path = path.add(PATH_SEPARATOR).add(&file_name);
 
@@ -1703,11 +1753,15 @@ pub(crate) fn read_object_classified(hash: &str) -> Result<StoreReadOutcome, Str
             // live server) the pack registry can predate an external `compact` that moved this
             // object into a new pack and swept its loose source — so reload the registry once and
             // retry the packs before concluding the object is gone (reload-on-miss).
-            return Ok(match crate::util::pack_utils::retrieve_from_packs_reloading(hash) {
-                Ok(Some(bytes)) => StoreReadOutcome::Verified(bytes),
-                Ok(None) => StoreReadOutcome::Absent,
-                Err(e) => StoreReadOutcome::Unverifiable(e),
-            });
+            return match crate::util::pack_utils::retrieve_from_packs_reloading(hash) {
+                Ok(PackRetrieval::Verified(bytes)) => Ok(StoreReadOutcome::Verified(bytes)),
+                Ok(PackRetrieval::NotLocated) => Ok(StoreReadOutcome::Absent),
+                Ok(PackRetrieval::Failed(e)) => Ok(StoreReadOutcome::Unverifiable(e)),
+                // The reload itself could not consult the store at all — an environment unknown,
+                // not a decisive verdict about this hash, so it must propagate as `Err` rather
+                // than being misclassified `Unverifiable` (a stale reload-registry conflation).
+                Err(e) => Err(e),
+            };
         }
         Err(error) => return Err(format!("Error while reading object from file \"{}\": {}", file_path, error)),
     };
@@ -1727,6 +1781,38 @@ pub(crate) fn read_object_classified(hash: &str) -> Result<StoreReadOutcome, Str
         Ok(()) => StoreReadOutcome::Verified(bytes),
         Err(e) => StoreReadOutcome::Unverifiable(e),
     })
+}
+
+/// Read the loose copy at `hash`'s own fan-out path, returning it only if it decodes and
+/// content-verifies. `Ok(None)` folds together "no loose file" and "a loose file exists but is
+/// not a servable copy of this hash" (a decode failure or a hash mismatch) — the caller's only
+/// next move in either case is the same reloading pack retry, so there is nothing for it to
+/// distinguish between them for. A genuine I/O error (not `NotFound`) still propagates as an
+/// environment failure, exactly as the ordinary loose branch below does.
+fn read_loose_if_verified(hash: &str) -> Result<Option<Vec<u8>>, String> {
+    let (path, file_name) = get_path_for_object(hash)?;
+    let file_path = path.add(PATH_SEPARATOR).add(&file_name);
+
+    let compressed = match std::fs::read(&file_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("Error while reading object from file \"{}\": {}", file_path, error)),
+    };
+
+    // Trusted bytes: a loose file is self-written from hash-verified plaintext, never foreign
+    // compressed bytes, and the grandfathered-giant contract requires this read to stay
+    // unbounded so a pre-existing over-ceiling object stays readable — same justification as the
+    // sibling decode in the ordinary loose branch below.
+    #[allow(clippy::disallowed_methods)]
+    let bytes = match zstd::stream::decode_all(compressed.as_slice()) {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(None),
+    };
+
+    match crate::util::object_utils::verify_object_bytes(hash, &bytes) {
+        Ok(()) => Ok(Some(bytes)),
+        Err(_) => Ok(None),
+    }
 }
 
 /// Read an object's decompressed bytes straight from the store, without consulting the read
@@ -3763,6 +3849,153 @@ mod tests {
         std::fs::remove_dir_all(&temp).ok();
     }
 
+    /// Rename a just-finalized pack pair's stem, so file-name enumeration order is deterministic
+    /// in a test. Pack stems are otherwise content-derived (layout-hashed) and so arbitrary from
+    /// a test's point of view; `load_pack_pair` validates magic/version/record structure, never
+    /// the stem, so any stem is safe to give it.
+    fn rename_pack_stem(
+        artifacts: &[crate::util::pack_utils::TransportPackArtifact], pack_folder: &Path, new_stem: &str,
+    ) {
+        assert_eq!(artifacts.len(), 1, "test fixture expects exactly one pack artifact pair");
+        for artifact_path in [&artifacts[0].data_path, &artifacts[0].index_path] {
+            let extension = artifact_path.extension().unwrap().to_str().unwrap();
+            let new_path = pack_folder.join(format!("{}.{}", new_stem, extension));
+            std::fs::rename(artifact_path, &new_path).unwrap();
+        }
+    }
+
+    /// (I5, the new reload — memo §2b) A pack record that fails to resolve must not stay
+    /// shadowed forever by a stale cached registry: if a *different* pack, written to disk after
+    /// this warehouse's pack set was already cached, holds a verifying copy of the same hash, the
+    /// `Failed`-path reload (`pack_utils::retrieve_from_packs_reloading`) must find it. This is
+    /// what keeps `Unverifiable`'s own decisiveness true even across an external `compact`: without
+    /// the reload, a process restart alone could change the answer for the exact same on-disk
+    /// state, which is precisely what "decisive" is supposed to rule out.
+    ///
+    /// Fixture: cache the registry with only a broken pack for X present (an `is_in_packs` call is
+    /// itself the first load, exactly like the sibling fixture at `heal_utils.rs:1233-1241`); then
+    /// write a second, genuinely good pack for X directly into the pack folder *without* calling
+    /// `invalidate_cache()` — a real on-disk pack sitting behind a still-live, stale registry, the
+    /// same shape an external `compact` in another process would leave for this one to eventually
+    /// notice. No fault hooks, no cache-poking backdoor: the registry only sees the update through
+    /// the reload this fix adds.
+    ///
+    /// Mutation: drop the `Failed`-path reload in `read_object_classified` (serve `Unverifiable`
+    /// as soon as the loose fallback also comes up empty, without ever calling
+    /// `retrieve_from_packs_reloading`) → the good pack, written after caching, is never seen →
+    /// `Unverifiable` → red.
+    #[test]
+    fn a_good_copy_written_after_caching_wins_via_the_failed_path_reload() {
+        use crate::util::pack_utils::TransportPackBuilder;
+
+        let temp = std::env::temp_dir()
+            .join(format!("forklift-classified-failed-reload-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+        let folder = crate::util::pack_utils::pack_folder();
+
+        let content = b"a good copy written by an external compact after this registry was cached".to_vec();
+        let hash = blake3::hash(&content).to_hex().to_string();
+
+        // X's only pack record at cache time: a delta against a base that was never stored —
+        // located, but unresolvable.
+        let never_stored_base = "5".repeat(64);
+        let mut broken_builder = TransportPackBuilder::new(&folder).unwrap();
+        broken_builder.append_delta(&hash, &never_stored_base, 10, b"not a real delta payload").unwrap();
+        broken_builder.finish().unwrap();
+
+        // Force the registry to cache now, with only the broken pack present — mirrors a live
+        // process whose pack set predates an external `compact`.
+        assert!(crate::util::pack_utils::is_in_packs(&hash).unwrap(),
+            "sanity: the registry is now cached with only the broken pack present");
+
+        // A second, genuine pack — written directly into the pack folder with no
+        // `invalidate_cache()` call, so this is a real on-disk pack sitting behind a still-stale,
+        // live registry.
+        let mut good_builder = TransportPackBuilder::new(&folder).unwrap();
+        good_builder.append_full(&hash, content.as_slice()).unwrap();
+        good_builder.finish().unwrap();
+
+        match read_object_classified(&hash).unwrap() {
+            StoreReadOutcome::Verified(bytes) => assert_eq!(bytes, content,
+                "the good copy's bytes must be the ones served"),
+            StoreReadOutcome::Unverifiable(e) => panic!(
+                "expected Verified via the Failed-path reload, got Unverifiable: {}", e
+            ),
+            StoreReadOutcome::Absent => panic!(
+                "expected Verified via the Failed-path reload, got Absent"
+            ),
+        }
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// (I6) The `Failed`-path fall-through to the loose store is verification-gated, never a
+    /// blind "anything at this path will do": a loose file at a broken hash's own fan-out path
+    /// only turns the terminal verdict `Verified` when its bytes actually hash to that address; a
+    /// present-but-wrong-content loose file leaves the pack's own decisive failure standing as
+    /// `Unverifiable` — this is the standing falsifier for the historical false-clear lesson (see
+    /// `read_object_classified`'s own doc comment).
+    ///
+    /// Mutations: (a) remove the `Failed`→loose fall-through entirely → the correct-loose-copy
+    /// case degrades from `Verified` to `Unverifiable` → red. (b) serve the loose bytes without
+    /// calling `verify_object_bytes` → the wrong-content-loose case wrongly becomes `Verified` →
+    /// red.
+    #[test]
+    fn a_broken_pack_record_is_served_by_a_verified_loose_copy_and_never_an_unverified_one() {
+        use crate::util::pack_utils::TransportPackBuilder;
+
+        #[derive(Debug, Clone, Copy)]
+        enum LooseCopy { Correct, WrongContent }
+
+        for case in [LooseCopy::Correct, LooseCopy::WrongContent] {
+            let temp = std::env::temp_dir()
+                .join(format!("forklift-classified-failed-loose-{:?}-{}", case, std::process::id()));
+            let _ = std::fs::remove_dir_all(&temp);
+            std::fs::create_dir_all(&temp).unwrap();
+            let _scope = StorageRootScope::enter(&temp);
+
+            let content = b"the genuine bytes that belong at X's own fan-out address".to_vec();
+            let hash = blake3::hash(&content).to_hex().to_string();
+
+            // X's only pack record: a delta against a base that was never stored — located, but
+            // unresolvable.
+            let never_stored_base = "6".repeat(64);
+            let mut builder = TransportPackBuilder::new(&crate::util::pack_utils::pack_folder()).unwrap();
+            builder.append_delta(&hash, &never_stored_base, 10, b"not a real delta payload").unwrap();
+            builder.finish().unwrap();
+
+            // A loose file at X's own fan-out path: either the genuine bytes, or an unrelated
+            // payload that decodes cleanly but does not hash to X's address.
+            let (folder, file_name) = get_path_for_object(&hash).unwrap();
+            std::fs::create_dir_all(&folder).unwrap();
+            let loose_bytes = match case {
+                LooseCopy::Correct => content.clone(),
+                LooseCopy::WrongContent => b"unrelated bytes that do not hash to X's address".to_vec(),
+            };
+            let compressed = zstd::encode_all(loose_bytes.as_slice(), 0).unwrap();
+            write_object_to_file(Path::new(&folder), &file_name, compressed).unwrap();
+
+            match read_object_classified(&hash).unwrap() {
+                StoreReadOutcome::Verified(bytes) => {
+                    assert!(matches!(case, LooseCopy::Correct),
+                        "[{:?}] a wrong-content loose file must never verify", case);
+                    assert_eq!(bytes, content, "[{:?}] the verified loose copy's bytes", case);
+                }
+                StoreReadOutcome::Unverifiable(_) => {
+                    assert!(matches!(case, LooseCopy::WrongContent),
+                        "[{:?}] a correct loose copy must be served, not left Unverifiable", case);
+                }
+                StoreReadOutcome::Absent => panic!(
+                    "[{:?}] a pack-located hash must never classify Absent", case
+                ),
+            }
+
+            std::fs::remove_dir_all(&temp).ok();
+        }
+    }
+
     /// Falsifying test (DESIGN.html §3.1.1): [`read_object_classified`]'s outcome class must agree
     /// with [`retrieve_object_by_hash_uncached`]'s (the ordinary read path's) success/failure
     /// across every shape the store can hand back — a genuinely verified object (loose or packed),
@@ -3780,11 +4013,17 @@ mod tests {
         use crate::util::pack_utils::TransportPackBuilder;
 
         #[derive(Debug, Clone, Copy)]
-        enum Shape { VerifiedLoose, CorruptLoose, PackedGood, PackedUnreconstructable, Absent }
+        enum Shape {
+            VerifiedLoose, CorruptLoose, PackedGood, PackedUnreconstructable, Absent,
+            // (I5/I6, PR 1) A located pack record that fails to resolve must not be the terminal
+            // verdict when a verifiable copy is reachable some other way.
+            PackedBrokenThenGoodCopy, PackedBrokenThenVerifiedLoose,
+        }
 
         for shape in [
             Shape::VerifiedLoose, Shape::CorruptLoose, Shape::PackedGood,
             Shape::PackedUnreconstructable, Shape::Absent,
+            Shape::PackedBrokenThenGoodCopy, Shape::PackedBrokenThenVerifiedLoose,
         ] {
             let temp = std::env::temp_dir()
                 .join(format!("forklift-classified-agreement-{:?}-{}", shape, std::process::id()));
@@ -3828,6 +4067,43 @@ mod tests {
                     hash
                 }
                 Shape::Absent => "4".repeat(64),
+                Shape::PackedBrokenThenGoodCopy => {
+                    let content = b"a genuinely verified packed object found only after a broken copy";
+                    let hash = blake3::hash(content).to_hex().to_string();
+                    let folder = crate::util::pack_utils::pack_folder();
+
+                    // Pack sorted first: a delta against a base that was never stored — located,
+                    // but unresolvable.
+                    let never_stored_base = "7".repeat(64);
+                    let mut broken_builder = TransportPackBuilder::new(&folder).unwrap();
+                    broken_builder.append_delta(&hash, &never_stored_base, 10, b"not a real delta payload").unwrap();
+                    let broken_artifacts = broken_builder.finish().unwrap();
+                    rename_pack_stem(&broken_artifacts, &folder, "0000-broken-first");
+
+                    // Pack sorted after: a genuine full record for the same hash.
+                    let mut good_builder = TransportPackBuilder::new(&folder).unwrap();
+                    good_builder.append_full(&hash, content.as_slice()).unwrap();
+                    let good_artifacts = good_builder.finish().unwrap();
+                    rename_pack_stem(&good_artifacts, &folder, "zzzz-good-second");
+
+                    hash
+                }
+                Shape::PackedBrokenThenVerifiedLoose => {
+                    let content = b"a genuinely verified loose object found after a broken pack record";
+                    let hash = blake3::hash(content).to_hex().to_string();
+
+                    let never_stored_base = "8".repeat(64);
+                    let mut builder = TransportPackBuilder::new(&crate::util::pack_utils::pack_folder()).unwrap();
+                    builder.append_delta(&hash, &never_stored_base, 10, b"not a real delta payload").unwrap();
+                    builder.finish().unwrap();
+
+                    let (folder, file_name) = get_path_for_object(&hash).unwrap();
+                    std::fs::create_dir_all(&folder).unwrap();
+                    let compressed = zstd::encode_all(content.as_slice(), 0).unwrap();
+                    write_object_to_file(Path::new(&folder), &file_name, compressed).unwrap();
+
+                    hash
+                }
             };
 
             let classified = read_object_classified(&hash)
@@ -3835,7 +4111,8 @@ mod tests {
             let ordinary = retrieve_object_by_hash_uncached(&hash);
 
             match shape {
-                Shape::VerifiedLoose | Shape::PackedGood => {
+                Shape::VerifiedLoose | Shape::PackedGood
+                | Shape::PackedBrokenThenGoodCopy | Shape::PackedBrokenThenVerifiedLoose => {
                     assert!(matches!(classified, StoreReadOutcome::Verified(_)),
                         "[{:?}] expected Verified", shape);
                     assert!(ordinary.is_ok(),

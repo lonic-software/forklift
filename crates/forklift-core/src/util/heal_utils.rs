@@ -1238,7 +1238,7 @@ mod tests {
         builder.append_delta(&h_hash, &never_stored_base, 10, b"not a real delta payload").unwrap();
         builder.finish().unwrap();
         assert!(pack_utils::is_in_packs(&h_hash).unwrap(), "sanity: H is a pack membership hit");
-        assert!(pack_utils::retrieve_from_packs(&h_hash).is_err(),
+        assert!(matches!(pack_utils::retrieve_from_packs(&h_hash).unwrap(), pack_utils::PackRetrieval::Failed(_)),
             "sanity: H's record cannot actually be reconstructed");
 
         let mut root_tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
