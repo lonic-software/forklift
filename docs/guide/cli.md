@@ -1234,7 +1234,11 @@ Every `heal` run also checks the pack registry for the same quarantined/unenumer
 `store` reports (see above) and prints a warning line for each one it finds — unconditionally,
 whether or not anything else was tainted this run, and whether or not that index is what caused
 the taint. A quarantined index's objects are left recoverable (`heal` can refetch them); an
-unenumerable one names the file to move aside.
+unenumerable one names the file to move aside. This appears even when `heal` still has to refuse
+on an unrelated dangling reference — as a clearly-separated "Pack index problems (unrelated to
+this refusal, clear them separately)" section, never as though it were the cause of the refusal —
+since a broken pack index is inert on its own and the only time it coincides with a refusal is
+exactly when an operator most needs to be told about it.
 
 ---
 
