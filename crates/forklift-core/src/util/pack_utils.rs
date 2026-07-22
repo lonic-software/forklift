@@ -573,6 +573,11 @@ fn load_packs_from_disk(pack_folder: &Path) -> Result<Vec<LoadedPack>, String> {
         packs.push(load_pack_pair(&data_path, &path)?);
     }
 
+    // `read_dir` order is platform-arbitrary (especially on Windows); a fixed, deterministic
+    // enumeration order makes which error a multi-pack failure reports reproducible, and is what
+    // lets a test pin the "broken copy enumerated first" case deterministically on every platform.
+    packs.sort_by(|a, b| a.data_path.file_name().cmp(&b.data_path.file_name()));
+
     Ok(packs)
 }
 
@@ -1120,35 +1125,82 @@ fn decode_full_transport_record(record: &[u8], hash: &str) -> Result<Vec<u8>, St
     })
 }
 
-/// Retrieve the decompressed bytes of an object from the packs, or `None` if no pack holds
-/// it. `file_utils::read_object_uncached`/`read_object_classified` consult this *first* — packs
-/// are the common case at scale, not a fallback for when the loose file is absent.
+/// The outcome of a pack lookup for one hash — kept distinct from a bare `Option`/`Err` because a
+/// pack *naming* a hash but failing to serve it must never silently collapse into "not here": the
+/// classified read (`file_utils::read_object_classified`) needs "no pack has heard of this hash"
+/// (`NotLocated`, which still permits the loose fallback / an eventual `Absent`) told apart from
+/// "some pack has it but the record could not be resolved" (`Failed`, which can only ever
+/// escalate to `Unverifiable` — it must never quietly decay to `Absent`, and it must never win
+/// over a verifiable copy elsewhere).
+///
+/// `Err(String)` is reserved separately for "the registry itself could not be loaded" — an
+/// environment failure that says nothing about this particular hash, never returned for a
+/// per-record resolve failure.
+#[derive(Debug)]
+pub(crate) enum PackRetrieval {
+    /// A located record resolved and content-verified.
+    Verified(Vec<u8>),
+    /// At least one loaded pack located the hash, but every located record failed to resolve.
+    /// Carries the *first* such error — later, redundant failures for the same hash add no
+    /// information once one is on record.
+    Failed(String),
+    /// No loaded pack's index names the hash.
+    NotLocated,
+}
+
+/// Retrieve the decompressed, verified bytes of an object from the packs.
+/// `file_utils::read_object_uncached`/`read_object_classified` consult this *first* — packs are
+/// the common case at scale, not a fallback for when the loose file is absent.
+///
+/// Tries *every* loaded pack that locates the hash, not just the first: a located record that
+/// fails to resolve (a corrupt full record, a bad delta, a delta rebuilt against the wrong base —
+/// `resolve_record` hash-verifies, so "resolved" is exactly "verified") no longer suppresses a
+/// good copy of the same hash sitting in a different pack. Only once every locating pack has
+/// failed does this report `Failed`.
 ///
 /// # Arguments
 /// * `hash` - The hex hash of the object.
 ///
 /// # Returns
-/// * `Ok(Some(Vec<u8>))` - The decompressed object bytes.
-/// * `Ok(None)`          - If the object is in no pack.
-/// * `Err(String)`       - If a pack could be read but the blob was unreadable.
-pub fn retrieve_from_packs(hash: &str) -> Result<Option<Vec<u8>>, String> {
+/// * `Ok(PackRetrieval)` - See [`PackRetrieval`].
+/// * `Err(String)`       - The pack registry itself could not be loaded.
+pub(crate) fn retrieve_from_packs(hash: &str) -> Result<PackRetrieval, String> {
     let Some(hash_bytes) = hash_to_bytes(hash) else {
-        return Ok(None);
+        return Ok(PackRetrieval::NotLocated);
     };
 
     let packs = loaded_packs()?;
+
+    let mut first_error: Option<String> = None;
 
     for pack in packs.iter() {
         let Some((offset, length)) = pack.locate(&hash_bytes) else {
             continue;
         };
 
+        // `offset`/`length` came straight from this pack's own index, which `validate_index_records`
+        // (`pack_utils.rs:648`, run by `load_pack_pair` before a pack ever enters the registry)
+        // already checked tiles every record's range exactly within `[PACK_DATA_HEADER_LEN,
+        // data.len()]` with no gaps or overlaps — the same bound `slice` rechecks. So for any pack
+        // reachable here, `slice` cannot fail on a `locate`d record: this `?` is a defensive
+        // anomaly channel (environment `Err`), never the located-but-broken path the `first_error`
+        // accumulation below exists for.
         let record = pack.slice(offset, length)?;
 
-        return resolve_record(record, pack.version, hash).map(Some);
+        match resolve_record(record, pack.version, hash) {
+            Ok(bytes) => return Ok(PackRetrieval::Verified(bytes)),
+            Err(e) => {
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
+        }
     }
 
-    Ok(None)
+    Ok(match first_error {
+        Some(e) => PackRetrieval::Failed(e),
+        None => PackRetrieval::NotLocated,
+    })
 }
 
 /// Retrieve an object from packs after forcibly reloading this warehouse's pack registry from
@@ -1158,9 +1210,12 @@ pub fn retrieve_from_packs(hash: &str) -> Result<Option<Vec<u8>>, String> {
 /// server whose registry predates an *external* `compact` would miss an object that was moved
 /// into a new pack — and whose loose source that same compact already swept — so both the cached
 /// pack lookup and the loose fallback come up empty even though the object is present on disk. One
-/// forced reload closes that window before the read is declared a miss. Called only from the
-/// read path's last-resort branch, so a genuinely absent object reloads at most once per read.
-pub fn retrieve_from_packs_reloading(hash: &str) -> Result<Option<Vec<u8>>, String> {
+/// forced reload closes that window before the read is declared a miss. Called from the read
+/// path's last-resort branches (a loose miss, and now — since a good copy an external `compact`
+/// wrote into a new pack must not stay shadowed by a stale cached registry — a failed pack
+/// resolve that the loose store also could not serve), so a genuinely absent or genuinely broken
+/// object reloads at most once per read.
+pub(crate) fn retrieve_from_packs_reloading(hash: &str) -> Result<PackRetrieval, String> {
     invalidate_cache();
     retrieve_from_packs(hash)
 }
@@ -3248,6 +3303,16 @@ mod tests {
     use super::*;
     use crate::globals::StorageRootScope;
 
+    /// Test-only convenience: assert `retrieve_from_packs(hash)` reports `Verified` and return
+    /// its bytes, so a byte-comparison assertion at the call site stays a single line as it was
+    /// before `PackRetrieval` replaced the bare `Option`.
+    fn packs_verified(hash: &str) -> Vec<u8> {
+        match retrieve_from_packs(hash).unwrap() {
+            PackRetrieval::Verified(bytes) => bytes,
+            other => panic!("expected a verified pack record for {}, got {:?}", hash, other),
+        }
+    }
+
     #[test]
     fn pack_id_depends_on_the_layout_not_just_the_object_set() {
         // The id must fold in each record's offset and length, so two packs holding the
@@ -3582,13 +3647,13 @@ mod tests {
         // ...but every object still reads back byte-for-byte from the packs.
         for (hash, content) in hashes.iter().zip(&contents) {
             assert!(is_in_packs(hash).unwrap(), "packed object should be found");
-            assert_eq!(retrieve_from_packs(hash).unwrap().unwrap(), *content);
+            assert_eq!(packs_verified(hash), *content);
         }
 
         // A hash in no pack is a clean miss, not an error.
         let absent = blake3::hash(b"absent").to_hex().to_string();
         assert!(!is_in_packs(&absent).unwrap());
-        assert!(retrieve_from_packs(&absent).unwrap().is_none());
+        assert!(matches!(retrieve_from_packs(&absent).unwrap(), PackRetrieval::NotLocated));
 
         std::fs::remove_dir_all(&temp).ok();
     }
@@ -3634,7 +3699,7 @@ mod tests {
         // The genuine sibling in the same batch is unaffected.
         assert_eq!(stats.objects_packed, 1);
         assert!(is_in_packs(&genuine_hash).unwrap());
-        assert_eq!(retrieve_from_packs(&genuine_hash).unwrap().unwrap(), genuine_content);
+        assert_eq!(packs_verified(&genuine_hash), genuine_content);
 
         std::fs::remove_dir_all(&temp).ok();
     }
@@ -3911,7 +3976,7 @@ mod tests {
         // Every version reconstructs byte-for-byte from the packs — through its delta chain,
         // whose base is fetched recursively from the store.
         for (hash, content) in hashes.iter().zip(&contents) {
-            assert_eq!(retrieve_from_packs(hash).unwrap().unwrap(), *content, "a delta must reconstruct exactly");
+            assert_eq!(packs_verified(hash), *content, "a delta must reconstruct exactly");
         }
 
         // And the deltas actually shrank the store far below storing every version in full
@@ -3960,7 +4025,7 @@ mod tests {
 
         // The framed reader reads the unframed v1 record transparently.
         assert!(is_in_packs(&hash).unwrap());
-        assert_eq!(retrieve_from_packs(&hash).unwrap().unwrap(), content);
+        assert_eq!(packs_verified(&hash), content);
 
         std::fs::remove_dir_all(&temp).ok();
     }
@@ -4009,9 +4074,102 @@ mod tests {
         // The record is present and decompresses fine, but to the wrong bytes — the read fails
         // instead of returning content B under hash A.
         assert!(is_in_packs(&hash_a).unwrap(), "the record is indexed under hash A");
-        let result = retrieve_from_packs(&hash_a);
-        assert!(result.is_err(), "a record decompressing to the wrong bytes must fail the read, got {:?}", result);
-        assert!(result.unwrap_err().contains("corrupt"), "the error should name the corruption");
+        let result = retrieve_from_packs(&hash_a).unwrap();
+        match &result {
+            PackRetrieval::Failed(e) => assert!(e.contains("corrupt"), "the error should name the corruption: {}", e),
+            other => panic!("a record decompressing to the wrong bytes must fail the read, got {:?}", other),
+        }
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// Rename a just-finalized pack pair's stem, so file-name enumeration order is deterministic
+    /// in a test. Pack stems are otherwise content-derived (`compute_pack_id`, layout-hashed) and
+    /// so arbitrary from a test's point of view; `load_pack_pair` validates magic/version/record
+    /// structure, never the stem (see the load-time sort's own precondition note on
+    /// `retrieve_from_packs`'s I5 falsifier), so any stem is safe to give it.
+    fn rename_pack_stem(artifacts: &[TransportPackArtifact], pack_folder: &Path, new_stem: &str) {
+        assert_eq!(artifacts.len(), 1, "test fixture expects exactly one pack artifact pair");
+        for artifact_path in [&artifacts[0].data_path, &artifacts[0].index_path] {
+            let extension = artifact_path.extension().unwrap().to_str().unwrap();
+            let new_path = pack_folder.join(format!("{}.{}", new_stem, extension));
+            std::fs::rename(artifact_path, &new_path).unwrap();
+        }
+    }
+
+    /// (I5, falsifies `pack_utils.rs:1148`'s old first-locate-wins `return`) A located pack
+    /// record that fails to resolve must never suppress a good, verifying record for the same
+    /// hash sitting in a *different* pack — `retrieve_from_packs` must try every locating pack,
+    /// not just the first. The load-time file-name sort (§2c) forces the broken copy to be
+    /// enumerated first on every platform, so this pins the worst order deterministically rather
+    /// than depending on `read_dir`'s platform-arbitrary order to happen to hit it.
+    ///
+    /// Mutation: restore the unconditional `return resolve_record(...).map(Some)` on the first
+    /// `locate` hit (the pre-fix body of `retrieve_from_packs`) → the broken pack (enumerated
+    /// first) wins and the good copy is never even tried → red.
+    #[test]
+    fn a_broken_record_falls_through_to_a_good_copy_in_a_later_pack() {
+        let temp = std::env::temp_dir()
+            .join(format!("forklift-pack-broken-then-good-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+        let folder = pack_folder();
+
+        let content = b"a genuinely good copy of X, sitting in the second, sorted-later pack";
+        let hash = blake3::hash(content).to_hex().to_string();
+
+        // Pack sorted first: a delta against a base that was never stored — located, but
+        // unresolvable.
+        let never_stored_base = "9".repeat(64);
+        let mut broken_builder = TransportPackBuilder::new(&folder).unwrap();
+        broken_builder.append_delta(&hash, &never_stored_base, 10, b"not a real delta payload").unwrap();
+        let broken_artifacts = broken_builder.finish().unwrap();
+        rename_pack_stem(&broken_artifacts, &folder, "0000-broken-first");
+
+        // Pack sorted after: a genuine full record for the same hash.
+        let mut good_builder = TransportPackBuilder::new(&folder).unwrap();
+        good_builder.append_full(&hash, content.as_slice()).unwrap();
+        let good_artifacts = good_builder.finish().unwrap();
+        rename_pack_stem(&good_artifacts, &folder, "zzzz-good-second");
+
+        invalidate_cache();
+
+        assert_eq!(packs_verified(&hash), content);
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// (I5, both-broken companion to the test above) When *every* locating pack's record fails to
+    /// resolve, the terminal outcome is `Failed`, carrying the first error — never a silent
+    /// success and never a panic from trying to keep scanning past the last pack.
+    #[test]
+    fn when_every_located_copy_is_broken_the_outcome_is_failed_not_verified() {
+        let temp = std::env::temp_dir()
+            .join(format!("forklift-pack-broken-then-broken-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+        let folder = pack_folder();
+
+        let hash = "c".repeat(64);
+
+        let never_stored_base_1 = "d".repeat(64);
+        let mut first_builder = TransportPackBuilder::new(&folder).unwrap();
+        first_builder.append_delta(&hash, &never_stored_base_1, 10, b"not a real delta payload").unwrap();
+        let first_artifacts = first_builder.finish().unwrap();
+        rename_pack_stem(&first_artifacts, &folder, "0000-broken-first");
+
+        let never_stored_base_2 = "e".repeat(64);
+        let mut second_builder = TransportPackBuilder::new(&folder).unwrap();
+        second_builder.append_delta(&hash, &never_stored_base_2, 10, b"also not a real delta payload").unwrap();
+        let second_artifacts = second_builder.finish().unwrap();
+        rename_pack_stem(&second_artifacts, &folder, "zzzz-broken-second");
+
+        invalidate_cache();
+
+        assert!(matches!(retrieve_from_packs(&hash).unwrap(), PackRetrieval::Failed(_)),
+            "every locating pack failed to resolve — the outcome must be Failed");
 
         std::fs::remove_dir_all(&temp).ok();
     }
@@ -4345,7 +4503,7 @@ mod tests {
         // v2 still packs — full, since its path base could not be read verified — and reads
         // back byte-exact.
         assert!(is_in_packs(&blob_v2_hash).unwrap());
-        assert_eq!(retrieve_from_packs(&blob_v2_hash).unwrap().unwrap(), blob_v2_content);
+        assert_eq!(packs_verified(&blob_v2_hash), blob_v2_content);
 
         std::fs::remove_dir_all(&temp).ok();
     }
@@ -4453,7 +4611,7 @@ mod tests {
 
         // And it reconstructs byte-exact: the delta-base fetch really did resolve the loose,
         // over-ceiling base through the unbounded read path, rather than failing or aborting.
-        assert_eq!(retrieve_from_packs(&blob_v2_hash).unwrap().unwrap(), blob_v2_content);
+        assert_eq!(packs_verified(&blob_v2_hash), blob_v2_content);
 
         std::fs::remove_dir_all(&temp).ok();
     }

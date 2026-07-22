@@ -3448,7 +3448,7 @@ mod tests {
         builder.append_delta(&h_hash, &never_stored_base, 10, b"not a real delta payload").unwrap();
         builder.finish().unwrap();
         assert!(pack_utils::is_in_packs(&h_hash).unwrap(), "sanity: H is a pack membership hit");
-        assert!(pack_utils::retrieve_from_packs(&h_hash).is_err(),
+        assert!(matches!(pack_utils::retrieve_from_packs(&h_hash).unwrap(), pack_utils::PackRetrieval::Failed(_)),
             "sanity: H's record cannot actually be reconstructed");
 
         let mut root_tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
@@ -3480,12 +3480,16 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// (DESIGN.html §3.1.1) The classifying read core must never fall through from a failed pack
-    /// read to the loose store — even when a perfectly good loose copy sits at the exact recorded
-    /// path. Fixture: H's only pack record is a delta against a base that was never stored
-    /// (unreconstructable); H's own loose fan-out path simultaneously holds a *verified-good* copy
-    /// of H, written directly at that path (`store_object_bytes`'s dedup gate would skip the write
-    /// once H is already a pack member, so this bypasses it — exactly what the spec calls for).
+    /// (DESIGN.html §3.1.1, I6 — superseded fixture) The classifying read core's fall-through is
+    /// *verification-gated*, not unconditional: once every pack record for a hash has failed to
+    /// resolve, a genuinely hash-verified loose copy sitting at that hash's own fan-out path now
+    /// legitimately wins (`Verified`), replacing the old "no fall-through, ever" rule this test
+    /// used to pin (see `read_object_classified`'s own doc comment for why a *stale/unrelated*
+    /// loose file still can never win — only bytes that content-verify to the address can). Same
+    /// fixture as before the fix: H's only pack record is a delta against a base that was never
+    /// stored (unreconstructable); H's own loose fan-out path simultaneously holds a
+    /// *verified-good* copy of H, written directly at that path (`store_object_bytes`'s dedup gate
+    /// would skip the write once H is already a pack member, so this bypasses it).
     ///
     /// `resolve_the_rest` is driven directly here (bypassing `attempt_restage_all`, via a
     /// hand-built [`heal_utils::RestageAttempt`] whose `hash_mismatch` set names H's own path) —
@@ -3493,14 +3497,15 @@ mod tests {
     /// corrupt-candidate path). This isolates exactly the recheck's own pack→loose question:
     /// `attempt_restage_all` itself never runs here, so nothing about *how* H's path was classified
     /// initially can confound what the recheck alone decides once it runs. The remote is configured
-    /// but unreachable, so nothing here can be fixed by a fetch.
+    /// but unreachable, so the recovery this test pins is served by the fall-through alone, never
+    /// by a fetch.
     ///
-    /// Mutation that must redden: add a pack→loose fall-through inside `read_object_classified`
-    /// (serve the good loose copy once the pack resolve fails) — H would be reported `resolved`,
-    /// the taint would clear, `run_heal` (via this direct call) would return `Ok`, and this test's
-    /// `.expect_err` would panic.
+    /// Mutation that must redden: drop the `Failed`→loose fall-through inside
+    /// `read_object_classified` (restore the pre-fix "no fall-through, ever" behavior) — H would
+    /// stay `Unverifiable`, `resolve_the_rest` would return `Err` instead of `Ok`, and this test's
+    /// `.expect(...)` would panic.
     #[test]
-    fn no_pack_to_loose_fall_through_even_with_a_good_loose_copy_present() {
+    fn a_broken_pack_record_falls_through_to_a_verified_loose_copy_and_the_recheck_clears_it() {
         use crate::enums::config_scope::ConfigScope;
         use crate::globals::StorageRootScope;
         use crate::util::config_utils;
@@ -3510,7 +3515,7 @@ mod tests {
         taint_utils::activate();
 
         let root = std::env::temp_dir()
-            .join(format!("forklift-recovery-utils-no-pack-loose-fallthrough-{}", std::process::id()));
+            .join(format!("forklift-recovery-utils-pack-failed-loose-fallthrough-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _scope = StorageRootScope::enter(&root);
@@ -3533,15 +3538,15 @@ mod tests {
         builder.append_delta(&h_hash, &never_stored_base, 10, b"not a real delta payload").unwrap();
         builder.finish().unwrap();
         assert!(pack_utils::is_in_packs(&h_hash).unwrap(), "sanity: H is a pack membership hit");
-        assert!(pack_utils::retrieve_from_packs(&h_hash).is_err(),
+        assert!(matches!(pack_utils::retrieve_from_packs(&h_hash).unwrap(), pack_utils::PackRetrieval::Failed(_)),
             "sanity: H's pack record cannot actually be reconstructed");
 
-        // Read-path witness: the ordinary read must fail even though a good loose copy sits right
-        // there — this is `read_object_uncached`'s own pre-existing packs-first behavior, and
-        // `read_object_classified` must agree with it exactly (that agreement is the whole point).
-        let ordinary_read = file_utils::retrieve_object_by_hash_uncached(&h_hash);
-        assert!(ordinary_read.is_err(), "the ordinary read must never silently prefer the good \
-            loose copy once pack membership with a failed resolve is established");
+        // Read-path witness: the ordinary read now succeeds, served by the verified loose copy
+        // once the pack record has failed to resolve — `read_object_classified` must agree with
+        // it exactly (that agreement is the whole point).
+        let ordinary_read = file_utils::retrieve_object_by_hash_uncached(&h_hash).unwrap();
+        assert_eq!(ordinary_read, good_content, "the ordinary read must serve the verified loose \
+            copy once the pack record has failed to resolve");
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -3555,26 +3560,17 @@ mod tests {
         let state = taint_utils::read_taints(&forklift).unwrap();
 
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        let error = runtime
+        let outcome = runtime
             .block_on(resolve_the_rest(&forklift, &state.recorded, &attempt, &state.files))
-            .expect_err("a corrupt candidate whose only pack record cannot reconstruct must never \
-                clear, even though a good loose copy sits at its own path");
+            .expect("H must be recovered — its verified loose copy is a genuine, servable \
+                substitute for its broken pack record");
 
-        // The corrupt-candidate recheck names the recorded *path* in its dangling line (not the
-        // bare hash — see `resolve_the_rest`'s corrupt-candidate loop), and the reason it carries
-        // must be the actual reconstruction failure (naming the missing delta base), never a
-        // silent read of H's own good loose bytes.
-        assert_durability_taint(&error, &[
-            "cannot be read back verified", "entity not found",
-            h_relative.to_string_lossy().as_ref(),
-        ]);
-        if let CoreError::Refusal { message, .. } = &error {
-            assert!(!message.contains("corrupt (content does not match its own hash)"),
-                "must not claim a hash-compare that never happened: {}", message);
-        }
+        assert!(outcome.resolved.iter().any(|entry| entry == &h_relative.to_string_lossy()),
+            "H's own path must be reported resolved: {:?}", outcome.resolved);
 
         let after_state = taint_utils::read_taints(&forklift).unwrap();
-        assert!(!after_state.recorded.is_empty(), "the taint must survive — H was never actually recovered");
+        assert!(!after_state.recorded.contains(&h_relative),
+            "the taint over H must clear — a genuinely verified copy was found");
 
         std::fs::remove_dir_all(&root).ok();
     }
