@@ -13,6 +13,8 @@
 //! bridge then rides inside each store so its synchronous trait methods can drive the SDK's
 //! async calls from the blocking thread the `Head` runs on (see `blocking.rs`).
 
+use aws_smithy_http_client::tls;
+
 use forklift_core::util::pallet_utils::DEFAULT_PALLET_NAME;
 
 use crate::aws::dynamo::DynamoRefStore;
@@ -97,17 +99,26 @@ impl AwsConfig {
 /// Build the S3 and DynamoDB capabilities from `config`, resolving credentials through the
 /// default provider chain and TLS through a **ring**-based rustls connector.
 ///
-/// The connector is built explicitly (inside [`S3Ops::build`]/[`DynamoOps::build`]) rather than
-/// left to the SDK default, because the SDK default (`default-https-client`) selects
-/// `rustls-aws-lc`, which drags in `aws-lc-sys` — a C/cmake build the workspace has no need of,
-/// since `ring` is already present (reqwest) and is forklift's trusted crypto provider. The
-/// choice is invisible on the wire; it is purely a build-time and dependency-surface decision.
+/// The connector is built explicitly rather than left to the SDK default, because the SDK
+/// default (`default-https-client`) selects `rustls-aws-lc`, which drags in `aws-lc-sys` — a
+/// C/cmake build the workspace has no need of, since `ring` is already present (reqwest) and
+/// is forklift's trusted crypto provider. The choice is invisible on the wire; it is purely a
+/// build-time and dependency-surface decision.
+///
+/// The provider-chain resolution and connector construction happen **once**, in
+/// [`load_shared_config`], and the resulting [`aws_config::SdkConfig`] is handed to both
+/// [`S3Ops::build`]/[`DynamoOps::build`] — a fix for a real cold-start regression the first cut
+/// of the capability-wrapper split introduced: each `build` doing its own `loader.load().await`
+/// meant two independent credential-chain resolutions (container/IMDS round trips) and two
+/// connector pools per cold start, under API Gateway's 29 s ceiling. `S3Ops::build`/
+/// `DynamoOps::build` themselves are now plain, synchronous client construction from an
+/// already-resolved config — nothing left in them can fail or await.
 ///
 /// This function — and this whole file — names no raw client type. That is deliberate: the two
 /// wrapper modules ([`s3_ops`](crate::aws::s3_ops), [`dynamo_ops`](crate::aws::dynamo_ops)) are
 /// the *only* places `aws_sdk_s3::Client`/`aws_sdk_dynamodb::Client` may appear anywhere in
-/// `src/` (`tests/iam_conformance.rs`'s smuggling guard asserts exactly that), so construction
-/// lives inside them and this function just asks each to build itself.
+/// `src/` (`tests/iam_conformance.rs`'s smuggling guard asserts exactly that); `SdkConfig`/
+/// `tls::Provider`/`Region` are not that type, so building them here does not reopen it.
 ///
 /// Must be called inside a tokio runtime.
 ///
@@ -116,12 +127,37 @@ impl AwsConfig {
 ///
 /// # Returns
 /// * `Ok((s3, dynamodb))` - The two sanctioned capabilities.
-/// * `Err(String)`        - If the provider chain or connector could not be built.
+/// * `Err(String)`        - Reserved for a future fallible step; nothing here can fail today.
 pub async fn build_clients(config: &AwsConfig) -> Result<(S3Ops, DynamoOps), String> {
-    let s3 = S3Ops::build(config).await?;
-    let dynamodb = DynamoOps::build(config).await?;
+    let shared = load_shared_config(config).await;
+
+    let s3 = S3Ops::build(&shared, config.endpoint_url.is_some());
+    let dynamodb = DynamoOps::build(&shared);
 
     Ok((s3, dynamodb))
+}
+
+/// Resolve the default provider chain and build the ring-based rustls connector exactly once,
+/// applying `config`'s region/endpoint override — shared by both [`S3Ops::build`] and
+/// [`DynamoOps::build`] so a cold start pays for one credential-chain resolution, not two (see
+/// [`build_clients`]'s docs for the regression this fixes).
+async fn load_shared_config(config: &AwsConfig) -> aws_config::SdkConfig {
+    let http_client = aws_smithy_http_client::Builder::new()
+        .tls_provider(tls::Provider::Rustls(tls::rustls_provider::CryptoMode::Ring))
+        .build_https();
+
+    let mut loader =
+        aws_config::defaults(aws_config::BehaviorVersion::latest()).http_client(http_client);
+
+    if let Some(region) = &config.region {
+        loader = loader.region(aws_sdk_s3::config::Region::new(region.clone()));
+    }
+
+    if let Some(endpoint) = &config.endpoint_url {
+        loader = loader.endpoint_url(endpoint.clone());
+    }
+
+    loader.load().await
 }
 
 /// Build both stores over freshly configured clients, moving `bridge` into them so their

@@ -60,8 +60,9 @@
 //! The derived operation set is simply this impl's non-constructor method names — no AST walk
 //! over `aws/s3.rs`/`aws/dynamo.rs` is needed anymore, because rustc's privacy already
 //! guarantees nothing outside this file (and `dynamo_ops.rs`) can name an operation this impl
-//! does not expose. `#[deny(dead_code)]` on the crate (see `lib.rs`) is what closes the
-//! remaining direction: an op method nothing calls is a **build error**, not a passing test.
+//! does not expose. `#![deny(dead_code)]`, scoped to **this file** (below, not on the crate —
+//! `lib.rs` carries only `#![forbid(unsafe_code)]`), is what closes the remaining direction: an
+//! op method nothing calls is a **build error**, not a passing test.
 //!
 //! # Residuals — not claimed to be closed here
 //!
@@ -92,56 +93,43 @@ use aws_sdk_s3::operation::head_object::builders::HeadObjectFluentBuilder;
 use aws_sdk_s3::operation::list_objects_v2::builders::ListObjectsV2FluentBuilder;
 use aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder;
 
-use aws_smithy_http_client::tls;
-
-use crate::aws::config::AwsConfig;
-
 /// The sanctioned S3 capability: a private client, and one method per operation this crate is
 /// allowed to perform. See the module docs for why the private field plus `pub(crate)` methods
-/// is the mechanism, not merely documentation of intent.
+/// is the mechanism, not merely documentation of intent — and note that being the mechanism is
+/// exactly why both halves of it (the field carrying no `pub` at all, and every op method being
+/// exactly `pub(crate)`, not `pub`) are themselves asserted by `tests/iam_conformance.rs`, not
+/// merely documented here: a flipped visibility keyword is a silent reopening of escape 3
+/// otherwise, and nothing in the type system stops a future edit from doing it by accident.
 #[derive(Clone, Debug)]
 pub struct S3Ops(aws_sdk_s3::Client);
 
 impl S3Ops {
-    /// Build the S3 client from `config`, resolving credentials through the default provider
-    /// chain and TLS through a **ring**-based rustls connector (see `aws/config.rs`'s module
-    /// docs for why the connector is explicit rather than left to the SDK default).
+    /// Build the S3 client over an already-resolved `shared` config — see `aws/config.rs`'s
+    /// `load_shared_config`, which resolves the default provider chain and the ring-based
+    /// rustls connector exactly once and hands the result to both this and
+    /// [`DynamoOps::build`](crate::aws::dynamo_ops::DynamoOps::build), so a cold start pays for
+    /// one credential-chain resolution, not two.
+    ///
+    /// `path_style`: true when `config.endpoint_url` is set (LocalStack/MinIO), which serves one
+    /// endpoint for every bucket and so needs path-style (`host/bucket/key`) addressing; real
+    /// AWS keeps the default (virtual-host) addressing.
     ///
     /// Exempt from the per-method shape check (it is the constructor), but every call it makes
-    /// must be on the checker's config-builder allowlist — `tls_provider`, `build_https`,
-    /// `defaults`, `latest`, `http_client`, `region`, `endpoint_url`, `load`, `from`,
-    /// `force_path_style`, `build`, `from_conf`, `new` — so a call this test has never seen
-    /// goes red until it is consciously added there.
-    pub(crate) async fn build(config: &AwsConfig) -> Result<S3Ops, String> {
-        let http_client = aws_smithy_http_client::Builder::new()
-            .tls_provider(tls::Provider::Rustls(tls::rustls_provider::CryptoMode::Ring))
-            .build_https();
-
-        let mut loader =
-            aws_config::defaults(aws_config::BehaviorVersion::latest()).http_client(http_client);
-
-        if let Some(region) = &config.region {
-            loader = loader.region(aws_sdk_s3::config::Region::new(region.clone()));
-        }
-
-        if let Some(endpoint) = &config.endpoint_url {
-            loader = loader.endpoint_url(endpoint.clone());
-        }
-
-        let shared = loader.load().await;
-
-        // LocalStack and MinIO serve one endpoint for every bucket, so the `bucket.host`
-        // virtual addressing real S3 uses cannot resolve there; path-style (`host/bucket/key`)
-        // is the form they understand. Real AWS keeps the default (virtual-host) addressing.
-        let client = if config.endpoint_url.is_some() {
+    /// must be on the checker's config-builder allowlist — `from`, `force_path_style`, `build`,
+    /// `from_conf`, `new` — so a call this test has never seen goes red until it is consciously
+    /// added there. (Matched by bare call *name*, not by receiver or return type — see
+    /// `CONSTRUCTOR_CALL_ALLOWLIST`'s docs in the test for the precision this does and does not
+    /// have.)
+    pub(crate) fn build(shared: &aws_config::SdkConfig, path_style: bool) -> S3Ops {
+        let client = if path_style {
             let s3_config =
-                aws_sdk_s3::config::Builder::from(&shared).force_path_style(true).build();
+                aws_sdk_s3::config::Builder::from(shared).force_path_style(true).build();
             aws_sdk_s3::Client::from_conf(s3_config)
         } else {
-            aws_sdk_s3::Client::new(&shared)
+            aws_sdk_s3::Client::new(shared)
         };
 
-        Ok(S3Ops(client))
+        S3Ops(client)
     }
 
     pub(crate) fn head_object(&self) -> HeadObjectFluentBuilder {

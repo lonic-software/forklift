@@ -38,6 +38,13 @@
 //!    ([`S3ObjectStore::new`](forklift_aws_lambda::aws::S3ObjectStore::new)/
 //!    [`DynamoRefStore::new`](forklift_aws_lambda::aws::DynamoRefStore::new)) is the only thing
 //!    it can do with one.
+//!
+//!    **This is only true if the field is actually private and the ops are actually
+//!    `pub(crate)`** — the wrapper's privacy is not a fact about the code that a doc comment can
+//!    assert into existence; it is a fact this file must check the same as any other, and PR
+//!    #79's review caught exactly that gap: flipping `S3Ops`'s field to `pub` (or an op method
+//!    to `pub`) left every test green. [`checks::field_privacy_violations`]/
+//!    [`checks::op_visibility_violations`] below close it, with probes reproducing both flips.
 //! 2. **A scanner shrunk to what it can be total over.** Escape 1 (a macro swallowing a call)
 //!    is closed by making the *derived operation set* the wrapper impl's own method names, not
 //!    an AST walk over every call site in `src/aws/` — so there is no code left for a macro to
@@ -45,17 +52,28 @@
 //!    contain zero macro invocations (parse totality — `syn`'s one blind spot, forced to zero
 //!    rather than "none we happened to notice"), an item-kind allowlist (only `use`, the one
 //!    struct, one inherent impl — any *trait* impl, e.g. `impl Deref<Target = Client>`, is red),
-//!    and a per-method shape check (a one-line `self.0.<name>()` delegation, zero arguments).
+//!    a file-level inner-attribute check (exactly `#![deny(dead_code)]` plus doc comments — an
+//!    `#![allow(dead_code)]` added beside it, or the `deny` simply deleted, is red; see
+//!    [`checks::file_attr_violations`]), and a per-method shape check (a one-line
+//!    `self.0.<name>()` delegation, zero arguments).
 //! 3. **rustc's own lints for what rustc already tracks better than a scanner could.**
-//!    `#[deny(dead_code)]` on the wrapper modules (see `lib.rs`/`s3_ops.rs`/`dynamo_ops.rs`)
-//!    turns an op method nothing calls into a build error — confirmed to fire in this crate's
-//!    layout before this was relied on. `#![forbid(unsafe_code)]` on the crate (`lib.rs`) rules
-//!    out the one route around all of the above that privacy alone cannot stop.
+//!    `#![deny(dead_code)]`, scoped to the two wrapper files (below — **not** on the crate;
+//!    `lib.rs` carries only `#![forbid(unsafe_code)]`), turns an op method nothing calls into a
+//!    build error — confirmed to fire in this crate's layout before this was relied on, and its
+//!    own presence is now itself checked (bullet 2, above), since a scanner that verifies the
+//!    field is private but not that the enforcing lint is even switched on is checking the wrong
+//!    half of the mechanism. `#![forbid(unsafe_code)]` on the crate (`lib.rs`) rules out the one
+//!    route around all of the above that privacy alone cannot stop.
 //!
 //! # What this file actually checks (and what it does not)
 //!
-//! * **Parse totality, item-kind allowlist, per-method shape, constructor call allowlist** —
-//!   over the two wrapper modules only (`s3_ops.rs`, `dynamo_ops.rs`). See `checks::wrapper`.
+//! * **Field privacy and op-method visibility** — the wrapper struct's tuple field must carry
+//!   no `pub` at all, and every non-constructor method must be exactly `pub(crate)` (not `pub`,
+//!   not bare-private). This is the mechanism itself, not a nice-to-have: see
+//!   [`checks::field_privacy_violations`]/[`checks::op_visibility_violations`].
+//! * **Parse totality, item-kind allowlist, file-level attributes, per-method shape,
+//!   constructor call allowlist** — over the two wrapper modules only (`s3_ops.rs`,
+//!   `dynamo_ops.rs`). See the `checks` module.
 //! * **Directions A/B (unmapped op, missing grant)** — every op the wrapper impls expose must
 //!   have an entry in [`op_actions`], and every action that entry needs must be granted
 //!   somewhere in the union of the two policy JSONs. Unchanged in spirit from v3; the input to
@@ -65,16 +83,24 @@
 //!   still worth catching; nothing in the v4 design doc says to drop it, and dropping it would
 //!   be a silent coverage loss, not a design decision I'm willing to make unasked — see the
 //!   report for this deviation flagged explicitly).
-//! * **Direction C, code side (dead op)** — is **not** re-implemented here at all. It is
-//!   `#[deny(dead_code)]` on the wrapper modules, a compiler error, not a test assertion. There
-//!   is no `#[test]` for it because there is nothing left for a test to assert once the build
-//!   itself refuses to compile a nothing-calls-it `pub(crate)` method.
-//! * **The smuggling guard** — `aws_sdk_s3::Client`/`aws_sdk_dynamodb::Client` tokens (and a
-//!   bare `use` of the type, including a glob that would import it) must appear in **zero**
-//!   files under `src/` other than the two wrapper modules. Kept from v3, minus the exact
-//!   position-sensitive `sanctioned_client_counts` map (a token *count* cannot distinguish "the
-//!   same sanctioned use, refactored" from "a new, unreviewed occurrence that happens to keep
-//!   the total the same" — the file-scope zero/nonzero split is what actually matters).
+//! * **Direction C, code side (dead op)** — is **not** re-implemented as a source-level check
+//!   here. It is `#![deny(dead_code)]`, scoped to each wrapper file, a compiler error rather
+//!   than a test assertion for the dead method itself — but the attribute's own *presence* is
+//!   now a checked property of this file ([`checks::file_attr_violations`]), because a lint that
+//!   enforces something only for as long as nobody deletes it is not an enforced property.
+//! * **The smuggling guard** — `aws_sdk_s3::Client`/`aws_sdk_dynamodb::Client` (matched by *any*
+//!   path whose first segment is the crate — resolving a crate-level rename alias first — and
+//!   whose last segment is `Client`, not only the exact two-segment form; see
+//!   [`smuggling::is_client_path`]'s docs for the two gaps this closes) and a bare/glob `use` of
+//!   the type must appear in **zero** files under `src/` other than the two wrapper modules.
+//!   Kept from v3, minus the exact position-sensitive `sanctioned_client_counts` map (a token
+//!   *count* cannot distinguish "the same sanctioned use, refactored" from "a new, unreviewed
+//!   occurrence that happens to keep the total the same" — the file-scope zero/nonzero split is
+//!   what actually matters). **Residual, stated plainly**: alias resolution here is one level
+//!   deep (a crate-root rename); a file that layers a second alias on top of a first, or
+//!   re-exports the type under a new name and imports *that*, is not chased further — this is a
+//!   syntactic guard, not real import resolution, and the item-kind/shape checks on the two
+//!   wrapper files (not this guard) are what keep the raw type's actual reachability closed.
 //! * **Policy-side polarity** — [`granted_actions`] panics on a `Deny` covering an in-scope
 //!   action (unconditionally: the union model has no way to represent an exception, so it must
 //!   never see one). A `Condition` on an in-scope action is **not** an unconditional panic here
@@ -94,10 +120,19 @@
 //! not a committer) than what the wrapper's privacy actually defends against.
 //!
 //! This test's own claim is the **composition**: rustc privacy (the wrapper's private field and
-//! `pub(crate)` ops) + the zero-macro parse-totality assertion + the default-red item/attribute/
-//! constructor-call allowlists, each backed by a committed escape probe below. It is not
-//! "fails-closed by construction" as an unqualified property — that phrasing is exactly what
-//! the first three specifications claimed and did not have.
+//! `pub(crate)` ops — itself checked, not assumed) + the zero-macro parse-totality assertion +
+//! the default-red item/attribute/file-attribute/constructor-call allowlists, each backed by a
+//! committed escape probe in `escape_probes` below. It is not "fails-closed by construction" as
+//! an unqualified property — that phrasing is exactly what the first three specifications
+//! claimed and did not have.
+//!
+//! One honest qualifier on the constructor-call allowlist specifically: it matches by bare call
+//! *name*, with no receiver or return-type context (`syn` does no type resolution), so a
+//! hypothetical unrelated `.build()`/`X::new()` inside a future constructor would be accepted
+//! just as readily as the SDK's own. What keeps that meaningful is the *scope* around it — the
+//! item-kind allowlist limits a wrapper file to one struct and one impl, and the constructor's
+//! body is a handful of lines building exactly one client — not the name match doing type-aware
+//! verification it cannot actually do.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -136,32 +171,19 @@ fn op_actions() -> BTreeMap<&'static str, &'static [&'static str]> {
 
 /// The config-builder calls `S3Ops::build`/`DynamoOps::build` are allowed to make — both
 /// `.method(...)` fluent calls and `Type::assoc_fn(...)` path calls (the constructors reach for
-/// both shapes: `.tls_provider(...)` is a method call, `aws_sdk_s3::Client::new(...)` is not).
-/// A call whose name is not here is red until it is consciously added — the same posture as the
-/// wrapper's item-kind allowlist. `"Ok"`/`"Err"` (the `Result` the constructor returns) and the
-/// wrapper struct's own name (its tuple-struct constructor, e.g. `S3Ops(client)`) are structural
-/// Rust, not an SDK call, and are added per-file by [`checks::wrapper::constructor_call_violations`]
-/// rather than listed here.
-const CONSTRUCTOR_CALL_ALLOWLIST: &[&str] = &[
-    "new",
-    "tls_provider",
-    "build_https",
-    "defaults",
-    "latest",
-    "http_client",
-    "region",
-    "endpoint_url",
-    "load",
-    "from",
-    "force_path_style",
-    "build",
-    "from_conf",
-    "clone",
-    "Rustls",
-    // `config.endpoint_url.is_some()` gates the S3 path-style branch — a query on the config
-    // struct's own field, not an SDK call, but the visitor doesn't distinguish the two.
-    "is_some",
-];
+/// both shapes: `.force_path_style(...)` is a method call, `aws_sdk_s3::Client::new(...)` is
+/// not). A call whose name is not here is red until it is consciously added — the same posture
+/// as the wrapper's item-kind allowlist. `"Ok"`/`"Err"` and the wrapper struct's own name (its
+/// tuple-struct constructor, e.g. `S3Ops(client)`) are structural Rust, not an SDK call, and are
+/// added per-file by [`checks::constructor_call_violations`] rather than listed here.
+///
+/// Small on purpose: the provider-chain/connector construction that used to live in these
+/// constructors (`tls_provider`, `defaults`, `region`, `endpoint_url`, `load`, …) was hoisted
+/// into `aws/config.rs::load_shared_config` (the cold-start fix — see that function's docs), so
+/// `S3Ops::build`/`DynamoOps::build` now only ever turn an already-resolved `SdkConfig` into a
+/// client. **Matched by bare call name only** — see the module docs' closing note on what that
+/// does and does not verify.
+const CONSTRUCTOR_CALL_ALLOWLIST: &[&str] = &["new", "from", "force_path_style", "build", "from_conf"];
 
 /// `Sid`s whose `Condition` has been reviewed and is a deliberate least-privilege narrowing, not
 /// an unrepresentable exception the union model would silently misreport. `StagingSweep` scopes
@@ -249,6 +271,68 @@ mod checks {
         visitor.count
     }
 
+    /// Whether `attr` is `#[deny(dead_code)]` (the file-level form, `#![deny(dead_code)]`,
+    /// desugars to this same `Attribute` shape attached to the file rather than an item).
+    fn is_deny_dead_code(attr: &syn::Attribute) -> bool {
+        if !attr.path().is_ident("deny") {
+            return false;
+        }
+
+        let mut found = false;
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("dead_code") {
+                found = true;
+            }
+            Ok(())
+        });
+
+        found
+    }
+
+    /// The file-level (`#![...]`) attribute check: a wrapper module's `syn::File::attrs` must be
+    /// exactly doc comments plus one `#![deny(dead_code)]` — no more, no fewer. This is a
+    /// distinct scan from [`item_kind_violations`]'s attribute check, which only ever inspects
+    /// `file.items` and so is structurally blind to inner attributes at the top of the file
+    /// (PR #79's review: deleting `#![deny(dead_code)]`, or adding `#![allow(dead_code)]` right
+    /// beside it, previously passed every test in this file). Requiring the `deny` to be present
+    /// is what makes direction C's enforcement (a compiler error on a dead op method) an
+    /// asserted property rather than an attribute nobody is checking is still switched on.
+    pub fn file_attr_violations(file: &syn::File) -> Vec<String> {
+        let mut violations = Vec::new();
+        let mut has_deny_dead_code = false;
+
+        for attr in &file.attrs {
+            if attr.path().is_ident("doc") {
+                continue;
+            }
+            if is_deny_dead_code(attr) {
+                has_deny_dead_code = true;
+                continue;
+            }
+
+            let name =
+                attr.path().get_ident().map(|ident| ident.to_string()).unwrap_or_else(|| "?".to_string());
+            violations.push(format!(
+                "file-level attribute `#![{}(...)]` is not allowed here — only \
+                 `#![deny(dead_code)]` and doc comments may appear at file scope in a wrapper \
+                 module (an `#![allow(dead_code)]` beside the `deny` would otherwise silently \
+                 defeat it for every item in the file)",
+                name
+            ));
+        }
+
+        if !has_deny_dead_code {
+            violations.push(
+                "missing `#![deny(dead_code)]` at file scope — direction C (an op method \
+                 nothing calls) relies entirely on this attribute to turn a dead method into a \
+                 build error; without it, an unused `pub(crate)` op method compiles silently"
+                    .to_string(),
+            );
+        }
+
+        violations
+    }
+
     fn readable_item_kind(item: &Item) -> &'static str {
         match item {
             Item::Const(_) => "const",
@@ -296,8 +380,9 @@ mod checks {
 
     /// Every attribute on `attrs` must be a doc comment (`///`/`//!`, which desugar to
     /// `#[doc = "..."]`) or the one allowed derive. Anything else — `#[allow(dead_code)]` above
-    /// all, which would otherwise defeat the crate-level `#[deny(dead_code)]` this whole design
-    /// leans on for direction C — is red.
+    /// all, which would otherwise defeat the file-level `#![deny(dead_code)]` this whole design
+    /// leans on for direction C (see [`file_attr_violations`] for the check on that attribute's
+    /// own presence) — is red.
     fn attribute_violations(attrs: &[syn::Attribute], label: &str) -> Vec<String> {
         attrs
             .iter()
@@ -365,6 +450,116 @@ mod checks {
                 "expected exactly one sanctioned inherent `impl {}`, found {}",
                 struct_name, impl_count
             ));
+        }
+
+        violations
+    }
+
+    /// A short label for `vis`, for violation messages — deliberately not a full token-stream
+    /// rendering (no `quote` dependency needed for three cases).
+    fn visibility_label(vis: &syn::Visibility) -> &'static str {
+        match vis {
+            syn::Visibility::Public(_) => "pub",
+            syn::Visibility::Inherited => "private (no visibility modifier)",
+            syn::Visibility::Restricted(restricted) if restricted.path.is_ident("crate") => "pub(crate)",
+            syn::Visibility::Restricted(_) => "a restricted visibility other than pub(crate) (pub(self)/pub(super)/pub(in ...))",
+        }
+    }
+
+    fn is_pub_crate(vis: &syn::Visibility) -> bool {
+        matches!(vis, syn::Visibility::Restricted(restricted) if restricted.path.is_ident("crate"))
+    }
+
+    /// **The mechanism itself.** The wrapper struct's one tuple field must carry no visibility
+    /// modifier at all — not `pub`, not `pub(crate)` — because the private field is the entire
+    /// reason a caller has to go through a delegation method rather than reaching the SDK client
+    /// directly. PR #79's review demonstrated the gap this closes: flipping
+    /// `S3Ops(aws_sdk_s3::Client)` to `S3Ops(pub aws_sdk_s3::Client)` left all ten tests green,
+    /// and re-opened escape 3 exactly (`ctx.s3.0.delete_bucket()` compiles without ever naming
+    /// `aws_sdk_s3::Client`, so the smuggling guard's path-token match never even sees it).
+    pub fn field_privacy_violations(file: &syn::File, struct_name: &str) -> Vec<String> {
+        for item in &file.items {
+            let Item::Struct(item_struct) = item else { continue };
+            if item_struct.ident != struct_name {
+                continue;
+            }
+
+            let syn::Fields::Unnamed(fields) = &item_struct.fields else {
+                return vec![format!(
+                    "struct {} must be a tuple struct with exactly one unnamed field",
+                    struct_name
+                )];
+            };
+
+            if fields.unnamed.len() != 1 {
+                return vec![format!(
+                    "struct {} must have exactly one field, found {}",
+                    struct_name,
+                    fields.unnamed.len()
+                )];
+            }
+
+            let field = &fields.unnamed[0];
+            if !matches!(field.vis, syn::Visibility::Inherited) {
+                return vec![format!(
+                    "struct {}'s tuple field is not private — found `{}`. The private field is \
+                     what forces every access through a `pub(crate)` delegation; any visibility \
+                     modifier at all (even `pub(crate)`) lets a caller reach the raw client via \
+                     `.0` directly, skipping the delegation (and the operation it names) \
+                     entirely.",
+                    struct_name,
+                    visibility_label(&field.vis)
+                )];
+            }
+
+            return Vec::new();
+        }
+
+        vec![format!("no `struct {}` found to check field privacy on", struct_name)]
+    }
+
+    /// **The other half of the mechanism.** Every non-constructor method on the sanctioned
+    /// inherent impl must be exactly `pub(crate)` — not `pub` (visible to a `[[bin]]` target or
+    /// an external integration test, reopening escape 3 the moment the field is also made
+    /// reachable, or even on its own if the field were ever relaxed) and not bare-private
+    /// (invisible even to the sibling store module that is supposed to call it, e.g. `aws/s3.rs`
+    /// calling `self.client.delete_object()` where `client: S3Ops` — bare-private would break
+    /// that from compiling at all, which is a correctness bug, not a security one, but still not
+    /// the sanctioned shape). The constructor is exempt: its own visibility does not gate an
+    /// operation the way an op method's does.
+    pub fn op_visibility_violations(
+        file: &syn::File,
+        struct_name: &str,
+        constructor_name: &str,
+    ) -> Vec<String> {
+        let mut violations = Vec::new();
+
+        for item in &file.items {
+            let Item::Impl(item_impl) = item else { continue };
+            if !is_inherent_impl_of(item_impl, struct_name) {
+                continue;
+            }
+
+            for impl_item in &item_impl.items {
+                let syn::ImplItem::Fn(method) = impl_item else { continue };
+                let name = method.sig.ident.to_string();
+
+                if name == constructor_name {
+                    continue;
+                }
+
+                if !is_pub_crate(&method.vis) {
+                    violations.push(format!(
+                        "{}::{} must be exactly `pub(crate)` — found `{}`. `pub` is directly \
+                         callable from a `[[bin]]` target or an external integration test crate \
+                         (escape 3, reopened); bare-private is invisible even to the sibling \
+                         store module this op exists to serve.",
+                        struct_name,
+                        name,
+                        visibility_label(&method.vis)
+                    ));
+                }
+            }
         }
 
         violations
@@ -544,49 +739,101 @@ mod checks {
 mod smuggling {
     use super::*;
 
-    /// Whether `path`'s first two segments are exactly `aws_sdk_s3::Client` or
-    /// `aws_sdk_dynamodb::Client` — a type reference, or the prefix of an associated-function
-    /// call (`Client::new(...)`, `Client::from_conf(...)`).
-    fn is_client_prefix(path: &SynPath) -> bool {
-        let mut segments = path.segments.iter();
-        let (Some(first), Some(second)) = (segments.next(), segments.next()) else { return false };
+    /// The two real crate names a client path may resolve to.
+    const SANCTIONED_ROOTS: [&str; 2] = ["aws_sdk_s3", "aws_sdk_dynamodb"];
 
-        matches!(
-            (first.ident.to_string().as_str(), second.ident.to_string().as_str()),
-            ("aws_sdk_s3", "Client") | ("aws_sdk_dynamodb", "Client")
-        )
+    /// Every crate-root rename alias in `file` — e.g. `use aws_sdk_s3 as sdk;` binds `sdk` to
+    /// `aws_sdk_s3`. PR #79's review: `sdk::Client::new(...)` after such a rename evades a path
+    /// match keyed on the literal segment text `"aws_sdk_s3"`, since the written path never
+    /// contains that text at all. One alias level is resolved (a rename of the crate root
+    /// itself); see this module's docs (in the parent file) for the residual this does not chase
+    /// further. Scanned with the same full recursive `Visit` as the bare-import check, so an
+    /// alias introduced inside a nested `mod` or fn body is not invisible either.
+    fn crate_aliases(file: &syn::File) -> BTreeMap<String, &'static str> {
+        struct AliasVisitor {
+            aliases: BTreeMap<String, &'static str>,
+        }
+
+        impl<'ast> Visit<'ast> for AliasVisitor {
+            fn visit_item_use(&mut self, node: &'ast syn::ItemUse) {
+                if let syn::UseTree::Rename(rename) = &node.tree {
+                    let original = rename.ident.to_string();
+                    if let Some(root) = SANCTIONED_ROOTS.iter().find(|root| **root == original) {
+                        self.aliases.insert(rename.rename.to_string(), root);
+                    }
+                }
+                syn::visit::visit_item_use(self, node);
+            }
+        }
+
+        let mut visitor = AliasVisitor { aliases: BTreeMap::new() };
+        visitor.visit_file(file);
+        visitor.aliases
     }
 
-    /// The count of fully-qualified `aws_sdk_s3::Client`/`aws_sdk_dynamodb::Client` path tokens
-    /// anywhere in `file`. Outside the two wrapper modules, this must be exactly zero — not an
+    /// Whether `path` resolves (through `aliases`) to a sanctioned crate's `Client` type —
+    /// generalized twice over the exact-two-segment match this replaces:
+    ///
+    /// 1. **Any depth, not exactly two segments** — `aws_sdk_s3::client::Client` (the crate's
+    ///    own `pub mod client` submodule, re-exported at the crate root as `aws_sdk_s3::Client`;
+    ///    both spellings name the identical type) matches just as surely as the two-segment
+    ///    form, because this checks "first segment is the crate, last segment is `Client`", not
+    ///    "exactly these two segments".
+    /// 2. **A crate-level rename alias** — `path`'s first segment is looked up in `aliases`
+    ///    first, so `sdk::Client::new(...)` after `use aws_sdk_s3 as sdk;` resolves to
+    ///    `aws_sdk_s3` before the crate-name comparison runs.
+    ///
+    /// Both gaps were demonstrated against the prior two-segment-exact check; see the escape
+    /// probes for both.
+    pub fn is_client_path(path: &SynPath, aliases: &BTreeMap<String, &'static str>) -> bool {
+        if path.segments.len() < 2 {
+            return false;
+        }
+
+        let first = path.segments.first().expect("checked len >= 2").ident.to_string();
+        let resolved_root = aliases.get(&first).copied().unwrap_or(first.as_str());
+
+        let last_is_client =
+            path.segments.last().expect("checked len >= 2").ident == "Client";
+
+        SANCTIONED_ROOTS.contains(&resolved_root) && last_is_client
+    }
+
+    /// The count of `aws_sdk_s3`/`aws_sdk_dynamodb` `Client` path tokens anywhere in `file`,
+    /// resolving crate-rename aliases and matching any path depth ending in `Client` (see
+    /// [`is_client_path`]). Outside the two wrapper modules, this must be exactly zero — not an
     /// exact allowlisted count (v3's `sanctioned_client_counts` was position-blind: swapping a
     /// constructor parameter for a helper parameter kept the total the same and stayed green).
     pub fn client_token_count(file: &syn::File) -> usize {
-        struct TokenVisitor {
+        let aliases = crate_aliases(file);
+
+        struct TokenVisitor<'a> {
+            aliases: &'a BTreeMap<String, &'static str>,
             count: usize,
         }
 
-        impl<'ast> Visit<'ast> for TokenVisitor {
+        impl<'ast> Visit<'ast> for TokenVisitor<'_> {
             fn visit_path(&mut self, node: &'ast SynPath) {
-                if is_client_prefix(node) {
+                if is_client_path(node, self.aliases) {
                     self.count += 1;
                 }
                 syn::visit::visit_path(self, node);
             }
         }
 
-        let mut visitor = TokenVisitor { count: 0 };
+        let mut visitor = TokenVisitor { aliases: &aliases, count: 0 };
         visitor.visit_file(file);
         visitor.count
     }
 
-    /// Whether a `use` tree imports the bare `Client` leaf — or a glob — from exactly
-    /// `aws_sdk_s3` or `aws_sdk_dynamodb`. A bare/renamed import would let a later
-    /// `Client::new(...)` evade [`client_token_count`]'s fully-qualified match; a glob is the
+    /// Whether a `use` tree imports the bare `Client` leaf — or a glob — from underneath a
+    /// sanctioned root, at **any** depth (not only the exact one-segment prefix `aws_sdk_s3::`;
+    /// `aws_sdk_s3::client::Client` — the crate's own submodule path for the identical type — is
+    /// underneath the root just as much as the crate-level re-export is). A bare/renamed import
+    /// would let a later `Client::new(...)` evade [`client_token_count`]'s match; a glob is the
     /// same hole (v3's bug: `UseTree::Glob(_) => false` was the literal "unseen -> OK" bucket).
     fn imports_bare_client(tree: &syn::UseTree, prefix: &[String]) -> bool {
-        let is_sanctioned_root =
-            matches!(prefix, [only] if only == "aws_sdk_s3" || only == "aws_sdk_dynamodb");
+        let is_sanctioned_root = matches!(prefix.first(), Some(root) if SANCTIONED_ROOTS.contains(&root.as_str()));
 
         match tree {
             syn::UseTree::Path(path) => {
@@ -751,6 +998,15 @@ fn iam_policies_match_the_wrapper_op_surface() {
             path,
         );
 
+        let file_attr_violations = checks::file_attr_violations(&file);
+        assert!(
+            file_attr_violations.is_empty(),
+            "{} ({}) fails the file-level attribute check:\n{}",
+            struct_name,
+            path,
+            file_attr_violations.join("\n"),
+        );
+
         let item_violations = checks::item_kind_violations(&file, struct_name);
         assert!(
             item_violations.is_empty(),
@@ -758,6 +1014,27 @@ fn iam_policies_match_the_wrapper_op_surface() {
             struct_name,
             path,
             item_violations.join("\n"),
+        );
+
+        // The mechanism itself (PR #79 review, HIGH): the field must be private, and every op
+        // method exactly `pub(crate)`. Nothing above this line checks either — item-kind and
+        // attribute checks inspect item *kinds* and attributes, never `Visibility`.
+        let field_violations = checks::field_privacy_violations(&file, struct_name);
+        assert!(
+            field_violations.is_empty(),
+            "{} ({}) fails the field privacy check:\n{}",
+            struct_name,
+            path,
+            field_violations.join("\n"),
+        );
+
+        let visibility_violations = checks::op_visibility_violations(&file, struct_name, "build");
+        assert!(
+            visibility_violations.is_empty(),
+            "{} ({}) fails the op-method visibility check:\n{}",
+            struct_name,
+            path,
+            visibility_violations.join("\n"),
         );
 
         let shape_violations = checks::op_method_shape_violations(&file, struct_name, "build");
@@ -1002,6 +1279,221 @@ mod escape_probes {
         assert!(
             unmapped.iter().any(|op| op.as_str() == "a_brand_new_operation"),
             "an operation with no `op_actions` entry must be reported as unmapped"
+        );
+    }
+
+    /// Probe 9 — PR #79's HIGH: a `pub` field on the wrapper struct must be red. Reproduces the
+    /// review's exact finding — `S3Ops(aws_sdk_s3::Client)` -> `S3Ops(pub aws_sdk_s3::Client)`
+    /// left all ten v4 tests green, because none of them inspected `Visibility` at all.
+    #[test]
+    fn probe_a_public_field_is_red() {
+        let src = r#"
+            pub struct S3Ops(pub aws_sdk_s3::Client);
+            impl S3Ops {
+                pub(crate) fn get_object(&self) -> GetObjectFluentBuilder { self.0.get_object() }
+            }
+        "#;
+        let file = parse_source(src);
+        let violations = checks::field_privacy_violations(&file, "S3Ops");
+        assert!(
+            !violations.is_empty(),
+            "a `pub` tuple field must fail the field privacy check — a public field lets \
+             `ctx.s3.0.delete_bucket()` compile without ever naming `aws_sdk_s3::Client`, \
+             reopening escape 3"
+        );
+    }
+
+    /// Probe 10 — PR #79's HIGH, other half: an op method declared `pub` instead of
+    /// `pub(crate)` must be red — directly callable from a bin or external test crate.
+    #[test]
+    fn probe_a_public_op_method_is_red() {
+        let src = r#"
+            pub struct S3Ops(aws_sdk_s3::Client);
+            impl S3Ops {
+                pub fn get_object(&self) -> GetObjectFluentBuilder { self.0.get_object() }
+            }
+        "#;
+        let file = parse_source(src);
+        let violations = checks::op_visibility_violations(&file, "S3Ops", "build");
+        assert!(
+            !violations.is_empty(),
+            "a `pub` op method must fail the visibility check — `pub` is reachable from a \
+             `[[bin]]` target or an external test crate, exactly escape 3"
+        );
+    }
+
+    /// Probe 11 — a bare-private op method (no `pub(crate)` at all) must also be red: the
+    /// *wrong* shape, not just an over-permissive one — it would break the sibling store module
+    /// that is supposed to call it, so it should never pass as if it were the sanctioned form.
+    #[test]
+    fn probe_a_bare_private_op_method_is_red() {
+        let src = r#"
+            pub struct S3Ops(aws_sdk_s3::Client);
+            impl S3Ops {
+                fn get_object(&self) -> GetObjectFluentBuilder { self.0.get_object() }
+            }
+        "#;
+        let file = parse_source(src);
+        let violations = checks::op_visibility_violations(&file, "S3Ops", "build");
+        assert!(!violations.is_empty(), "a bare-private op method must fail the visibility check");
+    }
+
+    /// Probe 12 — PR #79's MEDIUM 1: deleting `#![deny(dead_code)]` from a wrapper module must
+    /// be red. Direction C (a dead op method) relies entirely on this attribute; without it,
+    /// nothing catches an unused `pub(crate)` method.
+    #[test]
+    fn probe_missing_deny_dead_code_is_red() {
+        let src = r#"
+            pub struct S3Ops(aws_sdk_s3::Client);
+            impl S3Ops {
+                pub(crate) fn get_object(&self) -> GetObjectFluentBuilder { self.0.get_object() }
+            }
+        "#;
+        let file = parse_source(src);
+        let violations = checks::file_attr_violations(&file);
+        assert!(
+            !violations.is_empty(),
+            "a wrapper module with no `#![deny(dead_code)]` at all must fail the file-attribute \
+             check"
+        );
+    }
+
+    /// Probe 13 — PR #79's MEDIUM 1, other half: `#![deny(dead_code)]` *plus*
+    /// `#![allow(dead_code)]` right beside it must also be red — the `allow` would silently
+    /// defeat the `deny` for every item in the file, which is exactly the surgical version of
+    /// the same escape the per-method attribute check (probe on `item_kind_violations`) closes.
+    #[test]
+    fn probe_allow_dead_code_beside_deny_is_red() {
+        let src = r#"
+            #![deny(dead_code)]
+            #![allow(dead_code)]
+            pub struct S3Ops(aws_sdk_s3::Client);
+            impl S3Ops {
+                pub(crate) fn get_object(&self) -> GetObjectFluentBuilder { self.0.get_object() }
+            }
+        "#;
+        let file = parse_source(src);
+        let violations = checks::file_attr_violations(&file);
+        assert!(
+            !violations.is_empty(),
+            "an `#![allow(dead_code)]` beside the `deny` must still fail the file-attribute check"
+        );
+    }
+
+    /// Probe 14 — PR #79's MEDIUM 3, first form: `aws_sdk_s3::client::Client` (the crate's own
+    /// `pub mod client` submodule path for the identical type, re-exported at the crate root as
+    /// `aws_sdk_s3::Client`) must be counted as a leaked token just as the two-segment form is.
+    #[test]
+    fn probe_a_submodule_client_path_is_red() {
+        let src = r#"
+            pub struct Context {
+                s3: aws_sdk_s3::client::Client,
+            }
+        "#;
+        let file = parse_source(src);
+        assert!(
+            smuggling::client_token_count(&file) > 0,
+            "aws_sdk_s3::client::Client (the submodule path) must be counted, not only the \
+             crate-root re-export spelling"
+        );
+    }
+
+    /// Probe 15 — PR #79's MEDIUM 3, second form: a crate-level rename alias
+    /// (`use aws_sdk_s3 as sdk;`) followed by `sdk::Client::new(...)` must still be counted —
+    /// the literal segment text `"aws_sdk_s3"` never appears in the call at all, so a check
+    /// keyed on that text alone would miss it entirely.
+    #[test]
+    fn probe_a_crate_alias_client_path_is_red() {
+        let src = r#"
+            use aws_sdk_s3 as sdk;
+
+            pub struct Context {
+                s3: sdk::Client,
+            }
+
+            fn sneaky(ctx: &Context) {
+                let _ = sdk::Client::new(&ctx.s3_config());
+            }
+        "#;
+        let file = parse_source(src);
+        assert!(
+            smuggling::client_token_count(&file) > 0,
+            "sdk::Client after `use aws_sdk_s3 as sdk;` must resolve through the alias and be \
+             counted, not silently pass because the literal text \"aws_sdk_s3\" never appears"
+        );
+    }
+
+    /// Probe 16 — PR #79's LOW 6: the attribute allowlist (inside `item_kind_violations`) must
+    /// itself go red on a disallowed per-method attribute, not just on a struct/impl one.
+    #[test]
+    fn probe_a_disallowed_method_attribute_is_red() {
+        let src = r#"
+            pub struct S3Ops(aws_sdk_s3::Client);
+            impl S3Ops {
+                #[allow(dead_code)]
+                pub(crate) fn get_object(&self) -> GetObjectFluentBuilder { self.0.get_object() }
+            }
+        "#;
+        let file = parse_source(src);
+        let violations = checks::item_kind_violations(&file, "S3Ops");
+        assert!(
+            !violations.is_empty(),
+            "an `#[allow(dead_code)]` on one method must fail the item-kind allowlist's \
+             attribute check, the surgical version of defeating direction C"
+        );
+    }
+
+    /// Probe 17 — PR #79's LOW 6: the constructor-call allowlist must itself go red on a call
+    /// whose name is not on it.
+    #[test]
+    fn probe_a_disallowed_constructor_call_is_red() {
+        let src = r#"
+            pub struct S3Ops(aws_sdk_s3::Client);
+            impl S3Ops {
+                pub(crate) fn build(shared: &aws_config::SdkConfig) -> S3Ops {
+                    let client = aws_sdk_s3::Client::new(shared);
+                    client.a_call_this_allowlist_has_never_seen();
+                    S3Ops(client)
+                }
+                pub(crate) fn get_object(&self) -> GetObjectFluentBuilder { self.0.get_object() }
+            }
+        "#;
+        let file = parse_source(src);
+        let violations =
+            checks::constructor_call_violations(&file, "S3Ops", "build", CONSTRUCTOR_CALL_ALLOWLIST);
+        assert!(
+            !violations.is_empty(),
+            "a constructor call not on CONSTRUCTOR_CALL_ALLOWLIST must be reported"
+        );
+    }
+
+    /// Probe 18 — PR #79's LOW 6: direction B (missing grant) must itself go red when a derived
+    /// op needs an action neither policy grants.
+    #[test]
+    fn probe_a_missing_grant_is_red() {
+        let derived: BTreeSet<String> = ["delete_object".to_string()].into_iter().collect();
+        let actions = op_actions();
+        let granted: BTreeSet<String> = BTreeSet::new(); // nothing granted at all.
+
+        let missing = missing_grants(&derived, &actions, &granted);
+        assert!(
+            missing.contains("s3:DeleteObject"),
+            "an action required by a derived op but granted nowhere must be reported missing"
+        );
+    }
+
+    /// Probe 19 — PR #79's LOW 6: direction C, JSON side (dead grant) must itself go red when
+    /// the policy grants an action no derived op requires.
+    #[test]
+    fn probe_a_dead_grant_is_red() {
+        let derived: BTreeSet<String> = BTreeSet::new(); // no ops derived at all.
+        let actions = op_actions();
+        let granted: BTreeSet<String> = ["s3:DeleteObject".to_string()].into_iter().collect();
+
+        let dead = dead_grants(&derived, &actions, &granted);
+        assert!(
+            dead.contains("s3:DeleteObject"),
+            "a granted action no derived op requires must be reported as a dead grant"
         );
     }
 }
