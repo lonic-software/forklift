@@ -117,7 +117,7 @@ contention.** Two things decide almost every row:
    independent (a path delta is the object against the *previous version of the same file*, fetched
    from the store, and it never seeds the sliding window), so they now fan out. The catch was doing
    it *without* changing the pack: the size-window fallback deltas each object against the ones just
-   packed (a sequential chain), and reordering would change the content-derived pack filename (and
+   packed (a sequential chain), and reordering would change the layout-derived pack filename (and
    break idempotent repack). So it is a **byte-bounded batch pipeline** — `prepare_batch` compresses
    each batch's path deltas in parallel through the canonical fan-out helper (`fanout_utils::fanout_map`,
    see below), then the writer walks the batch *in order* doing only the sequential work (window

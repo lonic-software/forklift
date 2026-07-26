@@ -1421,12 +1421,15 @@ pub(crate) fn retrieve_from_packs_reloading(hash: &str) -> Result<PackRetrieval,
 ///
 /// This is a backstop only, not the mechanism that keeps chains short: `compact`'s write-time
 /// depth ledger (`true_depth`, consulted by its depth-safety pre-pass) is what enforces the real
-/// invariant — **no written delta's true chain depth may ever exceed `MAX_DELTA_CHAIN`, on any
-/// pass, from any starting store** — by resolving every candidate path base's *actual* current
-/// depth (from record headers, no decompression) before committing to it, rather than trusting
-/// `compute_path_bases`'s own bookkeeping (which only counts path hops since a reset, and is
-/// deliberately silent about a reset point's own real depth — see its doc comment) at face value.
-/// A candidate that would push true depth past the cap is demoted to a full record instead.
+/// invariant — **every delta this run *encodes* is depth-checked before it is written**, by
+/// resolving every candidate path base's *actual* current depth (from record headers, no
+/// decompression) before committing to it, rather than trusting `compute_path_bases`'s own
+/// bookkeeping (which only counts path hops since a reset, and is deliberately silent about a
+/// reset point's own real depth — see its doc comment) at face value. A candidate that would
+/// push true depth past the cap is demoted to a full record instead. A verbatim-copied delta
+/// (`Source::CopyRecord`) is not encoded and is not covered by this check — it inherits its
+/// base's carried depth unchecked, so a copied delta whose base gets re-encoded elsewhere in
+/// the same run can be written at an unverified true depth (tracked as FORK-59).
 ///
 /// So a well-formed pack's chains never approach this ceiling; it exists purely against a
 /// corrupt or adversarial pack that chains without end, turning unbounded recursion (a crash)
@@ -1791,7 +1794,7 @@ pub fn compact(all: bool, redelta: bool) -> Result<CompactStats, String> {
     // fetching a path base never depends on a just-finalized pack the read cache has not seen.
     let mut packed_sources: Vec<PathBuf> = Vec::new();
     // The new packs' own paths, so a repack never deletes one as an "old" pack (the id is
-    // content-derived, so an unchanged repack writes the very same filename).
+    // layout-derived, so an unchanged repack writes the very same filename).
     let mut new_pack_files: HashSet<PathBuf> = HashSet::new();
 
     // The write-time depth ledger (see `true_depth`): every hash this run has assigned a real (or,
@@ -1832,8 +1835,10 @@ pub fn compact(all: bool, redelta: bool) -> Result<CompactStats, String> {
         // pre-existing packed object at all). A candidate that would push true depth past
         // `MAX_DELTA_CHAIN` is rejected here, *before* `prepare_batch` ever reads or compresses
         // it — this is the hard invariant `compute_path_bases`'s own bookkeeping cannot provide
-        // (see `MAX_RECONSTRUCT_DEPTH`'s doc comment): no written delta's true chain depth may
-        // exceed `MAX_DELTA_CHAIN`, ever, on any pass, from any starting store.
+        // (see `MAX_RECONSTRUCT_DEPTH`'s doc comment): every delta this run *encodes* is
+        // depth-checked before it is written. The loop below skips every `Source::CopyRecord`
+        // target (it is copied verbatim, never encoded), so a verbatim-copied delta inherits its
+        // base's carried depth unchecked rather than being re-verified here (FORK-59).
         //
         // A safe candidate's depth is recorded here as the *planned* value — assuming it will
         // in fact be kept as a delta — before `prepare_batch` has even computed its payload, let
@@ -1875,8 +1880,14 @@ pub fn compact(all: bool, redelta: bool) -> Result<CompactStats, String> {
         for (i, target) in batch.iter().enumerate() {
             // A corrupt loose object (see `read_target`/`PrepSlot::CorruptLoose`): skip it before
             // the chunk check and before a writer is ever fetched, exactly like the chunk-skip
-            // below — never packed, never deleted, never the reason an all-corrupt batch creates
-            // an empty pack.
+            // below — for a *sole-copy* corrupt loose object, never packed, never deleted, never
+            // the reason an all-corrupt batch creates an empty pack. This variant is `Source::
+            // Loose`-only: a *duplicated* hash whose loose copy is corrupt is demoted by
+            // `collect_targets` to `Reconstruct` before this arm is ever reached, so it is
+            // instead packed from whichever copy verifies and its loose file is swept, changing
+            // `stats.corrupt_skipped` for that case. A non-`Loose` target is never skipped here or
+            // below (I4) — its only guaranteed surviving copy may be in a pack this run's sweep
+            // deletes, so skipping it would be a data-loss path, not a preservation one.
             if matches!(prepared[i], PrepSlot::CorruptLoose) {
                 stats.corrupt_skipped += 1;
                 continue;
@@ -1885,7 +1896,11 @@ pub fn compact(all: bool, redelta: bool) -> Result<CompactStats, String> {
             // A loose object above the whole-object ceiling (see `read_target`/
             // `PrepSlot::OverCeiling`): a grandfathered giant authored before the ceiling
             // existed, not corruption. Skipped the same way and at the same point as
-            // `CorruptLoose` above — never packed, never deleted, left loose and readable.
+            // `CorruptLoose` above — for a *sole-copy* giant, never packed, never deleted, left
+            // loose and readable. This variant is likewise `Source::Loose`-only: a *duplicated*
+            // over-ceiling giant is demoted to `Reconstruct` and packed via its unbounded local
+            // decode instead of reaching this arm. Same I4 rule as above: a non-`Loose` target is
+            // never skipped, because its only guaranteed copy may be in a pack this run deletes.
             if matches!(prepared[i], PrepSlot::OverCeiling) {
                 stats.over_ceiling_skipped += 1;
                 continue;
@@ -1896,7 +1911,10 @@ pub fn compact(all: bool, redelta: bool) -> Result<CompactStats, String> {
             // window with it). Detected from the decompressed bytes already prepared for this
             // target, so no extra read; only a loose target can be a chunk (a chunk is never in an
             // existing pack, so a `CopyRecord` never is one). This is checked before the writer is
-            // fetched so an all-chunk batch never creates an empty pack.
+            // fetched so an all-chunk batch never creates an empty pack. Guarded on
+            // `Source::Loose(_)` deliberately, per I4: a non-`Loose` target is never skipped,
+            // because its only guaranteed copy may be in a pack this run deletes — a demoted
+            // `Reconstruct` target that happens to be a chunk falls through and is packed instead.
             if matches!(target.source, Source::Loose(_))
                 && prepared[i].as_ready().is_some_and(|prep| is_chunk(&prep.raw)) {
                 continue;
@@ -2074,7 +2092,7 @@ pub fn compact(all: bool, redelta: bool) -> Result<CompactStats, String> {
     invalidate_cache();
 
     for old_pack in &old_packs {
-        // A content-derived pack id means an unchanged repack writes the same filename it is
+        // A layout-derived pack id means an unchanged repack writes the same filename it is
         // about to "delete" — never remove a file a new pack was just written to.
         if new_pack_files.contains(old_pack) {
             continue;
@@ -2125,18 +2143,26 @@ enum ReadOutcome {
 /// decompressed bytes and its zstd blob (the full-record payload and the size guard). A loose
 /// object is read from its file; a to-reconstruct object comes through the object store.
 ///
-/// This is the one ingress a loose object's bytes take into a pack (`enumerate_loose_objects`
-/// addresses it by *filename*, never by content — see the module doc), so it is also the one
-/// place that content is checked against that address: a decode failure or a hash mismatch is
-/// `CorruptLoose`, not an `Err` — corruption found here is pre-existing damage this run did not
-/// cause, and packing it under a hash it does not hash to would make it durable and outlive its
-/// last-recoverable loose form (deleted the moment its corrupt packed twin lands). A decode that
-/// would exceed the whole-object ceiling is `OverCeiling`, distinct from `CorruptLoose`: this
-/// object is not corrupt, it is a legitimate object authored before the ceiling existed (see
-/// [`object_utils::MAX_OBJECT_BYTES`]) — `compact` leaves it loose rather than claim a decode
-/// this ingress point deliberately refuses to finish. `Reconstruct` and `CopyRecord` are
-/// unchanged: any failure there still aborts the whole compact (see `PrepSlot`'s doc comment for
-/// why that asymmetry is load-bearing).
+/// For a *sole-copy* loose object this is the one ingress its bytes take into a pack
+/// (`enumerate_loose_objects` addresses it by *filename*, never by content — see the module
+/// doc), so it is also the one place that content is checked against that address: a decode
+/// failure or a hash mismatch is `CorruptLoose`, not an `Err` — corruption found here is
+/// pre-existing damage this run did not cause, and packing it under a hash it does not hash to
+/// would make it durable and outlive its last-recoverable loose form (deleted the moment its
+/// corrupt packed twin lands). A *duplicated* loose object's bytes can instead enter through the
+/// `Reconstruct` arm below, which serves whichever copy the exhaustive verified read finds
+/// servable (possibly this same loose file, read and verified again there) — this arm's own
+/// ingress checks are then bypassed in favor of that read (see `collect_targets`'s demotion).
+/// A decode that would exceed the whole-object ceiling is `OverCeiling`, distinct from
+/// `CorruptLoose`: this object is not corrupt, it is a legitimate object authored before the
+/// ceiling existed (see [`object_utils::MAX_OBJECT_BYTES`]). For a sole-copy giant `compact`
+/// leaves it loose rather than claim a decode this ingress point deliberately refuses to finish;
+/// a *duplicated* over-ceiling giant is demoted the same way as a duplicated loose object and is
+/// packed via the `Reconstruct` arm, whose local decode is deliberately unbounded so a
+/// grandfathered giant stays readable (see `reconstruct_record`'s doc comment; only *transport*
+/// decode is bounded). `Reconstruct` and `CopyRecord` are unchanged: any failure there
+/// still aborts the whole compact (see `PrepSlot`'s doc comment for why that asymmetry is
+/// load-bearing).
 fn read_target(target: &PackTarget) -> Result<ReadOutcome, String> {
     match &target.source {
         Source::Loose(path) => {
@@ -2205,13 +2231,17 @@ enum PrepSlot {
     /// A target ready to pack, with its bytes and any winning path delta.
     Ready(Prepared),
     /// A loose object whose bytes did not decode as zstd, or decoded but do not hash to the
-    /// address their filename claims — see `read_target`. The main loop skips it before ever
-    /// fetching a writer or touching the delta window: never packed, never deleted, left
-    /// exactly as found for `forklift audit`/`heal` or a future re-fetch.
+    /// address their filename claims — see `read_target`. Only produced for a *sole-copy*
+    /// `Source::Loose` target; a duplicated hash whose loose copy is corrupt is demoted to
+    /// `Reconstruct` instead and never reaches this variant. The main loop skips a sole-copy
+    /// occurrence before ever fetching a writer or touching the delta window: never packed,
+    /// never deleted, left exactly as found for `forklift audit`/`heal` or a future re-fetch.
     CorruptLoose,
     /// A loose object whose decoded size would exceed [`object_utils::MAX_OBJECT_BYTES`] — a
     /// grandfathered giant authored before that ceiling existed, not corruption (see
-    /// `read_target`). Skipped the same way `CorruptLoose` is: never packed, never deleted, left
+    /// `read_target`). Only produced for a *sole-copy* `Source::Loose` target; a duplicated
+    /// over-ceiling giant is demoted to `Reconstruct` and packed instead of reaching this
+    /// variant. Skipped the same way `CorruptLoose` is: never packed, never deleted, left
     /// loose and fully readable via the ordinary (unbounded) read path forever.
     OverCeiling,
 }
@@ -3088,9 +3118,19 @@ impl PackWriter {
     /// index of the old one — the fix for that is a layout-derived id alone, not an
     /// index-before-data reorder: a layout-derived id (see
     /// `compute_pack_id`) means a differently-laid-out pack of the same object set gets a
-    /// *different* name and is written fresh rather than overwriting this pair, so the only
-    /// remaining same-name rewrite is a byte-identical idempotent repack — harmless in either
-    /// order, while index-before-data would break the load-bearing new-pack invariant above.
+    /// *different* name and is written fresh rather than overwriting this pair. A same-name
+    /// rewrite therefore always has the same *layout* — the same records at the same offsets and
+    /// lengths — but not necessarily the same bytes: a repack that demotes a duplicated hash
+    /// re-encodes that record's content fresh (see `collect_targets`), and a fresh encode can land
+    /// on the replaced record's exact length. The rewrite is safe on layout identity plus
+    /// read-time verification, never byte identity: the not-yet-replaced old index tiles the new
+    /// data file exactly, each record it locates is either the replaced record's own bytes (a
+    /// verbatim copy of a sole or byte-identical duplicate) or bytes whose content this repack
+    /// verified (`read_target`), and every pack read verifies what it resolves
+    /// (`resolve_record`) — so a reader interleaving with the two renames serves verified bytes or
+    /// fails cleanly, and a same-name rewrite can only ever replace a record's bytes with bytes
+    /// that verify, never a verified copy with bytes that do not. Index-before-data, by contrast,
+    /// would break the load-bearing new-pack invariant above.
     /// Returns the loose files this pack now holds (the caller deletes them once **every** pack
     /// is durable) and this pack's two final paths (so a repack never deletes, as an "old"
     /// pack, a file a new pack was just written to — an idempotent repack lands on that name).
@@ -4316,7 +4356,7 @@ mod tests {
 
         // The repack did happen: the duplicate's own (distinctly-named) files are gone, and only
         // one pack file remains. Note this does *not* assert `!pack_a_data.exists()`: the new
-        // pack's filename is content-*derived* (`compute_pack_id`, hashed from each record's
+        // pack's filename is layout-*derived* (`compute_pack_id`, hashed from each record's
         // `(hash, offset, length)` triple, never its bytes -- see the doc comment there), and this
         // fixture's corrupted byte changes neither hash, offset, nor length, so the repack's
         // deterministic layout lands the new pack on the exact same filename pack A already had --
@@ -5048,7 +5088,7 @@ mod tests {
     }
 
     /// Rename a just-finalized pack pair's stem, so file-name enumeration order is deterministic
-    /// in a test. Pack stems are otherwise content-derived (`compute_pack_id`, layout-hashed) and
+    /// in a test. Pack stems are otherwise layout-derived (`compute_pack_id`, layout-hashed) and
     /// so arbitrary from a test's point of view; `load_pack_pair` validates magic/version/record
     /// structure, never the stem (see the load-time sort's own precondition note on
     /// `retrieve_from_packs`'s I5 falsifier), so any stem is safe to give it.

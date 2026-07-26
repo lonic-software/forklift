@@ -106,8 +106,13 @@ the same substrate.) A pack is two files under `.forklift/objects/pack/`:
   packing a full object re-hashes and re-compresses nothing — it only moves bytes.
 - `<id>.idx` — a header then fixed-width records `(32-byte hash, u64 offset, u64
   length)` **sorted by hash**, so a lookup is a binary search over the resident
-  index and a single `read` at the offset. `<id>` is the Blake3 of the pack's
-  sorted hashes (content-derived, so identical packs collide rather than pile up).
+  index and a single `read` at the offset. `<id>` is the Blake3 of each record's
+  `(hash, offset, length)` triple — layout-derived, never the record bytes — so a
+  repack that reproduces the same layout collides onto the same filename rather
+  than piling up a fresh one. (An earlier scheme hashed only the pack's sorted
+  object hashes, which let a repack land the same id on a differently-laid-out
+  pack and pair a fresh data file with a stale index mid-rename; folding in
+  offset and length closes that window.)
 
 The read fallback lives behind the two centralised object-store functions
 (`retrieve_object_by_hash`, `does_object_exist` in `file_utils.rs`): the loose
@@ -475,7 +480,7 @@ accumulate and packed garbage is never dropped. `compact --all` fixes both:
 Durability is unchanged: new packs are written and fsynced — and the pack directory is
 fsynced — before any original (loose file *or* old pack) is removed, so an interruption
 never loses an object, across a power loss and not just a process crash. One sharp edge the
-tests pin: the pack id is content-derived, so an **idempotent** repack writes a pack with
+tests pin: the pack id is layout-derived, so an **idempotent** repack writes a pack with
 the *same name* as the one it supersedes — the deletion step must therefore never remove a
 file a new pack was just written to (it skips new-pack paths).
 

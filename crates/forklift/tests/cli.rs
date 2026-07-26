@@ -5031,7 +5031,7 @@ fn compact_all_repacks_consolidates_and_drops_garbage() {
         4, "every live parcel must survive the repack"
     );
 
-    // A second repack is idempotent and never loses the pack (regression: the content-derived
+    // A second repack is idempotent and never loses the pack (regression: the layout-derived
     // pack name once made the repack delete the very pack it had just written).
     assert_success(&warehouse.run(&["compact", "--all"]));
     assert_eq!(count_packs(&objects), 1, "an idempotent repack must keep the pack");
@@ -6311,7 +6311,7 @@ fn compact_all_tolerates_a_sparse_store_and_a_later_scoped_stack_still_works() {
     assert_eq!(count_packs(&objects), 1, "the present live set consolidates into a single pack");
 
     // Byte-reproducible on the sparse store: a second repack lands on the same single pack (the
-    // pack id is content-derived, so an unchanged repack neither churns the name nor loses an
+    // pack id is layout-derived, so an unchanged repack neither churns the name nor loses an
     // object) — the determinism contract, holding with objects legitimately missing.
     assert_success(&warehouse.run(&["compact", "--all"]));
     assert_eq!(count_packs(&objects), 1, "an idempotent repack on a sparse store keeps the one pack");
