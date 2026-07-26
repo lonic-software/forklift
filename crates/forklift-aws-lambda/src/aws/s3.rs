@@ -105,6 +105,7 @@ use aws_sdk_s3::primitives::ByteStream;
 
 use forklift_core::util::object_utils;
 
+use crate::aws::s3_ops::S3Ops;
 use crate::aws::sdk::{describe, is_head_object_not_found, is_no_such_key, is_precondition_failed};
 use crate::blocking::AsyncBridge;
 use crate::store::{ObjectAccess, ObjectStore, PromoteOutcome, PutOutcome, PutTarget, SignatureOutcome};
@@ -214,7 +215,7 @@ fn percent_encode_copy_source_key(key: &str) -> String {
 /// [`AsyncBridge`]. It must be built inside a multi-thread runtime and its methods called
 /// from a blocking thread, exactly as the `Head` contract requires.
 pub struct S3ObjectStore {
-    client: aws_sdk_s3::Client,
+    client: S3Ops,
     bucket: String,
     bridge: AsyncBridge,
 }
@@ -282,7 +283,7 @@ async fn stream_hash_capped(mut body: ByteStream, cap: u64) -> Result<StreamHash
 impl S3ObjectStore {
     /// Build the store over an S3 `client` addressing `bucket`, driving its async calls
     /// through `bridge`. Capture the bridge on the runtime thread (see `aws::config`).
-    pub fn new(client: aws_sdk_s3::Client, bucket: String, bridge: AsyncBridge) -> S3ObjectStore {
+    pub fn new(client: S3Ops, bucket: String, bridge: AsyncBridge) -> S3ObjectStore {
         S3ObjectStore { client, bucket, bridge }
     }
 

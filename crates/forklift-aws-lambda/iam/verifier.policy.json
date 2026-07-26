@@ -1,0 +1,23 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "PromoteStagedObjects",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:DeleteObject"],
+      "Resource": "${bucket_arn}/staging/*"
+    },
+    {
+      "Sid": "WriteCanonicalObjects",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject"],
+      "Resource": "${bucket_arn}/objects/*"
+    },
+    {
+      "Sid": "Logs",
+      "Effect": "Allow",
+      "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
+      "Resource": ["${log_group_arn}", "${log_group_arn}:*"]
+    }
+  ]
+}

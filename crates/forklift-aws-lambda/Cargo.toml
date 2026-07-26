@@ -78,6 +78,12 @@ required-features = ["lambda"]
 # the workspace's existing (ring-based) client, added only for tests.
 reqwest = { workspace = true }
 
+# C11, the IAM conformance test (`tests/iam_conformance.rs`): parses `src/aws/` to *derive* the
+# SDK operation set from the AST — enumeration plus a closure invariant, not a pattern-per-op
+# check — rather than trust a hand-written list to stay in sync with the code. Pure Rust, no
+# native build; does not pull in `aws-lc` (see `aws::config`'s module docs on why that matters).
+syn = { version = "2", features = ["full", "visit"] }
+
 # A tiny in-test HTTP shim that serves `entrypoint::handle` over the real stores, so the real
 # `forklift` CLI can drive the whole staging lift end to end against LocalStack. The workspace's
 # existing axum (used by `forklift-server`), only for the LocalStack-gated integration test.

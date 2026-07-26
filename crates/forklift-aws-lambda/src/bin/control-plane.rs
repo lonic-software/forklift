@@ -10,7 +10,7 @@
 //!
 //! Build with `cargo build -p forklift-aws-lambda --features lambda --release`.
 
-use forklift_aws_lambda::aws::build_clients;
+use forklift_aws_lambda::aws::{build_clients, DynamoOps, S3Ops};
 use forklift_aws_lambda::{
     auth_from_env, config_from_env, handle, AsyncBridge, AuthConfig, AwsConfig, DynamoRefStore,
     Head, Routing, S3ObjectStore,
@@ -23,8 +23,8 @@ use tokio::sync::OnceCell;
 /// varies in multi mode — is nearly free, while the expensive audit mirror is amortized by the
 /// process-global scratch pool [`Head::pooled`] keys by warehouse.
 struct Context {
-    s3: aws_sdk_s3::Client,
-    dynamodb: aws_sdk_dynamodb::Client,
+    s3: S3Ops,
+    dynamodb: DynamoOps,
     bridge: AsyncBridge,
     config: AwsConfig,
     routing: Routing,

@@ -18,7 +18,9 @@ use aws_smithy_http_client::tls;
 use forklift_core::util::pallet_utils::DEFAULT_PALLET_NAME;
 
 use crate::aws::dynamo::DynamoRefStore;
+use crate::aws::dynamo_ops::DynamoOps;
 use crate::aws::s3::S3ObjectStore;
+use crate::aws::s3_ops::S3Ops;
 use crate::blocking::AsyncBridge;
 
 /// Everything an AWS-backed head needs to reach its byte plane and consistency point.
@@ -94,8 +96,8 @@ impl AwsConfig {
     }
 }
 
-/// Build the S3 and DynamoDB clients from `config`, resolving credentials through the default
-/// provider chain and TLS through a **ring**-based rustls connector.
+/// Build the S3 and DynamoDB capabilities from `config`, resolving credentials through the
+/// default provider chain and TLS through a **ring**-based rustls connector.
 ///
 /// The connector is built explicitly rather than left to the SDK default, because the SDK
 /// default (`default-https-client`) selects `rustls-aws-lc`, which drags in `aws-lc-sys` — a
@@ -103,17 +105,43 @@ impl AwsConfig {
 /// is forklift's trusted crypto provider. The choice is invisible on the wire; it is purely a
 /// build-time and dependency-surface decision.
 ///
+/// The provider-chain resolution and connector construction happen **once**, in
+/// [`load_shared_config`], and the resulting [`aws_config::SdkConfig`] is handed to both
+/// [`S3Ops::build`]/[`DynamoOps::build`] — a fix for a real cold-start regression the first cut
+/// of the capability-wrapper split introduced: each `build` doing its own `loader.load().await`
+/// meant two independent credential-chain resolutions (container/IMDS round trips) and two
+/// connector pools per cold start, under API Gateway's 29 s ceiling. `S3Ops::build`/
+/// `DynamoOps::build` themselves are now plain, synchronous client construction from an
+/// already-resolved config — nothing left in them can fail or await.
+///
+/// This function — and this whole file — names no raw client type. That is deliberate: the two
+/// wrapper modules ([`s3_ops`](crate::aws::s3_ops), [`dynamo_ops`](crate::aws::dynamo_ops)) are
+/// the *only* places `aws_sdk_s3::Client`/`aws_sdk_dynamodb::Client` may appear anywhere in
+/// `src/` (`tests/iam_conformance.rs`'s smuggling guard asserts exactly that); `SdkConfig`/
+/// `tls::Provider`/`Region` are not that type, so building them here does not reopen it.
+///
 /// Must be called inside a tokio runtime.
 ///
 /// # Arguments
 /// * `config` - The deployment's bucket, table, warehouse, region and endpoint.
 ///
 /// # Returns
-/// * `Ok((s3, dynamodb))` - The two configured clients.
-/// * `Err(String)`        - If the provider chain or connector could not be built.
-pub async fn build_clients(
-    config: &AwsConfig,
-) -> Result<(aws_sdk_s3::Client, aws_sdk_dynamodb::Client), String> {
+/// * `Ok((s3, dynamodb))` - The two sanctioned capabilities.
+/// * `Err(String)`        - Reserved for a future fallible step; nothing here can fail today.
+pub async fn build_clients(config: &AwsConfig) -> Result<(S3Ops, DynamoOps), String> {
+    let shared = load_shared_config(config).await;
+
+    let s3 = S3Ops::build(&shared, config.endpoint_url.is_some());
+    let dynamodb = DynamoOps::build(&shared);
+
+    Ok((s3, dynamodb))
+}
+
+/// Resolve the default provider chain and build the ring-based rustls connector exactly once,
+/// applying `config`'s region/endpoint override — shared by both [`S3Ops::build`] and
+/// [`DynamoOps::build`] so a cold start pays for one credential-chain resolution, not two (see
+/// [`build_clients`]'s docs for the regression this fixes).
+async fn load_shared_config(config: &AwsConfig) -> aws_config::SdkConfig {
     let http_client = aws_smithy_http_client::Builder::new()
         .tls_provider(tls::Provider::Rustls(tls::rustls_provider::CryptoMode::Ring))
         .build_https();
@@ -129,22 +157,7 @@ pub async fn build_clients(
         loader = loader.endpoint_url(endpoint.clone());
     }
 
-    let shared = loader.load().await;
-
-    // LocalStack and MinIO serve one endpoint for every bucket, so the `bucket.host` virtual
-    // addressing real S3 uses cannot resolve there; path-style (`host/bucket/key`) is the form
-    // they understand. Real AWS keeps the default (virtual-host) addressing.
-    let s3 = if config.endpoint_url.is_some() {
-        let s3_config =
-            aws_sdk_s3::config::Builder::from(&shared).force_path_style(true).build();
-        aws_sdk_s3::Client::from_conf(s3_config)
-    } else {
-        aws_sdk_s3::Client::new(&shared)
-    };
-
-    let dynamodb = aws_sdk_dynamodb::Client::new(&shared);
-
-    Ok((s3, dynamodb))
+    loader.load().await
 }
 
 /// Build both stores over freshly configured clients, moving `bridge` into them so their
