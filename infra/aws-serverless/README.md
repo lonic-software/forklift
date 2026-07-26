@@ -137,22 +137,63 @@ once published; renames and removals are breaking changes. A summary:
 `deletion_protection`, `enable_pitr`, `staging_expiry_days`, `responses_expiry_days`,
 `architecture`, memory/timeout/ephemeral-storage per function, `throttling_rate_limit`/
 `throttling_burst_limit`, `create_verifier_dlq`, `log_retention_days`, `name_prefix`,
-`bucket_name`, `table_name`, `default_pallet`, `permissions_boundary_arn`, `tags`,
-`dev_endpoint_url` (LocalStack only).
+`bucket_name`, `table_name`, `default_pallet`, `permissions_boundary_arn`, `tags`.
 
-**Outputs:** `api_endpoint`, `api_id`, bucket name/ARN, table name/ARN, both function names/ARNs,
-both role ARNs (the sanctioned seam for attaching extra policies externally), the DLQ URL/ARN
-(null when disabled), and both log group names.
+**Outputs:** `api_endpoint`, `api_id` (both **null** — not empty string — when `create_api =
+false`, see below), bucket name/ARN, table name/ARN, both function names/ARNs, both role ARNs
+(the sanctioned seam for attaching extra policies externally), the DLQ URL/ARN (null when
+disabled), and both log group names.
+
+### Internal variables — NOT part of the compatibility promise
+
+`dev_endpoint_url` and `create_api` exist for this module's own test harness (Layer 2, below),
+not for consumers. Unlike everything in `variables.tf`'s other sections, they may change shape
+or disappear in a future release without that counting as a breaking change:
+
+- **`dev_endpoint_url`** (default `null`) overrides `FORKLIFT_AWS_ENDPOINT_URL` for both Lambda
+  functions — LocalStack/MinIO only; never set in a real deployment.
+- **`create_api`** (default `true`) skips the HTTP API and everything that hangs off it (the
+  integration, the route, the `$default` stage, the gateway's Lambda invoke permission) when set
+  `false` — the only way Layer 2 can apply this module at all, since LocalStack community does
+  not implement API Gateway v2. A `validation` block makes `create_api = false` reachable only
+  when `dev_endpoint_url` is also set, so a headless stack (no API, nothing can ever reach the
+  control plane) is structurally undeployable against real AWS — closed by construction, the
+  same standard every other footgun in this module is held to, not a README warning.
+
+  When `create_api = false`, `api_endpoint` and `api_id` output `null`.
 
 ## Testing
 
 `tests/main.tftest.hcl` is this module's Layer 1: `tofu test` (or `terraform test`) with
 `mock_provider "aws"` — free, credential-less, and runs in CI on every PR. It pins the C1-C10
-claims from the design memo's §5, including two validation-failure cases
-(`staging_expiry_days = 0`, an empty `auth_token`) and a gateway-ceiling rejection
-(`control_plane_timeout_s` above 29). Each assertion is genuinely bidirectional — reverting the
-module line it checks makes the assertion fail, not merely pass vacuously.
+claims from the design memo's §5, plus C12/C13 for `create_api` (added 2026-07-26): `create_api
+= false` with `dev_endpoint_url` set applies cleanly and creates zero `aws_apigatewayv2_*`
+resources (C12), and `create_api = false` without `dev_endpoint_url` is rejected by validation
+(C13). Each assertion is genuinely bidirectional — reverting the module line it checks makes the
+assertion fail, not merely pass vacuously.
 
-Layer 2 (LocalStack apply-and-exercise) and Layer 3 (a real-account scheduled deploy-and-verify)
-are tracked separately; they pin the behavioral half of the notification/env claims and IAM
-sufficiency respectively, which a plan-only test cannot reach.
+**Layer 2** (`tests/localstack/`, `.github/workflows/infra-localstack.yml`) is a real `tofu
+apply` against a LocalStack service container — a pinned community image
+(`localstack/localstack:4.0`; `:stable` refuses to boot without a paid auth token, unrelated to
+API Gateway v2), never the LocalStack CLI, so what runs locally is what CI executes. Path-filtered
+on both `infra/**` and `crates/forklift-aws-lambda/**`: a crate change that alters the deployment
+contract breaks this in the same PR. It applies with `create_api = false`, `architecture =
+"x86_64"` (the module defaults to arm64; Layer 2's zips are built `x86_64` and a mismatch fails
+every invocation with an exec-format error unrelated to the module), stages an object under
+`staging/` exactly as a client's presigned `PUT` would, and polls `objects/` until the S3 event
+has fired the verifier Lambda and it has cold-started and promoted the object — the behavioural
+half of C3/C4 that a plan-only Layer 1 assert cannot reach. `tofu destroy` must exit `0`
+(requires overriding `force_destroy`/`deletion_protection`, which is exactly why C8 pins their
+*defaults* separately — Layer 2 necessarily overrides both).
+
+See `tests/localstack/main.tf`'s own comments for two LocalStack-specific quirks this workflow
+works around, neither of which says anything about the module itself: the deployed Lambda
+functions must reach LocalStack at a *different* address than the host does (`host.docker.internal`,
+not `localhost` — a Lambda invocation runs in its own nested Docker container), and the AWS
+provider is pinned below `5.70.0` for this root config only (`aws_s3_bucket_lifecycle_configuration`
+never converges against LocalStack on `>= 5.70.0` — a provider bug comparing a response header
+LocalStack never sends, github.com/hashicorp/terraform-provider-aws#49019).
+
+Layer 3 (a real-account scheduled deploy-and-verify) is tracked separately; it is the only pin for
+IAM sufficiency, real gateway semantics, and arm64 boot, none of which a LocalStack apply can
+reach.

@@ -294,12 +294,12 @@ run "c9_stage_is_default" {
   command = apply
 
   assert {
-    condition     = aws_apigatewayv2_stage.default.name == "$default"
+    condition     = aws_apigatewayv2_stage.default[0].name == "$default"
     error_message = "C9: the API Gateway stage must be the literal $default stage."
   }
 
   assert {
-    condition     = aws_apigatewayv2_stage.default.auto_deploy == true
+    condition     = aws_apigatewayv2_stage.default[0].auto_deploy == true
     error_message = "C9: the $default stage must auto-deploy."
   }
 }
@@ -317,5 +317,70 @@ run "c10_control_plane_timeout_above_ceiling_rejected" {
 
   expect_failures = [
     var.control_plane_timeout_s,
+  ]
+}
+
+# ---------------------------------------------------------------------------------------------
+# C12/C13 — create_api (design memo §3.2, added 2026-07-26): an internal, test-harness-only
+# toggle that skips the HTTP API entirely (Layer 2's LocalStack CI needs this, since LocalStack
+# community does not implement API Gateway v2). Two properties are load-bearing together:
+# create_api = false plans/applies cleanly when dev_endpoint_url is set (C12), and is rejected
+# by validation when it is not (C13) — the footgun closes by construction, not by documentation.
+# ---------------------------------------------------------------------------------------------
+
+run "c12_create_api_false_skips_the_gateway" {
+  command = apply
+
+  variables {
+    create_api       = false
+    dev_endpoint_url = "http://localhost:4566"
+  }
+
+  assert {
+    condition     = length(aws_apigatewayv2_api.this) == 0
+    error_message = "C12: create_api = false must create zero aws_apigatewayv2_api resources."
+  }
+
+  assert {
+    condition     = length(aws_apigatewayv2_integration.control_plane) == 0
+    error_message = "C12: create_api = false must create zero aws_apigatewayv2_integration resources."
+  }
+
+  assert {
+    condition     = length(aws_apigatewayv2_route.catch_all) == 0
+    error_message = "C12: create_api = false must create zero aws_apigatewayv2_route resources."
+  }
+
+  assert {
+    condition     = length(aws_apigatewayv2_stage.default) == 0
+    error_message = "C12: create_api = false must create zero aws_apigatewayv2_stage resources."
+  }
+
+  assert {
+    condition     = length(aws_lambda_permission.apigw_invoke) == 0
+    error_message = "C12: create_api = false must create zero API Gateway Lambda invoke permissions."
+  }
+
+  assert {
+    condition     = output.api_endpoint == null
+    error_message = "C12: api_endpoint must output null (not empty string) when create_api = false."
+  }
+
+  assert {
+    condition     = output.api_id == null
+    error_message = "C12: api_id must output null (not empty string) when create_api = false."
+  }
+}
+
+run "c13_create_api_false_without_dev_endpoint_is_rejected" {
+  command = plan
+
+  variables {
+    create_api       = false
+    dev_endpoint_url = null
+  }
+
+  expect_failures = [
+    var.create_api,
   ]
 }

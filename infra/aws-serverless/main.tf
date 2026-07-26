@@ -418,16 +418,27 @@ resource "aws_lambda_function" "verifier" {
 # API Gateway — HTTP API (v2). Created, no BYO, no REST option (§3.1, §7). A single catch-all
 # route is sufficient (docs/DEPLOYMENT.md: entrypoint::handle does its own method/path dispatch
 # and 404s on anything it does not recognize).
+#
+# Every resource below is `count`-gated on `var.create_api`, an internal test-harness variable
+# (variables.tf) that exists solely because LocalStack community does not implement API Gateway
+# v2 (design memo §8 risk 1) — Layer 2's LocalStack CI needs the bucket/DynamoDB/Lambda/event
+# wiring without the gateway. The variable's own validation block makes `create_api = false`
+# reachable only when `dev_endpoint_url` is also set, so this is structurally unreachable
+# against real AWS.
 # ---------------------------------------------------------------------------------------------
 
 resource "aws_apigatewayv2_api" "this" {
+  count = var.create_api ? 1 : 0
+
   name          = "${var.name_prefix}-api"
   protocol_type = "HTTP"
   tags          = var.tags
 }
 
 resource "aws_apigatewayv2_integration" "control_plane" {
-  api_id                 = aws_apigatewayv2_api.this.id
+  count = var.create_api ? 1 : 0
+
+  api_id                 = aws_apigatewayv2_api.this[0].id
   integration_type       = "AWS_PROXY"
   integration_uri        = aws_lambda_function.control_plane.invoke_arn
   integration_method     = "POST"
@@ -435,9 +446,11 @@ resource "aws_apigatewayv2_integration" "control_plane" {
 }
 
 resource "aws_apigatewayv2_route" "catch_all" {
-  api_id    = aws_apigatewayv2_api.this.id
+  count = var.create_api ? 1 : 0
+
+  api_id    = aws_apigatewayv2_api.this[0].id
   route_key = "ANY /{proxy+}"
-  target    = "integrations/${aws_apigatewayv2_integration.control_plane.id}"
+  target    = "integrations/${aws_apigatewayv2_integration.control_plane[0].id}"
 }
 
 # Deployed to the literal `$default` stage with auto_deploy, and no variable admits any other
@@ -447,7 +460,9 @@ resource "aws_apigatewayv2_route" "catch_all" {
 # "$default" would be noise, and one admitting named stages ships a footgun that breaks
 # everything. Pinned by C9.
 resource "aws_apigatewayv2_stage" "default" {
-  api_id      = aws_apigatewayv2_api.this.id
+  count = var.create_api ? 1 : 0
+
+  api_id      = aws_apigatewayv2_api.this[0].id
   name        = "$default"
   auto_deploy = true
 
@@ -460,9 +475,11 @@ resource "aws_apigatewayv2_stage" "default" {
 }
 
 resource "aws_lambda_permission" "apigw_invoke" {
+  count = var.create_api ? 1 : 0
+
   statement_id  = "AllowAPIGatewayInvoke"
   action        = "lambda:InvokeFunction"
   function_name = aws_lambda_function.control_plane.function_name
   principal     = "apigateway.amazonaws.com"
-  source_arn    = "${aws_apigatewayv2_api.this.execution_arn}/*/*"
+  source_arn    = "${aws_apigatewayv2_api.this[0].execution_arn}/*/*"
 }

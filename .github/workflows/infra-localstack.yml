@@ -1,0 +1,173 @@
+# Layer 2 (design memo, infra/aws-serverless — see forklift-planning/design-memos/
+# 2026-07-26-aws-serverless-terraform-reference.md §5): a real `tofu apply` of the module
+# against LocalStack, run the way GitHub Actions actually executes it — a service container,
+# not the LocalStack CLI — because what we validate locally has to be what CI runs.
+#
+# This is Layer 1's (tests/main.tftest.hcl, ci.yml-adjacent) necessary complement, not a
+# duplicate: a plan-only mock_provider assert cannot prove an S3 event is actually delivered or
+# that the verifier Lambda actually cold-starts and promotes. Layer 2 proves exactly that, and
+# only that — API Gateway v2 is out of scope entirely (create_api = false; LocalStack community
+# does not implement it, §8 risk 1 of the design memo), so this workflow never touches the
+# gateway.
+#
+# Path-filtered on BOTH infra/** and crates/forklift-aws-lambda/**: a crate change that alters
+# the deployment contract (a new S3/DynamoDB call, a changed env var, a changed staging-key
+# shape) must break this in the same PR, not silently rot until a scheduled Layer 3 run.
+name: Infra (LocalStack)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "infra/**"
+      - "crates/forklift-aws-lambda/**"
+      - ".github/workflows/infra-localstack.yml"
+  pull_request:
+    paths:
+      - "infra/**"
+      - "crates/forklift-aws-lambda/**"
+      - ".github/workflows/infra-localstack.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+  AWS_ACCESS_KEY_ID: test
+  AWS_SECRET_ACCESS_KEY: test
+  AWS_DEFAULT_REGION: us-east-1
+  # The host-side endpoint: what the AWS provider (tofu) and this workflow's own aws-cli calls
+  # use. NOT what the deployed Lambda functions use at runtime — see tests/localstack/main.tf's
+  # `lambda_endpoint_url` variable and its comment for why those two addresses must differ
+  # (a Lambda invocation runs in its own nested Docker container, where `localhost` refers to
+  # that container itself; this was reproduced directly while building this workflow — the
+  # verifier's first real invocation failed with a dispatch-level Connection Refused until its
+  # own endpoint was pointed at `host.docker.internal` instead).
+  LOCALSTACK_ENDPOINT: http://localhost:4566
+
+jobs:
+  layer2:
+    name: layer2 (localstack apply-and-exercise)
+    runs-on: ubuntu-latest
+    # A pinned community tag, not `:stable` — verified against localstack/localstack:stable
+    # (2026.7.0) directly: it refuses to boot at all without a paid LOCALSTACK_AUTH_TOKEN,
+    # independently of anything to do with API Gateway v2. `:4.0` (resolves to 4.0.3) is a
+    # pinned community image confirmed to boot and serve S3/DynamoDB/Lambda/IAM/STS/Logs/SQS.
+    services:
+      localstack:
+        image: localstack/localstack:4.0
+        ports:
+          - 4566:4566
+        env:
+          SERVICES: s3,dynamodb,lambda,iam,sts,logs,sqs,cloudwatch
+        # The Lambda executor needs to reach the host's Docker daemon to spin up each
+        # function's own execution container — without this mount, every Lambda create
+        # succeeds but every invoke fails ("Docker not available in the LocalStack container").
+        volumes:
+          - /var/run/docker.sock:/var/run/docker.sock
+        options: >-
+          --health-cmd "curl -sf http://localhost:4566/_localstack/health"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install OpenTofu
+        uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: "1.12.5"
+
+      # cargo-lambda cross-compiles via zig regardless of host architecture, for a
+      # reproducible glibc baseline (see docs/DEPLOYMENT.md "Building the deployment
+      # artifacts"). Both installed via pip: small, prebuilt wheels, no native toolchain.
+      - name: Install cargo-lambda and zig
+        run: pip3 install cargo-lambda ziglang
+
+      # Layer 2's own x86_64 override (design memo: "Layer 2 must also set architecture =
+      # x86_64 explicitly") — cargo-lambda's default target is whatever the host is, which for
+      # an ubuntu-latest runner is already x86_64-unknown-linux-gnu, but this is explicit so
+      # the artifact and the module's `architecture` tfvar can never silently drift apart.
+      - name: Build the Lambda deployment packages (x86_64, release)
+        run: |
+          cargo lambda build --release --x86-64 \
+            -p forklift-aws-lambda --features lambda --output-format zip
+
+      - name: Wait for LocalStack
+        # Actions already waits on the service container's own health check, but the first
+        # health-check pass can lag actual readiness by a beat (see aws-integration.yml, the
+        # sibling workflow this pattern is copied from).
+        run: |
+          for _ in $(seq 1 30); do
+            curl -sf http://localhost:4566/_localstack/health > /dev/null && exit 0
+            sleep 2
+          done
+          echo "LocalStack did not become healthy in time" >&2
+          exit 1
+
+      - name: tofu init (Layer 2 root config)
+        working-directory: infra/aws-serverless/tests/localstack
+        run: tofu init -input=false
+
+      - name: tofu apply
+        working-directory: infra/aws-serverless/tests/localstack
+        run: |
+          tofu apply -auto-approve \
+            -var control_plane_package="$GITHUB_WORKSPACE/target/lambda/forklift-aws-control-plane/bootstrap.zip" \
+            -var verifier_package="$GITHUB_WORKSPACE/target/lambda/forklift-aws-verifier/bootstrap.zip" \
+            -var auth_token="$(openssl rand -hex 32)" \
+            -var name_prefix="forklift-l2-${{ github.run_id }}"
+
+      # The point of Layer 2: stage an object under staging/ exactly as a client's presigned
+      # PUT would, then poll objects/ until the S3 event has fired the verifier and it has
+      # cold-started and promoted the object. A plan-only Layer 1 assert cannot reach either
+      # half of this claim.
+      - name: Exercise — stage an object, poll for promotion
+        working-directory: infra/aws-serverless/tests/localstack
+        run: |
+          set -euo pipefail
+          pip3 install blake3
+          BUCKET=$(tofu output -raw bucket_name)
+
+          content="layer 2 exercise run ${{ github.run_id }}/${{ github.run_attempt }}"
+          printf '%s' "$content" > /tmp/l2_object.txt
+          hash=$(python3 -c "
+          import blake3
+          with open('/tmp/l2_object.txt', 'rb') as f:
+              print(blake3.blake3(f.read()).hexdigest())
+          ")
+          echo "staging object $hash"
+
+          aws --endpoint-url "$LOCALSTACK_ENDPOINT" s3api put-object \
+            --bucket "$BUCKET" --key "staging/ci-session/$hash" --body /tmp/l2_object.txt
+
+          promoted=0
+          for _ in $(seq 1 30); do
+            if aws --endpoint-url "$LOCALSTACK_ENDPOINT" s3api head-object \
+              --bucket "$BUCKET" --key "objects/$hash" > /dev/null 2>&1; then
+              promoted=1
+              break
+            fi
+            sleep 2
+          done
+
+          if [ "$promoted" != "1" ]; then
+            echo "the staged object was never promoted to objects/$hash" >&2
+            exit 1
+          fi
+
+          aws --endpoint-url "$LOCALSTACK_ENDPOINT" s3api get-object \
+            --bucket "$BUCKET" --key "objects/$hash" /tmp/l2_object_fetched.txt > /dev/null
+          diff /tmp/l2_object.txt /tmp/l2_object_fetched.txt
+
+      - name: tofu destroy
+        if: always()
+        working-directory: infra/aws-serverless/tests/localstack
+        run: |
+          tofu destroy -auto-approve \
+            -var control_plane_package="$GITHUB_WORKSPACE/target/lambda/forklift-aws-control-plane/bootstrap.zip" \
+            -var verifier_package="$GITHUB_WORKSPACE/target/lambda/forklift-aws-verifier/bootstrap.zip" \
+            -var auth_token="$(openssl rand -hex 32)" \
+            -var name_prefix="forklift-l2-${{ github.run_id }}"

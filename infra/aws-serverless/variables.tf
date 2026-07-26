@@ -313,3 +313,31 @@ variable "dev_endpoint_url" {
   type        = string
   default     = null
 }
+
+variable "create_api" {
+  description = <<-EOT
+    INTERNAL — a test-harness variable, like dev_endpoint_url, and explicitly NOT part of this
+    module's semver compatibility promise: it may change shape or vanish in a future release
+    without that counting as a breaking change. Default true (an HTTP API is always created).
+
+    Exists solely because LocalStack community edition does not implement API Gateway v2 —
+    `apigatewayv2 create-api` answers "not yet implemented or pro feature" (design memo §8 risk
+    1) — so Layer 2's LocalStack CI needs to deploy everything except the gateway to exercise
+    the bucket -> S3 event -> verifier spine. Setting this false skips the HTTP API and every
+    resource that hangs off it (the integration, the route, the $default stage, and the
+    gateway's Lambda invoke permission); api_endpoint and api_id then output null rather than a
+    dangling reference (outputs.tf).
+
+    The validation below is load-bearing, not decorative: create_api = false is accepted only
+    when dev_endpoint_url is also set. Without it, a headless stack (no API, so nothing can ever
+    reach the control plane) would be constructible against real AWS — a footgun the rest of
+    this module closes by construction, not by a README warning. See the design memo §3.2.
+  EOT
+  type        = bool
+  default     = true
+
+  validation {
+    condition     = var.create_api || var.dev_endpoint_url != null
+    error_message = "create_api = false is only permitted when dev_endpoint_url is also set (LocalStack-only test harness) — a headless stack must never be deployable against real AWS."
+  }
+}

@@ -2,13 +2,13 @@
 # breaking changes.
 
 output "api_endpoint" {
-  description = "The HTTP API's invoke URL (the $default stage's own endpoint — see main.tf on why the stage cannot be named)."
-  value       = aws_apigatewayv2_api.this.api_endpoint
+  description = "The HTTP API's invoke URL (the $default stage's own endpoint — see main.tf on why the stage cannot be named). Null when create_api = false — the internal test-harness escape hatch (variables.tf) — since no API exists to have an endpoint."
+  value       = var.create_api ? aws_apigatewayv2_api.this[0].api_endpoint : null
 }
 
 output "api_id" {
-  description = "The HTTP API's id — the sanctioned extension seam for a custom-domain API mapping (§7: attach aws_apigatewayv2_domain_name + an API mapping to this id from outside the module, with an empty mapping key)."
-  value       = aws_apigatewayv2_api.this.id
+  description = "The HTTP API's id — the sanctioned extension seam for a custom-domain API mapping (§7: attach aws_apigatewayv2_domain_name + an API mapping to this id from outside the module, with an empty mapping key). Null when create_api = false, same reasoning as api_endpoint."
+  value       = var.create_api ? aws_apigatewayv2_api.this[0].id : null
 }
 
 output "bucket_name" {
