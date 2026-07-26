@@ -1614,6 +1614,9 @@ enum Source {
     /// (`collect_targets` returns them), so the record is a zero-copy slice out of that pack's
     /// mmap — no per-record `open`/`seek`/`read`. `framed` is false for a version-1 (unframed)
     /// record, which is wrapped in a full-record kind byte on the way into the version-2 pack.
+    /// This is the sole-copy case; when the hash is duplicated, `collect_targets` keeps this
+    /// verbatim path only if every copy's framed bytes are byte-identical, and demotes to
+    /// `Source::Reconstruct` otherwise, so a duplicate is never carried forward unverified.
     CopyRecord { pack_index: usize, offset: u64, len: u64, framed: bool, is_delta: bool },
     /// A packed object whose delta base is being dropped as garbage, or a duplicated hash whose
     /// surviving copy `collect_targets` could not trust verbatim (FORK-55): reconstruct it
@@ -1660,7 +1663,10 @@ struct WindowEntry {
 ///
 /// A repack's live *packed* objects normally take the fast path — copied verbatim, preserving
 /// whatever delta each already has (see `Source::CopyRecord`) — so the common repack is a
-/// byte-copy, not a re-compress. `redelta` (only meaningful with `all`; the caller is
+/// byte-copy, not a re-compress. A duplicated hash keeps this fast path only when every copy is
+/// byte-identical; a duplicate whose copies differ is demoted to the verified reconstruct path
+/// instead (see `Source::Reconstruct`), so the byte-copy guarantee never covers unverified
+/// bytes. `redelta` (only meaningful with `all`; the caller is
 /// responsible for refusing the combination otherwise, see the CLI's `compact` handler) turns
 /// every live packed object into a recompression candidate instead — the same treatment a
 /// loose object gets (read, decompress, offer to the path base then the size window, keep the
@@ -2351,7 +2357,10 @@ struct CollectedTargets {
 /// loose objects, plus live objects in existing packs, and every existing pack file to be
 /// deleted once the live set is safely re-packed. A live packed record is **copied verbatim**
 /// when its delta base also survives (the fast path); the rare object whose base is being
-/// dropped is reconstructed and re-deltated instead. Unreachable objects are simply not
+/// dropped is reconstructed and re-deltated instead. A duplicated live hash rides the same
+/// verbatim path only when every copy is byte-identical — a duplicate whose copies differ is
+/// demoted to the reconstruct path instead, so survival is decided by which bytes actually
+/// verify, not by which copy was enumerated first. Unreachable objects are simply not
 /// carried over, so packed garbage is dropped; unreachable *loose* objects are left for the
 /// grace-period collector.
 ///
@@ -4855,6 +4864,111 @@ mod tests {
         let read_back = file_utils::retrieve_object_by_hash_uncached(&x_hash)
             .expect("X must still be readable after the repack consolidated the clean duplicate");
         assert_eq!(read_back, expected, "X must read back its original, correct bytes after the repack");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn a_duplicated_grandfathered_giant_is_packed_and_its_corrupt_loose_copy_is_swept() {
+        // T4 (the D3 policy narrowing): unlike a *sole-copy* over-ceiling giant (see
+        // `compact_skips_a_correctly_addressed_over_ceiling_giant_loose_object`, above -- left
+        // loose and untouched, exactly as on `main`), a *duplicated* giant is demoted to
+        // `Reconstruct` by `collect_targets` and packed via its unbounded local decode, and any
+        // corrupt loose duplicate rides the ordinary durable-before-destructive sweep once the
+        // repack is durable. I1 wins over "never packed, never deleted" for this legacy state.
+        //
+        // No shipped writer ever packs a giant's *first* copy -- the `OverCeiling` skip is the
+        // only writer-side disposition for a sole-copy giant, and the only way this fix packs one
+        // is by demoting an already-*duplicated* giant, which needs a packed copy to already
+        // exist. So this fixture hand-builds pack A's record directly with the crate's own
+        // private `PackWriter` -- the exact primitive `compact` itself drives, called the same
+        // way `compact` would have called it had a duplicate existed at write time. This is not a
+        // production hook: no test-only escape hatch is added to production code, and the pack
+        // produced is byte-for-byte what a real write path emits (magic, version, framing,
+        // layout-derived id via `finalize`). The pack loader never validates a pack's stem against
+        // `compute_pack_id` of its own index (`load_pack_pair`/`validate_index_records` check
+        // only the data/index framing and record layout, never the filename), so no stem surgery
+        // is needed either.
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+        use crate::enums::dir_entry_type::DirEntryType;
+        use crate::model::parcel::Parcel;
+        use crate::model::tree_item::TreeItem;
+
+        let temp = std::env::temp_dir().join(format!("forklift-fork55-dup-giant-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+
+        let giant = deterministic_fill(object_utils::MAX_OBJECT_BYTES + 1);
+        let giant_hash_hex = blake3::hash(&giant).to_hex().to_string();
+        let giant_hash_bytes = hash_to_bytes(&giant_hash_hex).unwrap();
+
+        // Hand-built pack A: the giant's one and only full record, written with the same
+        // `PackWriter` primitive `compact` uses internally.
+        file_utils::create_folder_if_not_exists(&pack_folder()).unwrap();
+        let compressed = zstd::encode_all(giant.as_slice(), 0).unwrap();
+        let mut writer = PackWriter::new(&pack_folder()).unwrap();
+        writer.append_full(giant_hash_bytes, &compressed, None).unwrap();
+        writer.finalize().unwrap();
+
+        // A corrupt loose duplicate at the giant's own fan-out path -- honest bitrot (wrong
+        // content entirely), not a re-encode, so it fails verification outright rather than
+        // merely differing in bytes.
+        let (folder, file_name) = file_utils::get_path_for_object(&giant_hash_hex).unwrap();
+        let giant_loose_path = Path::new(&folder).join(&file_name);
+        file_utils::write_object_to_file(
+            Path::new(&folder), &file_name, b"not the giant at all -- honest bitrot".to_vec()
+        ).unwrap();
+
+        // Reachable history: a tree referencing the giant blob's hash, a parentless parcel,
+        // `main`'s head -- so `collect_live_set`'s walk marks the giant live (a blob leaf is
+        // marked live by hash alone, its bytes never read by that walk -- see
+        // `gc_utils::collect_live_set`) instead of collecting it as garbage.
+        let mut tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        tree.add_child(TreeItem::new("giant.bin".to_string(), giant_hash_hex.clone(), DirEntryType::Normal));
+        let mut tree_object = LooseObjectBuilder::build_tree(&tree);
+        tree_object.store().unwrap();
+
+        let parcel = Parcel {
+            tree_hash: tree_object.hash.clone(),
+            parents: Vec::new(),
+            actions: Vec::new(),
+            description: Some("base".to_string()),
+        };
+        let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
+        parcel_object.store().unwrap();
+        pallet_utils::set_pallet_head("main", &parcel_object.hash).unwrap();
+
+        invalidate_cache();
+        // Sanity: the giant really is duplicated (a live packed copy plus a corrupt loose file at
+        // its own address) and the packed copy is the one that verifies -- both true before the
+        // repack under test ever runs.
+        assert!(is_in_packs(&giant_hash_hex).unwrap(), "sanity: the giant must be packed already");
+        assert!(giant_loose_path.exists(), "sanity: the corrupt loose duplicate must be on disk");
+        let pre_repack = file_utils::retrieve_object_by_hash_uncached(&giant_hash_hex)
+            .expect("the giant must already be servable, from its packed copy, before the repack");
+        assert_eq!(pre_repack, giant, "the pre-repack read must return the giant's real bytes");
+
+        let folder = pack_folder();
+        let stats = compact(true, false).unwrap();
+
+        assert_eq!(stats.objects_packed, 3, "sanity: giant + tree + parcel all carried forward");
+        assert_eq!(stats.over_ceiling_skipped, 0,
+            "a duplicated giant must be packed, not skipped the way a sole-copy giant is");
+        assert!(!giant_loose_path.exists(),
+            "the corrupt loose duplicate must be swept once the repack is durable (loose_source)");
+
+        let packs_remaining: Vec<PathBuf> = std::fs::read_dir(&folder).unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some(PACK_DATA_EXTENSION))
+            .collect();
+        assert_eq!(packs_remaining.len(), 1,
+            "the repack must have consolidated down to exactly one pack file, got {:?}", packs_remaining);
+
+        let servable = file_utils::retrieve_object_by_hash_uncached(&giant_hash_hex)
+            .expect("the giant must still be servable after the repack packed its duplicated copy");
+        assert_eq!(servable, giant, "the giant must read back its real bytes after the repack");
 
         std::fs::remove_dir_all(&temp).ok();
     }
