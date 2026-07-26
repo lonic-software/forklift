@@ -6,3 +6,11 @@
 .dev/
 # macOS Finder metadata.
 .DS_Store
+
+# OpenTofu/Terraform (infra/aws-serverless): local plugin cache and any state a stray apply
+# leaves behind. The provider lock file (.terraform.lock.hcl) is NOT ignored — that one is
+# meant to be committed for reproducible provider selection.
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
