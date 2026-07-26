@@ -1,18 +1,25 @@
 # Layer 2 (design memo, infra/aws-serverless — see forklift-planning/design-memos/
 # 2026-07-26-aws-serverless-terraform-reference.md §5): a real `tofu apply` of the module
-# against LocalStack, run the way GitHub Actions actually executes it — a service container,
-# not the LocalStack CLI — because what we validate locally has to be what CI runs.
-#
-# This is Layer 1's (tests/main.tftest.hcl, ci.yml-adjacent) necessary complement, not a
-# duplicate: a plan-only mock_provider assert cannot prove an S3 event is actually delivered or
-# that the verifier Lambda actually cold-starts and promotes. Layer 2 proves exactly that, and
-# only that — API Gateway v2 is out of scope entirely (create_api = false; LocalStack community
-# does not implement it, §8 risk 1 of the design memo), so this workflow never touches the
-# gateway.
+# against LocalStack, staging an object and polling for its promotion — the behavioural half of
+# C3/C4 (does the S3 event actually deliver, does the verifier actually cold-start) that a
+# plan-only Layer 1 mock_provider assert cannot reach. API Gateway v2 is out of scope entirely
+# (create_api = false; LocalStack community does not implement it, §8 risk 1 of the design memo).
 #
 # Path-filtered on BOTH infra/** and crates/forklift-aws-lambda/**: a crate change that alters
 # the deployment contract (a new S3/DynamoDB call, a changed env var, a changed staging-key
 # shape) must break this in the same PR, not silently rot until a scheduled Layer 3 run.
+#
+# NOT a `services:` block. That was the original shape and it broke on this very runner: a
+# service container gives every Lambda function its own nested Docker container (LocalStack's
+# executor spins one up per invocation via the mounted socket), and that nested container could
+# not resolve `host.docker.internal` — a Docker-Desktop-only convenience the first version of
+# this workflow relied on without realizing local (Mac) and CI (Linux) were exercising two
+# different network paths. LocalStack is instead started by hand, by name, on a network created
+# by hand, by name — `docker network create forklift-l2-net` + `docker run --name localstack
+# --network forklift-l2-net`, exactly what a developer runs locally (see
+# infra/aws-serverless/tests/localstack/main.tf's `lambda_endpoint_url` comment). Losing the
+# `services:` block's free health-check wiring is the cost; polling `/_localstack/health`
+# explicitly is the entire price.
 name: Infra (LocalStack)
 
 on:
@@ -34,39 +41,16 @@ env:
   AWS_SECRET_ACCESS_KEY: test
   AWS_DEFAULT_REGION: us-east-1
   # The host-side endpoint: what the AWS provider (tofu) and this workflow's own aws-cli calls
-  # use. NOT what the deployed Lambda functions use at runtime — see tests/localstack/main.tf's
-  # `lambda_endpoint_url` variable and its comment for why those two addresses must differ
-  # (a Lambda invocation runs in its own nested Docker container, where `localhost` refers to
-  # that container itself; this was reproduced directly while building this workflow — the
-  # verifier's first real invocation failed with a dispatch-level Connection Refused until its
-  # own endpoint was pointed at `host.docker.internal` instead).
+  # use, reaching LocalStack through its published port. NOT what the deployed Lambda functions
+  # use at runtime (they resolve LocalStack by container name on FORKLIFT_L2_NETWORK instead —
+  # see tests/localstack/main.tf's `lambda_endpoint_url`).
   LOCALSTACK_ENDPOINT: http://localhost:4566
+  FORKLIFT_L2_NETWORK: forklift-l2-net
 
 jobs:
   layer2:
     name: layer2 (localstack apply-and-exercise)
     runs-on: ubuntu-latest
-    # A pinned community tag, not `:stable` — verified against localstack/localstack:stable
-    # (2026.7.0) directly: it refuses to boot at all without a paid LOCALSTACK_AUTH_TOKEN,
-    # independently of anything to do with API Gateway v2. `:4.0` (resolves to 4.0.3) is a
-    # pinned community image confirmed to boot and serve S3/DynamoDB/Lambda/IAM/STS/Logs/SQS.
-    services:
-      localstack:
-        image: localstack/localstack:4.0
-        ports:
-          - 4566:4566
-        env:
-          SERVICES: s3,dynamodb,lambda,iam,sts,logs,sqs,cloudwatch
-        # The Lambda executor needs to reach the host's Docker daemon to spin up each
-        # function's own execution container — without this mount, every Lambda create
-        # succeeds but every invoke fails ("Docker not available in the LocalStack container").
-        volumes:
-          - /var/run/docker.sock:/var/run/docker.sock
-        options: >-
-          --health-cmd "curl -sf http://localhost:4566/_localstack/health"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 20
     steps:
       - uses: actions/checkout@v4
 
@@ -95,10 +79,25 @@ jobs:
           cargo lambda build --release --x86-64 \
             -p forklift-aws-lambda --features lambda --output-format zip
 
+      # Started by hand rather than as a `services:` container — see this file's header
+      # comment for why. `--name localstack` on a user-defined network is what makes plain
+      # container-name DNS resolve for anything else attached to that same network, including
+      # every Lambda execution container LocalStack itself spins up once LAMBDA_DOCKER_NETWORK
+      # names it below. This is core Docker bridge-network behaviour, identical on a bare Linux
+      # dockerd (this runner) and on Docker Desktop (where it was first verified) — unlike
+      # `host.docker.internal`, nothing here is platform-specific.
+      - name: Start LocalStack
+        run: |
+          docker network create "$FORKLIFT_L2_NETWORK"
+          docker run -d --rm --name localstack \
+            --network "$FORKLIFT_L2_NETWORK" \
+            -p 4566:4566 \
+            -e SERVICES=s3,dynamodb,lambda,iam,sts,logs,sqs,cloudwatch \
+            -e LAMBDA_DOCKER_NETWORK="$FORKLIFT_L2_NETWORK" \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            localstack/localstack:4.0
+
       - name: Wait for LocalStack
-        # Actions already waits on the service container's own health check, but the first
-        # health-check pass can lag actual readiness by a beat (see aws-integration.yml, the
-        # sibling workflow this pattern is copied from).
         run: |
           for _ in $(seq 1 30); do
             curl -sf http://localhost:4566/_localstack/health > /dev/null && exit 0
@@ -171,3 +170,9 @@ jobs:
             -var verifier_package="$GITHUB_WORKSPACE/target/lambda/forklift-aws-verifier/bootstrap.zip" \
             -var auth_token="$(openssl rand -hex 32)" \
             -var name_prefix="forklift-l2-${{ github.run_id }}"
+
+      - name: Stop LocalStack and remove the network
+        if: always()
+        run: |
+          docker stop localstack || true
+          docker network rm "$FORKLIFT_L2_NETWORK" || true

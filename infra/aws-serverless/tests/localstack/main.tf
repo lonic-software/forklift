@@ -67,16 +67,37 @@ variable "lambda_endpoint_url" {
     a DIFFERENT address than localstack_endpoint. `localhost:4566` is only meaningful from the
     host (or from LocalStack's own container); a Lambda invocation runs in its own nested Docker
     container (LocalStack's Lambda executor spins one up per function via the mounted Docker
-    socket), where `localhost` refers to that container itself and LocalStack is unreachable —
-    confirmed by reproducing it directly: the verifier's `head_object` failed with a
-    `Connection refused` dispatch error until this was pointed at `host.docker.internal`, which
-    Docker resolves to the host from any container (LocalStack itself independently arrives at
-    the same fix internally: every Lambda container it starts is handed a correctly-routable
-    `AWS_ENDPOINT_URL` env var pointing at LocalStack's own container IP, which this module's
-    code does not read — its endpoint comes only from FORKLIFT_AWS_ENDPOINT_URL).
+    socket, per-invocation), where `localhost` refers to that nested container itself and
+    LocalStack is unreachable there — confirmed by reproducing it directly: the verifier's
+    `head_object` failed with a `Connection refused` dispatch error until this was fixed.
+
+    The default here, `http://localstack:4566`, is a plain container hostname, resolved by
+    Docker's embedded DNS for any two containers sharing a **user-defined** network — this is
+    core Docker behaviour, identical on Docker Desktop and on a bare Linux dockerd, not a
+    convenience layer either one adds. It requires exactly two things at the LocalStack side,
+    both set by whatever starts LocalStack (locally: `docker network create` + `docker run
+    --network`; in CI: the equivalent `docker` steps in `infra-localstack.yml` — deliberately
+    NOT a `services:` block, see that workflow's header comment for why):
+
+      1. LocalStack's own container is named `localstack` and attached to a user-defined
+         network (not the default `bridge`, which does no name-based DNS at all).
+      2. `LAMBDA_DOCKER_NETWORK` is set to that same network's name, so LocalStack attaches
+         every Lambda execution container it spins up to it too — making `localstack` resolve
+         from inside them.
+
+    An EARLIER version of this pointed here at `http://host.docker.internal:4566` — Docker
+    Desktop's magic host-reachable hostname. That works on a developer's Mac (verified) but
+    is a Desktop-only convenience: plain Linux dockerd (every GitHub Actions runner) does not
+    resolve it inside a container without an explicit `--add-host=host.docker.internal:
+    host-gateway`, which is exactly the kind of platform-specific special-casing the network
+    hostname above avoids entirely. This surfaced as a real CI failure (the apply and the
+    staging PUT succeeded; the promotion poll then timed out for 80s, because the verifier's
+    nested container could not resolve `host.docker.internal` on the Linux runner) — do not
+    reintroduce it. Local and CI now drive LocalStack the identical way for exactly this reason:
+    a mechanism that only one of them exercises is a mechanism only one of them proves.
   EOT
   type        = string
-  default     = "http://host.docker.internal:4566"
+  default     = "http://localstack:4566"
 }
 
 variable "control_plane_package" {

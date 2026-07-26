@@ -173,26 +173,40 @@ resources (C12), and `create_api = false` without `dev_endpoint_url` is rejected
 assertion fail, not merely pass vacuously.
 
 **Layer 2** (`tests/localstack/`, `.github/workflows/infra-localstack.yml`) is a real `tofu
-apply` against a LocalStack service container — a pinned community image
-(`localstack/localstack:4.0`; `:stable` refuses to boot without a paid auth token, unrelated to
-API Gateway v2), never the LocalStack CLI, so what runs locally is what CI executes. Path-filtered
-on both `infra/**` and `crates/forklift-aws-lambda/**`: a crate change that alters the deployment
-contract breaks this in the same PR. It applies with `create_api = false`, `architecture =
-"x86_64"` (the module defaults to arm64; Layer 2's zips are built `x86_64` and a mismatch fails
-every invocation with an exec-format error unrelated to the module), stages an object under
-`staging/` exactly as a client's presigned `PUT` would, and polls `objects/` until the S3 event
-has fired the verifier Lambda and it has cold-started and promoted the object — the behavioural
-half of C3/C4 that a plan-only Layer 1 assert cannot reach. `tofu destroy` must exit `0`
-(requires overriding `force_destroy`/`deletion_protection`, which is exactly why C8 pins their
-*defaults* separately — Layer 2 necessarily overrides both).
+apply` against LocalStack — a pinned community image (`localstack/localstack:4.0`; `:stable`
+refuses to boot without a paid auth token, unrelated to API Gateway v2), never the LocalStack
+CLI, so what runs locally is what CI executes. LocalStack is started by hand on a
+purpose-created Docker network (`docker network create` + `docker run --name localstack
+--network ...`), identically in both places — **not** a GitHub Actions `services:` container:
+that shape was tried first and broke in CI (below). Path-filtered on both `infra/**` and
+`crates/forklift-aws-lambda/**`: a crate change that alters the deployment contract breaks this
+in the same PR. It applies with `create_api = false`, `architecture = "x86_64"` (the module
+defaults to arm64; Layer 2's zips are built `x86_64` and a mismatch fails every invocation with
+an exec-format error unrelated to the module), stages an object under `staging/` exactly as a
+client's presigned `PUT` would, and polls `objects/` until the S3 event has fired the verifier
+Lambda and it has cold-started and promoted the object — the behavioural half of C3/C4 that a
+plan-only Layer 1 assert cannot reach. `tofu destroy` must exit `0` (requires overriding
+`force_destroy`/`deletion_protection`, which is exactly why C8 pins their *defaults* separately —
+Layer 2 necessarily overrides both).
 
-See `tests/localstack/main.tf`'s own comments for two LocalStack-specific quirks this workflow
-works around, neither of which says anything about the module itself: the deployed Lambda
-functions must reach LocalStack at a *different* address than the host does (`host.docker.internal`,
-not `localhost` — a Lambda invocation runs in its own nested Docker container), and the AWS
-provider is pinned below `5.70.0` for this root config only (`aws_s3_bucket_lifecycle_configuration`
-never converges against LocalStack on `>= 5.70.0` — a provider bug comparing a response header
-LocalStack never sends, github.com/hashicorp/terraform-provider-aws#49019).
+See `tests/localstack/main.tf`'s `lambda_endpoint_url` variable for the full account of a
+LocalStack networking quirk that bit this workflow directly: a Lambda invocation runs in its
+own nested Docker container (LocalStack's executor spins one up per invocation via the mounted
+Docker socket), where the host-side endpoint (`localhost:4566`) is unreachable. The first version
+of this workflow pointed the Lambda at `host.docker.internal` — works on a developer's Mac
+(Docker Desktop), and passed every local check — then failed in CI: plain Linux dockerd (every
+GitHub Actions runner) does not resolve that hostname inside a container without an explicit
+`--add-host`. The fix removes the Docker Desktop convenience from both sides instead of relying
+on it: LocalStack's own container is named `localstack` and `LAMBDA_DOCKER_NETWORK` attaches
+every Lambda container it spins up to the same user-defined network, so plain container-name DNS
+resolves `localstack` from inside them — core Docker behaviour on any dockerd, not a Desktop-only
+feature, which is exactly why local and CI now drive LocalStack the identical way instead of
+merely similar ways.
+
+Separately, the AWS provider is pinned below `5.70.0` for this root config only
+(`aws_s3_bucket_lifecycle_configuration` never converges against LocalStack on `>= 5.70.0` — a
+provider bug comparing a response header LocalStack never sends,
+github.com/hashicorp/terraform-provider-aws#49019).
 
 Layer 3 (a real-account scheduled deploy-and-verify) is tracked separately; it is the only pin for
 IAM sufficiency, real gateway semantics, and arm64 boot, none of which a LocalStack apply can
