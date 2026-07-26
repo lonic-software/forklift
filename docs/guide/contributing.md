@@ -212,7 +212,8 @@ tracked-metadata formats each have a spec in `format/`. When you change one:
 **Licensing and the CLA.** The legal side of contributing lives in the root
 [`CONTRIBUTING.md`](../../CONTRIBUTING.md): client/core/docs contributions are
 inbound = outbound (MIT/Apache, no paperwork); contributions touching the server
-heads (`forklift-server`, `forklift-aws-lambda`) require the
+heads (`forklift-server`, `forklift-aws-lambda`) or the infrastructure that
+deploys them (`infra/aws-serverless`) require the
 [CLA](../../CLA.md), signed once via a bot comment on your pull request.
 
 Commit subjects follow `Area - Topic: short description`, e.g.

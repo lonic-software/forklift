@@ -12,10 +12,11 @@ non-compete license that becomes fully open after two years.
 | Command-line client | `crates/forklift` | **MIT OR Apache-2.0** |
 | Self-hostable server head | `crates/forklift-server` | **FSL-1.1-ALv2** |
 | AWS serverless head | `crates/forklift-aws-lambda` | **FSL-1.1-ALv2** |
+| AWS serverless head, as infrastructure | `infra/aws-serverless` | **FSL-1.1-ALv2** |
 | Docs, specs, formats | `docs/` | **MIT OR Apache-2.0** |
 
 - **[LICENSE-MIT](LICENSE-MIT)** and **[LICENSE-APACHE](LICENSE-APACHE)** — the client and everything else.
-- **[LICENSE-FSL](LICENSE-FSL)** — the server heads only.
+- **[LICENSE-FSL](LICENSE-FSL)** — the server heads only, including the OpenTofu module that deploys them.
 
 ## What this means in practice
 

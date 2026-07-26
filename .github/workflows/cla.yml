@@ -1,9 +1,10 @@
 # CLA gate for server-head contributions (see CONTRIBUTING.md and CLA.md).
 #
 # Client-only PRs are inbound = outbound (MIT/Apache) and skip this entirely;
-# the check only engages when a PR touches crates/forklift-server or
-# crates/forklift-aws-lambda. Acceptances are recorded by the bot on the
-# `cla-signatures` branch. A contributor registers once per CLA version;
+# the check only engages when a PR touches crates/forklift-server,
+# crates/forklift-aws-lambda, or infra/aws-serverless (the OpenTofu module
+# that deploys it — same FSL terms). Acceptances are recorded by the bot on
+# the `cla-signatures` branch. A contributor registers once per CLA version;
 # legally, each subsequent PR is a fresh per-contribution grant under the
 # registered agreement (CLA.md is deliberately per-contribution — a blanket
 # grant of indeterminate future works is void under Hungarian copyright law),
@@ -51,7 +52,7 @@ jobs:
           PR: ${{ github.event_name == 'issue_comment' && github.event.issue.number || github.event.pull_request.number }}
         run: |
           files=$(gh api "repos/${{ github.repository }}/pulls/$PR/files" --paginate --jq '.[].filename')
-          if printf '%s\n' "$files" | grep -qE '^crates/(forklift-server|forklift-aws-lambda)/'; then
+          if printf '%s\n' "$files" | grep -qE '^(crates/(forklift-server|forklift-aws-lambda)|infra/aws-serverless)/'; then
             echo "server=true" >> "$GITHUB_OUTPUT"
           else
             echo "server=false" >> "$GITHUB_OUTPUT"
