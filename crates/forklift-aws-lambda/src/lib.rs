@@ -17,6 +17,11 @@
 //! infrastructure, registry, UI and billing around it, in their own repos. The
 //! implementation design lives in docs/DESIGN.html §4.6.
 //!
+//! `unsafe` is never needed here — the crate `forbid`s it below — so C11 (the IAM conformance
+//! test, `tests/iam_conformance.rs`) can rely on ordinary rustc privacy and doesn't have to
+//! defend against a committer reaching for `transmute`/raw pointers to smuggle a client past a
+//! private field. It defends against a mistake, not an adversary; see that test's module docs.
+//!
 //! # Architecture (the testable spine)
 //!
 //! The head's protocol logic lives in [`Head`], generic over two narrow traits —
@@ -33,6 +38,8 @@
 //! same `audit_utils` checks the CLI and the server head run — with the one seam that a
 //! serverless head varies, the working-blob existence check, routed to `ObjectStore`
 //! (an S3 `HEAD`) via `audit_utils::verify_parcel_closure_with`.
+
+#![forbid(unsafe_code)]
 
 pub mod aws;
 pub mod blocking;

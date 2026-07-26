@@ -29,10 +29,11 @@ use std::time::Duration;
 use aws_sdk_dynamodb::types::{
     AttributeDefinition, BillingMode, KeySchemaElement, KeyType, ScalarAttributeType, TableStatus,
 };
+use aws_smithy_http_client::tls;
 
 use http::{Request, Response};
 
-use forklift_aws_lambda::aws::{build_clients, build_stores, AwsConfig};
+use forklift_aws_lambda::aws::{build_clients, build_stores, AwsConfig, DynamoOps, S3Ops};
 use forklift_aws_lambda::store::{
     CasOutcome, ObjectAccess, ObjectStore, PromoteOutcome, PutOutcome, PutTarget, RefStore,
     SignatureOutcome, TrustOutcome,
@@ -75,10 +76,53 @@ fn test_config(endpoint: &str) -> AwsConfig {
         .with_endpoint_url(endpoint)
 }
 
+/// Build a **raw** S3 + DynamoDB client pair for test-only purposes that fall outside the
+/// sanctioned `S3Ops`/`DynamoOps` surface (`forklift_aws_lambda::aws::{S3Ops, DynamoOps}`):
+/// LocalStack provisioning (`create_bucket`/`create_table`/`describe_table` — none of which any
+/// Lambda's IAM policy ever grants; Terraform provisions those in a real deployment, exactly as
+/// this test does by hand for LocalStack) and a few direct pokes that deliberately bypass the
+/// store to seed or inspect raw S3 state (`chunk_stage_raw`, `chunk_list_staging_keys`, and the
+/// background `run_staging_verifier`'s listing).
+///
+/// This crate's own `S3Ops::build`/`DynamoOps::build` do the equivalent construction, but their
+/// op methods are `pub(crate)` — invisible from this integration-test crate by design (see
+/// `tests/iam_conformance.rs`'s module docs on why: it is exactly what stops a bin from calling
+/// an unaudited op directly). Duplicating the small connector-construction snippet here, rather
+/// than exposing a raw-client constructor from the crate's public API, is deliberate: the latter
+/// would reopen the exact hole C11 v4 closes for anything else that imported it.
+async fn raw_clients(config: &AwsConfig) -> (aws_sdk_s3::Client, aws_sdk_dynamodb::Client) {
+    let http_client = aws_smithy_http_client::Builder::new()
+        .tls_provider(tls::Provider::Rustls(tls::rustls_provider::CryptoMode::Ring))
+        .build_https();
+
+    let mut loader =
+        aws_config::defaults(aws_config::BehaviorVersion::latest()).http_client(http_client);
+
+    if let Some(region) = &config.region {
+        loader = loader.region(aws_sdk_s3::config::Region::new(region.clone()));
+    }
+    if let Some(endpoint) = &config.endpoint_url {
+        loader = loader.endpoint_url(endpoint.clone());
+    }
+
+    let shared = loader.load().await;
+
+    let s3 = if config.endpoint_url.is_some() {
+        let s3_config = aws_sdk_s3::config::Builder::from(&shared).force_path_style(true).build();
+        aws_sdk_s3::Client::from_conf(s3_config)
+    } else {
+        aws_sdk_s3::Client::new(&shared)
+    };
+
+    let dynamodb = aws_sdk_dynamodb::Client::new(&shared);
+
+    (s3, dynamodb)
+}
+
 /// Create the bucket and the ref table (`wh` partition, `entity` sort), then wait for the
 /// table to go active. Idempotent enough for a one-shot test: the names are unique.
 async fn provision(config: &AwsConfig) {
-    let (s3, dynamodb) = build_clients(config).await.expect("build clients");
+    let (s3, dynamodb) = raw_clients(config).await;
 
     s3.create_bucket().bucket(&config.bucket).send().await.expect("create the bucket");
 
@@ -230,7 +274,7 @@ async fn s3_verify_and_promote_gates_the_canonical_namespace() {
     provision(&config).await;
 
     let bridge = AsyncBridge::current().expect("a multi-thread runtime");
-    let (s3, _dynamodb) = build_clients(&config).await.expect("clients");
+    let (s3, _dynamodb) = raw_clients(&config).await;
     let (objects, _refs) = build_stores(&config, bridge).await.expect("stores");
     let bucket = config.bucket.clone();
 
@@ -342,7 +386,7 @@ async fn s3_verify_and_promote_streams_large_staged_objects() {
     provision(&config).await;
 
     let bridge = AsyncBridge::current().expect("a multi-thread runtime");
-    let (s3, _dynamodb) = build_clients(&config).await.expect("clients");
+    let (s3, _dynamodb) = raw_clients(&config).await;
     let (objects, _refs) = build_stores(&config, bridge).await.expect("stores");
     let bucket = config.bucket.clone();
 
@@ -609,8 +653,8 @@ async fn a_head_untrusted_lift_commits_over_s3_and_dynamodb() {
 /// this suite is built around). The clients are cheap to clone, so a per-request store matches how
 /// the control-plane binary serves each invocation.
 async fn edge(
-    s3: aws_sdk_s3::Client,
-    dynamodb: aws_sdk_dynamodb::Client,
+    s3: S3Ops,
+    dynamodb: DynamoOps,
     bridge: AsyncBridge,
     config: AwsConfig,
     request: Request<Vec<u8>>,
@@ -974,6 +1018,10 @@ struct StagingHead {
 impl StagingHead {
     async fn start(config: &AwsConfig, bridge: AsyncBridge) -> StagingHead {
         let (s3, dynamodb) = build_clients(config).await.expect("build clients for the shim");
+        // The verifier's own listing of the `staging/` prefix is a direct, store-bypassing poke
+        // (see `raw_clients`'s docs) — it needs a raw client, independent of the `S3Ops` the
+        // shim's per-request store construction uses.
+        let (raw_s3, _raw_dynamodb) = raw_clients(config).await;
 
         let state = Arc::new(ShimState {
             s3: s3.clone(),
@@ -992,7 +1040,7 @@ impl StagingHead {
             let _ = axum::serve(listener, app).await;
         });
 
-        let verifier = tokio::spawn(run_staging_verifier(s3, config.clone(), bridge));
+        let verifier = tokio::spawn(run_staging_verifier(raw_s3, s3, config.clone(), bridge));
 
         StagingHead { url: format!("http://{}", addr), server, verifier }
     }
@@ -1005,10 +1053,10 @@ impl Drop for StagingHead {
     }
 }
 
-/// The shim's shared state: the clients the per-request [`Head`] is built from.
+/// The shim's shared state: the capabilities the per-request [`Head`] is built from.
 struct ShimState {
-    s3: aws_sdk_s3::Client,
-    dynamodb: aws_sdk_dynamodb::Client,
+    s3: S3Ops,
+    dynamodb: DynamoOps,
     bridge: AsyncBridge,
     config: AwsConfig,
 }
@@ -1062,10 +1110,14 @@ async fn shim_handler(
 /// exactly as the S3-event Lambda would. Idempotent and race-safe (a control-plane object the
 /// commit also promotes just reads `AlreadyPresent`; a swept key reads `Missing`), so running
 /// it continuously is harmless.
-async fn run_staging_verifier(s3: aws_sdk_s3::Client, config: AwsConfig, bridge: AsyncBridge) {
+///
+/// Takes both a raw `list_objects_v2` client (`raw_s3` — this listing deliberately bypasses the
+/// store, so it cannot go through the crate's `S3Ops`; see `raw_clients`'s docs) and the
+/// sanctioned `s3_ops` capability the store construction below actually needs.
+async fn run_staging_verifier(raw_s3: aws_sdk_s3::Client, s3_ops: S3Ops, config: AwsConfig, bridge: AsyncBridge) {
     loop {
         if let Ok(listed) =
-            s3.list_objects_v2().bucket(&config.bucket).prefix("staging/").send().await
+            raw_s3.list_objects_v2().bucket(&config.bucket).prefix("staging/").send().await
         {
             for object in listed.contents() {
                 let Some(key) = object.key() else { continue };
@@ -1078,12 +1130,12 @@ async fn run_staging_verifier(s3: aws_sdk_s3::Client, config: AwsConfig, bridge:
 
                 let session = parts[1].to_string();
                 let hash = parts[2].to_string();
-                let s3 = s3.clone();
+                let s3_ops = s3_ops.clone();
                 let bucket = config.bucket.clone();
                 let bridge = bridge.clone();
 
                 let _ = tokio::task::spawn_blocking(move || {
-                    let objects = S3ObjectStore::new(s3, bucket, bridge);
+                    let objects = S3ObjectStore::new(s3_ops, bucket, bridge);
                     let _ = objects.verify_and_promote(&session, &hash);
                 })
                 .await;
@@ -1446,7 +1498,7 @@ async fn a_multi_batch_commit_lift_does_not_sweep_staging_until_the_final_batch_
     let config = test_config(&endpoint);
     provision(&config).await;
     let bridge = AsyncBridge::current().expect("a multi-thread runtime");
-    let (s3, _dynamodb) = build_clients(&config).await.expect("clients");
+    let (s3, _dynamodb) = raw_clients(&config).await;
     let bucket = config.bucket.clone();
     let (objects, refs) = build_stores(&config, bridge).await.expect("stores");
 

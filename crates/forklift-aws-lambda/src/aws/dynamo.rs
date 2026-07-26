@@ -42,6 +42,7 @@ use forklift_core::model::remote::TrustAnchorDto;
 use forklift_core::util::office_utils::TrustAnchor;
 use forklift_core::util::pallet_utils::{PalletNamespace, PalletRef};
 
+use crate::aws::dynamo_ops::DynamoOps;
 use crate::aws::sdk::describe;
 use crate::blocking::AsyncBridge;
 use crate::store::{CasOutcome, RefStore, TrustOutcome};
@@ -84,7 +85,7 @@ fn head_of(item: &HashMap<String, AttributeValue>) -> Option<String> {
 /// default pallet is held here rather than read per call — it is set once when the warehouse
 /// is registered, exactly as the fake holds it — so `default_pallet` costs no round trip.
 pub struct DynamoRefStore {
-    client: aws_sdk_dynamodb::Client,
+    client: DynamoOps,
     table: String,
     warehouse: String,
     default_pallet: String,
@@ -95,7 +96,7 @@ impl DynamoRefStore {
     /// Build the store over a DynamoDB `client` addressing `table`, scoped to `warehouse`
     /// (the partition key) and serving `default_pallet`, driving async calls through `bridge`.
     pub fn new(
-        client: aws_sdk_dynamodb::Client,
+        client: DynamoOps,
         table: String,
         warehouse: String,
         default_pallet: String,

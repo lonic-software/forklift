@@ -13,12 +13,12 @@
 //! bridge then rides inside each store so its synchronous trait methods can drive the SDK's
 //! async calls from the blocking thread the `Head` runs on (see `blocking.rs`).
 
-use aws_smithy_http_client::tls;
-
 use forklift_core::util::pallet_utils::DEFAULT_PALLET_NAME;
 
 use crate::aws::dynamo::DynamoRefStore;
+use crate::aws::dynamo_ops::DynamoOps;
 use crate::aws::s3::S3ObjectStore;
+use crate::aws::s3_ops::S3Ops;
 use crate::blocking::AsyncBridge;
 
 /// Everything an AWS-backed head needs to reach its byte plane and consistency point.
@@ -94,14 +94,20 @@ impl AwsConfig {
     }
 }
 
-/// Build the S3 and DynamoDB clients from `config`, resolving credentials through the default
-/// provider chain and TLS through a **ring**-based rustls connector.
+/// Build the S3 and DynamoDB capabilities from `config`, resolving credentials through the
+/// default provider chain and TLS through a **ring**-based rustls connector.
 ///
-/// The connector is built explicitly rather than left to the SDK default, because the SDK
-/// default (`default-https-client`) selects `rustls-aws-lc`, which drags in `aws-lc-sys` — a
-/// C/cmake build the workspace has no need of, since `ring` is already present (reqwest) and
-/// is forklift's trusted crypto provider. The choice is invisible on the wire; it is purely a
-/// build-time and dependency-surface decision.
+/// The connector is built explicitly (inside [`S3Ops::build`]/[`DynamoOps::build`]) rather than
+/// left to the SDK default, because the SDK default (`default-https-client`) selects
+/// `rustls-aws-lc`, which drags in `aws-lc-sys` — a C/cmake build the workspace has no need of,
+/// since `ring` is already present (reqwest) and is forklift's trusted crypto provider. The
+/// choice is invisible on the wire; it is purely a build-time and dependency-surface decision.
+///
+/// This function — and this whole file — names no raw client type. That is deliberate: the two
+/// wrapper modules ([`s3_ops`](crate::aws::s3_ops), [`dynamo_ops`](crate::aws::dynamo_ops)) are
+/// the *only* places `aws_sdk_s3::Client`/`aws_sdk_dynamodb::Client` may appear anywhere in
+/// `src/` (`tests/iam_conformance.rs`'s smuggling guard asserts exactly that), so construction
+/// lives inside them and this function just asks each to build itself.
 ///
 /// Must be called inside a tokio runtime.
 ///
@@ -109,40 +115,11 @@ impl AwsConfig {
 /// * `config` - The deployment's bucket, table, warehouse, region and endpoint.
 ///
 /// # Returns
-/// * `Ok((s3, dynamodb))` - The two configured clients.
+/// * `Ok((s3, dynamodb))` - The two sanctioned capabilities.
 /// * `Err(String)`        - If the provider chain or connector could not be built.
-pub async fn build_clients(
-    config: &AwsConfig,
-) -> Result<(aws_sdk_s3::Client, aws_sdk_dynamodb::Client), String> {
-    let http_client = aws_smithy_http_client::Builder::new()
-        .tls_provider(tls::Provider::Rustls(tls::rustls_provider::CryptoMode::Ring))
-        .build_https();
-
-    let mut loader =
-        aws_config::defaults(aws_config::BehaviorVersion::latest()).http_client(http_client);
-
-    if let Some(region) = &config.region {
-        loader = loader.region(aws_sdk_s3::config::Region::new(region.clone()));
-    }
-
-    if let Some(endpoint) = &config.endpoint_url {
-        loader = loader.endpoint_url(endpoint.clone());
-    }
-
-    let shared = loader.load().await;
-
-    // LocalStack and MinIO serve one endpoint for every bucket, so the `bucket.host` virtual
-    // addressing real S3 uses cannot resolve there; path-style (`host/bucket/key`) is the form
-    // they understand. Real AWS keeps the default (virtual-host) addressing.
-    let s3 = if config.endpoint_url.is_some() {
-        let s3_config =
-            aws_sdk_s3::config::Builder::from(&shared).force_path_style(true).build();
-        aws_sdk_s3::Client::from_conf(s3_config)
-    } else {
-        aws_sdk_s3::Client::new(&shared)
-    };
-
-    let dynamodb = aws_sdk_dynamodb::Client::new(&shared);
+pub async fn build_clients(config: &AwsConfig) -> Result<(S3Ops, DynamoOps), String> {
+    let s3 = S3Ops::build(config).await?;
+    let dynamodb = DynamoOps::build(config).await?;
 
     Ok((s3, dynamodb))
 }
