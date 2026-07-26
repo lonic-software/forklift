@@ -1,0 +1,91 @@
+# Real-account deploy-and-verify for infra/aws-serverless (FORK-60, design memo §5, "Layer 3").
+#
+# Scheduled and workflow_dispatch ONLY — deliberately never on push or pull_request. The design
+# memo is explicit about this (§5 "Layer 3", §7 "Per-PR real-account CI — rejected"): a public
+# repo cannot hand fork PRs credentials to a real AWS account, and per-PR real-account CI was
+# rejected outright on exactly that basis. Layer 1 (tests/main.tftest.hcl, mock_provider) and
+# Layer 2 (LocalStack apply-and-exercise) already cover every PR; this workflow is the only place
+# real IAM enforcement, real arm64 Lambda boot, real API Gateway semantics, and the presigned-URL
+# / async-promotion KMS interactions get pinned at all — see infra/aws-serverless/verify.sh's own
+# header comment for the full "why" and its "unverified until a real run" list.
+#
+# SCOPE, decided narrowly on purpose: this workflow VERIFIES the already-deployed dogfood staging
+# stack (infra/aws-serverless/examples/staging/); it does not run `tofu apply`/`destroy` itself.
+# The stack's outputs (api endpoint, bucket, table) are expected to be stable between scheduled
+# runs and are supplied as repository secrets rather than re-read via `tofu output`, which would
+# additionally require this workflow to carry remote-state backend credentials — a separate
+# decision the design memo does not settle and this task does not scope. See the FORK-60 Layer 3
+# report for this as a flagged, deliberate scope call rather than a silent omission.
+name: AWS serverless — real-account verify (FORK-60 Layer 3)
+
+on:
+  schedule:
+    # Once daily. The exact minute/hour is arbitrary — offset from the hour to dodge GitHub's
+    # documented pile-up of jobs scheduled exactly on the hour.
+    - cron: "17 6 * * *"
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: verify (real AWS account)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # Fail fast and legibly when a required secret is absent, rather than half-running: without
+      # this, a missing secret surfaces many steps later as a confusing, credential-shaped error
+      # from deep inside `aws` or `curl`, instead of a clear "this hasn't been configured" message.
+      - name: Check required secrets are present
+        shell: bash
+        env:
+          FORKLIFT_STAGING_ENDPOINT: ${{ secrets.FORKLIFT_STAGING_ENDPOINT }}
+          FORKLIFT_STAGING_BUCKET: ${{ secrets.FORKLIFT_STAGING_BUCKET }}
+          FORKLIFT_STAGING_TABLE: ${{ secrets.FORKLIFT_STAGING_TABLE }}
+          FORKLIFT_STAGING_TOKEN: ${{ secrets.FORKLIFT_STAGING_TOKEN }}
+          CHECK_AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          CHECK_AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          CHECK_AWS_REGION: ${{ secrets.AWS_REGION }}
+        run: |
+          missing=()
+          [[ -n "$FORKLIFT_STAGING_ENDPOINT" ]] || missing+=(FORKLIFT_STAGING_ENDPOINT)
+          [[ -n "$FORKLIFT_STAGING_BUCKET" ]] || missing+=(FORKLIFT_STAGING_BUCKET)
+          [[ -n "$FORKLIFT_STAGING_TABLE" ]] || missing+=(FORKLIFT_STAGING_TABLE)
+          [[ -n "$FORKLIFT_STAGING_TOKEN" ]] || missing+=(FORKLIFT_STAGING_TOKEN)
+          [[ -n "$CHECK_AWS_ACCESS_KEY_ID" ]] || missing+=(AWS_ACCESS_KEY_ID)
+          [[ -n "$CHECK_AWS_SECRET_ACCESS_KEY" ]] || missing+=(AWS_SECRET_ACCESS_KEY)
+          [[ -n "$CHECK_AWS_REGION" ]] || missing+=(AWS_REGION)
+          if ((${#missing[@]})); then
+            printf 'Missing required repository secret(s): %s\n' "${missing[*]}" >&2
+            printf 'This workflow verifies a real, already-deployed staging stack and refuses to half-run without them.\n' >&2
+            printf 'See infra/aws-serverless/verify.sh and infra/aws-serverless/examples/staging/.\n' >&2
+            exit 1
+          fi
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # verify.sh drives the real `forklift` CLI (prepare/load/stack/lift/franchise/history)
+      # against the deployed stack's endpoint — the Lambda binaries themselves are already
+      # running there and are not built by this workflow.
+      - name: Build the forklift CLI
+        run: cargo build -p forklift --release
+
+      - name: Run verify.sh against the deployed staging stack
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          FORKLIFT_BIN: ${{ github.workspace }}/target/release/forklift
+          STAGING_ENDPOINT: ${{ secrets.FORKLIFT_STAGING_ENDPOINT }}
+          STAGING_BUCKET: ${{ secrets.FORKLIFT_STAGING_BUCKET }}
+          STAGING_TABLE: ${{ secrets.FORKLIFT_STAGING_TABLE }}
+          STAGING_TOKEN: ${{ secrets.FORKLIFT_STAGING_TOKEN }}
+        run: |
+          ./infra/aws-serverless/verify.sh \
+            "$STAGING_ENDPOINT" "$STAGING_BUCKET" "$STAGING_TABLE" "$STAGING_TOKEN"
