@@ -3862,7 +3862,7 @@ mod tests {
     }
 
     /// Rename a just-finalized pack pair's stem, so file-name enumeration order is deterministic
-    /// in a test. Pack stems are otherwise content-derived (layout-hashed) and so arbitrary from
+    /// in a test. Pack stems are otherwise layout-derived (layout-hashed) and so arbitrary from
     /// a test's point of view; `load_pack_pair` validates magic/version/record structure, never
     /// the stem, so any stem is safe to give it.
     fn rename_pack_stem(
