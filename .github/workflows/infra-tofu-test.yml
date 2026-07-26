@@ -1,0 +1,84 @@
+# Layer 1 (design memo, infra/aws-serverless — see forklift-planning/design-memos/
+# 2026-07-26-aws-serverless-terraform-reference.md §5): `tofu test` (and `terraform test`, the
+# same suite under the other toolchain) against tests/main.tftest.hcl's `mock_provider "aws"` —
+# free, credential-less, plan-only, and the cheapest layer in this module's CI to run. Added by
+# PR #80 review (finding #3): before this job existed, README.md claimed C1-C13 "run in CI on
+# every PR" while nothing in .github/workflows/ actually ran `tofu test` or `terraform test` at
+# all — a regression in any pinned claim (the public-access block, the staging lifecycle floor,
+# the `$default` stage, the control-plane timeout ceiling, ...) would have merged green.
+#
+# Deliberately its own job, not folded into infra-localstack.yml's Layer 2: no Rust build, no
+# cargo-lambda, no Docker/LocalStack — just the two toolchains and this module's own HCL, so it
+# runs in well under a minute and never blocks on anything Layer 2 needs.
+#
+# Path-filtered like Layer 2 (infra-localstack.yml), on the same two things for the same reason:
+# a crate change that alters the deployment contract (C6 renders
+# crates/forklift-aws-lambda/iam/*.policy.json directly via templatefile() and asserts the
+# planned policy equals that render — tests/main.tftest.hcl's c6_deployed_policy_matches_crate_
+# json) must break this in the same PR, not silently rot until it's noticed by hand.
+name: Infra (tofu test)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "infra/**"
+      - "crates/forklift-aws-lambda/**"
+      - ".github/workflows/infra-tofu-test.yml"
+  pull_request:
+    paths:
+      - "infra/**"
+      - "crates/forklift-aws-lambda/**"
+      - ".github/workflows/infra-tofu-test.yml"
+
+jobs:
+  layer1-tofu:
+    name: layer1 (tofu test, mock_provider)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra/aws-serverless
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OpenTofu
+        uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: "1.12.5"
+
+      - name: tofu init
+        run: tofu init -input=false -backend=false
+
+      - name: tofu fmt -check
+        run: tofu fmt -check -recursive .
+
+      - name: tofu test
+        run: tofu test
+
+  # Terraform runs the identical suite against the identical HCL — this is the CI-side proof of
+  # the README's "common HCL subset" claim, not just a doc assertion. Its own job (not a matrix
+  # with layer1-tofu above) so a Terraform-only failure is never mistaken for an OpenTofu one, or
+  # vice versa, in the checks list on a PR.
+  layer1-terraform:
+    name: layer1 (terraform test, mock_provider)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra/aws-serverless
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.13.5"
+          terraform_wrapper: false
+
+      - name: terraform init
+        run: terraform init -input=false -backend=false
+
+      - name: terraform validate
+        run: terraform validate
+
+      - name: terraform test
+        run: terraform test

@@ -59,10 +59,30 @@
 #      promotion under real S3-event latency — LocalStack's event delivery latency is not
 #      representative of production's.
 #   4. Timing/cost of the throttling defaults and PITR billing under real, sustained scheduled use.
+#   5. Whether the signature-sidecar check (step 4/4) ever actually runs its 200 branch — see its
+#      own comment: on any stack that has never had trust established (true of examples/staging/
+#      today), it is a documented, standing can't-build, not something a real run has confirmed.
 #
 # Do not treat a clean run of THIS script's argument handling (see the definition-of-done demo in
 # the FORK-60 Layer 3 report) as evidence for any of the above — it only proves the script itself
 # doesn't crash on bad input or hang on a bad endpoint.
+#
+# PR #80 REVIEW — two HIGH findings fixed here, both previously untested because this is the one
+# layer that has never been executed against a real stack:
+#
+#   - Every run used to `prepare` a brand-new root parcel and lift it to the persistent stack's
+#     pallet: run 1 succeeded, then every run after diverged from what the stack actually held
+#     (remote_utils.rs's divergence check / head.rs's "not a fast-forward"), turning the daily
+#     scheduled workflow permanently red after its first success — and indistinguishably from a
+#     real verifier-KMS failure, the worst possible false signal. Fixed by franchising the
+#     persistent stack FIRST, then stacking new fixture content on top of whatever it already
+#     holds, every run (step 2/4's comment has the full reasoning, including why this was chosen
+#     over a per-run pallet).
+#   - Step 4/4 asserted `GET /v1/signatures/{parcel}` returns 200 unconditionally, but a stack
+#     with no trust anchor established never signs anything, so that parcel's signature can only
+#     ever 404. Fixed by making the assertion conditional on the handshake already having
+#     reported a trust anchor — see step 4/4's comment for why establishing one from inside this
+#     script was ruled out rather than attempted.
 
 set -euo pipefail
 
@@ -86,7 +106,10 @@ Usage: verify.sh <api-endpoint> <bucket-name> <table-name> <auth-token> [warehou
 
 Environment:
   FORKLIFT_BIN     Path to the forklift CLI binary (default: "forklift", resolved via PATH).
-  VERIFY_WORKDIR   Scratch directory root (default: a fresh mktemp -d, removed on exit).
+  VERIFY_WORKDIR   Scratch directory root (default: a fresh mktemp -d, removed on exit). When
+                   set, the directory is created if missing (mkdir -p) and is NEVER removed by
+                   this script on exit — only a directory this script itself created (the
+                   mktemp default) is cleaned up.
   CURL_MAX_TIME    Seconds before any single curl request gives up (default: 20).
 
 Exit codes: 2 = bad invocation or missing prerequisites; 1 = a verification step failed;
@@ -146,8 +169,27 @@ if ((${#missing_cmds[@]})); then
   exit 2
 fi
 
-WORKDIR="${VERIFY_WORKDIR:-$(mktemp -d -t forklift-verify.XXXXXX)}"
-trap 'rm -rf "$WORKDIR"' EXIT
+# PR #80 review, finding #6: VERIFY_WORKDIR used to be removed on exit unconditionally, even
+# though the usage text only ever promised that of the mktemp default — a caller-supplied
+# `VERIFY_WORKDIR=~/scratch` was silently deleted too. Only remove what this script itself
+# created. A supplied directory is also never created before the first write into it (the
+# handshake response, below) — that used to fail with a confusing curl "couldn't write file"
+# error instead of a clear one, so it is mkdir -p'd here, up front.
+CREATED_WORKDIR=0
+if [[ -n "${VERIFY_WORKDIR:-}" ]]; then
+  WORKDIR="$VERIFY_WORKDIR"
+  mkdir -p "$WORKDIR" || fail "could not create VERIFY_WORKDIR \"$WORKDIR\""
+else
+  WORKDIR="$(mktemp -d -t forklift-verify.XXXXXX)"
+  CREATED_WORKDIR=1
+fi
+
+cleanup() {
+  if ((CREATED_WORKDIR)); then
+    rm -rf "$WORKDIR"
+  fi
+}
+trap cleanup EXIT
 
 log "scratch directory: $WORKDIR"
 
@@ -176,6 +218,30 @@ run_in() {
     "$@"
   )
 }
+
+# ---------------------------------------------------------------------------------------------
+# staging/ baseline (PR #80 review, finding #7) — snapshotted before this run touches anything,
+# so step 3/4's post-lift check can be scoped to what THIS run added rather than the whole
+# bucket. The CLI has no way to report the lift session id it minted (remote_utils.rs's
+# new_lift_session() is internal and never surfaces through LiftReport/--json), so a literal
+# "this run's session prefix" isn't obtainable from the outside — a before/after delta on the
+# same bucket-wide listing is the mechanism instead, and it is equivalent for the property that
+# actually matters: did THIS run's own commit_lift sweep clear everything THIS run staged. One
+# aborted run's leftover (from before this run started) no longer wedges every run after it —
+# it is carried forward as an unchanging baseline until its own lifecycle-rule expiry, exactly
+# the "harmless" the old comment already described, rather than a bucket-wide fatal.
+# ---------------------------------------------------------------------------------------------
+
+staging_key_count_before="$(aws s3api list-objects-v2 \
+  --bucket "$BUCKET" --prefix "staging/" --query 'KeyCount' --output text 2>&1)" ||
+  fail "aws s3api list-objects-v2 against bucket $BUCKET failed: $staging_key_count_before"
+
+if [[ "$staging_key_count_before" != "0" ]]; then
+  log "  NOTE — staging/ already holds $staging_key_count_before key(s) before this run starts \
+(most likely a previous aborted run's leftover, e.g. one killed by the job timeout) — harmless, \
+and left alone until its own lifecycle-rule expiry. This run's own check (step 3/4) only asserts \
+it does not ADD to that count."
+fi
 
 # ---------------------------------------------------------------------------------------------
 # Step 1/4 (checklist step 1) — handshake.
@@ -211,15 +277,44 @@ log "  OK — 200, chunking: true"
 # remote_utils.rs) before giving up, so a real KMS failure here is a slow, real failure, not a
 # fast one; that slowness is itself the asynchronous-and-invisible failure mode the design memo
 # warns about, made visible by giving it somewhere to surface.
+#
+# PR #80 review, finding (HIGH) #1 — WHY FRANCHISE-FIRST, NOT A PER-RUN PALLET: this used to
+# `prepare` a brand-new, disconnected warehouse and stack straight onto it, then lift — which
+# works once (an unborn pallet lifting to an unborn remote pallet) and diverges every run after,
+# since the persistent stack's pallet has since moved and this run's root parcel shares no
+# ancestry with it. Two shapes were on the table:
+#
+#   (a) a per-run pallet name (e.g. "fork60-verify-<run id>") — sidesteps divergence by never
+#       touching the pallet a previous run used, but accumulates one new pallet in the staging
+#       warehouse per scheduled run, forever, with no natural cleanup: nothing in this stack's
+#       design ever prunes an abandoned pallet, so this would need its own retention story on
+#       top (and did not get designed one).
+#   (b) franchise (clone) the persistent stack's pallet FIRST, then load/stack new content on
+#       top of whatever it already holds, then lift — the same pallet, every run, exactly the
+#       pull-then-push shape a real client actually uses. Chosen: it does not accumulate
+#       anything (no new pallet is ever created after the very first run), and `franchise`
+#       already handles a never-lifted-to remote gracefully (an "unborn" pallet — verified by
+#       reading crates/forklift/src/commands/franchise.rs: it checks out the pallet name with no
+#       head and returns cleanly), so the first scheduled run and the thousandth run go through
+#       the identical code path. Franchising also adopts the remote's `remote.url`/`remote.token`
+#       and trust anchor automatically, which is why the old explicit `config remote.url` /
+#       `config remote.token` calls are gone below.
+#
+# One consequence worth naming: the fixture files below now get OVERWRITTEN each run (not
+# freshly created each time) once a persistent stack has been verified more than once — `load`
+# detects the change like any modified file would. That is arguably a more representative
+# exercise of a long-lived warehouse than always-brand-new files were.
 # ---------------------------------------------------------------------------------------------
 
 log "step 2/4 (checklist #2, #3): small + chunked (>= 8 MiB) round trip"
 
 SRC_DIR="$WORKDIR/src"
 FR_DIR="$WORKDIR/franchise"
-mkdir -p "$SRC_DIR"
 
-run_in "$SRC_DIR" "$FORKLIFT_BIN" prepare >/dev/null || fail "forklift prepare failed"
+log "  franchising the persistent stack into a scratch working copy (so this run stacks on top \
+of whatever it already holds, rather than diverging from a disconnected new root)..."
+"$FORKLIFT_BIN" franchise "${ENDPOINT}${PREFIX}" "$SRC_DIR" --token "$TOKEN" >/dev/null ||
+  fail "initial franchise (of the persistent stack, before this run's own changes) failed"
 
 printf 'FORK-60 Layer 3 verify run — small file A (%s)\n' "$(date -u +%FT%TZ)" >"$SRC_DIR/small-a.txt"
 printf 'FORK-60 Layer 3 verify run — small file B\n' >"$SRC_DIR/small-b.txt"
@@ -230,17 +325,16 @@ printf 'FORK-60 Layer 3 verify run — small file B\n' >"$SRC_DIR/small-b.txt"
 dd if=/dev/urandom of="$SRC_DIR/big.bin" bs=1M count=9 status=none
 
 run_in "$SRC_DIR" "$FORKLIFT_BIN" load . >/dev/null || fail "forklift load failed"
-run_in "$SRC_DIR" "$FORKLIFT_BIN" stack "FORK-60 Layer 3 verify run" >/dev/null || fail "forklift stack failed"
-run_in "$SRC_DIR" "$FORKLIFT_BIN" config remote.url "${ENDPOINT}${PREFIX}" >/dev/null || fail "forklift config remote.url failed"
-run_in "$SRC_DIR" "$FORKLIFT_BIN" config remote.token "$TOKEN" >/dev/null || fail "forklift config remote.token failed"
+run_in "$SRC_DIR" "$FORKLIFT_BIN" stack "FORK-60 Layer 3 verify run ($(date -u +%FT%TZ))" >/dev/null ||
+  fail "forklift stack failed"
 
 log "  lifting (small files promote synchronously; big.bin promotes asynchronously via the verifier)..."
 run_in "$SRC_DIR" "$FORKLIFT_BIN" lift ||
   fail "lift failed. If this is the only thing that changed since Layer 2's LocalStack coverage passed, this is exactly the asynchronous/invisible verifier-KMS failure the design memo warns about (§3.1): the staging PUT succeeded, but promotion never completed."
 
-log "  franchising into a second directory and comparing byte-for-byte..."
+log "  franchising into a second, independent directory and comparing byte-for-byte..."
 "$FORKLIFT_BIN" franchise "${ENDPOINT}${PREFIX}" "$FR_DIR" --token "$TOKEN" >/dev/null ||
-  fail "franchise failed"
+  fail "second franchise failed"
 
 for f in small-a.txt small-b.txt big.bin; do
   cmp -s "$SRC_DIR/$f" "$FR_DIR/$f" ||
@@ -250,22 +344,24 @@ done
 log "  OK — small files and big.bin round-tripped identically"
 
 # ---------------------------------------------------------------------------------------------
-# Step 3/4 (checklist step 4) — after a successful lift, staging/ must be empty: commit_lift's
-# final batch sweeps it. A non-empty staging/ after this point means either an abandoned session
-# from a previous failed run (harmless but worth knowing about) or, more concerning, that the
-# sweep itself silently failed.
+# Step 3/4 (checklist step 4) — after a successful lift, staging/ must not have grown: commit_
+# lift's final batch sweeps everything THIS run staged. See the "staging/ baseline" section
+# above (PR #80 review, finding #7) for why this is a before/after delta on the bucket-wide
+# count rather than an absolute zero: a leftover from an unrelated aborted run must not wedge
+# this or any later run, only a leftover THIS run itself created should.
 # ---------------------------------------------------------------------------------------------
 
-log "step 3/4 (checklist #4): staging/ is empty after a successful lift"
+log "step 3/4 (checklist #4): staging/ has not grown since before this run's lift"
 
-staging_key_count="$(aws s3api list-objects-v2 \
+staging_key_count_after="$(aws s3api list-objects-v2 \
   --bucket "$BUCKET" --prefix "staging/" --query 'KeyCount' --output text 2>&1)" ||
-  fail "aws s3api list-objects-v2 against bucket $BUCKET failed: $staging_key_count"
+  fail "aws s3api list-objects-v2 against bucket $BUCKET failed: $staging_key_count_after"
 
-[[ "$staging_key_count" == "0" ]] ||
-  fail "staging/ is not empty after a successful lift (KeyCount=$staging_key_count) — commit_lift's final sweep should have cleared it"
+if (( staging_key_count_after > staging_key_count_before )); then
+  fail "staging/ grew from $staging_key_count_before to $staging_key_count_after key(s) after this run's lift — this run's own commit_lift sweep should have cleared everything it staged"
+fi
 
-log "  OK — staging/ is empty"
+log "  OK — staging/ did not grow ($staging_key_count_before -> $staging_key_count_after key(s))"
 
 # ---------------------------------------------------------------------------------------------
 # Step 4/4 — signature-sidecar fetch (binary response path) and the explicit control-plane read
@@ -284,6 +380,47 @@ log "  OK — staging/ is empty"
 # inside the control-plane Lambda's own execution context, using its own role's credentials —
 # there is no hand-off to a separately-authenticated client request the way a presigned URL's
 # eventual GET is.
+#
+# PR #80 review, finding (HIGH) #2 — WHY THIS IS CONDITIONAL, AND WHY IT IS A CAN'T-BUILD ON A
+# STACK WITHOUT A TRUST ANCHOR: this used to assert 200 unconditionally, but a parcel is only
+# ever signed once trust is established (stack_utils::resolve_signing_key returns Ok(None), no
+# error, while it is not — forklift-core/src/util/stack_utils.rs), and nothing in this script or
+# examples/staging/ ever establishes one. So on any such stack (true of examples/staging/ today)
+# get_signature has nothing to return and head.rs's signature_get 404s — "The parcel carries no
+# signature" — on every run, unconditionally asserting 200 was simply wrong, not flaky.
+#
+# Two ways to close this were considered and both were ruled out for THIS script, rather than
+# silently dropping the check:
+#
+#   - An alternative unsigned binary-response probe: ruled out with evidence, not assumed. Read
+#     against the real S3-backed store (crates/forklift-aws-lambda/src/aws/s3.rs): object_get
+#     (`access`) always returns Redirect, never Direct bytes (line ~552); offload_response
+#     (the `batch` bundle's own possible direct-bytes path) always uploads and returns a
+#     presigned URL, unconditionally (line ~734) — there is no size threshold under which it
+#     hands back bytes directly. The signature sidecar is the ONLY 200-with-raw-bytes path this
+#     deployment ever has; there is no unsigned substitute to swap in.
+#   - Establishing a trust anchor from inside this script (`office keygen` + `office admit`,
+#     or the equivalent `office enroll`): ruled out as OUT OF SCOPE for this script, not
+#     attempted and silently left broken. `office enroll` is a one-way door for the ENTIRE
+#     persistent warehouse ("from then on every parcel stacked in this warehouse must be
+#     signed" — its own CLI help text) — flipping that on the real dogfood staging stack is a
+#     standing security/product decision, not a shell-script bugfix, and this repo's own
+#     convention is that new-invariant decisions like that get a design doc, not a silent side
+#     effect of a review-fix PR. It also cannot be made to work per-run without new
+#     infrastructure this workflow does not have: enrollment can only happen once per warehouse,
+#     so every later run would need to sign as the SAME already-enrolled identity, which means a
+#     signing key persisted across runs (a new CI secret) and script-level plumbing to place it
+#     correctly in each run's fresh franchise before `stack` — none of which exists today. And
+#     because Layer 3 cannot be run for real from this environment (no AWS account, by design —
+#     see this file's header), establishing trust for the first time could not be verified here
+#     even if it were built.
+#
+# So: read whether trust is already established from the SAME handshake response step 1/4
+# already fetched (`.trust` is `null` until a trust anchor exists — WarehouseInfo, forklift-core/
+# src/model/remote.rs), and only assert the 200 when it is. When it is not, this is logged
+# loudly as a known, standing can't-build — never a silent pass, never a deletion of the check —
+# so the day trust IS deliberately established on this stack (a separate, explicit decision),
+# this exact check starts pinning the binary-response path with no further script change needed.
 # ---------------------------------------------------------------------------------------------
 
 log "step 4/4: signature-sidecar fetch + explicit control-plane read"
@@ -293,16 +430,24 @@ parcel_hash="$(printf '%s' "$history_json" | jq -r '.data.entries[0].parcel // e
 [[ -n "$parcel_hash" ]] ||
   fail "could not extract a parcel hash from 'forklift history -n 1 --json': $history_json"
 
-log "  fetching signature sidecar: GET ${PREFIX}/v1/signatures/$parcel_hash"
-sig_code="$(curl_to_file "${ENDPOINT}${PREFIX}/v1/signatures/$parcel_hash" "$WORKDIR/sig.bin" \
-  -H "Authorization: Bearer $TOKEN")" || fail "signature-sidecar request did not complete"
+if jq -e '.trust != null' "$WORKDIR/handshake.json" >/dev/null 2>&1; then
+  log "  fetching signature sidecar: GET ${PREFIX}/v1/signatures/$parcel_hash"
+  sig_code="$(curl_to_file "${ENDPOINT}${PREFIX}/v1/signatures/$parcel_hash" "$WORKDIR/sig.bin" \
+    -H "Authorization: Bearer $TOKEN")" || fail "signature-sidecar request did not complete"
 
-[[ "$sig_code" == "200" ]] ||
-  fail "GET /v1/signatures/$parcel_hash expected 200 (direct bytes, no redirect), got $sig_code"
-[[ -s "$WORKDIR/sig.bin" ]] || fail "signature sidecar came back with an empty body"
+  [[ "$sig_code" == "200" ]] ||
+    fail "GET /v1/signatures/$parcel_hash expected 200 (direct bytes, no redirect), got $sig_code"
+  [[ -s "$WORKDIR/sig.bin" ]] || fail "signature sidecar came back with an empty body"
 
-sig_bytes="$(wc -c <"$WORKDIR/sig.bin" | tr -d ' ')"
-log "  OK — signature sidecar fetched directly ($sig_bytes bytes) — binary-response path exercised"
+  sig_bytes="$(wc -c <"$WORKDIR/sig.bin" | tr -d ' ')"
+  log "  OK — signature sidecar fetched directly ($sig_bytes bytes) — binary-response path exercised"
+else
+  log "  SKIP (known can't-build, see this step's header comment) — this stack's handshake \
+reports no trust anchor (.trust is null), so no parcel is ever signed and GET /v1/signatures/\
+$parcel_hash can only 404. The binary-response path (API Gateway's handling of a raw-bytes \
+Lambda-proxy response) remains UNPINNED by this script until trust is deliberately established \
+on this stack, out of band, as its own decision."
+fi
 
 # NOT INDEPENDENT EVIDENCE (restated from the header comment, where it applies again): step 2's
 # franchise leg already fetched this exact parcel's object bytes via a presigned GET signed by

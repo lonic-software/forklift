@@ -411,6 +411,15 @@ resource "aws_lambda_function" "verifier" {
   depends_on = [
     aws_cloudwatch_log_group.verifier,
     aws_iam_role_policy.verifier,
+    # The DLQ send-permission policy (PR #80 review, finding #5): without it, the only ordering
+    # edge into this resource is the implicit one from `aws_sqs_queue.verifier_dlq[0].arn` in the
+    # dynamic `dead_letter_config` block above, which orders the *queue's creation*, not the
+    # policy that lets this function's role send to it. CreateFunction validates the DLQ target
+    # permission at creation time, so a real (non-mocked) apply can intermittently race: the
+    # function creates before `aws_iam_role_policy.verifier_dlq` finishes propagating. A no-op
+    # (empty list) when create_verifier_dlq = false, same as every other count-gated depends_on
+    # in this module.
+    aws_iam_role_policy.verifier_dlq,
   ]
 }
 

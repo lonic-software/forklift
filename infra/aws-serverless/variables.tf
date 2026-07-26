@@ -48,6 +48,20 @@ variable "name_prefix" {
   description = "Prefix applied to every resource name this module creates."
   type        = string
   default     = "forklift"
+
+  validation {
+    # PR #80 review, finding #9: name_prefix flows unvalidated into the S3 bucket name
+    # ("{name_prefix}-{account_id}-{region}", locals.bucket_name in main.tf — a 63-char ceiling,
+    # lowercase-alphanumeric-and-hyphen-only) and both IAM role names (64-char ceiling). Any of
+    # uppercase, underscores, or an over-long prefix plans cleanly (name_prefix itself is just a
+    # string) and only fails at apply, after the bucket and table already exist. The 20-char cap
+    # here is deliberately conservative, not the exact S3 boundary: it leaves headroom for the
+    # 12-digit account id, a hyphen on each side, and any real AWS region name (currently up to
+    # ~14 chars) without this module having to track S3's full naming grammar (IP-address-like
+    # names, consecutive periods, etc. are out of scope for this guard).
+    condition     = can(regex("^[a-z0-9]([a-z0-9-]{0,18}[a-z0-9])?$", var.name_prefix))
+    error_message = "name_prefix must be 1-20 characters, lowercase letters/digits/hyphens only, and must not start or end with a hyphen — it becomes part of the S3 bucket name and both IAM role names."
+  }
 }
 
 variable "bucket_name" {
@@ -214,6 +228,19 @@ variable "log_retention_days" {
   description = "CloudWatch Logs retention, in days, for both functions' log groups."
   type        = number
   default     = 14
+
+  validation {
+    # PR #80 review, finding #8: CloudWatch Logs accepts only this enumerated set (verified
+    # against the provider's own validator, terraform-provider-aws's
+    # internal/service/logs/group.go, 2026-07-26) — anything else (e.g. 10 or 45) plans cleanly,
+    # since this is just a number to OpenTofu/Terraform, and only fails at apply, after the
+    # bucket and table already exist. 0 is CloudWatch's own sentinel for "never expire".
+    condition = contains(
+      [0, 1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653],
+      var.log_retention_days
+    )
+    error_message = "log_retention_days must be one of CloudWatch Logs' enumerated retention values: 0, 1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653."
+  }
 }
 
 # ---------------------------------------------------------------------------------------------

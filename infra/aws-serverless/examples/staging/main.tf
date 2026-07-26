@@ -26,11 +26,14 @@
 # scheduled workflow's repository secrets. See that file's own header for why.)
 
 terraform {
-  required_version = ">= 1.8.0"
+  # See ../../versions.tf's comment: >= 1.9.0 (not 1.8.0) is the real floor, and the fully
+  # qualified provider source is what lets one committed lock file satisfy both toolchains'
+  # `-lockfile=readonly` (PR #80 review, findings #4 and #10).
+  required_version = ">= 1.9.0"
 
   required_providers {
     aws = {
-      source  = "hashicorp/aws"
+      source  = "registry.opentofu.org/hashicorp/aws"
       version = "~> 5.0"
     }
   }

@@ -10,11 +10,15 @@
 # consume it.
 
 terraform {
-  required_version = ">= 1.8.0"
+  # >= 1.9.0, not 1.8.0 (PR #80 review) — matches the module's own floor (../../versions.tf);
+  # see that file's comment for why 1.8.x cannot even parse this module's variables.tf.
+  required_version = ">= 1.9.0"
 
   required_providers {
     aws = {
-      source = "hashicorp/aws"
+      # Fully qualified host, matching ../../versions.tf's fix for the same reason: one lock
+      # file readable by both toolchains under `-lockfile=readonly` (PR #80 review, finding #10).
+      source = "registry.opentofu.org/hashicorp/aws"
       # Layer 2's own constraint, tighter than the module's `~> 5.0` (versions.tf): AWS
       # provider >= 5.70.0 added an eventual-consistency waiter to
       # aws_s3_bucket_lifecycle_configuration that unconditionally compares
