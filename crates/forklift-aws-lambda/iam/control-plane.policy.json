@@ -1,0 +1,40 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ObjectPlane",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject"],
+      "Resource": [
+        "${bucket_arn}/objects/*",
+        "${bucket_arn}/signatures/*",
+        "${bucket_arn}/responses/*"
+      ]
+    },
+    {
+      "Sid": "StagingPlane",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+      "Resource": "${bucket_arn}/staging/*"
+    },
+    {
+      "Sid": "StagingSweep",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "${bucket_arn}",
+      "Condition": { "StringLike": { "s3:prefix": "staging/*" } }
+    },
+    {
+      "Sid": "RefsAndTrust",
+      "Effect": "Allow",
+      "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:Query"],
+      "Resource": "${table_arn}"
+    },
+    {
+      "Sid": "Logs",
+      "Effect": "Allow",
+      "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
+      "Resource": ["${log_group_arn}", "${log_group_arn}:*"]
+    }
+  ]
+}
