@@ -54,13 +54,17 @@ variable "name_prefix" {
     # ("{name_prefix}-{account_id}-{region}", locals.bucket_name in main.tf — a 63-char ceiling,
     # lowercase-alphanumeric-and-hyphen-only) and both IAM role names (64-char ceiling). Any of
     # uppercase, underscores, or an over-long prefix plans cleanly (name_prefix itself is just a
-    # string) and only fails at apply, after the bucket and table already exist. The 20-char cap
-    # here is deliberately conservative, not the exact S3 boundary: it leaves headroom for the
-    # 12-digit account id, a hyphen on each side, and any real AWS region name (currently up to
-    # ~14 chars) without this module having to track S3's full naming grammar (IP-address-like
-    # names, consecutive periods, etc. are out of scope for this guard).
-    condition     = can(regex("^[a-z0-9]([a-z0-9-]{0,18}[a-z0-9])?$", var.name_prefix))
-    error_message = "name_prefix must be 1-20 characters, lowercase letters/digits/hyphens only, and must not start or end with a hyphen — it becomes part of the S3 bucket name and both IAM role names."
+    # string) and only fails at apply, after the bucket and table already exist. The 32-char cap
+    # here is deliberately conservative, not the exact S3 boundary: reserving 1 (hyphen) + 12
+    # (account id) + 1 (hyphen) + up to 16 for the region (every real AWS region name today is
+    # <= 14 characters) leaves room up to 33; 32 is chosen just inside that with a character of
+    # slack, rather than this module having to track S3's full naming grammar (IP-address-like
+    # names, consecutive periods, etc. are out of scope for this guard). Confirmed against
+    # .github/workflows/infra-localstack.yml's own "forklift-l2-${{ github.run_id }}" (currently
+    # 23 characters; GitHub run ids grow over time, hence the margin above today's length rather
+    # than a tighter cap).
+    condition     = can(regex("^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$", var.name_prefix))
+    error_message = "name_prefix must be 1-32 characters, lowercase letters/digits/hyphens only, and must not start or end with a hyphen — it becomes part of the S3 bucket name and both IAM role names."
   }
 }
 
