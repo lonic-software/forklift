@@ -1,0 +1,11 @@
+This directory is licensed under the Functional Source License, Version 1.1
+(FSL-1.1-ALv2) — the same terms as the AWS serverless head it deploys
+(`crates/forklift-aws-lambda`), not the MIT/Apache terms that cover the rest
+of this workspace.
+
+The full license text is at the repository root: ../../LICENSE-FSL
+
+Contributions to this directory require a signed Contributor License
+Agreement — see ../../CLA.md and ../../CONTRIBUTING.md.
+
+See ../../LICENSING.md for the full per-component license map.

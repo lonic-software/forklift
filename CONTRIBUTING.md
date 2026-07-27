@@ -23,9 +23,11 @@ pull request.
 
 Contributions touching the server heads — `crates/forklift-server` and
 `crates/forklift-aws-lambda` — require a signed
-[Contributor License Agreement](CLA.md).
+[Contributor License Agreement](CLA.md). So does `infra/aws-serverless`, the
+OpenTofu module that deploys the AWS head: it's executable infrastructure for
+the same head, under the same terms, not a separate component.
 
-**Why:** the server heads are licensed under the
+**Why:** the server heads (and the infrastructure module that deploys them) are licensed under the
 [Functional Source License](LICENSE-FSL) because managed hosting is the intended
 business that funds the project. For that to stay possible, the maintainer needs
 the right to license server-head code commercially and to relicense it (each FSL

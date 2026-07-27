@@ -197,7 +197,8 @@ Forklift is **open-core**. See [LICENSING.md](LICENSING.md) for the full map; in
   - MIT license ([LICENSE-MIT](LICENSE-MIT) or https://opensource.org/licenses/MIT)
 
   at your option. Use it, self-host with it, and build on it freely.
-- **The server heads** — `forklift-server` and `forklift-aws-lambda` — are source-available
+- **The server heads** — `forklift-server` and `forklift-aws-lambda`, plus
+  `infra/aws-serverless` (the OpenTofu module that deploys the AWS head) — are source-available
   under the [Functional Source License 1.1](LICENSE-FSL) (`FSL-1.1-ALv2`). You may do anything
   with them *except* offer a commercial service that competes with Forklift's own hosting;
   self-hosting for your own use is free. Each released version becomes Apache-2.0 two years
