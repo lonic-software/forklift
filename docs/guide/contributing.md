@@ -93,7 +93,7 @@ so the operational commands are one launcher away; the real logic lives in `bin/
 | `pult test` | just the test suite (fast loop) |
 | `pult release` | `bin/release` — preflight, bump the workspace version, tag `v<x.y.z>`, push (the tag triggers `.github/workflows/release.yml`) |
 | `pult install` | build & install the CLI + server from this checkout |
-| `pult serve` | `bin/serve` — a throwaway local `forklift-server` over `.dev/server` for testing lift/lower/franchise |
+| `pult dev-server` | `bin/serve` — a throwaway local `forklift-server` over `.dev/server` for testing lift/lower/franchise |
 | `pult design` | open `docs/DESIGN.html` (the source of truth) in a browser |
 | `pult gen-docs` | `bin/gen-docs` — regenerate the derived docs (error codes, per-command JSON schemas) |
 
