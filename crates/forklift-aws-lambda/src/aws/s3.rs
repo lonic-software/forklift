@@ -100,13 +100,18 @@
 
 use std::time::Duration;
 
+use aws_sdk_s3::operation::head_object::HeadObjectError;
 use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream;
+use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
+use aws_smithy_runtime_api::client::result::SdkError;
 
 use forklift_core::util::object_utils;
 
 use crate::aws::s3_ops::S3Ops;
-use crate::aws::sdk::{describe, is_head_object_not_found, is_no_such_key, is_precondition_failed};
+use crate::aws::sdk::{
+    describe, http_status, is_head_object_not_found, is_no_such_key, is_precondition_failed,
+};
 use crate::blocking::AsyncBridge;
 use crate::store::{ObjectAccess, ObjectStore, PromoteOutcome, PutOutcome, PutTarget, SignatureOutcome};
 
@@ -280,6 +285,40 @@ async fn stream_hash_capped(mut body: ByteStream, cap: u64) -> Result<StreamHash
     Ok(StreamHash::Hash(hasher.finalize().to_hex().to_string()))
 }
 
+/// Maps a raw `HeadObject` result to "does the key exist" — a free function (not inlined into
+/// [`S3ObjectStore::key_exists`]) so a unit test can drive it with a synthetic `SdkError`, with
+/// no S3 client, no network call, and no live AWS account required.
+///
+/// Three outcomes, not two: `Ok(_)` is present; the SDK's modeled `HeadObjectError::NotFound`
+/// (see [`is_head_object_not_found`]'s docs) is genuinely absent; anything else — in particular a
+/// bare `403 Forbidden` — is a **named** error, not folded into either. Folding a `403` into
+/// `Ok(false)` would repeat [`is_no_such_key`]'s mistake in reverse (masking a real access failure
+/// as an empty warehouse); the reason it gets its own arm rather than falling into the generic
+/// `describe(...)` catch-all is that this exact status has one specific, common, non-obvious
+/// cause worth naming: S3 answers `403` instead of `404` for a missing key when the caller's
+/// effective permissions lack an unconditional `s3:ListBucket` grant on the bucket
+/// (`docs/DEPLOYMENT.md`, "`s3:ListBucket` on both roles is unconditional, and has to be"). The
+/// two JSON policies in `iam/` are not the only way to lose that grant — a `permissions_boundary_
+/// arn` (`infra/aws-serverless/variables.tf`), an SCP, or a restrictive bucket policy all
+/// reproduce the identical zero-diagnostic outage (every genuinely-new object's promotion or
+/// lift fails with an opaque `500`) — so this message names the cause rather than assuming the
+/// crate's own shipped IAM JSON is the only place it could go missing.
+fn head_object_outcome<T>(
+    result: Result<T, SdkError<HeadObjectError, HttpResponse>>,
+) -> Result<bool, String> {
+    match result {
+        Ok(_) => Ok(true),
+        Err(err) if is_head_object_not_found(&err) => Ok(false),
+        Err(err) if http_status(&err) == Some(403) => Err(format!(
+            "S3 head_object returned 403 Forbidden, not 404 — this is the signature of a caller \
+             missing an unconditional s3:ListBucket grant on the bucket (S3 refuses to confirm a \
+             key's absence without it), not necessarily an actually-missing key: {}",
+            describe("S3 head_object", err),
+        )),
+        Err(err) => Err(describe("S3 head_object", err)),
+    }
+}
+
 impl S3ObjectStore {
     /// Build the store over an S3 `client` addressing `bucket`, driving its async calls
     /// through `bridge`. Capture the bridge on the runtime thread (see `aws::config`).
@@ -291,11 +330,7 @@ impl S3ObjectStore {
     /// [`is_head_object_not_found`]'s docs for the residual bucket-vs-key ambiguity this call
     /// cannot resolve — a limitation of `HeadObject` itself, not of this mapping.
     async fn key_exists(&self, key: &str) -> Result<bool, String> {
-        match self.client.head_object().bucket(&self.bucket).key(key).send().await {
-            Ok(_) => Ok(true),
-            Err(err) if is_head_object_not_found(&err) => Ok(false),
-            Err(err) => Err(describe("S3 head_object", err)),
-        }
+        head_object_outcome(self.client.head_object().bucket(&self.bucket).key(key).send().await)
     }
 
     /// The bytes at a key, or `None` when it is absent (`NoSuchKey` is `Ok(None)`; any other
@@ -880,5 +915,67 @@ mod tests {
             StreamHash::Hash(actual) => assert_eq!(actual, expected),
             StreamHash::TooLarge => panic!("exactly at the cap must still be accepted"),
         }
+    }
+
+    /// Builds a synthetic `HeadObject` `SdkError` carrying `status` and `code` — no S3 client, no
+    /// network call, no live account. `head_object_outcome` is generic over the `Ok` type
+    /// (`key_exists` never inspects it), so `()` stands in for `HeadObjectOutput` here.
+    fn synthetic_head_object_error(
+        status: u16,
+        code: &str,
+    ) -> SdkError<HeadObjectError, HttpResponse> {
+        let meta = aws_smithy_types::error::ErrorMetadata::builder()
+            .code(code)
+            .message(format!("synthetic {} for a unit test", code))
+            .build();
+        let raw = HttpResponse::new(
+            aws_smithy_runtime_api::http::StatusCode::try_from(status).expect("valid status"),
+            aws_smithy_types::body::SdkBody::empty(),
+        );
+
+        SdkError::service_error(HeadObjectError::generic(meta), raw)
+    }
+
+    /// Finding 5 (PR #82 review): a `403` on `HeadObject` must **not** be folded into `Ok(false)`
+    /// (that would repeat `is_no_such_key`'s exact mistake in reverse — masking a real access
+    /// failure as an empty warehouse) and must **not** fall into the generic, unnamed `describe`
+    /// catch-all either — it gets a message that names the specific, common cause: a missing
+    /// unconditional `s3:ListBucket` grant.
+    #[test]
+    fn a_403_on_head_object_is_a_named_error_not_an_absence() {
+        let err = synthetic_head_object_error(403, "AccessDenied");
+
+        let outcome = head_object_outcome::<()>(Err(err));
+
+        let message = outcome.expect_err("a 403 must be Err, never Ok(false)");
+        assert!(
+            message.contains("s3:ListBucket"),
+            "the error must name the missing grant, not read as a generic S3 failure: {}",
+            message
+        );
+    }
+
+    /// The other direction: a status this mapping has no special case for (`500`, a genuine
+    /// transient S3 failure) still falls into the generic `describe(...)` catch-all — the new
+    /// `403` arm must not swallow anything it wasn't built for.
+    #[test]
+    fn a_500_on_head_object_is_the_generic_error_not_the_listbucket_message() {
+        let err = synthetic_head_object_error(500, "InternalError");
+
+        let outcome = head_object_outcome::<()>(Err(err));
+
+        let message = outcome.expect_err("a 500 must still be Err");
+        assert!(
+            !message.contains("s3:ListBucket"),
+            "a plain 500 must not be misreported as the 403/ListBucket case: {}",
+            message
+        );
+    }
+
+    /// `Ok` still means "present" — the new error arm must not have disturbed the two outcomes
+    /// `key_exists` already relied on before this fix.
+    #[test]
+    fn head_object_ok_is_still_present() {
+        assert_eq!(head_object_outcome(Ok(())), Ok(true));
     }
 }

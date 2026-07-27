@@ -300,8 +300,29 @@ resource "aws_iam_role_policy" "verifier" {
 resource "aws_iam_role_policy" "kms" {
   for_each = var.kms_key_arn != null ? toset(["control_plane", "verifier"]) : toset([])
 
-  name = "${var.name_prefix}-${each.key}-kms"
+  # replace(): every other resource in this module hyphenates name segments
+  # (`local.control_plane_function_name` = "${name_prefix}-control-plane"); `each.key` here is
+  # "control_plane" (an HCL identifier-shaped set member, chosen to double as the ternary check
+  # below), so left bare this rendered "forklift-control_plane-kms" — the one inconsistently
+  # underscored resource name in a deployed stack, confirmed against a real account.
+  #
+  # This rename is NOT harmless on a live CMK stack (PR #82 review, finding 2 — corrected from an
+  # earlier, wrong claim that it was). `name` is `ForceNew` on `aws_iam_role_policy`, and
+  # Terraform's default replacement order is destroy-then-create: for the gap between the old
+  # name's destroy and the new name's create (plus IAM's own eventual-consistency lag on top),
+  # the role holds neither policy, and it loses kms:Decrypt/kms:GenerateDataKey entirely. If a
+  # verifier promotion runs in that window, it dies asynchronously and the object silently never
+  # becomes fetchable — the exact failure shape the comment above this resource calls the worst
+  # in the whole stack. `create_before_destroy` closes the window: the new (hyphenated) name is
+  # created first, so the role briefly holds *both* inline policies (they have different names,
+  # so nothing conflicts) before the old one is torn down, and the role's KMS grant is never
+  # actually absent.
+  name = "${var.name_prefix}-${replace(each.key, "_", "-")}-kms"
   role = each.key == "control_plane" ? aws_iam_role.control_plane.id : aws_iam_role.verifier.id
+
+  lifecycle {
+    create_before_destroy = true
+  }
 
   policy = jsonencode({
     Version = "2012-10-17"

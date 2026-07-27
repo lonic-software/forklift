@@ -446,21 +446,58 @@ Where each action in `iam/control-plane.policy.json` comes from: `HeadObject`/`G
 `GET` → `s3:GetObject`; `PutObject` (conditional and unconditional)/presigned staging
 `PUT`/`CopyObject` destination → `s3:PutObject`; `CopyObject` source read → `s3:GetObject` on
 `staging/*`; `DeleteObject` (staged cleanup, session sweep) → `s3:DeleteObject`; `ListObjectsV2`
-(`discard_session`'s sweep) → `s3:ListBucket` on the **bucket** resource (not `bucket/*`), scoped
-to the `staging/` prefix via condition; `GetItem`/`Query` (ref reads, enumeration) and
-`PutItem`/`UpdateItem` (trust, the ref CAS) → the table ARN, no index ARN needed (see "The CAS"
-above); the `Logs` statement (`logs:CreateLogGroup`/`logs:CreateLogStream`/`logs:PutLogEvents`) is
-the standard Lambda execution-role grant every function needs to write to its own CloudWatch log
-group.
+(`discard_session`'s sweep) and `HeadObject`/`GetObject` 404-vs-403 semantics (below) →
+`s3:ListBucket` on the **bucket** resource (not `bucket/*`); `GetItem`/`Query` (ref reads,
+enumeration) and `PutItem`/`UpdateItem` (trust, the ref CAS) → the table ARN, no index ARN needed
+(see "The CAS" above); the `Logs` statement (`logs:CreateLogGroup`/`logs:CreateLogStream`/
+`logs:PutLogEvents`) is the standard Lambda execution-role grant every function needs to write to
+its own CloudWatch log group.
 
 ### `forklift-aws-verifier`
 
-The verifier calls only `verify_and_promote` — no `s3:ListBucket`, no DynamoDB permissions of
-any kind (it builds a DynamoDB client via `config_from_env`/`build_clients`, but never issues a
-single operation against it). `iam/verifier.policy.json`'s statements: `s3:GetObject`/
-`s3:DeleteObject` on `staging/*` (read then clear the staged object once promoted),
-`s3:GetObject`/`s3:PutObject` on `objects/*` (write the promoted copy), and the same `Logs`
-statement as the control plane.
+The verifier calls only `verify_and_promote` — no DynamoDB permissions of any kind (it builds a
+DynamoDB client via `config_from_env`/`build_clients`, but never issues a single operation against
+it). `iam/verifier.policy.json`'s statements: `s3:GetObject`/`s3:DeleteObject` on `staging/*` (read
+then clear the staged object once promoted), `s3:GetObject`/`s3:PutObject` on `objects/*` (write the
+promoted copy), `s3:ListBucket` on the bucket (404-vs-403 semantics, below — `verify_and_promote`'s
+`key_exists` check against the canonical `objects/{hash}` key, absent by definition for a genuinely
+new object, is a `HeadObject` on a missing key), and the same `Logs` statement as the control plane.
+
+### `s3:ListBucket` on both roles is unconditional, and has to be
+
+This is a non-obvious operational fact, found against a real AWS account, not derived from the SDK
+docs: **S3 returns `403 Forbidden` instead of `404 Not Found` for `HeadObject`/`GetObject` on a
+missing key when the caller lacks `s3:ListBucket`** — without it, S3 refuses to confirm the key
+doesn't exist rather than saying so. `is_head_object_not_found`
+(`crates/forklift-aws-lambda/src/aws/sdk.rs`) only matches the SDK's modeled `HeadObjectError::
+NotFound` variant, which a `403` is not, so a caller missing this grant sees every "object not
+here yet" outcome surface as an opaque `500` instead of the expected absent/not-found result —
+concretely, this **breaks lifting any object the head does not already have**, since a fresh lift
+`HEAD`s a key that (correctly) doesn't exist yet.
+
+The grant **cannot be prefix-conditioned**. `s3:prefix` is not part of the request context S3
+authorizes a `HeadObject`/`GetObject` call against — it is a `ListObjectsV2`-specific condition key
+— so a `ListBucket` statement scoped with `Condition: {StringLike: {s3:prefix: "..."}}` (as an
+earlier version of this policy did, reasoning that `list_objects_v2`'s own callers only ever touch
+one prefix) satisfies `ListObjectsV2` but does **nothing** for the 404-vs-403 problem above;
+verified by toggling exactly this one variable against a live stack. The only grant that works is
+an unconditional `s3:ListBucket` on the bucket resource (not `bucket/*`), and **both** execution
+roles need it: the control plane's own `HeadObject`/`GetObject` calls need it directly, and the
+verifier's async `verify_and_promote` calls `key_exists` on the canonical key — which does not
+exist yet for a genuinely new object — so omitting it from the verifier fails promotion silently
+and asynchronously, the same failure shape KMS omission produces (see "KMS" above).
+`crates/forklift-aws-lambda/tests/iam_conformance.rs`'s module docs record this as a class of its
+own: an IAM action a call site needs for its **error semantics**, not to perform the operation —
+invisible to any op→action mapping, because the op genuinely only calls `GetObject`/`HeadObject`.
+
+**What this actually grants, stated plainly:** `s3:ListBucket` on the bucket resource (not
+`bucket/*`) lets its holder enumerate every key in the entire bucket via `ListObjectsV2` — both
+roles can now do this over `objects/`, `signatures/`, `responses/`, and every session's `staging/`
+prefix, not only the one they operate on. For the verifier in particular, this is a real widening:
+its job is promoting the one key an S3 event handed it, and it now has bucket-wide enumeration it
+has no operational need for beyond the 404-vs-403 semantics above. This is the trade-off this
+section's title ("least privilege") is naming, not overriding — it is what least privilege
+actually costs once `HeadObject`/`GetObject` correctness on a missing key is in scope.
 
 ### KMS — optional, and not in the two files above
 
