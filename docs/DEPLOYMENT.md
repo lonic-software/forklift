@@ -428,81 +428,54 @@ defense-in-depth choice, entirely orthogonal to what ships in the entrypoint.
 
 ## IAM — least privilege
 
-One policy per Lambda, derived from the actual SDK calls each store method makes. `{bucket}` and
-`{table}` are placeholders for your resource names.
+One policy per Lambda, derived from the actual SDK calls each store method makes. The **canonical,
+enforced** copies are `crates/forklift-aws-lambda/iam/control-plane.policy.json` and
+`crates/forklift-aws-lambda/iam/verifier.policy.json` — `{bucket_arn}`, `{table_arn}`, and
+`{log_group_arn}` are `templatefile()` placeholders for your resource ARNs. Two tests keep them
+honest, so treat what follows as an explanation of *why* each statement exists, not a copy to
+retype: `crates/forklift-aws-lambda/tests/iam_conformance.rs` (C11) asserts the code can only
+reach the SDK operations these wrapper types expose, and that set is exactly what the JSON grants;
+`infra/aws-serverless/tests/main.tftest.hcl`'s C6 asserts the Terraform-deployed policy equals an
+independent `templatefile()` render of the same JSON. If you deploy by hand instead of via the
+`infra/aws-serverless` module, attach the JSON files directly — do not retype a policy from this
+page.
 
 ### `forklift-aws-control-plane`
 
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Sid": "ObjectPlane",
-      "Effect": "Allow",
-      "Action": ["s3:GetObject", "s3:PutObject"],
-      "Resource": [
-        "arn:aws:s3:::{bucket}/objects/*",
-        "arn:aws:s3:::{bucket}/signatures/*",
-        "arn:aws:s3:::{bucket}/responses/*"
-      ]
-    },
-    {
-      "Sid": "StagingPlane",
-      "Effect": "Allow",
-      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
-      "Resource": "arn:aws:s3:::{bucket}/staging/*"
-    },
-    {
-      "Sid": "StagingSweep",
-      "Effect": "Allow",
-      "Action": "s3:ListBucket",
-      "Resource": "arn:aws:s3:::{bucket}",
-      "Condition": { "StringLike": { "s3:prefix": "staging/*" } }
-    },
-    {
-      "Sid": "RefsAndTrust",
-      "Effect": "Allow",
-      "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:Query"],
-      "Resource": "arn:aws:dynamodb:*:*:table/{table}"
-    }
-  ]
-}
-```
-
-Where each action comes from: `HeadObject`/`GetObject`/presigned `GET` → `s3:GetObject`;
-`PutObject` (conditional and unconditional)/presigned staging `PUT`/`CopyObject` destination →
-`s3:PutObject`; `CopyObject` source read → `s3:GetObject` on `staging/*`; `DeleteObject` (staged
-cleanup, session sweep) → `s3:DeleteObject`; `ListObjectsV2` (`discard_session`'s sweep) →
-`s3:ListBucket` on the **bucket** resource (not `bucket/*`), scoped to the `staging/` prefix via
-condition; `GetItem`/`Query` (ref reads, enumeration) and `PutItem`/`UpdateItem` (trust, the ref
-CAS) → the table ARN, no index ARN needed (see "The CAS" above).
+Where each action in `iam/control-plane.policy.json` comes from: `HeadObject`/`GetObject`/presigned
+`GET` → `s3:GetObject`; `PutObject` (conditional and unconditional)/presigned staging
+`PUT`/`CopyObject` destination → `s3:PutObject`; `CopyObject` source read → `s3:GetObject` on
+`staging/*`; `DeleteObject` (staged cleanup, session sweep) → `s3:DeleteObject`; `ListObjectsV2`
+(`discard_session`'s sweep) → `s3:ListBucket` on the **bucket** resource (not `bucket/*`), scoped
+to the `staging/` prefix via condition; `GetItem`/`Query` (ref reads, enumeration) and
+`PutItem`/`UpdateItem` (trust, the ref CAS) → the table ARN, no index ARN needed (see "The CAS"
+above); the `Logs` statement (`logs:CreateLogGroup`/`logs:CreateLogStream`/`logs:PutLogEvents`) is
+the standard Lambda execution-role grant every function needs to write to its own CloudWatch log
+group.
 
 ### `forklift-aws-verifier`
 
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Sid": "PromoteStagedObjects",
-      "Effect": "Allow",
-      "Action": ["s3:GetObject", "s3:DeleteObject"],
-      "Resource": "arn:aws:s3:::{bucket}/staging/*"
-    },
-    {
-      "Sid": "WriteCanonicalObjects",
-      "Effect": "Allow",
-      "Action": ["s3:GetObject", "s3:PutObject"],
-      "Resource": "arn:aws:s3:::{bucket}/objects/*"
-    }
-  ]
-}
-```
-
 The verifier calls only `verify_and_promote` — no `s3:ListBucket`, no DynamoDB permissions of
 any kind (it builds a DynamoDB client via `config_from_env`/`build_clients`, but never issues a
-single operation against it).
+single operation against it). `iam/verifier.policy.json`'s statements: `s3:GetObject`/
+`s3:DeleteObject` on `staging/*` (read then clear the staged object once promoted),
+`s3:GetObject`/`s3:PutObject` on `objects/*` (write the promoted copy), and the same `Logs`
+statement as the control plane.
+
+### KMS — optional, and not in the two files above
+
+Neither JSON file above grants any `kms:*` action, because SSE-S3 (no customer key) is the
+default and needs none. If you bring your own customer-managed key, **both** execution roles need
+`kms:Decrypt` and `kms:GenerateDataKey`, scoped to that key — not a narrower per-role split,
+because both roles turn out to need both actions once you trace the actual calls (a presigned
+`PUT`/`GET` and a `CopyObject` on each side). Withholding either role's grant fails in opposite
+shapes: the control plane fails loudly and synchronously (every presigned `GET`/offloaded response
+`403`s immediately), the verifier fails silently and asynchronously (the staging upload succeeds,
+promotion dies, the object never becomes fetchable) — which is exactly the failure mode this
+whole deployment's asynchronous verifier step exists to catch, and the harder of the two to debug
+blind. If you deploy via `infra/aws-serverless`, setting `kms_key_arn` adds these statements for
+you (see that module's `README.md`, "KMS" section, for the full per-operation trace and its
+example staging stack); if you deploy by hand, add them yourself alongside the two JSON files.
 
 ### Presigned URLs inherit the signing role — not the caller's
 
