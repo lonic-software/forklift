@@ -3692,6 +3692,63 @@ mod tests {
         std::fs::remove_dir_all(&temp).ok();
     }
 
+    /// Mechanism-level probe for PR #84 review finding 1, isolated from `franchise` entirely:
+    /// does an `Mmap`'d pack file actually block `remove_dir_all` on its own containing
+    /// directory? Windows-only by construction — POSIX permits unlinking (and therefore
+    /// recursively removing a directory over) a file that is still mapped, verified empirically
+    /// on macOS during that review round, so this question has no meaning on a non-Windows
+    /// target and the test is gated accordingly rather than asserting something platform-
+    /// specific as if it were universal.
+    ///
+    /// This is the test the review asked for after the franchise-level regression test for the
+    /// same finding turned out not to discriminate: it passed identically with and without
+    /// `invalidate_cache()` in `franchise.rs`'s cleanup path, on Windows CI, which leaves finding
+    /// 1 either (A) real but unreached by that fixture, or (B) not real on this platform at all.
+    /// This test isolates the *mechanism* — an mmap'd pack blocking its own directory's removal —
+    /// from `franchise`'s fixture entirely, so it can answer which.
+    #[cfg(windows)]
+    #[test]
+    fn an_mmapd_pack_blocks_its_own_directory_removal_until_the_cache_is_invalidated() {
+        let temp = std::env::temp_dir().join(format!("forklift-mmap-block-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+
+        let content = b"mmap block probe content".to_vec();
+        let hash = blake3::hash(&content).to_hex().to_string();
+        store_loose(&hash, &content);
+
+        // Packs it; loose is removed, so the only path to this hash is now through a pack.
+        // `compact`'s own trailing `invalidate_cache()` leaves the registry empty afterward —
+        // nothing is mapped yet.
+        compact(false, false).unwrap();
+
+        // A read through the real (uncached-content) path: this is what actually populates
+        // `PACK_REGISTRY` with a live `Mmap` for the pack just written.
+        assert_eq!(file_utils::retrieve_object_by_hash_uncached(&hash).unwrap(), content);
+
+        // The mmap is still held in the process-global registry. Does that block deleting the
+        // directory it lives under?
+        let removal_while_mapped = std::fs::remove_dir_all(&temp);
+        assert!(
+            removal_while_mapped.is_err(),
+            "MECHANISM NOT REAL on this platform/configuration: remove_dir_all succeeded on {:?} \
+            while a pack from it was still mmap'd in PACK_REGISTRY — finding 1's premise does not \
+            hold here (see franchise.rs's cleanup and PR #84's follow-up discussion)",
+            temp
+        );
+
+        // Dropping the cached mmap (the actual fix) must unblock exactly this.
+        invalidate_cache();
+
+        let removal_after_invalidate = std::fs::remove_dir_all(&temp);
+        assert!(
+            removal_after_invalidate.is_ok(),
+            "expected remove_dir_all to succeed once invalidate_cache() has dropped the mmap: {:?}",
+            removal_after_invalidate
+        );
+    }
+
     #[test]
     fn is_parcel_reads_the_type_from_the_object_header() {
         use crate::enums::object_type::ObjectType;
