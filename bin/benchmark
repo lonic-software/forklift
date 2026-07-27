@@ -1,4 +1,29 @@
 #!/usr/bin/env bash
+# ── re-exec under real bash if we're not running under it ──────────────────
+# macOS ships /bin/sh as bash 3.2 running in POSIX/sh-compat mode. In that
+# mode BASH_VERSION is still set, but process substitution (`< <(...)`,
+# used below) and other bashisms are disabled — `sh bin/benchmark` fails
+# with a syntax error deep into the script instead of at the top. Detect
+# "not really bash" (zsh, dash, POSIX-mode bash) here, in plain POSIX sh
+# syntax so this guard itself parses under any shell, and re-exec under a
+# real bash before any bash-only syntax runs.
+if [ -z "${FORKLIFT_BENCH_REEXECED:-}" ]; then
+    case "${BASH_VERSION:-}${SHELLOPTS:-}" in
+        *posix*) NEED_REEXEC=1 ;;
+        "") NEED_REEXEC=1 ;;
+        *) NEED_REEXEC=0 ;;
+    esac
+    if [ "$NEED_REEXEC" -eq 1 ]; then
+        if command -v bash >/dev/null 2>&1; then
+            FORKLIFT_BENCH_REEXECED=1
+            export FORKLIFT_BENCH_REEXECED
+            exec bash "$0" "$@"
+        else
+            echo "error: bin/benchmark needs real bash (not sh/POSIX mode); bash not found on PATH" >&2
+            exit 1
+        fi
+    fi
+fi
 # Benchmark forklift against git on a real repository.
 #
 # What it does, end to end:
@@ -37,7 +62,7 @@ OUT=""                            # also append the results table here
 MARKDOWN=0                         # render a markdown table instead of aligned text
 REDELTA=1                          # densify with `compact --all --redelta` after import
 
-usage() { sed -n '2,/^set /{ /^set /d; s/^# \{0,1\}//; p; }' "$0"; exit "${1:-0}"; }
+usage() { sed -n '/^# Benchmark forklift/,/^set /{ /^set /d; s/^# \{0,1\}//; p; }' "$0"; exit "${1:-0}"; }
 
 while [ $# -gt 0 ]; do
     case "$1" in
