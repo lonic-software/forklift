@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use serde::Serialize;
 use forklift_core::enums::config_scope::ConfigScope;
 use forklift_core::model::remote::WarehouseInfo;
@@ -22,9 +22,10 @@ use crate::output::{self, CommandOutput};
 /// so a bad URL, a bad token, an unreachable host, or a `--pallet` typo all leave the filesystem
 /// exactly as they found it — nothing to fetch, nothing to clean up. A failure after that point
 /// (a dropped connection mid-fetch, a full disk, a typo'd `--only` path, …) is cleaned up before
-/// this returns: the directory (or missing ancestor chain) franchise created is removed, or — if
-/// it pre-existed empty — just emptied back out, so an immediate retry lands in a directory that
-/// is new or empty either way, never permanently wedged.
+/// this returns: the target directory itself is removed if franchise created it, or — if it
+/// pre-existed empty — just emptied back out, so an immediate retry lands in a directory that is
+/// new or empty either way, never permanently wedged. Any missing *ancestor* directories
+/// franchise had to create along the way are left standing either way — see `claim_target`.
 ///
 /// # Arguments
 /// * `url`       - The remote to franchise.
@@ -94,14 +95,13 @@ pub async fn handle_command(url: &str,
     let resolution = resolve_pallet(&info, pallet)?;
 
     // The handshake (and the pallet check) succeeded; only now may the filesystem change.
-    // `claim_target` is the sole authority on whether franchise itself created the target (or any
-    // missing ancestor) — decided atomically, not by a separate `exists()` check racing the
-    // multi-second (or, over Tor, longer) gap the handshake just took. See its own doc comment.
+    // `claim_target` is the sole authority on whether franchise itself created the target —
+    // decided atomically, not by a separate `exists()` check racing the multi-second (or, over
+    // Tor, longer) gap the handshake just took. See its own doc comment.
     let original_cwd = std::env::current_dir()
         .map_err(|e| format!("Error while reading the current directory: {}", e))?;
-    let created_root = claim_target(target)?;
+    let created_directory = claim_target(target)?;
     let absolute_target = original_cwd.join(target);
-    let absolute_created_root = created_root.map(|root| original_cwd.join(root));
 
     let outcome = enter_and_franchise(
         target, directory, url, resolution, token, fetch_scope, sparse, &client, info,
@@ -124,7 +124,7 @@ pub async fn handle_command(url: &str,
         // failing must never shadow the original error: the operator needs to see why franchise
         // failed, not why the cleanup did, so a cleanup error is appended, not substituted.
         let _ = std::env::set_current_dir(&original_cwd);
-        return Err(cleanup_after_failure(&absolute_target, absolute_created_root.as_deref(), error));
+        return Err(cleanup_after_failure(&absolute_target, created_directory, error));
     }
 
     Ok(())
@@ -279,7 +279,27 @@ async fn franchise_into_prepared_target(
     pallet_utils::set_pallet_head(&pallet_name, &remote_head)?;
     pallet_utils::set_current_pallet_name(&pallet_name)?;
 
-    shift_utils::materialize_tree(None, &tree_hash, "Franchising")?;
+    // A failure here still goes through the caller's ordinary cleanup — the whole target is
+    // wiped — even though the warehouse is otherwise complete at this point: every object, the
+    // signed history and the pallet ref are already durable; only the working tree failed to
+    // materialize. Leaving a checked-out-except-for-this warehouse in place and pointing the
+    // user at `shift`/`restore` to finish in place (PR #84 review, finding 3) was considered and
+    // rejected: the dominant real causes here — a path this filesystem cannot represent, a case
+    // collision between two paths the source tolerated — are not fixed by retrying the same
+    // materialize in place. They need a different target (another filesystem) or a narrower
+    // checkout (`--only`, to route around the offending path), either of which means starting
+    // over anyway. A second, leave-it-in-place cleanup contract would mainly serve the rarer
+    // transient causes (a permission fixed mid-clone, a disk that freed up) — not enough, on its
+    // own, to justify a franchise failure having two different recovery contracts depending on
+    // which step failed. The error is at least pointed at `--only` below, so a retry that hits
+    // the same offending path again has a way past it that doesn't require a different target.
+    shift_utils::materialize_tree(None, &tree_hash, "Franchising").map_err(|e| format!(
+        "{} (the signed history was already fetched and verified; only checking out the working \
+        tree failed. This attempt is still cleaned up like any other failure, so a retry \
+        re-fetches from scratch rather than resuming — if the same path keeps failing here, \
+        franchise --only to route around it instead of retrying as-is)",
+        e
+    ))?;
 
     report.pallet = pallet_name;
     report.head = Some(remote_head.clone());
@@ -335,83 +355,86 @@ fn resolve_pallet(info: &WarehouseInfo, pallet: Option<String>) -> Result<Pallet
     Ok(PalletResolution { pallet_name, remote_head: None })
 }
 
-/// Atomically claim `target` (and any missing ancestor directories) for this franchise, closing
-/// the TOCTOU window a separate `exists()` check followed by `create_dir_all` would leave open
-/// across the handshake's network round trip: checking "does it exist" and then creating it are
-/// two different moments, and the remote handshake now sits in between them — seconds, not
-/// microseconds; longer still over Tor. `std::fs::create_dir` (never `create_dir_all`) is used
-/// one path component at a time instead, so each directory's creation is individually atomic —
-/// its own result alone proves whether *this call* created it, with no separate read required.
+/// Claim `target` for this franchise, closing the TOCTOU window a separate `exists()` check
+/// followed by creation would leave open across the handshake's network round trip: checking
+/// "does it exist" and then creating it are two different moments, and the remote handshake now
+/// sits in between them — seconds, not microseconds; longer still over Tor.
+///
+/// Any missing *ancestor* directories are created with the ordinary, tolerant `create_dir_all` —
+/// it already handles every platform edge case (a Windows drive root, a UNC share root, a `..`
+/// component, an ancestor another process creates concurrently) by falling back to "does this
+/// already exist as a directory" on any error, so there is no reason to reimplement that logic
+/// component-by-component here (an earlier version of this function did exactly that, and it
+/// broke an absolute Windows target: `CreateDirectoryW` on a drive root returns `PermissionDenied`,
+/// which a naive "only tolerate `AlreadyExists`" loop does not). Only `target` itself — the last
+/// component — is the atomic exclusivity token: `std::fs::create_dir`, a single syscall whose own
+/// success or `AlreadyExists` result is the sole, non-racing proof of whether *this call* created
+/// it, no separate read involved.
+///
+/// Ancestors `create_dir_all` creates are *not* tracked or later removed by `cleanup_after_failure`
+/// — deliberately: `create_dir_all(parent)` and `create_dir(target)` are still two separate
+/// syscalls, so a concurrent actor could in principle populate a just-created ancestor in the gap
+/// between them. Recursively deleting that ancestor on a later failure would destroy content
+/// franchise never touched. An empty leftover ancestor is harmless (it never blocks a retry —
+/// `target` itself is what must be empty-or-absent), so cleanup only ever acts on `target`.
 ///
 /// # Returns
-/// * `Ok(Some(root))` - The topmost directory this call created. Everything under it — every
-///   other ancestor and `target` itself — was created in this same loop, so removing `root`
-///   (recursively) removes exactly and only what franchise itself created here; nothing else
-///   could have raced in between two creations both made by this call.
-/// * `Ok(None)` - `target` already existed by the time this call reached it (whether from before
-///   the handshake, or from something else during it). Its emptiness is re-verified right here,
-///   immediately before anything is written into it — the only earlier check (before the
-///   handshake) is now stale.
-/// * `Err(String)` - A directory could not be created (a real error, not "already exists"), or
-///   `target` exists but is no longer empty. Nothing this call itself created is left behind on
-///   the first kind of error: it undoes its own partial progress before returning, so the caller
-///   never has to reason about a half-claimed chain.
-fn claim_target(target: &Path) -> Result<Option<PathBuf>, String> {
-    let mut created_root: Option<PathBuf> = None;
-    let mut current = PathBuf::new();
-
-    for component in target.components() {
-        current.push(component);
-
-        match std::fs::create_dir(&current) {
-            Ok(()) => {
-                if created_root.is_none() {
-                    created_root = Some(current.clone());
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => {
-                if let Some(root) = &created_root {
-                    let _ = std::fs::remove_dir_all(root);
-                }
-                return Err(format!("Error while creating \"{}\": {}", current.display(), e));
-            }
+/// * `Ok(true)`  - Franchise created `target` itself just now; it is empty by construction (this
+///   call's own `create_dir` is what brought it into existence).
+/// * `Ok(false)` - `target` already existed by the time this call reached it (whether from before
+///   the handshake, or from something else during it, including via a `..` alias of some other
+///   existing path). Its emptiness is re-verified right here, immediately before anything is
+///   written into it — the only earlier check (before the handshake) is now stale.
+/// * `Err(String)` - An ancestor or `target` itself could not be created, or `target` exists but
+///   is no longer empty.
+fn claim_target(target: &Path) -> Result<bool, String> {
+    if let Some(parent) = target.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Error while creating \"{}\": {}", parent.display(), e))?;
         }
     }
 
-    if created_root.is_none() {
-        let mut entries = std::fs::read_dir(target)
-            .map_err(|e| format!("Error while reading \"{}\": {}", target.display(), e))?;
+    match std::fs::create_dir(target) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let mut entries = std::fs::read_dir(target)
+                .map_err(|e| format!("Error while reading \"{}\": {}", target.display(), e))?;
 
-        if entries.next().is_some() {
-            return Err(format!(
-                "\"{}\" is not empty; franchise into a new or empty directory.",
-                target.display()
-            ));
+            if entries.next().is_some() {
+                return Err(format!(
+                    "\"{}\" is not empty; franchise into a new or empty directory.",
+                    target.display()
+                ));
+            }
+
+            Ok(false)
         }
+        Err(e) => Err(format!("Error while creating \"{}\": {}", target.display(), e)),
     }
-
-    Ok(created_root)
 }
 
-/// Undo whatever franchise created before it failed, so the directory is retryable rather than
-/// permanently wedged — the defect this closes: a franchise that failed partway through used to
-/// leave `.forklift`/`.forkliftignore` behind, and a subsequent, correct attempt then refused to
-/// enter a directory that was no longer empty.
+/// Undo whatever franchise created in `target` before it failed, so the directory is retryable
+/// rather than permanently wedged — the defect this closes: a franchise that failed partway
+/// through used to leave `.forklift`/`.forkliftignore` behind, and a subsequent, correct attempt
+/// then refused to enter a directory that was no longer empty.
 ///
-/// `created_root` is `claim_target`'s own record of what it created — never re-inferred here:
-/// * `Some(root)` - franchise created `root` (the target itself, or a missing ancestor of it);
-///   removing it recursively removes exactly what franchise created.
-/// * `None` - the target pre-existed (confirmed empty by `claim_target`); only its contents are
-///   removed, leaving the empty directory behind.
+/// `created_directory` is `claim_target`'s own record of whether it created `target` itself —
+/// never re-inferred here:
+/// * `true`  - franchise created `target`; removing it removes exactly what franchise created.
+/// * `false` - the target pre-existed (confirmed empty by `claim_target`); only its contents are
+///   removed, leaving the empty directory behind. Any ancestor `claim_target` may have had to
+///   create along the way is left standing regardless — see `claim_target`'s own doc comment for
+///   why.
 ///
 /// Cleanup failing must never mask the original error — the operator needs to see why franchise
 /// failed, not why the cleanup did — so on a cleanup error this appends the leftover path to the
 /// original message rather than replacing it.
-fn cleanup_after_failure(target: &Path, created_root: Option<&Path>, original_error: String) -> String {
-    let cleanup_result = match created_root {
-        Some(root) => std::fs::remove_dir_all(root),
-        None => remove_directory_contents(target),
+fn cleanup_after_failure(target: &Path, created_directory: bool, original_error: String) -> String {
+    let cleanup_result = if created_directory {
+        std::fs::remove_dir_all(target)
+    } else {
+        remove_directory_contents(target)
     };
 
     match cleanup_result {
@@ -419,7 +442,7 @@ fn cleanup_after_failure(target: &Path, created_root: Option<&Path>, original_er
         Err(cleanup_error) => format!(
             "{} (additionally, cleaning up \"{}\" after the failure did not succeed: {}; remove it \
             by hand before retrying)",
-            original_error, created_root.unwrap_or(target).display(), cleanup_error
+            original_error, target.display(), cleanup_error
         ),
     }
 }

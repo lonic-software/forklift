@@ -881,12 +881,14 @@ one, then loose objects for the rest), and materializes the chosen pallet
 
 The remote is contacted before anything is written, and a `--pallet` typo is checked against the
 handshake's own answer before anything is fetched, so a bad URL, a bad token, an unreachable
-host, or a pallet that does not exist all leave the target exactly as it was found — including
-any parent directories franchise would otherwise have had to create for a nested path (e.g.
-`some/new/path`). A failure partway through (a dropped connection, a full disk, …) is cleaned
-back up before `franchise` returns, so a retry — with a corrected token, say — always lands in a
-directory that is new or empty, never one refused as "not empty" by `franchise`'s own earlier
-leftovers.
+host, or a pallet that does not exist all leave the target exactly as it was found. A failure
+partway through (a dropped connection, a full disk, …) removes the target directory itself if
+franchise created it — or, if it already existed empty, just empties it back out — so a retry
+with a corrected token, say, always lands in a directory that is new or empty, never one refused
+as "not empty" by `franchise`'s own earlier leftovers. Any *parent* directories needed for a
+nested target path (e.g. `some/new/path`) are created the ordinary way and are deliberately left
+standing on a later failure, whether franchise created them or found them already there: an empty
+leftover parent is harmless and never blocks a retry, unlike the target directory itself.
 
 **Sparse franchise (`--only`).** With one or more `--only <path>`, franchise fetches the
 whole signed history — every parcel, signature and the tree spine — but only the **content**
