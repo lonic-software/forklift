@@ -32,7 +32,9 @@ commands:
       # "fl" already on PATH) must not fail this install step.
       - "[ -n \"${FORKLIFT_NO_ALIAS:-}\" ] || forklift alias install || true"
 
-  - id: serve
+  # NOT `serve`: pult reserves that id for its own subcommands, and it rejects the whole config on
+  # sight — so a reserved id here breaks every pult command in this repo, not just this one.
+  - id: dev-server
     title: Run a throwaway local forklift-server (test lift / lower / franchise)
     params:
       addr: { input: { default: "127.0.0.1:9418" } }
