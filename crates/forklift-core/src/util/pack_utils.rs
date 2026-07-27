@@ -671,9 +671,20 @@ pub(crate) fn pack_health_snapshot() -> Result<PackHealthSnapshot, String> {
     })
 }
 
-/// Forget the cached packs for the active warehouse, so the next read reloads them from
-/// disk. Called after `compact` writes new packs in this process.
-fn invalidate_cache() {
+/// Forget the cached packs for the active warehouse, so the next read reloads them from disk.
+///
+/// Called after `compact`/a bundle install write new packs in this process, so a later read in
+/// the same process sees them — and, the same idiom in reverse, called *before* deleting or
+/// renaming pack files this process may have already mmap'd: the cached [`PackSet`] holds a
+/// `memmap2::Mmap` per pack, and an open mmap blocks that pack file's own deletion on Windows
+/// (POSIX permits it). A caller about to remove or replace a pack folder wholesale — `compact`'s
+/// repack, or `franchise`'s cleanup after a failure partway through a bundle install — must drop
+/// this cache first, exactly like the existing `compact`/import call sites already do around
+/// their own pack renames.
+///
+/// `pub` (not `pub(crate)`) so a caller in the `forklift` binary crate — `franchise`'s cleanup —
+/// can call it too; every other caller here is within this crate.
+pub fn invalidate_cache() {
     registry().lock().expect("the pack registry lock is poisoned")
         .remove(&file_utils::get_path_objects_root());
 }

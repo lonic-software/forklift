@@ -4415,3 +4415,217 @@ fn a_post_handshake_failure_empties_a_pre_existing_target_directory() {
     assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0,
         "but everything franchise put in it must be gone: {:?}", dir);
 }
+
+#[test]
+fn a_pallet_typo_is_refused_before_anything_is_created() {
+    // PR #84 review, finding 6: a --pallet typo is checked against the handshake's own answer
+    // (info.pallets) *before* anything is fetched or mutated — unlike the --only tree check
+    // (which genuinely needs the fetched tree and cannot move this early), the handshake already
+    // carries the full pallet map, so this is a pure in-memory check. Refused this early, the
+    // target directory is never even created — strictly stronger than "cleaned up after a
+    // failure", and it means a typo costs nothing to retry.
+    let area = TestArea::new("pallet-typo-no-leftover");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/code.txt", "v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    let dir = area.path("typo-pallet");
+    assert!(!dir.exists());
+
+    let failed = area.forklift(".", &[
+        "franchise", &server.url, "typo-pallet", "--pallet", "does-not-exist",
+    ]);
+    assert!(!failed.status.success(), "a --pallet typo must be refused");
+    assert!(stderr(&failed).contains("no pallet \"does-not-exist\""), "{}", stderr(&failed));
+
+    assert!(!dir.exists(),
+        "a --pallet typo must be refused before the target directory is ever created: {:?}", dir);
+}
+
+#[test]
+fn a_pallet_typo_is_refused_before_a_broken_bundle_would_otherwise_fail_first() {
+    // Pins the *ordering* specifically, which the previous test does not: cleanup (findings 1-4
+    // in this same review round) makes "the target ends up clean" true whether the pallet is
+    // checked before or after the fetch, so that assertion alone cannot tell the two apart. Here
+    // the remote's bundle is deliberately corrupted — a recognized header, an unparseable
+    // payload — so importing it is a hard, unrelated failure. With the pallet check moved before
+    // any fetch, a --pallet typo is reported and the broken bundle is never even downloaded.
+    // Before this fix, the bundle install ran first in `franchise_into_prepared_target` and its
+    // own hard failure would have been reported instead, masking the pallet typo entirely.
+    let area = TestArea::new("pallet-typo-before-broken-bundle");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/code.txt", "v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    server.rebuild_bundle(&area);
+
+    // A recognized header (so it is not gracefully skipped as an unsupported future version)
+    // over a garbage payload (so importing it is a hard failure, not "nothing to import").
+    let bundle_path = area.path("server-root/.forklift/bundles/latest");
+    std::fs::write(&bundle_path, format!(
+        "{}\nthis is not a valid pack section table",
+        forklift_core::util::bundle_utils::BUNDLE_HEADER
+    )).unwrap();
+
+    let dir = area.path("typo-vs-broken-bundle");
+
+    let failed = area.forklift(".", &[
+        "franchise", &server.url, "typo-vs-broken-bundle", "--pallet", "does-not-exist",
+    ]);
+    assert!(!failed.status.success());
+    assert!(stderr(&failed).contains("no pallet \"does-not-exist\""),
+        "the pallet typo must be reported, not the (also broken) bundle: {}", stderr(&failed));
+    assert!(!dir.exists());
+}
+
+#[test]
+fn a_nested_target_with_missing_parents_is_created_and_fully_removed_on_failure() {
+    // PR #84 review, findings 2 & 4: `create_dir_all` used to create every missing ancestor
+    // (here, both "a" and "a/b" are absent) but cleanup only ever removed the leaf, leaving the
+    // ancestor chain behind — contradicting the "leaves the target exactly as it was found"
+    // claim. `claim_target` now creates one component at a time and reports the *topmost*
+    // directory it created; removing that one recursively must take the whole chain with it.
+    let area = TestArea::new("nested-missing-parents");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/src/api/a.txt", "api v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    let a = area.path("a");
+    assert!(!a.exists());
+
+    // "src/ap" (missing the final "i") triggers the post-handshake --only typo failure.
+    let failed = area.forklift(".", &[
+        "franchise", &server.url, "a/b/c", "--only", "src/ap",
+    ]);
+    assert!(!failed.status.success(), "a typo'd --only path must be refused");
+
+    assert!(!a.exists(),
+        "the whole ancestor chain franchise created (\"a\", \"a/b\", \"a/b/c\") must be gone, \
+        not just the leaf: {:?}", a);
+}
+
+#[test]
+fn a_nested_target_leaves_a_pre_existing_ancestor_alone_on_failure() {
+    // Same as above, but "a" pre-exists (not franchise's to remove) while "a/b" and "a/b/c" do
+    // not: cleanup must remove exactly "a/b" (taking "a/b/c" with it) and leave "a" standing.
+    let area = TestArea::new("nested-partial-parents");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/src/api/a.txt", "api v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    let a = area.path("a");
+    std::fs::create_dir_all(&a).unwrap();
+
+    let failed = area.forklift(".", &[
+        "franchise", &server.url, "a/b/c", "--only", "src/ap",
+    ]);
+    assert!(!failed.status.success(), "a typo'd --only path must be refused");
+
+    assert!(a.exists(), "a pre-existing ancestor must not be removed: {:?}", a);
+    assert_eq!(std::fs::read_dir(&a).unwrap().count(), 0,
+        "but everything franchise created under it (\"a/b\") must be gone: {:?}", a);
+}
+
+#[test]
+fn franchise_ignores_an_unrelated_ambient_warehouses_tor_setting() {
+    // PR #84 review, finding 5: moving the handshake before the cwd switch means it now runs in
+    // whatever directory the operator happened to invoke franchise from — which may be a
+    // pre-existing, unrelated warehouse with its own `remote.tor`/`remote.torProxy`. Inheriting
+    // that warehouse's Tor policy for a brand-new clone elsewhere would be a cwd-dependent,
+    // security-relevant surprise, so the initial handshake reads *global* configuration only.
+    //
+    // "outer" sets remote.tor = on (route every remote through Tor) and remote.torProxy to a
+    // port nothing listens on, at WAREHOUSE scope. If the initial handshake ever inherited this,
+    // routing the plain http:// test server through that dead proxy would make it unreachable.
+    let area = TestArea::new("franchise-tor-scope-independent");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/code.txt", "v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    std::fs::create_dir_all(area.path("outer")).unwrap();
+    assert_success(&area.forklift("outer", &["prepare"]));
+    assert_success(&area.forklift("outer", &["config", "remote.tor", "on"]));
+    assert_success(&area.forklift("outer", &["config", "remote.torProxy", "socks5h://127.0.0.1:9"]));
+
+    // Run from inside "outer": the plain http:// test server must still be reached directly.
+    let franchised = area.forklift("outer", &["franchise", &server.url, "sub"]);
+    assert_success(&franchised);
+    assert_eq!(area.read_file("outer/sub/code.txt"), "v1\n");
+}
+
+#[test]
+fn a_post_handshake_failure_after_a_native_bundle_install_still_removes_the_target() {
+    // PR #84 review, finding 1: a non-sparse franchise installs the remote's bundle as native
+    // packs (`bundle_utils::import_bundle` -> `pack_utils::import_transport_packs`), and reading
+    // any object afterward in this same process — here, `adopt_remote_trust` walking the
+    // enrolled office's history, which the bundle already covers — mmaps those packs into the
+    // process-global pack registry (`pack_utils::PACK_REGISTRY`). If a later step then fails,
+    // cleanup must still be able to delete the target: an un-dropped mmap on a pack file blocks
+    // that file's own deletion on Windows (POSIX permits it), reinstating the exact wedge this
+    // fix removes.
+    //
+    // Neither existing cleanup test exercises this: both pass --only, which puts franchise in
+    // sparse mode and skips the whole-store bundle install entirely. A --pallet typo — this PR's
+    // other repro for this same finding — no longer reaches this state either, now that it is
+    // refused before any fetch at all (see the early-refusal test above). The trigger here
+    // instead is a second, later parcel the (already-built, now-stale) bundle does not cover,
+    // whose object the remote then genuinely no longer has — forcing the incremental walk that
+    // must still fetch it to fail *after* the bundle (and its packs) are already installed and
+    // read.
+    let area = TestArea::new("post-handshake-cleanup-with-packs");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/a.txt", "first parcel\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "pre-trust base"]));
+    assert_success(&area.forklift("dev", &["office", "enroll"]));
+
+    // Built now: covers the office enrollment and this first parcel only.
+    server.rebuild_bundle(&area);
+
+    // A second parcel, lifted after the bundle was built — the bundle cannot cover it.
+    area.write_file("dev/b.txt", "second parcel, not in the bundle\n");
+    assert_success(&area.forklift("dev", &["load", "b.txt"]));
+    assert_success(&area.forklift("dev", &["stack", "second parcel"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    let head = pallet_head(&area, "dev", "main");
+    let blob_b = path_object_hash(&area, "dev", &head, "b.txt");
+
+    // The remote's own copy is now genuinely gone: whatever the incremental walk retries, it
+    // cannot recover an object the far end no longer has.
+    std::fs::remove_file(object_store_path(&area, "server-root", &blob_b)).unwrap();
+
+    let dir = area.path("packed");
+    assert!(!dir.exists());
+
+    let failed = area.forklift(".", &["franchise", &server.url, "packed"]);
+    assert!(!failed.status.success(),
+        "franchise must fail when a required object has vanished from the remote");
+
+    assert!(!dir.exists(),
+        "a post-handshake failure, even with the remote's native-bundle packs already installed \
+        and read in this process, must still fully remove a target directory franchise itself \
+        created: {:?}", dir);
+}

@@ -879,12 +879,14 @@ its trust anchor, downloads the history (using the remote's bundle when it has
 one, then loose objects for the rest), and materializes the chosen pallet
 (default: the remote's default pallet). The directory must be new or empty.
 
-The remote is contacted before anything is written, so a bad URL, bad token or
-unreachable host leaves the target exactly as it was found. A failure partway
-through (a dropped connection, a full disk, …) is cleaned back up before
-`franchise` returns, so a retry — with a corrected token, say — always lands in
-a directory that is new or empty, never one refused as "not empty" by
-`franchise`'s own earlier leftovers.
+The remote is contacted before anything is written, and a `--pallet` typo is checked against the
+handshake's own answer before anything is fetched, so a bad URL, a bad token, an unreachable
+host, or a pallet that does not exist all leave the target exactly as it was found — including
+any parent directories franchise would otherwise have had to create for a nested path (e.g.
+`some/new/path`). A failure partway through (a dropped connection, a full disk, …) is cleaned
+back up before `franchise` returns, so a retry — with a corrected token, say — always lands in a
+directory that is new or empty, never one refused as "not empty" by `franchise`'s own earlier
+leftovers.
 
 **Sparse franchise (`--only`).** With one or more `--only <path>`, franchise fetches the
 whole signed history — every parcel, signature and the tree spine — but only the **content**

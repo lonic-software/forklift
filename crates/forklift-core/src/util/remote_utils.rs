@@ -16,6 +16,7 @@ use crate::model::remote::{
     UploadTargetsResponse, WarehouseInfo, LIFT_SESSION_BLOB_NOT_READY, MAX_MISSING_BATCH,
     MAX_UPLOAD_TARGETS_BATCH, PROTOCOL_VERSION,
 };
+use crate::enums::config_scope::ConfigScope;
 use crate::error::{CoreError, RefusalCode};
 use crate::util::office_utils::OFFICE_PALLET_NAME;
 use crate::util::scope_utils::{self, MaterializationScope, ScopeClass};
@@ -186,6 +187,10 @@ impl TorSettings {
     /// missing or malformed configuration file must never make constructing a client fail (a
     /// client is built on hot paths, and in contexts with no warehouse at all), so a read error
     /// degrades to the defaults, which route only onion remotes through the stock local proxy.
+    ///
+    /// The warehouse configuration is consulted first (see [`config_utils::get_effective_value`]):
+    /// correct for every caller that already has "a warehouse" of its own to have an opinion —
+    /// which is every caller except one. See [`Self::from_global_config`] for that exception.
     pub fn from_config() -> TorSettings {
         let mode = config_utils::get_effective_value(config_utils::KEY_REMOTE_TOR)
             .ok()
@@ -197,6 +202,33 @@ impl TorSettings {
             .ok()
             .flatten()
             .map(|(value, _)| value)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_TOR_PROXY.to_string());
+
+        TorSettings { mode, proxy }
+    }
+
+    /// Like [`Self::from_config`], but *global* configuration only — never the warehouse scope.
+    ///
+    /// The one caller this exists for is `franchise`'s initial handshake, which now (deliberately)
+    /// runs before the target warehouse exists, so there is no "this warehouse" to have an
+    /// opinion about Tor — only the ambient working directory, which may happen to sit inside a
+    /// *different*, unrelated warehouse. `from_config`'s effective (warehouse-then-global) lookup
+    /// would silently pick up that unrelated warehouse's `remote.tor`/`remote.torProxy` — a
+    /// cwd-dependent, security-relevant surprise for a brand-new clone elsewhere. Before franchise
+    /// moved its handshake earlier, this could never happen: the handshake ran *inside* the fresh
+    /// (still-empty) target, whose warehouse scope had never had anything to set — so global was,
+    /// in effect, the only scope that could ever apply. This preserves that.
+    pub fn from_global_config() -> TorSettings {
+        let mode = config_utils::get_scoped_value(config_utils::KEY_REMOTE_TOR, ConfigScope::Global)
+            .ok()
+            .flatten()
+            .map(|value| TorMode::parse(&value))
+            .unwrap_or(TorMode::Auto);
+
+        let proxy = config_utils::get_scoped_value(config_utils::KEY_REMOTE_TOR_PROXY, ConfigScope::Global)
+            .ok()
+            .flatten()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| DEFAULT_TOR_PROXY.to_string());
 
