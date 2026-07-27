@@ -1,6 +1,7 @@
 use std::path::Path;
 use serde::Serialize;
 use forklift_core::enums::config_scope::ConfigScope;
+use forklift_core::model::remote::WarehouseInfo;
 use forklift_core::util::path_utils::WarehousePath;
 use forklift_core::util::remote_utils::RemoteClient;
 use forklift_core::util::scope_utils::MaterializationScope;
@@ -16,6 +17,13 @@ use crate::output::{self, CommandOutput};
 /// one, then whatever the bundle lacked as loose objects) and materialize the chosen
 /// pallet's head in the working directory.
 ///
+/// The remote is contacted before the target directory (or the warehouse in it) is touched, so
+/// a bad URL, bad token or unreachable host leaves the filesystem exactly as it found it. A
+/// failure after that point (a dropped connection mid-fetch, a full disk, …) is cleaned up before
+/// this returns: the directory franchise created is removed, or — if it pre-existed empty — just
+/// emptied back out, so an immediate retry lands in a directory that is new or empty either way,
+/// never permanently wedged.
+///
 /// # Arguments
 /// * `url`       - The remote to franchise.
 /// * `directory` - The directory to create the warehouse in (must be empty or absent).
@@ -30,8 +38,8 @@ use crate::output::{self, CommandOutput};
 ///
 /// # Returns
 /// * `Ok(())`      - If the franchise is ready to work in.
-/// * `Err(String)` - If the directory is not empty, the remote is unreachable, or a
-///                   transfer failed.
+/// * `Err(String)` - If the directory is not empty, the remote is unreachable, or a transfer
+///                   failed. The target is left as it was found (see above) either way.
 pub async fn handle_command(url: &str,
                             directory: &str,
                             pallet: Option<String>,
@@ -54,7 +62,26 @@ pub async fn handle_command(url: &str,
                 directory
             ));
         }
-    } else {
+    }
+
+    // Extending the same principle as the --only normalization above (refuse cleanly before any
+    // warehouse is created) to the network: talk to the remote *before* touching the filesystem
+    // at all. A bad URL, bad token or unreachable host must leave the target exactly as found —
+    // not even an empty directory left behind for a directory that did not exist before.
+    let client = RemoteClient::new(url, token.clone())?;
+    let info = client.fetch_info().await?;
+
+    // The handshake succeeded; only now may the filesystem change. Franchise proceeds past the
+    // emptiness check above only when the target is empty or absent, so anything left behind by
+    // a later failure is entirely franchise's own doing — track which case this is, so a failure
+    // partway through can undo exactly that and no more (see `cleanup_after_failure`).
+    let created_directory = !target.exists();
+
+    let original_cwd = std::env::current_dir()
+        .map_err(|e| format!("Error while reading the current directory: {}", e))?;
+    let absolute_target = original_cwd.join(target);
+
+    if created_directory {
         std::fs::create_dir_all(target)
             .map_err(|e| format!("Error while creating \"{}\": {}", directory, e))?;
     }
@@ -63,6 +90,36 @@ pub async fn handle_command(url: &str,
     std::env::set_current_dir(target)
         .map_err(|e| format!("Error while switching to \"{}\": {}", directory, e))?;
 
+    let outcome = franchise_into_prepared_target(
+        url, directory, pallet, token, fetch_scope, sparse, &client, info,
+    ).await;
+
+    if let Err(error) = outcome {
+        // Get back to where we started before touching the target — it may currently be our
+        // cwd, and removing the directory a process is standing in leaves it dangling. Cleanup
+        // failing must never shadow the original error: the operator needs to see why franchise
+        // failed, not why the cleanup did, so a cleanup error is appended, not substituted.
+        let _ = std::env::set_current_dir(&original_cwd);
+        return Err(cleanup_after_failure(&absolute_target, created_directory, error));
+    }
+
+    Ok(())
+}
+
+/// Everything that mutates the warehouse: run only after the remote handshake has already
+/// succeeded (see `handle_command`), with the current directory already switched into `target`.
+/// A failure anywhere in here is handled by the caller, which cleans up whatever this left behind.
+#[allow(clippy::too_many_arguments)]
+async fn franchise_into_prepared_target(
+    url: &str,
+    directory: &str,
+    pallet: Option<String>,
+    token: Option<String>,
+    fetch_scope: MaterializationScope,
+    sparse: bool,
+    client: &RemoteClient,
+    info: WarehouseInfo,
+) -> Result<(), String> {
     warehouse_utils::prepare_warehouse()?;
 
     config_utils::set_value(config_utils::KEY_REMOTE_URL, url, ConfigScope::Warehouse)?;
@@ -70,9 +127,6 @@ pub async fn handle_command(url: &str,
     if let Some(token) = &token {
         config_utils::set_value(config_utils::KEY_REMOTE_TOKEN, token, ConfigScope::Warehouse)?;
     }
-
-    let client = RemoteClient::new(url, token)?;
-    let info = client.fetch_info().await?;
 
     let mut report = FranchiseReport {
         remote: url.to_string(),
@@ -117,12 +171,12 @@ pub async fn handle_command(url: &str,
         }
     }
 
-    let trust = remote_utils::adopt_remote_trust(&client, &info).await?;
+    let trust = remote_utils::adopt_remote_trust(client, &info).await?;
     report.adopted_anchor = trust.adopted_anchor;
 
     // Adopt the meta pallets too (the manifest, …), so a clone carries the post-metadata,
     // not just the working history. A fresh clone has none locally, so nothing diverges.
-    report.meta_adopted = remote_utils::adopt_meta_pallets(&client, &info).await?.adopted;
+    report.meta_adopted = remote_utils::adopt_meta_pallets(client, &info).await?.adopted;
 
     let explicitly_requested = pallet.is_some();
 
@@ -169,7 +223,7 @@ pub async fn handle_command(url: &str,
         return Ok(());
     };
 
-    let stats = remote_utils::fetch_history_scoped(&client, remote_head, &fetch_scope).await?;
+    let stats = remote_utils::fetch_history_scoped(client, remote_head, &fetch_scope).await?;
 
     let tree_hash = object_utils::load_parcel(remote_head)?.tree_hash;
 
@@ -204,6 +258,56 @@ pub async fn handle_command(url: &str,
     report.head = Some(remote_head.clone());
     report.fetched_objects = stats.fetched_objects;
     output::emit("franchise", &report);
+
+    Ok(())
+}
+
+/// Undo whatever franchise created in `target` before it failed, so the directory is retryable
+/// rather than permanently wedged — the defect this closes: a franchise that failed partway
+/// through used to leave `.forklift`/`.forkliftignore` behind, and a subsequent, correct attempt
+/// then refused to enter a directory that was no longer empty.
+///
+/// Franchise only ever reaches the point where this can be called once the target was confirmed
+/// empty or absent, so anything present in it now is entirely franchise's own doing:
+/// * if franchise created the directory, remove the directory;
+/// * if it pre-existed (empty), remove only its contents, leaving the empty directory behind.
+///
+/// `created_directory` is the caller's own record of which case applies, not something
+/// re-inferred here. Cleanup failing must never mask the original error — the operator needs to
+/// see why franchise failed, not why the cleanup did — so on a cleanup error this appends the
+/// leftover path to the original message rather than replacing it.
+fn cleanup_after_failure(target: &Path, created_directory: bool, original_error: String) -> String {
+    let cleanup_result = if created_directory {
+        std::fs::remove_dir_all(target)
+    } else {
+        remove_directory_contents(target)
+    };
+
+    match cleanup_result {
+        Ok(()) => original_error,
+        Err(cleanup_error) => format!(
+            "{} (additionally, cleaning up \"{}\" after the failure did not succeed: {}; remove it \
+            by hand before retrying)",
+            original_error, target.display(), cleanup_error
+        ),
+    }
+}
+
+/// Remove every entry directly under `target`, leaving `target` itself in place. Used to restore
+/// a pre-existing (empty) directory that franchise dirtied before failing. `DirEntry::file_type`
+/// does not follow symlinks, so a symlink entry is unlinked itself (`remove_file`) rather than
+/// having its target recursively removed.
+fn remove_directory_contents(target: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(target)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        if entry.file_type()?.is_dir() {
+            std::fs::remove_dir_all(&path)?;
+        } else {
+            std::fs::remove_file(&path)?;
+        }
+    }
 
     Ok(())
 }

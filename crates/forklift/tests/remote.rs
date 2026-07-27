@@ -4302,3 +4302,116 @@ fn heal_driven_refetch_force_fetches_a_corrupt_present_object() {
     };
     assert_eq!(content, genuine_content.as_bytes());
 }
+
+#[test]
+fn a_failed_handshake_leaves_no_target_directory_behind() {
+    // The historical defect, reproduced live against a real remote: franchise created
+    // `.forklift`/`.forkliftignore` in the target directory nine lines before the first thing
+    // that talks to the remote (`RemoteClient::fetch_info`), so a wrong token left a wedged,
+    // half-initialized directory behind. The handshake must now happen before any filesystem
+    // mutation, so a bad token must not even create the target directory.
+    let area = TestArea::new("failed-handshake-no-leftover");
+    let server = Server::start(&area, Some("right-token"));
+
+    let dir = area.path("attempt1");
+    assert!(!dir.exists());
+
+    let failed = area.forklift(".", &[
+        "franchise", &server.url, "attempt1", "--token", "wrong-token",
+    ]);
+    assert!(!failed.status.success(), "a bad token must fail the franchise");
+    assert!(stderr(&failed).contains("401"), "{}", stderr(&failed));
+
+    assert!(!dir.exists(),
+        "a franchise whose handshake failed must not create the target directory at all: {:?}", dir);
+}
+
+#[test]
+fn a_retry_after_a_failed_handshake_succeeds_into_the_same_directory() {
+    // Pins the actual user-facing bug (verbatim from the field): before the fix, a franchise
+    // whose handshake failed had already dirtied the target with .forklift/.forkliftignore, so
+    // an immediate retry with the correct token into the *same* directory was refused — "...is
+    // not empty" — even though nothing had ever synced there.
+    let area = TestArea::new("retry-after-failed-handshake");
+    let server = Server::start(&area, Some("right-token"));
+
+    prepare_warehouse(&area, "dev", &server.url);
+    assert_success(&area.forklift("dev", &["config", "remote.token", "right-token"]));
+    area.write_file("dev/code.txt", "v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    let dir = area.path("attempt1");
+    assert!(!dir.exists());
+
+    // First attempt: wrong token, the handshake fails.
+    let failed = area.forklift(".", &[
+        "franchise", &server.url, "attempt1", "--token", "wrong-token",
+    ]);
+    assert!(!failed.status.success());
+    assert!(stderr(&failed).contains("401"), "{}", stderr(&failed));
+
+    // Immediate retry, same directory, correct token: must succeed, not "is not empty".
+    let retried = area.forklift(".", &[
+        "franchise", &server.url, "attempt1", "--token", "right-token",
+    ]);
+    assert_success(&retried);
+    assert_eq!(area.read_file("attempt1/code.txt"), "v1\n");
+}
+
+#[test]
+fn a_post_handshake_failure_removes_a_freshly_created_target_directory() {
+    // Cleanup coverage for a failure *after* the handshake has already succeeded (item 2 of the
+    // fix): a typo'd --only path is rejected only after the handshake, the scoped history fetch
+    // and the tree load have all already run (see `is_directory_in_tree`'s call site in
+    // franchise.rs) — by which point `prepare_warehouse` has already created `.forklift` and real
+    // objects have already been fetched into it. The target here did not exist before the
+    // attempt, so cleanup must remove the whole directory, not just the state that would have
+    // been written next.
+    let area = TestArea::new("post-handshake-cleanup-created");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/src/api/a.txt", "api v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    let dir = area.path("typo");
+    assert!(!dir.exists());
+
+    // "src/ap" (missing the final "i") names nothing in the head — rejected after the handshake.
+    let failed = area.forklift(".", &["franchise", &server.url, "typo", "--only", "src/ap"]);
+    assert!(!failed.status.success(), "a typo'd --only path must be refused");
+    assert!(stderr(&failed).contains("Nothing was recorded"), "{}", stderr(&failed));
+
+    assert!(!dir.exists(),
+        "a post-handshake failure must remove a target directory franchise itself created: {:?}",
+        dir);
+}
+
+#[test]
+fn a_post_handshake_failure_empties_a_pre_existing_target_directory() {
+    // Same post-handshake trigger as above, but the target pre-existed (empty) before the
+    // attempt: cleanup must leave the empty directory itself in place — it is the caller's, not
+    // franchise's, to remove — and only clear out what franchise put in it.
+    let area = TestArea::new("post-handshake-cleanup-preexisting");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/src/api/a.txt", "api v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    let dir = area.path("typo");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let failed = area.forklift(".", &["franchise", &server.url, "typo", "--only", "src/ap"]);
+    assert!(!failed.status.success(), "a typo'd --only path must be refused");
+
+    assert!(dir.exists(), "a pre-existing target directory must remain: {:?}", dir);
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0,
+        "but everything franchise put in it must be gone: {:?}", dir);
+}
