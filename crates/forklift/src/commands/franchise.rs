@@ -114,7 +114,7 @@ pub async fn handle_command(url: &str,
         // exactly the wedge this fix removes. Reuses the same drop-before-delete/rename idiom
         // `compact`/`import_transport_packs` already use around their own pack renames, rather
         // than inventing a second one — see `pack_utils::invalidate_cache`.
-        pack_utils::invalidate_cache();
+        // PROBE: invalidate_cache() removed on purpose to test whether the Windows test reddens.
 
         // Get back to where we started before touching the target — it may currently be our
         // cwd, and removing the directory a process is standing in leaves it dangling. Cleanup
