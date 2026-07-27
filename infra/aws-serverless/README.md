@@ -230,3 +230,85 @@ semantics, arm64 boot, and asynchronous verifier promotion under a customer-mana
 none of which a LocalStack apply can reach. It runs outside the pull-request path by design: it
 needs long-lived credentials and a stack that survives between runs, so it can neither gate a PR
 nor be reached from a fork.
+
+### Layer 3 retention & reset
+
+The `examples/staging/` bucket grows by roughly 9 MiB **every run**, forever, by design: each run
+stages a fresh 9 MiB of `/dev/urandom` (well above the 8 MiB chunk threshold, so it exercises the
+verifier's async promotion path — see `verify.sh`'s header) and lifts it into the canonical,
+content-addressed `objects/` namespace. Fresh urandom never deduplicates against anything already
+there, and nothing prunes a canonical object once written — that upload has to stay cold and
+un-deduplicated, or the verifier Lambda (the entire reason Layer 3 exists) stops being exercised
+from the second run on. An S3 lifecycle rule on `objects/` was considered and rejected: the
+franchise leg that follows re-fetches the full history closure, so expiring an old object would
+turn the *next* run's franchise into a permanently red run over a genuinely corrupted warehouse,
+not a fix. There is also no client-side prune to fall back to — the client has no delete
+operation at all (every "prune" in `remote_utils.rs` is walk-pruning, not a network delete).
+
+Rather than fight that growth, `verify.sh` tripwires it so a failure caused by it is
+self-identifying instead of looking like a real verifier/KMS regression (its own header calls
+that confusion "the worst possible false signal"). Before any of the four checklist steps run —
+so it always fires even when a later step would otherwise fail first — the script sums
+`Contents[].Size` over the whole bucket (not just `staging/`; the growth is in `objects/`) and
+compares it against two thresholds:
+
+- **Soft, 1 GiB** — logs a `NOTE` and continues. Expected eventually; just a heads-up.
+- **Hard, 4 GiB** — fails the run with a message that names itself as retention, states the stack
+  itself is healthy, and points back here.
+
+Both are round numbers sized for a comfortable multi-month runway on a daily cron (roughly 3-4
+months to the soft threshold, roughly 15 months to the hard one at ~9 MiB/run) — a tripwire, not
+a derived capacity plan.
+
+**When the hard threshold fires:** the `examples/staging/` warehouse is fixture-only and
+disposable (see that directory's own `main.tf` header) — it exists solely to give the scheduled
+workflow something to franchise onto and lift into, never to hold anything anyone depends on. The
+demo deployment is a **separate stack** from this one, so there is nothing here to preserve.
+Reset unconditionally:
+
+```sh
+cd infra/aws-serverless/examples/staging
+tofu destroy -var-file=staging.tfvars.example \
+  -var control_plane_package=/path/to/forklift-aws-control-plane.zip \
+  -var verifier_package=/path/to/forklift-aws-verifier.zip \
+  -var auth_token="$FORKLIFT_TOKEN" \
+  -var kms_key_arn="$KMS_KEY_ARN"
+tofu apply -var-file=staging.tfvars.example \
+  -var control_plane_package=/path/to/forklift-aws-control-plane.zip \
+  -var verifier_package=/path/to/forklift-aws-verifier.zip \
+  -var auth_token="$FORKLIFT_TOKEN" \
+  -var kms_key_arn="$KMS_KEY_ARN"
+```
+
+`force_destroy = true` and `deletion_protection = false` are already set in
+`examples/staging/main.tf` for exactly this — the directory's whole purpose is being torn down
+and recreated, unlike this module's own safe-by-default posture. Update the scheduled workflow's
+stored endpoint/bucket/table outputs (repository secrets or variables, per
+`.github/workflows/aws-serverless-verify.yml`) to the new stack's outputs after `apply`.
+
+## Consumption scope
+
+This module is only supported **in-repo** (`source = "../.."` from another root inside this
+repository) or as a **git source** (a whole clone of this repository, e.g.
+`source = "git::https://github.com/.../lonic-forklift.git//infra/aws-serverless"`). Registry or
+tarball **subdirectory** consumption (a Terraform/OpenTofu registry module, or `source =
+".../lonic-forklift//infra/aws-serverless"` pulled as an archive of just that subtree) is
+explicitly out of scope — this is a scope decision, not an oversight, and not planned to change
+without vendoring work that has not been judged worth it (see below).
+
+Two independent reasons, either one sufficient on its own:
+
+- `aws_iam_role_policy.control_plane` and `.verifier` (`main.tf`) read
+  `crates/forklift-aws-lambda/iam/*.policy.json` via `templatefile("${path.module}/../../...")` —
+  outside the module's own root, which a registry/tarball fetch of just `infra/aws-serverless`
+  would not include.
+- Even with that fixed, `control_plane_package`/`verifier_package` (`variables.tf`) must be
+  prebuilt Lambda zips — this module never shells out to `cargo` (see "Quickstart" above) — and no
+  such zips are published anywhere a registry consumer could point at. A registry consumer would
+  hold a module they cannot instantiate regardless.
+
+Vendoring the IAM JSON into this directory would close the first gap but not the second, while
+opening a new one: a second copy of security-sensitive IAM policy whose equality with the crate's
+own copy is enforced only by `tests/iam_conformance.rs`'s C11 (in the crate), which a registry
+consumer never runs — so the vendored copy could silently drift from what the Lambda code actually
+does. Not worth it for a gap that stays open either way.

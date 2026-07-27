@@ -269,6 +269,8 @@ resource "aws_iam_role_policy" "control_plane" {
   name = "${local.control_plane_function_name}-policy"
   role = aws_iam_role.control_plane.id
 
+  # Deliberately reaches outside this module's own root (PR #80 review, finding #6) — a scope
+  # decision, not an oversight. See README.md's "Consumption scope" section.
   policy = templatefile("${path.module}/../../crates/forklift-aws-lambda/iam/control-plane.policy.json", {
     bucket_arn    = aws_s3_bucket.this.arn
     table_arn     = aws_dynamodb_table.this.arn
@@ -280,6 +282,8 @@ resource "aws_iam_role_policy" "verifier" {
   name = "${local.verifier_function_name}-policy"
   role = aws_iam_role.verifier.id
 
+  # Same deliberate outside-the-module-root read as control_plane's policy above (PR #80 review,
+  # finding #6) — see README.md's "Consumption scope" section.
   policy = templatefile("${path.module}/../../crates/forklift-aws-lambda/iam/verifier.policy.json", {
     bucket_arn    = aws_s3_bucket.this.arn
     log_group_arn = local.verifier_log_group_arn

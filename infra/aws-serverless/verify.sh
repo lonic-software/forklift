@@ -254,6 +254,65 @@ staging_key_count() {
   printf '%s' "$out"
 }
 
+# bucket_total_size_bytes — prints the total byte size of every object in $BUCKET (PR #80
+# review, finding #3 (MEDIUM), "unbounded growth").
+#
+# Measured over the WHOLE bucket, deliberately, not just staging/ like staging_key_count above.
+# The growth this finding is about lives in objects/ — the canonical, permanent, content-
+# addressed namespace (crates/forklift-aws-lambda/src/aws/s3.rs's "Key layout" doc comment) —
+# not staging/, which already has its own mandatory lifecycle expiry (main.tf's "expire-staging"
+# rule, main.tf:118-129) and is not where anything accumulates run over run. signatures/ is
+# canonical-adjacent and permanent too, but tiny; responses/ is ephemeral and usually lifecycle-
+# managed (main.tf's optional "expire-responses" rule). A whole-bucket total is the simplest
+# measure guaranteed to catch the growth regardless of which prefix it nominally sits under, and
+# it is also the number an operator actually pays for.
+#
+# Every run stages a fresh 9 MiB of /dev/urandom (step 2/4 below) and franchises the whole
+# store's history twice. Fresh urandom never deduplicates against anything already in objects/,
+# and nothing anywhere — this script, the module, or the crate — ever prunes a canonical object:
+# an S3 lifecycle rule on objects/ would make the NEXT franchise fail on a missing object (the
+# franchise leg fetches the full history closure), which is a permanently red run AND a
+# genuinely corrupted warehouse, not a fix. So the store grows, by design, forever. The point of
+# this check is not to stop that growth — it's to make its eventual failure self-naming, rather
+# than indistinguishable from a real verifier/KMS failure (this file's header calls that "the
+# worst possible false signal").
+#
+# Same non_aggregate_keys pagination trap as staging_key_count above applies here too: there is
+# no top-level aggregate "total bucket size" the CLI can hand back for a paginated listing (only
+# Contents/CommonPrefixes survive auto-pagination), so this sums Contents[].Size across the
+# merged pages rather than trusting any single-field aggregate. `sum(... || `[]`)` is null-safe
+# for an empty bucket (Contents is then absent, the projection is null, `||` substitutes the
+# empty-array literal, and sum([]) is 0) — never a bare "None" fed into arithmetic. Same
+# stderr-to-a-file and numeric-guard discipline as staging_key_count, for the same reason.
+bucket_total_size_bytes() {
+  local out err_file
+  err_file="$(mktemp -t forklift-verify-s3err.XXXXXX)"
+  if ! out="$(aws s3api list-objects-v2 \
+    --bucket "$BUCKET" \
+    --query 'sum(Contents[].Size || `[]`)' --output text 2>"$err_file")"; then
+    local err
+    err="$(tr '\n' ' ' <"$err_file")"
+    rm -f "$err_file"
+    fail "aws s3api list-objects-v2 (whole-bucket size scan) against bucket $BUCKET failed: $err"
+  fi
+  rm -f "$err_file"
+  if [[ ! "$out" =~ ^[0-9]+$ ]]; then
+    fail "expected a numeric total size from list-objects-v2 on $BUCKET, got: \"$out\""
+  fi
+  printf '%s' "$out"
+}
+
+# Soft/hard thresholds the size tripwire (below) fires against. Soft is informational: a NOTE
+# an operator/log-scraper can key off before it's urgent. Hard aborts the run with a message
+# that names itself as retention, not a verifier or stack regression, so nobody has to debug
+# this as an application failure. Both are round numbers chosen for a comfortable multi-month
+# runway on a DAILY cron (.github/workflows/aws-serverless-verify.yml) at ~9 MiB genuinely new
+# bytes added per run (dd of urandom, step 2/4 below) — a tripwire, not a derived capacity plan:
+#   - SOFT = 1 GiB  -> roughly 110+ daily runs (~3-4 months) before it's even worth a look
+#   - HARD = 4 GiB  -> roughly 450+ daily runs (~15 months) before the run refuses to continue
+SOFT_BUCKET_SIZE_BYTES=$((1 * 1024 * 1024 * 1024)) # 1 GiB
+HARD_BUCKET_SIZE_BYTES=$((4 * 1024 * 1024 * 1024)) # 4 GiB
+
 # ---------------------------------------------------------------------------------------------
 # staging/ baseline (PR #80 review, finding #7) — snapshotted before this run touches anything,
 # so step 3/4's post-lift check can be scoped to what THIS run added rather than the whole
@@ -274,6 +333,35 @@ if [[ "$staging_key_count_before" != "0" ]]; then
 (most likely a previous aborted run's leftover, e.g. one killed by the job timeout) — harmless, \
 and left alone until its own lifecycle-rule expiry. This run's own check (step 3/4) only asserts \
 it does not ADD to that count."
+fi
+
+# ---------------------------------------------------------------------------------------------
+# Size tripwire (PR #80 review, finding #3) — deliberately run before any of the four checklist
+# steps below, not after them, so it always executes and reports even when a later step fails
+# outright under `set -e` (a bad endpoint, a real verifier/KMS regression, anything). The
+# operator needs to know "this is retention, not a real failure" regardless of what else does or
+# does not go wrong in the rest of this run. See bucket_total_size_bytes's header comment above
+# for what grows, why, and why the fix here is a tripwire rather than an attempt to stop it.
+# ---------------------------------------------------------------------------------------------
+
+bucket_size_bytes="$(bucket_total_size_bytes)"
+
+if (( bucket_size_bytes > HARD_BUCKET_SIZE_BYTES )); then
+  fail "bucket $BUCKET holds $bucket_size_bytes bytes, over the hard threshold of \
+$HARD_BUCKET_SIZE_BYTES bytes (4 GiB). This is RETENTION, not a verifier or stack regression — \
+by design (see bucket_total_size_bytes's header comment above), this store never deduplicates \
+and nothing ever prunes it. The persistent staging stack is fixture-only and disposable (see \
+examples/staging/main.tf's own header); reset it per this README's \"Layer 3 retention & reset\" \
+section (tofu destroy / tofu apply from examples/staging/) rather than investigating this as an \
+application failure."
+fi
+
+if (( bucket_size_bytes > SOFT_BUCKET_SIZE_BYTES )); then
+  log "  NOTE — bucket $BUCKET holds $bucket_size_bytes bytes, over the soft threshold of \
+$SOFT_BUCKET_SIZE_BYTES bytes (1 GiB) but under the hard threshold of $HARD_BUCKET_SIZE_BYTES \
+bytes (4 GiB) — not yet urgent. Expected: this store grows by design and is never pruned (see \
+bucket_total_size_bytes's header comment above). Worth planning a reset soon — see this \
+README's \"Layer 3 retention & reset\" section."
 fi
 
 # ---------------------------------------------------------------------------------------------
