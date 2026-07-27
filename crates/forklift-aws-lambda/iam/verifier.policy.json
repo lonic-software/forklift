@@ -14,6 +14,12 @@
       "Resource": "${bucket_arn}/objects/*"
     },
     {
+      "Sid": "ListBucketFor404Semantics",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "${bucket_arn}"
+    },
+    {
       "Sid": "Logs",
       "Effect": "Allow",
       "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],

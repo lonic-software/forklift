@@ -300,7 +300,14 @@ resource "aws_iam_role_policy" "verifier" {
 resource "aws_iam_role_policy" "kms" {
   for_each = var.kms_key_arn != null ? toset(["control_plane", "verifier"]) : toset([])
 
-  name = "${var.name_prefix}-${each.key}-kms"
+  # replace(): every other resource in this module hyphenates name segments
+  # (`local.control_plane_function_name` = "${name_prefix}-control-plane"); `each.key` here is
+  # "control_plane" (an HCL identifier-shaped set member, chosen to double as the ternary check
+  # below), so left bare this rendered "forklift-control_plane-kms" — the one inconsistently
+  # underscored resource name in a deployed stack, confirmed against a real account. Renaming it
+  # is a destroy+create of this inline policy on the next apply; harmless (it is recreated
+  # immediately with identical contents), but real.
+  name = "${var.name_prefix}-${replace(each.key, "_", "-")}-kms"
   role = each.key == "control_plane" ? aws_iam_role.control_plane.id : aws_iam_role.verifier.id
 
   policy = jsonencode({

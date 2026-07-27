@@ -18,11 +18,10 @@
       "Resource": "${bucket_arn}/staging/*"
     },
     {
-      "Sid": "StagingSweep",
+      "Sid": "ListBucketFor404Semantics",
       "Effect": "Allow",
       "Action": "s3:ListBucket",
-      "Resource": "${bucket_arn}",
-      "Condition": { "StringLike": { "s3:prefix": "staging/*" } }
+      "Resource": "${bucket_arn}"
     },
     {
       "Sid": "RefsAndTrust",

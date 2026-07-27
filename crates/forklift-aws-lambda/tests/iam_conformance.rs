@@ -104,20 +104,35 @@
 //! * **Policy-side polarity** — [`granted_actions`] panics on a `Deny` covering an in-scope
 //!   action (unconditionally: the union model has no way to represent an exception, so it must
 //!   never see one). A `Condition` on an in-scope action is **not** an unconditional panic here
-//!   — see the deviation note on [`REVIEWED_CONDITIONED_SIDS`] for why, and why this reading
-//!   was necessary to keep the real, unchanged policy JSON (`StagingSweep`'s legitimate
-//!   least-privilege scoping of `s3:ListBucket`) passing.
+//!   — see the deviation note on [`REVIEWED_CONDITIONED_SIDS`] for the mechanism, and for the
+//!   `StagingSweep` case that mechanism used to allowlist and why that condition turned out to be
+//!   a real bug (found by Layer 3 against a live account, not by review) rather than a reviewed
+//!   narrowing — the allowlist is empty today, but stays live for whatever the next one is.
 //!
 //! **Residuals — not claimed to be closed here.** `op_actions()`'s op → IAM-action mapping is
 //! hand-maintained and not verified *correct* (a typo'd action still passes; that is a review
-//! and Layer 3 concern). Per-role attribution is not checked — only the union across both
-//! policies (an action the verifier alone needs but only the control plane is granted still
-//! passes; deriving per-binary sets needs call-graph analysis, not a source scan). `Resource`/
-//! `Condition` scoping *correctness* is not evaluated beyond the narrow Deny/Condition polarity
-//! check above. And none of this defends against an adversarial committer reaching for
-//! `transmute`/raw pointers to reach the private field directly — `#![forbid(unsafe_code)]`
-//! (see `lib.rs`) is the crate's answer to that, and it is a different threat model (a mistake,
-//! not a committer) than what the wrapper's privacy actually defends against.
+//! and Layer 3 concern). **Layer 3 has now found exactly such a case** — see the
+//! [`REVIEWED_CONDITIONED_SIDS`] doc comment for the full account — and it names a concrete
+//! *class* this scanner cannot see by construction, not just one missed action: an IAM action a
+//! call site needs for its **error semantics** rather than to perform the operation.
+//! `head_object`/`get_object` call `s3:GetObject`, and that is the only action `op_actions` maps
+//! them to — but on a *missing* key, S3 also consults `s3:ListBucket` on the bucket resource to
+//! decide whether the caller is even allowed to learn the key doesn't exist, and answers `403`
+//! instead of the modeled `404` when that grant is absent or conditioned to a prefix the request
+//! context can't see. No op → action scan can find this: the op really does only call
+//! `GetObject`/`HeadObject`, so the mapping is not "wrong" by this file's own model, it is
+//! *incomplete* in a way the model has no field for (an action gating a failure path of a
+//! *different* action). Future readers adding a new S3 call should ask not only "what action does
+//! this call require to succeed" but "does a *failure* of this call — especially a missing-key
+//! `404` — depend on an action this call doesn't itself name." Per-role attribution is not
+//! checked — only the union across both policies (an action the verifier alone needs but only the
+//! control plane is granted still passes; deriving per-binary sets needs call-graph analysis, not
+//! a source scan). `Resource`/`Condition` scoping *correctness* is not evaluated beyond the narrow
+//! Deny/Condition polarity check above. And none of this defends against an adversarial committer
+//! reaching for `transmute`/raw pointers to reach the private field directly —
+//! `#![forbid(unsafe_code)]` (see `lib.rs`) is the crate's answer to that, and it is a different
+//! threat model (a mistake, not a committer) than what the wrapper's privacy actually defends
+//! against.
 //!
 //! This test's own claim is the **composition**: rustc privacy (the wrapper's private field and
 //! `pub(crate)` ops — itself checked, not assumed) + the zero-macro parse-totality assertion +
@@ -186,21 +201,36 @@ fn op_actions() -> BTreeMap<&'static str, &'static [&'static str]> {
 const CONSTRUCTOR_CALL_ALLOWLIST: &[&str] = &["new", "from", "force_path_style", "build", "from_conf"];
 
 /// `Sid`s whose `Condition` has been reviewed and is a deliberate least-privilege narrowing, not
-/// an unrepresentable exception the union model would silently misreport. `StagingSweep` scopes
-/// `s3:ListBucket` to the `staging/*` prefix with `StringLike: {s3:prefix: "staging/*"}` — every
-/// derived op that needs `s3:ListBucket` (`list_objects_v2`, used only against that same prefix
-/// in `aws/s3.rs::discard_session`) still gets exactly what it needs, so recording the action as
-/// granted is not wrong here, only imprecise about scope — the same imprecision the model
-/// already has for every `Resource` ARN, conceded as a residual.
+/// an unrepresentable exception the union model would silently misreport.
 ///
-/// **Deviation from the design doc, flagged explicitly**: the doc says to panic on *any*
-/// in-scope `Condition`, unconditionally. Implemented literally, that panics on this real,
-/// already-shipped, unchanged statement — the policy JSON's shape is pinned by PR #80's
-/// `templatefile()` consumer, so "fix the JSON" was not an available option. This allowlist is
-/// the default-red compromise: a *new*, unreviewed `Condition` on an in-scope action still
-/// panics (not on this list), but a specific, named, reasoned-about one does not block the
-/// build forever. Report this back before treating it as settled.
-const REVIEWED_CONDITIONED_SIDS: &[&str] = &["StagingSweep"];
+/// **Correction, not a residual.** This allowlist used to carry `StagingSweep`, which scoped
+/// `s3:ListBucket` to the `staging/*` prefix with `StringLike: {s3:prefix: "staging/*"}`. The doc
+/// comment here argued that was fine because every derived op needing `s3:ListBucket`
+/// (`list_objects_v2`, in `aws/s3.rs::discard_session`) still got exactly what it needed under
+/// the condition — an **op → action** argument. It was falsified against a real AWS account
+/// (not a review guess): `head_object`/`get_object` on a *missing* key also depend on
+/// `s3:ListBucket` being grantable — not to perform the call, but because S3 returns `403`
+/// instead of `404` for a missing key when the caller lacks `ListBucket`, and refuses to
+/// distinguish "no such key" from "no such bucket" without it (see
+/// `crates/forklift-aws-lambda/src/aws/sdk.rs`'s `is_head_object_not_found` docs). Worse: a
+/// `ListBucket` grant conditioned on `s3:prefix` can **never** satisfy this, because S3 does not
+/// place `s3:prefix` in the authorization request context for `HeadObject`/`GetObject` — only an
+/// *unconditional* `ListBucket` on the bucket resource works, confirmed by toggling it one
+/// variable at a time against a live stack. So the condition was not merely imprecise about
+/// scope, as the previous comment claimed — it was wrong, in a way no op→action scan can see,
+/// because the actions it protects are not the action the failing call site names (see the
+/// module docs' residuals section for the general class this is).
+///
+/// The fix was to make both policy JSONs' `ListBucket` grant unconditional
+/// (`ListBucketFor404Semantics` in both `iam/control-plane.policy.json` and
+/// `iam/verifier.policy.json`), which is why this allowlist is empty rather than retired outright:
+/// the mechanism — and its default-red behavior for a *new*, unreviewed `Condition` on an
+/// in-scope action — stays intact for whatever the next one turns out to be. The design doc's
+/// "panic on any in-scope Condition, unconditionally" reading is no longer a deviation forced by
+/// an unfixable JSON shape (the previous comment's "'fix the JSON' was not an available option"
+/// is itself now obsolete) — the JSON *was* fixed, once the reasoning that had excused it turned
+/// out not to hold.
+const REVIEWED_CONDITIONED_SIDS: &[&str] = &[];
 
 // ---------------------------------------------------------------------------------------
 // File I/O.
@@ -1257,7 +1287,11 @@ mod escape_probes {
 
     /// Probe 7 — an in-scope `Condition` on a `Sid` that is *not* in
     /// `REVIEWED_CONDITIONED_SIDS` must panic — the default-red posture for a new, unreviewed
-    /// narrowing (as opposed to `StagingSweep`, which is reviewed and allowlisted).
+    /// narrowing. `REVIEWED_CONDITIONED_SIDS` is empty today (see its docs: `StagingSweep`'s
+    /// entry was removed as a correction, not retired as an example still worth pointing at — the
+    /// condition it allowlisted was a real bug, not a reviewed narrowing), so this probe's
+    /// synthetic `Sid` would panic even if it happened to collide with a name that once appeared
+    /// there.
     #[test]
     #[should_panic(expected = "REVIEWED_CONDITIONED_SIDS")]
     fn probe_an_unreviewed_condition_statement_panics() {
