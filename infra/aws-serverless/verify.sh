@@ -219,6 +219,41 @@ run_in() {
   )
 }
 
+# staging_key_count — prints the number of keys under staging/ in $BUCKET, or fails the run.
+#
+# Deliberately NOT --query 'KeyCount'. list-objects-v2 is a paginated operation, and the CLI's
+# auto-pagination assembles its result from the paginator's result_keys only — for ListObjectsV2
+# those are Contents and CommonPrefixes (botocore data/s3/2006-03-01/paginators-1.json), with no
+# non_aggregate_keys entry. KeyCount is therefore dropped from the assembled result and --output
+# text prints the literal "None" for EVERY response, including a small non-truncated one. Both
+# readings were "None", and `(( None > None ))` is false — bash reads the bare word as an unset
+# parameter, i.e. 0 — so step 3/4 could not fail, and would not have reddened even if the
+# commit_lift sweep it exists to pin were removed outright. length(Contents || `[]`) counts the
+# merged pages and is correct across pagination.
+#
+# stderr is captured separately rather than folded in with 2>&1: a warning printed by an
+# otherwise SUCCESSFUL call would be concatenated into the value, and the arithmetic comparison
+# at the call site would then abort the run under set -e with a bash syntax error that looks
+# nothing like the real cause. The numeric guard below is the same reasoning applied to any
+# other unexpected shape — it must fail loudly here, not evaluate to 0 inside (( )) later.
+staging_key_count() {
+  local out err_file
+  err_file="$(mktemp -t forklift-verify-s3err.XXXXXX)"
+  if ! out="$(aws s3api list-objects-v2 \
+    --bucket "$BUCKET" --prefix "staging/" \
+    --query 'length(Contents || `[]`)' --output text 2>"$err_file")"; then
+    local err
+    err="$(tr '\n' ' ' <"$err_file")"
+    rm -f "$err_file"
+    fail "aws s3api list-objects-v2 against bucket $BUCKET failed: $err"
+  fi
+  rm -f "$err_file"
+  if [[ ! "$out" =~ ^[0-9]+$ ]]; then
+    fail "expected a numeric key count from list-objects-v2 on $BUCKET, got: \"$out\""
+  fi
+  printf '%s' "$out"
+}
+
 # ---------------------------------------------------------------------------------------------
 # staging/ baseline (PR #80 review, finding #7) — snapshotted before this run touches anything,
 # so step 3/4's post-lift check can be scoped to what THIS run added rather than the whole
@@ -232,9 +267,7 @@ run_in() {
 # the "harmless" the old comment already described, rather than a bucket-wide fatal.
 # ---------------------------------------------------------------------------------------------
 
-staging_key_count_before="$(aws s3api list-objects-v2 \
-  --bucket "$BUCKET" --prefix "staging/" --query 'KeyCount' --output text 2>&1)" ||
-  fail "aws s3api list-objects-v2 against bucket $BUCKET failed: $staging_key_count_before"
+staging_key_count_before="$(staging_key_count)"
 
 if [[ "$staging_key_count_before" != "0" ]]; then
   log "  NOTE — staging/ already holds $staging_key_count_before key(s) before this run starts \
@@ -311,6 +344,14 @@ log "step 2/4 (checklist #2, #3): small + chunked (>= 8 MiB) round trip"
 SRC_DIR="$WORKDIR/src"
 FR_DIR="$WORKDIR/franchise"
 
+# Cleared, not just created: a caller-supplied VERIFY_WORKDIR is documented as never removed by
+# this script, which invites reuse across runs — but `forklift franchise` refuses a non-empty
+# target outright ("... is not empty; franchise into a new or empty directory."), so the second
+# run into the same VERIFY_WORKDIR would die here. Removing only the two subdirectories this
+# script owns keeps that documented contract (the workdir itself, and anything the caller put
+# beside these, survives) while making reuse actually work.
+rm -rf "$SRC_DIR" "$FR_DIR"
+
 log "  franchising the persistent stack into a scratch working copy (so this run stacks on top \
 of whatever it already holds, rather than diverging from a disconnected new root)..."
 "$FORKLIFT_BIN" franchise "${ENDPOINT}${PREFIX}" "$SRC_DIR" --token "$TOKEN" >/dev/null ||
@@ -353,9 +394,7 @@ log "  OK — small files and big.bin round-tripped identically"
 
 log "step 3/4 (checklist #4): staging/ has not grown since before this run's lift"
 
-staging_key_count_after="$(aws s3api list-objects-v2 \
-  --bucket "$BUCKET" --prefix "staging/" --query 'KeyCount' --output text 2>&1)" ||
-  fail "aws s3api list-objects-v2 against bucket $BUCKET failed: $staging_key_count_after"
+staging_key_count_after="$(staging_key_count)"
 
 if (( staging_key_count_after > staging_key_count_before )); then
   fail "staging/ grew from $staging_key_count_before to $staging_key_count_after key(s) after this run's lift — this run's own commit_lift sweep should have cleared everything it staged"

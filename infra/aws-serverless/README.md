@@ -222,6 +222,11 @@ Separately, the AWS provider is pinned below `5.70.0` for this root config only
 provider bug comparing a response header LocalStack never sends,
 github.com/hashicorp/terraform-provider-aws#49019).
 
-Layer 3 (a real-account scheduled deploy-and-verify) is tracked separately; it is the only pin for
-IAM sufficiency, real gateway semantics, and arm64 boot, none of which a LocalStack apply can
-reach.
+Layer 3 is [`verify.sh`](verify.sh), run against a real account by
+[`.github/workflows/aws-serverless-verify.yml`](../../.github/workflows/aws-serverless-verify.yml)
+on a daily schedule (and on demand) against a persistent stack deployed from
+[`examples/staging/`](examples/staging/). It is the only pin for IAM sufficiency, real gateway
+semantics, arm64 boot, and asynchronous verifier promotion under a customer-managed KMS key —
+none of which a LocalStack apply can reach. It runs outside the pull-request path by design: it
+needs long-lived credentials and a stack that survives between runs, so it can neither gate a PR
+nor be reached from a fork.

@@ -301,12 +301,25 @@ variable "throttling_rate_limit" {
   description = "Default-route steady-state request rate limit (requests/second). There is no way to remove this throttle — a public endpoint without one lets drive-by traffic bill you for Lambda invocations even though every request 401s."
   type        = number
   default     = 50
+
+  # Floored at 1, not 0. A rate limit of 0 applies cleanly and then throttles the entire API to
+  # nothing: every request 429s, with no other symptom to distinguish it from an outage. A
+  # negative value is rejected by the API only at apply time, well after plan review.
+  validation {
+    condition     = var.throttling_rate_limit >= 1
+    error_message = "throttling_rate_limit must be at least 1; 0 throttles every request on the API to a 429."
+  }
 }
 
 variable "throttling_burst_limit" {
   description = "Default-route burst request limit."
   type        = number
   default     = 100
+
+  validation {
+    condition     = var.throttling_burst_limit >= 1
+    error_message = "throttling_burst_limit must be at least 1; 0 throttles every request on the API to a 429."
+  }
 }
 
 # ---------------------------------------------------------------------------------------------

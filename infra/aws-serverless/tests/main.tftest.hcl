@@ -116,6 +116,23 @@ run "c2_staging_expiry_floor_rejects_zero" {
   ]
 }
 
+# A throttle of 0 applies cleanly and then 429s every request on the API, which is
+# indistinguishable from an outage at the call site. Pinned as a rejection rather than an assert:
+# the guard is a variable validation, so the failure has to surface at plan time.
+run "c2_throttle_floor_rejects_zero" {
+  command = plan
+
+  variables {
+    throttling_rate_limit  = 0
+    throttling_burst_limit = 0
+  }
+
+  expect_failures = [
+    var.throttling_rate_limit,
+    var.throttling_burst_limit,
+  ]
+}
+
 # ---------------------------------------------------------------------------------------------
 # C3 — the S3 event notification is ObjectCreated:* scoped to staging/ only.
 # ---------------------------------------------------------------------------------------------

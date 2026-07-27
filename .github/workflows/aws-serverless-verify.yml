@@ -25,6 +25,18 @@ on:
     - cron: "17 6 * * *"
   workflow_dispatch: {}
 
+# One run at a time against the one persistent stack. workflow_dispatch is enabled alongside the
+# cron, so two runs can otherwise overlap: both franchise at the same head, both stack a parcel on
+# it, and the second lift is refused as not-a-fast-forward by the divergence check. That reddens
+# the job for a reason that has nothing to do with the stack, and it is indistinguishable at a
+# glance from the asynchronous verifier-KMS failure this workflow exists to catch — the worst
+# possible false signal, by this script's own reckoning. cancel-in-progress stays false: a
+# half-finished run has already staged objects, and killing it mid-lift is how staging/ leftovers
+# get created in the first place.
+concurrency:
+  group: aws-serverless-verify
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
 
