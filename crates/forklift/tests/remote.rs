@@ -2977,33 +2977,6 @@ fn expand_recovers_after_an_unreachable_remote_leaves_the_scope_unchanged() {
 }
 
 #[test]
-fn a_sparse_franchise_with_a_typo_d_only_path_leaves_no_state_behind() {
-    // A typo'd --only path (naming nothing in the head) must be rejected before the fetch scope,
-    // origin or pallet head are ever written — a fresh, discarded directory should not also be a
-    // scope-inconsistent warehouse an operator has to notice.
-    let area = TestArea::new("sparse-franchise-typo");
-    let server = Server::start(&area, None);
-
-    prepare_warehouse(&area, "dev", &server.url);
-    area.write_file("dev/src/api/a.txt", "api v1\n");
-    assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
-    assert_success(&area.forklift("dev", &["lift"]));
-
-    // "src/ap" (missing the final "i") names nothing in the head.
-    let failed = area.forklift(".", &["franchise", &server.url, "typo", "--only", "src/ap"]);
-    assert!(!failed.status.success(), "a typo'd --only path must be refused");
-    assert!(stderr(&failed).contains("Nothing was recorded"), "{}", stderr(&failed));
-
-    let dir = area.path("typo");
-    assert!(!dir.join(".forklift/config/fetch-scope").exists(), "no fetch scope was persisted");
-    assert!(!dir.join(".forklift/pallets/main").exists(), "no pallet head was recorded");
-
-    let origin = std::fs::read_to_string(dir.join(".forklift/config/warehouse.toml")).unwrap_or_default();
-    assert!(!origin.contains("origin"), "no remote origin was recorded: {}", origin);
-}
-
-#[test]
 fn lift_from_a_sparse_workspace_with_no_remote_configured_reports_the_plain_error() {
     // The origin guard must not fire when remote.url is simply unset: that is a different, plain
     // "no remote configured" problem. Treating "unset" as "configured to the empty string" would

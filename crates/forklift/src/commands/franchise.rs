@@ -1,6 +1,7 @@
 use std::path::Path;
 use serde::Serialize;
 use forklift_core::enums::config_scope::ConfigScope;
+use forklift_core::error;
 use forklift_core::model::remote::WarehouseInfo;
 use forklift_core::util::path_utils::WarehousePath;
 use forklift_core::util::remote_utils::{RemoteClient, TorSettings};
@@ -285,12 +286,11 @@ async fn franchise_into_prepared_target(
     // own, to justify a franchise failure having two different recovery contracts depending on
     // which step failed. The error is at least pointed at `--only` below, so a retry that hits
     // the same offending path again has a way past it that doesn't require a different target.
-    shift_utils::materialize_tree(None, &tree_hash, "Franchising").map_err(|e| format!(
-        "{} (the signed history was already fetched and verified; only checking out the working \
-        tree failed. This attempt is still cleaned up like any other failure, so a retry \
-        re-fetches from scratch rather than resuming — if the same path keeps failing here, \
-        franchise --only to route around it instead of retrying as-is)",
-        e
+    shift_utils::materialize_tree(None, &tree_hash, "Franchising").map_err(|e| error::append_to_message(
+        e,
+        "(the signed history was already fetched and verified; only checking out the working \
+        tree failed. A retry re-fetches from scratch rather than resuming — if the same path \
+        keeps failing here, franchise --only to route around it instead of retrying as-is)",
     ))?;
 
     report.pallet = pallet_name;
@@ -358,10 +358,29 @@ fn resolve_pallet(info: &WarehouseInfo, pallet: Option<String>) -> Result<Pallet
 /// already exist as a directory" on any error, so there is no reason to reimplement that logic
 /// component-by-component here (an earlier version of this function did exactly that, and it
 /// broke an absolute Windows target: `CreateDirectoryW` on a drive root returns `PermissionDenied`,
-/// which a naive "only tolerate `AlreadyExists`" loop does not). Only `target` itself — the last
-/// component — is the atomic exclusivity token: `std::fs::create_dir`, a single syscall whose own
-/// success or `AlreadyExists` result is the sole, non-racing proof of whether *this call* created
-/// it, no separate read involved.
+/// which a naive "only tolerate `AlreadyExists`" loop does not).
+///
+/// `target` itself is reached one of two ways — freshly created here, or pre-existing and
+/// re-verified empty — and **neither alone is an exclusivity proof**: two concurrent franchises
+/// into the same pre-existing empty directory both pass the empty re-verify and would otherwise
+/// both proceed, taking no warehouse lock, and interleave writes into one `.forklift` (PR #84
+/// review round 4, finding 1). Mutual exclusion instead comes from a single token shared by both
+/// branches: `target/.forklift` itself, claimed with `std::fs::create_dir` — one syscall whose
+/// own success or `AlreadyExists` is the sole, non-racing proof of *which* call claimed it. Using
+/// the real `.forklift` directory (not a bespoke marker) means there is no success-path removal
+/// step and no name that could ever collide with materialized content: a successful franchise
+/// ends with one there anyway, and `prepare_warehouse` already tolerates a pre-existing one
+/// (`file_utils::create_folder_if_not_exists`, see `warehouse_utils.rs`).
+///
+/// `create_dir(target)`'s own result is *not* the exclusivity proof (it was, before this fix) —
+/// it now only decides `cleanup_after_failure`'s cleanup scope: whether franchise created `target`
+/// itself (so a later failure removes the whole thing) or found it pre-existing (so a later
+/// failure only empties it back out). A losing token claim is always an `Err`, so
+/// `handle_command`'s `claim_target(target)?` propagates it immediately, before the
+/// cleanup-wrapped section even begins — a failed claim structurally cannot trigger cleanup. The
+/// loser leaving behind a just-created empty `target` (or an untouched pre-existing one) is
+/// correct: an empty directory never wedges a retry, and deleting anything under it here would
+/// destroy the winner's claim instead of the loser's own leftovers.
 ///
 /// Ancestors `create_dir_all` creates are *not* tracked or later removed by `cleanup_after_failure`
 /// — deliberately: `create_dir_all(parent)` and `create_dir(target)` are still two separate
@@ -370,23 +389,38 @@ fn resolve_pallet(info: &WarehouseInfo, pallet: Option<String>) -> Result<Pallet
 /// franchise never touched. An empty leftover ancestor is harmless (it never blocks a retry —
 /// `target` itself is what must be empty-or-absent), so cleanup only ever acts on `target`.
 ///
-/// Accepted residual, by design, not chased further: once this call returns `Ok(true)`, `target`
-/// is claimed but the fetch is only just starting — a concurrent actor can still drop files into
-/// it while franchise is mid-fetch, and a later failure's cleanup will delete them along with
-/// everything else in `target`. Closing that window would need a lock outliving this function,
-/// which nothing here provides; it doesn't need to, since this is the same exposure `git clone`
-/// (or any "claim an empty directory, then fill it" tool) has always had, not something this fix
-/// introduced or could reasonably remove.
+/// Accepted residual, by design, not chased further: once this call returns `Ok`, `target` is
+/// claimed but the fetch is only just starting — a concurrent *non-franchise* actor can still
+/// drop files into it while franchise is mid-fetch, and a later failure's cleanup will delete them
+/// along with everything else in `target`. Closing that window would need a lock outliving this
+/// function, which nothing here provides; it doesn't need to, since this is the same exposure
+/// `git clone` (or any "claim an empty directory, then fill it" tool) has always had, not
+/// something this fix introduced or could reasonably remove. The token above closes the
+/// franchise-vs-franchise race specifically; it does not and cannot close this different,
+/// pre-existing one.
+///
+/// Crash caveat, documented rather than fixed: a `kill -9` after the token is claimed but before
+/// any real write leaves a pre-existing directory containing only an empty `.forklift`, so a
+/// retry's `refuse_if_not_an_empty_directory` refuses it as "not empty" where, before this fix,
+/// that same instant would have left a pristine empty directory. The window is sub-millisecond,
+/// requires an uncatchable signal to land inside it, is self-describing when it does (the token
+/// is the only thing there), and its remedy — remove `.forklift` — is exactly what any crash
+/// mid-`prepare_warehouse` already needs; it is not a new wedge *class*, and does not change the
+/// residual accepted in `cleanup_after_failure`'s doc comment (a non-franchise actor dropping
+/// files in after the claim still gets deleted — the token only ever addressed franchise-vs-
+/// franchise).
 ///
 /// # Returns
-/// * `Ok(true)`  - Franchise created `target` itself just now; it is empty by construction (this
-///   call's own `create_dir` is what brought it into existence).
+/// * `Ok(true)`  - Franchise created `target` itself just now (empty by construction) and claimed
+///   the token in it.
 /// * `Ok(false)` - `target` already existed by the time this call reached it (whether from before
 ///   the handshake, or from something else during it, including via a `..` alias of some other
-///   existing path). Its emptiness is re-verified right here, immediately before anything is
-///   written into it — the only earlier check (before the handshake) is now stale.
-/// * `Err(String)` - An ancestor or `target` itself could not be created, or `target` exists but
-///   is no longer empty.
+///   existing path). Its emptiness was re-verified immediately before anything is written into it
+///   — the only earlier check (before the handshake) is now stale — and the token was then
+///   claimed the same way.
+/// * `Err(String)` - An ancestor or `target` itself could not be created, `target` exists but is no
+///   longer empty, or the `.forklift` token in `target` was already claimed (by a concurrent or an
+///   interrupted franchise).
 fn claim_target(target: &Path) -> Result<bool, String> {
     if let Some(parent) = target.parent() {
         if !parent.as_os_str().is_empty() {
@@ -395,13 +429,34 @@ fn claim_target(target: &Path) -> Result<bool, String> {
         }
     }
 
-    match std::fs::create_dir(target) {
-        Ok(()) => Ok(true),
+    let created_directory = match std::fs::create_dir(target) {
+        Ok(()) => true,
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             refuse_if_not_an_empty_directory(target)?;
-            Ok(false)
+            false
         }
-        Err(e) => Err(format!("Error while creating \"{}\": {}", target.display(), e)),
+        Err(e) => return Err(format!("Error while creating \"{}\": {}", target.display(), e)),
+    };
+
+    claim_token(target)?;
+
+    Ok(created_directory)
+}
+
+/// Claim the `.forklift` token inside an already-verified-empty (or just-created) `target` — the
+/// sole write-exclusivity proof shared by both of `claim_target`'s branches. See its doc comment
+/// for why `.forklift` and not a bespoke marker.
+fn claim_token(target: &Path) -> Result<(), String> {
+    let token = target.join(".forklift");
+
+    match std::fs::create_dir(&token) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(format!(
+            "\"{}\" is already claimed — another franchise may be running there now, or one was \
+            interrupted before finishing. If none is running, remove \"{}\" and retry.",
+            target.display(), token.display()
+        )),
+        Err(e) => Err(format!("Error while claiming \"{}\": {}", token.display(), e)),
     }
 }
 
@@ -455,11 +510,11 @@ fn cleanup_after_failure(target: &Path, created_directory: bool, original_error:
 
     match cleanup_result {
         Ok(()) => original_error,
-        Err(cleanup_error) => format!(
-            "{} (additionally, cleaning up \"{}\" after the failure did not succeed: {}; remove it \
+        Err(cleanup_error) => error::append_to_message(original_error, &format!(
+            "(additionally, cleaning up \"{}\" after the failure did not succeed: {}; remove it \
             by hand before retrying)",
-            original_error, target.display(), cleanup_error
-        ),
+            target.display(), cleanup_error
+        )),
     }
 }
 
@@ -624,4 +679,60 @@ pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
     vec![
         ("FranchiseReport", schemars::schema_for!(FranchiseReport)),
     ]
+}
+
+#[cfg(test)]
+mod claim_target_tests {
+    use super::*;
+
+    fn unique_temp_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("forklift-franchise-claim-{}-{}", label, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// Falsifying test, PR #84 review round 4 finding 1: a **sequential** double-claim into the
+    /// same pre-existing empty directory is a deterministic falsifier for the token fix — no
+    /// threads needed, since `claim_target` itself has no notion of "concurrently" beyond what
+    /// the filesystem's own `create_dir` atomicity gives it. Before the token, the pre-existing
+    /// branch had no exclusivity at all: both calls passed the empty re-verify and both returned
+    /// `Ok(false)`, which is exactly the bug (two concurrent franchises would both believe they
+    /// alone owned the directory). After the token, the second call is refused because the first
+    /// call's `.forklift` is still there.
+    #[test]
+    fn a_second_claim_of_a_pre_existing_empty_directory_is_refused() {
+        let dir = unique_temp_dir("preexisting");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let first = claim_target(&dir);
+        assert_eq!(first, Ok(false), "the directory pre-existed, so franchise did not create it");
+        assert!(dir.join(".forklift").is_dir(), "the first claim must leave its token behind");
+
+        let second = claim_target(&dir);
+        assert!(second.is_err(),
+            "a second claim of the same pre-existing directory must be refused, got {:?}", second);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Same falsifier, the fresh-path branch: the first call both creates `target` and claims the
+    /// token (`Ok(true)`); a second call into the same now-non-empty-again path must not also
+    /// succeed. (This branch was never racy on its own — `create_dir(target)` was always the
+    /// atomic proof — but the token is now shared machinery for both branches, so this pins that
+    /// the fresh-path branch still behaves correctly with the token in place.)
+    #[test]
+    fn a_second_claim_of_a_freshly_created_directory_is_refused() {
+        let dir = unique_temp_dir("fresh");
+
+        let first = claim_target(&dir);
+        assert_eq!(first, Ok(true), "franchise itself must have created the directory");
+        assert!(dir.join(".forklift").is_dir(), "the first claim must leave its token behind");
+
+        let second = claim_target(&dir);
+        assert!(second.is_err(),
+            "a second claim of the same freshly created directory must be refused, got {:?}", second);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

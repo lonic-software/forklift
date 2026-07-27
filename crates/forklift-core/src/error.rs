@@ -282,6 +282,24 @@ impl From<CoreError> for String {
     }
 }
 
+/// Append `extra` prose to an error's human-visible message, without corrupting a framed refusal
+/// the way a naive `format!("{} {}", error, extra)` would: [`deframe`] takes the frame's *third*
+/// field to end-of-string, so text appended to the raw string lands in `next_step`, not the
+/// message — and a head's human-mode renderer prints `message` only (`next_step` is JSON-only), so
+/// the appended note would be silently invisible to a human operator. This re-lifts `error`
+/// through [`CoreError::from`] first, appends to whichever field is actually the rendered message,
+/// then lowers back to `String` (reframing a `Refusal`) — built entirely from the existing public
+/// `CoreError` API, no new framing primitive. A plain (unframed) `error` round-trips as
+/// `CoreError::Other` and is handled the same way, so this is safe to call unconditionally on any
+/// `Result<_, String>` error.
+pub fn append_to_message(error: String, extra: &str) -> String {
+    match CoreError::from(error) {
+        CoreError::Refusal { code, message, next_step } =>
+            CoreError::refusal(code, format!("{} {}", message, extra), next_step).into(),
+        CoreError::Other(message) => format!("{} {}", message, extra),
+    }
+}
+
 /// Fold a would-be-dropped next step into the human message, for the degrade-to-`Other` paths
 /// that have no typed field left to carry it in. Next steps in this codebase read as complete
 /// sentences (e.g. "Move them out of the way (or load and stack them) first."), so a space is
@@ -412,6 +430,36 @@ mod tests {
             CoreError::Refusal { code, .. } => assert_eq!(code, RefusalCode::NarrowUnclean),
             other => panic!("the code must survive the reframe, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn append_to_message_extends_the_message_not_the_next_step() {
+        // PR #84 review, findings 2/3: appending via a naive `format!("{} extra", framed)` lands
+        // the extra text in `next_step` (deframe's third field takes the rest of the string), not
+        // in `message` — invisible in human mode, which prints `message` only. This is the
+        // falsifier: red under that naive approach, green under `append_to_message`.
+        let original = CoreError::refusal(
+            RefusalCode::OversizedTransportUnsupported, "too big", "shrink it",
+        );
+        let framed: String = original.into();
+
+        let extended = append_to_message(framed, "(additionally, cleanup failed)");
+        let relifted: CoreError = extended.into();
+
+        match relifted {
+            CoreError::Refusal { code, message, next_step } => {
+                assert_eq!(code, RefusalCode::OversizedTransportUnsupported);
+                assert_eq!(message, "too big (additionally, cleanup failed)");
+                assert_eq!(next_step, "shrink it", "next_step must be untouched");
+            }
+            other => panic!("expected a refusal to survive, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn append_to_message_extends_a_plain_unframed_error() {
+        let extended = append_to_message("plain error".to_string(), "(and more)");
+        assert_eq!(CoreError::from(extended), CoreError::Other("plain error (and more)".to_string()));
     }
 
     #[test]
