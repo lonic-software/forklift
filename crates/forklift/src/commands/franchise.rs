@@ -56,15 +56,7 @@ pub async fn handle_command(url: &str,
     let target = Path::new(directory);
 
     if target.exists() {
-        let mut entries = std::fs::read_dir(target)
-            .map_err(|e| format!("Error while reading \"{}\": {}", directory, e))?;
-
-        if entries.next().is_some() {
-            return Err(format!(
-                "\"{}\" is not empty; franchise into a new or empty directory.",
-                directory
-            ));
-        }
+        refuse_if_not_an_empty_directory(target)?;
     }
 
     // Extending the same principle as the --only normalization above (refuse cleanly before any
@@ -378,6 +370,14 @@ fn resolve_pallet(info: &WarehouseInfo, pallet: Option<String>) -> Result<Pallet
 /// franchise never touched. An empty leftover ancestor is harmless (it never blocks a retry —
 /// `target` itself is what must be empty-or-absent), so cleanup only ever acts on `target`.
 ///
+/// Accepted residual, by design, not chased further: once this call returns `Ok(true)`, `target`
+/// is claimed but the fetch is only just starting — a concurrent actor can still drop files into
+/// it while franchise is mid-fetch, and a later failure's cleanup will delete them along with
+/// everything else in `target`. Closing that window would need a lock outliving this function,
+/// which nothing here provides; it doesn't need to, since this is the same exposure `git clone`
+/// (or any "claim an empty directory, then fill it" tool) has always had, not something this fix
+/// introduced or could reasonably remove.
+///
 /// # Returns
 /// * `Ok(true)`  - Franchise created `target` itself just now; it is empty by construction (this
 ///   call's own `create_dir` is what brought it into existence).
@@ -398,20 +398,36 @@ fn claim_target(target: &Path) -> Result<bool, String> {
     match std::fs::create_dir(target) {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            let mut entries = std::fs::read_dir(target)
-                .map_err(|e| format!("Error while reading \"{}\": {}", target.display(), e))?;
-
-            if entries.next().is_some() {
-                return Err(format!(
-                    "\"{}\" is not empty; franchise into a new or empty directory.",
-                    target.display()
-                ));
-            }
-
+            refuse_if_not_an_empty_directory(target)?;
             Ok(false)
         }
         Err(e) => Err(format!("Error while creating \"{}\": {}", target.display(), e)),
     }
+}
+
+/// Refuse if `target` exists but is not an empty directory — shared by the fast, pre-handshake
+/// check in `handle_command` and `claim_target`'s authoritative post-handshake re-check. Naming
+/// a file (not a directory) explicitly, rather than letting a raw `read_dir` error on it (or the
+/// generic "not empty" wording) stand in for the real problem.
+fn refuse_if_not_an_empty_directory(target: &Path) -> Result<(), String> {
+    if !target.is_dir() {
+        return Err(format!(
+            "\"{}\" already exists and is not a directory; franchise into a new or empty directory.",
+            target.display()
+        ));
+    }
+
+    let mut entries = std::fs::read_dir(target)
+        .map_err(|e| format!("Error while reading \"{}\": {}", target.display(), e))?;
+
+    if entries.next().is_some() {
+        return Err(format!(
+            "\"{}\" is not empty; franchise into a new or empty directory.",
+            target.display()
+        ));
+    }
+
+    Ok(())
 }
 
 /// Undo whatever franchise created in `target` before it failed, so the directory is retryable
