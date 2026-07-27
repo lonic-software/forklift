@@ -20,9 +20,21 @@ name: AWS serverless — real-account verify (FORK-60 Layer 3)
 
 on:
   schedule:
-    # Once daily. The exact minute/hour is arbitrary — offset from the hour to dodge GitHub's
-    # documented pile-up of jobs scheduled exactly on the hour.
-    - cron: "17 6 * * *"
+    # Weekly, not daily. What this job can actually detect between runs is AWS-side drift — a
+    # patched Lambda runtime, changed service behaviour, an expiring certificate — because nothing
+    # deploys the stack automatically; it changes only when someone applies. That drift moves on a
+    # scale of weeks, so a daily run mostly re-proves yesterday's answer.
+    #
+    # Cadence is also the lever on this stack's retention problem, which is why it is worth stating
+    # rather than leaving to taste. Each run adds ~9 MiB that can never deduplicate and is never
+    # pruned (see verify.sh's bucket_total_size_bytes). Daily is ~3.3 GB/year and reaches the hard
+    # size tripwire in roughly 15 months; weekly is ~470 MB/year and reaches it in roughly seven.
+    # The tripwire instruments the symptom; the cadence is the cause.
+    #
+    # The minute/hour is arbitrary, offset from the hour to dodge GitHub's documented pile-up of
+    # jobs scheduled exactly on the hour. Run it on demand (workflow_dispatch, below) whenever a
+    # point-in-time answer is actually wanted — before a demo, or after touching the stack.
+    - cron: "17 6 * * 1"
   workflow_dispatch: {}
 
 # One run at a time against the one persistent stack. workflow_dispatch is enabled alongside the
@@ -45,6 +57,14 @@ jobs:
     name: verify (real AWS account)
     runs-on: ubuntu-latest
     timeout-minutes: 20
+
+    # Required for OIDC: the job needs to mint a short-lived identity token to exchange for AWS
+    # credentials. `contents: read` must be restated because naming any permission drops the
+    # defaults for all the others.
+    permissions:
+      id-token: write
+      contents: read
+
     steps:
       - uses: actions/checkout@v4
 
@@ -58,8 +78,7 @@ jobs:
           FORKLIFT_STAGING_BUCKET: ${{ secrets.FORKLIFT_STAGING_BUCKET }}
           FORKLIFT_STAGING_TABLE: ${{ secrets.FORKLIFT_STAGING_TABLE }}
           FORKLIFT_STAGING_TOKEN: ${{ secrets.FORKLIFT_STAGING_TOKEN }}
-          CHECK_AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          CHECK_AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          CHECK_AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
           CHECK_AWS_REGION: ${{ secrets.AWS_REGION }}
         run: |
           missing=()
@@ -67,8 +86,7 @@ jobs:
           [[ -n "$FORKLIFT_STAGING_BUCKET" ]] || missing+=(FORKLIFT_STAGING_BUCKET)
           [[ -n "$FORKLIFT_STAGING_TABLE" ]] || missing+=(FORKLIFT_STAGING_TABLE)
           [[ -n "$FORKLIFT_STAGING_TOKEN" ]] || missing+=(FORKLIFT_STAGING_TOKEN)
-          [[ -n "$CHECK_AWS_ACCESS_KEY_ID" ]] || missing+=(AWS_ACCESS_KEY_ID)
-          [[ -n "$CHECK_AWS_SECRET_ACCESS_KEY" ]] || missing+=(AWS_SECRET_ACCESS_KEY)
+          [[ -n "$CHECK_AWS_ROLE_ARN" ]] || missing+=(AWS_ROLE_ARN)
           [[ -n "$CHECK_AWS_REGION" ]] || missing+=(AWS_REGION)
           if ((${#missing[@]})); then
             printf 'Missing required repository secret(s): %s\n' "${missing[*]}" >&2
@@ -88,11 +106,19 @@ jobs:
       - name: Build the forklift CLI
         run: cargo build -p forklift --release
 
+      # OIDC, not stored keys: the job exchanges a short-lived GitHub identity token for AWS
+      # credentials that expire with the run. There is no long-lived secret to leak, which matters
+      # more here than usual because this is a public repo. The role's entire permission set is
+      # s3:ListBucket on the staging bucket — the only AWS API call verify.sh makes — and its trust
+      # policy is scoped to this repository, so a fork cannot assume it.
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
       - name: Run verify.sh against the deployed staging stack
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_REGION: ${{ secrets.AWS_REGION }}
           FORKLIFT_BIN: ${{ github.workspace }}/target/release/forklift
           STAGING_ENDPOINT: ${{ secrets.FORKLIFT_STAGING_ENDPOINT }}
           STAGING_BUCKET: ${{ secrets.FORKLIFT_STAGING_BUCKET }}

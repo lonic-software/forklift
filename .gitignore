@@ -14,3 +14,9 @@
 *.tfstate
 *.tfstate.*
 *.tfplan
+
+# Local-only remote-state wiring; the committed examples stay backend-free for public consumers.
+backend_override.tf
+
+# Cross-compiled Lambda build output (cargo target dir used by the Linux container build).
+target-lambda-docker/
