@@ -4575,18 +4575,25 @@ fn franchise_ignores_an_unrelated_ambient_warehouses_tor_setting() {
 
 #[test]
 fn a_post_handshake_failure_after_a_native_bundle_install_still_removes_the_target() {
-    // PR #84 review, finding 1: a non-sparse franchise installs the remote's bundle as native
-    // packs (`bundle_utils::import_bundle` -> `pack_utils::import_transport_packs`), and reading
-    // any object afterward in this same process — here, `adopt_remote_trust` walking the
-    // enrolled office's history, which the bundle already covers — mmaps those packs into the
+    // PR #84 review, finding 1 — general regression coverage, not a Windows-mechanism pin (see
+    // below): a non-sparse franchise installs the remote's bundle as native packs
+    // (`bundle_utils::import_bundle` -> `pack_utils::import_transport_packs`), and reading any
+    // object afterward in this same process — here, `adopt_remote_trust` walking the enrolled
+    // office's history, which the bundle already covers — mmaps those packs into the
     // process-global pack registry (`pack_utils::PACK_REGISTRY`). If a later step then fails,
-    // cleanup must still be able to delete the target: an un-dropped mmap on a pack file blocks
-    // that file's own deletion on Windows (POSIX permits it), reinstating the exact wedge this
-    // fix removes.
+    // cleanup must still be able to delete the target with those packs still mapped.
     //
-    // Neither existing cleanup test exercises this: both pass --only, which puts franchise in
-    // sparse mode and skips the whole-store bundle install entirely. A --pallet typo — this PR's
-    // other repro for this same finding — no longer reaches this state either, now that it is
+    // The original worry was that an un-dropped mmap on a pack file blocks that file's own
+    // deletion on Windows. Tested directly on `windows-latest` (see
+    // `pack_utils::an_mmapd_pack_does_not_block_its_own_directory_removal`), that specific claim
+    // did not hold — Rust's `std::fs::File` defaults to `FILE_SHARE_DELETE` on Windows, so this
+    // scenario was never actually at risk of the wedge finding 1 described. This test is kept as
+    // general coverage for cleanup with packs loaded (a real, if lower-stakes, code path worth
+    // exercising), not as proof of a Windows-specific bug that turned out not to exist.
+    //
+    // Neither of the other two cleanup tests exercises this: both pass --only, which puts
+    // franchise in sparse mode and skips the whole-store bundle install entirely. A --pallet
+    // typo — the finding's original repro — no longer reaches this state either, now that it is
     // refused before any fetch at all (see the early-refusal test above). The trigger here
     // instead is a second, later parcel the (already-built, now-stale) bundle does not cover,
     // whose object the remote then genuinely no longer has — forcing the incremental walk that

@@ -109,11 +109,14 @@ pub async fn handle_command(url: &str,
 
     if let Err(error) = outcome {
         // Drop any mmap'd pack handles this run loaded (reading a franchised bundle's packs
-        // while adopting trust or meta pallets) before deleting anything under the target: an
-        // open mmap on a pack file blocks that file's own deletion on Windows — reinstating
-        // exactly the wedge this fix removes. Reuses the same drop-before-delete/rename idiom
-        // `compact`/`import_transport_packs` already use around their own pack renames, rather
-        // than inventing a second one — see `pack_utils::invalidate_cache`.
+        // while adopting trust or meta pallets) before deleting anything under the target.
+        // Originally added on the theory that an open mmap blocks its own pack file's deletion
+        // on Windows (PR #84 review finding 1) — tested directly on `windows-latest` and that
+        // specific claim did not hold (see `pack_utils::invalidate_cache`'s doc comment and
+        // `an_mmapd_pack_does_not_block_its_own_directory_removal` for the confirming probe).
+        // Kept anyway as cheap, correctness-neutral insurance, reusing the same drop-before-
+        // delete/rename idiom `compact`/`import_transport_packs` already use, rather than
+        // asserting a Windows-deletion-blocking mechanism this run no longer relies on.
         pack_utils::invalidate_cache();
 
         // Get back to where we started before touching the target — it may currently be our
