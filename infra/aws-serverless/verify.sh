@@ -44,6 +44,30 @@
 # pass on both must NOT be read as two independent confirmations of the control-plane grant. See
 # the comment directly above those checks for the same caveat, restated where it applies.
 #
+# s3:ListBucket COVERAGE (PR #82) — a second instance of the same loud/silent asymmetry, found by
+# this script's real-account role, not by a source scan:
+#
+# S3 answers `403 Forbidden` instead of `404 Not Found` for HeadObject/GetObject on a missing key
+# when the caller lacks an unconditional s3:ListBucket grant on the bucket — it refuses to confirm
+# non-existence rather than saying so. Both roles need this grant, and the two fail in the SAME
+# opposite shapes KMS does: the control plane fails LOUDLY and SYNCHRONOUSLY (every fresh lift
+# HEADs a key that correctly doesn't exist yet, and without the grant that comes back as an opaque
+# 500 instead of the expected "not there"). The verifier fails SILENTLY and ASYNCHRONOUSLY
+# (`verify_and_promote`'s `key_exists` check against the canonical key — absent by definition for
+# a genuinely new object — hits the identical 403, and a staged upload that never promotes reads
+# from the outside exactly like a hung lift). Like the KMS grant, this one is real-account-only:
+# LocalStack does not enforce IAM, so a missing or misconfigured s3:ListBucket grant plans and
+# applies clean in Layer 1/2 and is only ever caught here. Unlike KMS, there is no narrower variant
+# to consider — the grant cannot be prefix-conditioned at all (s3:prefix is not in the request
+# context HeadObject/GetObject authorize against; see docs/DEPLOYMENT.md and
+# crates/forklift-aws-lambda/tests/iam_conformance.rs for the full account, including how a
+# per-file conformance test now pins it directly, and iam/*.policy.json for the actual grant).
+# This script's existing round trip already exercises it end to end: every step below HEADs or
+# GETs at least one key that does not yet exist at the point of the call (a fresh object being
+# lifted, the canonical key `verify_and_promote` checks before promoting) — there is no separate
+# check to add here, only this account of why a clean run is evidence for this grant too, not only
+# for KMS.
+#
 # UNVERIFIED UNTIL A REAL ACCOUNT ACTUALLY RUNS THIS — this script cannot be exercised against a
 # real AWS account from this development environment (no AWS account is available here, and none
 # was sought — that constraint is by design, not an oversight). What a real run is needed to

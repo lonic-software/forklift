@@ -459,9 +459,9 @@ The verifier calls only `verify_and_promote` — no DynamoDB permissions of any 
 DynamoDB client via `config_from_env`/`build_clients`, but never issues a single operation against
 it). `iam/verifier.policy.json`'s statements: `s3:GetObject`/`s3:DeleteObject` on `staging/*` (read
 then clear the staged object once promoted), `s3:GetObject`/`s3:PutObject` on `objects/*` (write the
-promoted copy), `s3:ListBucket` on the bucket (404-vs-403 semantics, below — the verifier's own
-`get_object` read of the staged key needs it too), and the same `Logs` statement as the control
-plane.
+promoted copy), `s3:ListBucket` on the bucket (404-vs-403 semantics, below — `verify_and_promote`'s
+`key_exists` check against the canonical `objects/{hash}` key, absent by definition for a genuinely
+new object, is a `HeadObject` on a missing key), and the same `Logs` statement as the control plane.
 
 ### `s3:ListBucket` on both roles is unconditional, and has to be
 
@@ -489,6 +489,15 @@ and asynchronously, the same failure shape KMS omission produces (see "KMS" abov
 `crates/forklift-aws-lambda/tests/iam_conformance.rs`'s module docs record this as a class of its
 own: an IAM action a call site needs for its **error semantics**, not to perform the operation —
 invisible to any op→action mapping, because the op genuinely only calls `GetObject`/`HeadObject`.
+
+**What this actually grants, stated plainly:** `s3:ListBucket` on the bucket resource (not
+`bucket/*`) lets its holder enumerate every key in the entire bucket via `ListObjectsV2` — both
+roles can now do this over `objects/`, `signatures/`, `responses/`, and every session's `staging/`
+prefix, not only the one they operate on. For the verifier in particular, this is a real widening:
+its job is promoting the one key an S3 event handed it, and it now has bucket-wide enumeration it
+has no operational need for beyond the 404-vs-403 semantics above. This is the trade-off this
+section's title ("least privilege") is naming, not overriding — it is what least privilege
+actually costs once `HeadObject`/`GetObject` correctness on a missing key is in scope.
 
 ### KMS — optional, and not in the two files above
 
