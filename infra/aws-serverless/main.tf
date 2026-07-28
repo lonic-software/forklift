@@ -1,6 +1,5 @@
 # infra/aws-serverless — the mechanized form of docs/DEPLOYMENT.md. See the module's README.md
-# for the quickstart and infra/aws-serverless/../../forklift-planning design memo
-# (2026-07-26-aws-serverless-terraform-reference.md) for the contract this file implements.
+# for the quickstart, and variables.tf/outputs.tf for the contract this file implements.
 
 data "aws_caller_identity" "current" {}
 
@@ -292,7 +291,7 @@ resource "aws_iam_role_policy" "verifier" {
 
 # KMS, when configured: {kms:Decrypt, kms:GenerateDataKey} on *both* roles, resource-scoped to
 # the key. Deliberately not a narrower per-role set — two earlier attempts at deriving one were
-# both wrong (§3.1 of the design memo). The control plane needs both actions (a presigned PUT it
+# both wrong. The control plane needs both actions (a presigned PUT it
 # signs, presign_get's get_object, key_bytes' direct get_object); the verifier needs both too
 # (get_object on the staged key, copy_object promoting it). Omitting either role fails in a
 # different shape — the control plane loudly and synchronously, the verifier silently and
@@ -455,7 +454,7 @@ resource "aws_lambda_function" "verifier" {
 #
 # Every resource below is `count`-gated on `var.create_api`, an internal test-harness variable
 # (variables.tf) that exists solely because LocalStack community does not implement API Gateway
-# v2 (design memo §8 risk 1) — Layer 2's LocalStack CI needs the bucket/DynamoDB/Lambda/event
+# v2 — Layer 2's LocalStack CI needs the bucket/DynamoDB/Lambda/event
 # wiring without the gateway. The variable's own validation block makes `create_api = false`
 # reachable only when `dev_endpoint_url` is also set, so this is structurally unreachable
 # against real AWS.

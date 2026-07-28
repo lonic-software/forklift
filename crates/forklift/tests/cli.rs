@@ -7422,7 +7422,7 @@ fn entry_heal_still_restages_a_content_addressed_object_inline_with_no_escalatio
         "the taint must be fully cleared by the inline restage");
 }
 
-// ---- Multi-bay durable-taint soundness audit (design memo §10.2/§10.3) ----
+// ---- Multi-bay durable-taint soundness audit ----
 //
 // `forklift heal` (the recovery verb) only ever takes the CURRENT bay's own (bay-local)
 // `WarehouseLock` — never the warehouse-global `StoreLock` that serializes destructive object-

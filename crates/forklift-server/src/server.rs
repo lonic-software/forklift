@@ -1875,7 +1875,7 @@ mod tests {
     /// is strictly worse than today's baseline (a permanent in-process wedge, or a disk taint
     /// nobody consumes — see that module's doc comment). `forklift-server` does not wire the
     /// entry-heal (a long-lived, multi-warehouse process needs a per-request chokepoint of its own
-    /// design, scoped out as a follow-up — see the design memo's server section), so it must never
+    /// design, scoped out as a follow-up — see DESIGN.html §3.1.1), so it must never
     /// call that module's activation entry point either. A compile-time grep is cheap and precise
     /// here: the whole crate is two files, and the forbidden call is an exact, unmistakable
     /// string — this fails the moment either file starts calling it, without needing a runtime

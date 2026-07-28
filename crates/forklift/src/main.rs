@@ -122,8 +122,9 @@ async fn async_main() {
 /// (rather than a per-command guard sprinkled at each write site) is what the trust-gating
 /// invariant actually needs.
 ///
-/// **Lock-then-heal for mutating commands (the design memo's §3.3 reorder, closing half of the
-/// §1.2 restage-vs-live-writer race).** [`Command::requires_warehouse_lock`] commands acquire
+/// **Lock-then-heal for mutating commands (closing half of the restage-vs-live-writer race — see
+/// DESIGN.html §3.1.1 for the full taint-and-heal contract).**
+/// [`Command::requires_warehouse_lock`] commands acquire
 /// [`lock_utils::WarehouseLock`] *before* entry-heal runs, not after: a lock-*waiting* mutating
 /// command must never restage a recorded path concurrently with the current lock-holder's own
 /// deletions (e.g. a `stack` consuming a staged inventory shard, or a `compact --all` dropping a

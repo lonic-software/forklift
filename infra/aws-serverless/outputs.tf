@@ -1,5 +1,5 @@
-# §3.3 of the design memo. Semver-governed alongside variables.tf — renames and removals are
-# breaking changes.
+# Outputs are part of the module's public contract, semver-governed alongside variables.tf —
+# renames and removals are breaking changes.
 
 output "api_endpoint" {
   description = "The HTTP API's invoke URL (the $default stage's own endpoint — see main.tf on why the stage cannot be named). Null when create_api = false — the internal test-harness escape hatch (variables.tf) — since no API exists to have an endpoint."

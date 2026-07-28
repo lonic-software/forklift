@@ -4504,8 +4504,8 @@ mod tests {
     /// `compact --all` before the destructive sweep, never carry a corrupt copy forward or
     /// silently drop the only recoverable state. Also pins §7's requirement that `read_target`'s
     /// `Reconstruct` abort names the failing hash and points at `heal` -- a "must" with no
-    /// falsifier before this test (see the design memo's v5 changelog: `is_err` alone is
-    /// satisfied by an abort on *any* hash, including the wrong one).
+    /// falsifier before this test (`is_err` alone would be satisfied by an abort on *any* hash,
+    /// including the wrong one).
     ///
     /// The fixture: X packed good into pack A by a first `compact --all` (full record). Pack A is
     /// then byte-copied to a duplicate stem sorting before A's own, and *both* copies are
@@ -4775,8 +4775,8 @@ mod tests {
         std::fs::remove_dir_all(&temp).ok();
     }
 
-    /// FORK-55, T3 (§5 I3) — property assertion, not a falsifier (see the design memo's v1
-    /// changelog: its redness under the demote-all mutation is likely but not guaranteed, since
+    /// FORK-55, T3 (§5 I3) — property assertion, not a falsifier (its redness under the
+    /// demote-all mutation is likely but not guaranteed, since
     /// the encode pipeline is deterministic and a re-encode may reproduce the original layout and
     /// filename anyway). Retained for the crash-recovery idempotency story this fix must not
     /// regress: the common duplicate shape in practice is the crash-window self-duplicate --

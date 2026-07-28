@@ -56,10 +56,9 @@ and (optionally) a verifier dead-letter queue.
 `docs/DEPLOYMENT.md` "Building the deployment artifacts"), the bearer auth token, an optional KMS
 key ARN for SSE-KMS, and an optional IAM permissions boundary.
 
-Why no BYO bucket/table/gateway: see the design memo
-(`forklift-planning/design-memos/2026-07-26-aws-serverless-terraform-reference.md`, §3.1/§7) —
-in short, the bucket's lifecycle rule and event notification are bucket-global singletons that a
-foreign bucket's owner would fight; the table adds nothing over a name override; and a BYO
+Why no BYO bucket/table/gateway, in short: the bucket's lifecycle rule and event notification are
+bucket-global singletons that a foreign bucket's owner would fight; the table adds nothing over a
+name override; and a BYO
 gateway would degrade several by-construction guarantees (route throttling, the `$default` pin,
 the source-scoped invoke permission) to mere documentation. A custom domain — the usual reason to
 want BYO-gateway — is already served: attach `aws_apigatewayv2_domain_name` plus an API mapping
@@ -125,7 +124,7 @@ narrower per-role split. The control plane needs both actions (it signs a presig
 the staged key, `copy_object` promoting it). Omitting either role's grant fails in a different
 shape: the control plane fails loudly and synchronously (every presigned `GET`/offloaded response
 403s), the verifier fails silently and asynchronously (uploads succeed, promotion dies, objects
-never become fetchable). See the design memo §3.1 for the full per-role/per-operation table.
+never become fetchable).
 
 ## IAM policies come from the crate, not from this module
 
@@ -179,9 +178,10 @@ or disappear in a future release without that counting as a breaking change:
 `mock_provider "aws"` — free, credential-less, and runs in CI on every PR
 (`.github/workflows/infra-tofu-test.yml`, added by PR #80 review: before that job existed this
 claim was false — nothing in CI actually ran `tofu test` or `terraform test`, so a regression in
-any C1-C13 claim below would have merged green). It pins the C1-C10 claims from the design memo's
-§5, plus C12/C13 for `create_api` (added 2026-07-26): `create_api = false` with
-`dev_endpoint_url` set applies cleanly and creates zero `aws_apigatewayv2_*` resources (C12), and
+any C1-C13 claim below would have merged green). It pins the C1-C10 claims (each one defined by
+its own comment in `tests/main.tftest.hcl`), plus C12/C13 for `create_api` (added 2026-07-26):
+`create_api = false` with `dev_endpoint_url` set applies cleanly and creates zero
+`aws_apigatewayv2_*` resources (C12), and
 `create_api = false` without `dev_endpoint_url` is rejected by validation (C13). Each assertion is
 genuinely bidirectional — reverting the module line it checks makes the assertion fail, not
 merely pass vacuously.

@@ -1,5 +1,4 @@
-//! C11 — the IAM conformance test (design memo `2026-07-26-aws-serverless-terraform-reference.md`
-//! v4, the **fourth** specification).
+//! C11 — the IAM conformance test, now on its **fourth** specification.
 //!
 //! The first three specifications were source scanners of increasing sophistication, and each
 //! shipped a hole a scanner cannot see past — all three reproduced against the shipped v3 code

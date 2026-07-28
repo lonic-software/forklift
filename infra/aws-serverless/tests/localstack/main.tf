@@ -1,13 +1,13 @@
-# Layer 2 (design memo §5): a real `tofu apply` of this module against LocalStack, exercising
-# the behavioural half of C3/C4 that a plan-only Layer 1 assert cannot reach — does the S3 event
-# actually deliver, and does the verifier actually cold-start and promote?
+# Layer 2 (see README.md's Testing section): a real `tofu apply` of this module against
+# LocalStack, exercising the behavioural half of C3/C4 that a plan-only Layer 1 assert cannot
+# reach — does the S3 event actually deliver, and does the verifier actually cold-start and
+# promote?
 #
 # This is a separate root configuration, not `examples/complete`, because it wires a provider
 # pointed entirely at LocalStack (fake credentials, every service endpoint overridden) and sets
 # `create_api = false` — the internal test-harness toggle (variables.tf) that exists because
-# LocalStack community does not implement API Gateway v2 (§8 risk 1). Nothing here is part of
-# the module's public contract; this directory documents how to *drive* the module, not how to
-# consume it.
+# LocalStack community does not implement API Gateway v2. Nothing here is part of the module's
+# public contract; this directory documents how to *drive* the module, not how to consume it.
 
 terraform {
   # >= 1.9.0, not 1.8.0 (PR #80 review) — matches the module's own floor (../../versions.tf);
@@ -134,7 +134,7 @@ module "forklift" {
   auth_token            = var.auth_token
   name_prefix           = var.name_prefix
 
-  # The x86_64 override (design memo, "Layer 2 must also set architecture = x86_64 explicitly"):
+  # The x86_64 override ("Layer 2 must also set architecture = x86_64 explicitly"):
   # cargo-lambda's cross-compiled zips here are x86_64, but the module defaults to arm64 — an
   # unoverridden apply would create arm64 functions loaded with x86_64 code, and every
   # invocation would fail with an exec-format error for a reason unrelated to the module itself.

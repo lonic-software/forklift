@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 #
-# verify.sh — real-account deploy-and-verify for infra/aws-serverless (FORK-60, design memo §5,
-# "Layer 3"). Mechanizes docs/DEPLOYMENT.md's "Verification checklist" (steps 1-4) against a REAL
-# deployed stack — never LocalStack, that's Layer 2's job — plus a signature-sidecar fetch that
-# pins the one binary-response path the redirect-based reads never touch.
+# verify.sh — real-account deploy-and-verify for infra/aws-serverless (FORK-60, "Layer 3" — see
+# README.md's Testing section). Mechanizes docs/DEPLOYMENT.md's "Verification checklist" (steps
+# 1-4) against a REAL deployed stack — never LocalStack, that's Layer 2's job — plus a
+# signature-sidecar fetch that pins the one binary-response path the redirect-based reads never
+# touch.
 #
 # WHY THIS SCRIPT EXISTS, AND WHAT IT DOES NOT PROVE:
 #
@@ -18,7 +19,7 @@
 # see the signature-sidecar check below), and the presigned-URL / async-promotion signer-role
 # interactions under a customer-managed KMS key.
 #
-# KMS COVERAGE (design memo §3.1, §5) — the reason this script exists at all:
+# KMS COVERAGE — the reason this script exists at all:
 #
 # Under a CMK, both Lambda execution roles need the SAME two actions
 # (kms:Decrypt, kms:GenerateDataKey), scoped to the key — but the two roles fail in OPPOSITE
@@ -28,7 +29,7 @@
 # verifier's promotion dies inside a Lambda nobody is watching, and the object simply never
 # becomes fetchable — the worst failure shape in the whole stack, because nothing surfaces at
 # the point of use. A design that only exercised a presigned PUT (as an earlier revision of the
-# underlying module did, twice, in two different ways — see the design memo's changelog) would
+# underlying module did, twice, in two different ways — see this module's git history) would
 # never catch either failure. This script deliberately exercises both halves:
 #
 #   - the >= 8 MiB file in the round trip below is chunked and routes through ASYNC promotion —
@@ -76,8 +77,8 @@
 #   1. That every step below actually passes against real API Gateway, real IAM enforcement, and
 #      a real arm64 Lambda boot — this script's control flow and argument handling can be checked
 #      without AWS; whether the *deployed stack* behaves as the design predicts cannot.
-#   2. The minimal sufficient KMS action set (N4 in the design memo's §5 "Can't-build entries" —
-#      this script proves the *chosen* set works, never that a narrower one would have too).
+#   2. The minimal sufficient KMS action set — this script proves the *chosen* set works, never
+#      that a narrower one would have too.
 #   3. Whether 24s of commit_lift's built-in retry/backoff (see forklift-core's remote_utils.rs)
 #      is actually enough real-world margin for the verifier to complete a large-object
 #      promotion under real S3-event latency — LocalStack's event delivery latency is not
@@ -420,8 +421,8 @@ log "  OK — 200, chunking: true"
 # verifier is missing its KMS grants, this is exactly where it shows up — `lift`'s commit_lift
 # retries with backoff for about 24s while a blob is "not yet promoted" (forklift-core's
 # remote_utils.rs) before giving up, so a real KMS failure here is a slow, real failure, not a
-# fast one; that slowness is itself the asynchronous-and-invisible failure mode the design memo
-# warns about, made visible by giving it somewhere to surface.
+# fast one; that slowness is itself the asynchronous-and-invisible failure mode described above,
+# made visible by giving it somewhere to surface.
 #
 # PR #80 review, finding (HIGH) #1 — WHY FRANCHISE-FIRST, NOT A PER-RUN PALLET: this used to
 # `prepare` a brand-new, disconnected warehouse and stack straight onto it, then lift — which
@@ -483,7 +484,7 @@ run_in "$SRC_DIR" "$FORKLIFT_BIN" stack "FORK-60 Layer 3 verify run ($(date -u +
 
 log "  lifting (small files promote synchronously; big.bin promotes asynchronously via the verifier)..."
 run_in "$SRC_DIR" "$FORKLIFT_BIN" lift ||
-  fail "lift failed. If this is the only thing that changed since Layer 2's LocalStack coverage passed, this is exactly the asynchronous/invisible verifier-KMS failure the design memo warns about (§3.1): the staging PUT succeeded, but promotion never completed."
+  fail "lift failed. If this is the only thing that changed since Layer 2's LocalStack coverage passed, this is exactly the asynchronous/invisible verifier-KMS failure this script exists to catch: the staging PUT succeeded, but promotion never completed."
 
 log "  franchising into a second, independent directory and comparing byte-for-byte..."
 "$FORKLIFT_BIN" franchise "${ENDPOINT}${PREFIX}" "$FR_DIR" --token "$TOKEN" >/dev/null ||

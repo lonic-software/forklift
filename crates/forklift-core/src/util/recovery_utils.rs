@@ -3903,7 +3903,7 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    // ---- Multi-bay ref-pointer resurrection audit (design memo §10.3) ----
+    // ---- Multi-bay ref-pointer resurrection audit ----
     //
     // §10.3's claim: `forklift heal` verbatim-restaging a tainted pallet ref pointer could
     // silently revert a concurrent, legitimate head move in another bay (the ref file has no

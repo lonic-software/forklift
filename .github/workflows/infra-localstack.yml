@@ -1,9 +1,8 @@
-# Layer 2 (design memo, infra/aws-serverless — see forklift-planning/design-memos/
-# 2026-07-26-aws-serverless-terraform-reference.md §5): a real `tofu apply` of the module
-# against LocalStack, staging an object and polling for its promotion — the behavioural half of
-# C3/C4 (does the S3 event actually deliver, does the verifier actually cold-start) that a
+# Layer 2 (see infra/aws-serverless/README.md's Testing section): a real `tofu apply` of the
+# module against LocalStack, staging an object and polling for its promotion — the behavioural
+# half of C3/C4 (does the S3 event actually deliver, does the verifier actually cold-start) that a
 # plan-only Layer 1 mock_provider assert cannot reach. API Gateway v2 is out of scope entirely
-# (create_api = false; LocalStack community does not implement it, §8 risk 1 of the design memo).
+# (create_api = false; LocalStack community does not implement it).
 #
 # Path-filtered on BOTH infra/** and crates/forklift-aws-lambda/**: a crate change that alters
 # the deployment contract (a new S3/DynamoDB call, a changed env var, a changed staging-key
@@ -70,7 +69,7 @@ jobs:
       - name: Install cargo-lambda and zig
         run: pip3 install cargo-lambda ziglang
 
-      # Layer 2's own x86_64 override (design memo: "Layer 2 must also set architecture =
+      # Layer 2's own x86_64 override ("Layer 2 must also set architecture =
       # x86_64 explicitly") — cargo-lambda's default target is whatever the host is, which for
       # an ubuntu-latest runner is already x86_64-unknown-linux-gnu, but this is explicit so
       # the artifact and the module's `architecture` tfvar can never silently drift apart.
