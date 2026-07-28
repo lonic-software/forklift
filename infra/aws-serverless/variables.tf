@@ -1,6 +1,6 @@
-# The module contract (§3 of the design memo). Variables and outputs are semver-governed —
-# renames and removals are breaking changes — so this list is deliberately minimal. See
-# docs/DEPLOYMENT.md for the deployment this module mechanizes.
+# The module contract. Variables and outputs are semver-governed — renames and removals are
+# breaking changes — so this list is deliberately minimal. See docs/DEPLOYMENT.md for the
+# deployment this module mechanizes.
 
 # ---------------------------------------------------------------------------------------------
 # Required.
@@ -255,8 +255,8 @@ variable "kms_key_arn" {
   description = <<-EOT
     ARN of a customer-managed KMS key for S3 object encryption. Null (the default) uses SSE-S3.
     When set, both Lambda execution roles are granted kms:Decrypt and kms:GenerateDataKey scoped
-    to this key — deliberately not a narrower per-role set (§3 of the design memo: two earlier
-    attempts at narrowing this were both wrong. The control plane needs Decrypt for presign_get
+    to this key — deliberately not a narrower per-role set (two earlier attempts at narrowing
+    this were both wrong. The control plane needs Decrypt for presign_get
     and key_bytes and GenerateDataKey for the presigned PUT it signs; the verifier needs Decrypt
     to read a staged object and GenerateDataKey to copy-promote it — omitting either role's grant
     fails in a different way: the control plane fails loudly and synchronously, the verifier
@@ -365,8 +365,8 @@ variable "create_api" {
     without that counting as a breaking change. Default true (an HTTP API is always created).
 
     Exists solely because LocalStack community edition does not implement API Gateway v2 —
-    `apigatewayv2 create-api` answers "not yet implemented or pro feature" (design memo §8 risk
-    1) — so Layer 2's LocalStack CI needs to deploy everything except the gateway to exercise
+    `apigatewayv2 create-api` answers "not yet implemented or pro feature" — so Layer 2's
+    LocalStack CI needs to deploy everything except the gateway to exercise
     the bucket -> S3 event -> verifier spine. Setting this false skips the HTTP API and every
     resource that hangs off it (the integration, the route, the $default stage, and the
     gateway's Lambda invoke permission); api_endpoint and api_id then output null rather than a
@@ -375,7 +375,7 @@ variable "create_api" {
     The validation below is load-bearing, not decorative: create_api = false is accepted only
     when dev_endpoint_url is also set. Without it, a headless stack (no API, so nothing can ever
     reach the control plane) would be constructible against real AWS — a footgun the rest of
-    this module closes by construction, not by a README warning. See the design memo §3.2.
+    this module closes by construction, not by a README warning.
   EOT
   type        = bool
   default     = true

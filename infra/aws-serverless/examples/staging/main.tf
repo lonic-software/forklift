@@ -1,7 +1,7 @@
-# The dogfooded staging deployment (design memo §5, "Layer 3"): a CMK-configured stack so the
-# scheduled real-account verify workflow (../../verify.sh, run by
+# The dogfooded staging deployment ("Layer 3" — see README.md's Testing section): a CMK-configured
+# stack so the scheduled real-account verify workflow (../../verify.sh, run by
 # .github/workflows/aws-serverless-verify.yml) continuously exercises the KMS grants on BOTH
-# Lambda execution roles (§3.1) as a standing pin, rather than as a one-off manual check that
+# Lambda execution roles as a standing pin, rather than as a one-off manual check that
 # could silently regress. See ../../verify.sh's header comment for exactly what that buys and
 # what it still cannot prove.
 #
@@ -69,7 +69,7 @@ variable "kms_key_arn" {
   description = <<-EOT
     ARN of the customer-managed KMS key backing this stack. Not in the committed tfvars file —
     it's account-specific (create the key once, then pass its ARN here at apply time). Setting
-    this is the entire point of the staging stack (design memo §5): it converts the KMS
+    this is the entire point of the staging stack: it converts the KMS
     interaction from a one-off manual check into something the scheduled verify.sh run exercises
     on every pass, on both Lambda execution roles.
   EOT

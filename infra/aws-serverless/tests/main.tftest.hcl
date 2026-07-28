@@ -1,4 +1,5 @@
-# Layer 1 (design memo §5): `tofu test` with `mock_provider` — free, credential-less, per-PR.
+# Layer 1 (see README.md's Testing section): `tofu test` with `mock_provider` — free,
+# credential-less, per-PR.
 # Every C-claim below is genuinely bidirectional: revert the module line it pins and the assert
 # reddens (demonstrated for C1/C2/C8/C9 in the slice-2 PR description). Runs entirely offline —
 # no AWS credentials, no network calls beyond the one-time `tofu init` provider download.
@@ -338,8 +339,8 @@ run "c10_control_plane_timeout_above_ceiling_rejected" {
 }
 
 # ---------------------------------------------------------------------------------------------
-# C12/C13 — create_api (design memo §3.2, added 2026-07-26): an internal, test-harness-only
-# toggle that skips the HTTP API entirely (Layer 2's LocalStack CI needs this, since LocalStack
+# C12/C13 — create_api (added 2026-07-26): an internal, test-harness-only toggle that skips the
+# HTTP API entirely (Layer 2's LocalStack CI needs this, since LocalStack
 # community does not implement API Gateway v2). Two properties are load-bearing together:
 # create_api = false plans/applies cleanly when dev_endpoint_url is set (C12), and is rejected
 # by validation when it is not (C13) — the footgun closes by construction, not by documentation.

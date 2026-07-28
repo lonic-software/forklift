@@ -1,7 +1,6 @@
 # Non-secret, safe-to-commit values for the FORK-60 Layer 3 dogfood staging stack. See main.tf
 # in this directory for what force_destroy/deletion_protection/warehouse_id are hardcoded to and
-# why, and for the KMS-driven reasoning this whole example directory exists to pin (design memo
-# §3.1, §5).
+# why, and for the KMS-driven reasoning this whole example directory exists to pin.
 #
 # kms_key_arn, auth_token, control_plane_package, and verifier_package are deliberately absent
 # from this file: the first two are secret/account-specific, the last two are build artifacts

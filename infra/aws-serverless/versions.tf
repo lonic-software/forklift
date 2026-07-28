@@ -1,6 +1,5 @@
 # Common-subset HCL: this file (and every other file in this module) must run unchanged under
-# both OpenTofu and Terraform. See infra/aws-serverless/README.md and the design memo
-# (forklift-planning/design-memos/2026-07-26-aws-serverless-terraform-reference.md, v4) for why:
+# both OpenTofu and Terraform. See infra/aws-serverless/README.md for why:
 # OpenTofu is the primary target (state encryption / early variable evaluation are OpenTofu-only
 # and must never be used here), Terraform support is a first-class compatibility promise, not an
 # afterthought.

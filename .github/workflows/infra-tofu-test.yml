@@ -1,6 +1,6 @@
-# Layer 1 (design memo, infra/aws-serverless — see forklift-planning/design-memos/
-# 2026-07-26-aws-serverless-terraform-reference.md §5): `tofu test` (and `terraform test`, the
-# same suite under the other toolchain) against tests/main.tftest.hcl's `mock_provider "aws"` —
+# Layer 1 (see infra/aws-serverless/README.md's Testing section): `tofu test` (and
+# `terraform test`, the same suite under the other toolchain) against tests/main.tftest.hcl's
+# `mock_provider "aws"` —
 # free, credential-less, plan-only, and the cheapest layer in this module's CI to run. Added by
 # PR #80 review (finding #3): before this job existed, README.md claimed C1-C13 "run in CI on
 # every PR" while nothing in .github/workflows/ actually ran `tofu test` or `terraform test` at

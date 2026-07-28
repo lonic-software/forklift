@@ -1,7 +1,7 @@
-# Real-account deploy-and-verify for infra/aws-serverless (FORK-60, design memo §5, "Layer 3").
+# Real-account deploy-and-verify for infra/aws-serverless (FORK-60, "Layer 3" — see
+# infra/aws-serverless/README.md's Testing section).
 #
-# Scheduled and workflow_dispatch ONLY — deliberately never on push or pull_request. The design
-# memo is explicit about this (§5 "Layer 3", §7 "Per-PR real-account CI — rejected"): a public
+# Scheduled and workflow_dispatch ONLY — deliberately never on push or pull_request: a public
 # repo cannot hand fork PRs credentials to a real AWS account, and per-PR real-account CI was
 # rejected outright on exactly that basis. Layer 1 (tests/main.tftest.hcl, mock_provider) and
 # Layer 2 (LocalStack apply-and-exercise) already cover every PR; this workflow is the only place
@@ -14,8 +14,8 @@
 # The stack's outputs (api endpoint, bucket, table) are expected to be stable between scheduled
 # runs and are supplied as repository secrets rather than re-read via `tofu output`, which would
 # additionally require this workflow to carry remote-state backend credentials — a separate
-# decision the design memo does not settle and this task does not scope. See the FORK-60 Layer 3
-# report for this as a flagged, deliberate scope call rather than a silent omission.
+# decision this task does not scope. See the FORK-60 Layer 3 report for this as a flagged,
+# deliberate scope call rather than a silent omission.
 name: AWS serverless — real-account verify (FORK-60 Layer 3)
 
 on:
