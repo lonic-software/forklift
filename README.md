@@ -5,6 +5,20 @@ The idea for Forklift was born when I tried to design a serverless hosting provi
 At the end of my research, I came to the conclusion that Git just simply wasn't designed for this.\
 So, I decided to build my own VCS with this in mind, and also add some other nice features along the way.
 
+> [!WARNING]
+> **Forklift is experimental. Don't use it for anything that matters yet.**
+>
+> This is a v0 project and it is still moving fast. On-disk formats, the command surface and the wire
+> protocol change whenever a better design turns up, **without migrations** — upgrading can leave an
+> existing warehouse unreadable, and that is a deliberate trade rather than an oversight. Until v1,
+> getting the design right is worth more than keeping older versions working.
+>
+> So: keep anything you care about in a tool you already trust, and try Forklift beside it rather than
+> instead of it. That path is supported on purpose — `forklift export-git` turns a warehouse back into
+> an ordinary git repository, so trying this out is meant to be reversible.
+>
+> Bug reports and design arguments are very welcome; assumptions of stability are not yet.
+
 ## Documentation
 
 Detailed guides live in [`docs/guide/`](docs/guide/README.md):
