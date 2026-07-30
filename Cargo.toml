@@ -24,6 +24,10 @@ disallowed_methods = "deny"
 forklift-core = { path = "crates/forklift-core" }
 axum = "0.8"
 blake3 = "1.5.4"
+# Already in the tree transitively via reqwest/hyper/http; promoted to a direct dependency so
+# `remote_utils.rs` can slice an upload's chunks off one refcounted `Bytes` (zero-copy) instead of
+# allocating a second full copy of the body (FORK-49 slice 2 review, S2-F6).
+bytes = "1"
 chrono = { version = "0.4.38", features = ["serde"] }
 clap = { version = "4.5", features = ["derive", "wrap_help"] }
 serde = { version = "1.0.209", features = ["derive"] }

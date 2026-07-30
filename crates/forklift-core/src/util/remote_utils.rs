@@ -371,7 +371,24 @@ fn bounded_read_timeout(connect_timeout: std::time::Duration,
 /// genuine stall is caught close to the configured budget, not masked by one giant chunk that
 /// takes long to hand off — large enough not to spend a large upload's CPU mostly on per-chunk
 /// bookkeeping.
-const UPLOAD_CHUNK_SIZE: usize = 64 * 1024;
+///
+/// This size sets a **per-connection throughput floor** (review round S2-F4): hyper pulls the
+/// next chunk from this stream only after handing the previous one off, so `progress`'s timestamp
+/// advances at most once per `UPLOAD_CHUNK_SIZE` bytes — a connection that cannot move at least
+/// one chunk within [`UPLOAD_SILENCE_BUDGET`] plus connect looks silent to the watchdog even if
+/// it is genuinely, if slowly, progressing. At the old 64 KiB this floor was
+/// `65536 / 15s ≈ 4.4 kB/s` per connection — with [`CONCURRENT_TRANSFERS`] (24) sharing one
+/// uplink, an aggregate floor of `≈105 kB/s` (`≈840 kbit/s`), which a real ADSL-class 1 Mbit/s
+/// uplink sits uncomfortably close to. At `4 KiB` the same arithmetic gives
+/// `4096 / 15s ≈ 273 B/s` per connection, `≈6.6 kB/s` (`≈52 kbit/s`) aggregate — comfortably below
+/// any uplink this tool needs to keep working on, and within reach of the read path's own
+/// resolution (`read_timeout` resets per socket read, ordinarily an MSS-sized ~1.5 KB — about 44×
+/// finer than the old 64 KiB chunk, about 2.7× finer than this one). Kept a fixed constant rather
+/// than something smaller still because the chunking is zero-copy (`Bytes::slice`, see
+/// [`UploadChunks`]'s doc) — a smaller chunk costs a few more `Arc`/mutex touches, not another
+/// allocation, so there is no real tension between "small enough to stay off the throughput
+/// floor" and "large enough not to waste CPU."
+const UPLOAD_CHUNK_SIZE: usize = 4 * 1024;
 
 /// How long an upload's body-send stream may go without the client pulling a single chunk from it
 /// before [`RemoteClient::send_with_watchdog`] gives up and abandons the request, *on top of*
@@ -420,8 +437,12 @@ const POST_SEND_VERIFY_BASE: std::time::Duration = std::time::Duration::from_sec
 /// short of a maximum-size object.
 const POST_SEND_VERIFY_RATE_BYTES_PER_SEC: u64 = 8 * 1024 * 1024;
 
-/// The post-send response-wait budget for an upload of `body_len` bytes — see
-/// [`POST_SEND_VERIFY_BASE`]/[`POST_SEND_VERIFY_RATE_BYTES_PER_SEC`]'s docs for the constants.
+/// The **server-side verification** component of the post-send phase's budget, for an upload of
+/// `body_len` bytes — see [`POST_SEND_VERIFY_BASE`]/[`POST_SEND_VERIFY_RATE_BYTES_PER_SEC`]'s
+/// docs for the constants. This alone is *not* [`RemoteClient::send_with_watchdog`]'s actual
+/// post-send budget (see that method's doc, review round S2-F2, for why it also folds in the
+/// send-phase allowance as a flush-time margin) — it names only the part of that budget scaled to
+/// this specific quantity.
 ///
 /// Scaled to the body size because, unlike `update_ref`'s audit walk (deliberately left unbounded
 /// — its server side is scoped by the *pushed history segment*, which on a first lift is the whole
@@ -445,13 +466,21 @@ fn post_send_verify_budget(body_len: usize) -> std::time::Duration {
 /// actually yields a chunk (the only signal available that the transfer is still moving — see
 /// [`UPLOAD_SILENCE_BUDGET`]'s doc), and a flag set once the stream is exhausted.
 ///
-/// That second half is deliberate, not an oversight: once every byte has been handed to hyper,
-/// whatever happens next — flushing the last buffered bytes, waiting for the remote's response —
-/// is exactly the same unbounded response-wait every other mutation on this module's `http` client
-/// already accepts by design (see [`RemoteClient::describe_mutation_transport_error`]'s doc on
-/// `update_ref`'s audit walk). This watchdog exists to bound the *body-send* phase only, and must
-/// not silently grow into bounding the response-wait phase no other mutation call bounds either —
-/// so [`RemoteClient::send_with_watchdog`] stops enforcing the budget the moment this flag is set.
+/// That second half does **not** mean "stop bounding the wait" (an earlier version of this fix
+/// did exactly that, on the theory that it matched `update_ref`'s own unbounded response wait —
+/// review round S2-F2 found that theory didn't hold: `update_ref`'s wait is unbounded because its
+/// server-side work is the *pushed history segment*, unknowable in advance, while
+/// `upload_object`'s post-receive work is inline hash verification of the exact bytes just sent,
+/// bounded by a quantity — `body_len` — the client already has. A remote that reads the whole
+/// body and then wedges is an ordinary failure, and it hung exactly like the original FORK-49 bug
+/// on this exact path when this phase was left unbounded). What exhaustion changes is *which*
+/// budget [`RemoteClient::send_with_watchdog`] checks `silent_for()` against, not whether it
+/// checks at all — see that method's doc for the two-budget shape and why phase 2's budget still
+/// has to be generous: `is_exhausted()` means every chunk was handed to hyper, not that every byte
+/// reached the peer, so the post-exhaustion silence can legitimately include time the OS kernel
+/// (or hyper's own internal buffer) is still spending flushing an in-flight tail — S2-F2's own
+/// numbers: a 64 MiB object on a 2 Mbit/s uplink can have several seconds of genuinely-still-
+/// moving tail queued the instant this flag flips.
 struct UploadProgress {
     last_chunk: std::sync::Mutex<std::time::Instant>,
     exhausted: std::sync::atomic::AtomicBool,
@@ -484,75 +513,91 @@ impl UploadProgress {
     }
 }
 
-/// A `Stream` over pre-chunked upload bytes that touches a shared [`UploadProgress`] every time it
-/// is polled and has a chunk to hand back — i.e. exactly when hyper actually pulls more data to
-/// write — and marks it exhausted **the moment the last chunk is handed back**, not on some later
-/// poll that returns `None`. That distinction is load-bearing, not stylistic: with an explicit
-/// `Content-Length` set (see [`watched_upload_body`]'s doc), hyper already knows the exact byte
-/// count to expect and can consider the body fully sent once that many bytes have been produced —
-/// it has no *need* to poll again just to observe an explicit end-of-stream `None`, and a real
-/// run against a small, fully-draining body confirmed it does not: an earlier version of this
-/// stream that only called `mark_exhausted` from the `None` arm left `progress.is_exhausted()`
-/// false forever on a body small enough to fit in one chunk, so `send_with_watchdog`'s send-phase
-/// silence check fired at its own budget instead of ever reaching the post-send phase at all —
-/// wrong phase, wrong (and much larger) budget, wrong message. Checking the *remaining* count on
-/// the same poll that yields the last item avoids depending on a poll that may never come.
+/// A `Stream` over an upload's bytes, sliced into [`UPLOAD_CHUNK_SIZE`] windows of one shared
+/// `bytes::Bytes` rather than copied into a `Vec<Vec<u8>>` up front (review round S2-F6):
+/// `Bytes::from(Vec<u8>)` takes ownership of the caller's existing allocation with no copy, and
+/// `Bytes::slice` shares that same backing buffer via a refcount bump — so a 64 MiB upload no
+/// longer peaks at 128 MiB (the original bytes plus a second, fully-copied chunk list), and
+/// [`CONCURRENT_TRANSFERS`] of them no longer peaks at roughly double the aggregate memory this
+/// module otherwise needs.
+///
+/// Touches a shared [`UploadProgress`] every time it is polled and has a chunk to hand back — i.e.
+/// exactly when hyper actually pulls more data to write — and marks it exhausted **the moment the
+/// last chunk is handed back**, not on some later poll that returns `None`. That distinction is
+/// load-bearing, not stylistic: with an explicit `Content-Length` set (see
+/// [`watched_upload_body`]'s doc), hyper already knows the exact byte count to expect and can
+/// consider the body fully sent once that many bytes have been produced — it has no *need* to
+/// poll again just to observe an explicit end-of-stream `None`, and a real run against a small,
+/// fully-draining body confirmed it does not: an earlier version of this stream that only called
+/// `mark_exhausted` from the `None` arm left `progress.is_exhausted()` false forever on a body
+/// small enough to fit in one chunk, so `send_with_watchdog`'s send-phase silence check fired at
+/// its own budget instead of ever reaching the post-send phase at all — wrong phase, wrong (and
+/// much larger) budget, wrong message. Checking the *remaining* length on the same poll that
+/// yields the last item avoids depending on a poll that may never come.
+///
 /// Implemented by hand, rather than via a combinator, because `tokio_stream::StreamExt` (this
 /// crate's only stream-utilities dependency) carries no side-effecting `map`-style adapter, and
 /// pulling in a full stream-combinators crate for one adapter would be a heavier dependency than
-/// this needs. `Self` holds nothing self-referential (a plain iterator and an `Arc`), so it is
+/// this needs. `Self` holds nothing self-referential (a `Bytes`, a cursor, and an `Arc`), so it is
 /// automatically `Unpin` and needs no manual pin-projection.
+///
+/// **`is_exhausted()` means "every chunk was handed to hyper," not "every byte reached the
+/// peer."** Hyper may still hold buffered-but-unwritten bytes, and the OS kernel's own send
+/// buffer may hold more on top of that — see [`RemoteClient::send_with_watchdog`]'s doc (review
+/// round S2-F2) for why the post-send phase's budget has to account for that gap rather than
+/// treating "exhausted" as "delivered."
 struct UploadChunks {
-    chunks: std::vec::IntoIter<Vec<u8>>,
+    body: bytes::Bytes,
+    offset: usize,
     progress: Arc<UploadProgress>,
 }
 
 impl tokio_stream::Stream for UploadChunks {
-    type Item = Result<Vec<u8>, std::io::Error>;
+    type Item = Result<bytes::Bytes, std::io::Error>;
 
     fn poll_next(mut self: std::pin::Pin<&mut Self>,
                  _cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
-        match self.chunks.next() {
-            Some(chunk) => {
-                self.progress.touch();
-                // `chunks` is a `Vec::IntoIter`, so `.len()` is the exact remaining count (an
-                // `ExactSizeIterator`), not an estimate — checking it here, on the very poll that
-                // hands back the last chunk, is what makes exhaustion detection independent of
-                // whether hyper ever polls again (see this struct's own doc for why it might not).
-                if self.chunks.len() == 0 {
-                    self.progress.mark_exhausted();
-                }
-                std::task::Poll::Ready(Some(Ok(chunk)))
-            }
-            None => {
-                self.progress.mark_exhausted();
-                std::task::Poll::Ready(None)
-            }
+        if self.offset >= self.body.len() {
+            // Reachable only for an already-exhausted stream hyper polls again anyway (harmless —
+            // `mark_exhausted` is idempotent); the *first* time exhaustion is observed is always
+            // on the branch below, on the same poll that hands back the last chunk.
+            self.progress.mark_exhausted();
+            return std::task::Poll::Ready(None);
         }
+
+        let end = std::cmp::min(self.offset + UPLOAD_CHUNK_SIZE, self.body.len());
+        let chunk = self.body.slice(self.offset..end);
+        self.offset = end;
+        self.progress.touch();
+
+        // On the same poll that hands back the last chunk — see this struct's own doc for why
+        // that matters — not a later poll that may never come.
+        if self.offset >= self.body.len() {
+            self.progress.mark_exhausted();
+        }
+
+        std::task::Poll::Ready(Some(Ok(chunk)))
     }
 }
 
-/// Build a watchdog-instrumented streaming body for an upload: `bytes` split into
-/// [`UPLOAD_CHUNK_SIZE`] chunks, handed to `reqwest::Body::wrap_stream` over an [`UploadChunks`]
-/// that touches `progress` as each one is pulled. Returns the body alongside the exact byte
-/// length, which the caller must set as an explicit `Content-Length` header: `wrap_stream`'s body
-/// always reports an unknown `size_hint`, and without that header reqwest/hyper fall back to
-/// `Transfer-Encoding: chunked` — which a presigned S3 `PUT` rejects outright (see
-/// [`RemoteClient::put_presigned`]'s doc). An empty body marks `progress` exhausted immediately,
-/// up front: there would otherwise be no chunk whose yielding ever sets the flag.
+/// Build a watchdog-instrumented streaming body for an upload: `bytes` wrapped (zero-copy, see
+/// [`UploadChunks`]'s doc) in a `bytes::Bytes` and sliced into [`UPLOAD_CHUNK_SIZE`] windows,
+/// handed to `reqwest::Body::wrap_stream` over an [`UploadChunks`] that touches `progress` as each
+/// one is pulled. Returns the body alongside the exact byte length, which the caller must set as
+/// an explicit `Content-Length` header: `wrap_stream`'s body always reports an unknown
+/// `size_hint`, and without that header reqwest/hyper fall back to `Transfer-Encoding: chunked` —
+/// which a presigned S3 `PUT` rejects outright (see [`RemoteClient::put_presigned`]'s doc). An
+/// empty body marks `progress` exhausted immediately, up front: there would otherwise be no chunk
+/// whose yielding ever sets the flag.
 fn watched_upload_body(bytes: Vec<u8>, progress: Arc<UploadProgress>) -> (reqwest::Body, usize) {
     let len = bytes.len();
+    let body = bytes::Bytes::from(bytes);
 
-    if bytes.is_empty() {
+    if body.is_empty() {
         progress.mark_exhausted();
     }
 
-    let chunks: Vec<Vec<u8>> = bytes
-        .chunks(UPLOAD_CHUNK_SIZE)
-        .map(|chunk| chunk.to_vec())
-        .collect();
-
-    let stream = UploadChunks { chunks: chunks.into_iter(), progress };
+    let stream = UploadChunks { body, offset: 0, progress };
 
     (reqwest::Body::wrap_stream(stream), len)
 }
@@ -931,65 +976,106 @@ impl RemoteClient {
     /// established, and by the time silence trips the watchdog, request bytes may already be
     /// underway to the remote — the mutation-uncertainty wording applies exactly as it does to a
     /// real `reqwest::Error` of the same shape.
+    ///
+    /// "may or may not have fully reached" (review round S2-F7), not "was sent": `silent_for()`
+    /// is measured from when [`UploadProgress`] is constructed, *before* `send()` is even called,
+    /// so this can fire with zero chunks ever having been pulled — claiming the request "was
+    /// sent" would overstate what is actually known in that case.
     fn mutation_read_timeout_message(action: &str) -> String {
         format!(
-            "Timed out while {}: the request was sent but no response arrived. It may have \
-            already completed on the remote — re-running converges, so retrying is safe.",
+            "Timed out while {}: the request may or may not have fully reached the remote, and \
+            no response arrived. It may have already completed there — re-running converges, so \
+            retrying is safe.",
             action
         )
     }
 
     /// The message for a *post-send* mutation stall — the watchdog's second phase (see
-    /// [`Self::send_with_watchdog`]): the stream reported itself exhausted (the whole body was
-    /// handed off), and then [`post_send_verify_budget`] elapsed with no response. Deliberately
-    /// distinct wording from [`Self::mutation_read_timeout_message`] (the mid-body composer, left
-    /// untouched by this fix) so an operator can tell the two failures apart, and because they are
-    /// not equally uncertain: here transmission is *known* complete, not merely possible, so a
-    /// message that failed to say the bytes may already be verified and stored would be a false
-    /// claim, not just an imprecise one. `re-uploading the same content is a no-op if it already
-    /// landed` names the concrete reason retrying is safe: every upload in this module is
-    /// content-addressed, so a repeat `PUT` of bytes the remote already has changes nothing.
+    /// [`Self::send_with_watchdog`]): the stream reported itself exhausted (every chunk was
+    /// handed to hyper), and then `budget` elapsed with no response. Deliberately distinct
+    /// wording from [`Self::mutation_read_timeout_message`] (the mid-body composer) so an operator
+    /// can tell the two failures apart, and because they are not equally uncertain: here every
+    /// chunk really was handed off, not merely possibly so, so a message that failed to say the
+    /// remote may already have verified and stored the bytes would be a false claim, not just an
+    /// imprecise one. `re-uploading the same content is a no-op if it already landed` names the
+    /// concrete reason retrying is safe: every upload in this module is content-addressed, so a
+    /// repeat `PUT` of bytes the remote already has changes nothing.
+    ///
+    /// "the client finished streaming the request body" (review round S2-F7), not "the request
+    /// finished sending": exhaustion means hyper has every chunk, not that the peer has received
+    /// every byte — hyper's own buffer, and the OS kernel's send buffer beneath it, can still hold
+    /// an unflushed tail at the instant this fires (see [`Self::send_with_watchdog`]'s doc, S2-F2)
+    /// — so this states only the locally-observable fact, not a claim about what the remote has.
     fn mutation_post_send_timeout_message(action: &str, budget: std::time::Duration) -> String {
         format!(
-            "Timed out while {}: the request finished sending, but no response arrived within \
-            {:?}. The bytes are on the wire — the remote may have already verified and stored \
-            them — so retrying is safe; re-uploading the same content is a no-op if it already \
-            landed.",
+            "Timed out while {}: the client finished streaming the request body, but no \
+            response arrived within {:?}. The remote may already have received, verified, and \
+            stored the bytes — so retrying is safe; re-uploading the same content is a no-op if \
+            it already landed.",
             action, budget
         )
     }
 
     /// Send `builder` (with a [`watched_upload_body`]-built body of `body_len` bytes already
-    /// attached, sharing `progress`) through two, independently bounded phases:
+    /// attached, sharing `progress`) through two phases, both bounded, both watched through the
+    /// same `progress.silent_for()` signal — just against a different threshold once the stream is
+    /// exhausted:
     ///
-    /// 1. **Send**: enforces [`UPLOAD_SILENCE_BUDGET`] — plus this client's connect budget —
-    ///    against `progress`'s "last chunk pulled" timestamp while the body is still streaming. A
-    ///    stall here means the peer stopped reading mid-transfer.
-    /// 2. **Post-send response wait**: once the stream reports itself exhausted, the whole body
-    ///    is on the wire — this phase instead enforces [`post_send_verify_budget`]`(body_len)`
-    ///    against the response future itself. Unlike phase 1, this is **not** left unbounded the
-    ///    way `update_ref`'s response wait is: the server-side work this phase waits on (inline
-    ///    hash verification, or a storage backend's `PUT` completion) is bounded by `body_len`,
-    ///    which the client already knows — see [`post_send_verify_budget`]'s doc for why that
-    ///    makes bounding it honest where `update_ref`'s audit walk is not. Leaving this phase
-    ///    unbounded would have left the original FORK-49 defect alive on exactly the path this
-    ///    fix exists to close: a remote that reads the whole body and then wedges (a crash, a
-    ///    stuck disk, anything mid-verification) would still hang forever.
+    /// 1. **Send**: `silent_for()` is checked against `phase1_budget` (this client's connect
+    ///    budget plus [`UPLOAD_SILENCE_BUDGET`]) while the body is still streaming. A stall here
+    ///    means the peer stopped reading mid-transfer.
+    /// 2. **Post-send response wait**: once the stream reports itself exhausted, `silent_for()` —
+    ///    which stops advancing the instant the last chunk is handed off, since there is nothing
+    ///    left to touch it — is checked against a *larger* `phase2_budget` instead:
+    ///    `phase1_budget + post_send_verify_budget(body_len)`.
+    ///
+    /// An earlier version of this fix (review round S2-F2) treated exhaustion as "stop bounding
+    /// the wait at all" — restoring the original FORK-49 hang on exactly this path, since a remote
+    /// that reads the whole body and then wedges during verification is an ordinary failure. A
+    /// second attempt then bounded phase 2 with `post_send_verify_budget(body_len)` alone — too
+    /// tight: `is_exhausted()` means every chunk was handed to *hyper*, not that every byte
+    /// reached the *peer* (see [`UploadProgress`]'s doc) — hyper's own buffer, and the OS kernel's
+    /// send buffer beneath it, can still hold an in-flight tail the instant this flag flips, and
+    /// under Linux/Windows autotuning that tail can be megabytes. A verify-only budget would kill
+    /// a transfer that is still genuinely, if slowly, moving those bytes — the same "must never
+    /// kill a transfer that is still moving" property [`UPLOAD_SILENCE_BUDGET`]'s own doc requires
+    /// of phase 1. `phase2_budget` folds phase 1's *entire* allowance back in as the tail's flush
+    /// budget: it is the same figure this client already treats as generous for a single healthy
+    /// gap to resolve (see [`UPLOAD_SILENCE_BUDGET`]'s doc), and flushing an already-in-flight
+    /// tail is exactly that — a healthy link finishing outstanding work, not new work starting
+    /// from nothing — on top of which [`post_send_verify_budget`]`(body_len)` adds the
+    /// server-side, client-known-bounded verification time. This also folds in this client's own
+    /// connect budget (review round S2-F3), the same way [`bounded_read_timeout`] and phase 1
+    /// itself already do — a bound that ignores the link's own latency preempts healthy work on a
+    /// slow-but-legitimate connection (a Tor circuit most sharply: `REMOTE_CONNECT_TIMEOUT_TOR` is
+    /// 60s precisely because multi-second round trips are normal there).
+    ///
+    /// **Accepted residual**, in the same spirit as [`FETCH_OBJECT_READ_TIMEOUT`]'s documented
+    /// gap: an autotuned buffer that grew large while the link was fast and then degraded to a
+    /// much slower rate mid-transfer could in principle still exceed `phase2_budget`'s flush
+    /// allowance. TCP autotuning targets a buffer near the bandwidth-delay product, so the ordinary
+    /// case (buffer sized for the link's *own* rate) drains in on the order of a few round trips,
+    /// not the link's raw throughput — comfortably inside [`UPLOAD_SILENCE_BUDGET`]'s allowance —
+    /// but a link that changes character mid-flight is not covered by that reasoning. Not
+    /// separately fixed here: it would need either OS-level control of the send buffer (no public
+    /// `reqwest`/hyper hook exists for it) or a budget scaled to a worst-case buffer size no
+    /// portable assumption can name honestly.
     ///
     /// Both phases can end in a watchdog kill, and both produce no `reqwest::Error` when they do
-    /// (the in-flight future is simply dropped or its `timeout` wrapper elapses — reqwest/hyper
-    /// tear down the underlying socket as part of that drop either way, so no connection is
-    /// leaked) — so both compose their message directly ([`Self::mutation_read_timeout_message`]
-    /// for phase 1, [`Self::mutation_post_send_timeout_message`] for phase 2) rather than through
-    /// `classify`, which needs an actual `reqwest::Error` neither kill ever produces. A genuine
-    /// `reqwest::Error` from either phase (a real transport failure, not a watchdog kill) still
-    /// flows through `classify` via [`Self::describe_mutation_transport_error`] as before.
+    /// (the in-flight future is simply dropped, and reqwest/hyper tear down the underlying socket
+    /// as part of that drop, so no connection is leaked) — so both compose their message directly
+    /// ([`Self::mutation_read_timeout_message`] for phase 1,
+    /// [`Self::mutation_post_send_timeout_message`] for phase 2) rather than through `classify`,
+    /// which needs an actual `reqwest::Error` neither kill ever produces. A genuine
+    /// `reqwest::Error` (a real transport failure, not a watchdog kill) still flows through
+    /// `classify` via [`Self::describe_mutation_transport_error`] as before, from either phase.
     async fn send_with_watchdog(&self,
                                 builder: reqwest::RequestBuilder,
                                 progress: Arc<UploadProgress>,
                                 action: &str,
                                 body_len: usize) -> Result<reqwest::Response, String> {
-        let budget = self.connect_timeout + UPLOAD_SILENCE_BUDGET;
+        let phase1_budget = self.connect_timeout + UPLOAD_SILENCE_BUDGET;
+        let phase2_budget = phase1_budget + post_send_verify_budget(body_len);
         let send_fut = builder.send();
         tokio::pin!(send_fut);
 
@@ -999,25 +1085,46 @@ impl RemoteClient {
                     return result.map_err(|e| self.describe_mutation_transport_error(action, e));
                 }
                 _ = tokio::time::sleep(UPLOAD_WATCHDOG_POLL_INTERVAL) => {
-                    if progress.is_exhausted() {
-                        break;
-                    }
+                    let exhausted = progress.is_exhausted();
+                    let budget = if exhausted { phase2_budget } else { phase1_budget };
+
                     if progress.silent_for() >= budget {
-                        return Err(Self::mutation_read_timeout_message(action));
+                        return Err(if exhausted {
+                            Self::mutation_post_send_timeout_message(action, phase2_budget)
+                        } else {
+                            Self::mutation_read_timeout_message(action)
+                        });
                     }
                 }
             }
         }
+    }
 
-        // The whole body is already handed off; what remains (flushing the last buffered bytes,
-        // waiting for the remote's response) is client-known-bounded work, unlike `update_ref`'s
-        // audit walk — see `post_send_verify_budget`'s doc — so it gets its own, tighter bound
-        // rather than the unbounded wait every other mutation call accepts.
-        let verify_budget = post_send_verify_budget(body_len);
-        match tokio::time::timeout(verify_budget, send_fut).await {
-            Ok(result) => result.map_err(|e| self.describe_mutation_transport_error(action, e)),
-            Err(_) => Err(Self::mutation_post_send_timeout_message(action, verify_budget)),
-        }
+    /// Compose a loud, specific error for a `3xx` response to a streamed upload `PUT` (review
+    /// round S2-F5). Verified against this pinned `reqwest`/`tower-http` version:
+    /// `Body::try_clone` (`async_impl/body.rs`) returns `None` for a streaming body, `clone_body`
+    /// (`redirect.rs`) forwards that `None` on, and `tower-http`'s `follow_redirect` middleware
+    /// (`follow_redirect/mod.rs`) breaks out of its redirect loop and hands the raw `3xx` straight
+    /// back whenever the body cannot be reproduced for the replay. The pre-streaming `.body(Vec<u8>)`
+    /// built a `Reusable` body that cloned fine, so a redirect *was* followed before this fix — this
+    /// is a real behavior change, not a latent one, and pre-1.0 there is no compatibility argument
+    /// against it (CLAUDE.md) — but it must never be a *silent* one: an operator seeing a bare
+    /// "refused (307)" would have no idea a redirect was even involved. Names the status and,
+    /// when present, the `Location` header the remote pointed at, so the caller can see exactly
+    /// what happened and ask the remote for a fresh target rather than guess.
+    fn describe_upload_redirect(action: &str, response: &reqwest::Response) -> String {
+        let status = response.status();
+        let location = response.headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("(no Location header)");
+
+        format!(
+            "The remote redirected {} ({}) to {} — a streamed upload cannot follow a redirect \
+            (its body cannot be replayed to retry elsewhere), so this failed instead of silently \
+            retrying at the new location. Ask the remote for a fresh upload target and retry.",
+            action, status.as_u16(), location
+        )
     }
 
     /// Turn a non-success response into the client-facing error, threading the server's refusal
@@ -1274,8 +1381,8 @@ impl RemoteClient {
     /// a slow link — the same reasoning [`REMOTE_READ_TIMEOUT`]'s doc gives for the read path,
     /// applied to the send side instead of the receive side. A remote that reads the whole body
     /// and then wedges (during the inline hash-verify this endpoint's own doc names above) is
-    /// bounded too, by [`post_send_verify_budget`] — see [`Self::send_with_watchdog`]'s doc for
-    /// why that phase gets its own, size-scaled bound instead of being left unbounded.
+    /// bounded too — see [`Self::send_with_watchdog`]'s doc for that phase's own, size-scaled
+    /// bound instead of the unbounded wait an earlier version of this fix left it with.
     pub async fn upload_object(&self, hash: &str, bytes: Vec<u8>) -> Result<(), String> {
         let action = format!("uploading object {}", hash);
         let progress = UploadProgress::new();
@@ -1285,6 +1392,10 @@ impl RemoteClient {
             .body(body);
 
         let response = self.send_with_watchdog(builder, progress, &action, len).await?;
+
+        if response.status().is_redirection() {
+            return Err(Self::describe_upload_redirect(&action, &response));
+        }
 
         if !response.status().is_success() {
             return Err(Self::error_of(response, &format!("object {}", hash)).await);
@@ -1359,6 +1470,10 @@ impl RemoteClient {
         let response = self.send_with_watchdog(
             builder, progress, "uploading to a staging URL", len
         ).await?;
+
+        if response.status().is_redirection() {
+            return Err(Self::describe_upload_redirect("uploading to a staging URL", &response));
+        }
 
         if !response.status().is_success() {
             return Err(format!(
@@ -5743,6 +5858,136 @@ mod tests {
         );
     }
 
+    /// A SOCKS5 proxy that completes a real handshake (same protocol steps as
+    /// [`HandshakeCompletingSocksProxy`]) and then genuinely **relays** the tunneled connection to
+    /// a fixed local backend — ignoring whatever destination the client actually asked for, since
+    /// this only needs a real two-way byte relay, not real DNS/routing. Unlike
+    /// [`HandshakeCompletingSocksProxy`] (which parks right after the handshake, standing in for a
+    /// stalled tunnel), this is what a phase-2-over-Tor test needs: genuine data flow all the way
+    /// to a backend that fully reads the body and only then goes silent, so the client's own
+    /// `is_exhausted()` transition — and the phase-2 budget it triggers — is exercised for real,
+    /// not simulated.
+    struct RelayingSocksProxy {
+        addr: String,
+    }
+
+    impl RelayingSocksProxy {
+        fn start(backend_addr: std::net::SocketAddr) -> RelayingSocksProxy {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+
+            std::thread::spawn(move || {
+                for incoming in listener.incoming() {
+                    let Ok(client_stream) = incoming else { continue };
+
+                    std::thread::spawn(move || {
+                        use std::io::{Read, Write};
+                        let mut client_stream = client_stream;
+
+                        // Greeting: VER(1) NMETHODS(1) METHODS(NMETHODS) — unconditionally select
+                        // "no auth" (0x00).
+                        let mut header = [0u8; 2];
+                        if client_stream.read_exact(&mut header).is_err() { return; }
+                        let mut methods = vec![0u8; header[1] as usize];
+                        if client_stream.read_exact(&mut methods).is_err() { return; }
+                        if client_stream.write_all(&[0x05, 0x00]).is_err() { return; }
+
+                        // CONNECT request — consume whichever address form (ATYP) the client sent,
+                        // then discard it: the relay always dials `backend_addr` regardless.
+                        let mut req_head = [0u8; 4];
+                        if client_stream.read_exact(&mut req_head).is_err() { return; }
+                        let address_read = match req_head[3] {
+                            0x01 => client_stream.read_exact(&mut [0u8; 4 + 2]),
+                            0x04 => client_stream.read_exact(&mut [0u8; 16 + 2]),
+                            0x03 => {
+                                let mut len = [0u8; 1];
+                                if client_stream.read_exact(&mut len).is_err() { return; }
+                                client_stream.read_exact(&mut vec![0u8; len[0] as usize + 2])
+                            }
+                            _ => return,
+                        };
+                        if address_read.is_err() { return; }
+
+                        // Success reply: VER REP=0(succeeded) RSV ATYP=IPv4 BND.ADDR=0.0.0.0
+                        // BND.PORT=0 — a minimal but valid "the tunnel is up" answer.
+                        if client_stream.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).is_err() {
+                            return;
+                        }
+
+                        // Handshake genuinely done — now actually relay both directions to a real
+                        // backend, rather than parking.
+                        let Ok(backend_stream) = std::net::TcpStream::connect(backend_addr) else { return };
+                        let (Ok(mut client_read), Ok(mut backend_write)) =
+                            (client_stream.try_clone(), backend_stream.try_clone()) else { return };
+                        let mut backend_read = backend_stream;
+                        let mut client_write = client_stream;
+
+                        let upstream = std::thread::spawn(move || {
+                            let _ = std::io::copy(&mut client_read, &mut backend_write);
+                        });
+                        let _ = std::io::copy(&mut backend_read, &mut client_write);
+                        let _ = upstream.join();
+                    });
+                }
+            });
+
+            RelayingSocksProxy { addr }
+        }
+    }
+
+    /// `upload_object`'s post-send phase must fold in the Tor connect budget, not just
+    /// [`UPLOAD_SILENCE_BUDGET`] and [`post_send_verify_budget`] (review round S2-F3): both
+    /// `bounded_read_timeout` and phase 1 itself already add `self.connect_timeout` in first,
+    /// precisely because a bound that ignores the link's own latency preempts healthy work on a
+    /// slow-but-legitimate connection — the same reasoning [`REMOTE_CONNECT_TIMEOUT_TOR`]'s doc
+    /// gives for why an onion circuit build needs 60s, not 5s. Routes a real upload through
+    /// [`RelayingSocksProxy`] (real SOCKS5 handshake, real byte relay) to a [`SilentRemote`]
+    /// backend that reads the whole body and then genuinely goes silent, so phase 2 fires for
+    /// real — then checks the message names the *Tor-inclusive* figure.
+    #[test]
+    fn upload_object_post_send_message_names_the_effective_tor_bound() {
+        let backend = SilentRemote::start();
+        let backend_addr: std::net::SocketAddr = backend.url
+            .trim_start_matches("http://")
+            .parse()
+            .expect("SilentRemote's url is always a bare host:port");
+
+        let proxy = RelayingSocksProxy::start(backend_addr);
+        let tor = TorSettings { mode: TorMode::On, proxy: format!("socks5h://{}", proxy.addr) };
+        let client = RemoteClient::new_with_tor(
+            "http://forklift-fork-49-s2f3-message-test.invalid", None, tor,
+        ).unwrap();
+
+        let hash = "a".repeat(64);
+        let body = vec![5u8; 4096];
+        let phase2_budget = TEST_TOR_CONNECT_TIMEOUT + TEST_UPLOAD_SILENCE_BUDGET
+            + post_send_verify_budget(body.len());
+        let hard_ceiling = phase2_budget + std::time::Duration::from_secs(20);
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let outcome = runtime.block_on(async {
+            tokio::time::timeout(hard_ceiling, client.upload_object(&hash, body)).await
+        });
+
+        let message = outcome
+            .unwrap_or_else(|_| panic!(
+                "upload_object hung past the test's own {:?} ceiling — no timeout fired at all",
+                hard_ceiling
+            ))
+            .expect_err("a silent backend must not appear to succeed");
+
+        assert!(
+            message.to_lowercase().contains("timed out"),
+            "must fail specifically with a timeout: {}", message
+        );
+        assert!(
+            message.contains(&format!("{:?}", phase2_budget)),
+            "must name the effective Tor-inclusive phase-2 budget {:?} (60s Tor connect + 10s \
+            silence + verify), not the direct client's 5s connect or verify alone: {}",
+            phase2_budget, message
+        );
+    }
+
     // -----------------------------------------------------------------------------------
     // FORK-49 slice 2: the upload path. `upload_object` and `put_presigned` used to hang forever
     // against a remote that accepted the connection and then simply stopped reading — no error,
@@ -5915,8 +6160,14 @@ mod tests {
     // because its server-side work (the pushed history segment) can legitimately take minutes and
     // the client has no way to size it in advance; `upload_object`'s post-receive work is inline
     // hash verification of the exact bytes the client just sent, capped by `body_len` — a
-    // quantity the client already has in hand. That's what makes bounding this phase honest, and
-    // what `post_send_verify_budget` does.
+    // quantity the client already has in hand. That's what makes bounding this phase honest.
+    //
+    // A follow-up round (S2-F2/S2-F3) found the *first* fix too tight: `post_send_verify_budget`
+    // alone ignores connect latency and the in-flight tail hyper/the OS kernel can still be
+    // flushing the instant `is_exhausted()` flips — see `send_with_watchdog`'s doc for the full
+    // reasoning. The budget these tests now expect is `phase2_budget`
+    // (`connect + UPLOAD_SILENCE_BUDGET + post_send_verify_budget(body_len)`), not
+    // `post_send_verify_budget(body_len)` alone.
     //
     // `SilentRemote` (above, from slice 1) is exactly the fixture this needs: it already reads a
     // request in full via `read_test_request` (headers *and* body, draining to `Content-Length`)
@@ -5940,8 +6191,9 @@ mod tests {
         // Deliberately small — the whole point is that this bound is tight for an ordinary-sized
         // object, not that it needs a huge body to exercise (that's the *send*-phase tests' job).
         let body = vec![9u8; 64 * 1024];
-        let verify_budget = post_send_verify_budget(body.len());
-        let hard_ceiling = TEST_DIRECT_CONNECT_TIMEOUT + verify_budget + std::time::Duration::from_secs(20);
+        let phase2_budget = TEST_DIRECT_CONNECT_TIMEOUT + TEST_UPLOAD_SILENCE_BUDGET
+            + post_send_verify_budget(body.len());
+        let hard_ceiling = phase2_budget + std::time::Duration::from_secs(20);
 
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let outcome = runtime.block_on(async {
@@ -5960,14 +6212,16 @@ mod tests {
             "must fail specifically with a timeout, not some other transport error: {}", message
         );
         assert_eq!(
-            message, RemoteClient::mutation_post_send_timeout_message(&action, verify_budget),
+            message, RemoteClient::mutation_post_send_timeout_message(&action, phase2_budget),
             "a post-send wedge must carry the post-send wording (transmission known-complete, \
-            verification may have already happened), not the mid-body composer's: {}", message
+            verification may have already happened) and name the full phase-2 budget (connect + \
+            silence + verify, not verify alone), not the mid-body composer's: {}", message
         );
         assert!(
-            message.contains("bytes are on the wire") && message.contains("may have already verified and stored"),
-            "must not understate what's known: the full body really was received, so this must \
-            never read as if nothing might have happened: {}", message
+            message.contains("finished streaming the request body")
+                && message.contains("may already have received, verified, and stored"),
+            "must not understate what's known (the full body really was handed off), nor \
+            overstate it (claiming the bytes are certainly \"on the wire\" — S2-F7): {}", message
         );
     }
 
@@ -5983,8 +6237,9 @@ mod tests {
         let client = RemoteClient::new(&remote.url, None).unwrap();
         let action = "uploading to a staging URL";
         let body = vec![9u8; 64 * 1024];
-        let verify_budget = post_send_verify_budget(body.len());
-        let hard_ceiling = TEST_DIRECT_CONNECT_TIMEOUT + verify_budget + std::time::Duration::from_secs(20);
+        let phase2_budget = TEST_DIRECT_CONNECT_TIMEOUT + TEST_UPLOAD_SILENCE_BUDGET
+            + post_send_verify_budget(body.len());
+        let hard_ceiling = phase2_budget + std::time::Duration::from_secs(20);
         let url = remote.url.clone();
 
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -6004,7 +6259,7 @@ mod tests {
             "must fail specifically with a timeout, not some other transport error: {}", message
         );
         assert_eq!(
-            message, RemoteClient::mutation_post_send_timeout_message(action, verify_budget),
+            message, RemoteClient::mutation_post_send_timeout_message(action, phase2_budget),
             "a post-send wedge must carry the post-send wording: {}", message
         );
     }
@@ -6206,20 +6461,236 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------------------
+    // Review round S2-F2: `is_exhausted()` means every chunk was handed to *hyper*, not that
+    // every byte reached the *peer*. `start_delayed_read_remote` below is the deterministic,
+    // cross-platform way to exercise the gap between those two facts without depending on any
+    // particular OS/hyper buffering threshold (which the FORK-49 spike already established is
+    // non-deterministic even on one machine — see `WEDGED_UPLOAD_BODY_LEN`'s doc): a body small
+    // enough to fit inside *any* platform's default TCP send/receive window (a couple KB, far
+    // under even the smallest realistic default) gets fully accepted into the outgoing pipeline —
+    // and so reported "exhausted" by the client's own stream — almost instantly, regardless of
+    // whether the peer's *application* has read a single byte. The fixture's deliberate pause
+    // before it ever calls `read()` stands in for exactly the invisible, still-genuinely-
+    // happening work (an in-flight tail draining slowly) S2-F2 is about — the client cannot tell
+    // it apart from having actually reached the remote already, and must not be too impatient
+    // about it.
+    // -----------------------------------------------------------------------------------
+
+    /// Starts a remote that reads only the request headers immediately, then pauses for `delay`
+    /// *before touching the body at all*, then drains the body fully and answers `200 OK`. See
+    /// this section's own comment for why a small body plus this pause is a deterministic stand-in
+    /// for S2-F2's real failure (a slow-draining in-flight tail the client cannot observe).
+    fn start_delayed_read_remote(delay: std::time::Duration) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buffer = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let header_end = loop {
+                    if let Some(position) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break position + 4;
+                    }
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+                    }
+                };
+
+                let head = String::from_utf8_lossy(&buffer[..header_end]).to_string();
+                let content_length: usize = head.lines()
+                    .find(|line| line.to_ascii_lowercase().starts_with("content-length:"))
+                    .and_then(|line| line.split_once(':'))
+                    .and_then(|(_, value)| value.trim().parse().ok())
+                    .unwrap_or(0);
+
+                // Deliberately does not read a byte of the body yet — the client's own kernel
+                // and hyper's buffering will have already accepted a small body regardless.
+                std::thread::sleep(delay);
+
+                let mut received = buffer.len().saturating_sub(header_end);
+                while received < content_length {
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => received += n,
+                    }
+                }
+
+                let _ = write!(
+                    stream, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.flush();
+            }
+        });
+
+        url
+    }
+
+    /// `upload_object` must survive a remote that pauses before reading a small body — the
+    /// deterministic stand-in for S2-F2's real failure (see this section's own comment). A
+    /// verify-only phase-2 budget (`post_send_verify_budget` alone — the shape S2-F2 found too
+    /// tight) is far shorter than `delay` here and would fail this test; the real `phase2_budget`
+    /// (which folds the full send-phase allowance back in as flush margin, see
+    /// `send_with_watchdog`'s doc) comfortably covers it. This is exactly the test a fix that
+    /// only re-tightened `post_send_verify_budget`'s own constants — without folding the
+    /// send-phase allowance back in — would still fail.
+    #[test]
+    fn upload_object_survives_a_remote_that_pauses_before_reading_a_small_body() {
+        let body_len = 2 * 1024;
+        let verify_only_budget = post_send_verify_budget(body_len);
+        let phase2_budget = TEST_DIRECT_CONNECT_TIMEOUT + TEST_UPLOAD_SILENCE_BUDGET + verify_only_budget;
+        // Comfortably past the (too-tight) verify-only budget, comfortably short of the real
+        // phase-2 budget — the gap this test exists to probe.
+        let delay = verify_only_budget + std::time::Duration::from_secs(8);
+        assert!(
+            delay > verify_only_budget,
+            "delay must exceed the too-tight verify-only budget, or this doesn't prove anything \
+            about S2-F2 at all"
+        );
+        assert!(
+            delay < phase2_budget,
+            "delay must stay under the real phase-2 budget, or this is a timeout test in \
+            disguise rather than a \"must survive\" one"
+        );
+
+        let url = start_delayed_read_remote(delay);
+        let client = RemoteClient::new(&url, None).unwrap();
+        let hash = "f".repeat(64);
+        let body = vec![3u8; body_len];
+        let outer_ceiling = phase2_budget + std::time::Duration::from_secs(20);
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let outcome = runtime.block_on(async {
+            tokio::time::timeout(outer_ceiling, client.upload_object(&hash, body)).await
+        });
+
+        outcome
+            .unwrap_or_else(|_| panic!(
+                "upload_object hung past its own generous outer ceiling {:?}", outer_ceiling
+            ))
+            .unwrap_or_else(|e| panic!(
+                "a remote that is genuinely still working (just invisibly to the client) must \
+                not be treated as a stall: {}", e
+            ));
+    }
+
+    // -----------------------------------------------------------------------------------
+    // Review round S2-F5: `wrap_stream`'s body cannot be cloned to replay a redirect (verified
+    // against this pinned `reqwest`/`tower-http` version — see `describe_upload_redirect`'s doc),
+    // so a `3xx` a streamed upload receives is no longer followed the way the old
+    // `.body(Vec<u8>)` used to follow it. Pre-1.0 that behavior change needs no compatibility
+    // shim, but it must be loud and tested, not a silent fall-through to a generic "refused"
+    // message.
+    // -----------------------------------------------------------------------------------
+
+    /// A remote that reads a full request and answers with a redirect (`status`, `location`)
+    /// instead of a normal response — for proving a streamed upload surfaces it as a specific,
+    /// named error rather than following it silently or reporting a bare status code.
+    fn start_redirecting_remote(status: u16, location: &str) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let status = status;
+        let location = location.to_string();
+
+        std::thread::spawn(move || {
+            use std::io::Write;
+
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = read_test_request(&mut stream);
+                let reason = match status {
+                    301 => "Moved Permanently",
+                    302 => "Found",
+                    303 => "See Other",
+                    307 => "Temporary Redirect",
+                    308 => "Permanent Redirect",
+                    _ => "Redirect",
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {} {}\r\nLocation: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    status, reason, location
+                );
+                let _ = stream.flush();
+            }
+        });
+
+        url
+    }
+
+    /// `put_presigned` against a remote that answers a fully-received upload with a `307` must
+    /// surface a specific, named error — never silently retry elsewhere (it structurally cannot:
+    /// the body is a one-shot stream, already consumed) and never fall through to a bare "refused
+    /// (307)" that gives no hint a redirect was even involved. This is the "live case" review
+    /// round S2-F5 named: an S3 bucket reached via the wrong regional endpoint answers `PUT` with
+    /// exactly this shape.
+    #[test]
+    fn put_presigned_reports_a_redirect_by_name_instead_of_following_or_hiding_it() {
+        let location = "https://correct-region.example.com/bucket/key?X-Amz-Signature=redirected";
+        let url = start_redirecting_remote(307, location);
+        let client = RemoteClient::new(&url, None).unwrap();
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let error = runtime.block_on(client.put_presigned(&url, vec![1u8; 4096]))
+            .expect_err("a redirect must not appear to succeed");
+
+        assert!(
+            error.to_lowercase().contains("redirect"),
+            "must name what actually happened, not a bare status code: {}", error
+        );
+        assert!(
+            error.contains("307"),
+            "must name the actual status: {}", error
+        );
+        assert!(
+            error.contains(location),
+            "must surface the Location header so the caller can see exactly where the remote \
+            pointed, not just that a redirect happened: {}", error
+        );
+    }
+
+    /// `upload_object` gets the same treatment for consistency (it also rides `self.http`, which
+    /// allows redirects) even though its target — this module's own control plane — is not the
+    /// "live case" S2-F5 named; a lighter check than `put_presigned`'s since the mechanism
+    /// (`describe_upload_redirect`) is shared and already fully pinned there.
+    #[test]
+    fn upload_object_reports_a_redirect_by_name() {
+        let location = "https://elsewhere.example.com/v1/objects/moved";
+        let url = start_redirecting_remote(302, location);
+        let client = RemoteClient::new(&url, None).unwrap();
+        let hash = "a".repeat(64);
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let error = runtime.block_on(client.upload_object(&hash, vec![1u8; 4096]))
+            .expect_err("a redirect must not appear to succeed");
+
+        assert!(
+            error.to_lowercase().contains("redirect") && error.contains("302") && error.contains(location),
+            "must name the redirect, its status, and its target: {}", error
+        );
+    }
+
     /// Pins the exact wording [`RemoteClient::mutation_read_timeout_message`] produces — the
-    /// message the upload watchdog manufactures on a stall, with no `reqwest::Error` to hand
-    /// `classify` (a killed watchdog future is simply dropped, never polled to failure). Must
-    /// carry the mutation-uncertainty wording: a body-send stall means the request was, or may
-    /// have been, already underway to the remote, so the caller must never be told nothing
+    /// message the upload watchdog manufactures on a mid-body stall, with no `reqwest::Error` to
+    /// hand `classify` (a killed watchdog future is simply dropped, never polled to failure). Must
+    /// carry the mutation-uncertainty wording: a body-send stall means the request may, or may
+    /// not, have been already underway to the remote, so the caller must never be told nothing
     /// happened (the connect-timeout wording) or that the response merely never arrived (the read
-    /// path's own, non-mutation wording) — only that retrying converges.
+    /// path's own, non-mutation wording) — only that retrying converges. Must also *not* overclaim
+    /// (review round S2-F7): `silent_for()` is measured from before `send()` is even called, so
+    /// this can fire having pulled zero chunks — "the request was sent" would assert more than is
+    /// actually known.
     #[test]
     fn mutation_read_timeout_message_carries_the_uncertainty_wording() {
         let message = RemoteClient::mutation_read_timeout_message("uploading object aaaa");
 
         assert!(
-            message.contains("may have already completed on the remote"),
-            "must carry the mutation-uncertainty wording, not claim nothing happened: {}", message
+            message.contains("may or may not have fully reached the remote"),
+            "must carry the mutation-uncertainty wording, spanning the whole zero-to-full range \
+            (S2-F7), not claim nothing happened: {}", message
         );
         assert!(
             message.contains("retrying is safe"),
@@ -6229,6 +6700,44 @@ mod tests {
             !message.to_lowercase().contains("nothing was sent"),
             "a body-send stall means the request was (or may have been) partly sent — must never \
             claim nothing was sent, that is the connect-timeout wording: {}", message
+        );
+        assert!(
+            !message.contains("the request was sent"),
+            "must not overclaim full delivery when at most partial delivery is known (S2-F7): {}",
+            message
+        );
+    }
+
+    /// Pins the exact wording [`RemoteClient::mutation_post_send_timeout_message`] produces — the
+    /// message the upload watchdog manufactures on a *post-send* stall (review round S2-F1/S2-F7).
+    /// Distinct from the mid-body composer above: here every chunk really was handed to hyper, so
+    /// the message can (and must) say the remote may already have received, verified, and stored
+    /// the bytes — but it must still say only what's *locally observable* ("finished streaming …
+    /// the request body" — handed to hyper) rather than assert delivery ("the bytes are on the
+    /// wire" — S2-F2 found `is_exhausted()` does not mean that), and must name the actual budget
+    /// that governed rather than a vague phrase.
+    #[test]
+    fn mutation_post_send_timeout_message_carries_the_uncertainty_wording() {
+        let budget = std::time::Duration::from_secs(17);
+        let message = RemoteClient::mutation_post_send_timeout_message("uploading object aaaa", budget);
+
+        assert!(
+            message.contains("finished streaming the request body"),
+            "must state only the locally-observable fact (handed off to hyper), not a claim \
+            about what the remote received: {}", message
+        );
+        assert!(
+            message.contains("may already have received, verified, and stored the bytes"),
+            "must carry the mutation-uncertainty wording, properly hedged with \"may\": {}", message
+        );
+        assert!(
+            !message.contains("the bytes are on the wire"),
+            "must not overclaim active transmission — the peer may have read zero bytes if fully \
+            wedged, which is exactly what S2-F2 found `is_exhausted()` cannot rule out: {}", message
+        );
+        assert!(
+            message.contains(&format!("{:?}", budget)),
+            "must name the actual budget that governed, not a generic phrase: {}", message
         );
     }
 }
