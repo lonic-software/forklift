@@ -580,20 +580,32 @@ impl RemoteClient {
 
     /// Compose the client-facing message for a *transport* failure (one that never got as far as
     /// an HTTP status) on one of the four bounded read/metadata calls, distinguishing three cases
-    /// that `reqwest::Error`'s own `Display` cannot: a connect-phase timeout, a read/silence-phase
-    /// timeout, and everything else (a connection reset, a DNS failure, a refused connect). All
-    /// three otherwise print identically ("error sending request for url (...)"), because reqwest
-    /// only records the distinguishing detail in the error's `source()` chain, never in its own
-    /// message — `is_connect`/`is_timeout` walk that chain, so they, not the message text, decide.
+    /// that `reqwest::Error`'s own `Display` cannot: a connect-phase timeout, a read-phase timeout,
+    /// and everything else (a connection reset, a DNS failure, a refused connect). All three
+    /// otherwise print identically ("error sending request for url (...)"), because reqwest only
+    /// records the distinguishing detail in the error's `source()` chain, never in its own message
+    /// — `is_connect`/`is_timeout` walk that chain, so they, not the message text, decide.
     ///
     /// `is_connect()` comes first: a connect-phase failure is also `is_timeout() == true` when it
-    /// was `connect_timeout` that fired (FORK-49 F3 — verified: a black-holed SYN expires at
-    /// [`Self::connect_timeout`], not at `silence_budget`, so reporting it as read-silence would
-    /// name both the wrong bound and the wrong cause — nothing was ever silent if nothing ever
-    /// connected). `silence_budget` is the read-silence figure to name for whichever call this
-    /// is — [`REMOTE_READ_TIMEOUT`] for `fetch_info`/`fetch_signature`/`fetch_bundle_to`,
-    /// [`FETCH_OBJECT_READ_TIMEOUT`] for `fetch_object` — passed in rather than hardcoded so this
-    /// one function serves both budgets honestly.
+    /// was `connect_timeout` that fired, so it is named against [`Self::connect_timeout`] — the
+    /// bound that actually governed that phase — not against the read budget.
+    ///
+    /// The `is_timeout()` branch (FORK-49 F8, following F1): the client's `read_timeout` is not
+    /// `silence_budget` alone, it is [`bounded_read_timeout`]`(`[`Self::connect_timeout`]`,
+    /// silence_budget)` — connect budget *plus* silence budget (see that function's doc for why).
+    /// Reporting the raw `silence_budget` here, as an earlier version of this function did, names
+    /// a bound that is not the one that fired: on a Tor-routed remote that is 70s vs. the 10s this
+    /// used to print, a 7× understatement in exactly the number an operator would use to decide
+    /// whether to retry or raise a bound. This recomputes the same effective figure the client was
+    /// actually built with, so it can never drift from it independently. `silence_budget` is
+    /// passed in — [`REMOTE_READ_TIMEOUT`] for `fetch_info`/`fetch_signature`/`fetch_bundle_to`,
+    /// [`FETCH_OBJECT_READ_TIMEOUT`] for `fetch_object` — because it differs per call; only the
+    /// arithmetic combining it with `connect_timeout` belongs here, not the constant itself.
+    ///
+    /// Phrased as "did not respond within", not "went silent for `silence_budget`": `read_timeout`
+    /// is armed from request construction, before the connector is even polled, so the window this
+    /// names spans connect *and* send *and* wait — never claiming the whole window was silence,
+    /// which would be false whenever any part of it was spent connecting or sending.
     fn describe_transport_error(&self,
                                 action: &str,
                                 silence_budget: std::time::Duration,
@@ -604,9 +616,10 @@ impl RemoteClient {
                 action, self.connect_timeout
             )
         } else if e.is_timeout() {
+            let effective_budget = self.connect_timeout + silence_budget;
             format!(
-                "Timed out while {}: the remote went silent for {:?} without sending anything.",
-                action, silence_budget
+                "Timed out while {}: the remote did not respond within {:?}.",
+                action, effective_budget
             )
         } else {
             format!("Error while {}: {}", action, e)
@@ -4573,6 +4586,7 @@ mod tests {
     // -----------------------------------------------------------------------------------
 
     const TEST_DIRECT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    const TEST_TOR_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
     const TEST_TIGHT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
     const TEST_LOOSE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -4635,8 +4649,8 @@ mod tests {
     fn fetch_info_times_out_against_a_silent_remote() {
         let remote = SilentRemote::start();
         let client = RemoteClient::new(&remote.url, None).unwrap();
-        let hard_ceiling = TEST_DIRECT_CONNECT_TIMEOUT + TEST_TIGHT_READ_TIMEOUT
-            + std::time::Duration::from_secs(15);
+        let effective_budget = TEST_DIRECT_CONNECT_TIMEOUT + TEST_TIGHT_READ_TIMEOUT;
+        let hard_ceiling = effective_budget + std::time::Duration::from_secs(15);
 
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let outcome = runtime.block_on(async {
@@ -4655,6 +4669,12 @@ mod tests {
         assert!(
             message.to_lowercase().contains("timed out"),
             "must fail specifically with a timeout, not some other transport error: {}", message
+        );
+        // FORK-49 F8: the message must name the *effective* bound (connect + silence) that
+        // actually governs, not the raw silence budget alone.
+        assert!(
+            message.contains(&format!("{:?}", effective_budget)),
+            "must name the effective bound {:?}, not some other figure: {}", effective_budget, message
         );
     }
 
@@ -5070,5 +5090,118 @@ mod tests {
 
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         runtime.block_on(assert_still_running("fetch_info (Tor-routed)", check_after, client.fetch_info()));
+    }
+
+    /// A fixture SOCKS5 proxy that **completes the handshake honestly** — greeting, method
+    /// selection, and a successful `CONNECT` reply, per RFC 1928 — so the connector's own
+    /// `connect_timeout` enforcement is satisfied and the call moves past the connect phase
+    /// entirely, and only *then* parks, never forwarding a byte of the "target" response. Exists
+    /// to reach the read-silence branch specifically: unlike [`ParkingSocksProxy`] (which never
+    /// even finishes the handshake, so its silence is itself a connect-phase failure), this
+    /// proxy's silence happens strictly after connect — whatever fires next is `read_timeout`'s
+    /// own generic sleep, the branch FORK-49 F8 is about.
+    struct HandshakeCompletingSocksProxy {
+        addr: String,
+        _park: std::sync::mpsc::Sender<()>,
+    }
+
+    impl HandshakeCompletingSocksProxy {
+        fn start() -> HandshakeCompletingSocksProxy {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+
+            std::thread::spawn(move || {
+                use std::io::{Read, Write};
+
+                let Ok((mut stream, _)) = listener.accept() else { return };
+
+                // Greeting: VER(1) NMETHODS(1) METHODS(NMETHODS) — consume it, then unconditionally
+                // select "no auth" (0x00).
+                let mut header = [0u8; 2];
+                if stream.read_exact(&mut header).is_err() { return; }
+                let mut methods = vec![0u8; header[1] as usize];
+                if stream.read_exact(&mut methods).is_err() { return; }
+                if stream.write_all(&[0x05, 0x00]).is_err() { return; }
+
+                // CONNECT request: VER(1) CMD(1) RSV(1) ATYP(1) DST.ADDR DST.PORT(2) — the address
+                // form varies by ATYP; consume whichever the client actually sent.
+                let mut req_head = [0u8; 4];
+                if stream.read_exact(&mut req_head).is_err() { return; }
+                let address_read = match req_head[3] {
+                    0x01 => stream.read_exact(&mut [0u8; 4 + 2]),
+                    0x04 => stream.read_exact(&mut [0u8; 16 + 2]),
+                    0x03 => {
+                        let mut len = [0u8; 1];
+                        if stream.read_exact(&mut len).is_err() { return; }
+                        stream.read_exact(&mut vec![0u8; len[0] as usize + 2])
+                    }
+                    _ => return,
+                };
+                if address_read.is_err() { return; }
+
+                // Success reply: VER REP=0(succeeded) RSV ATYP=IPv4 BND.ADDR=0.0.0.0 BND.PORT=0 —
+                // a minimal but valid "the tunnel is up" answer.
+                if stream.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).is_err() { return; }
+
+                // Handshake genuinely done — now park, never reading or answering the tunneled
+                // HTTP request that follows.
+                let _ = rx.recv();
+                drop(stream);
+            });
+
+            HandshakeCompletingSocksProxy { addr, _park: tx }
+        }
+    }
+
+    /// FORK-49 F8: the timed-out message must name the *effective* bound (connect + silence) that
+    /// actually governs the client, not the raw silence constant alone — reintroduced by F1's own
+    /// fix, since `bounded_read_timeout` changed what the client is actually configured with
+    /// without `describe_transport_error` being updated to match. The gap is widest, and nothing
+    /// before this test checked it, on a Tor-routed remote: the effective bound is 70s (60s Tor
+    /// connect + 10s silence), not the 10s an earlier version of the message printed regardless of
+    /// transport. Uses [`HandshakeCompletingSocksProxy`], not [`ParkingSocksProxy`]: this test
+    /// needs the failure to land specifically in the read-silence branch, which requires connect
+    /// to have genuinely succeeded first.
+    #[test]
+    fn fetch_info_message_names_the_effective_tor_bound() {
+        let proxy = HandshakeCompletingSocksProxy::start();
+        let tor = TorSettings { mode: TorMode::On, proxy: format!("socks5h://{}", proxy.addr) };
+        let client = RemoteClient::new_with_tor(
+            "http://forklift-fork-49-tor-message-test.invalid", None, tor,
+        ).unwrap();
+
+        let effective_budget = TEST_TOR_CONNECT_TIMEOUT + TEST_TIGHT_READ_TIMEOUT;
+        let hard_ceiling = effective_budget + std::time::Duration::from_secs(20);
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let outcome = runtime.block_on(async {
+            tokio::time::timeout(hard_ceiling, client.fetch_info()).await
+        });
+
+        let inner = outcome.unwrap_or_else(|_| panic!(
+            "fetch_info hung past the test's own {:?} ceiling — no timeout fired at all",
+            hard_ceiling
+        ));
+        let message = match inner {
+            Err(message) => message,
+            Ok(_) => panic!("a parked proxy must not appear to succeed"),
+        };
+
+        assert!(
+            message.to_lowercase().contains("timed out"),
+            "must fail specifically with a timeout: {}", message
+        );
+        assert!(
+            !message.to_lowercase().contains("could not connect"),
+            "must land in the read-silence branch, not the connect branch — the SOCKS handshake \
+            completed successfully in this fixture: {}", message
+        );
+        assert!(
+            message.contains(&format!("{:?}", effective_budget)),
+            "must name the effective Tor bound {:?} (60s connect + 10s silence), not some other \
+            figure — an operator on an onion remote needs the real number to decide whether to \
+            retry or raise a bound: {}", effective_budget, message
+        );
     }
 }
