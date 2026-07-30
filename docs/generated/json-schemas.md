@@ -3520,8 +3520,11 @@ A command not listed here either reports only the generic human-message shape `{
           "type": "string"
         },
         "subject_absent": {
-          "description": "Whether the subject parcel is not present in this store (never fetched here, or\ncollected after nothing else referenced it — see `tag_utils::require_subject_present`).\nSkip-serialized when `false` so the common row shape is unchanged; `tag show` refuses\noutright instead of ever setting this, so it is a `list`-only signal.",
-          "type": "boolean"
+          "description": "Whether the subject parcel is not present in this store (never fetched here, or\ncollected after nothing else referenced it — see [`probe_subject_absent`]). `Some(true)`\nwhen absent, `None` when present — never `Some(false)` — so the common row/render shape\n(subject present) is unchanged; matches the [`Option`] + `skip_serializing_if` pattern\n`tagger_role` above already uses, which a plain `bool` cannot: a `bool` field is always\npresent in the schema's `required` list regardless of `skip_serializing_if`, so it would\ndeclare a field the common case never actually emits.",
+          "type": [
+            "boolean",
+            "null"
+          ]
         },
         "tagged_at": {
           "description": "The tag creation time as RFC 3339 (UTC).",
@@ -3552,8 +3555,7 @@ A command not listed here either reports only the generic human-message shape `{
         "message",
         "tagger",
         "tagged_at",
-        "parcel",
-        "subject_absent"
+        "parcel"
       ],
       "type": "object"
     }
@@ -3599,8 +3601,11 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "string"
     },
     "subject_absent": {
-      "description": "Whether the subject parcel is not present in this store (never fetched here, or\ncollected after nothing else referenced it — see `tag_utils::require_subject_present`).\nSkip-serialized when `false` so the common row shape is unchanged; `tag show` refuses\noutright instead of ever setting this, so it is a `list`-only signal.",
-      "type": "boolean"
+      "description": "Whether the subject parcel is not present in this store (never fetched here, or\ncollected after nothing else referenced it — see [`probe_subject_absent`]). `Some(true)`\nwhen absent, `None` when present — never `Some(false)` — so the common row/render shape\n(subject present) is unchanged; matches the [`Option`] + `skip_serializing_if` pattern\n`tagger_role` above already uses, which a plain `bool` cannot: a `bool` field is always\npresent in the schema's `required` list regardless of `skip_serializing_if`, so it would\ndeclare a field the common case never actually emits.",
+      "type": [
+        "boolean",
+        "null"
+      ]
     },
     "tagged_at": {
       "description": "The tag creation time as RFC 3339 (UTC).",
@@ -3631,8 +3636,7 @@ A command not listed here either reports only the generic human-message shape `{
     "message",
     "tagger",
     "tagged_at",
-    "parcel",
-    "subject_absent"
+    "parcel"
   ],
   "title": "TagView",
   "type": "object"

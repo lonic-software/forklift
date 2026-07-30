@@ -615,12 +615,16 @@ the current pallet's head.
 
 A tag's subject is nothing more than a parcel hash: if the parcel was never fetched here,
 or was collected because nothing else referenced it (e.g. after an `undo` moved the only
-pallet head off it), the hash still exists in the record but the parcel is gone. `tag show`
-refuses (`tag_subject_absent`, exit 22) rather than print a dead hash as though it were
-live; the message names the parcel, and `lower` the pallet that still holds it is the only
-way back. `tag list` still succeeds — a listing is not a claim about one referent, and a
-sparse or franchised store can legitimately hold `@tags` without every subject's pallet —
-but marks the affected row instead of rendering it identically to a live tag.
+pallet head off it), the hash still exists in the record but the parcel is gone. Both
+causes leave the identical local state, so nothing on disk can tell them apart — and a
+sparse or franchised clone can hit the "never fetched" case in perfectly ordinary use
+(cloning `--only` one pallet still adopts every tag, including ones cut on pallets it never
+fetched). Rather than refuse over a state that is often entirely healthy, both `tag show`
+and `tag list` probe the subject and **mark**, not fail: `tag show` still renders the tag in
+full — every field it prints comes from the tag record itself, never the subject — and adds
+a `warning:` line naming the parcel; `tag list` appends `(subject not in this store)` to the
+row. Either way the exit code stays `0`; only an actual read failure while probing (an I/O
+error, never a definite answer) fails the command.
 
 ### `haul` — pull requests (reviewable merge proposals)
 

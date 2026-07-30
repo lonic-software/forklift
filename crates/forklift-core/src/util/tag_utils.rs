@@ -17,14 +17,13 @@ use toml_edit::{value, DocumentMut};
 use crate::builder::object::loose_object_builder::LooseObjectBuilder;
 use crate::enums::dir_entry_type::DirEntryType;
 use crate::enums::parcel_action_type::ParcelActionType;
-use crate::error::{CoreError, RefusalCode};
 use crate::model::blob::Blob;
 use crate::model::operator::Operator;
 use crate::model::parcel::Parcel;
 use crate::model::parcel_action::ParcelAction;
 use crate::model::tree_item::TreeItem;
 use chrono::Utc;
-use crate::util::{file_utils, object_utils, office_utils, pallet_utils, sign_utils};
+use crate::util::{object_utils, office_utils, pallet_utils, sign_utils};
 
 /// The name of the tags meta pallet. Lives in the meta namespace, so it is reached as
 /// `@tags` and reserves no user pallet name (DESIGN.html §3.3).
@@ -39,11 +38,6 @@ const TREE_NAME_TAGS: &str = "tags";
 
 /// The filename suffix of a stored tag record blob.
 const RECORD_SUFFIX: &str = ".toml";
-
-/// The stable code string for [`RefusalCode::TagSubjectAbsent`], re-exported so a head can
-/// match on it without importing `RefusalCode` itself — the same convention
-/// `load_guard_utils::CODE_INCOMPLETE_LOAD` and its siblings use.
-pub const CODE_TAG_SUBJECT_ABSENT: &str = RefusalCode::TagSubjectAbsent.as_str();
 
 /// One signed tag: a named pointer at a subject parcel. Carries no tagger field — the
 /// tagger is the signer of the parcel that introduces it (resolved by [`read_tags`]), which
@@ -167,51 +161,6 @@ pub fn read_tags() -> Result<Vec<AttributedTag>, String> {
 /// * `Err(String)`             - If an object could not be read.
 pub fn find_tag(name: &str) -> Result<Option<AttributedTag>, String> {
     Ok(read_tags()?.into_iter().find(|attributed| attributed.tag.name == name))
-}
-
-/// Confirm a tag's subject parcel is actually present in this store, and build the refusal if
-/// not. A tag is a bare parcel hash (see [`Tag::subject`]) that the GC mark walk (`gc_utils`)
-/// does not root, so `undo` moving a pallet head back past it, or the parcel simply never
-/// having been fetched here, can leave the hash pointing at nothing.
-///
-/// This is the head's `tag show` refusal-builder: a caller about to treat the subject as live
-/// calls this and propagates `Err` outright, never rendering the dangling hash as though it
-/// were real. `tag list` asks the same underlying presence question (`file_utils::
-/// does_object_exist`) directly instead, because a list degrades a row rather than refuses the
-/// whole command, and a plain `bool` — not a ready-built refusal it would just discard — is
-/// what a degrade needs; the two call sites answer the same question through the same probe,
-/// they just do different things with a negative answer.
-///
-/// # Arguments
-/// * `tag` - The tag whose subject to check.
-///
-/// # Returns
-/// * `Ok(())`         - If the subject parcel is present.
-/// * `Err(CoreError)` - `TagSubjectAbsent` if it is not, or `Other` if presence could not be
-///                       determined at all.
-pub fn require_subject_present(tag: &Tag) -> Result<(), CoreError> {
-    let present = file_utils::does_object_exist(&tag.subject).map_err(CoreError::Other)?;
-
-    if present {
-        return Ok(());
-    }
-
-    let next_step = format!(
-        "If a remote or another copy of this warehouse still holds parcel {}, lower the \
-        pallet that contains it to restore it; otherwise the tagged parcel is unrecoverable.",
-        tag.subject
-    );
-
-    Err(CoreError::refusal(
-        RefusalCode::TagSubjectAbsent,
-        format!(
-            "Tag \"{}\" points at parcel {}, but that parcel is not in this store. It may \
-            never have been fetched here, or it may have been collected after nothing else \
-            referenced it.",
-            tag.name, tag.subject
-        ),
-        next_step,
-    ))
 }
 
 /// The operator who authored a tag parcel: the owner of the key that signed it.

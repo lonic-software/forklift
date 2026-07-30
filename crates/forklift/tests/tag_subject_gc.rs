@@ -4,10 +4,15 @@
 //! `pre_head` (journal_utils.rs:191), so tagging a parcel and then undoing the stack that
 //! created it leaves the tag's subject reachable from no ref at all — and gc collects it.
 //!
-//! This needs no pallet-deletion verb, which is why it is a live defect: `tag show` then names
-//! an absent parcel with a success exit — a silent misread. The settled fix is a presence check
-//! at the reader (`tag_utils::require_subject_present`), not rooting the subject; see
-//! `tag_utils.rs` and `gc_utils.rs` for why rooting was refuted.
+//! This needs no pallet-deletion verb, which is why it is a live defect: `tag show` used to name
+//! an absent parcel with a success exit and no marker at all — a silent misread. The settled fix
+//! is a presence *probe* at the reader (`crate::commands::tag::probe_subject_absent`), not
+//! rooting the subject (see `tag_utils.rs` and `gc_utils.rs` for why rooting was refuted) — and
+//! not a refusal either: `show` renders and marks rather than refuses, because "collected here"
+//! and "never fetched here" are the same local state, and a sparse or franchised clone
+//! legitimately holds tags whose subject it never fetched. Only `list`'s presence probe failing
+//! outright (an indeterminate answer, never a definite one) is still an ordinary command error —
+//! see the second test below.
 //!
 //! This file is trimmed from a shared spike (`boundary_gc.rs`, on another branch) down to the
 //! tag leg and the harness it actually needs; the anchor-boundary legs are FORK-81's evidence
@@ -129,12 +134,15 @@ fn assert_the_sweep_ran(warehouse: &Warehouse, canary: &str, deleted: usize) {
 ///
 /// Builds the state `undo` produces (a tag whose subject a pallet head no longer reaches), runs
 /// gc over it, and checks both the object store (the subject is gone) and every reader surface
-/// FORK-79 touches: `tag show` (must refuse, naming the hash, exit 22), the same over `--json`
-/// (the envelope must carry the stable code string), and `tag list` (must still succeed, but
-/// mark the row).
+/// FORK-79 touches: `tag show` (must still succeed — exit 0 — but render a warning naming the
+/// hash), the same over `--json` (the envelope must carry `subject_absent: true`), and `tag
+/// list` (must still succeed, and mark the row).
 ///
-/// Pin the code string and the hash — never prose adjectives like "missing" — so wording can be
-/// tuned without reddening this test.
+/// Assertions pin the hash and the structured `subject_absent` field — never prose adjectives
+/// like "missing" — so wording can be tuned without reddening this test. The `show` legs assert
+/// on the marker itself, not just the exit code: an exit-0 assertion alone would pass against a
+/// completely unmarked render, which is exactly the silent-misread shape this ticket exists to
+/// remove.
 #[test]
 fn a_signed_tag_subject_is_collected_after_undo_moves_the_head_back() {
     let warehouse = Warehouse::new("tag");
@@ -169,7 +177,9 @@ fn a_signed_tag_subject_is_collected_after_undo_moves_the_head_back() {
         "the tag's subject survived — the fixture is wrong (this must hold regardless of the fix)"
     );
 
-    // `tag show` must refuse: exit 22 specifically (not merely non-zero), naming the hash.
+    // `tag show` must still succeed — exit 0 — over a collected subject: refusing would
+    // over-fire on a healthy sparse/franchised clone that never fetched this pallet at all (see
+    // the module doc comment). It must still name the hash and mark it, not render it silently.
     let show = warehouse.run(&["tag", "show", "v1.0"]);
     let show_stdout = String::from_utf8_lossy(&show.stdout).to_string();
     let show_stderr = String::from_utf8_lossy(&show.stderr).to_string();
@@ -179,36 +189,41 @@ fn a_signed_tag_subject_is_collected_after_undo_moves_the_head_back() {
         show.status.code(), show_stdout.trim(), show_stderr.trim()
     );
 
-    assert_eq!(
-        show.status.code(), Some(22),
-        "`tag show` over a collected subject must exit 22 (TagSubjectAbsent); stdout: {} / \
-        stderr: {}",
+    assert!(
+        show.status.success(),
+        "`tag show` over a collected subject must still exit 0 (a marked render, not a \
+        refusal); stdout: {} / stderr: {}",
         show_stdout, show_stderr
     );
+    // The defining assertion: the marker itself, not just the exit code — an exit-0 assertion
+    // alone would pass against a completely unmarked render (the silent misread this ticket
+    // exists to remove).
     assert!(
-        show_stderr.contains(&tagged) || show_stdout.contains(&tagged),
-        "the refusal must name the absent subject hash {} verbatim; stdout: {} / stderr: {}",
-        tagged, show_stdout, show_stderr
+        show_stdout.to_lowercase().contains("warning") && show_stdout.contains(&tagged),
+        "the render must carry a warning naming the absent subject hash {} verbatim; stdout: {}",
+        tagged, show_stdout
     );
 
-    // The same refusal over `--json`: the envelope must carry the stable code string — this
-    // pins the public machine contract, not just the human prose.
+    // The same render over `--json`: the envelope must carry `subject_absent: true` — this pins
+    // the public machine contract, not just the human prose.
     let show_json = warehouse.run(&["--json", "tag", "show", "v1.0"]);
     let show_json_stdout = String::from_utf8_lossy(&show_json.stdout).to_string();
+    let show_json_value: serde_json::Value =
+        serde_json::from_str(&show_json_stdout).expect("tag show --json must parse");
 
     println!(
         "TAG: `--json tag show v1.0` exit = {:?}; stdout = {}",
         show_json.status.code(), show_json_stdout.trim()
     );
 
-    assert_eq!(show_json.status.code(), Some(22), "the --json leg must also exit 22");
-    assert!(
-        show_json_stdout.contains("tag_subject_absent"),
-        "the --json envelope must carry the stable code \"tag_subject_absent\"; stdout: {}",
+    assert!(show_json.status.success(), "the --json leg must also exit 0");
+    assert_eq!(
+        show_json_value["data"]["subject_absent"], serde_json::Value::Bool(true),
+        "the --json envelope must carry subject_absent: true; stdout: {}",
         show_json_stdout
     );
-    assert!(
-        show_json_stdout.contains(&tagged),
+    assert_eq!(
+        show_json_value["data"]["subject"], serde_json::Value::String(tagged.clone()),
         "the --json envelope must also carry the absent subject hash {}; stdout: {}",
         tagged, show_json_stdout
     );

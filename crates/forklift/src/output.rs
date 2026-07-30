@@ -16,7 +16,7 @@
 use std::sync::OnceLock;
 use serde::Serialize;
 use forklift_core::error::{CoreError, RefusalCode};
-use forklift_core::util::{heal_utils, load_guard_utils, merge_utils, query_utils, scope_utils, tag_utils};
+use forklift_core::util::{heal_utils, load_guard_utils, merge_utils, query_utils, scope_utils};
 
 /// The output schema version, carried on every JSON envelope as `forklift_json`.
 /// It changes only when the envelope or a command's `data` shape changes
@@ -300,10 +300,6 @@ error_codes! {
     /// own (a vanished, unreadable, or corrupt object, or a torn taint record) and refused rather
     /// than silently trust unproven state.
     DurabilityTaint,
-
-    /// A tag points at a parcel this store does not hold: never fetched here, or collected
-    /// after `undo` moved a pallet head back past it and nothing else referenced it.
-    TagSubjectAbsent,
 }
 
 impl ErrorCode {
@@ -329,7 +325,6 @@ impl ErrorCode {
             ErrorCode::EmptyHistory => "empty_history",
             ErrorCode::IncompleteLoad => load_guard_utils::CODE_INCOMPLETE_LOAD,
             ErrorCode::DurabilityTaint => heal_utils::CODE_DURABILITY_TAINT,
-            ErrorCode::TagSubjectAbsent => tag_utils::CODE_TAG_SUBJECT_ABSENT,
         }
     }
 
@@ -357,7 +352,6 @@ impl ErrorCode {
             ErrorCode::EmptyHistory => 19,
             ErrorCode::IncompleteLoad => 20,
             ErrorCode::DurabilityTaint => 21,
-            ErrorCode::TagSubjectAbsent => 22,
         }
     }
 
@@ -402,8 +396,6 @@ impl ErrorCode {
             ErrorCode::DurabilityTaint =>
                 "A durability taint could not be auto-healed (a vanished, unreadable, or \
                  corrupt path, or a torn taint record)",
-            ErrorCode::TagSubjectAbsent =>
-                "A tag points at a parcel this store does not hold (never fetched, or collected)",
         }
     }
 
@@ -428,7 +420,6 @@ impl ErrorCode {
             RefusalCode::QueryPredicateInvalid => ErrorCode::QueryPredicateInvalid,
             RefusalCode::IncompleteLoad => ErrorCode::IncompleteLoad,
             RefusalCode::DurabilityTaint => ErrorCode::DurabilityTaint,
-            RefusalCode::TagSubjectAbsent => ErrorCode::TagSubjectAbsent,
         }
     }
 }

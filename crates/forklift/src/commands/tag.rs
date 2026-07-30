@@ -96,23 +96,12 @@ async fn create(name: &str, revision: Option<String>, message: Option<String>) -
 /// List every tag, attributed to its (forge-proof) tagger.
 ///
 /// A list is an enumeration, not a claim about one referent — a franchised or sparse store
-/// legitimately holds `@tags` without every subject's pallet, so a *definitively* absent
-/// subject degrades the row (`subject_absent`) rather than fails the command; failing would
-/// brick listing on a store working exactly as designed. A probe that could not answer at all
-/// is a different question, though: e.g. an I/O error reading the loose-object path (an
-/// unreadable fan-out directory is the reachable, tested case — see
-/// `tag_list_fails_loudly_rather_than_mislabeling_a_subject_it_could_not_probe`).
-/// `file_utils::does_object_exist` also consults a durability-taint gate, which can likewise
-/// turn "present?" into "unknown", but that gate is process-local (only a write *this* process
-/// performed and failed to sync ever sets it — `taint_utils::gate_check`'s own doc comment), so
-/// it is not reachable from this read-only command's own process; a disk-recorded taint from an
-/// earlier run is instead intercepted by `main.rs`'s entry-heal chokepoint before `list` ever
-/// runs at all. Either way, an indeterminate probe is propagated as an ordinary command failure
-/// rather than folded into `subject_absent`, which must stay a *definite* claim (the project's
-/// own rule against silently guessing at an unknown). Probes directly
-/// (`file_utils::does_object_exist`) rather than through [`tag_utils::require_subject_present`],
-/// which only ever returns a bool or a fully-built `show` refusal — never the bare "could not
-/// determine" this needs to tell apart.
+/// legitimately holds `@tags` without every subject's pallet (see [`probe_subject_absent`]), so
+/// a *definitively* absent subject degrades the row (`subject_absent`) rather than fails the
+/// command; failing would brick listing on a store working exactly as designed. An
+/// *indeterminate* probe is a different question and is propagated as an ordinary command
+/// failure instead — see [`probe_subject_absent`] for why, and for the one case that is
+/// actually reachable here.
 async fn list() -> Result<(), String> {
     let tags = tag_utils::read_tags()?;
 
@@ -122,7 +111,7 @@ async fn list() -> Result<(), String> {
 
     let entries = tags.iter()
         .map(|attributed| {
-            let subject_absent = !file_utils::does_object_exist(&attributed.tag.subject)?;
+            let subject_absent = probe_subject_absent(&attributed.tag.subject)?;
 
             Ok(TagView::of(attributed, &names, &office, subject_absent))
         })
@@ -134,23 +123,53 @@ async fn list() -> Result<(), String> {
 }
 
 /// Show one tag in full, verifying that it is signed against the office chain.
+///
+/// Renders even when the subject is absent — it does not refuse. `franchise`'s
+/// `adopt_meta_pallets` brings `@tags` over in full while `fetch_history_scoped` fetches only
+/// the resolved pallet's history (and a sparse `--only` franchise deliberately skips the
+/// whole-store bundle that would otherwise mask this), so a perfectly healthy `--only` clone
+/// legitimately holds tags whose subject was cut on a pallet it never fetched — and every field
+/// this renders (name, message, tagger, date) comes straight from the `@tags` record itself,
+/// never from the subject object. A hash-shaped local state cannot distinguish "collected here
+/// after nothing else referenced it" from "never fetched here" — gc keeps no tombstone and
+/// there is no fetch ledger — so a refusal would have to fire on both, including the healthy
+/// one; marking the row instead of refusing is what stays honest without over-firing on a store
+/// working exactly as designed. See [`probe_subject_absent`] for the probe itself.
 async fn show(name: &str) -> Result<(), String> {
     let attributed = tag_utils::find_tag(name)?
         .ok_or(format!("No tag named \"{}\" exists.", name))?;
 
-    // Nothing roots a tag subject (deliberately — see `tag_utils::require_subject_present`), so
-    // `undo` or a never-completed fetch can leave it dangling; refuse rather than show a dead
-    // hash as though it were live.
-    tag_utils::require_subject_present(&attributed.tag)?;
+    let subject_absent = probe_subject_absent(&attributed.tag.subject)?;
 
     let names = remote_utils::resolve_office_display_names().await;
     let office = office_utils::read_office_state()
         .unwrap_or(OfficeState { users: Vec::new(), keys: Vec::new() });
 
-    // Presence was already confirmed above; the tag is live here by construction.
-    output::emit("tag", &TagView::of(&attributed, &names, &office, false));
+    output::emit("tag", &TagView::of(&attributed, &names, &office, subject_absent));
 
     Ok(())
+}
+
+/// Whether a tag's subject parcel is absent from this store, probed directly
+/// (`file_utils::does_object_exist`) rather than assumed from anything else. Shared by `list`
+/// (degrades a row) and `show` (marks a full render) — see each for what it does with a
+/// definite `true`.
+///
+/// An indeterminate probe — `does_object_exist` returned `Err`, so presence could not be
+/// determined at all — is a different question from a definite absence and is propagated as an
+/// ordinary command failure rather than reported as `true`; the reachable, tested case is a
+/// plain I/O error reading the loose-object path (see
+/// `tag_list_fails_loudly_rather_than_mislabeling_a_subject_it_could_not_probe`).
+/// `does_object_exist` also consults a durability-taint gate, a second real source of the same
+/// kind of failure *in that function*, but it is not reachable from here: the gate is
+/// process-local, set only by a write *this same process* performed and failed to sync
+/// (`taint_utils::gate_check`'s own doc comment) — and nothing in `tag`'s own commands writes
+/// before this probe runs, so no such write is ever this process's to have failed. A
+/// disk-recorded taint left standing by an earlier process is instead intercepted by
+/// `main.rs`'s entry-heal chokepoint before any command's body — including this probe's — ever
+/// runs.
+fn probe_subject_absent(subject: &str) -> Result<bool, String> {
+    Ok(!file_utils::does_object_exist(subject)?)
 }
 
 /// The result of creating a tag.
@@ -196,7 +215,8 @@ impl CommandOutput for TagList {
                 .map(|line| format!("  {}", line))
                 .unwrap_or_default();
 
-            let absent_marker = if tag.subject_absent { "  (subject not in this store)" } else { "" };
+            let absent_marker =
+                if tag.subject_absent == Some(true) { "  (subject not in this store)" } else { "" };
 
             println!(
                 "{:<width$}  {}  by {}{}{}",
@@ -243,11 +263,14 @@ pub(crate) struct TagView {
     parcel: String,
 
     /// Whether the subject parcel is not present in this store (never fetched here, or
-    /// collected after nothing else referenced it — see `tag_utils::require_subject_present`).
-    /// Skip-serialized when `false` so the common row shape is unchanged; `tag show` refuses
-    /// outright instead of ever setting this, so it is a `list`-only signal.
-    #[serde(skip_serializing_if = "is_false")]
-    subject_absent: bool,
+    /// collected after nothing else referenced it — see [`probe_subject_absent`]). `Some(true)`
+    /// when absent, `None` when present — never `Some(false)` — so the common row/render shape
+    /// (subject present) is unchanged; matches the [`Option`] + `skip_serializing_if` pattern
+    /// `tagger_role` above already uses, which a plain `bool` cannot: a `bool` field is always
+    /// present in the schema's `required` list regardless of `skip_serializing_if`, so it would
+    /// declare a field the common case never actually emits.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subject_absent: Option<bool>,
 }
 
 impl TagView {
@@ -270,7 +293,7 @@ impl TagView {
             tagger_role,
             tagged_at: render_timestamp(attributed.tag.tagged_at),
             parcel: attributed.parcel.clone(),
-            subject_absent,
+            subject_absent: subject_absent.then_some(true),
         }
     }
 
@@ -289,6 +312,21 @@ impl CommandOutput for TagView {
     fn render_human(&self) {
         println!("tag {}", self.name);
         println!("subject {}", self.subject);
+
+        // A dedicated line, not a losable suffix on the subject line — `show` is a full render,
+        // not a one-line row, so it can afford (and owes the reader) the longer, honest form.
+        // Offers no command: there is no shipped verb that fetches history for a pallet with no
+        // local ref (`shift` to an unreffed pallet refuses, and `lower` takes no pallet
+        // argument), so naming one would be unexecutable advice.
+        if self.subject_absent == Some(true) {
+            println!(
+                "warning: parcel {} is not in this store — never fetched here, or collected \
+                after nothing else referenced it. Another copy of this warehouse may still \
+                hold it; this store cannot restore it by itself.",
+                self.subject
+            );
+        }
+
         println!("tagger  {}", self.tagger_label());
         println!("date    {}", render_display_date(&self.tagged_at));
 
@@ -300,12 +338,6 @@ impl CommandOutput for TagView {
             }
         }
     }
-}
-
-/// Whether a subject-absence flag is `false` (for skipping it in the JSON envelope, so the
-/// common row shape — subject present — is unchanged).
-fn is_false(flag: &bool) -> bool {
-    !*flag
 }
 
 /// Render a Unix timestamp as RFC 3339 (UTC), the JSON form.

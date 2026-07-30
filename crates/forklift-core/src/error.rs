@@ -171,12 +171,6 @@ refusal_codes! {
     /// vanished, failed to read back, no longer matched their own content hash, or the taint's own
     /// record was itself incomplete (torn). The taint is left standing in every case.
     DurabilityTaint => "durability_taint",
-
-    /// A tag's subject parcel is not present in this store: never fetched here, or collected
-    /// after `undo` moved a pallet head back past it and nothing else referenced it. Rooting
-    /// the subject is deliberately not the fix (see `tag_utils::require_subject_present`); a
-    /// reader refuses rather than print a dangling hash as though it were live.
-    TagSubjectAbsent => "tag_subject_absent",
 }
 
 impl RefusalCode {
