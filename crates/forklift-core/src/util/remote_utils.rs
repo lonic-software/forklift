@@ -265,9 +265,9 @@ const REMOTE_CONNECT_TIMEOUT_TOR: std::time::Duration = std::time::Duration::fro
 /// pre-first-byte work** — it does not get the resets-on-progress behavior at all, because there
 /// is nothing yet to make progress on, **and it is armed and checked from the moment the request
 /// is constructed, before the connector is even polled** — so it covers DNS/TCP/TLS/SOCKS too, not
-/// just the body (FORK-49 F1: measured empirically against this exact reqwest version — a client
-/// built with `connect_timeout(60s)` + `read_timeout(3s)` against a black-holed address failed at
-/// 3.002s, not 60s). That is why this is carried by only three of the module's read/metadata calls
+/// just the body (measured empirically against this exact reqwest version — a client built with
+/// `connect_timeout(60s)` + `read_timeout(3s)` against a black-holed address failed at 3.002s,
+/// not 60s). That is why this is carried by only three of the module's read/metadata calls
 /// — [`RemoteClient::fetch_info`], [`RemoteClient::fetch_signature`],
 /// [`RemoteClient::fetch_bundle_to`] — each of whose server side does O(constant) work (a single
 /// lookup, or serving an already-built file) before writing anything, so a flat 10s pre-first-byte
@@ -320,8 +320,8 @@ const FETCH_OBJECT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// client instance actually uses and the post-connect silence budget intended for it
 /// ([`REMOTE_READ_TIMEOUT`] or [`FETCH_OBJECT_READ_TIMEOUT`]).
 ///
-/// Simply using `silence_budget` as the client's `read_timeout` is the FORK-49 F1 bug: that sleep
-/// is armed and checked before the connector is even polled (see [`REMOTE_READ_TIMEOUT`]'s doc),
+/// Simply using `silence_budget` as the client's `read_timeout` is a bug: that sleep is armed and
+/// checked before the connector is even polled (see [`REMOTE_READ_TIMEOUT`]'s doc),
 /// so it would preempt a legitimately slow connect — most sharply for a Tor dial, whose circuit
 /// build can take tens of seconds under [`REMOTE_CONNECT_TIMEOUT_TOR`], far longer than a bare 10s
 /// or even 60s silence budget would tolerate. Adding the connect budget in first guarantees the
@@ -464,8 +464,8 @@ impl RemoteClient {
         let mut no_redirect = reqwest::Client::builder()
             .connect_timeout(connect_timeout)
             .redirect(reqwest::redirect::Policy::none());
-        // FORK-49 F1: `read_timeout` is armed and checked before the connector is even polled, so
-        // using the raw silence budget here would let it preempt this exact `connect_timeout` —
+        // `read_timeout` is armed and checked before the connector is even polled, so using the
+        // raw silence budget here would let it preempt this exact `connect_timeout` —
         // `bounded_read_timeout` adds it in first so the connect phase always gets its full
         // allowance regardless of which budget (direct or Tor) applies to this instance.
         let mut bounded_reads = reqwest::Client::builder()
@@ -590,8 +590,8 @@ impl RemoteClient {
     /// was `connect_timeout` that fired, so it is named against [`Self::connect_timeout`] — the
     /// bound that actually governed that phase — not against the read budget.
     ///
-    /// The `is_timeout()` branch (FORK-49 F8, following F1): the client's `read_timeout` is not
-    /// `silence_budget` alone, it is [`bounded_read_timeout`]`(`[`Self::connect_timeout`]`,
+    /// The `is_timeout()` branch: the client's `read_timeout` is not `silence_budget` alone, it is
+    /// [`bounded_read_timeout`]`(`[`Self::connect_timeout`]`,
     /// silence_budget)` — connect budget *plus* silence budget (see that function's doc for why).
     /// Reporting the raw `silence_budget` here, as an earlier version of this function did, names
     /// a bound that is not the one that fired: on a Tor-routed remote that is 70s vs. the 10s this
@@ -1104,7 +1104,7 @@ impl RemoteClient {
     /// never be treated as a stall.
     ///
     /// Downloads to a fresh temp file beside `path` and only renames it into place once every
-    /// chunk has landed (FORK-49 F6): `path` is this warehouse's *own* latest bundle, which
+    /// chunk has landed: `path` is this warehouse's *own* latest bundle, which
     /// `forklift serve` would otherwise hand out as-is, and any mid-download failure — the new
     /// timeout very much included — must never leave a truncated file sitting at the real name. A
     /// failure at any point during the download removes the temp file and leaves whatever bundle
@@ -4643,8 +4643,8 @@ mod tests {
         }
     }
 
-    /// FORK-49 T1: `fetch_info` against a remote that connects and then never writes anything
-    /// must fail with a timeout — not hang forever, and not fail for some unrelated reason.
+    /// `fetch_info` against a remote that connects and then never writes anything must fail with
+    /// a timeout — not hang forever, and not fail for some unrelated reason.
     #[test]
     fn fetch_info_times_out_against_a_silent_remote() {
         let remote = SilentRemote::start();
@@ -4670,17 +4670,17 @@ mod tests {
             message.to_lowercase().contains("timed out"),
             "must fail specifically with a timeout, not some other transport error: {}", message
         );
-        // FORK-49 F8: the message must name the *effective* bound (connect + silence) that
-        // actually governs, not the raw silence budget alone.
+        // The message must name the *effective* bound (connect + silence) that actually
+        // governs, not the raw silence budget alone.
         assert!(
             message.contains(&format!("{:?}", effective_budget)),
             "must name the effective bound {:?}, not some other figure: {}", effective_budget, message
         );
     }
 
-    /// FORK-49 F5: `fetch_signature` must be bounded exactly like `fetch_info` — pins that it
-    /// stays wired to `bounded_reads` and never silently drifts back to the unbounded client
-    /// (which would restore the hang).
+    /// `fetch_signature` must be bounded exactly like `fetch_info` — pins that it stays wired to
+    /// `bounded_reads` and never silently drifts back to the unbounded client (which would
+    /// restore the hang).
     #[test]
     fn fetch_signature_times_out_against_a_silent_remote() {
         let remote = SilentRemote::start();
@@ -4706,7 +4706,7 @@ mod tests {
         );
     }
 
-    /// FORK-49 F5: `fetch_bundle_to` must be bounded exactly like `fetch_info` — same pin as
+    /// `fetch_bundle_to` must be bounded exactly like `fetch_info` — same pin as
     /// `fetch_signature`'s, for the same reason.
     #[test]
     fn fetch_bundle_to_times_out_against_a_silent_remote() {
@@ -4735,14 +4735,14 @@ mod tests {
             "must fail specifically with a timeout, not some other transport error: {}", message
         );
         // A silent remote never gets past headers, so no temp file is ever created here — the
-        // dedicated FORK-49 F6 test below is what actually exercises the mid-download cleanup.
+        // dedicated test below is what actually exercises the mid-download cleanup.
         assert!(!dest.exists(), "no file should appear at the destination at all in this scenario");
 
         let _ = std::fs::remove_file(&dest);
     }
 
-    /// FORK-49 F6: a mid-download failure — the new timeout being the routine case now — must
-    /// never leave a truncated file at the destination, which would otherwise be this warehouse's
+    /// A mid-download failure — the new timeout being the routine case now — must never leave a
+    /// truncated file at the destination, which would otherwise be this warehouse's
     /// own latest bundle. Unlike the silent-remote scenario above, [`LyingContentLengthRemote`]
     /// gets past headers and writes a few real bytes before going quiet, so the temp file this
     /// exercises genuinely exists (and has content) at the moment the timeout fires and the
@@ -4775,14 +4775,14 @@ mod tests {
         );
         assert!(
             !dest.exists(),
-            "a mid-download timeout must never leave a truncated file at the destination (FORK-49 F6)"
+            "a mid-download timeout must never leave a truncated file at the destination"
         );
 
         let _ = std::fs::remove_file(&dest);
     }
 
-    /// FORK-49 F5: `missing_objects`'s server work scales with the batch, so the contract forbids
-    /// bounding it at all (see its own doc comment). Pins the "unbounded direction": a silent
+    /// `missing_objects`'s server work scales with the batch, so the contract forbids bounding it
+    /// at all (see its own doc comment). Pins the "unbounded direction": a silent
     /// remote alone must never make this call fail within a window comfortably past the tight
     /// bounded budget — if it did, either this call or `request()`'s own default client had been
     /// silently rewired onto a bounded one.
@@ -4799,8 +4799,8 @@ mod tests {
         ));
     }
 
-    /// FORK-49 F5: `fetch_batch`'s server work is size-dependent (see its own doc comment) — same
-    /// "unbounded direction" pin as `missing_objects`'s.
+    /// `fetch_batch`'s server work is size-dependent (see its own doc comment) — same "unbounded
+    /// direction" pin as `missing_objects`'s.
     #[test]
     fn fetch_batch_is_not_flat_bounded_by_silence() {
         let remote = SilentRemote::start();
@@ -4814,8 +4814,8 @@ mod tests {
         ));
     }
 
-    /// FORK-49 F5: `fetch_subtree`'s server work is size-dependent (see its own doc comment) —
-    /// same "unbounded direction" pin as `missing_objects`'s.
+    /// `fetch_subtree`'s server work is size-dependent (see its own doc comment) — same
+    /// "unbounded direction" pin as `missing_objects`'s.
     #[test]
     fn fetch_subtree_is_not_flat_bounded_by_silence() {
         let remote = SilentRemote::start();
@@ -4867,10 +4867,10 @@ mod tests {
         }
     }
 
-    /// FORK-49 T2: `fetch_object` against a remote whose `Content-Length` outlives the bytes it
-    /// actually sends must fail with a timeout, not hang waiting for a body that is never coming.
-    /// Ceiling sized to `TEST_LOOSE_READ_TIMEOUT` (FORK-49 F2): `fetch_object` rides
-    /// `bounded_object_reads`, not the tight `bounded_reads` the other three calls use.
+    /// `fetch_object` against a remote whose `Content-Length` outlives the bytes it actually
+    /// sends must fail with a timeout, not hang waiting for a body that is never coming. Ceiling
+    /// sized to `TEST_LOOSE_READ_TIMEOUT`: `fetch_object` rides `bounded_object_reads`, not the
+    /// tight `bounded_reads` the other three calls use.
     #[test]
     fn fetch_object_times_out_against_a_content_length_lie() {
         let remote = LyingContentLengthRemote::start();
@@ -4898,8 +4898,9 @@ mod tests {
     }
 
     /// Streams a body in `chunks`, sleeping `gap` before each one and flushing immediately after
-    /// — a body that is always "moving bytes, however slowly" (the settled §0 silence contract),
-    /// never a single stall long enough to trip a read/idle timeout, but with a *total* duration
+    /// — a body that is always moving bytes, however slowly (never silent, per the settled
+    /// contract quoted in `REMOTE_READ_TIMEOUT`'s doc), never a single stall long enough to trip
+    /// a read/idle timeout, but with a *total* duration
     /// comfortably past one. Pins the finding that a per-request **total** deadline (the shape
     /// this fix's first attempt used) kills this kind of transfer even though nothing ever went
     /// silent — only a per-read/idle bound (`ClientBuilder::read_timeout`, which resets on every
@@ -4933,8 +4934,8 @@ mod tests {
         url
     }
 
-    /// FORK-49, pinning §0 (the settled silence contract): `fetch_object` against a body that
-    /// dribbles in slowly but steadily — every inter-chunk gap comfortably under
+    /// `fetch_object` against a body that dribbles in slowly but steadily — every inter-chunk gap
+    /// comfortably under
     /// `TEST_LOOSE_READ_TIMEOUT`, the total transfer comfortably past it — must **succeed**,
     /// never be treated as a stall. A total-deadline bound (rejected in favor of
     /// `read_timeout`-on-its-own-client, see `REMOTE_READ_TIMEOUT`'s doc) fails this test: it
@@ -5003,14 +5004,15 @@ mod tests {
         url
     }
 
-    /// FORK-49 T3, pinning constraint B: `update_ref` must ride out a response slower than the
-    /// tight read/metadata budget, not fail at it. A fixture that only answers after the
-    /// effective tight budget (connect + read) plus slack, succeeding here, is the shape this
-    /// constraint gets without a live slow server (the real case is a server-side audit walk that
-    /// can take minutes on a real first push — not something this test suite can wait out
-    /// directly). If a future change ever gives `update_ref` the same per-request timeout the
-    /// reads get, this is exactly what turns red: the call would fail at the timeout, well before
-    /// this fixture ever answers.
+    /// `update_ref` must ride out a response slower than the tight read/metadata budget, not fail
+    /// at it — its server side legitimately runs an audit walk that can take minutes on a real
+    /// first push into an empty pallet, and must never be cut off by a bound meant for a
+    /// handshake or a single object. A fixture that only answers after the effective tight budget
+    /// (connect + read) plus slack, succeeding here, is the shape that gets without a live slow
+    /// server (the real case is that server-side audit walk — not something this test suite can
+    /// wait out directly). If a future change ever gives `update_ref` the same per-request
+    /// timeout the reads get, this is exactly what turns red: the call would fail at the timeout,
+    /// well before this fixture ever answers.
     #[test]
     fn update_ref_outlives_the_read_metadata_timeout() {
         let past_read_timeout = TEST_DIRECT_CONNECT_TIMEOUT + TEST_TIGHT_READ_TIMEOUT
@@ -5065,15 +5067,14 @@ mod tests {
         }
     }
 
-    /// FORK-49 F1: a Tor-routed client's read/silence budget must not preempt its own, much
-    /// larger, connect budget. Built directly through `new_with_tor`/`TorSettings`
-    /// (`TorMode::On`, pointed at a fixture-controlled fake SOCKS proxy) — no live Tor daemon, no
-    /// config file needed. Before the F1 fix, `bounded_reads`' flat `TEST_TIGHT_READ_TIMEOUT`
-    /// `read_timeout` fired regardless of `connect_timeout` (`read_timeout` is armed and checked
-    /// before the connector is even polled), so this call failed at ~10s even though
-    /// `REMOTE_CONNECT_TIMEOUT_TOR` allows 60s; after the fix, the configured `read_timeout`
-    /// accommodates whichever connect budget applies, so the call must still be running well past
-    /// both the old flat tight budget and the direct connect budget.
+    /// A Tor-routed client's read/silence budget must not preempt its own, much larger, connect
+    /// budget. Built directly through `new_with_tor`/`TorSettings` (`TorMode::On`, pointed at a
+    /// fixture-controlled fake SOCKS proxy) — no live Tor daemon, no config file needed. With a
+    /// flat `TEST_TIGHT_READ_TIMEOUT` `read_timeout` fired regardless of `connect_timeout`
+    /// (`read_timeout` is armed and checked before the connector is even polled), this call would
+    /// fail at ~10s even though `REMOTE_CONNECT_TIMEOUT_TOR` allows 60s; with the configured
+    /// `read_timeout` accommodating whichever connect budget applies, the call must still be
+    /// running well past both that flat tight budget and the direct connect budget.
     #[test]
     fn tor_routed_read_budget_does_not_preempt_the_tor_connect_budget() {
         let proxy = ParkingSocksProxy::start();
@@ -5099,7 +5100,7 @@ mod tests {
     /// to reach the read-silence branch specifically: unlike [`ParkingSocksProxy`] (which never
     /// even finishes the handshake, so its silence is itself a connect-phase failure), this
     /// proxy's silence happens strictly after connect — whatever fires next is `read_timeout`'s
-    /// own generic sleep, the branch FORK-49 F8 is about.
+    /// own generic sleep, the branch whose reported bound this fixture exists to check.
     struct HandshakeCompletingSocksProxy {
         addr: String,
         _park: std::sync::mpsc::Sender<()>,
@@ -5154,11 +5155,11 @@ mod tests {
         }
     }
 
-    /// FORK-49 F8: the timed-out message must name the *effective* bound (connect + silence) that
-    /// actually governs the client, not the raw silence constant alone — reintroduced by F1's own
-    /// fix, since `bounded_read_timeout` changed what the client is actually configured with
-    /// without `describe_transport_error` being updated to match. The gap is widest, and nothing
-    /// before this test checked it, on a Tor-routed remote: the effective bound is 70s (60s Tor
+    /// The timed-out message must name the *effective* bound (connect + silence) that actually
+    /// governs the client — `bounded_read_timeout` computes what the client is actually
+    /// configured with, and `describe_transport_error` must report that same figure, not the raw
+    /// silence constant alone. The gap is widest, and nothing before this test checked it, on a
+    /// Tor-routed remote: the effective bound is 70s (60s Tor
     /// connect + 10s silence), not the 10s an earlier version of the message printed regardless of
     /// transport. Uses [`HandshakeCompletingSocksProxy`], not [`ParkingSocksProxy`]: this test
     /// needs the failure to land specifically in the read-silence branch, which requires connect
