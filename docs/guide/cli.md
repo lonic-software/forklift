@@ -613,6 +613,15 @@ act. Tag names are **immutable** (a name already in use is refused). Tags live o
 `@tags` meta pallet, reserving no user pallet name; without a revision, `tag create` tags
 the current pallet's head.
 
+A tag's subject is nothing more than a parcel hash: if the parcel was never fetched here,
+or was collected because nothing else referenced it (e.g. after an `undo` moved the only
+pallet head off it), the hash still exists in the record but the parcel is gone. `tag show`
+refuses (`tag_subject_absent`, exit 22) rather than print a dead hash as though it were
+live; the message names the parcel, and `lower` the pallet that still holds it is the only
+way back. `tag list` still succeeds — a listing is not a claim about one referent, and a
+sparse or franchised store can legitimately hold `@tags` without every subject's pallet —
+but marks the affected row instead of rendering it identically to a live tag.
+
 ### `haul` — pull requests (reviewable merge proposals)
 
 ```sh

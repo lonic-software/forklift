@@ -32,4 +32,5 @@ Exit code 17 is reserved for a future feature and is not yet assigned to any cod
 | `empty_history` | 19 | "history" was asked to walk a pallet that has nothing stacked on it yet |
 | `incomplete_load` | 20 | "stack" or "park" refused because a "load" that never finished cleanly is still recorded |
 | `durability_taint` | 21 | A durability taint could not be auto-healed (a vanished, unreadable, or corrupt path, or a torn taint record) |
+| `tag_subject_absent` | 22 | A tag points at a parcel this store does not hold (never fetched, or collected) |
 

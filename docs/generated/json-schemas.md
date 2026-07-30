@@ -3519,6 +3519,10 @@ A command not listed here either reports only the generic human-message shape `{
           "description": "The parcel the tag points at.",
           "type": "string"
         },
+        "subject_absent": {
+          "description": "Whether the subject parcel is not present in this store (never fetched here, or\ncollected after nothing else referenced it — see `tag_utils::require_subject_present`).\nSkip-serialized when `false` so the common row shape is unchanged; `tag show` refuses\noutright instead of ever setting this, so it is a `list`-only signal.",
+          "type": "boolean"
+        },
         "tagged_at": {
           "description": "The tag creation time as RFC 3339 (UTC).",
           "type": "string"
@@ -3548,7 +3552,8 @@ A command not listed here either reports only the generic human-message shape `{
         "message",
         "tagger",
         "tagged_at",
-        "parcel"
+        "parcel",
+        "subject_absent"
       ],
       "type": "object"
     }
@@ -3593,6 +3598,10 @@ A command not listed here either reports only the generic human-message shape `{
       "description": "The parcel the tag points at.",
       "type": "string"
     },
+    "subject_absent": {
+      "description": "Whether the subject parcel is not present in this store (never fetched here, or\ncollected after nothing else referenced it — see `tag_utils::require_subject_present`).\nSkip-serialized when `false` so the common row shape is unchanged; `tag show` refuses\noutright instead of ever setting this, so it is a `list`-only signal.",
+      "type": "boolean"
+    },
     "tagged_at": {
       "description": "The tag creation time as RFC 3339 (UTC).",
       "type": "string"
@@ -3622,7 +3631,8 @@ A command not listed here either reports only the generic human-message shape `{
     "message",
     "tagger",
     "tagged_at",
-    "parcel"
+    "parcel",
+    "subject_absent"
   ],
   "title": "TagView",
   "type": "object"

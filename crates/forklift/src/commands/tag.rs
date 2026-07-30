@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 use forklift_core::util::office_utils::{OfficeState, Role};
 use forklift_core::util::tag_utils::{AttributedTag, Tag};
-use forklift_core::util::{config_utils, office_utils, pallet_utils, remote_utils, stack_utils, tag_utils};
+use forklift_core::util::{config_utils, file_utils, office_utils, pallet_utils, remote_utils, stack_utils, tag_utils};
 use crate::cli::TagAction;
 use crate::output::{self, CommandOutput};
 
@@ -94,6 +94,25 @@ async fn create(name: &str, revision: Option<String>, message: Option<String>) -
 }
 
 /// List every tag, attributed to its (forge-proof) tagger.
+///
+/// A list is an enumeration, not a claim about one referent — a franchised or sparse store
+/// legitimately holds `@tags` without every subject's pallet, so a *definitively* absent
+/// subject degrades the row (`subject_absent`) rather than fails the command; failing would
+/// brick listing on a store working exactly as designed. A probe that could not answer at all
+/// is a different question, though: e.g. an I/O error reading the loose-object path (an
+/// unreadable fan-out directory is the reachable, tested case — see
+/// `tag_list_fails_loudly_rather_than_mislabeling_a_subject_it_could_not_probe`).
+/// `file_utils::does_object_exist` also consults a durability-taint gate, which can likewise
+/// turn "present?" into "unknown", but that gate is process-local (only a write *this* process
+/// performed and failed to sync ever sets it — `taint_utils::gate_check`'s own doc comment), so
+/// it is not reachable from this read-only command's own process; a disk-recorded taint from an
+/// earlier run is instead intercepted by `main.rs`'s entry-heal chokepoint before `list` ever
+/// runs at all. Either way, an indeterminate probe is propagated as an ordinary command failure
+/// rather than folded into `subject_absent`, which must stay a *definite* claim (the project's
+/// own rule against silently guessing at an unknown). Probes directly
+/// (`file_utils::does_object_exist`) rather than through [`tag_utils::require_subject_present`],
+/// which only ever returns a bool or a fully-built `show` refusal — never the bare "could not
+/// determine" this needs to tell apart.
 async fn list() -> Result<(), String> {
     let tags = tag_utils::read_tags()?;
 
@@ -101,7 +120,13 @@ async fn list() -> Result<(), String> {
     let office = office_utils::read_office_state()
         .unwrap_or(OfficeState { users: Vec::new(), keys: Vec::new() });
 
-    let entries = tags.iter().map(|attributed| TagView::of(attributed, &names, &office)).collect();
+    let entries = tags.iter()
+        .map(|attributed| {
+            let subject_absent = !file_utils::does_object_exist(&attributed.tag.subject)?;
+
+            Ok(TagView::of(attributed, &names, &office, subject_absent))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
 
     output::emit("tag", &TagList { tags: entries });
 
@@ -113,11 +138,17 @@ async fn show(name: &str) -> Result<(), String> {
     let attributed = tag_utils::find_tag(name)?
         .ok_or(format!("No tag named \"{}\" exists.", name))?;
 
+    // Nothing roots a tag subject (deliberately — see `tag_utils::require_subject_present`), so
+    // `undo` or a never-completed fetch can leave it dangling; refuse rather than show a dead
+    // hash as though it were live.
+    tag_utils::require_subject_present(&attributed.tag)?;
+
     let names = remote_utils::resolve_office_display_names().await;
     let office = office_utils::read_office_state()
         .unwrap_or(OfficeState { users: Vec::new(), keys: Vec::new() });
 
-    output::emit("tag", &TagView::of(&attributed, &names, &office));
+    // Presence was already confirmed above; the tag is live here by construction.
+    output::emit("tag", &TagView::of(&attributed, &names, &office, false));
 
     Ok(())
 }
@@ -165,12 +196,15 @@ impl CommandOutput for TagList {
                 .map(|line| format!("  {}", line))
                 .unwrap_or_default();
 
+            let absent_marker = if tag.subject_absent { "  (subject not in this store)" } else { "" };
+
             println!(
-                "{:<width$}  {}  by {}{}",
+                "{:<width$}  {}  by {}{}{}",
                 tag.name,
                 &tag.subject[..tag.subject.len().min(12)],
                 tag.tagger_label(),
                 message,
+                absent_marker,
                 width = width,
             );
         }
@@ -207,10 +241,22 @@ pub(crate) struct TagView {
 
     /// The @tags parcel that introduced the tag.
     parcel: String,
+
+    /// Whether the subject parcel is not present in this store (never fetched here, or
+    /// collected after nothing else referenced it — see `tag_utils::require_subject_present`).
+    /// Skip-serialized when `false` so the common row shape is unchanged; `tag show` refuses
+    /// outright instead of ever setting this, so it is a `list`-only signal.
+    #[serde(skip_serializing_if = "is_false")]
+    subject_absent: bool,
 }
 
 impl TagView {
-    fn of(attributed: &AttributedTag, names: &BTreeMap<String, String>, office: &OfficeState) -> TagView {
+    fn of(
+        attributed: &AttributedTag,
+        names: &BTreeMap<String, String>,
+        office: &OfficeState,
+        subject_absent: bool,
+    ) -> TagView {
         let tagger = attributed.tagger.clone();
         let tagger_name = names.get(&tagger).cloned();
         let tagger_role = office.find_user(&tagger).map(|user| user.role.as_str().to_string());
@@ -224,6 +270,7 @@ impl TagView {
             tagger_role,
             tagged_at: render_timestamp(attributed.tag.tagged_at),
             parcel: attributed.parcel.clone(),
+            subject_absent,
         }
     }
 
@@ -253,6 +300,12 @@ impl CommandOutput for TagView {
             }
         }
     }
+}
+
+/// Whether a subject-absence flag is `false` (for skipping it in the JSON envelope, so the
+/// common row shape — subject present — is unchanged).
+fn is_false(flag: &bool) -> bool {
+    !*flag
 }
 
 /// Render a Unix timestamp as RFC 3339 (UTC), the JSON form.
