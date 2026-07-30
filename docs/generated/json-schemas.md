@@ -3511,6 +3511,13 @@ A command not listed here either reports only the generic human-message shape `{
         "name": {
           "type": "string"
         },
+        "name_invalid": {
+          "description": "Present and `true` when `name` does not meet the naming rules `tag create` enforces\n(letters, digits, `.`, `_`, `-` only); omitted otherwise. `@tags` syncs in wholesale\n(`franchise`/`lower`), and nothing validates a record's `name` on the way in — only\n`tag create` does, for a name of its own choosing — so a foreign or older client's record\ncan carry one this build would never have created itself.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "parcel": {
           "description": "The @tags parcel that introduced the tag.",
           "type": "string"
@@ -3518,6 +3525,13 @@ A command not listed here either reports only the generic human-message shape `{
         "subject": {
           "description": "The parcel the tag points at.",
           "type": "string"
+        },
+        "subject_absent": {
+          "description": "Present and `true` when the subject parcel is not in this store (never fetched, collected,\nor recorded with an invalid hash); omitted when the subject is present.",
+          "type": [
+            "boolean",
+            "null"
+          ]
         },
         "tagged_at": {
           "description": "The tag creation time as RFC 3339 (UTC).",
@@ -3585,6 +3599,13 @@ A command not listed here either reports only the generic human-message shape `{
     "name": {
       "type": "string"
     },
+    "name_invalid": {
+      "description": "Present and `true` when `name` does not meet the naming rules `tag create` enforces\n(letters, digits, `.`, `_`, `-` only); omitted otherwise. `@tags` syncs in wholesale\n(`franchise`/`lower`), and nothing validates a record's `name` on the way in — only\n`tag create` does, for a name of its own choosing — so a foreign or older client's record\ncan carry one this build would never have created itself.",
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
     "parcel": {
       "description": "The @tags parcel that introduced the tag.",
       "type": "string"
@@ -3592,6 +3613,13 @@ A command not listed here either reports only the generic human-message shape `{
     "subject": {
       "description": "The parcel the tag points at.",
       "type": "string"
+    },
+    "subject_absent": {
+      "description": "Present and `true` when the subject parcel is not in this store (never fetched, collected,\nor recorded with an invalid hash); omitted when the subject is present.",
+      "type": [
+        "boolean",
+        "null"
+      ]
     },
     "tagged_at": {
       "description": "The tag creation time as RFC 3339 (UTC).",

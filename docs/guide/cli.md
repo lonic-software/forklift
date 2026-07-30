@@ -613,6 +613,32 @@ act. Tag names are **immutable** (a name already in use is refused). Tags live o
 `@tags` meta pallet, reserving no user pallet name; without a revision, `tag create` tags
 the current pallet's head.
 
+A tag's subject is nothing more than a parcel hash: if the parcel was never fetched here,
+or was collected because nothing else referenced it (e.g. after an `undo` moved the only
+pallet head off it), the hash still exists in the record but the parcel is gone. Both
+causes leave the identical local state, so nothing on disk can tell them apart — and a
+sparse or franchised clone can hit the "never fetched" case in perfectly ordinary use
+(cloning `--only` one pallet still adopts every tag, including ones cut on pallets it never
+fetched). A third case reads the same way: `@tags` records sync in wholesale, so a foreign
+or older client's record can carry a subject that is not even a well-formed hash — nothing
+could ever hold that, so it is a definite absence too, just for a different reason.
+
+Rather than refuse over a state that is often entirely healthy, both `tag show` and `tag
+list` probe the subject and **mark**, not fail: `tag show` still renders the tag in full —
+every field it prints comes from the tag record itself, never the subject — and adds a
+`warning:` line naming the parcel, worded for whichever of the two reasons applies; `tag
+list` marks the row with `(subject not in this store)`. Either way the exit code stays `0`.
+Only a probe that genuinely could not determine presence (an I/O error, never a definite
+answer either way) fails the command, and it names the affected tag when it does.
+
+Every string in a `@tags` record — name, subject, message, tagger — is equally
+unvalidated (nothing checks a synced-in record on the way in; only `tag create` validates
+the name it creates). `tag show`/`tag list` render all of it safely rather than trust it:
+control characters (including ANSI escapes) are neutralized before printing, and a name
+that fails `tag create`'s own naming rules is shown with a `[invalid name] ` marker
+(`list`) or its own `warning:` line (`show`) rather than silently treated as ordinary.
+`--json` output is never touched by any of this — it always carries the raw values.
+
 ### `haul` — pull requests (reviewable merge proposals)
 
 ```sh

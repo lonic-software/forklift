@@ -149,6 +149,23 @@ pub fn get_path_graph_root() -> String {
     memoized_root(&MEMO, FOLDER_NAME_GRAPH_ROOT)
 }
 
+/// Whether `hash` is shaped like an object hash: long enough to carve a fan-out folder off of,
+/// and every character an ASCII hex digit. This is the one rule [`get_path_for_object`] enforces
+/// (and the only one — it does not check length against any particular digest's width), pulled
+/// out so a caller that needs to know *whether* a string is hash-shaped, without wanting the
+/// path or the error string, has something to call instead of re-deriving the condition (or,
+/// worse, inferring it from [`get_path_for_object`]'s `Err` text).
+///
+/// # Arguments
+/// * `hash` - The candidate string.
+///
+/// # Returns
+/// * `true`  - If `hash` is shaped like an object hash.
+/// * `false` - Otherwise (too short, or not all hex digits).
+pub fn is_valid_object_hash(hash: &str) -> bool {
+    hash.len() > OBJECT_HASH_FOLDER_PATH_CHARACTERS && hash.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// Get the path and file name for an object.
 ///
 /// # Arguments
@@ -178,8 +195,7 @@ pub fn get_path_graph_root() -> String {
 pub fn get_path_for_object(hash: &str) -> Result<(String, String), String> {
     // A corrupted or hand-entered hash must produce an error instead of a panic
     // (or a bogus path outside the object fan-out folders).
-    if hash.len() <= OBJECT_HASH_FOLDER_PATH_CHARACTERS
-        || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if !is_valid_object_hash(hash) {
         return Err(format!("\"{}\" is not a valid object hash.", hash));
     }
 
