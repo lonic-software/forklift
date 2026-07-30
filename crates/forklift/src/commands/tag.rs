@@ -96,12 +96,12 @@ async fn create(name: &str, revision: Option<String>, message: Option<String>) -
 /// List every tag, attributed to its (forge-proof) tagger.
 ///
 /// A list is an enumeration, not a claim about one referent — a franchised or sparse store
-/// legitimately holds `@tags` without every subject's pallet (see [`probe_subject_absent`]), so
-/// a *definitively* absent subject degrades the row (`subject_absent`) rather than fails the
-/// command; failing would brick listing on a store working exactly as designed. An
-/// *indeterminate* probe is a different question and is propagated as an ordinary command
-/// failure instead — see [`probe_subject_absent`] for why, and for the one case that is
-/// actually reachable here.
+/// legitimately holds `@tags` without every subject's pallet (see [`probe_subject`]), so a
+/// *definitively* absent subject (including a malformed one — see [`probe_subject`]) degrades
+/// the row (`subject_absent`) rather than fails the command; failing would brick listing on a
+/// store working exactly as designed. An *indeterminate* probe is a different question and is
+/// propagated as an ordinary command failure instead — see [`probe_subject`] for why, and for
+/// the one case that is actually reachable here.
 async fn list() -> Result<(), String> {
     let tags = tag_utils::read_tags()?;
 
@@ -111,9 +111,9 @@ async fn list() -> Result<(), String> {
 
     let entries = tags.iter()
         .map(|attributed| {
-            let subject_absent = probe_subject_absent(&attributed.tag.subject)?;
+            let probe = probe_subject(&attributed.tag)?;
 
-            Ok(TagView::of(attributed, &names, &office, subject_absent))
+            Ok(TagView::of(attributed, &names, &office, probe))
         })
         .collect::<Result<Vec<_>, String>>()?;
 
@@ -134,31 +134,63 @@ async fn list() -> Result<(), String> {
 /// after nothing else referenced it" from "never fetched here" — gc keeps no tombstone and
 /// there is no fetch ledger — so a refusal would have to fire on both, including the healthy
 /// one; marking the row instead of refusing is what stays honest without over-firing on a store
-/// working exactly as designed. See [`probe_subject_absent`] for the probe itself.
+/// working exactly as designed. See [`probe_subject`] for the probe itself, including the third,
+/// non-hash-shaped case.
 async fn show(name: &str) -> Result<(), String> {
     let attributed = tag_utils::find_tag(name)?
         .ok_or(format!("No tag named \"{}\" exists.", name))?;
 
-    let subject_absent = probe_subject_absent(&attributed.tag.subject)?;
+    let probe = probe_subject(&attributed.tag)?;
 
     let names = remote_utils::resolve_office_display_names().await;
     let office = office_utils::read_office_state()
         .unwrap_or(OfficeState { users: Vec::new(), keys: Vec::new() });
 
-    output::emit("tag", &TagView::of(&attributed, &names, &office, subject_absent));
+    output::emit("tag", &TagView::of(&attributed, &names, &office, probe));
 
     Ok(())
 }
 
-/// Whether a tag's subject parcel is absent from this store, probed directly
-/// (`file_utils::does_object_exist`) rather than assumed from anything else. Shared by `list`
-/// (degrades a row) and `show` (marks a full render) — see each for what it does with a
-/// definite `true`.
+/// What probing a tag's subject found: present, definitely absent, or not even hash-shaped.
+enum SubjectProbe {
+    /// The subject parcel is in this store.
+    Present,
+
+    /// The subject parcel is not in this store, but the subject is at least a well-formed
+    /// object hash — never fetched here, or collected after nothing else referenced it.
+    Absent,
+
+    /// The subject is not shaped like an object hash at all (`file_utils::is_valid_object_hash`
+    /// says no) — a `@tags` record can carry one because [`Tag::subject`] is an unvalidated
+    /// free string a foreign or older client could have authored, synced in wholesale by
+    /// `adopt_meta_pallets`. No copy of any warehouse could ever hold an object under a name
+    /// that is not a hash, so this is also a *definite* absence — just for a different reason,
+    /// one the reader must describe accurately rather than fold into "never fetched, or
+    /// collected" (both are false for this case).
+    Malformed,
+}
+
+impl SubjectProbe {
+    /// Whether the subject is absent for either reason — the single bit `TagView::subject_absent`
+    /// carries over the wire; a consumer that only wants "is it here" never needs the reason.
+    fn is_absent(&self) -> bool {
+        !matches!(self, SubjectProbe::Present)
+    }
+}
+
+/// Probe a tag's subject, classifying it three ways rather than two. A malformed subject is
+/// handled first and entirely locally (a string shape check, never touching the object store):
+/// detected explicitly via [`file_utils::is_valid_object_hash`], never inferred from
+/// [`file_utils::does_object_exist`]'s `Err` text, which is brittle and not what that text is
+/// for. Only a hash-shaped subject goes on to the real presence probe
+/// (`file_utils::does_object_exist`).
 ///
 /// An indeterminate probe — `does_object_exist` returned `Err`, so presence could not be
-/// determined at all — is a different question from a definite absence and is propagated as an
-/// ordinary command failure rather than reported as `true`; the reachable, tested case is a
-/// plain I/O error reading the loose-object path (see
+/// determined at all for an otherwise well-formed hash — is a different question from either
+/// definite-absence case and is propagated as an ordinary command failure, naming the tag so a
+/// user can find the offending record (never anonymous — this is what a caller's `?` gets: an
+/// error message this function has already built, not `does_object_exist`'s raw one). The
+/// reachable, tested case is a plain I/O error reading the loose-object path (see
 /// `tag_list_fails_loudly_rather_than_mislabeling_a_subject_it_could_not_probe`).
 /// `does_object_exist` also consults a durability-taint gate, a second real source of the same
 /// kind of failure *in that function*, but it is not reachable from here: the gate is
@@ -168,8 +200,19 @@ async fn show(name: &str) -> Result<(), String> {
 /// disk-recorded taint left standing by an earlier process is instead intercepted by
 /// `main.rs`'s entry-heal chokepoint before any command's body — including this probe's — ever
 /// runs.
-fn probe_subject_absent(subject: &str) -> Result<bool, String> {
-    Ok(!file_utils::does_object_exist(subject)?)
+fn probe_subject(tag: &Tag) -> Result<SubjectProbe, String> {
+    if !file_utils::is_valid_object_hash(&tag.subject) {
+        return Ok(SubjectProbe::Malformed);
+    }
+
+    match file_utils::does_object_exist(&tag.subject) {
+        Ok(true) => Ok(SubjectProbe::Present),
+        Ok(false) => Ok(SubjectProbe::Absent),
+        Err(error) => Err(format!(
+            "Could not determine whether tag \"{}\"'s subject ({}) is present in this store: {}",
+            tag.name, tag.subject, error
+        )),
+    }
 }
 
 /// The result of creating a tag.
@@ -215,16 +258,19 @@ impl CommandOutput for TagList {
                 .map(|line| format!("  {}", line))
                 .unwrap_or_default();
 
+            // Placed ahead of `tagger`/`message` — both remote-authored text — rather than
+            // trailing the line: a message ending in text that imitates this marker (or, worse,
+            // an ANSI escape) cannot forge or blank it if it never gets to render after it.
             let absent_marker =
-                if tag.subject_absent == Some(true) { "  (subject not in this store)" } else { "" };
+                if tag.subject_absent == Some(true) { "(subject not in this store)  " } else { "" };
 
             println!(
-                "{:<width$}  {}  by {}{}{}",
+                "{:<width$}  {}  {}by {}{}",
                 tag.name,
                 &tag.subject[..tag.subject.len().min(12)],
+                absent_marker,
                 tag.tagger_label(),
                 message,
-                absent_marker,
                 width = width,
             );
         }
@@ -262,15 +308,22 @@ pub(crate) struct TagView {
     /// The @tags parcel that introduced the tag.
     parcel: String,
 
-    /// Whether the subject parcel is not present in this store (never fetched here, or
-    /// collected after nothing else referenced it — see [`probe_subject_absent`]). `Some(true)`
-    /// when absent, `None` when present — never `Some(false)` — so the common row/render shape
-    /// (subject present) is unchanged; matches the [`Option`] + `skip_serializing_if` pattern
-    /// `tagger_role` above already uses, which a plain `bool` cannot: a `bool` field is always
-    /// present in the schema's `required` list regardless of `skip_serializing_if`, so it would
-    /// declare a field the common case never actually emits.
+    // `Option`, not a bare `bool`: `skip_serializing_if = "Option::is_none"` actually drops it
+    // from the schema's `required` list, which a bare `bool` field cannot do regardless of
+    // `skip_serializing_if` — the same pattern `tagger_role` above already uses. `Some(true)`
+    // when absent, `None` when present — `Some(false)` is never constructed.
+    /// Present and `true` when the subject parcel is not in this store (never fetched, collected,
+    /// or recorded with an invalid hash); omitted when the subject is present.
     #[serde(skip_serializing_if = "Option::is_none")]
     subject_absent: Option<bool>,
+
+    // Render-only: which wording `render_human`'s warning line uses when `subject_absent` is
+    // `true`. Not part of the wire contract (`subject_absent` alone answers "is it here" for a
+    // `--json` consumer) and never rendered by `TagList` — `#[serde(skip)]`, not
+    // `skip_serializing_if`, so it never reaches the schema at all, unlike `subject_absent`
+    // above before this fix.
+    #[serde(skip)]
+    subject_malformed: bool,
 }
 
 impl TagView {
@@ -278,11 +331,12 @@ impl TagView {
         attributed: &AttributedTag,
         names: &BTreeMap<String, String>,
         office: &OfficeState,
-        subject_absent: bool,
+        probe: SubjectProbe,
     ) -> TagView {
         let tagger = attributed.tagger.clone();
         let tagger_name = names.get(&tagger).cloned();
         let tagger_role = office.find_user(&tagger).map(|user| user.role.as_str().to_string());
+        let subject_malformed = matches!(probe, SubjectProbe::Malformed);
 
         TagView {
             name: attributed.tag.name.clone(),
@@ -293,7 +347,8 @@ impl TagView {
             tagger_role,
             tagged_at: render_timestamp(attributed.tag.tagged_at),
             parcel: attributed.parcel.clone(),
-            subject_absent: subject_absent.then_some(true),
+            subject_absent: probe.is_absent().then_some(true),
+            subject_malformed,
         }
     }
 
@@ -317,8 +372,16 @@ impl CommandOutput for TagView {
         // not a one-line row, so it can afford (and owes the reader) the longer, honest form.
         // Offers no command: there is no shipped verb that fetches history for a pallet with no
         // local ref (`shift` to an unreffed pallet refuses, and `lower` takes no pallet
-        // argument), so naming one would be unexecutable advice.
-        if self.subject_absent == Some(true) {
+        // argument), so naming one would be unexecutable advice. Two distinct wordings — never
+        // fetched/collected is false for a malformed subject, so it gets its own honest line
+        // rather than sharing the other's.
+        if self.subject_malformed {
+            println!(
+                "warning: this tag's recorded subject, \"{}\", is not a valid parcel hash — no \
+                copy of any warehouse could ever hold an object under that name.",
+                self.subject
+            );
+        } else if self.subject_absent == Some(true) {
             println!(
                 "warning: parcel {} is not in this store — never fetched here, or collected \
                 after nothing else referenced it. Another copy of this warehouse may still \
@@ -364,4 +427,122 @@ pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
         ("TagList", schemars::schema_for!(TagList)),
         ("TagView", schemars::schema_for!(TagView)),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    //! A malformed (non-hash) subject cannot be reproduced end-to-end through the shipped CLI:
+    //! `tag create`'s only two subject sources (`pallet_utils::resolve_revision`,
+    //! `pallet_utils::get_pallet_head`) both already verify hash shape *and* object presence
+    //! before returning, and no other production code path ever writes a `@tags` record — see
+    //! `crates/forklift/tests/tag_subject_gc.rs`'s module doc comment for the fuller account of
+    //! why (an on-disk fixture would mean reimplementing `LooseObject::store`'s compression by
+    //! hand from the test, which is exactly the "reach into internals" this was told not to do).
+    //! These unit tests instead pin [`probe_subject`]'s classification and [`TagView::of`]'s
+    //! consequent field state directly — the type-level gap (`Tag.subject` is an unvalidated
+    //! `String`) is real and worth covering even though only a foreign client, not this codebase,
+    //! can currently produce the value.
+
+    use super::*;
+
+    fn malformed_tag(subject: &str) -> Tag {
+        Tag {
+            name: "v1.0".to_string(),
+            subject: subject.to_string(),
+            message: String::new(),
+            tagged_at: 1_700_000_000,
+        }
+    }
+
+    #[test]
+    fn probe_subject_classifies_a_non_hash_subject_as_malformed_without_touching_the_store() {
+        // No `StorageRootScope` entered at all: a malformed subject is caught by a pure string
+        // check before `probe_subject` would ever need to consult the object store, so this
+        // must not need one — if it did, this test would panic on a missing storage root instead
+        // of asserting anything about classification. "abc" is deliberately NOT in this list: at
+        // 3 hex characters it clears `is_valid_object_hash`'s permissive floor (it does not
+        // enforce any particular digest's width, only "hex and long enough to fan out on") — a
+        // short-but-hex-shaped subject is an ordinary Absent question, not a malformed one; see
+        // the next test.
+        for subject in ["not-a-valid-hash", "", "a", "ab", &"g".repeat(64)] {
+            let probe = probe_subject(&malformed_tag(subject));
+
+            assert!(
+                matches!(probe, Ok(SubjectProbe::Malformed)),
+                "\"{}\" is not hash-shaped and must classify as Malformed, not touch the store \
+                or error; got {:?}",
+                subject, probe.map(|_| "should be unreachable if Malformed").err()
+            );
+        }
+    }
+
+    /// A well-formed hex string that happens to name nothing is a different question — length +
+    /// hex-ness alone is `probe_subject`'s definition of "malformed" (it does not check length
+    /// against any particular digest's width), so a `Present`/`Absent` question for a
+    /// hash-shaped-but-nonexistent subject must reach the real object-store probe, not the
+    /// malformed short-circuit. This needs a real store, so it uses the same `tag_subject_gc.rs`
+    /// integration fixture instead of a unit test here — see
+    /// `a_signed_tag_subject_is_collected_after_undo_moves_the_head_back`.
+    #[test]
+    fn is_valid_object_hash_accepts_a_well_formed_hex_string_of_any_length_above_the_floor() {
+        assert!(file_utils::is_valid_object_hash(&"a".repeat(64)));
+        assert!(file_utils::is_valid_object_hash("abc123"));
+        assert!(!file_utils::is_valid_object_hash("ab"));
+        assert!(!file_utils::is_valid_object_hash(""));
+        assert!(!file_utils::is_valid_object_hash("not-hex"));
+    }
+
+    fn attributed(tag: Tag) -> AttributedTag {
+        AttributedTag { tag, tagger: "spike@forklift".to_string(), parcel: "b".repeat(64) }
+    }
+
+    fn empty_office() -> OfficeState {
+        OfficeState { users: Vec::new(), keys: Vec::new() }
+    }
+
+    #[test]
+    fn tag_view_of_a_malformed_subject_marks_absent_and_malformed_but_a_present_one_marks_neither() {
+        let names = BTreeMap::new();
+        let office = empty_office();
+
+        let malformed = TagView::of(
+            &attributed(malformed_tag("not-a-valid-hash")), &names, &office, SubjectProbe::Malformed,
+        );
+        assert_eq!(malformed.subject_absent, Some(true), "malformed must still mark subject_absent");
+        assert!(malformed.subject_malformed, "malformed must set the render-only reason flag");
+
+        let absent = TagView::of(
+            &attributed(malformed_tag(&"a".repeat(64))), &names, &office, SubjectProbe::Absent,
+        );
+        assert_eq!(absent.subject_absent, Some(true), "a definite absence must mark subject_absent");
+        assert!(!absent.subject_malformed, "an ordinary absence must not claim to be malformed");
+
+        let present = TagView::of(
+            &attributed(malformed_tag(&"a".repeat(64))), &names, &office, SubjectProbe::Present,
+        );
+        assert_eq!(present.subject_absent, None, "a present subject must omit subject_absent");
+        assert!(!present.subject_malformed, "a present subject is never malformed");
+    }
+
+    /// Pins Finding 3's schema fix at the wire level, not just the Rust struct: the render-only
+    /// `subject_malformed` field must never reach `--json` output at all (`#[serde(skip)]`, not
+    /// `skip_serializing_if`) — a consumer only ever sees `subject_absent`.
+    #[test]
+    fn subject_malformed_never_appears_in_the_serialized_envelope() {
+        let names = BTreeMap::new();
+        let office = empty_office();
+        let malformed = TagView::of(
+            &attributed(malformed_tag("not-a-valid-hash")), &names, &office, SubjectProbe::Malformed,
+        );
+
+        let value = serde_json::to_value(&malformed).expect("TagView must serialize");
+        let object = value.as_object().expect("TagView serializes as a JSON object");
+
+        assert_eq!(object.get("subject_absent"), Some(&serde_json::Value::Bool(true)));
+        assert!(
+            !object.contains_key("subject_malformed"),
+            "subject_malformed must never be serialized; keys were: {:?}",
+            object.keys().collect::<Vec<_>>()
+        );
+    }
 }

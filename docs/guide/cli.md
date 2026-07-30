@@ -619,12 +619,17 @@ pallet head off it), the hash still exists in the record but the parcel is gone.
 causes leave the identical local state, so nothing on disk can tell them apart — and a
 sparse or franchised clone can hit the "never fetched" case in perfectly ordinary use
 (cloning `--only` one pallet still adopts every tag, including ones cut on pallets it never
-fetched). Rather than refuse over a state that is often entirely healthy, both `tag show`
-and `tag list` probe the subject and **mark**, not fail: `tag show` still renders the tag in
-full — every field it prints comes from the tag record itself, never the subject — and adds
-a `warning:` line naming the parcel; `tag list` appends `(subject not in this store)` to the
-row. Either way the exit code stays `0`; only an actual read failure while probing (an I/O
-error, never a definite answer) fails the command.
+fetched). A third case reads the same way: `@tags` records sync in wholesale, so a foreign
+or older client's record can carry a subject that is not even a well-formed hash — nothing
+could ever hold that, so it is a definite absence too, just for a different reason.
+
+Rather than refuse over a state that is often entirely healthy, both `tag show` and `tag
+list` probe the subject and **mark**, not fail: `tag show` still renders the tag in full —
+every field it prints comes from the tag record itself, never the subject — and adds a
+`warning:` line naming the parcel, worded for whichever of the two reasons applies; `tag
+list` marks the row with `(subject not in this store)`. Either way the exit code stays `0`.
+Only a probe that genuinely could not determine presence (an I/O error, never a definite
+answer either way) fails the command, and it names the affected tag when it does.
 
 ### `haul` — pull requests (reviewable merge proposals)
 

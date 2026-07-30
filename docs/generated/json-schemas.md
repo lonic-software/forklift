@@ -3520,7 +3520,7 @@ A command not listed here either reports only the generic human-message shape `{
           "type": "string"
         },
         "subject_absent": {
-          "description": "Whether the subject parcel is not present in this store (never fetched here, or\ncollected after nothing else referenced it — see [`probe_subject_absent`]). `Some(true)`\nwhen absent, `None` when present — never `Some(false)` — so the common row/render shape\n(subject present) is unchanged; matches the [`Option`] + `skip_serializing_if` pattern\n`tagger_role` above already uses, which a plain `bool` cannot: a `bool` field is always\npresent in the schema's `required` list regardless of `skip_serializing_if`, so it would\ndeclare a field the common case never actually emits.",
+          "description": "Present and `true` when the subject parcel is not in this store (never fetched, collected,\nor recorded with an invalid hash); omitted when the subject is present.",
           "type": [
             "boolean",
             "null"
@@ -3601,7 +3601,7 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "string"
     },
     "subject_absent": {
-      "description": "Whether the subject parcel is not present in this store (never fetched here, or\ncollected after nothing else referenced it — see [`probe_subject_absent`]). `Some(true)`\nwhen absent, `None` when present — never `Some(false)` — so the common row/render shape\n(subject present) is unchanged; matches the [`Option`] + `skip_serializing_if` pattern\n`tagger_role` above already uses, which a plain `bool` cannot: a `bool` field is always\npresent in the schema's `required` list regardless of `skip_serializing_if`, so it would\ndeclare a field the common case never actually emits.",
+      "description": "Present and `true` when the subject parcel is not in this store (never fetched, collected,\nor recorded with an invalid hash); omitted when the subject is present.",
       "type": [
         "boolean",
         "null"
