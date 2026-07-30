@@ -90,25 +90,6 @@ fn is_transient_commit_failure(status: reqwest::StatusCode, message: &str) -> bo
         && message.contains(LIFT_SESSION_BLOB_NOT_READY)
 }
 
-/// Compose the client-facing message for a *transport* failure (one that never got as far as an
-/// HTTP status) on a read/metadata call, distinguishing [`REMOTE_READ_TIMEOUT`] firing from every
-/// other kind of transport error — a connection reset, a DNS failure, a refused connect. This
-/// distinction is not visible in `reqwest::Error`'s own `Display`: a timeout and a connection reset
-/// print identically ("error sending request for url (...)"), because reqwest only records the
-/// distinguishing detail in the error's `source()` chain, never in its own message.
-/// [`reqwest::Error::is_timeout`] walks that chain, so it — not the message text — is what this
-/// reads to decide.
-fn describe_transport_error(action: &str, e: reqwest::Error) -> String {
-    if e.is_timeout() {
-        format!(
-            "Timed out while {}: the remote went silent for {:?} without sending anything.",
-            action, REMOTE_READ_TIMEOUT
-        )
-    } else {
-        format!("Error while {}: {}", action, e)
-    }
-}
-
 /// A fresh client-side lift session id — a random v4 UUID (the same in-tree generator that
 /// mints pseudonymous operator ids, so no new dependency). It scopes one pallet lift's staging
 /// keys (`staging/{session}/{hash}`) on a storage-backed head and is a safe single path
@@ -264,58 +245,106 @@ const REMOTE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 const REMOTE_CONNECT_TIMEOUT_TOR: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// How long a read/metadata request whose server side does **O(constant) work before its first
-/// response byte** may go without receiving any bytes before the client gives up. This is the
-/// FORK-49 fix: a remote that completes the TCP connect and then never writes anything (or writes
-/// a `Content-Length` it never delivers) used to hang the calling command forever, with no output
-/// and no way out short of killing the process.
+/// response byte** may go without receiving any bytes before the client gives up, *on top of*
+/// whatever connect budget already applies (see [`bounded_read_timeout`] — this constant alone is
+/// not the value configured on the client). This is the FORK-49 fix: a remote that completes the
+/// TCP connect and then never writes anything (or writes a `Content-Length` it never delivers)
+/// used to hang the calling command forever, with no output and no way out short of killing the
+/// process.
 ///
 /// This bounds *silence*, not duration: it is `ClientBuilder::read_timeout`, which applies
 /// per-read and resets on any progress *once headers have arrived*, so a transfer that is moving
 /// bytes — however slowly — is never killed by it, only one that has gone genuinely quiet for the
 /// full window. A per-request *total* deadline (`RequestBuilder::timeout`) was tried first and
-/// rejected: it cannot tell a stalled transfer from a slow-but-healthy one, and `fetch_object` can
-/// legitimately carry tens of megabytes (`object_utils::MAX_OBJECT_BYTES` is 64MiB) — a fixed
-/// total window kills a real, progressing download on any link slower than the window can cover,
-/// identically on every retry, which is worse than the hang this fix exists to remove (the
-/// settled contract: "a transfer that is moving bytes… is never silent"; only silence may fail).
+/// rejected: it cannot tell a stalled transfer from a slow-but-healthy one, and a large response
+/// body would be killed on any link slower than the window can cover, identically on every retry,
+/// which is worse than the hang this fix exists to remove (the settled contract: "a transfer that
+/// is moving bytes… is never silent"; only silence may fail).
 ///
 /// **Before headers arrive, `read_timeout` is a fixed, non-resetting deadline on the server's own
 /// pre-first-byte work** — it does not get the resets-on-progress behavior at all, because there
-/// is nothing yet to make progress on. That is why this is carried by only four of the module's
-/// read/metadata calls — [`RemoteClient::fetch_info`], [`RemoteClient::fetch_object`],
-/// [`RemoteClient::fetch_signature`], [`RemoteClient::fetch_bundle_to`] — each of whose server
-/// side does O(constant) work (a single lookup, or serving an already-built file) before writing
-/// anything, so a flat 10s pre-first-byte budget is honest. `missing_objects`, `fetch_batch`, and
-/// `fetch_subtree` are deliberately **not** on this client: their server sides build a bundle (or
-/// consult up to `MAX_MISSING_BATCH` hashes) *before* the first byte, work whose cost depends on
-/// object sizes the client cannot know in advance — no flat budget for that is honest, so they
-/// stay on the unbounded client until they have their own scaled/measured budget or an
-/// abandon-and-fall-back lane (see the comment at each of those three call sites).
+/// is nothing yet to make progress on, **and it is armed and checked from the moment the request
+/// is constructed, before the connector is even polled** — so it covers DNS/TCP/TLS/SOCKS too, not
+/// just the body (FORK-49 F1: measured empirically against this exact reqwest version — a client
+/// built with `connect_timeout(60s)` + `read_timeout(3s)` against a black-holed address failed at
+/// 3.002s, not 60s). That is why this is carried by only three of the module's read/metadata calls
+/// — [`RemoteClient::fetch_info`], [`RemoteClient::fetch_signature`],
+/// [`RemoteClient::fetch_bundle_to`] — each of whose server side does O(constant) work (a single
+/// lookup, or serving an already-built file) before writing anything, so a flat 10s pre-first-byte
+/// budget is honest. `fetch_object` needs a much looser budget of its own
+/// ([`FETCH_OBJECT_READ_TIMEOUT`]) since its server side is size-dependent, not O(constant).
+/// `missing_objects`, `fetch_batch`, and `fetch_subtree` are deliberately **not** bounded at all:
+/// their server sides build a bundle (or consult up to `MAX_MISSING_BATCH` hashes) *before* the
+/// first byte, work whose cost depends on object sizes the client cannot know in advance — no flat
+/// budget for that is honest, so they stay on the unbounded client until they have their own
+/// scaled/measured budget or an abandon-and-fall-back lane (see the comment at each of those three
+/// call sites).
 ///
 /// `read_timeout` is a `ClientBuilder`-level setting with no per-request override — it cannot be
 /// switched off for one specific request — so it is carried only by
-/// [`RemoteClient::bounded_reads`], never by `http`. `update_ref` shares `http`, and its server
-/// side legitimately runs a parcel-closure audit walk — scoped by the history segment being
-/// pushed, which on a first lift into an empty pallet is the whole history — before its first
-/// response byte; that can take minutes with *no* bytes moving at all, which this constant would
-/// (correctly) call silence if it applied there. Giving the bounded reads their own client means
-/// `update_ref` needs no exemption: it was simply never wired to a client that carries this
-/// setting.
+/// [`RemoteClient::bounded_reads`]/[`RemoteClient::bounded_object_reads`], never by `http`.
+/// `update_ref` shares `http`, and its server side legitimately runs a parcel-closure audit walk —
+/// scoped by the history segment being pushed, which on a first lift into an empty pallet is the
+/// whole history — before its first response byte; that can take minutes with *no* bytes moving at
+/// all, which this constant would (correctly) call silence if it applied there. Giving the bounded
+/// reads their own clients means `update_ref` needs no exemption: it was simply never wired to a
+/// client that carries this setting.
 ///
-/// 10s of silence is generous for any of the four calls above: a healthy connection carrying real
-/// progress, however slow the link, essentially never goes a full 10s without delivering a byte,
-/// and each of their pre-first-byte server costs is a single lookup or an already-built file.
+/// 10s of silence, on top of whichever connect budget applies, is generous for any of the three
+/// tight calls above: a healthy connection carrying real progress, however slow the link,
+/// essentially never goes a full 10s without delivering a byte, and each of their pre-first-byte
+/// server costs is a single lookup or an already-built file.
 const REMOTE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The read/metadata silence budget for [`RemoteClient::fetch_object`] alone — see
+/// [`RemoteClient::bounded_object_reads`]. Deliberately loose, not tuned to feel responsive:
+/// `server.rs`'s `get_object` handler documents that it "buffers the whole object in memory" via
+/// `retrieve_object_by_hash`, which content-verifies before returning and, for a packed/delta
+/// object, decompresses and reconstructs it in memory too — all inside `blocking(...)`, entirely
+/// before `bytes.into_response()` writes a single byte. That pre-first-byte phase is
+/// size-dependent, structurally the same shape as `objects/batch` (which stays fully unbounded for
+/// exactly this reason) — the difference is that a single object's size is capped
+/// (`object_utils::MAX_OBJECT_BYTES`, 64MiB), so unlike a batch, a flat budget over that ceiling
+/// can be honest, if it is loose enough. 60s is sized to comfortably cover reading, reconstructing,
+/// and hashing any object up to that ceiling — not to feel snappy.
+///
+/// Accepted residual, recorded rather than silently absorbed: `server.rs` also documents
+/// grandfathered pre-ceiling blobs (from before `MAX_OBJECT_BYTES` existed) as served "whole and
+/// genuinely unbounded" — for a multi-gigabyte one, even 60s can be too tight, making it
+/// permanently, deterministically unfetchable through this bound. Knowingly accepted for this
+/// slice; the root fix (streaming these handlers instead of buffering, removing the size-dependent
+/// pre-first-byte phase entirely) is FORK-85.
+const FETCH_OBJECT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The `read_timeout` to configure on a bounded-reads client, given the `connect_timeout` this
+/// client instance actually uses and the post-connect silence budget intended for it
+/// ([`REMOTE_READ_TIMEOUT`] or [`FETCH_OBJECT_READ_TIMEOUT`]).
+///
+/// Simply using `silence_budget` as the client's `read_timeout` is the FORK-49 F1 bug: that sleep
+/// is armed and checked before the connector is even polled (see [`REMOTE_READ_TIMEOUT`]'s doc),
+/// so it would preempt a legitimately slow connect — most sharply for a Tor dial, whose circuit
+/// build can take tens of seconds under [`REMOTE_CONNECT_TIMEOUT_TOR`], far longer than a bare 10s
+/// or even 60s silence budget would tolerate. Adding the connect budget in first guarantees the
+/// connect phase always gets its own full allowance — whichever of [`REMOTE_CONNECT_TIMEOUT`] or
+/// [`REMOTE_CONNECT_TIMEOUT_TOR`] this client was built with — before the silence clock can matter
+/// at all.
+fn bounded_read_timeout(connect_timeout: std::time::Duration,
+                        silence_budget: std::time::Duration) -> std::time::Duration {
+    connect_timeout + silence_budget
+}
 
 /// The remote endpoint: base URL, optional bearer token, and the HTTP clients.
 ///
-/// Three clients, not one, because two independent axes each need to vary per call: *redirect
-/// policy* (`fetch_batch`'s initial `POST` must not auto-follow; everything else may) and
-/// *whether a read/metadata silence bound applies* — only the four calls whose server side does
-/// O(constant) pre-first-byte work (see [`REMOTE_READ_TIMEOUT`]'s doc); never `update_ref`,
-/// `missing_objects`, `fetch_batch`, `fetch_subtree`, or any upload path. All three otherwise
-/// share the same proxy/connect-timeout configuration built once in
-/// [`RemoteClient::new_with_tor`].
+/// Four clients, not one, because three independent axes each need to vary per call: *redirect
+/// policy* (`fetch_batch`'s initial `POST` must not auto-follow; everything else may), *whether a
+/// read/metadata silence bound applies at all* (only `fetch_info`, `fetch_object`,
+/// `fetch_signature`, `fetch_bundle_to`; never `update_ref`, `missing_objects`, `fetch_batch`,
+/// `fetch_subtree`, or any upload path — see [`REMOTE_READ_TIMEOUT`]'s doc), and *how loose that
+/// bound is* (`fetch_object` alone needs [`FETCH_OBJECT_READ_TIMEOUT`] instead of
+/// [`REMOTE_READ_TIMEOUT`] — see [`bounded_object_reads`](Self::bounded_object_reads)'s doc). All
+/// four otherwise share the same proxy/connect-timeout configuration built once in
+/// [`RemoteClient::new_with_tor`], which is also where each bounded client's actual `read_timeout`
+/// is computed via [`bounded_read_timeout`] rather than being the raw silence-budget constant.
 #[derive(Clone)]
 pub struct RemoteClient {
     http: reqwest::Client,
@@ -326,13 +355,27 @@ pub struct RemoteClient {
     /// answers `500`, AWS `403 SignatureDoesNotMatch`). Redirects off this client are instead
     /// inspected and followed by hand with a fresh `GET` (see `fetch_batch`). Unbounded, like
     /// `http`: `fetch_batch` is one of the three calls [`REMOTE_READ_TIMEOUT`]'s doc explains are
-    /// deliberately not on `bounded_reads`.
+    /// deliberately never bounded at all.
     no_redirect: reqwest::Client,
-    /// Same endpoint as [`Self::http`], plus [`REMOTE_READ_TIMEOUT`]. Used only by the four
-    /// O(constant)-pre-first-byte calls (`fetch_info`, `fetch_object`, `fetch_signature`,
-    /// `fetch_bundle_to`) — never by `update_ref`, `missing_objects`, `fetch_batch`,
+    /// Same endpoint as [`Self::http`], plus a `read_timeout` of
+    /// [`bounded_read_timeout`]`(connect_timeout, `[`REMOTE_READ_TIMEOUT`]`)`. Used only by the
+    /// three O(constant)-pre-first-byte calls (`fetch_info`, `fetch_signature`,
+    /// `fetch_bundle_to`) — never by `fetch_object` (which needs the much looser
+    /// [`Self::bounded_object_reads`]), `update_ref`, `missing_objects`, `fetch_batch`,
     /// `fetch_subtree`, or any upload path (see [`REMOTE_READ_TIMEOUT`]'s doc for why).
     bounded_reads: reqwest::Client,
+    /// Same endpoint as [`Self::http`], plus a `read_timeout` of
+    /// [`bounded_read_timeout`]`(connect_timeout, `[`FETCH_OBJECT_READ_TIMEOUT`]`)` — the same
+    /// shape as [`Self::bounded_reads`], just with the looser silence budget `fetch_object`'s
+    /// size-dependent server work needs (see [`FETCH_OBJECT_READ_TIMEOUT`]'s doc). Used only by
+    /// `fetch_object`.
+    bounded_object_reads: reqwest::Client,
+    /// The connect-phase bound this instance's clients were actually built with —
+    /// [`REMOTE_CONNECT_TIMEOUT`] or [`REMOTE_CONNECT_TIMEOUT_TOR`], whichever
+    /// `should_route_through_tor` selected at construction. Kept so a connect-phase transport
+    /// failure can be reported against the bound that actually applied, rather than a
+    /// hardcoded guess (see `describe_transport_error`).
+    connect_timeout: std::time::Duration,
     base: String,
     token: Option<String>,
 }
@@ -378,9 +421,14 @@ impl RemoteClient {
     /// configuration — the seam the tests use to exercise onion routing without a config file,
     /// and the constructor a caller with settings already in hand can use.
     ///
-    /// When the settings route this remote through Tor (see [`should_route_through_tor`]), both
-    /// underlying clients dial through the Tor SOCKS proxy; otherwise they are built exactly as
-    /// before, so every non-onion remote and every existing call is byte-for-byte unchanged.
+    /// When the settings route this remote through Tor (see [`should_route_through_tor`]), all
+    /// four underlying clients (see [`RemoteClient`]'s own doc) dial through the Tor SOCKS proxy
+    /// and use [`REMOTE_CONNECT_TIMEOUT_TOR`] as their connect budget instead of
+    /// [`REMOTE_CONNECT_TIMEOUT`]; the two bounded clients' `read_timeout` is computed from
+    /// whichever of those applies (see [`bounded_read_timeout`]), so a Tor dial's much longer
+    /// connect allowance is never undercut by the read-silence budget. Every non-onion remote gets
+    /// the shorter, direct connect budget, as before — but every remote, onion or not, now carries
+    /// a connect bound it did not before this diff, so "unchanged" no longer describes it.
     ///
     /// # Arguments
     /// * `url`   - The base URL of the remote (`http://…`, or `http://<onion>.onion`).
@@ -416,16 +464,24 @@ impl RemoteClient {
         let mut no_redirect = reqwest::Client::builder()
             .connect_timeout(connect_timeout)
             .redirect(reqwest::redirect::Policy::none());
+        // FORK-49 F1: `read_timeout` is armed and checked before the connector is even polled, so
+        // using the raw silence budget here would let it preempt this exact `connect_timeout` —
+        // `bounded_read_timeout` adds it in first so the connect phase always gets its full
+        // allowance regardless of which budget (direct or Tor) applies to this instance.
         let mut bounded_reads = reqwest::Client::builder()
             .connect_timeout(connect_timeout)
-            .read_timeout(REMOTE_READ_TIMEOUT);
+            .read_timeout(bounded_read_timeout(connect_timeout, REMOTE_READ_TIMEOUT));
+        let mut bounded_object_reads = reqwest::Client::builder()
+            .connect_timeout(connect_timeout)
+            .read_timeout(bounded_read_timeout(connect_timeout, FETCH_OBJECT_READ_TIMEOUT));
 
-        // The same proxy governs all three clients: the redirect-following ones and the
+        // The same proxy governs all four clients: the redirect-following ones and the
         // hand-following one alike route through Tor when the remote does.
         if let Some(proxy) = &proxy {
             http = http.proxy(proxy.clone());
             no_redirect = no_redirect.proxy(proxy.clone());
             bounded_reads = bounded_reads.proxy(proxy.clone());
+            bounded_object_reads = bounded_object_reads.proxy(proxy.clone());
         }
 
         let http = http.build()
@@ -437,10 +493,15 @@ impl RemoteClient {
         let bounded_reads = bounded_reads.build()
             .map_err(|e| format!("Error while creating the HTTP client: {}", e))?;
 
+        let bounded_object_reads = bounded_object_reads.build()
+            .map_err(|e| format!("Error while creating the HTTP client: {}", e))?;
+
         Ok(RemoteClient {
             http,
             no_redirect,
             bounded_reads,
+            bounded_object_reads,
+            connect_timeout,
             base: url.trim_end_matches('/').to_string(),
             token,
         })
@@ -500,9 +561,10 @@ impl RemoteClient {
     }
 
     /// Build a request against this remote using a specific underlying `reqwest::Client` — the
-    /// seam the four O(constant)-pre-first-byte reads use to go out on
-    /// [`RemoteClient::bounded_reads`] instead of the unbounded default, and `fetch_batch`'s
-    /// initial `POST` uses to go out on [`RemoteClient::no_redirect`].
+    /// seam `fetch_info`/`fetch_signature`/`fetch_bundle_to` use to go out on
+    /// [`RemoteClient::bounded_reads`], `fetch_object` uses to go out on
+    /// [`RemoteClient::bounded_object_reads`], and `fetch_batch`'s initial `POST` uses to go out
+    /// on [`RemoteClient::no_redirect`] — all instead of the unbounded default.
     fn request_on(&self,
                    http: &reqwest::Client,
                    method: reqwest::Method,
@@ -514,6 +576,61 @@ impl RemoteClient {
         }
 
         builder
+    }
+
+    /// Compose the client-facing message for a *transport* failure (one that never got as far as
+    /// an HTTP status) on one of the four bounded read/metadata calls, distinguishing three cases
+    /// that `reqwest::Error`'s own `Display` cannot: a connect-phase timeout, a read/silence-phase
+    /// timeout, and everything else (a connection reset, a DNS failure, a refused connect). All
+    /// three otherwise print identically ("error sending request for url (...)"), because reqwest
+    /// only records the distinguishing detail in the error's `source()` chain, never in its own
+    /// message — `is_connect`/`is_timeout` walk that chain, so they, not the message text, decide.
+    ///
+    /// `is_connect()` comes first: a connect-phase failure is also `is_timeout() == true` when it
+    /// was `connect_timeout` that fired (FORK-49 F3 — verified: a black-holed SYN expires at
+    /// [`Self::connect_timeout`], not at `silence_budget`, so reporting it as read-silence would
+    /// name both the wrong bound and the wrong cause — nothing was ever silent if nothing ever
+    /// connected). `silence_budget` is the read-silence figure to name for whichever call this
+    /// is — [`REMOTE_READ_TIMEOUT`] for `fetch_info`/`fetch_signature`/`fetch_bundle_to`,
+    /// [`FETCH_OBJECT_READ_TIMEOUT`] for `fetch_object` — passed in rather than hardcoded so this
+    /// one function serves both budgets honestly.
+    fn describe_transport_error(&self,
+                                action: &str,
+                                silence_budget: std::time::Duration,
+                                e: reqwest::Error) -> String {
+        if e.is_connect() {
+            format!(
+                "Timed out while {}: could not connect to the remote within {:?}.",
+                action, self.connect_timeout
+            )
+        } else if e.is_timeout() {
+            format!(
+                "Timed out while {}: the remote went silent for {:?} without sending anything.",
+                action, silence_budget
+            )
+        } else {
+            format!("Error while {}: {}", action, e)
+        }
+    }
+
+    /// The mutation counterpart of [`Self::describe_transport_error`], for the six calls that ride
+    /// the unbounded `http`/`no_redirect` clients (`update_ref`, `upload_object`, `put_presigned`,
+    /// `upload_signature`, `put_trust`, `commit_lift`) — `connect_timeout` is the *only* timeout
+    /// mechanism ever active on those clients (no `read_timeout` is ever set on them), so any
+    /// `is_timeout()` failure there is necessarily a connect-phase one; there is no read-silence
+    /// case to distinguish it from. Says so, and that retrying is safe: a connect expiry means the
+    /// request never left the client, so — unlike a failure partway through an upload or a ref
+    /// move — there is no uncertainty about whether the remote saw it.
+    fn describe_mutation_transport_error(&self, action: &str, e: reqwest::Error) -> String {
+        if e.is_timeout() {
+            format!(
+                "Timed out while {}: could not connect to the remote within {:?}. Nothing was \
+                sent — safe to retry.",
+                action, self.connect_timeout
+            )
+        } else {
+            format!("Error while {}: {}", action, e)
+        }
     }
 
     /// Turn a non-success response into the client-facing error, threading the server's refusal
@@ -534,7 +651,9 @@ impl RemoteClient {
         let response = self.request_on(&self.bounded_reads, reqwest::Method::GET, "/v1/warehouse")
             .send()
             .await
-            .map_err(|e| describe_transport_error(&format!("reaching the remote {}", self.base), e))?;
+            .map_err(|e| self.describe_transport_error(
+                &format!("reaching the remote {}", self.base), REMOTE_READ_TIMEOUT, e
+            ))?;
 
         if !response.status().is_success() {
             return Err(Self::error_of(response, "the handshake").await);
@@ -543,7 +662,9 @@ impl RemoteClient {
         let info: WarehouseInfo = response.json()
             .await
             .map_err(|e| if e.is_timeout() {
-                describe_transport_error(&format!("reaching the remote {}", self.base), e)
+                self.describe_transport_error(
+                    &format!("reaching the remote {}", self.base), REMOTE_READ_TIMEOUT, e
+                )
             } else {
                 format!("The remote's handshake is not valid JSON: {}", e)
             })?;
@@ -733,12 +854,15 @@ impl RemoteClient {
             .map_err(|e| format!("Error while reading the subtree response: {}", e))
     }
 
-    /// Fetch one object's raw bytes.
+    /// Fetch one object's raw bytes. On [`Self::bounded_object_reads`], not [`Self::bounded_reads`]
+    /// — see [`FETCH_OBJECT_READ_TIMEOUT`]'s doc for why this call alone needs the looser budget.
     pub async fn fetch_object(&self, hash: &str) -> Result<Vec<u8>, String> {
-        let response = self.request_on(&self.bounded_reads, reqwest::Method::GET, &format!("/v1/objects/{}", hash))
+        let response = self.request_on(&self.bounded_object_reads, reqwest::Method::GET, &format!("/v1/objects/{}", hash))
             .send()
             .await
-            .map_err(|e| describe_transport_error(&format!("fetching object {}", hash), e))?;
+            .map_err(|e| self.describe_transport_error(
+                &format!("fetching object {}", hash), FETCH_OBJECT_READ_TIMEOUT, e
+            ))?;
 
         if !response.status().is_success() {
             return Err(Self::error_of(response, &format!("object {}", hash)).await);
@@ -747,7 +871,9 @@ impl RemoteClient {
         response.bytes()
             .await
             .map(|bytes| bytes.to_vec())
-            .map_err(|e| describe_transport_error(&format!("reading object {}", hash), e))
+            .map_err(|e| self.describe_transport_error(
+                &format!("reading object {}", hash), FETCH_OBJECT_READ_TIMEOUT, e
+            ))
     }
 
     /// Upload one object's raw bytes to the control plane (`PUT /v1/objects/{hash}`), where the
@@ -759,7 +885,7 @@ impl RemoteClient {
             .body(bytes)
             .send()
             .await
-            .map_err(|e| format!("Error while uploading object {}: {}", hash, e))?;
+            .map_err(|e| self.describe_mutation_transport_error(&format!("uploading object {}", hash), e))?;
 
         if !response.status().is_success() {
             return Err(Self::error_of(response, &format!("object {}", hash)).await);
@@ -822,7 +948,7 @@ impl RemoteClient {
             .body(bytes)
             .send()
             .await
-            .map_err(|e| format!("Error while uploading to a staging URL: {}", e))?;
+            .map_err(|e| self.describe_mutation_transport_error("uploading to a staging URL", e))?;
 
         if !response.status().is_success() {
             return Err(format!(
@@ -855,7 +981,7 @@ impl RemoteClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| format!("Error while committing the lift session: {}", e))?;
+            .map_err(|e| self.describe_mutation_transport_error("committing the lift session", e))?;
 
         if response.status().is_success() {
             return Ok(CommitOutcome::Committed);
@@ -879,7 +1005,9 @@ impl RemoteClient {
         let response = self.request_on(&self.bounded_reads, reqwest::Method::GET, &format!("/v1/signatures/{}", parcel_hash))
             .send()
             .await
-            .map_err(|e| describe_transport_error(&format!("fetching the signature of {}", parcel_hash), e))?;
+            .map_err(|e| self.describe_transport_error(
+                &format!("fetching the signature of {}", parcel_hash), REMOTE_READ_TIMEOUT, e
+            ))?;
 
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
@@ -892,7 +1020,9 @@ impl RemoteClient {
         response.bytes()
             .await
             .map(|bytes| Some(bytes.to_vec()))
-            .map_err(|e| describe_transport_error(&format!("reading the signature of {}", parcel_hash), e))
+            .map_err(|e| self.describe_transport_error(
+                &format!("reading the signature of {}", parcel_hash), REMOTE_READ_TIMEOUT, e
+            ))
     }
 
     /// Upload a parcel's signature sidecar.
@@ -901,7 +1031,9 @@ impl RemoteClient {
             .body(bytes)
             .send()
             .await
-            .map_err(|e| format!("Error while uploading the signature of {}: {}", parcel_hash, e))?;
+            .map_err(|e| self.describe_mutation_transport_error(
+                &format!("uploading the signature of {}", parcel_hash), e
+            ))?;
 
         if !response.status().is_success() {
             return Err(Self::error_of(response, &format!("the signature of {}", parcel_hash)).await);
@@ -916,7 +1048,7 @@ impl RemoteClient {
             .json(anchor)
             .send()
             .await
-            .map_err(|e| format!("Error while uploading the trust anchor: {}", e))?;
+            .map_err(|e| self.describe_mutation_transport_error("uploading the trust anchor", e))?;
 
         if !response.status().is_success() {
             return Err(Self::error_of(response, "the trust anchor").await);
@@ -939,7 +1071,9 @@ impl RemoteClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| format!("Error while moving the remote pallet \"{}\": {}", pallet, e))?;
+            .map_err(|e| self.describe_mutation_transport_error(
+                &format!("moving the remote pallet \"{}\"", pallet), e
+            ))?;
 
         if !response.status().is_success() {
             return Err(Self::error_of(response, &format!("moving pallet \"{}\"", pallet)).await);
@@ -956,6 +1090,13 @@ impl RemoteClient {
     /// half of `read_timeout` matters: a bundle can be large, and a slow-but-steady download must
     /// never be treated as a stall.
     ///
+    /// Downloads to a fresh temp file beside `path` and only renames it into place once every
+    /// chunk has landed (FORK-49 F6): `path` is this warehouse's *own* latest bundle, which
+    /// `forklift serve` would otherwise hand out as-is, and any mid-download failure — the new
+    /// timeout very much included — must never leave a truncated file sitting at the real name. A
+    /// failure at any point during the download removes the temp file and leaves whatever bundle
+    /// (or absence of one) `path` already had, untouched.
+    ///
     /// # Returns
     /// * `Ok(true)`    - The bundle was downloaded.
     /// * `Ok(false)`   - The remote has no bundle.
@@ -964,7 +1105,7 @@ impl RemoteClient {
         let mut response = self.request_on(&self.bounded_reads, reqwest::Method::GET, "/v1/bundles/latest")
             .send()
             .await
-            .map_err(|e| describe_transport_error("fetching the bundle", e))?;
+            .map_err(|e| self.describe_transport_error("fetching the bundle", REMOTE_READ_TIMEOUT, e))?;
 
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(false);
@@ -974,15 +1115,47 @@ impl RemoteClient {
             return Err(Self::error_of(response, "the bundle").await);
         }
 
-        let mut file = std::fs::File::create(path)
+        // The same temp-path naming `write_file_atomically` uses elsewhere in the store — unique
+        // per write, in the same directory as the final name, so the eventual rename is a same-
+        // filesystem metadata-only operation. Not `write_file_atomically` itself: that takes the
+        // full content up front, which would put the whole bundle back in memory — exactly what
+        // streaming via `response.chunk()` exists to avoid.
+        let temp_path = file_utils::temp_path_for(path)?;
+        let mut file = std::fs::File::create(&temp_path)
             .map_err(|e| format!("Error while creating the bundle file: {}", e))?;
 
-        while let Some(chunk) = response.chunk()
-            .await
-            .map_err(|e| describe_transport_error("downloading the bundle", e))?
-        {
-            std::io::Write::write_all(&mut file, &chunk)
-                .map_err(|e| format!("Error while writing the bundle file: {}", e))?;
+        let download: Result<(), String> = async {
+            while let Some(chunk) = response.chunk()
+                .await
+                .map_err(|e| self.describe_transport_error("downloading the bundle", REMOTE_READ_TIMEOUT, e))?
+            {
+                std::io::Write::write_all(&mut file, &chunk)
+                    .map_err(|e| format!("Error while writing the bundle file: {}", e))?;
+            }
+            Ok(())
+        }.await;
+
+        if let Err(e) = download {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(e);
+        }
+
+        // Fsync via the still-open write handle, never by reopening `temp_path` — a handle
+        // reopened after the fact cannot force a durable fsync on every platform this runs on.
+        if file_utils::fsync_enabled() {
+            file.sync_all()
+                .map_err(|e| format!("Error while syncing the bundle file: {}", e))?;
+        }
+        drop(file);
+
+        std::fs::rename(&temp_path, path).map_err(|e| format!(
+            "Error while moving the bundle into place at \"{}\": {}", path.to_string_lossy(), e
+        ))?;
+
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                file_utils::sync_dir(parent)?;
+            }
         }
 
         Ok(true)
@@ -4375,31 +4548,39 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------------------
-    // FORK-49 slice 1: a remote that completes the TCP connect and then never finishes its
-    // response must fail with a timeout, not hang the caller forever (previously: neither
-    // `reqwest` client this module builds set any timeout at all, so this class of remote
-    // failure hung the calling command with no output and no way out short of killing the
-    // process). Both fixtures below **park** their handler thread on a channel receive that is
-    // only ever unblocked by the fixture being dropped at the end of the test — never by
-    // returning early, which would drop the `TcpStream`, send a FIN, and let the client fail
-    // instantly on a connection-closed error that has nothing to do with any timeout; a test
-    // built that way would pass even against the unfixed client. Each assertion below wraps the
-    // call in an outer `tokio::time::timeout` (a hard ceiling well past the timeout under test)
-    // so a future regression that drops the fix fails the suite loudly instead of wedging CI
-    // forever, and checks the failure is specifically a *timeout* — not merely "some error" —
-    // since a connection-closed error and a timeout are otherwise easy to conflate.
+    // FORK-49: a remote that completes the TCP connect and then never finishes its response
+    // must fail with a timeout, not hang the caller forever (previously: neither `reqwest`
+    // client this module builds set any timeout at all). The fixtures below **park** their
+    // handler thread on a channel receive that is only ever unblocked by the fixture being
+    // dropped at the end of the test — never by returning early, which would drop the
+    // `TcpStream`, send a FIN, and let the client fail instantly on a connection-closed error
+    // that has nothing to do with any timeout; a test built that way would pass even against an
+    // unfixed client. Each "must time out" assertion wraps the call in an outer
+    // `tokio::time::timeout` (a hard ceiling well past the timeout under test) so a future
+    // regression that drops the fix fails the suite loudly instead of wedging CI forever, and
+    // checks the failure is specifically a *timeout* — not merely "some error" — since a
+    // connection-closed error and a timeout are otherwise easy to conflate. Each "must stay
+    // unbounded" assertion instead races the call against a timer and requires it to *still be
+    // running* once the timer fires — the mirror-image failure mode, where a silent remote must
+    // never be enough on its own to fail a call the settled contract says may only be abandoned.
     //
-    // `TEST_EXPECTED_READ_TIMEOUT` mirrors the production `REMOTE_READ_TIMEOUT` (10s) as its own
-    // constant, rather than referencing the production one directly, so this module keeps
-    // compiling against the pre-fix tree too (used to confirm these tests are red before the fix
-    // lands).
+    // `TEST_DIRECT_CONNECT_TIMEOUT`/`TEST_TIGHT_READ_TIMEOUT`/`TEST_LOOSE_READ_TIMEOUT` mirror the
+    // production `REMOTE_CONNECT_TIMEOUT`/`REMOTE_READ_TIMEOUT`/`FETCH_OBJECT_READ_TIMEOUT` as
+    // their own constants (rather than referencing the production ones directly) purely so this
+    // module keeps compiling against a tree with those constants renamed or removed — every test
+    // below was at some point run against the pre-fix tree to confirm it was red for the right
+    // reason before the corresponding fix landed.
     // -----------------------------------------------------------------------------------
 
-    const TEST_EXPECTED_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    const TEST_DIRECT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    const TEST_TIGHT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    const TEST_LOOSE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
     /// A remote that accepts the connection, reads the request in full, and then genuinely goes
     /// silent: it never writes a byte of response. See the section note above for the parking
-    /// pattern and why a returning handler would be a false pass.
+    /// pattern and why a returning handler would be a false pass. Shared by every "must time out"
+    /// and "must stay unbounded" test below — the same fixture proves both properties, on
+    /// whichever call each test points it at.
     struct SilentRemote {
         url: String,
         /// Owns the sender; dropping it — when this value goes out of scope at the end of the
@@ -4427,13 +4608,35 @@ mod tests {
         }
     }
 
+    /// Race `future` against a `check_after` timer and require it to **still be running** once
+    /// the timer fires — the "unbounded direction" pin: a silent remote must never be enough, on
+    /// its own, to fail a call the settled contract says may only ever be abandoned, not failed.
+    /// Panics (naming whatever the future resolved to) if it finishes first; returns normally
+    /// (the passing case) if the timer wins.
+    async fn assert_still_running<F, T>(label: &str, check_after: std::time::Duration, future: F)
+    where
+        F: std::future::Future<Output = T>,
+    {
+        tokio::select! {
+            _ = future => panic!(
+                "{} already finished after only {:?} — a silent remote must never be enough on \
+                its own to fail a call this contract says may only be abandoned.",
+                label, check_after
+            ),
+            _ = tokio::time::sleep(check_after) => {
+                // Still running, as required — the passing case.
+            }
+        }
+    }
+
     /// FORK-49 T1: `fetch_info` against a remote that connects and then never writes anything
     /// must fail with a timeout — not hang forever, and not fail for some unrelated reason.
     #[test]
     fn fetch_info_times_out_against_a_silent_remote() {
         let remote = SilentRemote::start();
         let client = RemoteClient::new(&remote.url, None).unwrap();
-        let hard_ceiling = TEST_EXPECTED_READ_TIMEOUT + std::time::Duration::from_secs(15);
+        let hard_ceiling = TEST_DIRECT_CONNECT_TIMEOUT + TEST_TIGHT_READ_TIMEOUT
+            + std::time::Duration::from_secs(15);
 
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let outcome = runtime.block_on(async {
@@ -4453,6 +4656,157 @@ mod tests {
             message.to_lowercase().contains("timed out"),
             "must fail specifically with a timeout, not some other transport error: {}", message
         );
+    }
+
+    /// FORK-49 F5: `fetch_signature` must be bounded exactly like `fetch_info` — pins that it
+    /// stays wired to `bounded_reads` and never silently drifts back to the unbounded client
+    /// (which would restore the hang).
+    #[test]
+    fn fetch_signature_times_out_against_a_silent_remote() {
+        let remote = SilentRemote::start();
+        let client = RemoteClient::new(&remote.url, None).unwrap();
+        let hard_ceiling = TEST_DIRECT_CONNECT_TIMEOUT + TEST_TIGHT_READ_TIMEOUT
+            + std::time::Duration::from_secs(15);
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let outcome = runtime.block_on(async {
+            tokio::time::timeout(hard_ceiling, client.fetch_signature(&"a".repeat(64))).await
+        });
+
+        let message = outcome
+            .unwrap_or_else(|_| panic!(
+                "fetch_signature hung past the test's own {:?} ceiling — no timeout fired at all",
+                hard_ceiling
+            ))
+            .expect_err("a silent remote must not appear to succeed");
+
+        assert!(
+            message.to_lowercase().contains("timed out"),
+            "must fail specifically with a timeout, not some other transport error: {}", message
+        );
+    }
+
+    /// FORK-49 F5: `fetch_bundle_to` must be bounded exactly like `fetch_info` — same pin as
+    /// `fetch_signature`'s, for the same reason.
+    #[test]
+    fn fetch_bundle_to_times_out_against_a_silent_remote() {
+        let remote = SilentRemote::start();
+        let client = RemoteClient::new(&remote.url, None).unwrap();
+        let dest = std::env::temp_dir().join(format!(
+            "forklift-fetch-bundle-to-silent-{}-{}", std::process::id(), line!()
+        ));
+        let hard_ceiling = TEST_DIRECT_CONNECT_TIMEOUT + TEST_TIGHT_READ_TIMEOUT
+            + std::time::Duration::from_secs(15);
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let outcome = runtime.block_on(async {
+            tokio::time::timeout(hard_ceiling, client.fetch_bundle_to(&dest)).await
+        });
+
+        let message = outcome
+            .unwrap_or_else(|_| panic!(
+                "fetch_bundle_to hung past the test's own {:?} ceiling — no timeout fired at all",
+                hard_ceiling
+            ))
+            .expect_err("a silent remote must not appear to succeed");
+
+        assert!(
+            message.to_lowercase().contains("timed out"),
+            "must fail specifically with a timeout, not some other transport error: {}", message
+        );
+        // A silent remote never gets past headers, so no temp file is ever created here — the
+        // dedicated FORK-49 F6 test below is what actually exercises the mid-download cleanup.
+        assert!(!dest.exists(), "no file should appear at the destination at all in this scenario");
+
+        let _ = std::fs::remove_file(&dest);
+    }
+
+    /// FORK-49 F6: a mid-download failure — the new timeout being the routine case now — must
+    /// never leave a truncated file at the destination, which would otherwise be this warehouse's
+    /// own latest bundle. Unlike the silent-remote scenario above, [`LyingContentLengthRemote`]
+    /// gets past headers and writes a few real bytes before going quiet, so the temp file this
+    /// exercises genuinely exists (and has content) at the moment the timeout fires and the
+    /// cleanup runs.
+    #[test]
+    fn fetch_bundle_to_leaves_no_truncated_file_on_a_mid_download_timeout() {
+        let remote = LyingContentLengthRemote::start();
+        let client = RemoteClient::new(&remote.url, None).unwrap();
+        let dest = std::env::temp_dir().join(format!(
+            "forklift-fetch-bundle-to-truncated-{}-{}", std::process::id(), line!()
+        ));
+        let hard_ceiling = TEST_DIRECT_CONNECT_TIMEOUT + TEST_TIGHT_READ_TIMEOUT
+            + std::time::Duration::from_secs(15);
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let outcome = runtime.block_on(async {
+            tokio::time::timeout(hard_ceiling, client.fetch_bundle_to(&dest)).await
+        });
+
+        let message = outcome
+            .unwrap_or_else(|_| panic!(
+                "fetch_bundle_to hung past the test's own {:?} ceiling — no timeout fired at all",
+                hard_ceiling
+            ))
+            .expect_err("a body that never completes must not appear to succeed");
+
+        assert!(
+            message.to_lowercase().contains("timed out"),
+            "must fail specifically with a timeout, not some other transport error: {}", message
+        );
+        assert!(
+            !dest.exists(),
+            "a mid-download timeout must never leave a truncated file at the destination (FORK-49 F6)"
+        );
+
+        let _ = std::fs::remove_file(&dest);
+    }
+
+    /// FORK-49 F5: `missing_objects`'s server work scales with the batch, so the contract forbids
+    /// bounding it at all (see its own doc comment). Pins the "unbounded direction": a silent
+    /// remote alone must never make this call fail within a window comfortably past the tight
+    /// bounded budget — if it did, either this call or `request()`'s own default client had been
+    /// silently rewired onto a bounded one.
+    #[test]
+    fn missing_objects_is_not_flat_bounded_by_silence() {
+        let remote = SilentRemote::start();
+        let client = RemoteClient::new(&remote.url, None).unwrap();
+        let check_after = TEST_DIRECT_CONNECT_TIMEOUT + TEST_TIGHT_READ_TIMEOUT
+            + std::time::Duration::from_secs(5);
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(assert_still_running(
+            "missing_objects", check_after, client.missing_objects(&["a".repeat(64)]),
+        ));
+    }
+
+    /// FORK-49 F5: `fetch_batch`'s server work is size-dependent (see its own doc comment) — same
+    /// "unbounded direction" pin as `missing_objects`'s.
+    #[test]
+    fn fetch_batch_is_not_flat_bounded_by_silence() {
+        let remote = SilentRemote::start();
+        let client = RemoteClient::new(&remote.url, None).unwrap();
+        let check_after = TEST_DIRECT_CONNECT_TIMEOUT + TEST_TIGHT_READ_TIMEOUT
+            + std::time::Duration::from_secs(5);
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(assert_still_running(
+            "fetch_batch", check_after, client.fetch_batch(&["a".repeat(64)]),
+        ));
+    }
+
+    /// FORK-49 F5: `fetch_subtree`'s server work is size-dependent (see its own doc comment) —
+    /// same "unbounded direction" pin as `missing_objects`'s.
+    #[test]
+    fn fetch_subtree_is_not_flat_bounded_by_silence() {
+        let remote = SilentRemote::start();
+        let client = RemoteClient::new(&remote.url, None).unwrap();
+        let check_after = TEST_DIRECT_CONNECT_TIMEOUT + TEST_TIGHT_READ_TIMEOUT
+            + std::time::Duration::from_secs(5);
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(assert_still_running(
+            "fetch_subtree", check_after, client.fetch_subtree(&"p".repeat(64), "src"),
+        ));
     }
 
     /// A remote that accepts the connection, reads the request, sends response headers claiming
@@ -4495,12 +4849,15 @@ mod tests {
 
     /// FORK-49 T2: `fetch_object` against a remote whose `Content-Length` outlives the bytes it
     /// actually sends must fail with a timeout, not hang waiting for a body that is never coming.
+    /// Ceiling sized to `TEST_LOOSE_READ_TIMEOUT` (FORK-49 F2): `fetch_object` rides
+    /// `bounded_object_reads`, not the tight `bounded_reads` the other three calls use.
     #[test]
     fn fetch_object_times_out_against_a_content_length_lie() {
         let remote = LyingContentLengthRemote::start();
         let client = RemoteClient::new(&remote.url, None).unwrap();
         let hash = "a".repeat(64);
-        let hard_ceiling = TEST_EXPECTED_READ_TIMEOUT + std::time::Duration::from_secs(15);
+        let hard_ceiling = TEST_DIRECT_CONNECT_TIMEOUT + TEST_LOOSE_READ_TIMEOUT
+            + std::time::Duration::from_secs(20);
 
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let outcome = runtime.block_on(async {
@@ -4558,19 +4915,23 @@ mod tests {
 
     /// FORK-49, pinning §0 (the settled silence contract): `fetch_object` against a body that
     /// dribbles in slowly but steadily — every inter-chunk gap comfortably under
-    /// `TEST_EXPECTED_READ_TIMEOUT`, the total transfer comfortably past it — must **succeed**,
+    /// `TEST_LOOSE_READ_TIMEOUT`, the total transfer comfortably past it — must **succeed**,
     /// never be treated as a stall. A total-deadline bound (rejected in favor of
     /// `read_timeout`-on-its-own-client, see `REMOTE_READ_TIMEOUT`'s doc) fails this test: it
     /// would kill the transfer partway through even though every single gap was healthy.
     #[test]
     fn fetch_object_survives_a_slow_but_steadily_progressing_body() {
-        let gap = std::time::Duration::from_secs(4);
+        let gap = std::time::Duration::from_secs(20);
         let chunks: Vec<Vec<u8>> = (0..4).map(|i| format!("chunk-{}-of-the-drip", i).into_bytes()).collect();
         let expected: Vec<u8> = chunks.concat();
-        // 4 gaps of 4s = 16s total, ~60% past the 10s read timeout, while no single gap comes
-        // anywhere near it.
+        // 4 gaps of 20s = 80s total, ~15s past the 65s effective loose budget (connect + read),
+        // while no single gap comes anywhere near even the tight budget, let alone the loose one.
         let total_duration = gap * (chunks.len() as u32);
-        assert!(total_duration > TEST_EXPECTED_READ_TIMEOUT, "the fixture must actually outlast the bound under test");
+        let effective_loose_budget = TEST_DIRECT_CONNECT_TIMEOUT + TEST_LOOSE_READ_TIMEOUT;
+        assert!(
+            total_duration > effective_loose_budget,
+            "the fixture must actually outlast the bound under test"
+        );
 
         let url = start_steady_drip_remote(chunks, gap);
         let client = RemoteClient::new(&url, None).unwrap();
@@ -4623,16 +4984,17 @@ mod tests {
     }
 
     /// FORK-49 T3, pinning constraint B: `update_ref` must ride out a response slower than the
-    /// read/metadata timeout, not fail at it. A fixture that only answers after
-    /// `TEST_EXPECTED_READ_TIMEOUT` plus slack, succeeding here, is the shape this constraint
-    /// gets without a live slow server (the real case is a server-side audit walk that can take
-    /// minutes on a real first push — not something this test suite can wait out directly). If a
-    /// future change ever gives `update_ref` the same per-request timeout the reads get, this is
-    /// exactly what turns red: the call would fail at the timeout, well before this fixture ever
-    /// answers.
+    /// tight read/metadata budget, not fail at it. A fixture that only answers after the
+    /// effective tight budget (connect + read) plus slack, succeeding here, is the shape this
+    /// constraint gets without a live slow server (the real case is a server-side audit walk that
+    /// can take minutes on a real first push — not something this test suite can wait out
+    /// directly). If a future change ever gives `update_ref` the same per-request timeout the
+    /// reads get, this is exactly what turns red: the call would fail at the timeout, well before
+    /// this fixture ever answers.
     #[test]
     fn update_ref_outlives_the_read_metadata_timeout() {
-        let past_read_timeout = TEST_EXPECTED_READ_TIMEOUT + std::time::Duration::from_secs(3);
+        let past_read_timeout = TEST_DIRECT_CONNECT_TIMEOUT + TEST_TIGHT_READ_TIMEOUT
+            + std::time::Duration::from_secs(3);
         let url = start_slow_ref_update_remote(past_read_timeout);
         let client = RemoteClient::new(&url, None).unwrap();
         let outer_ceiling = past_read_timeout + std::time::Duration::from_secs(15);
@@ -4653,5 +5015,60 @@ mod tests {
                 "update_ref must not fail on a response that only arrived slowly, never on any \
                 timeout: {}", e
             ));
+    }
+
+    /// A fixture standing in for a Tor SOCKS proxy this test fully controls: it TCP-accepts (the
+    /// "connect" a proxied client dials through it) and then genuinely parks, never beginning the
+    /// SOCKS5 handshake. From the connector's perspective this is still "connecting" — the whole
+    /// proxy handshake is part of establishing the tunnel, exactly like the real onion circuit
+    /// build `REMOTE_CONNECT_TIMEOUT_TOR`'s doc describes — so this is a faithful stand-in for a
+    /// slow Tor dial without needing a live daemon.
+    struct ParkingSocksProxy {
+        addr: String,
+        _park: std::sync::mpsc::Sender<()>,
+    }
+
+    impl ParkingSocksProxy {
+        fn start() -> ParkingSocksProxy {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+
+            std::thread::spawn(move || {
+                if let Ok((stream, _)) = listener.accept() {
+                    let _ = rx.recv();
+                    drop(stream);
+                }
+            });
+
+            ParkingSocksProxy { addr, _park: tx }
+        }
+    }
+
+    /// FORK-49 F1: a Tor-routed client's read/silence budget must not preempt its own, much
+    /// larger, connect budget. Built directly through `new_with_tor`/`TorSettings`
+    /// (`TorMode::On`, pointed at a fixture-controlled fake SOCKS proxy) — no live Tor daemon, no
+    /// config file needed. Before the F1 fix, `bounded_reads`' flat `TEST_TIGHT_READ_TIMEOUT`
+    /// `read_timeout` fired regardless of `connect_timeout` (`read_timeout` is armed and checked
+    /// before the connector is even polled), so this call failed at ~10s even though
+    /// `REMOTE_CONNECT_TIMEOUT_TOR` allows 60s; after the fix, the configured `read_timeout`
+    /// accommodates whichever connect budget applies, so the call must still be running well past
+    /// both the old flat tight budget and the direct connect budget.
+    #[test]
+    fn tor_routed_read_budget_does_not_preempt_the_tor_connect_budget() {
+        let proxy = ParkingSocksProxy::start();
+        let tor = TorSettings { mode: TorMode::On, proxy: format!("socks5h://{}", proxy.addr) };
+        let client = RemoteClient::new_with_tor(
+            "http://forklift-fork-49-tor-test.invalid", None, tor,
+        ).unwrap();
+
+        // Comfortably past both the old flat tight-budget bug and the direct connect budget — if
+        // either were still preempting the Tor connect allowance, the call would already have
+        // failed well before this fires.
+        let check_after = TEST_DIRECT_CONNECT_TIMEOUT + TEST_TIGHT_READ_TIMEOUT
+            + std::time::Duration::from_secs(10);
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(assert_still_running("fetch_info (Tor-routed)", check_after, client.fetch_info()));
     }
 }
