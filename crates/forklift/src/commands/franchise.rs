@@ -1,12 +1,14 @@
 use std::path::Path;
 use serde::Serialize;
 use forklift_core::enums::config_scope::ConfigScope;
+use forklift_core::error;
+use forklift_core::model::remote::WarehouseInfo;
 use forklift_core::util::path_utils::WarehousePath;
-use forklift_core::util::remote_utils::RemoteClient;
+use forklift_core::util::remote_utils::{RemoteClient, TorSettings};
 use forklift_core::util::scope_utils::MaterializationScope;
 use forklift_core::util::{
-    bundle_utils, config_utils, object_utils, pallet_utils, remote_utils, scope_utils,
-    shift_utils, warehouse_utils,
+    bundle_utils, config_utils, object_utils, pack_utils, pallet_utils, remote_utils,
+    scope_utils, shift_utils, warehouse_utils,
 };
 use crate::output::{self, CommandOutput};
 
@@ -15,6 +17,16 @@ use crate::output::{self, CommandOutput};
 /// adopt its trust anchor, download the history (the remote's bundle first, when it has
 /// one, then whatever the bundle lacked as loose objects) and materialize the chosen
 /// pallet's head in the working directory.
+///
+/// The remote is contacted before the target directory (or the warehouse in it) is touched, and
+/// the requested pallet is checked against the handshake's own answer before anything is fetched,
+/// so a bad URL, a bad token, an unreachable host, or a `--pallet` typo all leave the filesystem
+/// exactly as they found it — nothing to fetch, nothing to clean up. A failure after that point
+/// (a dropped connection mid-fetch, a full disk, a typo'd `--only` path, …) is cleaned up before
+/// this returns: the target directory itself is removed if franchise created it, or — if it
+/// pre-existed empty — just emptied back out, so an immediate retry lands in a directory that is
+/// new or empty either way, never permanently wedged. Any missing *ancestor* directories
+/// franchise had to create along the way are left standing either way — see `claim_target`.
 ///
 /// # Arguments
 /// * `url`       - The remote to franchise.
@@ -29,9 +41,9 @@ use crate::output::{self, CommandOutput};
 ///                 elsewhere).
 ///
 /// # Returns
-/// * `Ok(())`      - If the franchise is ready to work in.
-/// * `Err(String)` - If the directory is not empty, the remote is unreachable, or a
-///                   transfer failed.
+/// * `Ok(())` - If the franchise is ready to work in.
+/// * `Err(String)` - If the directory is not empty, the remote is unreachable, the pallet does
+///   not exist, or a transfer failed. The target is left as it was found (see above) either way.
 pub async fn handle_command(url: &str,
                             directory: &str,
                             pallet: Option<String>,
@@ -45,24 +57,109 @@ pub async fn handle_command(url: &str,
     let target = Path::new(directory);
 
     if target.exists() {
-        let mut entries = std::fs::read_dir(target)
-            .map_err(|e| format!("Error while reading \"{}\": {}", directory, e))?;
-
-        if entries.next().is_some() {
-            return Err(format!(
-                "\"{}\" is not empty; franchise into a new or empty directory.",
-                directory
-            ));
-        }
-    } else {
-        std::fs::create_dir_all(target)
-            .map_err(|e| format!("Error while creating \"{}\": {}", directory, e))?;
+        refuse_if_not_an_empty_directory(target)?;
     }
 
-    // Everything from here on happens inside the new warehouse.
+    // Extending the same principle as the --only normalization above (refuse cleanly before any
+    // warehouse is created) to the network: talk to the remote *before* touching the filesystem
+    // at all. A bad URL, bad token or unreachable host must leave the target exactly as found —
+    // not even an empty directory left behind for a directory that did not exist before.
+    //
+    // Tor settings come from *global* configuration only — deliberately, never the effective
+    // (warehouse-then-global) resolution `RemoteClient::new` would use. There is no "this
+    // warehouse" yet to have an opinion here; only the ambient working directory, which may
+    // happen to sit inside a *different*, unrelated warehouse. Before this handshake moved
+    // earlier, it always ran *inside* the fresh (still-empty) target, whose own warehouse scope
+    // had never had anything to set — so global was, in effect, the only scope that could ever
+    // apply. Falling through to `from_config`'s cascade now would silently make a brand-new
+    // clone's Tor routing depend on whatever unrelated warehouse the caller happened to be
+    // standing in — a cwd-dependent, security-relevant surprise this preserves against.
+    let client = RemoteClient::new_with_tor(url, token.clone(), TorSettings::from_global_config())?;
+    let info = client.fetch_info().await?;
+
+    // Resolve the pallet from the handshake alone — no I/O — so a `--pallet` typo is refused
+    // immediately, before anything is fetched or mutated: the same principle once more. (The
+    // `--only` scope, by contrast, cannot be validated this early: it names a subtree of a
+    // *tree*, and no tree is available until the pallet's history is actually fetched — see the
+    // check after `fetch_history_scoped` below. That fetch is unavoidably real I/O even for this
+    // validation, though a sparse one stays lean — spine and signatures only, never out-of-scope
+    // content — so a typo'd --only wastes far less than a typo'd --pallet against a non-sparse
+    // franchise would have, before this change.)
+    let resolution = resolve_pallet(&info, pallet)?;
+
+    // The handshake (and the pallet check) succeeded; only now may the filesystem change.
+    // `claim_target` is the sole authority on whether franchise itself created the target —
+    // decided atomically, not by a separate `exists()` check racing the multi-second (or, over
+    // Tor, longer) gap the handshake just took. See its own doc comment.
+    let original_cwd = std::env::current_dir()
+        .map_err(|e| format!("Error while reading the current directory: {}", e))?;
+    let created_directory = claim_target(target)?;
+    let absolute_target = original_cwd.join(target);
+
+    let outcome = enter_and_franchise(
+        target, directory, url, resolution, token, fetch_scope, sparse, &client, info,
+    ).await;
+
+    if let Err(error) = outcome {
+        // Drop any mmap'd pack handles this run loaded (reading a franchised bundle's packs
+        // while adopting trust or meta pallets) before deleting anything under the target.
+        // Originally added on the theory that an open mmap blocks its own pack file's deletion
+        // on Windows (PR #84 review finding 1) — tested directly on `windows-latest` and that
+        // specific claim did not hold (see `pack_utils::invalidate_cache`'s doc comment and
+        // `an_mmapd_pack_does_not_block_its_own_directory_removal` for the confirming probe).
+        // Kept anyway as cheap, correctness-neutral insurance, reusing the same drop-before-
+        // delete/rename idiom `compact`/`import_transport_packs` already use, rather than
+        // asserting a Windows-deletion-blocking mechanism this run no longer relies on.
+        pack_utils::invalidate_cache();
+
+        // Get back to where we started before touching the target — it may currently be our
+        // cwd, and removing the directory a process is standing in leaves it dangling. Cleanup
+        // failing must never shadow the original error: the operator needs to see why franchise
+        // failed, not why the cleanup did, so a cleanup error is appended, not substituted.
+        let _ = std::env::set_current_dir(&original_cwd);
+        return Err(cleanup_after_failure(&absolute_target, created_directory, error));
+    }
+
+    Ok(())
+}
+
+/// Switch into the already-claimed `target` and run the rest of the franchise. `set_current_dir`'s
+/// own failure is routed through this `Result` rather than an early `?` return in
+/// `handle_command`, so the caller's cleanup runs unconditionally for *any* failure from this
+/// point on, not only the ones inside `franchise_into_prepared_target`.
+#[allow(clippy::too_many_arguments)]
+async fn enter_and_franchise(
+    target: &Path,
+    directory: &str,
+    url: &str,
+    resolution: PalletResolution,
+    token: Option<String>,
+    fetch_scope: MaterializationScope,
+    sparse: bool,
+    client: &RemoteClient,
+    info: WarehouseInfo,
+) -> Result<(), String> {
     std::env::set_current_dir(target)
         .map_err(|e| format!("Error while switching to \"{}\": {}", directory, e))?;
 
+    franchise_into_prepared_target(url, directory, resolution, token, fetch_scope, sparse, client, info).await
+}
+
+/// Everything that mutates the warehouse: run only after the remote handshake and the pallet
+/// check have already succeeded (see `handle_command`), with the current directory already
+/// switched into the target. A failure anywhere in here is handled by the caller, which cleans
+/// up whatever this left behind.
+#[allow(clippy::too_many_arguments)]
+async fn franchise_into_prepared_target(
+    url: &str,
+    directory: &str,
+    resolution: PalletResolution,
+    token: Option<String>,
+    fetch_scope: MaterializationScope,
+    sparse: bool,
+    client: &RemoteClient,
+    info: WarehouseInfo,
+) -> Result<(), String> {
     warehouse_utils::prepare_warehouse()?;
 
     config_utils::set_value(config_utils::KEY_REMOTE_URL, url, ConfigScope::Warehouse)?;
@@ -70,9 +167,6 @@ pub async fn handle_command(url: &str,
     if let Some(token) = &token {
         config_utils::set_value(config_utils::KEY_REMOTE_TOKEN, token, ConfigScope::Warehouse)?;
     }
-
-    let client = RemoteClient::new(url, token)?;
-    let info = client.fetch_info().await?;
 
     let mut report = FranchiseReport {
         remote: url.to_string(),
@@ -117,40 +211,20 @@ pub async fn handle_command(url: &str,
         }
     }
 
-    let trust = remote_utils::adopt_remote_trust(&client, &info).await?;
+    let trust = remote_utils::adopt_remote_trust(client, &info).await?;
     report.adopted_anchor = trust.adopted_anchor;
 
     // Adopt the meta pallets too (the manifest, …), so a clone carries the post-metadata,
     // not just the working history. A fresh clone has none locally, so nothing diverges.
-    report.meta_adopted = remote_utils::adopt_meta_pallets(&client, &info).await?.adopted;
+    report.meta_adopted = remote_utils::adopt_meta_pallets(client, &info).await?.adopted;
 
-    let explicitly_requested = pallet.is_some();
+    let PalletResolution { pallet_name, remote_head } = resolution;
 
-    let pallet_name = match pallet {
-        Some(name) => name,
-        None => info.default_pallet.clone(),
-    };
-
-    let Some(remote_head) = info.pallets.get(&pallet_name) else {
-        // A pallet absent from the handshake is unborn on the remote. The remote's own
-        // default pallet legitimately starts unborn (a fresh remote, or one whose
-        // current pallet has nothing stacked while others do); a pallet the user asked
-        // for by name gets typo protection instead, unless nothing is stacked at all.
-        // Meta pallets (`@office`, …) are not working pallets — a remote with only those
-        // is still fresh, and they never appear in the "it has: …" hint.
-        let user_pallets: Vec<&String> = info.pallets.keys()
-            .filter(|name| !name.starts_with(pallet_utils::META_QUALIFIER))
-            .collect();
-        let is_fresh = user_pallets.is_empty();
-
-        if explicitly_requested && !is_fresh {
-            return Err(format!(
-                "The remote has no pallet \"{}\" (it has: {}).",
-                pallet_name,
-                user_pallets.into_iter().cloned().collect::<Vec<_>>().join(", ")
-            ));
-        }
-
+    let Some(remote_head) = remote_head else {
+        // Legitimately unborn: `resolve_pallet` already ruled out a typo before any of this
+        // warehouse's mutation began, so reaching this branch means either the remote's own
+        // default pallet has nothing stacked yet, or an explicitly named pallet does not exist
+        // on an otherwise-fresh remote — both fine starting points, not errors.
         pallet_utils::set_current_pallet_name(&pallet_name)?;
 
         // There is no tree to validate --only against (the pallet has nothing stacked on the
@@ -169,9 +243,9 @@ pub async fn handle_command(url: &str,
         return Ok(());
     };
 
-    let stats = remote_utils::fetch_history_scoped(&client, remote_head, &fetch_scope).await?;
+    let stats = remote_utils::fetch_history_scoped(client, &remote_head, &fetch_scope).await?;
 
-    let tree_hash = object_utils::load_parcel(remote_head)?.tree_hash;
+    let tree_hash = object_utils::load_parcel(&remote_head)?.tree_hash;
 
     // Validate the --only paths against the fetched head BEFORE any of this warehouse's state
     // (the fetch scope, the origin record, the pallet head) is written: a typo'd path is
@@ -195,15 +269,270 @@ pub async fn handle_command(url: &str,
         config_utils::set_value(config_utils::KEY_REMOTE_ORIGIN, url, ConfigScope::Warehouse)?;
     }
 
-    pallet_utils::set_pallet_head(&pallet_name, remote_head)?;
+    pallet_utils::set_pallet_head(&pallet_name, &remote_head)?;
     pallet_utils::set_current_pallet_name(&pallet_name)?;
 
-    shift_utils::materialize_tree(None, &tree_hash, "Franchising")?;
+    // A failure here still goes through the caller's ordinary cleanup — the whole target is
+    // wiped — even though the warehouse is otherwise complete at this point: every object, the
+    // signed history and the pallet ref are already durable; only the working tree failed to
+    // materialize. Leaving a checked-out-except-for-this warehouse in place and pointing the
+    // user at `shift`/`restore` to finish in place (PR #84 review, finding 3) was considered and
+    // rejected: the dominant real causes here — a path this filesystem cannot represent, a case
+    // collision between two paths the source tolerated — are not fixed by retrying the same
+    // materialize in place. They need a different target (another filesystem) or a narrower
+    // checkout (`--only`, to route around the offending path), either of which means starting
+    // over anyway. A second, leave-it-in-place cleanup contract would mainly serve the rarer
+    // transient causes (a permission fixed mid-clone, a disk that freed up) — not enough, on its
+    // own, to justify a franchise failure having two different recovery contracts depending on
+    // which step failed. The error is at least pointed at `--only` below, so a retry that hits
+    // the same offending path again has a way past it that doesn't require a different target.
+    shift_utils::materialize_tree(None, &tree_hash, "Franchising").map_err(|e| error::append_to_message(
+        e,
+        "(the signed history was already fetched and verified; only checking out the working \
+        tree failed. A retry re-fetches from scratch rather than resuming — if the same path \
+        keeps failing here, franchise --only to route around it instead of retrying as-is)",
+    ))?;
 
     report.pallet = pallet_name;
     report.head = Some(remote_head.clone());
     report.fetched_objects = stats.fetched_objects;
     output::emit("franchise", &report);
+
+    Ok(())
+}
+
+/// Which pallet to check out, resolved from the handshake alone (see `resolve_pallet`).
+struct PalletResolution {
+    pallet_name: String,
+    /// `None` when the pallet is unborn on the remote (legitimate — see `resolve_pallet`'s doc).
+    remote_head: Option<String>,
+}
+
+/// Resolve which pallet franchise should check out, using only the handshake's own answer
+/// (`info.pallets`) — no I/O. Named explicitly and absent from the remote is refused right here,
+/// before anything is fetched or mutated, unless the remote is entirely fresh (no working pallets
+/// stacked at all), in which case an explicit name still starts unborn, exactly like the default
+/// pallet does.
+///
+/// # Returns
+/// * `Ok(PalletResolution)` - The pallet to check out, and its head (`None` if unborn).
+/// * `Err(String)`          - The named pallet does not exist and the remote is not fresh.
+fn resolve_pallet(info: &WarehouseInfo, pallet: Option<String>) -> Result<PalletResolution, String> {
+    let explicitly_requested = pallet.is_some();
+    let pallet_name = pallet.unwrap_or_else(|| info.default_pallet.clone());
+
+    if let Some(remote_head) = info.pallets.get(&pallet_name) {
+        return Ok(PalletResolution { pallet_name, remote_head: Some(remote_head.clone()) });
+    }
+
+    // A pallet absent from the handshake is unborn on the remote. The remote's own default
+    // pallet legitimately starts unborn (a fresh remote, or one whose current pallet has
+    // nothing stacked while others do); a pallet the user asked for by name gets typo
+    // protection instead, unless nothing is stacked at all. Meta pallets (`@office`, …) are
+    // not working pallets — a remote with only those is still fresh, and they never appear in
+    // the "it has: …" hint.
+    let user_pallets: Vec<&String> = info.pallets.keys()
+        .filter(|name| !name.starts_with(pallet_utils::META_QUALIFIER))
+        .collect();
+    let is_fresh = user_pallets.is_empty();
+
+    if explicitly_requested && !is_fresh {
+        return Err(format!(
+            "The remote has no pallet \"{}\" (it has: {}).",
+            pallet_name,
+            user_pallets.into_iter().cloned().collect::<Vec<_>>().join(", ")
+        ));
+    }
+
+    Ok(PalletResolution { pallet_name, remote_head: None })
+}
+
+/// Claim `target` for this franchise, closing the TOCTOU window a separate `exists()` check
+/// followed by creation would leave open across the handshake's network round trip: checking
+/// "does it exist" and then creating it are two different moments, and the remote handshake now
+/// sits in between them — seconds, not microseconds; longer still over Tor.
+///
+/// Any missing *ancestor* directories are created with the ordinary, tolerant `create_dir_all` —
+/// it already handles every platform edge case (a Windows drive root, a UNC share root, a `..`
+/// component, an ancestor another process creates concurrently) by falling back to "does this
+/// already exist as a directory" on any error, so there is no reason to reimplement that logic
+/// component-by-component here (an earlier version of this function did exactly that, and it
+/// broke an absolute Windows target: `CreateDirectoryW` on a drive root returns `PermissionDenied`,
+/// which a naive "only tolerate `AlreadyExists`" loop does not).
+///
+/// `target` itself is reached one of two ways — freshly created here, or pre-existing and
+/// re-verified empty — and **neither alone is an exclusivity proof**: two concurrent franchises
+/// into the same pre-existing empty directory both pass the empty re-verify and would otherwise
+/// both proceed, taking no warehouse lock, and interleave writes into one `.forklift` (PR #84
+/// review round 4, finding 1). Mutual exclusion instead comes from a single token shared by both
+/// branches: `target/.forklift` itself, claimed with `std::fs::create_dir` — one syscall whose
+/// own success or `AlreadyExists` is the sole, non-racing proof of *which* call claimed it. Using
+/// the real `.forklift` directory (not a bespoke marker) means there is no success-path removal
+/// step and no name that could ever collide with materialized content: a successful franchise
+/// ends with one there anyway, and `prepare_warehouse` already tolerates a pre-existing one
+/// (`file_utils::create_folder_if_not_exists`, see `warehouse_utils.rs`).
+///
+/// `create_dir(target)`'s own result is *not* the exclusivity proof (it was, before this fix) —
+/// it now only decides `cleanup_after_failure`'s cleanup scope: whether franchise created `target`
+/// itself (so a later failure removes the whole thing) or found it pre-existing (so a later
+/// failure only empties it back out). A losing token claim is always an `Err`, so
+/// `handle_command`'s `claim_target(target)?` propagates it immediately, before the
+/// cleanup-wrapped section even begins — a failed claim structurally cannot trigger cleanup. The
+/// loser leaving behind a just-created empty `target` (or an untouched pre-existing one) is
+/// correct: an empty directory never wedges a retry, and deleting anything under it here would
+/// destroy the winner's claim instead of the loser's own leftovers.
+///
+/// Ancestors `create_dir_all` creates are *not* tracked or later removed by `cleanup_after_failure`
+/// — deliberately: `create_dir_all(parent)` and `create_dir(target)` are still two separate
+/// syscalls, so a concurrent actor could in principle populate a just-created ancestor in the gap
+/// between them. Recursively deleting that ancestor on a later failure would destroy content
+/// franchise never touched. An empty leftover ancestor is harmless (it never blocks a retry —
+/// `target` itself is what must be empty-or-absent), so cleanup only ever acts on `target`.
+///
+/// Accepted residual, by design, not chased further: once this call returns `Ok`, `target` is
+/// claimed but the fetch is only just starting — a concurrent *non-franchise* actor can still
+/// drop files into it while franchise is mid-fetch, and a later failure's cleanup will delete them
+/// along with everything else in `target`. Closing that window would need a lock outliving this
+/// function, which nothing here provides; it doesn't need to, since this is the same exposure
+/// `git clone` (or any "claim an empty directory, then fill it" tool) has always had, not
+/// something this fix introduced or could reasonably remove. The token above closes the
+/// franchise-vs-franchise race specifically; it does not and cannot close this different,
+/// pre-existing one.
+///
+/// Crash caveat, documented rather than fixed: a `kill -9` after the token is claimed but before
+/// any real write leaves a pre-existing directory containing only an empty `.forklift`, so a
+/// retry's `refuse_if_not_an_empty_directory` refuses it as "not empty" where, before this fix,
+/// that same instant would have left a pristine empty directory. The window is sub-millisecond,
+/// requires an uncatchable signal to land inside it, is self-describing when it does (the token
+/// is the only thing there), and its remedy — remove `.forklift` — is exactly what any crash
+/// mid-`prepare_warehouse` already needs; it is not a new wedge *class*, and does not change the
+/// residual accepted in `cleanup_after_failure`'s doc comment (a non-franchise actor dropping
+/// files in after the claim still gets deleted — the token only ever addressed franchise-vs-
+/// franchise).
+///
+/// # Returns
+/// * `Ok(true)`  - Franchise created `target` itself just now (empty by construction) and claimed
+///   the token in it.
+/// * `Ok(false)` - `target` already existed by the time this call reached it (whether from before
+///   the handshake, or from something else during it, including via a `..` alias of some other
+///   existing path). Its emptiness was re-verified immediately before anything is written into it
+///   — the only earlier check (before the handshake) is now stale — and the token was then
+///   claimed the same way.
+/// * `Err(String)` - An ancestor or `target` itself could not be created, `target` exists but is no
+///   longer empty, or the `.forklift` token in `target` was already claimed (by a concurrent or an
+///   interrupted franchise).
+fn claim_target(target: &Path) -> Result<bool, String> {
+    if let Some(parent) = target.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Error while creating \"{}\": {}", parent.display(), e))?;
+        }
+    }
+
+    let created_directory = match std::fs::create_dir(target) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            refuse_if_not_an_empty_directory(target)?;
+            false
+        }
+        Err(e) => return Err(format!("Error while creating \"{}\": {}", target.display(), e)),
+    };
+
+    claim_token(target)?;
+
+    Ok(created_directory)
+}
+
+/// Claim the `.forklift` token inside an already-verified-empty (or just-created) `target` — the
+/// sole write-exclusivity proof shared by both of `claim_target`'s branches. See its doc comment
+/// for why `.forklift` and not a bespoke marker.
+fn claim_token(target: &Path) -> Result<(), String> {
+    let token = target.join(".forklift");
+
+    match std::fs::create_dir(&token) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(format!(
+            "\"{}\" is already claimed — another franchise may be running there now, or one was \
+            interrupted before finishing. If none is running, remove \"{}\" and retry.",
+            target.display(), token.display()
+        )),
+        Err(e) => Err(format!("Error while claiming \"{}\": {}", token.display(), e)),
+    }
+}
+
+/// Refuse if `target` exists but is not an empty directory — shared by the fast, pre-handshake
+/// check in `handle_command` and `claim_target`'s authoritative post-handshake re-check. Naming
+/// a file (not a directory) explicitly, rather than letting a raw `read_dir` error on it (or the
+/// generic "not empty" wording) stand in for the real problem.
+fn refuse_if_not_an_empty_directory(target: &Path) -> Result<(), String> {
+    if !target.is_dir() {
+        return Err(format!(
+            "\"{}\" already exists and is not a directory; franchise into a new or empty directory.",
+            target.display()
+        ));
+    }
+
+    let mut entries = std::fs::read_dir(target)
+        .map_err(|e| format!("Error while reading \"{}\": {}", target.display(), e))?;
+
+    if entries.next().is_some() {
+        return Err(format!(
+            "\"{}\" is not empty; franchise into a new or empty directory.",
+            target.display()
+        ));
+    }
+
+    Ok(())
+}
+
+/// Undo whatever franchise created in `target` before it failed, so the directory is retryable
+/// rather than permanently wedged — the defect this closes: a franchise that failed partway
+/// through used to leave `.forklift`/`.forkliftignore` behind, and a subsequent, correct attempt
+/// then refused to enter a directory that was no longer empty.
+///
+/// `created_directory` is `claim_target`'s own record of whether it created `target` itself —
+/// never re-inferred here:
+/// * `true`  - franchise created `target`; removing it removes exactly what franchise created.
+/// * `false` - the target pre-existed (confirmed empty by `claim_target`); only its contents are
+///   removed, leaving the empty directory behind. Any ancestor `claim_target` may have had to
+///   create along the way is left standing regardless — see `claim_target`'s own doc comment for
+///   why.
+///
+/// Cleanup failing must never mask the original error — the operator needs to see why franchise
+/// failed, not why the cleanup did — so on a cleanup error this appends the leftover path to the
+/// original message rather than replacing it.
+fn cleanup_after_failure(target: &Path, created_directory: bool, original_error: String) -> String {
+    let cleanup_result = if created_directory {
+        std::fs::remove_dir_all(target)
+    } else {
+        remove_directory_contents(target)
+    };
+
+    match cleanup_result {
+        Ok(()) => original_error,
+        Err(cleanup_error) => error::append_to_message(original_error, &format!(
+            "(additionally, cleaning up \"{}\" after the failure did not succeed: {}; remove it \
+            by hand before retrying)",
+            target.display(), cleanup_error
+        )),
+    }
+}
+
+/// Remove every entry directly under `target`, leaving `target` itself in place. Used to restore
+/// a pre-existing (empty) directory that franchise dirtied before failing. `DirEntry::file_type`
+/// does not follow symlinks, so a symlink entry is unlinked itself (`remove_file`) rather than
+/// having its target recursively removed.
+fn remove_directory_contents(target: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(target)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        if entry.file_type()?.is_dir() {
+            std::fs::remove_dir_all(&path)?;
+        } else {
+            std::fs::remove_file(&path)?;
+        }
+    }
 
     Ok(())
 }
@@ -350,4 +679,60 @@ pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
     vec![
         ("FranchiseReport", schemars::schema_for!(FranchiseReport)),
     ]
+}
+
+#[cfg(test)]
+mod claim_target_tests {
+    use super::*;
+
+    fn unique_temp_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("forklift-franchise-claim-{}-{}", label, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// Falsifying test, PR #84 review round 4 finding 1: a **sequential** double-claim into the
+    /// same pre-existing empty directory is a deterministic falsifier for the token fix — no
+    /// threads needed, since `claim_target` itself has no notion of "concurrently" beyond what
+    /// the filesystem's own `create_dir` atomicity gives it. Before the token, the pre-existing
+    /// branch had no exclusivity at all: both calls passed the empty re-verify and both returned
+    /// `Ok(false)`, which is exactly the bug (two concurrent franchises would both believe they
+    /// alone owned the directory). After the token, the second call is refused because the first
+    /// call's `.forklift` is still there.
+    #[test]
+    fn a_second_claim_of_a_pre_existing_empty_directory_is_refused() {
+        let dir = unique_temp_dir("preexisting");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let first = claim_target(&dir);
+        assert_eq!(first, Ok(false), "the directory pre-existed, so franchise did not create it");
+        assert!(dir.join(".forklift").is_dir(), "the first claim must leave its token behind");
+
+        let second = claim_target(&dir);
+        assert!(second.is_err(),
+            "a second claim of the same pre-existing directory must be refused, got {:?}", second);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Same falsifier, the fresh-path branch: the first call both creates `target` and claims the
+    /// token (`Ok(true)`); a second call into the same now-non-empty-again path must not also
+    /// succeed. (This branch was never racy on its own — `create_dir(target)` was always the
+    /// atomic proof — but the token is now shared machinery for both branches, so this pins that
+    /// the fresh-path branch still behaves correctly with the token in place.)
+    #[test]
+    fn a_second_claim_of_a_freshly_created_directory_is_refused() {
+        let dir = unique_temp_dir("fresh");
+
+        let first = claim_target(&dir);
+        assert_eq!(first, Ok(true), "franchise itself must have created the directory");
+        assert!(dir.join(".forklift").is_dir(), "the first claim must leave its token behind");
+
+        let second = claim_target(&dir);
+        assert!(second.is_err(),
+            "a second claim of the same freshly created directory must be refused, got {:?}", second);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

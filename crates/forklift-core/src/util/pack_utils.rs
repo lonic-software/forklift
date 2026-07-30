@@ -671,9 +671,28 @@ pub(crate) fn pack_health_snapshot() -> Result<PackHealthSnapshot, String> {
     })
 }
 
-/// Forget the cached packs for the active warehouse, so the next read reloads them from
-/// disk. Called after `compact` writes new packs in this process.
-fn invalidate_cache() {
+/// Forget the cached packs for the active warehouse, so the next read reloads them from disk.
+///
+/// Called after `compact`/a bundle install write new packs in this process, so a later read in
+/// the same process sees them — and, the same idiom in reverse, called defensively *before*
+/// deleting or renaming pack files this process may have already mmap'd. The cached [`PackSet`]
+/// holds a `memmap2::Mmap` per pack; the original worry (PR #84 review finding 1) was that an
+/// open mmap blocks its own pack file's deletion on Windows. **That specific claim was tested
+/// directly on `windows-latest` and did not hold**: `load_pack_pair` opens the pack file with a
+/// plain `std::fs::File::open`, and Rust's `std::fs::File` defaults its Windows share mode to
+/// include `FILE_SHARE_DELETE`, so a file mapped from that handle stays deletable the whole time
+/// it's open — see `an_mmapd_pack_does_not_block_its_own_directory_removal` in this file's own
+/// tests for the confirming probe. Calling this before a delete/rename is kept anyway, here and
+/// at the pre-existing `compact`/import call sites: it is cheap, and correctness-neutral either
+/// way (a caller that drops the cache and then reloads it pays one extra disk read, never a
+/// wrong answer), so there's no reason to remove the insurance now that the specific rationale
+/// for it has been shown false. Do not re-cite the Windows-deletion-blocking claim as settled;
+/// it isn't, on this platform/toolchain — if you're relying on it for a *new* decision, verify
+/// it the same way this one was.
+///
+/// `pub` (not `pub(crate)`) so a caller in the `forklift` binary crate — `franchise`'s cleanup —
+/// can call it too; every other caller here is within this crate.
+pub fn invalidate_cache() {
     registry().lock().expect("the pack registry lock is poisoned")
         .remove(&file_utils::get_path_objects_root());
 }
@@ -3679,6 +3698,69 @@ mod tests {
         assert_eq!(file_utils::retrieve_object_by_hash(&hash).unwrap(), content);
 
         std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// Mechanism-level probe for PR #84 review finding 1, isolated from `franchise` entirely:
+    /// does an `Mmap`'d pack file actually block `remove_dir_all` on its own containing
+    /// directory? Windows-only by construction — POSIX permits unlinking (and therefore
+    /// recursively removing a directory over) a file that is still mapped, verified empirically
+    /// on macOS during that review round, so this question has no meaning on a non-Windows
+    /// target and the test is gated accordingly rather than asserting something platform-
+    /// specific as if it were universal.
+    ///
+    /// This was written after the franchise-level regression test for the same finding turned
+    /// out not to discriminate: it passed identically with and without `invalidate_cache()` in
+    /// `franchise.rs`'s cleanup path, on Windows CI. Run directly on `windows-latest`, this probe
+    /// answered the question the other test couldn't: **the mechanism is not real** in this
+    /// configuration. `remove_dir_all` succeeds on a directory containing a still-mapped pack.
+    ///
+    /// Why: `load_pack_pair` opens the pack file with a plain `std::fs::File::open` before
+    /// mapping it, and Rust's `std::fs::File` on Windows defaults its share mode to
+    /// `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE` — the file (and, transitively,
+    /// anything mapped from that same handle) stays deletable the whole time it's open. This
+    /// contradicts the comment on `compact`'s own `drop(source_packs)` a few thousand lines up
+    /// (`"a file opened (or mapped) without FILE_SHARE_DELETE — the platform default — cannot be
+    /// deleted"`), which was never actually verified on Windows either (its own test, right below
+    /// this one, explicitly says so: "unobservable as a failure on POSIX... this test instead
+    /// pins the outcome"). That's a pre-existing, out-of-scope question this PR does not resolve
+    /// — flagging it for a follow-up, not fixing it here.
+    ///
+    /// So: this test pins the *actual*, now-confirmed platform behavior (removal succeeds
+    /// regardless), so a future change cannot silently reintroduce the disproven assumption
+    /// without this test calling it out.
+    #[cfg(windows)]
+    #[test]
+    fn an_mmapd_pack_does_not_block_its_own_directory_removal() {
+        let temp = std::env::temp_dir().join(format!("forklift-mmap-block-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+
+        let content = b"mmap block probe content".to_vec();
+        let hash = blake3::hash(&content).to_hex().to_string();
+        store_loose(&hash, &content);
+
+        // Packs it; loose is removed, so the only path to this hash is now through a pack.
+        // `compact`'s own trailing `invalidate_cache()` leaves the registry empty afterward —
+        // nothing is mapped yet.
+        compact(false, false).unwrap();
+
+        // A read through the real (uncached-content) path: this is what actually populates
+        // `PACK_REGISTRY` with a live `Mmap` for the pack just written.
+        assert_eq!(file_utils::retrieve_object_by_hash_uncached(&hash).unwrap(), content);
+
+        // The mmap is still held in the process-global registry, with no `invalidate_cache()`
+        // call anywhere in this test — yet removal succeeds anyway (see the doc comment above
+        // for why: `FILE_SHARE_DELETE` is Rust's own Windows default for `std::fs::File`).
+        let removal_while_mapped = std::fs::remove_dir_all(&temp);
+        assert!(
+            removal_while_mapped.is_ok(),
+            "expected remove_dir_all to succeed even while a pack from this directory is still \
+            mmap'd (the confirmed Windows behavior) — got {:?}; if this now fails, the platform \
+            or toolchain behavior this test documents has changed and finding 1 needs \
+            re-examining, not this assertion silently flipped back",
+            removal_while_mapped
+        );
     }
 
     #[test]

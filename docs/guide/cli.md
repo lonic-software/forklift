@@ -879,6 +879,28 @@ its trust anchor, downloads the history (using the remote's bundle when it has
 one, then loose objects for the rest), and materializes the chosen pallet
 (default: the remote's default pallet). The directory must be new or empty.
 
+The remote is contacted before anything is written, and a `--pallet` typo is checked against the
+handshake's own answer before anything is fetched, so a bad URL, a bad token, an unreachable
+host, or a pallet that does not exist all leave the target exactly as it was found. A failure
+partway through (a dropped connection, a full disk, …) removes the target directory itself if
+franchise created it — or, if it already existed empty, just empties it back out — so a retry
+with a corrected token, say, always lands in a directory that is new or empty, never one refused
+as "not empty" by `franchise`'s own earlier leftovers. Any *parent* directories needed for a
+nested target path (e.g. `some/new/path`) are created the ordinary way and are deliberately left
+standing on a later failure, whether franchise created them or found them already there: an empty
+leftover parent is harmless and never blocks a retry, unlike the target directory itself.
+
+Claiming the target directory is exclusive, whether franchise creates it fresh or finds it
+pre-existing and empty: franchise stakes a `.forklift` directory inside it as a claim token before
+writing anything else, so two concurrent `franchise` runs into the same directory cannot both
+proceed and silently interleave (or delete each other's) writes. The loser is refused —
+`"<dir>" is already claimed — another franchise may be running there now, or one was interrupted
+before finishing`, with the token's path and the fix (remove it, then retry) — rather than
+corrupting the winner's warehouse or clobbering one that had already finished. A `.forklift` left
+behind by a franchise that was killed outright (`kill -9`) between claiming the token and its
+first real write looks the same as one from a concurrent run; if nothing is actually running there,
+removing `.forklift` and retrying is always the fix.
+
 **Sparse franchise (`--only`).** With one or more `--only <path>`, franchise fetches the
 whole signed history — every parcel, signature and the tree spine — but only the **content**
 under the named subtree(s). Out-of-scope subtrees and files are never downloaded; they stay
