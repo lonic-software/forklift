@@ -403,6 +403,56 @@ fn classify_remote_error(status: u16, action: &str, message: String,
     }
 }
 
+/// How a transport-level failure (one that never got as far as an HTTP status) classifies, given
+/// only `reqwest::Error::is_connect()` and `reqwest::Error::is_timeout()` — the two booleans the
+/// crate exposes for exactly this decision. A free enum plus a pure function over those two
+/// `bool`s, rather than a method taking `reqwest::Error` directly, so all four combinations are
+/// directly unit-testable: one of them (a genuine multi-minute kernel `ETIMEDOUT` on an
+/// already-established socket, once TCP retransmissions are exhausted — see
+/// [`TransportFailure::ReadTimedOut`]) is not practically constructible in a test at all, and
+/// pinning the *decision* rather than the error construction is what makes that tractable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransportFailure {
+    /// `is_connect() && is_timeout()`. In hyper-util, every connector-layer error — refused,
+    /// no-such-host, TLS failure, *and* a genuine connect timeout — is tagged `ErrorKind::Connect`
+    /// regardless of cause, so `is_connect()` alone cannot tell a timeout from any other connect
+    /// failure. Pairing it with `is_timeout()` can: a kernel-level SYN-retry exhaustion takes far
+    /// longer (~127s+ on common defaults) than any budget this client configures (5s direct, 60s
+    /// Tor), so whenever both are true, this client's own `connect_timeout` is what fired — never
+    /// a slower kernel-level connect timeout racing it.
+    ConnectTimedOut,
+
+    /// `is_timeout() && !is_connect()`. Ambiguous, and deliberately reported without naming a
+    /// specific bound: this can be either this client's own configured `read_timeout` (exactly
+    /// the effective connect+silence budget), or a genuine kernel `ETIMEDOUT` on a connection that
+    /// was already established — the OS returns that once TCP retransmissions are exhausted,
+    /// roughly 15 minutes on common Linux/macOS defaults — and `reqwest::Error::is_timeout()`
+    /// cannot tell the two apart: it matches any `io::Error` with `kind() == TimedOut` anywhere in
+    /// the source chain, not only its own synthetic marker for a client-configured timeout.
+    /// Naming the configured budget here would be right most of the time and wrong by two orders
+    /// of magnitude the rest, which is worse than not naming a number at all.
+    ReadTimedOut,
+
+    /// Neither of the above: a connection reset, a DNS failure, a refused connect, a TLS failure,
+    /// or anything else that is not a timeout. Checking `is_connect()` without also requiring
+    /// `is_timeout()` would wrongly route all of these into [`Self::ConnectTimedOut`] — every one
+    /// of them is `is_connect() == true`, none of them timed out.
+    Other,
+}
+
+/// Classify a transport failure from the two booleans `reqwest::Error` exposes for it. Pure and
+/// total, so every one of the four combinations is directly assertable without constructing a
+/// real `reqwest::Error` of each underlying kind.
+fn classify(is_connect: bool, is_timeout: bool) -> TransportFailure {
+    if is_connect && is_timeout {
+        TransportFailure::ConnectTimedOut
+    } else if is_timeout {
+        TransportFailure::ReadTimedOut
+    } else {
+        TransportFailure::Other
+    }
+}
+
 impl RemoteClient {
     /// Create a client for a remote.
     ///
@@ -578,71 +628,71 @@ impl RemoteClient {
         builder
     }
 
+    /// Walk a `std::error::Error` source chain to its root and return that root's own `Display`
+    /// text. `reqwest::Error`'s own `Display` prints only its `Kind` plus the URL ("error sending
+    /// request for url (...)") — the actual cause (connection refused, no such host, a TLS
+    /// failure) lives in the `source()` chain and is otherwise silently dropped on the floor.
+    /// `reqwest::Error::Debug` does include the chain, but as Rust struct-debug syntax, not
+    /// something worth showing a CLI operator; this instead surfaces just the innermost cause's
+    /// own message, which for an I/O failure is normally the OS's own wording (e.g. "Connection
+    /// refused (os error 61)").
+    fn root_cause(e: &(dyn std::error::Error + 'static)) -> String {
+        let mut current = e;
+        while let Some(source) = current.source() {
+            current = source;
+        }
+        current.to_string()
+    }
+
     /// Compose the client-facing message for a *transport* failure (one that never got as far as
-    /// an HTTP status) on one of the four bounded read/metadata calls, distinguishing three cases
-    /// that `reqwest::Error`'s own `Display` cannot: a connect-phase timeout, a read-phase timeout,
-    /// and everything else (a connection reset, a DNS failure, a refused connect). All three
-    /// otherwise print identically ("error sending request for url (...)"), because reqwest only
-    /// records the distinguishing detail in the error's `source()` chain, never in its own message
-    /// — `is_connect`/`is_timeout` walk that chain, so they, not the message text, decide.
-    ///
-    /// `is_connect()` comes first: a connect-phase failure is also `is_timeout() == true` when it
-    /// was `connect_timeout` that fired, so it is named against [`Self::connect_timeout`] — the
-    /// bound that actually governed that phase — not against the read budget.
-    ///
-    /// The `is_timeout()` branch: the client's `read_timeout` is not `silence_budget` alone, it is
-    /// [`bounded_read_timeout`]`(`[`Self::connect_timeout`]`,
-    /// silence_budget)` — connect budget *plus* silence budget (see that function's doc for why).
-    /// Reporting the raw `silence_budget` here, as an earlier version of this function did, names
-    /// a bound that is not the one that fired: on a Tor-routed remote that is 70s vs. the 10s this
-    /// used to print, a 7× understatement in exactly the number an operator would use to decide
-    /// whether to retry or raise a bound. This recomputes the same effective figure the client was
-    /// actually built with, so it can never drift from it independently. `silence_budget` is
-    /// passed in — [`REMOTE_READ_TIMEOUT`] for `fetch_info`/`fetch_signature`/`fetch_bundle_to`,
-    /// [`FETCH_OBJECT_READ_TIMEOUT`] for `fetch_object` — because it differs per call; only the
-    /// arithmetic combining it with `connect_timeout` belongs here, not the constant itself.
-    ///
-    /// Phrased as "did not respond within", not "went silent for `silence_budget`": `read_timeout`
-    /// is armed from request construction, before the connector is even polled, so the window this
-    /// names spans connect *and* send *and* wait — never claiming the whole window was silence,
-    /// which would be false whenever any part of it was spent connecting or sending.
+    /// an HTTP status) on one of the four bounded read/metadata calls. Thin: all it does is read
+    /// `is_connect()`/`is_timeout()` off `e` and hand them to [`classify`], then render the
+    /// resulting [`TransportFailure`] — the actual case analysis lives there, pure and
+    /// unit-tested over all four boolean combinations, because the combination this function
+    /// cares least about (a genuine multi-minute kernel timeout on an already-established socket)
+    /// is not practically constructible in a test at all; see [`TransportFailure::ReadTimedOut`]'s
+    /// doc.
     fn describe_transport_error(&self,
                                 action: &str,
                                 silence_budget: std::time::Duration,
                                 e: reqwest::Error) -> String {
-        if e.is_connect() {
-            format!(
+        match classify(e.is_connect(), e.is_timeout()) {
+            TransportFailure::ConnectTimedOut => format!(
                 "Timed out while {}: could not connect to the remote within {:?}.",
                 action, self.connect_timeout
-            )
-        } else if e.is_timeout() {
-            let effective_budget = self.connect_timeout + silence_budget;
-            format!(
-                "Timed out while {}: the remote did not respond within {:?}.",
-                action, effective_budget
-            )
-        } else {
-            format!("Error while {}: {}", action, e)
+            ),
+            TransportFailure::ReadTimedOut => {
+                let effective_budget = self.connect_timeout + silence_budget;
+                format!(
+                    "Timed out while {}: the remote did not respond within at least {:?}.",
+                    action, effective_budget
+                )
+            }
+            TransportFailure::Other => format!("Error while {}: {}", action, Self::root_cause(&e)),
         }
     }
 
     /// The mutation counterpart of [`Self::describe_transport_error`], for the six calls that ride
     /// the unbounded `http`/`no_redirect` clients (`update_ref`, `upload_object`, `put_presigned`,
-    /// `upload_signature`, `put_trust`, `commit_lift`) — `connect_timeout` is the *only* timeout
-    /// mechanism ever active on those clients (no `read_timeout` is ever set on them), so any
-    /// `is_timeout()` failure there is necessarily a connect-phase one; there is no read-silence
-    /// case to distinguish it from. Says so, and that retrying is safe: a connect expiry means the
-    /// request never left the client, so — unlike a failure partway through an upload or a ref
-    /// move — there is no uncertainty about whether the remote saw it.
+    /// `upload_signature`, `put_trust`, `commit_lift`). Same [`classify`] dispatch, but the
+    /// [`TransportFailure::ReadTimedOut`] wording differs from the read path's: on these clients
+    /// that case can only be a timeout on an *established* connection — after the request bytes
+    /// were already sent — so the settled contract requires the uncertainty be carried in the
+    /// message rather than asserted away: it may have completed on the remote, and the caller
+    /// must decide whether to check before retrying, never be told nothing happened.
     fn describe_mutation_transport_error(&self, action: &str, e: reqwest::Error) -> String {
-        if e.is_timeout() {
-            format!(
+        match classify(e.is_connect(), e.is_timeout()) {
+            TransportFailure::ConnectTimedOut => format!(
                 "Timed out while {}: could not connect to the remote within {:?}. Nothing was \
                 sent — safe to retry.",
                 action, self.connect_timeout
-            )
-        } else {
-            format!("Error while {}: {}", action, e)
+            ),
+            TransportFailure::ReadTimedOut => format!(
+                "Timed out while {}: the request was sent but no response arrived. It may have \
+                already completed on the remote — re-running converges, so retrying is safe.",
+                action
+            ),
+            TransportFailure::Other => format!("Error while {}: {}", action, Self::root_cause(&e)),
         }
     }
 
@@ -1105,10 +1155,26 @@ impl RemoteClient {
     ///
     /// Downloads to a fresh temp file beside `path` and only renames it into place once every
     /// chunk has landed: `path` is this warehouse's *own* latest bundle, which
-    /// `forklift serve` would otherwise hand out as-is, and any mid-download failure — the new
-    /// timeout very much included — must never leave a truncated file sitting at the real name. A
-    /// failure at any point during the download removes the temp file and leaves whatever bundle
-    /// (or absence of one) `path` already had, untouched.
+    /// `forklift serve` would otherwise hand out as-is, and any failure along the way — the new
+    /// timeout very much included — must never leave a truncated (or otherwise stray) file
+    /// sitting at the real name. [`RemoveTempOnDrop`] guards every early return between creating
+    /// the temp file and the rename succeeding, not just the download loop, so `sync_all` or the
+    /// rename itself failing can never leave the temp copy behind either — a manual
+    /// `if let Err(e) = ... { remove_file; return Err(e) }` around only the download loop, which
+    /// an earlier version of this function used, does not cover those.
+    ///
+    /// The directory sync after the rename goes through [`file_utils::sync_dir_or_taint`], not
+    /// the plain [`file_utils::sync_dir`] every other call in this file uses for a `bounded_reads`
+    /// response: unlike those, this rename publishes a file at a durable, reused name inside
+    /// `forklift_root()` exactly like every other rename-into-place in the store
+    /// (`write_file_atomically`, pack publication) — the file is visible at `path` the instant
+    /// the rename returns, so a directory-sync failure right after leaves a *visible-but-not-
+    /// durability-proven* bundle with no record of that fact unless a taint is recorded, same as
+    /// any other object-store rename. `franchise` propagates a bare `Err` from this function
+    /// straight out of the whole command (its `?` bypasses the loose-object fallback walk
+    /// entirely — that fallback is only reached on `Ok(false)`/an unsupported-format import
+    /// error, never on a transport-level `Err` from this call) — so treating a lost bundle here
+    /// as "only an optimization" would be wrong for exactly the failure this fix introduces.
     ///
     /// # Returns
     /// * `Ok(true)`    - The bundle was downloaded.
@@ -1136,21 +1202,14 @@ impl RemoteClient {
         let temp_path = file_utils::temp_path_for(path)?;
         let mut file = std::fs::File::create(&temp_path)
             .map_err(|e| format!("Error while creating the bundle file: {}", e))?;
+        let mut cleanup = RemoveTempOnDrop::armed(&temp_path);
 
-        let download: Result<(), String> = async {
-            while let Some(chunk) = response.chunk()
-                .await
-                .map_err(|e| self.describe_transport_error("downloading the bundle", REMOTE_READ_TIMEOUT, e))?
-            {
-                std::io::Write::write_all(&mut file, &chunk)
-                    .map_err(|e| format!("Error while writing the bundle file: {}", e))?;
-            }
-            Ok(())
-        }.await;
-
-        if let Err(e) = download {
-            let _ = std::fs::remove_file(&temp_path);
-            return Err(e);
+        while let Some(chunk) = response.chunk()
+            .await
+            .map_err(|e| self.describe_transport_error("downloading the bundle", REMOTE_READ_TIMEOUT, e))?
+        {
+            std::io::Write::write_all(&mut file, &chunk)
+                .map_err(|e| format!("Error while writing the bundle file: {}", e))?;
         }
 
         // Fsync via the still-open write handle, never by reopening `temp_path` — a handle
@@ -1165,13 +1224,47 @@ impl RemoteClient {
             "Error while moving the bundle into place at \"{}\": {}", path.to_string_lossy(), e
         ))?;
 
+        // The rename succeeded: `temp_path` no longer names anything, so there is nothing left
+        // for the guard to clean up regardless of what happens next.
+        cleanup.disarm();
+
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
-                file_utils::sync_dir(parent)?;
+                file_utils::sync_dir_or_taint(parent, &[path])?;
             }
         }
 
         Ok(true)
+    }
+}
+
+/// Removes the temp file at `path` when dropped, unless [`Self::disarm`] was called first.
+/// [`RemoteClient::fetch_bundle_to`]'s one use of this guards *every* early return between
+/// creating its temp file and the rename that publishes it succeeding — not just the download
+/// loop — so a later failure (`sync_all`, the rename itself) can never leave the temp copy behind
+/// either.
+struct RemoveTempOnDrop<'a> {
+    path: &'a std::path::Path,
+    armed: bool,
+}
+
+impl<'a> RemoveTempOnDrop<'a> {
+    fn armed(path: &'a std::path::Path) -> RemoveTempOnDrop<'a> {
+        RemoveTempOnDrop { path, armed: true }
+    }
+
+    /// Call once the temp file has been consumed (renamed away) so `Drop` becomes a no-op —
+    /// there is nothing left at `path` to remove, and nothing wrong with there not being.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RemoveTempOnDrop<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(self.path);
+        }
     }
 }
 
@@ -4590,6 +4683,81 @@ mod tests {
     const TEST_TIGHT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
     const TEST_LOOSE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+    /// `classify` is pure and total over the two booleans `reqwest::Error` exposes — this pins
+    /// all four combinations directly, including the one no live socket can construct: a genuine
+    /// kernel `ETIMEDOUT` on an already-established connection (`is_timeout() == true`,
+    /// `is_connect() == false`) is indistinguishable, from these two booleans alone, from this
+    /// client's own configured `read_timeout` firing — which is exactly why `ReadTimedOut` is
+    /// deliberately the same variant either way, and why `describe_transport_error` must not
+    /// name a specific bound in that case.
+    #[test]
+    fn classify_covers_all_four_boolean_combinations() {
+        assert_eq!(
+            classify(true, true), TransportFailure::ConnectTimedOut,
+            "connect timeout: is_connect() and is_timeout() both true"
+        );
+        assert_eq!(
+            classify(false, true), TransportFailure::ReadTimedOut,
+            "read/silence timeout (or a kernel ETIMEDOUT on an established socket): only \
+            is_timeout() true"
+        );
+        assert_eq!(
+            classify(true, false), TransportFailure::Other,
+            "a refused connect, DNS failure, or TLS failure: is_connect() true but not a \
+            timeout — every hyper-util connector error is tagged Connect regardless of cause, \
+            so is_connect() alone must never be read as \"timed out\""
+        );
+        assert_eq!(
+            classify(false, false), TransportFailure::Other,
+            "neither flag set: some other transport failure entirely"
+        );
+    }
+
+    /// A refused connection is `is_connect() == true` but never `is_timeout() ==
+    /// true` — checking `is_connect()` alone (as an earlier version of `describe_transport_error`
+    /// did) wrongly reports it as "could not connect ... within {connect_timeout}", discarding
+    /// the real cause and claiming a timeout that never happened. A listener bound then
+    /// immediately dropped leaves the OS to refuse any connection to that port near-instantly
+    /// (`ECONNREFUSED`), the cheapest real (non-fixture) way to exercise this — no fake error
+    /// construction, no fixture standing in for the OS.
+    #[test]
+    fn fetch_info_against_a_refused_connection_does_not_claim_a_timeout() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener); // now genuinely closed: nothing is listening on `addr` any more
+
+        let client = RemoteClient::new(&format!("http://{}", addr), None).unwrap();
+        // A refused connection must fail near-instantly; this ceiling exists only to turn a
+        // regression into a loud failure instead of a hang, not because this is expected to run
+        // anywhere near it.
+        let hard_ceiling = std::time::Duration::from_secs(10);
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let outcome = runtime.block_on(async {
+            tokio::time::timeout(hard_ceiling, client.fetch_info()).await
+        });
+
+        let inner = outcome.unwrap_or_else(|_| panic!(
+            "fetch_info hung past the test's own {:?} ceiling — a refused connection must fail \
+            promptly, never hang", hard_ceiling
+        ));
+        let message = match inner {
+            Err(message) => message,
+            Ok(_) => panic!("a refused connection must not appear to succeed"),
+        };
+
+        assert!(
+            !message.to_lowercase().contains("timed out"),
+            "a refused connection never timed out, and must not be reported as if it did: {}",
+            message
+        );
+        assert!(
+            message.to_lowercase().contains("refused") || message.to_lowercase().contains("connect"),
+            "must name something useful about the actual cause, not a generic wrapper message: {}",
+            message
+        );
+    }
+
     /// A remote that accepts the connection, reads the request in full, and then genuinely goes
     /// silent: it never writes a byte of response. See the section note above for the parking
     /// pattern and why a returning handler would be a false pass. Shared by every "must time out"
@@ -4776,6 +4944,25 @@ mod tests {
         assert!(
             !dest.exists(),
             "a mid-download timeout must never leave a truncated file at the destination"
+        );
+
+        // The cleanup must be pinned, not just its visible effect — a test that only
+        // checks `!dest.exists()` would still pass if the temp-file `remove_file` call were
+        // simply deleted, since the temp file is never renamed to `dest` in this scenario either
+        // way. Scoped to this test's own temp-file prefix (not a bare ".tmp" scan) since
+        // `std::env::temp_dir()` is shared with whatever else is running concurrently.
+        let dest_name = dest.file_name().unwrap().to_string_lossy().into_owned();
+        let temp_prefix = format!("{}.tmp", dest_name);
+        let leftover_temp_files: Vec<String> = std::fs::read_dir(dest.parent().unwrap())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(&temp_prefix))
+            .collect();
+        assert!(
+            leftover_temp_files.is_empty(),
+            "the temp file must be cleaned up on a mid-download failure, not just absent from \
+            the final destination: {:?}", leftover_temp_files
         );
 
         let _ = std::fs::remove_file(&dest);
