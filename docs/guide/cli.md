@@ -631,6 +631,14 @@ list` marks the row with `(subject not in this store)`. Either way the exit code
 Only a probe that genuinely could not determine presence (an I/O error, never a definite
 answer either way) fails the command, and it names the affected tag when it does.
 
+Every string in a `@tags` record — name, subject, message, tagger — is equally
+unvalidated (nothing checks a synced-in record on the way in; only `tag create` validates
+the name it creates). `tag show`/`tag list` render all of it safely rather than trust it:
+control characters (including ANSI escapes) are neutralized before printing, and a name
+that fails `tag create`'s own naming rules is shown with a `[invalid name] ` marker
+(`list`) or its own `warning:` line (`show`) rather than silently treated as ordinary.
+`--json` output is never touched by any of this — it always carries the raw values.
+
 ### `haul` — pull requests (reviewable merge proposals)
 
 ```sh

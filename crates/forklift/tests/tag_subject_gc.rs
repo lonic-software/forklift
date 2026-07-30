@@ -30,6 +30,23 @@
 //! `crate::commands::tag::tests` (`crates/forklift/src/commands/tag.rs`) for the unit-level
 //! coverage of the classification and rendering logic instead.
 //!
+//! Round 3 found round 2's fix incomplete: `parse_tag` validates none of `Tag`'s fields (only
+//! `tag create` validates the one it creates, `name`), so `name`/`subject`/`message`/`tagger` are
+//! *all* remote-authored and arbitrary, and the render path did not honour that — a subject
+//! sliced by byte range (`&s[..12]`) could panic on multi-byte UTF-8, and `name` renders even
+//! further ahead of the marker than `message` does, so round 2's positional fix did not cover it.
+//! The fix moved from field-by-field patching to a boundary: every tag-record string a human
+//! render prints goes through `crate::commands::tag::render_safe` (neutralizes control
+//! characters, including ANSI escapes) and, where truncated for display,
+//! `crate::commands::tag::truncate_chars` (character-safe, never a byte range). A name that fails
+//! `tag create`'s own naming rules is surfaced (`TagView::name_invalid`) rather than hidden or
+//! rejected, the same way a malformed subject already was. `--json` is untouched by any of this —
+//! `TagView`'s stored fields are never sanitized, only the copies `render_human` prints are; see
+//! `list_row_fields_cannot_forge_hide_or_corrupt_the_absent_marker`'s own `--json` leg. The
+//! multi-byte-subject panic and the name-forgery case are both unreachable through the shipped
+//! CLI for the same reason the malformed-subject case is (see above) — pinned at the unit level
+//! instead, in `crate::commands::tag::tests`.
+//!
 //! This file is trimmed from a shared spike (`boundary_gc.rs`, on another branch) down to the
 //! tag leg and the harness it actually needs; the anchor-boundary legs are FORK-81's evidence
 //! and stay behind on that branch.
@@ -408,29 +425,42 @@ fn tag_list_and_show_fail_loudly_and_name_the_tag_when_the_probe_is_indeterminat
     );
 }
 
-/// Finding 2 (review round 2): `TagList::render_human`'s absent-subject marker used to trail the
-/// row, after the tag's own message — remote-authored, unvalidated text a franchise/lower can
-/// bring in from anyone. A message ending in text that imitates the marker could forge marking
-/// on a perfectly healthy row (`forklift tag create v9 <rev> -m "release (subject not in this
-/// store)"`), and an ANSI escape at the start of a message could restyle or blank a real marker
-/// that preceded it. The marker now renders ahead of the tagger and message, where neither can
-/// reach it.
+/// Round 2 found: `TagList::render_human`'s absent-subject marker trailed the row, after the
+/// tag's own message — remote-authored, unvalidated text a franchise/lower can bring in from
+/// anyone. A message ending in text that imitates the marker could forge marking on a perfectly
+/// healthy row, and an ANSI escape at the start of a message could restyle or blank a real
+/// marker that preceded it. The marker now renders ahead of the tagger and message, where
+/// neither can reach it.
 ///
-/// Builds one healthy tag (subject present) whose message spells out the exact marker text, and
-/// one genuinely marked tag (subject absent, via the same undo-then-gc fixture the first test in
-/// this file uses), then asserts the marker-lookalike in the healthy row's message can only ever
-/// appear *after* " by " (inside the message region), while the genuine marker on the absent row
-/// always appears *before* it — the position, not the text, is what a reader must trust.
+/// Round 3 found the fix incomplete: **every** `@tags` string is remote-authored (`parse_tag`
+/// validates nothing; only `tag create` validates its own `name`, never a synced-in one), and
+/// `name` renders even further ahead than the marker — first in the row. A `name` containing
+/// space/paren characters could, in principle, spell a fake marker and a fake " by " boundary
+/// ahead of the real one. It cannot reach that state through `tag create` here (`validate_tag_
+/// name`'s charset excludes space and `(`/`)` outright, so this test cannot construct one — see
+/// `crate::commands::tag::tests::tag_view_of_sets_name_invalid_only_for_a_name_tag_create_would_
+/// never_produce`, which pins the same defense — a `[invalid name] ` prefix, printed by code
+/// ahead of anything `name` supplies — at the unit level instead), but two things ARE reachable
+/// here and are what this test now covers: an ANSI/control-character forgery through `message`
+/// (unvalidated at every layer, so directly constructible via `-m`), and that `--json` keeps
+/// message/name raw — sanitizing is a terminal-rendering concern, not a wire-format one.
 #[test]
-fn list_marker_cannot_be_forged_or_hidden_by_message_content() {
+fn list_row_fields_cannot_forge_hide_or_corrupt_the_absent_marker() {
     let warehouse = Warehouse::new("marker-spoof");
     const MARKER: &str = "(subject not in this store)";
+    const ANSI_MESSAGE: &str = "\x1b[31mHIDDEN\x1b[0m release";
 
     // A healthy tag whose message spells out the marker text verbatim — an attempt to forge
     // marking on a live row purely through message content.
     let live_head = warehouse.stack("app.txt", "v1\n", "first");
     let spoofing_message = format!("{} release", MARKER);
     warehouse.run_ok(&["tag", "create", "v-live", &live_head, "-m", &spoofing_message]);
+
+    // A healthy tag whose message carries a raw ANSI/SGR escape sequence — `message` has no
+    // validation at all (unlike `name`), so this is reachable through the shipped CLI directly,
+    // with a literal ESC byte in the `-m` argument.
+    let ansi_head = warehouse.stack("app.txt", "v1.5\n", "ansi");
+    warehouse.run_ok(&["tag", "create", "v-ansi", &ansi_head, "-m", ANSI_MESSAGE]);
 
     // A genuinely absent-subject tag, built the same way
     // `a_signed_tag_subject_is_collected_after_undo_moves_the_head_back` does.
@@ -449,7 +479,7 @@ fn list_marker_cannot_be_forged_or_hidden_by_message_content() {
     let list = warehouse.run(&["tag", "list"]);
     let stdout = String::from_utf8_lossy(&list.stdout).to_string();
 
-    println!("TAG: `tag list` with a message-embedded marker lookalike: stdout =\n{}", stdout);
+    println!("TAG: `tag list` with a message-embedded marker lookalike and ANSI: stdout =\n{}", stdout);
 
     assert!(list.status.success(), "`tag list` must still succeed; stdout: {}", stdout);
 
@@ -457,6 +487,8 @@ fn list_marker_cannot_be_forged_or_hidden_by_message_content() {
         .unwrap_or_else(|| panic!("no \"v-live\" row in: {}", stdout));
     let absent_line = stdout.lines().find(|line| line.starts_with("v-absent"))
         .unwrap_or_else(|| panic!("no \"v-absent\" row in: {}", stdout));
+    let ansi_line = stdout.lines().find(|line| line.starts_with("v-ansi"))
+        .unwrap_or_else(|| panic!("no \"v-ansi\" row in: {}", stdout));
 
     let by_pos_live = live_line.find(" by ").expect("every row has \" by \"");
     let by_pos_absent = absent_line.find(" by ").expect("every row has \" by \"");
@@ -482,5 +514,35 @@ fn list_marker_cannot_be_forged_or_hidden_by_message_content() {
         "a message-embedded marker lookalike must never appear before \" by \" — that would \
         make a healthy row indistinguishable from a genuinely marked one; row: {}",
         live_line
+    );
+
+    // THE ANSI ESCAPE: the raw ESC byte must never survive to a printed row — the whole point of
+    // `render_safe`. Checked over the full `stdout`, not just `ansi_line`, so a leaked escape
+    // that (mis)styles a *different* row still fails this.
+    assert!(
+        !stdout.contains('\x1b'),
+        "a raw ESC byte must never reach rendered output; stdout: {}",
+        stdout
+    );
+    assert!(
+        ansi_line.contains("HIDDEN") && ansi_line.contains("[31m") && ansi_line.contains("[0m"),
+        "the message's non-control text must still render (neutralized, not dropped); row: {}",
+        ansi_line
+    );
+
+    // `--json` KEEPS THE RAW VALUES: sanitizing is a terminal-rendering concern, not a
+    // wire-format one — a `--json` consumer needs the real bytes, ESC included.
+    let list_json = warehouse.run(&["--json", "tag", "list"]);
+    let list_json_value: serde_json::Value =
+        serde_json::from_slice(&list_json.stdout).expect("tag list --json must parse");
+    let tags = list_json_value["data"]["tags"].as_array().expect("a tags array");
+    let ansi_entry = tags.iter().find(|tag| tag["name"] == "v-ansi")
+        .unwrap_or_else(|| panic!("no v-ansi entry in: {}", list_json_value));
+
+    assert_eq!(
+        ansi_entry["message"], serde_json::Value::String(ANSI_MESSAGE.to_string()),
+        "--json must carry the message's raw bytes, ESC included, unlike the human render; \
+        entry: {}",
+        ansi_entry
     );
 }

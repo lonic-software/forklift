@@ -67,11 +67,13 @@ async fn create(name: &str, revision: Option<String>, message: Option<String>) -
         ));
     }
 
-    // A tag name is immutable: refuse one already reachable from the tags head.
+    // A tag name is immutable: refuse one already reachable from the tags head. `existing` came
+    // out of `@tags` (synced in wholesale, unvalidated — see `render_safe`'s doc comment), so its
+    // subject is rendered the same untrusted way every other tag-record string is.
     if let Some(existing) = tag_utils::find_tag(name)? {
         return Err(format!(
             "Tag \"{}\" already exists (points at {}); tags are immutable.",
-            name, &existing.tag.subject[..existing.tag.subject.len().min(12)]
+            name, render_safe(&truncate_chars(&existing.tag.subject, 12))
         ));
     }
 
@@ -228,11 +230,14 @@ pub(crate) struct Created {
 
 impl CommandOutput for Created {
     fn render_human(&self) {
+        // `subject`/`parcel` are hashes this process resolved and stored itself (never a foreign
+        // record — `create` never renders one), so char-safe truncation here is defense in depth
+        // rather than a reachable panic; `name` already passed `validate_tag_name` above `create`.
         println!(
             "Created tag \"{}\" -> {} (signed; @tags parcel {}).",
             self.name,
-            &self.subject[..self.subject.len().min(12)],
-            &self.parcel[..self.parcel.len().min(12)],
+            truncate_chars(&self.subject, 12),
+            truncate_chars(&self.parcel, 12),
         );
     }
 }
@@ -251,11 +256,14 @@ impl CommandOutput for TagList {
             return;
         }
 
-        let width = self.tags.iter().map(|tag| tag.name.len()).max().unwrap_or(0);
+        // Sanitized once here (not stored on `TagView`, which `--json` also reads — see
+        // `render_safe`'s doc comment) so the column width matches what actually prints.
+        let names: Vec<String> = self.tags.iter().map(|tag| render_safe(&tag.name)).collect();
+        let width = names.iter().map(|name| name.chars().count()).max().unwrap_or(0);
 
-        for tag in &self.tags {
+        for (tag, name) in self.tags.iter().zip(names) {
             let message = tag.message.lines().next().filter(|line| !line.is_empty())
-                .map(|line| format!("  {}", line))
+                .map(|line| format!("  {}", render_safe(line)))
                 .unwrap_or_default();
 
             // Placed ahead of `tagger`/`message` — both remote-authored text — rather than
@@ -264,10 +272,22 @@ impl CommandOutput for TagList {
             let absent_marker =
                 if tag.subject_absent == Some(true) { "(subject not in this store)  " } else { "" };
 
+            // `name` itself is remote-authored and precedes everything else in the row,
+            // including the marker above — sanitizing its control characters (done above) stops
+            // it from restyling or splitting the row, but a *printable* forgery (spaces and
+            // parens are enough to spell the marker text or a fake " by " boundary) is a
+            // different threat `validate_tag_name`'s own charset already rules out for any name
+            // this codebase ever creates. A name that fails it is foreign; flagged with a prefix
+            // literal — printed by code, before anything `name` supplies — so nothing inside
+            // `name` can ever precede it, unlike a position defined only in terms of `name`'s own
+            // content.
+            let name_prefix = if tag.name_invalid == Some(true) { "[invalid name] " } else { "" };
+
             println!(
-                "{:<width$}  {}  {}by {}{}",
-                tag.name,
-                &tag.subject[..tag.subject.len().min(12)],
+                "{}{:<width$}  {}  {}by {}{}",
+                name_prefix,
+                name,
+                render_safe(&truncate_chars(&tag.subject, 12)),
                 absent_marker,
                 tag.tagger_label(),
                 message,
@@ -282,6 +302,14 @@ impl CommandOutput for TagList {
 #[derive(Serialize)]
 pub(crate) struct TagView {
     name: String,
+
+    /// Present and `true` when `name` does not meet the naming rules `tag create` enforces
+    /// (letters, digits, `.`, `_`, `-` only); omitted otherwise. `@tags` syncs in wholesale
+    /// (`franchise`/`lower`), and nothing validates a record's `name` on the way in — only
+    /// `tag create` does, for a name of its own choosing — so a foreign or older client's record
+    /// can carry one this build would never have created itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name_invalid: Option<bool>,
 
     /// The parcel the tag points at.
     subject: String,
@@ -338,8 +366,11 @@ impl TagView {
         let tagger_role = office.find_user(&tagger).map(|user| user.role.as_str().to_string());
         let subject_malformed = matches!(probe, SubjectProbe::Malformed);
 
+        let name_invalid = tag_utils::validate_tag_name(&attributed.tag.name).is_err();
+
         TagView {
             name: attributed.tag.name.clone(),
+            name_invalid: name_invalid.then_some(true),
             subject: attributed.tag.subject.clone(),
             message: attributed.tag.message.clone(),
             tagger,
@@ -353,8 +384,13 @@ impl TagView {
     }
 
     /// The tagger label for the list: display name (or operator id), plus role when known.
+    /// Sanitized (see [`render_safe`]): `tagger_name` is a remote directory lookup and `tagger`
+    /// falls back to a signature's raw `key_id` when the office does not recognize it, so either
+    /// can carry attacker-chosen text; `tagger_role` cannot — it is one of a fixed local set of
+    /// strings ([`office_utils::Role::as_str`]), never interpolated user content.
     fn tagger_label(&self) -> String {
         let who = self.tagger_name.clone().unwrap_or_else(|| self.tagger.clone());
+        let who = render_safe(&who);
 
         match &self.tagger_role {
             Some(role) => format!("{} ({})", who, role),
@@ -365,8 +401,26 @@ impl TagView {
 
 impl CommandOutput for TagView {
     fn render_human(&self) {
-        println!("tag {}", self.name);
-        println!("subject {}", self.subject);
+        let name = render_safe(&self.name);
+        let subject = render_safe(&self.subject);
+
+        // "tag <name>" is the very first line — an ANSI/SGR sequence in `name` would otherwise
+        // land ahead of (and could restyle or blank) every warning line below it, including the
+        // subject one; sanitizing `name` closes that regardless of which warning follows.
+        println!("tag {}", name);
+
+        // Surfaced the way a malformed subject is (never refused): `name` reaching this render
+        // means `find_tag` already matched it against a name argument, so it is never rejected
+        // here, only flagged — see `TagView::name_invalid`'s doc comment for why one can exist
+        // at all despite `tag create` validating its own.
+        if self.name_invalid == Some(true) {
+            println!(
+                "warning: this tag's recorded name does not meet the naming rules \"tag create\" \
+                enforces (letters, digits, \".\", \"_\", \"-\" only) — shown exactly as recorded."
+            );
+        }
+
+        println!("subject {}", subject);
 
         // A dedicated line, not a losable suffix on the subject line — `show` is a full render,
         // not a one-line row, so it can afford (and owes the reader) the longer, honest form.
@@ -379,14 +433,14 @@ impl CommandOutput for TagView {
             println!(
                 "warning: this tag's recorded subject, \"{}\", is not a valid parcel hash — no \
                 copy of any warehouse could ever hold an object under that name.",
-                self.subject
+                subject
             );
         } else if self.subject_absent == Some(true) {
             println!(
                 "warning: parcel {} is not in this store — never fetched here, or collected \
                 after nothing else referenced it. Another copy of this warehouse may still \
                 hold it; this store cannot restore it by itself.",
-                self.subject
+                subject
             );
         }
 
@@ -397,10 +451,64 @@ impl CommandOutput for TagView {
             println!();
 
             for line in self.message.lines() {
-                println!("    {}", line);
+                println!("    {}", render_safe(line));
             }
         }
     }
+}
+
+/// Truncate `s` to at most `chars` **Unicode scalar values**, never bytes — `&s[..n]` on a byte
+/// index that lands mid-codepoint panics. A tag's `subject`/`parcel` are ordinarily pure ASCII
+/// hex, but a subject is not guaranteed to be: [`SubjectProbe::Malformed`] exists precisely
+/// because a `@tags` record's subject is an unvalidated free string a foreign client can fill
+/// with anything, multi-byte UTF-8 included. Matches the `.chars().take(n).collect()` idiom
+/// `manifest.rs`'s and `haul.rs`'s own `short` helpers already use for the same reason, over
+/// those commands' own remote-authored hashes/ids.
+///
+/// # Arguments
+/// * `s` - The text to truncate.
+/// * `chars` - The maximum number of characters to keep.
+///
+/// # Returns
+/// * `s`, truncated to at most `chars` characters (unchanged if already shorter).
+fn truncate_chars(s: &str, chars: usize) -> String {
+    s.chars().take(chars).collect()
+}
+
+/// Neutralize every control character in `s` — replaced with a space, never dropped, so a
+/// length or column width computed before this call still roughly matches what renders. Applied
+/// to every remote-authored string a `tag` command prints for a human: `@tags` syncs in wholesale
+/// (`franchise`'s `adopt_meta_pallets`), `parse_tag` validates none of `Tag`'s fields, and
+/// `tag create` is the *only* code path that ever validates one (its own `name`, at creation) —
+/// so a foreign or older client's record can carry a `name`, `subject`, or `message` containing
+/// anything, and an unrecognized signature falls back to its raw, equally unvalidated `key_id`
+/// (see `tagger_label`). `--json` output is unaffected: `TagView`'s stored fields are never
+/// mutated by this, only the copies `render_human` prints — a `--json` consumer needs the real
+/// bytes, and escaping is a terminal-rendering concern, not a wire-format one.
+///
+/// The same technique `forklift_core::error::sanitize` already uses for `CoreError`'s human
+/// message/next-step (`char::is_control`, replace with a space) — not reused directly, since
+/// that helper is private and tied specifically to `CoreError`'s frame-safety contract, a
+/// different reason to want the same effect than this module's terminal-rendering one; making it
+/// a general-purpose cross-crate utility for an unrelated concern would conflate the two.
+/// Replace-with-space, not drop, both to match that precedent and because a run of controls
+/// collapsing to nothing could accidentally weld two words together into a third, unintended one.
+///
+/// This single pass is also why an ANSI/SGR escape sequence needs no separate handling: every
+/// such sequence opens with the ESC control byte (`\x1b`), and with that byte gone the rest of
+/// the sequence (`[31m`, …) is inert — just printable text a terminal never treats specially. The
+/// same pass catches a bare `\r` (which can move a real terminal's cursor back to the start of
+/// the line without a matching `\n`, letting later text overwrite earlier text on screen) and an
+/// embedded `\n` (which would otherwise split a `tag list` row — and the marker position it
+/// depends on — across more than the one line the format assumes).
+///
+/// # Arguments
+/// * `s` - The text to neutralize.
+///
+/// # Returns
+/// * `s`, with every [`char::is_control`] character replaced by a single space.
+fn render_safe(s: &str) -> String {
+    s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect()
 }
 
 /// Render a Unix timestamp as RFC 3339 (UTC), the JSON form.
@@ -544,5 +652,112 @@ mod tests {
             "subject_malformed must never be serialized; keys were: {:?}",
             object.keys().collect::<Vec<_>>()
         );
+    }
+
+    // --- Round 3: every `@tags` string is remote-authored and arbitrary — a `TagView`'s stored
+    // fields (which `--json` serializes verbatim) are never sanitized; only what `render_human`
+    // prints to a terminal is. These tests exercise `render_safe`/`truncate_chars` directly, plus
+    // the `TagView` fields (`name_invalid`) that surface an anomaly rather than hide or reject
+    // it, matching `subject_malformed`'s own precedent.
+
+    #[test]
+    fn render_safe_neutralizes_every_control_character_and_nothing_else() {
+        // An ANSI/SGR sequence needs no special-case handling: stripping the leading ESC control
+        // byte alone is enough to make the rest of it ("[31m", "[0m") inert, ordinary text.
+        let ansi = "\x1b[31mHIDDEN\x1b[0m";
+        assert_eq!(render_safe(ansi), " [31mHIDDEN [0m");
+        assert!(!render_safe(ansi).contains('\x1b'), "the raw ESC byte must never survive");
+
+        // A bare `\r` (cursor-to-line-start on a real terminal, no matching `\n`) and an embedded
+        // `\n` (which would otherwise split one row into more than one line) are both neutralized
+        // by the same pass, not special-cased.
+        assert_eq!(render_safe("a\rb"), "a b");
+        assert_eq!(render_safe("a\nb"), "a b");
+
+        // Ordinary Unicode — including non-ASCII printable text, which is not a control character
+        // — passes through untouched; this is a control-character filter, not an ASCII filter.
+        assert_eq!(render_safe("héllo wörld"), "héllo wörld");
+        assert_eq!(render_safe(""), "");
+        assert_eq!(render_safe("plain text, no controls"), "plain text, no controls");
+    }
+
+    #[test]
+    fn truncate_chars_is_byte_safe_on_multi_byte_input_and_never_panics() {
+        // "é" is 2 bytes (U+00E9); 12 of them is 24 bytes — a byte-range `&s[..12]` would land
+        // exactly mid-character (byte 12 sits inside the 7th "é") and panic before this fix.
+        let multi_byte = "é".repeat(12);
+        assert_eq!(truncate_chars(&multi_byte, 12), multi_byte, "12 chars of 12 is everything");
+        assert_eq!(truncate_chars(&multi_byte, 5).chars().count(), 5);
+        assert_eq!(truncate_chars(&multi_byte, 5), "é".repeat(5));
+
+        // Shorter than the requested length: returned whole, not padded or panicking.
+        assert_eq!(truncate_chars("ab", 12), "ab");
+        assert_eq!(truncate_chars("", 12), "");
+    }
+
+    /// THE PANIC FINDING, PINNED DIRECTLY: a subject containing a multi-byte UTF-8 character,
+    /// rendered by both `list` and `show`, must produce a row/render rather than abort the
+    /// process. Unreachable through the shipped CLI for the same reason the malformed-subject
+    /// cases above are (see this module's own doc comment): `tag create`'s two subject sources
+    /// both verify pure-ASCII hash shape before returning, and `probe_subject` itself never
+    /// slices a subject at all (only `render_human`/`TagList::render_human`/`Created::
+    /// render_human`/`create`'s duplicate-name refusal do) — so this builds the `TagView`
+    /// directly, past `probe_subject` and `TagView::of` both, exactly the state a foreign
+    /// record's malformed, multi-byte subject would put it in.
+    #[test]
+    fn a_multi_byte_subject_renders_without_panicking() {
+        // 11 ASCII bytes, then "é" (2 bytes) straddling byte offset 12 — the exact shape that
+        // panicked `&subject[..subject.len().min(12)]` before this fix.
+        let subject = format!("{}{}{}", "a".repeat(11), "é", "b".repeat(20));
+        assert!(
+            !subject.is_char_boundary(12),
+            "the fixture must actually straddle byte offset 12, or this test proves nothing"
+        );
+
+        let view = TagView {
+            name: "v1.0".to_string(),
+            name_invalid: None,
+            subject: subject.clone(),
+            message: "release".to_string(),
+            tagger: "spike@forklift".to_string(),
+            tagger_name: None,
+            tagger_role: None,
+            tagged_at: render_timestamp(1_700_000_000),
+            parcel: "b".repeat(64),
+            subject_absent: Some(true),
+            subject_malformed: true,
+        };
+
+        // Must not panic — that is the entire point. `render_human` (`show`'s full render) slices
+        // the subject nowhere post-fix (it prints the sanitized value whole), but exercising it
+        // guards the class, not just today's specific slice sites.
+        view.render_human();
+
+        // `TagList::render_human` (`list`'s row) does still truncate the subject to 12 characters
+        // for display — the site the finding named directly.
+        let list = TagList { tags: vec![view] };
+        list.render_human();
+    }
+
+    #[test]
+    fn tag_view_of_sets_name_invalid_only_for_a_name_tag_create_would_never_produce() {
+        let names = BTreeMap::new();
+        let office = empty_office();
+
+        // `validate_tag_name` rejects a space and parens outright — a foreign record's name
+        // containing either could never have come from this codebase's own `tag create`.
+        let mut forged = malformed_tag(&"a".repeat(64));
+        forged.name = "v9 (subject not in this store)  by x".to_string();
+        assert!(
+            tag_utils::validate_tag_name(&forged.name).is_err(),
+            "the fixture must actually be invalid, or this test proves nothing"
+        );
+
+        let view = TagView::of(&attributed(forged), &names, &office, SubjectProbe::Present);
+        assert_eq!(view.name_invalid, Some(true), "a name outside tag create's own charset must be flagged");
+
+        let ordinary = malformed_tag(&"a".repeat(64)); // name: "v1.0", from `malformed_tag`
+        let view = TagView::of(&attributed(ordinary), &names, &office, SubjectProbe::Present);
+        assert_eq!(view.name_invalid, None, "an ordinary name must never be flagged");
     }
 }
