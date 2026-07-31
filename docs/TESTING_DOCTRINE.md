@@ -103,35 +103,58 @@ test go red?" check the original batch ran by hand, mechanized.
 **What it does not cover.** None of those genres swaps one already-valid, in-scope
 expression for another — the tool never rewrites `self.connect_timeout` to read a
 sibling field, a different constant, or a hardcoded literal of the same type, because
-doing so is not one of its genres. That gap is not theoretical. A recent fix to this
-codebase's remote-fetch error path (`crates/forklift-core/src/util/remote_utils.rs`,
-under review as PR #93) needed a bounded HTTP client's error-body read to budget against
-*that client's own* `connect_timeout` field — a Tor-routed client and a direct one carry
-genuinely different values (`REMOTE_CONNECT_TIMEOUT_TOR` = 60s vs. `REMOTE_CONNECT_TIMEOUT`
-= 5s, both real constants in that file) — rather than a fixed constant. Pinning that
-fix took three attempts:
+doing so is not one of its genres. That gap is not theoretical, and this module's own
+history shows it was closed by hand, not by a tool. FORK-49's fix to this module's
+error-body-read bound (`RemoteClient::error_of` and `RemoteClient::error_body_budget`,
+`crates/forklift-core/src/util/remote_utils.rs`) needed the read to budget against
+*that instance's own* `connect_timeout` field, because a Tor-routed client and a direct
+one carry genuinely different values (`REMOTE_CONNECT_TIMEOUT_TOR` = 60s vs.
+`REMOTE_CONNECT_TIMEOUT` = 5s) — not a fixed constant. `error_body_budget` folds that
+field into the free function `error_body_read_budget(connect_timeout)`, which adds a
+flat `ERROR_BODY_READ_TIMEOUT` (10s). Pinning that took three tries, each closing a gap
+the last one didn't know it had:
 
-- The first pinning test asserted a free helper function's own arithmetic, in isolation.
-  Nothing required the code under fix to actually call that helper — a caller could
-  inline different arithmetic, or skip it, and the test would still pass.
-- Reverting the call site back to a bare hardcoded constant (undoing the fix entirely)
-  left the full suite green, that test included: it exercised the helper, not the call
-  site the fix actually changed.
-- The next attempt fixed that by asserting on the call site directly — but the fixture
-  it chose replaced `self.connect_timeout` with the sibling constant
-  `REMOTE_CONNECT_TIMEOUT_TOR`, and the suite stayed green *again*. The reason: a Tor
-  client's `connect_timeout` field genuinely **equals** `REMOTE_CONNECT_TIMEOUT_TOR`
-  (60s), and a wholly unrelated constant in the same file, `FETCH_OBJECT_READ_TIMEOUT`,
-  also happens to be 60s. A fixture asserting the total budget equals `60s + 10s`
-  (`REMOTE_CONNECT_TIMEOUT_TOR` plus the read-silence budget `REMOTE_READ_TIMEOUT`)
-  cannot distinguish "this code read the instance field" from "this code hardcoded
-  either rival constant" — all three produce the identical number.
+- The first pinning test, `missing_objects_bounds_the_error_body_read_after_a_wedged_500`,
+  asserts a **lower bound** on how long the call takes against a server that never sends
+  an error body. That only proves *some* connect-timeout-shaped value got folded in — a
+  direct client's `connect_timeout` is exactly `REMOTE_CONNECT_TIMEOUT` (5s), so nothing
+  distinguishes "reads `self.connect_timeout`" from "hardcodes `REMOTE_CONNECT_TIMEOUT`
+  directly." A mutation doing the latter — swapping the field read for the constant —
+  would still pass this test.
+- A Tor-mode fixture was tried next, on the reasoning that its 60s connect timeout would
+  separate the two. It didn't: a `TorMode::On` client's `connect_timeout` field
+  genuinely **equals** `REMOTE_CONNECT_TIMEOUT_TOR` (60s), so a mutation that hardcodes
+  that constant instead of reading the field produces the identical number, and the
+  fixture cannot tell the difference.
+- The test that actually pins the property,
+  `error_body_budget_reads_this_field_not_a_rival_constant`, injects a connect timeout
+  no production path can ever emit: `RemoteClient::new_test_with_connect_timeout` builds
+  a client whose `connect_timeout` is 7s, a value distinct from both `RemoteClient::new`'s
+  5s and a `TorMode::On` `RemoteClient::new_with_tor`'s 60s. Only once the injected value
+  cannot coincidentally equal a rival does the assertion distinguish "read the field"
+  from "hardcode one of the two values a real constructor could produce." Even that is
+  not the whole property — a further test,
+  `error_body_budget_is_70s_for_a_real_tor_mode_client`, separately pins the value a real
+  Tor-mode client gets (70s), because the sentinel test alone stays green under a
+  hypothetical future cap on the computed result that would silently break the real Tor
+  case.
 
-No mutation-testing genre in the list above would have generated any of these three
-mutants: none of them delete an operator, replace a match arm, or drop a struct-literal
-field — they swap one already-valid expression for a same-typed rival, which is
-precisely the class `cargo-mutants` does not implement. A mutation-testing gate over
-this exact file, running today, would not have caught this.
+None of these three defeated mutations — swap the field read for `REMOTE_CONNECT_TIMEOUT`,
+swap it for `REMOTE_CONNECT_TIMEOUT_TOR`, cap the computed result — is one `cargo-mutants`
+generates: none deletes an operator, drops a match arm, or removes a struct-literal
+field; each substitutes one already-valid expression, or bounds one, which is outside
+the tool's documented genres. Whoever found these gaps did it by hand, the same way the
+original batch's manual "delete the drain, does a test go red?" check did. A
+mutation-testing gate over this file, run today, would not have caught any of the three.
+
+An earlier draft of this very section named the 10-second addend as
+`REMOTE_READ_TIMEOUT` where the code actually reads `ERROR_BODY_READ_TIMEOUT` — two
+distinct constants that both happen to equal 10s, so the stated arithmetic still summed
+correctly and no reader checking the total would have noticed. That is the section's own
+rule failing inside the section that states it, which is evidence for the rule rather
+than an embarrassment: equal-valued constants make the wrong name and the right name
+indistinguishable by inspection, so *reading* the prose cannot catch the swap — only
+checking the cited name against the source can.
 
 **The rule this doctrine states directly, because a green revert run is not enough to
 trust a pinning test:** a pinning test's fixture must give the source a value that
@@ -145,8 +168,11 @@ constructor or a field override built for exactly this exists to make that possi
 every constant, default, and same-typed field the source under test could have read
 instead of the one the fixture actually injects — pick or construct an injected value
 distinct from all of them, and record, for the record: the value injected, which rivals
-it is separated from, and any collisions found along the way. A collision found during
-that enumeration is itself the finding; fix the fixture, not the code.
+it is separated from, and any collisions found along the way. The sentinel test above
+does exactly this in its own comment: it lists every named `Duration` constant in the
+module (2, 3, 5, 10, and 60 seconds), checks its chosen 7s against each of them and
+against their pairwise sums, and only then trusts it as a separator. A collision found
+during that enumeration is itself the finding; fix the fixture, not the code.
 
 Use the tool, not an LLM agent, for the part it actually does automate. "Can this test
 fail?" against one of the six genres above is a fact you run, not a judgment you reason
