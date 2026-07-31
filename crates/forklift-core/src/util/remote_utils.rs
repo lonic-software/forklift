@@ -673,6 +673,19 @@ fn watched_upload_body(bytes: Vec<u8>, progress: Arc<UploadProgress>) -> (reqwes
 /// is computed via [`bounded_read_timeout`] rather than being the raw silence-budget constant.
 #[derive(Clone)]
 pub struct RemoteClient {
+    /// The default client: auto-follows redirects (reqwest's default `redirect::Policy`) and
+    /// carries only [`Self::connect_timeout`] — no `read_timeout` at all, so once past connect it
+    /// waits out any silence, however long. Ridden by five calls, none of which this module can
+    /// give an honest flat pre-first-byte budget (see [`REMOTE_READ_TIMEOUT`]'s doc for the
+    /// reasoning behind the first four): `missing_objects` and `upload_targets` each walk up to a
+    /// batch cap of hashes before responding; `fetch_subtree` walks and buffers a resolved subtree
+    /// closure; each cost scales with input the client cannot size in advance. `resolve` is the
+    /// one exception with a bound of its own — a per-request `RequestBuilder::timeout(5s)` at its
+    /// call site, since it degrades to pseudonyms on any failure rather than surfacing an error,
+    /// so it needs no client-level setting. The fifth, `commit_lift`, is this module's one
+    /// remaining mutation that still rides this auto-following client unguarded — see
+    /// [`Self::no_redirect`]'s doc for why FORK-89 left it here rather than moving it, and
+    /// FORK-91 for the still-open question of its own response-wait bound.
     http: reqwest::Client,
     /// Same endpoint, automatic redirect-following disabled. `fetch_batch`'s initial `POST` uses
     /// this one: reqwest's default policy replays a `307`/`308` redirect with the original
@@ -710,10 +723,17 @@ pub struct RemoteClient {
     no_redirect: reqwest::Client,
     /// Same endpoint as [`Self::http`], plus a `read_timeout` of
     /// [`bounded_read_timeout`]`(connect_timeout, `[`REMOTE_READ_TIMEOUT`]`)`. Used only by the
-    /// three O(constant)-pre-first-byte calls (`fetch_info`, `fetch_signature`,
-    /// `fetch_bundle_to`) — never by `fetch_object` (which needs the much looser
-    /// [`Self::bounded_object_reads`]), `update_ref`, `missing_objects`, `fetch_batch`,
-    /// `fetch_subtree`, or any upload path (see [`REMOTE_READ_TIMEOUT`]'s doc for why).
+    /// three O(constant)-pre-first-byte calls — `fetch_info`, `fetch_signature`,
+    /// `fetch_bundle_to` — whose server side does a single fixed-size lookup or serves an
+    /// already-built file before writing anything, so a flat 10s silence budget is honest for
+    /// them (see [`REMOTE_READ_TIMEOUT`]'s doc). Never used by any call whose server side does
+    /// work that scales with its input before the first byte — `missing_objects`, `fetch_batch`,
+    /// `fetch_subtree`, `upload_targets` all fall in that category, and so does `fetch_object`,
+    /// which needs the same shape of bound but a much looser budget of its own
+    /// ([`Self::bounded_object_reads`]) — nor by any call that must never auto-follow a redirect,
+    /// which this client (like `http`) still does: every mutation in this module, `update_ref`
+    /// included (see [`Self::no_redirect`]'s doc for the full list and why). `resolve` rides
+    /// neither this client nor an unbounded one — its own per-request timeout is bound enough.
     bounded_reads: reqwest::Client,
     /// Same endpoint as [`Self::http`], plus a `read_timeout` of
     /// [`bounded_read_timeout`]`(connect_timeout, `[`FETCH_OBJECT_READ_TIMEOUT`]`)` — the same
