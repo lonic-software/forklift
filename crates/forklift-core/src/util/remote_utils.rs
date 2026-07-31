@@ -4030,9 +4030,13 @@ mod tests {
     /// `connect_timeout` into the flat `ERROR_BODY_READ_TIMEOUT` base — a Tor-routed client's
     /// (60s) connect budget must survive into the composed bound, not just the direct client's
     /// (5s) one. Asserts the arithmetic directly rather than constructing a live Tor client and
-    /// waiting out the real budget (the exact ~72s shape deleted from this suite in 8b93d00) —
-    /// `error_of`/`commit_lift` both delegate to this pure function with `self.connect_timeout`,
-    /// so pinning the function's own arithmetic pins their behavior without a live remote.
+    /// waiting out the real budget (the exact ~72s shape deleted from this suite in 8b93d00).
+    ///
+    /// This pins one of two links; on its own it pins only the helper's arithmetic, not that
+    /// `error_of` actually calls it (review round 6, finding 1 — nothing enforced that link
+    /// before `missing_objects_bounds_the_error_body_read_after_a_wedged_500` below started
+    /// asserting a lower bound on elapsed time). The two together — call-site-uses-helper and
+    /// helper-arithmetic — pin `error_of`'s real behavior without a live remote.
     #[test]
     fn error_body_read_budget_folds_in_the_connect_timeout() {
         assert_eq!(
@@ -5881,22 +5885,38 @@ mod tests {
 
     /// `missing_objects` rides `self.http`, unbounded (only a `connect_timeout`) — so before this
     /// fix, a `500` whose body then wedges hangs this call forever, with the status line and
-    /// headers already fully delivered. The test's own outer ceiling
-    /// (`ERROR_BODY_READ_TIMEOUT` plus a margin) is a safety net, not the property under test: if
-    /// the wrapper in `error_of` is missing, that outer ceiling is what trips (the test fails
-    /// instead of hanging the suite), which is unambiguous evidence the internal bound is gone —
-    /// status line and headers were fully delivered before the park, so the only thing left to
-    /// hang on is the error-body read itself.
+    /// headers already fully delivered. The outer ceiling is a safety net, not the property under
+    /// test: if the wrapper in `error_of` is missing, that outer ceiling is what trips (the test
+    /// fails instead of hanging the suite), which is unambiguous evidence the internal bound is
+    /// gone — status line and headers were fully delivered before the park, so the only thing
+    /// left to hang on is the error-body read itself.
+    ///
+    /// Also asserts a **lower** bound on elapsed time (review round 6, finding 1): a red-then-green
+    /// suite run alone does not prove `error_of` calls [`error_body_read_budget`] at all — nothing
+    /// else in the suite requires that link, so a regression back to the bare
+    /// [`ERROR_BODY_READ_TIMEOUT`] (dropping the folded-in [`REMOTE_CONNECT_TIMEOUT`]) still
+    /// passes every other assertion here, which only ceiling-checks. `tokio::time::timeout` never
+    /// fires early and this fixture never sends a body, so the read burns the *entire* budget —
+    /// making the lower bound exact, not approximate. Together with
+    /// `error_body_read_budget_folds_in_the_connect_timeout` (which pins the helper's own
+    /// arithmetic), this closes the loop: one test pins call-site-uses-helper, the other pins
+    /// helper-arithmetic.
     #[test]
     fn missing_objects_bounds_the_error_body_read_after_a_wedged_500() {
         let remote = SilentErrorBodyRemote::start();
         let client = RemoteClient::new(&remote.url, None).unwrap();
-        let outer_ceiling = ERROR_BODY_READ_TIMEOUT + std::time::Duration::from_secs(10);
+        // Written explicitly as the constant sum, not via `error_body_read_budget`, so this
+        // assertion doesn't co-move with a corrupted helper — a helper bug would then move the
+        // elapsed time it produces and this fixed lower bound in lockstep, pinning nothing.
+        let lower_bound = REMOTE_CONNECT_TIMEOUT + ERROR_BODY_READ_TIMEOUT;
+        let outer_ceiling = lower_bound + std::time::Duration::from_secs(10);
 
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let started = std::time::Instant::now();
         let outcome = runtime.block_on(async {
             tokio::time::timeout(outer_ceiling, client.missing_objects(&["a".repeat(64)])).await
         });
+        let elapsed = started.elapsed();
 
         let error = outcome
             .unwrap_or_else(|_| panic!(
@@ -5904,6 +5924,14 @@ mod tests {
                 read is unbounded", outer_ceiling
             ))
             .expect_err("a 500 status must surface as an error, not succeed");
+
+        assert!(
+            elapsed >= lower_bound,
+            "elapsed {:?} is under the {:?} the folded budget (REMOTE_CONNECT_TIMEOUT + \
+            ERROR_BODY_READ_TIMEOUT) requires — error_of is no longer calling \
+            error_body_read_budget, it's using the bare ERROR_BODY_READ_TIMEOUT (or less)",
+            elapsed, lower_bound
+        );
 
         assert!(
             error.contains("(500)"),
