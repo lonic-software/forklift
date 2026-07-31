@@ -605,7 +605,8 @@ fn watched_upload_body(bytes: Vec<u8>, progress: Arc<UploadProgress>) -> (reqwes
 /// The remote endpoint: base URL, optional bearer token, and the HTTP clients.
 ///
 /// Four clients, not one, because three independent axes each need to vary per call: *redirect
-/// policy* (`fetch_batch`'s initial `POST` must not auto-follow; everything else may), *whether a
+/// policy* (`fetch_batch`'s initial `POST`, `upload_object`, and `put_presigned` must not
+/// auto-follow; everything else may), *whether a
 /// read/metadata silence bound applies at all* (only `fetch_info`, `fetch_object`,
 /// `fetch_signature`, `fetch_bundle_to`; never `update_ref`, `missing_objects`, `fetch_batch`,
 /// `fetch_subtree`, or any upload path — see [`REMOTE_READ_TIMEOUT`]'s doc), and *how loose that
@@ -625,6 +626,12 @@ pub struct RemoteClient {
     /// inspected and followed by hand with a fresh `GET` (see `fetch_batch`). Unbounded, like
     /// `http`: `fetch_batch` is one of the three calls [`REMOTE_READ_TIMEOUT`]'s doc explains are
     /// deliberately never bounded at all.
+    ///
+    /// Also used by [`Self::upload_object`] and [`Self::put_presigned`] (review round S2 fix hole):
+    /// a streamed upload body is one-shot and cannot be replayed at a redirect target, so any `3xx`
+    /// — not only the `307`/`308` this doc's other reasoning names — must come back to
+    /// [`Self::describe_upload_redirect`] raw rather than being auto-followed. See that function's
+    /// doc for why a `303` specifically forced the move off `self.http`.
     no_redirect: reqwest::Client,
     /// Same endpoint as [`Self::http`], plus a `read_timeout` of
     /// [`bounded_read_timeout`]`(connect_timeout, `[`REMOTE_READ_TIMEOUT`]`)`. Used only by the
@@ -1101,17 +1108,16 @@ impl RemoteClient {
     }
 
     /// Compose a loud, specific error for a `3xx` response to a streamed upload `PUT` (review
-    /// round S2-F5). Verified against this pinned `reqwest`/`tower-http` version:
-    /// `Body::try_clone` (`async_impl/body.rs`) returns `None` for a streaming body, `clone_body`
-    /// (`redirect.rs`) forwards that `None` on, and `tower-http`'s `follow_redirect` middleware
-    /// (`follow_redirect/mod.rs`) breaks out of its redirect loop and hands the raw `3xx` straight
-    /// back whenever the body cannot be reproduced for the replay. The pre-streaming `.body(Vec<u8>)`
-    /// built a `Reusable` body that cloned fine, so a redirect *was* followed before this fix — this
-    /// is a real behavior change, not a latent one, and pre-1.0 there is no compatibility argument
-    /// against it (CLAUDE.md) — but it must never be a *silent* one: an operator seeing a bare
-    /// "refused (307)" would have no idea a redirect was even involved. Names the status and,
-    /// when present, the `Location` header the remote pointed at, so the caller can see exactly
-    /// what happened and ask the remote for a fresh target rather than guess.
+    /// round S2-F5). Both call sites that reach this ([`Self::upload_object`],
+    /// [`Self::put_presigned`]) go out on [`Self::no_redirect`], which never auto-follows *any*
+    /// redirect status — so this is a local, unconditional invariant of this client, not a claim
+    /// about how any particular `3xx` happens to behave under a dependency's redirect matrix (a
+    /// `303` once slipped through here on the auto-following client precisely because that matrix
+    /// has more than one case; see the fixed-hole review round for the history). A silent redirect
+    /// must never look like success: an operator seeing a bare "refused (307)" would have no idea
+    /// a redirect was even involved. Names the status and, when present, the `Location` header the
+    /// remote pointed at, so the caller can see exactly what happened and ask the remote for a
+    /// fresh target rather than guess.
     fn describe_upload_redirect(action: &str, response: &reqwest::Response) -> String {
         let status = response.status();
         let location = response.headers()
@@ -1387,7 +1393,7 @@ impl RemoteClient {
         let action = format!("uploading object {}", hash);
         let progress = UploadProgress::new();
         let (body, len) = watched_upload_body(bytes, progress.clone());
-        let builder = self.request(reqwest::Method::PUT, &format!("/v1/objects/{}", hash))
+        let builder = self.request_on(&self.no_redirect, reqwest::Method::PUT, &format!("/v1/objects/{}", hash))
             .header(reqwest::header::CONTENT_LENGTH, len)
             .body(body);
 
@@ -1463,7 +1469,7 @@ impl RemoteClient {
     async fn put_presigned(&self, url: &str, bytes: Vec<u8>) -> Result<(), String> {
         let progress = UploadProgress::new();
         let (body, len) = watched_upload_body(bytes, progress.clone());
-        let builder = self.http.put(url)
+        let builder = self.no_redirect.put(url)
             .header(reqwest::header::CONTENT_LENGTH, len)
             .body(body);
 
@@ -6670,6 +6676,99 @@ mod tests {
         assert!(
             error.to_lowercase().contains("redirect") && error.contains("302") && error.contains(location),
             "must name the redirect, its status, and its target: {}", error
+        );
+    }
+
+    // -----------------------------------------------------------------------------------
+    // The `303` redirect hole: `is_redirection()` guards `upload_object`/`put_presigned`, but
+    // both rode `self.http`, which auto-follows. `tower-http`'s `follow_redirect` middleware
+    // (`follow_redirect/mod.rs`, `SEE_OTHER` arm) unconditionally forces the body to
+    // `BodyRepr::Empty` and rewrites the method to `GET` *before* the `take()` guard the
+    // `MOVED_PERMANENTLY | FOUND` arm relies on to skip non-`POST` methods — so a `303` to a
+    // streamed `PUT` silently becomes a bare `GET`, and a `2xx` at the target makes the call
+    // return `Ok(())` having stored nothing. The 302/307 tests above cannot catch this: a `PUT`
+    // simply misses the `method == POST` condition in the other arm. The fix routes both sites
+    // through `self.no_redirect` instead of special-casing `303`, so no future tower-http
+    // redirect-matrix change can reopen this hole.
+    // -----------------------------------------------------------------------------------
+
+    /// A second live listener a redirect can point at: answers any request with a bare `200 OK`
+    /// and no body, and records whether it was ever contacted. Landing on this flag being `true`
+    /// is what would prove a redirect was actually followed — the discriminator this test needs
+    /// beyond just "an `Err` came out", since an unrelated `Err` could come out for the wrong
+    /// reason and still leave this looking green.
+    fn start_landing_remote() -> (String, Arc<std::sync::atomic::AtomicBool>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let landed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let landed_writer = landed.clone();
+
+        std::thread::spawn(move || {
+            use std::io::Write;
+
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = read_test_request(&mut stream);
+                landed_writer.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.flush();
+            }
+        });
+
+        (url, landed)
+    }
+
+    /// The fixed hole itself: a `303` to `put_presigned` must not be auto-followed. Before the
+    /// fix (`self.http`, which auto-follows) this returns `Ok(())` with the landing flag `true` —
+    /// the redirect target really was reached as a bare `GET` and its `200` read back as success.
+    /// After the fix (`self.no_redirect`) the raw `303` comes back to the existing guard, the
+    /// landing flag stays `false`, and the error names the status and location by the same
+    /// mechanism the 302/307 tests already pin.
+    #[test]
+    fn put_presigned_does_not_follow_a_303_to_a_2xx_landing() {
+        let (landing_url, landed) = start_landing_remote();
+        let url = start_redirecting_remote(303, &landing_url);
+        let client = RemoteClient::new(&url, None).unwrap();
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let error = runtime.block_on(client.put_presigned(&url, vec![1u8; 4096]))
+            .expect_err("a 303 must not be silently followed to a 2xx landing");
+
+        assert!(
+            error.to_lowercase().contains("redirect") && error.contains("303") && error.contains(&landing_url),
+            "must name the redirect, its status, and its target: {}", error
+        );
+        assert!(
+            !landed.load(std::sync::atomic::Ordering::SeqCst),
+            "the landing listener must never have been contacted — that is what proves no \
+            follow was attempted, rather than merely that an error came out"
+        );
+    }
+
+    /// Same hole, `upload_object` site — the two client selections in the fix (`upload_object` →
+    /// `self.no_redirect` via `request_on`, `put_presigned` → `self.no_redirect.put`) change
+    /// independently, so each needs its own falsifier.
+    #[test]
+    fn upload_object_does_not_follow_a_303_to_a_2xx_landing() {
+        let (landing_url, landed) = start_landing_remote();
+        let url = start_redirecting_remote(303, &landing_url);
+        let client = RemoteClient::new(&url, None).unwrap();
+        let hash = "b".repeat(64);
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let error = runtime.block_on(client.upload_object(&hash, vec![1u8; 4096]))
+            .expect_err("a 303 must not be silently followed to a 2xx landing");
+
+        assert!(
+            error.to_lowercase().contains("redirect") && error.contains("303") && error.contains(&landing_url),
+            "must name the redirect, its status, and its target: {}", error
+        );
+        assert!(
+            !landed.load(std::sync::atomic::Ordering::SeqCst),
+            "the landing listener must never have been contacted — that is what proves no \
+            follow was attempted, rather than merely that an error came out"
         );
     }
 
