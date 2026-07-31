@@ -172,7 +172,13 @@ impl RevocationReason {
 
 /// An enrolled user. Records carry only the opaque operator id — no display data ever
 /// goes on-chain (a hosting provider resolves ids to names behind its own policy).
-#[derive(Clone)]
+///
+/// `PartialEq` is derived (not hand-projected) deliberately: `verify_self_service_change`
+/// compares whole records so that a field added here is protected by default, rather
+/// than needing a matching update to a separate projection (see FORK-76 — a hand-built
+/// projection of five of these seven fields let `class` and `supervisor` drift silently
+/// unguarded for a release).
+#[derive(Clone, PartialEq, Debug)]
 pub struct UserRecord {
     /// The operator id the chain sees: an opaque string (a minted UUID by default).
     pub identifier: String,
@@ -990,5 +996,49 @@ mod tests {
         let toml = "identifier = \"op@x\"\nenrolled_at = 1\nrole = \"admin\"\nidentity_root = \"r\"\n";
         let parsed = parse_user_record(toml).unwrap();
         assert_eq!(parsed.class, IdentityClass::Human);
+    }
+
+    /// `verify_self_service_change` (in `audit_utils`) protects user records by
+    /// comparing whole `UserRecord` values instead of a hand-picked field projection
+    /// (FORK-76: the projection it replaced named five of seven fields and silently let
+    /// `class` and `supervisor` drift). That guard is only as strong as this derive: if
+    /// every field here did not genuinely participate in `==`, a whole-record compare
+    /// would be no safer than the projection it replaced. This exercises every current
+    /// field one at a time — proving none is silently excluded — and, because
+    /// `#[derive(PartialEq)]` compares structurally (there is no way to derive it over
+    /// only some fields), a field added to `UserRecord` in the future is swept into this
+    /// same guarantee automatically, with no matching test or projection to remember.
+    #[test]
+    fn user_record_equality_distinguishes_every_current_field() {
+        let base = UserRecord {
+            identifier: "op@x".to_string(),
+            enrolled_at: 7,
+            role: Role::Writer,
+            pallets: vec!["main".to_string()],
+            identity_root: "root".to_string(),
+            class: IdentityClass::Human,
+            supervisor: None,
+        };
+
+        assert_eq!(base, base.clone(), "a record must equal an identical copy of itself");
+
+        let variants: Vec<UserRecord> = vec![
+            UserRecord { identifier: "op@y".to_string(), ..base.clone() },
+            UserRecord { enrolled_at: 8, ..base.clone() },
+            UserRecord { role: Role::Admin, ..base.clone() },
+            UserRecord { pallets: vec!["other".to_string()], ..base.clone() },
+            UserRecord { identity_root: "root2".to_string(), ..base.clone() },
+            UserRecord { class: IdentityClass::Agent, ..base.clone() },
+            UserRecord { supervisor: Some("alice".to_string()), ..base.clone() },
+        ];
+
+        assert_eq!(variants.len(), 7, "one variant per field on UserRecord — keep this in sync");
+
+        for (index, variant) in variants.iter().enumerate() {
+            assert_ne!(
+                &base, variant,
+                "field at index {} does not affect UserRecord equality", index
+            );
+        }
     }
 }
