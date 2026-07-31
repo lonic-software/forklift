@@ -302,31 +302,37 @@ const REMOTE_CONNECT_TIMEOUT_TOR: std::time::Duration = std::time::Duration::fro
 /// `connect_timeout(60s)` + `read_timeout(3s)` against a black-holed address failed at 3.002s,
 /// not 60s). That is why this is carried by only three of the module's read/metadata calls
 /// — [`RemoteClient::fetch_info`], [`RemoteClient::fetch_signature`],
-/// [`RemoteClient::fetch_bundle_to`] — each of whose server side does O(constant) work (a single
-/// lookup, or serving an already-built file) before writing anything, so a flat 10s pre-first-byte
-/// budget is honest. `fetch_object` needs a much looser budget of its own
-/// ([`FETCH_OBJECT_READ_TIMEOUT`]) since its server side is size-dependent, not O(constant).
-/// `missing_objects`, `fetch_batch`, and `fetch_subtree` are deliberately **not** bounded at all:
-/// their server sides build a bundle (or consult up to `MAX_MISSING_BATCH` hashes) *before* the
-/// first byte, work whose cost depends on object sizes the client cannot know in advance — no flat
-/// budget for that is honest, so they stay on the unbounded client until they have their own
-/// scaled/measured budget or an abandon-and-fall-back lane (see the comment at each of those three
-/// call sites).
+/// [`RemoteClient::fetch_bundle_to`] — plus, since FORK-49's follow-up found their server-side work
+/// is equally O(constant), the module's two smallest *mutations*,
+/// [`RemoteClient::upload_signature`] and [`RemoteClient::put_trust`] (`forklift-server`'s
+/// `put_signature`/`put_trust` handlers do a single fixed-size file read plus a single fixed-size
+/// atomic write, verified before this budget was extended to them) — each of whose server side
+/// does O(constant) work (a single lookup, an already-built file, or one small read-then-write)
+/// before writing anything, so a flat 10s pre-first-byte budget is honest for all five. `fetch_object`
+/// needs a much looser budget of its own ([`FETCH_OBJECT_READ_TIMEOUT`]) since its server side is
+/// size-dependent, not O(constant). `missing_objects`, `fetch_batch`, `fetch_subtree`, `update_ref`,
+/// `commit_lift`, and the streamed-upload paths (`upload_object`, `put_presigned`) are deliberately
+/// **not** bounded by this constant at all: their server sides (or, for the streamed uploads, the
+/// client's own send phase) do work whose cost the client cannot know in advance — no flat budget
+/// for that is honest, so they stay on an unbounded client (or, for the streamed uploads, their own
+/// [`RemoteClient::send_with_watchdog`] mechanism) until they have their own scaled/measured budget
+/// or an abandon-and-fall-back lane (see the comment at each of those call sites).
 ///
 /// `read_timeout` is a `ClientBuilder`-level setting with no per-request override — it cannot be
 /// switched off for one specific request — so it is carried only by
-/// [`RemoteClient::bounded_reads`]/[`RemoteClient::bounded_object_reads`], never by `http`.
-/// `update_ref` shares `http`, and its server side legitimately runs a parcel-closure audit walk —
+/// [`RemoteClient::bounded_reads`], [`RemoteClient::bounded_object_reads`], and
+/// [`RemoteClient::bounded_writes`], never by `http`/`no_redirect`. `update_ref` shares
+/// `no_redirect` (unbounded), and its server side legitimately runs a parcel-closure audit walk —
 /// scoped by the history segment being pushed, which on a first lift into an empty pallet is the
 /// whole history — before its first response byte; that can take minutes with *no* bytes moving at
 /// all, which this constant would (correctly) call silence if it applied there. Giving the bounded
-/// reads their own clients means `update_ref` needs no exemption: it was simply never wired to a
+/// calls their own clients means `update_ref` needs no exemption: it was simply never wired to a
 /// client that carries this setting.
 ///
-/// 10s of silence, on top of whichever connect budget applies, is generous for any of the three
+/// 10s of silence, on top of whichever connect budget applies, is generous for any of the five
 /// tight calls above: a healthy connection carrying real progress, however slow the link,
 /// essentially never goes a full 10s without delivering a byte, and each of their pre-first-byte
-/// server costs is a single lookup or an already-built file.
+/// server costs is a single lookup, an already-built file, or one small read-then-write.
 const REMOTE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The read/metadata silence budget for [`RemoteClient::fetch_object`] alone — see
@@ -646,15 +652,20 @@ fn watched_upload_body(bytes: Vec<u8>, progress: Arc<UploadProgress>) -> (reqwes
 
 /// The remote endpoint: base URL, optional bearer token, and the HTTP clients.
 ///
-/// Four clients, not one, because three independent axes each need to vary per call: *redirect
-/// policy* (`fetch_batch`'s initial `POST`, `upload_object`, and `put_presigned` must not
-/// auto-follow; everything else may), *whether a
-/// read/metadata silence bound applies at all* (only `fetch_info`, `fetch_object`,
-/// `fetch_signature`, `fetch_bundle_to`; never `update_ref`, `missing_objects`, `fetch_batch`,
-/// `fetch_subtree`, or any upload path — see [`REMOTE_READ_TIMEOUT`]'s doc), and *how loose that
-/// bound is* (`fetch_object` alone needs [`FETCH_OBJECT_READ_TIMEOUT`] instead of
-/// [`REMOTE_READ_TIMEOUT`] — see [`bounded_object_reads`](Self::bounded_object_reads)'s doc). All
-/// four otherwise share the same proxy/connect-timeout configuration built once in
+/// Five clients, not one, because three independent axes each need to vary per call: *redirect
+/// policy* (`fetch_batch`'s initial `POST`, `upload_object`, `put_presigned`, `update_ref`,
+/// `upload_signature`, and `put_trust` must not auto-follow — every mutation but `commit_lift`,
+/// see [`Self::no_redirect`]'s doc for that gap; everything else may), *whether a read/metadata
+/// silence bound applies at all* (`fetch_info`, `fetch_object`, `fetch_signature`,
+/// `fetch_bundle_to`, `upload_signature`, and `put_trust`; never `update_ref`, `missing_objects`,
+/// `fetch_batch`, `fetch_subtree`, `commit_lift`, or the streamed-upload paths — see
+/// [`REMOTE_READ_TIMEOUT`]'s doc), and *how loose that bound is* (`fetch_object` alone needs
+/// [`FETCH_OBJECT_READ_TIMEOUT`] instead of [`REMOTE_READ_TIMEOUT`] — see
+/// [`bounded_object_reads`](Self::bounded_object_reads)'s doc). `upload_signature`/`put_trust`
+/// are the one combination needing both a bound *and* no auto-follow at once, which is why they
+/// get their own client ([`Self::bounded_writes`]) rather than reusing either
+/// [`Self::bounded_reads`] (auto-follows) or [`Self::no_redirect`] (unbounded). All five otherwise
+/// share the same proxy/connect-timeout configuration built once in
 /// [`RemoteClient::new_with_tor`], which is also where each bounded client's actual `read_timeout`
 /// is computed via [`bounded_read_timeout`] rather than being the raw silence-budget constant.
 #[derive(Clone)]
@@ -675,19 +686,23 @@ pub struct RemoteClient {
     /// [`Self::describe_mutation_redirect`] raw rather than being auto-followed. See that
     /// function's doc for why a `303` specifically forced the move off `self.http`.
     ///
-    /// Also used by [`Self::update_ref`], [`Self::upload_signature`], and [`Self::put_trust`]
-    /// (FORK-89): unlike the two above, none of these three stream a one-shot body — they hand
-    /// `self.request_on` a `.json(...)` or an in-memory `.body(Vec<u8>)`, which *could* in
-    /// principle be replayed at a redirect target. That is not why they are here: they were on
-    /// `self.http` (auto-following, with no `is_redirection()` guard) until FORK-89, which found
-    /// `tower-http`'s `SEE_OTHER` arm forces a `POST`'s method
-    /// to `GET` and its body empty unconditionally, and every arm does the same to a `PUT` — so a
-    /// `303` (and, for `update_ref`'s `POST`, a `301`/`302` too) silently became a bare `GET`,
-    /// whose `2xx` at the redirect target read back as a fabricated success having mutated
-    /// nothing. Moving these three here closes that the same way the other two are already closed:
-    /// no mutation on this client ever auto-follows, replayable body or not — see
-    /// [`Self::describe_mutation_redirect`]'s doc for why that is a client-selection guarantee,
-    /// not a claim about any dependency's redirect matrix.
+    /// Also used by [`Self::update_ref`] (FORK-89): unlike the two above, its body is not a
+    /// one-shot stream — it hands `self.request_on` a `.json(...)`, which *could* in principle be
+    /// replayed at a redirect target. That is not why it is here: it was on `self.http`
+    /// (auto-following, with no `is_redirection()` guard) until FORK-89, which found
+    /// `tower-http`'s `SEE_OTHER` arm forces a `POST`'s method to `GET` and its body empty
+    /// unconditionally, and its `MOVED_PERMANENTLY | FOUND` arm does the same conditioned only on
+    /// `method == POST` — so a `303`, `301`, or `302` to this call's `POST` all silently became a
+    /// bare `GET`, whose `2xx` at the redirect target read back as a fabricated success having
+    /// moved nothing. `upload_signature` and `put_trust` had the identical `303` exposure (as
+    /// `PUT`s, never the `301`/`302` one) — FORK-89 closed all three, but the latter two now ride
+    /// [`Self::bounded_writes`] instead of here (see that field's doc, FORK-49): they needed a
+    /// bound too, which this client structurally cannot provide alongside no-auto-follow;
+    /// `update_ref` stays on this unbounded client because its own response wait is deliberately
+    /// unbounded (its server-side work is the pushed history segment, unknowable in advance — see
+    /// [`REMOTE_READ_TIMEOUT`]'s doc). Either way, no mutation on either client ever auto-follows,
+    /// replayable body or not — see [`Self::describe_mutation_redirect`]'s doc for why that is a
+    /// client-selection guarantee, not a claim about any dependency's redirect matrix.
     ///
     /// `commit_lift` still rides `self.http` and is not part of this fix — it carries the same
     /// latent 3xx auto-follow exposure the other five closed. Not moved here: out of the stated
@@ -696,10 +711,12 @@ pub struct RemoteClient {
     no_redirect: reqwest::Client,
     /// Same endpoint as [`Self::http`], plus a `read_timeout` of
     /// [`bounded_read_timeout`]`(connect_timeout, `[`REMOTE_READ_TIMEOUT`]`)`. Used only by the
-    /// three O(constant)-pre-first-byte calls (`fetch_info`, `fetch_signature`,
+    /// three O(constant)-pre-first-byte *read* calls (`fetch_info`, `fetch_signature`,
     /// `fetch_bundle_to`) — never by `fetch_object` (which needs the much looser
     /// [`Self::bounded_object_reads`]), `update_ref`, `missing_objects`, `fetch_batch`,
-    /// `fetch_subtree`, or any upload path (see [`REMOTE_READ_TIMEOUT`]'s doc for why).
+    /// `fetch_subtree`, or any streamed-upload path (see [`REMOTE_READ_TIMEOUT`]'s doc for why).
+    /// Auto-follows — never usable for a mutation, which is why `upload_signature`/`put_trust`
+    /// get their own [`Self::bounded_writes`] instead of riding this one.
     bounded_reads: reqwest::Client,
     /// Same endpoint as [`Self::http`], plus a `read_timeout` of
     /// [`bounded_read_timeout`]`(connect_timeout, `[`FETCH_OBJECT_READ_TIMEOUT`]`)` — the same
@@ -707,6 +724,26 @@ pub struct RemoteClient {
     /// size-dependent server work needs (see [`FETCH_OBJECT_READ_TIMEOUT`]'s doc). Used only by
     /// `fetch_object`.
     bounded_object_reads: reqwest::Client,
+    /// Same shape as [`Self::bounded_reads`] — a `read_timeout` of
+    /// [`bounded_read_timeout`]`(connect_timeout, `[`REMOTE_READ_TIMEOUT`]`)` — but with automatic
+    /// redirect-following disabled like [`Self::no_redirect`]. Used only by [`Self::upload_signature`]
+    /// and [`Self::put_trust`] (FORK-49/FORK-89 together): both mutate, so they need the same
+    /// never-auto-follow guarantee as every other mutation in this module, but unlike `update_ref`
+    /// (whose server-side work is the unknowable-in-advance pushed history segment) their
+    /// server-side work is a single fixed-size file read plus a single fixed-size atomic write —
+    /// `forklift-server`'s `put_signature`/`put_trust` handlers, verified O(constant) before this
+    /// client was added — so a flat silence budget is honest for them the same way it already is
+    /// for `fetch_info`/`fetch_signature`/`fetch_bundle_to`. Before this client existed, both rode
+    /// `self.no_redirect`: correctly guarded against a silent redirect, but still fully unbounded
+    /// against a remote that never sends a response at all (or a status line, then nothing) —
+    /// exactly the FORK-49 shape, surviving on this one pair of calls because their O(constant)
+    /// premise had never been checked. [`Self::error_of`]'s own bound
+    /// ([`Self::error_body_budget`]) already covered the narrower case of a non-success status
+    /// line arriving and then the *body* wedging (proven by
+    /// `missing_objects_bounds_the_error_body_read_after_a_wedged_500`, which exercises that same
+    /// mechanism on an unrelated call) — what this client closes is the wider gap: no response of
+    /// any kind ever arriving.
+    bounded_writes: reqwest::Client,
     /// The connect-phase bound this instance's clients were actually built with —
     /// [`REMOTE_CONNECT_TIMEOUT`] or [`REMOTE_CONNECT_TIMEOUT_TOR`], whichever
     /// `should_route_through_tor` selected at construction. Kept so a connect-phase transport
@@ -809,9 +846,9 @@ impl RemoteClient {
     /// and the constructor a caller with settings already in hand can use.
     ///
     /// When the settings route this remote through Tor (see [`should_route_through_tor`]), all
-    /// four underlying clients (see [`RemoteClient`]'s own doc) dial through the Tor SOCKS proxy
+    /// five underlying clients (see [`RemoteClient`]'s own doc) dial through the Tor SOCKS proxy
     /// and use [`REMOTE_CONNECT_TIMEOUT_TOR`] as their connect budget instead of
-    /// [`REMOTE_CONNECT_TIMEOUT`]; the two bounded clients' `read_timeout` is computed from
+    /// [`REMOTE_CONNECT_TIMEOUT`]; the three bounded clients' `read_timeout` is computed from
     /// whichever of those applies (see [`bounded_read_timeout`]), so a Tor dial's much longer
     /// connect allowance is never undercut by the read-silence budget. Every non-onion remote gets
     /// the shorter, direct connect budget, as before — but every remote, onion or not, now carries
@@ -842,13 +879,13 @@ impl RemoteClient {
         Self::build(url, token, &tor, routes_through_tor, connect_timeout)
     }
 
-    /// Build the four underlying clients and assemble a [`RemoteClient`], given a
+    /// Build the five underlying clients and assemble a [`RemoteClient`], given a
     /// `connect_timeout` already decided by the caller — [`Self::new_with_tor`] is the only
     /// production caller, and decides it from [`should_route_through_tor`] as its doc describes.
     /// Split out from `new_with_tor` so [`Self::new_test_with_connect_timeout`] (test-only) can
     /// supply an arbitrary `connect_timeout` that actually gets built into every client, rather
     /// than one construction path deciding the timeout and a second one overwriting only the
-    /// `connect_timeout` field afterward — the latter would leave the four inner clients armed
+    /// `connect_timeout` field afterward — the latter would leave the five inner clients armed
     /// with a *different* bound than the field reports, which is not a client any production
     /// constructor could ever produce and would silently invalidate any test built on top of it
     /// that touches `describe_transport_error` or `send_with_watchdog`, both of which trust this
@@ -881,14 +918,23 @@ impl RemoteClient {
         let mut bounded_object_reads = reqwest::Client::builder()
             .connect_timeout(connect_timeout)
             .read_timeout(bounded_read_timeout(connect_timeout, FETCH_OBJECT_READ_TIMEOUT));
+        // Combines `no_redirect`'s policy with `bounded_reads`'s budget: the one client
+        // `upload_signature`/`put_trust` need, since both mutate (so must never auto-follow) and
+        // are O(constant) server-side (so a flat silence budget is honest for them) — see
+        // [`RemoteClient::bounded_writes`]'s own doc.
+        let mut bounded_writes = reqwest::Client::builder()
+            .connect_timeout(connect_timeout)
+            .read_timeout(bounded_read_timeout(connect_timeout, REMOTE_READ_TIMEOUT))
+            .redirect(reqwest::redirect::Policy::none());
 
-        // The same proxy governs all four clients: the redirect-following ones and the
-        // hand-following one alike route through Tor when the remote does.
+        // The same proxy governs all five clients: the redirect-following ones and the
+        // hand-following ones alike route through Tor when the remote does.
         if let Some(proxy) = &proxy {
             http = http.proxy(proxy.clone());
             no_redirect = no_redirect.proxy(proxy.clone());
             bounded_reads = bounded_reads.proxy(proxy.clone());
             bounded_object_reads = bounded_object_reads.proxy(proxy.clone());
+            bounded_writes = bounded_writes.proxy(proxy.clone());
         }
 
         let http = http.build()
@@ -903,11 +949,15 @@ impl RemoteClient {
         let bounded_object_reads = bounded_object_reads.build()
             .map_err(|e| format!("Error while creating the HTTP client: {}", e))?;
 
+        let bounded_writes = bounded_writes.build()
+            .map_err(|e| format!("Error while creating the HTTP client: {}", e))?;
+
         Ok(RemoteClient {
             http,
             no_redirect,
             bounded_reads,
             bounded_object_reads,
+            bounded_writes,
             connect_timeout,
             base: url.trim_end_matches('/').to_string(),
             token,
@@ -915,7 +965,7 @@ impl RemoteClient {
     }
 
     /// Test-only: build a client with an arbitrary injected `connect_timeout`, threaded into the
-    /// four inner clients via [`Self::build`] rather than overwritten on the field afterward (see
+    /// five inner clients via [`Self::build`] rather than overwritten on the field afterward (see
     /// that method's doc for why the two are not equivalent). Never routes through Tor — `tor` is
     /// irrelevant to a plain/`.invalid` test URL, and passing `routes_through_tor: false`
     /// explicitly here means that is a direct fact about this constructor, not a side effect of
@@ -1050,22 +1100,24 @@ impl RemoteClient {
         }
     }
 
-    /// The mutation counterpart of [`Self::describe_transport_error`], for the six calls that ride
-    /// the unbounded `http`/`no_redirect` clients (`update_ref`, `upload_object`, `put_presigned`,
-    /// `upload_signature`, `put_trust`, `commit_lift`) — `upload_object`, `put_presigned`,
-    /// `update_ref`, `upload_signature`, and `put_trust` all ride `no_redirect` (the last three
-    /// moved off `http` by FORK-89, `upload_object`/`put_presigned` by the earlier fix for the
-    /// `303` redirect hole — see [`Self::no_redirect`]'s doc); only `commit_lift` still rides
-    /// `http` directly. `upload_object`/`put_presigned` also layer [`Self::send_with_watchdog`] on
-    /// top for their body-send phase, but `no_redirect` is just as unbounded as `http` itself, so a
-    /// transport failure on any of the six still lands here for anything `classify` can actually
-    /// see (a connect failure, or a `reqwest::Error`-bearing timeout on the response side). Same
-    /// [`classify`] dispatch, but the [`TransportFailure::ReadTimedOut`] wording differs from the
-    /// read path's: on these clients that case can only be a timeout on an *established*
-    /// connection — after the request bytes were already sent — so the settled contract requires
-    /// the uncertainty be carried in the message rather than asserted away: it may have completed
-    /// on the remote, and the caller must decide whether to check before retrying, never be told
-    /// nothing happened.
+    /// The mutation counterpart of [`Self::describe_transport_error`], for all six mutations in
+    /// this module (`update_ref`, `upload_object`, `put_presigned`, `upload_signature`,
+    /// `put_trust`, `commit_lift`), regardless of which client each rides:
+    /// `upload_object`/`put_presigned` ride the unbounded [`Self::no_redirect`] (moved off `http`
+    /// by the fix for the `303` redirect hole) and layer [`Self::send_with_watchdog`] on top for
+    /// their body-send phase; `update_ref` rides the unbounded `no_redirect` too (FORK-89); only
+    /// `commit_lift` still rides the unbounded `http` directly; `upload_signature`/`put_trust`
+    /// ride the *bounded* [`Self::bounded_writes`] (FORK-49/FORK-89 together) — the one pair where
+    /// [`TransportFailure::ReadTimedOut`] is the common, expected outcome of a stalled remote
+    /// rather than the near-unreachable multi-minute kernel timeout that arm's own doc describes
+    /// for every other call here, since `bounded_writes` carries a real, configured
+    /// `read_timeout` the other five clients this function serves do not. Same [`classify`]
+    /// dispatch either way, and the same wording either way: whether the timeout is this client's
+    /// own configured bound or (on the still-unbounded five) a genuine kernel-level one, it can
+    /// only fire on an *established* connection — after the request bytes were already sent — so
+    /// the settled contract requires the uncertainty be carried in the message rather than
+    /// asserted away: it may have completed on the remote, and the caller must decide whether to
+    /// check before retrying, never be told nothing happened.
     fn describe_mutation_transport_error(&self, action: &str, e: reqwest::Error) -> String {
         match classify(e.is_connect(), e.is_timeout()) {
             TransportFailure::ConnectTimedOut => format!(
@@ -1214,10 +1266,12 @@ impl RemoteClient {
     }
 
     /// Compose a loud, specific error for a `3xx` response to a mutation. Every call site that
-    /// reaches this (`upload_object`, `put_presigned`, `update_ref`, `upload_signature`,
-    /// `put_trust` — FORK-89 widened this from the original two) goes out on [`Self::no_redirect`],
-    /// which never auto-follows *any* redirect status — so this is a local, unconditional invariant
-    /// of *this client*, not a claim about how any particular `3xx` happens to behave under a
+    /// reaches this (`upload_object`, `put_presigned`, `update_ref` — via [`Self::no_redirect`] —
+    /// and `upload_signature`, `put_trust` — via [`Self::bounded_writes`]; FORK-89 widened this
+    /// from the original two) goes out on a client with `redirect::Policy::none()`, which never
+    /// auto-follows *any* redirect status regardless of whether that client also carries a
+    /// `read_timeout` — so this is a local, unconditional invariant of *whichever client sent the
+    /// request*, not a claim about how any particular `3xx` happens to behave under a
     /// dependency's redirect matrix. Do not turn it back into one: an earlier version of this doc
     /// asserted exactly that (which status codes `tower-http`'s auto-following policy skips for a
     /// given method) and was false for `303` — `follow_redirect`'s `SEE_OTHER` arm forces the body
@@ -1704,16 +1758,16 @@ impl RemoteClient {
 
     /// Upload a parcel's signature sidecar.
     ///
-    /// Rides [`Self::no_redirect`] (FORK-89), not `self.http`: this call mutates the remote, and
-    /// this client never auto-follows a redirect on a mutation — a local, unconditional invariant
-    /// of *this client*, holding regardless of which status code or dependency version is in play
-    /// (see [`Self::describe_mutation_redirect`]'s doc). Before FORK-89 this rode `self.http` with
-    /// no `is_redirection()` guard, so a `303` (which `tower-http`'s `SEE_OTHER` arm forces to a
-    /// bare `GET` unconditionally) silently landed at the redirect target instead of storing
-    /// anything, and a `2xx` there read back as a fabricated success.
+    /// Rides [`Self::bounded_writes`] (FORK-89's redirect guard, FORK-49's response-wait bound —
+    /// see that field's doc): this call mutates the remote, so it must never auto-follow a
+    /// redirect (a local, unconditional invariant of *this client*, holding regardless of which
+    /// status code or dependency version is in play — see [`Self::describe_mutation_redirect`]'s
+    /// doc), and `forklift-server`'s `put_signature` handler is verified O(constant) server-side,
+    /// so an honest flat silence budget applies too. Before FORK-89 this rode `self.http` with no
+    /// `is_redirection()` guard at all and no response-wait bound either.
     pub async fn upload_signature(&self, parcel_hash: &str, bytes: Vec<u8>) -> Result<(), String> {
         let action = format!("uploading the signature of {}", parcel_hash);
-        let response = self.request_on(&self.no_redirect, reqwest::Method::PUT, &format!("/v1/signatures/{}", parcel_hash))
+        let response = self.request_on(&self.bounded_writes, reqwest::Method::PUT, &format!("/v1/signatures/{}", parcel_hash))
             .body(bytes)
             .send()
             .await
@@ -1732,12 +1786,16 @@ impl RemoteClient {
 
     /// Establish the trust anchor on the remote (idempotent for an identical anchor).
     ///
-    /// Rides [`Self::no_redirect`] (FORK-89) — same reasoning as [`Self::upload_signature`]'s doc:
-    /// a mutation on this client never auto-follows any redirect, unconditionally, and before
-    /// FORK-89 this call had no such guard at all.
+    /// Rides [`Self::bounded_writes`] (FORK-89/FORK-49) — same reasoning as
+    /// [`Self::upload_signature`]'s doc: a mutation on this client never auto-follows any
+    /// redirect, unconditionally, and `forklift-server`'s `put_trust` handler is verified
+    /// O(constant) server-side (a handful of single fixed-size file reads/writes — the trust file,
+    /// one pallet ref file — plus in-memory comparisons; never a walk over history or all
+    /// pallets), so the same flat silence budget applies. Before FORK-89 this call had no
+    /// redirect guard or response-wait bound at all.
     pub async fn put_trust(&self, anchor: &TrustAnchorDto) -> Result<(), String> {
         let action = "uploading the trust anchor";
-        let response = self.request_on(&self.no_redirect, reqwest::Method::PUT, "/v1/trust")
+        let response = self.request_on(&self.bounded_writes, reqwest::Method::PUT, "/v1/trust")
             .json(anchor)
             .send()
             .await
@@ -5745,6 +5803,89 @@ mod tests {
         let message = outcome
             .unwrap_or_else(|_| panic!(
                 "fetch_signature hung past the test's own {:?} ceiling — no timeout fired at all",
+                hard_ceiling
+            ))
+            .expect_err("a silent remote must not appear to succeed");
+
+        assert!(
+            message.to_lowercase().contains("timed out"),
+            "must fail specifically with a timeout, not some other transport error: {}", message
+        );
+    }
+
+    // -----------------------------------------------------------------------------------
+    // FORK-49 (the O(constant)-mutations slice): `upload_signature`/`put_trust` now ride
+    // `bounded_writes`, which combines `no_redirect`'s policy with `bounded_reads`'s budget.
+    //
+    // The falsifier here is deliberately a fully-silent remote (no status line at all), *not* the
+    // `SilentErrorBodyRemote` shape (`missing_objects_bounds_the_error_body_read_after_a_wedged_500`
+    // above) — checked directly against this file's own collision warning:
+    // `REMOTE_READ_TIMEOUT` and `ERROR_BODY_READ_TIMEOUT` are both 10s, and
+    // [`RemoteClient::error_of`]'s own `error_body_budget()` already, independently, bounds a
+    // `500`-then-wedged-body response for *every* call in this module, `upload_signature`/
+    // `put_trust` included — proven by hand: reverting this fix and rerunning a `500`+wedged-body
+    // probe against `put_trust` still returned within ~15s, because that scenario never reaches
+    // `bounded_writes`'s `read_timeout` at all — `error_of`'s independent timeout resolves it
+    // first. A response that never arrives is the one shape only `bounded_writes` can catch: the
+    // client is `.send()`-blocked, `error_of` is never even reached, and only `bounded_writes`'s
+    // own `read_timeout` (armed before the connector is even polled — see [`REMOTE_READ_TIMEOUT`]'s
+    // doc) can time it out.
+    // -----------------------------------------------------------------------------------
+
+    /// `upload_signature` must be bounded against a remote that never sends any response at all —
+    /// before FORK-49 this rode an unbounded client (`self.http`, then `self.no_redirect`) and
+    /// hung forever; verified by hand (`assert_still_running` against this same fixture, reverted
+    /// to `self.no_redirect`) before writing this pin.
+    #[test]
+    fn upload_signature_times_out_against_a_silent_remote() {
+        let remote = SilentRemote::start();
+        let client = RemoteClient::new(&remote.url, None).unwrap();
+        let hard_ceiling = TEST_DIRECT_CONNECT_TIMEOUT + TEST_TIGHT_READ_TIMEOUT
+            + std::time::Duration::from_secs(15);
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let outcome = runtime.block_on(async {
+            tokio::time::timeout(hard_ceiling, client.upload_signature(&"a".repeat(64), vec![1u8; 64])).await
+        });
+
+        let message = outcome
+            .unwrap_or_else(|_| panic!(
+                "upload_signature hung past the test's own {:?} ceiling — no timeout fired at all",
+                hard_ceiling
+            ))
+            .expect_err("a silent remote must not appear to succeed");
+
+        assert!(
+            message.to_lowercase().contains("timed out"),
+            "must fail specifically with a timeout, not some other transport error: {}", message
+        );
+    }
+
+    /// `put_trust` must be bounded against a remote that never sends any response at all — same
+    /// hole, same fix, its own falsifier (its client selection changed independently of
+    /// `upload_signature`'s).
+    #[test]
+    fn put_trust_times_out_against_a_silent_remote() {
+        let remote = SilentRemote::start();
+        let client = RemoteClient::new(&remote.url, None).unwrap();
+        let hard_ceiling = TEST_DIRECT_CONNECT_TIMEOUT + TEST_TIGHT_READ_TIMEOUT
+            + std::time::Duration::from_secs(15);
+        let anchor = TrustAnchorDto {
+            genesis: "g".repeat(64),
+            enabled_at: 0,
+            boundary: Vec::new(),
+            prior_genesis: None,
+            adopts: None,
+        };
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let outcome = runtime.block_on(async {
+            tokio::time::timeout(hard_ceiling, client.put_trust(&anchor)).await
+        });
+
+        let message = outcome
+            .unwrap_or_else(|_| panic!(
+                "put_trust hung past the test's own {:?} ceiling — no timeout fired at all",
                 hard_ceiling
             ))
             .expect_err("a silent remote must not appear to succeed");
