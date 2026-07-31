@@ -1,5 +1,10 @@
 # Testing doctrine: a contract must be able to fail a test
 
+*Re-grounded against `main` @ `9bcafd4` (2026-07-31) — every file:line and code claim
+below was checked against that commit. If this doc has drifted far from current `main`,
+treat its concrete claims as unverified again, the way this revision treated its
+predecessor's.*
+
 ## Why this exists
 
 A batch of stacked changes to the durability and parallelism primitives (the
@@ -88,9 +93,9 @@ could break with no test going red — is a test that cannot fail its own contra
 worse than no test because it sells false confidence. As of this writing there is no such
 job in `.github/workflows/`; this is still a proposal, not a shipped gate.
 
-**What it covers.** `cargo-mutants`' documented mutation genres (`mutants.rs`'s
-mutation-patterns page, mirrored in the project's own book source at
-`book/src/mutants.md`) are: replacing a function's body with a value guessed from its
+**What it covers.** `cargo-mutants`' documented mutation genres — published at
+<https://mutants.rs/mutants.html> by the `sourcefrog/cargo-mutants` project itself, not
+by anything in this repository — are: replacing a function's body with a value guessed from its
 return type (`FnValue`); substituting one binary operator for another (`==`→`!=`,
 `+`→`-`, and similarly for the rest); deleting a unary operator (`-a`→`a`); deleting a
 match arm when a wildcard is present; replacing a match guard with `true`/`false`; and
@@ -100,52 +105,68 @@ shapes — a helper nobody's test would notice returning `0` instead of the real
 comparison nobody's test would notice flipped — is exactly the "delete the drain, does a
 test go red?" check the original batch ran by hand, mechanized.
 
-**What it does not cover.** None of those genres swaps one already-valid, in-scope
-expression for another — the tool never rewrites `self.connect_timeout` to read a
-sibling field, a different constant, or a hardcoded literal of the same type, because
-doing so is not one of its genres. That gap is not theoretical, and this module's own
-history shows it was closed by hand, not by a tool. FORK-49's fix to this module's
-error-body-read bound (`RemoteClient::error_of` and `RemoteClient::error_body_budget`,
-`crates/forklift-core/src/util/remote_utils.rs`) needed the read to budget against
-*that instance's own* `connect_timeout` field, because a Tor-routed client and a direct
-one carry genuinely different values (`REMOTE_CONNECT_TIMEOUT_TOR` = 60s vs.
-`REMOTE_CONNECT_TIMEOUT` = 5s) — not a fixed constant. `error_body_budget` folds that
-field into the free function `error_body_read_budget(connect_timeout)`, which adds a
-flat `ERROR_BODY_READ_TIMEOUT` (10s). Pinning that took three tries, each closing a gap
-the last one didn't know it had:
+**What it does not cover.** None of those genres rewrites one sub-expression inside a
+function's body while leaving the rest of that body alone — the tool never replaces
+just a `self.connect_timeout` read, in place, with a sibling field or a rival constant,
+because that substitution is not one of its genres. `FnValue` reaches further than a
+sub-expression, though: it replaces a function's *entire* body with a type-guessed
+default, so a function whose whole body is a single expression is fully exposed to it —
+worth stating precisely, because the counterexample below is exactly that shape.
 
-- The first pinning test, `missing_objects_bounds_the_error_body_read_after_a_wedged_500`,
-  asserts a **lower bound** on how long the call takes against a server that never sends
-  an error body. That only proves *some* connect-timeout-shaped value got folded in — a
-  direct client's `connect_timeout` is exactly `REMOTE_CONNECT_TIMEOUT` (5s), so nothing
-  distinguishes "reads `self.connect_timeout`" from "hardcodes `REMOTE_CONNECT_TIMEOUT`
-  directly." A mutation doing the latter — swapping the field read for the constant —
-  would still pass this test.
-- A Tor-mode fixture was tried next, on the reasoning that its 60s connect timeout would
-  separate the two. It didn't: a `TorMode::On` client's `connect_timeout` field
-  genuinely **equals** `REMOTE_CONNECT_TIMEOUT_TOR` (60s), so a mutation that hardcodes
-  that constant instead of reading the field produces the identical number, and the
-  fixture cannot tell the difference.
-- The test that actually pins the property,
-  `error_body_budget_reads_this_field_not_a_rival_constant`, injects a connect timeout
-  no production path can ever emit: `RemoteClient::new_test_with_connect_timeout` builds
-  a client whose `connect_timeout` is 7s, a value distinct from both `RemoteClient::new`'s
-  5s and a `TorMode::On` `RemoteClient::new_with_tor`'s 60s. Only once the injected value
-  cannot coincidentally equal a rival does the assertion distinguish "read the field"
-  from "hardcode one of the two values a real constructor could produce." Even that is
-  not the whole property — a further test,
-  `error_body_budget_is_70s_for_a_real_tor_mode_client`, separately pins the value a real
-  Tor-mode client gets (70s), because the sentinel test alone stays green under a
+FORK-49's fix to this module's error-body-read bound (`RemoteClient::error_of` and
+`RemoteClient::error_body_budget`, `crates/forklift-core/src/util/remote_utils.rs`)
+needed the read to budget against *that instance's own* `connect_timeout` field, because
+a Tor-routed client and a direct one carry genuinely different values
+(`REMOTE_CONNECT_TIMEOUT_TOR` = 60s vs. `REMOTE_CONNECT_TIMEOUT` = 5s) — not a fixed
+constant. `error_body_budget`'s entire body is the single expression
+`error_body_read_budget(self.connect_timeout)`, which itself adds a flat
+`ERROR_BODY_READ_TIMEOUT` (10s) to whatever `connect_timeout` it is handed. `FnValue`
+*would* generate a mutant replacing that whole body with a default `Duration` (0s), and
+the second test below kills it outright — a near-zero budget elapses nowhere near the
+asserted lower bound. What actually took four tests to pin was a narrower mutation
+outside any of the six genres: leave the `+ ERROR_BODY_READ_TIMEOUT` formula exactly as
+it is and swap only the `self.connect_timeout` operand for a same-typed rival — three
+different rivals in turn, before one stuck:
+
+- `error_body_read_budget_folds_in_the_connect_timeout` pins the free function's own
+  arithmetic directly: both Tor's 60s and direct's 5s connect timeouts fold correctly
+  into the `+10s` base. On its own it pins nothing about the call site — nothing
+  requires `error_of` to call this function at all.
+- `missing_objects_bounds_the_error_body_read_after_a_wedged_500` closes that gap with a
+  **lower bound** on elapsed time against a server that never sends an error body — now
+  something does require `error_of` to call the budget. It still can't separate "reads
+  `self.connect_timeout`" from "hardcodes `REMOTE_CONNECT_TIMEOUT`": its client is a
+  direct one, whose field is exactly that constant, 5s. A mutation swapping the field
+  read for the constant would still pass this test.
+- A `TorMode::On` fixture was tried next, on the reasoning that its 60s connect timeout
+  would separate the two claims. It didn't: a `TorMode::On` client's `connect_timeout`
+  field genuinely **equals** `REMOTE_CONNECT_TIMEOUT_TOR` (60s), so a mutation
+  hardcoding that constant instead of reading the field produces the identical number,
+  and the fixture cannot tell the difference.
+- `error_body_budget_reads_this_field_not_a_rival_constant` is the test that actually
+  pins it: it injects a connect timeout no production path can ever emit —
+  `RemoteClient::new_test_with_connect_timeout` builds a client whose `connect_timeout`
+  is 7s, distinct from both `RemoteClient::new`'s 5s and a `TorMode::On`
+  `RemoteClient::new_with_tor`'s 60s. Only once the injected value cannot coincidentally
+  equal a rival does the assertion distinguish "read the field" from "hardcode one of
+  the two values a real constructor could produce." Even that is not the whole property
+  — `error_body_budget_is_70s_for_a_real_tor_mode_client` separately pins the value a
+  real Tor-mode client gets (70s), because the sentinel test alone stays green under a
   hypothetical future cap on the computed result that would silently break the real Tor
   case.
 
-None of these three defeated mutations — swap the field read for `REMOTE_CONNECT_TIMEOUT`,
-swap it for `REMOTE_CONNECT_TIMEOUT_TOR`, cap the computed result — is one `cargo-mutants`
-generates: none deletes an operator, drops a match arm, or removes a struct-literal
-field; each substitutes one already-valid expression, or bounds one, which is outside
-the tool's documented genres. Whoever found these gaps did it by hand, the same way the
-original batch's manual "delete the drain, does a test go red?" check did. A
-mutation-testing gate over this file, run today, would not have caught any of the three.
+Four tests, not three, are what actually pin this property end to end — the free
+function's arithmetic, that `error_of` calls it, that the accessor reads the instance
+field rather than a rival, and that the one client mode shipping a non-default value
+gets the correct one. None of the three defeated mutations along the way — hardcode
+`REMOTE_CONNECT_TIMEOUT`, hardcode `REMOTE_CONNECT_TIMEOUT_TOR`, cap the computed result
+— is one `cargo-mutants` generates: none deletes an operator, drops a match arm, or
+removes a struct-literal field; each substitutes one already-valid sub-expression, or
+bounds one, which is outside the tool's documented genres. Whoever found these gaps did
+it by hand, the same way the original batch's manual "delete the drain, does a test go
+red?" check did. A mutation-testing gate over this file, run today, would catch a crude
+whole-body `FnValue` mutant here — but not any of the three sub-expression
+substitutions that actually needed catching.
 
 An earlier draft of this very section named the 10-second addend as
 `REMOTE_READ_TIMEOUT` where the code actually reads `ERROR_BODY_READ_TIMEOUT` — two
@@ -168,11 +189,23 @@ constructor or a field override built for exactly this exists to make that possi
 every constant, default, and same-typed field the source under test could have read
 instead of the one the fixture actually injects — pick or construct an injected value
 distinct from all of them, and record, for the record: the value injected, which rivals
-it is separated from, and any collisions found along the way. The sentinel test above
-does exactly this in its own comment: it lists every named `Duration` constant in the
-module (2, 3, 5, 10, and 60 seconds), checks its chosen 7s against each of them and
-against their pairwise sums, and only then trusts it as a separator. A collision found
-during that enumeration is itself the finding; fix the fixture, not the code.
+it is separated from, and any collisions found along the way.
+
+The sentinel test above is worth reading for the judgment call in its own comment, not
+just the check. It lists the distinct *values* carried by this module's `Duration`
+constants at the time — 2, 3, 5, 10, and 60 seconds, a sample of what is in scope, not
+an exhaustive list of every such constant in the file — and confirms 7 matches none of
+them individually. But it does not stop there: it notices that `2 + 5` also sums to 7, a
+genuine coincidence, and does not treat "distinct from every value" as license to skip
+past it. It argues the coincidence away instead: the mutation under test is a
+`connect_timeout` substitution, and nothing in the module ever adds `POST_SEND_VERIFY_BASE`
+(the constant behind the 2) to a connect timeout, so that sum names no rival this test
+could ever actually collide with. It then checks a *different* thing — the full
+pairwise-sum set over those five values — against the test's asserted **output**, 17s
+(`7 + ERROR_BODY_READ_TIMEOUT`), and finds no match there either. A collision turning up
+during this kind of enumeration is not automatically disqualifying, but it is always the
+finding: it has to be checked against what the code can actually compose and argued in
+writing, not assumed away silently.
 
 Use the tool, not an LLM agent, for the part it actually does automate. "Can this test
 fail?" against one of the six genres above is a fact you run, not a judgment you reason
@@ -202,10 +235,11 @@ check.
 
 ### 4. A diff-bounded contract/doc coherence check in review
 
-Add one dimension to the existing code-review workflow: *does this diff change a contract
-comment without changing its pinning test, or leave a comment near the changed code
-asserting something the change made false?* This is a good scoped LLM task because it is
-bounded to the diff.
+Whoever or whatever reviews a diff — a person, or a scoped LLM pass over just that
+diff — should check one more thing: *does this diff change a contract comment without
+changing its pinning test, or leave a comment near the changed code asserting something
+the change made false?* An LLM is a reasonable tool for this specifically because the
+check is bounded to the diff, not the whole tree.
 
 **Do not** build a standing, repo-wide "documentation agent" that continuously syncs
 comments. It chases the symptom (drift) instead of the disease (untestable contracts), it
