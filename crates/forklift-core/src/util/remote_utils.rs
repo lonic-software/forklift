@@ -311,7 +311,15 @@ const REMOTE_CONNECT_TIMEOUT_TOR: std::time::Duration = std::time::Duration::fro
 /// first byte, work whose cost depends on object sizes the client cannot know in advance — no flat
 /// budget for that is honest, so they stay on the unbounded client until they have their own
 /// scaled/measured budget or an abandon-and-fall-back lane (see the comment at each of those three
-/// call sites).
+/// call sites). `upload_targets` shares that same reasoning (it walks up to
+/// `MAX_UPLOAD_TARGETS_BATCH` hashes before its first byte) and stays unbounded for it. `resolve`
+/// is unbounded by *this* mechanism too, but is not left unbounded outright: it carries its own
+/// per-request `RequestBuilder::timeout(5s)` at its call site instead, since it is a best-effort
+/// display lookup (falls back to pseudonyms on any failure, never surfaces an error) rather than a
+/// call whose budget needs `connect_timeout` folded in the way every client-level bound here does.
+/// `update_ref`, `commit_lift`, and the streamed-upload paths (`upload_object`, `put_presigned`)
+/// are unbounded for reasons of their own — see each call's own doc, and
+/// [`RemoteClient::send_with_watchdog`]'s for the uploads.
 ///
 /// `read_timeout` is a `ClientBuilder`-level setting with no per-request override — it cannot be
 /// switched off for one specific request — so it is carried only by
@@ -647,12 +655,18 @@ fn watched_upload_body(bytes: Vec<u8>, progress: Arc<UploadProgress>) -> (reqwes
 /// The remote endpoint: base URL, optional bearer token, and the HTTP clients.
 ///
 /// Four clients, not one, because three independent axes each need to vary per call: *redirect
-/// policy* (`fetch_batch`'s initial `POST`, `upload_object`, and `put_presigned` must not
-/// auto-follow; everything else may), *whether a
+/// policy* (`fetch_batch`'s initial `POST`, `upload_object`, `put_presigned`, `update_ref`,
+/// `upload_signature`, and `put_trust` must not auto-follow; everything else may), *whether a
 /// read/metadata silence bound applies at all* (only `fetch_info`, `fetch_object`,
-/// `fetch_signature`, `fetch_bundle_to`; never `update_ref`, `missing_objects`, `fetch_batch`,
-/// `fetch_subtree`, or any upload path — see [`REMOTE_READ_TIMEOUT`]'s doc), and *how loose that
-/// bound is* (`fetch_object` alone needs [`FETCH_OBJECT_READ_TIMEOUT`] instead of
+/// `fetch_signature`, `fetch_bundle_to` carry a client-level `read_timeout`; never `update_ref`,
+/// `missing_objects`, `fetch_batch`, `fetch_subtree`, `upload_signature`, `put_trust`,
+/// `commit_lift`, `upload_targets`, or the streamed-upload paths (`upload_object`,
+/// `put_presigned`) — see [`REMOTE_READ_TIMEOUT`]'s doc for why none of those has an honest flat
+/// budget yet. `resolve` is the one exception worth naming separately: it is bounded, but by its
+/// own per-request `RequestBuilder::timeout(5s)`, not by any client-level setting — a
+/// best-effort display lookup that degrades to pseudonyms on any failure, not a call whose
+/// budget needs to compose with `connect_timeout` the way the client-level ones do), and *how
+/// loose that bound is* (`fetch_object` alone needs [`FETCH_OBJECT_READ_TIMEOUT`] instead of
 /// [`REMOTE_READ_TIMEOUT`] — see [`bounded_object_reads`](Self::bounded_object_reads)'s doc). All
 /// four otherwise share the same proxy/connect-timeout configuration built once in
 /// [`RemoteClient::new_with_tor`], which is also where each bounded client's actual `read_timeout`
@@ -989,10 +1003,13 @@ impl RemoteClient {
     }
 
     /// Build a request against this remote using a specific underlying `reqwest::Client` — the
-    /// seam `fetch_info`/`fetch_signature`/`fetch_bundle_to` use to go out on
-    /// [`RemoteClient::bounded_reads`], `fetch_object` uses to go out on
-    /// [`RemoteClient::bounded_object_reads`], and `fetch_batch`'s initial `POST` uses to go out
-    /// on [`RemoteClient::no_redirect`] — all instead of the unbounded default.
+    /// seam every call that needs something other than the default [`Self::http`] uses to reach
+    /// one of this type's other clients ([`Self::bounded_reads`], [`Self::bounded_object_reads`],
+    /// [`Self::no_redirect`]). Deliberately not enumerated here by caller: that list has already
+    /// drifted stale more than once as call sites moved between clients (most recently FORK-89,
+    /// which added three more callers of `no_redirect` without this doc noticing) — each client
+    /// field's own doc is the authoritative list of which calls ride it, kept next to the
+    /// declaration that would actually change if a caller moved.
     fn request_on(&self,
                    http: &reqwest::Client,
                    method: reqwest::Method,
