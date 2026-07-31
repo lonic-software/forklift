@@ -1,0 +1,277 @@
+# Testing doctrine: a contract must be able to fail a test
+
+*Re-grounded against `main` @ `9bcafd4` (2026-07-31) — every file:line and code claim
+below was checked against that commit. If this doc has drifted far from current `main`,
+treat its concrete claims as unverified again, the way this revision treated its
+predecessor's.*
+
+## Why this exists
+
+A batch of stacked changes to the durability and parallelism primitives (the
+`WriteBatch` finish contract, the `TaskExecutor` join guarantee, the transfer-pool
+error paths) went through several adversarial review rounds. Across those rounds the
+same defect shape recurred more than twenty times:
+
+> A doc comment or contract asserts invariant **X**. The code does **not-X** on some
+> reachable path. The next fix is written against the false comment, and introduces a
+> new not-X somewhere adjacent.
+
+The reason it kept happening is not carelessness. It is that **the contracts were
+load-bearing for correctness and unfalsifiable** — natural-language prose about what
+happens when something fails, with no test that would go red if the prose were wrong.
+Prose that nothing checks drifts, and once it has drifted every fix built on it inherits
+the error. Two concrete instances from that batch: a "best-effort, attempts every
+directory" comment sitting above a loop that `?`-returned on the first failure; and an
+"every caller joins its workers before finishing" comment above a caller that called
+`abort_all()` without waiting. Both are fixed today — `TaskExecutor::execute`
+(`crates/forklift-core/src/model/task.rs`) now documents, and enforces with a drain
+loop, that it never returns while a worker's task body is still running (see its own
+doc comment for the exact `abort_all`-only-signals-cancellation reasoning); the
+transfer pool's `join_all`/`drain_remaining` pair (`crates/forklift-core/src/util/remote_utils.rs`)
+carries the equivalent guarantee for network tasks.
+
+The rounds stopped finding live defects the moment the contracts became testable — a
+mutation-verified directory-sync counter, a pinnable worker count, fault-injection seams
+— not because the code became more careful, but because "is this claim true?" turned from
+a thing you argue into a thing you run.
+
+## The category is error-path correctness under concurrency — not "crash safety"
+
+It is tempting to call this "crash-safety work," because the primitives describe
+themselves in durability vocabulary (`barrier`, `durable`, `crash interleaving`). That
+label is wrong and it under-scopes the problem. Of the defects in the batch, exactly one
+required a crash (a rename made visible but not directory-fsynced, exposed only by a power
+loss). Every other one fired on an **ordinary failure on a concurrent path**:
+
+| Defect | Trigger | Crash needed? |
+|--------|---------|---------------|
+| Leak check misreads an in-flight producer as failed | one unreadable file, normal run | no |
+| Reported error inverted (last failure wins) | two tasks fail together | no |
+| Shard names a blob that never landed | disk fills mid-walk (ENOSPC) | no |
+| Zombie transfer task writes after lock release | a failed GET + a second process | no |
+| Flaky durability test | a small CI runner | no |
+| Parcel references a dropped object | error → retry → **power loss** | **yes** |
+
+The real category is: **what happens when an ordinary failure (an I/O error, a task
+failure, a full disk, a dropped connection) occurs while multiple things are running in
+parallel.** Crash-across-power-loss is one slice of that, not the frame. These paths are
+under-tested for two structural reasons — they are rarely exercised (you do not hit ENOSPC
+in normal development), and concurrency means a failure *races its siblings* instead of
+staying isolated.
+
+Anything that audits or reviews this class must scope to **the failure and cleanup paths
+of concurrent code** — error propagation, cancellation, partial failure, what happens to
+sibling tasks when one dies — of which durability across a crash is one bullet.
+
+## The principle: a test is the source of truth for a contract
+
+"Treat the code as the source of truth, docs must match it" is half right, and the wrong
+half is dangerous. In this batch the *code* was sometimes the bug. Blindly syncing docs to
+code would have carefully documented the defects.
+
+The correct hierarchy:
+
+- **A test is the source of truth for a *contract*.** It encodes intent *and* is checked
+  against the code on every run. If a guarantee matters, it is a test.
+- **Code is the source of truth for *behavior*** — what actually happens.
+- **A doc/comment is a human-readable projection of the contract.** When it is
+  load-bearing (its being wrong would cause a bug), it must be *backed by* a test that
+  fails if the claim is false. When it is mere narration, it is not policed.
+
+So the rule is never "code wins" or "docs win." It is: **if a claim matters, make it a
+test — then code and docs are both checked against it, every run.**
+
+## Practices
+
+In priority order.
+
+### 1. Mutation testing in CI — a lane that catches deletions, not substitutions
+
+Run [`cargo-mutants`](https://mutants.rs) over `forklift-core`'s failure/concurrency
+modules and gate merge on it for changed files. A *surviving mutant* — a line the tool
+could break with no test going red — is a test that cannot fail its own contract, which is
+worse than no test because it sells false confidence. As of this writing there is no such
+job in `.github/workflows/`; this is still a proposal, not a shipped gate.
+
+**What it covers.** `cargo-mutants`' documented mutation genres — published at
+<https://mutants.rs/mutants.html> by the `sourcefrog/cargo-mutants` project itself, not
+by anything in this repository — are: replacing a function's body with a value guessed from its
+return type (`FnValue`); substituting one binary operator for another (`==`→`!=`,
+`+`→`-`, and similarly for the rest); deleting a unary operator (`-a`→`a`); deleting a
+match arm when a wildcard is present; replacing a match guard with `true`/`false`; and
+deleting an individual field from a struct literal that has a `..base` expression. That
+is the complete documented list. A test suite with a surviving mutant in one of these
+shapes — a helper nobody's test would notice returning `0` instead of the real value, a
+comparison nobody's test would notice flipped — is exactly the "delete the drain, does a
+test go red?" check the original batch ran by hand, mechanized.
+
+**What it does not cover.** None of those genres rewrites one sub-expression inside a
+function's body while leaving the rest of that body alone — the tool never replaces
+just a `self.connect_timeout` read, in place, with a sibling field or a rival constant,
+because that substitution is not one of its genres. `FnValue` reaches further than a
+sub-expression, though: it replaces a function's *entire* body with a type-guessed
+default, so a function whose whole body is a single expression is fully exposed to it —
+worth stating precisely, because the counterexample below is exactly that shape.
+
+FORK-49's fix to this module's error-body-read bound (`RemoteClient::error_of` and
+`RemoteClient::error_body_budget`, `crates/forklift-core/src/util/remote_utils.rs`)
+needed the read to budget against *that instance's own* `connect_timeout` field, because
+a Tor-routed client and a direct one carry genuinely different values
+(`REMOTE_CONNECT_TIMEOUT_TOR` = 60s vs. `REMOTE_CONNECT_TIMEOUT` = 5s) — not a fixed
+constant. `error_body_budget`'s entire body is the single expression
+`error_body_read_budget(self.connect_timeout)`, which itself adds a flat
+`ERROR_BODY_READ_TIMEOUT` (10s) to whatever `connect_timeout` it is handed. `FnValue`
+*would* generate a mutant replacing that whole body with a default `Duration` (0s), and
+the second test below kills it outright — a near-zero budget elapses nowhere near the
+asserted lower bound. What actually took four tests to pin was a narrower mutation
+outside any of the six genres: leave the `+ ERROR_BODY_READ_TIMEOUT` formula exactly as
+it is and swap only the `self.connect_timeout` operand for a same-typed rival — three
+different rivals in turn, before one stuck:
+
+- `error_body_read_budget_folds_in_the_connect_timeout` pins the free function's own
+  arithmetic directly: both Tor's 60s and direct's 5s connect timeouts fold correctly
+  into the `+10s` base. On its own it pins nothing about the call site — nothing
+  requires `error_of` to call this function at all.
+- `missing_objects_bounds_the_error_body_read_after_a_wedged_500` closes that gap with a
+  **lower bound** on elapsed time against a server that never sends an error body — now
+  something does require `error_of` to call the budget. It still can't separate "reads
+  `self.connect_timeout`" from "hardcodes `REMOTE_CONNECT_TIMEOUT`": its client is a
+  direct one, whose field is exactly that constant, 5s. A mutation swapping the field
+  read for the constant would still pass this test.
+- A `TorMode::On` fixture was tried next, on the reasoning that its 60s connect timeout
+  would separate the two claims. It didn't: a `TorMode::On` client's `connect_timeout`
+  field genuinely **equals** `REMOTE_CONNECT_TIMEOUT_TOR` (60s), so a mutation
+  hardcoding that constant instead of reading the field produces the identical number,
+  and the fixture cannot tell the difference.
+- `error_body_budget_reads_this_field_not_a_rival_constant` is the test that actually
+  pins it: it injects a connect timeout no production path can ever emit —
+  `RemoteClient::new_test_with_connect_timeout` builds a client whose `connect_timeout`
+  is 7s, distinct from both `RemoteClient::new`'s 5s and a `TorMode::On`
+  `RemoteClient::new_with_tor`'s 60s. Only once the injected value cannot coincidentally
+  equal a rival does the assertion distinguish "read the field" from "hardcode one of
+  the two values a real constructor could produce." Even that is not the whole property
+  — `error_body_budget_is_70s_for_a_real_tor_mode_client` separately pins the value a
+  real Tor-mode client gets (70s), because the sentinel test alone stays green under a
+  hypothetical future cap on the computed result that would silently break the real Tor
+  case.
+
+Four tests, not three, are what actually pin this property end to end — the free
+function's arithmetic, that `error_of` calls it, that the accessor reads the instance
+field rather than a rival, and that the one client mode shipping a non-default value
+gets the correct one. None of the three defeated mutations along the way — hardcode
+`REMOTE_CONNECT_TIMEOUT`, hardcode `REMOTE_CONNECT_TIMEOUT_TOR`, cap the computed result
+— is one `cargo-mutants` generates: none deletes an operator, drops a match arm, or
+removes a struct-literal field; each substitutes one already-valid sub-expression, or
+bounds one, which is outside the tool's documented genres. Whoever found these gaps did
+it by hand, the same way the original batch's manual "delete the drain, does a test go
+red?" check did. A mutation-testing gate over this file, run today, would catch a crude
+whole-body `FnValue` mutant here — but not any of the three sub-expression
+substitutions that actually needed catching.
+
+An earlier draft of this very section named the 10-second addend as
+`REMOTE_READ_TIMEOUT` where the code actually reads `ERROR_BODY_READ_TIMEOUT` — two
+distinct constants that both happen to equal 10s, so the stated arithmetic still summed
+correctly and no reader checking the total would have noticed. That is the section's own
+rule failing inside the section that states it, which is evidence for the rule rather
+than an embarrassment: equal-valued constants make the wrong name and the right name
+indistinguishable by inspection, so *reading* the prose cannot catch the swap — only
+checking the cited name against the source can.
+
+**The rule this doctrine states directly, because a green revert run is not enough to
+trust a pinning test:** a pinning test's fixture must give the source a value that
+separates it from every rival the code could have read instead — every constant in
+scope, every default, every same-typed field. If the injected value coincides with any
+of them, the test cannot tell right from wrong there, whatever the revert run showed.
+Where no production constructor can emit a separating value, inject one — a test-only
+constructor or a field override built for exactly this exists to make that possible.
+
+**The habit that enforces it:** before trusting a pinning test, enumerate its rivals —
+every constant, default, and same-typed field the source under test could have read
+instead of the one the fixture actually injects — pick or construct an injected value
+distinct from all of them, and record, for the record: the value injected, which rivals
+it is separated from, and any collisions found along the way.
+
+The sentinel test above is worth reading for the judgment call in its own comment, not
+just the check. It lists the distinct *values* carried by this module's `Duration`
+constants at the time — 2, 3, 5, 10, and 60 seconds, a sample of what is in scope, not
+an exhaustive list of every such constant in the file — and confirms 7 matches none of
+them individually. But it does not stop there: it notices that `2 + 5` also sums to 7, a
+genuine coincidence, and does not treat "distinct from every value" as license to skip
+past it. It argues the coincidence away instead: the mutation under test is a
+`connect_timeout` substitution, and nothing in the module ever adds `POST_SEND_VERIFY_BASE`
+(the constant behind the 2) to a connect timeout, so that sum names no rival this test
+could ever actually collide with. It then checks a *different* thing — the full
+pairwise-sum set over those five values — against the test's asserted **output**, 17s
+(`7 + ERROR_BODY_READ_TIMEOUT`), and finds no match there either. A collision turning up
+during this kind of enumeration is not automatically disqualifying, but it is always the
+finding: it has to be checked against what the code can actually compose and argued in
+writing, not assumed away silently.
+
+Use the tool, not an LLM agent, for the part it actually does automate. "Can this test
+fail?" against one of the six genres above is a fact you run, not a judgment you reason
+about — reasoning about it is exactly how the original batch mis-measured a flake
+threshold twice. But the genre list is also the tool's ceiling: it is one lane in a
+testing doctrine, not the load-bearing one, and it would not by itself have caught the
+class of defect the batch's manual review found.
+
+### 2. One-time contract audit of the failure-path primitives
+
+Enumerate the load-bearing contract comments on the concurrent-failure primitives —
+`WriteBatch`, `TaskExecutor`, the transfer pool, the pack machinery, and the durability
+taint-and-heal record-and-repair contract (`taint_utils`/`heal_utils`/`recovery_utils`,
+which now carries the object store's visibility/retry guarantees — see the note below on
+what used to be out of scope here). For each, ask one question: **is there a test that
+fails if this claim is false?** If no → add one, or delete the claim. This is finite and
+it is "fix the class" applied at the repo level. Scope it to *failure and cleanup paths*,
+per the category note above — not just durability claims.
+
+### 3. Changed contract ⇒ changed test (enforceable, not a checklist)
+
+"Every PR updates its docs" is unenforceable and gets skipped. The enforceable form:
+**if a PR changes a documented contract, it must change the test that pins that
+contract.** No such test exists? That is the finding — the contract was never testable.
+This makes doc-currency a *side effect* of test-currency, which CI and review can actually
+check.
+
+### 4. A diff-bounded contract/doc coherence check in review
+
+Whoever or whatever reviews a diff — a person, or a scoped LLM pass over just that
+diff — should check one more thing: *does this diff change a contract comment without
+changing its pinning test, or leave a comment near the changed code asserting something
+the change made false?* An LLM is a reasonable tool for this specifically because the
+check is bounded to the diff, not the whole tree.
+
+**Do not** build a standing, repo-wide "documentation agent" that continuously syncs
+comments. It chases the symptom (drift) instead of the disease (untestable contracts), it
+produces unbounded noise, and — the fatal flaw — it will confidently sync a doc to match
+buggy code. The bounded, in-review version is good; the standing sweeper manufactures the
+problem it claims to solve.
+
+## What used to be out of scope here
+
+> **Update — resolved.** When this section was first written, it named the object
+> store's **visible ⟹ durable** assumption as a genuine open design decision, deliberately
+> kept off this doctrine's process track. That decision has since been made and shipped:
+> a failing write now records exactly its own final paths as a durability taint
+> (`taint_utils`), an automatic entry-heal chokepoint restages them at the next command's
+> entry (`heal_utils::heal_if_tainted`), and a dedicated `forklift heal` verb walks every
+> durable ref source for whatever entry-heal alone cannot resolve
+> (`recovery_utils`) — full contract in `docs/DESIGN.html` §3.1.1. It is no longer an
+> open question this doctrine defers; it is a shipped contract that belongs, like the
+> other primitives above, under practice 2's audit.
+
+The general point that section was making still holds for whatever the next such
+question turns out to be: some invariants are correctness **decisions** the design has
+to make — what a retry may assume about visibility, what an error is allowed to claim
+about durability — not coverage gaps a test can paper over. A decision like that needs a
+decision, argued and written down, not a mutation test. When one comes up, give it its
+own track rather than folding it into this doctrine's process items, so the two kinds of
+work — "is this claim tested?" and "is this claim even the right one?" — never get
+tangled together.
+
+## The one-line version
+
+If a guarantee about what happens when something fails matters enough to write down, it
+matters enough to make a test that goes red when it is false. Everything else here is
+machinery for enforcing that one sentence — and knowing which lane actually catches which
+class of violation is part of enforcing it honestly.
