@@ -67,7 +67,6 @@ const COMMIT_BACKOFF_START: std::time::Duration = std::time::Duration::from_mill
 const COMMIT_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// The outcome of one lift-session commit attempt.
-#[derive(Debug)]
 enum CommitOutcome {
     /// The session's objects are verified and promoted; the ref update may proceed.
     Committed,
@@ -350,10 +349,10 @@ const REMOTE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// pre-first-byte phase entirely) is FORK-85.
 const FETCH_OBJECT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// The base allowance for [`RemoteClient::error_of`] and [`RemoteClient::commit_lift`]'s own
-/// inline error-body read, once a non-success status line and headers have already arrived.
-/// Needed because neither call's own bound (if any) covers this: `error_of` serves responses from
-/// every client this type builds, including the three deliberately-unbounded ones
+/// The base allowance for [`RemoteClient::error_of`]'s own inline error-body read, once a
+/// non-success status line and headers have already arrived. Needed because `error_of`'s own
+/// bound (if any) doesn't cover this: it serves responses from every client this type builds,
+/// including the three deliberately-unbounded ones
 /// (`http`/`no_redirect`/`upload_targets`'s negotiation calls — see those calls' own docs), so a
 /// remote that answers a `5xx` with full headers and then wedges before writing the JSON body can
 /// otherwise hang the caller forever even though the status line already told it the call failed.
@@ -1553,24 +1552,10 @@ impl RemoteClient {
 
     /// One `POST /v1/lift/{session}/commit` attempt: ask a storage-backed head to verify and
     /// promote the session's staged control-plane objects and presence-check its blobs, before
-    /// the ref update. `Ok(Committed)` when the session is ready; `Ok(BlobNotReady)` for the
-    /// transient case(s) — a blob the staging verifier has not promoted yet, which the caller
+    /// the ref update. `Ok(Committed)` when the session is ready; `Ok(BlobNotReady)` for the one
+    /// transient case — a blob the staging verifier has not promoted yet, which the caller
     /// retries with backoff; `Err` for a terminal failure (a corrupt staged object, a
     /// control-plane object never uploaded, or a transport error).
-    ///
-    /// A `422` whose body times out (review round 5, finding 1) is folded into `BlobNotReady`
-    /// too, *not* the generic canonical-reason fallback a parse failure gets: `422` is the one
-    /// status this head ever uses for the transient case, and a body that never arrived cannot be
-    /// told apart from one that arrived and named [`LIFT_SESSION_BLOB_NOT_READY`] — "unknown"
-    /// must retry, not fail terminally, because a genuinely terminal `422` (a corrupt staged
-    /// object) is retried anyway on a real remote's next attempt, while a wrongly-terminal
-    /// `BlobNotReady` throws away a lift that would have converged. **Accepted cost**: a
-    /// genuinely terminal `422` whose body also happens to be slow now burns
-    /// [`MAX_COMMIT_ATTEMPTS`] of backoff before this call finally fails — bounded and
-    /// latency-only, which is why this is the side to err on, but worth recording rather than
-    /// leaving implicit. A body that arrived and simply failed to parse as JSON stays on the
-    /// generic fallback: that is a different signal (something answered, just not with the
-    /// expected shape), not "could not tell."
     async fn commit_lift(&self,
                          session: &str,
                          control_plane: &[String],
@@ -1593,36 +1578,16 @@ impl RemoteClient {
         }
 
         let status = response.status();
-        // Bounded by `error_body_read_budget(self.connect_timeout)` for the same reason
-        // `error_of` is (review round 5, finding 2: not the flat `ERROR_BODY_READ_TIMEOUT` alone
-        // — see that function's doc): this rides the unbounded `http` client, so nothing else
-        // stops a remote that answers the status line and then wedges before writing the body
-        // from hanging this call forever, and a Tor-routed remote's own connect budget must be
-        // folded in so a slow-but-healthy round trip isn't killed by a bound sized for a direct
-        // dial alone.
-        match tokio::time::timeout(
-            error_body_read_budget(self.connect_timeout), response.json::<ErrorResponse>()
-        ).await {
-            Ok(Ok(body)) if is_transient_commit_failure(status, &body.error) => {
-                Ok(CommitOutcome::BlobNotReady)
-            }
-            Ok(Ok(body)) => Err(format!(
-                "The remote refused the lift commit ({}): {}", status.as_u16(), body.error
-            )),
-            // The body arrived but did not parse as JSON — a different signal from "never
-            // arrived" (see doc above): fold into the generic fallback, terminal as before.
-            Ok(Err(_)) => Err(format!(
-                "The remote refused the lift commit ({}): {}", status.as_u16(),
-                status.canonical_reason().unwrap_or("unknown error")
-            )),
-            // The read itself timed out. Only a `422` gets the benefit of the doubt — see this
-            // function's own doc for why "unknown" must retry there rather than fail terminally.
-            Err(_) if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY => Ok(CommitOutcome::BlobNotReady),
-            Err(_) => Err(format!(
-                "The remote refused the lift commit ({}): {}", status.as_u16(),
-                status.canonical_reason().unwrap_or("unknown error")
-            )),
+        let message = match response.json::<ErrorResponse>().await {
+            Ok(body) => body.error,
+            Err(_) => status.canonical_reason().unwrap_or("unknown error").to_string(),
+        };
+
+        if is_transient_commit_failure(status, &message) {
+            return Ok(CommitOutcome::BlobNotReady);
         }
+
+        Err(format!("The remote refused the lift commit ({}): {}", status.as_u16(), message))
     }
 
     /// Fetch a parcel's signature sidecar (`None` for unsigned parcels).
@@ -5864,14 +5829,16 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------------------
-    // The unbounded error-body read: `error_of`/`commit_lift` call `response.json()` with no
-    // bound of their own once a non-success status line has arrived. `self.http` (which
-    // `missing_objects` rides) carries only a `connect_timeout`, no `read_timeout` at all — so a
-    // remote that delivers a full status line and headers and then wedges before writing the
-    // body hangs the caller forever. `ERROR_BODY_READ_TIMEOUT` bounds the read itself, in
-    // `error_of`/`commit_lift`, rather than trying to fix it with a fifth client — a client
-    // cannot help here, since the body-read bound is inherited from whichever client sent the
-    // request, and `error_of` serves responses from all of them.
+    // The unbounded error-body read: `error_of` calls `response.json()` with no bound of its own
+    // once a non-success status line has arrived. `self.http` (which `missing_objects` rides)
+    // carries only a `connect_timeout`, no `read_timeout` at all — so a remote that delivers a
+    // full status line and headers and then wedges before writing the body hangs the caller
+    // forever. `ERROR_BODY_READ_TIMEOUT` bounds the read itself, in `error_of`, rather than
+    // trying to fix it with a fifth client — a client cannot help here, since the body-read
+    // bound is inherited from whichever client sent the request, and `error_of` serves responses
+    // from all of them. `commit_lift`'s own error-body read is deliberately left unbounded (a
+    // pre-existing, ticketed defect — FORK-49 is scoped to reads whose result only shapes a
+    // message, not this call's retry-vs-terminal control flow).
     // -----------------------------------------------------------------------------------
 
     /// A remote that delivers a non-success status line and full headers (claiming a body),
@@ -5880,20 +5847,17 @@ mod tests {
     /// arrive. Distinct from [`SilentRemote`] (silent *before* the status line even arrives) and
     /// [`LyingContentLengthRemote`] (a `2xx` success path): this is specifically the shape
     /// [`ERROR_BODY_READ_TIMEOUT`] exists for — status and headers fully delivered, only the
-    /// error body itself left hanging. `status`/`reason` are parameters (not hardcoded to `500`)
-    /// so review round 5's `422` falsifier can reuse this fixture rather than duplicating it.
+    /// error body itself left hanging.
     struct SilentErrorBodyRemote {
         url: String,
         _park: std::sync::mpsc::Sender<()>,
     }
 
     impl SilentErrorBodyRemote {
-        fn start(status: u16, reason: &str) -> SilentErrorBodyRemote {
+        fn start() -> SilentErrorBodyRemote {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let url = format!("http://{}", listener.local_addr().unwrap());
             let (tx, rx) = std::sync::mpsc::channel::<()>();
-            let status = status;
-            let reason = reason.to_string();
 
             std::thread::spawn(move || {
                 use std::io::Write;
@@ -5902,8 +5866,8 @@ mod tests {
                     let _ = read_test_request(&mut stream);
                     let _ = write!(
                         stream,
-                        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: 4096\r\n\r\n",
-                        status, reason
+                        "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\
+                         Content-Length: 4096\r\n\r\n"
                     );
                     let _ = stream.flush();
                     let _ = rx.recv();
@@ -5925,7 +5889,7 @@ mod tests {
     /// hang on is the error-body read itself.
     #[test]
     fn missing_objects_bounds_the_error_body_read_after_a_wedged_500() {
-        let remote = SilentErrorBodyRemote::start(500, "Internal Server Error");
+        let remote = SilentErrorBodyRemote::start();
         let client = RemoteClient::new(&remote.url, None).unwrap();
         let outer_ceiling = ERROR_BODY_READ_TIMEOUT + std::time::Duration::from_secs(10);
 
@@ -5949,38 +5913,6 @@ mod tests {
             error.contains("Internal Server Error"),
             "on a timed-out/unparseable body, must fall back to the canonical reason — the same \
             fallback already used for a parse failure: {}", error
-        );
-    }
-
-    /// Review round 5, finding 1: a `422` whose body times out must fold into `BlobNotReady`
-    /// (retryable), not the generic canonical-reason fallback a parse failure gets — otherwise a
-    /// slow-but-genuinely-blob-not-ready remote (a loaded head, or a Tor round trip this module
-    /// itself budgets 60s for) fails a lift terminally instead of letting the caller's own
-    /// backoff retry converge. Status and headers arrive in full (so the client never doubts the
-    /// commit was refused); only the body — the one place the marker could live — wedges.
-    #[test]
-    fn commit_lift_treats_a_timed_out_422_body_as_retryable() {
-        let remote = SilentErrorBodyRemote::start(422, "Unprocessable Entity");
-        let client = RemoteClient::new(&remote.url, None).unwrap();
-        let outer_ceiling = ERROR_BODY_READ_TIMEOUT + std::time::Duration::from_secs(10);
-
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        let outcome = runtime.block_on(async {
-            tokio::time::timeout(
-                outer_ceiling,
-                client.commit_lift("session-1", &[], &["a".repeat(64)], false),
-            ).await
-        });
-
-        let result = outcome.unwrap_or_else(|_| panic!(
-            "commit_lift hung past the test's own {:?} outer ceiling — the error-body read is \
-            unbounded", outer_ceiling
-        ));
-
-        assert!(
-            matches!(result, Ok(CommitOutcome::BlobNotReady)),
-            "a 422 whose body could not be read must be treated as \"unknown, so retry\" — not \
-            a terminal failure: {:?}", result
         );
     }
 
