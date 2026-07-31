@@ -311,7 +311,15 @@ const REMOTE_CONNECT_TIMEOUT_TOR: std::time::Duration = std::time::Duration::fro
 /// first byte, work whose cost depends on object sizes the client cannot know in advance — no flat
 /// budget for that is honest, so they stay on the unbounded client until they have their own
 /// scaled/measured budget or an abandon-and-fall-back lane (see the comment at each of those three
-/// call sites).
+/// call sites). `upload_targets` shares that same reasoning (it walks up to
+/// `MAX_UPLOAD_TARGETS_BATCH` hashes before its first byte) and stays unbounded for it. `resolve`
+/// is unbounded by *this* mechanism too, but is not left unbounded outright: it carries its own
+/// per-request `RequestBuilder::timeout(5s)` at its call site instead, since it is a best-effort
+/// display lookup (falls back to pseudonyms on any failure, never surfaces an error) rather than a
+/// call whose budget needs `connect_timeout` folded in the way every client-level bound here does.
+/// `update_ref`, `commit_lift`, and the streamed-upload paths (`upload_object`, `put_presigned`)
+/// are unbounded for reasons of their own — see each call's own doc, and
+/// [`RemoteClient::send_with_watchdog`]'s for the uploads.
 ///
 /// `read_timeout` is a `ClientBuilder`-level setting with no per-request override — it cannot be
 /// switched off for one specific request — so it is carried only by
@@ -647,18 +655,37 @@ fn watched_upload_body(bytes: Vec<u8>, progress: Arc<UploadProgress>) -> (reqwes
 /// The remote endpoint: base URL, optional bearer token, and the HTTP clients.
 ///
 /// Four clients, not one, because three independent axes each need to vary per call: *redirect
-/// policy* (`fetch_batch`'s initial `POST`, `upload_object`, and `put_presigned` must not
-/// auto-follow; everything else may), *whether a
+/// policy* (`fetch_batch`'s initial `POST`, `upload_object`, `put_presigned`, `update_ref`,
+/// `upload_signature`, and `put_trust` must not auto-follow; everything else may), *whether a
 /// read/metadata silence bound applies at all* (only `fetch_info`, `fetch_object`,
-/// `fetch_signature`, `fetch_bundle_to`; never `update_ref`, `missing_objects`, `fetch_batch`,
-/// `fetch_subtree`, or any upload path — see [`REMOTE_READ_TIMEOUT`]'s doc), and *how loose that
-/// bound is* (`fetch_object` alone needs [`FETCH_OBJECT_READ_TIMEOUT`] instead of
+/// `fetch_signature`, `fetch_bundle_to` carry a client-level `read_timeout`; never `update_ref`,
+/// `missing_objects`, `fetch_batch`, `fetch_subtree`, `upload_signature`, `put_trust`,
+/// `commit_lift`, `upload_targets`, or the streamed-upload paths (`upload_object`,
+/// `put_presigned`) — see [`REMOTE_READ_TIMEOUT`]'s doc for why none of those has an honest flat
+/// budget yet. `resolve` is the one exception worth naming separately: it is bounded, but by its
+/// own per-request `RequestBuilder::timeout(5s)`, not by any client-level setting — a
+/// best-effort display lookup that degrades to pseudonyms on any failure, not a call whose
+/// budget needs to compose with `connect_timeout` the way the client-level ones do), and *how
+/// loose that bound is* (`fetch_object` alone needs [`FETCH_OBJECT_READ_TIMEOUT`] instead of
 /// [`REMOTE_READ_TIMEOUT`] — see [`bounded_object_reads`](Self::bounded_object_reads)'s doc). All
 /// four otherwise share the same proxy/connect-timeout configuration built once in
 /// [`RemoteClient::new_with_tor`], which is also where each bounded client's actual `read_timeout`
 /// is computed via [`bounded_read_timeout`] rather than being the raw silence-budget constant.
 #[derive(Clone)]
 pub struct RemoteClient {
+    /// The default client: auto-follows redirects (reqwest's default `redirect::Policy`) and
+    /// carries only [`Self::connect_timeout`] — no `read_timeout` at all, so once past connect it
+    /// waits out any silence, however long. Ridden by five calls, none of which this module can
+    /// give an honest flat pre-first-byte budget (see [`REMOTE_READ_TIMEOUT`]'s doc for the
+    /// reasoning behind the first four): `missing_objects` and `upload_targets` each walk up to a
+    /// batch cap of hashes before responding; `fetch_subtree` walks and buffers a resolved subtree
+    /// closure; each cost scales with input the client cannot size in advance. `resolve` is the
+    /// one exception with a bound of its own — a per-request `RequestBuilder::timeout(5s)` at its
+    /// call site, since it degrades to pseudonyms on any failure rather than surfacing an error,
+    /// so it needs no client-level setting. The fifth, `commit_lift`, is this module's one
+    /// remaining mutation that still rides this auto-following client unguarded — see
+    /// [`Self::no_redirect`]'s doc for why FORK-89 left it here rather than moving it, and
+    /// FORK-91 for the still-open question of its own response-wait bound.
     http: reqwest::Client,
     /// Same endpoint, automatic redirect-following disabled. `fetch_batch`'s initial `POST` uses
     /// this one: reqwest's default policy replays a `307`/`308` redirect with the original
@@ -672,15 +699,41 @@ pub struct RemoteClient {
     /// Also used by [`Self::upload_object`] and [`Self::put_presigned`] (review round S2 fix hole):
     /// a streamed upload body is one-shot and cannot be replayed at a redirect target, so any `3xx`
     /// — not only the `307`/`308` this doc's other reasoning names — must come back to
-    /// [`Self::describe_upload_redirect`] raw rather than being auto-followed. See that function's
-    /// doc for why a `303` specifically forced the move off `self.http`.
+    /// [`Self::describe_mutation_redirect`] raw rather than being auto-followed. See that
+    /// function's doc for why a `303` specifically forced the move off `self.http`.
+    ///
+    /// Also used by [`Self::update_ref`], [`Self::upload_signature`], and [`Self::put_trust`]
+    /// (FORK-89): unlike the two above, none of these three stream a one-shot body — they hand
+    /// `self.request_on` a `.json(...)` or an in-memory `.body(Vec<u8>)`, which *could* in
+    /// principle be replayed at a redirect target. That is not why they are here: they were on
+    /// `self.http` (auto-following, with no `is_redirection()` guard) until FORK-89, which found
+    /// `tower-http`'s `SEE_OTHER` arm forces a `POST`'s method
+    /// to `GET` and its body empty unconditionally, and every arm does the same to a `PUT` — so a
+    /// `303` (and, for `update_ref`'s `POST`, a `301`/`302` too) silently became a bare `GET`,
+    /// whose `2xx` at the redirect target read back as a fabricated success having mutated
+    /// nothing. Moving these three here closes that the same way the other two are already closed:
+    /// no mutation on this client ever auto-follows, replayable body or not — see
+    /// [`Self::describe_mutation_redirect`]'s doc for why that is a client-selection guarantee,
+    /// not a claim about any dependency's redirect matrix.
+    ///
+    /// `commit_lift` still rides `self.http` and is not part of this fix — it carries the same
+    /// latent 3xx auto-follow exposure the other five closed. Not moved here: out of the stated
+    /// scope of the fix that added the other three (which named only `update_ref`,
+    /// `upload_signature`, `put_trust`), left as a known gap rather than folded in silently.
     no_redirect: reqwest::Client,
     /// Same endpoint as [`Self::http`], plus a `read_timeout` of
     /// [`bounded_read_timeout`]`(connect_timeout, `[`REMOTE_READ_TIMEOUT`]`)`. Used only by the
-    /// three O(constant)-pre-first-byte calls (`fetch_info`, `fetch_signature`,
-    /// `fetch_bundle_to`) — never by `fetch_object` (which needs the much looser
-    /// [`Self::bounded_object_reads`]), `update_ref`, `missing_objects`, `fetch_batch`,
-    /// `fetch_subtree`, or any upload path (see [`REMOTE_READ_TIMEOUT`]'s doc for why).
+    /// three O(constant)-pre-first-byte calls — `fetch_info`, `fetch_signature`,
+    /// `fetch_bundle_to` — whose server side does a single fixed-size lookup or serves an
+    /// already-built file before writing anything, so a flat 10s silence budget is honest for
+    /// them (see [`REMOTE_READ_TIMEOUT`]'s doc). Never used by any call whose server side does
+    /// work that scales with its input before the first byte — `missing_objects`, `fetch_batch`,
+    /// `fetch_subtree`, `upload_targets` all fall in that category, and so does `fetch_object`,
+    /// which needs the same shape of bound but a much looser budget of its own
+    /// ([`Self::bounded_object_reads`]) — nor by any call that must never auto-follow a redirect,
+    /// which this client (like `http`) still does: every mutation in this module, `update_ref`
+    /// included (see [`Self::no_redirect`]'s doc for the full list and why). `resolve` rides
+    /// neither this client nor an unbounded one — its own per-request timeout is bound enough.
     bounded_reads: reqwest::Client,
     /// Same endpoint as [`Self::http`], plus a `read_timeout` of
     /// [`bounded_read_timeout`]`(connect_timeout, `[`FETCH_OBJECT_READ_TIMEOUT`]`)` — the same
@@ -970,10 +1023,13 @@ impl RemoteClient {
     }
 
     /// Build a request against this remote using a specific underlying `reqwest::Client` — the
-    /// seam `fetch_info`/`fetch_signature`/`fetch_bundle_to` use to go out on
-    /// [`RemoteClient::bounded_reads`], `fetch_object` uses to go out on
-    /// [`RemoteClient::bounded_object_reads`], and `fetch_batch`'s initial `POST` uses to go out
-    /// on [`RemoteClient::no_redirect`] — all instead of the unbounded default.
+    /// seam every call that needs something other than the default [`Self::http`] uses to reach
+    /// one of this type's other clients ([`Self::bounded_reads`], [`Self::bounded_object_reads`],
+    /// [`Self::no_redirect`]). Deliberately not enumerated here by caller: that list has already
+    /// drifted stale more than once as call sites moved between clients (most recently FORK-89,
+    /// which added three more callers of `no_redirect` without this doc noticing) — each client
+    /// field's own doc is the authoritative list of which calls ride it, kept next to the
+    /// declaration that would actually change if a caller moved.
     fn request_on(&self,
                    http: &reqwest::Client,
                    method: reqwest::Method,
@@ -1033,17 +1089,20 @@ impl RemoteClient {
 
     /// The mutation counterpart of [`Self::describe_transport_error`], for the six calls that ride
     /// the unbounded `http`/`no_redirect` clients (`update_ref`, `upload_object`, `put_presigned`,
-    /// `upload_signature`, `put_trust`, `commit_lift`) — `upload_object` and `put_presigned` ride
-    /// `no_redirect` specifically (moved off `http` in the fix for the `303` redirect hole — see
-    /// [`Self::no_redirect`]'s doc), and also layer [`Self::send_with_watchdog`] on top for their
-    /// body-send phase, but `no_redirect` is just as unbounded as `http` itself, so a transport
-    /// failure on either still lands here for anything `classify` can actually see (a connect
-    /// failure, or a `reqwest::Error`-bearing timeout on the response side). Same [`classify`]
-    /// dispatch, but the [`TransportFailure::ReadTimedOut`] wording differs from the read path's:
-    /// on these clients that case can only be a timeout on an *established* connection — after
-    /// the request bytes were already sent — so the settled contract requires the uncertainty be
-    /// carried in the message rather than asserted away: it may have completed on the remote, and
-    /// the caller must decide whether to check before retrying, never be told nothing happened.
+    /// `upload_signature`, `put_trust`, `commit_lift`) — `upload_object`, `put_presigned`,
+    /// `update_ref`, `upload_signature`, and `put_trust` all ride `no_redirect` (the last three
+    /// moved off `http` by FORK-89, `upload_object`/`put_presigned` by the earlier fix for the
+    /// `303` redirect hole — see [`Self::no_redirect`]'s doc); only `commit_lift` still rides
+    /// `http` directly. `upload_object`/`put_presigned` also layer [`Self::send_with_watchdog`] on
+    /// top for their body-send phase, but `no_redirect` is just as unbounded as `http` itself, so a
+    /// transport failure on any of the six still lands here for anything `classify` can actually
+    /// see (a connect failure, or a `reqwest::Error`-bearing timeout on the response side). Same
+    /// [`classify`] dispatch, but the [`TransportFailure::ReadTimedOut`] wording differs from the
+    /// read path's: on these clients that case can only be a timeout on an *established*
+    /// connection — after the request bytes were already sent — so the settled contract requires
+    /// the uncertainty be carried in the message rather than asserted away: it may have completed
+    /// on the remote, and the caller must decide whether to check before retrying, never be told
+    /// nothing happened.
     fn describe_mutation_transport_error(&self, action: &str, e: reqwest::Error) -> String {
         match classify(e.is_connect(), e.is_timeout()) {
             TransportFailure::ConnectTimedOut => format!(
@@ -1191,18 +1250,25 @@ impl RemoteClient {
         }
     }
 
-    /// Compose a loud, specific error for a `3xx` response to a streamed upload `PUT` (review
-    /// round S2-F5). Both call sites that reach this ([`Self::upload_object`],
-    /// [`Self::put_presigned`]) go out on [`Self::no_redirect`], which never auto-follows *any*
-    /// redirect status — so this is a local, unconditional invariant of this client, not a claim
-    /// about how any particular `3xx` happens to behave under a dependency's redirect matrix (a
-    /// `303` once slipped through here on the auto-following client precisely because that matrix
-    /// has more than one case; see the fixed-hole review round for the history). A silent redirect
-    /// must never look like success: an operator seeing a bare "refused (307)" would have no idea
-    /// a redirect was even involved. Names the status and, when present, the `Location` header the
-    /// remote pointed at, so the caller can see exactly what happened and ask the remote for a
-    /// fresh target rather than guess.
-    fn describe_upload_redirect(action: &str, response: &reqwest::Response) -> String {
+    /// Compose a loud, specific error for a `3xx` response to a mutation. Every call site that
+    /// reaches this (`upload_object`, `put_presigned`, `update_ref`, `upload_signature`,
+    /// `put_trust` — FORK-89 widened this from the original two) goes out on [`Self::no_redirect`],
+    /// which never auto-follows *any* redirect status — so this is a local, unconditional invariant
+    /// of *this client*, not a claim about how any particular `3xx` happens to behave under a
+    /// dependency's redirect matrix. Do not turn it back into one: an earlier version of this doc
+    /// asserted exactly that (which status codes `tower-http`'s auto-following policy skips for a
+    /// given method) and was false for `303` — `follow_redirect`'s `SEE_OTHER` arm forces the body
+    /// empty and the method to `GET` unconditionally, unlike the `MOVED_PERMANENTLY | FOUND` arm,
+    /// which only does so for a `POST` — the hole FORK-89 closed. The guarantee here holds because
+    /// of the client selection, not because of which status codes a dependency version happens to
+    /// redirect on.
+    ///
+    /// A silent redirect must never look like success: an operator seeing a bare "refused (307)"
+    /// would have no idea a redirect was even involved, and for a streamed upload the body is a
+    /// one-shot stream that structurally cannot be replayed at a new target even if the caller
+    /// wanted to retry there. Names the status and, when present, the `Location` header the remote
+    /// pointed at, so the caller can see exactly what happened rather than guess.
+    fn describe_mutation_redirect(action: &str, response: &reqwest::Response) -> String {
         let status = response.status();
         let location = response.headers()
             .get(reqwest::header::LOCATION)
@@ -1210,9 +1276,10 @@ impl RemoteClient {
             .unwrap_or("(no Location header)");
 
         format!(
-            "The remote redirected {} ({}) to {} — a streamed upload cannot follow a redirect \
-            (its body cannot be replayed to retry elsewhere), so this failed instead of silently \
-            retrying at the new location. Ask the remote for a fresh upload target and retry.",
+            "The remote redirected {} ({}) to {} — a mutation must never silently follow a \
+            redirect (retrying at an unannounced target risks applying somewhere the caller never \
+            approved), so this failed instead of retrying at the new location. Check the remote's \
+            configured URL and retry.",
             action, status.as_u16(), location
         )
     }
@@ -1507,7 +1574,7 @@ impl RemoteClient {
         let response = self.send_with_watchdog(builder, progress, &action, len).await?;
 
         if response.status().is_redirection() {
-            return Err(Self::describe_upload_redirect(&action, &response));
+            return Err(Self::describe_mutation_redirect(&action, &response));
         }
 
         if !response.status().is_success() {
@@ -1594,7 +1661,7 @@ impl RemoteClient {
         ).await?;
 
         if response.status().is_redirection() {
-            return Err(Self::describe_upload_redirect("uploading to a staging URL", &response));
+            return Err(Self::describe_mutation_redirect("uploading to a staging URL", &response));
         }
 
         if !response.status().is_success() {
@@ -1673,14 +1740,25 @@ impl RemoteClient {
     }
 
     /// Upload a parcel's signature sidecar.
+    ///
+    /// Rides [`Self::no_redirect`] (FORK-89), not `self.http`: this call mutates the remote, and
+    /// this client never auto-follows a redirect on a mutation — a local, unconditional invariant
+    /// of *this client*, holding regardless of which status code or dependency version is in play
+    /// (see [`Self::describe_mutation_redirect`]'s doc). Before FORK-89 this rode `self.http` with
+    /// no `is_redirection()` guard, so a `303` (which `tower-http`'s `SEE_OTHER` arm forces to a
+    /// bare `GET` unconditionally) silently landed at the redirect target instead of storing
+    /// anything, and a `2xx` there read back as a fabricated success.
     pub async fn upload_signature(&self, parcel_hash: &str, bytes: Vec<u8>) -> Result<(), String> {
-        let response = self.request(reqwest::Method::PUT, &format!("/v1/signatures/{}", parcel_hash))
+        let action = format!("uploading the signature of {}", parcel_hash);
+        let response = self.request_on(&self.no_redirect, reqwest::Method::PUT, &format!("/v1/signatures/{}", parcel_hash))
             .body(bytes)
             .send()
             .await
-            .map_err(|e| self.describe_mutation_transport_error(
-                &format!("uploading the signature of {}", parcel_hash), e
-            ))?;
+            .map_err(|e| self.describe_mutation_transport_error(&action, e))?;
+
+        if response.status().is_redirection() {
+            return Err(Self::describe_mutation_redirect(&action, &response));
+        }
 
         if !response.status().is_success() {
             return Err(self.error_of(response, &format!("the signature of {}", parcel_hash)).await);
@@ -1690,12 +1768,21 @@ impl RemoteClient {
     }
 
     /// Establish the trust anchor on the remote (idempotent for an identical anchor).
+    ///
+    /// Rides [`Self::no_redirect`] (FORK-89) — same reasoning as [`Self::upload_signature`]'s doc:
+    /// a mutation on this client never auto-follows any redirect, unconditionally, and before
+    /// FORK-89 this call had no such guard at all.
     pub async fn put_trust(&self, anchor: &TrustAnchorDto) -> Result<(), String> {
-        let response = self.request(reqwest::Method::PUT, "/v1/trust")
+        let action = "uploading the trust anchor";
+        let response = self.request_on(&self.no_redirect, reqwest::Method::PUT, "/v1/trust")
             .json(anchor)
             .send()
             .await
-            .map_err(|e| self.describe_mutation_transport_error("uploading the trust anchor", e))?;
+            .map_err(|e| self.describe_mutation_transport_error(action, e))?;
+
+        if response.status().is_redirection() {
+            return Err(Self::describe_mutation_redirect(action, &response));
+        }
 
         if !response.status().is_success() {
             return Err(self.error_of(response, "the trust anchor").await);
@@ -1705,6 +1792,13 @@ impl RemoteClient {
     }
 
     /// Commit a ref update (the CAS of a lift).
+    ///
+    /// Rides [`Self::no_redirect`] (FORK-89) — same reasoning as [`Self::upload_signature`]'s doc.
+    /// This call is the one of the three that is a `POST`, not a `PUT`: `tower-http`'s
+    /// `MOVED_PERMANENTLY | FOUND` arm forces a `POST`'s method to `GET` and body to empty (unlike
+    /// its `PUT` handling, which that arm leaves alone), so before FORK-89 this call was
+    /// additionally exposed to a silent-success `301`/`302`, on top of the `303` every mutation on
+    /// `self.http` shared. Moving to `no_redirect` closes all of it the same way, uniformly.
     pub async fn update_ref(&self,
                             pallet: &str,
                             old_head: Option<&str>,
@@ -1713,14 +1807,17 @@ impl RemoteClient {
             old_head: old_head.map(|hash| hash.to_string()),
             new_head: new_head.to_string(),
         };
+        let action = format!("moving the remote pallet \"{}\"", pallet);
 
-        let response = self.request(reqwest::Method::POST, &format!("/v1/pallets/{}", pallet))
+        let response = self.request_on(&self.no_redirect, reqwest::Method::POST, &format!("/v1/pallets/{}", pallet))
             .json(&body)
             .send()
             .await
-            .map_err(|e| self.describe_mutation_transport_error(
-                &format!("moving the remote pallet \"{}\"", pallet), e
-            ))?;
+            .map_err(|e| self.describe_mutation_transport_error(&action, e))?;
+
+        if response.status().is_redirection() {
+            return Err(Self::describe_mutation_redirect(&action, &response));
+        }
 
         if !response.status().is_success() {
             return Err(self.error_of(response, &format!("moving pallet \"{}\"", pallet)).await);
@@ -7035,7 +7132,7 @@ mod tests {
 
     // -----------------------------------------------------------------------------------
     // Review round S2-F5: `wrap_stream`'s body cannot be cloned to replay a redirect (verified
-    // against this pinned `reqwest`/`tower-http` version — see `describe_upload_redirect`'s doc),
+    // against this pinned `reqwest`/`tower-http` version — see `describe_mutation_redirect`'s doc),
     // so a `3xx` a streamed upload receives is no longer followed the way the old
     // `.body(Vec<u8>)` used to follow it. Pre-1.0 that behavior change needs no compatibility
     // shim, but it must be loud and tested, not a silent fall-through to a generic "refused"
@@ -7110,7 +7207,7 @@ mod tests {
     /// `upload_object` gets the same treatment for consistency (it also rides `no_redirect`,
     /// which returns a raw `3xx` straight to the `is_redirection()` guard) even though its
     /// target — this module's own control plane — is not the "live case" S2-F5 named; a lighter
-    /// check than `put_presigned`'s since the mechanism (`describe_upload_redirect`) is shared
+    /// check than `put_presigned`'s since the mechanism (`describe_mutation_redirect`) is shared
     /// and already fully pinned there.
     #[test]
     fn upload_object_reports_a_redirect_by_name() {
@@ -7209,6 +7306,125 @@ mod tests {
 
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let error = runtime.block_on(client.upload_object(&hash, vec![1u8; 4096]))
+            .expect_err("a 303 must not be silently followed to a 2xx landing");
+
+        assert!(
+            error.to_lowercase().contains("redirect") && error.contains("303") && error.contains(&landing_url),
+            "must name the redirect, its status, and its target: {}", error
+        );
+        assert!(
+            !landed.load(std::sync::atomic::Ordering::SeqCst),
+            "the landing listener must never have been contacted — that is what proves no \
+            follow was attempted, rather than merely that an error came out"
+        );
+    }
+
+    // -----------------------------------------------------------------------------------
+    // FORK-89: `update_ref`, `upload_signature`, and `put_trust` had no `is_redirection()` guard
+    // at all and rode `self.http` (auto-following), unlike `upload_object`/`put_presigned` above.
+    // A `303` to any of the three — a `PUT` for the latter two, exactly the shape the 303 hole
+    // above already proves is silently followed on `self.http` — became a bare `GET`, and a `2xx`
+    // at the target read back as a fabricated success having mutated nothing. `update_ref` is a
+    // `POST`, so it carries a second, wider exposure the two `PUT`s do not: `tower-http`'s
+    // `MOVED_PERMANENTLY | FOUND` arm *also* forces a `POST`'s method to `GET` and body to empty,
+    // conditioned on `method == POST` — a condition a `PUT` never satisfies, so `301`/`302` never
+    // touched `upload_signature`/`put_trust` even before this fix, but did silently follow for
+    // `update_ref`. Each site changes its client selection independently, so each needs its own
+    // falsifier — same reasoning as the `upload_object`/`put_presigned` pair above.
+    // -----------------------------------------------------------------------------------
+
+    /// `update_ref` must not silently follow a `303` to a `2xx` landing. Before the fix
+    /// (`self.request` → `self.http`) this returns `Ok(())` with the landing flag `true`; after
+    /// (`self.no_redirect` + the `is_redirection()` guard) the raw `303` is reported by name and
+    /// the landing listener is never contacted.
+    #[test]
+    fn update_ref_does_not_follow_a_303_to_a_2xx_landing() {
+        let (landing_url, landed) = start_landing_remote();
+        let url = start_redirecting_remote(303, &landing_url);
+        let client = RemoteClient::new(&url, None).unwrap();
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let error = runtime.block_on(client.update_ref("main", None, &"a".repeat(64)))
+            .expect_err("a 303 must not be silently followed to a 2xx landing");
+
+        assert!(
+            error.to_lowercase().contains("redirect") && error.contains("303") && error.contains(&landing_url),
+            "must name the redirect, its status, and its target: {}", error
+        );
+        assert!(
+            !landed.load(std::sync::atomic::Ordering::SeqCst),
+            "the landing listener must never have been contacted — that is what proves no \
+            follow was attempted, rather than merely that an error came out"
+        );
+    }
+
+    /// `update_ref`'s `POST`-specific exposure: a `302` is the case `upload_signature`/`put_trust`
+    /// (both `PUT`s) were never vulnerable to even on the unfixed `self.http` — `tower-http`'s
+    /// `MOVED_PERMANENTLY | FOUND` arm only rewrites a `POST`. This is exactly the asymmetry an
+    /// earlier version of this test suite missed by only covering `303`: a regression that moved
+    /// `update_ref` back onto `self.http` while somehow keeping `upload_signature`/`put_trust` on
+    /// `no_redirect` would pass every `303` test here and still silently drop a lift's ref update.
+    #[test]
+    fn update_ref_does_not_follow_a_302_to_a_2xx_landing() {
+        let (landing_url, landed) = start_landing_remote();
+        let url = start_redirecting_remote(302, &landing_url);
+        let client = RemoteClient::new(&url, None).unwrap();
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let error = runtime.block_on(client.update_ref("main", None, &"a".repeat(64)))
+            .expect_err("a 302 must not be silently followed to a 2xx landing");
+
+        assert!(
+            error.to_lowercase().contains("redirect") && error.contains("302") && error.contains(&landing_url),
+            "must name the redirect, its status, and its target: {}", error
+        );
+        assert!(
+            !landed.load(std::sync::atomic::Ordering::SeqCst),
+            "the landing listener must never have been contacted — that is what proves no \
+            follow was attempted, rather than merely that an error came out"
+        );
+    }
+
+    /// `upload_signature` must not silently follow a `303` to a `2xx` landing — the same hole,
+    /// its own client selection (`self.request` → `self.request_on(&self.no_redirect, ...)`).
+    #[test]
+    fn upload_signature_does_not_follow_a_303_to_a_2xx_landing() {
+        let (landing_url, landed) = start_landing_remote();
+        let url = start_redirecting_remote(303, &landing_url);
+        let client = RemoteClient::new(&url, None).unwrap();
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let error = runtime.block_on(client.upload_signature(&"c".repeat(64), vec![1u8; 64]))
+            .expect_err("a 303 must not be silently followed to a 2xx landing");
+
+        assert!(
+            error.to_lowercase().contains("redirect") && error.contains("303") && error.contains(&landing_url),
+            "must name the redirect, its status, and its target: {}", error
+        );
+        assert!(
+            !landed.load(std::sync::atomic::Ordering::SeqCst),
+            "the landing listener must never have been contacted — that is what proves no \
+            follow was attempted, rather than merely that an error came out"
+        );
+    }
+
+    /// `put_trust` must not silently follow a `303` to a `2xx` landing — the same hole, its own
+    /// client selection.
+    #[test]
+    fn put_trust_does_not_follow_a_303_to_a_2xx_landing() {
+        let (landing_url, landed) = start_landing_remote();
+        let url = start_redirecting_remote(303, &landing_url);
+        let client = RemoteClient::new(&url, None).unwrap();
+        let anchor = TrustAnchorDto {
+            genesis: "g".repeat(64),
+            enabled_at: 0,
+            boundary: Vec::new(),
+            prior_genesis: None,
+            adopts: None,
+        };
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let error = runtime.block_on(client.put_trust(&anchor))
             .expect_err("a 303 must not be silently followed to a 2xx landing");
 
         assert!(
