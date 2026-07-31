@@ -18,6 +18,7 @@ use crate::model::remote::{
 };
 use crate::enums::config_scope::ConfigScope;
 use crate::error::{CoreError, RefusalCode};
+use crate::globals::{self, StorageRootScope};
 use crate::util::office_utils::OFFICE_PALLET_NAME;
 use crate::util::scope_utils::{self, MaterializationScope, ScopeClass};
 use crate::util::{
@@ -2730,11 +2731,96 @@ fn refuse_if_over_ceiling_for_upload(hash: &str, bytes: &[u8]) -> Result<(), Cor
     scope_utils::refuse_if_over_object_ceiling(&format!("object {}", hash), bytes.len())
 }
 
+/// Load one object's bytes and apply the transport-ceiling refusal, off the async runtime
+/// (review round S2 fix hole): `retrieve_object_by_hash` is synchronous pack/loose-object I/O
+/// (decompression, hash verification), not a `.await` point, so running it directly inside a
+/// spawned task blocks whichever runtime worker polls that task for however long the read takes.
+/// On the production multi-thread runtime with [`CONCURRENT_TRANSFERS`] (24) workers all
+/// eventually doing this at once, every in-flight upload's body-send stream and its
+/// [`RemoteClient::send_with_watchdog`] loop go unpolled while their worker is pinned here — on
+/// the next poll, `select!`'s random branch order can let the watchdog observe a stale
+/// `silent_for()` before the body-send future gets a chance to refresh it, producing a false
+/// "timed out" verdict for a transfer that was never actually silent. `spawn_blocking` moves the
+/// read onto tokio's separate blocking thread pool, which exists independently of the runtime's
+/// scheduler flavor (present on `current_thread` too — see the blocking-pool construction tokio
+/// shares between `build_current_thread_runtime` and `build_threaded_runtime`), so the async
+/// workers keep polling every other in-flight task while this one reads from disk.
+///
+/// `scope_root` re-enters the caller's storage-root scope on the blocking thread (the same idiom
+/// [`crate::util::fanout_utils::fanout_map`] and the server's own `blocking` helper use):
+/// [`StorageRootScope`] is thread-local and is **not** inherited by a spawned task, whether that
+/// task runs via `spawn_blocking` or — on a genuine multi-thread runtime — plain `tokio::spawn`/
+/// `JoinSet::spawn` (`Runtime::block_on`'s own doc: "the future will execute on the current
+/// thread, but all spawned tasks will execute on the thread pool"). So `scope_root` must be read
+/// by the *caller*, before it ever spawns the task this function runs inside of — reading it in
+/// here instead would capture whatever (likely empty) scope happens to belong to the worker
+/// thread that picked up the spawned task, not the caller's. `None` (the CLI, which resolves by
+/// working directory, and the process-global bay context) needs nothing re-entered — the
+/// blocking thread already shares both.
+///
+/// `delay` is the test seam for the starvation falsifier below — always `Duration::ZERO` outside
+/// `#[cfg(test)]` callers, for the identical reason `scope_root` is a parameter rather than
+/// self-discovered: it must reflect the *caller's* thread-local test knob, not whatever the
+/// spawned task's own thread happens to see.
+async fn retrieve_object_for_upload(hash: String,
+                                    scope_root: Option<std::path::PathBuf>,
+                                    delay: std::time::Duration) -> Result<Vec<u8>, String> {
+    tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
+        let _scope = scope_root.as_deref().map(StorageRootScope::enter);
+
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
+
+        let bytes = file_utils::retrieve_object_by_hash(&hash)?;
+        refuse_if_over_ceiling_for_upload(&hash, &bytes)?;
+        Ok(bytes)
+    })
+        .await
+        .map_err(|e| format!("The object-retrieval task panicked: {}", e))?
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only seam (review round S2 fix hole, falsifier for the `spawn_blocking` fix above):
+    /// lets a test make the blocking retrieval artificially slow, long enough that a runtime
+    /// whose only worker is stuck *synchronously* inside the read would visibly miss timer ticks
+    /// a sibling task is trying to fire. Thread-local, not a process-global `static`: `cargo test`
+    /// runs different tests on different OS threads, so a thread-local set by one test's own
+    /// thread is invisible to every other test running concurrently — a `static` would leak the
+    /// delay across them. Read by [`upload_objects`]/[`upload_to_targets`] on their own (caller's)
+    /// thread, before spawning any task — see [`retrieve_object_for_upload`]'s doc for why that
+    /// placement matters.
+    static TEST_RETRIEVAL_DELAY: std::cell::Cell<std::time::Duration> =
+        const { std::cell::Cell::new(std::time::Duration::ZERO) };
+}
+
+#[cfg(test)]
+fn test_retrieval_delay() -> std::time::Duration {
+    TEST_RETRIEVAL_DELAY.with(|cell| cell.get())
+}
+
+#[cfg(not(test))]
+fn test_retrieval_delay() -> std::time::Duration {
+    std::time::Duration::ZERO
+}
+
+#[cfg(test)]
+fn set_test_retrieval_delay(delay: std::time::Duration) {
+    TEST_RETRIEVAL_DELAY.with(|cell| cell.set(delay));
+}
+
 /// Upload (concurrently) the objects of the given hashes.
 async fn upload_objects(client: &RemoteClient, hashes: &[String]) -> Result<(), String> {
     if hashes.is_empty() {
         return Ok(());
     }
+
+    // Read once, synchronously, on whichever thread is currently driving this function's own
+    // poll — before any task below is spawned onto (possibly) a different one. See
+    // `retrieve_object_for_upload`'s doc for why this can't just be read again inside it.
+    let scope_root = globals::current_scope_root();
+    let delay = test_retrieval_delay();
 
     let semaphore = Arc::new(Semaphore::new(CONCURRENT_TRANSFERS));
     let mut tasks: JoinSet<Result<(), String>> = JoinSet::new();
@@ -2743,13 +2829,13 @@ async fn upload_objects(client: &RemoteClient, hashes: &[String]) -> Result<(), 
         let client = client.clone();
         let hash = hash.clone();
         let semaphore = Arc::clone(&semaphore);
+        let scope_root = scope_root.clone();
 
         tasks.spawn(async move {
             let _permit = semaphore.acquire().await
                 .map_err(|_| "The transfer pool was closed unexpectedly.".to_string())?;
 
-            let bytes = file_utils::retrieve_object_by_hash(&hash)?;
-            refuse_if_over_ceiling_for_upload(&hash, &bytes)?;
+            let bytes = retrieve_object_for_upload(hash.clone(), scope_root, delay).await?;
 
             client.upload_object(&hash, bytes).await
         });
@@ -2851,6 +2937,11 @@ async fn upload_to_targets(client: &RemoteClient,
         return Ok(());
     }
 
+    // See `upload_objects`'s identical capture for why this must happen here, before any task
+    // is spawned, rather than inside `retrieve_object_for_upload` itself.
+    let scope_root = globals::current_scope_root();
+    let delay = test_retrieval_delay();
+
     let semaphore = Arc::new(Semaphore::new(CONCURRENT_TRANSFERS));
     let mut tasks: JoinSet<Result<(), String>> = JoinSet::new();
 
@@ -2859,13 +2950,13 @@ async fn upload_to_targets(client: &RemoteClient,
         let hash = hash.clone();
         let url = url.clone();
         let semaphore = Arc::clone(&semaphore);
+        let scope_root = scope_root.clone();
 
         tasks.spawn(async move {
             let _permit = semaphore.acquire().await
                 .map_err(|_| "The transfer pool was closed unexpectedly.".to_string())?;
 
-            let bytes = file_utils::retrieve_object_by_hash(&hash)?;
-            refuse_if_over_ceiling_for_upload(&hash, &bytes)?;
+            let bytes = retrieve_object_for_upload(hash.clone(), scope_root, delay).await?;
 
             client.put_presigned(&url, bytes).await
         });
@@ -3474,7 +3565,6 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Mutex;
     use crate::builder::object::loose_object_builder::LooseObjectBuilder;
-    use crate::globals::StorageRootScope;
     use crate::model::remote::ErrorResponse;
 
     /// A host ending in `.onion` is recognized as an onion service; a clearnet host, an IP, and a
@@ -4229,6 +4319,77 @@ mod tests {
 
         assert_eq!(code, scope_utils::CODE_OVERSIZED_TRANSPORT_UNSUPPORTED);
         assert!(message.contains(&hash), "the refusal names the object: {}", message);
+    }
+
+    // -----------------------------------------------------------------------------------
+    // Review round S2 fix hole: `upload_objects`/`upload_to_targets` called the synchronous
+    // `retrieve_object_by_hash` directly inside a spawned async task, no `spawn_blocking`. On
+    // the production multi-thread runtime, with `CONCURRENT_TRANSFERS` (24) workers all
+    // eventually blocked in pack retrieval at once, in-flight upload watchdogs go unpolled and
+    // can observe a stale `silent_for()` on their next poll — a false "timed out" verdict for a
+    // transfer that was never actually silent. A direct starvation test (two concurrent uploads,
+    // assert the fast one isn't delayed by the slow one's read) is ~50% flaky on `select!`'s
+    // branch-order tiebreak; this instead pins the underlying invariant directly — the runtime
+    // keeps making progress on other tasks while a transfer task reads from disk — which is
+    // deterministic regardless of `select!`'s internal tiebreak.
+    // -----------------------------------------------------------------------------------
+
+    /// With the blocking retrieval moved onto `spawn_blocking`'s separate pool, a single-worker
+    /// runtime's one async worker thread stays free to keep polling a sibling task while the
+    /// read (here, artificially stretched to 5s via [`set_test_retrieval_delay`]) runs on a
+    /// different OS thread entirely. A 100ms ticker should fire close to 50 times over that
+    /// window; `>= 35` leaves slack for scheduling jitter without being satisfiable by a runtime
+    /// that spent most of the window synchronously blocked (which deterministically misses on
+    /// the order of 50 ticks — see the reverted-fix run this test's doc references).
+    #[test]
+    fn upload_objects_retrieval_does_not_starve_the_runtime() {
+        let _scratch = Scratch::new("upload-retrieval-no-starve");
+        let hash = store_blob("upload-retrieval-no-starve-blob");
+
+        set_test_retrieval_delay(std::time::Duration::from_secs(5));
+        struct ResetDelay;
+        impl Drop for ResetDelay {
+            fn drop(&mut self) {
+                set_test_retrieval_delay(std::time::Duration::ZERO);
+            }
+        }
+        let _reset_delay = ResetDelay;
+
+        // Nothing needs to listen here: the artificial delay happens entirely inside the
+        // retrieval step, before any network call — `upload_object`'s own (fast) connection
+        // failure afterward is irrelevant to what this test measures.
+        let client = RemoteClient::new("http://127.0.0.1:1", None).unwrap();
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let ticks = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let ticks_for_ticker = Arc::clone(&ticks);
+
+        runtime.block_on(async move {
+            let ticker = tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    ticks_for_ticker.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            });
+
+            let _ = upload_objects(&client, &[hash]).await;
+
+            ticker.abort();
+        });
+
+        let observed = ticks.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            observed >= 35,
+            "expected the single-worker runtime to keep firing ~100ms ticks throughout the \
+            ~5s artificially-slow retrieval (~50 ticks), only observed {} — the retrieval \
+            starved the runtime's only worker instead of running on the blocking pool",
+            observed
+        );
     }
 
     // -----------------------------------------------------------------------------------
