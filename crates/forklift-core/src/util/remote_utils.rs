@@ -350,10 +350,10 @@ const REMOTE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// pre-first-byte phase entirely) is FORK-85.
 const FETCH_OBJECT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// How long [`RemoteClient::error_of`] and [`RemoteClient::commit_lift`]'s own inline error-body
-/// read may take, once a non-success status line and headers have already arrived. Needed because
-/// neither call's own bound (if any) covers this: `error_of` serves responses from every client
-/// this type builds, including the three deliberately-unbounded ones
+/// The base allowance for [`RemoteClient::error_of`] and [`RemoteClient::commit_lift`]'s own
+/// inline error-body read, once a non-success status line and headers have already arrived.
+/// Needed because neither call's own bound (if any) covers this: `error_of` serves responses from
+/// every client this type builds, including the three deliberately-unbounded ones
 /// (`http`/`no_redirect`/`upload_targets`'s negotiation calls — see those calls' own docs), so a
 /// remote that answers a `5xx` with full headers and then wedges before writing the JSON body can
 /// otherwise hang the caller forever even though the status line already told it the call failed.
@@ -366,7 +366,30 @@ const FETCH_OBJECT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// code already uses when the body fails to parse as JSON at all, so a timeout and a malformed
 /// body are indistinguishable to the caller, which is right: both mean "no usable error body
 /// arrived."
+///
+/// Not the actual timeout duration on its own (review round 5, finding 2) — see
+/// [`error_body_read_budget`] for why `self.connect_timeout` is folded in on top of this base,
+/// the same way [`bounded_read_timeout`] and [`RemoteClient::send_with_watchdog`]'s own phase
+/// budgets already do.
 const ERROR_BODY_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The actual bound to arm around an error-body read, given the connect budget this client
+/// instance actually carries. `ERROR_BODY_READ_TIMEOUT` alone is a flat 10s regardless of which
+/// client sent the request — but by the time a non-success response is in hand, the connection is
+/// already established, so it is *not* protecting a connect phase the way
+/// [`bounded_read_timeout`] protects a client's `read_timeout` sleep from preempting a legitimately
+/// slow dial. It plays the other role this module already gives `connect_timeout` elsewhere
+/// (`send_with_watchdog`'s `phase1_budget`/`phase2_budget`): a stand-in for "how slow is normal on
+/// this link at all," which for a Tor-routed remote is 60s, not 5s. Without it, a refusal body
+/// that takes, say, 11s to arrive over a healthy but slow Tor circuit gets killed at the flat 10s
+/// mark — discarding a typed [`RefusalCode`] and its `next_step` for no reason but an unfairly
+/// tight bound, degrading a machine caller to the wrong exit code.
+///
+/// A free function taking `connect_timeout` directly, not a method, so the arithmetic itself is
+/// unit-testable without constructing a live client or waiting out a real budget.
+fn error_body_read_budget(connect_timeout: std::time::Duration) -> std::time::Duration {
+    connect_timeout + ERROR_BODY_READ_TIMEOUT
+}
 
 /// The `read_timeout` to configure on a bounded-reads client, given the `connect_timeout` this
 /// client instance actually uses and the post-connect silence budget intended for it
@@ -1155,13 +1178,16 @@ impl RemoteClient {
 
     /// Turn a non-success response into the client-facing error, threading the server's refusal
     /// code (§7.4) through the taxonomy when the body carries one. The body read is bounded by
-    /// [`ERROR_BODY_READ_TIMEOUT`] — see that constant's doc for why this call in particular needs
-    /// its own bound rather than inheriting one from whichever client sent the request.
-    async fn error_of(response: reqwest::Response, action: &str) -> String {
+    /// [`error_body_read_budget`] (`&self`, review round 5 finding 2, so this instance's own
+    /// `connect_timeout` is folded in) — see that function's doc for why this call in particular
+    /// needs its own bound rather than inheriting one from whichever client sent the request, and
+    /// why the flat [`ERROR_BODY_READ_TIMEOUT`] alone is not it.
+    async fn error_of(&self, response: reqwest::Response, action: &str) -> String {
         let status = response.status();
+        let budget = error_body_read_budget(self.connect_timeout);
 
         let (message, code, next_step) = match tokio::time::timeout(
-            ERROR_BODY_READ_TIMEOUT, response.json::<ErrorResponse>()
+            budget, response.json::<ErrorResponse>()
         ).await {
             Ok(Ok(body)) => (body.error, body.code, body.next_step),
             Ok(Err(_)) | Err(_) => (status.canonical_reason().unwrap_or("unknown error").to_string(), None, None),
@@ -1180,7 +1206,7 @@ impl RemoteClient {
             ))?;
 
         if !response.status().is_success() {
-            return Err(Self::error_of(response, "the handshake").await);
+            return Err(self.error_of(response, "the handshake").await);
         }
 
         let info: WarehouseInfo = response.json()
@@ -1223,7 +1249,7 @@ impl RemoteClient {
                 .map_err(|e| format!("Error while negotiating with the remote: {}", e))?;
 
             if !response.status().is_success() {
-                return Err(Self::error_of(response, "the negotiation").await);
+                return Err(self.error_of(response, "the negotiation").await);
             }
 
             let body: MissingObjectsResponse = response.json()
@@ -1327,7 +1353,7 @@ impl RemoteClient {
         };
 
         if !response.status().is_success() {
-            return Err(Self::error_of(response, "the batch fetch").await);
+            return Err(self.error_of(response, "the batch fetch").await);
         }
 
         response.bytes()
@@ -1369,7 +1395,7 @@ impl RemoteClient {
         }
 
         if !response.status().is_success() {
-            return Err(Self::error_of(response, &format!("the subtree fetch for \"{}\"", path)).await);
+            return Err(self.error_of(response, &format!("the subtree fetch for \"{}\"", path)).await);
         }
 
         response.bytes()
@@ -1389,7 +1415,7 @@ impl RemoteClient {
             ))?;
 
         if !response.status().is_success() {
-            return Err(Self::error_of(response, &format!("object {}", hash)).await);
+            return Err(self.error_of(response, &format!("object {}", hash)).await);
         }
 
         response.bytes()
@@ -1428,7 +1454,7 @@ impl RemoteClient {
         }
 
         if !response.status().is_success() {
-            return Err(Self::error_of(response, &format!("object {}", hash)).await);
+            return Err(self.error_of(response, &format!("object {}", hash)).await);
         }
 
         Ok(())
@@ -1470,7 +1496,7 @@ impl RemoteClient {
             }
 
             if !response.status().is_success() {
-                return Err(Self::error_of(response, "the upload negotiation").await);
+                return Err(self.error_of(response, "the upload negotiation").await);
             }
 
             let body: UploadTargetsResponse = response.json()
@@ -1564,10 +1590,16 @@ impl RemoteClient {
         }
 
         let status = response.status();
-        // Bounded by `ERROR_BODY_READ_TIMEOUT` for the same reason `error_of` is: this rides the
-        // unbounded `http` client, so nothing else stops a remote that answers the status line
-        // and then wedges before writing the body from hanging this call forever.
-        match tokio::time::timeout(ERROR_BODY_READ_TIMEOUT, response.json::<ErrorResponse>()).await {
+        // Bounded by `error_body_read_budget(self.connect_timeout)` for the same reason
+        // `error_of` is (review round 5, finding 2: not the flat `ERROR_BODY_READ_TIMEOUT` alone
+        // — see that function's doc): this rides the unbounded `http` client, so nothing else
+        // stops a remote that answers the status line and then wedges before writing the body
+        // from hanging this call forever, and a Tor-routed remote's own connect budget must be
+        // folded in so a slow-but-healthy round trip isn't killed by a bound sized for a direct
+        // dial alone.
+        match tokio::time::timeout(
+            error_body_read_budget(self.connect_timeout), response.json::<ErrorResponse>()
+        ).await {
             Ok(Ok(body)) if is_transient_commit_failure(status, &body.error) => {
                 Ok(CommitOutcome::BlobNotReady)
             }
@@ -1604,7 +1636,7 @@ impl RemoteClient {
         }
 
         if !response.status().is_success() {
-            return Err(Self::error_of(response, &format!("the signature of {}", parcel_hash)).await);
+            return Err(self.error_of(response, &format!("the signature of {}", parcel_hash)).await);
         }
 
         response.bytes()
@@ -1626,7 +1658,7 @@ impl RemoteClient {
             ))?;
 
         if !response.status().is_success() {
-            return Err(Self::error_of(response, &format!("the signature of {}", parcel_hash)).await);
+            return Err(self.error_of(response, &format!("the signature of {}", parcel_hash)).await);
         }
 
         Ok(())
@@ -1641,7 +1673,7 @@ impl RemoteClient {
             .map_err(|e| self.describe_mutation_transport_error("uploading the trust anchor", e))?;
 
         if !response.status().is_success() {
-            return Err(Self::error_of(response, "the trust anchor").await);
+            return Err(self.error_of(response, "the trust anchor").await);
         }
 
         Ok(())
@@ -1666,7 +1698,7 @@ impl RemoteClient {
             ))?;
 
         if !response.status().is_success() {
-            return Err(Self::error_of(response, &format!("moving pallet \"{}\"", pallet)).await);
+            return Err(self.error_of(response, &format!("moving pallet \"{}\"", pallet)).await);
         }
 
         Ok(())
@@ -1718,7 +1750,7 @@ impl RemoteClient {
         }
 
         if !response.status().is_success() {
-            return Err(Self::error_of(response, "the bundle").await);
+            return Err(self.error_of(response, "the bundle").await);
         }
 
         // The same temp-path naming `write_file_atomically` uses elsewhere in the store — unique
@@ -4024,6 +4056,29 @@ mod tests {
         assert!(!is_transient_commit_failure(
             reqwest::StatusCode::INTERNAL_SERVER_ERROR, &not_ready
         ));
+    }
+
+    /// Review round 5, finding 2: `error_body_read_budget` must fold the caller's own
+    /// `connect_timeout` into the flat `ERROR_BODY_READ_TIMEOUT` base — a Tor-routed client's
+    /// (60s) connect budget must survive into the composed bound, not just the direct client's
+    /// (5s) one. Asserts the arithmetic directly rather than constructing a live Tor client and
+    /// waiting out the real budget (the exact ~72s shape deleted from this suite in 8b93d00) —
+    /// `error_of`/`commit_lift` both delegate to this pure function with `self.connect_timeout`,
+    /// so pinning the function's own arithmetic pins their behavior without a live remote.
+    #[test]
+    fn error_body_read_budget_folds_in_the_connect_timeout() {
+        assert_eq!(
+            error_body_read_budget(TEST_TOR_CONNECT_TIMEOUT),
+            TEST_TOR_CONNECT_TIMEOUT + ERROR_BODY_READ_TIMEOUT,
+            "a Tor-routed client's 60s connect budget must be folded into the error-body-read \
+            bound, not just the flat 10s base — a bound that ignores the link's own latency \
+            preempts healthy work on a slow-but-legitimate connection"
+        );
+        assert_eq!(
+            error_body_read_budget(TEST_DIRECT_CONNECT_TIMEOUT),
+            TEST_DIRECT_CONNECT_TIMEOUT + ERROR_BODY_READ_TIMEOUT,
+            "the same folding must hold for a direct (5s) client too, not just Tor"
+        );
     }
 
     /// A lift session id is a distinct, hyphenated uuid-shaped string — a safe single path
