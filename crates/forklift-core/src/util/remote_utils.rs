@@ -1176,15 +1176,29 @@ impl RemoteClient {
         )
     }
 
+    /// The actual error-body-read bound to arm for *this* client instance — folds this
+    /// instance's own `connect_timeout` into [`error_body_read_budget`]'s arithmetic (review
+    /// round 5 finding 2). Split out as its own `&self` method, rather than inlining the call to
+    /// the free function at the one call site, so a test can pin that the right instance field
+    /// is actually read (review round 6 finding 1's fix was itself unpinned in this one
+    /// dimension: nothing distinguished "reads `self.connect_timeout`" from "hardcodes the
+    /// direct 5s constant", since every behavioral test of [`Self::error_of`] necessarily used a
+    /// direct client, on which the two are indistinguishable) — see
+    /// `error_body_budget_reads_this_instances_connect_timeout` in the test module.
+    fn error_body_budget(&self) -> std::time::Duration {
+        error_body_read_budget(self.connect_timeout)
+    }
+
     /// Turn a non-success response into the client-facing error, threading the server's refusal
     /// code (§7.4) through the taxonomy when the body carries one. The body read is bounded by
-    /// [`error_body_read_budget`] (`&self`, review round 5 finding 2, so this instance's own
-    /// `connect_timeout` is folded in) — see that function's doc for why this call in particular
-    /// needs its own bound rather than inheriting one from whichever client sent the request, and
-    /// why the flat [`ERROR_BODY_READ_TIMEOUT`] alone is not it.
+    /// [`Self::error_body_budget`] (review round 5 finding 2, so this instance's own
+    /// `connect_timeout` is folded in) — see that method's and [`error_body_read_budget`]'s docs
+    /// for why this call in particular needs its own bound rather than inheriting one from
+    /// whichever client sent the request, and why the flat [`ERROR_BODY_READ_TIMEOUT`] alone is
+    /// not it.
     async fn error_of(&self, response: reqwest::Response, action: &str) -> String {
         let status = response.status();
-        let budget = error_body_read_budget(self.connect_timeout);
+        let budget = self.error_body_budget();
 
         let (message, code, next_step) = match tokio::time::timeout(
             budget, response.json::<ErrorResponse>()
@@ -4032,11 +4046,15 @@ mod tests {
     /// (5s) one. Asserts the arithmetic directly rather than constructing a live Tor client and
     /// waiting out the real budget (the exact ~72s shape deleted from this suite in 8b93d00).
     ///
-    /// This pins one of two links; on its own it pins only the helper's arithmetic, not that
+    /// This pins one of three links; on its own it pins only the helper's arithmetic, not that
     /// `error_of` actually calls it (review round 6, finding 1 — nothing enforced that link
     /// before `missing_objects_bounds_the_error_body_read_after_a_wedged_500` below started
-    /// asserting a lower bound on elapsed time). The two together — call-site-uses-helper and
-    /// helper-arithmetic — pin `error_of`'s real behavior without a live remote.
+    /// asserting a lower bound on elapsed time), and not that the accessor computing the budget
+    /// reads *this instance's* `connect_timeout` rather than a hardcoded direct one (review round
+    /// 7, finding 1 — every behavioral test of `error_of` necessarily runs on a direct client, on
+    /// which the two are the same value and so indistinguishable; see
+    /// `error_body_budget_reads_this_instances_connect_timeout`). All three together pin
+    /// `error_of`'s real behavior, on any client, without a live remote.
     #[test]
     fn error_body_read_budget_folds_in_the_connect_timeout() {
         assert_eq!(
@@ -5430,6 +5448,13 @@ mod tests {
     /// Mirrors production `UPLOAD_SILENCE_BUDGET` — see `TEST_TIGHT_READ_TIMEOUT`'s doc for why
     /// this is its own constant rather than a reference to the production one.
     const TEST_UPLOAD_SILENCE_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+    /// Mirrors production `ERROR_BODY_READ_TIMEOUT` — its own constant, not
+    /// `TEST_TIGHT_READ_TIMEOUT`, even though the two happen to share a value today:
+    /// `TEST_TIGHT_READ_TIMEOUT` mirrors the unrelated `REMOTE_READ_TIMEOUT`, and the whole point
+    /// of a per-production-constant mirror (see `TEST_TIGHT_READ_TIMEOUT`'s doc) is that an
+    /// assertion built on it must not silently track a change to a *different* production
+    /// constant that happens to coincide in value today.
+    const TEST_ERROR_BODY_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
     /// `classify` is pure and total over the two booleans `reqwest::Error` exposes — this pins
     /// all four combinations directly, including the one no live socket can construct: a genuine
@@ -5897,10 +5922,17 @@ mod tests {
     /// [`ERROR_BODY_READ_TIMEOUT`] (dropping the folded-in [`REMOTE_CONNECT_TIMEOUT`]) still
     /// passes every other assertion here, which only ceiling-checks. `tokio::time::timeout` never
     /// fires early and this fixture never sends a body, so the read burns the *entire* budget —
-    /// making the lower bound exact, not approximate. Together with
-    /// `error_body_read_budget_folds_in_the_connect_timeout` (which pins the helper's own
-    /// arithmetic), this closes the loop: one test pins call-site-uses-helper, the other pins
-    /// helper-arithmetic.
+    /// making the lower bound exact, not approximate.
+    ///
+    /// On its own this pins only that *some* connect-timeout-shaped value gets folded in — a
+    /// direct client's `connect_timeout` is [`REMOTE_CONNECT_TIMEOUT`], so this cannot tell
+    /// "reads `self.connect_timeout`" apart from "hardcodes the direct 5s constant" (review round
+    /// 7, finding 1: this is exactly the gap `error_body_budget_reads_this_instances_connect_timeout`
+    /// closes, on a Tor-mode client, where the two diverge). Three tests together pin the
+    /// property: this one pins call-site-uses-the-budget,
+    /// `error_body_read_budget_folds_in_the_connect_timeout` pins the arithmetic the budget
+    /// computes, and `error_body_budget_reads_this_instances_connect_timeout` pins that the
+    /// accessor computing it reads *this instance's* connect timeout rather than a hardcoded one.
     #[test]
     fn missing_objects_bounds_the_error_body_read_after_a_wedged_500() {
         let remote = SilentErrorBodyRemote::start();
@@ -5941,6 +5973,31 @@ mod tests {
             error.contains("Internal Server Error"),
             "on a timed-out/unparseable body, must fall back to the canonical reason — the same \
             fallback already used for a parse failure: {}", error
+        );
+    }
+
+    /// Review round 7, finding 1: neither test above can tell "[`RemoteClient::error_body_budget`]
+    /// reads `self.connect_timeout`" apart from "hardcodes the direct 5s constant"
+    /// ([`REMOTE_CONNECT_TIMEOUT`]) — both only ever exercise a direct client, on which the two
+    /// are the same value. Pins the one remaining link directly, on a `TorMode::On` client, where
+    /// the two diverge (60s vs. 5s): no I/O at all needed here, since `error_body_budget` is a
+    /// pure `&self` method (same no-dial idiom as `new_with_tor_selects_the_60s_connect_budget` —
+    /// `new_with_tor` never touches the network — except this doesn't even need that instant
+    /// grace period, since there is no async call to await here at all).
+    #[test]
+    fn error_body_budget_reads_this_instances_connect_timeout() {
+        let tor = TorSettings { mode: TorMode::On, proxy: DEFAULT_TOR_PROXY.to_string() };
+        let client = RemoteClient::new_with_tor(
+            "http://forklift-fork-49-error-body-budget-test.invalid", None, tor,
+        ).unwrap();
+
+        assert_eq!(
+            client.error_body_budget(),
+            TEST_TOR_CONNECT_TIMEOUT + TEST_ERROR_BODY_READ_TIMEOUT,
+            "a TorMode::On client's error_body_budget must fold in its own 60s connect_timeout, \
+            not a hardcoded direct 5s one — otherwise a Tor remote's refusal body gets killed at \
+            15s instead of 70s, discarding a typed RefusalCode/next_step and degrading a machine \
+            caller to the wrong exit code for no reason but an unfairly tight bound"
         );
     }
 
