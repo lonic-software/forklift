@@ -810,13 +810,6 @@ impl RemoteClient {
                         token: Option<String>,
                         tor: TorSettings) -> Result<RemoteClient, String> {
         let routes_through_tor = should_route_through_tor(&tor.mode, url);
-        let proxy = if routes_through_tor {
-            Some(reqwest::Proxy::all(&tor.proxy).map_err(|e| format!(
-                "Error while configuring the Tor proxy \"{}\": {}", tor.proxy, e
-            ))?)
-        } else {
-            None
-        };
 
         // A Tor dial's connect phase covers the whole SOCKS handshake and onion circuit build,
         // which can legitimately take tens of seconds — far past what a direct dial should ever
@@ -825,6 +818,33 @@ impl RemoteClient {
             REMOTE_CONNECT_TIMEOUT_TOR
         } else {
             REMOTE_CONNECT_TIMEOUT
+        };
+
+        Self::build(url, token, &tor, routes_through_tor, connect_timeout)
+    }
+
+    /// Build the four underlying clients and assemble a [`RemoteClient`], given a
+    /// `connect_timeout` already decided by the caller — [`Self::new_with_tor`] is the only
+    /// production caller, and decides it from [`should_route_through_tor`] as its doc describes.
+    /// Split out from `new_with_tor` so [`Self::new_test_with_connect_timeout`] (test-only) can
+    /// supply an arbitrary `connect_timeout` that actually gets built into every client, rather
+    /// than one construction path deciding the timeout and a second one overwriting only the
+    /// `connect_timeout` field afterward — the latter would leave the four inner clients armed
+    /// with a *different* bound than the field reports, which is not a client any production
+    /// constructor could ever produce and would silently invalidate any test built on top of it
+    /// that touches `describe_transport_error` or `send_with_watchdog`, both of which trust this
+    /// field to describe what the clients actually carry.
+    fn build(url: &str,
+             token: Option<String>,
+             tor: &TorSettings,
+             routes_through_tor: bool,
+             connect_timeout: std::time::Duration) -> Result<RemoteClient, String> {
+        let proxy = if routes_through_tor {
+            Some(reqwest::Proxy::all(&tor.proxy).map_err(|e| format!(
+                "Error while configuring the Tor proxy \"{}\": {}", tor.proxy, e
+            ))?)
+        } else {
+            None
         };
 
         let mut http = reqwest::Client::builder()
@@ -875,9 +895,14 @@ impl RemoteClient {
         })
     }
 
-    /// Test-only: like [`Self::new`], but with `connect_timeout` overridden afterward to an
-    /// arbitrary injected value. Needed because the two production constructors can only ever
-    /// produce one of two values — [`REMOTE_CONNECT_TIMEOUT`] (5s) or
+    /// Test-only: build a client with an arbitrary injected `connect_timeout`, threaded into the
+    /// four inner clients via [`Self::build`] rather than overwritten on the field afterward (see
+    /// that method's doc for why the two are not equivalent). Never routes through Tor — `tor` is
+    /// irrelevant to a plain/`.invalid` test URL, and passing `routes_through_tor: false`
+    /// explicitly here means that is a direct fact about this constructor, not a side effect of
+    /// `TorMode::Auto`'s onion-sniffing that a future `.onion` call site could quietly flip.
+    /// Needed because the two production constructors can only ever produce one of two
+    /// `connect_timeout` values — [`REMOTE_CONNECT_TIMEOUT`] (5s) or
     /// [`REMOTE_CONNECT_TIMEOUT_TOR`] (60s) — so a fixture built through either one can never
     /// separate "reads this instance's own `connect_timeout`" from "hardcodes whichever of those
     /// two constants that fixture happens to carry": a Tor-mode fixture asserting the Tor-folded
@@ -887,10 +912,8 @@ impl RemoteClient {
     /// constructor can ever emit closes that gap — see `error_body_budget_reads_this_field_not_a_rival_constant`.
     #[cfg(test)]
     fn new_test_with_connect_timeout(url: &str, connect_timeout: std::time::Duration) -> RemoteClient {
-        let mut client = RemoteClient::new_with_tor(url, None, TorSettings::default())
-            .expect("test fixture URL must build a client");
-        client.connect_timeout = connect_timeout;
-        client
+        RemoteClient::build(url, None, &TorSettings::default(), false, connect_timeout)
+            .expect("test fixture URL must build a client")
     }
 
     /// Create the client for the configured remote of the current warehouse
@@ -4066,17 +4089,20 @@ mod tests {
     /// (5s) one. Asserts the arithmetic directly rather than constructing a live Tor client and
     /// waiting out the real budget (the exact ~72s shape deleted from this suite in 8b93d00).
     ///
-    /// This pins one of three links; on its own it pins only the helper's arithmetic, not that
+    /// This pins one of four links; on its own it pins only the helper's arithmetic, not that
     /// `error_of` actually calls it (review round 6, finding 1 — nothing enforced that link
     /// before `missing_objects_bounds_the_error_body_read_after_a_wedged_500` below started
-    /// asserting a lower bound on elapsed time), and not that the accessor computing the budget
-    /// reads *this instance's* `connect_timeout` field at all, rather than hardcoding whichever
-    /// constant a given fixture's client happens to carry (review round 7 — a fixture built
-    /// through a production constructor can only ever carry `REMOTE_CONNECT_TIMEOUT` or
+    /// asserting a lower bound on elapsed time), not that the accessor computing the budget reads
+    /// *this instance's* `connect_timeout` field at all, rather than hardcoding whichever constant
+    /// a given fixture's client happens to carry (review round 7 — a fixture built through a
+    /// production constructor can only ever carry `REMOTE_CONNECT_TIMEOUT` or
     /// `REMOTE_CONNECT_TIMEOUT_TOR`, so it cannot separate "reads the field" from "hardcodes that
     /// one value"; see `error_body_budget_reads_this_field_not_a_rival_constant`, which injects a
-    /// value neither constructor can produce). All three together pin `error_of`'s real behavior,
-    /// on any client, without a live remote.
+    /// value neither constructor can produce), and not that the value at the one client mode that
+    /// actually ships with a non-default budget (`TorMode::On`) is the correct 70s rather than some
+    /// other value a future change (e.g. a cap) could silently substitute (review round 8, finding
+    /// 1; see `error_body_budget_is_70s_for_a_real_tor_mode_client`). All four together pin
+    /// `error_of`'s real behavior, on any client, without a live remote.
     #[test]
     fn error_body_read_budget_folds_in_the_connect_timeout() {
         assert_eq!(
@@ -5951,11 +5977,15 @@ mod tests {
     /// "reads `self.connect_timeout`" apart from "hardcodes the direct 5s constant" (review round
     /// 7: this is exactly the gap `error_body_budget_reads_this_field_not_a_rival_constant` closes,
     /// with a connect_timeout no production constructor can produce, so a hardcoded rival can never
-    /// coincidentally match it). Three tests together pin the property: this one pins
+    /// coincidentally match it). Four tests together pin the property: this one pins
     /// call-site-uses-the-budget, `error_body_read_budget_folds_in_the_connect_timeout` pins the
-    /// arithmetic the budget computes, and `error_body_budget_reads_this_field_not_a_rival_constant`
-    /// pins that the accessor computing it reads *this instance's* connect timeout field rather
-    /// than hardcoding any constant a real constructor could produce.
+    /// arithmetic the budget computes, `error_body_budget_reads_this_field_not_a_rival_constant`
+    /// pins that the accessor reads *this instance's* connect timeout field rather than hardcoding
+    /// any constant a real constructor could produce, and
+    /// `error_body_budget_is_70s_for_a_real_tor_mode_client` pins that the value at the one client
+    /// mode that actually ships a non-default budget is the correct, uncapped 70s (review round 8,
+    /// finding 1 — the previous field-read property alone does not imply this one: a future cap on
+    /// the result would leave it unaffected while breaking this).
     #[test]
     fn missing_objects_bounds_the_error_body_read_after_a_wedged_500() {
         let remote = SilentErrorBodyRemote::start();
@@ -6000,7 +6030,8 @@ mod tests {
         );
     }
 
-    /// Review round 7, finding: a Tor-mode fixture (this test's first version) cannot tell
+    /// Review round 7, finding: a Tor-mode fixture (this test's predecessor,
+    /// `error_body_budget_reads_this_instances_connect_timeout`) cannot tell
     /// "[`RemoteClient::error_body_budget`] reads `self.connect_timeout`" apart from "hardcodes
     /// [`REMOTE_CONNECT_TIMEOUT_TOR`] directly" — a mutation to the latter still passed, because a
     /// `TorMode::On` client's field genuinely *is* 60s, the same value the hardcoded rival would
@@ -6010,26 +6041,33 @@ mod tests {
     /// `TorMode::On` only ever yields [`REMOTE_CONNECT_TIMEOUT_TOR`] (60s) — both are rivals a
     /// hardcoded mutant can impersonate. [`RemoteClient::new_test_with_connect_timeout`] injects a
     /// third value, `SENTINEL_CONNECT_TIMEOUT` (7s), that no production constructor can ever
-    /// produce, so a mutant hardcoding *either* rival constant is caught here — see that
-    /// constructor's doc for why the injection has to happen after construction.
+    /// produce, so a mutant hardcoding *either* rival constant is caught here.
     ///
-    /// 7s was checked against every `Duration::from_secs`/`from_millis` constant in this module
-    /// (`grep -n "Duration::from_secs\|Duration::from_millis"`) before picking it: none of the
-    /// named connect/read/budget constants equals 7 (the distinct values in play are 2, 3, 5, 10,
-    /// and 60), so 7 collides with none of them directly. `7s + 10s = 17s` (this test's expected
-    /// budget) also doesn't coincide with any pairwise sum of those same values — the full set is
-    /// 10 (5+5), 15 (5+10), 20 (10+10), 65 (5+60), 70 (60+10), and 120 (60+60), none of which is
-    /// 17. The one literal `17s` that does appear elsewhere in this module
-    /// (`mutation_post_send_timeout_message_carries_the_uncertainty_wording`) is an arbitrary
-    /// sample duration for a message-formatting test, not a timeout this code ever arms, so it
-    /// isn't a rival either.
+    /// 7 was checked against every named `Duration` constant in this module before picking it
+    /// (`grep -n "Duration::from_secs\|Duration::from_millis"`): the distinct values in play are 2
+    /// (`POST_SEND_VERIFY_BASE`), 3 (`COMMIT_BACKOFF_CAP`), 5, 10, and 60 — 7 itself matches none of
+    /// them, though 2+5 does coincidentally sum to 7. That sum isn't a rival: the mutation this test
+    /// defends against is a hardcoded *connect_timeout* substitution — one of the two values a
+    /// production constructor can actually produce — not an arbitrary recombination of unrelated
+    /// budgets from a different phase (`POST_SEND_VERIFY_BASE` belongs to the post-send verify
+    /// wait; nothing in this module ever adds it to a connect timeout). What would actually matter
+    /// is a rival for this test's asserted *output*, `17s` (`7 + TEST_ERROR_BODY_READ_TIMEOUT`).
+    /// Every composed budget in this module is built from exactly two addends (a connect timeout
+    /// plus one read/silence/verify-type budget), so that is the fidelity level that matters here
+    /// too: the full pairwise-sum set over `{2, 3, 5, 10, 60}` is
+    /// `{4, 5, 6, 7, 8, 10, 12, 13, 15, 20, 62, 63, 65, 70, 120}` — no 17. One literal `17s` does
+    /// appear elsewhere in this module
+    /// (`mutation_post_send_timeout_message_carries_the_uncertainty_wording`), but as an arbitrary
+    /// sample duration for a message-formatting assertion, not a timeout this code ever arms — not
+    /// a rival either.
     ///
-    /// This test now strictly subsumes the two `error_body_budget` fixtures it replaces (a direct
-    /// client and a `TorMode::On` one): combined with
-    /// `error_body_read_budget_folds_in_the_connect_timeout` (arithmetic) and
-    /// `new_with_tor_selects_the_60s_connect_budget` (that `TorMode::On` sets the field to 60s in
-    /// the first place, pinned independently of `error_body_budget`), this one test's general
-    /// field-read property implies both specific cases without needing either fixture to exist.
+    /// This test does **not** subsume `error_body_budget_is_70s_for_a_real_tor_mode_client` below —
+    /// an earlier round argued it did, on prose alone; nobody tested the argument, and it's false.
+    /// Capping `error_body_budget`'s result at, say, 30s (`min(computed, 30s)`, a plausible future
+    /// "bound the wait" change) leaves this test's 17s untouched — already comfortably under 30s —
+    /// while silently breaking the real Tor-mode value the property exists to protect. The two
+    /// tests pin different claims: this one, reads-the-field-not-a-rival-constant; the other, the
+    /// value at the endpoint that actually ships. Both are required.
     #[test]
     fn error_body_budget_reads_this_field_not_a_rival_constant() {
         const SENTINEL_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(7);
@@ -6045,6 +6083,29 @@ mod tests {
             "error_body_budget must fold in *this instance's* connect_timeout — a value neither \
             RemoteClient::new (5s) nor RemoteClient::new_with_tor under TorMode::On (60s) can ever \
             produce, so this cannot pass by coincidentally matching a hardcoded rival constant"
+        );
+    }
+
+    /// Review round 8, finding 1: the sentinel test above pins *reads-the-field-not-a-rival* but
+    /// not what `error_body_budget` actually returns for a real Tor-mode client — the two are
+    /// different claims, and a round 7 argument that the sentinel subsumed this test's predecessor
+    /// was accepted on prose alone and never tested. It doesn't hold: see that test's own doc for
+    /// the falsifying mutation (a 30s cap) that leaves the sentinel green while this one reddens.
+    /// Built the same no-I/O way as `new_with_tor_selects_the_60s_connect_budget` (`new_with_tor`
+    /// never touches the network).
+    #[test]
+    fn error_body_budget_is_70s_for_a_real_tor_mode_client() {
+        let tor = TorSettings { mode: TorMode::On, proxy: DEFAULT_TOR_PROXY.to_string() };
+        let client = RemoteClient::new_with_tor(
+            "http://forklift-fork-49-error-body-budget-tor-endpoint-test.invalid", None, tor,
+        ).unwrap();
+
+        assert_eq!(
+            client.error_body_budget(),
+            TEST_TOR_CONNECT_TIMEOUT + TEST_ERROR_BODY_READ_TIMEOUT,
+            "a real TorMode::On client's error_body_budget must be exactly the Tor-folded 70s — \
+            otherwise a Tor remote's refusal body gets killed early, discarding a typed \
+            RefusalCode/next_step and degrading a machine caller to the wrong exit code"
         );
     }
 
