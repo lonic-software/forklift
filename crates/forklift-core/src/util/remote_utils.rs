@@ -6145,133 +6145,28 @@ mod tests {
         );
     }
 
-    /// A SOCKS5 proxy that completes a real handshake (same protocol steps as
-    /// [`HandshakeCompletingSocksProxy`]) and then genuinely **relays** the tunneled connection to
-    /// a fixed local backend — ignoring whatever destination the client actually asked for, since
-    /// this only needs a real two-way byte relay, not real DNS/routing. Unlike
-    /// [`HandshakeCompletingSocksProxy`] (which parks right after the handshake, standing in for a
-    /// stalled tunnel), this is what a phase-2-over-Tor test needs: genuine data flow all the way
-    /// to a backend that fully reads the body and only then goes silent, so the client's own
-    /// `is_exhausted()` transition — and the phase-2 budget it triggers — is exercised for real,
-    /// not simulated.
-    struct RelayingSocksProxy {
-        addr: String,
-    }
-
-    impl RelayingSocksProxy {
-        fn start(backend_addr: std::net::SocketAddr) -> RelayingSocksProxy {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let addr = listener.local_addr().unwrap().to_string();
-
-            std::thread::spawn(move || {
-                for incoming in listener.incoming() {
-                    let Ok(client_stream) = incoming else { continue };
-
-                    std::thread::spawn(move || {
-                        use std::io::{Read, Write};
-                        let mut client_stream = client_stream;
-
-                        // Greeting: VER(1) NMETHODS(1) METHODS(NMETHODS) — unconditionally select
-                        // "no auth" (0x00).
-                        let mut header = [0u8; 2];
-                        if client_stream.read_exact(&mut header).is_err() { return; }
-                        let mut methods = vec![0u8; header[1] as usize];
-                        if client_stream.read_exact(&mut methods).is_err() { return; }
-                        if client_stream.write_all(&[0x05, 0x00]).is_err() { return; }
-
-                        // CONNECT request — consume whichever address form (ATYP) the client sent,
-                        // then discard it: the relay always dials `backend_addr` regardless.
-                        let mut req_head = [0u8; 4];
-                        if client_stream.read_exact(&mut req_head).is_err() { return; }
-                        let address_read = match req_head[3] {
-                            0x01 => client_stream.read_exact(&mut [0u8; 4 + 2]),
-                            0x04 => client_stream.read_exact(&mut [0u8; 16 + 2]),
-                            0x03 => {
-                                let mut len = [0u8; 1];
-                                if client_stream.read_exact(&mut len).is_err() { return; }
-                                client_stream.read_exact(&mut vec![0u8; len[0] as usize + 2])
-                            }
-                            _ => return,
-                        };
-                        if address_read.is_err() { return; }
-
-                        // Success reply: VER REP=0(succeeded) RSV ATYP=IPv4 BND.ADDR=0.0.0.0
-                        // BND.PORT=0 — a minimal but valid "the tunnel is up" answer.
-                        if client_stream.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).is_err() {
-                            return;
-                        }
-
-                        // Handshake genuinely done — now actually relay both directions to a real
-                        // backend, rather than parking.
-                        let Ok(backend_stream) = std::net::TcpStream::connect(backend_addr) else { return };
-                        let (Ok(mut client_read), Ok(mut backend_write)) =
-                            (client_stream.try_clone(), backend_stream.try_clone()) else { return };
-                        let mut backend_read = backend_stream;
-                        let mut client_write = client_stream;
-
-                        let upstream = std::thread::spawn(move || {
-                            let _ = std::io::copy(&mut client_read, &mut backend_write);
-                        });
-                        let _ = std::io::copy(&mut backend_read, &mut client_write);
-                        let _ = upstream.join();
-                    });
-                }
-            });
-
-            RelayingSocksProxy { addr }
-        }
-    }
-
-    /// `upload_object`'s post-send phase must fold in the Tor connect budget, not just
-    /// [`UPLOAD_SILENCE_BUDGET`] and [`post_send_verify_budget`] (review round S2-F3): both
-    /// `bounded_read_timeout` and phase 1 itself already add `self.connect_timeout` in first,
-    /// precisely because a bound that ignores the link's own latency preempts healthy work on a
-    /// slow-but-legitimate connection — the same reasoning [`REMOTE_CONNECT_TIMEOUT_TOR`]'s doc
-    /// gives for why an onion circuit build needs 60s, not 5s. Routes a real upload through
-    /// [`RelayingSocksProxy`] (real SOCKS5 handshake, real byte relay) to a [`SilentRemote`]
-    /// backend that reads the whole body and then genuinely goes silent, so phase 2 fires for
-    /// real — then checks the message names the *Tor-inclusive* figure.
+    /// Pins the one link a live Tor-routed upload test would otherwise need ~72s of real wall
+    /// time to prove (60s Tor connect + 10s silence + verify) — that `new_with_tor` with
+    /// `TorMode::On` selects [`REMOTE_CONNECT_TIMEOUT_TOR`] (60s) as this instance's
+    /// `connect_timeout`, not the direct 5s [`REMOTE_CONNECT_TIMEOUT`]. Everything downstream of
+    /// that selection — that `send_with_watchdog`'s phase-2 budget folds `self.connect_timeout`
+    /// back in, and that the composed message names whatever `connect_timeout` this instance
+    /// carries — is already pinned without a live Tor circuit at all: see
+    /// `upload_object_times_out_after_a_fully_received_body_that_never_responds`, which exercises
+    /// the identical mechanism on the direct 5s client in ~17s. This test is the only remaining
+    /// link between the two: that Tor routing actually selects the 60s constant in the first
+    /// place. `new_with_tor` does no I/O (a `reqwest::Client` dials lazily, on first request), so
+    /// this is instant — no live proxy, no live remote, no real wait.
     #[test]
-    fn upload_object_post_send_message_names_the_effective_tor_bound() {
-        let backend = SilentRemote::start();
-        let backend_addr: std::net::SocketAddr = backend.url
-            .trim_start_matches("http://")
-            .parse()
-            .expect("SilentRemote's url is always a bare host:port");
-
-        let proxy = RelayingSocksProxy::start(backend_addr);
-        let tor = TorSettings { mode: TorMode::On, proxy: format!("socks5h://{}", proxy.addr) };
+    fn new_with_tor_selects_the_60s_connect_budget() {
+        let tor = TorSettings { mode: TorMode::On, proxy: DEFAULT_TOR_PROXY.to_string() };
         let client = RemoteClient::new_with_tor(
-            "http://forklift-fork-49-s2f3-message-test.invalid", None, tor,
+            "http://forklift-fork-49-tor-connect-budget-test.invalid", None, tor,
         ).unwrap();
 
-        let hash = "a".repeat(64);
-        let body = vec![5u8; 4096];
-        let phase2_budget = TEST_TOR_CONNECT_TIMEOUT + TEST_UPLOAD_SILENCE_BUDGET
-            + post_send_verify_budget(body.len());
-        let hard_ceiling = phase2_budget + std::time::Duration::from_secs(20);
-
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        let outcome = runtime.block_on(async {
-            tokio::time::timeout(hard_ceiling, client.upload_object(&hash, body)).await
-        });
-
-        let message = outcome
-            .unwrap_or_else(|_| panic!(
-                "upload_object hung past the test's own {:?} ceiling — no timeout fired at all",
-                hard_ceiling
-            ))
-            .expect_err("a silent backend must not appear to succeed");
-
-        assert!(
-            message.to_lowercase().contains("timed out"),
-            "must fail specifically with a timeout: {}", message
-        );
-        assert!(
-            message.contains(&format!("{:?}", phase2_budget)),
-            "must name the effective Tor-inclusive phase-2 budget {:?} (60s Tor connect + 10s \
-            silence + verify), not the direct client's 5s connect or verify alone: {}",
-            phase2_budget, message
+        assert_eq!(
+            client.connect_timeout, TEST_TOR_CONNECT_TIMEOUT,
+            "TorMode::On must select the 60s Tor connect budget, not the direct 5s one"
         );
     }
 
