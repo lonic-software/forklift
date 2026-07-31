@@ -348,6 +348,24 @@ const REMOTE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// pre-first-byte phase entirely) is FORK-85.
 const FETCH_OBJECT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// How long [`RemoteClient::error_of`] and [`RemoteClient::commit_lift`]'s own inline error-body
+/// read may take, once a non-success status line and headers have already arrived. Needed because
+/// neither call's own bound (if any) covers this: `error_of` serves responses from every client
+/// this type builds, including the three deliberately-unbounded ones
+/// (`http`/`no_redirect`/`upload_targets`'s negotiation calls — see those calls' own docs), so a
+/// remote that answers a `5xx` with full headers and then wedges before writing the JSON body can
+/// otherwise hang the caller forever even though the status line already told it the call failed.
+///
+/// Flat, not scaled like [`FETCH_OBJECT_READ_TIMEOUT`] or the negotiation calls' own read costs:
+/// after a non-success status line, the error body this module parses (an [`ErrorResponse`]) is
+/// small and O(constant) regardless of which call produced it or why *that* call's own success
+/// path is unbounded — the scaling reason a success body might be large or slow never applies to
+/// the error one. On elapse, falls back to `status.canonical_reason()` — the exact fallback this
+/// code already uses when the body fails to parse as JSON at all, so a timeout and a malformed
+/// body are indistinguishable to the caller, which is right: both mean "no usable error body
+/// arrived."
+const ERROR_BODY_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// The `read_timeout` to configure on a bounded-reads client, given the `connect_timeout` this
 /// client instance actually uses and the post-connect silence budget intended for it
 /// ([`REMOTE_READ_TIMEOUT`] or [`FETCH_OBJECT_READ_TIMEOUT`]).
@@ -1134,13 +1152,17 @@ impl RemoteClient {
     }
 
     /// Turn a non-success response into the client-facing error, threading the server's refusal
-    /// code (§7.4) through the taxonomy when the body carries one.
+    /// code (§7.4) through the taxonomy when the body carries one. The body read is bounded by
+    /// [`ERROR_BODY_READ_TIMEOUT`] — see that constant's doc for why this call in particular needs
+    /// its own bound rather than inheriting one from whichever client sent the request.
     async fn error_of(response: reqwest::Response, action: &str) -> String {
         let status = response.status();
 
-        let (message, code, next_step) = match response.json::<ErrorResponse>().await {
-            Ok(body) => (body.error, body.code, body.next_step),
-            Err(_) => (status.canonical_reason().unwrap_or("unknown error").to_string(), None, None),
+        let (message, code, next_step) = match tokio::time::timeout(
+            ERROR_BODY_READ_TIMEOUT, response.json::<ErrorResponse>()
+        ).await {
+            Ok(Ok(body)) => (body.error, body.code, body.next_step),
+            Ok(Err(_)) | Err(_) => (status.canonical_reason().unwrap_or("unknown error").to_string(), None, None),
         };
 
         classify_remote_error(status.as_u16(), action, message, code, next_step)
@@ -1418,6 +1440,13 @@ impl RemoteClient {
     /// staged and `direct` for what it verifies inline; a direct head answers every missing hash
     /// in `direct` with empty `targets`, so one client code path serves both heads. `present`
     /// (the complement of `missing`) is skipped.
+    ///
+    /// Deliberately **not** on [`Self::bounded_reads`], the same reasoning as
+    /// [`Self::missing_objects`]: the server side (`forklift-server/src/server.rs`'s
+    /// `post_upload_targets`) walks up to `MAX_UPLOAD_TARGETS_BATCH` (1,000) hashes, checking each
+    /// against on-disk object presence, before its first response byte — work that scales with the
+    /// batch rather than being O(constant). Same later-slice caveat as `missing_objects`: likely
+    /// fast in practice, but not asserted bounded here.
     pub async fn upload_targets(&self,
                                 session: &str,
                                 hashes: &[String]) -> Result<Option<UploadTargetsResponse>, String> {
@@ -1519,9 +1548,14 @@ impl RemoteClient {
         }
 
         let status = response.status();
-        let message = match response.json::<ErrorResponse>().await {
-            Ok(body) => body.error,
-            Err(_) => status.canonical_reason().unwrap_or("unknown error").to_string(),
+        // Bounded by `ERROR_BODY_READ_TIMEOUT` for the same reason `error_of` is: this rides the
+        // unbounded `http` client, so nothing else stops a remote that answers the status line
+        // and then wedges before writing the body from hanging this call forever.
+        let message = match tokio::time::timeout(
+            ERROR_BODY_READ_TIMEOUT, response.json::<ErrorResponse>()
+        ).await {
+            Ok(Ok(body)) => body.error,
+            Ok(Err(_)) | Err(_) => status.canonical_reason().unwrap_or("unknown error").to_string(),
         };
 
         if is_transient_commit_failure(status, &message) {
@@ -5552,6 +5586,92 @@ mod tests {
         assert!(
             message.to_lowercase().contains("timed out"),
             "must fail specifically with a timeout, not some other transport error: {}", message
+        );
+    }
+
+    // -----------------------------------------------------------------------------------
+    // The unbounded error-body read: `error_of`/`commit_lift` call `response.json()` with no
+    // bound of their own once a non-success status line has arrived. `self.http` (which
+    // `missing_objects` rides) carries only a `connect_timeout`, no `read_timeout` at all — so a
+    // remote that delivers a full status line and headers and then wedges before writing the
+    // body hangs the caller forever. `ERROR_BODY_READ_TIMEOUT` bounds the read itself, in
+    // `error_of`/`commit_lift`, rather than trying to fix it with a fifth client — a client
+    // cannot help here, since the body-read bound is inherited from whichever client sent the
+    // request, and `error_of` serves responses from all of them.
+    // -----------------------------------------------------------------------------------
+
+    /// A remote that delivers a non-success status line and full headers (claiming a body),
+    /// then genuinely goes silent before writing a single byte of that body — the connection
+    /// stays open (no FIN), so anything reading the body is left waiting on bytes that never
+    /// arrive. Distinct from [`SilentRemote`] (silent *before* the status line even arrives) and
+    /// [`LyingContentLengthRemote`] (a `2xx` success path): this is specifically the shape
+    /// [`ERROR_BODY_READ_TIMEOUT`] exists for — status and headers fully delivered, only the
+    /// error body itself left hanging.
+    struct SilentErrorBodyRemote {
+        url: String,
+        _park: std::sync::mpsc::Sender<()>,
+    }
+
+    impl SilentErrorBodyRemote {
+        fn start() -> SilentErrorBodyRemote {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+
+            std::thread::spawn(move || {
+                use std::io::Write;
+
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let _ = read_test_request(&mut stream);
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\
+                         Content-Length: 4096\r\n\r\n"
+                    );
+                    let _ = stream.flush();
+                    let _ = rx.recv();
+                    drop(stream);
+                }
+            });
+
+            SilentErrorBodyRemote { url, _park: tx }
+        }
+    }
+
+    /// `missing_objects` rides `self.http`, unbounded (only a `connect_timeout`) — so before this
+    /// fix, a `500` whose body then wedges hangs this call forever, with the status line and
+    /// headers already fully delivered. The test's own outer ceiling
+    /// (`ERROR_BODY_READ_TIMEOUT` plus a margin) is a safety net, not the property under test: if
+    /// the wrapper in `error_of` is missing, that outer ceiling is what trips (the test fails
+    /// instead of hanging the suite), which is unambiguous evidence the internal bound is gone —
+    /// status line and headers were fully delivered before the park, so the only thing left to
+    /// hang on is the error-body read itself.
+    #[test]
+    fn missing_objects_bounds_the_error_body_read_after_a_wedged_500() {
+        let remote = SilentErrorBodyRemote::start();
+        let client = RemoteClient::new(&remote.url, None).unwrap();
+        let outer_ceiling = ERROR_BODY_READ_TIMEOUT + std::time::Duration::from_secs(10);
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let outcome = runtime.block_on(async {
+            tokio::time::timeout(outer_ceiling, client.missing_objects(&["a".repeat(64)])).await
+        });
+
+        let error = outcome
+            .unwrap_or_else(|_| panic!(
+                "missing_objects hung past the test's own {:?} outer ceiling — the error-body \
+                read is unbounded", outer_ceiling
+            ))
+            .expect_err("a 500 status must surface as an error, not succeed");
+
+        assert!(
+            error.contains("(500)"),
+            "must name the actual status: {}", error
+        );
+        assert!(
+            error.contains("Internal Server Error"),
+            "on a timed-out/unparseable body, must fall back to the canonical reason — the same \
+            fallback already used for a parse failure: {}", error
         );
     }
 
