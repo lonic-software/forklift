@@ -5937,10 +5937,11 @@ mod tests {
     fn missing_objects_bounds_the_error_body_read_after_a_wedged_500() {
         let remote = SilentErrorBodyRemote::start();
         let client = RemoteClient::new(&remote.url, None).unwrap();
-        // Written explicitly as the constant sum, not via `error_body_read_budget`, so this
-        // assertion doesn't co-move with a corrupted helper — a helper bug would then move the
-        // elapsed time it produces and this fixed lower bound in lockstep, pinning nothing.
-        let lower_bound = REMOTE_CONNECT_TIMEOUT + ERROR_BODY_READ_TIMEOUT;
+        // Mirrors, not the production constants directly (see the `TEST_*` block's doc above) —
+        // written as the constant sum, not via `error_body_read_budget`, so this assertion
+        // doesn't co-move with a corrupted helper — a helper bug would then move the elapsed time
+        // it produces and this fixed lower bound in lockstep, pinning nothing.
+        let lower_bound = TEST_DIRECT_CONNECT_TIMEOUT + TEST_ERROR_BODY_READ_TIMEOUT;
         let outer_ceiling = lower_bound + std::time::Duration::from_secs(10);
 
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -5959,9 +5960,9 @@ mod tests {
 
         assert!(
             elapsed >= lower_bound,
-            "elapsed {:?} is under the {:?} the folded budget (REMOTE_CONNECT_TIMEOUT + \
-            ERROR_BODY_READ_TIMEOUT) requires — error_of is no longer calling \
-            error_body_read_budget, it's using the bare ERROR_BODY_READ_TIMEOUT (or less)",
+            "elapsed {:?} is under the {:?} the folded budget (connect timeout + error-body-read \
+            timeout) requires — error_of is no longer calling error_body_read_budget, it's using \
+            the bare error-body-read timeout (or less)",
             elapsed, lower_bound
         );
 
