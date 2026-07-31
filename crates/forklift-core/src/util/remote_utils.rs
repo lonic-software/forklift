@@ -993,16 +993,17 @@ impl RemoteClient {
 
     /// The mutation counterpart of [`Self::describe_transport_error`], for the six calls that ride
     /// the unbounded `http`/`no_redirect` clients (`update_ref`, `upload_object`, `put_presigned`,
-    /// `upload_signature`, `put_trust`, `commit_lift`) — `upload_object` and `put_presigned` now
-    /// also layer [`Self::send_with_watchdog`] on top for their body-send phase, but still ride
-    /// `http` itself, so a transport failure on either still lands here for anything `classify`
-    /// can actually see (a connect failure, or a `reqwest::Error`-bearing timeout on the response
-    /// side). Same [`classify`] dispatch, but the [`TransportFailure::ReadTimedOut`] wording
-    /// differs from the read path's: on these clients that case can only be a timeout on an
-    /// *established* connection — after the request bytes were already sent — so the settled
-    /// contract requires the uncertainty be carried in the message rather than asserted away: it
-    /// may have completed on the remote, and the caller must decide whether to check before
-    /// retrying, never be told nothing happened.
+    /// `upload_signature`, `put_trust`, `commit_lift`) — `upload_object` and `put_presigned` ride
+    /// `no_redirect` specifically (moved off `http` in the fix for the `303` redirect hole — see
+    /// [`Self::no_redirect`]'s doc), and also layer [`Self::send_with_watchdog`] on top for their
+    /// body-send phase, but `no_redirect` is just as unbounded as `http` itself, so a transport
+    /// failure on either still lands here for anything `classify` can actually see (a connect
+    /// failure, or a `reqwest::Error`-bearing timeout on the response side). Same [`classify`]
+    /// dispatch, but the [`TransportFailure::ReadTimedOut`] wording differs from the read path's:
+    /// on these clients that case can only be a timeout on an *established* connection — after
+    /// the request bytes were already sent — so the settled contract requires the uncertainty be
+    /// carried in the message rather than asserted away: it may have completed on the remote, and
+    /// the caller must decide whether to check before retrying, never be told nothing happened.
     fn describe_mutation_transport_error(&self, action: &str, e: reqwest::Error) -> String {
         match classify(e.is_connect(), e.is_timeout()) {
             TransportFailure::ConnectTimedOut => format!(
@@ -1513,9 +1514,11 @@ impl RemoteClient {
 
     /// Upload one object's bytes straight to a presigned storage URL (a staging `PUT`). The
     /// URL's own signature is the authorization, so this deliberately carries **no** bearer
-    /// token — and because the bearer is attached per request (in `request`, never as a client
-    /// default header), a plain `self.http.put(url)` cannot leak it to the storage host, even
-    /// were the storage host the remote itself.
+    /// token — and because the bearer is attached per request (in `request`/`request_on`, never
+    /// as a client default header), `self.no_redirect.put(url)` (moved off `self.http` in the fix
+    /// for the `303` redirect hole — see [`Self::no_redirect`]'s doc) cannot leak it to the
+    /// storage host either, even were the storage host the remote itself: `no_redirect` is built
+    /// (in [`Self::new_with_tor`]) with no default headers of its own, exactly like `http`.
     ///
     /// Same watchdog-guarded body as [`Self::upload_object`] (FORK-49 slice 2) — see that call's
     /// doc. This site is the higher-risk of the two: it dials a different host (object storage,
@@ -6440,9 +6443,9 @@ mod tests {
     /// `put_presigned` against the same wedged shape must be bounded exactly like `upload_object`
     /// — pins that it is independently wired to the watchdog rather than accidentally covered by
     /// `upload_object`'s own wiring. It is the higher-risk site: it dials straight through
-    /// `self.http.put(url)`, bypassing `request`/`request_on` entirely (no bearer token, no
-    /// shared client selection), so nothing about `upload_object`'s wiring guarantees this one
-    /// got the same fix.
+    /// `self.no_redirect.put(url)`, bypassing `request`/`request_on` entirely (no bearer token
+    /// attached), so nothing about `upload_object`'s watchdog wiring guarantees this one got the
+    /// same fix, even though both now ride the same `no_redirect` client for redirect handling.
     #[test]
     fn put_presigned_times_out_against_a_wedged_remote() {
         let remote = WedgedUploadRemote::start();
@@ -6979,10 +6982,11 @@ mod tests {
         );
     }
 
-    /// `upload_object` gets the same treatment for consistency (it also rides `self.http`, which
-    /// allows redirects) even though its target — this module's own control plane — is not the
-    /// "live case" S2-F5 named; a lighter check than `put_presigned`'s since the mechanism
-    /// (`describe_upload_redirect`) is shared and already fully pinned there.
+    /// `upload_object` gets the same treatment for consistency (it also rides `no_redirect`,
+    /// which returns a raw `3xx` straight to the `is_redirection()` guard) even though its
+    /// target — this module's own control plane — is not the "live case" S2-F5 named; a lighter
+    /// check than `put_presigned`'s since the mechanism (`describe_upload_redirect`) is shared
+    /// and already fully pinned there.
     #[test]
     fn upload_object_reports_a_redirect_by_name() {
         let location = "https://elsewhere.example.com/v1/objects/moved";
