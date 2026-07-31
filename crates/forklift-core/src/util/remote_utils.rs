@@ -4420,6 +4420,25 @@ mod tests {
     /// window; `>= 35` leaves slack for scheduling jitter without being satisfiable by a runtime
     /// that spent most of the window synchronously blocked (which deterministically misses on
     /// the order of 50 ticks — see the reverted-fix run this test's doc references).
+    ///
+    /// Review round 5, finding 3: the ticker count alone does not exercise *where*
+    /// `current_scope_root()`/the delay seam are captured — moving that capture from
+    /// `upload_objects`'s own loop into `retrieve_object_for_upload` itself (see that function's
+    /// doc for why the two placements differ on a genuine multi-thread runtime) would leave the
+    /// ticker count green regardless, because `Scratch`'s scope would simply become invisible to
+    /// the spawned task and the retrieval would silently fail to find the blob — the count isn't
+    /// sensitive to *which* thread the capture happens on, only to whether the read blocks. So
+    /// this also asserts the discarded `upload_objects` result discriminates the two placements:
+    /// correctly captured, the read succeeds and the call fails only at the network step
+    /// (nothing listens on `127.0.0.1:1`); captured on the wrong thread, the read itself fails
+    /// first (the object is "not found" under the wrong, unscoped root) and the network is never
+    /// reached at all. Empirically confirmed both message shapes before writing this assertion:
+    /// correctly captured — `"Error while uploading object <hash>: Connection refused (os error
+    /// 61)"`; captured on the wrong thread — `"Error while reading object from file
+    /// \".forklift/objects/...\": entity not found"`. Distinct enough that
+    /// `contains("refused") || contains("connect")` (the same idiom
+    /// `fetch_info_against_a_refused_connection_does_not_claim_a_timeout` already uses in this
+    /// file) cleanly picks out the correct-placement shape and rejects the wrong one.
     #[test]
     fn upload_objects_retrieval_does_not_starve_the_runtime() {
         let _scratch = Scratch::new("upload-retrieval-no-starve");
@@ -4434,9 +4453,10 @@ mod tests {
         }
         let _reset_delay = ResetDelay;
 
-        // Nothing needs to listen here: the artificial delay happens entirely inside the
-        // retrieval step, before any network call — `upload_object`'s own (fast) connection
-        // failure afterward is irrelevant to what this test measures.
+        // Nothing listens here: the artificial delay happens entirely inside the retrieval
+        // step, before any network call, so a *successful* retrieval must still fail afterward —
+        // at the network step, with a connection-refused message. See this test's own doc for
+        // why that specific failure shape is what proves the scope-capture placement is correct.
         let client = RemoteClient::new("http://127.0.0.1:1", None).unwrap();
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -4448,7 +4468,7 @@ mod tests {
         let ticks = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let ticks_for_ticker = Arc::clone(&ticks);
 
-        runtime.block_on(async move {
+        let outcome = runtime.block_on(async move {
             let ticker = tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -4456,10 +4476,21 @@ mod tests {
                 }
             });
 
-            let _ = upload_objects(&client, &[hash]).await;
-
+            let outcome = upload_objects(&client, &[hash]).await;
             ticker.abort();
+            outcome
         });
+
+        let error = outcome.expect_err(
+            "nothing listens on 127.0.0.1:1 — this must fail, never succeed"
+        );
+        assert!(
+            error.to_lowercase().contains("refused") || error.to_lowercase().contains("connect"),
+            "must fail at the network step (proving the retrieval itself succeeded, having found \
+            the blob under the correctly-captured scope), not while reading the object off disk \
+            — a retrieval failure here would mean the scope was captured on the wrong thread and \
+            the blob was never actually reached: {}", error
+        );
 
         let observed = ticks.load(std::sync::atomic::Ordering::SeqCst);
         assert!(
