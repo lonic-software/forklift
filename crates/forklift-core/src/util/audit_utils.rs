@@ -2575,23 +2575,58 @@ mod tests {
     /// root (exactly what `office enroll` produces), trust established.
     struct PrivilegeFixture {
         _scope: crate::globals::StorageRootScope,
-        _keys_lock: std::sync::MutexGuard<'static, ()>,
+        // `None` when a caller is holding `PRIVILEGE_KEYS_ENV_LOCK` itself in an outer
+        // scope that must outlive this fixture (see `build`'s doc comment) — otherwise
+        // `Some`, and the fixture releases the lock as part of its own drop, in field
+        // order, right after `Drop::drop` restores `FORKLIFT_KEYS_DIR`.
+        _keys_lock: Option<std::sync::MutexGuard<'static, ()>>,
         root: std::path::PathBuf,
         anchor: TrustAnchor,
         admin: crate::model::operator::Operator,
         admin_key_id: String,
+        // What `FORKLIFT_KEYS_DIR` held before this fixture pointed it at its own
+        // (about-to-be-deleted) directory — restored in `Drop` so a later test in this
+        // binary never inherits a path this fixture already removed. `FORKLIFT_KEYS_DIR`
+        // is process-global (see `PRIVILEGE_KEYS_ENV_LOCK`), so leaving it pointed at a
+        // removed directory would flake the next signer that runs without the lock.
+        previous_keys_dir: Option<String>,
     }
 
     impl PrivilegeFixture {
         fn new(name: &str) -> PrivilegeFixture {
             let keys_lock = PRIVILEGE_KEYS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            PrivilegeFixture::build(name, Some(keys_lock))
+        }
 
+        /// The body of `new`, taking the `PRIVILEGE_KEYS_ENV_LOCK` guard as a
+        /// parameter instead of acquiring one itself, so a caller can choose who ends
+        /// up owning it:
+        ///
+        /// - `new` passes `Some(lock)` (the normal case): the fixture takes ownership
+        ///   and holds it for its own lifetime, releasing it in field-drop order right
+        ///   after `Drop::drop` restores `FORKLIFT_KEYS_DIR` — unchanged from before.
+        /// - A caller that must keep observing `FORKLIFT_KEYS_DIR` (both its own
+        ///   writes and this fixture's) after the fixture is gone passes `None` and
+        ///   keeps its own guard alive in an outer scope instead. This is what the
+        ///   restore-on-drop falsifier below does: it asserts on `FORKLIFT_KEYS_DIR`
+        ///   both right after construction and after `drop(fixture)`, and every one of
+        ///   those assertions — not just construction — needs the lock held, or a
+        ///   concurrent fixture from another test in this binary can be mid-flight and
+        ///   change the value out from under the assertion. Handing the fixture `None`
+        ///   means `drop(fixture)` only drops the fixture, not the lock; the caller's
+        ///   own guard, still alive in its own scope, keeps every assertion covered
+        ///   and is released only when that scope ends.
+        fn build(
+            name: &str,
+            keys_lock: Option<std::sync::MutexGuard<'static, ()>>,
+        ) -> PrivilegeFixture {
             let root = std::env::temp_dir().join(format!(
                 "forklift-privilege-test-{}-{}", name, std::process::id()
             ));
             let _ = std::fs::remove_dir_all(&root);
             let keys_dir = root.join("keys");
             std::fs::create_dir_all(&keys_dir).unwrap();
+            let previous_keys_dir = std::env::var("FORKLIFT_KEYS_DIR").ok();
             std::env::set_var("FORKLIFT_KEYS_DIR", &keys_dir);
 
             let scope = crate::globals::StorageRootScope::enter(&root);
@@ -2630,6 +2665,7 @@ mod tests {
 
             PrivilegeFixture {
                 _scope: scope, _keys_lock: keys_lock, root, anchor, admin, admin_key_id,
+                previous_keys_dir,
             }
         }
 
@@ -2669,7 +2705,62 @@ mod tests {
 
     impl Drop for PrivilegeFixture {
         fn drop(&mut self) {
+            match &self.previous_keys_dir {
+                Some(previous) => std::env::set_var("FORKLIFT_KEYS_DIR", previous),
+                None => std::env::remove_var("FORKLIFT_KEYS_DIR"),
+            }
             let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// Falsifies the leak this fixture used to have: `FORKLIFT_KEYS_DIR` is
+    /// process-global, and this fixture points it at a directory its own `Drop`
+    /// deletes. Without restoring the prior value first, the process would be left
+    /// with `FORKLIFT_KEYS_DIR` pointing at a removed path after the fixture goes
+    /// away — flaking any later signer in this binary that runs without
+    /// `PRIVILEGE_KEYS_ENV_LOCK`. Covers both directions: a prior value to restore,
+    /// and no prior value (must end up unset again, not set to `""`).
+    ///
+    /// Every assertion below — including the ones after `drop(fixture)` — runs while
+    /// this test's own `keys_lock` is held. Passing `PrivilegeFixture::build` `None`
+    /// keeps that guard here instead of handing it to the fixture, so `drop(fixture)`
+    /// releases only the fixture, not the lock: a concurrent fixture from another
+    /// test in this binary cannot become mid-flight and change `FORKLIFT_KEYS_DIR`
+    /// out from under an assertion. (An earlier version of this test handed the lock
+    /// to the fixture and read `FORKLIFT_KEYS_DIR` after dropping it — unlocked. That
+    /// version's own assertions could flake for the exact reason this test exists.)
+    #[test]
+    fn dropping_privilege_fixture_restores_the_previous_keys_dir_env_var() {
+        const SENTINEL: &str = "/does/not/exist/forklift-restore-sentinel";
+
+        // Case 1: FORKLIFT_KEYS_DIR pointed somewhere else before the fixture.
+        {
+            let keys_lock = PRIVILEGE_KEYS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::set_var("FORKLIFT_KEYS_DIR", SENTINEL);
+            let fixture = PrivilegeFixture::build("restore-check-was-set", None);
+            assert_ne!(
+                std::env::var("FORKLIFT_KEYS_DIR").ok(), Some(SENTINEL.to_string()),
+                "fixture construction should have repointed FORKLIFT_KEYS_DIR at its own directory"
+            );
+            drop(fixture);
+            assert_eq!(
+                std::env::var("FORKLIFT_KEYS_DIR").ok(), Some(SENTINEL.to_string()),
+                "dropping the fixture must restore FORKLIFT_KEYS_DIR to what it held before construction"
+            );
+            drop(keys_lock);
+        }
+
+        // Case 2: FORKLIFT_KEYS_DIR was not set at all before the fixture.
+        {
+            let keys_lock = PRIVILEGE_KEYS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::remove_var("FORKLIFT_KEYS_DIR");
+            let fixture = PrivilegeFixture::build("restore-check-was-unset", None);
+            drop(fixture);
+            assert!(
+                std::env::var("FORKLIFT_KEYS_DIR").is_err(),
+                "dropping the fixture must leave FORKLIFT_KEYS_DIR unset if it started unset"
+            );
+            drop(keys_lock);
         }
     }
 
@@ -2789,7 +2880,6 @@ mod tests {
             }
         }
         state.keys.push(new_key);
-        let _ = new_key_id;
 
         let rotated = crate::util::office_utils::stack_office_parcel(
             &state, &bob, "bob rotates his own key".to_string(), &bob_key_id

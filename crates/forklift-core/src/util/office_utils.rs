@@ -1003,13 +1003,30 @@ mod tests {
     /// (FORK-76: the projection it replaced named five of seven fields and silently let
     /// `class` and `supervisor` drift). That guard is only as strong as this derive: if
     /// every field here did not genuinely participate in `==`, a whole-record compare
-    /// would be no safer than the projection it replaced. This exercises every current
-    /// field one at a time — proving none is silently excluded — and, because
-    /// `#[derive(PartialEq)]` compares structurally (there is no way to derive it over
-    /// only some fields), a field added to `UserRecord` in the future is swept into this
-    /// same guarantee automatically, with no matching test or projection to remember.
+    /// would be no safer than the projection it replaced.
+    ///
+    /// Two separate guarantees are in play, and they come from different places:
+    ///
+    /// - Automatic, no maintenance required: because `#[derive(PartialEq)]` compares
+    ///   structurally (there is no way to derive it over only some fields), a field
+    ///   added to `UserRecord` tomorrow is swept into `==` — and therefore into
+    ///   `verify_self_service_change` — without anyone touching this test.
+    /// - What THIS test actually covers: the seven fields that exist today, changed one
+    ///   at a time against `base`, proving none of them is silently excluded from `==`.
+    ///   A field added in the future is NOT automatically exercised here — nothing
+    ///   forces a matching variant to be added below, because there is no Rust
+    ///   construct that enforces "one variant per field".
+    ///
+    /// The one compile-time tripwire that does exist is the exhaustive `base` literal
+    /// itself: a new field fails the build there (E0063, missing field) until someone
+    /// fills it in. That failure is the cue to add a matching variant above — it does
+    /// not add the variant for you.
     #[test]
     fn user_record_equality_distinguishes_every_current_field() {
+        // Exhaustive on purpose (no `..Default::default()`): adding a field to
+        // `UserRecord` fails the build right here (E0063) rather than silently. When
+        // that happens, add a corresponding variant below — the compile error only
+        // forces this literal to stay exhaustive, not the variant list.
         let base = UserRecord {
             identifier: "op@x".to_string(),
             enrolled_at: 7,
@@ -1031,8 +1048,6 @@ mod tests {
             UserRecord { class: IdentityClass::Agent, ..base.clone() },
             UserRecord { supervisor: Some("alice".to_string()), ..base.clone() },
         ];
-
-        assert_eq!(variants.len(), 7, "one variant per field on UserRecord — keep this in sync");
 
         for (index, variant) in variants.iter().enumerate() {
             assert_ne!(
