@@ -300,23 +300,19 @@ const REMOTE_CONNECT_TIMEOUT_TOR: std::time::Duration = std::time::Duration::fro
 /// is constructed, before the connector is even polled** — so it covers DNS/TCP/TLS/SOCKS too, not
 /// just the body (measured empirically against this exact reqwest version — a client built with
 /// `connect_timeout(60s)` + `read_timeout(3s)` against a black-holed address failed at 3.002s,
-/// not 60s). That is why this is carried by only three of the module's read/metadata calls
+/// not 60s). That is why this is carried by only four of the module's read/metadata calls
 /// — [`RemoteClient::fetch_info`], [`RemoteClient::fetch_signature`],
-/// [`RemoteClient::fetch_bundle_to`] — each of whose server side does O(constant) work (a single
-/// lookup, or serving an already-built file) before writing anything, so a flat 10s pre-first-byte
-/// budget is honest. `fetch_object` needs a much looser budget of its own
-/// ([`FETCH_OBJECT_READ_TIMEOUT`]) since its server side is size-dependent, not O(constant).
+/// [`RemoteClient::fetch_bundle_to`], [`RemoteClient::resolve`] — each of whose server side does
+/// O(constant) work (a single lookup, or serving an already-built file) before writing anything,
+/// so a flat 10s pre-first-byte budget is honest. `fetch_object` needs a much looser budget of its
+/// own ([`FETCH_OBJECT_READ_TIMEOUT`]) since its server side is size-dependent, not O(constant).
 /// `missing_objects`, `fetch_batch`, and `fetch_subtree` are deliberately **not** bounded at all:
 /// their server sides build a bundle (or consult up to `MAX_MISSING_BATCH` hashes) *before* the
 /// first byte, work whose cost depends on object sizes the client cannot know in advance — no flat
 /// budget for that is honest, so they stay on the unbounded client until they have their own
 /// scaled/measured budget or an abandon-and-fall-back lane (see the comment at each of those three
 /// call sites). `upload_targets` shares that same reasoning (it walks up to
-/// `MAX_UPLOAD_TARGETS_BATCH` hashes before its first byte) and stays unbounded for it. `resolve`
-/// is unbounded by *this* mechanism too, but is not left unbounded outright: it carries its own
-/// per-request `RequestBuilder::timeout(5s)` at its call site instead, since it is a best-effort
-/// display lookup (falls back to pseudonyms on any failure, never surfaces an error) rather than a
-/// call whose budget needs `connect_timeout` folded in the way every client-level bound here does.
+/// `MAX_UPLOAD_TARGETS_BATCH` hashes before its first byte) and stays unbounded for it.
 /// `update_ref`, `commit_lift`, and the streamed-upload paths (`upload_object`, `put_presigned`)
 /// are unbounded for reasons of their own — see each call's own doc, and
 /// [`RemoteClient::send_with_watchdog`]'s for the uploads.
@@ -334,7 +330,7 @@ const REMOTE_CONNECT_TIMEOUT_TOR: std::time::Duration = std::time::Duration::fro
 /// enumerated content; giving it a flat silence budget before that walk-equivalence question is
 /// settled would be exactly the kind of guess this module's bounded clients exist to avoid.
 ///
-/// 10s of silence, on top of whichever connect budget applies, is generous for any of the three
+/// 10s of silence, on top of whichever connect budget applies, is generous for any of the four
 /// tight calls above: a healthy connection carrying real progress, however slow the link,
 /// essentially never goes a full 10s without delivering a byte, and each of their pre-first-byte
 /// server costs is a single lookup or an already-built file.
@@ -696,13 +692,14 @@ fn watched_upload_body(bytes: Vec<u8>, progress: Arc<UploadProgress>) -> (reqwes
 mod clients {
     use super::{bounded_read_timeout, FETCH_OBJECT_READ_TIMEOUT, REMOTE_READ_TIMEOUT};
 
-    /// Which `reqwest::Client` a request rides, and — for the two that carry no client-level
+    /// Which `reqwest::Client` a request rides, and — for the one that carries no client-level
     /// `read_timeout` — what (if anything) bounds that call's response wait instead. Every request
     /// [`super::RemoteClient`] sends must name one of these explicitly; [`Clients::pick`] has no other
     /// argument to construct a request from, so there is nothing to fall back to.
     pub(super) enum Posture {
         /// [`REMOTE_READ_TIMEOUT`]-bounded via a client-level `read_timeout`. For the
-        /// O(constant)-pre-first-byte calls: `fetch_info`, `fetch_signature`, `fetch_bundle_to`.
+        /// O(constant)-pre-first-byte calls: `fetch_info`, `fetch_signature`, `fetch_bundle_to`,
+        /// `resolve`.
         ///
         /// **Auto-follows redirects — never select this for a mutation.** The client this
         /// selects carries no `redirect::Policy::none()`, for the same reason [`Clients::http`]
@@ -722,11 +719,6 @@ mod clients {
         /// **Auto-follows redirects — never select this for a mutation**, same reasoning and
         /// same trap as [`Self::BoundedReads`]'s own doc.
         BoundedObjectReads,
-        /// Auto-follows redirects; no client-level `read_timeout`. The caller bounds this call's
-        /// own response wait with a per-request `RequestBuilder::timeout(...)` instead — not
-        /// through the client at all. `resolve` alone (a best-effort display lookup that degrades
-        /// to pseudonyms on any failure, so a call site of its own rather than a shared budget).
-        OwnTimeoutFollowsRedirects,
         /// Never auto-follows any redirect; no client-level `read_timeout`. The caller bounds this
         /// call's own response wait through [`super::RemoteClient::send_with_watchdog`]'s progress-reset
         /// watchdog instead — not through the client. The streamed-upload paths:
@@ -759,14 +751,13 @@ mod clients {
     /// act of accepting a new unbounded call site.
     ///
     /// `grep 'UnboundedTicket::'` enumerates every **ticket-carrying** unbounded call — it does
-    /// not enumerate every unbounded call, full stop. [`Posture::WatchdogNoRedirect`] and
-    /// [`Posture::OwnTimeoutFollowsRedirects`] each assert their call is bounded by a mechanism
-    /// outside the client (a watchdog, a per-request override) — assert, not prove: nothing in
-    /// this module's types checks that `send_with_watchdog` or `.timeout(...)` was actually
-    /// applied at a given call site, so those two postures carry no ticket and sit outside what
-    /// this grep finds, by design of the postures themselves rather than an oversight here. That
-    /// gap — bounds these two postures claim but nothing enforces — is tracked separately and is
-    /// deliberately not touched by this comment or this PR.
+    /// not enumerate every unbounded call, full stop. [`Posture::WatchdogNoRedirect`] asserts its
+    /// call is bounded by a mechanism outside the client (the progress-reset watchdog) — assert,
+    /// not prove: nothing in this module's types checks that `send_with_watchdog` was actually
+    /// applied at a given call site, so that posture carries no ticket and sits outside what this
+    /// grep finds, by design of the posture itself rather than an oversight here. That gap — a
+    /// bound this posture claims but nothing enforces — is tracked separately and is deliberately
+    /// not touched by this comment or this PR.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(super) enum UnboundedTicket {
         /// `missing_objects`, `upload_targets`, `fetch_subtree`, and `fetch_batch`'s initial
@@ -810,7 +801,7 @@ mod clients {
     pub(super) struct Clients {
         /// Auto-follows redirects (reqwest's default `redirect::Policy`); no `read_timeout` at
         /// all, so once past connect it waits out any silence, however long. Selected by
-        /// [`Posture::OwnTimeoutFollowsRedirects`] and [`Posture::UnboundedFollowsRedirects`].
+        /// [`Posture::UnboundedFollowsRedirects`].
         ///
         /// **`commit_lift` is a mutation that rides this client** — the one FORK-89 left
         /// unfixed. See [`super::RemoteClient::commit_lift`]'s own doc for the standing gap this
@@ -892,7 +883,6 @@ mod clients {
             match posture {
                 Posture::BoundedReads => &self.bounded_reads,
                 Posture::BoundedObjectReads => &self.bounded_object_reads,
-                Posture::OwnTimeoutFollowsRedirects => &self.http,
                 Posture::UnboundedFollowsRedirects(_) => &self.http,
                 Posture::WatchdogNoRedirect => &self.no_redirect,
                 Posture::UnboundedNoRedirect(_) => &self.no_redirect,
@@ -1535,15 +1525,25 @@ impl RemoteClient {
     /// unreachable remote, or a malformed answer all resolve to an empty map — the
     /// caller shows the pseudonymous identifiers. The *server* decides which names
     /// this caller may see (§8.12); the client only asks.
+    ///
+    /// Rides [`Posture::BoundedReads`] — the same client `fetch_info`/`fetch_signature`/
+    /// `fetch_bundle_to` use — rather than a per-request timeout of its own. It used to carry a
+    /// flat `RequestBuilder::timeout(5s)` here instead, which looked tighter but was not actually
+    /// a working bound: per `reqwest`'s own docs, that timeout is a *total* deadline starting at
+    /// connect, and this file's own [`REMOTE_CONNECT_TIMEOUT_TOR`] exists because a Tor circuit
+    /// build alone can legitimately take tens of seconds — so on a Tor remote the old 5s expired
+    /// during connect on essentially every call, degrading `resolve` to pseudonyms always, never
+    /// actually resolving anything. Worst case before falling back to pseudonyms is now roughly
+    /// `connect_timeout + REMOTE_READ_TIMEOUT` — about 15s direct, about 70s over Tor (see
+    /// [`bounded_read_timeout`]) — a real, visible increase in the display-lookup's own worst-case
+    /// latency, accepted because the bound it replaces was never a working one on Tor in the first
+    /// place.
     pub async fn resolve(&self, identifiers: Vec<String>) -> BTreeMap<String, String> {
         if identifiers.is_empty() {
             return BTreeMap::new();
         }
 
-        let response = self.request_on(Posture::OwnTimeoutFollowsRedirects, reqwest::Method::POST, "/v1/resolve")
-            // A slow or black-holed remote must never hang a display command; the
-            // fallback is pseudonyms anyway.
-            .timeout(std::time::Duration::from_secs(5))
+        let response = self.request_on(Posture::BoundedReads, reqwest::Method::POST, "/v1/resolve")
             .json(&ResolveRequest { identifiers })
             .send()
             .await;
@@ -6546,6 +6546,72 @@ mod tests {
                 "update_ref must not fail on a response that only arrived slowly, never on any \
                 timeout: {}", e
             ));
+    }
+
+    /// Starts a remote that answers `POST /v1/resolve` with a real, non-empty name mapping, but
+    /// only after `delay` — never a byte before that. Same shape as
+    /// [`start_slow_ref_update_remote`], just returning a body [`RemoteClient::resolve`] can
+    /// actually parse into names, not an empty `200`.
+    fn start_slow_resolving_remote(delay: std::time::Duration) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+
+        std::thread::spawn(move || {
+            use std::io::Write;
+
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = read_test_request(&mut stream);
+                std::thread::sleep(delay);
+                let body = r#"{"names":{"agent-1":"Real Display Name"}}"#;
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                    Connection: close\r\n\r\n{}",
+                    body.len(), body
+                );
+                let _ = stream.flush();
+            }
+        });
+
+        url
+    }
+
+    /// The discriminating fixture for `resolve`'s move onto [`Posture::BoundedReads`]: a remote
+    /// that connects instantly (loopback) and then stays silent for 8s before answering correctly.
+    /// 8s is chosen to sit strictly between the two bounds this test exists to tell apart, with
+    /// real slack on both sides and no collision with any other constant in scope: it is 3s past
+    /// the *old* flat `RequestBuilder::timeout(5s)` `resolve` used to carry
+    /// (`TEST_DIRECT_CONNECT_TIMEOUT` alone, since that old bound was a total deadline from
+    /// connect, and connect here is near-instant), and 7s inside the *new*
+    /// `Posture::BoundedReads` budget of `TEST_DIRECT_CONNECT_TIMEOUT + TEST_TIGHT_READ_TIMEOUT`
+    /// = 15s. Before the fix: the old 5s deadline fires mid-wait, `send` returns `Err`, and
+    /// `resolve` falls back to an empty map — pseudonyms, even though the remote was healthy and
+    /// answering. After the fix: 8s is comfortably inside the 15s budget, so the real mapping
+    /// comes back. Asserts the returned mapping itself, not merely that the call returned
+    /// promptly — a timing-only assertion is green in both worlds (5s empty-map return, 15s
+    /// real-map return), so it would pin nothing.
+    #[test]
+    fn resolve_survives_silence_past_the_old_five_second_bound() {
+        let delay = std::time::Duration::from_secs(8);
+        let url = start_slow_resolving_remote(delay);
+        let client = RemoteClient::new(&url, None).unwrap();
+        let outer_ceiling = TEST_DIRECT_CONNECT_TIMEOUT + TEST_TIGHT_READ_TIMEOUT
+            + std::time::Duration::from_secs(15);
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let names = runtime.block_on(async {
+            tokio::time::timeout(outer_ceiling, client.resolve(vec!["agent-1".to_string()])).await
+        })
+            .unwrap_or_else(|_| panic!(
+                "resolve hung past its own generous outer ceiling {:?}", outer_ceiling
+            ));
+
+        assert_eq!(
+            names.get("agent-1").map(String::as_str), Some("Real Display Name"),
+            "a remote that answers correctly after {:?} — past the old flat 5s bound, well \
+            inside the new connect+read budget — must return the real mapping, not fall back \
+            to pseudonyms: got {:?}", delay, names
+        );
     }
 
     /// A fixture standing in for a Tor SOCKS proxy this test fully controls: it TCP-accepts (the
