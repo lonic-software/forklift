@@ -322,14 +322,17 @@ const REMOTE_CONNECT_TIMEOUT_TOR: std::time::Duration = std::time::Duration::fro
 /// [`RemoteClient::send_with_watchdog`]'s for the uploads.
 ///
 /// `read_timeout` is a `ClientBuilder`-level setting with no per-request override — it cannot be
-/// switched off for one specific request — so it is carried only by
-/// [`RemoteClient::bounded_reads`]/[`RemoteClient::bounded_object_reads`], never by `http`.
-/// `update_ref` shares `http`, and its server side legitimately runs a parcel-closure audit walk —
-/// scoped by the history segment being pushed, which on a first lift into an empty pallet is the
-/// whole history — before its first response byte; that can take minutes with *no* bytes moving at
-/// all, which this constant would (correctly) call silence if it applied there. Giving the bounded
-/// reads their own clients means `update_ref` needs no exemption: it was simply never wired to a
-/// client that carries this setting.
+/// switched off for one specific request — so it is carried only by the clients
+/// [`Posture::BoundedReads`]/[`Posture::BoundedObjectReads`] select, never by the auto-following
+/// client `update_ref` rides. **`update_ref` must never move to [`Posture::BoundedReads`]**: its
+/// server side legitimately runs a parcel-closure audit walk — scoped by the history segment
+/// being pushed, which on a first lift into an empty pallet is the whole history — before its
+/// first response byte; that can take minutes with *no* bytes moving at all, which this constant
+/// would (correctly) call silence if it applied there. This is not an accident of wiring — FORK-94
+/// found `update_ref`'s pre-first-byte cost is a *derived* quantity (an audit walk), unlike the
+/// four calls [`UnboundedTicket::Fork92`] covers, whose priced quantity is the request body's own
+/// enumerated content; giving it a flat silence budget before that walk-equivalence question is
+/// settled would be exactly the kind of guess this module's bounded clients exist to avoid.
 ///
 /// 10s of silence, on top of whichever connect budget applies, is generous for any of the three
 /// tight calls above: a healthy connection carrying real progress, however slow the link,
@@ -338,7 +341,7 @@ const REMOTE_CONNECT_TIMEOUT_TOR: std::time::Duration = std::time::Duration::fro
 const REMOTE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The read/metadata silence budget for [`RemoteClient::fetch_object`] alone — see
-/// [`RemoteClient::bounded_object_reads`]. Deliberately loose, not tuned to feel responsive:
+/// [`Posture::BoundedObjectReads`]. Deliberately loose, not tuned to feel responsive:
 /// `server.rs`'s `get_object` handler documents that it "buffers the whole object in memory" via
 /// `retrieve_object_by_hash`, which content-verifies before returning and, for a packed/delta
 /// object, decompresses and reconstructs it in memory too — all inside `blocking(...)`, entirely
@@ -652,95 +655,262 @@ fn watched_upload_body(bytes: Vec<u8>, progress: Arc<UploadProgress>) -> (reqwes
     (reqwest::Body::wrap_stream(stream), len)
 }
 
-/// The remote endpoint: base URL, optional bearer token, and the HTTP clients.
+/// The private home of [`RemoteClient`]'s four `reqwest::Client`s, and the only way to reach any
+/// of them.
 ///
-/// Four clients, not one, because three independent axes each need to vary per call: *redirect
-/// policy* (`fetch_batch`'s initial `POST`, `upload_object`, `put_presigned`, `update_ref`,
-/// `upload_signature`, and `put_trust` must not auto-follow; everything else may), *whether a
-/// read/metadata silence bound applies at all* (only `fetch_info`, `fetch_object`,
-/// `fetch_signature`, `fetch_bundle_to` carry a client-level `read_timeout`; never `update_ref`,
-/// `missing_objects`, `fetch_batch`, `fetch_subtree`, `upload_signature`, `put_trust`,
-/// `commit_lift`, `upload_targets`, or the streamed-upload paths (`upload_object`,
-/// `put_presigned`) — see [`REMOTE_READ_TIMEOUT`]'s doc for why none of those has an honest flat
-/// budget yet. `resolve` is the one exception worth naming separately: it is bounded, but by its
-/// own per-request `RequestBuilder::timeout(5s)`, not by any client-level setting — a
-/// best-effort display lookup that degrades to pseudonyms on any failure, not a call whose
-/// budget needs to compose with `connect_timeout` the way the client-level ones do), and *how
-/// loose that bound is* (`fetch_object` alone needs [`FETCH_OBJECT_READ_TIMEOUT`] instead of
-/// [`REMOTE_READ_TIMEOUT`] — see [`bounded_object_reads`](Self::bounded_object_reads)'s doc). All
-/// four otherwise share the same proxy/connect-timeout configuration built once in
-/// [`RemoteClient::new_with_tor`], which is also where each bounded client's actual `read_timeout`
+/// **Why this module exists.** Which client a call used to use — and therefore whether its
+/// response wait was bounded at all — used to be decided by which field name a caller happened to
+/// type (`self.http`, `self.no_redirect`, `self.bounded_reads`, `self.bounded_object_reads`), all
+/// four reachable from every method on `RemoteClient`. Enumerating "which calls ride the unbounded
+/// ones" by reading the source got tried three times and got three different answers (two, then
+/// four, then eight) — and the eight-count parser, which matched a fixed list of spellings, still
+/// missed a call built by handing a client straight to the request-builder helper rather than going
+/// through the one convenience spelling the parser recognized. A fixed list of spellings cannot see
+/// a spelling it was not written for.
+///
+/// So the fields are private to this module, and the module hands out exactly one thing:
+/// [`Clients::pick`], which takes a [`Posture`] — a required argument, not a default — and returns
+/// the chosen `reqwest::Client`. A new call site cannot reach any client without the compiler
+/// forcing that choice; there is no ambient "just use the default one" path left to fall into.
+///
+/// The residual trust base is this module **plus** its only two callers outside it —
+/// [`RemoteClient::request_on`] (builds a request, bearer token attached) and
+/// [`RemoteClient::client_for`] (hands back the bare `&reqwest::Client` itself, for the two call
+/// sites that must not attach a bearer token) — since privacy alone only covers the *fields*, not
+/// what those two functions go on to do with a reference once `pick` returns one. That the base is
+/// exactly these three items, and nothing wider, is a procedural claim, not an assertion to take on
+/// faith: `grep -n 'reqwest::Client\b' crates/forklift-core/src/util/remote_utils.rs`, read against
+/// which lines are doc comments, currently finds the type spelled outside a comment only inside
+/// `mod clients` itself and at `client_for`'s own signature — nowhere else in the file. Re-run that
+/// grep to re-check the claim; do not trust this sentence past the next edit that moves the type.
+///
+/// **Four physical clients, three independent axes.** *Redirect policy* (mutations, and the
+/// one-shot streamed-upload bodies, must never auto-follow; reads may). *Whether a read/metadata
+/// silence bound applies at all* (only two of the four carry a client-level `read_timeout`; see
+/// [`REMOTE_READ_TIMEOUT`]'s doc for why the rest don't have an honest flat budget yet). *How loose
+/// that bound is*, for the two that do (`fetch_object` alone needs [`FETCH_OBJECT_READ_TIMEOUT`]
+/// instead of [`REMOTE_READ_TIMEOUT`] — see [`FETCH_OBJECT_READ_TIMEOUT`]'s doc). All four share the
+/// same proxy/connect-timeout configuration, built once by [`Clients::build`] (called from
+/// [`RemoteClient::new_with_tor`]), which is also where each bounded client's actual `read_timeout`
 /// is computed via [`bounded_read_timeout`] rather than being the raw silence-budget constant.
+mod clients {
+    use super::{bounded_read_timeout, FETCH_OBJECT_READ_TIMEOUT, REMOTE_READ_TIMEOUT};
+
+    /// Which `reqwest::Client` a request rides, and — for the two that carry no client-level
+    /// `read_timeout` — what (if anything) bounds that call's response wait instead. Every request
+    /// [`super::RemoteClient`] sends must name one of these explicitly; [`Clients::pick`] has no other
+    /// argument to construct a request from, so there is nothing to fall back to.
+    pub(super) enum Posture {
+        /// [`REMOTE_READ_TIMEOUT`]-bounded via a client-level `read_timeout`. For the
+        /// O(constant)-pre-first-byte calls: `fetch_info`, `fetch_signature`, `fetch_bundle_to`.
+        ///
+        /// **Auto-follows redirects — never select this for a mutation.** The client this
+        /// selects carries no `redirect::Policy::none()`, for the same reason [`Clients::http`]
+        /// doesn't: nothing about adding a `read_timeout` also disables auto-follow, they are
+        /// independent axes (this module's own doc names all three). A mutation that rode this
+        /// posture would reopen exactly the hole FORK-89 closed — a `3xx` silently followed and
+        /// read back as success. This is the trap [`UnboundedTicket::Fork49`]'s own doc names:
+        /// `upload_signature`/`put_trust` stay on [`Self::UnboundedNoRedirect`], unbounded,
+        /// specifically because no client here combines no-auto-redirect *with* a client-level
+        /// `read_timeout` — reaching for this variant to "just add a bound" to either of them
+        /// would silently reopen their redirect exposure instead.
+        BoundedReads,
+        /// [`FETCH_OBJECT_READ_TIMEOUT`]-bounded via a client-level `read_timeout` — the same
+        /// shape as [`Self::BoundedReads`], just with the looser budget `fetch_object`'s
+        /// size-dependent server work needs. `fetch_object` alone.
+        ///
+        /// **Auto-follows redirects — never select this for a mutation**, same reasoning and
+        /// same trap as [`Self::BoundedReads`]'s own doc.
+        BoundedObjectReads,
+        /// Auto-follows redirects; no client-level `read_timeout`. The caller bounds this call's
+        /// own response wait with a per-request `RequestBuilder::timeout(...)` instead — not
+        /// through the client at all. `resolve` alone (a best-effort display lookup that degrades
+        /// to pseudonyms on any failure, so a call site of its own rather than a shared budget).
+        OwnTimeoutFollowsRedirects,
+        /// Never auto-follows any redirect; no client-level `read_timeout`. The caller bounds this
+        /// call's own response wait through [`super::RemoteClient::send_with_watchdog`]'s progress-reset
+        /// watchdog instead — not through the client. The streamed-upload paths:
+        /// `upload_object`, `put_presigned`.
+        WatchdogNoRedirect,
+        /// Auto-follows redirects; no client-level `read_timeout`; **nothing else bounds this
+        /// call's response wait either** — no per-request override, no watchdog. Deliberate, not
+        /// an oversight: the ticket that owns adding a bound is a required part of this variant,
+        /// not a comment beside it, so a reviewer sees it in any diff that constructs one.
+        ///
+        /// The payload is never pattern-matched out — [`Clients::pick`] routes on the variant
+        /// alone, not on which ticket it carries — so it is `#[allow(dead_code)]` rather than
+        /// read. That is the point: this field's whole job is to be *present in the source*, not
+        /// consumed by anything at runtime.
+        #[allow(dead_code)]
+        UnboundedFollowsRedirects(UnboundedTicket),
+        /// Same as [`Self::UnboundedFollowsRedirects`], but on the client that never auto-follows
+        /// a redirect — every currently-unbounded mutation reaches this variant, since a mutation
+        /// must never silently follow a `3xx` (see [`super::RemoteClient::describe_mutation_redirect`]'s
+        /// doc) regardless of whether its response wait also happens to be bounded.
+        #[allow(dead_code)]
+        UnboundedNoRedirect(UnboundedTicket),
+    }
+
+    /// The ticket that owns bounding one [`Posture::UnboundedFollowsRedirects`] or
+    /// [`Posture::UnboundedNoRedirect`] call's response wait — a required payload of those
+    /// variants, not an optional annotation. A closed set, not a free string: every variant here
+    /// is a call this PR found still genuinely unbounded and recorded as-is (a later PR's job is
+    /// to shrink this set, not this one's). Adding a new variant is itself the visible, greppable
+    /// act of accepting a new unbounded call site.
+    ///
+    /// `grep 'UnboundedTicket::'` enumerates every **ticket-carrying** unbounded call — it does
+    /// not enumerate every unbounded call, full stop. [`Posture::WatchdogNoRedirect`] and
+    /// [`Posture::OwnTimeoutFollowsRedirects`] each assert their call is bounded by a mechanism
+    /// outside the client (a watchdog, a per-request override) — assert, not prove: nothing in
+    /// this module's types checks that `send_with_watchdog` or `.timeout(...)` was actually
+    /// applied at a given call site, so those two postures carry no ticket and sit outside what
+    /// this grep finds, by design of the postures themselves rather than an oversight here. That
+    /// gap — bounds these two postures claim but nothing enforces — is tracked separately and is
+    /// deliberately not touched by this comment or this PR.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum UnboundedTicket {
+        /// `missing_objects`, `upload_targets`, `fetch_subtree`, and `fetch_batch`'s initial
+        /// `POST`. FORK-92's current keystone (narrowed after review, 2026-08-01): for these
+        /// four, the priced quantity **equals the server's workload by construction** — the
+        /// request body enumerates it (a hash list), and the server iterates that same list under
+        /// a cap both sides share (`MAX_MISSING_BATCH`/`MAX_UPLOAD_TARGETS_BATCH`), or (for
+        /// `fetch_subtree`) is worst-case-bounded by the equivalent shared cap. That is *why* a
+        /// scaled budget is fixable here at all — not (as an earlier framing had it) merely that
+        /// the work "scales with input the client cannot size in advance": the client can size it,
+        /// from its own request. No such budget has landed yet, so all four stay unbounded.
+        ///
+        /// `fetch_batch`'s **second** request station — the follow-up `GET` taken only when the
+        /// head redirects to storage, which actually reads the bundle bytes — does **not** share
+        /// that keystone and is filed here only because no other ticket owns it yet: it carries no
+        /// request body of its own to enumerate anything, so FORK-92's "priced by construction"
+        /// mechanism does not apply to it as written. The bundle's size *is* implicitly known —
+        /// it is whatever the preceding `POST`'s hash list determined — but this bare `GET`
+        /// carries none of that context forward, and inventing a scaling term for it here would
+        /// misstate what the request itself proves. Left as an open attribution question for
+        /// FORK-92's design to resolve (a distinct budget, or threading the known size through),
+        /// not asserted as already covered.
+        Fork92,
+        /// `update_ref`: unbounded for a different reason than FORK-92's four — its server-side
+        /// cost is a *derived* quantity (an audit walk over the pushed history segment), not one
+        /// the request enumerates, so it was split out rather than sharing that mechanism.
+        /// FORK-94.
+        Fork94,
+        /// `commit_lift`: its error-body read decides retry-vs-terminal control flow, so bounding
+        /// it is a retry-contract design question, not a flat constant. FORK-91.
+        Fork91,
+        /// `upload_signature`, `put_trust`: single-write endpoints whose server side could take a
+        /// flat bound, but no client combining no-auto-redirect with a client-level
+        /// `read_timeout` exists yet. FORK-49.
+        Fork49,
+    }
+
+    /// The four `reqwest::Client`s a request against the remote may ride — private to this
+    /// module; [`Clients::pick`] is the only way any of them leaves it.
+    #[derive(Clone)]
+    pub(super) struct Clients {
+        /// Auto-follows redirects (reqwest's default `redirect::Policy`); no `read_timeout` at
+        /// all, so once past connect it waits out any silence, however long. Selected by
+        /// [`Posture::OwnTimeoutFollowsRedirects`] and [`Posture::UnboundedFollowsRedirects`].
+        ///
+        /// **`commit_lift` is a mutation that rides this client** — the one FORK-89 left
+        /// unfixed. See [`super::RemoteClient::commit_lift`]'s own doc for the standing gap this
+        /// is: auto-following exposes it to the same silent-3xx-success hole FORK-89 closed for
+        /// every other mutation in this module.
+        http: reqwest::Client,
+        /// Same endpoint as [`Self::http`], automatic redirect-following disabled
+        /// (`redirect::Policy::none()`); no `read_timeout` either. Selected by
+        /// [`Posture::WatchdogNoRedirect`] and [`Posture::UnboundedNoRedirect`]: reqwest's default
+        /// policy replays a `307`/`308` with the original method *and* body, and `tower-http`'s
+        /// `SEE_OTHER`/`MOVED_PERMANENTLY`/`FOUND` arms force a mutation's method to `GET` and
+        /// body empty — either way a redirect must come back raw rather than being auto-followed
+        /// (FORK-89; see [`super::RemoteClient::describe_mutation_redirect`]'s doc). **Not every
+        /// mutation rides this client**: `commit_lift` does not — see [`Self::http`]'s own doc
+        /// and [`super::RemoteClient::commit_lift`]'s for that standing,
+        /// deliberately-not-silently-closed gap.
+        no_redirect: reqwest::Client,
+        /// Same endpoint as [`Self::http`], plus a `read_timeout` of
+        /// [`bounded_read_timeout`]`(connect_timeout, `[`REMOTE_READ_TIMEOUT`]`)`. Selected only
+        /// by [`Posture::BoundedReads`].
+        bounded_reads: reqwest::Client,
+        /// Same endpoint as [`Self::http`], plus a `read_timeout` of
+        /// [`bounded_read_timeout`]`(connect_timeout, `[`FETCH_OBJECT_READ_TIMEOUT`]`)` — the
+        /// same shape as [`Self::bounded_reads`], just with the looser silence budget
+        /// `fetch_object`'s size-dependent server work needs. Selected only by
+        /// [`Posture::BoundedObjectReads`].
+        bounded_object_reads: reqwest::Client,
+    }
+
+    impl Clients {
+        /// Build all four clients from one shared connect-timeout/proxy configuration. Moved here
+        /// unchanged from the pre-refactor `RemoteClient::build` — see
+        /// [`super::RemoteClient::build`]'s own doc for why one `connect_timeout` must reach every
+        /// client rather than being decided by one path and overwritten on a field by another.
+        pub(super) fn build(connect_timeout: std::time::Duration,
+                            proxy: Option<&reqwest::Proxy>) -> Result<Clients, String> {
+            let mut http = reqwest::Client::builder()
+                .connect_timeout(connect_timeout);
+            let mut no_redirect = reqwest::Client::builder()
+                .connect_timeout(connect_timeout)
+                .redirect(reqwest::redirect::Policy::none());
+            // `read_timeout` is armed and checked before the connector is even polled, so using
+            // the raw silence budget here would let it preempt this exact `connect_timeout` —
+            // `bounded_read_timeout` adds it in first so the connect phase always gets its full
+            // allowance regardless of which budget (direct or Tor) applies to this instance.
+            let mut bounded_reads = reqwest::Client::builder()
+                .connect_timeout(connect_timeout)
+                .read_timeout(bounded_read_timeout(connect_timeout, REMOTE_READ_TIMEOUT));
+            let mut bounded_object_reads = reqwest::Client::builder()
+                .connect_timeout(connect_timeout)
+                .read_timeout(bounded_read_timeout(connect_timeout, FETCH_OBJECT_READ_TIMEOUT));
+
+            // The same proxy governs all four clients: the redirect-following ones and the
+            // hand-following one alike route through Tor when the remote does.
+            if let Some(proxy) = proxy {
+                http = http.proxy(proxy.clone());
+                no_redirect = no_redirect.proxy(proxy.clone());
+                bounded_reads = bounded_reads.proxy(proxy.clone());
+                bounded_object_reads = bounded_object_reads.proxy(proxy.clone());
+            }
+
+            let http = http.build()
+                .map_err(|e| format!("Error while creating the HTTP client: {}", e))?;
+            let no_redirect = no_redirect.build()
+                .map_err(|e| format!("Error while creating the HTTP client: {}", e))?;
+            let bounded_reads = bounded_reads.build()
+                .map_err(|e| format!("Error while creating the HTTP client: {}", e))?;
+            let bounded_object_reads = bounded_object_reads.build()
+                .map_err(|e| format!("Error while creating the HTTP client: {}", e))?;
+
+            Ok(Clients { http, no_redirect, bounded_reads, bounded_object_reads })
+        }
+
+        /// The only way any of the four clients leaves this module: a request cannot be built
+        /// without first choosing a [`Posture`]. Exhaustive by construction — a new [`Posture`]
+        /// variant that this `match` does not cover fails to compile, so this function can never
+        /// silently fall through to a default client.
+        pub(super) fn pick(&self, posture: &Posture) -> &reqwest::Client {
+            match posture {
+                Posture::BoundedReads => &self.bounded_reads,
+                Posture::BoundedObjectReads => &self.bounded_object_reads,
+                Posture::OwnTimeoutFollowsRedirects => &self.http,
+                Posture::UnboundedFollowsRedirects(_) => &self.http,
+                Posture::WatchdogNoRedirect => &self.no_redirect,
+                Posture::UnboundedNoRedirect(_) => &self.no_redirect,
+            }
+        }
+    }
+}
+
+use clients::{Clients, Posture, UnboundedTicket};
+
+/// The remote endpoint: base URL, optional bearer token, and the HTTP clients — see the
+/// [`clients`] module's own doc for why there are four of them and why they are not fields here
+/// any more.
 #[derive(Clone)]
 pub struct RemoteClient {
-    /// The default client: auto-follows redirects (reqwest's default `redirect::Policy`) and
-    /// carries only [`Self::connect_timeout`] — no `read_timeout` at all, so once past connect it
-    /// waits out any silence, however long. Ridden by five calls, none of which this module can
-    /// give an honest flat pre-first-byte budget (see [`REMOTE_READ_TIMEOUT`]'s doc for the
-    /// reasoning behind the first four): `missing_objects` and `upload_targets` each walk up to a
-    /// batch cap of hashes before responding; `fetch_subtree` walks and buffers a resolved subtree
-    /// closure; each cost scales with input the client cannot size in advance. `resolve` is the
-    /// one exception with a bound of its own — a per-request `RequestBuilder::timeout(5s)` at its
-    /// call site, since it degrades to pseudonyms on any failure rather than surfacing an error,
-    /// so it needs no client-level setting. The fifth, `commit_lift`, is this module's one
-    /// remaining mutation that still rides this auto-following client unguarded — see
-    /// [`Self::no_redirect`]'s doc for why FORK-89 left it here rather than moving it, and
-    /// FORK-91 for the still-open question of its own response-wait bound.
-    http: reqwest::Client,
-    /// Same endpoint, automatic redirect-following disabled. `fetch_batch`'s initial `POST` uses
-    /// this one: reqwest's default policy replays a `307`/`308` redirect with the original
-    /// method *and body*, which would re-`POST` that call's signed JSON at a URL presigned
-    /// for `GET` only — failing signature verification on a real S3-backed head (LocalStack
-    /// answers `500`, AWS `403 SignatureDoesNotMatch`). Redirects off this client are instead
-    /// inspected and followed by hand with a fresh `GET` (see `fetch_batch`). Unbounded, like
-    /// `http`: `fetch_batch` is one of the three calls [`REMOTE_READ_TIMEOUT`]'s doc explains are
-    /// deliberately never bounded at all.
-    ///
-    /// Also used by [`Self::upload_object`] and [`Self::put_presigned`] (review round S2 fix hole):
-    /// a streamed upload body is one-shot and cannot be replayed at a redirect target, so any `3xx`
-    /// — not only the `307`/`308` this doc's other reasoning names — must come back to
-    /// [`Self::describe_mutation_redirect`] raw rather than being auto-followed. See that
-    /// function's doc for why a `303` specifically forced the move off `self.http`.
-    ///
-    /// Also used by [`Self::update_ref`], [`Self::upload_signature`], and [`Self::put_trust`]
-    /// (FORK-89): unlike the two above, none of these three stream a one-shot body — they hand
-    /// `self.request_on` a `.json(...)` or an in-memory `.body(Vec<u8>)`, which *could* in
-    /// principle be replayed at a redirect target. That is not why they are here: they were on
-    /// `self.http` (auto-following, with no `is_redirection()` guard) until FORK-89, which found
-    /// `tower-http`'s `SEE_OTHER` arm forces a `POST`'s method
-    /// to `GET` and its body empty unconditionally, and every arm does the same to a `PUT` — so a
-    /// `303` (and, for `update_ref`'s `POST`, a `301`/`302` too) silently became a bare `GET`,
-    /// whose `2xx` at the redirect target read back as a fabricated success having mutated
-    /// nothing. Moving these three here closes that the same way the other two are already closed:
-    /// no mutation on this client ever auto-follows, replayable body or not — see
-    /// [`Self::describe_mutation_redirect`]'s doc for why that is a client-selection guarantee,
-    /// not a claim about any dependency's redirect matrix.
-    ///
-    /// `commit_lift` still rides `self.http` and is not part of this fix — it carries the same
-    /// latent 3xx auto-follow exposure the other five closed. Not moved here: out of the stated
-    /// scope of the fix that added the other three (which named only `update_ref`,
-    /// `upload_signature`, `put_trust`), left as a known gap rather than folded in silently.
-    no_redirect: reqwest::Client,
-    /// Same endpoint as [`Self::http`], plus a `read_timeout` of
-    /// [`bounded_read_timeout`]`(connect_timeout, `[`REMOTE_READ_TIMEOUT`]`)`. Used only by the
-    /// three O(constant)-pre-first-byte calls — `fetch_info`, `fetch_signature`,
-    /// `fetch_bundle_to` — whose server side does a single fixed-size lookup or serves an
-    /// already-built file before writing anything, so a flat 10s silence budget is honest for
-    /// them (see [`REMOTE_READ_TIMEOUT`]'s doc). Never used by any call whose server side does
-    /// work that scales with its input before the first byte — `missing_objects`, `fetch_batch`,
-    /// `fetch_subtree`, `upload_targets` all fall in that category, and so does `fetch_object`,
-    /// which needs the same shape of bound but a much looser budget of its own
-    /// ([`Self::bounded_object_reads`]) — nor by any call that must never auto-follow a redirect,
-    /// which this client (like `http`) still does: every mutation in this module, `update_ref`
-    /// included (see [`Self::no_redirect`]'s doc for the full list and why). `resolve` rides
-    /// neither this client nor an unbounded one — its own per-request timeout is bound enough.
-    bounded_reads: reqwest::Client,
-    /// Same endpoint as [`Self::http`], plus a `read_timeout` of
-    /// [`bounded_read_timeout`]`(connect_timeout, `[`FETCH_OBJECT_READ_TIMEOUT`]`)` — the same
-    /// shape as [`Self::bounded_reads`], just with the looser silence budget `fetch_object`'s
-    /// size-dependent server work needs (see [`FETCH_OBJECT_READ_TIMEOUT`]'s doc). Used only by
-    /// `fetch_object`.
-    bounded_object_reads: reqwest::Client,
+    /// The four `reqwest::Client`s this remote may send a request on, gated behind
+    /// [`clients::Posture`] — see the [`clients`] module's own doc.
+    clients: Clients,
     /// The connect-phase bound this instance's clients were actually built with —
     /// [`REMOTE_CONNECT_TIMEOUT`] or [`REMOTE_CONNECT_TIMEOUT_TOR`], whichever
     /// `should_route_through_tor` selected at construction. Kept so a connect-phase transport
@@ -900,48 +1070,10 @@ impl RemoteClient {
             None
         };
 
-        let mut http = reqwest::Client::builder()
-            .connect_timeout(connect_timeout);
-        let mut no_redirect = reqwest::Client::builder()
-            .connect_timeout(connect_timeout)
-            .redirect(reqwest::redirect::Policy::none());
-        // `read_timeout` is armed and checked before the connector is even polled, so using the
-        // raw silence budget here would let it preempt this exact `connect_timeout` —
-        // `bounded_read_timeout` adds it in first so the connect phase always gets its full
-        // allowance regardless of which budget (direct or Tor) applies to this instance.
-        let mut bounded_reads = reqwest::Client::builder()
-            .connect_timeout(connect_timeout)
-            .read_timeout(bounded_read_timeout(connect_timeout, REMOTE_READ_TIMEOUT));
-        let mut bounded_object_reads = reqwest::Client::builder()
-            .connect_timeout(connect_timeout)
-            .read_timeout(bounded_read_timeout(connect_timeout, FETCH_OBJECT_READ_TIMEOUT));
-
-        // The same proxy governs all four clients: the redirect-following ones and the
-        // hand-following one alike route through Tor when the remote does.
-        if let Some(proxy) = &proxy {
-            http = http.proxy(proxy.clone());
-            no_redirect = no_redirect.proxy(proxy.clone());
-            bounded_reads = bounded_reads.proxy(proxy.clone());
-            bounded_object_reads = bounded_object_reads.proxy(proxy.clone());
-        }
-
-        let http = http.build()
-            .map_err(|e| format!("Error while creating the HTTP client: {}", e))?;
-
-        let no_redirect = no_redirect.build()
-            .map_err(|e| format!("Error while creating the HTTP client: {}", e))?;
-
-        let bounded_reads = bounded_reads.build()
-            .map_err(|e| format!("Error while creating the HTTP client: {}", e))?;
-
-        let bounded_object_reads = bounded_object_reads.build()
-            .map_err(|e| format!("Error while creating the HTTP client: {}", e))?;
+        let clients = Clients::build(connect_timeout, proxy.as_ref())?;
 
         Ok(RemoteClient {
-            http,
-            no_redirect,
-            bounded_reads,
-            bounded_object_reads,
+            clients,
             connect_timeout,
             base: url.trim_end_matches('/').to_string(),
             token,
@@ -1018,29 +1150,34 @@ impl RemoteClient {
         &self.base
     }
 
-    fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
-        self.request_on(&self.http, method, path)
-    }
-
-    /// Build a request against this remote using a specific underlying `reqwest::Client` — the
-    /// seam every call that needs something other than the default [`Self::http`] uses to reach
-    /// one of this type's other clients ([`Self::bounded_reads`], [`Self::bounded_object_reads`],
-    /// [`Self::no_redirect`]). Deliberately not enumerated here by caller: that list has already
-    /// drifted stale more than once as call sites moved between clients (most recently FORK-89,
-    /// which added three more callers of `no_redirect` without this doc noticing) — each client
-    /// field's own doc is the authoritative list of which calls ride it, kept next to the
-    /// declaration that would actually change if a caller moved.
+    /// Build a request against this remote, riding whichever of the four clients `posture`
+    /// selects (see the [`clients`] module's own doc). `posture` is a required argument, not a
+    /// default — there is no more "the seam every call that needs something other than the
+    /// default client uses"; every call, including the ones that used to ride an implicit
+    /// default, names its posture explicitly here.
     fn request_on(&self,
-                   http: &reqwest::Client,
+                   posture: Posture,
                    method: reqwest::Method,
                    path: &str) -> reqwest::RequestBuilder {
-        let mut builder = http.request(method, format!("{}{}", self.base, path));
+        let mut builder = self.client_for(posture).request(method, format!("{}{}", self.base, path));
 
         if let Some(token) = &self.token {
             builder = builder.bearer_auth(token);
         }
 
         builder
+    }
+
+    /// The lower-level counterpart of [`Self::request_on`], for the two call sites that must
+    /// build their request on the bare `reqwest::Client` without the bearer-token attachment
+    /// `request_on` always applies: [`Self::fetch_batch`]'s redirect-follow `GET` (a presigned
+    /// storage URL is self-authorizing; forwarding a bearer token meant for the control plane
+    /// would be a needless credential leak) and [`Self::put_presigned`] (the presigned URL's own
+    /// signature is the authorization; this call carries no bearer token at all). Still requires
+    /// an explicit [`Posture`] — the only difference from `request_on` is which builder method
+    /// the caller goes on to call on the returned client.
+    fn client_for(&self, posture: Posture) -> &reqwest::Client {
+        self.clients.pick(&posture)
     }
 
     /// Walk a `std::error::Error` source chain to its root and return that root's own `Display`
@@ -1088,13 +1225,15 @@ impl RemoteClient {
     }
 
     /// The mutation counterpart of [`Self::describe_transport_error`], for the six calls that ride
-    /// the unbounded `http`/`no_redirect` clients (`update_ref`, `upload_object`, `put_presigned`,
-    /// `upload_signature`, `put_trust`, `commit_lift`) — `upload_object`, `put_presigned`,
-    /// `update_ref`, `upload_signature`, and `put_trust` all ride `no_redirect` (the last three
-    /// moved off `http` by FORK-89, `upload_object`/`put_presigned` by the earlier fix for the
-    /// `303` redirect hole — see [`Self::no_redirect`]'s doc); only `commit_lift` still rides
-    /// `http` directly. `upload_object`/`put_presigned` also layer [`Self::send_with_watchdog`] on
-    /// top for their body-send phase, but `no_redirect` is just as unbounded as `http` itself, so a
+    /// the unbounded no-auto-follow or auto-follow clients (`update_ref`, `upload_object`,
+    /// `put_presigned`, `upload_signature`, `put_trust`, `commit_lift`) — `upload_object`,
+    /// `put_presigned`, `update_ref`, `upload_signature`, and `put_trust` all ride
+    /// [`Posture::UnboundedNoRedirect`] or [`Posture::WatchdogNoRedirect`] (the last three moved
+    /// off the auto-following client by FORK-89, `upload_object`/`put_presigned` by the earlier
+    /// fix for the `303` redirect hole); only `commit_lift` still rides the auto-following client
+    /// ([`Posture::UnboundedFollowsRedirects`]) directly. `upload_object`/`put_presigned` also
+    /// layer [`Self::send_with_watchdog`] on top for their body-send phase, but the no-auto-follow
+    /// client is just as unbounded as the auto-following one, so a
     /// transport failure on any of the six still lands here for anything `classify` can actually
     /// see (a connect failure, or a `reqwest::Error`-bearing timeout on the response side). Same
     /// [`classify`] dispatch, but the [`TransportFailure::ReadTimedOut`] wording differs from the
@@ -1252,8 +1391,9 @@ impl RemoteClient {
 
     /// Compose a loud, specific error for a `3xx` response to a mutation. Every call site that
     /// reaches this (`upload_object`, `put_presigned`, `update_ref`, `upload_signature`,
-    /// `put_trust` — FORK-89 widened this from the original two) goes out on [`Self::no_redirect`],
-    /// which never auto-follows *any* redirect status — so this is a local, unconditional invariant
+    /// `put_trust` — FORK-89 widened this from the original two) goes out on the never-auto-follow
+    /// client ([`Posture::UnboundedNoRedirect`]/[`Posture::WatchdogNoRedirect`]), which never
+    /// auto-follows *any* redirect status — so this is a local, unconditional invariant
     /// of *this client*, not a claim about how any particular `3xx` happens to behave under a
     /// dependency's redirect matrix. Do not turn it back into one: an earlier version of this doc
     /// asserted exactly that (which status codes `tower-http`'s auto-following policy skips for a
@@ -1322,7 +1462,7 @@ impl RemoteClient {
 
     /// Fetch the warehouse handshake and check the protocol version.
     pub async fn fetch_info(&self) -> Result<WarehouseInfo, String> {
-        let response = self.request_on(&self.bounded_reads, reqwest::Method::GET, "/v1/warehouse")
+        let response = self.request_on(Posture::BoundedReads, reqwest::Method::GET, "/v1/warehouse")
             .send()
             .await
             .map_err(|e| self.describe_transport_error(
@@ -1356,7 +1496,7 @@ impl RemoteClient {
 
     /// Ask which of the given objects the remote lacks (batched).
     ///
-    /// Deliberately **not** on [`Self::bounded_reads`]: the server side consults up to
+    /// Deliberately **not** on [`Posture::BoundedReads`]: the server side consults up to
     /// `MAX_MISSING_BATCH` (10,000) hashes before its first response byte, work that scales with
     /// the batch rather than being O(constant) — the settled contract puts that in the
     /// scaled/measured-budget category, not the flat one `REMOTE_READ_TIMEOUT` is honest for.
@@ -1366,7 +1506,10 @@ impl RemoteClient {
         let mut missing: Vec<String> = Vec::new();
 
         for batch in hashes.chunks(MAX_MISSING_BATCH) {
-            let response = self.request(reqwest::Method::POST, "/v1/objects/missing")
+            let response = self.request_on(
+                Posture::UnboundedFollowsRedirects(UnboundedTicket::Fork92),
+                reqwest::Method::POST, "/v1/objects/missing"
+            )
                 .json(&MissingObjectsRequest { hashes: batch.to_vec() })
                 .send()
                 .await
@@ -1397,7 +1540,7 @@ impl RemoteClient {
             return BTreeMap::new();
         }
 
-        let response = self.request(reqwest::Method::POST, "/v1/resolve")
+        let response = self.request_on(Posture::OwnTimeoutFollowsRedirects, reqwest::Method::POST, "/v1/resolve")
             // A slow or black-holed remote must never hang a display command; the
             // fallback is pseudonyms anyway.
             .timeout(std::time::Duration::from_secs(5))
@@ -1427,16 +1570,20 @@ impl RemoteClient {
     /// control plane, so it answers this `POST` with a redirect to a presigned `GET` of the
     /// bundle bytes under an ephemeral response key (`303 See Other` from a fixed head; a
     /// `307`/`308` from an older one is followed identically). The redirect is followed **by
-    /// hand**, never by reqwest's automatic policy (this call goes out on [`Self::no_redirect`]
-    /// for exactly that reason): a `307`/`308` replays the original request verbatim — method
-    /// and JSON body — which would re-`POST` this call's body at a URL SigV4-signed for `GET`
-    /// only, failing signature verification (`500` on LocalStack, `403 SignatureDoesNotMatch`
-    /// on real AWS) rather than fetching anything. The follow-up `GET` also deliberately omits
-    /// this remote's `Authorization` header: the presigned URL is self-authorizing, and
-    /// forwarding a bearer token meant for the control plane to a storage host it was never
-    /// issued for would be a needless credential leak.
+    /// hand**, never by reqwest's automatic policy (this call goes out on the no-auto-follow
+    /// client, [`Posture::UnboundedNoRedirect`], for exactly that reason): a `307`/`308` replays
+    /// the original request verbatim — method and JSON body — which would re-`POST` this call's
+    /// body at a URL SigV4-signed for `GET` only, failing signature verification (`500` on
+    /// LocalStack, `403 SignatureDoesNotMatch` on real AWS) rather than fetching anything. The
+    /// follow-up `GET` also deliberately omits this remote's `Authorization` header: the
+    /// presigned URL is self-authorizing, and forwarding a bearer token meant for the control
+    /// plane to a storage host it was never issued for would be a needless credential leak — see
+    /// [`Self::client_for`]'s doc for why this call reaches that URL directly rather than through
+    /// [`Self::request_on`].
     ///
-    /// Deliberately **not** on [`Self::bounded_reads`]: the server builds the whole requested
+    /// Both this call's request stations (the initial `POST` here, and the redirect-follow `GET`
+    /// below) ride an unbounded posture: deliberately **not** [`Posture::BoundedReads`], since
+    /// the server builds the whole requested
     /// bundle — every object fully into memory — before its first response byte
     /// (`forklift-server/src/server.rs`'s `objects/batch` handler), and that cost depends on the
     /// byte sizes of objects this client doesn't have yet, which it cannot know in advance. No
@@ -1444,7 +1591,10 @@ impl RemoteClient {
     /// an abandon-and-fall-back lane, so a cold-cache multi-MB batch that works today keeps
     /// working rather than hard-failing identically on every retry.
     pub async fn fetch_batch(&self, hashes: &[String]) -> Result<Option<Vec<u8>>, String> {
-        let response = self.request_on(&self.no_redirect, reqwest::Method::POST, "/v1/objects/batch")
+        let response = self.request_on(
+            Posture::UnboundedNoRedirect(UnboundedTicket::Fork92),
+            reqwest::Method::POST, "/v1/objects/batch"
+        )
             .json(&MissingObjectsRequest { hashes: hashes.to_vec() })
             .send()
             .await
@@ -1467,8 +1617,10 @@ impl RemoteClient {
                     .to_string();
 
                 // A bare GET: no Authorization header (the URL is self-authorizing) and no
-                // body — the request the redirect target is actually presigned for.
-                self.http.get(&location)
+                // body — the request the redirect target is actually presigned for. A second,
+                // distinct unbounded response-reading station from the POST above — same ticket
+                // (FORK-92), different physical request, only reached on a redirect.
+                self.client_for(Posture::UnboundedFollowsRedirects(UnboundedTicket::Fork92)).get(&location)
                     .send()
                     .await
                     .map_err(|e| format!("Error while following the batch redirect: {}", e))?
@@ -1501,16 +1653,19 @@ impl RemoteClient {
     /// * `parcel` - The parcel whose tree the path is resolved in.
     /// * `path`   - The warehouse path key of the subtree (`/`-separated, e.g. `src/api`).
     ///
-    /// Deliberately **not** on [`Self::bounded_reads`]: the server side walks and buffers the
+    /// Deliberately **not** on [`Posture::BoundedReads`]: the server side walks and buffers the
     /// whole resolved subtree closure into memory before its first response byte
     /// (`forklift-server/src/server.rs`'s `get_subtree` handler notes an uncapped closure "would
     /// buffer an arbitrarily large bundle in memory"), cost the client cannot bound in advance.
     /// Same reasoning as `fetch_batch` — this stays unbounded until it has its own scaled budget
     /// or an abandon-and-fall-back lane.
     pub async fn fetch_subtree(&self, parcel: &str, path: &str) -> Result<Option<Vec<u8>>, String> {
-        let response = self.request(reqwest::Method::GET, &format!(
-            "/v1/parcels/{}/subtree/{}", parcel, encode_path_segments(path)
-        )).send()
+        let response = self.request_on(
+            Posture::UnboundedFollowsRedirects(UnboundedTicket::Fork92),
+            reqwest::Method::GET, &format!(
+                "/v1/parcels/{}/subtree/{}", parcel, encode_path_segments(path)
+            )
+        ).send()
             .await
             .map_err(|e| format!("Error while fetching subtree \"{}\" from the remote: {}", path, e))?;
 
@@ -1528,10 +1683,10 @@ impl RemoteClient {
             .map_err(|e| format!("Error while reading the subtree response: {}", e))
     }
 
-    /// Fetch one object's raw bytes. On [`Self::bounded_object_reads`], not [`Self::bounded_reads`]
+    /// Fetch one object's raw bytes. On [`Posture::BoundedObjectReads`], not [`Posture::BoundedReads`]
     /// — see [`FETCH_OBJECT_READ_TIMEOUT`]'s doc for why this call alone needs the looser budget.
     pub async fn fetch_object(&self, hash: &str) -> Result<Vec<u8>, String> {
-        let response = self.request_on(&self.bounded_object_reads, reqwest::Method::GET, &format!("/v1/objects/{}", hash))
+        let response = self.request_on(Posture::BoundedObjectReads, reqwest::Method::GET, &format!("/v1/objects/{}", hash))
             .send()
             .await
             .map_err(|e| self.describe_transport_error(
@@ -1567,7 +1722,7 @@ impl RemoteClient {
         let action = format!("uploading object {}", hash);
         let progress = UploadProgress::new();
         let (body, len) = watched_upload_body(bytes, progress.clone());
-        let builder = self.request_on(&self.no_redirect, reqwest::Method::PUT, &format!("/v1/objects/{}", hash))
+        let builder = self.request_on(Posture::WatchdogNoRedirect, reqwest::Method::PUT, &format!("/v1/objects/{}", hash))
             .header(reqwest::header::CONTENT_LENGTH, len)
             .body(body);
 
@@ -1593,7 +1748,7 @@ impl RemoteClient {
     /// in `direct` with empty `targets`, so one client code path serves both heads. `present`
     /// (the complement of `missing`) is skipped.
     ///
-    /// Deliberately **not** on [`Self::bounded_reads`], the same reasoning as
+    /// Deliberately **not** on [`Posture::BoundedReads`], the same reasoning as
     /// [`Self::missing_objects`]: the server side (`forklift-server/src/server.rs`'s
     /// `post_upload_targets`) walks up to `MAX_UPLOAD_TARGETS_BATCH` (1,000) hashes, checking each
     /// against on-disk object presence, before its first response byte — work that scales with the
@@ -1609,7 +1764,10 @@ impl RemoteClient {
         };
 
         for batch in hashes.chunks(MAX_UPLOAD_TARGETS_BATCH) {
-            let response = self.request(reqwest::Method::POST, "/v1/objects/upload-targets")
+            let response = self.request_on(
+                Posture::UnboundedFollowsRedirects(UnboundedTicket::Fork92),
+                reqwest::Method::POST, "/v1/objects/upload-targets"
+            )
                 .json(&UploadTargetsRequest { session: session.to_string(), hashes: batch.to_vec() })
                 .send()
                 .await
@@ -1637,11 +1795,12 @@ impl RemoteClient {
 
     /// Upload one object's bytes straight to a presigned storage URL (a staging `PUT`). The
     /// URL's own signature is the authorization, so this deliberately carries **no** bearer
-    /// token — and because the bearer is attached per request (in `request`/`request_on`, never
-    /// as a client default header), `self.no_redirect.put(url)` (moved off `self.http` in the fix
-    /// for the `303` redirect hole — see [`Self::no_redirect`]'s doc) cannot leak it to the
-    /// storage host either, even were the storage host the remote itself: `no_redirect` is built
-    /// (in [`Self::new_with_tor`]) with no default headers of its own, exactly like `http`.
+    /// token — and because the bearer is attached only inside [`Self::request_on`], never as a
+    /// client default header, going around it via [`Self::client_for`]`(`[`Posture::WatchdogNoRedirect`]`).put(url)`
+    /// (moved off the auto-following client in the fix for the `303` redirect hole) cannot leak
+    /// it to the storage host either, even were the storage host the remote itself: the
+    /// no-auto-follow client is built (in [`Self::new_with_tor`]) with no default headers of its
+    /// own, exactly like the auto-following one.
     ///
     /// Same watchdog-guarded body as [`Self::upload_object`] (FORK-49 slice 2) — see that call's
     /// doc. This site is the higher-risk of the two: it dials a different host (object storage,
@@ -1652,7 +1811,7 @@ impl RemoteClient {
     async fn put_presigned(&self, url: &str, bytes: Vec<u8>) -> Result<(), String> {
         let progress = UploadProgress::new();
         let (body, len) = watched_upload_body(bytes, progress.clone());
-        let builder = self.no_redirect.put(url)
+        let builder = self.client_for(Posture::WatchdogNoRedirect).put(url)
             .header(reqwest::header::CONTENT_LENGTH, len)
             .body(body);
 
@@ -1680,6 +1839,32 @@ impl RemoteClient {
     /// transient case — a blob the staging verifier has not promoted yet, which the caller
     /// retries with backoff; `Err` for a terminal failure (a corrupt staged object, a
     /// control-plane object never uploaded, or a transport error).
+    ///
+    /// **Two standing gaps, recorded not silently absorbed — distinct facts, neither implies the
+    /// other:**
+    ///
+    /// 1. **Response wait is unbounded** (rides [`Posture::UnboundedFollowsRedirects`],
+    ///    [`UnboundedTicket::Fork91`]): this call's error-body read decides retry-vs-terminal
+    ///    control flow, so bounding it is a retry-contract design question — FORK-91's own scope,
+    ///    still open.
+    /// 2. **No redirect guard** (a *separate* axis from 1, not covered by fixing it): this is
+    ///    this module's one remaining mutation that still rides the auto-following client with no
+    ///    `is_redirection()` check. FORK-89 moved every other mutation (`update_ref`,
+    ///    `upload_object`, `put_presigned`, `upload_signature`, `put_trust`) onto the
+    ///    never-auto-follow client because reqwest's default redirect policy, combined with
+    ///    `tower-http`'s `follow_redirect` middleware, silently turns a `3xx` into a bare `GET`
+    ///    whose `2xx` at the target reads back as a fabricated success — **but FORK-89 shipped
+    ///    without `commit_lift`**: its stated scope named only those five call sites, and this one
+    ///    was left out as a known gap rather than folded in silently (see the auto-following
+    ///    client's own doc, [`Clients::http`]). Do not read gap 1's ticket (FORK-91) as covering
+    ///    this: FORK-91 is about *how long* to wait, not *whether a redirect is trusted* — closing
+    ///    one leaves the other exactly as open. No ticket currently owns gap 2 on its own.
+    ///
+    /// Gap 2, concretely: an ALB or storage-backed head that answers this `POST` with a `303` gets
+    /// auto-followed as a bare `GET`; a `2xx` at whatever the `Location` header names makes this
+    /// function return `Ok(Committed)` for a session whose objects were never actually verified or
+    /// promoted. `Ok(BlobNotReady)`'s eventual promotion is unaffected — the exposure is
+    /// specifically a redirected `2xx` masquerading as a genuine commit response.
     async fn commit_lift(&self,
                          session: &str,
                          control_plane: &[String],
@@ -1691,7 +1876,10 @@ impl RemoteClient {
             more,
         };
 
-        let response = self.request(reqwest::Method::POST, &format!("/v1/lift/{}/commit", session))
+        let response = self.request_on(
+            Posture::UnboundedFollowsRedirects(UnboundedTicket::Fork91),
+            reqwest::Method::POST, &format!("/v1/lift/{}/commit", session)
+        )
             .json(&body)
             .send()
             .await
@@ -1716,7 +1904,7 @@ impl RemoteClient {
 
     /// Fetch a parcel's signature sidecar (`None` for unsigned parcels).
     pub async fn fetch_signature(&self, parcel_hash: &str) -> Result<Option<Vec<u8>>, String> {
-        let response = self.request_on(&self.bounded_reads, reqwest::Method::GET, &format!("/v1/signatures/{}", parcel_hash))
+        let response = self.request_on(Posture::BoundedReads, reqwest::Method::GET, &format!("/v1/signatures/{}", parcel_hash))
             .send()
             .await
             .map_err(|e| self.describe_transport_error(
@@ -1741,16 +1929,20 @@ impl RemoteClient {
 
     /// Upload a parcel's signature sidecar.
     ///
-    /// Rides [`Self::no_redirect`] (FORK-89), not `self.http`: this call mutates the remote, and
-    /// this client never auto-follows a redirect on a mutation — a local, unconditional invariant
-    /// of *this client*, holding regardless of which status code or dependency version is in play
-    /// (see [`Self::describe_mutation_redirect`]'s doc). Before FORK-89 this rode `self.http` with
+    /// Rides [`Posture::UnboundedNoRedirect`] (FORK-89), not the auto-following client: this call
+    /// mutates the remote, and this client never auto-follows a redirect on a mutation — a local,
+    /// unconditional invariant of *this client*, holding regardless of which status code or
+    /// dependency version is in play (see [`Self::describe_mutation_redirect`]'s doc). Before
+    /// FORK-89 this rode the auto-following client with
     /// no `is_redirection()` guard, so a `303` (which `tower-http`'s `SEE_OTHER` arm forces to a
     /// bare `GET` unconditionally) silently landed at the redirect target instead of storing
     /// anything, and a `2xx` there read back as a fabricated success.
     pub async fn upload_signature(&self, parcel_hash: &str, bytes: Vec<u8>) -> Result<(), String> {
         let action = format!("uploading the signature of {}", parcel_hash);
-        let response = self.request_on(&self.no_redirect, reqwest::Method::PUT, &format!("/v1/signatures/{}", parcel_hash))
+        let response = self.request_on(
+            Posture::UnboundedNoRedirect(UnboundedTicket::Fork49),
+            reqwest::Method::PUT, &format!("/v1/signatures/{}", parcel_hash)
+        )
             .body(bytes)
             .send()
             .await
@@ -1769,12 +1961,15 @@ impl RemoteClient {
 
     /// Establish the trust anchor on the remote (idempotent for an identical anchor).
     ///
-    /// Rides [`Self::no_redirect`] (FORK-89) — same reasoning as [`Self::upload_signature`]'s doc:
-    /// a mutation on this client never auto-follows any redirect, unconditionally, and before
-    /// FORK-89 this call had no such guard at all.
+    /// Rides [`Posture::UnboundedNoRedirect`] (FORK-89) — same reasoning as
+    /// [`Self::upload_signature`]'s doc: a mutation on this client never auto-follows any
+    /// redirect, unconditionally, and before FORK-89 this call had no such guard at all.
     pub async fn put_trust(&self, anchor: &TrustAnchorDto) -> Result<(), String> {
         let action = "uploading the trust anchor";
-        let response = self.request_on(&self.no_redirect, reqwest::Method::PUT, "/v1/trust")
+        let response = self.request_on(
+            Posture::UnboundedNoRedirect(UnboundedTicket::Fork49),
+            reqwest::Method::PUT, "/v1/trust"
+        )
             .json(anchor)
             .send()
             .await
@@ -1793,12 +1988,13 @@ impl RemoteClient {
 
     /// Commit a ref update (the CAS of a lift).
     ///
-    /// Rides [`Self::no_redirect`] (FORK-89) — same reasoning as [`Self::upload_signature`]'s doc.
-    /// This call is the one of the three that is a `POST`, not a `PUT`: `tower-http`'s
-    /// `MOVED_PERMANENTLY | FOUND` arm forces a `POST`'s method to `GET` and body to empty (unlike
-    /// its `PUT` handling, which that arm leaves alone), so before FORK-89 this call was
-    /// additionally exposed to a silent-success `301`/`302`, on top of the `303` every mutation on
-    /// `self.http` shared. Moving to `no_redirect` closes all of it the same way, uniformly.
+    /// Rides [`Posture::UnboundedNoRedirect`] (FORK-89) — same reasoning as
+    /// [`Self::upload_signature`]'s doc. This call is the one of the three that is a `POST`, not
+    /// a `PUT`: `tower-http`'s `MOVED_PERMANENTLY | FOUND` arm forces a `POST`'s method to `GET`
+    /// and body to empty (unlike its `PUT` handling, which that arm leaves alone), so before
+    /// FORK-89 this call was additionally exposed to a silent-success `301`/`302`, on top of the
+    /// `303` every mutation on the auto-following client shared. Moving off it closes all of it
+    /// the same way, uniformly.
     pub async fn update_ref(&self,
                             pallet: &str,
                             old_head: Option<&str>,
@@ -1809,7 +2005,10 @@ impl RemoteClient {
         };
         let action = format!("moving the remote pallet \"{}\"", pallet);
 
-        let response = self.request_on(&self.no_redirect, reqwest::Method::POST, &format!("/v1/pallets/{}", pallet))
+        let response = self.request_on(
+            Posture::UnboundedNoRedirect(UnboundedTicket::Fork94),
+            reqwest::Method::POST, &format!("/v1/pallets/{}", pallet)
+        )
             .json(&body)
             .send()
             .await
@@ -1826,7 +2025,7 @@ impl RemoteClient {
         Ok(())
     }
 
-    /// Download the remote's latest bundle into a file. On [`Self::bounded_reads`]: the bundle
+    /// Download the remote's latest bundle into a file. On [`Posture::BoundedReads`]: the bundle
     /// is a **pre-built** file (whatever `forklift compact`/the equivalent server-side job last
     /// produced), so the server's pre-first-byte work is O(constant) — serving an already-built
     /// file — exactly the category [`REMOTE_READ_TIMEOUT`]'s flat budget is honest for. The
@@ -1862,7 +2061,7 @@ impl RemoteClient {
     /// * `Ok(false)`   - The remote has no bundle.
     /// * `Err(String)` - On any other failure.
     pub async fn fetch_bundle_to(&self, path: &std::path::Path) -> Result<bool, String> {
-        let mut response = self.request_on(&self.bounded_reads, reqwest::Method::GET, "/v1/bundles/latest")
+        let mut response = self.request_on(Posture::BoundedReads, reqwest::Method::GET, "/v1/bundles/latest")
             .send()
             .await
             .map_err(|e| self.describe_transport_error("fetching the bundle", REMOTE_READ_TIMEOUT, e))?;
@@ -6004,8 +6203,9 @@ mod tests {
 
     // -----------------------------------------------------------------------------------
     // The unbounded error-body read: `error_of` calls `response.json()` with no bound of its own
-    // once a non-success status line has arrived. `self.http` (which `missing_objects` rides)
-    // carries only a `connect_timeout`, no `read_timeout` at all — so a remote that delivers a
+    // once a non-success status line has arrived. The auto-following client (`Posture::
+    // UnboundedFollowsRedirects`, which `missing_objects` rides) carries only a `connect_timeout`,
+    // no `read_timeout` at all — so a remote that delivers a
     // full status line and headers and then wedges before writing the body hangs the caller
     // forever. `ERROR_BODY_READ_TIMEOUT` bounds the read itself, in `error_of`, rather than
     // trying to fix it with a fifth client — a client cannot help here, since the body-read
@@ -6053,7 +6253,7 @@ mod tests {
         }
     }
 
-    /// `missing_objects` rides `self.http`, unbounded (only a `connect_timeout`) — so before this
+    /// `missing_objects` rides the auto-following client, unbounded (only a `connect_timeout`) — so before this
     /// fix, a `500` whose body then wedges hangs this call forever, with the status line and
     /// headers already fully delivered. The outer ceiling is a safety net, not the property under
     /// test: if the wrapper in `error_of` is missing, that outer ceiling is what trips (the test
@@ -6665,9 +6865,10 @@ mod tests {
     /// `put_presigned` against the same wedged shape must be bounded exactly like `upload_object`
     /// — pins that it is independently wired to the watchdog rather than accidentally covered by
     /// `upload_object`'s own wiring. It is the higher-risk site: it dials straight through
-    /// `self.no_redirect.put(url)`, bypassing `request`/`request_on` entirely (no bearer token
-    /// attached), so nothing about `upload_object`'s watchdog wiring guarantees this one got the
-    /// same fix, even though both now ride the same `no_redirect` client for redirect handling.
+    /// `self.client_for(Posture::WatchdogNoRedirect).put(url)`, bypassing the bearer-token-attaching
+    /// `request_on` entirely (no bearer token attached), so nothing about `upload_object`'s
+    /// watchdog wiring guarantees this one got the same fix, even though both now ride the same
+    /// no-auto-follow client for redirect handling.
     #[test]
     fn put_presigned_times_out_against_a_wedged_remote() {
         let remote = WedgedUploadRemote::start();
@@ -7228,15 +7429,15 @@ mod tests {
 
     // -----------------------------------------------------------------------------------
     // The `303` redirect hole: `is_redirection()` guards `upload_object`/`put_presigned`, but
-    // both rode `self.http`, which auto-follows. `tower-http`'s `follow_redirect` middleware
-    // (`follow_redirect/mod.rs`, `SEE_OTHER` arm) unconditionally forces the body to
+    // both rode the auto-following client, which auto-follows. `tower-http`'s `follow_redirect`
+    // middleware (`follow_redirect/mod.rs`, `SEE_OTHER` arm) unconditionally forces the body to
     // `BodyRepr::Empty` and rewrites the method to `GET` *before* the `take()` guard the
     // `MOVED_PERMANENTLY | FOUND` arm relies on to skip non-`POST` methods — so a `303` to a
     // streamed `PUT` silently becomes a bare `GET`, and a `2xx` at the target makes the call
     // return `Ok(())` having stored nothing. The 302/307 tests above cannot catch this: a `PUT`
     // simply misses the `method == POST` condition in the other arm. The fix routes both sites
-    // through `self.no_redirect` instead of special-casing `303`, so no future tower-http
-    // redirect-matrix change can reopen this hole.
+    // through the never-auto-follow client (today: `Posture::WatchdogNoRedirect`) instead of
+    // special-casing `303`, so no future tower-http redirect-matrix change can reopen this hole.
     // -----------------------------------------------------------------------------------
 
     /// A second live listener a redirect can point at: answers any request with a bare `200 OK`
@@ -7268,11 +7469,11 @@ mod tests {
     }
 
     /// The fixed hole itself: a `303` to `put_presigned` must not be auto-followed. Before the
-    /// fix (`self.http`, which auto-follows) this returns `Ok(())` with the landing flag `true` —
+    /// fix (the auto-following client) this returns `Ok(())` with the landing flag `true` —
     /// the redirect target really was reached as a bare `GET` and its `200` read back as success.
-    /// After the fix (`self.no_redirect`) the raw `303` comes back to the existing guard, the
-    /// landing flag stays `false`, and the error names the status and location by the same
-    /// mechanism the 302/307 tests already pin.
+    /// After the fix (the never-auto-follow client) the raw `303` comes back to the existing
+    /// guard, the landing flag stays `false`, and the error names the status and location by the
+    /// same mechanism the 302/307 tests already pin.
     #[test]
     fn put_presigned_does_not_follow_a_303_to_a_2xx_landing() {
         let (landing_url, landed) = start_landing_remote();
@@ -7295,8 +7496,8 @@ mod tests {
     }
 
     /// Same hole, `upload_object` site — the two client selections in the fix (`upload_object` →
-    /// `self.no_redirect` via `request_on`, `put_presigned` → `self.no_redirect.put`) change
-    /// independently, so each needs its own falsifier.
+    /// the never-auto-follow client via `request_on`, `put_presigned` → the never-auto-follow
+    /// client via `client_for`) change independently, so each needs its own falsifier.
     #[test]
     fn upload_object_does_not_follow_a_303_to_a_2xx_landing() {
         let (landing_url, landed) = start_landing_remote();
@@ -7321,9 +7522,10 @@ mod tests {
 
     // -----------------------------------------------------------------------------------
     // FORK-89: `update_ref`, `upload_signature`, and `put_trust` had no `is_redirection()` guard
-    // at all and rode `self.http` (auto-following), unlike `upload_object`/`put_presigned` above.
+    // at all and rode the auto-following client, unlike `upload_object`/`put_presigned` above.
     // A `303` to any of the three — a `PUT` for the latter two, exactly the shape the 303 hole
-    // above already proves is silently followed on `self.http` — became a bare `GET`, and a `2xx`
+    // above already proves is silently followed on the auto-following client — became a bare
+    // `GET`, and a `2xx`
     // at the target read back as a fabricated success having mutated nothing. `update_ref` is a
     // `POST`, so it carries a second, wider exposure the two `PUT`s do not: `tower-http`'s
     // `MOVED_PERMANENTLY | FOUND` arm *also* forces a `POST`'s method to `GET` and body to empty,
@@ -7333,10 +7535,10 @@ mod tests {
     // falsifier — same reasoning as the `upload_object`/`put_presigned` pair above.
     // -----------------------------------------------------------------------------------
 
-    /// `update_ref` must not silently follow a `303` to a `2xx` landing. Before the fix
-    /// (`self.request` → `self.http`) this returns `Ok(())` with the landing flag `true`; after
-    /// (`self.no_redirect` + the `is_redirection()` guard) the raw `303` is reported by name and
-    /// the landing listener is never contacted.
+    /// `update_ref` must not silently follow a `303` to a `2xx` landing. Before the fix (the
+    /// implicit-default client, then the auto-following client) this returns `Ok(())` with the
+    /// landing flag `true`; after (the never-auto-follow client + the `is_redirection()` guard)
+    /// the raw `303` is reported by name and the landing listener is never contacted.
     #[test]
     fn update_ref_does_not_follow_a_303_to_a_2xx_landing() {
         let (landing_url, landed) = start_landing_remote();
@@ -7359,11 +7561,12 @@ mod tests {
     }
 
     /// `update_ref`'s `POST`-specific exposure: a `302` is the case `upload_signature`/`put_trust`
-    /// (both `PUT`s) were never vulnerable to even on the unfixed `self.http` — `tower-http`'s
-    /// `MOVED_PERMANENTLY | FOUND` arm only rewrites a `POST`. This is exactly the asymmetry an
-    /// earlier version of this test suite missed by only covering `303`: a regression that moved
-    /// `update_ref` back onto `self.http` while somehow keeping `upload_signature`/`put_trust` on
-    /// `no_redirect` would pass every `303` test here and still silently drop a lift's ref update.
+    /// (both `PUT`s) were never vulnerable to even on the unfixed auto-following client —
+    /// `tower-http`'s `MOVED_PERMANENTLY | FOUND` arm only rewrites a `POST`. This is exactly the
+    /// asymmetry an earlier version of this test suite missed by only covering `303`: a
+    /// regression that moved `update_ref` back onto the auto-following client while somehow
+    /// keeping `upload_signature`/`put_trust` on the never-auto-follow one would pass every `303`
+    /// test here and still silently drop a lift's ref update.
     #[test]
     fn update_ref_does_not_follow_a_302_to_a_2xx_landing() {
         let (landing_url, landed) = start_landing_remote();
@@ -7386,7 +7589,8 @@ mod tests {
     }
 
     /// `upload_signature` must not silently follow a `303` to a `2xx` landing — the same hole,
-    /// its own client selection (`self.request` → `self.request_on(&self.no_redirect, ...)`).
+    /// its own client selection (the implicit-default client → `request_on(Posture::
+    /// UnboundedNoRedirect(...), ...)`, the never-auto-follow client).
     #[test]
     fn upload_signature_does_not_follow_a_303_to_a_2xx_landing() {
         let (landing_url, landed) = start_landing_remote();
