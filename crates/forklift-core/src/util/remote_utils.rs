@@ -302,10 +302,19 @@ const REMOTE_CONNECT_TIMEOUT_TOR: std::time::Duration = std::time::Duration::fro
 /// `connect_timeout(60s)` + `read_timeout(3s)` against a black-holed address failed at 3.002s,
 /// not 60s). That is why this is carried by only four of the module's read/metadata calls
 /// — [`RemoteClient::fetch_info`], [`RemoteClient::fetch_signature`],
-/// [`RemoteClient::fetch_bundle_to`], [`RemoteClient::resolve`] — each of whose server side does
-/// O(constant) work (a single lookup, or serving an already-built file) before writing anything,
-/// so a flat 10s pre-first-byte budget is honest. `fetch_object` needs a much looser budget of its
-/// own ([`FETCH_OBJECT_READ_TIMEOUT`]) since its server side is size-dependent, not O(constant).
+/// [`RemoteClient::fetch_bundle_to`], [`RemoteClient::resolve`]. The first three share one
+/// justification: each of their server sides does O(constant) work (a single lookup, or serving
+/// an already-built file) before writing anything, so a flat 10s pre-first-byte budget is honest.
+/// `resolve` does **not** belong to that class — narrower claim, not a stretch of this one: its
+/// pre-first-byte work is a single resolution-hook call over the office roster, proportional to
+/// enrolled users and never to history or object count (see
+/// [`resolve_office_display_names`]'s own doc), and the hook itself is deployment-supplied code
+/// (`forklift-server`'s `post_resolve` hands it the whole identifier list) this file cannot bound
+/// at all. 10s here is a judgement that a directory lookup over a roster-sized list answers
+/// inside it, not a claim the work is O(constant); a deployment whose hook is slower degrades
+/// `resolve` to pseudonyms, which is already its designed outcome for every other failure.
+/// `fetch_object` needs a much looser budget of its own ([`FETCH_OBJECT_READ_TIMEOUT`]) since its
+/// server side is size-dependent, not O(constant).
 /// `missing_objects`, `fetch_batch`, and `fetch_subtree` are deliberately **not** bounded at all:
 /// their server sides build a bundle (or consult up to `MAX_MISSING_BATCH` hashes) *before* the
 /// first byte, work whose cost depends on object sizes the client cannot know in advance — no flat
@@ -330,10 +339,13 @@ const REMOTE_CONNECT_TIMEOUT_TOR: std::time::Duration = std::time::Duration::fro
 /// enumerated content; giving it a flat silence budget before that walk-equivalence question is
 /// settled would be exactly the kind of guess this module's bounded clients exist to avoid.
 ///
-/// 10s of silence, on top of whichever connect budget applies, is generous for any of the four
-/// tight calls above: a healthy connection carrying real progress, however slow the link,
-/// essentially never goes a full 10s without delivering a byte, and each of their pre-first-byte
-/// server costs is a single lookup or an already-built file.
+/// 10s of silence, on top of whichever connect budget applies, is generous for
+/// [`RemoteClient::fetch_info`], [`RemoteClient::fetch_signature`], and
+/// [`RemoteClient::fetch_bundle_to`]: a healthy connection carrying real progress, however slow
+/// the link, essentially never goes a full 10s without delivering a byte, and each of their
+/// pre-first-byte server costs is a single lookup or an already-built file. For `resolve`, the
+/// same 10s is instead the judgement call described above — how long a roster-sized
+/// resolution-hook call should reasonably take, not a claim about O(constant) server work.
 const REMOTE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The read/metadata silence budget for [`RemoteClient::fetch_object`] alone — see
@@ -698,8 +710,10 @@ mod clients {
     /// argument to construct a request from, so there is nothing to fall back to.
     pub(super) enum Posture {
         /// [`REMOTE_READ_TIMEOUT`]-bounded via a client-level `read_timeout`. For the
-        /// O(constant)-pre-first-byte calls: `fetch_info`, `fetch_signature`, `fetch_bundle_to`,
-        /// `resolve`.
+        /// O(constant)-pre-first-byte calls `fetch_info`, `fetch_signature`, `fetch_bundle_to` —
+        /// and for `resolve`, whose pre-first-byte work is proportional to the office roster
+        /// instead, not O(constant); see [`REMOTE_READ_TIMEOUT`]'s own doc for why the same
+        /// budget still applies to it.
         ///
         /// **Auto-follows redirects — never select this for a mutation.** The client this
         /// selects carries no `redirect::Policy::none()`, for the same reason [`Clients::http`]
@@ -1528,16 +1542,18 @@ impl RemoteClient {
     ///
     /// Rides [`Posture::BoundedReads`] — the same client `fetch_info`/`fetch_signature`/
     /// `fetch_bundle_to` use — rather than a per-request timeout of its own. It used to carry a
-    /// flat `RequestBuilder::timeout(5s)` here instead, which looked tighter but was not actually
-    /// a working bound: per `reqwest`'s own docs, that timeout is a *total* deadline starting at
-    /// connect, and this file's own [`REMOTE_CONNECT_TIMEOUT_TOR`] exists because a Tor circuit
-    /// build alone can legitimately take tens of seconds — so on a Tor remote the old 5s expired
-    /// during connect on essentially every call, degrading `resolve` to pseudonyms always, never
-    /// actually resolving anything. Worst case before falling back to pseudonyms is now roughly
-    /// `connect_timeout + REMOTE_READ_TIMEOUT` — about 15s direct, about 70s over Tor (see
-    /// [`bounded_read_timeout`]) — a real, visible increase in the display-lookup's own worst-case
-    /// latency, accepted because the bound it replaces was never a working one on Tor in the first
-    /// place.
+    /// flat `RequestBuilder::timeout(5s)` here instead, which looked tighter but was structurally
+    /// incapable of covering a Tor dial: per `reqwest`'s own docs, that timeout is a *total*
+    /// deadline starting at connect, smaller than the connect allowance this same file
+    /// deliberately grants a Tor dial ([`REMOTE_CONNECT_TIMEOUT_TOR`] = 60s, because — this
+    /// file's own stated reason — circuit build alone can legitimately take tens of seconds). So
+    /// on Tor the old 5s deadline could expire before the request was ever sent, for a remote the
+    /// rest of this file already treats as legitimately slow to reach; how often it actually did
+    /// is not something this file measures or claims. Worst case before falling back to
+    /// pseudonyms is now roughly `connect_timeout + REMOTE_READ_TIMEOUT` — about 15s direct, about
+    /// 70s over Tor (see [`bounded_read_timeout`]) — a real, visible increase in the
+    /// display-lookup's own worst-case latency, accepted because the bound it replaces was never
+    /// structurally capable of covering a Tor connect at all.
     pub async fn resolve(&self, identifiers: Vec<String>) -> BTreeMap<String, String> {
         if identifiers.is_empty() {
             return BTreeMap::new();
@@ -6577,26 +6593,43 @@ mod tests {
     }
 
     /// The discriminating fixture for `resolve`'s move onto [`Posture::BoundedReads`]: a remote
-    /// that connects instantly (loopback) and then stays silent for 8s before answering correctly.
-    /// 8s is chosen to sit strictly between the two bounds this test exists to tell apart, with
-    /// real slack on both sides and no collision with any other constant in scope: it is 3s past
-    /// the *old* flat `RequestBuilder::timeout(5s)` `resolve` used to carry
-    /// (`TEST_DIRECT_CONNECT_TIMEOUT` alone, since that old bound was a total deadline from
-    /// connect, and connect here is near-instant), and 7s inside the *new*
-    /// `Posture::BoundedReads` budget of `TEST_DIRECT_CONNECT_TIMEOUT + TEST_TIGHT_READ_TIMEOUT`
-    /// = 15s. Before the fix: the old 5s deadline fires mid-wait, `send` returns `Err`, and
-    /// `resolve` falls back to an empty map — pseudonyms, even though the remote was healthy and
-    /// answering. After the fix: 8s is comfortably inside the 15s budget, so the real mapping
-    /// comes back. Asserts the returned mapping itself, not merely that the call returned
-    /// promptly — a timing-only assertion is green in both worlds (5s empty-map return, 15s
-    /// real-map return), so it would pin nothing.
+    /// that connects instantly (loopback) and then stays silent for a fixed delay before
+    /// answering correctly. The test itself asserts that this delay sits strictly between the
+    /// *old* flat bound `resolve` used to carry (a plain `RequestBuilder::timeout(5s)`, not
+    /// mirrored as a `TEST_*` constant since the production value it mirrored no longer exists to
+    /// drift against) and the *new* [`Posture::BoundedReads`] budget
+    /// (`TEST_DIRECT_CONNECT_TIMEOUT + TEST_TIGHT_READ_TIMEOUT`) — so a future change to either
+    /// bound fails this test loudly instead of leaving a stale comment. Before the fix: the old
+    /// 5s deadline fires mid-wait, `send` returns `Err`, and `resolve` falls back to an empty map
+    /// — pseudonyms, even though the remote was healthy and answering. After the fix: the delay
+    /// is comfortably inside the new budget, so the real mapping comes back. Asserts the returned
+    /// mapping itself, not merely that the call returned promptly — a timing-only assertion is
+    /// green in both worlds (5s empty-map return, ~15s real-map return), so it would pin nothing.
     #[test]
     fn resolve_survives_silence_past_the_old_five_second_bound() {
+        // Not a `TEST_*` mirror: this is `resolve`'s own historical bound, a value this PR
+        // deletes from production entirely — there is no live constant left to mirror or drift
+        // against, only the fixed number the fix replaced.
+        let old_flat_bound = std::time::Duration::from_secs(5);
+        let new_budget = TEST_DIRECT_CONNECT_TIMEOUT + TEST_TIGHT_READ_TIMEOUT;
         let delay = std::time::Duration::from_secs(8);
+
+        assert!(
+            delay > old_flat_bound,
+            "the fixture's delay {:?} must exceed the old flat bound {:?}, or this test no \
+            longer discriminates the old behavior from the new — it would pass even against the \
+            reverted fix", delay, old_flat_bound
+        );
+        assert!(
+            delay < new_budget,
+            "the fixture's delay {:?} must stay under the new budget {:?}, or this test would \
+            fail for an unrelated reason (the remote genuinely never answering in time), not the \
+            one it exists to catch", delay, new_budget
+        );
+
         let url = start_slow_resolving_remote(delay);
         let client = RemoteClient::new(&url, None).unwrap();
-        let outer_ceiling = TEST_DIRECT_CONNECT_TIMEOUT + TEST_TIGHT_READ_TIMEOUT
-            + std::time::Duration::from_secs(15);
+        let outer_ceiling = new_budget + std::time::Duration::from_secs(15);
 
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let names = runtime.block_on(async {
