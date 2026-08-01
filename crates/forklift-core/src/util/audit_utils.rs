@@ -1237,21 +1237,13 @@ fn verify_key_permanence(previous: &OfficeState, current: &OfficeState) -> Resul
 fn verify_self_service_change(previous: &OfficeState,
                               current: &OfficeState,
                               signer: &str) -> Result<(), String> {
-    type UserFacts = (String, i64, String, Vec<String>, String);
-
-    let user_facts = |state: &OfficeState| -> Vec<UserFacts> {
-        state.users.iter()
-            .map(|user| (
-                user.identifier.clone(),
-                user.enrolled_at,
-                user.role.as_str().to_string(),
-                user.pallets.clone(),
-                user.identity_root.clone(),
-            ))
-            .collect()
-    };
-
-    if user_facts(previous) != user_facts(current) {
+    // Compare whole records, not a hand-picked projection of fields: `UserRecord`
+    // derives `PartialEq` precisely so a field added there is protected here by
+    // default, rather than by remembering to extend a parallel tuple (FORK-76 — a
+    // five-of-seven-field projection let `class` and `supervisor` drift unguarded).
+    // Every legitimate self-service change (key rotation, retirement, device linking)
+    // only ever touches `OfficeState::keys`; no `UserRecord` field is self-service.
+    if previous.users != current.users {
         return Err("changes user records; only admins may".to_string());
     }
 
@@ -2559,5 +2551,367 @@ mod tests {
             "the overflow is summarized rather than dumped: {}",
             err
         );
+    }
+
+    // -------------------------------------------------------------------------------
+    // verify_office_privileges — user-record permanence (FORK-76)
+    //
+    // `verify_self_service_change` is the only governance check a non-admin's office
+    // parcel faces (an admin's signature short-circuits past it entirely, see
+    // `verify_office_privileges`). These tests build real, disk-signed office chains —
+    // through the same `office_utils`/`sign_utils` calls the CLI's `office` commands
+    // use — so a fixture that never actually reached the non-admin branch could not
+    // pass by accident, and a hostile parcel is signed with the attacker's own real key,
+    // not a stand-in.
+    // -------------------------------------------------------------------------------
+
+    /// Serializes every test here that touches `FORKLIFT_KEYS_DIR` (a process-global
+    /// environment variable, not thread-local) so two tests never point the process at
+    /// different key directories at once. Mirrors the same guard `forklift-server`'s own
+    /// office-chain test fixture uses, for the same reason.
+    static PRIVILEGE_KEYS_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// A real, disk-backed office chain: a genesis admin with a self-endorsed identity
+    /// root (exactly what `office enroll` produces), trust established.
+    struct PrivilegeFixture {
+        _scope: crate::globals::StorageRootScope,
+        // `None` when a caller is holding `PRIVILEGE_KEYS_ENV_LOCK` itself in an outer
+        // scope that must outlive this fixture (see `build`'s doc comment) — otherwise
+        // `Some`, and the fixture releases the lock as part of its own drop, in field
+        // order, right after `Drop::drop` restores `FORKLIFT_KEYS_DIR`.
+        _keys_lock: Option<std::sync::MutexGuard<'static, ()>>,
+        root: std::path::PathBuf,
+        anchor: TrustAnchor,
+        admin: crate::model::operator::Operator,
+        admin_key_id: String,
+        // What `FORKLIFT_KEYS_DIR` held before this fixture pointed it at its own
+        // (about-to-be-deleted) directory — restored in `Drop` so a later test in this
+        // binary never inherits a path this fixture already removed. `FORKLIFT_KEYS_DIR`
+        // is process-global (see `PRIVILEGE_KEYS_ENV_LOCK`), so leaving it pointed at a
+        // removed directory would flake the next signer that runs without the lock.
+        previous_keys_dir: Option<String>,
+    }
+
+    impl PrivilegeFixture {
+        fn new(name: &str) -> PrivilegeFixture {
+            let keys_lock = PRIVILEGE_KEYS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            PrivilegeFixture::build(name, Some(keys_lock))
+        }
+
+        /// The body of `new`, taking the `PRIVILEGE_KEYS_ENV_LOCK` guard as a
+        /// parameter instead of acquiring one itself, so a caller can choose who ends
+        /// up owning it:
+        ///
+        /// - `new` passes `Some(lock)` (the normal case): the fixture takes ownership
+        ///   and holds it for its own lifetime, releasing it in field-drop order right
+        ///   after `Drop::drop` restores `FORKLIFT_KEYS_DIR` — unchanged from before.
+        /// - A caller that must keep observing `FORKLIFT_KEYS_DIR` (both its own
+        ///   writes and this fixture's) after the fixture is gone passes `None` and
+        ///   keeps its own guard alive in an outer scope instead. This is what the
+        ///   restore-on-drop falsifier below does: it asserts on `FORKLIFT_KEYS_DIR`
+        ///   both right after construction and after `drop(fixture)`, and every one of
+        ///   those assertions — not just construction — needs the lock held, or a
+        ///   concurrent fixture from another test in this binary can be mid-flight and
+        ///   change the value out from under the assertion. Handing the fixture `None`
+        ///   means `drop(fixture)` only drops the fixture, not the lock; the caller's
+        ///   own guard, still alive in its own scope, keeps every assertion covered
+        ///   and is released only when that scope ends.
+        fn build(
+            name: &str,
+            keys_lock: Option<std::sync::MutexGuard<'static, ()>>,
+        ) -> PrivilegeFixture {
+            let root = std::env::temp_dir().join(format!(
+                "forklift-privilege-test-{}-{}", name, std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            let keys_dir = root.join("keys");
+            std::fs::create_dir_all(&keys_dir).unwrap();
+            let previous_keys_dir = std::env::var("FORKLIFT_KEYS_DIR").ok();
+            std::env::set_var("FORKLIFT_KEYS_DIR", &keys_dir);
+
+            let scope = crate::globals::StorageRootScope::enter(&root);
+            crate::util::warehouse_utils::prepare_warehouse().unwrap();
+
+            let admin = crate::model::operator::Operator {
+                name: "alice".to_string(),
+                identifier: ALICE.to_string(),
+            };
+            let (admin_key_id, admin_pub) = sign_utils::generate_keypair(&admin.identifier).unwrap();
+            let pop = crate::util::office_utils::sign_key_pop(
+                &admin_key_id, &admin_pub, &admin.identifier
+            ).unwrap();
+            let root_key = crate::util::office_utils::endorse_key(
+                &admin_pub, &admin.identifier, &admin_key_id, &pop, 1_700_000_000
+            ).unwrap();
+
+            let state = OfficeState {
+                users: vec![user(ALICE, Role::Admin, &admin_key_id)],
+                keys: vec![root_key],
+            };
+
+            let genesis = crate::util::office_utils::stack_office_parcel(
+                &state, &admin, "genesis".to_string(), &admin_key_id
+            ).unwrap();
+
+            let anchor = TrustAnchor {
+                genesis,
+                enabled_at: 1_700_000_000,
+                boundary: Vec::new(),
+                prior_genesis: None,
+                adopts: None,
+            };
+
+            crate::util::office_utils::write_trust_anchor(&anchor).unwrap();
+
+            PrivilegeFixture {
+                _scope: scope, _keys_lock: keys_lock, root, anchor, admin, admin_key_id,
+                previous_keys_dir,
+            }
+        }
+
+        /// Admit an operator (admin-signed — a legitimate admission) and return their
+        /// key id and the office parcel hash of the admission itself (the head right
+        /// after it — the "previous" state the parcel under test builds on).
+        fn admit(&self,
+                identifier: &str,
+                role: Role,
+                class: crate::util::office_utils::IdentityClass,
+                supervisor: Option<String>) -> (String, String) {
+            let (key_id, public_key) = sign_utils::generate_keypair(identifier).unwrap();
+            let pop = crate::util::office_utils::sign_key_pop(&key_id, &public_key, identifier).unwrap();
+            let key = crate::util::office_utils::endorse_key(
+                &public_key, identifier, &self.admin_key_id, &pop, 1_700_000_001
+            ).unwrap();
+
+            let mut state = crate::util::office_utils::read_office_state().unwrap();
+            state.users.push(UserRecord {
+                identifier: identifier.to_string(),
+                enrolled_at: 1_700_000_001,
+                role,
+                pallets: Vec::new(),
+                identity_root: key_id.clone(),
+                class,
+                supervisor,
+            });
+            state.keys.push(key);
+
+            let head = crate::util::office_utils::stack_office_parcel(
+                &state, &self.admin, format!("admit {}", identifier), &self.admin_key_id
+            ).unwrap();
+
+            (key_id, head)
+        }
+    }
+
+    impl Drop for PrivilegeFixture {
+        fn drop(&mut self) {
+            match &self.previous_keys_dir {
+                Some(previous) => std::env::set_var("FORKLIFT_KEYS_DIR", previous),
+                None => std::env::remove_var("FORKLIFT_KEYS_DIR"),
+            }
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// Falsifies the leak this fixture used to have: `FORKLIFT_KEYS_DIR` is
+    /// process-global, and this fixture points it at a directory its own `Drop`
+    /// deletes. Without restoring the prior value first, the process would be left
+    /// with `FORKLIFT_KEYS_DIR` pointing at a removed path after the fixture goes
+    /// away — flaking any later signer in this binary that runs without
+    /// `PRIVILEGE_KEYS_ENV_LOCK`. Covers both directions: a prior value to restore,
+    /// and no prior value (must end up unset again, not set to `""`).
+    ///
+    /// Every assertion below — including the ones after `drop(fixture)` — runs while
+    /// this test's own `keys_lock` is held. Passing `PrivilegeFixture::build` `None`
+    /// keeps that guard here instead of handing it to the fixture, so `drop(fixture)`
+    /// releases only the fixture, not the lock: a concurrent fixture from another
+    /// test in this binary cannot become mid-flight and change `FORKLIFT_KEYS_DIR`
+    /// out from under an assertion. (An earlier version of this test handed the lock
+    /// to the fixture and read `FORKLIFT_KEYS_DIR` after dropping it — unlocked. That
+    /// version's own assertions could flake for the exact reason this test exists.)
+    #[test]
+    fn dropping_privilege_fixture_restores_the_previous_keys_dir_env_var() {
+        const SENTINEL: &str = "/does/not/exist/forklift-restore-sentinel";
+
+        // Case 1: FORKLIFT_KEYS_DIR pointed somewhere else before the fixture.
+        {
+            let keys_lock = PRIVILEGE_KEYS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::set_var("FORKLIFT_KEYS_DIR", SENTINEL);
+            let fixture = PrivilegeFixture::build("restore-check-was-set", None);
+            assert_ne!(
+                std::env::var("FORKLIFT_KEYS_DIR").ok(), Some(SENTINEL.to_string()),
+                "fixture construction should have repointed FORKLIFT_KEYS_DIR at its own directory"
+            );
+            drop(fixture);
+            assert_eq!(
+                std::env::var("FORKLIFT_KEYS_DIR").ok(), Some(SENTINEL.to_string()),
+                "dropping the fixture must restore FORKLIFT_KEYS_DIR to what it held before construction"
+            );
+            drop(keys_lock);
+        }
+
+        // Case 2: FORKLIFT_KEYS_DIR was not set at all before the fixture.
+        {
+            let keys_lock = PRIVILEGE_KEYS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::remove_var("FORKLIFT_KEYS_DIR");
+            let fixture = PrivilegeFixture::build("restore-check-was-unset", None);
+            drop(fixture);
+            assert!(
+                std::env::var("FORKLIFT_KEYS_DIR").is_err(),
+                "dropping the fixture must leave FORKLIFT_KEYS_DIR unset if it started unset"
+            );
+            drop(keys_lock);
+        }
+    }
+
+    /// Build a fixture with `BOB` admitted as a plain writer, apply `mutate` to Bob's own
+    /// user record, sign the resulting parcel with Bob's own (real, disk) key, and return
+    /// the error `verify_office_privileges` raises for it.
+    fn refuse_self_service_user_edit(name: &str, mutate: impl FnOnce(&mut UserRecord)) -> String {
+        let fixture = PrivilegeFixture::new(name);
+        let (bob_key_id, admitted_head) = fixture.admit(
+            BOB, Role::Writer, crate::util::office_utils::IdentityClass::Human, None
+        );
+        let bob = crate::model::operator::Operator { name: BOB.to_string(), identifier: BOB.to_string() };
+
+        let mut state = crate::util::office_utils::read_office_state().unwrap();
+        let bob_record = state.users.iter_mut().find(|record| record.identifier == BOB)
+            .expect("bob was just admitted");
+        mutate(bob_record);
+
+        let hostile = crate::util::office_utils::stack_office_parcel(
+            &state, &bob, "self-service edit".to_string(), &bob_key_id
+        ).unwrap();
+
+        let error = verify_office_privileges(&fixture.anchor, Some(&admitted_head), &hostile)
+            .expect_err("a non-admin editing their own user record must be refused");
+
+        // Proves the fixture actually reached `verify_self_service_change` (the
+        // non-admin branch) rather than short-circuiting at the admin check: this exact
+        // wording, naming the non-admin signer, is only produced by that branch (see
+        // `verify_office_privileges`'s error-wrapping around it).
+        assert!(error.contains("not an admin"), "{}", error);
+        assert!(error.contains(BOB), "{}", error);
+        assert!(error.contains("changes user records"), "{}", error);
+
+        error
+    }
+
+    /// Falsifier 1: a non-admin relabeling their own `class` (e.g. laundering
+    /// agent-authored work as human-authored) must be refused.
+    #[test]
+    fn a_non_admin_flipping_their_own_identity_class_is_refused() {
+        refuse_self_service_user_edit("class-flip", |user| {
+            user.class = crate::util::office_utils::IdentityClass::Agent;
+        });
+    }
+
+    /// Falsifier 2: a non-admin repointing their own `supervisor` (attributing their
+    /// actions to an operator who never agreed to supervise them) must be refused.
+    #[test]
+    fn a_non_admin_repointing_their_supervisor_is_refused() {
+        refuse_self_service_user_edit("supervisor-flip", |user| {
+            user.supervisor = Some("mallory-never-agreed-to-this".to_string());
+        });
+    }
+
+    /// Falsifier 3: the class stays closed for a field beyond the two named in FORK-76.
+    /// `pallets` stands in here as a third, unrelated field; the mechanism that catches
+    /// it is structural, not a per-field list — `UserRecord` derives `PartialEq`, so a
+    /// field added to the struct in the future is compared automatically, the same way
+    /// `pallets` is compared today, without touching `verify_self_service_change` at all.
+    #[test]
+    fn a_non_admin_changing_any_protected_user_field_is_refused() {
+        refuse_self_service_user_edit("pallets-flip", |user| {
+            user.pallets = vec!["stolen-pallet".to_string()];
+        });
+    }
+
+    /// Falsifier 4 (over-tightened check): an admin-signed `class`/`supervisor` change
+    /// still passes — the fix must not touch the admin short-circuit.
+    #[test]
+    fn an_admin_may_change_a_users_class_or_supervisor() {
+        let fixture = PrivilegeFixture::new("admin-class-change");
+        let (_, admitted_head) = fixture.admit(
+            BOB, Role::Writer, crate::util::office_utils::IdentityClass::Human, None
+        );
+
+        let mut state = crate::util::office_utils::read_office_state().unwrap();
+        for record in state.users.iter_mut() {
+            if record.identifier == BOB {
+                record.class = crate::util::office_utils::IdentityClass::Bot;
+                record.supervisor = None;
+            }
+        }
+
+        let approved = crate::util::office_utils::stack_office_parcel(
+            &state, &fixture.admin, "admin reclassifies bob".to_string(), &fixture.admin_key_id
+        ).unwrap();
+
+        assert!(verify_office_privileges(&fixture.anchor, Some(&admitted_head), &approved).is_ok());
+    }
+
+    /// Falsifier 5 (over-tightened check): a non-admin's self-service key rotation still
+    /// passes — rotation touches only `OfficeState::keys`, never `UserRecord`.
+    #[test]
+    fn a_non_admin_self_service_key_rotation_still_passes() {
+        let fixture = PrivilegeFixture::new("writer-key-rotation");
+        let (bob_key_id, admitted_head) = fixture.admit(
+            BOB, Role::Writer, crate::util::office_utils::IdentityClass::Human, None
+        );
+        let bob = crate::model::operator::Operator { name: BOB.to_string(), identifier: BOB.to_string() };
+
+        let (new_key_id, new_public) = sign_utils::generate_keypair(BOB).unwrap();
+        let pop = crate::util::office_utils::sign_key_pop(&new_key_id, &new_public, BOB).unwrap();
+        // A rotation authorized by the key it replaces — exactly what `office rotate` does.
+        let new_key = crate::util::office_utils::endorse_key(
+            &new_public, BOB, &bob_key_id, &pop, 1_700_000_002
+        ).unwrap();
+
+        let mut state = crate::util::office_utils::read_office_state().unwrap();
+        for key in state.keys.iter_mut() {
+            if key.operator == BOB && key.is_active() {
+                key.retired_at = Some(1_700_000_002);
+                key.revocation_reason = Some(crate::util::office_utils::RevocationReason::Retirement);
+                // Boundary content is irrelevant to this check (`verify_key_permanence`
+                // only forbids a *later* rewrite of an already-recorded boundary); empty
+                // is fine for isolating the check under test.
+                key.distrust_boundary = Vec::new();
+            }
+        }
+        state.keys.push(new_key);
+
+        let rotated = crate::util::office_utils::stack_office_parcel(
+            &state, &bob, "bob rotates his own key".to_string(), &bob_key_id
+        ).unwrap();
+
+        assert!(verify_office_privileges(&fixture.anchor, Some(&admitted_head), &rotated).is_ok());
+    }
+
+    /// Falsifier 6 (over-tightened check): a non-admin parcel that changes nothing about
+    /// user records still passes — here, linking a second device key without retiring
+    /// anything (a pure key addition, `OfficeState::users` untouched byte-for-byte).
+    #[test]
+    fn a_non_admin_parcel_that_touches_no_user_record_still_passes() {
+        let fixture = PrivilegeFixture::new("writer-link-device");
+        let (bob_key_id, admitted_head) = fixture.admit(
+            BOB, Role::Writer, crate::util::office_utils::IdentityClass::Human, None
+        );
+        let bob = crate::model::operator::Operator { name: BOB.to_string(), identifier: BOB.to_string() };
+
+        let (device_key_id, device_public) = sign_utils::generate_keypair(BOB).unwrap();
+        let pop = crate::util::office_utils::sign_key_pop(&device_key_id, &device_public, BOB).unwrap();
+        let device_key = crate::util::office_utils::endorse_key(
+            &device_public, BOB, &bob_key_id, &pop, 1_700_000_002
+        ).unwrap();
+
+        let mut state = crate::util::office_utils::read_office_state().unwrap();
+        state.keys.push(device_key);
+
+        let linked = crate::util::office_utils::stack_office_parcel(
+            &state, &bob, "bob links a second device".to_string(), &bob_key_id
+        ).unwrap();
+
+        assert!(verify_office_privileges(&fixture.anchor, Some(&admitted_head), &linked).is_ok());
     }
 }
