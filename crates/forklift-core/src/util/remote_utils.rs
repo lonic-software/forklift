@@ -751,6 +751,14 @@ mod clients {
     /// different way — see [`Clients::send_with_watchdog`]'s own doc — and so never construct a
     /// `Posture` at all; there is no variant here standing in for that mechanism to keep in sync
     /// with it.
+    ///
+    /// `#[derive(..., Copy, ...)]`: [`super::RemoteClient::describe_transport_error`] takes a
+    /// `Posture` by value, since it reports the exact posture a call was actually armed with —
+    /// every call site needs to arm a request with a posture and then hand that same posture to
+    /// the composer, and `Copy` is what lets a call site bind one local and use it twice (once in
+    /// [`Self::request_on`], once in the error map) without a borrow fight. `PartialEq`/`Eq`/`Debug`
+    /// are for the tests that need to match or print one.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(super) enum Posture {
         /// [`REMOTE_READ_TIMEOUT`]-bounded via a client-level `read_timeout`. For the
         /// O(constant)-pre-first-byte calls: `fetch_info`, `fetch_signature`, `fetch_bundle_to`.
@@ -1035,13 +1043,41 @@ mod clients {
         /// apart. `destination` names the two request shapes callers need — see
         /// [`RequestDestination`]'s own doc — the same split [`Self::send_with_watchdog`] makes for
         /// uploads, and for the same reason: a caller-supplied builder, or a caller-supplied bare
-        /// client, is exactly the seam a posture's payload can go missing through.
+        /// client, is exactly the seam a posture's payload can go missing through. `connect_timeout`
+        /// is threaded in as a parameter, the same shape [`Self::send_with_watchdog`] already takes
+        /// it (see that method's own doc for why it is a parameter here rather than a field this
+        /// module stores): it exists solely for the `debug_assert!` below, pinning the invariant
+        /// [`super::RemoteClient::describe_transport_error`]'s `TotalDeadline` wording depends on —
+        /// see that invariant's own note at the `debug_assert!` site.
         pub(super) fn request_on(&self,
                                  posture: Posture,
+                                 connect_timeout: std::time::Duration,
                                  method: reqwest::Method,
                                  destination: RequestDestination<'_>) -> reqwest::RequestBuilder {
             let total_deadline = match &posture {
-                Posture::TotalDeadline(duration) => Some(*duration),
+                Posture::TotalDeadline(duration) => {
+                    // Every producer of a `TotalDeadline` payload builds it as `connect_timeout +
+                    // a positive addend` (`RemoteClient::resolve_budget`,
+                    // `RemoteClient::presence_negotiation_budget`) — never merely a post-connect
+                    // budget on its own — specifically so a connect-phase stall on this posture
+                    // always classifies as `TransportFailure::ConnectTimedOut`, never the
+                    // ambiguous `ReadTimedOut` arm. `describe_transport_error`'s `TotalDeadline`
+                    // arm trusts that and reports `*duration` verbatim as an exact figure, not an
+                    // "at least" one; a payload that violates this would silently make that figure
+                    // wrong. Checked here, at the one seam every `TotalDeadline` posture passes
+                    // through on its way to a live request, rather than left as a claim in a
+                    // producer's own doc comment that nothing re-checks.
+                    debug_assert!(
+                        *duration > connect_timeout,
+                        "a Posture::TotalDeadline payload ({:?}) must strictly exceed this \
+                        request's connect_timeout ({:?}) — otherwise a connect-phase stall no \
+                        longer reliably lands in TransportFailure::ConnectTimedOut, and \
+                        describe_transport_error's TotalDeadline wording would report the wrong \
+                        figure for a ReadTimedOut that was actually a connect timeout underneath",
+                        *duration, connect_timeout
+                    );
+                    Some(*duration)
+                }
                 // Listed explicitly, not `_`, so a future payload-carrying `Posture` variant
                 // forces this match to be revisited too instead of silently falling through to
                 // `None` and dropping the new payload.
@@ -1499,7 +1535,7 @@ impl RemoteClient {
     /// function's own doc.
     fn request_on(&self, posture: Posture, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
         self.clients.request_on(
-            posture, method,
+            posture, self.connect_timeout, method,
             RequestDestination::Authenticated { base: &self.base, token: self.token.as_deref(), path },
         )
     }
@@ -1522,7 +1558,7 @@ impl RemoteClient {
     /// likely than this staying permanently singular, and inlining now would just have to be
     /// undone.
     fn request_on_presigned(&self, posture: Posture, method: reqwest::Method, url: &str) -> reqwest::RequestBuilder {
-        self.clients.request_on(posture, method, RequestDestination::Presigned { url })
+        self.clients.request_on(posture, self.connect_timeout, method, RequestDestination::Presigned { url })
     }
 
     /// Walk a `std::error::Error` source chain to its root and return that root's own `Display`
@@ -1542,29 +1578,57 @@ impl RemoteClient {
     }
 
     /// Compose the client-facing message for a *transport* failure (one that never got as far as
-    /// an HTTP status) on one of the four bounded read/metadata calls. Thin: all it does is read
-    /// `is_connect()`/`is_timeout()` off `e` and hand them to [`classify`], then render the
-    /// resulting [`TransportFailure`] — the actual case analysis lives there, pure and
-    /// unit-tested over all four boolean combinations, because the combination this function
-    /// cares least about (a genuine multi-minute kernel timeout on an already-established socket)
-    /// is not practically constructible in a test at all; see [`TransportFailure::ReadTimedOut`]'s
-    /// doc.
+    /// an HTTP status) on any call riding a [`Posture`] through [`Self::request_on`] or
+    /// [`Self::request_on_presigned`]. Thin: all it does is read `is_connect()`/`is_timeout()` off
+    /// `e` and hand them to [`classify`], then render the resulting [`TransportFailure`] — the
+    /// actual case analysis lives there, pure and unit-tested over all four boolean combinations,
+    /// because the combination this function cares least about (a genuine multi-minute kernel
+    /// timeout on an already-established socket) is not practically constructible in a test at
+    /// all; see [`TransportFailure::ReadTimedOut`]'s doc.
+    ///
+    /// Takes the exact `posture` a call was armed with, not a bare silence-budget `Duration` —
+    /// what bound (if any) actually governed the wait is a function of which posture the request
+    /// rode, and a call site could otherwise name a bound different from the one that applied.
+    /// The `ReadTimedOut` arm renders that per-posture: [`Posture::BoundedReads`]/
+    /// [`Posture::BoundedObjectReads`] report a *lower* bound ("at least") on
+    /// [`bounded_read_timeout`]'s own value, unchanged from before this reshape, since a
+    /// resetting silence budget only ever guarantees the wait went on at least that long.
+    /// [`Posture::TotalDeadline`] instead reports its own payload verbatim, with no "at least" —
+    /// a non-resetting `RequestBuilder::timeout` is a genuine upper bound the call could never
+    /// have exceeded, so the exact figure is honest (see the `debug_assert!` in
+    /// [`clients::Clients::request_on`]'s `TotalDeadline` arm for the invariant this depends on).
+    /// [`Posture::UnboundedFollowsRedirects`]/[`Posture::UnboundedNoRedirect`] name no figure at
+    /// all — nothing was armed, so [`TransportFailure::ReadTimedOut`]'s own doc's ambiguity
+    /// (a client `read_timeout` vs. a genuine multi-minute kernel `ETIMEDOUT`) applies at full
+    /// force here, the one case this function cannot narrow at all.
     fn describe_transport_error(&self,
                                 action: &str,
-                                silence_budget: std::time::Duration,
+                                posture: Posture,
                                 e: reqwest::Error) -> String {
         match classify(e.is_connect(), e.is_timeout()) {
             TransportFailure::ConnectTimedOut => format!(
                 "Timed out while {}: could not connect to the remote within {:?}.",
                 action, self.connect_timeout
             ),
-            TransportFailure::ReadTimedOut => {
-                let effective_budget = self.connect_timeout + silence_budget;
-                format!(
+            TransportFailure::ReadTimedOut => match posture {
+                Posture::BoundedReads => format!(
                     "Timed out while {}: the remote did not respond within at least {:?}.",
-                    action, effective_budget
-                )
-            }
+                    action, bounded_read_timeout(self.connect_timeout, REMOTE_READ_TIMEOUT)
+                ),
+                Posture::BoundedObjectReads => format!(
+                    "Timed out while {}: the remote did not respond within at least {:?}.",
+                    action, bounded_read_timeout(self.connect_timeout, FETCH_OBJECT_READ_TIMEOUT)
+                ),
+                Posture::TotalDeadline(deadline) => format!(
+                    "Timed out while {}: the remote did not complete its answer within this \
+                    request's {:?} total deadline.",
+                    action, deadline
+                ),
+                Posture::UnboundedFollowsRedirects(_) | Posture::UnboundedNoRedirect(_) => format!(
+                    "Timed out while {}: the remote did not respond.",
+                    action
+                ),
+            },
             TransportFailure::Other => format!("Error while {}: {}", action, Self::root_cause(&e)),
         }
     }
@@ -1752,11 +1816,12 @@ impl RemoteClient {
 
     /// Fetch the warehouse handshake and check the protocol version.
     pub async fn fetch_info(&self) -> Result<WarehouseInfo, String> {
-        let response = self.request_on(Posture::BoundedReads, reqwest::Method::GET, "/v1/warehouse")
+        let posture = Posture::BoundedReads;
+        let response = self.request_on(posture, reqwest::Method::GET, "/v1/warehouse")
             .send()
             .await
             .map_err(|e| self.describe_transport_error(
-                &format!("reaching the remote {}", self.base), REMOTE_READ_TIMEOUT, e
+                &format!("reaching the remote {}", self.base), posture, e
             ))?;
 
         if !response.status().is_success() {
@@ -1767,7 +1832,7 @@ impl RemoteClient {
             .await
             .map_err(|e| if e.is_timeout() {
                 self.describe_transport_error(
-                    &format!("reaching the remote {}", self.base), REMOTE_READ_TIMEOUT, e
+                    &format!("reaching the remote {}", self.base), posture, e
                 )
             } else {
                 format!("The remote's handshake is not valid JSON: {}", e)
@@ -1825,14 +1890,15 @@ impl RemoteClient {
         let mut missing: Vec<String> = Vec::new();
 
         for batch in hashes.chunks(MAX_MISSING_BATCH) {
+            let posture = Posture::TotalDeadline(self.presence_negotiation_budget(batch.len()));
             let response = self.request_on(
-                Posture::TotalDeadline(self.presence_negotiation_budget(batch.len())),
+                posture,
                 reqwest::Method::POST, "/v1/objects/missing"
             )
                 .json(&MissingObjectsRequest { hashes: batch.to_vec() })
                 .send()
                 .await
-                .map_err(|e| format!("Error while negotiating with the remote: {}", e))?;
+                .map_err(|e| self.describe_transport_error("negotiating with the remote", posture, e))?;
 
             if !response.status().is_success() {
                 return Err(self.error_of(response, "the negotiation").await);
@@ -1840,7 +1906,11 @@ impl RemoteClient {
 
             let body: MissingObjectsResponse = response.json()
                 .await
-                .map_err(|e| format!("The remote's negotiation response is not valid JSON: {}", e))?;
+                .map_err(|e| if e.is_timeout() {
+                    self.describe_transport_error("negotiating with the remote", posture, e)
+                } else {
+                    format!("The remote's negotiation response is not valid JSON: {}", e)
+                })?;
 
             missing.extend(body.missing);
         }
@@ -1983,20 +2053,25 @@ impl RemoteClient {
     /// silence budget, which resets on every byte received and so rides out a large-but-progressing
     /// bundle, only ever cutting off a genuinely stalled one.
     pub async fn fetch_batch(&self, hashes: &[String]) -> Result<Option<Vec<u8>>, String> {
+        let post_posture = Posture::UnboundedNoRedirect(UnboundedTicket::Fork92);
         let response = self.request_on(
-            Posture::UnboundedNoRedirect(UnboundedTicket::Fork92),
+            post_posture,
             reqwest::Method::POST, "/v1/objects/batch"
         )
             .json(&MissingObjectsRequest { hashes: hashes.to_vec() })
             .send()
             .await
-            .map_err(|e| format!("Error while batch-fetching from the remote: {}", e))?;
+            .map_err(|e| self.describe_transport_error("batch-fetching from the remote", post_posture, e))?;
 
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
 
-        let response = match response.status() {
+        // `body_posture` follows whichever station actually produced the response bytes below:
+        // the unbounded `POST` above when there was no redirect to follow, or the bounded
+        // redirect-follow `GET`'s own posture when there was — a single posture cannot honestly
+        // describe both, since they carry different bounds.
+        let (response, body_posture) = match response.status() {
             reqwest::StatusCode::SEE_OTHER
             | reqwest::StatusCode::TEMPORARY_REDIRECT
             | reqwest::StatusCode::PERMANENT_REDIRECT => {
@@ -2013,14 +2088,16 @@ impl RemoteClient {
                 // [`Posture::BoundedObjectReads`], not the unbounded ticket the `POST` above
                 // still carries — see this function's own doc for why this station's cost shape
                 // matches [`Self::fetch_object`]'s, not the `POST`'s.
-                self.request_on_presigned(Posture::BoundedObjectReads, reqwest::Method::GET, &location)
+                let redirect_posture = Posture::BoundedObjectReads;
+                let response = self.request_on_presigned(redirect_posture, reqwest::Method::GET, &location)
                     .send()
                     .await
                     .map_err(|e| self.describe_transport_error(
-                        "following the batch redirect", FETCH_OBJECT_READ_TIMEOUT, e
-                    ))?
+                        "following the batch redirect", redirect_posture, e
+                    ))?;
+                (response, redirect_posture)
             }
-            _ => response,
+            _ => (response, post_posture),
         };
 
         if !response.status().is_success() {
@@ -2030,7 +2107,7 @@ impl RemoteClient {
         response.bytes()
             .await
             .map(|bytes| Some(bytes.to_vec()))
-            .map_err(|e| format!("Error while reading the batch response: {}", e))
+            .map_err(|e| self.describe_transport_error("reading the batch response", body_posture, e))
     }
 
     /// Fetch the object closure of a subtree at a path of a parcel, as a bundle-format stream
@@ -2055,14 +2132,17 @@ impl RemoteClient {
     /// Same reasoning as `fetch_batch` — this stays unbounded until it has its own scaled budget
     /// or an abandon-and-fall-back lane.
     pub async fn fetch_subtree(&self, parcel: &str, path: &str) -> Result<Option<Vec<u8>>, String> {
+        let posture = Posture::UnboundedFollowsRedirects(UnboundedTicket::Fork92);
         let response = self.request_on(
-            Posture::UnboundedFollowsRedirects(UnboundedTicket::Fork92),
+            posture,
             reqwest::Method::GET, &format!(
                 "/v1/parcels/{}/subtree/{}", parcel, encode_path_segments(path)
             )
         ).send()
             .await
-            .map_err(|e| format!("Error while fetching subtree \"{}\" from the remote: {}", path, e))?;
+            .map_err(|e| self.describe_transport_error(
+                &format!("fetching subtree \"{}\" from the remote", path), posture, e
+            ))?;
 
         if endpoint_absent(response.status()) || response.status() == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
             return Ok(None);
@@ -2075,17 +2155,18 @@ impl RemoteClient {
         response.bytes()
             .await
             .map(|bytes| Some(bytes.to_vec()))
-            .map_err(|e| format!("Error while reading the subtree response: {}", e))
+            .map_err(|e| self.describe_transport_error("reading the subtree response", posture, e))
     }
 
     /// Fetch one object's raw bytes. On [`Posture::BoundedObjectReads`], not [`Posture::BoundedReads`]
     /// — see [`FETCH_OBJECT_READ_TIMEOUT`]'s doc for why this call needs the looser budget.
     pub async fn fetch_object(&self, hash: &str) -> Result<Vec<u8>, String> {
-        let response = self.request_on(Posture::BoundedObjectReads, reqwest::Method::GET, &format!("/v1/objects/{}", hash))
+        let posture = Posture::BoundedObjectReads;
+        let response = self.request_on(posture, reqwest::Method::GET, &format!("/v1/objects/{}", hash))
             .send()
             .await
             .map_err(|e| self.describe_transport_error(
-                &format!("fetching object {}", hash), FETCH_OBJECT_READ_TIMEOUT, e
+                &format!("fetching object {}", hash), posture, e
             ))?;
 
         if !response.status().is_success() {
@@ -2096,7 +2177,7 @@ impl RemoteClient {
             .await
             .map(|bytes| bytes.to_vec())
             .map_err(|e| self.describe_transport_error(
-                &format!("reading object {}", hash), FETCH_OBJECT_READ_TIMEOUT, e
+                &format!("reading object {}", hash), posture, e
             ))
     }
 
@@ -2164,14 +2245,15 @@ impl RemoteClient {
         };
 
         for batch in hashes.chunks(MAX_UPLOAD_TARGETS_BATCH) {
+            let posture = Posture::TotalDeadline(self.presence_negotiation_budget(batch.len()));
             let response = self.request_on(
-                Posture::TotalDeadline(self.presence_negotiation_budget(batch.len())),
+                posture,
                 reqwest::Method::POST, "/v1/objects/upload-targets"
             )
                 .json(&UploadTargetsRequest { session: session.to_string(), hashes: batch.to_vec() })
                 .send()
                 .await
-                .map_err(|e| format!("Error while negotiating upload targets: {}", e))?;
+                .map_err(|e| self.describe_transport_error("negotiating upload targets", posture, e))?;
 
             if endpoint_absent(response.status()) {
                 return Ok(None);
@@ -2183,7 +2265,11 @@ impl RemoteClient {
 
             let body: UploadTargetsResponse = response.json()
                 .await
-                .map_err(|e| format!("The remote's upload-targets response is not valid JSON: {}", e))?;
+                .map_err(|e| if e.is_timeout() {
+                    self.describe_transport_error("negotiating upload targets", posture, e)
+                } else {
+                    format!("The remote's upload-targets response is not valid JSON: {}", e)
+                })?;
 
             merged.present.extend(body.present);
             merged.targets.extend(body.targets);
@@ -2306,11 +2392,12 @@ impl RemoteClient {
 
     /// Fetch a parcel's signature sidecar (`None` for unsigned parcels).
     pub async fn fetch_signature(&self, parcel_hash: &str) -> Result<Option<Vec<u8>>, String> {
-        let response = self.request_on(Posture::BoundedReads, reqwest::Method::GET, &format!("/v1/signatures/{}", parcel_hash))
+        let posture = Posture::BoundedReads;
+        let response = self.request_on(posture, reqwest::Method::GET, &format!("/v1/signatures/{}", parcel_hash))
             .send()
             .await
             .map_err(|e| self.describe_transport_error(
-                &format!("fetching the signature of {}", parcel_hash), REMOTE_READ_TIMEOUT, e
+                &format!("fetching the signature of {}", parcel_hash), posture, e
             ))?;
 
         if response.status() == reqwest::StatusCode::NOT_FOUND {
@@ -2325,7 +2412,7 @@ impl RemoteClient {
             .await
             .map(|bytes| Some(bytes.to_vec()))
             .map_err(|e| self.describe_transport_error(
-                &format!("reading the signature of {}", parcel_hash), REMOTE_READ_TIMEOUT, e
+                &format!("reading the signature of {}", parcel_hash), posture, e
             ))
     }
 
@@ -2463,10 +2550,11 @@ impl RemoteClient {
     /// * `Ok(false)`   - The remote has no bundle.
     /// * `Err(String)` - On any other failure.
     pub async fn fetch_bundle_to(&self, path: &std::path::Path) -> Result<bool, String> {
-        let mut response = self.request_on(Posture::BoundedReads, reqwest::Method::GET, "/v1/bundles/latest")
+        let posture = Posture::BoundedReads;
+        let mut response = self.request_on(posture, reqwest::Method::GET, "/v1/bundles/latest")
             .send()
             .await
-            .map_err(|e| self.describe_transport_error("fetching the bundle", REMOTE_READ_TIMEOUT, e))?;
+            .map_err(|e| self.describe_transport_error("fetching the bundle", posture, e))?;
 
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(false);
@@ -2488,7 +2576,7 @@ impl RemoteClient {
 
         while let Some(chunk) = response.chunk()
             .await
-            .map_err(|e| self.describe_transport_error("downloading the bundle", REMOTE_READ_TIMEOUT, e))?
+            .map_err(|e| self.describe_transport_error("downloading the bundle", posture, e))?
         {
             std::io::Write::write_all(&mut file, &chunk)
                 .map_err(|e| format!("Error while writing the bundle file: {}", e))?;
@@ -6702,20 +6790,22 @@ mod tests {
     /// [`tests::resolve_gives_up_on_a_remote_that_never_stops_trickling`] for the test that calls
     /// `resolve` itself and pins that.
     ///
-    /// A short 2s [`Posture::TotalDeadline`] against a remote writing one byte every 500ms —
-    /// never silent for longer than 500ms, an order of magnitude under every silence budget in
-    /// this file — must still be cut off at ~2s, because a `RequestBuilder::timeout` does not
-    /// reset on anything. `total_bytes` (100) at that gap makes the full trickle 50s: far longer
-    /// than `hard_ceiling` (17s), so the fixture is still comfortably writing when the ceiling
-    /// would fire — not literally unbounded, just sized well past this test's own horizon. If the
-    /// deadline were silently dropped, the outer `tokio::time::timeout` — not the assertion below
-    /// it — is what would catch it, loudly, rather than the test quietly passing on a
-    /// technicality.
+    /// A short [`Posture::TotalDeadline`] (`TEST_DIRECT_CONNECT_TIMEOUT + 1s` = 6s — deliberately
+    /// above the client's own `connect_timeout`, the invariant
+    /// [`clients::Clients::request_on`]'s `debug_assert!` now enforces on every `TotalDeadline`
+    /// payload) against a remote writing one byte every 500ms — never silent for longer than
+    /// 500ms, an order of magnitude under every silence budget in this file — must still be cut
+    /// off at ~6s, because a `RequestBuilder::timeout` does not reset on anything. `total_bytes`
+    /// (100) at that gap makes the full trickle 50s: far longer than `hard_ceiling` (21s), so the
+    /// fixture is still comfortably writing when the ceiling would fire — not literally unbounded,
+    /// just sized well past this test's own horizon. If the deadline were silently dropped, the
+    /// outer `tokio::time::timeout` — not the assertion below it — is what would catch it, loudly,
+    /// rather than the test quietly passing on a technicality.
     #[test]
     fn request_on_applies_a_total_deadline_that_ignores_progress() {
         let url = start_continuously_trickling_remote(100, std::time::Duration::from_millis(500));
         let client = RemoteClient::new(&url, None).unwrap();
-        let deadline = std::time::Duration::from_secs(2);
+        let deadline = TEST_DIRECT_CONNECT_TIMEOUT + std::time::Duration::from_secs(1);
         let hard_ceiling = deadline + std::time::Duration::from_secs(15);
 
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -7540,6 +7630,276 @@ mod tests {
             total deadline; a rewiring onto BoundedReads would still return an Err inside the \
             generous hard_ceiling above, so this tighter bound is what actually separates the two",
             elapsed, upper_bound, effective_budget, rival_bounded_reads_budget
+        );
+    }
+
+    // -----------------------------------------------------------------------------------
+    // Transport-error composer posture: `missing_objects`/`upload_targets` used to map a
+    // `.send()`/`.json()` failure with a bare `format!`, so a genuine deadline expiry read to an
+    // operator as a raw reqwest Debug string, never told it was a timeout at all. Both now route
+    // through `describe_transport_error`, which — since the reshape below — takes the exact
+    // `Posture` a call was armed with rather than a bare silence-budget `Duration`, so it can
+    // report `Posture::TotalDeadline`'s own payload verbatim (an exact figure, not "at least")
+    // instead of double-counting `self.connect_timeout` against it.
+    // -----------------------------------------------------------------------------------
+
+    /// The falsifying test for `missing_objects`'s send-error branch: before this fix it composed
+    /// a bare `format!("Error while negotiating with the remote: {}", e)` on `.send()` failure —
+    /// no timeout wording, no figure — so an operator staring at a stuck negotiation had no way to
+    /// tell "the remote is genuinely gone" from "the deadline this call itself armed just
+    /// expired." This pins that the composed message now names *that exact armed total*, read
+    /// from [`RemoteClient::presence_negotiation_budget`] itself rather than a hand-written
+    /// duration literal — a hand-written literal could silently drift from the real arithmetic and
+    /// this test would never notice.
+    ///
+    /// **Why a 4s sentinel connect_timeout.** Neither [`RemoteClient::new`] (5s,
+    /// [`REMOTE_CONNECT_TIMEOUT`]) nor [`RemoteClient::new_with_tor`] under `TorMode::On` (60s,
+    /// [`REMOTE_CONNECT_TIMEOUT_TOR`]) can ever produce it, so a rival implementation that
+    /// hardcodes either production constant in place of `self.connect_timeout` cannot
+    /// coincidentally match this test's expected figure. It is also absent from this module's own
+    /// named `Duration` constants — `{0.2, 2, 3, 5, 10, 60}`, checked via `grep -n
+    /// "Duration::from_secs\|Duration::from_millis"` at the time this test was written — and from
+    /// the connect-timeout sentinels already in use elsewhere in this file (`{5, 7, 10, 11, 13,
+    /// 60}`), so it collides with none of them either. Re-run that grep before trusting either set
+    /// past a later edit.
+    ///
+    /// At `n=1` the true budget is `4s + POST_SEND_VERIFY_BASE (2s) + 1 * \
+    /// PRESENCE_ALLOWANCE_MS_PER_OP (5ms) = 6.005s`. The `.005` fraction only ever comes from
+    /// `PRESENCE_ALLOWANCE_MS_PER_OP`: over that same named-constant set, whose only fractional
+    /// member is 0.2s, every sum's fractional part is a multiple of 0.2 (`.0`/`.2`/`.4`/`.6`/`.8`),
+    /// never `.005` — so a message containing `6.005s` could only have come from the real
+    /// arithmetic. Measured (not merely reasoned
+    /// about) against the rivals below, run as hand-applied mutants at this test's own `S=4s,
+    /// n=1`:
+    ///
+    /// | Rival | Prints | Separated from 6.005s |
+    /// |---|---|---|
+    /// | status-quo bare `format!` | no figure, no timeout wording | yes |
+    /// | double-counting (`connect + total budget`) | 10.005s | yes |
+    /// | connect-blind (drops `self.connect_timeout`) | 2.005s | yes |
+    /// | wrong arm / silence path with `REMOTE_READ_TIMEOUT` | 14s | yes |
+    /// | hardcoded production connect (5s / 60s) | 7.005s / 62.005s | yes |
+    ///
+    /// This is not a completeness argument over every possible wrong implementation — only the
+    /// rivals above were run as mutants and measured.
+    #[test]
+    fn missing_objects_deadline_message_names_the_armed_total() {
+        const SENTINEL_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+
+        let remote = SilentRemote::start();
+        let client = RemoteClient::new_test_with_connect_timeout(&remote.url, SENTINEL_CONNECT_TIMEOUT);
+        let hashes = vec!["a".repeat(64)];
+        let expected_budget = client.presence_negotiation_budget(hashes.len());
+        assert_eq!(
+            expected_budget,
+            std::time::Duration::from_secs(6) + std::time::Duration::from_millis(5),
+            "sanity: this test's own doc promises 6.005s — 4s connect + 2s POST_SEND_VERIFY_BASE \
+            + 1 * 5ms PRESENCE_ALLOWANCE_MS_PER_OP"
+        );
+        let hard_ceiling = expected_budget + std::time::Duration::from_secs(15);
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let outcome = runtime.block_on(async {
+            tokio::time::timeout(hard_ceiling, client.missing_objects(&hashes)).await
+        });
+
+        let message = outcome
+            .unwrap_or_else(|_| panic!(
+                "missing_objects hung past the test's own {:?} ceiling — no total deadline fired \
+                at all", hard_ceiling
+            ))
+            .expect_err("a silent remote must not appear to succeed");
+
+        assert!(
+            message.contains(&format!("{:?}", expected_budget)),
+            "must name the exact armed total {:?} — read from presence_negotiation_budget \
+            itself, not a hand-written duration literal: {}", expected_budget, message
+        );
+        assert!(
+            message.to_lowercase().contains("timed out"),
+            "must carry the timeout wording, not the status-quo bare format!: {}", message
+        );
+        assert!(
+            !message.to_lowercase().contains("connect"),
+            "must not carry the connect-timeout wording — this is the ReadTimedOut branch, \
+            armed on a TotalDeadline posture, not ConnectTimedOut: {}", message
+        );
+    }
+
+    /// The `upload_targets` counterpart of [`missing_objects_deadline_message_names_the_armed_total`]
+    /// — a separate code path (its own `.send()` map_err site), so it gets its own test rather than
+    /// being parameterised into that one. Same defect, same fix, same rival table (that test's own
+    /// doc carries it; not repeated here).
+    #[test]
+    fn upload_targets_deadline_message_names_the_armed_total() {
+        const SENTINEL_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+
+        let remote = SilentRemote::start();
+        let client = RemoteClient::new_test_with_connect_timeout(&remote.url, SENTINEL_CONNECT_TIMEOUT);
+        let hashes = vec!["a".repeat(64)];
+        let expected_budget = client.presence_negotiation_budget(hashes.len());
+        let hard_ceiling = expected_budget + std::time::Duration::from_secs(15);
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let outcome = runtime.block_on(async {
+            tokio::time::timeout(
+                hard_ceiling, client.upload_targets("session-composer-posture-test", &hashes)
+            ).await
+        });
+
+        let inner = outcome.unwrap_or_else(|_| panic!(
+            "upload_targets hung past the test's own {:?} ceiling — no total deadline fired \
+            at all", hard_ceiling
+        ));
+        let message = match inner {
+            Err(message) => message,
+            Ok(_) => panic!("a silent remote must not appear to succeed"),
+        };
+
+        assert!(
+            message.contains(&format!("{:?}", expected_budget)),
+            "must name the exact armed total {:?} — read from presence_negotiation_budget \
+            itself, not a hand-written duration literal: {}", expected_budget, message
+        );
+        assert!(
+            message.to_lowercase().contains("timed out"),
+            "must carry the timeout wording, not the status-quo bare format!: {}", message
+        );
+        assert!(
+            !message.to_lowercase().contains("connect"),
+            "must not carry the connect-timeout wording — this is the ReadTimedOut branch, \
+            armed on a TotalDeadline posture, not ConnectTimedOut: {}", message
+        );
+    }
+
+    /// A remote that sends a full `200 OK` with JSON headers and a `Content-Length` far larger
+    /// than the partial JSON fragment it actually writes, then genuinely goes silent — same
+    /// parked-connection shape as [`LyingContentLengthRemote`], but for a JSON body instead of raw
+    /// bytes, and generic to any request path (via [`read_test_request`]) rather than one
+    /// endpoint. Exists for the tests below: a fully [`SilentRemote`] never gets past headers, so
+    /// it cannot distinguish `missing_objects`/`upload_targets`'s `response.json()` timeout branch
+    /// (route through the composer) from their JSON-parse-failure branch (the unconditional "not
+    /// valid JSON" message) — both look identical against total silence, because neither branch is
+    /// ever reached without headers. This fixture reaches the body-read arm specifically: headers
+    /// and a fragment arrive, then the connection stalls forever mid-body.
+    struct PartialJsonThenSilentRemote {
+        url: String,
+        _park: std::sync::mpsc::Sender<()>,
+    }
+
+    impl PartialJsonThenSilentRemote {
+        fn start() -> PartialJsonThenSilentRemote {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+
+            std::thread::spawn(move || {
+                use std::io::Write;
+
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let _ = read_test_request(&mut stream);
+                    // Claims 4096 bytes of JSON, writes one opening brace, then parks — the rest
+                    // never arrives and the connection is never closed, so response.json() is
+                    // left waiting on bytes that are never coming rather than failing to parse
+                    // what little it already has.
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: 4096\r\n\r\n{{"
+                    );
+                    let _ = stream.flush();
+                    let _ = rx.recv();
+                    drop(stream);
+                }
+            });
+
+            PartialJsonThenSilentRemote { url, _park: tx }
+        }
+    }
+
+    /// Distinguishes the body-phase fix from a cosmetic one: reverting `missing_objects`'s
+    /// `response.json()` map_err back to the unconditional "not valid JSON" message (dropping the
+    /// `is_timeout()` branch) would still pass every silent-remote test above — a fully silent
+    /// remote never sends headers at all, so it never reaches `response.json()`'s error arm in the
+    /// first place. Against [`PartialJsonThenSilentRemote`] it does: the deadline still fires (the
+    /// `TotalDeadline` posture bounds the whole response, body included — a total timeout carries
+    /// into the body read, not just `.send()`), and the message must be the deadline message, not
+    /// the JSON-parse-failure one, since the remote never sent garbage — it sent a valid-so-far
+    /// prefix and then nothing further.
+    #[test]
+    fn missing_objects_deadline_message_survives_a_partial_json_body() {
+        const SENTINEL_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+
+        let remote = PartialJsonThenSilentRemote::start();
+        let client = RemoteClient::new_test_with_connect_timeout(&remote.url, SENTINEL_CONNECT_TIMEOUT);
+        let hashes = vec!["a".repeat(64)];
+        let expected_budget = client.presence_negotiation_budget(hashes.len());
+        let hard_ceiling = expected_budget + std::time::Duration::from_secs(15);
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let outcome = runtime.block_on(async {
+            tokio::time::timeout(hard_ceiling, client.missing_objects(&hashes)).await
+        });
+
+        let message = outcome
+            .unwrap_or_else(|_| panic!(
+                "missing_objects hung past the test's own {:?} ceiling — no total deadline fired \
+                at all", hard_ceiling
+            ))
+            .expect_err("a body that never completes must not appear to succeed");
+
+        assert!(
+            message.contains(&format!("{:?}", expected_budget)),
+            "a partial JSON body followed by silence must still compose the deadline message \
+            naming the exact armed total {:?}, not fall through to the unconditional \"not \
+            valid JSON\" message: {}", expected_budget, message
+        );
+        assert!(
+            !message.to_lowercase().contains("not valid json"),
+            "must not be the JSON-parse-failure message — the remote never finished sending, it \
+            did not send garbage: {}", message
+        );
+    }
+
+    /// The `upload_targets` counterpart of
+    /// [`missing_objects_deadline_message_survives_a_partial_json_body`] — same defect, same fix,
+    /// same fixture, its own test since it is a separate code path.
+    #[test]
+    fn upload_targets_deadline_message_survives_a_partial_json_body() {
+        const SENTINEL_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+
+        let remote = PartialJsonThenSilentRemote::start();
+        let client = RemoteClient::new_test_with_connect_timeout(&remote.url, SENTINEL_CONNECT_TIMEOUT);
+        let hashes = vec!["a".repeat(64)];
+        let expected_budget = client.presence_negotiation_budget(hashes.len());
+        let hard_ceiling = expected_budget + std::time::Duration::from_secs(15);
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let outcome = runtime.block_on(async {
+            tokio::time::timeout(
+                hard_ceiling, client.upload_targets("session-composer-posture-json-test", &hashes)
+            ).await
+        });
+
+        let inner = outcome.unwrap_or_else(|_| panic!(
+            "upload_targets hung past the test's own {:?} ceiling — no total deadline fired \
+            at all", hard_ceiling
+        ));
+        let message = match inner {
+            Err(message) => message,
+            Ok(_) => panic!("a body that never completes must not appear to succeed"),
+        };
+
+        assert!(
+            message.contains(&format!("{:?}", expected_budget)),
+            "a partial JSON body followed by silence must still compose the deadline message \
+            naming the exact armed total {:?}, not fall through to the unconditional \"not \
+            valid JSON\" message: {}", expected_budget, message
+        );
+        assert!(
+            !message.to_lowercase().contains("not valid json"),
+            "must not be the JSON-parse-failure message — the remote never finished sending, it \
+            did not send garbage: {}", message
         );
     }
 
