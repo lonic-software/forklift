@@ -752,13 +752,14 @@ mod clients {
     /// `Posture` at all; there is no variant here standing in for that mechanism to keep in sync
     /// with it.
     ///
-    /// `#[derive(..., Copy, ...)]`: [`super::RemoteClient::describe_transport_error`] takes a
+    /// `#[derive(Clone, Copy)]`: [`super::RemoteClient::describe_transport_error`] takes a
     /// `Posture` by value, since it reports the exact posture a call was actually armed with —
     /// every call site needs to arm a request with a posture and then hand that same posture to
     /// the composer, and `Copy` is what lets a call site bind one local and use it twice (once in
-    /// [`Self::request_on`], once in the error map) without a borrow fight. `PartialEq`/`Eq`/`Debug`
-    /// are for the tests that need to match or print one.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    /// [`Clients::request_on`], once in the error map) without a borrow fight. Nothing here
+    /// derives `Debug`/`PartialEq`: no code compares or prints a `Posture`, and a derive whose
+    /// stated purpose has no caller is exactly the kind of unenforced claim this module avoids.
+    #[derive(Clone, Copy)]
     pub(super) enum Posture {
         /// [`REMOTE_READ_TIMEOUT`]-bounded via a client-level `read_timeout`. For the
         /// O(constant)-pre-first-byte calls: `fetch_info`, `fetch_signature`, `fetch_bundle_to`.
@@ -1059,21 +1060,31 @@ mod clients {
                     // Every producer of a `TotalDeadline` payload builds it as `connect_timeout +
                     // a positive addend` (`RemoteClient::resolve_budget`,
                     // `RemoteClient::presence_negotiation_budget`) — never merely a post-connect
-                    // budget on its own — specifically so a connect-phase stall on this posture
-                    // always classifies as `TransportFailure::ConnectTimedOut`, never the
-                    // ambiguous `ReadTimedOut` arm. `describe_transport_error`'s `TotalDeadline`
-                    // arm trusts that and reports `*duration` verbatim as an exact figure, not an
-                    // "at least" one; a payload that violates this would silently make that figure
-                    // wrong. Checked here, at the one seam every `TotalDeadline` posture passes
-                    // through on its way to a live request, rather than left as a claim in a
-                    // producer's own doc comment that nothing re-checks.
+                    // budget on its own — so the connector's own timeout always fires first on a
+                    // connect-phase stall, classifying it as `TransportFailure::ConnectTimedOut`
+                    // rather than `ReadTimedOut`.
+                    //
+                    // What a violating payload costs is the *wording*, not the figure. Were
+                    // `*duration <= connect_timeout`, this deadline would fire first and produce a
+                    // bare `TimedOut` with no `hyper_util` error in its source chain, so
+                    // `is_connect()` reads false and it lands in `ReadTimedOut` — which still
+                    // reports `*duration`, still exactly the bound that fired. The damage is that
+                    // `describe_transport_error`'s `TotalDeadline` text says the remote "did not
+                    // complete its answer" when in fact no connection was ever established and
+                    // nothing was sent — the same overstatement the mutation path treats as a
+                    // contract violation. Hence a `debug_assert`: adequate for a wording hazard,
+                    // and deliberately not an invariant the released binary's numbers depend on.
+                    //
+                    // Checked here, at the one seam every `TotalDeadline` posture passes through
+                    // on its way to a live request, rather than left as a claim in a producer's own
+                    // doc comment that nothing re-checks.
                     debug_assert!(
                         *duration > connect_timeout,
                         "a Posture::TotalDeadline payload ({:?}) must strictly exceed this \
-                        request's connect_timeout ({:?}) — otherwise a connect-phase stall no \
-                        longer reliably lands in TransportFailure::ConnectTimedOut, and \
-                        describe_transport_error's TotalDeadline wording would report the wrong \
-                        figure for a ReadTimedOut that was actually a connect timeout underneath",
+                        request's connect_timeout ({:?}) — otherwise a connect-phase stall lands \
+                        in TransportFailure::ReadTimedOut instead of ConnectTimedOut, and \
+                        describe_transport_error reports that the remote did not finish answering \
+                        when no connection was ever established",
                         *duration, connect_timeout
                     );
                     Some(*duration)
@@ -1333,15 +1344,26 @@ enum TransportFailure {
     /// a slower kernel-level connect timeout racing it.
     ConnectTimedOut,
 
-    /// `is_timeout() && !is_connect()`. Ambiguous, and deliberately reported without naming a
-    /// specific bound: this can be either this client's own configured `read_timeout` (exactly
-    /// the effective connect+silence budget), or a genuine kernel `ETIMEDOUT` on a connection that
-    /// was already established — the OS returns that once TCP retransmissions are exhausted,
-    /// roughly 15 minutes on common Linux/macOS defaults — and `reqwest::Error::is_timeout()`
-    /// cannot tell the two apart: it matches any `io::Error` with `kind() == TimedOut` anywhere in
-    /// the source chain, not only its own synthetic marker for a client-configured timeout.
-    /// Naming the configured budget here would be right most of the time and wrong by two orders
-    /// of magnitude the rest, which is worse than not naming a number at all.
+    /// `is_timeout() && !is_connect()`. **How precisely this can be reported depends on the
+    /// [`clients::Posture`] the request was armed with**, which is why
+    /// [`RemoteClient::describe_transport_error`] takes that posture rather than a bare duration.
+    ///
+    /// The underlying ambiguity is real: this can be a client-configured timeout, or a genuine
+    /// kernel `ETIMEDOUT` on an already-established connection — the OS returns that once TCP
+    /// retransmissions are exhausted, roughly 15 minutes on common Linux/macOS defaults — and
+    /// `reqwest::Error::is_timeout()` cannot tell the two apart: it matches any `io::Error` with
+    /// `kind() == TimedOut` anywhere in the source chain, not only its own synthetic marker for a
+    /// client-configured timeout.
+    ///
+    /// On a posture carrying no armed total — [`clients::Posture::UnboundedFollowsRedirects`],
+    /// [`clients::Posture::UnboundedNoRedirect`] — that ambiguity is unresolvable, so no figure is
+    /// named at all: naming one would be right most of the time and wrong by two orders of
+    /// magnitude the rest, which is worse than naming nothing. On a silence-budgeted posture the
+    /// configured value is a genuine *lower* bound and is reported as one ("at least"). On
+    /// [`clients::Posture::TotalDeadline`] the ambiguity is **closed**: the armed deadline is at
+    /// most ~112s (a Tor connect allowance plus the largest presence budget), and a kernel
+    /// `ETIMEDOUT` needs two orders of magnitude longer, so the deadline always fires first and
+    /// the reported figure is exact.
     ReadTimedOut,
 
     /// Neither of the above: a connection reset, a DNS failure, a refused connect, a TLS failure,
@@ -1595,8 +1617,9 @@ impl RemoteClient {
     /// resetting silence budget only ever guarantees the wait went on at least that long.
     /// [`Posture::TotalDeadline`] instead reports its own payload verbatim, with no "at least" —
     /// a non-resetting `RequestBuilder::timeout` is a genuine upper bound the call could never
-    /// have exceeded, so the exact figure is honest (see the `debug_assert!` in
-    /// [`clients::Clients::request_on`]'s `TotalDeadline` arm for the invariant this depends on).
+    /// have exceeded, so the exact figure is honest. (The `debug_assert!` in
+    /// [`clients::Clients::request_on`]'s `TotalDeadline` arm guards this arm's *wording*, not its
+    /// figure — see that comment for why the number stays correct either way.)
     /// [`Posture::UnboundedFollowsRedirects`]/[`Posture::UnboundedNoRedirect`] name no figure at
     /// all — nothing was armed, so [`TransportFailure::ReadTimedOut`]'s own doc's ambiguity
     /// (a client `read_timeout` vs. a genuine multi-minute kernel `ETIMEDOUT`) applies at full
@@ -7660,9 +7683,10 @@ mod tests {
     /// coincidentally match this test's expected figure. It is also absent from this module's own
     /// named `Duration` constants — `{0.2, 2, 3, 5, 10, 60}`, checked via `grep -n
     /// "Duration::from_secs\|Duration::from_millis"` at the time this test was written — and from
-    /// the connect-timeout sentinels already in use elsewhere in this file (`{5, 7, 10, 11, 13,
-    /// 60}`), so it collides with none of them either. Re-run that grep before trusting either set
-    /// past a later edit.
+    /// the connect-timeout sentinels already in use elsewhere in this file (`{5, 7, 11, 12.5, 13,
+    /// 60}`, via `grep -n "new_test_with_connect_timeout"` and the two production constructors), so
+    /// it collides with none of them either. Re-run both greps before trusting either set past a
+    /// later edit.
     ///
     /// At `n=1` the true budget is `4s + POST_SEND_VERIFY_BASE (2s) + 1 * \
     /// PRESENCE_ALLOWANCE_MS_PER_OP (5ms) = 6.005s`. The `.005` fraction only ever comes from
@@ -7859,6 +7883,133 @@ mod tests {
             !message.to_lowercase().contains("not valid json"),
             "must not be the JSON-parse-failure message — the remote never finished sending, it \
             did not send garbage: {}", message
+        );
+    }
+
+    /// A remote that answers `200` with a complete, correctly framed body that is **not** JSON,
+    /// then closes. The counterpart of [`PartialJsonThenSilentRemote`]: there the body never
+    /// finishes and the failure is a timeout; here it finishes immediately and the failure is a
+    /// parse error. Shaped like the captive-portal/proxy case that motivates the distinction — a
+    /// `200` carrying an HTML interstitial.
+    struct MalformedJsonRemote {
+        url: String,
+    }
+
+    impl MalformedJsonRemote {
+        fn start() -> MalformedJsonRemote {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+
+            std::thread::spawn(move || {
+                use std::io::Write;
+
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let _ = read_test_request(&mut stream);
+                    let body = "<html><body>Sign in to continue</body></html>";
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(), body
+                    );
+                    let _ = stream.flush();
+                }
+            });
+
+            MalformedJsonRemote { url }
+        }
+    }
+
+    /// Pins the `else` half of `missing_objects`'s `if e.is_timeout()` guard, which the two
+    /// partial-body tests above cannot reach: their fixture only ever produces the timeout case,
+    /// so widening the condition to `true` — routing *every* `response.json()` failure through the
+    /// composer — leaves both of them green.
+    ///
+    /// Measured under that mutant, against a proxy or captive portal answering `200` with an HTML
+    /// interstitial: the message becomes `"Error while negotiating with the remote: expected value
+    /// at line 1 column 1"`. A decode error is neither a connect failure nor a timeout, so
+    /// `classify` routes it to [`TransportFailure::Other`] and it degrades to the generic
+    /// transport wrapper — it does **not** fabricate a deadline figure. So the wording assertion
+    /// below is what catches this mutant; the figure assertion excludes a different rival, one
+    /// that reaches the `TotalDeadline` arm.
+    ///
+    /// Worth stating because the prediction that motivated this test was that the mutant would
+    /// quote an exact, fabricated deadline. Running it showed otherwise, and the consequence is
+    /// milder than predicted: the operator loses the "not valid JSON" framing rather than being
+    /// told a false number.
+    #[test]
+    fn missing_objects_reports_a_parse_failure_as_a_parse_failure() {
+        const SENTINEL_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+
+        let remote = MalformedJsonRemote::start();
+        let client = RemoteClient::new_test_with_connect_timeout(&remote.url, SENTINEL_CONNECT_TIMEOUT);
+        let hashes = vec!["a".repeat(64)];
+        let armed_budget = client.presence_negotiation_budget(hashes.len());
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let started = std::time::Instant::now();
+        let message = runtime
+            .block_on(client.missing_objects(&hashes))
+            .expect_err("an HTML body behind a JSON content type must not appear to succeed");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < armed_budget,
+            "the failure must be observed on arrival, well inside the {:?} armed deadline — it \
+            took {:?}, which means this fixture is exercising the timeout path, not the parse \
+            path this test exists for", armed_budget, elapsed
+        );
+        assert!(
+            message.to_lowercase().contains("not valid json"),
+            "a complete but unparseable body must keep the parse-failure wording: {}", message
+        );
+        assert!(
+            !message.contains(&format!("{:?}", armed_budget)),
+            "must not name the armed deadline {:?} — nothing timed out, and quoting an exact \
+            figure here would attribute a parse failure to a bound that never fired: {}",
+            armed_budget, message
+        );
+    }
+
+    /// The `upload_targets` counterpart of
+    /// [`missing_objects_reports_a_parse_failure_as_a_parse_failure`] — same guard, same mutant,
+    /// its own test since it is a separate code path.
+    #[test]
+    fn upload_targets_reports_a_parse_failure_as_a_parse_failure() {
+        const SENTINEL_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+
+        let remote = MalformedJsonRemote::start();
+        let client = RemoteClient::new_test_with_connect_timeout(&remote.url, SENTINEL_CONNECT_TIMEOUT);
+        let hashes = vec!["a".repeat(64)];
+        let armed_budget = client.presence_negotiation_budget(hashes.len());
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let started = std::time::Instant::now();
+        let outcome = runtime.block_on(
+            client.upload_targets("session-composer-posture-parse-test", &hashes)
+        );
+        let elapsed = started.elapsed();
+
+        let message = match outcome {
+            Err(message) => message,
+            Ok(_) => panic!("an HTML body behind a JSON content type must not appear to succeed"),
+        };
+
+        assert!(
+            elapsed < armed_budget,
+            "the failure must be observed on arrival, well inside the {:?} armed deadline — it \
+            took {:?}, which means this fixture is exercising the timeout path, not the parse \
+            path this test exists for", armed_budget, elapsed
+        );
+        assert!(
+            message.to_lowercase().contains("not valid json"),
+            "a complete but unparseable body must keep the parse-failure wording: {}", message
+        );
+        assert!(
+            !message.contains(&format!("{:?}", armed_budget)),
+            "must not name the armed deadline {:?} — nothing timed out, and quoting an exact \
+            figure here would attribute a parse failure to a bound that never fired: {}",
+            armed_budget, message
         );
     }
 
