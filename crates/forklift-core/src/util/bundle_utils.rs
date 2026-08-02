@@ -1553,4 +1553,72 @@ mod tests {
         let error = import_bundle_bytes(&bytes).err().unwrap();
         assert!(error.contains("object ceiling"), "a v3 bundle refuses the giant: {}", error);
     }
+
+    // -----------------------------------------------------------------------------------
+    // SPIKE FORK-92-2b — does `build_partial_bundle`'s per-object cost stay flat as object
+    // *byte size* grows, or does it scale with bytes? `spike_fork92_bundle_build_rate` (ported
+    // onto `main` at 0fad3c7, not merged here — see this crate's own remote_utils.rs doc for
+    // `UnboundedTicket::Fork92`) measured only ~200-byte blobs, so its 100.0 ms/op ceiling prices
+    // per-object constant overhead (hashing, framing, the zstd stream's own per-frame cost), not
+    // `retrieve_object_by_hash` + zstd-compression of the object's actual payload. `fetch_batch`
+    // requests up to `BATCH_FETCH_CHUNK` (512) hashes per call with no per-object size floor, and
+    // the store's own hard ceiling (`object_utils::MAX_OBJECT_BYTES`, 64 MiB) is far above 200
+    // bytes — if per-object cost is size-scaled, a count-only budget derived from the small-blob
+    // rate is not honest for a batch of large objects. Throwaway diagnostic instrumentation, not
+    // a standing regression pin — `#[ignore]`d, run explicitly with `cargo test --release -p
+    // forklift-core spike_fork92_2b_bundle_build_size_scaling -- --ignored --nocapture`. `n` kept
+    // small (4) at each size so the whole sweep finishes in a bounded amount of wall time even at
+    // the largest size tested; content is `rand`-filled, not zeros or a repeated pattern, so
+    // zstd's compressor is doing realistic work rather than collapsing a trivially-compressible
+    // run to near-nothing.
+    // -----------------------------------------------------------------------------------
+    #[test]
+    #[ignore]
+    fn spike_fork92_2b_bundle_build_size_scaling() {
+        use rand::RngCore;
+        use std::time::Instant;
+
+        const N: usize = 4;
+
+        println!(
+            "\nSPIKE FORK-92-2b — bundle-build cost vs object byte size (n={} per size), release={}",
+            N, !cfg!(debug_assertions)
+        );
+        println!("{:>10} | {:>14} | {:>16} | {:>16}", "size", "total", "ms/object", "MB/s (payload)");
+
+        for &size in &[
+            64 * 1024usize,        // 64 KiB — well under the 8 MiB post-chunking threshold
+            1024 * 1024,           // 1 MiB
+            8 * 1024 * 1024,       // 8 MiB — the CDC chunking target size
+            32 * 1024 * 1024,      // 32 MiB — halfway to the hard ceiling
+            // object_utils::MAX_OBJECT_BYTES (64 MiB) minus loose-object header overhead, so the
+            // stored object itself lands at (just under) the hard ceiling rather than tripping it.
+            64 * 1024 * 1024 - 4096,
+        ] {
+            let _scratch = Scratch::new(&format!("bundle-size-scaling-{}", size));
+
+            let hashes: Vec<String> = (0..N).map(|_| {
+                let mut content = vec![0u8; size];
+                rand::rngs::OsRng.fill_bytes(&mut content);
+                let mut object = LooseObjectBuilder::build_blob(&Blob { content });
+                object.store().unwrap();
+                object.hash
+            }).collect();
+
+            let start = Instant::now();
+            let bytes = build_partial_bundle(&hashes).unwrap();
+            let elapsed = start.elapsed();
+
+            assert!(bytes.len() > 0);
+
+            let ms_per_op = elapsed.as_secs_f64() * 1000.0 / N as f64;
+            let payload_mb = (size * N) as f64 / (1024.0 * 1024.0);
+            let mb_per_sec = payload_mb / elapsed.as_secs_f64();
+
+            println!(
+                "{:>10} | {:>12.3?} | {:>13.3}ms | {:>13.2}MB/s   (bundle {} bytes)",
+                size, elapsed, ms_per_op, mb_per_sec, bytes.len(),
+            );
+        }
+    }
 }
