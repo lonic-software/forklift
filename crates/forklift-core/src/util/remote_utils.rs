@@ -313,10 +313,12 @@ const REMOTE_CONNECT_TIMEOUT_TOR: std::time::Duration = std::time::Duration::fro
 /// scaled/measured budget or an abandon-and-fall-back lane (see the comment at each of those three
 /// call sites). `upload_targets` shares that same reasoning (it walks up to
 /// `MAX_UPLOAD_TARGETS_BATCH` hashes before its first byte) and stays unbounded for it. `resolve`
-/// is unbounded by *this* mechanism too, but is not left unbounded outright: it carries its own
-/// per-request `RequestBuilder::timeout(5s)` at its call site instead, since it is a best-effort
-/// display lookup (falls back to pseudonyms on any failure, never surfaces an error) rather than a
-/// call whose budget needs `connect_timeout` folded in the way every client-level bound here does.
+/// is unbounded by *this* mechanism too (no client-level `read_timeout`), but is not left
+/// unbounded outright: it rides [`Posture::TotalDeadline`] instead, a genuine per-request
+/// `RequestBuilder::timeout` the module applies itself rather than the call site — sized at
+/// `connect_timeout + REMOTE_READ_TIMEOUT`, reusing this constant's *value* for that arithmetic
+/// without joining the class of calls it silence-bounds (see that variant's own doc for why a
+/// *total* deadline, not a silence budget, is the right shape for `resolve` specifically).
 /// `update_ref`, `commit_lift`, and the streamed-upload paths (`upload_object`, `put_presigned`)
 /// are unbounded for reasons of their own — see each call's own doc, and
 /// [`RemoteClient::send_with_watchdog`]'s for the uploads.
@@ -413,6 +415,12 @@ fn error_body_read_budget(connect_timeout: std::time::Duration) -> std::time::Du
 /// connect phase always gets its own full allowance — whichever of [`REMOTE_CONNECT_TIMEOUT`] or
 /// [`REMOTE_CONNECT_TIMEOUT_TOR`] this client was built with — before the silence clock can matter
 /// at all.
+///
+/// Also reused, unmodified, by [`RemoteClient::resolve`] to size its own
+/// [`Posture::TotalDeadline`] payload: the arithmetic — connect budget plus a post-connect
+/// allowance — is identical, only what consumes the result differs (a resettable client-level
+/// sleep here; a non-resetting per-request total deadline there, since `resolve`'s pre-first-byte
+/// risk has nothing yet to "make progress" on for a silence budget to protect).
 fn bounded_read_timeout(connect_timeout: std::time::Duration,
                         silence_budget: std::time::Duration) -> std::time::Duration {
     connect_timeout + silence_budget
@@ -696,8 +704,11 @@ fn watched_upload_body(bytes: Vec<u8>, progress: Arc<UploadProgress>) -> (reqwes
 mod clients {
     use super::{bounded_read_timeout, FETCH_OBJECT_READ_TIMEOUT, REMOTE_READ_TIMEOUT};
 
-    /// Which `reqwest::Client` a request rides, and — for the two that carry no client-level
-    /// `read_timeout` — what (if anything) bounds that call's response wait instead. Every request
+    /// Which `reqwest::Client` a request rides, and — for the postures that carry no
+    /// client-level `read_timeout` — what (if anything) bounds that call's response wait instead:
+    /// [`Self::WatchdogNoRedirect`]'s progress-reset watchdog, [`Self::TotalDeadline`]'s own
+    /// payload, or nothing at all for [`Self::UnboundedFollowsRedirects`]/
+    /// [`Self::UnboundedNoRedirect`] (see [`UnboundedTicket`]'s doc). Every request
     /// [`super::RemoteClient`] sends must name one of these explicitly; [`Clients::pick`] has no other
     /// argument to construct a request from, so there is nothing to fall back to.
     pub(super) enum Posture {
@@ -722,11 +733,33 @@ mod clients {
         /// **Auto-follows redirects — never select this for a mutation**, same reasoning and
         /// same trap as [`Self::BoundedReads`]'s own doc.
         BoundedObjectReads,
-        /// Auto-follows redirects; no client-level `read_timeout`. The caller bounds this call's
-        /// own response wait with a per-request `RequestBuilder::timeout(...)` instead — not
-        /// through the client at all. `resolve` alone (a best-effort display lookup that degrades
-        /// to pseudonyms on any failure, so a call site of its own rather than a shared budget).
-        OwnTimeoutFollowsRedirects,
+        /// Auto-follows redirects; no client-level `read_timeout`. The bound is the payload
+        /// itself — a genuine *total* per-request deadline (`RequestBuilder::timeout`) that
+        /// [`super::RemoteClient::request_on`] reads off this variant and applies, so the promise
+        /// is discharged by the module, not merely asserted at the call site the way the deleted
+        /// `OwnTimeoutFollowsRedirects` posture used to (that variant carried no payload at all;
+        /// nothing checked that any caller of it actually called `.timeout(...)`). `resolve`
+        /// alone.
+        ///
+        /// A *silence* budget ([`Self::BoundedReads`]) is not a substitute — but not for the
+        /// reason "resolve has nothing to move before headers arrive": `BoundedReads`'s own
+        /// pre-header deadline is fixed and non-resetting (see [`REMOTE_READ_TIMEOUT`]'s own
+        /// doc), so it already terminates correctly against a remote that goes fully silent and
+        /// never answers at all — confirmed directly, not assumed: probed
+        /// `request_on(BoundedReads, ...)` against a permanently silent remote and it failed with
+        /// a genuine timeout at 15.003s, no hang. What a silence budget cannot catch is the
+        /// opposite shape: a remote that *does* start answering and then trickles bytes slowly,
+        /// forever, resetting the clock on every byte (this file's own settled contract: a
+        /// transfer that is moving bytes, however slowly, is never silence). For
+        /// `fetch_info`/`fetch_signature`/`fetch_bundle_to` that tolerance is the whole point — a
+        /// real, slow transfer must never be killed. For `resolve` it is a liability instead: the
+        /// call is cosmetic display sugar whose fallback (pseudonyms) is free, so there is no
+        /// reason to accept an unbounded wait for a slow-but-real trickle the way the other three
+        /// do. `resolve` carries `connect_timeout + REMOTE_READ_TIMEOUT` — see
+        /// [`super::RemoteClient::resolve`]'s own doc for the residual this accepts, and
+        /// [`super::tests::request_on_applies_a_total_deadline_that_ignores_progress`] for the
+        /// falsifying test.
+        TotalDeadline(std::time::Duration),
         /// Never auto-follows any redirect; no client-level `read_timeout`. The caller bounds this
         /// call's own response wait through [`super::RemoteClient::send_with_watchdog`]'s progress-reset
         /// watchdog instead — not through the client. The streamed-upload paths:
@@ -759,14 +792,13 @@ mod clients {
     /// act of accepting a new unbounded call site.
     ///
     /// `grep 'UnboundedTicket::'` enumerates every **ticket-carrying** unbounded call — it does
-    /// not enumerate every unbounded call, full stop. [`Posture::WatchdogNoRedirect`] and
-    /// [`Posture::OwnTimeoutFollowsRedirects`] each assert their call is bounded by a mechanism
-    /// outside the client (a watchdog, a per-request override) — assert, not prove: nothing in
-    /// this module's types checks that `send_with_watchdog` or `.timeout(...)` was actually
-    /// applied at a given call site, so those two postures carry no ticket and sit outside what
-    /// this grep finds, by design of the postures themselves rather than an oversight here. That
-    /// gap — bounds these two postures claim but nothing enforces — is tracked separately and is
-    /// deliberately not touched by this comment or this PR.
+    /// not enumerate every unbounded call, full stop. [`Posture::WatchdogNoRedirect`] asserts its
+    /// call is bounded by a mechanism outside the client (the progress-reset watchdog) — assert,
+    /// not prove: nothing in this module's types checks that `send_with_watchdog` was actually
+    /// applied at a given call site, so that posture carries no ticket and sits outside what this
+    /// grep finds, by design of the posture itself rather than an oversight here. That gap — a
+    /// bound this posture claims but nothing enforces — is tracked separately and is deliberately
+    /// not touched by this comment or this PR.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(super) enum UnboundedTicket {
         /// `missing_objects`, `upload_targets`, `fetch_subtree`, and `fetch_batch`'s initial
@@ -808,9 +840,11 @@ mod clients {
     /// module; [`Clients::pick`] is the only way any of them leaves it.
     #[derive(Clone)]
     pub(super) struct Clients {
-        /// Auto-follows redirects (reqwest's default `redirect::Policy`); no `read_timeout` at
-        /// all, so once past connect it waits out any silence, however long. Selected by
-        /// [`Posture::OwnTimeoutFollowsRedirects`] and [`Posture::UnboundedFollowsRedirects`].
+        /// Auto-follows redirects (reqwest's default `redirect::Policy`); no client-level
+        /// `read_timeout`, so once past connect it waits out any silence, however long — unless a
+        /// per-request `RequestBuilder::timeout(...)` is layered on top, which
+        /// [`super::RemoteClient::request_on`] does for [`Posture::TotalDeadline`] alone. Selected
+        /// by [`Posture::UnboundedFollowsRedirects`] and [`Posture::TotalDeadline`].
         ///
         /// **`commit_lift` is a mutation that rides this client** — the one FORK-89 left
         /// unfixed. See [`super::RemoteClient::commit_lift`]'s own doc for the standing gap this
@@ -892,7 +926,7 @@ mod clients {
             match posture {
                 Posture::BoundedReads => &self.bounded_reads,
                 Posture::BoundedObjectReads => &self.bounded_object_reads,
-                Posture::OwnTimeoutFollowsRedirects => &self.http,
+                Posture::TotalDeadline(_) => &self.http,
                 Posture::UnboundedFollowsRedirects(_) => &self.http,
                 Posture::WatchdogNoRedirect => &self.no_redirect,
                 Posture::UnboundedNoRedirect(_) => &self.no_redirect,
@@ -1155,11 +1189,35 @@ impl RemoteClient {
     /// default — there is no more "the seam every call that needs something other than the
     /// default client uses"; every call, including the ones that used to ride an implicit
     /// default, names its posture explicitly here.
+    ///
+    /// [`Posture::TotalDeadline`]'s payload is applied *here*, not by the caller: this is what
+    /// makes it a bound the module discharges rather than one a call site merely promises to add
+    /// (the failure mode the deleted `OwnTimeoutFollowsRedirects` posture had — a payload-free
+    /// variant nothing checked was ever actually bounded). The `Duration` is read off the posture
+    /// before it is moved into [`Self::client_for`], since that call consumes it.
     fn request_on(&self,
                    posture: Posture,
                    method: reqwest::Method,
                    path: &str) -> reqwest::RequestBuilder {
+        let total_deadline = match &posture {
+            Posture::TotalDeadline(duration) => Some(*duration),
+            // Listed explicitly, not `_`, so that a future payload-carrying `Posture` variant
+            // (mirroring `Clients::pick`'s own compiler-owned exhaustiveness, which deliberately
+            // has no wildcard arm) forces this match to be revisited too, instead of silently
+            // falling through to `None` and dropping the new payload the way the deleted
+            // `OwnTimeoutFollowsRedirects` posture already did once.
+            Posture::BoundedReads
+            | Posture::BoundedObjectReads
+            | Posture::WatchdogNoRedirect
+            | Posture::UnboundedFollowsRedirects(_)
+            | Posture::UnboundedNoRedirect(_) => None,
+        };
+
         let mut builder = self.client_for(posture).request(method, format!("{}{}", self.base, path));
+
+        if let Some(duration) = total_deadline {
+            builder = builder.timeout(duration);
+        }
 
         if let Some(token) = &self.token {
             builder = builder.bearer_auth(token);
@@ -1529,21 +1587,81 @@ impl RemoteClient {
         Ok(missing)
     }
 
+    /// The total-deadline budget to arm for *this* client instance's call to [`Self::resolve`] —
+    /// folds this instance's own `connect_timeout` into [`bounded_read_timeout`]'s arithmetic.
+    /// Split out as its own `&self` method, rather than inlining the call to
+    /// `bounded_read_timeout` at `resolve`'s one call site, so a test can pin that the right
+    /// instance field is actually read: not just read from *some* client. [`Self::error_body_budget`]
+    /// carries the identical shape (`self.connect_timeout` plus a fixed post-connect addend) for a
+    /// sibling budget, and its own doc explains why that distinction needs a `connect_timeout` no
+    /// production constructor can produce — the direct and Tor-mode constructors only ever emit
+    /// [`REMOTE_CONNECT_TIMEOUT`] or [`REMOTE_CONNECT_TIMEOUT_TOR`], so a test built through either
+    /// one can never separate "reads this field" from "hardcodes whichever of those two constants
+    /// that fixture happens to carry." See `resolve_budget_reads_this_field_not_a_rival_constant`
+    /// and `resolve_budget_is_70s_for_a_real_tor_mode_client` in the test module: the same
+    /// two-test pair `error_body_budget` carries, and for the same reason — neither subsumes the
+    /// other, see `error_body_budget_reads_this_field_not_a_rival_constant`'s own doc for why.
+    fn resolve_budget(&self) -> std::time::Duration {
+        bounded_read_timeout(self.connect_timeout, REMOTE_READ_TIMEOUT)
+    }
+
     /// Resolve operator identifiers to display names through the server
     /// (`POST /v1/resolve`). Best-effort by the resolution failure policy: a server
     /// without a resolution hook (or that predates the endpoint, a `404`), an
     /// unreachable remote, or a malformed answer all resolve to an empty map — the
     /// caller shows the pseudonymous identifiers. The *server* decides which names
     /// this caller may see (§8.12); the client only asks.
+    ///
+    /// Rides [`Posture::TotalDeadline`], carrying `connect_timeout + REMOTE_READ_TIMEOUT` — about
+    /// 15s direct, about 70s over Tor, a genuine **total** per-request deadline
+    /// (`RequestBuilder::timeout`) applied by [`Self::request_on`] itself. Deliberately *not*
+    /// [`Posture::BoundedReads`], even though it reuses [`REMOTE_READ_TIMEOUT`]'s value — and not
+    /// because a silence budget fails to cover total silence: `BoundedReads`'s own pre-header
+    /// deadline is fixed and non-resetting (see [`REMOTE_READ_TIMEOUT`]'s own doc), so it already
+    /// terminates correctly against a remote that never answers at all. What it cannot cover is
+    /// the opposite shape: a remote that *does* start answering and then trickles bytes slowly,
+    /// forever, resetting the clock on every byte (the whole FORK-49 contract: a transfer moving
+    /// bytes, however slowly, is never silence). Riding `BoundedReads` would have removed
+    /// `resolve`'s only real *total* bound and replaced it with none: a remote trickling one byte
+    /// every few seconds, once past headers, would keep the silence clock perpetually reset and
+    /// the call alive forever, reopening exactly the FORK-49 hang this module exists to close, on
+    /// a direct remote as much as a Tor one — proven directly by
+    /// [`tests::request_on_applies_a_total_deadline_that_ignores_progress`], not merely argued.
+    ///
+    /// It used to carry a flat `RequestBuilder::timeout(5s)` at the call site instead — also a
+    /// total deadline, but structurally incapable of covering a Tor dial: per `reqwest`'s own
+    /// docs that timeout starts at connect, and 5s is smaller than the connect allowance this
+    /// same file deliberately grants a Tor dial ([`REMOTE_CONNECT_TIMEOUT_TOR`] = 60s, because —
+    /// this file's own stated reason — circuit build alone can legitimately take tens of
+    /// seconds). So on Tor the old 5s deadline could expire before the request was ever sent;
+    /// how often it actually did is not something this file measures or claims. The other defect
+    /// the old 5s shared with `OwnTimeoutFollowsRedirects`, the posture it rode: the bound was a
+    /// call-site promise nothing checked, not a payload the module itself applied. Both defects
+    /// are fixed the same way — a real `Duration` payload `request_on` reads and applies.
+    ///
+    /// **Accepted residual:** `/v1/resolve`'s own pre-first-byte server work can legitimately run
+    /// close to this 15s direct budget on its own, before any network latency at all.
+    /// `forklift-server/src/server.rs`'s hook client is built with a flat 10s timeout
+    /// (`server.rs:288-289`), and a single call can pay that twice: `post_resolve` first calls
+    /// `check_auth` (`server.rs:1775`, defined at `server.rs:533`), which on a bearer-token
+    /// auth-cache miss makes its own hook round trip via `authenticate_via_hook`
+    /// (`server.rs:569`) — up to 10s — before `post_resolve` makes its *own* resolution-hook call
+    /// (`server.rs:1803`) — up to another 10s. A 15s total deadline can therefore abandon a
+    /// request a slow-hook deployment is still legitimately serving. Accepted deliberately:
+    /// `resolve` is cosmetic display sugar and its fallback to pseudonyms is free (never a
+    /// command failure), so giving up early is the right failure for this one call — unlike
+    /// `fetch_info`/`fetch_signature`/`fetch_bundle_to`, whose `BoundedReads` silence budget never
+    /// has to make this trade because a *silence* bound cannot mistake a slow-but-real transfer
+    /// for a hang in the first place.
     pub async fn resolve(&self, identifiers: Vec<String>) -> BTreeMap<String, String> {
         if identifiers.is_empty() {
             return BTreeMap::new();
         }
 
-        let response = self.request_on(Posture::OwnTimeoutFollowsRedirects, reqwest::Method::POST, "/v1/resolve")
-            // A slow or black-holed remote must never hang a display command; the
-            // fallback is pseudonyms anyway.
-            .timeout(std::time::Duration::from_secs(5))
+        let total_deadline = self.resolve_budget();
+        let response = self.request_on(
+            Posture::TotalDeadline(total_deadline), reqwest::Method::POST, "/v1/resolve"
+        )
             .json(&ResolveRequest { identifiers })
             .send()
             .await;
@@ -6026,6 +6144,154 @@ mod tests {
         let _ = std::fs::remove_file(&dest);
     }
 
+    /// `resolve` must **return** — its designed fallback, an empty map — against a remote that
+    /// connects and then never writes anything, not hang forever. `resolve` has no `Result` to
+    /// inspect the way its siblings above do (it is best-effort by contract: see its own doc), so
+    /// this pins the one property their message-content assertions can't stand in for here: that
+    /// the call actually completes within its own effective budget at all. Sibling coverage to
+    /// `fetch_info`/`fetch_signature`/`fetch_bundle_to`'s own `*_times_out_against_a_silent_remote`
+    /// tests above — every [`Posture::BoundedReads`]/[`Posture::TotalDeadline`] carrier gets one.
+    ///
+    /// **Verified not to distinguish [`Posture::TotalDeadline`] from [`Posture::BoundedReads`]
+    /// — by a committed, re-run test, not a transcribed one-off measurement.** A fully silent
+    /// remote never sends even a partial header, and [`REMOTE_READ_TIMEOUT`]'s own doc is explicit
+    /// that *before* headers arrive its client-level `read_timeout` is a fixed, non-resetting
+    /// deadline — so `Posture::BoundedReads` alone already terminates against total silence, with
+    /// no total deadline needed. `fetch_info_times_out_against_a_silent_remote` above establishes
+    /// exactly this: `fetch_info` rides `Posture::BoundedReads` (no `TotalDeadline` payload
+    /// anywhere in the picture) against this same [`SilentRemote`] fixture and asserts both a
+    /// genuine timeout and the effective 15s budget that produced it. So this test would have
+    /// stayed green through the defect this PR fixes (`resolve` riding `BoundedReads` with no
+    /// total bound) — it is real regression coverage (a fully-unbounded posture, or a dropped
+    /// bound entirely, still fails it), just not *that* regression's own falsifying test.
+    /// `request_on_applies_a_total_deadline_that_ignores_progress` below is: it uses a remote that
+    /// never goes silent at all, the one shape a silence budget structurally cannot catch and a
+    /// total deadline must.
+    #[test]
+    fn resolve_times_out_against_a_silent_remote() {
+        let remote = SilentRemote::start();
+        let client = RemoteClient::new(&remote.url, None).unwrap();
+        let effective_budget = TEST_DIRECT_CONNECT_TIMEOUT + TEST_TIGHT_READ_TIMEOUT;
+        let hard_ceiling = effective_budget + std::time::Duration::from_secs(15);
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let names = runtime.block_on(async {
+            tokio::time::timeout(hard_ceiling, client.resolve(vec!["agent-1".to_string()])).await
+        })
+            .unwrap_or_else(|_| panic!(
+                "resolve hung past the test's own {:?} ceiling — no total deadline fired at all",
+                hard_ceiling
+            ));
+
+        assert!(
+            names.is_empty(),
+            "a silent remote must degrade resolve to its designed fallback (pseudonyms, an \
+            empty map), not somehow produce names: {:?}", names
+        );
+    }
+
+    /// Starts a remote that sends full headers (declaring `total_bytes` via `Content-Length`)
+    /// immediately, then writes exactly one byte every `gap` — continuous, healthy progress,
+    /// never silent for longer than `gap` at a stretch — until the body completes or the client
+    /// gives up and drops the connection (detected via a failed write, which ends the loop early
+    /// so the handler thread does not outlive the test). The shape a *silence* budget
+    /// (`ClientBuilder::read_timeout`, [`Posture::BoundedReads`]/[`Posture::BoundedObjectReads`])
+    /// is specifically designed to never fail against — see
+    /// `fetch_object_survives_a_slow_but_steadily_progressing_body`, which pins exactly that for
+    /// the sibling posture — which is what makes it the fixture that isolates
+    /// [`Posture::TotalDeadline`]'s one distinguishing property: firing anyway.
+    fn start_continuously_trickling_remote(total_bytes: usize, gap: std::time::Duration) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+
+        std::thread::spawn(move || {
+            use std::io::Write;
+
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = read_test_request(&mut stream);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                    Content-Length: {}\r\n\r\n",
+                    total_bytes
+                );
+                let _ = stream.flush();
+
+                for _ in 0..total_bytes {
+                    std::thread::sleep(gap);
+                    if stream.write_all(b"x").is_err() {
+                        break; // the client already gave up; nothing left to prove
+                    }
+                    let _ = stream.flush();
+                }
+            }
+        });
+
+        url
+    }
+
+    /// The falsifying test for the defect this PR fixes: moving `resolve` onto
+    /// [`Posture::BoundedReads`] removed its only total bound and replaced it with none, so a
+    /// remote trickling one byte at a time, forever, would have kept it alive forever too — the
+    /// FORK-49 symptom this module exists to eliminate, reachable on a direct remote, not just
+    /// Tor. `resolve_times_out_against_a_silent_remote` above cannot catch this: total silence
+    /// is exactly what a silence budget already handles (see that test's own doc). Continuous
+    /// progress is the one shape it structurally cannot — this file's own settled contract
+    /// (`REMOTE_READ_TIMEOUT`'s doc) is that "a transfer that is moving bytes… is never silent".
+    ///
+    /// This pins [`Self::request_on`]'s wiring directly rather than inferring it from `resolve`
+    /// itself, so it is fast and deterministic: a short 2s [`Posture::TotalDeadline`] against a
+    /// remote writing one byte every 500ms — never silent for longer than 500ms, an order of
+    /// magnitude under every silence budget in this file — must still be cut off at ~2s, because
+    /// a `RequestBuilder::timeout` does not reset on anything. `total_bytes` (100) is sized so the
+    /// full trickle (50s) is far longer than `hard_ceiling` (17s): if the deadline were silently
+    /// dropped, the outer `tokio::time::timeout` — not the assertion below it — is what would
+    /// catch it, loudly, rather than the test quietly passing on a technicality.
+    #[test]
+    fn request_on_applies_a_total_deadline_that_ignores_progress() {
+        let url = start_continuously_trickling_remote(100, std::time::Duration::from_millis(500));
+        let client = RemoteClient::new(&url, None).unwrap();
+        let deadline = std::time::Duration::from_secs(2);
+        let hard_ceiling = deadline + std::time::Duration::from_secs(15);
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let outcome = runtime.block_on(async {
+            tokio::time::timeout(hard_ceiling, async {
+                // `.send()` alone resolves as soon as headers arrive — this fixture writes them
+                // immediately, so `.send()` returns `Ok` almost instantly regardless of whether
+                // the deadline is applied at all (confirmed: without the body read below, this
+                // test passed for the wrong reason, observing a `200` in well under a second).
+                // Reading the body is what actually exercises the deadline: reqwest's own docs
+                // for `RequestBuilder::timeout` state it runs "until the response body has
+                // finished", so it is the `.bytes()` await — not `.send()` — that must be what
+                // observes the cutoff.
+                let response = client.request_on(
+                    Posture::TotalDeadline(deadline), reqwest::Method::GET, "/v1/probe"
+                )
+                    .send()
+                    .await?;
+
+                response.bytes().await
+            }).await
+        });
+
+        let inner = outcome.unwrap_or_else(|_| panic!(
+            "request_on(TotalDeadline) hung past the test's own {:?} outer ceiling — the total \
+            deadline never fired at all, even though the remote never stopped writing bytes",
+            hard_ceiling
+        ));
+
+        let error = inner.expect_err(
+            "a remote making continuous progress every 500ms must still be cut off by a 2s total \
+            deadline — if the full body arrived, the deadline was never actually applied"
+        );
+
+        assert!(
+            error.is_timeout(),
+            "must fail specifically with a timeout, not some other transport error: {}", error
+        );
+    }
+
     /// A mid-download failure — the new timeout being the routine case now — must never leave a
     /// truncated file at the destination, which would otherwise be this warehouse's
     /// own latest bundle. Unlike the silent-remote scenario above, [`LyingContentLengthRemote`]
@@ -6406,6 +6672,66 @@ mod tests {
         );
     }
 
+    /// Mirrors [`error_body_budget_reads_this_field_not_a_rival_constant`] for
+    /// `resolve`'s own [`RemoteClient::resolve_budget`] — the identical gap applies here for the
+    /// identical reason: every existing behavioral test of `resolve` builds a direct client via
+    /// `RemoteClient::new`, where `self.connect_timeout` == [`REMOTE_CONNECT_TIMEOUT`] ==
+    /// [`TEST_DIRECT_CONNECT_TIMEOUT`] (5s) — so a hardcoded-constant mutant of `resolve_budget`
+    /// (`REMOTE_CONNECT_TIMEOUT` in place of `self.connect_timeout`) is extensionally identical to
+    /// the correct implementation everywhere those tests look, and would still give a Tor client
+    /// only a 15s total deadline against a 60s connect allowance — the deadline firing during
+    /// circuit build, the exact defect class this fix exists to close.
+    ///
+    /// `SENTINEL_CONNECT_TIMEOUT` (11s) is deliberately a different value from
+    /// `error_body_budget`'s own sentinel (7s) — reusing it would make the two tests read as one
+    /// case split in half rather than two independently readable pins — and, like that test's own
+    /// sentinel, was checked against every named `Duration` constant in this module
+    /// (`grep -n "Duration::from_secs\|Duration::from_millis"`) before being picked: the distinct
+    /// values in play are 0.2 (`COMMIT_BACKOFF_START`/`UPLOAD_WATCHDOG_POLL_INTERVAL`), 2
+    /// (`POST_SEND_VERIFY_BASE`), 3 (`COMMIT_BACKOFF_CAP`), 5, 10, 60, and the sibling test's own
+    /// 7 — 11 matches none of them. What would actually matter is a rival for this test's asserted
+    /// *output*, 21s (`11 + TEST_TIGHT_READ_TIMEOUT`): the full pairwise-sum set over
+    /// `{2, 3, 5, 7, 10, 60}` is `{5, 7, 8, 9, 10, 12, 13, 15, 17, 62, 63, 65, 67, 70, 120}` — no
+    /// 21, and 21 does not coincide with any single named constant either.
+    #[test]
+    fn resolve_budget_reads_this_field_not_a_rival_constant() {
+        const SENTINEL_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(11);
+
+        let client = RemoteClient::new_test_with_connect_timeout(
+            "http://forklift-fork-96-resolve-budget-sentinel-test.invalid",
+            SENTINEL_CONNECT_TIMEOUT,
+        );
+
+        assert_eq!(
+            client.resolve_budget(),
+            SENTINEL_CONNECT_TIMEOUT + TEST_TIGHT_READ_TIMEOUT,
+            "resolve_budget must fold in *this instance's* connect_timeout — a value neither \
+            RemoteClient::new (5s) nor RemoteClient::new_with_tor under TorMode::On (60s) can ever \
+            produce, so this cannot pass by coincidentally matching a hardcoded rival constant"
+        );
+    }
+
+    /// Mirrors [`error_body_budget_is_70s_for_a_real_tor_mode_client`] for
+    /// [`RemoteClient::resolve_budget`], for the identical reason that test's own doc gives: the
+    /// sentinel test above pins *reads-the-field-not-a-rival* but not what `resolve_budget`
+    /// actually returns for a real Tor-mode client, and neither claim subsumes the other. Built
+    /// the same no-I/O way (`new_with_tor` never touches the network).
+    #[test]
+    fn resolve_budget_is_70s_for_a_real_tor_mode_client() {
+        let tor = TorSettings { mode: TorMode::On, proxy: DEFAULT_TOR_PROXY.to_string() };
+        let client = RemoteClient::new_with_tor(
+            "http://forklift-fork-96-resolve-budget-tor-endpoint-test.invalid", None, tor,
+        ).unwrap();
+
+        assert_eq!(
+            client.resolve_budget(),
+            TEST_TOR_CONNECT_TIMEOUT + TEST_TIGHT_READ_TIMEOUT,
+            "a real TorMode::On client's resolve_budget must be exactly the Tor-folded 70s — \
+            otherwise resolve's own total deadline fires during Tor circuit build, the exact \
+            defect class this fix exists to close"
+        );
+    }
+
     /// Streams a body in `chunks`, sleeping `gap` before each one and flushing immediately after
     /// — a body that is always moving bytes, however slowly (never silent, per the settled
     /// contract quoted in `REMOTE_READ_TIMEOUT`'s doc), never a single stall long enough to trip
@@ -6485,16 +6811,20 @@ mod tests {
         assert_eq!(bytes, expected, "the full body must arrive intact despite the drip");
     }
 
-    /// Starts a remote that answers `POST /v1/pallets/{pallet}` — what `update_ref` hits — only
-    /// after `delay`. Stands in for the settled contract's slow first-push audit walk
-    /// (`audit_utils.rs`): server-side work `update_ref` legitimately waits on before its first
-    /// response byte, unbounded by design because it is scoped by the history segment being
-    /// pushed, which on a first lift into an empty pallet is the whole history and can take
-    /// minutes. Returns the remote's base URL; the connection closes itself after the one
-    /// delayed response, so nothing needs parking or dropping here.
-    fn start_slow_ref_update_remote(delay: std::time::Duration) -> String {
+    /// Starts a remote that answers whatever request it receives with a `200` and `body` — empty
+    /// or a JSON payload, the caller's choice — only after `delay`, never a byte before that.
+    /// Shared by every fixture in this file that needs a remote whose pre-first-byte work
+    /// legitimately takes a while but then answers correctly: `update_ref`'s slow first-push
+    /// audit-walk stand-in (`audit_utils.rs`; server-side work `update_ref` legitimately waits on
+    /// before its first response byte, unbounded by design because it is scoped by the history
+    /// segment being pushed, which on a first lift into an empty pallet is the whole history and
+    /// can take minutes) and `resolve`'s discriminating-window fixture. Returns the remote's base
+    /// URL; the connection closes itself after the one delayed response, so nothing needs parking
+    /// or dropping here.
+    fn start_slow_answering_remote(delay: std::time::Duration, body: &str) -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
+        let body = body.to_string();
 
         std::thread::spawn(move || {
             use std::io::Write;
@@ -6504,7 +6834,9 @@ mod tests {
                 std::thread::sleep(delay);
                 let _ = write!(
                     stream,
-                    "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                    Connection: close\r\n\r\n{}",
+                    body.len(), body
                 );
                 let _ = stream.flush();
             }
@@ -6526,7 +6858,7 @@ mod tests {
     fn update_ref_outlives_the_read_metadata_timeout() {
         let past_read_timeout = TEST_DIRECT_CONNECT_TIMEOUT + TEST_TIGHT_READ_TIMEOUT
             + std::time::Duration::from_secs(3);
-        let url = start_slow_ref_update_remote(past_read_timeout);
+        let url = start_slow_answering_remote(past_read_timeout, "");
         let client = RemoteClient::new(&url, None).unwrap();
         let outer_ceiling = past_read_timeout + std::time::Duration::from_secs(15);
 
@@ -6546,6 +6878,73 @@ mod tests {
                 "update_ref must not fail on a response that only arrived slowly, never on any \
                 timeout: {}", e
             ));
+    }
+
+    /// The discriminating fixture for `resolve`'s own [`Posture::TotalDeadline`]: a remote that
+    /// connects instantly (loopback) and then stays silent for a fixed delay before answering
+    /// correctly — it *does* eventually answer, which is exactly why this test alone cannot pin
+    /// termination (see the note on that below). The test itself asserts that this delay sits
+    /// strictly between the *old* flat bound `resolve` used to carry (a plain
+    /// `RequestBuilder::timeout(5s)`, not mirrored as a `TEST_*` constant since the production
+    /// value it mirrored no longer exists to drift against) and the *new*
+    /// [`Posture::TotalDeadline`] budget (`TEST_DIRECT_CONNECT_TIMEOUT + TEST_TIGHT_READ_TIMEOUT`
+    /// — the same arithmetic production computes via [`bounded_read_timeout`]) — so a future
+    /// change to either bound fails this test loudly instead of leaving a stale comment. Before
+    /// the fix: the old 5s deadline fires mid-wait, `send` returns `Err`, and `resolve` falls
+    /// back to an empty map — pseudonyms, even though the remote was healthy and answering. After
+    /// the fix: the delay is comfortably inside the new budget, so the real mapping comes back.
+    /// Asserts the returned mapping itself, not merely that the call returned promptly — a
+    /// timing-only assertion is green in both worlds (5s empty-map return, ~15s real-map return),
+    /// so it would pin nothing.
+    ///
+    /// **Not a termination pin.** This fixture always answers eventually, so it is green whether
+    /// `resolve` is bounded at ~15s *or not bounded at all* — exactly the gap that let `resolve`
+    /// briefly ride [`Posture::BoundedReads`] (a silence budget, no total bound) through review:
+    /// this test stayed green throughout, because its remote is never silent forever. It still
+    /// earns its keep by pinning the *lower* edge (must not still be the old flat 5s), which
+    /// `resolve_times_out_against_a_silent_remote` below does not cover — that one pins
+    /// termination against a remote that never answers at all, the property this one structurally
+    /// cannot test.
+    #[test]
+    fn resolve_survives_silence_past_the_old_five_second_bound() {
+        // Not a `TEST_*` mirror: this is `resolve`'s own historical bound, a value this PR
+        // deletes from production entirely — there is no live constant left to mirror or drift
+        // against, only the fixed number the fix replaced.
+        let old_flat_bound = std::time::Duration::from_secs(5);
+        let new_budget = TEST_DIRECT_CONNECT_TIMEOUT + TEST_TIGHT_READ_TIMEOUT;
+        let delay = std::time::Duration::from_secs(6);
+
+        assert!(
+            delay > old_flat_bound,
+            "the fixture's delay {:?} must exceed the old flat bound {:?}, or this test no \
+            longer discriminates the old behavior from the new — it would pass even against the \
+            reverted fix", delay, old_flat_bound
+        );
+        assert!(
+            delay < new_budget,
+            "the fixture's delay {:?} must stay under the new budget {:?}, or this test would \
+            fail for an unrelated reason (the remote genuinely never answering in time), not the \
+            one it exists to catch", delay, new_budget
+        );
+
+        let url = start_slow_answering_remote(delay, r#"{"names":{"agent-1":"Real Display Name"}}"#);
+        let client = RemoteClient::new(&url, None).unwrap();
+        let outer_ceiling = new_budget + std::time::Duration::from_secs(15);
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let names = runtime.block_on(async {
+            tokio::time::timeout(outer_ceiling, client.resolve(vec!["agent-1".to_string()])).await
+        })
+            .unwrap_or_else(|_| panic!(
+                "resolve hung past its own generous outer ceiling {:?}", outer_ceiling
+            ));
+
+        assert_eq!(
+            names.get("agent-1").map(String::as_str), Some("Real Display Name"),
+            "a remote that answers correctly after {:?} — past the old flat 5s bound, well \
+            inside the new connect+read budget — must return the real mapping, not fall back \
+            to pseudonyms: got {:?}", delay, names
+        );
     }
 
     /// A fixture standing in for a Tor SOCKS proxy this test fully controls: it TCP-accepts (the
