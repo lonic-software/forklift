@@ -26,7 +26,7 @@ use forklift_core::model::hooks::{
     AdmissionHookRequest, AdmissionHookResponse, AuthenticationHookRequest,
     AuthenticationHookResponse, HookEvent, ResolutionHookRequest, ResolutionHookResponse,
     EVENT_KEY_REVOKED, EVENT_PALLET_UPDATED, EVENT_TRUST_ESTABLISHED, EVENT_TRUST_RESET,
-    EVENT_WAREHOUSE_CREATED,
+    EVENT_WAREHOUSE_CREATED, HOOK_CLIENT_TIMEOUT,
 };
 use forklift_core::model::remote::{
     ErrorResponse, MissingObjectsRequest, MissingObjectsResponse, RefUpdateRequest,
@@ -286,7 +286,7 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
     }
 
     let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(HOOK_CLIENT_TIMEOUT)
         .build()
         .map_err(|e| format!("Error while building the hook HTTP client: {}", e))?;
 

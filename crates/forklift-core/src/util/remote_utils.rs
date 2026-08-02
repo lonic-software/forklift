@@ -19,6 +19,7 @@ use crate::model::remote::{
 use crate::enums::config_scope::ConfigScope;
 use crate::error::{CoreError, RefusalCode};
 use crate::globals::{self, StorageRootScope};
+use crate::model::hooks::HOOK_CLIENT_TIMEOUT;
 use crate::util::office_utils::OFFICE_PALLET_NAME;
 use crate::util::scope_utils::{self, MaterializationScope, ScopeClass};
 use crate::util::{
@@ -547,6 +548,32 @@ fn post_send_verify_budget(body_len: usize) -> std::time::Duration {
 /// import needs, so `pub(crate)` is the right width, not a wider `pub`.
 pub(crate) const PRESENCE_ALLOWANCE_MS_PER_OP: f64 = 5.0;
 
+/// The post-connect allowance [`RemoteClient::single_write_budget`] folds `self.connect_timeout`
+/// into, for `upload_signature` and `put_trust` — the two single-write endpoints whose server
+/// side runs a bounded, known-shape sequence after the body is already in hand rather than the
+/// derived, unknowable-in-advance one `update_ref`'s audit walk runs.
+///
+/// Derived, not guessed: `upload_signature`'s server side (`put_signature`, `forklift-server`)
+/// runs the authentication and admission hooks — each capped at [`HOOK_CLIENT_TIMEOUT`], the
+/// server's own flat per-hook budget, imported rather than mirrored so this figure cannot drift
+/// out of sync with what the server actually allows — after the body is fully buffered (Axum's
+/// `Bytes` extractor buffers the whole body before the handler runs), plus a flat office read and
+/// an atomic sidecar write. `put_trust`'s server side (`put_trust`, `forklift-server`) runs one
+/// such hook plus an anchor read/write under the warehouse write lock. One shared constant covers
+/// both calls: `2 * HOOK_CLIENT_TIMEOUT` prices the costlier of the two (`upload_signature`'s pair
+/// of hooks) so the same value is never tight for either; the flat 5s on top is dispatch and disk
+/// margin, not a third hook's worth of budget.
+///
+/// **Accepted residual, not priced in here:** `put_trust` additionally holds `warehouse.writes` —
+/// the same mutex the ref-update handler holds across closure verification, ancestry and the
+/// office-chain verify, work this module elsewhere documents can legitimately run minutes — for
+/// the whole of its handler. A first-contact `put_trust` racing another client's long first lift
+/// on the same warehouse can exceed this budget regardless of its size; see
+/// [`RemoteClient::put_trust`]'s own doc for why that residual is accepted rather than absorbed.
+const SINGLE_WRITE_ALLOWANCE: std::time::Duration = std::time::Duration::from_secs(
+    2 * HOOK_CLIENT_TIMEOUT.as_secs() + 5
+);
+
 /// Shared state between an upload's body-send stream ([`UploadChunks`]) and
 /// [`clients::Clients::send_with_watchdog`]'s polling loop: a timestamp updated every time the stream
 /// actually yields a chunk (the only signal available that the transfer is still moving — see
@@ -769,11 +796,13 @@ mod clients {
         /// doesn't: nothing about adding a `read_timeout` also disables auto-follow, they are
         /// independent axes (this module's own doc names all three). A mutation that rode this
         /// posture would reopen exactly the hole FORK-89 closed — a `3xx` silently followed and
-        /// read back as success. This is the trap [`UnboundedTicket::Fork49`]'s own doc names:
-        /// `upload_signature`/`put_trust` stay on [`Self::UnboundedNoRedirect`], unbounded,
-        /// specifically because no client here combines no-auto-redirect *with* a client-level
-        /// `read_timeout` — reaching for this variant to "just add a bound" to either of them
-        /// would silently reopen their redirect exposure instead.
+        /// read back as success. This is the trap a flat `read_timeout` cannot escape for
+        /// `upload_signature`/`put_trust` either: `read_timeout` is a `ClientBuilder`-level
+        /// setting with no per-request override, and no client this module builds combines
+        /// no-auto-redirect *with* a client-level `read_timeout` — reaching for this variant to
+        /// "just add a bound" to either of them would silently reopen their redirect exposure
+        /// instead. They carry their bound as a per-request payload on
+        /// [`Self::TotalDeadlineNoRedirect`] instead, which needs no such client.
         BoundedReads,
         /// [`FETCH_OBJECT_READ_TIMEOUT`]-bounded via a client-level `read_timeout` — the same
         /// shape as [`Self::BoundedReads`], just with the looser budget `fetch_object`'s
@@ -819,6 +848,20 @@ mod clients {
         /// `super::tests::request_on_applies_a_total_deadline_that_ignores_progress`, which pins
         /// only `request_on`'s own wiring and never calls `resolve`.
         TotalDeadline(std::time::Duration),
+        /// Same shape as [`Self::TotalDeadline`] — a genuine *total* per-request deadline, applied
+        /// the same way by [`Clients::request_on`] — but on the client that never auto-follows a
+        /// redirect, for a mutation that also needs a bound. `upload_signature` and `put_trust`:
+        /// single-write endpoints whose server side does bounded work (a fixed number of hooks,
+        /// each capped, plus O(constant) file I/O) after the body is already in hand, so a total
+        /// deadline is honest the same way [`Self::TotalDeadline`]'s own doc argues for `resolve`
+        /// and the presence-negotiation calls — but the mutation invariant still applies: neither
+        /// may ride [`Self::TotalDeadline`] itself, since that variant is carried on
+        /// [`Clients::http`], the auto-following client, and a mutation riding it would reopen the
+        /// exact silent-`3xx`-success hole FORK-89 closed (see [`Clients::pick`]'s own doc for
+        /// which client each variant selects). Sized by
+        /// [`super::RemoteClient::single_write_budget`] — see that method's own doc for the
+        /// arithmetic and the accepted residual.
+        TotalDeadlineNoRedirect(std::time::Duration),
         /// Auto-follows redirects; no client-level `read_timeout`; **nothing else bounds this
         /// call's response wait either** — no per-request override, no watchdog. Deliberate, not
         /// an oversight: the ticket that owns adding a bound is a required part of this variant,
@@ -920,10 +963,6 @@ mod clients {
         /// `commit_lift`: its error-body read decides retry-vs-terminal control flow, so bounding
         /// it is a retry-contract design question, not a flat constant. FORK-91.
         Fork91,
-        /// `upload_signature`, `put_trust`: single-write endpoints whose server side could take a
-        /// flat bound, but no client combining no-auto-redirect with a client-level
-        /// `read_timeout` exists yet. FORK-49.
-        Fork49,
     }
 
     /// The four `reqwest::Client`s a request against the remote may ride — private to this
@@ -943,7 +982,11 @@ mod clients {
         http: reqwest::Client,
         /// Same endpoint as [`Self::http`], automatic redirect-following disabled
         /// (`redirect::Policy::none()`); no `read_timeout` either. Selected by
-        /// [`Posture::UnboundedNoRedirect`], and directly (bypassing [`Posture`] entirely) by
+        /// [`Posture::UnboundedNoRedirect`] and [`Posture::TotalDeadlineNoRedirect`] alike — the
+        /// latter layers a per-request total deadline on top via the same
+        /// [`Clients::request_on`] extraction [`Posture::TotalDeadline`] uses, never a
+        /// client-level `read_timeout` this client cannot carry — and directly (bypassing
+        /// [`Posture`] entirely) by
         /// [`Clients::send_with_watchdog`] — the watchdog-guarded upload paths: reqwest's default
         /// policy replays a `307`/`308` with the original method *and* body, and `tower-http`'s
         /// `SEE_OTHER`/`MOVED_PERMANENTLY`/`FOUND` arms force a mutation's method to `GET` and
@@ -1028,14 +1071,16 @@ mod clients {
                 Posture::BoundedReads => &self.bounded_reads,
                 Posture::BoundedObjectReads => &self.bounded_object_reads,
                 Posture::TotalDeadline(_) => &self.http,
+                Posture::TotalDeadlineNoRedirect(_) => &self.no_redirect,
                 Posture::UnboundedFollowsRedirects(_) => &self.http,
                 Posture::UnboundedNoRedirect(_) => &self.no_redirect,
             }
         }
 
         /// The only way any of the four clients leaves this module: build a `reqwest::RequestBuilder`
-        /// on whichever client [`Self::pick`] chooses, with `posture`'s own payload — currently only
-        /// [`Posture::TotalDeadline`]'s `Duration` — already applied. `pick` is private to this
+        /// on whichever client [`Self::pick`] chooses, with `posture`'s own payload — currently
+        /// [`Posture::TotalDeadline`]'s or [`Posture::TotalDeadlineNoRedirect`]'s `Duration` —
+        /// already applied. `pick` is private to this
         /// module and this is its only caller, so there is no path from a `Posture` to a client that
         /// can skip this extraction; a future payload-carrying variant forces the match below to be
         /// revisited (it has no wildcard arm, deliberately, mirroring `pick`'s own exhaustiveness)
@@ -1056,13 +1101,18 @@ mod clients {
                                  method: reqwest::Method,
                                  destination: RequestDestination<'_>) -> reqwest::RequestBuilder {
             let total_deadline = match &posture {
-                Posture::TotalDeadline(duration) => {
-                    // Every producer of a `TotalDeadline` payload builds it as `connect_timeout +
-                    // a positive addend` (`RemoteClient::resolve_budget`,
-                    // `RemoteClient::presence_negotiation_budget`) — never merely a post-connect
-                    // budget on its own — so the connector's own timeout always fires first on a
-                    // connect-phase stall, classifying it as `TransportFailure::ConnectTimedOut`
-                    // rather than `ReadTimedOut`.
+                // Same arm for both: [`Posture::TotalDeadlineNoRedirect`] carries the identical
+                // total-deadline payload shape as [`Posture::TotalDeadline`], differing only in
+                // which client `Self::pick` sends it on — so the `debug_assert!` and the deadline
+                // application below apply unconditionally to both rather than being duplicated
+                // for a second variant that would drift out of sync with this one.
+                Posture::TotalDeadline(duration) | Posture::TotalDeadlineNoRedirect(duration) => {
+                    // Every producer of a `TotalDeadline`/`TotalDeadlineNoRedirect` payload builds
+                    // it as `connect_timeout + a positive addend` (`RemoteClient::resolve_budget`,
+                    // `RemoteClient::presence_negotiation_budget`, `RemoteClient::single_write_budget`)
+                    // — never merely a post-connect budget on its own — so the connector's own
+                    // timeout always fires first on a connect-phase stall, classifying it as
+                    // `TransportFailure::ConnectTimedOut` rather than `ReadTimedOut`.
                     //
                     // What a violating payload costs is the *wording*, not the figure. Were
                     // `*duration <= connect_timeout`, this deadline would fire first and produce a
@@ -1075,16 +1125,16 @@ mod clients {
                     // contract violation. Hence a `debug_assert`: adequate for a wording hazard,
                     // and deliberately not an invariant the released binary's numbers depend on.
                     //
-                    // Checked here, at the one seam every `TotalDeadline` posture passes through
+                    // Checked here, at the one seam every total-deadline posture passes through
                     // on its way to a live request, rather than left as a claim in a producer's own
                     // doc comment that nothing re-checks.
                     debug_assert!(
                         *duration > connect_timeout,
-                        "a Posture::TotalDeadline payload ({:?}) must strictly exceed this \
-                        request's connect_timeout ({:?}) — otherwise a connect-phase stall lands \
-                        in TransportFailure::ReadTimedOut instead of ConnectTimedOut, and \
-                        describe_transport_error reports that the remote did not finish answering \
-                        when no connection was ever established",
+                        "a Posture::TotalDeadline/TotalDeadlineNoRedirect payload ({:?}) must \
+                        strictly exceed this request's connect_timeout ({:?}) — otherwise a \
+                        connect-phase stall lands in TransportFailure::ReadTimedOut instead of \
+                        ConnectTimedOut, and describe_transport_error reports that the remote did \
+                        not finish answering when no connection was ever established",
                         *duration, connect_timeout
                     );
                     Some(*duration)
@@ -1621,7 +1671,9 @@ impl RemoteClient {
     /// [`Posture::UnboundedFollowsRedirects`]/[`Posture::UnboundedNoRedirect`] name no figure at
     /// all — nothing was armed, so [`TransportFailure::ReadTimedOut`]'s own doc's ambiguity
     /// (a client `read_timeout` vs. a genuine multi-minute kernel `ETIMEDOUT`) applies at full
-    /// force here, the one case this function cannot narrow at all.
+    /// force here, the one case this function cannot narrow at all. [`Posture::TotalDeadlineNoRedirect`]'s
+    /// arm exists only so this match stays exhaustive — every call riding it is a mutation and
+    /// never reaches this function at all (see [`Self::describe_mutation_transport_error`]'s doc).
     fn describe_transport_error(&self,
                                 action: &str,
                                 posture: Posture,
@@ -1645,6 +1697,14 @@ impl RemoteClient {
                     request's {:?} total deadline.",
                     action, deadline
                 ),
+                // Required only for this match's exhaustiveness — every call riding
+                // `TotalDeadlineNoRedirect` is a mutation and routes its transport errors through
+                // `describe_mutation_transport_error` instead, never through this function.
+                Posture::TotalDeadlineNoRedirect(deadline) => format!(
+                    "Timed out while {}: the remote did not complete its answer within this \
+                    request's {:?} total deadline.",
+                    action, deadline
+                ),
                 Posture::UnboundedFollowsRedirects(_) | Posture::UnboundedNoRedirect(_) => format!(
                     "Timed out while {}: the remote did not respond.",
                     action
@@ -1654,26 +1714,32 @@ impl RemoteClient {
         }
     }
 
-    /// The mutation counterpart of [`Self::describe_transport_error`], for the six calls that ride
-    /// the unbounded no-auto-follow or auto-follow clients (`update_ref`, `upload_object`,
-    /// `put_presigned`, `upload_signature`, `put_trust`, `commit_lift`) — `update_ref`,
-    /// `upload_signature`, and `put_trust` ride [`Posture::UnboundedNoRedirect`] (moved off the
-    /// auto-following client by FORK-89); `upload_object`/`put_presigned` ride
-    /// [`clients::Clients::send_with_watchdog`] directly, on the same never-auto-follow client, but
-    /// bypassing [`Posture`] entirely (moved by the earlier fix for the `303` redirect hole, then
-    /// off `Posture` again once a payload-free posture proved unable to guarantee the watchdog was
-    /// actually applied); only `commit_lift` still rides the auto-following client
+    /// The mutation counterpart of [`Self::describe_transport_error`], for all six mutations that
+    /// never auto-follow a redirect (`update_ref`, `upload_object`, `put_presigned`,
+    /// `upload_signature`, `put_trust`, `commit_lift`) — takes no `Posture` because its wording
+    /// does not vary by one: unlike the read path, a mutation's `ReadTimedOut` is always the same
+    /// uncertain shape regardless of which bound (if any) actually fired, so every one of the six
+    /// funnels through the identical composer. `update_ref` rides [`Posture::UnboundedNoRedirect`]
+    /// (moved off the auto-following client by FORK-89); `upload_signature`/`put_trust` ride
+    /// [`Posture::TotalDeadlineNoRedirect`] — bounded, but on the identical never-auto-follow
+    /// client, so their transport failures land here the same way; `upload_object`/`put_presigned`
+    /// ride [`clients::Clients::send_with_watchdog`] directly, on the same never-auto-follow
+    /// client, but bypassing [`Posture`] entirely (moved by the earlier fix for the `303` redirect
+    /// hole, then off `Posture` again once a payload-free posture proved unable to guarantee the
+    /// watchdog was actually applied); only `commit_lift` still rides the auto-following client
     /// ([`Posture::UnboundedFollowsRedirects`]) directly. `upload_object`/`put_presigned`'s
     /// watchdog also produces a genuine `reqwest::Error` for an actual transport failure (as
     /// opposed to a watchdog kill, which produces no `reqwest::Error` at all — see
     /// [`clients::WatchdogOutcome::Transport`]'s doc), so a transport failure on any of the six
     /// still lands here for anything `classify` can actually see (a connect failure, or a
-    /// `reqwest::Error`-bearing timeout on the response side). Same [`classify`] dispatch, but the
-    /// [`TransportFailure::ReadTimedOut`] wording differs from the read path's: on these clients
-    /// that case can only be a timeout on an *established* connection — after the request bytes
-    /// were already sent — so the settled contract requires the uncertainty be carried in the
-    /// message rather than asserted away: it may have completed on the remote, and the caller must
-    /// decide whether to check before retrying, never be told nothing happened.
+    /// `reqwest::Error`-bearing timeout on the response side — a fired
+    /// [`Posture::TotalDeadlineNoRedirect`] deadline is exactly such a `reqwest::Error`, `is_timeout()`
+    /// true, same as any other). Same [`classify`] dispatch, but the [`TransportFailure::ReadTimedOut`]
+    /// wording differs from the read path's: on these clients that case can only be a timeout on an
+    /// *established* connection — after the request bytes were already sent — so the settled
+    /// contract requires the uncertainty be carried in the message rather than asserted away: it
+    /// may have completed on the remote, and the caller must decide whether to check before
+    /// retrying, never be told nothing happened.
     fn describe_mutation_transport_error(&self, action: &str, e: reqwest::Error) -> String {
         match classify(e.is_connect(), e.is_timeout()) {
             TransportFailure::ConnectTimedOut => format!(
@@ -1766,7 +1832,8 @@ impl RemoteClient {
     /// Compose a loud, specific error for a `3xx` response to a mutation. Every call site that
     /// reaches this (`upload_object`, `put_presigned`, `update_ref`, `upload_signature`,
     /// `put_trust` — FORK-89 widened this from the original two) goes out on the never-auto-follow
-    /// client ([`Posture::UnboundedNoRedirect`], or — for `upload_object`/`put_presigned` —
+    /// client ([`Posture::UnboundedNoRedirect`] for `update_ref`, [`Posture::TotalDeadlineNoRedirect`]
+    /// for `upload_signature`/`put_trust`, or — for `upload_object`/`put_presigned` —
     /// directly via [`clients::Clients::send_with_watchdog`]), which never
     /// auto-follows *any* redirect status — so this is a local, unconditional invariant
     /// of *this client*, not a claim about how any particular `3xx` happens to behave under a
@@ -2437,20 +2504,44 @@ impl RemoteClient {
             ))
     }
 
+    /// The total-deadline budget to arm for *this* client instance's call to
+    /// [`Self::upload_signature`] or [`Self::put_trust`] — folds this instance's own
+    /// `connect_timeout` into [`SINGLE_WRITE_ALLOWANCE`]'s arithmetic, the same shape
+    /// [`Self::error_body_budget`]/[`Self::resolve_budget`]/[`Self::presence_negotiation_budget`]
+    /// already carry (`self.connect_timeout` plus a post-connect addend), for the identical
+    /// reason: a Tor dial's 60s connect allowance must never be undercut by a budget sized for a
+    /// direct remote. Split out as its own `&self` method rather than inlining the arithmetic at
+    /// either call site, so a test can pin that the right instance field is actually read — see
+    /// `single_write_budget_reads_this_field_not_a_rival_constant` in the test module. 30s direct,
+    /// 85s over Tor.
+    ///
+    /// Sound as a *total*, non-resetting deadline for exactly the reason [`SINGLE_WRITE_ALLOWANCE`]'s
+    /// own doc gives: both calls' server sides run a bounded, known-shape sequence — a fixed
+    /// number of capped hooks plus O(constant) file I/O — after the body is already in hand, not
+    /// a derived quantity like `update_ref`'s audit walk. `put_trust`'s own doc records the one
+    /// residual this arithmetic does not price in (the shared warehouse write lock); nothing else
+    /// in either call's server side is unpriced here.
+    fn single_write_budget(&self) -> std::time::Duration {
+        self.connect_timeout + SINGLE_WRITE_ALLOWANCE
+    }
+
     /// Upload a parcel's signature sidecar.
     ///
-    /// Rides [`Posture::UnboundedNoRedirect`] (FORK-89), not the auto-following client: this call
-    /// mutates the remote, and this client never auto-follows a redirect on a mutation — a local,
-    /// unconditional invariant of *this client*, holding regardless of which status code or
-    /// dependency version is in play (see [`Self::describe_mutation_redirect`]'s doc). Before
-    /// FORK-89 this rode the auto-following client with
-    /// no `is_redirection()` guard, so a `303` (which `tower-http`'s `SEE_OTHER` arm forces to a
-    /// bare `GET` unconditionally) silently landed at the redirect target instead of storing
-    /// anything, and a `2xx` there read back as a fabricated success.
+    /// Rides [`Posture::TotalDeadlineNoRedirect`], sized by [`Self::single_write_budget`] — not
+    /// the auto-following client: this call mutates the remote, and this client never
+    /// auto-follows a redirect on a mutation — a local, unconditional invariant of *this client*,
+    /// holding regardless of which status code or dependency version is in play (see
+    /// [`Self::describe_mutation_redirect`]'s doc). Before FORK-89 this rode the auto-following
+    /// client with no `is_redirection()` guard, so a `303` (which `tower-http`'s `SEE_OTHER` arm
+    /// forces to a bare `GET` unconditionally) silently landed at the redirect target instead of
+    /// storing anything, and a `2xx` there read back as a fabricated success. Between FORK-89 and
+    /// this fix it rode [`Posture::UnboundedNoRedirect`] — the redirect hole closed, but the
+    /// response wait itself still unbounded — until [`Self::single_write_budget`]'s own doc
+    /// argued a flat bound is honest for this call's server side too.
     pub async fn upload_signature(&self, parcel_hash: &str, bytes: Vec<u8>) -> Result<(), String> {
         let action = format!("uploading the signature of {}", parcel_hash);
         let response = self.request_on(
-            Posture::UnboundedNoRedirect(UnboundedTicket::Fork49),
+            Posture::TotalDeadlineNoRedirect(self.single_write_budget()),
             reqwest::Method::PUT, &format!("/v1/signatures/{}", parcel_hash)
         )
             .body(bytes)
@@ -2471,13 +2562,25 @@ impl RemoteClient {
 
     /// Establish the trust anchor on the remote (idempotent for an identical anchor).
     ///
-    /// Rides [`Posture::UnboundedNoRedirect`] (FORK-89) — same reasoning as
-    /// [`Self::upload_signature`]'s doc: a mutation on this client never auto-follows any
-    /// redirect, unconditionally, and before FORK-89 this call had no such guard at all.
+    /// Rides [`Posture::TotalDeadlineNoRedirect`], sized by [`Self::single_write_budget`] — same
+    /// reasoning as [`Self::upload_signature`]'s doc: a mutation on this client never
+    /// auto-follows any redirect, unconditionally, and before FORK-89 this call had no such
+    /// guard at all.
+    ///
+    /// **Accepted residual:** the server holds `warehouse.writes` — the same mutex the ref-update
+    /// handler holds across closure verification, ancestry and the office-chain verify, work this
+    /// module elsewhere documents can legitimately run minutes — for the whole of this call's
+    /// handler, including its own read/write of the trust anchor. A first-contact `put_trust`
+    /// racing another client's long first lift on the same warehouse can therefore exceed
+    /// [`Self::single_write_budget`], however generous. Not absorbed by inflating the budget:
+    /// minutes cannot be absorbed by a flat bound sized for O(constant) work. Accepted because it
+    /// is rare (`put_trust` fires on first contact or re-genesis, not per lift), the failure is
+    /// loud and correctly worded (the standard mutation-uncertainty message, not a hang), and a
+    /// retry converges once the racing lift releases the lock.
     pub async fn put_trust(&self, anchor: &TrustAnchorDto) -> Result<(), String> {
         let action = "uploading the trust anchor";
         let response = self.request_on(
-            Posture::UnboundedNoRedirect(UnboundedTicket::Fork49),
+            Posture::TotalDeadlineNoRedirect(self.single_write_budget()),
             reqwest::Method::PUT, "/v1/trust"
         )
             .json(anchor)
@@ -7021,6 +7124,119 @@ mod tests {
         let _ = std::fs::remove_file(&dest);
     }
 
+    // -----------------------------------------------------------------------------------
+    // The single-write mutation path: `upload_signature`/`put_trust` used to ride
+    // `Posture::UnboundedNoRedirect`, genuinely unbounded, on the theory that no client here
+    // combined no-auto-redirect with a client-level `read_timeout` — false, and the wrong ask:
+    // a client-level `read_timeout` resets on every byte, so it would not have bounded a
+    // trickling remote either (see `resolve_gives_up_on_a_remote_that_never_stops_trickling`
+    // above for that exact failure mode, on a different call). Both now ride
+    // `Posture::TotalDeadlineNoRedirect`, sized by `RemoteClient::single_write_budget` — the
+    // same total-deadline mechanism `Posture::TotalDeadline` already gives `resolve` and the
+    // presence-negotiation calls, just on the client that never auto-follows a redirect, so the
+    // FORK-89 guard neither call ever loses stays in force.
+    // -----------------------------------------------------------------------------------
+
+    /// `upload_signature` against a remote that connects and then never writes anything must
+    /// fail with a timeout close to its own `single_write_budget`, not hang forever (the rival
+    /// this excludes: staying on the old unbounded posture, which this outer ceiling would catch
+    /// as a hang) and not close to a connect-blind flat budget that drops `self.connect_timeout`
+    /// (the rival the lower-bound assertion excludes). A third rival — hardcoding
+    /// `REMOTE_CONNECT_TIMEOUT` in place of `self.connect_timeout` — is indistinguishable here at
+    /// this client's production connect timeout (`5 + 25 == 5 + 25`); see
+    /// `single_write_budget_reads_this_field_not_a_rival_constant` for the test that excludes it.
+    #[test]
+    fn upload_signature_times_out_against_a_silent_remote() {
+        let remote = SilentRemote::start();
+        let client = RemoteClient::new(&remote.url, None).unwrap();
+        // The constant sum, not `client.single_write_budget()` — a bug in that method would
+        // otherwise move this expected value and the real behavior it is meant to guard against
+        // in lockstep, silently validating a broken implementation instead of catching it (the
+        // same reasoning `missing_objects_bounds_the_error_body_read_after_a_wedged_500`'s own
+        // doc gives for its `lower_bound`).
+        let effective_budget = TEST_DIRECT_CONNECT_TIMEOUT + SINGLE_WRITE_ALLOWANCE;
+        let rival_flat_budget = SINGLE_WRITE_ALLOWANCE;
+        let lower_bound = rival_flat_budget + (effective_budget - rival_flat_budget) / 2;
+        let hard_ceiling = effective_budget + std::time::Duration::from_secs(15);
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let started = std::time::Instant::now();
+        let outcome = runtime.block_on(async {
+            tokio::time::timeout(
+                hard_ceiling, client.upload_signature(&"c".repeat(64), vec![1u8; 64])
+            ).await
+        });
+        let elapsed = started.elapsed();
+
+        let message = outcome
+            .unwrap_or_else(|_| panic!(
+                "upload_signature hung past the test's own {:?} ceiling — no total deadline \
+                fired at all", hard_ceiling
+            ))
+            .expect_err("a silent remote must not appear to succeed");
+
+        assert!(
+            message.to_lowercase().contains("timed out"),
+            "must fail specifically with a timeout, not some other transport error: {}", message
+        );
+        assert!(
+            elapsed >= lower_bound,
+            "elapsed {:?} is under {:?} (the midpoint between the connect-blind rival budget \
+            {:?} and the true budget {:?}) — upload_signature returned close to a call site that \
+            ignores self.connect_timeout, dropping it entirely, rather than folding it in via \
+            single_write_budget()",
+            elapsed, lower_bound, rival_flat_budget, effective_budget
+        );
+    }
+
+    /// `put_trust` against a remote that connects and then never writes anything — same pin as
+    /// `upload_signature_times_out_against_a_silent_remote`, its own call site.
+    #[test]
+    fn put_trust_times_out_against_a_silent_remote() {
+        let remote = SilentRemote::start();
+        let client = RemoteClient::new(&remote.url, None).unwrap();
+        // The constant sum, not `client.single_write_budget()` — same reasoning as
+        // `upload_signature_times_out_against_a_silent_remote`'s own comment.
+        let effective_budget = TEST_DIRECT_CONNECT_TIMEOUT + SINGLE_WRITE_ALLOWANCE;
+        let rival_flat_budget = SINGLE_WRITE_ALLOWANCE;
+        let lower_bound = rival_flat_budget + (effective_budget - rival_flat_budget) / 2;
+        let hard_ceiling = effective_budget + std::time::Duration::from_secs(15);
+        let anchor = TrustAnchorDto {
+            genesis: "g".repeat(64),
+            enabled_at: 0,
+            boundary: Vec::new(),
+            prior_genesis: None,
+            adopts: None,
+        };
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let started = std::time::Instant::now();
+        let outcome = runtime.block_on(async {
+            tokio::time::timeout(hard_ceiling, client.put_trust(&anchor)).await
+        });
+        let elapsed = started.elapsed();
+
+        let message = outcome
+            .unwrap_or_else(|_| panic!(
+                "put_trust hung past the test's own {:?} ceiling — no total deadline fired at \
+                all", hard_ceiling
+            ))
+            .expect_err("a silent remote must not appear to succeed");
+
+        assert!(
+            message.to_lowercase().contains("timed out"),
+            "must fail specifically with a timeout, not some other transport error: {}", message
+        );
+        assert!(
+            elapsed >= lower_bound,
+            "elapsed {:?} is under {:?} (the midpoint between the connect-blind rival budget \
+            {:?} and the true budget {:?}) — put_trust returned close to a call site that \
+            ignores self.connect_timeout, dropping it entirely, rather than folding it in via \
+            single_write_budget()",
+            elapsed, lower_bound, rival_flat_budget, effective_budget
+        );
+    }
+
     /// `fetch_batch`'s server work is size-dependent (see its own doc comment), so unlike
     /// `missing_objects`/`upload_targets` (moved onto [`Posture::TotalDeadline`], see
     /// `missing_objects_times_out_against_a_silent_remote`) it stays genuinely unbounded — pins
@@ -7555,6 +7771,45 @@ mod tests {
             missing_objects/upload_targets ever send must be exactly the Tor-folded value — \
             otherwise the deadline fires during Tor circuit build on the very calls this fix \
             exists to protect"
+        );
+    }
+
+    /// Mirrors [`error_body_budget_reads_this_field_not_a_rival_constant`]/
+    /// [`resolve_budget_reads_this_field_not_a_rival_constant`]/
+    /// [`presence_negotiation_budget_reads_this_field_not_a_rival_constant`] for
+    /// [`RemoteClient::single_write_budget`] — the identical gap: every end-to-end test of
+    /// `upload_signature`/`put_trust` builds a direct client via `RemoteClient::new`, where
+    /// `self.connect_timeout` == [`REMOTE_CONNECT_TIMEOUT`] (5s), so a hardcoded-constant mutant
+    /// (`REMOTE_CONNECT_TIMEOUT` in place of `self.connect_timeout`) is extensionally identical to
+    /// the correct implementation everywhere those tests look — `5 + SINGLE_WRITE_ALLOWANCE` either
+    /// way — and neither elapsed-time end-to-end test above can catch it either, for the same
+    /// reason `resolve_gives_up_on_a_remote_that_never_stops_trickling`'s own doc names for the
+    /// identical rival: at production `connect_timeout`, the two implementations produce the exact
+    /// same `Duration`.
+    ///
+    /// `SENTINEL_CONNECT_TIMEOUT` (9s) is a value distinct from every connect sentinel already used
+    /// elsewhere in this module (`4, 5, 7, 11, 12.5, 13, 60`) and from every named `Duration`
+    /// constant this module defines (`0.2, 2, 3, 5, 10, 60`, plus [`SINGLE_WRITE_ALLOWANCE`]
+    /// itself, 25) — checked by `grep -n "Duration::from_secs\|Duration::from_millis"` before being
+    /// picked. This test's asserted output, 34s (`9 + 25`), is not producible by summing any two of
+    /// those named constants either: the full pairwise-sum set over `{0.2, 2, 3, 5, 10, 25, 60}` is
+    /// `{2.2, 3.2, 5, 5.2, 7, 8, 10.2, 12, 13, 15, 25.2, 27, 28, 30, 35, 60.2, 62, 63, 65, 70, 85}`
+    /// — no 34.
+    #[test]
+    fn single_write_budget_reads_this_field_not_a_rival_constant() {
+        const SENTINEL_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(9);
+
+        let client = RemoteClient::new_test_with_connect_timeout(
+            "http://forklift-fork-49-single-write-budget-sentinel-test.invalid",
+            SENTINEL_CONNECT_TIMEOUT,
+        );
+
+        assert_eq!(
+            client.single_write_budget(),
+            SENTINEL_CONNECT_TIMEOUT + SINGLE_WRITE_ALLOWANCE,
+            "single_write_budget must fold in *this instance's* connect_timeout — a value neither \
+            RemoteClient::new (5s) nor RemoteClient::new_with_tor under TorMode::On (60s) can ever \
+            produce, so this cannot pass by coincidentally matching a hardcoded rival constant"
         );
     }
 
