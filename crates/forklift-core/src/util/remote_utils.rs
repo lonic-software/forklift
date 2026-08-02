@@ -7928,8 +7928,11 @@ mod tests {
     /// at line 1 column 1"`. A decode error is neither a connect failure nor a timeout, so
     /// `classify` routes it to [`TransportFailure::Other`] and it degrades to the generic
     /// transport wrapper — it does **not** fabricate a deadline figure. So the wording assertion
-    /// below is what catches this mutant; the figure assertion excludes a different rival, one
-    /// that reaches the `TotalDeadline` arm.
+    /// is the one doing the pinning here, and it is the only one: the elapsed check below is a
+    /// fixture-health check, not a rival-excluding assertion, since any run that reached the armed
+    /// budget ended via the total deadline and so could not have produced this wording anyway. It
+    /// earns its place by naming the *fixture* as the suspect when it fails, rather than the
+    /// implementation.
     ///
     /// Worth stating because the prediction that motivated this test was that the mutant would
     /// quote an exact, fabricated deadline. Running it showed otherwise, and the consequence is
@@ -7960,12 +7963,6 @@ mod tests {
         assert!(
             message.to_lowercase().contains("not valid json"),
             "a complete but unparseable body must keep the parse-failure wording: {}", message
-        );
-        assert!(
-            !message.contains(&format!("{:?}", armed_budget)),
-            "must not name the armed deadline {:?} — nothing timed out, and quoting an exact \
-            figure here would attribute a parse failure to a bound that never fired: {}",
-            armed_budget, message
         );
     }
 
@@ -8003,11 +8000,33 @@ mod tests {
             message.to_lowercase().contains("not valid json"),
             "a complete but unparseable body must keep the parse-failure wording: {}", message
         );
+    }
+
+    /// The third `is_timeout()` json guard, on `fetch_info`, gets the same treatment as the two
+    /// above. It predates this reshape and was the *least* covered of the three: mutating it to
+    /// `if true` left the entire crate suite green, because every existing `fetch_info` test
+    /// drives either a refused connect or header-phase silence, neither of which ever reaches
+    /// `response.json()`'s error arm at all.
+    ///
+    /// The handshake is the first call any remote operation makes, so this is the guard a captive
+    /// portal meets first: a `200` carrying an HTML sign-in page on `/v1/warehouse` must be
+    /// reported as a malformed handshake, not as a transport failure against a bound that never
+    /// fired.
+    #[test]
+    fn fetch_info_reports_a_parse_failure_as_a_parse_failure() {
+        let remote = MalformedJsonRemote::start();
+        let client = RemoteClient::new(&remote.url, None).unwrap();
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let message = match runtime.block_on(client.fetch_info()) {
+            Err(message) => message,
+            Ok(_) => panic!("an HTML body behind a JSON content type must not appear to succeed"),
+        };
+
         assert!(
-            !message.contains(&format!("{:?}", armed_budget)),
-            "must not name the armed deadline {:?} — nothing timed out, and quoting an exact \
-            figure here would attribute a parse failure to a bound that never fired: {}",
-            armed_budget, message
+            message.to_lowercase().contains("not valid json"),
+            "a complete but unparseable handshake body must keep the parse-failure wording, not \
+            degrade to the generic transport wrapper: {}", message
         );
     }
 
