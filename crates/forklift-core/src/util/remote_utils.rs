@@ -701,28 +701,32 @@ fn watched_upload_body(bytes: Vec<u8>, progress: Arc<UploadProgress>) -> (reqwes
 /// through the one convenience spelling the parser recognized. A fixed list of spellings cannot see
 /// a spelling it was not written for.
 ///
-/// So the fields are private to this module, and the module hands out two things: [`Clients::pick`],
-/// which takes a [`Posture`] — a required argument, not a default — and returns the chosen
-/// `reqwest::Client`, and [`Clients::send_with_watchdog`], which never hands a client out at all —
-/// it takes the upload's bytes and the pieces of a request (destination, method), builds the
-/// watchdog-guarded body and the request itself, and returns a [`WatchdogOutcome`]. A new call site
-/// cannot reach any client, nor send a watchdog-guarded upload, without the compiler forcing that
-/// choice; there is no ambient "just use the default one" path left to fall into.
+/// So the fields are private to this module, and [`Clients::pick`] — the only function that reads
+/// them — is private too, reachable only from inside `mod clients` itself. The module hands out
+/// exactly two things instead: [`Clients::request_on`], which takes a [`Posture`] — a required
+/// argument, not a default — plus a [`RequestDestination`] and method, and returns a
+/// `reqwest::RequestBuilder` on whichever client `pick` chose, with that posture's own payload
+/// (currently only [`Posture::TotalDeadline`]'s `Duration`) already applied; and
+/// [`Clients::send_with_watchdog`], which never hands a client (or a plain builder) out at all — it
+/// takes the upload's bytes and the pieces of a request, builds the watchdog-guarded body and the
+/// request itself, and returns a [`WatchdogOutcome`]. Neither function can be skipped in favor of
+/// reaching `pick` directly, because nothing outside `mod clients` can name `pick` at all — that is
+/// a privacy error, not a convention. A new call site cannot reach any client, nor send a
+/// watchdog-guarded upload, without the compiler forcing it through one of these two, payload-
+/// applying paths; there is no ambient "just use the default one" path left to fall into, and no
+/// lower-level escape hatch left standing beside them either.
 ///
-/// The residual trust base is this module **plus** its two remaining callers outside it —
-/// [`RemoteClient::request_on`] (builds a request, bearer token attached) and
-/// [`RemoteClient::client_for`] (hands back the bare `&reqwest::Client` itself, for the one call
-/// site that must not attach a bearer token) — since privacy alone only covers the *fields*, not
-/// what those two functions go on to do with a reference once `pick` returns one. The
-/// watchdog-guarded uploads (`upload_object`, `put_presigned`) are not part of that external trust
-/// base at all any more: they never touch a `reqwest::Client` reference, only the bytes and
-/// destination they hand to [`Clients::send_with_watchdog`], which does its own request-building
-/// entirely inside this module. That the external base is exactly those two items, and nothing
-/// wider, is a procedural claim, not an assertion to take on faith:
-/// `grep -n 'reqwest::Client\b' crates/forklift-core/src/util/remote_utils.rs`, read against which
-/// lines are doc comments, currently finds the type spelled outside a comment only inside
-/// `mod clients` itself and at `client_for`'s own signature — nowhere else in the file. Re-run that
-/// grep to re-check the claim; do not trust this sentence past the next edit that moves the type.
+/// **The residual trust base is this module, full stop — nothing outside it.** That used to
+/// require two named exceptions ([`RemoteClient::request_on`] and a since-deleted `client_for`,
+/// which handed back the bare `&reqwest::Client` itself for the one call site that must not attach
+/// a bearer token); both now build on [`Clients::request_on`], which returns a `RequestBuilder`
+/// directly, so neither ever touches a `reqwest::Client` reference at all. The watchdog-guarded
+/// uploads (`upload_object`, `put_presigned`) were already outside the trust base the same way. That
+/// the external base is empty, not merely small, is a procedural claim, not an assertion to take on
+/// faith: `grep -n 'reqwest::Client\b' crates/forklift-core/src/util/remote_utils.rs`, read against
+/// which lines are doc comments, currently finds the type spelled outside a comment only inside
+/// `mod clients` itself — nowhere else in the file. Re-run that grep to re-check the claim; do not
+/// trust this sentence past the next edit that moves the type.
 ///
 /// **Four physical clients, three independent axes.** *Redirect policy* (mutations, and the
 /// one-shot streamed-upload bodies, must never auto-follow; reads may). *Whether a read/metadata
@@ -772,10 +776,12 @@ mod clients {
         BoundedObjectReads,
         /// Auto-follows redirects; no client-level `read_timeout`. The bound is the payload
         /// itself — a genuine *total* per-request deadline (`RequestBuilder::timeout`) that
-        /// [`super::RemoteClient::request_on`] reads off this variant and applies, so the promise
-        /// is discharged by the module, not merely asserted at the call site the way the deleted
-        /// `OwnTimeoutFollowsRedirects` posture used to (that variant carried no payload at all;
-        /// nothing checked that any caller of it actually called `.timeout(...)`). `resolve`,
+        /// [`Clients::request_on`] reads off this variant and applies unconditionally, so the
+        /// promise is discharged by the module, not merely asserted at the call site the way the
+        /// deleted `OwnTimeoutFollowsRedirects` posture used to (that variant carried no payload at
+        /// all; nothing checked that any caller of it actually called `.timeout(...)`) — and the
+        /// way the since-deleted `client_for` reopened one layer down, by handing back a bare
+        /// client that skipped this extraction entirely for its one caller. `resolve`,
         /// `missing_objects`, and `upload_targets` — the latter two sized per call by
         /// [`super::RemoteClient::presence_negotiation_budget`] rather than `resolve`'s own fixed
         /// `connect_timeout + REMOTE_READ_TIMEOUT`; see that method's own doc for why a *total*
@@ -830,19 +836,28 @@ mod clients {
     ///
     /// `grep 'UnboundedTicket::'` enumerates every unbounded call, full stop. Its domain: every
     /// construction site of [`Posture::UnboundedFollowsRedirects`]/[`Posture::UnboundedNoRedirect`]
-    /// — the only two variants whose response wait is unbounded, and both require this payload, so
-    /// nothing reachable through [`Clients::pick`] can go unbounded without also being ticketed
-    /// here. That completeness depends on every unbounded wait staying reachable only through one
-    /// of those two variants; it would stop holding the moment some other mechanism bounded (or
-    /// failed to bound) a call without routing through `Posture` at all — precisely what the
-    /// deleted `Posture::WatchdogNoRedirect` used to be: a payload-free posture whose claimed bound
-    /// (a watchdog) lived entirely outside anything this grep could see, so the actual gap tracked
-    /// separately from this doc was never visible here. [`Clients::send_with_watchdog`] closed that
-    /// gap by removing `Posture` from its call sites' construction entirely, not by adding a ticket
-    /// to it — the response wait it bounds is discharged by the module itself, the same way
-    /// [`Posture::TotalDeadline`]'s payload is, so it needs no representation in this enum. Before
-    /// trusting the grep again, re-check that condition: confirm any new way to send a request
-    /// still goes through [`Posture`], or re-derive by hand whether it is actually bounded.
+    /// — the only two variants whose response wait is unbounded outright, and both require this
+    /// payload. What makes that exhaustive is *not* merely that [`Clients::pick`]'s own match over
+    /// `Posture` is exhaustive — `pick` only chooses a *client*, it says nothing about whether a
+    /// payload-carrying variant's payload actually gets applied before the request goes out. A call
+    /// site that could reach `pick` directly, bypassing payload application, could hold a
+    /// bounded-looking posture like [`Posture::TotalDeadline`] and still be unbounded in practice,
+    /// with no `UnboundedTicket` construction anywhere for this grep to find — not a hypothetical:
+    /// the deleted `client_for` handed back a bare client for exactly this reason, for its one
+    /// caller, and a payload-carrying posture routed through it would have hung forever unticketed.
+    /// What actually closes the set now is that [`Clients::pick`] is private to `mod clients`,
+    /// reachable only from [`Clients::request_on`] — the sole place a `Posture` ever becomes a
+    /// sendable request, and the one place that applies an exhaustive match (mirroring `pick`'s own)
+    /// to read off any payload a variant carries before building it. Reaching a client at all means
+    /// having gone through that match, so a payload-carrying variant can no longer go unbounded by
+    /// way of a second, competing path, and an unbounded call can only be
+    /// `UnboundedFollowsRedirects`/`UnboundedNoRedirect`, both requiring this ticket by construction.
+    /// [`Clients::send_with_watchdog`] closes the analogous gap for uploads the same way it always
+    /// did: by never constructing a `Posture` at all, so its own bound (the watchdog) needs no
+    /// representation here either. Before trusting the grep again, re-check both conditions: that
+    /// `Clients::pick` is still private (no `pub` on its `fn pick` line), and that every way to send
+    /// a request still goes through [`Clients::request_on`] or [`Clients::send_with_watchdog`] —
+    /// or re-derive by hand whether some new path is actually bounded.
     ///
     /// The set this enumerates is meant to reach zero: every call ticketed here eventually earns
     /// a real budget and moves off [`Posture::UnboundedFollowsRedirects`]/
@@ -984,11 +999,20 @@ mod clients {
             Ok(Clients { http, no_redirect, bounded_reads, bounded_object_reads })
         }
 
-        /// The only way any of the four clients leaves this module: a request cannot be built
-        /// without first choosing a [`Posture`]. Exhaustive by construction — a new [`Posture`]
-        /// variant that this `match` does not cover fails to compile, so this function can never
-        /// silently fall through to a default client.
-        pub(super) fn pick(&self, posture: &Posture) -> &reqwest::Client {
+        /// Choose which of the four clients a `posture` rides. Exhaustive by construction — a new
+        /// [`Posture`] variant that this `match` does not cover fails to compile, so this function
+        /// can never silently fall through to a default client.
+        ///
+        /// **Private on purpose — not `pub(super)`.** Choosing a client says nothing about whether
+        /// a payload-carrying posture's payload gets applied; a caller that reached this function
+        /// directly could hand back a bare `reqwest::Client` for a bounded-looking posture like
+        /// [`Posture::TotalDeadline`] with its `Duration` never read at all, exactly the hole the
+        /// deleted `client_for` reopened for its one caller (see [`super::UnboundedTicket`]'s own
+        /// doc for the closure claim this bug falsified). Keeping this function unreachable from
+        /// outside `mod clients` means the only way to turn a `Posture` into a sendable request is
+        /// [`Self::request_on`], which calls this and then unconditionally applies the payload — so
+        /// there is no second, competing path left for a future caller to reach for instead.
+        fn pick(&self, posture: &Posture) -> &reqwest::Client {
             match posture {
                 Posture::BoundedReads => &self.bounded_reads,
                 Posture::BoundedObjectReads => &self.bounded_object_reads,
@@ -996,6 +1020,53 @@ mod clients {
                 Posture::UnboundedFollowsRedirects(_) => &self.http,
                 Posture::UnboundedNoRedirect(_) => &self.no_redirect,
             }
+        }
+
+        /// The only way any of the four clients leaves this module: build a `reqwest::RequestBuilder`
+        /// on whichever client [`Self::pick`] chooses, with `posture`'s own payload — currently only
+        /// [`Posture::TotalDeadline`]'s `Duration` — already applied. `pick` is private to this
+        /// module and this is its only caller, so there is no path from a `Posture` to a client that
+        /// can skip this extraction; a future payload-carrying variant forces the match below to be
+        /// revisited (it has no wildcard arm, deliberately, mirroring `pick`'s own exhaustiveness)
+        /// rather than silently compiling with the new payload dropped — the failure mode both the
+        /// deleted `OwnTimeoutFollowsRedirects` posture and the deleted `client_for` had, one layer
+        /// apart. `destination` names the two request shapes callers need — see
+        /// [`RequestDestination`]'s own doc — the same split [`Self::send_with_watchdog`] makes for
+        /// uploads, and for the same reason: a caller-supplied builder, or a caller-supplied bare
+        /// client, is exactly the seam a posture's payload can go missing through.
+        pub(super) fn request_on(&self,
+                                 posture: Posture,
+                                 method: reqwest::Method,
+                                 destination: RequestDestination<'_>) -> reqwest::RequestBuilder {
+            let total_deadline = match &posture {
+                Posture::TotalDeadline(duration) => Some(*duration),
+                // Listed explicitly, not `_`, so a future payload-carrying `Posture` variant
+                // forces this match to be revisited too instead of silently falling through to
+                // `None` and dropping the new payload.
+                Posture::BoundedReads
+                | Posture::BoundedObjectReads
+                | Posture::UnboundedFollowsRedirects(_)
+                | Posture::UnboundedNoRedirect(_) => None,
+            };
+
+            let client = self.pick(&posture);
+
+            let mut builder = match destination {
+                RequestDestination::Authenticated { base, token, path } => {
+                    let mut builder = client.request(method, format!("{}{}", base, path));
+                    if let Some(token) = token {
+                        builder = builder.bearer_auth(token);
+                    }
+                    builder
+                }
+                RequestDestination::Presigned { url } => client.request(method, url),
+            };
+
+            if let Some(duration) = total_deadline {
+                builder = builder.timeout(duration);
+            }
+
+            builder
         }
 
         /// Send a watchdog-guarded upload — the operation that used to be promised by
@@ -1032,10 +1103,10 @@ mod clients {
         /// Always rides [`Self::no_redirect`] — never auto-follows a redirect — for the same
         /// reason [`Posture::UnboundedNoRedirect`] does (see that client field's own doc): a
         /// one-shot streamed body cannot be replayed if reqwest's default policy tried to
-        /// auto-follow a `3xx`. `destination` names the two request shapes this module's two
-        /// upload call sites need — see [`UploadDestination`]'s own doc — since a caller-supplied
-        /// builder is exactly the seam this function exists to close; letting a caller hand one in
-        /// would reopen it.
+        /// auto-follow a `3xx`. `destination` names the two request shapes callers need — see
+        /// [`RequestDestination`]'s own doc, shared with [`Self::request_on`] — since a
+        /// caller-supplied builder is exactly the seam this function exists to close; letting a
+        /// caller hand one in would reopen it.
         ///
         /// Bounds the wait itself (through `phase1_budget`/`phase2_budget` below) rather than
         /// asserting a bound the way the deleted posture did; the caller supplies `connect_timeout`
@@ -1058,21 +1129,21 @@ mod clients {
         /// [`super::post_send_verify_budget`]) for the full history of why the shape is what it is.
         pub(super) async fn send_with_watchdog(&self,
                                                connect_timeout: std::time::Duration,
-                                               destination: UploadDestination<'_>,
+                                               destination: RequestDestination<'_>,
                                                method: reqwest::Method,
                                                bytes: Vec<u8>) -> WatchdogOutcome {
             let progress = super::UploadProgress::new();
             let (body, body_len) = super::watched_upload_body(bytes, progress.clone());
 
             let mut builder = match destination {
-                UploadDestination::Authenticated { base, token, path } => {
+                RequestDestination::Authenticated { base, token, path } => {
                     let mut builder = self.no_redirect.request(method, format!("{}{}", base, path));
                     if let Some(token) = token {
                         builder = builder.bearer_auth(token);
                     }
                     builder
                 }
-                UploadDestination::Presigned { url } => self.no_redirect.request(method, url),
+                RequestDestination::Presigned { url } => self.no_redirect.request(method, url),
             };
             builder = builder.header(reqwest::header::CONTENT_LENGTH, body_len).body(body);
 
@@ -1106,22 +1177,27 @@ mod clients {
         }
     }
 
-    /// Which physical request [`Clients::send_with_watchdog`] builds — the two shapes this
-    /// module's two watchdog-guarded upload call sites need, named explicitly rather than letting
-    /// a caller hand in a pre-built `reqwest::RequestBuilder` (the seam [`Clients::send_with_watchdog`]
-    /// exists to close; see that method's own doc).
-    pub(super) enum UploadDestination<'a> {
+    /// Which physical request a call builds through this module — shared by
+    /// [`Clients::send_with_watchdog`] (the two watchdog-guarded upload call sites) and
+    /// [`Clients::request_on`] (every other sendable request), named explicitly rather than letting
+    /// a caller hand in a pre-built `reqwest::RequestBuilder` or a bare `reqwest::Client` (the seam
+    /// both of those functions exist to close; see their own docs).
+    pub(super) enum RequestDestination<'a> {
         /// A path relative to the remote's `base`, with the bearer token attached (if one is
-        /// configured) — the control-plane shape, `RemoteClient::upload_object`'s only caller.
+        /// configured) — the control-plane shape almost every caller needs:
+        /// `RemoteClient::upload_object` (through `send_with_watchdog`) and every ordinary
+        /// `RemoteClient::request_on` call (through `Clients::request_on`).
         Authenticated {
             base: &'a str,
             token: Option<&'a str>,
             path: &'a str,
         },
-        /// An absolute, self-authorizing URL, with **no** bearer token — a presigned storage `PUT`
-        /// carries its own credentials in its query string, and attaching this remote's bearer
-        /// token to a request bound for a different host would be a needless credential leak (see
-        /// [`super::RemoteClient::put_presigned`]'s own doc). `put_presigned`'s only caller.
+        /// An absolute, self-authorizing URL, with **no** bearer token — a presigned storage
+        /// request carries its own credentials in its query string, and attaching this remote's
+        /// bearer token to a request bound for a different host would be a needless credential leak
+        /// (see [`super::RemoteClient::put_presigned`]'s own doc). `put_presigned` (through
+        /// `send_with_watchdog`) and `RemoteClient::fetch_batch`'s redirect-follow `GET` (through
+        /// `Clients::request_on`, via `RemoteClient::request_on_presigned`).
         Presigned { url: &'a str },
     }
 
@@ -1157,7 +1233,7 @@ mod clients {
     }
 }
 
-use clients::{Clients, Posture, UnboundedTicket, UploadDestination, WatchdogOutcome};
+use clients::{Clients, Posture, RequestDestination, UnboundedTicket, WatchdogOutcome};
 
 /// The remote endpoint: base URL, optional bearer token, and the HTTP clients — see the
 /// [`clients`] module's own doc for why there are four of them and why they are not fields here
@@ -1406,61 +1482,45 @@ impl RemoteClient {
         &self.base
     }
 
-    /// Build a request against this remote, riding whichever of the four clients `posture`
-    /// selects (see the [`clients`] module's own doc). `posture` is a required argument, not a
+    /// Build a request against this remote's control plane, riding whichever of the four clients
+    /// `posture` selects and with that posture's own payload already applied — see
+    /// [`clients::Clients::request_on`]'s own doc for the mechanism that guarantees the latter
+    /// unconditionally, not merely at this one call site. `posture` is a required argument, not a
     /// default — there is no more "the seam every call that needs something other than the
     /// default client uses"; every call, including the ones that used to ride an implicit
     /// default, names its posture explicitly here.
     ///
-    /// [`Posture::TotalDeadline`]'s payload is applied *here*, not by the caller: this is what
-    /// makes it a bound the module discharges rather than one a call site merely promises to add
-    /// (the failure mode the deleted `OwnTimeoutFollowsRedirects` posture had — a payload-free
-    /// variant nothing checked was ever actually bounded). The `Duration` is read off the posture
-    /// before it is moved into [`Self::client_for`], since that call consumes it.
-    fn request_on(&self,
-                   posture: Posture,
-                   method: reqwest::Method,
-                   path: &str) -> reqwest::RequestBuilder {
-        let total_deadline = match &posture {
-            Posture::TotalDeadline(duration) => Some(*duration),
-            // Listed explicitly, not `_`, so that a future payload-carrying `Posture` variant
-            // (mirroring `Clients::pick`'s own compiler-owned exhaustiveness, which deliberately
-            // has no wildcard arm) forces this match to be revisited too, instead of silently
-            // falling through to `None` and dropping the new payload the way the deleted
-            // `OwnTimeoutFollowsRedirects` posture already did once.
-            Posture::BoundedReads
-            | Posture::BoundedObjectReads
-            | Posture::UnboundedFollowsRedirects(_)
-            | Posture::UnboundedNoRedirect(_) => None,
-        };
-
-        let mut builder = self.client_for(posture).request(method, format!("{}{}", self.base, path));
-
-        if let Some(duration) = total_deadline {
-            builder = builder.timeout(duration);
-        }
-
-        if let Some(token) = &self.token {
-            builder = builder.bearer_auth(token);
-        }
-
-        builder
+    /// Always attaches the bearer token, if one is configured: this is the authenticated,
+    /// relative-path shape almost every call needs. The one exception —
+    /// [`Self::fetch_batch`]'s redirect-follow `GET`, an absolute presigned URL that must *not*
+    /// carry this remote's token — goes through [`Self::request_on_presigned`] instead; see that
+    /// function's own doc.
+    fn request_on(&self, posture: Posture, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
+        self.clients.request_on(
+            posture, method,
+            RequestDestination::Authenticated { base: &self.base, token: self.token.as_deref(), path },
+        )
     }
 
-    /// The lower-level counterpart of [`Self::request_on`], for building a request on the bare
-    /// `reqwest::Client` without the bearer-token attachment `request_on` always applies. Down to
-    /// one live caller — [`Self::fetch_batch`]'s redirect-follow `GET` (a presigned storage URL is
-    /// self-authorizing; forwarding a bearer token meant for the control plane would be a
-    /// needless credential leak) — since [`Self::put_presigned`], this function's other historical
+    /// The presigned counterpart of [`Self::request_on`] — same posture, same payload guarantee,
+    /// but building on an absolute, self-authorizing URL with **no** bearer token attached. Down
+    /// to one live caller — [`Self::fetch_batch`]'s redirect-follow `GET` (a presigned storage URL
+    /// is self-authorizing; forwarding a bearer token meant for the control plane would be a
+    /// needless credential leak) — since [`Self::put_presigned`], this shape's other historical
     /// caller, moved onto [`clients::Clients::send_with_watchdog`], which builds its own
-    /// bearer-token-free request entirely inside [`clients`] rather than reaching back out here
-    /// for a raw client to build one on. Still requires an explicit [`Posture`] — the only
-    /// difference from `request_on` is which builder method the caller goes on to call on the
-    /// returned client. Kept rather than inlined into `fetch_batch` because a second caller
-    /// reappearing (another self-authorizing, no-bearer-token request) is more likely than this
-    /// staying permanently singular, and inlining now would just have to be undone.
-    fn client_for(&self, posture: Posture) -> &reqwest::Client {
-        self.clients.pick(&posture)
+    /// bearer-token-free request entirely inside [`clients`] rather than reaching back out here.
+    ///
+    /// Both this function and [`Self::request_on`] are now thin wrappers around
+    /// [`clients::Clients::request_on`], which is the only place in this module a `Posture` ever
+    /// becomes a sendable request — neither wrapper, nor anything else outside `mod clients`, can
+    /// reach a bare `reqwest::Client` at all any more (that was the deleted `client_for`'s whole
+    /// shape, and the hole it reopened one layer below this module's own guarantee). Kept as its
+    /// own function rather than inlined into `fetch_batch`, same reasoning `client_for` gave: a
+    /// second caller reappearing (another self-authorizing, no-bearer-token request) is more
+    /// likely than this staying permanently singular, and inlining now would just have to be
+    /// undone.
+    fn request_on_presigned(&self, posture: Posture, method: reqwest::Method, url: &str) -> reqwest::RequestBuilder {
+        self.clients.request_on(posture, method, RequestDestination::Presigned { url })
     }
 
     /// Walk a `std::error::Error` source chain to its root and return that root's own `Display`
@@ -1895,8 +1955,8 @@ impl RemoteClient {
     /// follow-up `GET` also deliberately omits this remote's `Authorization` header: the
     /// presigned URL is self-authorizing, and forwarding a bearer token meant for the control
     /// plane to a storage host it was never issued for would be a needless credential leak — see
-    /// [`Self::client_for`]'s doc for why this call reaches that URL directly rather than through
-    /// [`Self::request_on`].
+    /// [`Self::request_on_presigned`]'s doc for why this call reaches that URL through it rather
+    /// than through [`Self::request_on`].
     ///
     /// The initial `POST` above rides an unbounded posture: deliberately **not**
     /// [`Posture::BoundedReads`], since the server builds the whole requested bundle — every
@@ -1948,7 +2008,7 @@ impl RemoteClient {
                 // [`Posture::BoundedObjectReads`], not the unbounded ticket the `POST` above
                 // still carries — see this function's own doc for why this station's cost shape
                 // matches [`Self::fetch_object`]'s, not the `POST`'s.
-                self.client_for(Posture::BoundedObjectReads).get(&location)
+                self.request_on_presigned(Posture::BoundedObjectReads, reqwest::Method::GET, &location)
                     .send()
                     .await
                     .map_err(|e| self.describe_transport_error(
@@ -2054,7 +2114,7 @@ impl RemoteClient {
         let path = format!("/v1/objects/{}", hash);
         let outcome = self.clients.send_with_watchdog(
             self.connect_timeout,
-            UploadDestination::Authenticated { base: &self.base, token: self.token.as_deref(), path: &path },
+            RequestDestination::Authenticated { base: &self.base, token: self.token.as_deref(), path: &path },
             reqwest::Method::PUT,
             bytes,
         ).await;
@@ -2130,10 +2190,10 @@ impl RemoteClient {
 
     /// Upload one object's bytes straight to a presigned storage URL (a staging `PUT`). The
     /// URL's own signature is the authorization, so this deliberately carries **no** bearer
-    /// token: [`UploadDestination::Presigned`] carries no token field to attach, so
+    /// token: [`RequestDestination::Presigned`] carries no token field to attach, so
     /// [`clients::Clients::send_with_watchdog`] structurally cannot attach one — there is no
     /// `Option<&str>` for a future edit to accidentally start populating on this path, the way
-    /// there would be if this call reused [`UploadDestination::Authenticated`] with the token set
+    /// there would be if this call reused [`RequestDestination::Authenticated`] with the token set
     /// to `None`. The no-auto-follow client this rides (moved off the auto-following client in the
     /// fix for the `303` redirect hole) cannot leak it to the storage host either, even were the
     /// storage host the remote itself: it is built (in [`Self::new_with_tor`]) with no default
@@ -2150,7 +2210,7 @@ impl RemoteClient {
         let action = "uploading to a staging URL";
         let outcome = self.clients.send_with_watchdog(
             self.connect_timeout,
-            UploadDestination::Presigned { url },
+            RequestDestination::Presigned { url },
             reqwest::Method::PUT,
             bytes,
         ).await;
@@ -7904,9 +7964,9 @@ mod tests {
     /// `put_presigned` against the same wedged shape must be bounded exactly like `upload_object`
     /// — pins that it is independently wired to the watchdog rather than accidentally covered by
     /// `upload_object`'s own wiring. It is the higher-risk site: it calls
-    /// `clients::Clients::send_with_watchdog` with `UploadDestination::Presigned` (no bearer token
+    /// `clients::Clients::send_with_watchdog` with `RequestDestination::Presigned` (no bearer token
     /// attached, by construction — see that destination variant's own doc), so nothing about
-    /// `upload_object`'s `UploadDestination::Authenticated` wiring guarantees this one got the
+    /// `upload_object`'s `RequestDestination::Authenticated` wiring guarantees this one got the
     /// same fix, even though both now ride the same operation and the same no-auto-follow client.
     #[test]
     fn put_presigned_times_out_against_a_wedged_remote() {
@@ -8537,7 +8597,7 @@ mod tests {
 
     /// Same hole, `upload_object` site — both call sites now reach the same
     /// `clients::Clients::send_with_watchdog` operation and the same no-auto-follow client, but
-    /// each builds its own `UploadDestination` (`Authenticated` here, `Presigned` for
+    /// each builds its own `RequestDestination` (`Authenticated` here, `Presigned` for
     /// `put_presigned`) and could in principle regress independently of the other, so each keeps
     /// its own falsifier rather than trusting `put_presigned`'s test to cover this site too.
     #[test]
