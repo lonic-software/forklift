@@ -6686,23 +6686,31 @@ mod tests {
         url
     }
 
-    /// The falsifying test for the defect this PR fixes: moving `resolve` onto
-    /// [`Posture::BoundedReads`] removed its only total bound and replaced it with none, so a
-    /// remote trickling one byte at a time, forever, would have kept it alive forever too — the
-    /// FORK-49 symptom this module exists to eliminate, reachable on a direct remote, not just
-    /// Tor. `resolve_times_out_against_a_silent_remote` above cannot catch this: total silence
-    /// is exactly what a silence budget already handles (see that test's own doc). Continuous
-    /// progress is the one shape it structurally cannot — this file's own settled contract
-    /// (`REMOTE_READ_TIMEOUT`'s doc) is that "a transfer that is moving bytes… is never silent".
+    /// The falsifying test for `request_on`'s own [`Posture::TotalDeadline`] handling: a genuine
+    /// *total*, non-resetting deadline (`RequestBuilder::timeout`), applied by [`Self::request_on`]
+    /// itself against a remote that never goes silent — the one shape a *silence* budget
+    /// ([`Posture::BoundedReads`]) structurally cannot catch, because it resets its own clock on
+    /// every byte (this file's own settled contract, `REMOTE_READ_TIMEOUT`'s doc: "a transfer
+    /// that is moving bytes… is never silent").
     ///
-    /// This pins [`Self::request_on`]'s wiring directly rather than inferring it from `resolve`
-    /// itself, so it is fast and deterministic: a short 2s [`Posture::TotalDeadline`] against a
-    /// remote writing one byte every 500ms — never silent for longer than 500ms, an order of
-    /// magnitude under every silence budget in this file — must still be cut off at ~2s, because
-    /// a `RequestBuilder::timeout` does not reset on anything. `total_bytes` (100) is sized so the
-    /// full trickle (50s) is far longer than `hard_ceiling` (17s): if the deadline were silently
-    /// dropped, the outer `tokio::time::timeout` — not the assertion below it — is what would
-    /// catch it, loudly, rather than the test quietly passing on a technicality.
+    /// **Does not exercise `resolve`'s call site.** This pins [`Self::request_on`]'s wiring
+    /// directly — it hand-constructs `Posture::TotalDeadline` and calls `request_on` itself —
+    /// which is what makes it fast and deterministic, but also means it says nothing about which
+    /// posture `resolve`'s own call site actually names: it would stay green whether `resolve`
+    /// passed `resolve_budget()` to `request_on`, hardcoded some other total deadline, or rode
+    /// `Posture::BoundedReads` instead. See
+    /// [`tests::resolve_gives_up_on_a_remote_that_never_stops_trickling`] for the test that calls
+    /// `resolve` itself and pins that.
+    ///
+    /// A short 2s [`Posture::TotalDeadline`] against a remote writing one byte every 500ms —
+    /// never silent for longer than 500ms, an order of magnitude under every silence budget in
+    /// this file — must still be cut off at ~2s, because a `RequestBuilder::timeout` does not
+    /// reset on anything. `total_bytes` (100) at that gap makes the full trickle 50s: far longer
+    /// than `hard_ceiling` (17s), so the fixture is still comfortably writing when the ceiling
+    /// would fire — not literally unbounded, just sized well past this test's own horizon. If the
+    /// deadline were silently dropped, the outer `tokio::time::timeout` — not the assertion below
+    /// it — is what would catch it, loudly, rather than the test quietly passing on a
+    /// technicality.
     #[test]
     fn request_on_applies_a_total_deadline_that_ignores_progress() {
         let url = start_continuously_trickling_remote(100, std::time::Duration::from_millis(500));
@@ -6748,39 +6756,59 @@ mod tests {
         );
     }
 
-    /// The falsifying test for the defect this PR fixes at `resolve`'s own call site — not
-    /// `request_on`'s wiring in the abstract, the way
-    /// `request_on_applies_a_total_deadline_that_ignores_progress` above does. That test never
-    /// calls `resolve` at all: it hand-constructs `Posture::TotalDeadline` and drives
-    /// `request_on` directly, so it stays green no matter which posture `resolve`'s own call
-    /// site names — it cannot catch `resolve` being rewired onto `Posture::BoundedReads`, the
-    /// regression this series already shipped once and backed out.
+    /// The falsifying test for `resolve`'s own call site: that it actually hands
+    /// `resolve_budget()`'s value down as a [`Posture::TotalDeadline`], not merely that
+    /// `request_on` applies whatever `Posture::TotalDeadline` payload it is given.
+    /// `request_on_applies_a_total_deadline_that_ignores_progress` above already pins the
+    /// latter, but hand-constructs the posture itself and never calls `resolve` — see that
+    /// test's own doc — so it says nothing about which posture, or which payload, `resolve`'s
+    /// own call site actually names. This test calls [`RemoteClient::resolve`] directly.
     ///
-    /// This test calls [`RemoteClient::resolve`] itself, against
-    /// [`start_continuously_trickling_remote`]: headers immediately, then one byte every
-    /// 500ms, forever — continuous progress, never silent for longer than 500ms. Under
-    /// `resolve`'s own `Posture::TotalDeadline` that must still be cut off at
-    /// `resolve_budget()` and degrade to the designed fallback (an empty map, see `resolve`'s
-    /// own doc); under `Posture::BoundedReads` the silence clock resets on every byte and the
-    /// call never returns — reopening the FORK-49 hang on the one call whose fallback happens
-    /// to be free.
+    /// Against [`start_continuously_trickling_remote`] (headers immediately, then one byte
+    /// every 500ms — never silent for longer than 500ms, an order of magnitude under every
+    /// silence budget in this file), `resolve`'s own `Posture::TotalDeadline` must still cut the
+    /// call off at `resolve_budget()` and degrade to the designed fallback (an empty map, see
+    /// `resolve`'s own doc). A *silence* budget instead ([`Posture::BoundedReads`]) would reset
+    /// its clock on every byte; within this test's observation window such a call never returns
+    /// at all, which is why the outer `tokio::time::timeout` below exists as a backstop.
     ///
-    /// [`RemoteClient::new_test_with_connect_timeout`] injects a 1s `connect_timeout` so
-    /// `resolve_budget()` (`connect_timeout + REMOTE_READ_TIMEOUT`) comes to 11s rather than
-    /// production's 15s — `REMOTE_READ_TIMEOUT` itself is a fixed module constant no test can
-    /// shrink further. `total_bytes` (100) at a 500ms gap makes the full trickle 50s, far
-    /// longer than the 11s budget: if the deadline were silently dropped, the outer
-    /// `tokio::time::timeout` — not the assertion below it — is what catches it, loudly,
+    /// **A bare "returned before the outer ceiling" check does not pin *when*.** A call site
+    /// that hardcodes a flat, connect-timeout-blind budget — e.g.
+    /// `Posture::TotalDeadline(REMOTE_READ_TIMEOUT)` alone, dropping the `self.connect_timeout`
+    /// fold-in `resolve_budget()` exists to apply — would still return comfortably inside a
+    /// generous ceiling, just too early: the same call-site-versus-mechanism gap
+    /// `missing_objects_times_out_against_a_silent_remote` guards against for `missing_objects`,
+    /// applied here to `resolve`. [`RemoteClient::new_test_with_connect_timeout`] injects a 6s
+    /// `connect_timeout`, so the true budget (`6s + REMOTE_READ_TIMEOUT` = 16s) sits 6s clear of
+    /// that flat 10s rival — `REMOTE_READ_TIMEOUT` itself is a fixed module constant no test can
+    /// shrink. Six seconds of separation is generous against this file's own measured timer
+    /// precision (`resolve_times_out_against_a_silent_remote`'s doc records an observed 15.003s
+    /// against a 15s deadline — single-digit milliseconds of overshoot, not the fraction of a
+    /// second this margin needs to absorb). `elapsed` is asserted on both sides: `lower_bound`
+    /// (13s, the midpoint between the flat rival and the true budget) rules out an early return
+    /// for an unrelated reason — a stray parse failure, say — passing this test for free;
+    /// `upper_bound` (19s, 3s past the true budget) keeps a pass meaning "terminated near the
+    /// right value," not merely "terminated before a distant ceiling."
+    ///
+    /// `total_bytes` (100) at the 500ms gap makes the full trickle 50s: comfortably longer than
+    /// `hard_ceiling` (31s), so the fixture is still writing when the ceiling would fire — not
+    /// literally unbounded, just sized well past this test's own horizon. If the deadline were
+    /// silently dropped, or the call site rewired onto `Posture::BoundedReads`, the outer
+    /// `tokio::time::timeout` — not either assertion below it — is what catches it, loudly,
     /// rather than the test quietly hanging the suite.
     #[test]
     fn resolve_gives_up_on_a_remote_that_never_stops_trickling() {
         let url = start_continuously_trickling_remote(100, std::time::Duration::from_millis(500));
-        let connect_timeout = std::time::Duration::from_secs(1);
+        let connect_timeout = std::time::Duration::from_secs(6);
         let client = RemoteClient::new_test_with_connect_timeout(&url, connect_timeout);
-        let effective_budget = connect_timeout + TEST_TIGHT_READ_TIMEOUT;
-        let hard_ceiling = effective_budget + std::time::Duration::from_secs(15);
+        let true_budget = connect_timeout + TEST_TIGHT_READ_TIMEOUT;
+        let rival_flat_budget = TEST_TIGHT_READ_TIMEOUT;
+        let lower_bound = rival_flat_budget + (true_budget - rival_flat_budget) / 2;
+        let upper_bound = true_budget + std::time::Duration::from_secs(3);
+        let hard_ceiling = true_budget + std::time::Duration::from_secs(15);
 
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let started = std::time::Instant::now();
         let names = runtime.block_on(async {
             tokio::time::timeout(hard_ceiling, client.resolve(vec!["agent-1".to_string()])).await
         })
@@ -6789,12 +6817,29 @@ mod tests {
                 all, even though the remote never stopped writing bytes",
                 hard_ceiling
             ));
+        let elapsed = started.elapsed();
 
         assert!(
             names.is_empty(),
-            "a remote making continuous progress forever must still be cut off by resolve's \
-            own total deadline and degrade to its designed fallback (pseudonyms, an empty \
-            map), not somehow produce names: {:?}", names
+            "a remote making continuous progress must still be cut off by resolve's own total \
+            deadline and degrade to its designed fallback (pseudonyms, an empty map), not \
+            somehow produce names: {:?}", names
+        );
+
+        assert!(
+            elapsed >= lower_bound,
+            "elapsed {:?} is under {:?} (the midpoint between the flat rival budget {:?} and \
+            the true budget {:?}) — resolve returned close to a call site that ignores \
+            self.connect_timeout and rides a flat REMOTE_READ_TIMEOUT alone, not \
+            resolve_budget()'s own connect-timeout-folded value",
+            elapsed, lower_bound, rival_flat_budget, true_budget
+        );
+        assert!(
+            elapsed <= upper_bound,
+            "elapsed {:?} exceeds {:?} ({:?} past the true budget {:?}) — resolve took \
+            meaningfully longer than its own total deadline to give up, so this pass would not \
+            actually certify termination near resolve_budget()'s value",
+            elapsed, upper_bound, upper_bound.saturating_sub(true_budget), true_budget
         );
     }
 
