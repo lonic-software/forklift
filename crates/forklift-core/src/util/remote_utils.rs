@@ -321,7 +321,7 @@ const REMOTE_CONNECT_TIMEOUT_TOR: std::time::Duration = std::time::Duration::fro
 /// *total* deadline, not a silence budget, is the right shape for `resolve` specifically).
 /// `update_ref`, `commit_lift`, and the streamed-upload paths (`upload_object`, `put_presigned`)
 /// are unbounded for reasons of their own — see each call's own doc, and
-/// [`RemoteClient::send_with_watchdog`]'s for the uploads.
+/// [`clients::Clients::send_with_watchdog`]'s for the uploads.
 ///
 /// `read_timeout` is a `ClientBuilder`-level setting with no per-request override — it cannot be
 /// switched off for one specific request — so it is carried only by the clients
@@ -381,7 +381,7 @@ const FETCH_OBJECT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from
 ///
 /// Not the actual timeout duration on its own (review round 5, finding 2) — see
 /// [`error_body_read_budget`] for why `self.connect_timeout` is folded in on top of this base,
-/// the same way [`bounded_read_timeout`] and [`RemoteClient::send_with_watchdog`]'s own phase
+/// the same way [`bounded_read_timeout`] and [`clients::Clients::send_with_watchdog`]'s own phase
 /// budgets already do.
 const ERROR_BODY_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -427,7 +427,7 @@ fn bounded_read_timeout(connect_timeout: std::time::Duration,
 }
 
 /// How large each chunk handed to `reqwest::Body::wrap_stream` is for an upload's
-/// watchdog-guarded body stream (see [`RemoteClient::send_with_watchdog`]). Small enough that the
+/// watchdog-guarded body stream (see [`clients::Clients::send_with_watchdog`]). Small enough that the
 /// watchdog's "last chunk pulled" timestamp advances often during a healthy transfer — so a
 /// genuine stall is caught close to the configured budget, not masked by one giant chunk that
 /// takes long to hand off — large enough not to spend a large upload's CPU mostly on per-chunk
@@ -452,7 +452,7 @@ fn bounded_read_timeout(connect_timeout: std::time::Duration,
 const UPLOAD_CHUNK_SIZE: usize = 4 * 1024;
 
 /// How long an upload's body-send stream may go without the client pulling a single chunk from it
-/// before [`RemoteClient::send_with_watchdog`] gives up and abandons the request, *on top of*
+/// before [`clients::Clients::send_with_watchdog`] gives up and abandons the request, *on top of*
 /// whichever connect budget applies — same reasoning as [`bounded_read_timeout`]'s: a per-request
 /// bound starts before connect too, so the connect allowance is added in rather than layered on
 /// blind.
@@ -462,7 +462,7 @@ const UPLOAD_CHUNK_SIZE: usize = 4 * 1024;
 /// non-resetting deadline that covers connect *and* the entire pre-headers send phase, which is
 /// exactly wrong for an upload — arming it here would cap the whole upload's total duration and
 /// kill a healthy transfer on any link slower than the window it allows. This budget instead
-/// governs a hand-rolled watchdog ([`RemoteClient::send_with_watchdog`]) driven by a timestamp
+/// governs a hand-rolled watchdog ([`clients::Clients::send_with_watchdog`]) driven by a timestamp
 /// updated every time the body's stream actually yields a chunk to hyper — which only happens
 /// while hyper is still pulling data to write, i.e. only while the connection is making progress.
 /// Like `read_timeout`, it resets on every chunk moved and only fires on genuine silence, never on
@@ -475,7 +475,7 @@ const UPLOAD_CHUNK_SIZE: usize = 4 * 1024;
 /// reading, not that the link is merely slow.
 const UPLOAD_SILENCE_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// How often [`RemoteClient::send_with_watchdog`] wakes up to re-check its shared progress
+/// How often [`clients::Clients::send_with_watchdog`] wakes up to re-check its shared progress
 /// timestamp against [`UPLOAD_SILENCE_BUDGET`]. Small relative to that budget so a genuine stall
 /// is caught close to the configured deadline rather than delayed by a coarse poll; large enough
 /// not to spin the executor pointlessly during a normal transfer.
@@ -500,7 +500,7 @@ const POST_SEND_VERIFY_RATE_BYTES_PER_SEC: u64 = 8 * 1024 * 1024;
 
 /// The **server-side verification** component of the post-send phase's budget, for an upload of
 /// `body_len` bytes — see [`POST_SEND_VERIFY_BASE`]/[`POST_SEND_VERIFY_RATE_BYTES_PER_SEC`]'s
-/// docs for the constants. This alone is *not* [`RemoteClient::send_with_watchdog`]'s actual
+/// docs for the constants. This alone is *not* [`clients::Clients::send_with_watchdog`]'s actual
 /// post-send budget (see that method's doc, review round S2-F2, for why it also folds in the
 /// send-phase allowance as a flush-time margin) — it names only the part of that budget scaled to
 /// this specific quantity.
@@ -523,7 +523,7 @@ fn post_send_verify_budget(body_len: usize) -> std::time::Duration {
 }
 
 /// Shared state between an upload's body-send stream ([`UploadChunks`]) and
-/// [`RemoteClient::send_with_watchdog`]'s polling loop: a timestamp updated every time the stream
+/// [`clients::Clients::send_with_watchdog`]'s polling loop: a timestamp updated every time the stream
 /// actually yields a chunk (the only signal available that the transfer is still moving — see
 /// [`UPLOAD_SILENCE_BUDGET`]'s doc), and a flag set once the stream is exhausted.
 ///
@@ -535,7 +535,7 @@ fn post_send_verify_budget(body_len: usize) -> std::time::Duration {
 /// bounded by a quantity — `body_len` — the client already has. A remote that reads the whole
 /// body and then wedges is an ordinary failure, and it hung exactly like the original FORK-49 bug
 /// on this exact path when this phase was left unbounded). What exhaustion changes is *which*
-/// budget [`RemoteClient::send_with_watchdog`] checks `silent_for()` against, not whether it
+/// budget [`clients::Clients::send_with_watchdog`] checks `silent_for()` against, not whether it
 /// checks at all — see that method's doc for the two-budget shape and why phase 2's budget still
 /// has to be generous: `is_exhausted()` means every chunk was handed to hyper, not that every byte
 /// reached the peer, so the post-exhaustion silence can legitimately include time the OS kernel
@@ -568,7 +568,7 @@ impl UploadProgress {
     }
 
     /// How long it has been since the stream last yielded a chunk — the value
-    /// [`RemoteClient::send_with_watchdog`] compares against the budget.
+    /// [`clients::Clients::send_with_watchdog`] compares against the budget.
     fn silent_for(&self) -> std::time::Duration {
         self.last_chunk.lock().unwrap().elapsed()
     }
@@ -604,7 +604,7 @@ impl UploadProgress {
 ///
 /// **`is_exhausted()` means "every chunk was handed to hyper," not "every byte reached the
 /// peer."** Hyper may still hold buffered-but-unwritten bytes, and the OS kernel's own send
-/// buffer may hold more on top of that — see [`RemoteClient::send_with_watchdog`]'s doc (review
+/// buffer may hold more on top of that — see [`clients::Clients::send_with_watchdog`]'s doc (review
 /// round S2-F2) for why the post-send phase's budget has to account for that gap rather than
 /// treating "exhausted" as "delivered."
 struct UploadChunks {
@@ -676,19 +676,26 @@ fn watched_upload_body(bytes: Vec<u8>, progress: Arc<UploadProgress>) -> (reqwes
 /// through the one convenience spelling the parser recognized. A fixed list of spellings cannot see
 /// a spelling it was not written for.
 ///
-/// So the fields are private to this module, and the module hands out exactly one thing:
-/// [`Clients::pick`], which takes a [`Posture`] — a required argument, not a default — and returns
-/// the chosen `reqwest::Client`. A new call site cannot reach any client without the compiler
-/// forcing that choice; there is no ambient "just use the default one" path left to fall into.
+/// So the fields are private to this module, and the module hands out two things: [`Clients::pick`],
+/// which takes a [`Posture`] — a required argument, not a default — and returns the chosen
+/// `reqwest::Client`, and [`Clients::send_with_watchdog`], which never hands a client out at all —
+/// it takes the upload's bytes and the pieces of a request (destination, method), builds the
+/// watchdog-guarded body and the request itself, and returns a [`WatchdogOutcome`]. A new call site
+/// cannot reach any client, nor send a watchdog-guarded upload, without the compiler forcing that
+/// choice; there is no ambient "just use the default one" path left to fall into.
 ///
-/// The residual trust base is this module **plus** its only two callers outside it —
+/// The residual trust base is this module **plus** its two remaining callers outside it —
 /// [`RemoteClient::request_on`] (builds a request, bearer token attached) and
-/// [`RemoteClient::client_for`] (hands back the bare `&reqwest::Client` itself, for the two call
-/// sites that must not attach a bearer token) — since privacy alone only covers the *fields*, not
-/// what those two functions go on to do with a reference once `pick` returns one. That the base is
-/// exactly these three items, and nothing wider, is a procedural claim, not an assertion to take on
-/// faith: `grep -n 'reqwest::Client\b' crates/forklift-core/src/util/remote_utils.rs`, read against
-/// which lines are doc comments, currently finds the type spelled outside a comment only inside
+/// [`RemoteClient::client_for`] (hands back the bare `&reqwest::Client` itself, for the one call
+/// site that must not attach a bearer token) — since privacy alone only covers the *fields*, not
+/// what those two functions go on to do with a reference once `pick` returns one. The
+/// watchdog-guarded uploads (`upload_object`, `put_presigned`) are not part of that external trust
+/// base at all any more: they never touch a `reqwest::Client` reference, only the bytes and
+/// destination they hand to [`Clients::send_with_watchdog`], which does its own request-building
+/// entirely inside this module. That the external base is exactly those two items, and nothing
+/// wider, is a procedural claim, not an assertion to take on faith:
+/// `grep -n 'reqwest::Client\b' crates/forklift-core/src/util/remote_utils.rs`, read against which
+/// lines are doc comments, currently finds the type spelled outside a comment only inside
 /// `mod clients` itself and at `client_for`'s own signature — nowhere else in the file. Re-run that
 /// grep to re-check the claim; do not trust this sentence past the next edit that moves the type.
 ///
@@ -706,11 +713,14 @@ mod clients {
 
     /// Which `reqwest::Client` a request rides, and — for the postures that carry no
     /// client-level `read_timeout` — what (if anything) bounds that call's response wait instead:
-    /// [`Self::WatchdogNoRedirect`]'s progress-reset watchdog, [`Self::TotalDeadline`]'s own
-    /// payload, or nothing at all for [`Self::UnboundedFollowsRedirects`]/
-    /// [`Self::UnboundedNoRedirect`] (see [`UnboundedTicket`]'s doc). Every request
-    /// [`super::RemoteClient`] sends must name one of these explicitly; [`Clients::pick`] has no other
-    /// argument to construct a request from, so there is nothing to fall back to.
+    /// [`Self::TotalDeadline`]'s own payload, or nothing at all for
+    /// [`Self::UnboundedFollowsRedirects`]/[`Self::UnboundedNoRedirect`] (see [`UnboundedTicket`]'s
+    /// doc). Every request [`super::RemoteClient`] sends through [`Clients::pick`] must name one of
+    /// these explicitly; `pick` has no other argument to construct a request from, so there is
+    /// nothing to fall back to. The watchdog-guarded uploads bound their own response wait a
+    /// different way — see [`Clients::send_with_watchdog`]'s own doc — and so never construct a
+    /// `Posture` at all; there is no variant here standing in for that mechanism to keep in sync
+    /// with it.
     pub(super) enum Posture {
         /// [`REMOTE_READ_TIMEOUT`]-bounded via a client-level `read_timeout`. For the
         /// O(constant)-pre-first-byte calls: `fetch_info`, `fetch_signature`, `fetch_bundle_to`.
@@ -760,11 +770,6 @@ mod clients {
         /// [`super::tests::request_on_applies_a_total_deadline_that_ignores_progress`] for the
         /// falsifying test.
         TotalDeadline(std::time::Duration),
-        /// Never auto-follows any redirect; no client-level `read_timeout`. The caller bounds this
-        /// call's own response wait through [`super::RemoteClient::send_with_watchdog`]'s progress-reset
-        /// watchdog instead — not through the client. The streamed-upload paths:
-        /// `upload_object`, `put_presigned`.
-        WatchdogNoRedirect,
         /// Auto-follows redirects; no client-level `read_timeout`; **nothing else bounds this
         /// call's response wait either** — no per-request override, no watchdog. Deliberate, not
         /// an oversight: the ticket that owns adding a bound is a required part of this variant,
@@ -791,14 +796,21 @@ mod clients {
     /// to shrink this set, not this one's). Adding a new variant is itself the visible, greppable
     /// act of accepting a new unbounded call site.
     ///
-    /// `grep 'UnboundedTicket::'` enumerates every **ticket-carrying** unbounded call — it does
-    /// not enumerate every unbounded call, full stop. [`Posture::WatchdogNoRedirect`] asserts its
-    /// call is bounded by a mechanism outside the client (the progress-reset watchdog) — assert,
-    /// not prove: nothing in this module's types checks that `send_with_watchdog` was actually
-    /// applied at a given call site, so that posture carries no ticket and sits outside what this
-    /// grep finds, by design of the posture itself rather than an oversight here. That gap — a
-    /// bound this posture claims but nothing enforces — is tracked separately and is deliberately
-    /// not touched by this comment or this PR.
+    /// `grep 'UnboundedTicket::'` enumerates every unbounded call, full stop. Its domain: every
+    /// construction site of [`Posture::UnboundedFollowsRedirects`]/[`Posture::UnboundedNoRedirect`]
+    /// — the only two variants whose response wait is unbounded, and both require this payload, so
+    /// nothing reachable through [`Clients::pick`] can go unbounded without also being ticketed
+    /// here. That completeness depends on every unbounded wait staying reachable only through one
+    /// of those two variants; it would stop holding the moment some other mechanism bounded (or
+    /// failed to bound) a call without routing through `Posture` at all — precisely what the
+    /// deleted `Posture::WatchdogNoRedirect` used to be: a payload-free posture whose claimed bound
+    /// (a watchdog) lived entirely outside anything this grep could see, so the actual gap tracked
+    /// separately from this doc was never visible here. [`Clients::send_with_watchdog`] closed that
+    /// gap by removing `Posture` from its call sites' construction entirely, not by adding a ticket
+    /// to it — the response wait it bounds is discharged by the module itself, the same way
+    /// [`Posture::TotalDeadline`]'s payload is, so it needs no representation in this enum. Before
+    /// trusting the grep again, re-check that condition: confirm any new way to send a request
+    /// still goes through [`Posture`], or re-derive by hand whether it is actually bounded.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(super) enum UnboundedTicket {
         /// `missing_objects`, `upload_targets`, `fetch_subtree`, and `fetch_batch`'s initial
@@ -853,7 +865,8 @@ mod clients {
         http: reqwest::Client,
         /// Same endpoint as [`Self::http`], automatic redirect-following disabled
         /// (`redirect::Policy::none()`); no `read_timeout` either. Selected by
-        /// [`Posture::WatchdogNoRedirect`] and [`Posture::UnboundedNoRedirect`]: reqwest's default
+        /// [`Posture::UnboundedNoRedirect`], and directly (bypassing [`Posture`] entirely) by
+        /// [`Clients::send_with_watchdog`] — the watchdog-guarded upload paths: reqwest's default
         /// policy replays a `307`/`308` with the original method *and* body, and `tower-http`'s
         /// `SEE_OTHER`/`MOVED_PERMANENTLY`/`FOUND` arms force a mutation's method to `GET` and
         /// body empty — either way a redirect must come back raw rather than being auto-followed
@@ -928,14 +941,170 @@ mod clients {
                 Posture::BoundedObjectReads => &self.bounded_object_reads,
                 Posture::TotalDeadline(_) => &self.http,
                 Posture::UnboundedFollowsRedirects(_) => &self.http,
-                Posture::WatchdogNoRedirect => &self.no_redirect,
                 Posture::UnboundedNoRedirect(_) => &self.no_redirect,
             }
         }
+
+        /// Send a watchdog-guarded upload — the operation that used to be promised by
+        /// `Posture::WatchdogNoRedirect` (deleted) and discharged by a caller-assembled
+        /// `reqwest::RequestBuilder` passed into `RemoteClient::send_with_watchdog`. That shape let
+        /// three things drift apart with nothing to catch it: the [`super::UploadProgress`] woven
+        /// into the request body could be a different one than the watchdog polled; the watchdog
+        /// could simply not be called (`builder.send()` compiled fine and was silently unbounded);
+        /// and the explicit `Content-Length` [`super::watched_upload_body`] requires could be
+        /// forgotten, silently falling back to `Transfer-Encoding: chunked` (which a presigned S3
+        /// `PUT` rejects outright). This function owns all three pairings by construction: it takes
+        /// the raw upload `bytes`, not a builder, so the body and the progress the watchdog polls
+        /// are always the same [`super::UploadProgress`]; it always runs the watchdog loop, so
+        /// there is no bare `.send()` for a call site to reach for instead; and it always sets
+        /// `Content-Length` itself, so no call site can omit it.
+        ///
+        /// **What actually makes the body/progress pairing hold is sole-sourcing, not a type the
+        /// compiler checks.** [`super::watched_upload_body`] and `UploadProgress::new` are both
+        /// file-private, and this function's own two lines below are their only call — nothing in
+        /// either function's signature stops a second call site from constructing its own
+        /// `UploadProgress`, elsewhere in this file, and pairing it with a body built from a
+        /// different one. `grep -n 'watched_upload_body(' crates/forklift-core/src/util/remote_utils.rs`
+        /// and `grep -n 'UploadProgress::new()' crates/forklift-core/src/util/remote_utils.rs` are
+        /// the procedure that checks this: read against which lines are doc comments (this
+        /// paragraph names both patterns literally, so it is its own hit) and which are this
+        /// function's own definition and call, any further hit is a second caller, and a second
+        /// caller is exactly the seam reopening — the same failure shape as the deleted
+        /// `Posture::WatchdogNoRedirect`, just one level down. Nothing (no compiler error, no test)
+        /// catches that on its own; a reviewer noticing the new call site is what actually keeps
+        /// this pairing closed. Re-run both greps before trusting this doc, and treat any hit
+        /// outside this function and its own doc comment as the claim no longer holding, not as a
+        /// benign refactor to wave through.
+        ///
+        /// Always rides [`Self::no_redirect`] — never auto-follows a redirect — for the same
+        /// reason [`Posture::UnboundedNoRedirect`] does (see that client field's own doc): a
+        /// one-shot streamed body cannot be replayed if reqwest's default policy tried to
+        /// auto-follow a `3xx`. `destination` names the two request shapes this module's two
+        /// upload call sites need — see [`UploadDestination`]'s own doc — since a caller-supplied
+        /// builder is exactly the seam this function exists to close; letting a caller hand one in
+        /// would reopen it.
+        ///
+        /// Bounds the wait itself (through `phase1_budget`/`phase2_budget` below) rather than
+        /// asserting a bound the way the deleted posture did; the caller supplies `connect_timeout`
+        /// because that budget — like every other one this module computes — has to account for
+        /// the connect phase's own latency (a Tor circuit most sharply), and this module has no
+        /// field of its own to read it from (see this module's own doc for why `RemoteClient`'s
+        /// fields stay on `RemoteClient` rather than moving in here).
+        ///
+        /// Returns a [`WatchdogOutcome`] rather than a `Result<_, String>`: this module's boundary
+        /// is boundedness, not operator-facing wording — composing the actual message (which of
+        /// [`super::RemoteClient::describe_mutation_transport_error`],
+        /// `mutation_read_timeout_message`, or `mutation_post_send_timeout_message` applies, and
+        /// what action string to name) stays [`super::RemoteClient`]'s job, the same as it always
+        /// was.
+        ///
+        /// The two phases, and the reasoning behind `phase1_budget`/`phase2_budget`, are unchanged
+        /// from the pre-refactor `RemoteClient::send_with_watchdog` — see review rounds S2-F1
+        /// through S2-F7, referenced throughout this file's other watchdog-adjacent docs
+        /// ([`super::UploadProgress`], [`super::UploadChunks`], [`super::UPLOAD_SILENCE_BUDGET`],
+        /// [`super::post_send_verify_budget`]) for the full history of why the shape is what it is.
+        pub(super) async fn send_with_watchdog(&self,
+                                               connect_timeout: std::time::Duration,
+                                               destination: UploadDestination<'_>,
+                                               method: reqwest::Method,
+                                               bytes: Vec<u8>) -> WatchdogOutcome {
+            let progress = super::UploadProgress::new();
+            let (body, body_len) = super::watched_upload_body(bytes, progress.clone());
+
+            let mut builder = match destination {
+                UploadDestination::Authenticated { base, token, path } => {
+                    let mut builder = self.no_redirect.request(method, format!("{}{}", base, path));
+                    if let Some(token) = token {
+                        builder = builder.bearer_auth(token);
+                    }
+                    builder
+                }
+                UploadDestination::Presigned { url } => self.no_redirect.request(method, url),
+            };
+            builder = builder.header(reqwest::header::CONTENT_LENGTH, body_len).body(body);
+
+            let phase1_budget = connect_timeout + super::UPLOAD_SILENCE_BUDGET;
+            let phase2_budget = phase1_budget + super::post_send_verify_budget(body_len);
+            let send_fut = builder.send();
+            tokio::pin!(send_fut);
+
+            loop {
+                tokio::select! {
+                    result = &mut send_fut => {
+                        return match result {
+                            Ok(response) => WatchdogOutcome::Sent(response),
+                            Err(e) => WatchdogOutcome::Transport(e),
+                        };
+                    }
+                    _ = tokio::time::sleep(super::UPLOAD_WATCHDOG_POLL_INTERVAL) => {
+                        let exhausted = progress.is_exhausted();
+                        let budget = if exhausted { phase2_budget } else { phase1_budget };
+
+                        if progress.silent_for() >= budget {
+                            return if exhausted {
+                                WatchdogOutcome::SilentAfterSend { budget: phase2_budget }
+                            } else {
+                                WatchdogOutcome::SilentDuringSend
+                            };
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Which physical request [`Clients::send_with_watchdog`] builds — the two shapes this
+    /// module's two watchdog-guarded upload call sites need, named explicitly rather than letting
+    /// a caller hand in a pre-built `reqwest::RequestBuilder` (the seam [`Clients::send_with_watchdog`]
+    /// exists to close; see that method's own doc).
+    pub(super) enum UploadDestination<'a> {
+        /// A path relative to the remote's `base`, with the bearer token attached (if one is
+        /// configured) — the control-plane shape, `RemoteClient::upload_object`'s only caller.
+        Authenticated {
+            base: &'a str,
+            token: Option<&'a str>,
+            path: &'a str,
+        },
+        /// An absolute, self-authorizing URL, with **no** bearer token — a presigned storage `PUT`
+        /// carries its own credentials in its query string, and attaching this remote's bearer
+        /// token to a request bound for a different host would be a needless credential leak (see
+        /// [`super::RemoteClient::put_presigned`]'s own doc). `put_presigned`'s only caller.
+        Presigned { url: &'a str },
+    }
+
+    /// What [`Clients::send_with_watchdog`] found, before [`super::RemoteClient`] turns it into an
+    /// operator-facing message. A structured outcome rather than a `Result<_, String>` because
+    /// composing that message is policy this module deliberately does not own — see
+    /// [`Clients::send_with_watchdog`]'s own doc.
+    pub(super) enum WatchdogOutcome {
+        /// The request was sent and a response came back — success or not is the caller's status
+        /// check to make; this variant only means the wait itself completed.
+        Sent(reqwest::Response),
+        /// A genuine `reqwest::Error` — a real transport failure, not a watchdog kill. Maps onto
+        /// [`super::RemoteClient::describe_mutation_transport_error`].
+        Transport(reqwest::Error),
+        /// The watchdog killed the request during the send phase: `phase1_budget` elapsed with no
+        /// chunk pulled from the body and the stream not yet exhausted. Carries no budget, unlike
+        /// [`Self::SilentAfterSend`]: it maps onto
+        /// [`super::RemoteClient::mutation_read_timeout_message`], which is deliberately shared,
+        /// word-for-word, with a genuinely ambiguous `reqwest::Error` timeout on an
+        /// already-established connection (see that function's own doc) — a mid-body watchdog kill
+        /// is the same *shape* of failure as that ambiguous case, so it deliberately gets the same
+        /// wording rather than a more precise one the mechanism happens to have on hand. Naming
+        /// `phase1_budget` here anyway would be dead weight: no consumer of this variant would ever
+        /// read it, and a value nothing reads is worse than no field at all — the lesson
+        /// `UnboundedTicket`'s own carried-but-unread payloads do *not* generalize to, since those
+        /// earn their keep by being greppable even unread, and this field wouldn't.
+        SilentDuringSend,
+        /// The watchdog killed the request after the stream reported itself exhausted: `budget`
+        /// (the larger, post-send figure) elapsed with still no response. Maps onto
+        /// [`super::RemoteClient::mutation_post_send_timeout_message`], which does name this
+        /// budget.
+        SilentAfterSend { budget: std::time::Duration },
     }
 }
 
-use clients::{Clients, Posture, UnboundedTicket};
+use clients::{Clients, Posture, UnboundedTicket, UploadDestination, WatchdogOutcome};
 
 /// The remote endpoint: base URL, optional bearer token, and the HTTP clients — see the
 /// [`clients`] module's own doc for why there are four of them and why they are not fields here
@@ -1208,7 +1377,6 @@ impl RemoteClient {
             // `OwnTimeoutFollowsRedirects` posture already did once.
             Posture::BoundedReads
             | Posture::BoundedObjectReads
-            | Posture::WatchdogNoRedirect
             | Posture::UnboundedFollowsRedirects(_)
             | Posture::UnboundedNoRedirect(_) => None,
         };
@@ -1226,14 +1394,18 @@ impl RemoteClient {
         builder
     }
 
-    /// The lower-level counterpart of [`Self::request_on`], for the two call sites that must
-    /// build their request on the bare `reqwest::Client` without the bearer-token attachment
-    /// `request_on` always applies: [`Self::fetch_batch`]'s redirect-follow `GET` (a presigned
-    /// storage URL is self-authorizing; forwarding a bearer token meant for the control plane
-    /// would be a needless credential leak) and [`Self::put_presigned`] (the presigned URL's own
-    /// signature is the authorization; this call carries no bearer token at all). Still requires
-    /// an explicit [`Posture`] — the only difference from `request_on` is which builder method
-    /// the caller goes on to call on the returned client.
+    /// The lower-level counterpart of [`Self::request_on`], for building a request on the bare
+    /// `reqwest::Client` without the bearer-token attachment `request_on` always applies. Down to
+    /// one live caller — [`Self::fetch_batch`]'s redirect-follow `GET` (a presigned storage URL is
+    /// self-authorizing; forwarding a bearer token meant for the control plane would be a
+    /// needless credential leak) — since [`Self::put_presigned`], this function's other historical
+    /// caller, moved onto [`clients::Clients::send_with_watchdog`], which builds its own
+    /// bearer-token-free request entirely inside [`clients`] rather than reaching back out here
+    /// for a raw client to build one on. Still requires an explicit [`Posture`] — the only
+    /// difference from `request_on` is which builder method the caller goes on to call on the
+    /// returned client. Kept rather than inlined into `fetch_batch` because a second caller
+    /// reappearing (another self-authorizing, no-bearer-token request) is more likely than this
+    /// staying permanently singular, and inlining now would just have to be undone.
     fn client_for(&self, posture: Posture) -> &reqwest::Client {
         self.clients.pick(&posture)
     }
@@ -1284,22 +1456,24 @@ impl RemoteClient {
 
     /// The mutation counterpart of [`Self::describe_transport_error`], for the six calls that ride
     /// the unbounded no-auto-follow or auto-follow clients (`update_ref`, `upload_object`,
-    /// `put_presigned`, `upload_signature`, `put_trust`, `commit_lift`) — `upload_object`,
-    /// `put_presigned`, `update_ref`, `upload_signature`, and `put_trust` all ride
-    /// [`Posture::UnboundedNoRedirect`] or [`Posture::WatchdogNoRedirect`] (the last three moved
-    /// off the auto-following client by FORK-89, `upload_object`/`put_presigned` by the earlier
-    /// fix for the `303` redirect hole); only `commit_lift` still rides the auto-following client
-    /// ([`Posture::UnboundedFollowsRedirects`]) directly. `upload_object`/`put_presigned` also
-    /// layer [`Self::send_with_watchdog`] on top for their body-send phase, but the no-auto-follow
-    /// client is just as unbounded as the auto-following one, so a
-    /// transport failure on any of the six still lands here for anything `classify` can actually
-    /// see (a connect failure, or a `reqwest::Error`-bearing timeout on the response side). Same
-    /// [`classify`] dispatch, but the [`TransportFailure::ReadTimedOut`] wording differs from the
-    /// read path's: on these clients that case can only be a timeout on an *established*
-    /// connection — after the request bytes were already sent — so the settled contract requires
-    /// the uncertainty be carried in the message rather than asserted away: it may have completed
-    /// on the remote, and the caller must decide whether to check before retrying, never be told
-    /// nothing happened.
+    /// `put_presigned`, `upload_signature`, `put_trust`, `commit_lift`) — `update_ref`,
+    /// `upload_signature`, and `put_trust` ride [`Posture::UnboundedNoRedirect`] (moved off the
+    /// auto-following client by FORK-89); `upload_object`/`put_presigned` ride
+    /// [`clients::Clients::send_with_watchdog`] directly, on the same never-auto-follow client, but
+    /// bypassing [`Posture`] entirely (moved by the earlier fix for the `303` redirect hole, then
+    /// off `Posture` again once a payload-free posture proved unable to guarantee the watchdog was
+    /// actually applied); only `commit_lift` still rides the auto-following client
+    /// ([`Posture::UnboundedFollowsRedirects`]) directly. `upload_object`/`put_presigned`'s
+    /// watchdog also produces a genuine `reqwest::Error` for an actual transport failure (as
+    /// opposed to a watchdog kill, which produces no `reqwest::Error` at all — see
+    /// [`clients::WatchdogOutcome::Transport`]'s doc), so a transport failure on any of the six
+    /// still lands here for anything `classify` can actually see (a connect failure, or a
+    /// `reqwest::Error`-bearing timeout on the response side). Same [`classify`] dispatch, but the
+    /// [`TransportFailure::ReadTimedOut`] wording differs from the read path's: on these clients
+    /// that case can only be a timeout on an *established* connection — after the request bytes
+    /// were already sent — so the settled contract requires the uncertainty be carried in the
+    /// message rather than asserted away: it may have completed on the remote, and the caller must
+    /// decide whether to check before retrying, never be told nothing happened.
     fn describe_mutation_transport_error(&self, action: &str, e: reqwest::Error) -> String {
         match classify(e.is_connect(), e.is_timeout()) {
             TransportFailure::ConnectTimedOut => format!(
@@ -1315,7 +1489,8 @@ impl RemoteClient {
     /// The message for a mutation transport failure that can only be a timeout on an
     /// *already-established* connection — after the request bytes may already have been sent.
     /// Factored out of [`Self::describe_mutation_transport_error`]'s own `ReadTimedOut` arm so
-    /// [`Self::send_with_watchdog`]'s upload watchdog can produce the identical wording without a
+    /// [`clients::Clients::send_with_watchdog`]'s upload watchdog can produce the identical
+    /// wording (via [`Self::response_from_watchdog`]) without a
     /// `reqwest::Error` to hand `classify`: a stalled body-send stream it kills produces no
     /// `reqwest::Error` at all — the in-flight `send()` future is simply dropped, never polled to
     /// completion or failure — so there is nothing for `classify` to inspect. The watchdog names
@@ -1338,7 +1513,7 @@ impl RemoteClient {
     }
 
     /// The message for a *post-send* mutation stall — the watchdog's second phase (see
-    /// [`Self::send_with_watchdog`]): the stream reported itself exhausted (every chunk was
+    /// [`clients::Clients::send_with_watchdog`]): the stream reported itself exhausted (every chunk was
     /// handed to hyper), and then `budget` elapsed with no response. Deliberately distinct
     /// wording from [`Self::mutation_read_timeout_message`] (the mid-body composer) so an operator
     /// can tell the two failures apart, and because they are not equally uncertain: here every
@@ -1351,8 +1526,9 @@ impl RemoteClient {
     /// "the client finished streaming the request body" (review round S2-F7), not "the request
     /// finished sending": exhaustion means hyper has every chunk, not that the peer has received
     /// every byte — hyper's own buffer, and the OS kernel's send buffer beneath it, can still hold
-    /// an unflushed tail at the instant this fires (see [`Self::send_with_watchdog`]'s doc, S2-F2)
-    /// — so this states only the locally-observable fact, not a claim about what the remote has.
+    /// an unflushed tail at the instant this fires (see [`clients::Clients::send_with_watchdog`]'s
+    /// doc, S2-F2) — so this states only the locally-observable fact, not a claim about what the
+    /// remote has.
     fn mutation_post_send_timeout_message(action: &str, budget: std::time::Duration) -> String {
         format!(
             "Timed out while {}: the client finished streaming the request body, but no \
@@ -1363,86 +1539,26 @@ impl RemoteClient {
         )
     }
 
-    /// Send `builder` (with a [`watched_upload_body`]-built body of `body_len` bytes already
-    /// attached, sharing `progress`) through two phases, both bounded, both watched through the
-    /// same `progress.silent_for()` signal — just against a different threshold once the stream is
-    /// exhausted:
-    ///
-    /// 1. **Send**: `silent_for()` is checked against `phase1_budget` (this client's connect
-    ///    budget plus [`UPLOAD_SILENCE_BUDGET`]) while the body is still streaming. A stall here
-    ///    means the peer stopped reading mid-transfer.
-    /// 2. **Post-send response wait**: once the stream reports itself exhausted, `silent_for()` —
-    ///    which stops advancing the instant the last chunk is handed off, since there is nothing
-    ///    left to touch it — is checked against a *larger* `phase2_budget` instead:
-    ///    `phase1_budget + post_send_verify_budget(body_len)`.
-    ///
-    /// An earlier version of this fix (review round S2-F2) treated exhaustion as "stop bounding
-    /// the wait at all" — restoring the original FORK-49 hang on exactly this path, since a remote
-    /// that reads the whole body and then wedges during verification is an ordinary failure. A
-    /// second attempt then bounded phase 2 with `post_send_verify_budget(body_len)` alone — too
-    /// tight: `is_exhausted()` means every chunk was handed to *hyper*, not that every byte
-    /// reached the *peer* (see [`UploadProgress`]'s doc) — hyper's own buffer, and the OS kernel's
-    /// send buffer beneath it, can still hold an in-flight tail the instant this flag flips, and
-    /// under Linux/Windows autotuning that tail can be megabytes. A verify-only budget would kill
-    /// a transfer that is still genuinely, if slowly, moving those bytes — the same "must never
-    /// kill a transfer that is still moving" property [`UPLOAD_SILENCE_BUDGET`]'s own doc requires
-    /// of phase 1. `phase2_budget` folds phase 1's *entire* allowance back in as the tail's flush
-    /// budget: it is the same figure this client already treats as generous for a single healthy
-    /// gap to resolve (see [`UPLOAD_SILENCE_BUDGET`]'s doc), and flushing an already-in-flight
-    /// tail is exactly that — a healthy link finishing outstanding work, not new work starting
-    /// from nothing — on top of which [`post_send_verify_budget`]`(body_len)` adds the
-    /// server-side, client-known-bounded verification time. This also folds in this client's own
-    /// connect budget (review round S2-F3), the same way [`bounded_read_timeout`] and phase 1
-    /// itself already do — a bound that ignores the link's own latency preempts healthy work on a
-    /// slow-but-legitimate connection (a Tor circuit most sharply: `REMOTE_CONNECT_TIMEOUT_TOR` is
-    /// 60s precisely because multi-second round trips are normal there).
-    ///
-    /// **Accepted residual**, in the same spirit as [`FETCH_OBJECT_READ_TIMEOUT`]'s documented
-    /// gap: an autotuned buffer that grew large while the link was fast and then degraded to a
-    /// much slower rate mid-transfer could in principle still exceed `phase2_budget`'s flush
-    /// allowance. TCP autotuning targets a buffer near the bandwidth-delay product, so the ordinary
-    /// case (buffer sized for the link's *own* rate) drains in on the order of a few round trips,
-    /// not the link's raw throughput — comfortably inside [`UPLOAD_SILENCE_BUDGET`]'s allowance —
-    /// but a link that changes character mid-flight is not covered by that reasoning. Not
-    /// separately fixed here: it would need either OS-level control of the send buffer (no public
-    /// `reqwest`/hyper hook exists for it) or a budget scaled to a worst-case buffer size no
-    /// portable assumption can name honestly.
-    ///
-    /// Both phases can end in a watchdog kill, and both produce no `reqwest::Error` when they do
-    /// (the in-flight future is simply dropped, and reqwest/hyper tear down the underlying socket
-    /// as part of that drop, so no connection is leaked) — so both compose their message directly
-    /// ([`Self::mutation_read_timeout_message`] for phase 1,
-    /// [`Self::mutation_post_send_timeout_message`] for phase 2) rather than through `classify`,
-    /// which needs an actual `reqwest::Error` neither kill ever produces. A genuine
-    /// `reqwest::Error` (a real transport failure, not a watchdog kill) still flows through
-    /// `classify` via [`Self::describe_mutation_transport_error`] as before, from either phase.
-    async fn send_with_watchdog(&self,
-                                builder: reqwest::RequestBuilder,
-                                progress: Arc<UploadProgress>,
-                                action: &str,
-                                body_len: usize) -> Result<reqwest::Response, String> {
-        let phase1_budget = self.connect_timeout + UPLOAD_SILENCE_BUDGET;
-        let phase2_budget = phase1_budget + post_send_verify_budget(body_len);
-        let send_fut = builder.send();
-        tokio::pin!(send_fut);
-
-        loop {
-            tokio::select! {
-                result = &mut send_fut => {
-                    return result.map_err(|e| self.describe_mutation_transport_error(action, e));
-                }
-                _ = tokio::time::sleep(UPLOAD_WATCHDOG_POLL_INTERVAL) => {
-                    let exhausted = progress.is_exhausted();
-                    let budget = if exhausted { phase2_budget } else { phase1_budget };
-
-                    if progress.silent_for() >= budget {
-                        return Err(if exhausted {
-                            Self::mutation_post_send_timeout_message(action, phase2_budget)
-                        } else {
-                            Self::mutation_read_timeout_message(action)
-                        });
-                    }
-                }
+    /// Turn a [`clients::WatchdogOutcome`] — the mechanism-level result of
+    /// [`clients::Clients::send_with_watchdog`], which owns bounding the two-phase upload wait
+    /// itself (see that method's own doc for the `phase1_budget`/`phase2_budget` reasoning, review
+    /// rounds S2-F1 through S2-F7) — into this call's own operator-facing error. The four outcomes
+    /// map onto the three composers every other mutation transport failure already goes through:
+    /// [`Self::describe_mutation_transport_error`] for a genuine `reqwest::Error`,
+    /// [`Self::mutation_read_timeout_message`] for a send-phase watchdog kill, and
+    /// [`Self::mutation_post_send_timeout_message`] for a post-send one — a successful send just
+    /// unwraps to the response, status yet unchecked. Kept on `RemoteClient`, not folded into
+    /// [`clients`], for the same reason those three composers are: wording is this type's job, not
+    /// the client module's boundary — see [`clients`]'s own doc.
+    fn response_from_watchdog(&self,
+                              action: &str,
+                              outcome: WatchdogOutcome) -> Result<reqwest::Response, String> {
+        match outcome {
+            WatchdogOutcome::Sent(response) => Ok(response),
+            WatchdogOutcome::Transport(e) => Err(self.describe_mutation_transport_error(action, e)),
+            WatchdogOutcome::SilentDuringSend => Err(Self::mutation_read_timeout_message(action)),
+            WatchdogOutcome::SilentAfterSend { budget } => {
+                Err(Self::mutation_post_send_timeout_message(action, budget))
             }
         }
     }
@@ -1450,7 +1566,8 @@ impl RemoteClient {
     /// Compose a loud, specific error for a `3xx` response to a mutation. Every call site that
     /// reaches this (`upload_object`, `put_presigned`, `update_ref`, `upload_signature`,
     /// `put_trust` — FORK-89 widened this from the original two) goes out on the never-auto-follow
-    /// client ([`Posture::UnboundedNoRedirect`]/[`Posture::WatchdogNoRedirect`]), which never
+    /// client ([`Posture::UnboundedNoRedirect`], or — for `upload_object`/`put_presigned` —
+    /// directly via [`clients::Clients::send_with_watchdog`]), which never
     /// auto-follows *any* redirect status — so this is a local, unconditional invariant
     /// of *this client*, not a claim about how any particular `3xx` happens to behave under a
     /// dependency's redirect matrix. Do not turn it back into one: an earlier version of this doc
@@ -1828,23 +1945,25 @@ impl RemoteClient {
     /// path — for the objects `upload-targets` returns in `direct`, and the whole missing set on
     /// the legacy fallback.
     ///
-    /// The body streams through [`watched_upload_body`]/[`Self::send_with_watchdog`] (FORK-49
-    /// slice 2): a remote that accepts the connection and then never reads the body must not hang
-    /// this call forever, but a per-request *total* deadline would kill a healthy large upload on
-    /// a slow link — the same reasoning [`REMOTE_READ_TIMEOUT`]'s doc gives for the read path,
-    /// applied to the send side instead of the receive side. A remote that reads the whole body
-    /// and then wedges (during the inline hash-verify this endpoint's own doc names above) is
-    /// bounded too — see [`Self::send_with_watchdog`]'s doc for that phase's own, size-scaled
-    /// bound instead of the unbounded wait an earlier version of this fix left it with.
+    /// The body streams through [`clients::Clients::send_with_watchdog`] (FORK-49 slice 2, moved
+    /// off a caller-assembled builder onto this operation by a later slice — see that method's own
+    /// doc for why): a remote that accepts the connection and then never reads the body must not
+    /// hang this call forever, but a per-request *total* deadline would kill a healthy large
+    /// upload on a slow link — the same reasoning [`REMOTE_READ_TIMEOUT`]'s doc gives for the read
+    /// path, applied to the send side instead of the receive side. A remote that reads the whole
+    /// body and then wedges (during the inline hash-verify this endpoint's own doc names above) is
+    /// bounded too — see [`clients::Clients::send_with_watchdog`]'s doc for that phase's own,
+    /// size-scaled bound instead of the unbounded wait an earlier version of this fix left it with.
     pub async fn upload_object(&self, hash: &str, bytes: Vec<u8>) -> Result<(), String> {
         let action = format!("uploading object {}", hash);
-        let progress = UploadProgress::new();
-        let (body, len) = watched_upload_body(bytes, progress.clone());
-        let builder = self.request_on(Posture::WatchdogNoRedirect, reqwest::Method::PUT, &format!("/v1/objects/{}", hash))
-            .header(reqwest::header::CONTENT_LENGTH, len)
-            .body(body);
-
-        let response = self.send_with_watchdog(builder, progress, &action, len).await?;
+        let path = format!("/v1/objects/{}", hash);
+        let outcome = self.clients.send_with_watchdog(
+            self.connect_timeout,
+            UploadDestination::Authenticated { base: &self.base, token: self.token.as_deref(), path: &path },
+            reqwest::Method::PUT,
+            bytes,
+        ).await;
+        let response = self.response_from_watchdog(&action, outcome)?;
 
         if response.status().is_redirection() {
             return Err(Self::describe_mutation_redirect(&action, &response));
@@ -1913,32 +2032,34 @@ impl RemoteClient {
 
     /// Upload one object's bytes straight to a presigned storage URL (a staging `PUT`). The
     /// URL's own signature is the authorization, so this deliberately carries **no** bearer
-    /// token — and because the bearer is attached only inside [`Self::request_on`], never as a
-    /// client default header, going around it via [`Self::client_for`]`(`[`Posture::WatchdogNoRedirect`]`).put(url)`
-    /// (moved off the auto-following client in the fix for the `303` redirect hole) cannot leak
-    /// it to the storage host either, even were the storage host the remote itself: the
-    /// no-auto-follow client is built (in [`Self::new_with_tor`]) with no default headers of its
-    /// own, exactly like the auto-following one.
+    /// token: [`UploadDestination::Presigned`] carries no token field to attach, so
+    /// [`clients::Clients::send_with_watchdog`] structurally cannot attach one — there is no
+    /// `Option<&str>` for a future edit to accidentally start populating on this path, the way
+    /// there would be if this call reused [`UploadDestination::Authenticated`] with the token set
+    /// to `None`. The no-auto-follow client this rides (moved off the auto-following client in the
+    /// fix for the `303` redirect hole) cannot leak it to the storage host either, even were the
+    /// storage host the remote itself: it is built (in [`Self::new_with_tor`]) with no default
+    /// headers of its own, exactly like the auto-following one.
     ///
     /// Same watchdog-guarded body as [`Self::upload_object`] (FORK-49 slice 2) — see that call's
     /// doc. This site is the higher-risk of the two: it dials a different host (object storage,
-    /// not the control plane) and the explicit `Content-Length` [`watched_upload_body`] requires
-    /// the caller to set matters especially here — a presigned S3 `PUT` is signed for a specific
-    /// framing, and `Transfer-Encoding: chunked` (what `reqwest`/hyper fall back to without an
-    /// explicit length on a streamed body) is not it; S3 rejects a chunked presigned `PUT` outright.
+    /// not the control plane) and the explicit `Content-Length`
+    /// [`clients::Clients::send_with_watchdog`] sets internally matters especially here — a
+    /// presigned S3 `PUT` is signed for a specific framing, and `Transfer-Encoding: chunked`
+    /// (what `reqwest`/hyper fall back to without an explicit length on a streamed body) is not
+    /// it; S3 rejects a chunked presigned `PUT` outright.
     async fn put_presigned(&self, url: &str, bytes: Vec<u8>) -> Result<(), String> {
-        let progress = UploadProgress::new();
-        let (body, len) = watched_upload_body(bytes, progress.clone());
-        let builder = self.client_for(Posture::WatchdogNoRedirect).put(url)
-            .header(reqwest::header::CONTENT_LENGTH, len)
-            .body(body);
-
-        let response = self.send_with_watchdog(
-            builder, progress, "uploading to a staging URL", len
-        ).await?;
+        let action = "uploading to a staging URL";
+        let outcome = self.clients.send_with_watchdog(
+            self.connect_timeout,
+            UploadDestination::Presigned { url },
+            reqwest::Method::PUT,
+            bytes,
+        ).await;
+        let response = self.response_from_watchdog(action, outcome)?;
 
         if response.status().is_redirection() {
-            return Err(Self::describe_mutation_redirect("uploading to a staging URL", &response));
+            return Err(Self::describe_mutation_redirect(action, &response));
         }
 
         if !response.status().is_success() {
@@ -3232,7 +3353,7 @@ fn refuse_if_over_ceiling_for_upload(hash: &str, bytes: &[u8]) -> Result<(), Cor
 /// spawned task blocks whichever runtime worker polls that task for however long the read takes.
 /// On the production multi-thread runtime with [`CONCURRENT_TRANSFERS`] (24) workers all
 /// eventually doing this at once, every in-flight upload's body-send stream and its
-/// [`RemoteClient::send_with_watchdog`] loop go unpolled while their worker is pinned here — on
+/// [`clients::Clients::send_with_watchdog`] loop go unpolled while their worker is pinned here — on
 /// the next poll, `select!`'s random branch order can let the watchdog observe a stale
 /// `silent_for()` before the body-send future gets a chance to refresh it, producing a false
 /// "timed out" verdict for a transfer that was never actually silent. `spawn_blocking` moves the
@@ -7263,11 +7384,11 @@ mod tests {
 
     /// `put_presigned` against the same wedged shape must be bounded exactly like `upload_object`
     /// — pins that it is independently wired to the watchdog rather than accidentally covered by
-    /// `upload_object`'s own wiring. It is the higher-risk site: it dials straight through
-    /// `self.client_for(Posture::WatchdogNoRedirect).put(url)`, bypassing the bearer-token-attaching
-    /// `request_on` entirely (no bearer token attached), so nothing about `upload_object`'s
-    /// watchdog wiring guarantees this one got the same fix, even though both now ride the same
-    /// no-auto-follow client for redirect handling.
+    /// `upload_object`'s own wiring. It is the higher-risk site: it calls
+    /// `clients::Clients::send_with_watchdog` with `UploadDestination::Presigned` (no bearer token
+    /// attached, by construction — see that destination variant's own doc), so nothing about
+    /// `upload_object`'s `UploadDestination::Authenticated` wiring guarantees this one got the
+    /// same fix, even though both now ride the same operation and the same no-auto-follow client.
     #[test]
     fn put_presigned_times_out_against_a_wedged_remote() {
         let remote = WedgedUploadRemote::start();
@@ -7835,8 +7956,9 @@ mod tests {
     // streamed `PUT` silently becomes a bare `GET`, and a `2xx` at the target makes the call
     // return `Ok(())` having stored nothing. The 302/307 tests above cannot catch this: a `PUT`
     // simply misses the `method == POST` condition in the other arm. The fix routes both sites
-    // through the never-auto-follow client (today: `Posture::WatchdogNoRedirect`) instead of
-    // special-casing `303`, so no future tower-http redirect-matrix change can reopen this hole.
+    // through the never-auto-follow client (today: `clients::Clients::send_with_watchdog`,
+    // routing around `Posture` entirely) instead of special-casing `303`, so no future
+    // tower-http redirect-matrix change can reopen this hole.
     // -----------------------------------------------------------------------------------
 
     /// A second live listener a redirect can point at: answers any request with a bare `200 OK`
@@ -7894,9 +8016,11 @@ mod tests {
         );
     }
 
-    /// Same hole, `upload_object` site — the two client selections in the fix (`upload_object` →
-    /// the never-auto-follow client via `request_on`, `put_presigned` → the never-auto-follow
-    /// client via `client_for`) change independently, so each needs its own falsifier.
+    /// Same hole, `upload_object` site — both call sites now reach the same
+    /// `clients::Clients::send_with_watchdog` operation and the same no-auto-follow client, but
+    /// each builds its own `UploadDestination` (`Authenticated` here, `Presigned` for
+    /// `put_presigned`) and could in principle regress independently of the other, so each keeps
+    /// its own falsifier rather than trusting `put_presigned`'s test to cover this site too.
     #[test]
     fn upload_object_does_not_follow_a_303_to_a_2xx_landing() {
         let (landing_url, landed) = start_landing_remote();
