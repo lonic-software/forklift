@@ -237,6 +237,27 @@ impl Drop for Server {
     }
 }
 
+/// Send a bodyless raw GET and return `(status line, response body)` — the GET counterpart of
+/// `http_post_json`, used where a test needs to check the refusal's wording, not just its status.
+fn http_get(server_url: &str, path: &str) -> (String, String) {
+    let address = server_url.strip_prefix("http://").unwrap();
+    let mut stream = std::net::TcpStream::connect(address).unwrap();
+
+    write!(
+        stream,
+        "GET {} HTTP/1.1\r\nHost: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        path, address
+    ).unwrap();
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+
+    let status = response.lines().next().unwrap_or_default().to_string();
+    let body = response.split("\r\n\r\n").nth(1).unwrap_or_default().to_string();
+
+    (status, body)
+}
+
 /// Send a bodyless raw HTTP request and return the response's status line.
 fn http_status(server_url: &str, method: &str, path: &str, token: Option<&str>) -> String {
     let address = server_url.strip_prefix("http://").unwrap();
@@ -3748,10 +3769,22 @@ fn the_subtree_endpoint_refuses_an_oversized_closure_and_the_client_falls_back()
     // one over the cap.
     let head = build_wide_subtree(&area.path("server-root"), "big", 10_000);
 
-    // The server refuses with 422, not a streamed bundle.
-    let status = http_status(&server.url, "GET", &format!("/v1/parcels/{}/subtree/big", head), None);
+    // The server refuses with 422, not a streamed bundle — same status and wording whether the
+    // walk is bounded internally (the fix) or only checked after it completes (the defect this
+    // guards): the cap changes what the walk pays for, never what the caller observes.
+    let (status, body) = http_get(&server.url, &format!("/v1/parcels/{}/subtree/big", head));
     assert_eq!(status, "HTTP/1.1 422 Unprocessable Entity",
         "an oversized subtree closure is refused, not streamed");
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        json["error"],
+        serde_json::json!(format!(
+            "The subtree at \"big\" has more than {} objects; fetch it with the hash-addressed \
+            walk instead.",
+            forklift_core::model::remote::MAX_MISSING_BATCH
+        )),
+        "unexpected refusal body: {}", body
+    );
 
     // The client treats that 422 exactly like a 404: `Ok(None)`, the fallback signal.
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();

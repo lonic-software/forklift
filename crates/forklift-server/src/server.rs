@@ -1193,7 +1193,7 @@ async fn get_subtree(State(state): State<Arc<AppState>>,
             .map_err(|_| (StatusCode::NOT_FOUND, format!("No parcel {} exists.", parcel)))?
             .tree_hash;
 
-        let closure = tree_utils::collect_subtree_closure(&root, &path)
+        let outcome = tree_utils::collect_subtree_closure(&root, &path, MAX_MISSING_BATCH)
             .map_err(internal)?
             .ok_or_else(|| (StatusCode::NOT_FOUND, format!("No subtree at \"{}\" in {}.", path, parcel)))?;
 
@@ -1202,13 +1202,20 @@ async fn get_subtree(State(state): State<Arc<AppState>>,
         // empty path (the whole tree) is exactly the request expected to blow this cap on a big
         // repo — that is the correct outcome: the client falls back to the hash-addressed walk,
         // the same fallback a 404 already triggers, so a 422 here reuses that exact path.
-        if closure.len() > MAX_MISSING_BATCH {
-            return Err(unprocessable(format!(
-                "The subtree at \"{}\" has more than {} objects; fetch it with the hash-addressed \
-                walk instead.",
-                path, MAX_MISSING_BATCH
-            )));
-        }
+        //
+        // The cap bounds the walk itself, not just this check: `collect_subtree_closure` aborts
+        // as soon as the closure exceeds it, so an oversized subtree is refused without first
+        // loading every tree and blob beneath it.
+        let closure = match outcome {
+            tree_utils::SubtreeClosure::Overflowed => {
+                return Err(unprocessable(format!(
+                    "The subtree at \"{}\" has more than {} objects; fetch it with the \
+                    hash-addressed walk instead.",
+                    path, MAX_MISSING_BATCH
+                )));
+            }
+            tree_utils::SubtreeClosure::Complete(closure) => closure,
+        };
 
         bundle_utils::build_partial_bundle(&closure).map_err(internal)
     }).await;
