@@ -6612,10 +6612,10 @@ mod tests {
     /// no total deadline needed. `fetch_info_times_out_against_a_silent_remote` above establishes
     /// exactly this: `fetch_info` rides `Posture::BoundedReads` (no `TotalDeadline` payload
     /// anywhere in the picture) against this same [`SilentRemote`] fixture and asserts both a
-    /// genuine timeout and the effective 15s budget that produced it. So this test would have
-    /// stayed green through the defect this PR fixes (`resolve` riding `BoundedReads` with no
-    /// total bound) — it is real regression coverage (a fully-unbounded posture, or a dropped
-    /// bound entirely, still fails it), just not *that* regression's own falsifying test.
+    /// genuine timeout and the effective 15s budget that produced it. So this test would stay
+    /// green even if `resolve`'s call site rode `Posture::BoundedReads` with no total bound at
+    /// all — it is real coverage (a fully-unbounded posture, or a dropped bound entirely, still
+    /// fails it), just not the falsifying test for that specific call-site choice.
     /// `resolve_gives_up_on_a_remote_that_never_stops_trickling` below is: it calls `resolve`
     /// itself against a remote that never goes silent at all, the one shape a silence budget
     /// structurally cannot catch and a total deadline must.
@@ -6772,39 +6772,65 @@ mod tests {
     /// its clock on every byte; within this test's observation window such a call never returns
     /// at all, which is why the outer `tokio::time::timeout` below exists as a backstop.
     ///
-    /// **A bare "returned before the outer ceiling" check does not pin *when*.** A call site
-    /// that hardcodes a flat, connect-timeout-blind budget — e.g.
-    /// `Posture::TotalDeadline(REMOTE_READ_TIMEOUT)` alone, dropping the `self.connect_timeout`
-    /// fold-in `resolve_budget()` exists to apply — would still return comfortably inside a
-    /// generous ceiling, just too early: the same call-site-versus-mechanism gap
+    /// **A bare "returned before the outer ceiling" check does not pin *when*, and a shallow
+    /// margin does not survive a second rival.** Two distinct call-site defects both ignore
+    /// `self.connect_timeout`: hardcoding `Posture::TotalDeadline(REMOTE_READ_TIMEOUT)` alone
+    /// (10s, connect-blind) is one; hardcoding
+    /// `Posture::TotalDeadline(REMOTE_CONNECT_TIMEOUT + REMOTE_READ_TIMEOUT)` (15s — folds in *a*
+    /// connect budget, just never `self`'s own) is a second, closer one. Both must fail this
+    /// test — the same call-site-versus-mechanism gap
     /// `missing_objects_times_out_against_a_silent_remote` guards against for `missing_objects`,
-    /// applied here to `resolve`. [`RemoteClient::new_test_with_connect_timeout`] injects a 6s
-    /// `connect_timeout`, so the true budget (`6s + REMOTE_READ_TIMEOUT` = 16s) sits 6s clear of
-    /// that flat 10s rival — `REMOTE_READ_TIMEOUT` itself is a fixed module constant no test can
-    /// shrink. Six seconds of separation is generous against this file's own measured timer
-    /// precision (`resolve_times_out_against_a_silent_remote`'s doc records an observed 15.003s
-    /// against a 15s deadline — single-digit milliseconds of overshoot, not the fraction of a
-    /// second this margin needs to absorb). `elapsed` is asserted on both sides: `lower_bound`
-    /// (13s, the midpoint between the flat rival and the true budget) rules out an early return
-    /// for an unrelated reason — a stray parse failure, say — passing this test for free;
-    /// `upper_bound` (19s, 3s past the true budget) keeps a pass meaning "terminated near the
-    /// right value," not merely "terminated before a distant ceiling."
+    /// applied here to `resolve`.
+    ///
+    /// The injected `connect_timeout` is chosen by the discipline
+    /// `resolve_budget_reads_this_field_not_a_rival_constant`'s own doc states: checked against
+    /// the full pairwise-sum set of every named `Duration` in this module, not merely the two
+    /// rivals named above. That domain — production constants plus every sibling test's own
+    /// sentinel — is `{0.2 (COMMIT_BACKOFF_START/UPLOAD_WATCHDOG_POLL_INTERVAL), 2
+    /// (POST_SEND_VERIFY_BASE), 3 (COMMIT_BACKOFF_CAP), 5 (REMOTE_CONNECT_TIMEOUT), 7
+    /// (`error_body_budget`'s own sentinel), 10 (REMOTE_READ_TIMEOUT/ERROR_BODY_READ_TIMEOUT/
+    /// UPLOAD_SILENCE_BUDGET), 11 (`resolve_budget`'s own sentinel), 13
+    /// (`presence_negotiation_budget`'s own sentinel), 60 (REMOTE_CONNECT_TIMEOUT_TOR/
+    /// FETCH_OBJECT_READ_TIMEOUT)}`. Its only fractional member is 0.2, so every two-term sum
+    /// drawn from it lands on a `.0`, `.2`, or `.4` second boundary — never `.5`. Choosing
+    /// `connect_timeout` (12.5s) and the resulting true budget (22.5s) on that half-second
+    /// boundary is therefore *provably* clear of the entire pairwise-sum set, not merely
+    /// checked-and-lucky against today's snapshot of it: no future addition to this domain that
+    /// keeps 0.2 as its only fractional member can ever land on either value.
+    ///
+    /// **Margins:** the true budget (22.5s) sits 7.5s past the connect-blind rival (15s) and
+    /// 12.5s past the flat rival (10s). `lower_bound` (18.75s) is the midpoint between the true
+    /// budget and the nearer, more dangerous of the two rivals — which clears the flat rival for
+    /// free, since it sits even farther below. There is no named rival *above* 22.5s that
+    /// `hard_ceiling` (37.5s) does not already exclude: the next candidate, a Tor-blind
+    /// `REMOTE_CONNECT_TIMEOUT_TOR + REMOTE_READ_TIMEOUT` (70s), blows straight through
+    /// `hard_ceiling` and fails loudly as a hang, so no separate upper-bound assertion earns its
+    /// keep here (contrast `missing_objects_times_out_against_a_silent_remote`, whose own
+    /// `upper_bound` excludes a *named* rival its hard ceiling would not otherwise catch).
+    ///
+    /// **Accepted residual, not engineered around:** `error_body_budget(x)` and
+    /// `resolve_budget(x)` are `x + ERROR_BODY_READ_TIMEOUT` and `x + REMOTE_READ_TIMEOUT`
+    /// respectively, and `ERROR_BODY_READ_TIMEOUT == REMOTE_READ_TIMEOUT` (both 10s) — so the
+    /// two functions return numerically identical values for every `x`, including this test's
+    /// own `connect_timeout`. No injected value can separate them; this fixture does not
+    /// attempt to. A call site that silently called `error_body_budget` where `resolve_budget`
+    /// belongs would pass this test undetected — a live, unexploited gap, not a covered one.
     ///
     /// `total_bytes` (100) at the 500ms gap makes the full trickle 50s: comfortably longer than
-    /// `hard_ceiling` (31s), so the fixture is still writing when the ceiling would fire — not
+    /// `hard_ceiling` (37.5s), so the fixture is still writing when the ceiling would fire — not
     /// literally unbounded, just sized well past this test's own horizon. If the deadline were
     /// silently dropped, or the call site rewired onto `Posture::BoundedReads`, the outer
-    /// `tokio::time::timeout` — not either assertion below it — is what catches it, loudly,
-    /// rather than the test quietly hanging the suite.
+    /// `tokio::time::timeout` — not the assertion below it — is what catches it, loudly, rather
+    /// than the test quietly hanging the suite.
     #[test]
     fn resolve_gives_up_on_a_remote_that_never_stops_trickling() {
         let url = start_continuously_trickling_remote(100, std::time::Duration::from_millis(500));
-        let connect_timeout = std::time::Duration::from_secs(6);
+        let connect_timeout = std::time::Duration::from_millis(12_500);
         let client = RemoteClient::new_test_with_connect_timeout(&url, connect_timeout);
         let true_budget = connect_timeout + TEST_TIGHT_READ_TIMEOUT;
-        let rival_flat_budget = TEST_TIGHT_READ_TIMEOUT;
-        let lower_bound = rival_flat_budget + (true_budget - rival_flat_budget) / 2;
-        let upper_bound = true_budget + std::time::Duration::from_secs(3);
+        let rival_connect_blind_budget = TEST_DIRECT_CONNECT_TIMEOUT + TEST_TIGHT_READ_TIMEOUT;
+        let lower_bound = rival_connect_blind_budget
+            + (true_budget - rival_connect_blind_budget) / 2;
         let hard_ceiling = true_budget + std::time::Duration::from_secs(15);
 
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -6828,18 +6854,11 @@ mod tests {
 
         assert!(
             elapsed >= lower_bound,
-            "elapsed {:?} is under {:?} (the midpoint between the flat rival budget {:?} and \
-            the true budget {:?}) — resolve returned close to a call site that ignores \
-            self.connect_timeout and rides a flat REMOTE_READ_TIMEOUT alone, not \
-            resolve_budget()'s own connect-timeout-folded value",
-            elapsed, lower_bound, rival_flat_budget, true_budget
-        );
-        assert!(
-            elapsed <= upper_bound,
-            "elapsed {:?} exceeds {:?} ({:?} past the true budget {:?}) — resolve took \
-            meaningfully longer than its own total deadline to give up, so this pass would not \
-            actually certify termination near resolve_budget()'s value",
-            elapsed, upper_bound, upper_bound.saturating_sub(true_budget), true_budget
+            "elapsed {:?} is under {:?} (the midpoint between the connect-blind rival budget \
+            {:?} and the true budget {:?}) — resolve returned close to a call site that \
+            hardcodes REMOTE_CONNECT_TIMEOUT + REMOTE_READ_TIMEOUT instead of folding in \
+            self.connect_timeout via resolve_budget()",
+            elapsed, lower_bound, rival_connect_blind_budget, true_budget
         );
     }
 
