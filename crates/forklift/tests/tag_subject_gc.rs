@@ -305,6 +305,72 @@ fn a_signed_tag_subject_is_collected_after_undo_moves_the_head_back() {
     );
 }
 
+/// Build a warehouse holding a tag `"v1.0"` whose subject alone occupies its fan-out
+/// directory (its own `.sig` sidecar aside) — the precondition
+/// `tag_list_and_show_fail_loudly_and_name_the_tag_when_the_probe_is_indeterminate` needs
+/// before it can revoke that directory's permissions and mean only the subject by it.
+///
+/// `tag create` does not only touch the subject: it also stores the `@tags` parcel itself,
+/// the tree chain leading to it (`.forklift`, `tracked`, `tags`), and the tag record blob —
+/// each a distinct object, each landing in a fan-out directory keyed by ITS OWN hash, which by
+/// pure hash coincidence (~1-in-256 per object) can be the same two-hex-character directory as
+/// the subject. When that happens, revoking the directory collaterally blocks that other
+/// object too, and since `tag_utils::read_tags` reads the parcel/tree chain/record blob with a
+/// bare `?` before it has parsed any tag name at all, a collision there makes `tag
+/// list`/`show` fail with the raw, anonymous loose-object-read error instead of
+/// `probe_subject`'s tag-naming one — a fixture-caused false red. Confirmed directly (not
+/// merely suspected): forcing this collision reproduces `Error while reading object from file
+/// "…/<hash>": Permission denied (os error 13)` verbatim, with no "v1.0" in it anywhere; the
+/// colliding object varies by run (observed once as the @tags parcel's own intermediate tree
+/// object) — any object `read_tags` walks can be the one.
+///
+/// Retries with fresh content on collision, up to `MAX_ATTEMPTS` times: a tag name is
+/// immutable, so the same warehouse cannot retry the same name, and each attempt therefore
+/// rebuilds a fresh warehouse (`Warehouse::new` wipes its own temp directory). Checked right
+/// after `tag create` returns — the point the precondition must hold — and before anything
+/// touches permissions. Bounded and loud on exhaustion rather than looping forever or silently
+/// proceeding with a directory that is not actually exclusive.
+fn warehouse_with_an_exclusive_tag_subject(name: &str) -> (Warehouse, String) {
+    const MAX_ATTEMPTS: usize = 500;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let warehouse = Warehouse::new(name);
+        let head = warehouse.stack("app.txt", &format!("v1-attempt-{}\n", attempt), "first");
+        warehouse.run_ok(&["tag", "create", "v1.0", &head, "-m", "release"]);
+
+        let fan_out_dir = warehouse.root.join(".forklift").join("objects").join(&head[..2]);
+        let subject_suffix = head[2..].to_string();
+        let sig_suffix = format!("{}.sig", subject_suffix);
+
+        let entries: Vec<String> = std::fs::read_dir(&fan_out_dir)
+            .unwrap_or_else(|error| panic!("could not list {}: {}", fan_out_dir.display(), error))
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+
+        let foreign: Vec<&String> = entries.iter()
+            .filter(|entry| entry.as_str() != subject_suffix && entry.as_str() != sig_suffix)
+            .collect();
+
+        if foreign.is_empty() {
+            return (warehouse, head);
+        }
+
+        println!(
+            "PROBE-FAILURE FIXTURE: attempt {} collided — {} foreign object(s) share the \
+            subject's fan-out directory {}: {:?}; rebuilding with different content",
+            attempt, foreign.len(), fan_out_dir.display(), foreign
+        );
+    }
+
+    panic!(
+        "could not build a tag subject with an exclusive fan-out directory in {} attempts; \
+        the fixture's collision precondition should hold within a handful of tries at roughly \
+        1-in-256 odds per @tags object — this many consecutive collisions points at something \
+        other than chance",
+        MAX_ATTEMPTS
+    );
+}
+
 /// `tag list`/`tag show`'s presence probe (`file_utils::does_object_exist`) can fail for a
 /// reason other than "the subject is not here": the loose-object read itself can error. That is
 /// a genuinely different answer from a definite absence, and must not be folded into
@@ -326,20 +392,45 @@ fn a_signed_tag_subject_is_collected_after_undo_moves_the_head_back() {
 /// probe in that case at all. The I/O failure this test builds instead exercises the identical
 /// contract the fix adds — propagate an indeterminate probe, naming the tag, rather than
 /// mislabel it — through the same function both commands call (`probe_subject`).
+///
+/// PRECONDITION — the subject must be the *only* object in its fan-out directory (its own
+/// `.sig` sidecar aside) before permissions are revoked. `tag create` writes more than the
+/// subject: the `@tags` parcel, the tree chain leading to it, and the tag record blob are each
+/// distinct objects that land in fan-out directories keyed by their OWN hash, and by pure
+/// hash coincidence (~1-in-256 per object) one of them can land in the SAME directory as the
+/// subject. `tag_utils::read_tags` reads that parcel/tree chain/record blob with a bare `?`
+/// before it has parsed any tag name at all, so when the collateral object is what the
+/// revoked directory blocks, `read_tags` fails first with the raw, anonymous loose-object-read
+/// error — never reaching `probe_subject`, so the failure never names "v1.0" and this test
+/// goes red for a reason that has nothing to do with the contract under test. This is not
+/// theoretical: two 2026-08-01 CI runs hit exactly this anonymous failure on two different
+/// hash prefixes, and forcing the collision deliberately reproduces it verbatim (see
+/// `warehouse_with_an_exclusive_tag_subject`, which this test uses to build a warehouse where
+/// the precondition provably holds, retrying with fresh content — bounded, and loud on
+/// exhaustion — until the subject's fan-out directory is exclusive to it).
 #[cfg(unix)]
 #[test]
 fn tag_list_and_show_fail_loudly_and_name_the_tag_when_the_probe_is_indeterminate() {
     use std::os::unix::fs::PermissionsExt;
 
-    let warehouse = Warehouse::new("probe-failure");
-
-    let head = warehouse.stack("app.txt", "v1\n", "first");
-    warehouse.run_ok(&["tag", "create", "v1.0", &head, "-m", "release"]);
+    let (warehouse, head) = warehouse_with_an_exclusive_tag_subject("probe-failure");
 
     // The loose object's one-level fan-out directory (`file_utils::get_path_for_object`: the
     // first 2 hex chars of the hash name it). Revoking access here makes `std::fs::exists`
     // return `Err` instead of `Ok(false)` — the store cannot say whether the object is there.
+    // `warehouse_with_an_exclusive_tag_subject` has already established that the subject (and
+    // its `.sig` sidecar) are the only things this revoke can collaterally touch.
     let fan_out_dir = warehouse.root.join(".forklift").join("objects").join(&head[..2]);
+
+    // Captured while the directory is still readable, purely as a diagnostic: if the
+    // tag-naming assertions below fail anyway, for a reason other than the collision this
+    // fixture now guards against, this dump (plus the subject hash) makes a future occurrence
+    // self-diagnosing instead of another anonymous report.
+    let fan_out_contents_before_revoke: Vec<String> = std::fs::read_dir(&fan_out_dir)
+        .unwrap_or_else(|error| panic!("could not list {}: {}", fan_out_dir.display(), error))
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+
     std::fs::set_permissions(&fan_out_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
 
     let list = warehouse.run(&["tag", "list"]);
@@ -412,16 +503,21 @@ fn tag_list_and_show_fail_loudly_and_name_the_tag_when_the_probe_is_indeterminat
     );
 
     // THE NEW ASSERTION: the failure names the tag, so a user can find the offending record —
-    // round 1's error was anonymous (`does_object_exist`'s raw message alone).
+    // round 1's error was anonymous (`does_object_exist`'s raw message alone). If this ever
+    // fails despite `warehouse_with_an_exclusive_tag_subject`'s precondition, the failure
+    // message below dumps the subject hash and the fan-out directory's pre-revoke contents so
+    // the occurrence is self-diagnosing rather than another anonymous report.
     assert!(
         stderr.contains("v1.0"),
-        "`tag list`'s failure must name the affected tag \"v1.0\"; stderr: {}",
-        stderr
+        "`tag list`'s failure must name the affected tag \"v1.0\"; stderr: {} (subject {}; \
+        fan-out dir {} held {:?} before permissions were revoked)",
+        stderr, head, fan_out_dir.display(), fan_out_contents_before_revoke
     );
     assert!(
         show_stderr.contains("v1.0"),
-        "`tag show`'s failure must name the affected tag \"v1.0\"; stderr: {}",
-        show_stderr
+        "`tag show`'s failure must name the affected tag \"v1.0\"; stderr: {} (subject {}; \
+        fan-out dir {} held {:?} before permissions were revoked)",
+        show_stderr, head, fan_out_dir.display(), fan_out_contents_before_revoke
     );
 }
 
