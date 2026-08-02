@@ -557,19 +557,33 @@ pub(crate) const PRESENCE_ALLOWANCE_MS_PER_OP: f64 = 5.0;
 /// runs the authentication and admission hooks — each capped at [`HOOK_CLIENT_TIMEOUT`], the
 /// server's own flat per-hook budget, imported rather than mirrored so this figure cannot drift
 /// out of sync with what the server actually allows — after the body is fully buffered (Axum's
-/// `Bytes` extractor buffers the whole body before the handler runs), plus a flat office read and
-/// an atomic sidecar write. `put_trust`'s server side (`put_trust`, `forklift-server`) runs one
-/// such hook plus an anchor read/write under the warehouse write lock. One shared constant covers
-/// both calls: `2 * HOOK_CLIENT_TIMEOUT` prices the costlier of the two (`upload_signature`'s pair
-/// of hooks) so the same value is never tight for either; the flat 5s on top is dispatch and disk
-/// margin, not a third hook's worth of budget.
+/// `Bytes` extractor buffers the whole body before the handler runs). `put_trust`'s server side
+/// (`put_trust`, `forklift-server`) runs one such hook plus an anchor read/write under the
+/// warehouse write lock. One shared constant covers both calls: `2 * HOOK_CLIENT_TIMEOUT` prices
+/// the costlier of the two (`upload_signature`'s pair of hooks) so the same value is never tight
+/// for either.
 ///
-/// **Accepted residual, not priced in here:** `put_trust` additionally holds `warehouse.writes` —
-/// the same mutex the ref-update handler holds across closure verification, ancestry and the
-/// office-chain verify, work this module elsewhere documents can legitimately run minutes — for
-/// the whole of its handler. A first-contact `put_trust` racing another client's long first lift
-/// on the same warehouse can exceed this budget regardless of its size; see
-/// [`RemoteClient::put_trust`]'s own doc for why that residual is accepted rather than absorbed.
+/// The flat 5s on top covers the boundable remainder — request dispatch, the atomic sidecar or
+/// anchor write and its fsync — and nothing more. It is deliberately not sized to absorb the
+/// residuals below, because none of them has a bound a flat number could absorb.
+///
+/// **Residuals this arithmetic does not price, and cannot:**
+///
+/// - `put_trust` holds `warehouse.writes` for the whole of its handler — the same mutex the
+///   ref-update handler holds across closure verification, ancestry and the office-chain verify,
+///   work this module elsewhere documents can legitimately run minutes. A first-contact `put_trust`
+///   racing another client's long first lift on the same warehouse exceeds this budget regardless
+///   of its size; see [`RemoteClient::put_trust`]'s own doc for why that is accepted.
+/// - `upload_signature`'s handler reaches `office_utils::read_office_state`, which loads one object
+///   per user record and one per key record. That is O(roster), not the O(constant) file I/O an
+///   earlier version of this doc claimed — a large roster shifts it without bound.
+/// - Both handlers run their work on the shared `spawn_blocking` pool, the same pool the
+///   minutes-long ref-update verification occupies. Queue wait there is unbounded and is not a
+///   quantity either side can price.
+///
+/// The consequence of any of these is a mutation reported as uncertain-outcome when it in fact
+/// succeeded. Both endpoints are idempotent, so the recovery is an ordinary retry — but a retry
+/// against the *same* condition fails identically, since this budget is fixed rather than adaptive.
 const SINGLE_WRITE_ALLOWANCE: std::time::Duration = std::time::Duration::from_secs(
     2 * HOOK_CLIENT_TIMEOUT.as_secs() + 5
 );
@@ -2515,12 +2529,21 @@ impl RemoteClient {
     /// `single_write_budget_reads_this_field_not_a_rival_constant` in the test module. 30s direct,
     /// 85s over Tor.
     ///
-    /// Sound as a *total*, non-resetting deadline for exactly the reason [`SINGLE_WRITE_ALLOWANCE`]'s
-    /// own doc gives: both calls' server sides run a bounded, known-shape sequence — a fixed
-    /// number of capped hooks plus O(constant) file I/O — after the body is already in hand, not
-    /// a derived quantity like `update_ref`'s audit walk. `put_trust`'s own doc records the one
-    /// residual this arithmetic does not price in (the shared warehouse write lock); nothing else
-    /// in either call's server side is unpriced here.
+    /// Sound as a *total*, non-resetting deadline for the reason [`SINGLE_WRITE_ALLOWANCE`]'s own
+    /// doc gives: the dominant term on both calls' server sides is a fixed number of individually
+    /// capped hooks, run after the body is already in hand — not a derived quantity like
+    /// `update_ref`'s audit walk, which is why that call stays unbounded and these two do not.
+    ///
+    /// It is *not* the whole of either server side, and [`SINGLE_WRITE_ALLOWANCE`]'s doc lists the
+    /// terms this arithmetic leaves as residuals rather than prices. Read that list before
+    /// treating this budget as a ceiling on anything but the hook sequence.
+    ///
+    /// One consequence worth knowing at the call sites: a per-request total deadline spans the
+    /// *error body* read too, so [`Self::error_of`]'s own budget is not the binding one once the
+    /// server has already spent most of this. A refusal that arrives very late in the budget can
+    /// have its body cut off, degrading a typed refusal code and its recovery guidance to the bare
+    /// canonical status reason. Both calls were unbounded before, so that body always arrived;
+    /// this is a real change, accepted because the alternative is the indefinite hang.
     fn single_write_budget(&self) -> std::time::Duration {
         self.connect_timeout + SINGLE_WRITE_ALLOWANCE
     }
@@ -7806,10 +7829,16 @@ mod tests {
 
         assert_eq!(
             client.single_write_budget(),
-            SENTINEL_CONNECT_TIMEOUT + SINGLE_WRITE_ALLOWANCE,
-            "single_write_budget must fold in *this instance's* connect_timeout — a value neither \
-            RemoteClient::new (5s) nor RemoteClient::new_with_tor under TorMode::On (60s) can ever \
-            produce, so this cannot pass by coincidentally matching a hardcoded rival constant"
+            std::time::Duration::from_secs(34),
+            "single_write_budget must be this instance's 9s connect_timeout plus the 25s \
+            allowance. The expected value is a literal, deliberately, and not \
+            `SENTINEL_CONNECT_TIMEOUT + SINGLE_WRITE_ALLOWANCE`: written symbolically, a change to \
+            the allowance's own arithmetic moves both sides of this assertion together and every \
+            budget test in this module stays green — including a halving of the hook allowance, \
+            which is the under-pricing direction that turns a healthy slow write into an \
+            unresolvable uncertain-outcome error. Measured: that mutant left 114 of 114 tests \
+            passing before this literal was introduced. 34s also separates from the two rivals a \
+            hardcoded production connect_timeout would produce, 30s and 85s"
         );
     }
 
