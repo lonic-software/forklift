@@ -6784,37 +6784,61 @@ mod tests {
     ///
     /// The injected `connect_timeout` is chosen by the discipline
     /// `resolve_budget_reads_this_field_not_a_rival_constant`'s own doc states: checked against
-    /// the full pairwise-sum set of every named `Duration` in this module, not merely the two
-    /// rivals named above. That domain — production constants plus every sibling test's own
-    /// sentinel — is `{0.2 (COMMIT_BACKOFF_START/UPLOAD_WATCHDOG_POLL_INTERVAL), 2
-    /// (POST_SEND_VERIFY_BASE), 3 (COMMIT_BACKOFF_CAP), 5 (REMOTE_CONNECT_TIMEOUT), 7
-    /// (`error_body_budget`'s own sentinel), 10 (REMOTE_READ_TIMEOUT/ERROR_BODY_READ_TIMEOUT/
-    /// UPLOAD_SILENCE_BUDGET), 11 (`resolve_budget`'s own sentinel), 13
-    /// (`presence_negotiation_budget`'s own sentinel), 60 (REMOTE_CONNECT_TIMEOUT_TOR/
-    /// FETCH_OBJECT_READ_TIMEOUT)}`. Its only fractional member is 0.2, so every two-term sum
-    /// drawn from it lands on a `.0`, `.2`, or `.4` second boundary — never `.5`. Choosing
-    /// `connect_timeout` (12.5s) and the resulting true budget (22.5s) on that half-second
-    /// boundary is therefore *provably* clear of the entire pairwise-sum set, not merely
-    /// checked-and-lucky against today's snapshot of it: no future addition to this domain that
-    /// keeps 0.2 as its only fractional member can ever land on either value.
+    /// the full pairwise-sum set of every named `Duration` **constant** in this module (not
+    /// every named `Duration` — plenty of test-local `Duration` variables exist outside this
+    /// set; only the constants a call-site mutation could plausibly hardcode are the relevant
+    /// domain), not merely the two rivals named above. That domain — production constants plus
+    /// every sibling test's own sentinel — is `{0.2
+    /// (COMMIT_BACKOFF_START/UPLOAD_WATCHDOG_POLL_INTERVAL), 2 (POST_SEND_VERIFY_BASE), 3
+    /// (COMMIT_BACKOFF_CAP), 5 (REMOTE_CONNECT_TIMEOUT), 7 (`error_body_budget`'s own sentinel),
+    /// 10 (REMOTE_READ_TIMEOUT/ERROR_BODY_READ_TIMEOUT/UPLOAD_SILENCE_BUDGET), 11
+    /// (`resolve_budget`'s own sentinel), 13 (`presence_negotiation_budget`'s own sentinel), 60
+    /// (REMOTE_CONNECT_TIMEOUT_TOR/FETCH_OBJECT_READ_TIMEOUT)}`. Its only fractional member is
+    /// 0.2, so every two-term sum drawn from it lands on a `.0`, `.2`, or `.4` second boundary —
+    /// never `.5`. Choosing `connect_timeout` (12.5s) and the resulting true budget (22.5s) on
+    /// that half-second boundary is therefore *provably* clear of exactly equalling any member
+    /// of that pairwise-sum set, not merely checked-and-lucky against today's snapshot of it.
     ///
-    /// **Margins:** the true budget (22.5s) sits 7.5s past the connect-blind rival (15s) and
-    /// 12.5s past the flat rival (10s). `lower_bound` (18.75s) is the midpoint between the true
-    /// budget and the nearer, more dangerous of the two rivals — which clears the flat rival for
-    /// free, since it sits even farther below. There is no named rival *above* 22.5s that
-    /// `hard_ceiling` (37.5s) does not already exclude: the next candidate, a Tor-blind
-    /// `REMOTE_CONNECT_TIMEOUT_TOR + REMOTE_READ_TIMEOUT` (70s), blows straight through
-    /// `hard_ceiling` and fails loudly as a hang, so no separate upper-bound assertion earns its
-    /// keep here (contrast `missing_objects_times_out_against_a_silent_remote`, whose own
-    /// `upper_bound` excludes a *named* rival its hard ceiling would not otherwise catch).
+    /// **Margins, stated precisely — what this excludes and what it does not.** The true budget
+    /// (22.5s) sits 7.5s past the connect-blind rival (15s) and 12.5s past the flat rival
+    /// (10s). `lower_bound` (18.75s) is the midpoint between the true budget and the nearer,
+    /// more dangerous of the two — which clears the flat rival for free, since it sits even
+    /// farther below — so this assertion excludes every rival *at or below* 18.75s. Above the
+    /// true budget, `hard_ceiling` (37.5s) excludes every rival that does not also make this
+    /// call finish before it fires: the next named candidate, a Tor-blind
+    /// `REMOTE_CONNECT_TIMEOUT_TOR + REMOTE_READ_TIMEOUT` (70s), blows straight through it and
+    /// fails loudly as a hang, so no separate upper-bound assertion earns its keep here
+    /// (contrast `missing_objects_times_out_against_a_silent_remote`, whose own `upper_bound`
+    /// excludes a *named* rival its hard ceiling would not otherwise catch).
     ///
-    /// **Accepted residual, not engineered around:** `error_body_budget(x)` and
-    /// `resolve_budget(x)` are `x + ERROR_BODY_READ_TIMEOUT` and `x + REMOTE_READ_TIMEOUT`
-    /// respectively, and `ERROR_BODY_READ_TIMEOUT == REMOTE_READ_TIMEOUT` (both 10s) — so the
-    /// two functions return numerically identical values for every `x`, including this test's
-    /// own `connect_timeout`. No injected value can separate them; this fixture does not
-    /// attempt to. A call site that silently called `error_body_budget` where `resolve_budget`
-    /// belongs would pass this test undetected — a live, unexploited gap, not a covered one.
+    /// **What is left uncovered: the band (18.75s, 22.5s) itself, not engineered around.** Two
+    /// more members of the same pairwise-sum set enumerated above sit inside it — 20s
+    /// (`REMOTE_READ_TIMEOUT + ERROR_BODY_READ_TIMEOUT`, equally
+    /// `REMOTE_READ_TIMEOUT + UPLOAD_SILENCE_BUDGET`, since all three are 10s) and 21s. A call
+    /// site hardcoding either sum is still connect-blind — still the defect class this test
+    /// exists to catch — and returns inside the band, undetected. Closing it at this
+    /// `connect_timeout` is not worth the cost: tightening `lower_bound` to clear 21s leaves
+    /// only ~1.25s of slack before the true budget, materially flakier than the ~4s
+    /// `missing_objects_times_out_against_a_silent_remote` keeps. Closing it by relocating the
+    /// true budget instead costs far more than that: the next domain gap wide enough to hold a
+    /// comparable margin on both sides sits at (26s, 60s], which would push `connect_timeout`
+    /// past 35s and this test's own runtime past 45s — to exclude two mutants with no
+    /// plausible code shape (summing two semantically unrelated timeout constants) that the two
+    /// *named*, independently red-verified mutants above do not stand in for. This fixture
+    /// proves the call site is not connect-blind against the two mutants actually run; it does
+    /// not prove the absence of every numerically-coincidental connect-blind sum drawable from a
+    /// nine-constant domain, and does not attempt to.
+    ///
+    /// **Accepted residual, not engineered around:** `REMOTE_READ_TIMEOUT`,
+    /// `ERROR_BODY_READ_TIMEOUT`, and `UPLOAD_SILENCE_BUDGET` are all exactly 10s, so any
+    /// `x + <one of these>` — `resolve_budget(x)`, `error_body_budget(x)`, or a hypothetical
+    /// mutant that swapped the addend `resolve_budget` itself sums — returns numerically
+    /// identical values for every `x`, including this test's own `connect_timeout`. No injected
+    /// value can separate them, and neither can `resolve_budget_reads_this_field_not_a_rival_constant`'s
+    /// own assertion, since `TEST_TIGHT_READ_TIMEOUT` mirrors that same 10s (see that constant's
+    /// own doc, next to `TEST_UPLOAD_SILENCE_BUDGET`, for the identical mirror-constant hazard).
+    /// The gap is general — any 10s post-connect addend, not `error_body_budget` specifically —
+    /// and this fixture does not attempt to close it.
     ///
     /// `total_bytes` (100) at the 500ms gap makes the full trickle 50s: comfortably longer than
     /// `hard_ceiling` (37.5s), so the fixture is still writing when the ceiling would fire — not
@@ -6828,6 +6852,7 @@ mod tests {
         let connect_timeout = std::time::Duration::from_millis(12_500);
         let client = RemoteClient::new_test_with_connect_timeout(&url, connect_timeout);
         let true_budget = connect_timeout + TEST_TIGHT_READ_TIMEOUT;
+        let rival_flat_budget = TEST_TIGHT_READ_TIMEOUT;
         let rival_connect_blind_budget = TEST_DIRECT_CONNECT_TIMEOUT + TEST_TIGHT_READ_TIMEOUT;
         let lower_bound = rival_connect_blind_budget
             + (true_budget - rival_connect_blind_budget) / 2;
@@ -6856,9 +6881,11 @@ mod tests {
             elapsed >= lower_bound,
             "elapsed {:?} is under {:?} (the midpoint between the connect-blind rival budget \
             {:?} and the true budget {:?}) — resolve returned close to a call site that \
-            hardcodes REMOTE_CONNECT_TIMEOUT + REMOTE_READ_TIMEOUT instead of folding in \
-            self.connect_timeout via resolve_budget()",
-            elapsed, lower_bound, rival_connect_blind_budget, true_budget
+            ignores self.connect_timeout, whether by dropping it entirely (a flat {:?} rival) \
+            or by hardcoding REMOTE_CONNECT_TIMEOUT in its place (the {:?} rival), rather than \
+            folding in self.connect_timeout via resolve_budget()",
+            elapsed, lower_bound, rival_connect_blind_budget, true_budget, rival_flat_budget,
+            rival_connect_blind_budget
         );
     }
 
