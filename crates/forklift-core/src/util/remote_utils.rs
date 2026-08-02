@@ -1587,6 +1587,24 @@ impl RemoteClient {
         Ok(missing)
     }
 
+    /// The total-deadline budget to arm for *this* client instance's call to [`Self::resolve`] —
+    /// folds this instance's own `connect_timeout` into [`bounded_read_timeout`]'s arithmetic.
+    /// Split out as its own `&self` method, rather than inlining the call to
+    /// `bounded_read_timeout` at `resolve`'s one call site, so a test can pin that the right
+    /// instance field is actually read: not just read from *some* client. [`Self::error_body_budget`]
+    /// carries the identical shape (`self.connect_timeout` plus a fixed post-connect addend) for a
+    /// sibling budget, and its own doc explains why that distinction needs a `connect_timeout` no
+    /// production constructor can produce — the direct and Tor-mode constructors only ever emit
+    /// [`REMOTE_CONNECT_TIMEOUT`] or [`REMOTE_CONNECT_TIMEOUT_TOR`], so a test built through either
+    /// one can never separate "reads this field" from "hardcodes whichever of those two constants
+    /// that fixture happens to carry." See `resolve_budget_reads_this_field_not_a_rival_constant`
+    /// and `resolve_budget_is_70s_for_a_real_tor_mode_client` in the test module: the same
+    /// two-test pair `error_body_budget` carries, and for the same reason — neither subsumes the
+    /// other, see `error_body_budget_reads_this_field_not_a_rival_constant`'s own doc for why.
+    fn resolve_budget(&self) -> std::time::Duration {
+        bounded_read_timeout(self.connect_timeout, REMOTE_READ_TIMEOUT)
+    }
+
     /// Resolve operator identifiers to display names through the server
     /// (`POST /v1/resolve`). Best-effort by the resolution failure policy: a server
     /// without a resolution hook (or that predates the endpoint, a `404`), an
@@ -1635,25 +1653,6 @@ impl RemoteClient {
     /// `fetch_info`/`fetch_signature`/`fetch_bundle_to`, whose `BoundedReads` silence budget never
     /// has to make this trade because a *silence* bound cannot mistake a slow-but-real transfer
     /// for a hang in the first place.
-    ///
-    /// The actual total-deadline budget to arm for *this* client instance — folds this instance's
-    /// own `connect_timeout` into [`bounded_read_timeout`]'s arithmetic. Split out as its own
-    /// `&self` method, rather than inlining the call to `bounded_read_timeout` at the one call
-    /// site below, so a test can pin that the right instance field is actually read: not just
-    /// read from *some* client. [`Self::error_body_budget`] carries the identical shape
-    /// (`self.connect_timeout` plus a fixed post-connect addend) for a sibling budget, and its own
-    /// doc explains why that distinction needs a `connect_timeout` no production constructor can
-    /// produce — the direct and Tor-mode constructors only ever emit [`REMOTE_CONNECT_TIMEOUT`] or
-    /// [`REMOTE_CONNECT_TIMEOUT_TOR`], so a test built through either one can never separate
-    /// "reads this field" from "hardcodes whichever of those two constants that fixture happens to
-    /// carry." See `resolve_budget_reads_this_field_not_a_rival_constant` and
-    /// `resolve_budget_is_70s_for_a_real_tor_mode_client` in the test module: the same two-test
-    /// pair `error_body_budget` carries, and for the same reason — neither subsumes the other, see
-    /// `error_body_budget_reads_this_field_not_a_rival_constant`'s own doc for why.
-    fn resolve_budget(&self) -> std::time::Duration {
-        bounded_read_timeout(self.connect_timeout, REMOTE_READ_TIMEOUT)
-    }
-
     pub async fn resolve(&self, identifiers: Vec<String>) -> BTreeMap<String, String> {
         if identifiers.is_empty() {
             return BTreeMap::new();
