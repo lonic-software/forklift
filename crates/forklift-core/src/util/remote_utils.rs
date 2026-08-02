@@ -6835,10 +6835,11 @@ mod tests {
             hard_ceiling
         ));
 
-        let error = inner.expect_err(
-            "a remote making continuous progress every 500ms must still be cut off by a 2s total \
-            deadline — if the full body arrived, the deadline was never actually applied"
-        );
+        let error = inner.expect_err(&format!(
+            "a remote making continuous progress every 500ms must still be cut off by this \
+            call's {:?} total deadline — if the full body arrived, the deadline was never \
+            actually applied", deadline
+        ));
 
         assert!(
             error.is_timeout(),
