@@ -7093,16 +7093,20 @@ mod tests {
     /// remote is *also* only 15s (direct) — so a mutant that rewired this call site onto
     /// `BoundedReads` instead of `TotalDeadline` would still return an `Err` comfortably inside
     /// that 22s ceiling, and the test would still pass, certifying nothing about which posture
-    /// actually fired. `upper_bound` below is the assertion that actually distinguishes them: it
-    /// is tight enough that `BoundedReads`'s ~15s is well outside it, while leaving 3s of margin
-    /// over `effective_budget` for local scheduling/dispatch overhead.
+    /// actually fired. `upper_bound` below is the assertion that actually distinguishes them, set
+    /// at the *midpoint* between this call's own budget and that rival's effective silence budget
+    /// (not an arbitrary margin over the true value): that split spends exactly as much slack on
+    /// absorbing scheduling/dispatch noise as it keeps in reserve to still catch the rewiring, and
+    /// makes the trade a reader who widens this margin later is making explicit — how much closer
+    /// to the rival's own budget they are choosing to get.
     #[test]
     fn missing_objects_times_out_against_a_silent_remote() {
         let remote = SilentRemote::start();
         let client = RemoteClient::new(&remote.url, None).unwrap();
         let hashes = vec!["a".repeat(64)];
         let effective_budget = client.presence_negotiation_budget(hashes.len());
-        let upper_bound = effective_budget + std::time::Duration::from_secs(3);
+        let rival_bounded_reads_budget = TEST_DIRECT_CONNECT_TIMEOUT + TEST_TIGHT_READ_TIMEOUT;
+        let upper_bound = effective_budget + (rival_bounded_reads_budget - effective_budget) / 2;
         let hard_ceiling = effective_budget + std::time::Duration::from_secs(15);
 
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -7121,12 +7125,12 @@ mod tests {
 
         assert!(
             elapsed <= upper_bound,
-            "elapsed {:?} exceeds {:?} (effective_budget {:?} + 3s margin) — missing_objects took \
-            closer to a Posture::BoundedReads-shaped ~15s silence budget than its own \
-            presence_negotiation_budget total deadline; a rewiring onto BoundedReads would still \
-            return an Err inside the generous hard_ceiling above, so this tighter bound is what \
-            actually separates the two",
-            elapsed, upper_bound, effective_budget
+            "elapsed {:?} exceeds {:?} (the midpoint between effective_budget {:?} and \
+            BoundedReads' own {:?} silence budget) — missing_objects took closer to a \
+            Posture::BoundedReads-shaped silence budget than its own presence_negotiation_budget \
+            total deadline; a rewiring onto BoundedReads would still return an Err inside the \
+            generous hard_ceiling above, so this tighter bound is what actually separates the two",
+            elapsed, upper_bound, effective_budget, rival_bounded_reads_budget
         );
     }
 
@@ -7141,7 +7145,8 @@ mod tests {
         let client = RemoteClient::new(&remote.url, None).unwrap();
         let hashes = vec!["a".repeat(64)];
         let effective_budget = client.presence_negotiation_budget(hashes.len());
-        let upper_bound = effective_budget + std::time::Duration::from_secs(3);
+        let rival_bounded_reads_budget = TEST_DIRECT_CONNECT_TIMEOUT + TEST_TIGHT_READ_TIMEOUT;
+        let upper_bound = effective_budget + (rival_bounded_reads_budget - effective_budget) / 2;
         let hard_ceiling = effective_budget + std::time::Duration::from_secs(15);
 
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -7163,12 +7168,12 @@ mod tests {
         );
         assert!(
             elapsed <= upper_bound,
-            "elapsed {:?} exceeds {:?} (effective_budget {:?} + 3s margin) — upload_targets took \
-            closer to a Posture::BoundedReads-shaped ~15s silence budget than its own \
-            presence_negotiation_budget total deadline; a rewiring onto BoundedReads would still \
-            return an Err inside the generous hard_ceiling above, so this tighter bound is what \
-            actually separates the two",
-            elapsed, upper_bound, effective_budget
+            "elapsed {:?} exceeds {:?} (the midpoint between effective_budget {:?} and \
+            BoundedReads' own {:?} silence budget) — upload_targets took closer to a \
+            Posture::BoundedReads-shaped silence budget than its own presence_negotiation_budget \
+            total deadline; a rewiring onto BoundedReads would still return an Err inside the \
+            generous hard_ceiling above, so this tighter bound is what actually separates the two",
+            elapsed, upper_bound, effective_budget, rival_bounded_reads_budget
         );
     }
 
