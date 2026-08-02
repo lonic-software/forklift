@@ -1355,15 +1355,13 @@ enum TransportFailure {
     /// `kind() == TimedOut` anywhere in the source chain, not only its own synthetic marker for a
     /// client-configured timeout.
     ///
-    /// On a posture carrying no armed total — [`clients::Posture::UnboundedFollowsRedirects`],
-    /// [`clients::Posture::UnboundedNoRedirect`] — that ambiguity is unresolvable, so no figure is
-    /// named at all: naming one would be right most of the time and wrong by two orders of
-    /// magnitude the rest, which is worse than naming nothing. On a silence-budgeted posture the
-    /// configured value is a genuine *lower* bound and is reported as one ("at least"). On
-    /// [`clients::Posture::TotalDeadline`] the ambiguity is **closed**: the armed deadline is at
-    /// most ~112s (a Tor connect allowance plus the largest presence budget), and a kernel
-    /// `ETIMEDOUT` needs two orders of magnitude longer, so the deadline always fires first and
-    /// the reported figure is exact.
+    /// With no armed total, that ambiguity is unresolvable and no figure is named at all: naming
+    /// one would be right most of the time and wrong by orders of magnitude the rest. With a
+    /// silence budget the configured value is a genuine *lower* bound, reported as one ("at
+    /// least"). With a total deadline it is exact — every producer of one builds it from a
+    /// connect allowance plus a post-connect addend (`grep -n "Posture::TotalDeadline("` for the
+    /// current set), all far under the kernel figure above, so the armed deadline is always what
+    /// fires.
     ReadTimedOut,
 
     /// Neither of the above: a connection reset, a DNS failure, a refused connect, a TLS failure,
