@@ -531,12 +531,15 @@ fn post_send_verify_budget(body_len: usize) -> std::time::Duration {
 /// [`RemoteClient::presence_negotiation_budget`] prices into `missing_objects`/`upload_targets`'s
 /// total deadline — see that method's own doc for the full arithmetic. An upper bound, not a
 /// measured average, on `does_object_exist`'s (`file_utils.rs`) real per-hash cost — the primitive
-/// both calls' server side loops over. `pub` so `file_utils.rs`'s own FORK-92 measurement spike
+/// both calls' server side loops over. `pub(crate)`, not `pub` — every sibling budget constant in
+/// this file ([`REMOTE_READ_TIMEOUT`], [`UPLOAD_SILENCE_BUDGET`], [`POST_SEND_VERIFY_BASE`]) is
+/// module-private; this one only needs to reach `file_utils.rs`'s own FORK-92 measurement spike
 /// (`spike_fork92_presence_rate`, `cargo test --release -p forklift-core
-/// spike_fork92_presence_rate -- --ignored --nocapture`) imports this exact constant rather than
-/// mirroring its value in a second, unlinked literal — a production change here cannot silently
-/// drift out of sync with what that spike actually checks.
-pub const PRESENCE_ALLOWANCE_MS_PER_OP: f64 = 5.0;
+/// spike_fork92_presence_rate -- --ignored --nocapture`), which imports this exact constant rather
+/// than mirroring its value in a second, unlinked literal — a production change here cannot
+/// silently drift out of sync with what that spike actually checks. Same-crate reach is all that
+/// import needs, so `pub(crate)` is the right width, not a wider `pub`.
+pub(crate) const PRESENCE_ALLOWANCE_MS_PER_OP: f64 = 5.0;
 
 /// Shared state between an upload's body-send stream ([`UploadChunks`]) and
 /// [`clients::Clients::send_with_watchdog`]'s polling loop: a timestamp updated every time the stream
@@ -6752,6 +6755,28 @@ mod tests {
         // doesn't co-move with a corrupted helper — a helper bug would then move the elapsed time
         // it produces and this fixed lower bound in lockstep, pinning nothing.
         let lower_bound = TEST_DIRECT_CONNECT_TIMEOUT + TEST_ERROR_BODY_READ_TIMEOUT;
+        // The bracket this fixture's batch size depends on, made an assertion rather than left as
+        // a comment: the call's own outer TotalDeadline must stay looser than error_of's inner
+        // error_body_budget (`lower_bound` above), or the outer bound fires first and every
+        // assertion below would end up blaming error_of/error_body_read_budget for a regression
+        // that actually lives in presence_negotiation_budget or its constants — a misleading red,
+        // not a wrong one. Computed the same constant-sum-not-via-helper way as `lower_bound`,
+        // for the identical reason: calling `presence_negotiation_budget` here would let a bug in
+        // that method move this guard and the real behavior it is meant to guard against in
+        // lockstep, silently validating a broken implementation instead of catching it.
+        let outer_budget = TEST_DIRECT_CONNECT_TIMEOUT + POST_SEND_VERIFY_BASE
+            + std::time::Duration::from_secs_f64(
+                hashes.len() as f64 * PRESENCE_ALLOWANCE_MS_PER_OP / 1000.0
+            );
+        assert!(
+            outer_budget > lower_bound,
+            "this fixture's batch size ({} hashes, outer TotalDeadline {:?}) no longer stays \
+            looser than error_of's own inner error_body_budget ({:?}) — resize `hashes` above \
+            until it does; every assertion below assumes the inner budget is what fires, and a \
+            red result here means they are about to fail for the wrong reason (the outer bound \
+            firing first) rather than the one they exist to catch",
+            hashes.len(), outer_budget, lower_bound
+        );
         let outer_ceiling = lower_bound + std::time::Duration::from_secs(10);
 
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -7061,18 +7086,31 @@ mod tests {
     /// `UnboundedTicket::Fork92` gap this PR closes for this call); this is the falsifying test
     /// for that defect, the same shape as `fetch_info_times_out_against_a_silent_remote` and
     /// siblings above, applied to the total-deadline posture this call now rides.
+    ///
+    /// A merely-generous outer ceiling alone does not separate the right implementation from a
+    /// plausible wrong one: `hard_ceiling` here is `effective_budget` (~7s at this `n`) `+ 15s` =
+    /// ~22s, but `Posture::BoundedReads`'s own effective silence budget against a fully silent
+    /// remote is *also* only 15s (direct) — so a mutant that rewired this call site onto
+    /// `BoundedReads` instead of `TotalDeadline` would still return an `Err` comfortably inside
+    /// that 22s ceiling, and the test would still pass, certifying nothing about which posture
+    /// actually fired. `upper_bound` below is the assertion that actually distinguishes them: it
+    /// is tight enough that `BoundedReads`'s ~15s is well outside it, while leaving 3s of margin
+    /// over `effective_budget` for local scheduling/dispatch overhead.
     #[test]
     fn missing_objects_times_out_against_a_silent_remote() {
         let remote = SilentRemote::start();
         let client = RemoteClient::new(&remote.url, None).unwrap();
         let hashes = vec!["a".repeat(64)];
         let effective_budget = client.presence_negotiation_budget(hashes.len());
+        let upper_bound = effective_budget + std::time::Duration::from_secs(3);
         let hard_ceiling = effective_budget + std::time::Duration::from_secs(15);
 
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let started = std::time::Instant::now();
         let outcome = runtime.block_on(async {
             tokio::time::timeout(hard_ceiling, client.missing_objects(&hashes)).await
         });
+        let elapsed = started.elapsed();
 
         outcome
             .unwrap_or_else(|_| panic!(
@@ -7080,26 +7118,40 @@ mod tests {
                 at all", hard_ceiling
             ))
             .expect_err("a silent remote must not appear to succeed");
+
+        assert!(
+            elapsed <= upper_bound,
+            "elapsed {:?} exceeds {:?} (effective_budget {:?} + 3s margin) — missing_objects took \
+            closer to a Posture::BoundedReads-shaped ~15s silence budget than its own \
+            presence_negotiation_budget total deadline; a rewiring onto BoundedReads would still \
+            return an Err inside the generous hard_ceiling above, so this tighter bound is what \
+            actually separates the two",
+            elapsed, upper_bound, effective_budget
+        );
     }
 
     /// `upload_targets` must terminate against a remote that connects, reads the request in
     /// full, and then genuinely goes silent — same defect, same fix, same falsifying shape as
     /// [`missing_objects_times_out_against_a_silent_remote`] immediately above, for the sibling
-    /// call this PR moves off the identical unbounded posture.
+    /// call this PR moves off the identical unbounded posture — including its `upper_bound`
+    /// assertion, for the identical `BoundedReads`-shaped-mutant reason that test's own doc gives.
     #[test]
     fn upload_targets_times_out_against_a_silent_remote() {
         let remote = SilentRemote::start();
         let client = RemoteClient::new(&remote.url, None).unwrap();
         let hashes = vec!["a".repeat(64)];
         let effective_budget = client.presence_negotiation_budget(hashes.len());
+        let upper_bound = effective_budget + std::time::Duration::from_secs(3);
         let hard_ceiling = effective_budget + std::time::Duration::from_secs(15);
 
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let started = std::time::Instant::now();
         let outcome = runtime.block_on(async {
             tokio::time::timeout(
                 hard_ceiling, client.upload_targets("session-fork-92-silent-test", &hashes)
             ).await
         });
+        let elapsed = started.elapsed();
 
         let inner = outcome.unwrap_or_else(|_| panic!(
             "upload_targets hung past the test's own {:?} ceiling — no total deadline fired \
@@ -7108,6 +7160,15 @@ mod tests {
         assert!(
             inner.is_err(),
             "a silent remote must not appear to succeed"
+        );
+        assert!(
+            elapsed <= upper_bound,
+            "elapsed {:?} exceeds {:?} (effective_budget {:?} + 3s margin) — upload_targets took \
+            closer to a Posture::BoundedReads-shaped ~15s silence budget than its own \
+            presence_negotiation_budget total deadline; a rewiring onto BoundedReads would still \
+            return an Err inside the generous hard_ceiling above, so this tighter bound is what \
+            actually separates the two",
+            elapsed, upper_bound, effective_budget
         );
     }
 
