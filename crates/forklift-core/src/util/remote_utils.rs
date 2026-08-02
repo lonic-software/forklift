@@ -959,6 +959,23 @@ mod clients {
         /// there is no bare `.send()` for a call site to reach for instead; and it always sets
         /// `Content-Length` itself, so no call site can omit it.
         ///
+        /// **What actually makes the body/progress pairing hold is sole-sourcing, not a type the
+        /// compiler checks.** [`super::watched_upload_body`] and `UploadProgress::new` are both
+        /// file-private, and this function's own two lines below are their only call — nothing in
+        /// either function's signature stops a second call site from constructing its own
+        /// `UploadProgress`, elsewhere in this file, and pairing it with a body built from a
+        /// different one. `grep -n 'watched_upload_body(' crates/forklift-core/src/util/remote_utils.rs`
+        /// and `grep -n 'UploadProgress::new()' crates/forklift-core/src/util/remote_utils.rs` are
+        /// the procedure that checks this: read against which lines are doc comments (this
+        /// paragraph names both patterns literally, so it is its own hit) and which are this
+        /// function's own definition and call, any further hit is a second caller, and a second
+        /// caller is exactly the seam reopening — the same failure shape as the deleted
+        /// `Posture::WatchdogNoRedirect`, just one level down. Nothing (no compiler error, no test)
+        /// catches that on its own; a reviewer noticing the new call site is what actually keeps
+        /// this pairing closed. Re-run both greps before trusting this doc, and treat any hit
+        /// outside this function and its own doc comment as the claim no longer holding, not as a
+        /// benign refactor to wave through.
+        ///
         /// Always rides [`Self::no_redirect`] — never auto-follows a redirect — for the same
         /// reason [`Posture::UnboundedNoRedirect`] does (see that client field's own doc): a
         /// one-shot streamed body cannot be replayed if reqwest's default policy tried to
@@ -1027,7 +1044,7 @@ mod clients {
                             return if exhausted {
                                 WatchdogOutcome::SilentAfterSend { budget: phase2_budget }
                             } else {
-                                WatchdogOutcome::SilentDuringSend { budget: phase1_budget }
+                                WatchdogOutcome::SilentDuringSend
                             };
                         }
                     }
@@ -1066,16 +1083,19 @@ mod clients {
         /// A genuine `reqwest::Error` — a real transport failure, not a watchdog kill. Maps onto
         /// [`super::RemoteClient::describe_mutation_transport_error`].
         Transport(reqwest::Error),
-        /// The watchdog killed the request during the send phase: `budget` elapsed with no chunk
-        /// pulled from the body and the stream not yet exhausted. Maps onto
-        /// [`super::RemoteClient::mutation_read_timeout_message`], which does not currently name
-        /// this budget in its wording — see that function's own doc for why — but the value is
-        /// carried here regardless, since which phase killed the request is mechanism this module
-        /// owns, not wording it owns — `#[allow(dead_code)]` for the same reason
-        /// [`UnboundedTicket`]'s own carried-but-unread payloads are: the field's job is to be
-        /// present in this outcome's shape, not necessarily read by every consumer of it.
-        #[allow(dead_code)]
-        SilentDuringSend { budget: std::time::Duration },
+        /// The watchdog killed the request during the send phase: `phase1_budget` elapsed with no
+        /// chunk pulled from the body and the stream not yet exhausted. Carries no budget, unlike
+        /// [`Self::SilentAfterSend`]: it maps onto
+        /// [`super::RemoteClient::mutation_read_timeout_message`], which is deliberately shared,
+        /// word-for-word, with a genuinely ambiguous `reqwest::Error` timeout on an
+        /// already-established connection (see that function's own doc) — a mid-body watchdog kill
+        /// is the same *shape* of failure as that ambiguous case, so it deliberately gets the same
+        /// wording rather than a more precise one the mechanism happens to have on hand. Naming
+        /// `phase1_budget` here anyway would be dead weight: no consumer of this variant would ever
+        /// read it, and a value nothing reads is worse than no field at all — the lesson
+        /// `UnboundedTicket`'s own carried-but-unread payloads do *not* generalize to, since those
+        /// earn their keep by being greppable even unread, and this field wouldn't.
+        SilentDuringSend,
         /// The watchdog killed the request after the stream reported itself exhausted: `budget`
         /// (the larger, post-send figure) elapsed with still no response. Maps onto
         /// [`super::RemoteClient::mutation_post_send_timeout_message`], which does name this
@@ -1536,7 +1556,7 @@ impl RemoteClient {
         match outcome {
             WatchdogOutcome::Sent(response) => Ok(response),
             WatchdogOutcome::Transport(e) => Err(self.describe_mutation_transport_error(action, e)),
-            WatchdogOutcome::SilentDuringSend { .. } => Err(Self::mutation_read_timeout_message(action)),
+            WatchdogOutcome::SilentDuringSend => Err(Self::mutation_read_timeout_message(action)),
             WatchdogOutcome::SilentAfterSend { budget } => {
                 Err(Self::mutation_post_send_timeout_message(action, budget))
             }
