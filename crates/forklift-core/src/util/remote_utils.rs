@@ -1201,7 +1201,16 @@ impl RemoteClient {
                    path: &str) -> reqwest::RequestBuilder {
         let total_deadline = match &posture {
             Posture::TotalDeadline(duration) => Some(*duration),
-            _ => None,
+            // Listed explicitly, not `_`, so that a future payload-carrying `Posture` variant
+            // (mirroring `Clients::pick`'s own compiler-owned exhaustiveness, which deliberately
+            // has no wildcard arm) forces this match to be revisited too, instead of silently
+            // falling through to `None` and dropping the new payload the way the deleted
+            // `OwnTimeoutFollowsRedirects` posture already did once.
+            Posture::BoundedReads
+            | Posture::BoundedObjectReads
+            | Posture::WatchdogNoRedirect
+            | Posture::UnboundedFollowsRedirects(_)
+            | Posture::UnboundedNoRedirect(_) => None,
         };
 
         let mut builder = self.client_for(posture).request(method, format!("{}{}", self.base, path));
@@ -1626,12 +1635,31 @@ impl RemoteClient {
     /// `fetch_info`/`fetch_signature`/`fetch_bundle_to`, whose `BoundedReads` silence budget never
     /// has to make this trade because a *silence* bound cannot mistake a slow-but-real transfer
     /// for a hang in the first place.
+    ///
+    /// The actual total-deadline budget to arm for *this* client instance — folds this instance's
+    /// own `connect_timeout` into [`bounded_read_timeout`]'s arithmetic. Split out as its own
+    /// `&self` method, rather than inlining the call to `bounded_read_timeout` at the one call
+    /// site below, so a test can pin that the right instance field is actually read: not just
+    /// read from *some* client. [`Self::error_body_budget`] carries the identical shape
+    /// (`self.connect_timeout` plus a fixed post-connect addend) for a sibling budget, and its own
+    /// doc explains why that distinction needs a `connect_timeout` no production constructor can
+    /// produce — the direct and Tor-mode constructors only ever emit [`REMOTE_CONNECT_TIMEOUT`] or
+    /// [`REMOTE_CONNECT_TIMEOUT_TOR`], so a test built through either one can never separate
+    /// "reads this field" from "hardcodes whichever of those two constants that fixture happens to
+    /// carry." See `resolve_budget_reads_this_field_not_a_rival_constant` and
+    /// `resolve_budget_is_70s_for_a_real_tor_mode_client` in the test module: the same two-test
+    /// pair `error_body_budget` carries, and for the same reason — neither subsumes the other, see
+    /// `error_body_budget_reads_this_field_not_a_rival_constant`'s own doc for why.
+    fn resolve_budget(&self) -> std::time::Duration {
+        bounded_read_timeout(self.connect_timeout, REMOTE_READ_TIMEOUT)
+    }
+
     pub async fn resolve(&self, identifiers: Vec<String>) -> BTreeMap<String, String> {
         if identifiers.is_empty() {
             return BTreeMap::new();
         }
 
-        let total_deadline = bounded_read_timeout(self.connect_timeout, REMOTE_READ_TIMEOUT);
+        let total_deadline = self.resolve_budget();
         let response = self.request_on(
             Posture::TotalDeadline(total_deadline), reqwest::Method::POST, "/v1/resolve"
         )
@@ -6126,18 +6154,20 @@ mod tests {
     /// tests above — every [`Posture::BoundedReads`]/[`Posture::TotalDeadline`] carrier gets one.
     ///
     /// **Verified not to distinguish [`Posture::TotalDeadline`] from [`Posture::BoundedReads`]
-    /// — measured, not assumed.** A fully silent remote never sends even a partial header, and
-    /// [`REMOTE_READ_TIMEOUT`]'s own doc is explicit that *before* headers arrive its client-level
-    /// `read_timeout` is a fixed, non-resetting deadline — so `Posture::BoundedReads` alone
-    /// already terminates against total silence, with no total deadline needed. Confirmed by
-    /// probing `request_on(Posture::BoundedReads, ...)` directly against [`SilentRemote`]: it
-    /// returned a genuine `is_timeout() == true` transport error at 15.003s, not a hang. So this
-    /// test would have stayed green through the defect this PR fixes (`resolve` riding
-    /// `BoundedReads` with no total bound) — it is real regression coverage (a fully-unbounded
-    /// posture, or a dropped bound entirely, still fails it), just not *that* regression's own
-    /// falsifying test. `request_on_applies_a_total_deadline_that_ignores_progress` below is: it
-    /// uses a remote that never goes silent at all, the one shape a silence budget structurally
-    /// cannot catch and a total deadline must.
+    /// — by a committed, re-run test, not a transcribed one-off measurement.** A fully silent
+    /// remote never sends even a partial header, and [`REMOTE_READ_TIMEOUT`]'s own doc is explicit
+    /// that *before* headers arrive its client-level `read_timeout` is a fixed, non-resetting
+    /// deadline — so `Posture::BoundedReads` alone already terminates against total silence, with
+    /// no total deadline needed. `fetch_info_times_out_against_a_silent_remote` above establishes
+    /// exactly this: `fetch_info` rides `Posture::BoundedReads` (no `TotalDeadline` payload
+    /// anywhere in the picture) against this same [`SilentRemote`] fixture and asserts both a
+    /// genuine timeout and the effective 15s budget that produced it. So this test would have
+    /// stayed green through the defect this PR fixes (`resolve` riding `BoundedReads` with no
+    /// total bound) — it is real regression coverage (a fully-unbounded posture, or a dropped
+    /// bound entirely, still fails it), just not *that* regression's own falsifying test.
+    /// `request_on_applies_a_total_deadline_that_ignores_progress` below is: it uses a remote that
+    /// never goes silent at all, the one shape a silence budget structurally cannot catch and a
+    /// total deadline must.
     #[test]
     fn resolve_times_out_against_a_silent_remote() {
         let remote = SilentRemote::start();
@@ -6640,6 +6670,66 @@ mod tests {
             "a real TorMode::On client's error_body_budget must be exactly the Tor-folded 70s — \
             otherwise a Tor remote's refusal body gets killed early, discarding a typed \
             RefusalCode/next_step and degrading a machine caller to the wrong exit code"
+        );
+    }
+
+    /// Mirrors [`error_body_budget_reads_this_field_not_a_rival_constant`] for
+    /// `resolve`'s own [`RemoteClient::resolve_budget`] — the identical gap applies here for the
+    /// identical reason: every existing behavioral test of `resolve` builds a direct client via
+    /// `RemoteClient::new`, where `self.connect_timeout` == [`REMOTE_CONNECT_TIMEOUT`] ==
+    /// [`TEST_DIRECT_CONNECT_TIMEOUT`] (5s) — so a hardcoded-constant mutant of `resolve_budget`
+    /// (`REMOTE_CONNECT_TIMEOUT` in place of `self.connect_timeout`) is extensionally identical to
+    /// the correct implementation everywhere those tests look, and would still give a Tor client
+    /// only a 15s total deadline against a 60s connect allowance — the deadline firing during
+    /// circuit build, the exact defect class this fix exists to close.
+    ///
+    /// `SENTINEL_CONNECT_TIMEOUT` (11s) is deliberately a different value from
+    /// `error_body_budget`'s own sentinel (7s) — reusing it would make the two tests read as one
+    /// case split in half rather than two independently readable pins — and, like that test's own
+    /// sentinel, was checked against every named `Duration` constant in this module
+    /// (`grep -n "Duration::from_secs\|Duration::from_millis"`) before being picked: the distinct
+    /// values in play are 0.2 (`COMMIT_BACKOFF_START`/`UPLOAD_WATCHDOG_POLL_INTERVAL`), 2
+    /// (`POST_SEND_VERIFY_BASE`), 3 (`COMMIT_BACKOFF_CAP`), 5, 10, 60, and the sibling test's own
+    /// 7 — 11 matches none of them. What would actually matter is a rival for this test's asserted
+    /// *output*, 21s (`11 + TEST_TIGHT_READ_TIMEOUT`): the full pairwise-sum set over
+    /// `{2, 3, 5, 7, 10, 60}` is `{5, 7, 8, 9, 10, 12, 13, 15, 17, 62, 63, 65, 67, 70, 120}` — no
+    /// 21, and 21 does not coincide with any single named constant either.
+    #[test]
+    fn resolve_budget_reads_this_field_not_a_rival_constant() {
+        const SENTINEL_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(11);
+
+        let client = RemoteClient::new_test_with_connect_timeout(
+            "http://forklift-fork-96-resolve-budget-sentinel-test.invalid",
+            SENTINEL_CONNECT_TIMEOUT,
+        );
+
+        assert_eq!(
+            client.resolve_budget(),
+            SENTINEL_CONNECT_TIMEOUT + TEST_TIGHT_READ_TIMEOUT,
+            "resolve_budget must fold in *this instance's* connect_timeout — a value neither \
+            RemoteClient::new (5s) nor RemoteClient::new_with_tor under TorMode::On (60s) can ever \
+            produce, so this cannot pass by coincidentally matching a hardcoded rival constant"
+        );
+    }
+
+    /// Mirrors [`error_body_budget_is_70s_for_a_real_tor_mode_client`] for
+    /// [`RemoteClient::resolve_budget`], for the identical reason that test's own doc gives: the
+    /// sentinel test above pins *reads-the-field-not-a-rival* but not what `resolve_budget`
+    /// actually returns for a real Tor-mode client, and neither claim subsumes the other. Built
+    /// the same no-I/O way (`new_with_tor` never touches the network).
+    #[test]
+    fn resolve_budget_is_70s_for_a_real_tor_mode_client() {
+        let tor = TorSettings { mode: TorMode::On, proxy: DEFAULT_TOR_PROXY.to_string() };
+        let client = RemoteClient::new_with_tor(
+            "http://forklift-fork-96-resolve-budget-tor-endpoint-test.invalid", None, tor,
+        ).unwrap();
+
+        assert_eq!(
+            client.resolve_budget(),
+            TEST_TOR_CONNECT_TIMEOUT + TEST_TIGHT_READ_TIMEOUT,
+            "a real TorMode::On client's resolve_budget must be exactly the Tor-folded 70s — \
+            otherwise resolve's own total deadline fires during Tor circuit build, the exact \
+            defect class this fix exists to close"
         );
     }
 
