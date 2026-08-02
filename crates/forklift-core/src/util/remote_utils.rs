@@ -811,6 +811,13 @@ mod clients {
     /// [`Posture::TotalDeadline`]'s payload is, so it needs no representation in this enum. Before
     /// trusting the grep again, re-check that condition: confirm any new way to send a request
     /// still goes through [`Posture`], or re-derive by hand whether it is actually bounded.
+    ///
+    /// The set this enumerates is meant to reach zero: every call ticketed here eventually earns
+    /// a real budget and moves off [`Posture::UnboundedFollowsRedirects`]/
+    /// [`Posture::UnboundedNoRedirect`] onto a bounded posture instead. When the last variant is
+    /// removed, delete this enum and both of those `Posture` variants in the same change — they
+    /// exist only to carry this payload and mean nothing without it. Until then, whatever
+    /// variants remain are a live gap awaiting a budget, not settled design to leave standing.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(super) enum UnboundedTicket {
         /// `missing_objects`, `upload_targets`, `fetch_subtree`, and `fetch_batch`'s initial
