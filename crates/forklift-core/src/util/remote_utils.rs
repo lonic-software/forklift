@@ -306,19 +306,23 @@ const REMOTE_CONNECT_TIMEOUT_TOR: std::time::Duration = std::time::Duration::fro
 /// lookup, or serving an already-built file) before writing anything, so a flat 10s pre-first-byte
 /// budget is honest. `fetch_object` needs a much looser budget of its own
 /// ([`FETCH_OBJECT_READ_TIMEOUT`]) since its server side is size-dependent, not O(constant).
-/// `missing_objects`, `fetch_batch`, and `fetch_subtree` are deliberately **not** bounded at all:
-/// their server sides build a bundle (or consult up to `MAX_MISSING_BATCH` hashes) *before* the
-/// first byte, work whose cost depends on object sizes the client cannot know in advance — no flat
-/// budget for that is honest, so they stay on the unbounded client until they have their own
-/// scaled/measured budget or an abandon-and-fall-back lane (see the comment at each of those three
-/// call sites). `upload_targets` shares that same reasoning (it walks up to
-/// `MAX_UPLOAD_TARGETS_BATCH` hashes before its first byte) and stays unbounded for it. `resolve`
-/// is unbounded by *this* mechanism too (no client-level `read_timeout`), but is not left
-/// unbounded outright: it rides [`Posture::TotalDeadline`] instead, a genuine per-request
-/// `RequestBuilder::timeout` the module applies itself rather than the call site — sized at
-/// `connect_timeout + REMOTE_READ_TIMEOUT`, reusing this constant's *value* for that arithmetic
-/// without joining the class of calls it silence-bounds (see that variant's own doc for why a
-/// *total* deadline, not a silence budget, is the right shape for `resolve` specifically).
+/// `fetch_batch` and `fetch_subtree` are deliberately **not** bounded at all: their server sides
+/// build a bundle — every requested object fully into memory — *before* the first byte, work whose
+/// cost depends on object sizes the client cannot know in advance — no flat budget for that is
+/// honest, so they stay on the unbounded client until they have their own scaled/measured budget or
+/// an abandon-and-fall-back lane (see the comment at each of those two call sites).
+/// `missing_objects`/`upload_targets` differ in exactly the property that matters here: their
+/// server sides only walk up to `MAX_MISSING_BATCH`/`MAX_UPLOAD_TARGETS_BATCH` *hashes* — a cost
+/// this client can size from its own request body, unlike an object's byte size it doesn't have yet
+/// — before the first byte, so like `resolve` they ride [`Posture::TotalDeadline`] rather than
+/// staying unbounded, sized per call by [`RemoteClient::presence_negotiation_budget`] (see that
+/// method's own doc for the arithmetic and accepted residual). `resolve` is unbounded by *this*
+/// mechanism too (no client-level `read_timeout`), but is not left unbounded outright: it rides
+/// [`Posture::TotalDeadline`] instead, a genuine per-request `RequestBuilder::timeout` the module
+/// applies itself rather than the call site — sized at `connect_timeout + REMOTE_READ_TIMEOUT`,
+/// reusing this constant's *value* for that arithmetic without joining the class of calls it
+/// silence-bounds (see that variant's own doc for why a *total* deadline, not a silence budget, is
+/// the right shape for `resolve` specifically).
 /// `update_ref`, `commit_lift`, and the streamed-upload paths (`upload_object`, `put_presigned`)
 /// are unbounded for reasons of their own — see each call's own doc, and
 /// [`clients::Clients::send_with_watchdog`]'s for the uploads.
@@ -331,10 +335,11 @@ const REMOTE_CONNECT_TIMEOUT_TOR: std::time::Duration = std::time::Duration::fro
 /// being pushed, which on a first lift into an empty pallet is the whole history — before its
 /// first response byte; that can take minutes with *no* bytes moving at all, which this constant
 /// would (correctly) call silence if it applied there. This is not an accident of wiring — FORK-94
-/// found `update_ref`'s pre-first-byte cost is a *derived* quantity (an audit walk), unlike the
-/// four calls [`UnboundedTicket::Fork92`] covers, whose priced quantity is the request body's own
-/// enumerated content; giving it a flat silence budget before that walk-equivalence question is
-/// settled would be exactly the kind of guess this module's bounded clients exist to avoid.
+/// found `update_ref`'s pre-first-byte cost is a *derived* quantity (an audit walk), unlike
+/// `missing_objects`/`upload_targets` and the calls still ticketed at [`UnboundedTicket::Fork92`],
+/// whose priced quantity is the request body's own enumerated content; giving it a flat silence
+/// budget before that walk-equivalence question is settled would be exactly the kind of guess this
+/// module's bounded clients exist to avoid.
 ///
 /// 10s of silence, on top of whichever connect budget applies, is generous for any of the three
 /// tight calls above: a healthy connection carrying real progress, however slow the link,
@@ -521,6 +526,17 @@ fn post_send_verify_budget(body_len: usize) -> std::time::Duration {
         body_len as f64 / POST_SEND_VERIFY_RATE_BYTES_PER_SEC as f64
     )
 }
+
+/// Ceiling on the server's per-hash presence-check cost that
+/// [`RemoteClient::presence_negotiation_budget`] prices into `missing_objects`/`upload_targets`'s
+/// total deadline — see that method's own doc for the full arithmetic. An upper bound, not a
+/// measured average, on `does_object_exist`'s (`file_utils.rs`) real per-hash cost — the primitive
+/// both calls' server side loops over. `pub` so `file_utils.rs`'s own FORK-92 measurement spike
+/// (`spike_fork92_presence_rate`, `cargo test --release -p forklift-core
+/// spike_fork92_presence_rate -- --ignored --nocapture`) imports this exact constant rather than
+/// mirroring its value in a second, unlinked literal — a production change here cannot silently
+/// drift out of sync with what that spike actually checks.
+pub const PRESENCE_ALLOWANCE_MS_PER_OP: f64 = 5.0;
 
 /// Shared state between an upload's body-send stream ([`UploadChunks`]) and
 /// [`clients::Clients::send_with_watchdog`]'s polling loop: a timestamp updated every time the stream
@@ -748,8 +764,13 @@ mod clients {
         /// [`super::RemoteClient::request_on`] reads off this variant and applies, so the promise
         /// is discharged by the module, not merely asserted at the call site the way the deleted
         /// `OwnTimeoutFollowsRedirects` posture used to (that variant carried no payload at all;
-        /// nothing checked that any caller of it actually called `.timeout(...)`). `resolve`
-        /// alone.
+        /// nothing checked that any caller of it actually called `.timeout(...)`). `resolve`,
+        /// `missing_objects`, and `upload_targets` — the latter two sized per call by
+        /// [`super::RemoteClient::presence_negotiation_budget`] rather than `resolve`'s own fixed
+        /// `connect_timeout + REMOTE_READ_TIMEOUT`; see that method's own doc for why a *total*
+        /// deadline is sound for them specifically, the identical reasoning `resolve`'s own doc
+        /// gives below but grounded in a request-body-enumerated cap instead of cosmetic-sugar
+        /// disposability.
         ///
         /// A *silence* budget ([`Self::BoundedReads`]) is not a substitute — but not for the
         /// reason "resolve has nothing to move before headers arrive": `BoundedReads`'s own
@@ -820,15 +841,23 @@ mod clients {
     /// variants remain are a live gap awaiting a budget, not settled design to leave standing.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(super) enum UnboundedTicket {
-        /// `missing_objects`, `upload_targets`, `fetch_subtree`, and `fetch_batch`'s initial
-        /// `POST`. FORK-92's current keystone (narrowed after review, 2026-08-01): for these
-        /// four, the priced quantity **equals the server's workload by construction** — the
-        /// request body enumerates it (a hash list), and the server iterates that same list under
-        /// a cap both sides share (`MAX_MISSING_BATCH`/`MAX_UPLOAD_TARGETS_BATCH`), or (for
-        /// `fetch_subtree`) is worst-case-bounded by the equivalent shared cap. That is *why* a
-        /// scaled budget is fixable here at all — not (as an earlier framing had it) merely that
-        /// the work "scales with input the client cannot size in advance": the client can size it,
-        /// from its own request. No such budget has landed yet, so all four stay unbounded.
+        /// `fetch_subtree`, and `fetch_batch`'s initial `POST`. FORK-92's current keystone
+        /// (narrowed after review, 2026-08-01): for these, the priced quantity **equals the
+        /// server's workload by construction** — the request body enumerates it (a hash list), and
+        /// the server iterates that same list under a cap both sides share
+        /// (`MAX_MISSING_BATCH`/`MAX_UPLOAD_TARGETS_BATCH`), or (for `fetch_subtree`) is
+        /// worst-case-bounded by the equivalent shared cap. That is *why* a scaled budget is
+        /// fixable here at all — not (as an earlier framing had it) merely that the work "scales
+        /// with input the client cannot size in advance": the client can size it, from its own
+        /// request. No such budget has landed yet for either of these, so both stay unbounded.
+        ///
+        /// `missing_objects` and `upload_targets` shared this exact keystone and are the first two
+        /// to cash it in: they have moved off this ticket onto [`super::Posture::TotalDeadline`],
+        /// carrying [`super::RemoteClient::presence_negotiation_budget`] — see that method's own
+        /// doc for the budget and [`super::PRESENCE_ALLOWANCE_MS_PER_OP`] for the rate it prices
+        /// in. `fetch_subtree` and `fetch_batch`'s `POST` share the identical construction (a
+        /// client-sizable, cap-bounded request-body quantity) but not yet a landed budget of their
+        /// own — left open here, not asserted as covered by the two that moved.
         ///
         /// `fetch_batch`'s **second** request station — the follow-up `GET` taken only when the
         /// head redirects to storage, which actually reads the bundle bytes — does **not** share
@@ -1676,20 +1705,49 @@ impl RemoteClient {
         Ok(info)
     }
 
+    /// The total-deadline budget to arm for *this* client instance's call to
+    /// [`Self::missing_objects`] or [`Self::upload_targets`], for one chunk of `n` hashes — folds
+    /// this instance's own `connect_timeout` into the arithmetic, the same shape
+    /// [`Self::error_body_budget`]/[`Self::resolve_budget`] already carry (`self.connect_timeout`
+    /// plus a post-connect addend), for the identical reason: a Tor dial's 60s connect allowance
+    /// must never be undercut by a budget sized for a direct remote, or the deadline expires during
+    /// circuit build on every call, every retry — see
+    /// `presence_negotiation_budget_reads_this_field_not_a_rival_constant` in the test module.
+    ///
+    /// `POST_SEND_VERIFY_BASE` covers dispatch/scheduling overhead — reused rather than minting a
+    /// second constant for the identical role it already plays for the upload post-send phase.
+    /// `n * PRESENCE_ALLOWANCE_MS_PER_OP` prices the chunk's own per-hash presence-check cost.
+    ///
+    /// Sound as a *total*, non-resetting deadline — where the same shape is *not* sound for
+    /// `fetch_batch`/`fetch_subtree` (see [`UnboundedTicket::Fork92`]'s own doc) — specifically
+    /// because `n` is never a guess: it is `batch.len()`, the exact size of the request body this
+    /// call just sent, itself capped at `MAX_MISSING_BATCH`/`MAX_UPLOAD_TARGETS_BATCH`. There is no
+    /// large-but-healthy response at a larger `n` this budget could mistake for a stall, because no
+    /// response larger than what `n` already prices is possible — unlike an object-bundle fetch,
+    /// whose response size the request does not bound at all.
+    fn presence_negotiation_budget(&self, n: usize) -> std::time::Duration {
+        self.connect_timeout + POST_SEND_VERIFY_BASE + std::time::Duration::from_secs_f64(
+            n as f64 * PRESENCE_ALLOWANCE_MS_PER_OP / 1000.0
+        )
+    }
+
     /// Ask which of the given objects the remote lacks (batched).
     ///
     /// Deliberately **not** on [`Posture::BoundedReads`]: the server side consults up to
     /// `MAX_MISSING_BATCH` (10,000) hashes before its first response byte, work that scales with
     /// the batch rather than being O(constant) — the settled contract puts that in the
     /// scaled/measured-budget category, not the flat one `REMOTE_READ_TIMEOUT` is honest for.
-    /// Likely fast in practice, but "probably fine" is exactly what the contract exists to stop
-    /// us asserting; a real budget for this is a later slice.
+    /// Rides [`Posture::TotalDeadline`] instead, sized per batch by
+    /// [`Self::presence_negotiation_budget`]. Accepted residual: a remote whose per-hash presence
+    /// check genuinely exceeds [`PRESENCE_ALLOWANCE_MS_PER_OP`] — an overloaded or pathologically
+    /// slow deployment — gets abandoned rather than waited out; this call's error is already a
+    /// plain, retry-safe `Err`, so an ordinary retry is the recovery path, not a looser budget.
     pub async fn missing_objects(&self, hashes: &[String]) -> Result<Vec<String>, String> {
         let mut missing: Vec<String> = Vec::new();
 
         for batch in hashes.chunks(MAX_MISSING_BATCH) {
             let response = self.request_on(
-                Posture::UnboundedFollowsRedirects(UnboundedTicket::Fork92),
+                Posture::TotalDeadline(self.presence_negotiation_budget(batch.len())),
                 reqwest::Method::POST, "/v1/objects/missing"
             )
                 .json(&MissingObjectsRequest { hashes: batch.to_vec() })
@@ -1996,8 +2054,11 @@ impl RemoteClient {
     /// [`Self::missing_objects`]: the server side (`forklift-server/src/server.rs`'s
     /// `post_upload_targets`) walks up to `MAX_UPLOAD_TARGETS_BATCH` (1,000) hashes, checking each
     /// against on-disk object presence, before its first response byte — work that scales with the
-    /// batch rather than being O(constant). Same later-slice caveat as `missing_objects`: likely
-    /// fast in practice, but not asserted bounded here.
+    /// batch rather than being O(constant). Rides [`Posture::TotalDeadline`] like
+    /// `missing_objects`, sized per batch by [`Self::presence_negotiation_budget`] — same accepted
+    /// residual: a per-hash presence check genuinely slower than [`PRESENCE_ALLOWANCE_MS_PER_OP`]
+    /// gets abandoned rather than waited out, recovered by an ordinary retry rather than a looser
+    /// budget.
     pub async fn upload_targets(&self,
                                 session: &str,
                                 hashes: &[String]) -> Result<Option<UploadTargetsResponse>, String> {
@@ -2009,7 +2070,7 @@ impl RemoteClient {
 
         for batch in hashes.chunks(MAX_UPLOAD_TARGETS_BATCH) {
             let response = self.request_on(
-                Posture::UnboundedFollowsRedirects(UnboundedTicket::Fork92),
+                Posture::TotalDeadline(self.presence_negotiation_budget(batch.len())),
                 reqwest::Method::POST, "/v1/objects/upload-targets"
             )
                 .json(&UploadTargetsRequest { session: session.to_string(), hashes: batch.to_vec() })
@@ -6479,26 +6540,11 @@ mod tests {
         let _ = std::fs::remove_file(&dest);
     }
 
-    /// `missing_objects`'s server work scales with the batch, so the contract forbids bounding it
-    /// at all (see its own doc comment). Pins the "unbounded direction": a silent
-    /// remote alone must never make this call fail within a window comfortably past the tight
-    /// bounded budget — if it did, either this call or `request()`'s own default client had been
-    /// silently rewired onto a bounded one.
-    #[test]
-    fn missing_objects_is_not_flat_bounded_by_silence() {
-        let remote = SilentRemote::start();
-        let client = RemoteClient::new(&remote.url, None).unwrap();
-        let check_after = TEST_DIRECT_CONNECT_TIMEOUT + TEST_TIGHT_READ_TIMEOUT
-            + std::time::Duration::from_secs(5);
-
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        runtime.block_on(assert_still_running(
-            "missing_objects", check_after, client.missing_objects(&["a".repeat(64)]),
-        ));
-    }
-
-    /// `fetch_batch`'s server work is size-dependent (see its own doc comment) — same "unbounded
-    /// direction" pin as `missing_objects`'s.
+    /// `fetch_batch`'s server work is size-dependent (see its own doc comment), so unlike
+    /// `missing_objects`/`upload_targets` (moved onto [`Posture::TotalDeadline`], see
+    /// `missing_objects_times_out_against_a_silent_remote`) it stays genuinely unbounded — pins
+    /// the "unbounded direction": a silent remote alone must never make this call fail within a
+    /// window comfortably past the tight bounded budget.
     #[test]
     fn fetch_batch_is_not_flat_bounded_by_silence() {
         let remote = SilentRemote::start();
@@ -6513,7 +6559,7 @@ mod tests {
     }
 
     /// `fetch_subtree`'s server work is size-dependent (see its own doc comment) — same
-    /// "unbounded direction" pin as `missing_objects`'s.
+    /// "unbounded direction" pin as [`fetch_batch_is_not_flat_bounded_by_silence`]'s.
     #[test]
     fn fetch_subtree_is_not_flat_bounded_by_silence() {
         let remote = SilentRemote::start();
@@ -6647,13 +6693,27 @@ mod tests {
         }
     }
 
-    /// `missing_objects` rides the auto-following client, unbounded (only a `connect_timeout`) — so before this
-    /// fix, a `500` whose body then wedges hangs this call forever, with the status line and
-    /// headers already fully delivered. The outer ceiling is a safety net, not the property under
-    /// test: if the wrapper in `error_of` is missing, that outer ceiling is what trips (the test
-    /// fails instead of hanging the suite), which is unambiguous evidence the internal bound is
-    /// gone — status line and headers were fully delivered before the park, so the only thing
-    /// left to hang on is the error-body read itself.
+    /// `missing_objects` now rides [`Posture::TotalDeadline`] (FORK-92 budget 1), sized per batch
+    /// by [`RemoteClient::presence_negotiation_budget`] — but that outer, per-request deadline is
+    /// a *different* bound from `error_of`'s own inner [`RemoteClient::error_body_budget`], and
+    /// this test's whole point survives that move only because the batch size below (2,000) is
+    /// deliberately picked so the outer bound (`connect + POST_SEND_VERIFY_BASE + 2,000 *
+    /// PRESENCE_ALLOWANCE_MS_PER_OP` = 17s direct) stays looser than the inner one (`connect +
+    /// ERROR_BODY_READ_TIMEOUT` = 15s direct): the inner budget is still what actually fires here.
+    /// At a small batch (see `missing_objects_times_out_against_a_silent_remote`'s own budget,
+    /// ~7s at `n=1`) the outer deadline is the *tighter* of the two and would fire first instead —
+    /// a real, deliberate interaction between the two bounds, not a gap: whichever fires first
+    /// still surfaces as a plain `Err` through the same `error_of` fallback path either way (a
+    /// timed-out `response.json()` and an elapsed inner `tokio::time::timeout` both take the same
+    /// "no usable error body arrived" arm), so no call ever hangs regardless of which bound wins.
+    ///
+    /// Before this call had its own outer deadline at all, it rode the auto-following client with
+    /// no bound of any kind — a `500` whose body then wedges hung it forever, with the status line
+    /// and headers already fully delivered. The outer test-ceiling below is a safety net, not the
+    /// property under test: if the wrapper in `error_of` were missing, that ceiling is what would
+    /// trip (the test failing instead of hanging the suite) — unambiguous evidence the internal
+    /// bound is gone, since status line and headers were fully delivered before the park, so the
+    /// only thing left to hang on is the error-body read itself.
     ///
     /// Also asserts a **lower** bound on elapsed time (review round 6, finding 1): a red-then-green
     /// suite run alone does not prove `error_of` calls [`error_body_read_budget`] at all — nothing
@@ -6681,6 +6741,12 @@ mod tests {
     fn missing_objects_bounds_the_error_body_read_after_a_wedged_500() {
         let remote = SilentErrorBodyRemote::start();
         let client = RemoteClient::new(&remote.url, None).unwrap();
+        // A batch of 2,000 hashes — large enough that the call's own outer TotalDeadline
+        // (`connect + POST_SEND_VERIFY_BASE + 2,000 * PRESENCE_ALLOWANCE_MS_PER_OP` = 17s direct)
+        // stays looser than error_of's inner error_body_budget (15s direct), so the inner budget
+        // is still what fires and this test still pins what it always pinned. Any real hash
+        // string works — the fixture never inspects the body.
+        let hashes: Vec<String> = (0..2000).map(|_| "a".repeat(64)).collect();
         // Mirrors, not the production constants directly (see the `TEST_*` block's doc above) —
         // written as the constant sum, not via `error_body_read_budget`, so this assertion
         // doesn't co-move with a corrupted helper — a helper bug would then move the elapsed time
@@ -6691,7 +6757,7 @@ mod tests {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let started = std::time::Instant::now();
         let outcome = runtime.block_on(async {
-            tokio::time::timeout(outer_ceiling, client.missing_objects(&["a".repeat(64)])).await
+            tokio::time::timeout(outer_ceiling, client.missing_objects(&hashes)).await
         });
         let elapsed = started.elapsed();
 
@@ -6857,6 +6923,191 @@ mod tests {
             "a real TorMode::On client's resolve_budget must be exactly the Tor-folded 70s — \
             otherwise resolve's own total deadline fires during Tor circuit build, the exact \
             defect class this fix exists to close"
+        );
+    }
+
+    // -----------------------------------------------------------------------------------
+    // FORK-92 (budget 1): `missing_objects`/`upload_targets` move off `UnboundedTicket::Fork92`
+    // onto `Posture::TotalDeadline`, sized by `RemoteClient::presence_negotiation_budget`. The
+    // four tests below mirror the `error_body_budget`/`resolve_budget` pattern directly above:
+    // reads-n (an implementation ignoring the batch size and returning a flat constant must
+    // fail), reads-this-instance's-connect_timeout-not-a-rival (the sentinel pattern), the real
+    // Tor-mode value, and that the bound actually fires against a remote that never answers.
+    // -----------------------------------------------------------------------------------
+
+    /// A flat-constant implementation of `presence_negotiation_budget` — one that ignores `n`
+    /// entirely — passes every other test in this section (the sentinel and Tor-mode tests both
+    /// fix `n`). This is the one that would catch it: the budget at `n=1` and at
+    /// `n=MAX_MISSING_BATCH` must differ, by exactly the arithmetic
+    /// `presence_negotiation_budget`'s own doc states, not merely by *some* positive amount (a
+    /// bug that scales the wrong term, or scales by the wrong rate, would still pass a
+    /// "must differ" check but not an exact one).
+    #[test]
+    fn presence_negotiation_budget_reads_n() {
+        let client = RemoteClient::new_test_with_connect_timeout(
+            "http://forklift-fork-92-presence-budget-n-test.invalid",
+            TEST_DIRECT_CONNECT_TIMEOUT,
+        );
+
+        let small = client.presence_negotiation_budget(1);
+        let large = client.presence_negotiation_budget(MAX_MISSING_BATCH);
+
+        assert!(
+            large > small,
+            "presence_negotiation_budget(n) must grow with n — got {:?} at n=1 and {:?} at \
+            n={} (MAX_MISSING_BATCH); an implementation that ignores n and returns a flat \
+            constant would make these equal", small, large, MAX_MISSING_BATCH
+        );
+
+        let expected_gap = std::time::Duration::from_secs_f64(
+            (MAX_MISSING_BATCH - 1) as f64 * PRESENCE_ALLOWANCE_MS_PER_OP / 1000.0
+        );
+        assert_eq!(
+            large - small, expected_gap,
+            "the n=1 vs n=MAX_MISSING_BATCH gap must be exactly (n-1) * \
+            PRESENCE_ALLOWANCE_MS_PER_OP — not merely some positive drift, which a wrong rate or \
+            a scaling bug on the wrong term could also produce"
+        );
+    }
+
+    /// Mirrors [`error_body_budget_reads_this_field_not_a_rival_constant`]/
+    /// [`resolve_budget_reads_this_field_not_a_rival_constant`] for
+    /// [`RemoteClient::presence_negotiation_budget`] — the identical gap for the identical reason:
+    /// every existing behavioral test of `missing_objects`/`upload_targets` builds a direct client
+    /// via `RemoteClient::new`, where `self.connect_timeout` == [`REMOTE_CONNECT_TIMEOUT`] (5s) —
+    /// so a hardcoded-constant mutant (`REMOTE_CONNECT_TIMEOUT` in place of `self.connect_timeout`)
+    /// is extensionally identical to the correct implementation everywhere those tests look, and
+    /// would still give a Tor client a deadline sized off a 5s connect budget against a 60s connect
+    /// allowance — the deadline firing during circuit build, [`REMOTE_CONNECT_TIMEOUT_TOR`]'s own
+    /// reason for existing.
+    ///
+    /// `SENTINEL_CONNECT_TIMEOUT` (13s) is a third value, distinct from `error_body_budget`'s own
+    /// sentinel (7s) and `resolve_budget`'s (11s) for the same "read independently, not one case
+    /// split in half" reason those two are distinct from each other — and, like both, checked
+    /// against every named `Duration` constant in this module before being picked (`grep -n
+    /// "Duration::from_secs\|Duration::from_millis"`): the distinct values in play are 0.2
+    /// (`COMMIT_BACKOFF_START`/`UPLOAD_WATCHDOG_POLL_INTERVAL`), 2 (`POST_SEND_VERIFY_BASE`), 3
+    /// (`COMMIT_BACKOFF_CAP`), 5, 7 (the sibling sentinel), 10, 11 (the other sibling sentinel),
+    /// and 60 — 13 matches none of them. `n` is fixed at 1 here (a 5ms scaled term) precisely so
+    /// this test's asserted *output* — 15.005s (`13 + POST_SEND_VERIFY_BASE + 0.005`) — is what
+    /// actually needs checking for collisions, and unlike `error_body_budget`/`resolve_budget`'s
+    /// own two-addend sums, `presence_negotiation_budget` sums *three* terms (`connect_timeout`,
+    /// `POST_SEND_VERIFY_BASE`, the `n`-scaled term); unlike those tests, the odd `.005s` fraction
+    /// this asserts is not producible at all by summing any subset of this module's named
+    /// (whole- or tenth-second) `Duration` constants, so no accidental collision is possible even
+    /// unchecked — the full pairwise-sum set over `{0.2, 2, 3, 5, 7, 10, 11, 60}` is `{2.2, 3.2,
+    /// 5, 5.2, 7, 7.2, 8, 9, 10, 10.2, 11.2, 12, 13, 14, 15, 16, 17, 18, 21, 60.2, 62, 63, 65, 67,
+    /// 70, 71}` — no 15.005 there either.
+    #[test]
+    fn presence_negotiation_budget_reads_this_field_not_a_rival_constant() {
+        const SENTINEL_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(13);
+
+        let client = RemoteClient::new_test_with_connect_timeout(
+            "http://forklift-fork-92-presence-budget-sentinel-test.invalid",
+            SENTINEL_CONNECT_TIMEOUT,
+        );
+
+        assert_eq!(
+            client.presence_negotiation_budget(1),
+            SENTINEL_CONNECT_TIMEOUT + POST_SEND_VERIFY_BASE
+                + std::time::Duration::from_secs_f64(1.0 * PRESENCE_ALLOWANCE_MS_PER_OP / 1000.0),
+            "presence_negotiation_budget must fold in *this instance's* connect_timeout — a value \
+            neither RemoteClient::new (5s) nor RemoteClient::new_with_tor under TorMode::On (60s) \
+            can ever produce, so this cannot pass by coincidentally matching a hardcoded rival \
+            constant"
+        );
+    }
+
+    /// Mirrors [`error_body_budget_is_70s_for_a_real_tor_mode_client`]/
+    /// [`resolve_budget_is_70s_for_a_real_tor_mode_client`] for
+    /// [`RemoteClient::presence_negotiation_budget`], for the identical reason those two give: the
+    /// sentinel test above pins *reads-the-field-not-a-rival* but not what the budget actually
+    /// returns for a real Tor-mode client, and neither claim subsumes the other — a future cap on
+    /// the result (e.g. `min(computed, 30s)`) would leave the sentinel's small-`n` assertion
+    /// untouched while silently breaking the real Tor-mode value this test pins. Built the same
+    /// no-I/O way (`new_with_tor` never touches the network). `n` is `MAX_MISSING_BATCH` — the
+    /// largest batch either call ever actually sends — so this also pins the budget at the real
+    /// worst case, not an arbitrary small `n`.
+    #[test]
+    fn presence_negotiation_budget_is_112s_for_a_real_tor_mode_client_at_the_missing_batch_cap() {
+        let tor = TorSettings { mode: TorMode::On, proxy: DEFAULT_TOR_PROXY.to_string() };
+        let client = RemoteClient::new_with_tor(
+            "http://forklift-fork-92-presence-budget-tor-endpoint-test.invalid", None, tor,
+        ).unwrap();
+
+        let expected = TEST_TOR_CONNECT_TIMEOUT + POST_SEND_VERIFY_BASE
+            + std::time::Duration::from_secs_f64(
+                MAX_MISSING_BATCH as f64 * PRESENCE_ALLOWANCE_MS_PER_OP / 1000.0
+            );
+        assert_eq!(
+            expected, std::time::Duration::from_secs(112),
+            "sanity: this test's own name promises 112s — 60s connect + 2s base + \
+            10,000 * 5ms = 60 + 2 + 50"
+        );
+
+        assert_eq!(
+            client.presence_negotiation_budget(MAX_MISSING_BATCH),
+            expected,
+            "a real TorMode::On client's presence_negotiation_budget at the largest batch \
+            missing_objects/upload_targets ever send must be exactly the Tor-folded value — \
+            otherwise the deadline fires during Tor circuit build on the very calls this fix \
+            exists to protect"
+        );
+    }
+
+    /// `missing_objects` must terminate against a remote that connects, reads the request in
+    /// full, and then genuinely goes silent — never answering — rather than hang forever. Before
+    /// this fix it rode `Posture::UnboundedFollowsRedirects`, with no bound of any kind (the
+    /// `UnboundedTicket::Fork92` gap this PR closes for this call); this is the falsifying test
+    /// for that defect, the same shape as `fetch_info_times_out_against_a_silent_remote` and
+    /// siblings above, applied to the total-deadline posture this call now rides.
+    #[test]
+    fn missing_objects_times_out_against_a_silent_remote() {
+        let remote = SilentRemote::start();
+        let client = RemoteClient::new(&remote.url, None).unwrap();
+        let hashes = vec!["a".repeat(64)];
+        let effective_budget = client.presence_negotiation_budget(hashes.len());
+        let hard_ceiling = effective_budget + std::time::Duration::from_secs(15);
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let outcome = runtime.block_on(async {
+            tokio::time::timeout(hard_ceiling, client.missing_objects(&hashes)).await
+        });
+
+        outcome
+            .unwrap_or_else(|_| panic!(
+                "missing_objects hung past the test's own {:?} ceiling — no total deadline fired \
+                at all", hard_ceiling
+            ))
+            .expect_err("a silent remote must not appear to succeed");
+    }
+
+    /// `upload_targets` must terminate against a remote that connects, reads the request in
+    /// full, and then genuinely goes silent — same defect, same fix, same falsifying shape as
+    /// [`missing_objects_times_out_against_a_silent_remote`] immediately above, for the sibling
+    /// call this PR moves off the identical unbounded posture.
+    #[test]
+    fn upload_targets_times_out_against_a_silent_remote() {
+        let remote = SilentRemote::start();
+        let client = RemoteClient::new(&remote.url, None).unwrap();
+        let hashes = vec!["a".repeat(64)];
+        let effective_budget = client.presence_negotiation_budget(hashes.len());
+        let hard_ceiling = effective_budget + std::time::Duration::from_secs(15);
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let outcome = runtime.block_on(async {
+            tokio::time::timeout(
+                hard_ceiling, client.upload_targets("session-fork-92-silent-test", &hashes)
+            ).await
+        });
+
+        let inner = outcome.unwrap_or_else(|_| panic!(
+            "upload_targets hung past the test's own {:?} ceiling — no total deadline fired \
+            at all", hard_ceiling
+        ));
+        assert!(
+            inner.is_err(),
+            "a silent remote must not appear to succeed"
         );
     }
 
