@@ -1553,4 +1553,77 @@ mod tests {
         let error = import_bundle_bytes(&bytes).err().unwrap();
         assert!(error.contains("object ceiling"), "a v3 bundle refuses the giant: {}", error);
     }
+
+    // -----------------------------------------------------------------------------------
+    // SPIKE FORK-92 S1 — measure build_partial_bundle's real per-object cost, the function
+    // `fetch_batch`'s server handler calls before its first response byte. Throwaway diagnostic
+    // instrumentation for the FORK-92 rate spike, not a standing regression pin — #[ignore]d, run
+    // explicitly with `cargo test --release -p forklift-core
+    // spike_fork92_bundle_build_rate -- --ignored --nocapture`. Release build, matching CI/real
+    // deployments (see the spike report for the measured debug/release ratio).
+    // -----------------------------------------------------------------------------------
+    #[test]
+    #[ignore]
+    fn spike_fork92_bundle_build_rate() {
+        use std::time::Instant;
+
+        // The design's proposed ceiling for build_partial_bundle's per-object cost (FORK-92
+        // rate spike report). Pins the design's claim, not a tight regression bound — see the
+        // report for the measured margin.
+        const BUNDLE_BUILD_MS_PER_OP: f64 = 100.0;
+
+        println!(
+            "\nSPIKE FORK-92 S1 — BUNDLE_BUILD_ALLOWANCE (build_partial_bundle), release={}",
+            !cfg!(debug_assertions)
+        );
+        println!("{:>8} | {:>16} | {:>16}", "n", "first-call", "second-call(warm)");
+
+        for &n in &[10usize, 100, 1_000, 10_000] {
+            let _scratch = Scratch::new(&format!("bundle-rate-{}", n));
+
+            let hashes: Vec<String> = (0..n).map(|i| {
+                let mut object = LooseObjectBuilder::build_blob(&Blob {
+                    // Small, realistic per-object payload (a source-file-sized blob) — big enough
+                    // that compression is doing real work, not measuring noise.
+                    content: format!(
+                        "spike-fork92-bundle-{}-{}-{}", n, i, "x".repeat(200)
+                    ).into_bytes(),
+                });
+                object.store().unwrap();
+                object.hash
+            }).collect();
+
+            let start = Instant::now();
+            let bytes_first = build_partial_bundle(&hashes).unwrap();
+            let first_call = start.elapsed();
+
+            let start = Instant::now();
+            let bytes_second = build_partial_bundle(&hashes).unwrap();
+            let second_call = start.elapsed();
+
+            assert_eq!(bytes_first.len() > 0, true);
+            assert_eq!(bytes_second.len() > 0, true);
+
+            let first_ms_per_op = first_call.as_secs_f64() * 1000.0 / n as f64;
+            let second_ms_per_op = second_call.as_secs_f64() * 1000.0 / n as f64;
+            assert!(
+                first_ms_per_op < BUNDLE_BUILD_MS_PER_OP,
+                "first-call at n={}: {:.4}ms/op exceeds the proposed {}ms/op ceiling",
+                n, first_ms_per_op, BUNDLE_BUILD_MS_PER_OP,
+            );
+            assert!(
+                second_ms_per_op < BUNDLE_BUILD_MS_PER_OP,
+                "second-call(warm) at n={}: {:.4}ms/op exceeds the proposed {}ms/op ceiling",
+                n, second_ms_per_op, BUNDLE_BUILD_MS_PER_OP,
+            );
+
+            println!(
+                "{:>8} | {:>12.4}ms/op | {:>12.4}ms/op   (totals: {:?}, {:?}; bundle {} bytes)",
+                n,
+                first_call.as_secs_f64() * 1000.0 / n as f64,
+                second_call.as_secs_f64() * 1000.0 / n as f64,
+                first_call, second_call, bytes_first.len(),
+            );
+        }
+    }
 }

@@ -4700,6 +4700,90 @@ mod tests {
         object.hash
     }
 
+    /// Build a flat directory of `n` distinct files, each its own blob — the fixture
+    /// [`spike_fork92_subtree_walk_rate`] resolves via `collect_subtree_closure`.
+    fn store_dir_of_files(tag: &str, n: usize) -> String {
+        use crate::enums::dir_entry_type::DirEntryType::Normal;
+
+        let entries: Vec<(String, String)> = (0..n)
+            .map(|i| (format!("f{}.txt", i), store_blob(&format!("{}-{}", tag, i))))
+            .collect();
+        let refs: Vec<(&str, &str, crate::enums::dir_entry_type::DirEntryType)> = entries.iter()
+            .map(|(name, hash)| (name.as_str(), hash.as_str(), Normal))
+            .collect();
+        store_tree(&refs)
+    }
+
+    // -----------------------------------------------------------------------------------
+    // FORK-92 survey/re-measure (2026-08-02) — re-run of the rebuild memo's own
+    // `spike_fork92_subtree_walk_rate` against current `main`, ported by hand since
+    // `remote_utils.rs` was restructured (PRs #97/#99) after the memo's base commit. Measures
+    // `tree_utils::collect_subtree_closure`'s real per-object walk cost — the phase
+    // `get_subtree` runs before `build_partial_bundle`, on every `fetch_subtree` request,
+    // unconditionally. Throwaway diagnostic instrumentation, not a standing regression pin —
+    // #[ignore]d, run explicitly with `cargo test --release -p forklift-core
+    // spike_fork92_subtree_walk_rate -- --ignored --nocapture`. Release build: CI and real
+    // deployments run release, and a debug number here would not size a production constant
+    // honestly.
+    // -----------------------------------------------------------------------------------
+    #[test]
+    #[ignore]
+    fn spike_fork92_subtree_walk_rate() {
+        use std::time::Instant;
+
+        // The proposed ceiling for `collect_subtree_closure`'s per-object walk cost
+        // (`SUBTREE_WALK_ALLOWANCE_MS_PER_OP` in the FORK-92 design). Pins the design's claim,
+        // not a tight regression bound — see the survey report for the measured margin.
+        const SUBTREE_WALK_MS_PER_OP: f64 = 5.0;
+
+        println!(
+            "\nFORK-92 SURVEY — SUBTREE_WALK_RATE (collect_subtree_closure), release={}",
+            !cfg!(debug_assertions)
+        );
+        println!("{:>8} | {:>16} | {:>16}", "closure_objects(n+1)", "first-call", "second-call(warm)");
+
+        for &n in &[10usize, 100, 1_000, 10_000] {
+            let _scratch = Scratch::new(&format!("subtree-walk-rate-{}", n));
+
+            let docs = store_dir_of_files(&format!("subtree-walk-{}", n), n);
+            let root = store_tree(&[("docs", &docs, crate::enums::dir_entry_type::DirEntryType::Tree)]);
+
+            let closure_objects = n + 1; // n blobs + the "docs" tree itself
+
+            let start = Instant::now();
+            let first = crate::util::tree_utils::collect_subtree_closure(&root, "docs")
+                .unwrap()
+                .expect("the fixture's own \"docs\" subtree must resolve");
+            let first_elapsed = start.elapsed();
+            assert_eq!(first.len(), closure_objects, "sanity: the fixture's own closure size");
+
+            let start = Instant::now();
+            let second = crate::util::tree_utils::collect_subtree_closure(&root, "docs")
+                .unwrap()
+                .expect("the fixture's own \"docs\" subtree must resolve (warm)");
+            let second_elapsed = start.elapsed();
+            assert_eq!(second.len(), closure_objects);
+
+            let first_ms_per_op = first_elapsed.as_secs_f64() * 1000.0 / closure_objects as f64;
+            let second_ms_per_op = second_elapsed.as_secs_f64() * 1000.0 / closure_objects as f64;
+            assert!(
+                first_ms_per_op < SUBTREE_WALK_MS_PER_OP,
+                "first walk at closure_objects={}: {:.4}ms/object exceeds the proposed {}ms/object ceiling",
+                closure_objects, first_ms_per_op, SUBTREE_WALK_MS_PER_OP,
+            );
+            assert!(
+                second_ms_per_op < SUBTREE_WALK_MS_PER_OP,
+                "warm walk at closure_objects={}: {:.4}ms/object exceeds the proposed {}ms/object ceiling",
+                closure_objects, second_ms_per_op, SUBTREE_WALK_MS_PER_OP,
+            );
+
+            println!(
+                "{:>8} | {:>12.4}ms/op | {:>12.4}ms/op   (totals: {:?}, {:?})",
+                closure_objects, first_ms_per_op, second_ms_per_op, first_elapsed, second_elapsed,
+            );
+        }
+    }
+
     /// The lift closure walk prunes a subtree against **every** parent, not just the
     /// first — so a merge parcel that adopted an out-of-scope sibling by hash from its *second*
     /// parent treats that subtree as base-explained and never loads it. This is what makes a

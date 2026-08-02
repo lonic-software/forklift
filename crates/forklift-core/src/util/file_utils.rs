@@ -4163,4 +4163,137 @@ mod tests {
             std::fs::remove_dir_all(&temp).ok();
         }
     }
+
+    // -----------------------------------------------------------------------------------
+    // SPIKE FORK-92 S1 — measure does_object_exist's real per-hash cost, the primitive
+    // missing_objects/upload_targets loop over. Throwaway diagnostic instrumentation for the
+    // FORK-92 rate spike, not a standing regression pin — #[ignore]d, run explicitly with
+    // `cargo test --release -p forklift-core spike_fork92_presence_rate -- --ignored --nocapture`.
+    // Release build: CI and real deployments run release, and a debug number here would be
+    // meaningless for sizing a production constant (this crate's own debug/release gap is large
+    // — see the spike report for the measured ratio).
+    // -----------------------------------------------------------------------------------
+    #[test]
+    #[ignore]
+    fn spike_fork92_presence_rate() {
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+        use crate::enums::dir_entry_type::DirEntryType;
+        use crate::model::blob::Blob;
+        use crate::model::parcel::Parcel;
+        use crate::model::tree_item::TreeItem;
+        use std::time::Instant;
+
+        // The design's proposed ceiling for does_object_exist's per-hash cost (FORK-92 rate
+        // spike report). Pins the design's claim, not a tight regression bound — see the report
+        // for the measured margin.
+        const PRESENCE_RATE_MS_PER_OP: f64 = 5.0;
+
+        fn scratch(name: &str) -> (PathBuf, StorageRootScope) {
+            let root = std::env::temp_dir().join(format!(
+                "forklift-spike-presence-{}-{}", name, std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            let scope = StorageRootScope::enter(&root);
+            (root, scope)
+        }
+
+        println!(
+            "\nSPIKE FORK-92 S1 — PRESENCE_RATE (does_object_exist), release={}",
+            !cfg!(debug_assertions)
+        );
+        println!("{:>8} | {:>14} | {:>14} | {:>14}", "n", "loose-present", "packed-present", "packed-absent");
+
+        for &n in &[10usize, 100, 1_000, 10_000] {
+            let (root, scope) = scratch(&format!("n{}", n));
+
+            // n distinct real blobs, referenced from one tree, one parcel, main's head — the
+            // shape compact's live-set walk needs to keep them instead of collecting them as
+            // garbage.
+            let mut hashes: Vec<String> = Vec::with_capacity(n);
+            let mut tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+
+            for i in 0..n {
+                let mut blob = LooseObjectBuilder::build_blob(&Blob {
+                    content: format!("spike-fork92-presence-{}-{}", n, i).into_bytes(),
+                });
+                blob.store().unwrap();
+                tree.add_child(TreeItem::new(format!("f{}", i), blob.hash.clone(), DirEntryType::Normal));
+                hashes.push(blob.hash);
+            }
+
+            // Warm loose-path presence check (nothing packed yet): each of the n real hashes.
+            let start = Instant::now();
+            for hash in &hashes {
+                assert!(does_object_exist(hash).unwrap(), "must be present (loose)");
+            }
+            let loose_present = start.elapsed();
+            let loose_present_ms_per_op = loose_present.as_secs_f64() * 1000.0 / n as f64;
+            assert!(
+                loose_present_ms_per_op < PRESENCE_RATE_MS_PER_OP,
+                "loose-present at n={}: {:.4}ms/op exceeds the proposed {}ms/op ceiling",
+                n, loose_present_ms_per_op, PRESENCE_RATE_MS_PER_OP,
+            );
+
+            // Pack everything, so the packed (index-probe) path is what the rest measures — the
+            // design's own rationale text assumes a warm presence check is "a stat plus a
+            // pack-index probe", i.e. the packed case.
+            let mut tree_object = LooseObjectBuilder::build_tree(&tree);
+            tree_object.store().unwrap();
+            let parcel = Parcel {
+                tree_hash: tree_object.hash.clone(),
+                parents: Vec::new(),
+                actions: Vec::new(),
+                description: Some("spike fork92 s1".to_string()),
+            };
+            let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
+            parcel_object.store().unwrap();
+            crate::util::pallet_utils::set_pallet_head("main", &parcel_object.hash).unwrap();
+            crate::util::pack_utils::compact(false, false).unwrap();
+
+            let start = Instant::now();
+            for hash in &hashes {
+                assert!(does_object_exist(hash).unwrap(), "must be present (packed)");
+            }
+            let packed_present = start.elapsed();
+            let packed_present_ms_per_op = packed_present.as_secs_f64() * 1000.0 / n as f64;
+            assert!(
+                packed_present_ms_per_op < PRESENCE_RATE_MS_PER_OP,
+                "packed-present at n={}: {:.4}ms/op exceeds the proposed {}ms/op ceiling",
+                n, packed_present_ms_per_op, PRESENCE_RATE_MS_PER_OP,
+            );
+
+            // n hashes that name no real object at all — the "still missing" case
+            // missing_objects's own loop spends most of its time on for a first negotiation.
+            let absent_hashes: Vec<String> = (0..n)
+                .map(|i| crate::util::object_utils::hash_object_bytes(
+                    format!("spike-fork92-absent-{}-{}", n, i).as_bytes()
+                ))
+                .collect();
+
+            let start = Instant::now();
+            for hash in &absent_hashes {
+                assert!(!does_object_exist(hash).unwrap(), "must be absent");
+            }
+            let packed_absent = start.elapsed();
+            let packed_absent_ms_per_op = packed_absent.as_secs_f64() * 1000.0 / n as f64;
+            assert!(
+                packed_absent_ms_per_op < PRESENCE_RATE_MS_PER_OP,
+                "packed-absent at n={}: {:.4}ms/op exceeds the proposed {}ms/op ceiling",
+                n, packed_absent_ms_per_op, PRESENCE_RATE_MS_PER_OP,
+            );
+
+            println!(
+                "{:>8} | {:>10.3}ms/op | {:>10.3}ms/op | {:>10.3}ms/op   (totals: loose {:?}, packed-present {:?}, packed-absent {:?})",
+                n,
+                loose_present.as_secs_f64() * 1000.0 / n as f64,
+                packed_present.as_secs_f64() * 1000.0 / n as f64,
+                packed_absent.as_secs_f64() * 1000.0 / n as f64,
+                loose_present, packed_present, packed_absent,
+            );
+
+            drop(scope);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
 }
