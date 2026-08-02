@@ -347,7 +347,7 @@ const REMOTE_CONNECT_TIMEOUT_TOR: std::time::Duration = std::time::Duration::fro
 /// server costs is a single lookup or an already-built file.
 const REMOTE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// The read/metadata silence budget for [`RemoteClient::fetch_object`] alone — see
+/// The read/metadata silence budget for [`RemoteClient::fetch_object`] — see
 /// [`Posture::BoundedObjectReads`]. Deliberately loose, not tuned to feel responsive:
 /// `server.rs`'s `get_object` handler documents that it "buffers the whole object in memory" via
 /// `retrieve_object_by_hash`, which content-verifies before returning and, for a packed/delta
@@ -365,6 +365,12 @@ const REMOTE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// permanently, deterministically unfetchable through this bound. Knowingly accepted for this
 /// slice; the root fix (streaming these handlers instead of buffering, removing the size-dependent
 /// pre-first-byte phase entirely) is FORK-85.
+///
+/// Reused unmodified for `fetch_batch`'s redirect-follow `GET` (see that function's own doc for
+/// the full reasoning): that station reads bytes an offloading store already finished writing
+/// before it ever presigned the URL, not bytes still being buffered server-side the way this
+/// constant's own sizing reasoning above assumes — a strictly easier case than the one this value
+/// was tuned for, so the same loose silence budget is at least as defensible there.
 const FETCH_OBJECT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The base allowance for [`RemoteClient::error_of`]'s own inline error-body read, once a
@@ -722,8 +728,9 @@ fn watched_upload_body(bytes: Vec<u8>, progress: Arc<UploadProgress>) -> (reqwes
 /// one-shot streamed-upload bodies, must never auto-follow; reads may). *Whether a read/metadata
 /// silence bound applies at all* (only two of the four carry a client-level `read_timeout`; see
 /// [`REMOTE_READ_TIMEOUT`]'s doc for why the rest don't have an honest flat budget yet). *How loose
-/// that bound is*, for the two that do (`fetch_object` alone needs [`FETCH_OBJECT_READ_TIMEOUT`]
-/// instead of [`REMOTE_READ_TIMEOUT`] — see [`FETCH_OBJECT_READ_TIMEOUT`]'s doc). All four share the
+/// that bound is*, for the two that do (`fetch_object` and `fetch_batch`'s redirect-follow `GET`
+/// need [`FETCH_OBJECT_READ_TIMEOUT`] instead of [`REMOTE_READ_TIMEOUT`] — see
+/// [`FETCH_OBJECT_READ_TIMEOUT`]'s doc). All four share the
 /// same proxy/connect-timeout configuration, built once by [`Clients::build`] (called from
 /// [`RemoteClient::new_with_tor`]), which is also where each bounded client's actual `read_timeout`
 /// is computed via [`bounded_read_timeout`] rather than being the raw silence-budget constant.
@@ -757,7 +764,8 @@ mod clients {
         BoundedReads,
         /// [`FETCH_OBJECT_READ_TIMEOUT`]-bounded via a client-level `read_timeout` — the same
         /// shape as [`Self::BoundedReads`], just with the looser budget `fetch_object`'s
-        /// size-dependent server work needs. `fetch_object` alone.
+        /// size-dependent server work needs. `fetch_object`, and `fetch_batch`'s redirect-follow
+        /// `GET` — see [`FETCH_OBJECT_READ_TIMEOUT`]'s doc for why the latter shares it.
         ///
         /// **Auto-follows redirects — never select this for a mutation**, same reasoning and
         /// same trap as [`Self::BoundedReads`]'s own doc.
@@ -863,15 +871,20 @@ mod clients {
         /// own — left open here, not asserted as covered by the two that moved.
         ///
         /// `fetch_batch`'s **second** request station — the follow-up `GET` taken only when the
-        /// head redirects to storage, which actually reads the bundle bytes — does **not** share
-        /// that keystone and is filed here only because no other ticket owns it yet: it carries no
-        /// request body of its own to enumerate anything, so FORK-92's "priced by construction"
-        /// mechanism does not apply to it as written. The bundle's size *is* implicitly known —
-        /// it is whatever the preceding `POST`'s hash list determined — but this bare `GET`
-        /// carries none of that context forward, and inventing a scaling term for it here would
-        /// misstate what the request itself proves. Left as an open attribution question for
-        /// FORK-92's design to resolve (a distinct budget, or threading the known size through),
-        /// not asserted as already covered.
+        /// head redirects to storage, which actually reads the bundle bytes — used to be filed
+        /// here too, as an open attribution question: it carried no request body of its own to
+        /// enumerate anything, so FORK-92's "priced by construction" mechanism never applied to it
+        /// as written, and it had no other ticket to belong to. Resolved, not by inventing a
+        /// scaling term for it after all: it was never a negotiation call this ticket's keystone
+        /// could describe, because it isn't negotiating anything. An offloading store finishes
+        /// writing the bundle to its response key and only *then* presigns the `GET` URL
+        /// (`crates/forklift-aws-lambda/src/aws/s3.rs`'s `offload_response`), so by the time this
+        /// station is reached the bytes it reads are already fully materialized — the same shape
+        /// [`super::RemoteClient::fetch_object`]'s read is, not the size-unknown-in-advance one
+        /// `fetch_subtree` and this ticket's `POST` above still have. It now rides
+        /// [`super::Posture::BoundedObjectReads`], the same [`super::FETCH_OBJECT_READ_TIMEOUT`]
+        /// silence budget `fetch_object` uses, and no longer constructs this ticket at all — see
+        /// [`super::RemoteClient::fetch_batch`]'s own doc for the full reasoning.
         Fork92,
         /// `update_ref`: unbounded for a different reason than FORK-92's four — its server-side
         /// cost is a *derived* quantity (an audit walk over the pushed history segment), not one
@@ -921,7 +934,8 @@ mod clients {
         /// Same endpoint as [`Self::http`], plus a `read_timeout` of
         /// [`bounded_read_timeout`]`(connect_timeout, `[`FETCH_OBJECT_READ_TIMEOUT`]`)` — the
         /// same shape as [`Self::bounded_reads`], just with the looser silence budget
-        /// `fetch_object`'s size-dependent server work needs. Selected only by
+        /// `fetch_object`'s size-dependent server work (and, sharing the same budget,
+        /// `fetch_batch`'s redirect-follow `GET`) needs. Selected only by
         /// [`Posture::BoundedObjectReads`].
         bounded_object_reads: reqwest::Client,
     }
@@ -1884,15 +1898,25 @@ impl RemoteClient {
     /// [`Self::client_for`]'s doc for why this call reaches that URL directly rather than through
     /// [`Self::request_on`].
     ///
-    /// Both this call's request stations (the initial `POST` here, and the redirect-follow `GET`
-    /// below) ride an unbounded posture: deliberately **not** [`Posture::BoundedReads`], since
-    /// the server builds the whole requested
-    /// bundle — every object fully into memory — before its first response byte
-    /// (`forklift-server/src/server.rs`'s `objects/batch` handler), and that cost depends on the
-    /// byte sizes of objects this client doesn't have yet, which it cannot know in advance. No
-    /// flat budget is honest here; this must stay unbounded until it has its own scaled budget or
-    /// an abandon-and-fall-back lane, so a cold-cache multi-MB batch that works today keeps
-    /// working rather than hard-failing identically on every retry.
+    /// The initial `POST` above rides an unbounded posture: deliberately **not**
+    /// [`Posture::BoundedReads`], since the server builds the whole requested bundle — every
+    /// object fully into memory — before its first response byte (`forklift-server/src/server.rs`'s
+    /// `objects/batch` handler), and that cost depends on the byte sizes of objects this client
+    /// doesn't have yet, which it cannot know in advance. No flat budget is honest here; this must
+    /// stay unbounded until it has its own scaled budget or an abandon-and-fall-back lane, so a
+    /// cold-cache multi-MB batch that works today keeps working rather than hard-failing
+    /// identically on every retry.
+    ///
+    /// The redirect-follow `GET` below does not share that reasoning: an offloading store writes
+    /// the bundle to its storage-backed response key and only *then* presigns and returns the
+    /// `GET` URL (`crates/forklift-aws-lambda/src/aws/s3.rs`'s `offload_response`, called from
+    /// `head.rs`'s `batch` after `build_partial_bundle` already ran) — so by the time this station
+    /// is reached, the bytes it reads are already fully materialized at a known size, not still
+    /// being assembled by whatever answers the request. That is the same shape
+    /// [`Self::fetch_object`]'s own read is, not the size-unknown-in-advance one the `POST` above
+    /// has, so it rides [`Posture::BoundedObjectReads`] — the same [`FETCH_OBJECT_READ_TIMEOUT`]
+    /// silence budget, which resets on every byte received and so rides out a large-but-progressing
+    /// bundle, only ever cutting off a genuinely stalled one.
     pub async fn fetch_batch(&self, hashes: &[String]) -> Result<Option<Vec<u8>>, String> {
         let response = self.request_on(
             Posture::UnboundedNoRedirect(UnboundedTicket::Fork92),
@@ -1920,13 +1944,16 @@ impl RemoteClient {
                     .to_string();
 
                 // A bare GET: no Authorization header (the URL is self-authorizing) and no
-                // body — the request the redirect target is actually presigned for. A second,
-                // distinct unbounded response-reading station from the POST above — same ticket
-                // (FORK-92), different physical request, only reached on a redirect.
-                self.client_for(Posture::UnboundedFollowsRedirects(UnboundedTicket::Fork92)).get(&location)
+                // body — the request the redirect target is actually presigned for. On
+                // [`Posture::BoundedObjectReads`], not the unbounded ticket the `POST` above
+                // still carries — see this function's own doc for why this station's cost shape
+                // matches [`Self::fetch_object`]'s, not the `POST`'s.
+                self.client_for(Posture::BoundedObjectReads).get(&location)
                     .send()
                     .await
-                    .map_err(|e| format!("Error while following the batch redirect: {}", e))?
+                    .map_err(|e| self.describe_transport_error(
+                        "following the batch redirect", FETCH_OBJECT_READ_TIMEOUT, e
+                    ))?
             }
             _ => response,
         };
@@ -1987,7 +2014,7 @@ impl RemoteClient {
     }
 
     /// Fetch one object's raw bytes. On [`Posture::BoundedObjectReads`], not [`Posture::BoundedReads`]
-    /// — see [`FETCH_OBJECT_READ_TIMEOUT`]'s doc for why this call alone needs the looser budget.
+    /// — see [`FETCH_OBJECT_READ_TIMEOUT`]'s doc for why this call needs the looser budget.
     pub async fn fetch_object(&self, hash: &str) -> Result<Vec<u8>, String> {
         let response = self.request_on(Posture::BoundedObjectReads, reqwest::Method::GET, &format!("/v1/objects/{}", hash))
             .send()
@@ -5573,6 +5600,174 @@ mod tests {
         assert!(
             error.to_lowercase().contains("location"),
             "the error should name the missing Location header: {}", error
+        );
+    }
+
+    /// A remote that answers `POST /v1/objects/batch` with a `303` redirect to
+    /// `/responses/bundle`, then — on the follow-up `GET` to that location — accepts the
+    /// connection, reads the request, and genuinely goes silent: it never writes a byte of
+    /// response. The redirect-follow station's own [`SilentRemote`]-equivalent: the first hop
+    /// succeeds and hands back a real redirect, only the second hop — the one now bounded — stalls.
+    struct RedirectThenSilentRemote {
+        url: String,
+        /// Owns the sender; dropping it at the end of the test is what finally unblocks the
+        /// second hop's parked handler, letting it close the connection. Never signaled mid-test.
+        _park: std::sync::mpsc::Sender<()>,
+    }
+
+    impl RedirectThenSilentRemote {
+        fn start() -> RedirectThenSilentRemote {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let base = url.clone();
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+
+            std::thread::spawn(move || {
+                use std::io::Write;
+
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let _ = read_test_request(&mut stream);
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 303 See Other\r\nLocation: {}/responses/bundle\r\n\
+                        Content-Length: 0\r\nConnection: close\r\n\r\n",
+                        base
+                    );
+                    let _ = stream.flush();
+                }
+
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let _ = read_test_request(&mut stream);
+                    let _ = rx.recv();
+                    drop(stream);
+                }
+            });
+
+            RedirectThenSilentRemote { url, _park: tx }
+        }
+    }
+
+    /// The falsifying test for this station's bound: `fetch_batch`'s redirect-follow `GET` — the
+    /// one that reads bundle bytes off a presigned storage URL — must fail with a timeout, not
+    /// hang forever, against a remote that redirects and then goes silent. Before this fix this
+    /// station rode [`Posture::UnboundedFollowsRedirects`], which this fixture would hang against
+    /// forever.
+    #[test]
+    fn fetch_batch_redirect_follow_times_out_against_a_silent_remote() {
+        let remote = RedirectThenSilentRemote::start();
+        let client = RemoteClient::new(&remote.url, None).unwrap();
+        let hard_ceiling = TEST_DIRECT_CONNECT_TIMEOUT + TEST_LOOSE_READ_TIMEOUT
+            + std::time::Duration::from_secs(20);
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let outcome = runtime.block_on(async {
+            tokio::time::timeout(hard_ceiling, client.fetch_batch(&["a".repeat(64)])).await
+        });
+
+        let message = outcome
+            .unwrap_or_else(|_| panic!(
+                "fetch_batch hung past the test's own {:?} ceiling — no timeout fired at all",
+                hard_ceiling
+            ))
+            .expect_err("a redirect target that never answers must not appear to succeed");
+
+        assert!(
+            message.to_lowercase().contains("timed out"),
+            "must fail specifically with a timeout, not some other transport error: {}", message
+        );
+    }
+
+    /// Same two-hop shape as [`RedirectThenSilentRemote`], but the second hop serves the bundle
+    /// as a steady drip instead of going silent — always moving, however slowly, never silent
+    /// long enough to trip a silence budget, with a total duration comfortably past one. The
+    /// redirect-follow station's own sibling to `start_steady_drip_remote`
+    /// (`fetch_object_survives_a_slow_but_steadily_progressing_body`'s own fixture).
+    fn start_batch_redirect_then_drip_remote(chunks: Vec<Vec<u8>>, gap: std::time::Duration) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let base = url.clone();
+
+        std::thread::spawn(move || {
+            use std::io::Write;
+
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = read_test_request(&mut stream);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 303 See Other\r\nLocation: {}/responses/bundle\r\n\
+                    Content-Length: 0\r\nConnection: close\r\n\r\n",
+                    base
+                );
+                let _ = stream.flush();
+            }
+
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = read_test_request(&mut stream);
+                let total_len: usize = chunks.iter().map(|c| c.len()).sum();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    total_len
+                );
+                let _ = stream.flush();
+
+                for chunk in chunks {
+                    std::thread::sleep(gap);
+                    let _ = stream.write_all(&chunk);
+                    let _ = stream.flush();
+                }
+            }
+        });
+
+        url
+    }
+
+    /// The property that makes a loose *silence* budget — not a total deadline, and not the
+    /// tighter [`Posture::BoundedReads`] silence budget — the right mechanism for this station: a
+    /// bundle that dribbles in slowly but steadily, comfortably past the effective loose silence
+    /// budget in total duration but never silent for anywhere near a single gap of it, must still
+    /// succeed. Mirrors `fetch_object_survives_a_slow_but_steadily_progressing_body`'s own gap and
+    /// chunk-count reasoning, applied to the redirect-follow station instead.
+    #[test]
+    fn fetch_batch_redirect_follow_survives_a_slow_but_steadily_progressing_bundle() {
+        let gap = std::time::Duration::from_secs(20);
+        let chunks: Vec<Vec<u8>> = (0..4).map(|i| format!("bundle-chunk-{}-drip", i).into_bytes()).collect();
+        let expected: Vec<u8> = chunks.concat();
+        // 4 gaps of 20s = 80s total, ~15s past the 65s effective loose budget (connect + read),
+        // while no single gap comes anywhere near it either — the sole property this fixture
+        // pins. Each gap (20s) does exceed the *tight* [`Posture::BoundedReads`] effective
+        // budget (connect + read = 15s) — deliberately: that gap width is what makes the
+        // BoundedReads mutation fail this test (confirmed by running it), the discriminating
+        // property this fixture exists for.
+        let total_duration = gap * (chunks.len() as u32);
+        let effective_loose_budget = TEST_DIRECT_CONNECT_TIMEOUT + TEST_LOOSE_READ_TIMEOUT;
+        assert!(
+            total_duration > effective_loose_budget,
+            "the fixture must actually outlast the bound under test"
+        );
+
+        let url = start_batch_redirect_then_drip_remote(chunks, gap);
+        let client = RemoteClient::new(&url, None).unwrap();
+        let outer_ceiling = total_duration + std::time::Duration::from_secs(20);
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let outcome = runtime.block_on(async {
+            tokio::time::timeout(outer_ceiling, client.fetch_batch(&["a".repeat(64)])).await
+        });
+
+        let bytes = outcome
+            .unwrap_or_else(|_| panic!(
+                "fetch_batch hung past its own generous outer ceiling {:?}", outer_ceiling
+            ))
+            .unwrap_or_else(|e| panic!(
+                "a slow-but-steady bundle must succeed — it was never silent, so it must never be \
+                treated as a stall: {}", e
+            ));
+
+        assert_eq!(
+            bytes, Some(expected),
+            "the full bundle must arrive intact despite the drip"
         );
     }
 
