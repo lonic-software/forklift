@@ -1964,10 +1964,11 @@ mod tests {
     /// A fresh `AppState` for a given serving mode, with no auth/hooks configured (tests
     /// override individual fields with struct-update syntax). `http` is built through
     /// [`build_hook_client`] — the same function [`serve`] uses — rather than a bare
-    /// `reqwest::Client::new()`: an unbounded stand-in here would let every hook test in this
-    /// module pass against a client `serve` never actually constructs, silently untested for
-    /// whatever `serve` does arm (review finding: a refactor dropping `.timeout(HOOK_CLIENT_TIMEOUT)`
-    /// from `serve` left this whole suite green until `build_hook_client` closed the gap).
+    /// `reqwest::Client::new()`: the latter carries no `read_timeout` at all, so a hook test built
+    /// on it would pass against a client that waits out a stalled hook endpoint forever, never
+    /// exercising the bound `serve` actually arms in production. Routing both through one function
+    /// makes that drift structurally impossible rather than a fact the suite has to happen to
+    /// keep testing.
     fn base_state(mode: ServeMode) -> AppState {
         AppState {
             mode,
@@ -2249,9 +2250,23 @@ mod tests {
     /// which fails fast regardless of whether `AppState.http` carries any timeout at all — so it
     /// cannot, on its own, prove `serve` actually arms one. This pins the response-side wait
     /// instead: a hook that accepts the connection and then never answers must still fail closed,
-    /// within a bound close to `HOOK_CLIENT_TIMEOUT`, rather than hang. `outer_ceiling` is a
-    /// generous multiple of `HOOK_CLIENT_TIMEOUT` so a genuine regression (no timeout applied at
-    /// all) shows up as this test's own panic rather than as a suite-wide hang.
+    /// within a bound close to `HOOK_CLIENT_TIMEOUT`, rather than hang.
+    ///
+    /// `lower_bound`/`upper_bound` are literals, not `HOOK_CLIENT_TIMEOUT`-derived expressions:
+    /// a symbolic derivation would move both bounds in lockstep with a mutation to
+    /// `HOOK_CLIENT_TIMEOUT`, the real elapsed time moving with it, and this test staying green
+    /// regardless — the identical lockstep defect `upload_signature_times_out_against_a_silent_remote`
+    /// (`forklift-core`) exists to close, applied here. Measured production elapsed is ~10.00s.
+    /// Separation from the rivals this excludes: `lower_bound` (8s) leaves 2s of margin below
+    /// that measured value for scheduling/dispatch jitter on a loaded test box, while still
+    /// separating from a client armed at `HOOK_CLIENT_TIMEOUT / 2` (5s, 3s clear of `lower_bound`)
+    /// and `HOOK_CLIENT_TIMEOUT / 4` (2.5s, 5.5s clear) — both confirmed by running each mutant
+    /// against `build_hook_client` and observing this assertion fail. `upper_bound` (15s) leaves
+    /// the same 5s of margin above the measured value for the same jitter reason, and separates
+    /// from a client armed at `HOOK_CLIENT_TIMEOUT * 2` (20s, 5s clear) — confirmed the same way.
+    /// `outer_ceiling` (30s) is a hard backstop three times the measured value, well past either
+    /// bound, so a genuinely unbounded regression fails this test's own panic (naming the real
+    /// cause) rather than hanging the suite.
     #[tokio::test]
     async fn an_authentication_hook_that_never_answers_fails_closed_near_the_hook_timeout() {
         let hook = SilentHook::start();
@@ -2259,7 +2274,9 @@ mod tests {
             authentication_hook: Some(HookEndpoint { url: hook.url.clone(), secret: "s".to_string() }),
             ..single_mode_state(PathBuf::from("/unused"))
         };
-        let outer_ceiling = HOOK_CLIENT_TIMEOUT * 3;
+        let lower_bound = std::time::Duration::from_secs(8);
+        let upper_bound = std::time::Duration::from_secs(15);
+        let outer_ceiling = std::time::Duration::from_secs(30);
 
         let started = std::time::Instant::now();
         let outcome = tokio::time::timeout(
@@ -2277,10 +2294,10 @@ mod tests {
 
         assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
         assert!(
-            elapsed < HOOK_CLIENT_TIMEOUT + std::time::Duration::from_secs(5),
-            "elapsed {:?} is not close to HOOK_CLIENT_TIMEOUT ({:?}) — the client that fired was \
-            armed with some other, looser bound than the one `build_hook_client` configures",
-            elapsed, HOOK_CLIENT_TIMEOUT
+            elapsed >= lower_bound && elapsed < upper_bound,
+            "elapsed {:?} is outside [{:?}, {:?}) — the client that fired was armed with some \
+            other bound than the one `build_hook_client` configures (HOOK_CLIENT_TIMEOUT, ~10s)",
+            elapsed, lower_bound, upper_bound
         );
     }
 
@@ -2370,7 +2387,8 @@ mod tests {
 
     /// The admission-hook sibling of
     /// `an_authentication_hook_that_never_answers_fails_closed_near_the_hook_timeout` — same gap,
-    /// same fixture, same bound; see that test's own doc.
+    /// same fixture, same literal bounds and the same reasoning for why they are literals rather
+    /// than `HOOK_CLIENT_TIMEOUT`-derived; see that test's own doc.
     #[tokio::test]
     async fn an_admission_hook_that_never_answers_fails_closed_near_the_hook_timeout() {
         let hook = SilentHook::start();
@@ -2378,7 +2396,9 @@ mod tests {
             admission_hook: Some(HookEndpoint { url: hook.url.clone(), secret: "s".to_string() }),
             ..single_mode_state(PathBuf::from("/unused"))
         };
-        let outer_ceiling = HOOK_CLIENT_TIMEOUT * 3;
+        let lower_bound = std::time::Duration::from_secs(8);
+        let upper_bound = std::time::Duration::from_secs(15);
+        let outer_ceiling = std::time::Duration::from_secs(30);
 
         let started = std::time::Instant::now();
         let outcome = tokio::time::timeout(
@@ -2398,10 +2418,10 @@ mod tests {
 
         assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
         assert!(
-            elapsed < HOOK_CLIENT_TIMEOUT + std::time::Duration::from_secs(5),
-            "elapsed {:?} is not close to HOOK_CLIENT_TIMEOUT ({:?}) — the client that fired was \
-            armed with some other, looser bound than the one `build_hook_client` configures",
-            elapsed, HOOK_CLIENT_TIMEOUT
+            elapsed >= lower_bound && elapsed < upper_bound,
+            "elapsed {:?} is outside [{:?}, {:?}) — the client that fired was armed with some \
+            other bound than the one `build_hook_client` configures (HOOK_CLIENT_TIMEOUT, ~10s)",
+            elapsed, lower_bound, upper_bound
         );
     }
 
