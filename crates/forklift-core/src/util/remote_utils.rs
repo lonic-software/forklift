@@ -9857,4 +9857,245 @@ mod tests {
             "must name the actual budget that governed, not a generic phrase: {}", message
         );
     }
+
+    // -----------------------------------------------------------------------------------
+    // SPIKE E1 — a design under review proposes replacing `RequestBuilder::timeout` (a total
+    // deadline that today can cut off an error body mid-read) with an external
+    // `tokio::time::timeout` wrapped around `send()` only, on a client with no per-request
+    // timeout of its own — so the deadline bounds the wait for response headers and stops
+    // applying the instant the status line arrives, leaving the body to be bounded separately.
+    // The claim under test: such a timer fires only before response-head arrival; body reads
+    // afterward are unaffected by it.
+    //
+    // Run with:
+    // `cargo test -p forklift-core --lib spike_e1 -- --ignored --nocapture`
+    // -----------------------------------------------------------------------------------
+
+    /// A fixture remote that independently controls two delays: how long it waits after reading
+    /// the request before writing the status line and headers (`headers_delay`), and how long it
+    /// takes to finish the body afterward, by trickling it out as `chunks` separated by
+    /// `chunk_gap` — never sleeping once and dumping the whole body, since a trickle is exactly
+    /// what distinguishes a total deadline from a head-only one. Same accept/read/respond shape
+    /// as [`SilentRemote`] and `start_steady_drip_remote` above, generalized to delay the status
+    /// line as well as the body.
+    fn start_headers_then_trickle_remote(
+        headers_delay: std::time::Duration,
+        chunks: Vec<Vec<u8>>,
+        chunk_gap: std::time::Duration,
+    ) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+
+        std::thread::spawn(move || {
+            use std::io::Write;
+
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = read_test_request(&mut stream);
+                std::thread::sleep(headers_delay);
+
+                let total_len: usize = chunks.iter().map(|c| c.len()).sum();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    total_len
+                );
+                let _ = stream.flush();
+
+                for chunk in chunks {
+                    std::thread::sleep(chunk_gap);
+                    let _ = stream.write_all(&chunk);
+                    let _ = stream.flush();
+                }
+            }
+        });
+
+        url
+    }
+
+    /// Sends one request against `url` through a `reqwest::Client` built with no `.timeout()`
+    /// and no `.read_timeout()`, wrapping only `send()` — not the subsequent body read — in an
+    /// external `tokio::time::timeout(timer, ..)`. Returns the elapsed time and either the full
+    /// body bytes or a description of whatever failed and at which stage.
+    async fn run_headers_only_deadline_case(
+        url: &str,
+        timer: std::time::Duration,
+    ) -> (std::time::Duration, Result<Vec<u8>, String>) {
+        let client = reqwest::Client::builder().build().unwrap();
+        let start = std::time::Instant::now();
+
+        let send_outcome = tokio::time::timeout(timer, client.get(url).send()).await;
+        let response = match send_outcome {
+            Err(elapsed) => {
+                return (start.elapsed(), Err(format!("external timer fired before headers arrived: {:?}", elapsed)));
+            }
+            Ok(Err(reqwest_err)) => {
+                return (start.elapsed(), Err(format!("reqwest error before/at headers: {:?}", reqwest_err)));
+            }
+            Ok(Ok(response)) => response,
+        };
+
+        // Headers arrived inside the timer's window; the timer is not wrapped around this read,
+        // so if E1 holds, nothing here is bounded by it any longer.
+        match response.bytes().await {
+            Ok(bytes) => (start.elapsed(), Ok(bytes.to_vec())),
+            Err(body_err) => (start.elapsed(), Err(format!("body read error: {:?}", body_err))),
+        }
+    }
+
+    /// The falsifying test for E1: runs the four cases from the spike spec against the fixture
+    /// above, all sharing one external timer duration, and checks each against what E1 predicts.
+    /// Cases A and D are the ones that matter — headers arrive promptly but the body is the slow
+    /// part, comfortably outlasting the timer. If either times out, E1 is false and an external
+    /// send()-only timer does not structurally protect a body read the way the design assumes.
+    #[test]
+    #[ignore]
+    fn spike_e1_headers_only_deadline() {
+        let timer = std::time::Duration::from_secs(2);
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            println!("\nSPIKE E1 — external tokio::time::timeout({:?}) wrapped around send() only", timer);
+
+            // Case A: headers arrive quickly, body is spread out well past the timer (4 chunks,
+            // 1s gap each = 4s total, double the 2s timer). Expected if E1 holds: succeeds, full
+            // body received, unaffected by the timer having already "spent" on nothing.
+            let chunks_a: Vec<Vec<u8>> = (0..4).map(|i| format!("case-a-chunk-{}", i).into_bytes()).collect();
+            let expected_a: Vec<u8> = chunks_a.concat();
+            let url_a = start_headers_then_trickle_remote(
+                std::time::Duration::from_millis(200), chunks_a, std::time::Duration::from_secs(1),
+            );
+            let (elapsed_a, outcome_a) = run_headers_only_deadline_case(&url_a, timer).await;
+            println!("case A (slow body, {:?} > timer): elapsed={:?} outcome={:?}", timer, elapsed_a,
+                outcome_a.as_ref().map(|b| String::from_utf8_lossy(b).to_string()));
+            assert_eq!(
+                outcome_a.as_deref(), Ok(expected_a.as_slice()),
+                "case A must succeed with the full body if E1 holds — body reads are not supposed \
+                to be governed by the head-wait timer at all"
+            );
+            assert!(
+                elapsed_a > timer,
+                "case A's own body took longer than the timer by construction; elapsed {:?} should \
+                exceed the {:?} timer, proving the body was never bounded by it", elapsed_a, timer
+            );
+
+            // Case B: headers themselves are delayed past the timer (6s > 2s). Expected: the
+            // external timer fires before any status line arrives, regardless of E1.
+            let url_b = start_headers_then_trickle_remote(
+                std::time::Duration::from_secs(6), vec![b"case-b-body".to_vec()], std::time::Duration::from_millis(0),
+            );
+            let (elapsed_b, outcome_b) = run_headers_only_deadline_case(&url_b, timer).await;
+            println!("case B (slow headers, {:?} > timer): elapsed={:?} outcome={:?}", timer, elapsed_b, outcome_b);
+            assert!(
+                outcome_b.is_err(), "case B must fail — headers never arrive inside the timer's window"
+            );
+            assert!(
+                elapsed_b >= timer && elapsed_b < timer + std::time::Duration::from_secs(2),
+                "case B must fail at approximately the timer's own duration ({:?}), not early and not \
+                after waiting for the 6s header delay: measured {:?}", timer, elapsed_b
+            );
+
+            // Case C: both phases are fast. Expected: succeeds well within the timer.
+            let chunks_c = vec![b"case-c-body".to_vec()];
+            let expected_c: Vec<u8> = chunks_c.concat();
+            let url_c = start_headers_then_trickle_remote(
+                std::time::Duration::from_millis(100), chunks_c, std::time::Duration::from_millis(100),
+            );
+            let (elapsed_c, outcome_c) = run_headers_only_deadline_case(&url_c, timer).await;
+            println!("case C (fast/fast): elapsed={:?} outcome={:?}", elapsed_c,
+                outcome_c.as_ref().map(|b| String::from_utf8_lossy(b).to_string()));
+            assert_eq!(outcome_c.as_deref(), Ok(expected_c.as_slice()), "case C must succeed");
+            assert!(
+                elapsed_c < timer,
+                "case C's own construction is fast on both phases; elapsed {:?} should stay well \
+                under the {:?} timer", elapsed_c, timer
+            );
+
+            // Case D: headers are quick, body is *much* longer than the timer (6 chunks, 2s gap
+            // each = 12s total, 6x the 2s timer) — the sharpest version of case A, recording
+            // total elapsed to prove the body really did outlive the timer rather than merely
+            // squeaking past it.
+            let chunks_d: Vec<Vec<u8>> = (0..6).map(|i| format!("case-d-chunk-{}", i).into_bytes()).collect();
+            let expected_d: Vec<u8> = chunks_d.concat();
+            let url_d = start_headers_then_trickle_remote(
+                std::time::Duration::from_millis(200), chunks_d, std::time::Duration::from_secs(2),
+            );
+            let (elapsed_d, outcome_d) = run_headers_only_deadline_case(&url_d, timer).await;
+            println!("case D (much-slower body, {:?} >> timer): elapsed={:?} outcome={:?}", timer, elapsed_d,
+                outcome_d.as_ref().map(|b| String::from_utf8_lossy(b).to_string()));
+            assert_eq!(
+                outcome_d.as_deref(), Ok(expected_d.as_slice()),
+                "case D must succeed with the full body if E1 holds"
+            );
+            assert!(
+                elapsed_d >= std::time::Duration::from_secs(10),
+                "case D's total elapsed ({:?}) must sit near its own construction (~12s), several \
+                multiples of the {:?} timer — proof the body genuinely outlived the timer rather \
+                than the timer merely failing to fire in time", elapsed_d, timer
+            );
+        });
+    }
+
+    /// The second half of E1: what does a head-wait expiry actually look like to a caller, and
+    /// — with no `RequestBuilder::timeout` anywhere — what still produces a `reqwest::Error` for
+    /// which `is_timeout()` is true? The module's transport-error composer routes on
+    /// `is_connect()`/`is_timeout()`, so this matters for every call site's error wording.
+    #[test]
+    #[ignore]
+    fn spike_e1_error_classification() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            // (a) A head-wait expiry from an external `tokio::time::timeout` around `send()`,
+            // against a remote whose headers never arrive in time.
+            let url = start_headers_then_trickle_remote(
+                std::time::Duration::from_secs(5), vec![], std::time::Duration::from_millis(0),
+            );
+            let client = reqwest::Client::builder().build().unwrap();
+            let outcome = tokio::time::timeout(std::time::Duration::from_millis(500), client.get(&url).send()).await;
+            match outcome {
+                Ok(_) => panic!("expected the external timer to fire before this remote's delayed headers arrived"),
+                Err(elapsed) => {
+                    println!("\nhead-wait expiry — outer Err variant type: {}", std::any::type_name::<tokio::time::error::Elapsed>());
+                    println!("head-wait expiry — Debug: {:?}", elapsed);
+                    println!(
+                        "note: `{}` has no `is_timeout()`/`is_connect()` methods at all — those are \
+                        inherent methods on `reqwest::Error`, a type this value never is. A caller must \
+                        match on the OUTER `Result<Result<Response, reqwest::Error>, Elapsed>` (the `Err` \
+                        arm here) to detect a head-wait expiry; there is no `reqwest::Error` in this path \
+                        to call `.is_timeout()` on at all.",
+                        std::any::type_name::<tokio::time::error::Elapsed>()
+                    );
+                }
+            }
+
+            // (b) What still produces a `reqwest::Error` for which `is_timeout()` is true, with
+            // no `RequestBuilder::timeout` set anywhere on the request or the client: the
+            // client-level `connect_timeout`. Pointed at 192.0.2.1 (RFC 5737 TEST-NET-1), which
+            // this sandbox's network silently drops packets to rather than refusing outright —
+            // confirmed separately via `curl -m 3 http://192.0.2.1:81/`, which reported
+            // "Connection timed out after 3004 milliseconds" rather than an immediate refusal —
+            // so the connect attempt genuinely hangs until `connect_timeout` fires.
+            let connect_timeout_client = reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_millis(500))
+                .build()
+                .unwrap();
+            let start = std::time::Instant::now();
+            let result = connect_timeout_client.get("http://192.0.2.1:81/").send().await;
+            let elapsed = start.elapsed();
+            match result {
+                Ok(_) => panic!("expected the blackholed TEST-NET-1 address to time out at connect, not succeed"),
+                Err(err) => {
+                    println!("connect_timeout expiry after {:?} — Debug: {:?}", elapsed, err);
+                    println!("is_connect() = {}, is_timeout() = {}", err.is_connect(), err.is_timeout());
+                    assert!(err.is_connect(), "a connect_timeout expiry must still classify as is_connect()");
+                    assert!(
+                        err.is_timeout(),
+                        "a connect_timeout expiry must still classify as is_timeout() even with no \
+                        RequestBuilder::timeout set anywhere — the connect-phase timeout is a separate \
+                        mechanism from the total per-request deadline the design proposes removing"
+                    );
+                }
+            }
+        });
+    }
 }
