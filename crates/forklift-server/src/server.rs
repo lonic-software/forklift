@@ -26,7 +26,7 @@ use forklift_core::model::hooks::{
     AdmissionHookRequest, AdmissionHookResponse, AuthenticationHookRequest,
     AuthenticationHookResponse, HookEvent, ResolutionHookRequest, ResolutionHookResponse,
     EVENT_KEY_REVOKED, EVENT_PALLET_UPDATED, EVENT_TRUST_ESTABLISHED, EVENT_TRUST_RESET,
-    EVENT_WAREHOUSE_CREATED,
+    EVENT_WAREHOUSE_CREATED, HOOK_CLIENT_TIMEOUT,
 };
 use forklift_core::model::remote::{
     ErrorResponse, MissingObjectsRequest, MissingObjectsResponse, RefUpdateRequest,
@@ -215,6 +215,21 @@ pub struct ServeOptions {
     pub authentication_cache_secs: Option<u64>,
 }
 
+/// Build the outbound HTTP client `AppState.http` holds — timeout-armed at
+/// [`HOOK_CLIENT_TIMEOUT`] so a hook endpoint that accepts a connection and then never answers
+/// cannot wedge the gated request forever. The one function [`serve`] and the test harness's
+/// `tests::base_state` both construct `AppState.http` through, so the test suite exercises the
+/// same armed client production actually runs rather than an unbounded `reqwest::Client::new()`
+/// standing in for it — see
+/// `tests::an_authentication_hook_that_never_answers_fails_closed_near_the_hook_timeout` (and its
+/// admission-hook sibling) for the tests this closes.
+fn build_hook_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .timeout(HOOK_CLIENT_TIMEOUT)
+        .build()
+        .map_err(|e| format!("Error while building the hook HTTP client: {}", e))
+}
+
 /// Serve one warehouse root, or every warehouse under a base folder.
 ///
 /// # Returns
@@ -285,10 +300,7 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
         }
     }
 
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| format!("Error while building the hook HTTP client: {}", e))?;
+    let http = build_hook_client()?;
 
     let state = Arc::new(AppState {
         mode,
@@ -1950,7 +1962,13 @@ mod tests {
     // ---------------------------------------------------------------------------------
 
     /// A fresh `AppState` for a given serving mode, with no auth/hooks configured (tests
-    /// override individual fields with struct-update syntax).
+    /// override individual fields with struct-update syntax). `http` is built through
+    /// [`build_hook_client`] — the same function [`serve`] uses — rather than a bare
+    /// `reqwest::Client::new()`: the latter carries no `read_timeout` at all, so a hook test built
+    /// on it would pass against a client that waits out a stalled hook endpoint forever, never
+    /// exercising the bound `serve` actually arms in production. Routing both through one function
+    /// makes that drift structurally impossible rather than a fact the suite has to happen to
+    /// keep testing.
     fn base_state(mode: ServeMode) -> AppState {
         AppState {
             mode,
@@ -1962,7 +1980,10 @@ mod tests {
             admission_hook: None,
             events_hook: None,
             resolution_hook: None,
-            http: reqwest::Client::new(),
+            http: build_hook_client().expect(
+                "the hook HTTP client must build with this module's fixed config: only a \
+                malformed TLS/proxy setting could fail this, and none is set here"
+            ),
             authentication_cache: Mutex::new(HashMap::new()),
             authentication_cache_ttl: std::time::Duration::from_secs(60),
         }
@@ -2042,6 +2063,45 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         drop(listener);
         format!("http://{}/hook", addr)
+    }
+
+    /// A hook endpoint that accepts the connection, makes a best-effort read of at most 4096
+    /// bytes of the request (not necessarily the whole body — draining it fully is not load-
+    /// bearing for this fixture, only holding the connection open with no response is), and then
+    /// never answers — distinct from [`unreachable_url`], which refuses the connection outright
+    /// and so never exercises the response-side wait at all. This is the fixture that actually proves
+    /// `AppState.http` is timeout-armed: against `unreachable_url`, a client with no timeout at
+    /// all still fails fast, on connection refusal, so that fixture alone cannot separate an armed
+    /// client from an unbounded one. Parks on a channel-recv rather than sleeping a fixed
+    /// duration, the same shape `forklift-core`'s own `SilentRemote` uses, so the connection stays
+    /// open for exactly as long as the test needs it and no longer.
+    struct SilentHook {
+        url: String,
+        _park: std::sync::mpsc::Sender<()>,
+    }
+
+    impl SilentHook {
+        fn start() -> SilentHook {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+
+            std::thread::spawn(move || {
+                use std::io::Read;
+
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buf = [0u8; 4096];
+                    // Best-effort: draining the request is not load-bearing for this fixture
+                    // (the client has already sent it by the time the server would notice a
+                    // partial read), only holding the connection open with no response is.
+                    let _ = stream.read(&mut buf);
+                    let _ = rx.recv();
+                    drop(stream);
+                }
+            });
+
+            SilentHook { url: format!("http://{}/hook", addr), _park: tx }
+        }
     }
 
     // ---------------------------------------------------------------------------------
@@ -2188,6 +2248,61 @@ mod tests {
         assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
     }
 
+    /// `an_unreachable_authentication_hook_fails_closed` above pins the connection-refused path,
+    /// which fails fast regardless of whether `AppState.http` carries any timeout at all — so it
+    /// cannot, on its own, prove `serve` actually arms one. This pins the response-side wait
+    /// instead: a hook that accepts the connection and then never answers must still fail closed,
+    /// within a bound close to `HOOK_CLIENT_TIMEOUT`, rather than hang.
+    ///
+    /// `lower_bound`/`upper_bound` are literals, not `HOOK_CLIENT_TIMEOUT`-derived expressions:
+    /// a symbolic derivation would move both bounds in lockstep with a mutation to
+    /// `HOOK_CLIENT_TIMEOUT`, the real elapsed time moving with it, and this test staying green
+    /// regardless — the identical lockstep defect `upload_signature_times_out_against_a_silent_remote`
+    /// (`forklift-core`) exists to close, applied here. Measured production elapsed is ~10.00s.
+    /// Separation from the rivals this excludes: `lower_bound` (8s) leaves 2s of margin below
+    /// that measured value for scheduling/dispatch jitter on a loaded test box, while still
+    /// separating from a client armed at `HOOK_CLIENT_TIMEOUT / 2` (5s, 3s clear of `lower_bound`)
+    /// and `HOOK_CLIENT_TIMEOUT / 4` (2.5s, 5.5s clear) — both confirmed by running each mutant
+    /// against `build_hook_client` and observing this assertion fail. `upper_bound` (15s) leaves
+    /// the same 5s of margin above the measured value for the same jitter reason, and separates
+    /// from a client armed at `HOOK_CLIENT_TIMEOUT * 2` (20s, 5s clear) — confirmed the same way.
+    /// `outer_ceiling` (30s) is a hard backstop three times the measured value, well past either
+    /// bound, so a genuinely unbounded regression fails this test's own panic (naming the real
+    /// cause) rather than hanging the suite.
+    #[tokio::test]
+    async fn an_authentication_hook_that_never_answers_fails_closed_near_the_hook_timeout() {
+        let hook = SilentHook::start();
+        let state = AppState {
+            authentication_hook: Some(HookEndpoint { url: hook.url.clone(), secret: "s".to_string() }),
+            ..single_mode_state(PathBuf::from("/unused"))
+        };
+        let lower_bound = std::time::Duration::from_secs(8);
+        let upper_bound = std::time::Duration::from_secs(15);
+        let outer_ceiling = std::time::Duration::from_secs(30);
+
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            outer_ceiling, check_auth(&state, &headers_with_bearer("tok"))
+        ).await;
+        let elapsed = started.elapsed();
+
+        let error = outcome
+            .unwrap_or_else(|_| panic!(
+                "check_auth hung past the test's own {:?} outer ceiling against a hook that \
+                never answers — AppState.http is not timeout-armed", outer_ceiling
+            ))
+            .err()
+            .expect("a hook that never answers must fail closed, not appear to succeed");
+
+        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            elapsed >= lower_bound && elapsed < upper_bound,
+            "elapsed {:?} is outside [{:?}, {:?}) — the client that fired was armed with some \
+            other bound than the one `build_hook_client` configures (HOOK_CLIENT_TIMEOUT, ~10s)",
+            elapsed, lower_bound, upper_bound
+        );
+    }
+
     #[tokio::test]
     async fn a_malformed_authentication_hook_answer_fails_closed() {
         let (url, _received, _hits) = spawn_hook(StatusCode::OK, "not json").await;
@@ -2270,6 +2385,46 @@ mod tests {
             &state, &PathParams::new(), &Principal::Operator("bob".to_string()), "upload", None
         ).await.unwrap_err();
         assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// The admission-hook sibling of
+    /// `an_authentication_hook_that_never_answers_fails_closed_near_the_hook_timeout` — same gap,
+    /// same fixture, same literal bounds and the same reasoning for why they are literals rather
+    /// than `HOOK_CLIENT_TIMEOUT`-derived; see that test's own doc.
+    #[tokio::test]
+    async fn an_admission_hook_that_never_answers_fails_closed_near_the_hook_timeout() {
+        let hook = SilentHook::start();
+        let state = AppState {
+            admission_hook: Some(HookEndpoint { url: hook.url.clone(), secret: "s".to_string() }),
+            ..single_mode_state(PathBuf::from("/unused"))
+        };
+        let lower_bound = std::time::Duration::from_secs(8);
+        let upper_bound = std::time::Duration::from_secs(15);
+        let outer_ceiling = std::time::Duration::from_secs(30);
+
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            outer_ceiling,
+            check_admission(
+                &state, &PathParams::new(), &Principal::Operator("bob".to_string()), "upload", None
+            )
+        ).await;
+        let elapsed = started.elapsed();
+
+        let error = outcome
+            .unwrap_or_else(|_| panic!(
+                "check_admission hung past the test's own {:?} outer ceiling against a hook that \
+                never answers — AppState.http is not timeout-armed", outer_ceiling
+            ))
+            .unwrap_err();
+
+        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            elapsed >= lower_bound && elapsed < upper_bound,
+            "elapsed {:?} is outside [{:?}, {:?}) — the client that fired was armed with some \
+            other bound than the one `build_hook_client` configures (HOOK_CLIENT_TIMEOUT, ~10s)",
+            elapsed, lower_bound, upper_bound
+        );
     }
 
     #[tokio::test]

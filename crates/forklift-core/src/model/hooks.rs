@@ -13,6 +13,27 @@ use serde::{Deserialize, Serialize};
 /// It only changes when the wire format changes.
 pub const HOOK_PROTOCOL_VERSION: &str = "2026-07-05";
 
+/// The flat request timeout the server head arms on the `reqwest::Client` it calls every
+/// hook through (`forklift-server`'s `serve` builds it from this constant rather than a
+/// second, unlinked literal). It bounds *every* hook that client carries — authentication,
+/// admission, events and resolution — individually, not collectively: a request running two
+/// of them may wait twice this long.
+///
+/// Which hooks a given request actually runs varies, and callers sizing a budget against this
+/// must not assume a fixed count: a mutating request may run authentication alone (`put_trust`)
+/// or authentication and admission (`put_signature`, `put_object`). The authentication and
+/// admission hooks fail closed on a transport failure, so a hook endpoint that never answers
+/// must not wedge the request it gates forever — but 10s is generous enough that a hook doing
+/// real work (a directory lookup, a policy check) never trips it under normal load.
+///
+/// `pub`, not module-private, because `forklift-core`'s own remote client derives its
+/// single-write budget from this value (`remote_utils::single_write_budget`) — the
+/// server's real per-hook allowance, not a mirrored guess, since the two crates cannot
+/// share a module-private item across the boundary. A change here is therefore load-bearing
+/// on both sides: it moves the server's own hook budget *and* the client-side deadline that
+/// waits out however many of these hooks a single write's server side runs.
+pub const HOOK_CLIENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// The header naming which hook a request speaks (`authentication`, `admission`,
 /// `event`, `resolution`).
 pub const HEADER_HOOK: &str = "x-forklift-hook";
