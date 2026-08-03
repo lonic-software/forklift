@@ -64,12 +64,18 @@ const BATCH_FETCH_CHUNK: usize = 512;
 /// chosen to comfortably outlast ordinary promotion lag while still surfacing a genuinely stuck
 /// verifier as an error rather than hanging the lift forever.
 ///
-/// Calibration evidence, not derivation: a storage-backed head has been observed promoting a
-/// blob within seconds of its staging `PUT` — well inside this schedule's ~24s. That is evidence
-/// this schedule is generous enough for at least one deployed head's ordinary behavior, not a
-/// guarantee it holds for every head or under every load; a slower promoter simply retries out
-/// and reports the standard uncertain-outcome error, the same fallback every other budget in this
-/// module reaches for when its own patience runs out.
+/// No calibration evidence, and saying so is the point: nothing committed to this repository
+/// measures any head's promotion lag, so ~24s is an uncalibrated policy choice about how long a
+/// lift waits before giving up. What would calibrate it is a spike that stages a blob against a
+/// given head and records the interval until the commit stops answering
+/// [`CommitOutcome::BlobNotReady`]; until one exists, do not treat this number as tuned for any
+/// deployment.
+///
+/// Exhausting the schedule is *not* the uncertain-outcome case the rest of this module's budgets
+/// report. Reaching here means every staged object was accepted and verified content-correct and
+/// only promotion is outstanding, so [`commit_one_batch`] returns its own error stating the
+/// upload is safe and the lift can simply be re-run — a definite claim this path is entitled to
+/// make and [`RemoteClient::mutation_read_timeout_message`] deliberately is not.
 const MAX_COMMIT_ATTEMPTS: usize = 12;
 const COMMIT_BACKOFF_START: std::time::Duration = std::time::Duration::from_millis(200);
 const COMMIT_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(3);
@@ -584,18 +590,24 @@ pub(crate) const PRESENCE_ALLOWANCE_MS_PER_OP: f64 = 5.0;
 /// now lives in `forklift-server` alone, precisely so a `forklift-core` budget cannot reach it
 /// without adding a dependency this workspace does not have.
 ///
-/// **Calibration evidence, not derivation.** The 25s value is unchanged from before this doc was
-/// rewritten (verified bit-identical at `forklift-server`'s current 10s hook timeout), and the
-/// facts that originally motivated it remain informative even though they no longer compute it:
-/// `forklift-server`'s own committed test suite measures each of its hooks failing closed at
-/// ~10.00s worst case against a hook that never answers
+/// **What the committed evidence actually bounds — and why it does not size this constant.** The
+/// 25s value is unchanged from before this doc was rewritten (verified bit-identical at
+/// `forklift-server`'s 10s hook timeout at the time of the change). The facts that originally
+/// motivated it turn out not to support the ceiling they were used to justify:
+/// `forklift-server`'s committed suite asserts each of its hooks fails closed within
+/// **`[8s, 15s)`** against a hook that never answers
 /// (`tests::an_authentication_hook_that_never_answers_fails_closed_near_the_hook_timeout` and its
-/// admission sibling, in `forklift-server/src/server.rs`) — `upload_signature`'s handler runs
-/// that pair in sequence, so ~20s is a real, measured worst case for one deployed head's hook
-/// work alone, and 25s leaves 5s of headroom above it for dispatch and the atomic sidecar/anchor
-/// write's own fsync. That is evidence this patience is generous enough for at least one shipped
-/// head's hook-bound cost, not a proof it covers every head's true worst case — see the residuals
-/// below, which this budget does not, and structurally cannot, absorb.
+/// admission sibling, in `forklift-server/src/server.rs`). Those tests' own doc comments name a
+/// ~10.00s production figure, but no assertion pins it, so it is not something this doc may lean
+/// on. `upload_signature`'s handler runs that pair in sequence and **no test measures the pair**,
+/// so the only pair bound the suite establishes is the sum of the individual upper bounds:
+/// **under 30s, which 25s does not clear.**
+///
+/// That is deliberately left standing rather than resolved by raising the number. A client budget
+/// sized to clear some head's hook pair would be the very derivation this constant exists to stop
+/// — and it could not succeed anyway, since the pair bound is a property of one head's
+/// configuration and the residuals below are unbounded regardless. 25s is how long *this client*
+/// waits; a head that needs longer is a head this client gives up on, loudly and retry-safely.
 ///
 /// **Named residuals — a bounded list of the ones this fix found, not a claim that no others
 /// exist:**

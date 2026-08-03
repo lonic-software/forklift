@@ -11,10 +11,10 @@
 //! one it calls out to individually rather than collectively — a request running two hooks may
 //! legitimately wait twice as long as one running a single hook. A client budget must not assume
 //! a fixed hook count, and must not price a specific head's own per-hook timeout at all: that
-//! timeout is that head's business, not a wire-contract constant this protocol defines (see
-//! `forklift-core::util::remote_utils`'s `SINGLE_WRITE_ALLOWANCE` doc for the defect that shipped
-//! when a client budget once did exactly that, and `forklift-server`'s own `HOOK_CLIENT_TIMEOUT`
-//! for where that head's timeout now lives).
+//! timeout is that head's business, not a wire-contract constant this protocol defines. Each head
+//! owns and names its own; none of them is reachable from here, which is the enforcement. See
+//! [`crate::util::remote_utils`]'s `SINGLE_WRITE_ALLOWANCE` doc for the defect that shipped when a
+//! client budget once did exactly that.
 
 use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
