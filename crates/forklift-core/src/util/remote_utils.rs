@@ -7040,9 +7040,26 @@ mod tests {
     /// for all three, and nothing in the suite exercises the branch where it actually fires. This
     /// test bypasses every producer and hand-constructs the violating payload directly (the same
     /// way `request_on_applies_a_total_deadline_that_ignores_progress` above hand-constructs a
-    /// valid one), so a deleted assert, or one weakened to `>=`, shows up as a missing panic here
-    /// rather than nowhere.
+    /// valid one).
+    ///
+    /// The payload is exactly equal to `connect_timeout` (10s each), not merely less than it —
+    /// deleting the assert and weakening it from `>` to `>=` are two different mutants, and only
+    /// an equal payload separates the correct implementation from both in one fixture. A strictly
+    /// lesser payload (an earlier version of this test used 5s against a 10s connect_timeout)
+    /// still satisfies `>=` (`5 >= 10` is false, the assert still fires, `#[should_panic]` is
+    /// still satisfied), so the `>=` mutant survives that fixture green — it does not survive this
+    /// one: at the equal payload, `>` gives `10 > 10` = false → fires (still catches the
+    /// deleted-assert mutant too, which never fires at all); `>=` gives `10 >= 10` = true → does
+    /// not fire → this test fails with "did not panic as expected", which is exactly what makes it
+    /// a falsifier for that mutant rather than a fixture it happens to survive.
+    ///
+    /// Ignored outside a debug profile: `debug_assert!` compiles out entirely when
+    /// `debug-assertions = false`, so under `cargo test --release` this assert never fires and the
+    /// test would fail with "did not panic" for a reason unrelated to any regression in the assert
+    /// itself — the ignore attribute keeps that a documented, deliberate skip rather than a
+    /// surprise red build.
     #[test]
+    #[cfg_attr(not(debug_assertions), ignore)]
     #[should_panic(expected = "must strictly exceed this request's connect_timeout")]
     fn request_on_debug_assert_catches_a_violating_total_deadline_payload() {
         let client = RemoteClient::new_test_with_connect_timeout(
@@ -7050,11 +7067,12 @@ mod tests {
             std::time::Duration::from_secs(10),
         );
 
-        // 5s does not strictly exceed the client's own 10s connect_timeout — exactly the
-        // condition the debug_assert! exists to catch. No network I/O happens: request_on only
-        // builds a RequestBuilder, so the assert fires before anything would be sent.
+        // Equal to connect_timeout (10s), not merely less than it — see this test's own doc for
+        // why a strictly lesser payload cannot separate a deleted assert from one weakened to
+        // `>=`. No network I/O happens: request_on only builds a RequestBuilder, so the assert
+        // fires (or doesn't) before anything would be sent.
         let _ = client.request_on(
-            Posture::TotalDeadline(std::time::Duration::from_secs(5)),
+            Posture::TotalDeadline(std::time::Duration::from_secs(10)),
             reqwest::Method::GET, "/v1/probe"
         );
     }
@@ -7901,11 +7919,21 @@ mod tests {
     /// identical rival: at production `connect_timeout`, the two implementations produce the exact
     /// same `Duration`.
     ///
-    /// `SENTINEL_CONNECT_TIMEOUT` (9s) is a value distinct from every connect sentinel already used
-    /// elsewhere in this module (`4, 5, 7, 11, 12.5, 13, 60`) and from every named `Duration`
-    /// constant this module defines (`0.2, 2, 3, 5, 10, 60`, plus [`SINGLE_WRITE_ALLOWANCE`]
-    /// itself, 25) — checked by `grep -n "Duration::from_secs\|Duration::from_millis"` before being
-    /// picked. This test's asserted output, 34s (`9 + 25`), separates from the two rivals a
+    /// `SENTINEL_CONNECT_TIMEOUT` (9s) is a value distinct from the two production connect-timeout
+    /// constants this test actually needs to separate from — [`REMOTE_CONNECT_TIMEOUT`] (5s) and
+    /// [`REMOTE_CONNECT_TIMEOUT_TOR`] (60s) — and from every named `Duration` constant this module
+    /// defines (`0.2, 2, 3, 5, 10, 60`, plus [`SINGLE_WRITE_ALLOWANCE`] itself, 25) — checked by
+    /// `grep -n "Duration::from_secs\|Duration::from_millis"` before being picked. It is not also
+    /// claimed to differ from every other test's own connect-timeout sentinel elsewhere in this
+    /// module: an earlier version of this doc carried that list, and it rotted within the same
+    /// commit that added [`super::tests::request_on_debug_assert_catches_a_violating_total_deadline_payload`]'s
+    /// own 10s sentinel — a hand-maintained enumeration is exactly the shape this module's history
+    /// keeps failing, so this doc drops the claim rather than repairing the list. Reusing another
+    /// test's sentinel value here would only cost readability (two tests reading as one case split
+    /// in half), never this test's own correctness, since nothing about `single_write_budget`
+    /// reads any other test's constant.
+    ///
+    /// This test's asserted output, 34s (`9 + 25`), separates from the two rivals a
     /// hardcoded production `connect_timeout` would actually produce here instead of reading
     /// `self.connect_timeout`: 30s (`REMOTE_CONNECT_TIMEOUT` + `SINGLE_WRITE_ALLOWANCE`) and 85s
     /// (`REMOTE_CONNECT_TIMEOUT_TOR` + `SINGLE_WRITE_ALLOWANCE`). This is a separation report

@@ -2065,9 +2065,11 @@ mod tests {
         format!("http://{}/hook", addr)
     }
 
-    /// A hook endpoint that accepts the connection, reads the request in full, and then never
-    /// answers — distinct from [`unreachable_url`], which refuses the connection outright and so
-    /// never exercises the response-side wait at all. This is the fixture that actually proves
+    /// A hook endpoint that accepts the connection, makes a best-effort read of at most 4096
+    /// bytes of the request (not necessarily the whole body — draining it fully is not load-
+    /// bearing for this fixture, only holding the connection open with no response is), and then
+    /// never answers — distinct from [`unreachable_url`], which refuses the connection outright
+    /// and so never exercises the response-side wait at all. This is the fixture that actually proves
     /// `AppState.http` is timeout-armed: against `unreachable_url`, a client with no timeout at
     /// all still fails fast, on connection refusal, so that fixture alone cannot separate an armed
     /// client from an unbounded one. Parks on a channel-recv rather than sleeping a fixed
