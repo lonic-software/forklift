@@ -4,6 +4,17 @@
 //! notification, identity resolution. Signature, sigchain and revocation
 //! verification, content authorization and signing are never hookable: they are
 //! Forklift-owned, deterministic and offline.
+//!
+//! How many hooks a given request runs, and which ones, is a property of the *head* serving it,
+//! not of this protocol: a mutating request may run authentication alone (`put_trust`) or
+//! authentication and admission (`put_signature`, `put_object`), and a head is free to bound each
+//! one it calls out to individually rather than collectively — a request running two hooks may
+//! legitimately wait twice as long as one running a single hook. A client budget must not assume
+//! a fixed hook count, and must not price a specific head's own per-hook timeout at all: that
+//! timeout is that head's business, not a wire-contract constant this protocol defines (see
+//! `forklift-core::util::remote_utils`'s `SINGLE_WRITE_ALLOWANCE` doc for the defect that shipped
+//! when a client budget once did exactly that, and `forklift-server`'s own `HOOK_CLIENT_TIMEOUT`
+//! for where that head's timeout now lives).
 
 use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
@@ -12,27 +23,6 @@ use serde::{Deserialize, Serialize};
 /// `x-forklift-hook-version` header; a receiver refuses versions it does not know.
 /// It only changes when the wire format changes.
 pub const HOOK_PROTOCOL_VERSION: &str = "2026-07-05";
-
-/// The flat request timeout the server head arms on the `reqwest::Client` it calls every
-/// hook through (`forklift-server`'s `serve` builds it from this constant rather than a
-/// second, unlinked literal). It bounds *every* hook that client carries — authentication,
-/// admission, events and resolution — individually, not collectively: a request running two
-/// of them may wait twice this long.
-///
-/// Which hooks a given request actually runs varies, and callers sizing a budget against this
-/// must not assume a fixed count: a mutating request may run authentication alone (`put_trust`)
-/// or authentication and admission (`put_signature`, `put_object`). The authentication and
-/// admission hooks fail closed on a transport failure, so a hook endpoint that never answers
-/// must not wedge the request it gates forever — but 10s is generous enough that a hook doing
-/// real work (a directory lookup, a policy check) never trips it under normal load.
-///
-/// `pub`, not module-private, because `forklift-core`'s own remote client derives its
-/// single-write budget from this value (`remote_utils::single_write_budget`) — the
-/// server's real per-hook allowance, not a mirrored guess, since the two crates cannot
-/// share a module-private item across the boundary. A change here is therefore load-bearing
-/// on both sides: it moves the server's own hook budget *and* the client-side deadline that
-/// waits out however many of these hooks a single write's server side runs.
-pub const HOOK_CLIENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The header naming which hook a request speaks (`authentication`, `admission`,
 /// `event`, `resolution`).

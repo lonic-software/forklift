@@ -19,7 +19,6 @@ use crate::model::remote::{
 use crate::enums::config_scope::ConfigScope;
 use crate::error::{CoreError, RefusalCode};
 use crate::globals::{self, StorageRootScope};
-use crate::model::hooks::HOOK_CLIENT_TIMEOUT;
 use crate::util::office_utils::OFFICE_PALLET_NAME;
 use crate::util::scope_utils::{self, MaterializationScope, ScopeClass};
 use crate::util::{
@@ -58,11 +57,19 @@ fn encode_path_segments(path: &str) -> String {
 const BATCH_FETCH_CHUNK: usize = 512;
 
 /// How many times a staged lift retries its session commit while the staging verifier catches
-/// up, and the backoff between attempts. A storage-backed head promotes a blob within seconds
-/// of its staging `PUT` in the hosted deployment; the schedule (~0.2s doubling to a 3s cap)
-/// spans about 24s of sleep (0.2+0.4+0.8+1.6+3×7), so a slow verifier still commits, while a
-/// genuinely stuck one surfaces as an error rather than hanging the lift forever. Only the transient
-/// blob-not-ready case is retried — a corrupt or missing object fails at once.
+/// up, and the backoff between attempts — client patience for one narrow, transient condition:
+/// the staged objects are already verified content-correct, just not yet visible to the verifier
+/// that gates the commit. Only that case is retried; a corrupt or missing object fails at once.
+/// The schedule (~0.2s doubling to a 3s cap, spanning about 24s of sleep: 0.2+0.4+0.8+1.6+3×7) is
+/// chosen to comfortably outlast ordinary promotion lag while still surfacing a genuinely stuck
+/// verifier as an error rather than hanging the lift forever.
+///
+/// Calibration evidence, not derivation: a storage-backed head has been observed promoting a
+/// blob within seconds of its staging `PUT` — well inside this schedule's ~24s. That is evidence
+/// this schedule is generous enough for at least one deployed head's ordinary behavior, not a
+/// guarantee it holds for every head or under every load; a slower promoter simply retries out
+/// and reports the standard uncertain-outcome error, the same fallback every other budget in this
+/// module reaches for when its own patience runs out.
 const MAX_COMMIT_ATTEMPTS: usize = 12;
 const COMMIT_BACKOFF_START: std::time::Duration = std::time::Duration::from_millis(200);
 const COMMIT_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(3);
@@ -342,23 +349,35 @@ const REMOTE_CONNECT_TIMEOUT_TOR: std::time::Duration = std::time::Duration::fro
 /// budget before that walk-equivalence question is settled would be exactly the kind of guess this
 /// module's bounded clients exist to avoid.
 ///
-/// 10s of silence, on top of whichever connect budget applies, is generous for any of the three
-/// tight calls above: a healthy connection carrying real progress, however slow the link,
-/// essentially never goes a full 10s without delivering a byte, and each of their pre-first-byte
-/// server costs is a single lookup or an already-built file.
+/// This is client patience, not a bound derived from any specific head's measured cost: 10s of
+/// silence, on top of whichever connect budget applies, is a policy choice about how long this
+/// caller waits for the first byte before calling it silence, not a computation of any head's
+/// true worst case. Calibration evidence supporting that choice, not deriving it: a healthy
+/// connection carrying real progress, however slow the link, essentially never goes a full 10s
+/// without delivering a byte; and this module places only calls whose pre-first-byte cost is
+/// O(constant) — a single lookup, or serving an already-built file, as `forklift-server`'s own
+/// handlers for these three calls happen to do today — onto this budget at all, never a scaled
+/// or open-ended one. That classification, not any one head's specific implementation of it, is
+/// what makes 10s generous here; a future head whose handler for one of these three calls does
+/// unbounded work before its first byte would need to stop riding this budget, not get a bigger
+/// number.
 const REMOTE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The read/metadata silence budget for [`RemoteClient::fetch_object`] — see
-/// [`Posture::BoundedObjectReads`]. Deliberately loose, not tuned to feel responsive:
-/// `server.rs`'s `get_object` handler documents that it "buffers the whole object in memory" via
-/// `retrieve_object_by_hash`, which content-verifies before returning and, for a packed/delta
-/// object, decompresses and reconstructs it in memory too — all inside `blocking(...)`, entirely
-/// before `bytes.into_response()` writes a single byte. That pre-first-byte phase is
-/// size-dependent, structurally the same shape as `objects/batch` (which stays fully unbounded for
-/// exactly this reason) — the difference is that a single object's size is capped
-/// (`object_utils::MAX_OBJECT_BYTES`, 64MiB), so unlike a batch, a flat budget over that ceiling
-/// can be honest, if it is loose enough. 60s is sized to comfortably cover reading, reconstructing,
-/// and hashing any object up to that ceiling — not to feel snappy.
+/// [`Posture::BoundedObjectReads`]. Deliberately loose, not tuned to feel responsive: a single
+/// object's pre-first-byte cost is bounded by `object_utils::MAX_OBJECT_BYTES` (64MiB) — a
+/// constant this crate defines and any head fetches against, a client-known ceiling rather than a
+/// specific head's own trait — structurally the same shape as `objects/batch` (which stays fully
+/// unbounded for exactly this reason: it has no such per-call ceiling), except that here a flat
+/// budget over that ceiling can be honest, if it is loose enough.
+///
+/// Calibration evidence, not derivation: `server.rs`'s `get_object` handler documents that it
+/// "buffers the whole object in memory" via `retrieve_object_by_hash`, which content-verifies
+/// before returning and, for a packed/delta object, decompresses and reconstructs it in memory
+/// too — all inside `blocking(...)`, entirely before `bytes.into_response()` writes a single
+/// byte. That is evidence a buffering implementation's worst case at the 64MiB ceiling is well
+/// inside 60s, not a computation of it — this client's patience is chosen at 60s for the ceiling
+/// regardless of which head serves it, and 60s is not to feel snappy either way.
 ///
 /// Accepted residual, recorded rather than silently absorbed: `server.rs` also documents
 /// grandfathered pre-ceiling blobs (from before `MAX_OBJECT_BYTES` existed) as served "whole and
@@ -553,60 +572,56 @@ pub(crate) const PRESENCE_ALLOWANCE_MS_PER_OP: f64 = 5.0;
 /// side runs a bounded, known-shape sequence after the body is already in hand rather than the
 /// derived, unknowable-in-advance one `update_ref`'s audit walk runs.
 ///
-/// Derived, not guessed, but only for **`forklift-server`'s** implementation of these two
-/// endpoints — the arithmetic below reasons entirely about that head's handlers, not about any
-/// other head a remote may be. `upload_signature`'s server side (`put_signature`,
-/// `forklift-server`) runs the authentication and admission hooks — each capped at
-/// [`HOOK_CLIENT_TIMEOUT`], the server's own flat per-hook budget, imported rather than mirrored
-/// so this figure cannot drift out of sync with what the server actually allows — after the body
-/// is fully buffered (Axum's `Bytes` extractor buffers the whole body before the handler runs).
-/// `put_trust`'s server side (`put_trust`, `forklift-server`) runs one such hook plus an anchor
-/// read/write under the warehouse write lock. One shared constant covers both calls: `2 *
-/// HOOK_CLIENT_TIMEOUT` prices the costlier of the two (`upload_signature`'s pair of hooks) so the
-/// same value is never tight for either.
+/// **Client patience, not a server-priced ceiling.** This is how long this caller is willing to
+/// wait for one of these two small, idempotent writes to finish before it gives up loudly and in
+/// a retry-safe way — a policy choice this client makes about itself, the same category as
+/// [`REMOTE_CONNECT_TIMEOUT`]. It is not, and must never become again, an arithmetic expression
+/// over some specific head's implementation: an earlier version of this constant computed itself
+/// as `2 * HOOK_CLIENT_TIMEOUT + 5s`, importing a constant whose entire meaning was
+/// `forklift-server`'s own per-hook allowance — wrong even against that one head, since
+/// `forklift-server`'s hooks are deployment-optional, and structurally wrong against
+/// `forklift-aws-lambda`, which serves both these routes and runs no hooks at all. `HOOK_CLIENT_TIMEOUT`
+/// now lives in `forklift-server` alone, precisely so a `forklift-core` budget cannot reach it
+/// without adding a dependency this workspace does not have.
 ///
-/// The flat 5s on top covers the boundable remainder — request dispatch, the atomic sidecar or
-/// anchor write and its fsync — and nothing more. It is deliberately not sized to absorb the
-/// residuals below, because none of them has a bound a flat number could absorb.
+/// **Calibration evidence, not derivation.** The 25s value is unchanged from before this doc was
+/// rewritten (verified bit-identical at `forklift-server`'s current 10s hook timeout), and the
+/// facts that originally motivated it remain informative even though they no longer compute it:
+/// `forklift-server`'s own committed test suite measures each of its hooks failing closed at
+/// ~10.00s worst case against a hook that never answers
+/// (`tests::an_authentication_hook_that_never_answers_fails_closed_near_the_hook_timeout` and its
+/// admission sibling, in `forklift-server/src/server.rs`) — `upload_signature`'s handler runs
+/// that pair in sequence, so ~20s is a real, measured worst case for one deployed head's hook
+/// work alone, and 25s leaves 5s of headroom above it for dispatch and the atomic sidecar/anchor
+/// write's own fsync. That is evidence this patience is generous enough for at least one shipped
+/// head's hook-bound cost, not a proof it covers every head's true worst case — see the residuals
+/// below, which this budget does not, and structurally cannot, absorb.
 ///
-/// **Named residuals this arithmetic does not price against `forklift-server`, and cannot** — a
-/// bounded list of the ones this fix found, not a claim that no others exist:
+/// **Named residuals — a bounded list of the ones this fix found, not a claim that no others
+/// exist:**
 ///
 /// - `put_trust` holds `warehouse.writes` for the whole of its handler — the same mutex the
 ///   ref-update handler holds across closure verification, ancestry and the office-chain verify,
 ///   work this module elsewhere documents can legitimately run minutes. A first-contact `put_trust`
 ///   racing another client's long first lift on the same warehouse exceeds this budget regardless
 ///   of its size; see [`RemoteClient::put_trust`]'s own doc for why that is accepted.
-/// - `upload_signature`'s handler reaches `office_utils::read_office_state`, which loads one object
-///   per user record and one per key record. That is O(roster), not the O(constant) file I/O an
-///   earlier version of this doc claimed — a large roster shifts it without bound.
-/// - Both handlers run their work on the shared `spawn_blocking` pool, the same pool the
-///   minutes-long ref-update verification occupies. Queue wait there is unbounded and is not a
-///   quantity either side can price.
-///
-/// **A second head serves both routes and prices nothing like the above at all.**
-/// `crates/forklift-aws-lambda/src/head.rs`'s `signature_put`/`put_trust` run no hooks whatsoever
-/// (`Head::signature_put` calls straight through to `ObjectStore::put_signature`; `Head::put_trust`
-/// to `RefStore::get_trust`/`put_trust_if_absent`, with no `AuthenticationHook`/`AdmissionHook`
-/// concept anywhere in that crate) — so on this head, `2 * HOOK_CLIENT_TIMEOUT`, 20 of this
-/// constant's 25 seconds, prices hook work that does not exist there. What that head's handlers
-/// actually spend instead — Lambda cold start, plus the S3 (`S3ObjectStore`) and DynamoDB
-/// (`DynamoRefStore`) round trips backing `ObjectStore`/`RefStore` — is priced nowhere in this
-/// arithmetic. This budget is not resized for that head in this change; the mismatch is recorded
-/// here as a residual, not resolved.
+/// - `upload_signature`'s handler (on `forklift-server`) reaches `office_utils::read_office_state`,
+///   which loads one object per user record and one per key record — O(roster), not O(constant),
+///   so a large roster shifts it without bound.
+/// - `forklift-server`'s hook-bound handlers run their work on its shared `spawn_blocking` pool,
+///   the same pool the minutes-long ref-update verification occupies there. Queue wait is
+///   unbounded and priced nowhere in this budget.
+/// - `forklift-aws-lambda` serves both these routes too (`Head::signature_put`/`Head::put_trust`)
+///   with no hook concept at all — none of the hook-timing evidence above applies to it. What its
+///   handlers spend instead — Lambda cold start, plus the S3 (`S3ObjectStore`) and DynamoDB
+///   (`DynamoRefStore`) round trips backing `ObjectStore`/`RefStore` — has no calibration evidence
+///   behind this budget at all; this constant applies to that head only as an uncalibrated
+///   uniform policy, not a tuned one.
 ///
 /// The consequence of any of these is a mutation reported as uncertain-outcome when it in fact
 /// succeeded. Both endpoints are idempotent, so the recovery is an ordinary retry — but a retry
 /// against the *same* condition fails identically, since this budget is fixed rather than adaptive.
-///
-/// Computed in milliseconds, not `2 * HOOK_CLIENT_TIMEOUT.as_secs() + 5`: `Duration::as_secs`
-/// truncates any fractional second, so a seconds-based sum would silently under-price this term
-/// for any non-integer-second [`HOOK_CLIENT_TIMEOUT`] (a value under 1s would collapse the whole
-/// hook term to 0) — exactly the "cannot drift out of sync" guarantee this doc and
-/// [`RemoteClient::single_write_budget`]'s own claim to fold in `HOOK_CLIENT_TIMEOUT` honestly.
-const SINGLE_WRITE_ALLOWANCE: std::time::Duration = std::time::Duration::from_millis(
-    2 * (HOOK_CLIENT_TIMEOUT.as_millis() as u64) + 5_000
-);
+const SINGLE_WRITE_ALLOWANCE: std::time::Duration = std::time::Duration::from_secs(25);
 
 /// Shared state between an upload's body-send stream ([`UploadChunks`]) and
 /// [`clients::Clients::send_with_watchdog`]'s polling loop: a timestamp updated every time the stream
@@ -7254,19 +7269,20 @@ mod tests {
     ///
     /// The four `Duration`s below are literals, not `TEST_DIRECT_CONNECT_TIMEOUT +
     /// SINGLE_WRITE_ALLOWANCE` written symbolically. A symbolic derivation reads
-    /// `SINGLE_WRITE_ALLOWANCE`, which itself reads `HOOK_CLIENT_TIMEOUT` — so it would move every
-    /// bound below in lockstep with a mutation to `HOOK_CLIENT_TIMEOUT`, the elapsed wall-clock
-    /// time moving with it, and every assertion here staying green regardless. Measured directly,
-    /// both directions: at `HOOK_CLIENT_TIMEOUT` = 10s (production), this test's own elapsed time
-    /// is ~30.003s, comfortably above the 27.5s `lower_bound` below; mutated to 5s
-    /// (`SINGLE_WRITE_ALLOWANCE` 25s→15s), the real client still takes exactly as long as
-    /// `single_write_budget()` now computes — `self.connect_timeout` (5s, unaffected) plus the
-    /// mutated 15s allowance — so elapsed drops to ~20.003s, and this literal `lower_bound` (still
-    /// 27.5s) correctly fails. A symbolic `lower_bound` would have dropped to ~17.5s in the same
-    /// mutation, and 20.003s still clears *that*, staying green — the exact failure this literal
-    /// exists to close. Literal values pin the numbers that must not move; they do not, and are
-    /// not meant to, catch `single_write_budget` reading a hardcoded `REMOTE_CONNECT_TIMEOUT` in
-    /// place of `self.connect_timeout` — that gap belongs to
+    /// `SINGLE_WRITE_ALLOWANCE` directly, so it would move every bound below in lockstep with any
+    /// future change to that constant's own value, the elapsed wall-clock time moving with it,
+    /// and every assertion here staying green regardless — including a halving of the allowance,
+    /// which is the under-pricing direction that turns a healthy slow write into an unresolvable
+    /// uncertain-outcome error. Measured directly, both directions: at the current 25s allowance,
+    /// this test's own elapsed time is ~30.003s, comfortably above the 27.5s `lower_bound` below;
+    /// mutated to 15s, the real client still takes exactly as long as `single_write_budget()` now
+    /// computes — `self.connect_timeout` (5s, unaffected) plus the mutated 15s allowance — so
+    /// elapsed drops to ~20.003s, and this literal `lower_bound` (still 27.5s) correctly fails. A
+    /// symbolic `lower_bound` would have dropped to ~17.5s in the same mutation, and 20.003s still
+    /// clears *that*, staying green — the exact failure this literal exists to close. Literal
+    /// values pin the numbers that must not move; they do not, and are not meant to, catch
+    /// `single_write_budget` reading a hardcoded `REMOTE_CONNECT_TIMEOUT` in place of
+    /// `self.connect_timeout` — that gap belongs to
     /// `single_write_budget_reads_this_field_not_a_rival_constant` alone, per its own doc.
     #[test]
     fn upload_signature_times_out_against_a_silent_remote() {
@@ -7274,9 +7290,9 @@ mod tests {
         let client = RemoteClient::new(&remote.url, None).unwrap();
         // Literals, not `TEST_DIRECT_CONNECT_TIMEOUT + SINGLE_WRITE_ALLOWANCE` — see this test's
         // own doc for why a symbolic derivation would move every bound below in lockstep with a
-        // mutation to HOOK_CLIENT_TIMEOUT rather than catching it. 30s = 5s (direct connect) +
-        // 25s (SINGLE_WRITE_ALLOWANCE at HOOK_CLIENT_TIMEOUT=10s); 25s is the flat-budget rival
-        // that drops the connect timeout entirely.
+        // mutation to SINGLE_WRITE_ALLOWANCE rather than catching it. 30s = 5s (direct connect) +
+        // 25s (SINGLE_WRITE_ALLOWANCE); 25s is the flat-budget rival that drops the connect
+        // timeout entirely.
         let effective_budget = std::time::Duration::from_secs(30);
         let rival_flat_budget = std::time::Duration::from_secs(25);
         let lower_bound = std::time::Duration::from_millis(27_500);
