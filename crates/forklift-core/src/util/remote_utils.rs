@@ -8084,6 +8084,37 @@ mod tests {
         );
     }
 
+    /// The **upper** fence of the same check, and it guards a different sentence than the lower
+    /// one. A `head` payload at or above this posture's own client-level `read_timeout` inverts
+    /// the two mechanisms' order: the read timeout fires first, before any header section, and
+    /// `RemoteClient::describe_transport_error`'s arm for this posture then tells the operator the
+    /// remote had already sent response headers when it had sent nothing at all.
+    ///
+    /// The payload is exactly *equal* to the fence for the same reason its sibling above uses an
+    /// equal one: a strictly greater payload leaves a `<=` mutant green (it would still fire), an
+    /// equal one does not — at equality the correct `<` fires and `<=` does not, so only this
+    /// fixture separates the two, and it still catches a deleted assert (which never fires).
+    ///
+    /// `connect_timeout` is 10s, a value no production constructor emits, so the payload is far
+    /// above the lower fence and it is unambiguously *this* assert that fires. The budget is built
+    /// from `TEST_LOOSE_READ_TIMEOUT` rather than the production constant, per the mirror
+    /// discipline at the top of this module; if production's own figure ever rises past the
+    /// mirror, this test fails loudly with "did not panic" rather than passing vacuously.
+    ///
+    /// Ignored outside a debug profile, same as its sibling. The release-side guarantee for the
+    /// one producer that exists is not this assert but the const assertion beside
+    /// `BATCH_HEAD_PATIENCE`, which fails the *build* rather than a test run.
+    #[test]
+    #[cfg_attr(not(debug_assertions), ignore)]
+    #[should_panic(expected = "must stay strictly under")]
+    fn the_head_deadline_payload_check_catches_a_payload_past_the_silence_budget() {
+        let connect_timeout = std::time::Duration::from_secs(10);
+        clients::check_head_deadline_payload(
+            connect_timeout + TEST_LOOSE_READ_TIMEOUT,
+            connect_timeout,
+        );
+    }
+
     /// **The half that survives release.** `check_head_deadline_payload` above compiles out when
     /// `debug-assertions = false`, so on its own it promises nothing about the shipped binary —
     /// and for this posture a violating payload does not merely produce a worse bound, it produces
@@ -8501,6 +8532,228 @@ mod tests {
         runtime.block_on(assert_still_running(
             "fetch_subtree", check_after, client.fetch_subtree(&"p".repeat(64), "src"),
         ));
+    }
+
+    /// A remote that answers the batch `POST` **directly** — no redirect anywhere in the picture —
+    /// with a `200`, a `Content-Length` far larger than what it writes, a few body bytes, and then
+    /// genuine silence with the connection held open (no FIN). The direct station's own
+    /// [`SilentRemote`], moved one phase later: the head-wait completes normally and it is the
+    /// *body* that stalls.
+    ///
+    /// The prefix bytes are not decoration. Without them the stall would begin at the header
+    /// boundary, and a bound that only covered the wait for a first body byte would look identical
+    /// to one that covers every subsequent gap. Writing some body first makes this genuinely
+    /// mid-body.
+    struct StalledDirectBodyRemote {
+        url: String,
+        /// Owns the sender for the same reason [`SilentRemote`] does: dropping it at the end of
+        /// the test unblocks the parked handler. Returning early instead would drop the stream,
+        /// send a FIN, and fail the client instantly on a connection-closed error that has nothing
+        /// to do with any budget — a test built that way passes against an unbounded client too.
+        _park: std::sync::mpsc::Sender<()>,
+    }
+
+    impl StalledDirectBodyRemote {
+        fn start() -> StalledDirectBodyRemote {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+
+            std::thread::spawn(move || {
+                use std::io::Write;
+
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let _ = read_test_request(&mut stream);
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                        Content-Length: 4096\r\n\r\nbundle-prefix"
+                    );
+                    let _ = stream.flush();
+                    let _ = rx.recv();
+                    drop(stream);
+                }
+            });
+
+            StalledDirectBodyRemote { url, _park: tx }
+        }
+    }
+
+    /// **The falsifying test for `fetch_batch`'s body-read bound**, on the station that had no
+    /// committed coverage in either direction: the direct, non-redirect response body of the batch
+    /// `POST`. Before the client [`Posture::HeadDeadlineNoRedirect`] selects carried a
+    /// `read_timeout`, this shape hung forever — the head-wait timer had already resolved at the
+    /// status line and nothing was left watching the body.
+    ///
+    /// The budget is the production one (`connect_timeout + FETCH_OBJECT_READ_TIMEOUT`, 65s
+    /// direct), so the assertions do the discriminating rather than the clock. The message must
+    /// name **exactly 65s**, which separates this from a mutant wiring the posture onto the tight
+    /// [`Posture::BoundedReads`] budget (15s) or onto no budget at all (hangs past the ceiling).
+    /// It must say **"at least"**: this budget resets on every byte, so the figure is a lower
+    /// bound on the silence and naming it exactly would be the head-wait timer's entitlement, not
+    /// this one's. And it must name the **headers** already having arrived, which is what tells
+    /// this station apart from the redirect-follow one at the same call site — the two share an
+    /// action string and print the identical figure, so wording is the only thing left to
+    /// distinguish them with, and
+    /// `the_two_batch_stations_do_not_share_one_stall_message` is what pins that they actually
+    /// differ.
+    #[test]
+    fn fetch_batch_times_out_on_a_stalled_direct_body() {
+        let remote = StalledDirectBodyRemote::start();
+        let client = RemoteClient::new(&remote.url, None).unwrap();
+        let effective_budget = TEST_DIRECT_CONNECT_TIMEOUT + TEST_LOOSE_READ_TIMEOUT;
+        let hard_ceiling = effective_budget + std::time::Duration::from_secs(20);
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let outcome = runtime.block_on(async {
+            tokio::time::timeout(hard_ceiling, client.fetch_batch(&["a".repeat(64)])).await
+        });
+
+        let message = outcome
+            .unwrap_or_else(|_| panic!(
+                "fetch_batch hung past the test's own {:?} ceiling — a body that stops arriving \
+                mid-transfer is the exact failure this station's silence budget exists to end",
+                hard_ceiling
+            ))
+            .expect_err("a body that never finishes must not appear to succeed");
+
+        assert!(
+            message.to_lowercase().contains("timed out"),
+            "must fail specifically with a timeout, not some other transport error: {}", message
+        );
+        assert!(
+            message.contains(&format!("{:?}", effective_budget)),
+            "must name the effective silence budget {:?} exactly, not the tight read budget and \
+            not some other figure: {}", effective_budget, message
+        );
+        assert!(
+            message.to_lowercase().contains("at least"),
+            "a resetting silence budget only ever guarantees the gap was at least this long — the \
+            figure must be hedged, unlike the head-wait timer's: {}", message
+        );
+        assert!(
+            message.to_lowercase().contains("headers"),
+            "the wording must say the response headers had already arrived, which is what names \
+            *which* of fetch_batch's two stations stalled — they share one action string and one \
+            figure: {}", message
+        );
+    }
+
+    /// **The distinguishing test the shared figure forces.** `fetch_batch` hands both of its
+    /// stations to one [`RemoteClient::describe_transport_error`] call under one action string,
+    /// and both render the same duration — the direct body through
+    /// [`Posture::HeadDeadlineNoRedirect`]'s client, the redirect-follow `GET` through
+    /// [`Posture::BoundedObjectReads`]', both sized from [`FETCH_OBJECT_READ_TIMEOUT`]. So a
+    /// per-station assertion on the figure certifies nothing about which one an operator is
+    /// looking at. This drives both stalls against the real call and requires the two messages to
+    /// differ.
+    ///
+    /// Runs the two concurrently on one runtime rather than back to back: both fail at the same
+    /// ~65s budget, so racing them costs one budget rather than two.
+    ///
+    /// A mutant that gives this posture's arm the `BoundedObjectReads` wording — the one this arm
+    /// carried before it had a budget of its own, and the shortest way to satisfy every other
+    /// assertion in this file — passes every test but this one.
+    #[test]
+    fn the_two_batch_stations_do_not_share_one_stall_message() {
+        let direct = StalledDirectBodyRemote::start();
+        let redirected = RedirectThenSilentRemote::start();
+        let direct_client = RemoteClient::new(&direct.url, None).unwrap();
+        let redirect_client = RemoteClient::new(&redirected.url, None).unwrap();
+        let hard_ceiling = TEST_DIRECT_CONNECT_TIMEOUT + TEST_LOOSE_READ_TIMEOUT
+            + std::time::Duration::from_secs(20);
+
+        let direct_hashes = vec!["a".repeat(64)];
+        let redirect_hashes = vec!["b".repeat(64)];
+        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        let (direct_outcome, redirect_outcome) = runtime.block_on(async {
+            tokio::join!(
+                tokio::time::timeout(hard_ceiling, direct_client.fetch_batch(&direct_hashes)),
+                tokio::time::timeout(hard_ceiling, redirect_client.fetch_batch(&redirect_hashes)),
+            )
+        });
+
+        let direct_message = direct_outcome
+            .unwrap_or_else(|_| panic!("the direct station hung past {:?}", hard_ceiling))
+            .expect_err("a stalled direct body must not appear to succeed");
+        let redirect_message = redirect_outcome
+            .unwrap_or_else(|_| panic!("the redirect station hung past {:?}", hard_ceiling))
+            .expect_err("a silent redirect target must not appear to succeed");
+
+        assert!(
+            direct_message.to_lowercase().contains("timed out")
+                && redirect_message.to_lowercase().contains("timed out"),
+            "both stations must fail with a timeout before their wording can be compared at all: \
+            direct {:?}, redirect {:?}", direct_message, redirect_message
+        );
+        assert_ne!(
+            direct_message, redirect_message,
+            "fetch_batch's two stations must not produce the same message: they share one action \
+            string and one figure, so identical wording leaves an operator with no way to tell a \
+            stalled control-plane answer from a stalled storage read"
+        );
+    }
+
+    /// **The stuck-green guard for the body bound, and the reason the phase split exists at all.**
+    /// A direct batch response whose body dribbles in steadily — every gap far under the silence
+    /// budget, the whole transfer far past it *and* past the head-wait budget — must **succeed**,
+    /// intact.
+    ///
+    /// Three rival implementations die here, which is what makes it worth its seconds. A *total*
+    /// deadline over the response (`RequestBuilder::timeout`, one line away in the seam's own
+    /// match) cuts the transfer off at its own figure however healthy it is. A head-wait timer
+    /// widened to cover the body kills it at 50s. The tight [`Posture::BoundedReads`] silence
+    /// budget (15s effective) kills it at the first 20s gap. Only a *loose, resetting* silence
+    /// budget survives, which is precisely the mechanism this station is supposed to carry.
+    ///
+    /// Reuses `start_steady_drip_remote` — `fetch_object`'s own drip fixture, on the direct path
+    /// with no redirect hop, which is exactly the shape the batch `POST` sees from a non-offloading
+    /// head.
+    #[test]
+    fn fetch_batch_survives_a_slow_but_steadily_progressing_direct_body() {
+        let gap = std::time::Duration::from_secs(20);
+        let chunks: Vec<Vec<u8>> =
+            (0..4).map(|i| format!("direct-chunk-{}-drip", i).into_bytes()).collect();
+        let expected: Vec<u8> = chunks.concat();
+        let total_duration = gap * (chunks.len() as u32);
+        let effective_silence_budget = TEST_DIRECT_CONNECT_TIMEOUT + TEST_LOOSE_READ_TIMEOUT;
+        let effective_head_budget = TEST_DIRECT_CONNECT_TIMEOUT + TEST_BATCH_HEAD_PATIENCE;
+
+        assert!(
+            total_duration > effective_silence_budget && total_duration > effective_head_budget,
+            "the fixture ({:?}) must outlast both of this call's bounds — the silence budget {:?} \
+            and the head budget {:?} — or it cannot tell a resetting per-gap bound from either of \
+            the rival mechanisms", total_duration, effective_silence_budget, effective_head_budget
+        );
+        assert!(
+            gap < effective_silence_budget,
+            "no single gap ({:?}) may approach the silence budget ({:?}), or this fixture would \
+            fail against the correct implementation too", gap, effective_silence_budget
+        );
+
+        let url = start_steady_drip_remote(chunks, gap);
+        let client = RemoteClient::new(&url, None).unwrap();
+        let outer_ceiling = total_duration + std::time::Duration::from_secs(20);
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let outcome = runtime.block_on(async {
+            tokio::time::timeout(outer_ceiling, client.fetch_batch(&["a".repeat(64)])).await
+        });
+
+        let bytes = outcome
+            .unwrap_or_else(|_| panic!(
+                "fetch_batch hung past its own generous outer ceiling {:?}", outer_ceiling
+            ))
+            .unwrap_or_else(|e| panic!(
+                "a body that was never silent for more than {:?} must never be treated as a \
+                stall, however long the whole transfer took: {}", gap, e
+            ));
+
+        assert_eq!(
+            bytes, Some(expected),
+            "the full body must arrive intact, not a prefix of it — a truncated read is the other \
+            shape a wrongly-scoped bound produces"
+        );
     }
 
     /// A remote that accepts the connection, reads the request, sends response headers claiming
@@ -9830,6 +10083,37 @@ mod tests {
                 "update_ref must not fail on a response that only arrived slowly, never on any \
                 timeout: {}", e
             ));
+    }
+
+    /// **The pin that catches the one-line version of the body-read fix**, and the reason the test
+    /// above cannot: adding a `read_timeout` to the shared `Clients::no_redirect` client instead of
+    /// building `Clients::bounded_object_reads_no_redirect` is the shortest way to bound
+    /// `fetch_batch`'s body, and it silently hands the same silence budget to `update_ref` — the
+    /// one call in this module that must never carry one, because its server side legitimately runs
+    /// a parcel-closure audit walk that moves no bytes for minutes.
+    ///
+    /// `update_ref_outlives_the_read_metadata_timeout` above cannot see that mistake at all. Its
+    /// fixture answers after `connect + tight read + 3s` = 18s, composed from the *tight* mirrors —
+    /// comfortably inside the 65s a loose-scaled budget would allow, so the wrongly-bounded client
+    /// still answers in time and that test stays green. This one is sized against the **loose**
+    /// budget precisely to close that gap, which is why it is worth its 70 seconds.
+    ///
+    /// The "unbounded direction" shape (see `assert_still_running`): a silent remote must not be
+    /// enough on its own to fail this call, checked past the loose budget with slack. It also
+    /// stands as the standing evidence that the fifth client bounded `fetch_batch`'s `POST` and
+    /// nothing else on the no-redirect side — `fetch_subtree_is_not_flat_bounded_by_silence` covers
+    /// only the auto-following client, so it cannot witness this at all.
+    #[test]
+    fn update_ref_stays_unbounded_against_the_loose_silence_budget() {
+        let remote = SilentRemote::start();
+        let client = RemoteClient::new(&remote.url, None).unwrap();
+        let check_after = TEST_DIRECT_CONNECT_TIMEOUT + TEST_LOOSE_READ_TIMEOUT
+            + std::time::Duration::from_secs(5);
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(assert_still_running(
+            "update_ref", check_after, client.update_ref("main", None, &"a".repeat(64)),
+        ));
     }
 
     /// The discriminating fixture for `resolve`'s own [`Posture::TotalDeadline`]: a remote that
