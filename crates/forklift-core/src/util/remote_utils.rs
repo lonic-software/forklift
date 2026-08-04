@@ -436,8 +436,9 @@ const FETCH_OBJECT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from
 ///   answers the client itself, which is a *response*, not a hang. 45s clears that with margin, so
 ///   against such a head this bound never fires on a legitimately slow build — there it protects
 ///   against a **wedge**, and against nothing else.
-/// - **Against a self-hosted `forklift-server`, the bundle build's pre-first-byte cost is nowhere
-///   near it.** Measured time-to-first-byte for `POST /v1/objects/batch` (0.3.0, 3 runs per point):
+/// - **Against a self-hosted `forklift-server`, the *measured* pre-first-byte cost is nowhere near
+///   it** — measured, and only measured; see the retraction below for what that does not cover.
+///   Time-to-first-byte for `POST /v1/objects/batch` (0.3.0, 3 runs per point):
 ///   0.4–0.9ms for 1 object / 256KiB; 4.1–13.0ms for 50 objects / 12.8MiB; 14.1–39.3ms for 203
 ///   objects / 52.5MiB loose, 52ms for the same set after `forklift compact`.
 ///
@@ -2803,9 +2804,10 @@ impl RemoteClient {
         }
 
         // `body_posture` follows whichever station actually produced the response bytes below:
-        // the unbounded `POST` above when there was no redirect to follow, or the bounded
-        // redirect-follow `GET`'s own posture when there was — a single posture cannot honestly
-        // describe both, since they carry different bounds.
+        // the head-bounded `POST` above when there was no redirect to follow — head-bounded, but
+        // with an unbounded *body* phase, which is the phase these bytes are read in — or the
+        // redirect-follow `GET`'s own silence budget when there was. A single posture cannot
+        // honestly describe both, since they carry different bounds.
         let (response, body_posture) = match response.status() {
             reqwest::StatusCode::SEE_OTHER
             | reqwest::StatusCode::TEMPORARY_REDIRECT
@@ -6600,8 +6602,12 @@ mod tests {
         let error = runtime.block_on(broken.fetch_batch(&["a".repeat(64)]))
             .expect_err("a server error must not be reported as the endpoint being absent");
         assert!(
-            error.to_lowercase().contains("500") || error.to_lowercase().contains("batch"),
-            "the error must name something about the actual refusal: {}", error
+            error.contains("500"),
+            "the error must name the status the remote actually sent. This assertion used to \
+            carry an `|| contains(\"batch\")` disjunct, which could not fail: every error path \
+            out of fetch_batch names the batch action, so the disjunct was satisfied by any Err \
+            at all — including a head-wait expiry, which is precisely the outcome this fixture \
+            exists to keep distinguishable from a real refusal: {}", error
         );
     }
 
@@ -7950,11 +7956,14 @@ mod tests {
     /// same call-site-versus-mechanism gap `missing_objects_times_out_against_a_silent_remote`
     /// guards against for `missing_objects`, applied here to `resolve`.
     ///
-    /// **Why 12.5s.** This module's named connect/read-timeout constants are whole seconds,
-    /// apart from one 0.2s constant (`COMMIT_BACKOFF_START`/`UPLOAD_WATCHDOG_POLL_INTERVAL`) —
-    /// so summing any two of them can never land on a half-second boundary. `connect_timeout`
-    /// (12.5s, true budget 22.5s) sits on exactly that boundary: a checkable reason to prefer
-    /// this value, not a claim that it is the only viable one.
+    /// **Why 12.5s.** Every named `Duration` constant this module defines is a whole number of
+    /// seconds except the two 200ms ones (`COMMIT_BACKOFF_START`/`UPLOAD_WATCHDOG_POLL_INTERVAL`)
+    /// — re-check with `grep -n "Duration::from_secs\|Duration::from_millis"` over this file — so
+    /// summing any two of them can never land on a half-second boundary. `connect_timeout` (12.5s,
+    /// true budget 22.5s) sits on exactly that boundary: a checkable reason to prefer this value,
+    /// not a claim that it is the only viable one. Stated as a property of the constants rather
+    /// than as a list of their values deliberately — the property survives a constant being added,
+    /// a list does not, and this module has repeatedly shipped stale lists of exactly that kind.
     ///
     /// This test excludes the two rivals named above, verified by running each as a mutant; it
     /// is not a completeness argument over any set of budgets, and other connect-blind values
@@ -8533,14 +8542,25 @@ mod tests {
     /// third value, `SENTINEL_CONNECT_TIMEOUT` (7s), that no production constructor can ever
     /// produce, so a mutant hardcoding *either* rival constant is caught here.
     ///
-    /// 7 was checked against every named `Duration` constant in this module before picking it
-    /// (`grep -n "Duration::from_secs\|Duration::from_millis"`): the distinct values in play are 2
-    /// (`POST_SEND_VERIFY_BASE`), 3 (`COMMIT_BACKOFF_CAP`), 5, 10, and 60 — 7 itself matches none of
-    /// them, though 2+5 does coincidentally sum to 7. That sum isn't a rival: the mutation this test
-    /// defends against is a hardcoded *connect_timeout* substitution — one of the two values a
-    /// production constructor can actually produce — not an arbitrary recombination of unrelated
-    /// budgets from a different phase (`POST_SEND_VERIFY_BASE` belongs to the post-send verify
-    /// wait; nothing in this module ever adds it to a connect timeout). What would actually matter
+    /// 7 was checked against every named `Duration` constant this module defines before being
+    /// picked, and collides with none of them. The procedure, so a reader can re-derive that
+    /// instead of trusting it: `grep -n "Duration::from_secs\|Duration::from_millis"` over this
+    /// file.
+    ///
+    /// **The values themselves are deliberately not transcribed here, and this is the canonical
+    /// statement of why** — the four sibling sentinel docs below say the same thing by pointing at
+    /// this paragraph. A transcribed census is a hand-maintained enumeration, and this module's
+    /// history is that contracts survive in prose while enumerations rot: the commit that added
+    /// this file's most recent `Duration` constant left **every** such list in this test module
+    /// stale at once, including the one it wrote itself. What each of these tests actually rests on is
+    /// the separation claim — this sentinel collides with nothing — and that claim is re-checkable
+    /// in a second by the grep above. The census only ever decays between edits.
+    ///
+    /// A coincidental *sum* of two unrelated constants would not be a rival even where one exists:
+    /// the mutation this test defends against is a hardcoded *connect_timeout* substitution — one
+    /// of the two values a production constructor can actually produce — not an arbitrary
+    /// recombination of budgets belonging to a different phase, which nothing in this module ever
+    /// adds to a connect timeout. What would actually matter
     /// is a rival for this test's asserted *output*, `17s` (`7 + TEST_ERROR_BODY_READ_TIMEOUT`):
     /// the two values a hardcoded production `connect_timeout` would actually produce here instead
     /// of reading `self.connect_timeout` are `15s` (`REMOTE_CONNECT_TIMEOUT` +
@@ -8615,16 +8635,16 @@ mod tests {
     /// `SENTINEL_CONNECT_TIMEOUT` (11s) is deliberately a different value from
     /// `error_body_budget`'s own sentinel (7s) — reusing it would make the two tests read as one
     /// case split in half rather than two independently readable pins — and, like that test's own
-    /// sentinel, was checked against every named `Duration` constant in this module
-    /// (`grep -n "Duration::from_secs\|Duration::from_millis"`) before being picked: the distinct
-    /// values in play are 0.2 (`COMMIT_BACKOFF_START`/`UPLOAD_WATCHDOG_POLL_INTERVAL`), 2
-    /// (`POST_SEND_VERIFY_BASE`), 3 (`COMMIT_BACKOFF_CAP`), 5, 10, 60, and the sibling test's own
-    /// 7 — 11 matches none of them. What would actually matter is a rival for this test's asserted
+    /// sentinel, was checked against every named `Duration` constant this module defines before
+    /// being picked, colliding with none of them. Procedure: `grep -n
+    /// "Duration::from_secs\|Duration::from_millis"` over this file; the values are not
+    /// transcribed here, for the reason
+    /// [`error_body_budget_reads_this_field_not_a_rival_constant`]'s own doc gives at length.
+    /// What would actually matter is a rival for this test's asserted
     /// *output*, 21s (`11 + TEST_TIGHT_READ_TIMEOUT`): the two values a hardcoded production
     /// `connect_timeout` would actually produce here are `15s` (`REMOTE_CONNECT_TIMEOUT` +
     /// `TEST_TIGHT_READ_TIMEOUT`) and `70s` (`REMOTE_CONNECT_TIMEOUT_TOR` +
-    /// `TEST_TIGHT_READ_TIMEOUT`), and 21s separates from both, and does not coincide with any
-    /// single named constant either. This is a separation report against those two rivals, not a
+    /// `TEST_TIGHT_READ_TIMEOUT`), and 21s separates from both. This is a separation report against those two rivals, not a
     /// claim that no other combination of this module's constants could ever sum to 21 —
     /// characterising a separation table as complete has cost a fresh defect on every attempt this
     /// module's history has tried it, so that claim is deliberately not made.
@@ -8675,10 +8695,15 @@ mod tests {
     /// and would give a Tor client a head budget sized off a 5s connect allowance against a 60s
     /// one, the bound expiring during circuit build on every call.
     ///
-    /// `SENTINEL_CONNECT_TIMEOUT` (17s) is a value no production constructor can emit, checked
-    /// against every named `Duration` constant this module defines
-    /// (`grep -n "Duration::from_secs\|Duration::from_millis"`: 0.2, 2, 3, 5, 10, 25, 45, 60) —
-    /// 17 matches none. This test's asserted *output*, 62s, separates from the two rivals a
+    /// `SENTINEL_CONNECT_TIMEOUT` (17s) is a value no production constructor can emit, and it was
+    /// checked against every named `Duration` constant this module defines before being picked,
+    /// colliding with none of them. Procedure: `grep -n
+    /// "Duration::from_secs\|Duration::from_millis"` over this file; the values are not
+    /// transcribed here, for the reason
+    /// [`error_body_budget_reads_this_field_not_a_rival_constant`]'s own doc gives at length —
+    /// the version of this paragraph that shipped with the head-wait bound *did* transcribe them,
+    /// and was stale on arrival, because the same commit added a `Duration` constant its own list
+    /// omitted. This test's asserted *output*, 62s, separates from the two rivals a
     /// hardcoded production connect timeout would actually produce here: 50s
     /// (`REMOTE_CONNECT_TIMEOUT + BATCH_HEAD_PATIENCE`) and 105s (`REMOTE_CONNECT_TIMEOUT_TOR +
     /// BATCH_HEAD_PATIENCE`). A separation report against those two rivals, not a claim that no
@@ -8797,11 +8822,11 @@ mod tests {
     /// `SENTINEL_CONNECT_TIMEOUT` (13s) is a third value, distinct from `error_body_budget`'s own
     /// sentinel (7s) and `resolve_budget`'s (11s) for the same "read independently, not one case
     /// split in half" reason those two are distinct from each other — and, like both, checked
-    /// against every named `Duration` constant in this module before being picked (`grep -n
-    /// "Duration::from_secs\|Duration::from_millis"`): the distinct values in play are 0.2
-    /// (`COMMIT_BACKOFF_START`/`UPLOAD_WATCHDOG_POLL_INTERVAL`), 2 (`POST_SEND_VERIFY_BASE`), 3
-    /// (`COMMIT_BACKOFF_CAP`), 5, 7 (the sibling sentinel), 10, 11 (the other sibling sentinel),
-    /// and 60 — 13 matches none of them. `n` is fixed at 1 here (a 5ms scaled term) precisely so
+    /// against every named `Duration` constant this module defines before being picked, colliding
+    /// with none of them. Procedure: `grep -n "Duration::from_secs\|Duration::from_millis"` over
+    /// this file; the values are not transcribed here, for the reason
+    /// [`error_body_budget_reads_this_field_not_a_rival_constant`]'s own doc gives at length.
+    /// `n` is fixed at 1 here (a 5ms scaled term) precisely so
     /// this test's asserted *output* — 15.005s (`13 + POST_SEND_VERIFY_BASE + 0.005`) — is what
     /// actually needs checking for collisions, and unlike `error_body_budget`/`resolve_budget`'s
     /// own two-addend sums, `presence_negotiation_budget` sums *three* terms (`connect_timeout`,
@@ -8884,13 +8909,16 @@ mod tests {
     /// `SENTINEL_CONNECT_TIMEOUT` (9s) is a value distinct from the two production connect-timeout
     /// constants this test actually needs to separate from — [`REMOTE_CONNECT_TIMEOUT`] (5s) and
     /// [`REMOTE_CONNECT_TIMEOUT_TOR`] (60s) — and from every named `Duration` constant this module
-    /// defines (`0.2, 2, 3, 5, 10, 60`, plus [`SINGLE_WRITE_ALLOWANCE`] itself, 25) — checked by
-    /// `grep -n "Duration::from_secs\|Duration::from_millis"` before being picked. It is not also
-    /// claimed to differ from every other test's own connect-timeout sentinel elsewhere in this
-    /// module: an earlier version of this doc carried that list, and it rotted within the same
-    /// commit that added [`super::tests::the_total_deadline_payload_check_catches_a_violating_payload`]'s
-    /// own 10s sentinel — a hand-maintained enumeration is exactly the shape this module's history
-    /// keeps failing, so this doc drops the claim rather than repairing the list. Reusing another
+    /// defines, checked by `grep -n "Duration::from_secs\|Duration::from_millis"` before being
+    /// picked. Those values are not transcribed here either, for the reason
+    /// [`error_body_budget_reads_this_field_not_a_rival_constant`]'s own doc gives at length —
+    /// **and this doc had already learned that lesson on a different list while keeping this one**:
+    /// it dropped an enumeration of the other tests' sentinels after that list rotted within the
+    /// same commit that added
+    /// [`super::tests::the_total_deadline_payload_check_catches_a_violating_payload`]'s own 10s
+    /// sentinel, and then kept a census of the module's `Duration` values that went stale in its
+    /// turn, for exactly the same reason. Recorded because a lesson applied to one list and not to
+    /// its neighbour in the same paragraph is how the class survives being fixed. Reusing another
     /// test's sentinel value here would only cost readability (two tests reading as one case split
     /// in half), never this test's own correctness, since nothing about `single_write_budget`
     /// reads any other test's constant.
@@ -9047,19 +9075,25 @@ mod tests {
     /// [`REMOTE_CONNECT_TIMEOUT_TOR`]) can ever produce it, so a rival implementation that
     /// hardcodes either production constant in place of `self.connect_timeout` cannot
     /// coincidentally match this test's expected figure. It is also absent from this module's own
-    /// named `Duration` constants — `{0.2, 2, 3, 5, 10, 60}`, checked via `grep -n
-    /// "Duration::from_secs\|Duration::from_millis"` at the time this test was written — and from
-    /// the connect-timeout sentinels already in use elsewhere in this file (`{5, 7, 11, 12.5, 13,
-    /// 60}`, via `grep -n "new_test_with_connect_timeout"` and the two production constructors), so
-    /// it collides with none of them either. Re-run both greps before trusting either set past a
-    /// later edit.
+    /// named `Duration` constants and from every connect-timeout sentinel already in use elsewhere
+    /// in this file — checked, at the time of writing, via `grep -n
+    /// "Duration::from_secs\|Duration::from_millis"` and `grep -n
+    /// "new_test_with_connect_timeout"` plus the two production constructors. **Both sets are the
+    /// procedure, not a transcription**: earlier versions of this paragraph carried both lists
+    /// inline and both were stale within two commits, which is the reason
+    /// [`error_body_budget_reads_this_field_not_a_rival_constant`]'s own doc gives at length for
+    /// dropping them everywhere in this module. Re-run the greps; do not trust a remembered set.
     ///
     /// At `n=1` the true budget is `4s + POST_SEND_VERIFY_BASE (2s) + 1 * \
     /// PRESENCE_ALLOWANCE_MS_PER_OP (5ms) = 6.005s`. The `.005` fraction only ever comes from
-    /// `PRESENCE_ALLOWANCE_MS_PER_OP`: over that same named-constant set, whose only fractional
-    /// member is 0.2s, every sum's fractional part is a multiple of 0.2 (`.0`/`.2`/`.4`/`.6`/`.8`),
-    /// never `.005` — so a message containing `6.005s` could only have come from the real
-    /// arithmetic. Measured (not merely reasoned
+    /// `PRESENCE_ALLOWANCE_MS_PER_OP`, and the reason is structural rather than a census: every
+    /// named `Duration` constant this module defines is a whole number of seconds except the two
+    /// 200ms ones (`COMMIT_BACKOFF_START`/`UPLOAD_WATCHDOG_POLL_INTERVAL`), so every sum of them
+    /// has a fractional part that is a multiple of 0.2 (`.0`/`.2`/`.4`/`.6`/`.8`) and never
+    /// `.005` — a message containing `6.005s` could only have come from the real arithmetic. Put
+    /// as a property of the constants rather than of a list of their values on purpose: this form
+    /// survives a new constant being added and is re-checkable by the same grep, where the list it
+    /// replaces was falsified by the next constant to land. Measured (not merely reasoned
     /// about) against the rivals below, run as hand-applied mutants at this test's own `S=4s,
     /// n=1`:
     ///
