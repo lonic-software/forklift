@@ -359,7 +359,7 @@ const REMOTE_CONNECT_TIMEOUT_TOR: std::time::Duration = std::time::Duration::fro
 /// none, and must not be given one. **`update_ref` must never move to [`Posture::BoundedReads`]**
 /// — nor may the client it already rides acquire a `read_timeout`, which is the same hazard by a
 /// shorter route, and the cheaper-looking one now that a client combining no-auto-redirect *with* a
-/// silence budget exists to copy from: its
+/// silence budget exists to copy from: `update_ref`'s
 /// server side legitimately runs a parcel-closure audit walk — scoped by the history segment
 /// being pushed, which on a first lift into an empty pallet is the whole history — before its
 /// first response byte; that can take minutes with *no* bytes moving at all, which this constant
@@ -494,6 +494,14 @@ const FETCH_OBJECT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// body read — is closed: see [`FETCH_OBJECT_READ_TIMEOUT`]'s doc for the budget that closed it and
 /// the terms it is honest on.) The falsifier that reopens **the number, not the mechanism**: a
 /// measured legitimate build exceeding this patience against a real deployment.
+///
+/// **What acting on that falsifier now costs, which it did not when the sentence was written.**
+/// These two constants used to be independent; the phase-precedence assertion below has since made
+/// this one a *strict* lower bound on [`FETCH_OBJECT_READ_TIMEOUT`]. So raising the patience is
+/// free only up to that ceiling — past it the build fails, and the only way through is to raise the
+/// silence budget too, which is not local: it also loosens [`RemoteClient::fetch_object`] and the
+/// redirect-follow `GET`. Loud rather than silent, but a measurement that lands above the ceiling
+/// reopens two constants, not one.
 const BATCH_HEAD_PATIENCE: std::time::Duration = std::time::Duration::from_secs(45);
 
 /// **The phase-precedence pin.** `fetch_batch`'s two bounds must fire in a fixed order — the
@@ -2937,8 +2945,10 @@ impl RemoteClient {
     /// control plane, so it answers this `POST` with a redirect to a presigned `GET` of the
     /// bundle bytes under an ephemeral response key (`303 See Other` from a fixed head; a
     /// `307`/`308` from an older one is followed identically). The redirect is followed **by
-    /// hand**, never by reqwest's automatic policy (this call goes out on the no-auto-follow
-    /// client, [`Posture::UnboundedNoRedirect`], for exactly that reason): a `307`/`308` replays
+    /// hand**, never by reqwest's automatic policy (this call goes out on a client whose redirect
+    /// policy is `none`, selected by the posture named two paragraphs below and deliberately not
+    /// restated here — a posture named twice in one doc is a posture that rots once): a `307`/`308`
+    /// replays
     /// the original request verbatim — method and JSON body — which would re-`POST` this call's
     /// body at a URL SigV4-signed for `GET` only, failing signature verification (`500` on
     /// LocalStack, `403 SignatureDoesNotMatch` on real AWS) rather than fetching anything. The
