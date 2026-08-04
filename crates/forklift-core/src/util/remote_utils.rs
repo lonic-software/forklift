@@ -791,31 +791,48 @@ fn watched_upload_body(bytes: Vec<u8>, progress: Arc<UploadProgress>) -> (reqwes
 ///
 /// So the fields are private to this module, and [`Clients::pick`] — the only function that reads
 /// them — is private too, reachable only from inside `mod clients` itself. The module hands out
-/// exactly two things instead: [`Clients::request_on`], which takes a [`Posture`] — a required
-/// argument, not a default — plus a [`RequestDestination`] and method, and returns a
-/// `reqwest::RequestBuilder` on whichever client `pick` chose, with that posture's own payload
-/// (currently [`Posture::TotalDeadline`]'s or [`Posture::TotalDeadlineNoRedirect`]'s `Duration`)
-/// already applied; and
-/// [`Clients::send_with_watchdog`], which never hands a client (or a plain builder) out at all — it
-/// takes the upload's bytes and the pieces of a request, builds the watchdog-guarded body and the
-/// request itself, and returns a [`WatchdogOutcome`]. Neither function can be skipped in favor of
+/// exactly two operations instead, and neither of them hands out a client, or a builder, or
+/// anything else a caller could send by hand: [`Clients::send_on`], which takes a [`Posture`] — a
+/// required argument, not a default — plus a [`RequestDestination`], a method and a [`SendBody`],
+/// applies that posture's own payload (currently [`Posture::TotalDeadline`]'s or
+/// [`Posture::TotalDeadlineNoRedirect`]'s `Duration`) on whichever client `pick` chose, sends the
+/// request itself, and returns a [`SendOutcome`]; and
+/// [`Clients::send_with_watchdog`], which takes the upload's bytes and the pieces of a request,
+/// builds the watchdog-guarded body and the request itself, and returns a [`WatchdogOutcome`].
+/// Neither function can be skipped in favor of
 /// reaching `pick` directly, because nothing outside `mod clients` can name `pick` at all — that is
-/// a privacy error, not a convention. A new call site cannot reach any client, nor send a
-/// watchdog-guarded upload, without the compiler forcing it through one of these two, payload-
+/// a privacy error, not a convention. A new call site cannot reach any client, nor send a request
+/// of any kind, without the compiler forcing it through one of these two, payload-
 /// applying paths; there is no ambient "just use the default one" path left to fall into, and no
 /// lower-level escape hatch left standing beside them either.
 ///
+/// **Why both of them own `send()` rather than returning a builder.** A `reqwest::RequestBuilder`
+/// handed back to a call site is a request this module has already stopped governing: the only
+/// bound it can still carry is whatever was attached before the hand-off, and the in-flight
+/// `send()` future — the only thing an outer bound could wrap, or a watchdog could race — belongs
+/// to whoever calls it. [`Clients::send_with_watchdog`] needed that future first, and holds it in
+/// a `select!` beside its own poll loop. [`Clients::send_on`] now holds it for the same
+/// structural reason rather than for any bound it arms today, and the gain is where a payload can
+/// be applied: at the exhaustive match over [`Posture`] here, rather than only in whatever a
+/// builder can be told before it leaves. The cost is that a body has to be described rather than
+/// chained on — see [`SendBody`], which is also where the one behaviour that description had to
+/// reproduce by hand is recorded.
+///
 /// **The residual trust base is this module, full stop — nothing outside it.** That used to
-/// require two named exceptions ([`RemoteClient::request_on`] and a since-deleted `client_for`,
-/// which handed back the bare `&reqwest::Client` itself for the one call site that must not attach
-/// a bearer token); both now build on [`Clients::request_on`], which returns a `RequestBuilder`
-/// directly, so neither ever touches a `reqwest::Client` reference at all. The watchdog-guarded
+/// require two named exceptions (`RemoteClient`'s own builder-returning wrapper and a
+/// since-deleted `client_for`, which handed back the bare `&reqwest::Client` itself for the one
+/// call site that must not attach a bearer token); both were replaced by
+/// [`RemoteClient::send_on`]/[`RemoteClient::send_on_presigned`], which forward to
+/// [`Clients::send_on`] and return a [`SendOutcome`], so neither ever touches a `reqwest::Client`
+/// — or a `reqwest::RequestBuilder` — at all. The watchdog-guarded
 /// uploads (`upload_object`, `put_presigned`) were already outside the trust base the same way. That
 /// the external base is empty, not merely small, is a procedural claim, not an assertion to take on
-/// faith: `grep -n 'reqwest::Client\b' crates/forklift-core/src/util/remote_utils.rs`, read against
-/// which lines are doc comments, currently finds the type spelled outside a comment only inside
-/// `mod clients` itself — nowhere else in the file. Re-run that grep to re-check the claim; do not
-/// trust this sentence past the next edit that moves the type.
+/// faith: `grep -n 'reqwest::Client\b' crates/forklift-core/src/util/remote_utils.rs` and
+/// `grep -n 'reqwest::RequestBuilder' crates/forklift-core/src/util/remote_utils.rs`, each read
+/// against which lines are doc comments, currently find either type spelled outside a comment only
+/// inside `mod clients` itself — nowhere else in the file. Domain: this file, at this commit;
+/// re-run both greps to re-check the claim, and do not trust this sentence past the next edit that
+/// moves either type.
 ///
 /// **Four physical clients, three independent axes.** *Redirect policy* (mutations, and the
 /// one-shot streamed-upload bodies, must never auto-follow; reads may). *Whether a read/metadata
@@ -845,8 +862,9 @@ mod clients {
     /// `#[derive(Clone, Copy)]`: [`super::RemoteClient::describe_transport_error`] takes a
     /// `Posture` by value, since it reports the exact posture a call was actually armed with —
     /// every call site needs to arm a request with a posture and then hand that same posture to
-    /// the composer, and `Copy` is what lets a call site bind one local and use it twice (once in
-    /// [`Clients::request_on`], once in the error map) without a borrow fight. Nothing here
+    /// the composer, and `Copy` is what lets a call site bind one local and use it twice (once
+    /// arming the request through [`Clients::send_on`], once handing the outcome to
+    /// [`super::RemoteClient::response_from_send`]) without a borrow fight. Nothing here
     /// derives `Debug`/`PartialEq`: no code compares or prints a `Posture`, and a derive whose
     /// stated purpose has no caller is exactly the kind of unenforced claim this module avoids.
     #[derive(Clone, Copy)]
@@ -877,7 +895,7 @@ mod clients {
         BoundedObjectReads,
         /// Auto-follows redirects; no client-level `read_timeout`. The bound is the payload
         /// itself — a genuine *total* per-request deadline (`RequestBuilder::timeout`) that
-        /// [`Clients::request_on`] reads off this variant and applies unconditionally, so the
+        /// [`Clients::send_on`] reads off this variant and applies unconditionally, so the
         /// promise is discharged by the module, not merely asserted at the call site the way the
         /// deleted `OwnTimeoutFollowsRedirects` posture used to (that variant carried no payload at
         /// all; nothing checked that any caller of it actually called `.timeout(...)`) — and the
@@ -894,8 +912,8 @@ mod clients {
         /// reason "resolve has nothing to move before headers arrive": `BoundedReads`'s own
         /// pre-header deadline is fixed and non-resetting (see [`REMOTE_READ_TIMEOUT`]'s own
         /// doc), so it already terminates correctly against a remote that goes fully silent and
-        /// never answers at all — confirmed directly, not assumed: probed
-        /// `request_on(BoundedReads, ...)` against a permanently silent remote and it failed with
+        /// never answers at all — confirmed directly, not assumed: probed a
+        /// [`Self::BoundedReads`] request against a permanently silent remote and it failed with
         /// a genuine timeout at 15.003s, no hang. What a silence budget cannot catch is the
         /// opposite shape: a remote that *does* start answering and then trickles bytes slowly,
         /// forever, resetting the clock on every byte (this file's own settled contract: a
@@ -908,11 +926,11 @@ mod clients {
         /// [`super::RemoteClient::resolve`]'s own doc for the residual this accepts, and
         /// [`super::tests::resolve_gives_up_on_a_remote_that_never_stops_trickling`] for the
         /// falsifying test — it calls `resolve` itself against the trickling shape, unlike
-        /// `super::tests::request_on_applies_a_total_deadline_that_ignores_progress`, which pins
-        /// only `request_on`'s own wiring and never calls `resolve`.
+        /// `super::tests::send_on_applies_a_total_deadline_that_ignores_progress`, which pins
+        /// only the seam's own wiring and never calls `resolve`.
         TotalDeadline(std::time::Duration),
         /// Same shape as [`Self::TotalDeadline`] — a genuine *total* per-request deadline, applied
-        /// the same way by [`Clients::request_on`] — but on the client that never auto-follows a
+        /// the same way by [`Clients::send_on`] — but on the client that never auto-follows a
         /// redirect, for a mutation that also needs a bound. `upload_signature` and `put_trust`,
         /// against `forklift-server`: single-write endpoints whose server side runs a fixed number
         /// of individually-capped hooks after the body is already in hand — not O(constant) file
@@ -967,9 +985,9 @@ mod clients {
     /// the deleted `client_for` handed back a bare client for exactly this reason, for its one
     /// caller, and a payload-carrying posture routed through it would have hung forever unticketed.
     /// What actually closes the set now is that [`Clients::pick`] is private to `mod clients`,
-    /// reachable only from [`Clients::request_on`] — the sole place a `Posture` ever becomes a
-    /// sendable request, and the one place that applies an exhaustive match (mirroring `pick`'s own)
-    /// to read off any payload a variant carries before building it. Reaching a client at all means
+    /// reachable only from [`Clients::send_on`] — the sole place a `Posture` ever becomes a
+    /// request on the wire, and the one place that applies an exhaustive match (mirroring `pick`'s own)
+    /// to read off any payload a variant carries before sending it. Reaching a client at all means
     /// having gone through that match, so a payload-carrying variant can no longer go unbounded by
     /// way of a second, competing path, and an unbounded call can only be
     /// `UnboundedFollowsRedirects`/`UnboundedNoRedirect`, both requiring this ticket by construction.
@@ -977,8 +995,15 @@ mod clients {
     /// did: by never constructing a `Posture` at all, so its own bound (the watchdog) needs no
     /// representation here either. Before trusting the grep again, re-check both conditions: that
     /// `Clients::pick` is still private (no `pub` on its `fn pick` line), and that every way to send
-    /// a request still goes through [`Clients::request_on`] or [`Clients::send_with_watchdog`] —
-    /// or re-derive by hand whether some new path is actually bounded.
+    /// a request still goes through [`Clients::send_on`] or [`Clients::send_with_watchdog`] —
+    /// or re-derive by hand whether some new path is actually bounded. The leak detector for the
+    /// second condition is
+    /// `grep -n '\.send()' crates/forklift-core/src/util/remote_utils.rs`, read against which
+    /// lines are comments: every remaining hit must fall inside `mod clients`, including in the
+    /// test module. It guards the floor rather than the property —
+    /// a *third* send entry point added to this module would leave it green — so the enumeration
+    /// that actually stands for "exactly two ways onto the wire" is the sentence above naming
+    /// both, and a third would have to be added to it to be reachable at all.
     ///
     /// The set this enumerates is meant to reach zero: every call ticketed here eventually earns
     /// a real budget and moves off [`Posture::UnboundedFollowsRedirects`]/
@@ -1039,7 +1064,7 @@ mod clients {
         /// Auto-follows redirects (reqwest's default `redirect::Policy`); no client-level
         /// `read_timeout`, so once past connect it waits out any silence, however long — unless a
         /// per-request `RequestBuilder::timeout(...)` is layered on top, which
-        /// [`super::RemoteClient::request_on`] does for [`Posture::TotalDeadline`] alone. Selected
+        /// [`Clients::send_on`] does for [`Posture::TotalDeadline`] alone. Selected
         /// by [`Posture::UnboundedFollowsRedirects`] and [`Posture::TotalDeadline`].
         ///
         /// **`commit_lift` is a mutation that rides this client** — the one FORK-89 left
@@ -1051,7 +1076,7 @@ mod clients {
         /// (`redirect::Policy::none()`); no `read_timeout` either. Selected by
         /// [`Posture::UnboundedNoRedirect`] and [`Posture::TotalDeadlineNoRedirect`] alike — the
         /// latter layers a per-request total deadline on top via the same
-        /// [`Clients::request_on`] extraction [`Posture::TotalDeadline`] uses, never a
+        /// [`Clients::send_on`] extraction [`Posture::TotalDeadline`] uses, never a
         /// client-level `read_timeout` this client cannot carry — and directly (bypassing
         /// [`Posture`] entirely) by
         /// [`Clients::send_with_watchdog`] — the watchdog-guarded upload paths: reqwest's default
@@ -1130,8 +1155,8 @@ mod clients {
         /// [`Posture::TotalDeadline`] with its `Duration` never read at all, exactly the hole the
         /// deleted `client_for` reopened for its one caller (see [`super::UnboundedTicket`]'s own
         /// doc for the closure claim this bug falsified). Keeping this function unreachable from
-        /// outside `mod clients` means the only way to turn a `Posture` into a sendable request is
-        /// [`Self::request_on`], which calls this and then unconditionally applies the payload — so
+        /// outside `mod clients` means the only way to turn a `Posture` into a request on the wire
+        /// is [`Self::send_on`], which calls this and then unconditionally applies the payload — so
         /// there is no second, competing path left for a future caller to reach for instead.
         fn pick(&self, posture: &Posture) -> &reqwest::Client {
             match posture {
@@ -1144,75 +1169,53 @@ mod clients {
             }
         }
 
-        /// The only way any of the four clients leaves this module: build a `reqwest::RequestBuilder`
-        /// on whichever client [`Self::pick`] chooses, with `posture`'s own payload — currently
+        /// The only way a request reaches any of the four clients: send it on whichever client
+        /// [`Self::pick`] chooses, with `posture`'s own payload — currently
         /// [`Posture::TotalDeadline`]'s or [`Posture::TotalDeadlineNoRedirect`]'s `Duration` —
-        /// already applied. `pick` is private to this
+        /// applied first, and return a [`SendOutcome`]. `pick` is private to this
         /// module and this is its only caller, so there is no path from a `Posture` to a client that
         /// can skip this extraction; a future payload-carrying variant forces the match below to be
         /// revisited (it has no wildcard arm, deliberately, mirroring `pick`'s own exhaustiveness)
         /// rather than silently compiling with the new payload dropped — the failure mode both the
         /// deleted `OwnTimeoutFollowsRedirects` posture and the deleted `client_for` had, one layer
-        /// apart. `destination` names the two request shapes callers need — see
+        /// apart.
+        ///
+        /// **Sends rather than returning a builder**, unlike the `request_on` it replaced. That is
+        /// what keeps the `send()` future inside this module — see the module's own doc for why
+        /// that matters — and it is what makes `body` a described [`SendBody`] rather than
+        /// something a call site chains on afterward. The one behaviour that description owns and
+        /// a chained `RequestBuilder::json` used to: [`SendBody::Json`] sets
+        /// `Content-Type: application/json` and [`SendBody::Bytes`] does not, at this one seam
+        /// instead of at every call site.
+        ///
+        /// `destination` names the two request shapes callers need — see
         /// [`RequestDestination`]'s own doc — the same split [`Self::send_with_watchdog`] makes for
         /// uploads, and for the same reason: a caller-supplied builder, or a caller-supplied bare
         /// client, is exactly the seam a posture's payload can go missing through. `connect_timeout`
         /// is threaded in as a parameter, the same shape [`Self::send_with_watchdog`] already takes
         /// it (see that method's own doc for why it is a parameter here rather than a field this
-        /// module stores): it exists solely for the `debug_assert!` below — a debug-build tripwire
-        /// against a *future* payload producer, not a live protection today. All three current
-        /// producers (`RemoteClient::resolve_budget`, `RemoteClient::presence_negotiation_budget`,
-        /// `RemoteClient::single_write_budget`) build `connect_timeout + <positive constant>` and
-        /// satisfy it by construction, so it cannot fire against any call site this module actually
-        /// has; it exists to catch the next producer that doesn't. Falsified directly — bypassing
-        /// every producer and hand-constructing a violating payload — by
-        /// [`super::tests::request_on_debug_assert_catches_a_violating_total_deadline_payload`];
-        /// see that test's own doc for why none of the three producers could ever reach this
-        /// branch, and [`super::RemoteClient::describe_transport_error`]'s doc for the wording
-        /// hazard a violation would cause. Compiles out entirely in a release build, same as any
-        /// `debug_assert!`.
-        pub(super) fn request_on(&self,
-                                 posture: Posture,
-                                 connect_timeout: std::time::Duration,
-                                 method: reqwest::Method,
-                                 destination: RequestDestination<'_>) -> reqwest::RequestBuilder {
+        /// module stores): it exists solely for [`check_total_deadline_payload`] below — a
+        /// debug-build tripwire against a *future* payload producer, not a live protection today.
+        ///
+        /// Returns a [`SendOutcome`] rather than a `Result<_, String>` for the same reason
+        /// [`Self::send_with_watchdog`] returns a [`WatchdogOutcome`]: this module's boundary is
+        /// boundedness, not operator-facing wording. The two adapters that cross that boundary are
+        /// [`super::RemoteClient::response_from_send`] and
+        /// [`super::RemoteClient::response_from_send_mutation`].
+        pub(super) async fn send_on(&self,
+                                    posture: Posture,
+                                    connect_timeout: std::time::Duration,
+                                    method: reqwest::Method,
+                                    destination: RequestDestination<'_>,
+                                    body: SendBody) -> SendOutcome {
             let total_deadline = match &posture {
                 // Same arm for both: [`Posture::TotalDeadlineNoRedirect`] carries the identical
                 // total-deadline payload shape as [`Posture::TotalDeadline`], differing only in
-                // which client `Self::pick` sends it on — so the `debug_assert!` and the deadline
+                // which client `Self::pick` sends it on — so the payload check and the deadline
                 // application below apply unconditionally to both rather than being duplicated
                 // for a second variant that would drift out of sync with this one.
                 Posture::TotalDeadline(duration) | Posture::TotalDeadlineNoRedirect(duration) => {
-                    // Every producer of a `TotalDeadline`/`TotalDeadlineNoRedirect` payload builds
-                    // it as `connect_timeout + a positive addend` (`RemoteClient::resolve_budget`,
-                    // `RemoteClient::presence_negotiation_budget`, `RemoteClient::single_write_budget`)
-                    // — never merely a post-connect budget on its own — so the connector's own
-                    // timeout always fires first on a connect-phase stall, classifying it as
-                    // `TransportFailure::ConnectTimedOut` rather than `ReadTimedOut`.
-                    //
-                    // What a violating payload costs is the *wording*, not the figure. Were
-                    // `*duration <= connect_timeout`, this deadline would fire first and produce a
-                    // bare `TimedOut` with no `hyper_util` error in its source chain, so
-                    // `is_connect()` reads false and it lands in `ReadTimedOut` — which still
-                    // reports `*duration`, still exactly the bound that fired. The damage is that
-                    // `describe_transport_error`'s `TotalDeadline` text says the remote "did not
-                    // complete its answer" when in fact no connection was ever established and
-                    // nothing was sent — the same overstatement the mutation path treats as a
-                    // contract violation. Hence a `debug_assert`: adequate for a wording hazard,
-                    // and deliberately not an invariant the released binary's numbers depend on.
-                    //
-                    // Checked here, at the one seam every total-deadline posture passes through
-                    // on its way to a live request, rather than left as a claim in a producer's own
-                    // doc comment that nothing re-checks.
-                    debug_assert!(
-                        *duration > connect_timeout,
-                        "a Posture::TotalDeadline/TotalDeadlineNoRedirect payload ({:?}) must \
-                        strictly exceed this request's connect_timeout ({:?}) — otherwise a \
-                        connect-phase stall lands in TransportFailure::ReadTimedOut instead of \
-                        ConnectTimedOut, and describe_transport_error reports that the remote did \
-                        not finish answering when no connection was ever established",
-                        *duration, connect_timeout
-                    );
+                    check_total_deadline_payload(*duration, connect_timeout);
                     Some(*duration)
                 }
                 // Listed explicitly, not `_`, so a future payload-carrying `Posture` variant
@@ -1241,7 +1244,10 @@ mod clients {
                 builder = builder.timeout(duration);
             }
 
-            builder
+            match body.apply(builder).send().await {
+                Ok(response) => SendOutcome::Sent(response),
+                Err(e) => SendOutcome::Transport(e),
+            }
         }
 
         /// Send a watchdog-guarded upload — the operation that used to be promised by
@@ -1279,7 +1285,7 @@ mod clients {
         /// reason [`Posture::UnboundedNoRedirect`] does (see that client field's own doc): a
         /// one-shot streamed body cannot be replayed if reqwest's default policy tried to
         /// auto-follow a `3xx`. `destination` names the two request shapes callers need — see
-        /// [`RequestDestination`]'s own doc, shared with [`Self::request_on`] — since a
+        /// [`RequestDestination`]'s own doc, shared with [`Self::send_on`] — since a
         /// caller-supplied builder is exactly the seam this function exists to close; letting a
         /// caller hand one in would reopen it.
         ///
@@ -1352,16 +1358,147 @@ mod clients {
         }
     }
 
+    /// The total-deadline payload check [`Clients::send_on`] performs, extracted as a free
+    /// function for one reason: it is the only way to falsify the check without sending anything.
+    /// The seam it guards is `async` and owns `send()`, so a test that drove the seam would have
+    /// to stand up a runtime and name a host — and a test that reaches DNS before its assert can
+    /// no longer tell a deleted assert apart from an unreachable name, which is exactly the
+    /// separation the falsifying test was written to buy. Driving this function directly costs
+    /// nothing and keeps that separation: no runtime, no I/O, nothing to resolve.
+    ///
+    /// What the check is for: every producer of a `TotalDeadline`/`TotalDeadlineNoRedirect`
+    /// payload builds it as `connect_timeout + a positive addend`
+    /// (`RemoteClient::resolve_budget`, `RemoteClient::presence_negotiation_budget`,
+    /// `RemoteClient::single_write_budget`) — never merely a post-connect budget on its own — so
+    /// the connector's own timeout always fires first on a connect-phase stall, classifying it as
+    /// `TransportFailure::ConnectTimedOut` rather than `ReadTimedOut`. All three satisfy this by
+    /// construction, so it cannot fire against any call site this module actually has; it exists
+    /// to catch the next producer that doesn't.
+    ///
+    /// What a violating payload costs is the *wording*, not the figure. Were
+    /// `duration <= connect_timeout`, that deadline would fire first and produce a bare `TimedOut`
+    /// with no `hyper_util` error in its source chain, so `is_connect()` reads false and it lands
+    /// in `ReadTimedOut` — which still reports `duration`, still exactly the bound that fired. The
+    /// damage is that `describe_transport_error`'s `TotalDeadline` text says the remote "did not
+    /// complete its answer" when in fact no connection was ever established and nothing was sent —
+    /// the same overstatement the mutation path treats as a contract violation. Hence a
+    /// `debug_assert`: adequate for a wording hazard, and deliberately not an invariant the
+    /// released binary's numbers depend on. It compiles out entirely in a release build, same as
+    /// any `debug_assert!`.
+    ///
+    /// Falsified directly — bypassing every producer and hand-constructing a violating payload —
+    /// by [`super::tests::the_total_deadline_payload_check_catches_a_violating_payload`]; see that
+    /// test's own doc for why none of the three producers could ever reach the failing branch, and
+    /// [`super::RemoteClient::describe_transport_error`]'s doc for the wording hazard a violation
+    /// would cause. **What that test pins is this function, not that the seam still calls it** —
+    /// the link between the two is [`Clients::send_on`]'s single call above, and this function
+    /// having no other caller. Check both before trusting the pairing:
+    /// `grep -n 'check_total_deadline_payload' crates/forklift-core/src/util/remote_utils.rs`.
+    pub(super) fn check_total_deadline_payload(duration: std::time::Duration,
+                                               connect_timeout: std::time::Duration) {
+        debug_assert!(
+            duration > connect_timeout,
+            "a Posture::TotalDeadline/TotalDeadlineNoRedirect payload ({:?}) must \
+            strictly exceed this request's connect_timeout ({:?}) — otherwise a \
+            connect-phase stall lands in TransportFailure::ReadTimedOut instead of \
+            ConnectTimedOut, and describe_transport_error reports that the remote did \
+            not finish answering when no connection was ever established",
+            duration, connect_timeout
+        );
+    }
+
+    /// The body [`Clients::send_on`] puts on a request, described rather than chained on by the
+    /// call site — which is the price of the seam owning `send()`: there is no builder left for a
+    /// call site to hang `.json(...)`/`.body(...)` off.
+    ///
+    /// **The [`Self::Json`] arm sets `Content-Type: application/json`; the [`Self::Bytes`] arm
+    /// does not. That difference is the entire reason the two variants are distinct** — otherwise
+    /// one `Body(Vec<u8>)` variant would do. Every json call site used to reach the wire through
+    /// `RequestBuilder::json`, which sets that header itself when the request does not already
+    /// carry one (reqwest 0.12.28, `async_impl/request.rs`'s `RequestBuilder::json`); a
+    /// pre-serialized `Vec<u8>` handed to `RequestBuilder::body` does not. Setting it here rather
+    /// than at every call site is the same argument this module makes for discharging a
+    /// posture's payload at one seam. Pinned in both directions by
+    /// [`super::tests::the_json_arm_sets_a_json_content_type_and_the_bytes_arm_does_not`].
+    ///
+    /// **The two heads do not agree on how much this matters, and only one of them fails loudly.**
+    /// `forklift-server` extracts these bodies with `axum::Json<T>`, whose `FromRequest` returns
+    /// `MissingJsonContentType` when the header is absent or names a non-json media type (axum
+    /// 0.8.9, `src/json.rs`'s `json_content_type`) — so a dropped header is a refusal on every
+    /// json endpoint there. `forklift-aws-lambda` parses the same bodies with
+    /// `serde_json::from_slice` (`entrypoint.rs`'s `parse_json`) and never reads the header at
+    /// all, so it would keep accepting them. Do not restate this as "the heads reject it": that
+    /// is true of one head. The client sets the header because the protocol says the body is
+    /// json, and because the stricter head is entitled to hold it to that.
+    ///
+    /// Bodies are pre-serialized at the call site rather than `send_on` being generic over
+    /// `T: Serialize`, which would force a dummy type at every body-less site. One consequence:
+    /// a serialization failure surfaces here, as its own error, instead of being deferred into a
+    /// `reqwest::Error` at send time.
+    pub(super) enum SendBody {
+        /// No body at all — the shape every `GET` this module sends uses.
+        Empty,
+        /// A pre-serialized json document, built by [`Self::json`]. Sets
+        /// `Content-Type: application/json`.
+        Json(Vec<u8>),
+        /// Raw bytes that are not json and declare no `Content-Type` of their own —
+        /// `RemoteClient::upload_signature`'s signature sidecar.
+        Bytes(Vec<u8>),
+    }
+
+    impl SendBody {
+        /// Serialize `value` into a [`Self::Json`] body. Fallible, and deliberately so: this is
+        /// where a serialization failure becomes visible, rather than at send time inside a
+        /// `reqwest::Error` that `classify` would then have to describe as a transport problem.
+        pub(super) fn json<T: serde::Serialize + ?Sized>(value: &T) -> Result<SendBody, String> {
+            serde_json::to_vec(value)
+                .map(SendBody::Json)
+                .map_err(|e| format!("Error while encoding the request body for the remote: {}", e))
+        }
+
+        /// Put this body on `builder`. Private to `mod clients`, and the only place a
+        /// `Content-Type` is decided: a caller able to apply a body for itself would be a second
+        /// place that decision could be made, which is the seam this type exists to close.
+        fn apply(self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+            match self {
+                SendBody::Empty => builder,
+                SendBody::Json(bytes) => builder
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body(bytes),
+                SendBody::Bytes(bytes) => builder.body(bytes),
+            }
+        }
+    }
+
+    /// What [`Clients::send_on`] found, before [`super::RemoteClient`] turns it into an
+    /// operator-facing message. The sibling of [`WatchdogOutcome`], and a structured outcome for
+    /// the same reason: composing that message is policy this module deliberately does not own.
+    ///
+    /// A two-variant enum here is isomorphic to `Result<reqwest::Response, reqwest::Error>`, and
+    /// that is not an accident to be simplified away — a `Result` invites a call site to `?` the
+    /// error straight into its own `String`, which is exactly the step that must go through
+    /// [`super::RemoteClient::response_from_send`]/[`super::RemoteClient::response_from_send_mutation`]
+    /// so the posture-dependent wording is chosen once. The same shape [`WatchdogOutcome`] already
+    /// has, for the same reason.
+    pub(super) enum SendOutcome {
+        /// The request was sent and a response came back — success or not is the caller's status
+        /// check to make; this variant only means the wait itself completed.
+        Sent(reqwest::Response),
+        /// A genuine `reqwest::Error`: connect, DNS, TLS, a fired total-deadline payload, or a
+        /// fired client-level `read_timeout`. Everything [`super::classify`] can see.
+        Transport(reqwest::Error),
+    }
+
     /// Which physical request a call builds through this module — shared by
     /// [`Clients::send_with_watchdog`] (the two watchdog-guarded upload call sites) and
-    /// [`Clients::request_on`] (every other sendable request), named explicitly rather than letting
+    /// [`Clients::send_on`] (every other request), named explicitly rather than letting
     /// a caller hand in a pre-built `reqwest::RequestBuilder` or a bare `reqwest::Client` (the seam
     /// both of those functions exist to close; see their own docs).
     pub(super) enum RequestDestination<'a> {
         /// A path relative to the remote's `base`, with the bearer token attached (if one is
         /// configured) — the control-plane shape almost every caller needs:
         /// `RemoteClient::upload_object` (through `send_with_watchdog`) and every ordinary
-        /// `RemoteClient::request_on` call (through `Clients::request_on`).
+        /// `RemoteClient::send_on` call (through `Clients::send_on`).
         Authenticated {
             base: &'a str,
             token: Option<&'a str>,
@@ -1372,7 +1509,7 @@ mod clients {
         /// bearer token to a request bound for a different host would be a needless credential leak
         /// (see [`super::RemoteClient::put_presigned`]'s own doc). `put_presigned` (through
         /// `send_with_watchdog`) and `RemoteClient::fetch_batch`'s redirect-follow `GET` (through
-        /// `Clients::request_on`, via `RemoteClient::request_on_presigned`).
+        /// `Clients::send_on`, via `RemoteClient::send_on_presigned`).
         Presigned { url: &'a str },
     }
 
@@ -1408,7 +1545,7 @@ mod clients {
     }
 }
 
-use clients::{Clients, Posture, RequestDestination, UnboundedTicket, WatchdogOutcome};
+use clients::{Clients, Posture, RequestDestination, SendBody, SendOutcome, UnboundedTicket, WatchdogOutcome};
 
 /// The remote endpoint: base URL, optional bearer token, and the HTTP clients — see the
 /// [`clients`] module's own doc for why there are four of them and why they are not fields here
@@ -1666,45 +1803,62 @@ impl RemoteClient {
         &self.base
     }
 
-    /// Build a request against this remote's control plane, riding whichever of the four clients
+    /// Send a request against this remote's control plane, riding whichever of the four clients
     /// `posture` selects and with that posture's own payload already applied — see
-    /// [`clients::Clients::request_on`]'s own doc for the mechanism that guarantees the latter
+    /// [`clients::Clients::send_on`]'s own doc for the mechanism that guarantees the latter
     /// unconditionally, not merely at this one call site. `posture` is a required argument, not a
     /// default — there is no more "the seam every call that needs something other than the
     /// default client uses"; every call, including the ones that used to ride an implicit
     /// default, names its posture explicitly here.
     ///
+    /// Returns a [`clients::SendOutcome`], not a `Result<_, String>`: the wording for a transport
+    /// failure depends on whether this call is a read or a mutation, which is the caller's fact,
+    /// not this wrapper's. Every caller hands the outcome straight to
+    /// [`Self::response_from_send`] or [`Self::response_from_send_mutation`].
+    ///
     /// Always attaches the bearer token, if one is configured: this is the authenticated,
     /// relative-path shape almost every call needs. The one exception —
     /// [`Self::fetch_batch`]'s redirect-follow `GET`, an absolute presigned URL that must *not*
-    /// carry this remote's token — goes through [`Self::request_on_presigned`] instead; see that
+    /// carry this remote's token — goes through [`Self::send_on_presigned`] instead; see that
     /// function's own doc.
-    fn request_on(&self, posture: Posture, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
-        self.clients.request_on(
+    async fn send_on(&self,
+                     posture: Posture,
+                     method: reqwest::Method,
+                     path: &str,
+                     body: SendBody) -> SendOutcome {
+        self.clients.send_on(
             posture, self.connect_timeout, method,
             RequestDestination::Authenticated { base: &self.base, token: self.token.as_deref(), path },
-        )
+            body,
+        ).await
     }
 
-    /// The presigned counterpart of [`Self::request_on`] — same posture, same payload guarantee,
-    /// but building on an absolute, self-authorizing URL with **no** bearer token attached. Down
+    /// The presigned counterpart of [`Self::send_on`] — same posture, same payload guarantee,
+    /// but sending to an absolute, self-authorizing URL with **no** bearer token attached. Down
     /// to one live caller — [`Self::fetch_batch`]'s redirect-follow `GET` (a presigned storage URL
     /// is self-authorizing; forwarding a bearer token meant for the control plane would be a
     /// needless credential leak) — since [`Self::put_presigned`], this shape's other historical
     /// caller, moved onto [`clients::Clients::send_with_watchdog`], which builds its own
     /// bearer-token-free request entirely inside [`clients`] rather than reaching back out here.
     ///
-    /// Both this function and [`Self::request_on`] are now thin wrappers around
-    /// [`clients::Clients::request_on`], which is the only place in this module a `Posture` ever
-    /// becomes a sendable request — neither wrapper, nor anything else outside `mod clients`, can
-    /// reach a bare `reqwest::Client` at all any more (that was the deleted `client_for`'s whole
+    /// Both this function and [`Self::send_on`] are thin wrappers around
+    /// [`clients::Clients::send_on`], which is the only place in this module a `Posture` ever
+    /// becomes a request on the wire — neither wrapper, nor anything else outside `mod clients`,
+    /// can reach a bare `reqwest::Client`, or even a `reqwest::RequestBuilder`, at all any more
+    /// (the bare client was the deleted `client_for`'s whole
     /// shape, and the hole it reopened one layer below this module's own guarantee). Kept as its
     /// own function rather than inlined into `fetch_batch`, same reasoning `client_for` gave: a
     /// second caller reappearing (another self-authorizing, no-bearer-token request) is more
     /// likely than this staying permanently singular, and inlining now would just have to be
     /// undone.
-    fn request_on_presigned(&self, posture: Posture, method: reqwest::Method, url: &str) -> reqwest::RequestBuilder {
-        self.clients.request_on(posture, self.connect_timeout, method, RequestDestination::Presigned { url })
+    async fn send_on_presigned(&self,
+                               posture: Posture,
+                               method: reqwest::Method,
+                               url: &str,
+                               body: SendBody) -> SendOutcome {
+        self.clients.send_on(
+            posture, self.connect_timeout, method, RequestDestination::Presigned { url }, body,
+        ).await
     }
 
     /// Walk a `std::error::Error` source chain to its root and return that root's own `Display`
@@ -1724,8 +1878,8 @@ impl RemoteClient {
     }
 
     /// Compose the client-facing message for a *transport* failure (one that never got as far as
-    /// an HTTP status) on any call riding a [`Posture`] through [`Self::request_on`] or
-    /// [`Self::request_on_presigned`]. Thin: all it does is read `is_connect()`/`is_timeout()` off
+    /// an HTTP status) on any call riding a [`Posture`] through [`Self::send_on`] or
+    /// [`Self::send_on_presigned`]. Thin: all it does is read `is_connect()`/`is_timeout()` off
     /// `e` and hand them to [`classify`], then render the resulting [`TransportFailure`] — the
     /// actual case analysis lives there, pure and unit-tested over all four boolean combinations,
     /// because the combination this function cares least about (a genuine multi-minute kernel
@@ -1742,8 +1896,9 @@ impl RemoteClient {
     /// [`Posture::TotalDeadline`] instead reports its own payload verbatim, with no "at least" —
     /// a non-resetting `RequestBuilder::timeout` is a genuine upper bound the call could never
     /// have exceeded, so the exact figure is honest. (The `debug_assert!` in
-    /// [`clients::Clients::request_on`]'s `TotalDeadline` arm guards this arm's *wording*, not its
-    /// figure — see that comment for why the number stays correct either way.)
+    /// [`clients::check_total_deadline_payload`], which [`clients::Clients::send_on`]'s
+    /// `TotalDeadline` arm calls, guards this arm's *wording*, not its
+    /// figure — see that function's own doc for why the number stays correct either way.)
     /// [`Posture::UnboundedFollowsRedirects`]/[`Posture::UnboundedNoRedirect`] name no figure at
     /// all — nothing was armed, so [`TransportFailure::ReadTimedOut`]'s own doc's ambiguity
     /// (a client `read_timeout` vs. a genuine multi-minute kernel `ETIMEDOUT`) applies at full
@@ -1908,6 +2063,46 @@ impl RemoteClient {
         }
     }
 
+    /// Turn a [`clients::SendOutcome`] — the mechanism-level result of
+    /// [`clients::Clients::send_on`] — into a *read* call's own operator-facing error. The read
+    /// half of the pair [`Self::response_from_send_mutation`] completes, and the sibling of
+    /// [`Self::response_from_watchdog`]: wording is `RemoteClient`'s job, not `mod clients`'s.
+    ///
+    /// Takes the exact `posture` the call was armed with, because
+    /// [`Self::describe_transport_error`] renders its `ReadTimedOut` arm per posture — see that
+    /// function's own doc. `Posture` is `Copy` precisely so a call site can bind one local, arm
+    /// the request with it, and hand the same value here.
+    ///
+    /// The one read that does not use this is [`Self::resolve`], which is best-effort by contract
+    /// and degrades every failure to an empty map — there is no message for it to compose.
+    fn response_from_send(&self,
+                          action: &str,
+                          posture: Posture,
+                          outcome: SendOutcome) -> Result<reqwest::Response, String> {
+        match outcome {
+            SendOutcome::Sent(response) => Ok(response),
+            SendOutcome::Transport(e) => Err(self.describe_transport_error(action, posture, e)),
+        }
+    }
+
+    /// The mutation counterpart of [`Self::response_from_send`], routing through
+    /// [`Self::describe_mutation_transport_error`] instead. Takes no `Posture` for the same reason
+    /// that composer doesn't: a mutation's transport wording does not vary by which bound (if any)
+    /// actually fired — see [`Self::describe_mutation_transport_error`]'s own doc.
+    ///
+    /// Kept separate rather than folded into [`Self::response_from_send`] behind a flag: which of
+    /// the two composers a call needs is a fact about the call, and a boolean parameter is exactly
+    /// the shape that lets a new mutation quietly pick up the read wording — the wording that
+    /// tells an operator nothing reached the remote.
+    fn response_from_send_mutation(&self,
+                                   action: &str,
+                                   outcome: SendOutcome) -> Result<reqwest::Response, String> {
+        match outcome {
+            SendOutcome::Sent(response) => Ok(response),
+            SendOutcome::Transport(e) => Err(self.describe_mutation_transport_error(action, e)),
+        }
+    }
+
     /// Compose a loud, specific error for a `3xx` response to a mutation. Every call site that
     /// reaches this (`upload_object`, `put_presigned`, `update_ref`, `upload_signature`,
     /// `put_trust` — FORK-89 widened this from the original two) goes out on the never-auto-follow
@@ -1984,12 +2179,12 @@ impl RemoteClient {
     /// Fetch the warehouse handshake and check the protocol version.
     pub async fn fetch_info(&self) -> Result<WarehouseInfo, String> {
         let posture = Posture::BoundedReads;
-        let response = self.request_on(posture, reqwest::Method::GET, "/v1/warehouse")
-            .send()
-            .await
-            .map_err(|e| self.describe_transport_error(
-                &format!("reaching the remote {}", self.base), posture, e
-            ))?;
+        let outcome = self.send_on(
+            posture, reqwest::Method::GET, "/v1/warehouse", SendBody::Empty
+        ).await;
+        let response = self.response_from_send(
+            &format!("reaching the remote {}", self.base), posture, outcome
+        )?;
 
         if !response.status().is_success() {
             return Err(self.error_of(response, "the handshake").await);
@@ -2058,14 +2253,14 @@ impl RemoteClient {
 
         for batch in hashes.chunks(MAX_MISSING_BATCH) {
             let posture = Posture::TotalDeadline(self.presence_negotiation_budget(batch.len()));
-            let response = self.request_on(
+            let outcome = self.send_on(
                 posture,
-                reqwest::Method::POST, "/v1/objects/missing"
-            )
-                .json(&MissingObjectsRequest { hashes: batch.to_vec() })
-                .send()
-                .await
-                .map_err(|e| self.describe_transport_error("negotiating with the remote", posture, e))?;
+                reqwest::Method::POST, "/v1/objects/missing",
+                SendBody::json(&MissingObjectsRequest { hashes: batch.to_vec() })?,
+            ).await;
+            let response = self.response_from_send(
+                "negotiating with the remote", posture, outcome
+            )?;
 
             if !response.status().is_success() {
                 return Err(self.error_of(response, "the negotiation").await);
@@ -2112,7 +2307,7 @@ impl RemoteClient {
     ///
     /// Rides [`Posture::TotalDeadline`], carrying `connect_timeout + REMOTE_READ_TIMEOUT` — about
     /// 15s direct, about 70s over Tor, a genuine **total** per-request deadline
-    /// (`RequestBuilder::timeout`) applied by [`Self::request_on`] itself. Deliberately *not*
+    /// (`RequestBuilder::timeout`) applied by [`clients::Clients::send_on`] itself. Deliberately *not*
     /// [`Posture::BoundedReads`], even though it reuses [`REMOTE_READ_TIMEOUT`]'s value — and not
     /// because a silence budget fails to cover total silence: `BoundedReads`'s own pre-header
     /// deadline is fixed and non-resetting (see [`REMOTE_READ_TIMEOUT`]'s own doc), so it already
@@ -2125,8 +2320,8 @@ impl RemoteClient {
     /// the call alive forever, reopening exactly the FORK-49 hang this module exists to close, on
     /// a direct remote as much as a Tor one — proven directly by calling `resolve` itself against
     /// exactly that shape, [`tests::resolve_gives_up_on_a_remote_that_never_stops_trickling`], not
-    /// merely argued. (`tests::request_on_applies_a_total_deadline_that_ignores_progress` pins
-    /// [`Self::request_on`]'s own wiring the same way, but never calls `resolve` — it stays green
+    /// merely argued. (`tests::send_on_applies_a_total_deadline_that_ignores_progress` pins
+    /// the seam's own wiring the same way, but never calls `resolve` — it stays green
     /// whatever posture `resolve`'s call site names, so it does not by itself prove this claim.)
     ///
     /// It used to carry a flat `RequestBuilder::timeout(5s)` at the call site instead — also a
@@ -2138,7 +2333,7 @@ impl RemoteClient {
     /// how often it actually did is not something this file measures or claims. The other defect
     /// the old 5s shared with `OwnTimeoutFollowsRedirects`, the posture it rode: the bound was a
     /// call-site promise nothing checked, not a payload the module itself applied. Both defects
-    /// are fixed the same way — a real `Duration` payload `request_on` reads and applies.
+    /// are fixed the same way — a real `Duration` payload the seam reads and applies.
     ///
     /// **Accepted residual:** `/v1/resolve`'s own pre-first-byte server work can legitimately run
     /// close to this 15s direct budget on its own, before any network latency at all.
@@ -2160,14 +2355,16 @@ impl RemoteClient {
         }
 
         let total_deadline = self.resolve_budget();
-        let response = self.request_on(
-            Posture::TotalDeadline(total_deadline), reqwest::Method::POST, "/v1/resolve"
-        )
-            .json(&ResolveRequest { identifiers })
-            .send()
-            .await;
+        // Every failure degrades to the designed fallback, including a serialization failure the
+        // seam now surfaces up front rather than deferring into a `reqwest::Error` — see this
+        // function's own doc for why an empty map is the right answer to all of them here.
+        let Ok(body) = SendBody::json(&ResolveRequest { identifiers }) else {
+            return BTreeMap::new();
+        };
 
-        let Ok(response) = response else {
+        let SendOutcome::Sent(response) = self.send_on(
+            Posture::TotalDeadline(total_deadline), reqwest::Method::POST, "/v1/resolve", body
+        ).await else {
             return BTreeMap::new();
         };
 
@@ -2197,8 +2394,8 @@ impl RemoteClient {
     /// follow-up `GET` also deliberately omits this remote's `Authorization` header: the
     /// presigned URL is self-authorizing, and forwarding a bearer token meant for the control
     /// plane to a storage host it was never issued for would be a needless credential leak — see
-    /// [`Self::request_on_presigned`]'s doc for why this call reaches that URL through it rather
-    /// than through [`Self::request_on`].
+    /// [`Self::send_on_presigned`]'s doc for why this call reaches that URL through it rather
+    /// than through [`Self::send_on`].
     ///
     /// The initial `POST` above rides an unbounded posture: deliberately **not**
     /// [`Posture::BoundedReads`], since the server builds the whole requested bundle — every
@@ -2221,14 +2418,14 @@ impl RemoteClient {
     /// bundle, only ever cutting off a genuinely stalled one.
     pub async fn fetch_batch(&self, hashes: &[String]) -> Result<Option<Vec<u8>>, String> {
         let post_posture = Posture::UnboundedNoRedirect(UnboundedTicket::Fork92);
-        let response = self.request_on(
+        let outcome = self.send_on(
             post_posture,
-            reqwest::Method::POST, "/v1/objects/batch"
-        )
-            .json(&MissingObjectsRequest { hashes: hashes.to_vec() })
-            .send()
-            .await
-            .map_err(|e| self.describe_transport_error("batch-fetching from the remote", post_posture, e))?;
+            reqwest::Method::POST, "/v1/objects/batch",
+            SendBody::json(&MissingObjectsRequest { hashes: hashes.to_vec() })?,
+        ).await;
+        let response = self.response_from_send(
+            "batch-fetching from the remote", post_posture, outcome
+        )?;
 
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
@@ -2256,12 +2453,12 @@ impl RemoteClient {
                 // still carries — see this function's own doc for why this station's cost shape
                 // matches [`Self::fetch_object`]'s, not the `POST`'s.
                 let redirect_posture = Posture::BoundedObjectReads;
-                let response = self.request_on_presigned(redirect_posture, reqwest::Method::GET, &location)
-                    .send()
-                    .await
-                    .map_err(|e| self.describe_transport_error(
-                        "following the batch redirect", redirect_posture, e
-                    ))?;
+                let outcome = self.send_on_presigned(
+                    redirect_posture, reqwest::Method::GET, &location, SendBody::Empty
+                ).await;
+                let response = self.response_from_send(
+                    "following the batch redirect", redirect_posture, outcome
+                )?;
                 (response, redirect_posture)
             }
             _ => (response, post_posture),
@@ -2300,16 +2497,16 @@ impl RemoteClient {
     /// or an abandon-and-fall-back lane.
     pub async fn fetch_subtree(&self, parcel: &str, path: &str) -> Result<Option<Vec<u8>>, String> {
         let posture = Posture::UnboundedFollowsRedirects(UnboundedTicket::Fork92);
-        let response = self.request_on(
+        let outcome = self.send_on(
             posture,
             reqwest::Method::GET, &format!(
                 "/v1/parcels/{}/subtree/{}", parcel, encode_path_segments(path)
-            )
-        ).send()
-            .await
-            .map_err(|e| self.describe_transport_error(
-                &format!("fetching subtree \"{}\" from the remote", path), posture, e
-            ))?;
+            ),
+            SendBody::Empty,
+        ).await;
+        let response = self.response_from_send(
+            &format!("fetching subtree \"{}\" from the remote", path), posture, outcome
+        )?;
 
         if endpoint_absent(response.status()) || response.status() == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
             return Ok(None);
@@ -2329,12 +2526,12 @@ impl RemoteClient {
     /// — see [`FETCH_OBJECT_READ_TIMEOUT`]'s doc for why this call needs the looser budget.
     pub async fn fetch_object(&self, hash: &str) -> Result<Vec<u8>, String> {
         let posture = Posture::BoundedObjectReads;
-        let response = self.request_on(posture, reqwest::Method::GET, &format!("/v1/objects/{}", hash))
-            .send()
-            .await
-            .map_err(|e| self.describe_transport_error(
-                &format!("fetching object {}", hash), posture, e
-            ))?;
+        let outcome = self.send_on(
+            posture, reqwest::Method::GET, &format!("/v1/objects/{}", hash), SendBody::Empty
+        ).await;
+        let response = self.response_from_send(
+            &format!("fetching object {}", hash), posture, outcome
+        )?;
 
         if !response.status().is_success() {
             return Err(self.error_of(response, &format!("object {}", hash)).await);
@@ -2413,14 +2610,16 @@ impl RemoteClient {
 
         for batch in hashes.chunks(MAX_UPLOAD_TARGETS_BATCH) {
             let posture = Posture::TotalDeadline(self.presence_negotiation_budget(batch.len()));
-            let response = self.request_on(
+            let outcome = self.send_on(
                 posture,
-                reqwest::Method::POST, "/v1/objects/upload-targets"
-            )
-                .json(&UploadTargetsRequest { session: session.to_string(), hashes: batch.to_vec() })
-                .send()
-                .await
-                .map_err(|e| self.describe_transport_error("negotiating upload targets", posture, e))?;
+                reqwest::Method::POST, "/v1/objects/upload-targets",
+                SendBody::json(&UploadTargetsRequest {
+                    session: session.to_string(), hashes: batch.to_vec()
+                })?,
+            ).await;
+            let response = self.response_from_send(
+                "negotiating upload targets", posture, outcome
+            )?;
 
             if endpoint_absent(response.status()) {
                 return Ok(None);
@@ -2531,14 +2730,12 @@ impl RemoteClient {
             more,
         };
 
-        let response = self.request_on(
+        let outcome = self.send_on(
             Posture::UnboundedFollowsRedirects(UnboundedTicket::Fork91),
-            reqwest::Method::POST, &format!("/v1/lift/{}/commit", session)
-        )
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| self.describe_mutation_transport_error("committing the lift session", e))?;
+            reqwest::Method::POST, &format!("/v1/lift/{}/commit", session),
+            SendBody::json(&body)?,
+        ).await;
+        let response = self.response_from_send_mutation("committing the lift session", outcome)?;
 
         if response.status().is_success() {
             return Ok(CommitOutcome::Committed);
@@ -2560,12 +2757,13 @@ impl RemoteClient {
     /// Fetch a parcel's signature sidecar (`None` for unsigned parcels).
     pub async fn fetch_signature(&self, parcel_hash: &str) -> Result<Option<Vec<u8>>, String> {
         let posture = Posture::BoundedReads;
-        let response = self.request_on(posture, reqwest::Method::GET, &format!("/v1/signatures/{}", parcel_hash))
-            .send()
-            .await
-            .map_err(|e| self.describe_transport_error(
-                &format!("fetching the signature of {}", parcel_hash), posture, e
-            ))?;
+        let outcome = self.send_on(
+            posture, reqwest::Method::GET, &format!("/v1/signatures/{}", parcel_hash),
+            SendBody::Empty,
+        ).await;
+        let response = self.response_from_send(
+            &format!("fetching the signature of {}", parcel_hash), posture, outcome
+        )?;
 
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
@@ -2628,14 +2826,12 @@ impl RemoteClient {
     /// argued a flat bound is honest for this call's server side too.
     pub async fn upload_signature(&self, parcel_hash: &str, bytes: Vec<u8>) -> Result<(), String> {
         let action = format!("uploading the signature of {}", parcel_hash);
-        let response = self.request_on(
+        let outcome = self.send_on(
             Posture::TotalDeadlineNoRedirect(self.single_write_budget()),
-            reqwest::Method::PUT, &format!("/v1/signatures/{}", parcel_hash)
-        )
-            .body(bytes)
-            .send()
-            .await
-            .map_err(|e| self.describe_mutation_transport_error(&action, e))?;
+            reqwest::Method::PUT, &format!("/v1/signatures/{}", parcel_hash),
+            SendBody::Bytes(bytes),
+        ).await;
+        let response = self.response_from_send_mutation(&action, outcome)?;
 
         if response.status().is_redirection() {
             return Err(Self::describe_mutation_redirect(&action, &response));
@@ -2667,14 +2863,12 @@ impl RemoteClient {
     /// retry converges once the racing lift releases the lock.
     pub async fn put_trust(&self, anchor: &TrustAnchorDto) -> Result<(), String> {
         let action = "uploading the trust anchor";
-        let response = self.request_on(
+        let outcome = self.send_on(
             Posture::TotalDeadlineNoRedirect(self.single_write_budget()),
-            reqwest::Method::PUT, "/v1/trust"
-        )
-            .json(anchor)
-            .send()
-            .await
-            .map_err(|e| self.describe_mutation_transport_error(action, e))?;
+            reqwest::Method::PUT, "/v1/trust",
+            SendBody::json(anchor)?,
+        ).await;
+        let response = self.response_from_send_mutation(action, outcome)?;
 
         if response.status().is_redirection() {
             return Err(Self::describe_mutation_redirect(action, &response));
@@ -2706,14 +2900,12 @@ impl RemoteClient {
         };
         let action = format!("moving the remote pallet \"{}\"", pallet);
 
-        let response = self.request_on(
+        let outcome = self.send_on(
             Posture::UnboundedNoRedirect(UnboundedTicket::Fork94),
-            reqwest::Method::POST, &format!("/v1/pallets/{}", pallet)
-        )
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| self.describe_mutation_transport_error(&action, e))?;
+            reqwest::Method::POST, &format!("/v1/pallets/{}", pallet),
+            SendBody::json(&body)?,
+        ).await;
+        let response = self.response_from_send_mutation(&action, outcome)?;
 
         if response.status().is_redirection() {
             return Err(Self::describe_mutation_redirect(&action, &response));
@@ -2763,10 +2955,10 @@ impl RemoteClient {
     /// * `Err(String)` - On any other failure.
     pub async fn fetch_bundle_to(&self, path: &std::path::Path) -> Result<bool, String> {
         let posture = Posture::BoundedReads;
-        let mut response = self.request_on(posture, reqwest::Method::GET, "/v1/bundles/latest")
-            .send()
-            .await
-            .map_err(|e| self.describe_transport_error("fetching the bundle", posture, e))?;
+        let outcome = self.send_on(
+            posture, reqwest::Method::GET, "/v1/bundles/latest", SendBody::Empty
+        ).await;
+        let mut response = self.response_from_send("fetching the bundle", posture, outcome)?;
 
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(false);
@@ -6919,9 +7111,9 @@ mod tests {
     /// `resolve_gives_up_on_a_remote_that_never_stops_trickling` below is: it calls `resolve`
     /// itself against a remote that never goes silent at all, the one shape a silence budget
     /// structurally cannot catch and a total deadline must.
-    /// (`request_on_applies_a_total_deadline_that_ignores_progress`, also below, uses that same
-    /// shape of remote but drives `request_on` directly rather than calling `resolve` — real
-    /// coverage of `request_on`'s own wiring, not of which posture `resolve`'s call site
+    /// (`send_on_applies_a_total_deadline_that_ignores_progress`, also below, uses that same
+    /// shape of remote but drives the seam directly rather than calling `resolve` — real
+    /// coverage of the seam's own wiring, not of which posture `resolve`'s call site
     /// actually names.)
     #[test]
     fn resolve_times_out_against_a_silent_remote() {
@@ -6986,25 +7178,27 @@ mod tests {
         url
     }
 
-    /// The falsifying test for `request_on`'s own [`Posture::TotalDeadline`] handling: a genuine
-    /// *total*, non-resetting deadline (`RequestBuilder::timeout`), applied by [`Self::request_on`]
+    /// The falsifying test for the seam's own [`Posture::TotalDeadline`] handling: a genuine
+    /// *total*, non-resetting deadline (`RequestBuilder::timeout`), applied by
+    /// [`clients::Clients::send_on`]
     /// itself against a remote that never goes silent — the one shape a *silence* budget
     /// ([`Posture::BoundedReads`]) structurally cannot catch, because it resets its own clock on
     /// every byte (this file's own settled contract, `REMOTE_READ_TIMEOUT`'s doc: "a transfer
     /// that is moving bytes… is never silent").
     ///
-    /// **Does not exercise `resolve`'s call site.** This pins [`Self::request_on`]'s wiring
-    /// directly — it hand-constructs `Posture::TotalDeadline` and calls `request_on` itself —
+    /// **Does not exercise `resolve`'s call site.** This pins the seam's wiring
+    /// directly — it hand-constructs `Posture::TotalDeadline` and calls [`RemoteClient::send_on`]
+    /// itself —
     /// which is what makes it fast and deterministic, but also means it says nothing about which
     /// posture `resolve`'s own call site actually names: it would stay green whether `resolve`
-    /// passed `resolve_budget()` to `request_on`, hardcoded some other total deadline, or rode
+    /// passed `resolve_budget()` down, hardcoded some other total deadline, or rode
     /// `Posture::BoundedReads` instead. See
     /// [`tests::resolve_gives_up_on_a_remote_that_never_stops_trickling`] for the test that calls
     /// `resolve` itself and pins that.
     ///
     /// A short [`Posture::TotalDeadline`] (`TEST_DIRECT_CONNECT_TIMEOUT + 1s` = 6s — deliberately
     /// above the client's own `connect_timeout`, the invariant
-    /// [`clients::Clients::request_on`]'s `debug_assert!` now enforces on every `TotalDeadline`
+    /// [`clients::check_total_deadline_payload`] enforces on every `TotalDeadline`
     /// payload) against a remote writing one byte every 500ms — never silent for longer than
     /// 500ms, an order of magnitude under every silence budget in this file — must still be cut
     /// off at ~6s, because a `RequestBuilder::timeout` does not reset on anything. `total_bytes`
@@ -7014,7 +7208,7 @@ mod tests {
     /// outer `tokio::time::timeout` — not the assertion below it — is what would catch it, loudly,
     /// rather than the test quietly passing on a technicality.
     #[test]
-    fn request_on_applies_a_total_deadline_that_ignores_progress() {
+    fn send_on_applies_a_total_deadline_that_ignores_progress() {
         let url = start_continuously_trickling_remote(100, std::time::Duration::from_millis(500));
         let client = RemoteClient::new(&url, None).unwrap();
         let deadline = TEST_DIRECT_CONNECT_TIMEOUT + std::time::Duration::from_secs(1);
@@ -7023,26 +7217,28 @@ mod tests {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let outcome = runtime.block_on(async {
             tokio::time::timeout(hard_ceiling, async {
-                // `.send()` alone resolves as soon as headers arrive — this fixture writes them
-                // immediately, so `.send()` returns `Ok` almost instantly regardless of whether
+                // The seam resolves as soon as headers arrive — this fixture writes them
+                // immediately, so `send_on` returns `Sent` almost instantly regardless of whether
                 // the deadline is applied at all (confirmed: without the body read below, this
                 // test passed for the wrong reason, observing a `200` in well under a second).
                 // Reading the body is what actually exercises the deadline: reqwest's own docs
                 // for `RequestBuilder::timeout` state it runs "until the response body has
-                // finished", so it is the `.bytes()` await — not `.send()` — that must be what
+                // finished", so it is the `.bytes()` await — not the send — that must be what
                 // observes the cutoff.
-                let response = client.request_on(
-                    Posture::TotalDeadline(deadline), reqwest::Method::GET, "/v1/probe"
-                )
-                    .send()
-                    .await?;
+                let response = match client.send_on(
+                    Posture::TotalDeadline(deadline), reqwest::Method::GET, "/v1/probe",
+                    SendBody::Empty,
+                ).await {
+                    SendOutcome::Sent(response) => response,
+                    SendOutcome::Transport(e) => return Err(e),
+                };
 
                 response.bytes().await
             }).await
         });
 
         let inner = outcome.unwrap_or_else(|_| panic!(
-            "request_on(TotalDeadline) hung past the test's own {:?} outer ceiling — the total \
+            "send_on(TotalDeadline) hung past the test's own {:?} outer ceiling — the total \
             deadline never fired at all, even though the remote never stopped writing bytes",
             hard_ceiling
         ));
@@ -7059,15 +7255,26 @@ mod tests {
         );
     }
 
-    /// The falsifying test for [`clients::Clients::request_on`]'s `debug_assert!` (~line 1151):
+    /// The falsifying test for [`clients::check_total_deadline_payload`]'s `debug_assert!`:
     /// every current producer of a `TotalDeadline`/`TotalDeadlineNoRedirect` payload
     /// (`RemoteClient::resolve_budget`, `RemoteClient::presence_negotiation_budget`,
     /// `RemoteClient::single_write_budget`) builds `self.connect_timeout + <positive constant>`,
     /// so none of them can ever construct a violating payload — the assert holds by construction
     /// for all three, and nothing in the suite exercises the branch where it actually fires. This
     /// test bypasses every producer and hand-constructs the violating payload directly (the same
-    /// way `request_on_applies_a_total_deadline_that_ignores_progress` above hand-constructs a
+    /// way `send_on_applies_a_total_deadline_that_ignores_progress` above hand-constructs a
     /// valid one).
+    ///
+    /// **It drives the check, not the seam, and that is a deliberate trade.** The predecessor of
+    /// this test called the seam itself, which was possible only while the seam returned a
+    /// `RequestBuilder` — it built nothing and sent nothing, so the assert fired with no runtime,
+    /// no DNS and no socket in the picture. The seam now owns `send()`, so the same test through
+    /// the seam would need a runtime and a host name, and a test that reaches DNS before its
+    /// assert can no longer tell a deleted assert apart from an unreachable name — precisely the
+    /// separation this test exists to buy. Extracting the check keeps the separation exactly;
+    /// what it gives up is that this test no longer observes the seam *calling* the check. That
+    /// link is `Clients::send_on`'s single call, and the check having no other caller — see
+    /// [`clients::check_total_deadline_payload`]'s own doc for the grep that re-checks it.
     ///
     /// The payload is exactly equal to `connect_timeout` (10s each), not merely less than it —
     /// deleting the assert and weakening it from `>` to `>=` are two different mutants, and only
@@ -7088,26 +7295,21 @@ mod tests {
     #[test]
     #[cfg_attr(not(debug_assertions), ignore)]
     #[should_panic(expected = "must strictly exceed this request's connect_timeout")]
-    fn request_on_debug_assert_catches_a_violating_total_deadline_payload() {
-        let client = RemoteClient::new_test_with_connect_timeout(
-            "http://forklift-fork-49-debug-assert-sentinel-test.invalid",
-            std::time::Duration::from_secs(10),
-        );
-
+    fn the_total_deadline_payload_check_catches_a_violating_payload() {
         // Equal to connect_timeout (10s), not merely less than it — see this test's own doc for
         // why a strictly lesser payload cannot separate a deleted assert from one weakened to
-        // `>=`. No network I/O happens: request_on only builds a RequestBuilder, so the assert
-        // fires (or doesn't) before anything would be sent.
-        let _ = client.request_on(
-            Posture::TotalDeadline(std::time::Duration::from_secs(10)),
-            reqwest::Method::GET, "/v1/probe"
+        // `>=`. Nothing here is async and nothing here has a URL: the check is a pure function
+        // over two `Duration`s, so there is no name to resolve and no socket to open.
+        clients::check_total_deadline_payload(
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(10),
         );
     }
 
     /// The falsifying test for `resolve`'s own call site: that it actually hands
     /// `resolve_budget()`'s value down as a [`Posture::TotalDeadline`], not merely that
-    /// `request_on` applies whatever `Posture::TotalDeadline` payload it is given.
-    /// `request_on_applies_a_total_deadline_that_ignores_progress` above already pins the
+    /// the seam applies whatever `Posture::TotalDeadline` payload it is given.
+    /// `send_on_applies_a_total_deadline_that_ignores_progress` above already pins the
     /// latter, but hand-constructs the posture itself and never calls `resolve` — see that
     /// test's own doc — so it says nothing about which posture, or which payload, `resolve`'s
     /// own call site actually names. This test calls [`RemoteClient::resolve`] directly.
@@ -7954,7 +8156,7 @@ mod tests {
     /// `grep -n "Duration::from_secs\|Duration::from_millis"` before being picked. It is not also
     /// claimed to differ from every other test's own connect-timeout sentinel elsewhere in this
     /// module: an earlier version of this doc carried that list, and it rotted within the same
-    /// commit that added [`super::tests::request_on_debug_assert_catches_a_violating_total_deadline_payload`]'s
+    /// commit that added [`super::tests::the_total_deadline_payload_check_catches_a_violating_payload`]'s
     /// own 10s sentinel — a hand-maintained enumeration is exactly the shape this module's history
     /// keeps failing, so this doc drops the claim rather than repairing the list. Reusing another
     /// test's sentinel value here would only cost readability (two tests reading as one case split
@@ -9387,6 +9589,64 @@ mod tests {
         );
     }
 
+    /// The falsifying test for the one behaviour the send-owner seam had to reproduce by hand.
+    /// Every json call site used to reach the wire through `RequestBuilder::json`, which sets
+    /// `Content-Type: application/json` itself; the seam pre-serializes instead and hands the
+    /// bytes to `RequestBuilder::body`, which sets no content type at all — so
+    /// [`clients::SendBody::Json`] has to set the header. A single `Body(Vec<u8>)` variant would
+    /// compile and pass every other test in this file: the `TcpListener` fixtures never inspect a
+    /// request header unless, like [`start_header_capturing_remote`], they are written to. What
+    /// it would break is `forklift-server`, whose `axum::Json<T>` extractor refuses a body with
+    /// no json content type — see [`clients::SendBody`]'s own doc, which also names the head that
+    /// would *not* have noticed.
+    ///
+    /// **Both directions in one test, because the claim has two halves.** Asserting only that
+    /// json carries the header leaves "the `Bytes` arm does not set it" — the entire reason the
+    /// two variants are distinct rather than one — with no falsifier at all, and an
+    /// implementation that set `application/json` unconditionally would pass. `put_trust` is the
+    /// json site (a `TrustAnchorDto` body) and `upload_signature` the bytes site (a raw signature
+    /// sidecar); both are mutations that treat the fixture's `200` as success, so each returns
+    /// `Ok` once its headers have been captured.
+    #[test]
+    fn the_json_arm_sets_a_json_content_type_and_the_bytes_arm_does_not() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+
+        let (json_url, json_rx) = start_header_capturing_remote();
+        let json_client = RemoteClient::new(&json_url, None).unwrap();
+        let anchor = TrustAnchorDto {
+            genesis: "g".repeat(64),
+            enabled_at: 0,
+            boundary: Vec::new(),
+            prior_genesis: None,
+            adopts: None,
+        };
+        runtime.block_on(json_client.put_trust(&anchor))
+            .expect("a 200-answering remote must let put_trust succeed");
+        let json_headers = json_rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the fixture must have captured request headers by the time the call returned");
+
+        assert!(
+            json_headers.to_ascii_lowercase().contains("content-type: application/json"),
+            "a SendBody::Json site must declare its body as json — forklift-server's axum Json \
+            extractor refuses a body without the header, and nothing else on this path sets it: {}",
+            json_headers
+        );
+
+        let (bytes_url, bytes_rx) = start_header_capturing_remote();
+        let bytes_client = RemoteClient::new(&bytes_url, None).unwrap();
+        runtime.block_on(bytes_client.upload_signature(&"d".repeat(64), vec![9u8; 64]))
+            .expect("a 200-answering remote must let upload_signature succeed");
+        let bytes_headers = bytes_rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the fixture must have captured request headers by the time the call returned");
+
+        assert!(
+            !bytes_headers.to_ascii_lowercase().contains("application/json"),
+            "a SendBody::Bytes site must not claim its raw body is json — that difference is the \
+            whole reason Json and Bytes are separate variants: {}",
+            bytes_headers
+        );
+    }
+
     // -----------------------------------------------------------------------------------
     // Review round S2-F2: `is_exhausted()` means every chunk was handed to *hyper*, not that
     // every byte reached the *peer*. `start_delayed_read_remote` below is the deterministic,
@@ -9765,7 +10025,7 @@ mod tests {
     }
 
     /// `upload_signature` must not silently follow a `303` to a `2xx` landing — the same hole,
-    /// its own client selection (`request_on(Posture::TotalDeadlineNoRedirect(self
+    /// its own client selection (`send_on(Posture::TotalDeadlineNoRedirect(self
     /// .single_write_budget()), ...)`, the never-auto-follow client).
     #[test]
     fn upload_signature_does_not_follow_a_303_to_a_2xx_landing() {
