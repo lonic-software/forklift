@@ -8579,6 +8579,62 @@ mod tests {
         }
     }
 
+    /// The redirect-follow station's counterpart to [`StalledDirectBodyRemote`]: hop 1 answers the
+    /// `POST` with a `303`, hop 2 answers the presigned `GET` with `200`, a `Content-Length` it
+    /// never delivers, a few body bytes, and then silence.
+    ///
+    /// **Why not [`RedirectThenSilentRemote`], which already exists.** That fixture's second hop
+    /// goes silent *before* its status line, so `fetch_batch` fails inside
+    /// `response_from_send("following the batch redirect", ...)` — a different composer call with
+    /// a different action string. Two messages that differ only by action string prove nothing
+    /// about the two postures' *arms*, which is the thing the shared figure puts at risk. Stalling
+    /// after the status line is what routes this station into the same
+    /// `describe_transport_error("reading the batch response", ...)` call the direct station uses,
+    /// where the posture is the only thing left that differs.
+    struct RedirectThenStalledBodyRemote {
+        url: String,
+        /// Parked for the same reason every silent fixture here is — see [`SilentRemote`].
+        _park: std::sync::mpsc::Sender<()>,
+    }
+
+    impl RedirectThenStalledBodyRemote {
+        fn start() -> RedirectThenStalledBodyRemote {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let base = url.clone();
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+
+            std::thread::spawn(move || {
+                use std::io::Write;
+
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let _ = read_test_request(&mut stream);
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 303 See Other\r\nLocation: {}/responses/bundle\r\n\
+                        Content-Length: 0\r\nConnection: close\r\n\r\n",
+                        base
+                    );
+                    let _ = stream.flush();
+                }
+
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let _ = read_test_request(&mut stream);
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                        Content-Length: 4096\r\n\r\nbundle-prefix"
+                    );
+                    let _ = stream.flush();
+                    let _ = rx.recv();
+                    drop(stream);
+                }
+            });
+
+            RedirectThenStalledBodyRemote { url, _park: tx }
+        }
+    }
+
     /// **The falsifying test for `fetch_batch`'s body-read bound**, on the station that had no
     /// committed coverage in either direction: the direct, non-redirect response body of the batch
     /// `POST`. Before the client [`Posture::HeadDeadlineNoRedirect`] selects carried a
@@ -8648,6 +8704,13 @@ mod tests {
     /// looking at. This drives both stalls against the real call and requires the two messages to
     /// differ.
     ///
+    /// **Both fixtures must stall *after* their status line**, which is why this uses
+    /// [`RedirectThenStalledBodyRemote`] rather than the older [`RedirectThenSilentRemote`]. A
+    /// redirect target that never answers at all fails at a different composer call with a
+    /// different action string — the messages would then differ for a reason that has nothing to
+    /// do with the two arms, and this test would stay green against the very mutant it exists to
+    /// catch. It did, when first written that way; that is why it says so here.
+    ///
     /// Runs the two concurrently on one runtime rather than back to back: both fail at the same
     /// ~65s budget, so racing them costs one budget rather than two.
     ///
@@ -8657,7 +8720,7 @@ mod tests {
     #[test]
     fn the_two_batch_stations_do_not_share_one_stall_message() {
         let direct = StalledDirectBodyRemote::start();
-        let redirected = RedirectThenSilentRemote::start();
+        let redirected = RedirectThenStalledBodyRemote::start();
         let direct_client = RemoteClient::new(&direct.url, None).unwrap();
         let redirect_client = RemoteClient::new(&redirected.url, None).unwrap();
         let hard_ceiling = TEST_DIRECT_CONNECT_TIMEOUT + TEST_LOOSE_READ_TIMEOUT
@@ -8678,13 +8741,21 @@ mod tests {
             .expect_err("a stalled direct body must not appear to succeed");
         let redirect_message = redirect_outcome
             .unwrap_or_else(|_| panic!("the redirect station hung past {:?}", hard_ceiling))
-            .expect_err("a silent redirect target must not appear to succeed");
+            .expect_err("a stalled redirect-target body must not appear to succeed");
 
         assert!(
             direct_message.to_lowercase().contains("timed out")
                 && redirect_message.to_lowercase().contains("timed out"),
             "both stations must fail with a timeout before their wording can be compared at all: \
             direct {:?}, redirect {:?}", direct_message, redirect_message
+        );
+        let shared_action = "reading the batch response";
+        assert!(
+            direct_message.contains(shared_action) && redirect_message.contains(shared_action),
+            "both stalls must reach the *body-read* composer call, the one both stations share — \
+            a message naming any other action means this fixture stalled at the wrong phase and \
+            the comparison below would be vacuous: direct {:?}, redirect {:?}",
+            direct_message, redirect_message
         );
         assert_ne!(
             direct_message, redirect_message,
