@@ -8726,9 +8726,19 @@ mod tests {
     /// Runs the two concurrently on one runtime rather than back to back: both fail at the same
     /// ~65s budget, so racing them costs one budget rather than two.
     ///
-    /// A mutant that gives this posture's arm the `BoundedObjectReads` wording — the one this arm
-    /// carried before it had a budget of its own, and the shortest way to satisfy every other
-    /// assertion in this file — passes every test but this one.
+    /// **The mutant this test alone catches, established by running it rather than by reasoning
+    /// about it:** give the *`BoundedObjectReads`* arm this arm's wording. Measured — this test
+    /// fails on identical `left`/`right`, and
+    /// [`fetch_batch_times_out_on_a_stalled_direct_body`] **passes**, because that test asserts on
+    /// the direct arm, which the mutant does not touch. Nothing else in the file compares the two
+    /// arms against each other, so without this test that mutant ships.
+    ///
+    /// The mirror mutant — giving *this* posture's arm the `BoundedObjectReads` wording — is **not**
+    /// the one that justifies this test's ~65s, and an earlier version of this doc said it was. It
+    /// fails two tests, not one: [`fetch_batch_times_out_on_a_stalled_direct_body`] trips first, on
+    /// its `contains("headers")` assertion. Recorded because a coverage claim is exactly what a
+    /// later reader consults when deciding a slow test is redundant, and this one was wrong in the
+    /// direction that would have got the test deleted.
     #[test]
     fn the_two_batch_stations_do_not_share_one_stall_message() {
         let direct = StalledDirectBodyRemote::start();
