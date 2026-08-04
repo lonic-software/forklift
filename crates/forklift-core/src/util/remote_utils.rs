@@ -1099,10 +1099,10 @@ mod clients {
         TotalDeadlineNoRedirect(std::time::Duration),
         /// Never auto-follows a redirect, **and** carries a client-level `read_timeout` — the one
         /// posture whose client combines both axes, and the reason a client had to exist for it
-        /// (neither of the other two axes' clients could be given the missing one: three postures
-        /// share the no-redirect client, `update_ref`'s among them, and that call must never carry
-        /// a silence budget; the loose bounded-reads client genuinely needs auto-follow, since an
-        /// offloading head's object endpoint can answer with a redirect to storage).
+        /// (neither existing client could be given the axis it lacked: the no-redirect client is
+        /// shared with `update_ref`'s posture, and that call must never carry a silence budget;
+        /// the loose bounded-reads client genuinely needs auto-follow, since an offloading head's
+        /// object endpoint can answer with a redirect to storage).
         ///
         /// **Two mechanisms, two phases, in a fixed order.** `head` bounds the **head-wait alone**
         /// — connect, request transmission, and the wait for a complete status line and header
