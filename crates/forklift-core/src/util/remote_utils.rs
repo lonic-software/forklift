@@ -1350,7 +1350,7 @@ mod clients {
         /// needs both at once: it must not let a `307`/`308` replay its body at a `GET`-only
         /// presigned URL, and its response body must not be able to stall forever.
         ///
-        /// **A fifth client rather than one more line on an existing one**, because neither
+        /// **Its own client rather than one more line on an existing one**, because neither
         /// existing client could be given the axis it lacks. [`Self::no_redirect`] cannot take a
         /// `read_timeout`: `update_ref` rides it, and that call must never carry a silence budget
         /// (see that field's own doc). [`Self::bounded_object_reads`] cannot drop auto-follow: an
@@ -1449,7 +1449,7 @@ mod clients {
             }
         }
 
-        /// The only way a request reaches any of the four clients: send it on whichever client
+        /// The only way a request reaches any client: send it on whichever one
         /// [`Self::pick`] chooses, with `posture`'s own payload — currently
         /// [`Posture::TotalDeadline`]'s or [`Posture::TotalDeadlineNoRedirect`]'s `Duration`, or
         /// [`Posture::HeadDeadlineNoRedirect`]'s `head` — applied first, and return a
@@ -2750,7 +2750,9 @@ impl RemoteClient {
     /// `n * PRESENCE_ALLOWANCE_MS_PER_OP` prices the chunk's own per-hash presence-check cost.
     ///
     /// Sound as a *total*, non-resetting deadline — where the same shape is *not* sound for
-    /// `fetch_batch`/`fetch_subtree` (see [`UnboundedTicket::Fork92`]'s own doc) — specifically
+    /// `fetch_batch`'s bundle response (see [`Posture::HeadDeadlineNoRedirect`]'s doc for the
+    /// two-phase shape it takes instead) or for `fetch_subtree` (see
+    /// [`UnboundedTicket::Fork92`]'s own doc) — specifically
     /// because `n` is never a guess: it is `batch.len()`, the exact size of the request body this
     /// call just sent, itself capped at `MAX_MISSING_BATCH`/`MAX_UPLOAD_TARGETS_BATCH`. There is no
     /// large-but-healthy response at a larger `n` this budget could mistake for a stall, because no
@@ -10171,7 +10173,7 @@ mod tests {
     ///
     /// The "unbounded direction" shape (see `assert_still_running`): a silent remote must not be
     /// enough on its own to fail this call, checked past the loose budget with slack. It also
-    /// stands as the standing evidence that the fifth client bounded `fetch_batch`'s `POST` and
+    /// stands as the standing evidence that the new client bounded `fetch_batch`'s `POST` and
     /// nothing else on the no-redirect side — `fetch_subtree_is_not_flat_bounded_by_silence` covers
     /// only the auto-following client, so it cannot witness this at all.
     #[test]
