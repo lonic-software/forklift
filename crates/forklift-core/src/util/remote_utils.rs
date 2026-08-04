@@ -326,11 +326,15 @@ const REMOTE_CONNECT_TIMEOUT_TOR: std::time::Duration = std::time::Duration::fro
 /// budget over their responses is honest — but they no longer share the same fate, and this clause
 /// splits accordingly. `fetch_subtree` is still not bounded at all, and stays that way until it has
 /// its own scaled/measured budget or an abandon-and-fall-back lane. `fetch_batch`'s `POST` took the
-/// other exit named just above: it is now bounded *before the status line*, by a different
-/// mechanism entirely — a head-wait timer carried on [`Posture::HeadDeadlineNoRedirect`] and sized
-/// by [`BATCH_HEAD_PATIENCE`] — which prices no server-side build work at all and leaves its
-/// response body exactly as unbounded as it ever was. See the comment at each of those two call
-/// sites.
+/// other exit named just above: it is bounded *before the status line* by a different mechanism
+/// entirely — a head-wait timer carried on [`Posture::HeadDeadlineNoRedirect`] and sized by
+/// [`BATCH_HEAD_PATIENCE`] — which prices no server-side build work at all, and *after* the status
+/// line by a client-level silence budget of its own, [`FETCH_OBJECT_READ_TIMEOUT`] rather than this
+/// constant (see that constant's doc for why the looser figure, and
+/// [`Posture::HeadDeadlineNoRedirect`]'s for how the two phases hand off). That split is what keeps
+/// the second budget from ever pricing the build: the head timer is strictly the tighter of the
+/// two, so no client-level read timeout can fire before the status line. See the comment at each of
+/// those two call sites.
 /// `missing_objects`/`upload_targets` differ in exactly the property that matters here: their
 /// server sides only walk up to `MAX_MISSING_BATCH`/`MAX_UPLOAD_TARGETS_BATCH` *hashes* — a cost
 /// this client can size from its own request body, unlike an object's byte size it doesn't have yet
@@ -348,15 +352,20 @@ const REMOTE_CONNECT_TIMEOUT_TOR: std::time::Duration = std::time::Duration::fro
 /// [`clients::Clients::send_with_watchdog`]'s for the uploads.
 ///
 /// `read_timeout` is a `ClientBuilder`-level setting with no per-request override — it cannot be
-/// switched off for one specific request — so it is carried only by the clients
-/// [`Posture::BoundedReads`]/[`Posture::BoundedObjectReads`] select, never by the auto-following
-/// client `update_ref` rides. **`update_ref` must never move to [`Posture::BoundedReads`]**: its
+/// switched off for one specific request — so a call carries one exactly when the client its
+/// posture selects was built with one. [`clients::Clients`]'s field docs are the enumeration that
+/// stays current; what matters here is that the client `update_ref` rides
+/// ([`Posture::UnboundedNoRedirect`]'s, shared with [`Posture::TotalDeadlineNoRedirect`]) carries
+/// none, and must not be given one. **`update_ref` must never move to [`Posture::BoundedReads`]**
+/// — nor may the client it already rides acquire a `read_timeout`, which is the same hazard by a
+/// shorter route, and the cheaper-looking one now that a client combining no-auto-redirect *with* a
+/// silence budget exists to copy from: `update_ref`'s
 /// server side legitimately runs a parcel-closure audit walk — scoped by the history segment
 /// being pushed, which on a first lift into an empty pallet is the whole history — before its
 /// first response byte; that can take minutes with *no* bytes moving at all, which this constant
 /// would (correctly) call silence if it applied there. This is not an accident of wiring — FORK-94
 /// found `update_ref`'s pre-first-byte cost is a *derived* quantity (an audit walk), unlike
-/// `missing_objects`/`upload_targets` and the calls still ticketed at [`UnboundedTicket::Fork92`],
+/// `missing_objects`/`upload_targets` and whatever remains ticketed at [`UnboundedTicket::Fork92`],
 /// whose priced quantity is the request body's own enumerated content; giving it a flat silence
 /// budget before that walk-equivalence question is settled would be exactly the kind of guess this
 /// module's bounded clients exist to avoid.
@@ -389,10 +398,12 @@ const REMOTE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// `forklift-aws-lambda`'s `Head::reject_oversized_batch`) — so that ceiling is a protocol
 /// property, client-known, exactly like `MAX_OBJECT_BYTES`. What actually differs is its size: the
 /// implied worst case is a *count* cap times the per-object byte ceiling, 10,000 × 64MiB, which
-/// bounds the space and is useless as a budget. No flat silence budget over that is honest — which
-/// is why that endpoint's response phase is still unbounded, the conclusion the old sentence
-/// reached by a false route. Its `POST` is nonetheless bounded before the status line now, by a
-/// mechanism that prices no response size at all: see [`BATCH_HEAD_PATIENCE`].
+/// bounds the space and is useless as a budget. No flat silence budget over the *build* is honest —
+/// the conclusion the old sentence reached by a false route — which is why nothing about that
+/// endpoint's response phase is priced from a response size. Both of its phases are bounded anyway,
+/// by mechanisms that price no response size at all: the head-wait by [`BATCH_HEAD_PATIENCE`],
+/// before the status line; the body read by this constant, after it, on the terms the next
+/// paragraph states.
 ///
 /// Calibration evidence, not derivation: `server.rs`'s `get_object` handler documents that it
 /// "buffers the whole object in memory" via `retrieve_object_by_hash`, which content-verifies
@@ -409,11 +420,31 @@ const REMOTE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// slice; the root fix (streaming these handlers instead of buffering, removing the size-dependent
 /// pre-first-byte phase entirely) is FORK-85.
 ///
-/// Reused unmodified for `fetch_batch`'s redirect-follow `GET` (see that function's own doc for
-/// the full reasoning): that station reads bytes an offloading store already finished writing
-/// before it ever presigned the URL, not bytes still being buffered server-side the way this
-/// constant's own sizing reasoning above assumes — a strictly easier case than the one this value
-/// was tuned for, so the same loose silence budget is at least as defensible there.
+/// Reused unmodified by **both** of `fetch_batch`'s stations, for two different reasons that end
+/// in the same place (see that function's own doc for the full reasoning):
+///
+/// - Its redirect-follow `GET` reads bytes an offloading store already finished writing before it
+///   ever presigned the URL, not bytes still being buffered server-side the way this constant's own
+///   sizing reasoning above assumes — a strictly easier case than the one this value was tuned for,
+///   so the same loose silence budget is at least as defensible there.
+/// - Its `POST`'s **body read** — the direct, non-redirect response path — gets it via the
+///   client [`Posture::HeadDeadlineNoRedirect`] selects. This budget never prices the bundle build:
+///   the head-wait timer is strictly the tighter of the two and always fires first, so by the time
+///   this one can matter the status line has already arrived. What it prices is only the gaps
+///   *between* body bytes.
+///
+/// **Why a flat silence budget is honest there at all, stated as a forward-facing contract rather
+/// than an observation about today's heads.** Both heads that exist materialize the whole bundle
+/// before writing any response byte (`forklift-server`'s `post_objects_batch` awaits a complete
+/// `Vec<u8>` and only then builds a response; `forklift-aws-lambda`'s `Head::batch` returns a
+/// finished `Vec<u8>` in its non-offloading branch, and in its offloading branch writes that same
+/// finished bundle to storage and answers with a redirect URL instead) — so on the direct path
+/// headers arriving *implies* the build is done, and mid-body silence has no legitimate server-side
+/// cause at all. A future streaming head would reintroduce mid-body gaps, but each gap would be one
+/// object's build, bounded by the same per-object ceiling this constant was already sized against.
+/// **The clause that binds:** a head that can legitimately exceed one object's build cost of
+/// silence mid-body must not be served by this budget — it has to change the posture, not the
+/// number.
 const FETCH_OBJECT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// How long [`RemoteClient::fetch_batch`]'s `POST` waits for the remote to produce a complete
@@ -422,8 +453,10 @@ const FETCH_OBJECT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// not it. Carried by [`Posture::HeadDeadlineNoRedirect`], whose external timer wraps the `send()`
 /// future, and `send()` resolves the moment the header section arrives — so this bounds the
 /// **head-wait alone** (connect, request transmission, the wait for headers) and structurally
-/// cannot observe a response body that is still arriving. The body read stays unbounded and still
-/// carries its own [`UnboundedTicket`].
+/// cannot observe a response body that is still arriving. The body read that follows is bounded by
+/// a separate mechanism on the same posture — the client-level silence budget
+/// [`FETCH_OBJECT_READ_TIMEOUT`] sizes — so neither phase can wait indefinitely on a silent remote,
+/// and the call carries no [`UnboundedTicket`].
 ///
 /// This is client patience, not a derivation of any head's worst case — and the two head shapes it
 /// faces support it on two independent grounds:
@@ -451,17 +484,49 @@ const FETCH_OBJECT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// is useless as a budget (see [`FETCH_OBJECT_READ_TIMEOUT`]'s doc); it is named here only so the
 /// next reader does not re-derive it and mistake it for a sizing argument.
 ///
-/// **Accepted residuals, all three of them.** The body read stays unbounded — a post-header stall
-/// is still an open gap, and a *total* deadline here would be the wrong fix, since it would kill
-/// large healthy bundles. A legitimately slow head now hard-fails identically on every retry rather
-/// than being waited out; that knowingly reverses the reason [`RemoteClient::fetch_batch`]'s own doc
-/// used to give for staying unbounded, and is accepted because a wedge and an over-budget build are
-/// indistinguishable at the client while a loud failure is the lesser wrong. And an expiry abandons
-/// the in-flight request, so the head may finish the build anyway and a retry re-pays it — harmless,
-/// since the result is ephemeral, but worth saying once. The falsifier that reopens **the number,
-/// not the mechanism**: a measured legitimate build exceeding this patience against a real
-/// deployment.
+/// **Accepted residuals, both of them.** A legitimately slow head now hard-fails identically on
+/// every retry rather than being waited out; that knowingly reverses the reason
+/// [`RemoteClient::fetch_batch`]'s own doc used to give for staying unbounded, and is accepted
+/// because a wedge and an over-budget build are indistinguishable at the client while a loud
+/// failure is the lesser wrong. And an expiry abandons the in-flight request, so the head may
+/// finish the build anyway and a retry re-pays it — harmless, since the result is ephemeral, but
+/// worth saying once. (The third residual an earlier version of this list carried — an unbounded
+/// body read — is closed: see [`FETCH_OBJECT_READ_TIMEOUT`]'s doc for the budget that closed it and
+/// the terms it is honest on.) The falsifier that reopens **the number, not the mechanism**: a
+/// measured legitimate build exceeding this patience against a real deployment.
+///
+/// **What acting on that falsifier now costs, which it did not when the sentence was written.**
+/// These two constants used to be independent; the phase-precedence assertion below has since made
+/// this one a *strict* lower bound on [`FETCH_OBJECT_READ_TIMEOUT`]. So raising the patience is
+/// free only up to that ceiling — past it the build fails, and the only way through is to raise the
+/// silence budget too, which is not local: it also loosens [`RemoteClient::fetch_object`] and the
+/// redirect-follow `GET`. Loud rather than silent, but a measurement that lands above the ceiling
+/// reopens two constants, not one.
 const BATCH_HEAD_PATIENCE: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// **The phase-precedence pin.** `fetch_batch`'s two bounds must fire in a fixed order — the
+/// head-wait timer strictly before the client-level `read_timeout` on the same request — and that
+/// order is a relationship between these two constants, not a property of any type.
+///
+/// Both budgets fold in the *same* `connect_timeout` term ([`RemoteClient::batch_head_budget`] adds
+/// it to the patience; [`bounded_read_timeout`] adds it to the silence budget), so the whole margin
+/// between them is the difference of the bare constants asserted here, whichever connect budget
+/// this client instance carries — 5s direct or 60s over Tor alike.
+///
+/// Two shipped claims rest on this ordering, and both become false the moment it inverts. That no
+/// client-level read timeout can fire before the status line, which is what lets
+/// [`RemoteClient::head_wait_expired_message`] keep its exact-figure wording and what keeps the
+/// body silence budget from ever pricing the server's bundle build. And that a `ReadTimedOut`
+/// reaching [`RemoteClient::describe_transport_error`] under [`Posture::HeadDeadlineNoRedirect`]
+/// can only be post-header, which is what entitles that arm to say response headers had already
+/// arrived. Raising the patience past the silence budget would swap which mechanism fires first and
+/// silently falsify both — so it fails the build here instead.
+const _: () = assert!(
+    BATCH_HEAD_PATIENCE.as_nanos() < FETCH_OBJECT_READ_TIMEOUT.as_nanos(),
+    "BATCH_HEAD_PATIENCE must stay strictly under FETCH_OBJECT_READ_TIMEOUT: fetch_batch's \
+    head-wait timer has to fire before the client-level read_timeout on the same request, or the \
+    head-wait wording and the post-header wording both start lying"
+);
 
 /// The base allowance for [`RemoteClient::error_of`]'s own inline error-body read, once a
 /// non-success status line and headers have already arrived. Needed because `error_of`'s own
@@ -840,13 +905,15 @@ fn watched_upload_body(bytes: Vec<u8>, progress: Arc<UploadProgress>) -> (reqwes
     (reqwest::Body::wrap_stream(stream), len)
 }
 
-/// The private home of [`RemoteClient`]'s four `reqwest::Client`s, and the only way to reach any
-/// of them.
+/// The private home of [`RemoteClient`]'s `reqwest::Client`s, and the only way to reach any
+/// of them. How many there are is [`Clients`]'s own field list, deliberately not restated here:
+/// the count has changed twice and a number in prose is the first thing to rot.
 ///
 /// **Why this module exists.** Which client a call used to use — and therefore whether its
 /// response wait was bounded at all — used to be decided by which field name a caller happened to
-/// type (`self.http`, `self.no_redirect`, `self.bounded_reads`, `self.bounded_object_reads`), all
-/// four reachable from every method on `RemoteClient`. Enumerating "which calls ride the unbounded
+/// type (`self.http`, `self.no_redirect`, `self.bounded_reads`, `self.bounded_object_reads` — the
+/// four that existed then), every one of them reachable from every method on `RemoteClient`.
+/// Enumerating "which calls ride the unbounded
 /// ones" by reading the source got tried three times and got three different answers (two, then
 /// four, then eight) — and the eight-count parser, which matched a fixed list of spellings, still
 /// missed a call built by handing a client straight to the request-builder helper rather than going
@@ -901,24 +968,29 @@ fn watched_upload_body(bytes: Vec<u8>, progress: Arc<UploadProgress>) -> (reqwes
 /// re-run both greps to re-check the claim, and do not trust this sentence past the next edit that
 /// moves either type.
 ///
-/// **Four physical clients, three independent axes.** *Redirect policy* (mutations, and the
+/// **Physical clients, three independent axes.** *Redirect policy* (mutations, and the
 /// one-shot streamed-upload bodies, must never auto-follow; reads may). *Whether a read/metadata
-/// silence bound applies at all* (only two of the four carry a client-level `read_timeout`; see
-/// [`REMOTE_READ_TIMEOUT`]'s doc for why the rest don't have an honest flat budget yet). *How loose
-/// that bound is*, for the two that do (`fetch_object` and `fetch_batch`'s redirect-follow `GET`
-/// need [`FETCH_OBJECT_READ_TIMEOUT`] instead of [`REMOTE_READ_TIMEOUT`] — see
-/// [`FETCH_OBJECT_READ_TIMEOUT`]'s doc). All four share the
+/// silence bound applies at all* (some carry a client-level `read_timeout`, some deliberately do
+/// not; see [`REMOTE_READ_TIMEOUT`]'s doc for why the rest don't have an honest flat budget yet).
+/// *How loose that bound is*, for the ones that do ([`FETCH_OBJECT_READ_TIMEOUT`] instead of
+/// [`REMOTE_READ_TIMEOUT`] — see that constant's doc). The axes are genuinely independent, and the
+/// current set proves it rather than merely asserting it: one client combines no-auto-redirect
+/// *with* a client-level `read_timeout`, which no client did until `fetch_batch`'s `POST` needed
+/// both at once. Which client has which combination is [`Clients`]'s field docs, and only
+/// there — an enumeration in this paragraph is exactly the thing that goes stale the next time a
+/// call needs a combination nothing yet builds. Every client shares the
 /// same proxy/connect-timeout configuration, built once by [`Clients::build`] (called from
 /// [`RemoteClient::new_with_tor`]), which is also where each bounded client's actual `read_timeout`
 /// is computed via [`bounded_read_timeout`] rather than being the raw silence-budget constant.
 mod clients {
     use super::{bounded_read_timeout, FETCH_OBJECT_READ_TIMEOUT, REMOTE_READ_TIMEOUT};
 
-    /// Which `reqwest::Client` a request rides, and — for the postures that carry no
-    /// client-level `read_timeout` — what (if anything) bounds that call's response wait instead:
-    /// [`Self::TotalDeadline`]'s or [`Self::TotalDeadlineNoRedirect`]'s own payload, spanning the
-    /// whole response; [`Self::HeadDeadlineNoRedirect`]'s, spanning only the wait for the status
-    /// line and headers; or nothing at all for
+    /// Which `reqwest::Client` a request rides, and — since a client-level `read_timeout` alone
+    /// does not cover every phase of every call — what else (if anything) bounds that call's
+    /// response wait: [`Self::TotalDeadline`]'s or [`Self::TotalDeadlineNoRedirect`]'s own payload,
+    /// spanning the whole response; [`Self::HeadDeadlineNoRedirect`]'s, spanning only the wait for
+    /// the status line and headers, with its client's own silence budget taking over after them;
+    /// or nothing at all for
     /// [`Self::UnboundedFollowsRedirects`]/[`Self::UnboundedNoRedirect`] (see
     /// [`UnboundedTicket`]'s doc). Every request [`super::RemoteClient`] sends through
     /// [`Clients::pick`] must name one of
@@ -946,13 +1018,22 @@ mod clients {
         /// doesn't: nothing about adding a `read_timeout` also disables auto-follow, they are
         /// independent axes (this module's own doc names all three). A mutation that rode this
         /// posture would reopen exactly the hole FORK-89 closed — a `3xx` silently followed and
-        /// read back as success. This is the trap a flat `read_timeout` cannot escape for
-        /// `upload_signature`/`put_trust` either: `read_timeout` is a `ClientBuilder`-level
-        /// setting with no per-request override, and no client this module builds combines
-        /// no-auto-redirect *with* a client-level `read_timeout` — reaching for this variant to
-        /// "just add a bound" to either of them would silently reopen their redirect exposure
-        /// instead. They carry their bound as a per-request payload on
-        /// [`Self::TotalDeadlineNoRedirect`] instead, which needs no such client.
+        /// read back as success. So reaching for *this* variant to "just add a bound" to
+        /// `upload_signature`/`put_trust` would silently reopen their redirect exposure; they
+        /// carry their bound as a per-request payload on [`Self::TotalDeadlineNoRedirect`]
+        /// instead.
+        ///
+        /// **A client combining no-auto-redirect *with* a client-level `read_timeout` now
+        /// exists** — the one [`Self::HeadDeadlineNoRedirect`] selects. An earlier version of this
+        /// paragraph said none did and used that to rule the combination out for
+        /// `upload_signature`/`put_trust`; that route is closed, and anyone reopening their
+        /// still-live "should these carry a silence bound too" question must not be sent down it.
+        /// The reason those two do not have one is unchanged and has nothing to do with which
+        /// clients exist: `read_timeout` resets on every byte, so it cannot bound a remote that
+        /// answers a mutation with an endless trickle — see
+        /// [`super::tests::resolve_gives_up_on_a_remote_that_never_stops_trickling`] for that exact
+        /// failure mode driven end to end on a different call. A silence budget *in addition to*
+        /// their total deadline is now constructible; whether it would buy anything is open.
         BoundedReads,
         /// [`FETCH_OBJECT_READ_TIMEOUT`]-bounded via a client-level `read_timeout` — the same
         /// shape as [`Self::BoundedReads`], just with the looser budget `fetch_object`'s
@@ -961,6 +1042,14 @@ mod clients {
         ///
         /// **Auto-follows redirects — never select this for a mutation**, same reasoning and
         /// same trap as [`Self::BoundedReads`]'s own doc.
+        ///
+        /// Shares its silence budget, but not its client, with
+        /// [`Self::HeadDeadlineNoRedirect`] — that one needs the same figure on a client that
+        /// never auto-follows. Both therefore render the same duration when a read timeout fires,
+        /// which is why [`super::RemoteClient::describe_transport_error`]'s two arms have to be
+        /// told apart by their words rather than by their figures: `fetch_batch` routes both of
+        /// its stations through one composer call with one action string, so the figure alone
+        /// cannot say which of them stalled.
         BoundedObjectReads,
         /// Auto-follows redirects; no client-level `read_timeout`. The bound is the payload
         /// itself — a genuine *total* per-request deadline (`RequestBuilder::timeout`) that
@@ -1016,44 +1105,59 @@ mod clients {
         /// [`super::RemoteClient::single_write_budget`] — see that method's own doc for the
         /// arithmetic and the accepted residual.
         TotalDeadlineNoRedirect(std::time::Duration),
-        /// Never auto-follows a redirect; no client-level `read_timeout`. `head` bounds the
-        /// **head-wait alone** — connect, request transmission, and the wait for a complete
-        /// status line and header section — and nothing past it: [`Clients::send_on`] arms it as
-        /// an external `tokio::time::timeout` around the `send()` future, and `send()` resolves
-        /// the moment the header section has arrived, so the timer structurally cannot observe a
-        /// body that is still coming. That phase split is the whole reason this variant exists
-        /// rather than `fetch_batch`'s `POST` simply moving to [`Self::TotalDeadlineNoRedirect`]:
-        /// a *total* deadline over a response whose size the request does not bound would kill
-        /// large healthy bundles, identically on every retry.
+        /// Never auto-follows a redirect, **and** carries a client-level `read_timeout` — the one
+        /// posture whose client combines both axes, and the reason a client had to exist for it
+        /// (neither existing client could be given the axis it lacked: the no-redirect client is
+        /// shared with `update_ref`'s posture, and that call must never carry a silence budget;
+        /// the loose bounded-reads client genuinely needs auto-follow, since an offloading head's
+        /// object endpoint can answer with a redirect to storage).
         ///
-        /// An expiry is **not** a `reqwest::Error`. It is [`SendOutcome::HeadWaitExpired`], which
-        /// never reaches [`super::classify`] — so `is_timeout()`'s inability to see it is
+        /// **Two mechanisms, two phases, in a fixed order.** `head` bounds the **head-wait alone**
+        /// — connect, request transmission, and the wait for a complete status line and header
+        /// section: [`Clients::send_on`] arms it as an external `tokio::time::timeout` around the
+        /// `send()` future, and `send()` resolves the moment the header section has arrived, so
+        /// that timer structurally cannot observe a body that is still coming. Everything after
+        /// the header section is the client's own `read_timeout`, a **silence** budget that resets
+        /// on every byte received — so a large healthy bundle is never killed by it however slow
+        /// the link, and only a genuinely stalled transfer fails. That is the whole reason this
+        /// variant exists rather than `fetch_batch`'s `POST` simply moving to
+        /// [`Self::TotalDeadlineNoRedirect`]: a *total* deadline over a response whose size the
+        /// request does not bound would kill large healthy bundles, identically on every retry.
+        ///
+        /// **Read what that does and does not promise.** No phase can wait indefinitely on a
+        /// *silent* remote. The call's duration is still not bounded: a remote delivering one byte
+        /// per sub-budget interval keeps this request alive forever, which is the deliberate price
+        /// of a silence budget and not a gap to close by swapping in a total deadline.
+        ///
+        /// The order of the two is not incidental — the head timer is always the tighter, pinned
+        /// at the constants (see [`super::BATCH_HEAD_PATIENCE`]'s doc for the assertion and the two
+        /// shipped sentences that rest on it). A producer arming a `head` at or above the client's
+        /// own `read_timeout` would break both: [`check_head_deadline_payload`] is the tripwire.
+        ///
+        /// A head-wait expiry is **not** a `reqwest::Error`. It is [`SendOutcome::HeadWaitExpired`],
+        /// which never reaches [`super::classify`] — so `is_timeout()`'s inability to see it is
         /// discharged by construction rather than by a rule someone has to remember; there is no
         /// path that could ask. Dually, at every expiry the connection is known established (see
         /// [`clamp_head_deadline_payload`]), which is what entitles
-        /// [`super::RemoteClient::head_wait_expired_message`] to say so.
+        /// [`super::RemoteClient::head_wait_expired_message`] to say so. A fired `read_timeout`
+        /// *is* an ordinary `reqwest::Error` and does reach `classify`, where this posture's arm
+        /// in [`super::RemoteClient::describe_transport_error`] gets wording of its own.
         ///
-        /// `body_read` is not decoration. This call's *body* read is still unbounded, so it must
-        /// keep carrying an [`UnboundedTicket`] or `grep 'UnboundedTicket::'` stops enumerating
-        /// every call with an unbounded response phase — see that enum's own doc, including the
-        /// erosion this variant introduces there. What the ticket names here is the **residual**,
-        /// not the whole wait.
+        /// **This variant carries no [`UnboundedTicket`], and that is the change worth noticing.**
+        /// It used to, for a `body_read` field naming the residual its head-wait bound left open;
+        /// closing that residual is what removed the field. `grep 'UnboundedTicket::'` still
+        /// enumerates every call with an unbounded response phase, and this call is simply no
+        /// longer one of them.
         ///
         /// **Only the no-redirect twin exists.** Its one consumer, `fetch_batch`'s `POST`, rides
-        /// the no-auto-follow client so that a `307`/`308` cannot re-`POST` its body at a URL
+        /// a no-auto-follow client so that a `307`/`308` cannot re-`POST` its body at a URL
         /// presigned for `GET` only (see [`super::RemoteClient::fetch_batch`]'s own doc), and
-        /// bounding the head-wait must not disturb that. *Bounded negative:* head-deadline
+        /// bounding either phase must not disturb that. *Bounded negative:* head-deadline
         /// variants number exactly one; the domain is this enum; re-check by reading it. The
         /// trigger for minting the follows-redirects twin is a consumer appearing — most
         /// plausibly `fetch_subtree` gaining a production caller.
         HeadDeadlineNoRedirect {
             head: std::time::Duration,
-            /// Never pattern-matched out — [`Clients::pick`] routes on the variant alone and
-            /// [`Clients::send_on`] reads only `head` — so it is `#[allow(dead_code)]` rather
-            /// than read, the same way the two fully-unbounded variants' own tickets are. Being
-            /// present in the source is the entire job.
-            #[allow(dead_code)]
-            body_read: UnboundedTicket,
         },
         /// Auto-follows redirects; no client-level `read_timeout`; **nothing else bounds this
         /// call's response wait either** — no per-request override, no watchdog. Deliberate, not
@@ -1074,28 +1178,32 @@ mod clients {
         UnboundedNoRedirect(UnboundedTicket),
     }
 
-    /// The ticket that owns bounding whatever part of one call's response wait is still
-    /// unbounded — a required payload of the **three** [`Posture`] variants that have such a
-    /// part, not an optional annotation. Two of the three are unbounded outright
-    /// ([`Posture::UnboundedFollowsRedirects`], [`Posture::UnboundedNoRedirect`]); the third,
-    /// [`Posture::HeadDeadlineNoRedirect`], is bounded up to the status line and unbounded after
-    /// it, so its ticket names a *residual* rather than a whole wait. A closed set, not a free
-    /// string: every variant here is a call still genuinely unbounded in some phase, recorded
+    /// The ticket that owns bounding a call's still-unbounded response wait — a required payload
+    /// of the **two** [`Posture`] variants that have one
+    /// ([`Posture::UnboundedFollowsRedirects`], [`Posture::UnboundedNoRedirect`]), not an optional
+    /// annotation. A closed set, not a free
+    /// string: every variant here is a call still genuinely unbounded, recorded
     /// as-is (a later PR's job is to shrink this set). Adding a new variant is itself the visible,
     /// greppable act of accepting a new unbounded call site.
     ///
-    /// **A known erosion, recorded rather than solved.** The compiler forces this payload at every
-    /// construction site of all three variants, because all three declare the field — but nothing
-    /// forces the *next* partially-bounded posture to declare it at all. Where the set used to be
-    /// closed by a plain "unbounded or not", a variant can now be bounded in one phase and
-    /// unbounded in another, and only discipline puts a ticket on such a variant. The alternative
-    /// — hoisting the ticket into an `Option`-typed field every `Posture` variant carries — makes
-    /// the fully bounded variants carry a permanently-`None` field to protect a grep. Named
-    /// trigger: the **second** partially-bounded variant is the point to hoist, not the first.
+    /// **A recorded erosion that resolved without ever firing.** While
+    /// [`Posture::HeadDeadlineNoRedirect`] was bounded up to the status line and unbounded after
+    /// it, it carried a ticket for that residual — and the compiler could force the payload at its
+    /// construction sites without forcing the *next* partially-bounded posture to declare one at
+    /// all. The recorded trigger was to hoist the ticket into an `Option`-typed field on every
+    /// variant once a **second** partially-bounded posture appeared. No second one ever did; the
+    /// first stopped being partially bounded instead (both of its phases now refuse to wait
+    /// indefinitely on a silent remote — which is not the same as bounding the call's duration,
+    /// see that variant's own doc). The trigger stands unchanged for whenever a genuinely
+    /// partially-bounded variant next appears.
     ///
     /// `grep 'UnboundedTicket::'` enumerates every call with an unbounded response phase, full
-    /// stop. Its domain: every construction site of those three variants — exactly the variants
-    /// whose response wait is unbounded in whole or in part, and all three require this
+    /// stop — but **run it and you get more lines than there are such calls**, and the difference
+    /// is not a defect in either. Only the constructions outside the test module and outside doc
+    /// comments are call sites; the rest are this file talking about the ticket. Read the hits
+    /// against those two boundaries rather than counting them. Its domain: every construction site
+    /// of those two variants — exactly the variants
+    /// whose response wait is unbounded, and both require this
     /// payload. What makes that exhaustive is *not* merely that [`Clients::pick`]'s own match over
     /// `Posture` is exhaustive — `pick` only chooses a *client*, it says nothing about whether a
     /// payload-carrying variant's payload actually gets applied before the request goes out. A call
@@ -1110,7 +1218,7 @@ mod clients {
     /// to read off any payload a variant carries before sending it. Reaching a client at all means
     /// having gone through that match, so a payload-carrying variant can no longer go unbounded by
     /// way of a second, competing path, and a call with an unbounded response phase can only be
-    /// `UnboundedFollowsRedirects`/`UnboundedNoRedirect`/`HeadDeadlineNoRedirect`, all three
+    /// `UnboundedFollowsRedirects`/`UnboundedNoRedirect`, both
     /// requiring this ticket by construction.
     /// [`Clients::send_with_watchdog`] closes the analogous gap for uploads the same way it always
     /// did: by never constructing a `Posture` at all, so its own bound (the watchdog) needs no
@@ -1130,51 +1238,52 @@ mod clients {
     /// a real budget and moves off [`Posture::UnboundedFollowsRedirects`]/
     /// [`Posture::UnboundedNoRedirect`] onto a bounded posture instead. When the last variant is
     /// removed, delete this enum and the two fully-unbounded `Posture` variants in the same change
-    /// — they exist only to carry this payload and mean nothing without it (the head-deadline
-    /// variant does not: it would lose its `body_read` field and keep its bound). Until then,
+    /// — they exist only to carry this payload and mean nothing without it.
+    /// [`Posture::HeadDeadlineNoRedirect`] is the worked example of the other exit: it dropped its
+    /// ticket and kept its bounds, because it stopped being unbounded rather than being deleted.
+    /// Until then,
     /// whatever variants remain are a live gap awaiting a budget, not settled design to leave
     /// standing.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(super) enum UnboundedTicket {
-        /// `fetch_subtree`, and the still-unbounded **body read** of `fetch_batch`'s initial
-        /// `POST` — that `POST`'s head-wait is bounded now (it rides
-        /// [`super::Posture::HeadDeadlineNoRedirect`], sized by
-        /// [`super::RemoteClient::batch_head_budget`]), so for that call this ticket names a
-        /// residual rather than the whole wait. FORK-92's current keystone
-        /// (narrowed after review, 2026-08-01): for these, the priced quantity **equals the
+        /// `fetch_subtree`, and nothing else — it is the last call still on this ticket.
+        /// FORK-92's current keystone
+        /// (narrowed after review, 2026-08-01): the priced quantity **equals the
         /// server's workload by construction** — the request body enumerates it (a hash list), and
         /// the server iterates that same list under a cap both sides share
         /// (`MAX_MISSING_BATCH`/`MAX_UPLOAD_TARGETS_BATCH`), or (for `fetch_subtree`) is
         /// worst-case-bounded by the equivalent shared cap. That is *why* a scaled budget is
         /// fixable here at all — not (as an earlier framing had it) merely that the work "scales
         /// with input the client cannot size in advance": the client can size it, from its own
-        /// request. No such budget has landed yet for either of these, so both stay unbounded.
+        /// request. No such budget has landed for `fetch_subtree`, so it stays unbounded.
         ///
-        /// `missing_objects` and `upload_targets` shared this exact keystone and are the first two
-        /// to cash it in: they have moved off this ticket onto [`super::Posture::TotalDeadline`],
+        /// `missing_objects` and `upload_targets` shared this exact keystone and were the first to
+        /// cash it in: they moved off this ticket onto [`super::Posture::TotalDeadline`],
         /// carrying [`super::RemoteClient::presence_negotiation_budget`] — see that method's own
         /// doc for the budget and [`super::PRESENCE_ALLOWANCE_MS_PER_OP`] for the rate it prices
-        /// in. `fetch_subtree` and `fetch_batch`'s `POST` share the identical construction (a
-        /// client-sizable, cap-bounded request-body quantity) but not yet a landed budget of their
-        /// own — left open here, not asserted as covered by the two that moved.
+        /// in.
         ///
-        /// `fetch_batch`'s **second** request station — the follow-up `GET` taken only when the
-        /// head redirects to storage, which actually reads the bundle bytes — used to be filed
-        /// here too, as an open attribution question: it carried no request body of its own to
-        /// enumerate anything, so FORK-92's "priced by construction" mechanism never applied to it
-        /// as written, and it had no other ticket to belong to. Resolved, not by inventing a
-        /// scaling term for it after all: it was never a negotiation call this ticket's keystone
-        /// could describe, because it isn't negotiating anything. An offloading store finishes
-        /// writing the bundle to its response key and only *then* presigns the `GET` URL
-        /// (`crates/forklift-aws-lambda/src/aws/s3.rs`'s `offload_response`), so by the time this
-        /// station is reached the bytes it reads are already fully materialized — the same shape
-        /// [`super::RemoteClient::fetch_object`]'s read is, not the size-unknown-in-advance one
-        /// `fetch_subtree` and this ticket's `POST` above still have. It now rides
-        /// [`super::Posture::BoundedObjectReads`], the same [`super::FETCH_OBJECT_READ_TIMEOUT`]
-        /// silence budget `fetch_object` uses, and no longer constructs this ticket at all — see
-        /// [`super::RemoteClient::fetch_batch`]'s own doc for the full reasoning.
+        /// **Both of `fetch_batch`'s stations have since left this ticket, by two different
+        /// routes, and neither route was "a scaled budget landed after all."** Its `POST` was
+        /// filed here for the same reason `fetch_subtree` still is — a bundle built entirely into
+        /// memory before the first byte, at a cost the client cannot size. It is off the ticket
+        /// because both of its phases now refuse to wait indefinitely on a silent remote without
+        /// pricing that build at all: a head-wait timer before the status line
+        /// ([`super::Posture::HeadDeadlineNoRedirect`], sized by
+        /// [`super::RemoteClient::batch_head_budget`]) and a resetting silence budget after it, on
+        /// that posture's own client. Its follow-up `GET` — taken only when the head redirects to
+        /// storage — was filed here as an open attribution question instead: it carries no request
+        /// body to enumerate anything, so this keystone never applied to it as written, and it had
+        /// no other ticket to belong to. Resolved without inventing a scaling term for it: an
+        /// offloading store finishes writing the bundle to its response key and only *then*
+        /// presigns the `GET` URL (`crates/forklift-aws-lambda/src/aws/s3.rs`'s
+        /// `offload_response`), so the bytes it reads are already fully materialized — the same
+        /// shape [`super::RemoteClient::fetch_object`]'s read is, and it rides
+        /// [`super::Posture::BoundedObjectReads`] accordingly. See
+        /// [`super::RemoteClient::fetch_batch`]'s own doc for the full reasoning on both.
         Fork92,
-        /// `update_ref`: unbounded for a different reason than FORK-92's four — its server-side
+        /// `update_ref`: unbounded for a different reason than the calls FORK-92 collected — its
+        /// server-side
         /// cost is a *derived* quantity (an audit walk over the pushed history segment), not one
         /// the request enumerates, so it was split out rather than sharing that mechanism.
         /// FORK-94.
@@ -1184,8 +1293,10 @@ mod clients {
         Fork91,
     }
 
-    /// The four `reqwest::Client`s a request against the remote may ride — private to this
-    /// module; [`Clients::pick`] is the only way any of them leaves it.
+    /// The `reqwest::Client`s a request against the remote may ride — private to this
+    /// module; [`Clients::pick`] is the only way any of them leaves it. The fields below are the
+    /// enumeration; no count is restated anywhere, because the axes each field names are what a
+    /// reader actually needs and a number is what goes stale.
     #[derive(Clone)]
     pub(super) struct Clients {
         /// Auto-follows redirects (reqwest's default `redirect::Policy`); no client-level
@@ -1201,11 +1312,10 @@ mod clients {
         http: reqwest::Client,
         /// Same endpoint as [`Self::http`], automatic redirect-following disabled
         /// (`redirect::Policy::none()`); no `read_timeout` either. Selected by
-        /// [`Posture::UnboundedNoRedirect`], [`Posture::TotalDeadlineNoRedirect`] and
-        /// [`Posture::HeadDeadlineNoRedirect`] alike — the second layers a per-request total
+        /// [`Posture::UnboundedNoRedirect`] and [`Posture::TotalDeadlineNoRedirect`] — the second
+        /// layers a per-request total
         /// deadline on top via the same [`Clients::send_on`] extraction [`Posture::TotalDeadline`]
-        /// uses, and the third an external head-wait timer at that same seam; never a
-        /// client-level `read_timeout` this client cannot carry — and directly (bypassing
+        /// uses; never a client-level `read_timeout` — and directly (bypassing
         /// [`Posture`] entirely) by
         /// [`Clients::send_with_watchdog`] — the watchdog-guarded upload paths: reqwest's default
         /// policy replays a `307`/`308` with the original method *and* body, and `tower-http`'s
@@ -1215,6 +1325,18 @@ mod clients {
         /// mutation rides this client**: `commit_lift` does not — see [`Self::http`]'s own doc
         /// and [`super::RemoteClient::commit_lift`]'s for that standing,
         /// deliberately-not-silently-closed gap.
+        ///
+        /// **This client must never be given a `read_timeout`, and that is the sharpest rule in
+        /// this struct.** `update_ref` rides it, and `update_ref`'s server side legitimately runs
+        /// a parcel-closure audit walk that can take minutes with no bytes moving at all (see
+        /// [`REMOTE_READ_TIMEOUT`]'s doc) — a silence budget here would abandon a healthy push
+        /// mid-audit, identically on every retry. The temptation is real and now cheaper-looking:
+        /// [`Self::bounded_object_reads_no_redirect`] exists precisely because a call needed
+        /// no-auto-redirect *and* a silence budget, and adding one line here looks like the same
+        /// thing without a new field. It is not. Pinned by
+        /// [`super::tests::update_ref_stays_unbounded_against_the_loose_silence_budget`], which is
+        /// sized against the loose budget on purpose — the tight-scaled `update_ref` pin beside it
+        /// cannot see this mistake at all.
         no_redirect: reqwest::Client,
         /// Same endpoint as [`Self::http`], plus a `read_timeout` of
         /// [`bounded_read_timeout`]`(connect_timeout, `[`REMOTE_READ_TIMEOUT`]`)`. Selected only
@@ -1227,11 +1349,34 @@ mod clients {
         /// `fetch_batch`'s redirect-follow `GET`) needs. Selected only by
         /// [`Posture::BoundedObjectReads`].
         bounded_object_reads: reqwest::Client,
+        /// The two axes no other client combines: automatic redirect-following disabled
+        /// (`redirect::Policy::none()`, exactly as [`Self::no_redirect`] has it) **plus** a
+        /// `read_timeout` of
+        /// [`bounded_read_timeout`]`(connect_timeout, `[`FETCH_OBJECT_READ_TIMEOUT`]`)` (exactly as
+        /// [`Self::bounded_object_reads`] has it). Selected only by
+        /// [`Posture::HeadDeadlineNoRedirect`], whose one consumer — `fetch_batch`'s `POST` —
+        /// needs both at once: it must not let a `307`/`308` replay its body at a `GET`-only
+        /// presigned URL, and its response body must not be able to stall forever.
+        ///
+        /// **Its own client rather than one more line on an existing one**, because neither
+        /// existing client could be given the axis it lacks. [`Self::no_redirect`] cannot take a
+        /// `read_timeout`: `update_ref` rides it, and that call must never carry a silence budget
+        /// (see that field's own doc). [`Self::bounded_object_reads`] cannot drop auto-follow: an
+        /// offloading head's object endpoint answers `fetch_object` with a redirect to storage,
+        /// which that client is expected to follow. And `read_timeout` is a `ClientBuilder`-level
+        /// setting with no per-request override, so there is no third option where one client
+        /// carries the budget for one call and not another.
+        ///
+        /// Reuses [`FETCH_OBJECT_READ_TIMEOUT`] rather than minting a tighter constant, and the
+        /// reuse is load-bearing twice over: it is what makes the budget honest for a bundle body
+        /// (see that constant's doc) and it is what keeps the head-wait timer strictly tighter than
+        /// this client's `read_timeout` (see [`super::BATCH_HEAD_PATIENCE`]'s doc for the pinned
+        /// ordering). A smaller constant here would satisfy neither.
+        bounded_object_reads_no_redirect: reqwest::Client,
     }
 
     impl Clients {
-        /// Build all four clients from one shared connect-timeout/proxy configuration. Moved here
-        /// unchanged from the pre-refactor `RemoteClient::build` — see
+        /// Build every client from one shared connect-timeout/proxy configuration. See
         /// [`super::RemoteClient::build`]'s own doc for why one `connect_timeout` must reach every
         /// client rather than being decided by one path and overwritten on a field by another.
         pub(super) fn build(connect_timeout: std::time::Duration,
@@ -1251,14 +1396,23 @@ mod clients {
             let mut bounded_object_reads = reqwest::Client::builder()
                 .connect_timeout(connect_timeout)
                 .read_timeout(bounded_read_timeout(connect_timeout, FETCH_OBJECT_READ_TIMEOUT));
+            // Both axes at once, which no other client here has: `no_redirect`'s policy and
+            // `bounded_object_reads`' budget. Deliberately not expressed as a tweak to either of
+            // those — see this field's own doc for why neither could take the other's axis.
+            let mut bounded_object_reads_no_redirect = reqwest::Client::builder()
+                .connect_timeout(connect_timeout)
+                .redirect(reqwest::redirect::Policy::none())
+                .read_timeout(bounded_read_timeout(connect_timeout, FETCH_OBJECT_READ_TIMEOUT));
 
-            // The same proxy governs all four clients: the redirect-following ones and the
-            // hand-following one alike route through Tor when the remote does.
+            // The same proxy governs every client: the redirect-following ones and the
+            // hand-following ones alike route through Tor when the remote does.
             if let Some(proxy) = proxy {
                 http = http.proxy(proxy.clone());
                 no_redirect = no_redirect.proxy(proxy.clone());
                 bounded_reads = bounded_reads.proxy(proxy.clone());
                 bounded_object_reads = bounded_object_reads.proxy(proxy.clone());
+                bounded_object_reads_no_redirect =
+                    bounded_object_reads_no_redirect.proxy(proxy.clone());
             }
 
             let http = http.build()
@@ -1269,11 +1423,16 @@ mod clients {
                 .map_err(|e| format!("Error while creating the HTTP client: {}", e))?;
             let bounded_object_reads = bounded_object_reads.build()
                 .map_err(|e| format!("Error while creating the HTTP client: {}", e))?;
+            let bounded_object_reads_no_redirect = bounded_object_reads_no_redirect.build()
+                .map_err(|e| format!("Error while creating the HTTP client: {}", e))?;
 
-            Ok(Clients { http, no_redirect, bounded_reads, bounded_object_reads })
+            Ok(Clients {
+                http, no_redirect, bounded_reads, bounded_object_reads,
+                bounded_object_reads_no_redirect,
+            })
         }
 
-        /// Choose which of the four clients a `posture` rides. Exhaustive by construction — a new
+        /// Choose which client a `posture` rides. Exhaustive by construction — a new
         /// [`Posture`] variant that this `match` does not cover fails to compile, so this function
         /// can never silently fall through to a default client.
         ///
@@ -1292,13 +1451,13 @@ mod clients {
                 Posture::BoundedObjectReads => &self.bounded_object_reads,
                 Posture::TotalDeadline(_) => &self.http,
                 Posture::TotalDeadlineNoRedirect(_) => &self.no_redirect,
-                Posture::HeadDeadlineNoRedirect { .. } => &self.no_redirect,
+                Posture::HeadDeadlineNoRedirect { .. } => &self.bounded_object_reads_no_redirect,
                 Posture::UnboundedFollowsRedirects(_) => &self.http,
                 Posture::UnboundedNoRedirect(_) => &self.no_redirect,
             }
         }
 
-        /// The only way a request reaches any of the four clients: send it on whichever client
+        /// The only way a request reaches any client: send it on whichever one
         /// [`Self::pick`] chooses, with `posture`'s own payload — currently
         /// [`Posture::TotalDeadline`]'s or [`Posture::TotalDeadlineNoRedirect`]'s `Duration`, or
         /// [`Posture::HeadDeadlineNoRedirect`]'s `head` — applied first, and return a
@@ -1360,7 +1519,7 @@ mod clients {
                 // the check fails loudly in a debug build, the clamp keeps the released binary
                 // out of the state where a `HeadWaitExpired` message would claim a connection
                 // that was never established. See `clamp_head_deadline_payload`'s own doc.
-                Posture::HeadDeadlineNoRedirect { head, .. } => {
+                Posture::HeadDeadlineNoRedirect { head } => {
                     check_head_deadline_payload(*head, connect_timeout);
                     (None, Some(clamp_head_deadline_payload(*head, connect_timeout)))
                 }
@@ -1592,8 +1751,25 @@ mod clients {
     /// in a debug build — the profile the suite runs in — which would leave the repair itself
     /// unfalsifiable exactly where it matters.
     ///
-    /// Falsified by [`super::tests::the_head_deadline_payload_check_catches_a_violating_payload`];
-    /// see that test's doc for why its fixture uses a payload exactly *equal* to `connect_timeout`
+    /// **The payload is fenced on both sides, and the two fences guard two different sentences.**
+    /// Below `connect_timeout` the head timer could fire during connect, and
+    /// [`super::RemoteClient::head_wait_expired_message`] would claim a connection that never
+    /// existed. At or above this posture's client-level `read_timeout` the ordering inverts the
+    /// other way: that read timeout would fire *first*, pre-headers, producing a `reqwest::Error`
+    /// whose [`super::RemoteClient::describe_transport_error`] arm says response headers had
+    /// already arrived — when none had. The one producer that exists satisfies both by
+    /// construction and cannot violate the upper fence at all
+    /// ([`super::RemoteClient::batch_head_budget`] is `connect_timeout` plus a constant a const
+    /// assertion holds under [`super::FETCH_OBJECT_READ_TIMEOUT`]; see
+    /// [`super::BATCH_HEAD_PATIENCE`]'s doc). This exists to catch the next producer, which is why
+    /// the upper fence is a `debug_assert!` and not a clamp: unlike the lower one, no repair value
+    /// is obviously right — a payload that big means the producer wanted something this posture
+    /// does not offer.
+    ///
+    /// Falsified in both directions by
+    /// [`super::tests::the_head_deadline_payload_check_catches_a_violating_payload`] and
+    /// [`super::tests::the_head_deadline_payload_check_catches_a_payload_past_the_silence_budget`];
+    /// see the first's doc for why its fixture uses a payload exactly *equal* to `connect_timeout`
     /// rather than a lesser one.
     pub(super) fn check_head_deadline_payload(head: std::time::Duration,
                                               connect_timeout: std::time::Duration) {
@@ -1604,6 +1780,14 @@ mod clients {
             fires during connect, and head_wait_expired_message tells the operator the \
             connection was established when none ever was",
             head, connect_timeout
+        );
+        debug_assert!(
+            head < bounded_read_timeout(connect_timeout, FETCH_OBJECT_READ_TIMEOUT),
+            "a Posture::HeadDeadlineNoRedirect head payload ({:?}) must stay strictly under \
+            this posture's own client-level read_timeout ({:?}) — otherwise that read timeout \
+            fires before the status line, and describe_transport_error tells the operator the \
+            remote had already sent response headers when it had sent nothing",
+            head, bounded_read_timeout(connect_timeout, FETCH_OBJECT_READ_TIMEOUT)
         );
     }
 
@@ -1804,11 +1988,11 @@ mod clients {
 use clients::{Clients, Posture, RequestDestination, SendBody, SendOutcome, UnboundedTicket, WatchdogOutcome};
 
 /// The remote endpoint: base URL, optional bearer token, and the HTTP clients — see the
-/// [`clients`] module's own doc for why there are four of them and why they are not fields here
+/// [`clients`] module's own doc for why there is more than one of them and why they are not fields here
 /// any more.
 #[derive(Clone)]
 pub struct RemoteClient {
-    /// The four `reqwest::Client`s this remote may send a request on, gated behind
+    /// The `reqwest::Client`s this remote may send a request on, gated behind
     /// [`clients::Posture`] — see the [`clients`] module's own doc.
     clients: Clients,
     /// The connect-phase bound this instance's clients were actually built with —
@@ -1921,10 +2105,10 @@ impl RemoteClient {
     /// configuration — the seam the tests use to exercise onion routing without a config file,
     /// and the constructor a caller with settings already in hand can use.
     ///
-    /// When the settings route this remote through Tor (see [`should_route_through_tor`]), all
-    /// four underlying clients (see [`RemoteClient`]'s own doc) dial through the Tor SOCKS proxy
-    /// and use [`REMOTE_CONNECT_TIMEOUT_TOR`] as their connect budget instead of
-    /// [`REMOTE_CONNECT_TIMEOUT`]; the two bounded clients' `read_timeout` is computed from
+    /// When the settings route this remote through Tor (see [`should_route_through_tor`]), every
+    /// underlying client (see [`RemoteClient`]'s own doc) dials through the Tor SOCKS proxy
+    /// and uses [`REMOTE_CONNECT_TIMEOUT_TOR`] as its connect budget instead of
+    /// [`REMOTE_CONNECT_TIMEOUT`]; each `read_timeout` a client carries is computed from
     /// whichever of those applies (see [`bounded_read_timeout`]), so a Tor dial's much longer
     /// connect allowance is never undercut by the read-silence budget. Every non-onion remote gets
     /// the shorter, direct connect budget, as before — but every remote, onion or not, now carries
@@ -1955,13 +2139,13 @@ impl RemoteClient {
         Self::build(url, token, &tor, routes_through_tor, connect_timeout)
     }
 
-    /// Build the four underlying clients and assemble a [`RemoteClient`], given a
+    /// Build the underlying clients and assemble a [`RemoteClient`], given a
     /// `connect_timeout` already decided by the caller — [`Self::new_with_tor`] is the only
     /// production caller, and decides it from [`should_route_through_tor`] as its doc describes.
     /// Split out from `new_with_tor` so [`Self::new_test_with_connect_timeout`] (test-only) can
     /// supply an arbitrary `connect_timeout` that actually gets built into every client, rather
     /// than one construction path deciding the timeout and a second one overwriting only the
-    /// `connect_timeout` field afterward — the latter would leave the four inner clients armed
+    /// `connect_timeout` field afterward — the latter would leave the inner clients armed
     /// with a *different* bound than the field reports, which is not a client any production
     /// constructor could ever produce and would silently invalidate any test built on top of it
     /// that touches `describe_transport_error` or `send_with_watchdog`, both of which trust this
@@ -1990,7 +2174,7 @@ impl RemoteClient {
     }
 
     /// Test-only: build a client with an arbitrary injected `connect_timeout`, threaded into the
-    /// four inner clients via [`Self::build`] rather than overwritten on the field afterward (see
+    /// inner clients via [`Self::build`] rather than overwritten on the field afterward (see
     /// that method's doc for why the two are not equivalent). Never routes through Tor — `tor` is
     /// irrelevant to a plain/`.invalid` test URL, and passing `routes_through_tor: false`
     /// explicitly here means that is a direct fact about this constructor, not a side effect of
@@ -2059,7 +2243,7 @@ impl RemoteClient {
         &self.base
     }
 
-    /// Send a request against this remote's control plane, riding whichever of the four clients
+    /// Send a request against this remote's control plane, riding whichever client
     /// `posture` selects and with that posture's own payload already applied — see
     /// [`clients::Clients::send_on`]'s own doc for the mechanism that guarantees the latter
     /// unconditionally, not merely at this one call site. `posture` is a required argument, not a
@@ -2159,11 +2343,24 @@ impl RemoteClient {
     /// all — nothing was armed, so [`TransportFailure::ReadTimedOut`]'s own doc's ambiguity
     /// (a client `read_timeout` vs. a genuine multi-minute kernel `ETIMEDOUT`) applies at full
     /// force here, the one case this function cannot narrow at all.
-    /// [`Posture::HeadDeadlineNoRedirect`] takes that same no-figure wording, for a reason the arm
-    /// itself states: its bound produces no `reqwest::Error`, so anything arriving here under it
-    /// was armed by nothing. [`Posture::TotalDeadlineNoRedirect`]'s
+    /// [`Posture::TotalDeadlineNoRedirect`]'s
     /// arm exists only so this match stays exhaustive — every call riding it is a mutation and
     /// never reaches this function at all (see [`Self::describe_mutation_transport_error`]'s doc).
+    ///
+    /// **[`Posture::HeadDeadlineNoRedirect`]'s arm has to be distinguishable by its words, because
+    /// its figure is already taken.** It reports the same lower bound
+    /// [`Posture::BoundedObjectReads`] does — the same constant, on a client built the same way —
+    /// and `fetch_batch` hands this function both postures under one action string, choosing by
+    /// which of its two stations produced the bytes. Rendering the same figure with interchangeable
+    /// wording would collapse exactly the distinction the two-posture split exists to keep, so
+    /// this arm says what the other cannot: that response headers had already arrived and the
+    /// silence began after them. That is available structurally rather than by luck — under this
+    /// posture the head-wait timer is strictly the tighter bound and produces no `reqwest::Error`
+    /// at all, so a `ReadTimedOut` reaching here can only be post-header (see
+    /// [`clients::check_head_deadline_payload`] for the fence, [`BATCH_HEAD_PATIENCE`]'s doc for
+    /// the constant-level pin). [`TransportFailure::ReadTimedOut`]'s kernel-`ETIMEDOUT` ambiguity
+    /// does not touch that claim: on an established connection a kernel timeout means an even
+    /// longer silence, which "at least" already covers.
     ///
     /// A head-wait *expiry* does not reach this function either, from any posture: it is not a
     /// `reqwest::Error`, so it never reaches [`classify`] — [`Self::head_wait_expired_message`] is
@@ -2199,17 +2396,19 @@ impl RemoteClient {
                     request's {:?} total deadline.",
                     action, deadline
                 ),
-                // Forced by exhaustiveness, and it takes the no-figure wording for a reason
-                // worth stating: a reqwest-level timeout under this posture means nothing
-                // reqwest-level was armed. The head bound is an external timer that produces no
-                // `reqwest::Error` at all (it produces `SendOutcome::HeadWaitExpired`, which
-                // routes to `head_wait_expired_message` and never reaches this function), and
-                // the no-auto-follow client this posture rides carries no client-level
-                // `read_timeout` — so `ReadTimedOut`'s own ambiguity applies here at full force,
-                // exactly as it does to the two unbounded postures below.
+                // A silence budget, so "at least" — and it must not read like the
+                // `BoundedObjectReads` arm above, which prints the identical figure. What
+                // separates them is the phase: the head-wait timer produces no `reqwest::Error`
+                // (it produces `SendOutcome::HeadWaitExpired`, routed to
+                // `head_wait_expired_message`) and always fires first, so anything landing here
+                // stalled *after* the header section. Naming the gap rather than the elapsed
+                // total is the other half: this budget resets on every byte, so the figure bounds
+                // one silent gap, never how long the transfer ran.
                 Posture::HeadDeadlineNoRedirect { .. } => format!(
-                    "Timed out while {}: the remote did not respond.",
-                    action
+                    "Timed out while {}: the remote sent response headers and then stopped \
+                    sending, with no further bytes for at least {:?}. That budget is on silence \
+                    between bytes, not on how long the whole transfer may take.",
+                    action, bounded_read_timeout(self.connect_timeout, FETCH_OBJECT_READ_TIMEOUT)
                 ),
                 Posture::UnboundedFollowsRedirects(_) | Posture::UnboundedNoRedirect(_) => format!(
                     "Timed out while {}: the remote did not respond.",
@@ -2559,7 +2758,9 @@ impl RemoteClient {
     /// `n * PRESENCE_ALLOWANCE_MS_PER_OP` prices the chunk's own per-hash presence-check cost.
     ///
     /// Sound as a *total*, non-resetting deadline — where the same shape is *not* sound for
-    /// `fetch_batch`/`fetch_subtree` (see [`UnboundedTicket::Fork92`]'s own doc) — specifically
+    /// `fetch_batch`'s bundle response (see [`Posture::HeadDeadlineNoRedirect`]'s doc for the
+    /// two-phase shape it takes instead) or for `fetch_subtree` (see
+    /// [`UnboundedTicket::Fork92`]'s own doc) — specifically
     /// because `n` is never a guess: it is `batch.len()`, the exact size of the request body this
     /// call just sent, itself capped at `MAX_MISSING_BATCH`/`MAX_UPLOAD_TARGETS_BATCH`. There is no
     /// large-but-healthy response at a larger `n` this budget could mistake for a stall, because no
@@ -2744,8 +2945,10 @@ impl RemoteClient {
     /// control plane, so it answers this `POST` with a redirect to a presigned `GET` of the
     /// bundle bytes under an ephemeral response key (`303 See Other` from a fixed head; a
     /// `307`/`308` from an older one is followed identically). The redirect is followed **by
-    /// hand**, never by reqwest's automatic policy (this call goes out on the no-auto-follow
-    /// client, [`Posture::UnboundedNoRedirect`], for exactly that reason): a `307`/`308` replays
+    /// hand**, never by reqwest's automatic policy (this call goes out on a client whose redirect
+    /// policy is `none`, selected by the posture named two paragraphs below and deliberately not
+    /// restated here — a posture named twice in one doc is a posture that rots once): a `307`/`308`
+    /// replays
     /// the original request verbatim — method and JSON body — which would re-`POST` this call's
     /// body at a URL SigV4-signed for `GET` only, failing signature verification (`500` on
     /// LocalStack, `403 SignatureDoesNotMatch` on real AWS) rather than fetching anything. The
@@ -2755,19 +2958,26 @@ impl RemoteClient {
     /// [`Self::send_on_presigned`]'s doc for why this call reaches that URL through it rather
     /// than through [`Self::send_on`].
     ///
-    /// The initial `POST` above is bounded at the **head-wait alone** — it rides
-    /// [`Posture::HeadDeadlineNoRedirect`], sized by [`Self::batch_head_budget`]. Deliberately
+    /// The initial `POST` above is bounded in **two phases, by two mechanisms** — it rides
+    /// [`Posture::HeadDeadlineNoRedirect`], whose head-wait timer is sized by
+    /// [`Self::batch_head_budget`] and whose client carries a [`FETCH_OBJECT_READ_TIMEOUT`]
+    /// silence budget for everything after the header section. Deliberately
     /// **not** [`Posture::BoundedReads`], and deliberately not a *total* deadline either: the
     /// server builds the whole requested bundle — every object fully into memory — before its
-    /// first response byte (`forklift-server/src/server.rs`'s `objects/batch` handler), and that
+    /// first response byte (`forklift-server/src/server.rs`'s `post_objects_batch`;
+    /// `forklift-aws-lambda`'s `Head::batch` likewise, in both of its branches), and that
     /// cost depends on the byte sizes of objects this client doesn't have yet. No flat budget over
-    /// the *response* is honest, so none is armed: the bound stops the moment headers arrive, and
-    /// the body read that follows is exactly as unbounded as it ever was — which is why the
-    /// posture still carries an [`UnboundedTicket`], now naming that residual rather than the whole
-    /// wait.
+    /// the *build* is honest, and none is armed over it: the head-wait timer prices no server work
+    /// at all, and being strictly the tighter of the two it always fires first, so the silence
+    /// budget only ever sees a body whose bytes were finished before the first one was written.
+    /// Because that budget resets on every byte, a large bundle over a slow link is never killed
+    /// by it. **Neither phase can wait indefinitely on a silent remote; neither bounds the call's
+    /// duration** — a remote trickling one byte per interval keeps this `POST` alive as long as it
+    /// likes, which is the accepted price of a silence budget rather than a gap left open.
     ///
     /// What that buys is the failure this call previously had no defence against at all: a remote
-    /// that accepted the connection and then never answered hung the calling command forever, with
+    /// that accepted the connection and then never answered — before the status line or after it —
+    /// hung the calling command forever, with
     /// no output and no way out short of killing the process. What it costs is stated in
     /// [`BATCH_HEAD_PATIENCE`]'s own doc, and it **reverses** what an earlier version of this
     /// paragraph promised: a head legitimately slower than that patience now fails identically on
@@ -2784,12 +2994,12 @@ impl RemoteClient {
     /// [`Self::fetch_object`]'s own read is, not the size-unknown-in-advance one the `POST` above
     /// has, so it rides [`Posture::BoundedObjectReads`] — the same [`FETCH_OBJECT_READ_TIMEOUT`]
     /// silence budget, which resets on every byte received and so rides out a large-but-progressing
-    /// bundle, only ever cutting off a genuinely stalled one.
+    /// bundle, only ever cutting off a genuinely stalled one. **The two stations reach the same
+    /// figure by different arguments, and share one composer call under one action string**, which
+    /// is why their [`Self::describe_transport_error`] arms have to be told apart by wording — see
+    /// that function's doc.
     pub async fn fetch_batch(&self, hashes: &[String]) -> Result<Option<Vec<u8>>, String> {
-        let post_posture = Posture::HeadDeadlineNoRedirect {
-            head: self.batch_head_budget(),
-            body_read: UnboundedTicket::Fork92,
-        };
+        let post_posture = Posture::HeadDeadlineNoRedirect { head: self.batch_head_budget() };
         let outcome = self.send_on(
             post_posture,
             reqwest::Method::POST, "/v1/objects/batch",
@@ -2804,10 +3014,11 @@ impl RemoteClient {
         }
 
         // `body_posture` follows whichever station actually produced the response bytes below:
-        // the head-bounded `POST` above when there was no redirect to follow — head-bounded, but
-        // with an unbounded *body* phase, which is the phase these bytes are read in — or the
-        // redirect-follow `GET`'s own silence budget when there was. A single posture cannot
-        // honestly describe both, since they carry different bounds.
+        // the `POST` above when there was no redirect to follow — whose client-level silence
+        // budget is what governs the phase these bytes are read in — or the redirect-follow
+        // `GET`'s own silence budget when there was. The two budgets are the same size and reached
+        // by different arguments, so a single posture would render the right figure with the wrong
+        // provenance, and the composer's two arms would have nothing left to tell apart.
         let (response, body_posture) = match response.status() {
             reqwest::StatusCode::SEE_OTHER
             | reqwest::StatusCode::TEMPORARY_REDIRECT
@@ -2822,9 +3033,10 @@ impl RemoteClient {
 
                 // A bare GET: no Authorization header (the URL is self-authorizing) and no
                 // body — the request the redirect target is actually presigned for. On
-                // [`Posture::BoundedObjectReads`], not the unbounded ticket the `POST` above
-                // still carries — see this function's own doc for why this station's cost shape
-                // matches [`Self::fetch_object`]'s, not the `POST`'s.
+                // [`Posture::BoundedObjectReads`], reaching the same silence budget the `POST`
+                // above reaches through its own posture, but on its own grounds — see this
+                // function's own doc for why this station's cost shape matches
+                // [`Self::fetch_object`]'s, not the `POST`'s.
                 let redirect_posture = Posture::BoundedObjectReads;
                 let outcome = self.send_on_presigned(
                     redirect_posture, reqwest::Method::GET, &location, SendBody::Empty
@@ -7722,9 +7934,16 @@ mod tests {
     }
 
     /// **The phase split's whole point, as a standing assertion rather than a spike observation.**
-    /// [`Posture::HeadDeadlineNoRedirect`] bounds the wait for the status line and headers and
-    /// nothing past it — so a remote that answers with headers promptly and then trickles a body
-    /// for far longer than the head budget must **succeed**, every byte of it.
+    /// [`Posture::HeadDeadlineNoRedirect`]'s *head* timer bounds the wait for the status line and
+    /// headers and nothing past it — so a remote that answers with headers promptly and then
+    /// trickles a body for far longer than the head budget must **succeed**, every byte of it.
+    ///
+    /// **This is the trickling direction, not the stalling one, and the two are easy to confuse.**
+    /// It drives a direct (non-redirect) response body on the batch `POST` under exactly the
+    /// posture `fetch_batch` uses, which makes it look like coverage of that station's silence
+    /// budget. It is not: its fixture never stops writing, so the client-level `read_timeout` this
+    /// posture also carries is never even approached. `fetch_batch_times_out_on_a_stalled_direct_body`
+    /// is the falsifier for that budget; this one is the guard against it being a total deadline.
     ///
     /// **This is the fixture that discriminates**, which is why it is worth its seconds. Implement
     /// the same posture as a *total* deadline (`RequestBuilder::timeout` — the mechanism
@@ -7745,7 +7964,10 @@ mod tests {
     ///
     /// The head budget deliberately exceeds `connect_timeout`, the invariant
     /// [`clients::clamp_head_deadline_payload`] enforces on every payload — so the clamp is a
-    /// no-op here and the figure under test is the one written below.
+    /// no-op here and the figure under test is the one written below. It also sits far under this
+    /// posture's own client-level `read_timeout` (1s connect + 60s), the other fence
+    /// [`clients::check_head_deadline_payload`] holds, so neither guard interferes with what this
+    /// test measures.
     #[test]
     fn send_on_head_deadline_does_not_bound_a_body_that_arrives_after_it() {
         let body_bytes = 20usize;
@@ -7766,9 +7988,7 @@ mod tests {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let bytes = runtime.block_on(async {
             tokio::time::timeout(hard_ceiling, async {
-                let posture = Posture::HeadDeadlineNoRedirect {
-                    head, body_read: UnboundedTicket::Fork92,
-                };
+                let posture = Posture::HeadDeadlineNoRedirect { head };
                 let response = match client.send_on(
                     posture, reqwest::Method::POST, "/v1/objects/batch", SendBody::Empty,
                 ).await {
@@ -7873,6 +8093,37 @@ mod tests {
         clients::check_head_deadline_payload(
             std::time::Duration::from_secs(8),
             std::time::Duration::from_secs(8),
+        );
+    }
+
+    /// The **upper** fence of the same check, and it guards a different sentence than the lower
+    /// one. A `head` payload at or above this posture's own client-level `read_timeout` inverts
+    /// the two mechanisms' order: the read timeout fires first, before any header section, and
+    /// `RemoteClient::describe_transport_error`'s arm for this posture then tells the operator the
+    /// remote had already sent response headers when it had sent nothing at all.
+    ///
+    /// The payload is exactly *equal* to the fence for the same reason its sibling above uses an
+    /// equal one: a strictly greater payload leaves a `<=` mutant green (it would still fire), an
+    /// equal one does not — at equality the correct `<` fires and `<=` does not, so only this
+    /// fixture separates the two, and it still catches a deleted assert (which never fires).
+    ///
+    /// `connect_timeout` is 10s, a value no production constructor emits, so the payload is far
+    /// above the lower fence and it is unambiguously *this* assert that fires. The budget is built
+    /// from `TEST_LOOSE_READ_TIMEOUT` rather than the production constant, per the mirror
+    /// discipline at the top of this module; if production's own figure ever rises past the
+    /// mirror, this test fails loudly with "did not panic" rather than passing vacuously.
+    ///
+    /// Ignored outside a debug profile, same as its sibling. The release-side guarantee for the
+    /// one producer that exists is not this assert but the const assertion beside
+    /// `BATCH_HEAD_PATIENCE`, which fails the *build* rather than a test run.
+    #[test]
+    #[cfg_attr(not(debug_assertions), ignore)]
+    #[should_panic(expected = "must stay strictly under")]
+    fn the_head_deadline_payload_check_catches_a_payload_past_the_silence_budget() {
+        let connect_timeout = std::time::Duration::from_secs(10);
+        clients::check_head_deadline_payload(
+            connect_timeout + TEST_LOOSE_READ_TIMEOUT,
+            connect_timeout,
         );
     }
 
@@ -8089,10 +8340,12 @@ mod tests {
     // -----------------------------------------------------------------------------------
     // The single-write mutation path: `upload_signature`/`put_trust` used to ride
     // `Posture::UnboundedNoRedirect`, genuinely unbounded, on the theory that no client here
-    // combined no-auto-redirect with a client-level `read_timeout` — false, and the wrong ask:
-    // a client-level `read_timeout` resets on every byte, so it would not have bounded a
-    // trickling remote either (see `resolve_gives_up_on_a_remote_that_never_stops_trickling`
-    // above for that exact failure mode, on a different call). Both now ride
+    // combined no-auto-redirect with a client-level `read_timeout`. That theory was the wrong ask
+    // even while it described the module — a client-level `read_timeout` resets on every byte, so
+    // it would not have bounded a trickling remote either (see
+    // `resolve_gives_up_on_a_remote_that_never_stops_trickling` above for that exact failure mode,
+    // on a different call) — and it no longer describes the module at all: the client
+    // `Posture::HeadDeadlineNoRedirect` selects combines exactly those two axes. Both now ride
     // `Posture::TotalDeadlineNoRedirect`, sized by `RemoteClient::single_write_budget` — the
     // same total-deadline mechanism `Posture::TotalDeadline` already gives `resolve` and the
     // presence-negotiation calls, just on the client that never auto-follows a redirect, so the
@@ -8293,6 +8546,309 @@ mod tests {
         ));
     }
 
+    /// A remote that answers the batch `POST` **directly** — no redirect anywhere in the picture —
+    /// with a `200`, a `Content-Length` far larger than what it writes, a few body bytes, and then
+    /// genuine silence with the connection held open (no FIN). The direct station's own
+    /// [`SilentRemote`], moved one phase later: the head-wait completes normally and it is the
+    /// *body* that stalls.
+    ///
+    /// The prefix bytes are not decoration. Without them the stall would begin at the header
+    /// boundary, and a bound that only covered the wait for a first body byte would look identical
+    /// to one that covers every subsequent gap. Writing some body first makes this genuinely
+    /// mid-body.
+    struct StalledDirectBodyRemote {
+        url: String,
+        /// Owns the sender for the same reason [`SilentRemote`] does: dropping it at the end of
+        /// the test unblocks the parked handler. Returning early instead would drop the stream,
+        /// send a FIN, and fail the client instantly on a connection-closed error that has nothing
+        /// to do with any budget — a test built that way passes against an unbounded client too.
+        _park: std::sync::mpsc::Sender<()>,
+    }
+
+    impl StalledDirectBodyRemote {
+        fn start() -> StalledDirectBodyRemote {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+
+            std::thread::spawn(move || {
+                use std::io::Write;
+
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let _ = read_test_request(&mut stream);
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                        Content-Length: 4096\r\n\r\nbundle-prefix"
+                    );
+                    let _ = stream.flush();
+                    let _ = rx.recv();
+                    drop(stream);
+                }
+            });
+
+            StalledDirectBodyRemote { url, _park: tx }
+        }
+    }
+
+    /// The redirect-follow station's counterpart to [`StalledDirectBodyRemote`]: hop 1 answers the
+    /// `POST` with a `303`, hop 2 answers the presigned `GET` with `200`, a `Content-Length` it
+    /// never delivers, a few body bytes, and then silence.
+    ///
+    /// **Why not [`RedirectThenSilentRemote`], which already exists.** That fixture's second hop
+    /// goes silent *before* its status line, so `fetch_batch` fails inside
+    /// `response_from_send("following the batch redirect", ...)` — a different composer call with
+    /// a different action string. Two messages that differ only by action string prove nothing
+    /// about the two postures' *arms*, which is the thing the shared figure puts at risk. Stalling
+    /// after the status line is what routes this station into the same
+    /// `describe_transport_error("reading the batch response", ...)` call the direct station uses,
+    /// where the posture is the only thing left that differs.
+    struct RedirectThenStalledBodyRemote {
+        url: String,
+        /// Parked for the same reason every silent fixture here is — see [`SilentRemote`].
+        _park: std::sync::mpsc::Sender<()>,
+    }
+
+    impl RedirectThenStalledBodyRemote {
+        fn start() -> RedirectThenStalledBodyRemote {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let base = url.clone();
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+
+            std::thread::spawn(move || {
+                use std::io::Write;
+
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let _ = read_test_request(&mut stream);
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 303 See Other\r\nLocation: {}/responses/bundle\r\n\
+                        Content-Length: 0\r\nConnection: close\r\n\r\n",
+                        base
+                    );
+                    let _ = stream.flush();
+                }
+
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let _ = read_test_request(&mut stream);
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                        Content-Length: 4096\r\n\r\nbundle-prefix"
+                    );
+                    let _ = stream.flush();
+                    let _ = rx.recv();
+                    drop(stream);
+                }
+            });
+
+            RedirectThenStalledBodyRemote { url, _park: tx }
+        }
+    }
+
+    /// **The falsifying test for `fetch_batch`'s body-read bound**, on the station that had no
+    /// committed coverage in either direction: the direct, non-redirect response body of the batch
+    /// `POST`. Before the client [`Posture::HeadDeadlineNoRedirect`] selects carried a
+    /// `read_timeout`, this shape hung forever — the head-wait timer had already resolved at the
+    /// status line and nothing was left watching the body.
+    ///
+    /// The budget is the production one (`connect_timeout + FETCH_OBJECT_READ_TIMEOUT`, 65s
+    /// direct), so the assertions do the discriminating rather than the clock. The message must
+    /// name **exactly 65s**, which separates this from a mutant wiring the posture onto the tight
+    /// [`Posture::BoundedReads`] budget (15s) or onto no budget at all (hangs past the ceiling).
+    /// It must say **"at least"**: this budget resets on every byte, so the figure is a lower
+    /// bound on the silence and naming it exactly would be the head-wait timer's entitlement, not
+    /// this one's. And it must name the **headers** already having arrived, which is what tells
+    /// this station apart from the redirect-follow one at the same call site — the two share an
+    /// action string and print the identical figure, so wording is the only thing left to
+    /// distinguish them with, and
+    /// `the_two_batch_stations_do_not_share_one_stall_message` is what pins that they actually
+    /// differ.
+    #[test]
+    fn fetch_batch_times_out_on_a_stalled_direct_body() {
+        let remote = StalledDirectBodyRemote::start();
+        let client = RemoteClient::new(&remote.url, None).unwrap();
+        let effective_budget = TEST_DIRECT_CONNECT_TIMEOUT + TEST_LOOSE_READ_TIMEOUT;
+        let hard_ceiling = effective_budget + std::time::Duration::from_secs(20);
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let outcome = runtime.block_on(async {
+            tokio::time::timeout(hard_ceiling, client.fetch_batch(&["a".repeat(64)])).await
+        });
+
+        let message = outcome
+            .unwrap_or_else(|_| panic!(
+                "fetch_batch hung past the test's own {:?} ceiling — a body that stops arriving \
+                mid-transfer is the exact failure this station's silence budget exists to end",
+                hard_ceiling
+            ))
+            .expect_err("a body that never finishes must not appear to succeed");
+
+        assert!(
+            message.to_lowercase().contains("timed out"),
+            "must fail specifically with a timeout, not some other transport error: {}", message
+        );
+        assert!(
+            message.contains(&format!("{:?}", effective_budget)),
+            "must name the effective silence budget {:?} exactly, not the tight read budget and \
+            not some other figure: {}", effective_budget, message
+        );
+        assert!(
+            message.to_lowercase().contains("at least"),
+            "a resetting silence budget only ever guarantees the gap was at least this long — the \
+            figure must be hedged, unlike the head-wait timer's: {}", message
+        );
+        assert!(
+            message.to_lowercase().contains("headers"),
+            "the wording must say the response headers had already arrived, which is what names \
+            *which* of fetch_batch's two stations stalled — they share one action string and one \
+            figure: {}", message
+        );
+    }
+
+    /// **The distinguishing test the shared figure forces.** `fetch_batch` hands both of its
+    /// stations to one [`RemoteClient::describe_transport_error`] call under one action string,
+    /// and both render the same duration — the direct body through
+    /// [`Posture::HeadDeadlineNoRedirect`]'s client, the redirect-follow `GET` through
+    /// [`Posture::BoundedObjectReads`]', both sized from [`FETCH_OBJECT_READ_TIMEOUT`]. So a
+    /// per-station assertion on the figure certifies nothing about which one an operator is
+    /// looking at. This drives both stalls against the real call and requires the two messages to
+    /// differ.
+    ///
+    /// **Both fixtures must stall *after* their status line**, which is why this uses
+    /// [`RedirectThenStalledBodyRemote`] rather than the older [`RedirectThenSilentRemote`]. A
+    /// redirect target that never answers at all fails at a different composer call with a
+    /// different action string — the messages would then differ for a reason that has nothing to
+    /// do with the two arms, and this test would stay green against the very mutant it exists to
+    /// catch. It did, when first written that way; that is why it says so here.
+    ///
+    /// Runs the two concurrently on one runtime rather than back to back: both fail at the same
+    /// ~65s budget, so racing them costs one budget rather than two.
+    ///
+    /// **The mutant this test alone catches, established by running it rather than by reasoning
+    /// about it:** give the *`BoundedObjectReads`* arm this arm's wording. Measured — this test
+    /// fails on identical `left`/`right`, and
+    /// [`fetch_batch_times_out_on_a_stalled_direct_body`] **passes**, because that test asserts on
+    /// the direct arm, which the mutant does not touch. Nothing else in the file compares the two
+    /// arms against each other, so without this test that mutant ships.
+    ///
+    /// The mirror mutant — giving *this* posture's arm the `BoundedObjectReads` wording — is **not**
+    /// the one that justifies this test's ~65s, and an earlier version of this doc said it was. It
+    /// fails two tests, not one: [`fetch_batch_times_out_on_a_stalled_direct_body`] trips first, on
+    /// its `contains("headers")` assertion. Recorded because a coverage claim is exactly what a
+    /// later reader consults when deciding a slow test is redundant, and this one was wrong in the
+    /// direction that would have got the test deleted.
+    #[test]
+    fn the_two_batch_stations_do_not_share_one_stall_message() {
+        let direct = StalledDirectBodyRemote::start();
+        let redirected = RedirectThenStalledBodyRemote::start();
+        let direct_client = RemoteClient::new(&direct.url, None).unwrap();
+        let redirect_client = RemoteClient::new(&redirected.url, None).unwrap();
+        let hard_ceiling = TEST_DIRECT_CONNECT_TIMEOUT + TEST_LOOSE_READ_TIMEOUT
+            + std::time::Duration::from_secs(20);
+
+        let direct_hashes = vec!["a".repeat(64)];
+        let redirect_hashes = vec!["b".repeat(64)];
+        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        let (direct_outcome, redirect_outcome) = runtime.block_on(async {
+            tokio::join!(
+                tokio::time::timeout(hard_ceiling, direct_client.fetch_batch(&direct_hashes)),
+                tokio::time::timeout(hard_ceiling, redirect_client.fetch_batch(&redirect_hashes)),
+            )
+        });
+
+        let direct_message = direct_outcome
+            .unwrap_or_else(|_| panic!("the direct station hung past {:?}", hard_ceiling))
+            .expect_err("a stalled direct body must not appear to succeed");
+        let redirect_message = redirect_outcome
+            .unwrap_or_else(|_| panic!("the redirect station hung past {:?}", hard_ceiling))
+            .expect_err("a stalled redirect-target body must not appear to succeed");
+
+        assert!(
+            direct_message.to_lowercase().contains("timed out")
+                && redirect_message.to_lowercase().contains("timed out"),
+            "both stations must fail with a timeout before their wording can be compared at all: \
+            direct {:?}, redirect {:?}", direct_message, redirect_message
+        );
+        let shared_action = "reading the batch response";
+        assert!(
+            direct_message.contains(shared_action) && redirect_message.contains(shared_action),
+            "both stalls must reach the *body-read* composer call, the one both stations share — \
+            a message naming any other action means this fixture stalled at the wrong phase and \
+            the comparison below would be vacuous: direct {:?}, redirect {:?}",
+            direct_message, redirect_message
+        );
+        assert_ne!(
+            direct_message, redirect_message,
+            "fetch_batch's two stations must not produce the same message: they share one action \
+            string and one figure, so identical wording leaves an operator with no way to tell a \
+            stalled control-plane answer from a stalled storage read"
+        );
+    }
+
+    /// **The stuck-green guard for the body bound, and the reason the phase split exists at all.**
+    /// A direct batch response whose body dribbles in steadily — every gap far under the silence
+    /// budget, the whole transfer far past it *and* past the head-wait budget — must **succeed**,
+    /// intact.
+    ///
+    /// Three rival implementations die here, which is what makes it worth its seconds. A *total*
+    /// deadline over the response (`RequestBuilder::timeout`, one line away in the seam's own
+    /// match) cuts the transfer off at its own figure however healthy it is. A head-wait timer
+    /// widened to cover the body kills it at 50s. The tight [`Posture::BoundedReads`] silence
+    /// budget (15s effective) kills it at the first 20s gap. Only a *loose, resetting* silence
+    /// budget survives, which is precisely the mechanism this station is supposed to carry.
+    ///
+    /// Reuses `start_steady_drip_remote` — `fetch_object`'s own drip fixture, on the direct path
+    /// with no redirect hop, which is exactly the shape the batch `POST` sees from a non-offloading
+    /// head.
+    #[test]
+    fn fetch_batch_survives_a_slow_but_steadily_progressing_direct_body() {
+        let gap = std::time::Duration::from_secs(20);
+        let chunks: Vec<Vec<u8>> =
+            (0..4).map(|i| format!("direct-chunk-{}-drip", i).into_bytes()).collect();
+        let expected: Vec<u8> = chunks.concat();
+        let total_duration = gap * (chunks.len() as u32);
+        let effective_silence_budget = TEST_DIRECT_CONNECT_TIMEOUT + TEST_LOOSE_READ_TIMEOUT;
+        let effective_head_budget = TEST_DIRECT_CONNECT_TIMEOUT + TEST_BATCH_HEAD_PATIENCE;
+
+        assert!(
+            total_duration > effective_silence_budget && total_duration > effective_head_budget,
+            "the fixture ({:?}) must outlast both of this call's bounds — the silence budget {:?} \
+            and the head budget {:?} — or it cannot tell a resetting per-gap bound from either of \
+            the rival mechanisms", total_duration, effective_silence_budget, effective_head_budget
+        );
+        assert!(
+            gap < effective_silence_budget,
+            "no single gap ({:?}) may approach the silence budget ({:?}), or this fixture would \
+            fail against the correct implementation too", gap, effective_silence_budget
+        );
+
+        let url = start_steady_drip_remote(chunks, gap);
+        let client = RemoteClient::new(&url, None).unwrap();
+        let outer_ceiling = total_duration + std::time::Duration::from_secs(20);
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let outcome = runtime.block_on(async {
+            tokio::time::timeout(outer_ceiling, client.fetch_batch(&["a".repeat(64)])).await
+        });
+
+        let bytes = outcome
+            .unwrap_or_else(|_| panic!(
+                "fetch_batch hung past its own generous outer ceiling {:?}", outer_ceiling
+            ))
+            .unwrap_or_else(|e| panic!(
+                "a body that was never silent for more than {:?} must never be treated as a \
+                stall, however long the whole transfer took: {}", gap, e
+            ));
+
+        assert_eq!(
+            bytes, Some(expected),
+            "the full body must arrive intact, not a prefix of it — a truncated read is the other \
+            shape a wrongly-scoped bound produces"
+        );
+    }
+
     /// A remote that accepts the connection, reads the request, sends response headers claiming
     /// a `Content-Length` far larger than the body it actually writes, and then genuinely goes
     /// silent — the connection stays open (no FIN), so the client is left waiting for bytes that
@@ -8368,7 +8924,7 @@ mod tests {
     // no `read_timeout` at all — so a remote that delivers a
     // full status line and headers and then wedges before writing the body hangs the caller
     // forever. `ERROR_BODY_READ_TIMEOUT` bounds the read itself, in `error_of`, rather than
-    // trying to fix it with a fifth client — a client cannot help here, since the body-read
+    // trying to fix it with yet another client — no client can help here, since the body-read
     // bound is inherited from whichever client sent the request, and `error_of` serves responses
     // from all of them. `commit_lift`'s own error-body read is deliberately left unbounded (a
     // pre-existing, ticketed defect — FORK-49 is scoped to reads whose result only shapes a
@@ -9620,6 +10176,37 @@ mod tests {
                 "update_ref must not fail on a response that only arrived slowly, never on any \
                 timeout: {}", e
             ));
+    }
+
+    /// **The pin that catches the one-line version of the body-read fix**, and the reason the test
+    /// above cannot: adding a `read_timeout` to the shared `Clients::no_redirect` client instead of
+    /// building `Clients::bounded_object_reads_no_redirect` is the shortest way to bound
+    /// `fetch_batch`'s body, and it silently hands the same silence budget to `update_ref` — the
+    /// one call in this module that must never carry one, because its server side legitimately runs
+    /// a parcel-closure audit walk that moves no bytes for minutes.
+    ///
+    /// `update_ref_outlives_the_read_metadata_timeout` above cannot see that mistake at all. Its
+    /// fixture answers after `connect + tight read + 3s` = 18s, composed from the *tight* mirrors —
+    /// comfortably inside the 65s a loose-scaled budget would allow, so the wrongly-bounded client
+    /// still answers in time and that test stays green. This one is sized against the **loose**
+    /// budget precisely to close that gap, which is why it is worth its 70 seconds.
+    ///
+    /// The "unbounded direction" shape (see `assert_still_running`): a silent remote must not be
+    /// enough on its own to fail this call, checked past the loose budget with slack. It also
+    /// stands as the standing evidence that the new client bounded `fetch_batch`'s `POST` and
+    /// nothing else on the no-redirect side — `fetch_subtree_is_not_flat_bounded_by_silence` covers
+    /// only the auto-following client, so it cannot witness this at all.
+    #[test]
+    fn update_ref_stays_unbounded_against_the_loose_silence_budget() {
+        let remote = SilentRemote::start();
+        let client = RemoteClient::new(&remote.url, None).unwrap();
+        let check_after = TEST_DIRECT_CONNECT_TIMEOUT + TEST_LOOSE_READ_TIMEOUT
+            + std::time::Duration::from_secs(5);
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(assert_still_running(
+            "update_ref", check_after, client.update_ref("main", None, &"a".repeat(64)),
+        ));
     }
 
     /// The discriminating fixture for `resolve`'s own [`Posture::TotalDeadline`]: a remote that
