@@ -26,7 +26,7 @@ use forklift_core::model::hooks::{
     AdmissionHookRequest, AdmissionHookResponse, AuthenticationHookRequest,
     AuthenticationHookResponse, HookEvent, ResolutionHookRequest, ResolutionHookResponse,
     EVENT_KEY_REVOKED, EVENT_PALLET_UPDATED, EVENT_TRUST_ESTABLISHED, EVENT_TRUST_RESET,
-    EVENT_WAREHOUSE_CREATED, HOOK_CLIENT_TIMEOUT,
+    EVENT_WAREHOUSE_CREATED,
 };
 use forklift_core::model::remote::{
     ErrorResponse, MissingObjectsRequest, MissingObjectsResponse, RefUpdateRequest,
@@ -214,6 +214,30 @@ pub struct ServeOptions {
     /// How long a positive authentication-hook answer is cached (seconds; default 60).
     pub authentication_cache_secs: Option<u64>,
 }
+
+/// The flat request timeout this head arms on the `reqwest::Client` it calls every hook
+/// through ([`build_hook_client`] builds from this constant rather than a second, unlinked
+/// literal). It bounds *every* hook that client carries — authentication, admission, events and
+/// resolution — individually, not collectively: a request running two of them may wait twice
+/// this long.
+///
+/// Which hooks a given request actually runs varies, and callers sizing anything against this
+/// must not assume a fixed count: a mutating request may run authentication alone (`put_trust`)
+/// or authentication and admission (`put_signature`, `put_object`). The authentication and
+/// admission hooks fail closed on a transport failure, so a hook endpoint that never answers
+/// must not wedge the request it gates forever — but 10s is generous enough that a hook doing
+/// real work (a directory lookup, a policy check) never trips it under normal load.
+///
+/// Module-private, not `pub` — unlike its previous home in `forklift-core::model::hooks`. This
+/// head's own outbound hook timeout is this head's own operational business, never a quantity a
+/// client budget may read: `forklift-core::util::remote_utils`'s `SINGLE_WRITE_ALLOWANCE` used to
+/// import this exact constant to size a client-side deadline, which priced this head's specific
+/// hook behavior into an arithmetic that has to be honest against every head, including
+/// `forklift-aws-lambda`, which runs no hooks at all. Moving the constant here — so a
+/// `forklift-core` budget can no longer reach it without adding a dependency this workspace does
+/// not have and should not gain — is what makes that coupling a compile error instead of a
+/// silent design defect.
+const HOOK_CLIENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Build the outbound HTTP client `AppState.http` holds — timeout-armed at
 /// [`HOOK_CLIENT_TIMEOUT`] so a hook endpoint that accepts a connection and then never answers
