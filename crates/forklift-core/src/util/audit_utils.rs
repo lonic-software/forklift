@@ -790,9 +790,9 @@ pub fn new_parcels(head: &str, known_verified: Option<&str>) -> Result<Vec<Strin
 ///
 /// The edges are not a convenience: `graph_utils::parents` falls back to decoding the parcel when
 /// the commit-graph has no record, so a caller that needs them too — the closure audit, whose
-/// candidate bases *are* the parents — would otherwise pay a second read per parcel. On the AWS
-/// head that second read is a synchronous object-storage round trip inside the commit Lambda, and
-/// a pooled-scratch test measures it.
+/// candidate bases *are* the parents — would otherwise decode every parcel of the segment twice.
+/// Returning them makes the audit's ordering and its candidate bases share one view of who a
+/// parent is, which is the property the ordering's soundness actually rests on.
 fn new_parcels_with_edges(head: &str, known_verified: Option<&str>)
                           -> Result<(Vec<String>, HashMap<String, Vec<String>>), String> {
     let fresh: Option<HashSet<String>> = match known_verified {
@@ -1412,52 +1412,6 @@ pub fn verify_parcel_closure(head: &str, known_complete: Option<&str>) -> Result
 ///                          scratch — so, like the recipe read, this reads them from object storage
 ///                          on that head and from the local store on the self-host head. Never
 ///                          called for a creation (`known_complete: None`), where there is no base.
-/// Order a push's new segment so every parcel follows the parents that are in the segment with it.
-///
-/// Kahn's algorithm over the induced subgraph. Only in-segment parents constrain anything: a parent
-/// outside it is at or below `known_complete`, which the audit already trusts. A `BTreeSet` ready
-/// set makes the emitted order a function of the DAG alone, so which failure an audit reports
-/// stays reproducible across runs. `None` means the segment contains a cycle.
-fn parents_first(segment: &[String],
-                 parents_of: &HashMap<String, Vec<String>>) -> Option<Vec<String>> {
-    let in_segment: HashSet<&str> = segment.iter().map(String::as_str).collect();
-    let mut pending: HashMap<&str, usize> = HashMap::new();
-    let mut children_of: HashMap<&str, Vec<&str>> = HashMap::new();
-
-    for hash in segment {
-        let mut count = 0;
-
-        for parent in parents_of.get(hash).into_iter().flatten() {
-            if in_segment.contains(parent.as_str()) {
-                children_of.entry(parent.as_str()).or_default().push(hash.as_str());
-                count += 1;
-            }
-        }
-
-        pending.insert(hash.as_str(), count);
-    }
-
-    let mut ready: std::collections::BTreeSet<&str> = pending.iter()
-        .filter(|(_, count)| **count == 0)
-        .map(|(hash, _)| *hash)
-        .collect();
-    let mut ordered: Vec<String> = Vec::with_capacity(segment.len());
-
-    while let Some(hash) = ready.pop_first() {
-        ordered.push(hash.to_string());
-
-        for child in children_of.get(hash).into_iter().flatten() {
-            let count = pending.get_mut(*child)?;
-            *count -= 1;
-            if *count == 0 {
-                ready.insert(child);
-            }
-        }
-    }
-
-    (ordered.len() == segment.len()).then_some(ordered)
-}
-
 pub fn verify_parcel_closure_with(
     head: &str,
     known_complete: Option<&str>,
@@ -1484,11 +1438,16 @@ pub fn verify_parcel_closure_with(
     // reused as the candidate bases below.
     //
     // Ordered by a topological sort of the segment against its own edges, deliberately *not* by
-    // commit-graph generation number. Generations are also topological, but reading one calls
-    // `graph_utils::ensure`, which walks below the segment loading every parcel without a stored
-    // record — and on the AWS head this loop runs inside the commit Lambda against object storage,
-    // where each of those is a synchronous round trip. A pooled-scratch test measures exactly that
-    // and refuses the generation form. Sorting against edges already in hand costs no read at all.
+    // commit-graph generation number.
+    //
+    // Not for cost: at the AWS gate the scratch mirrors ancestry parcel bodies, so `ensure`'s loads
+    // are local decodes, and `fresh_frontier` above already calls `node` on every parcel it first
+    // sees — an ordering that read generations would mostly be paying a bill already paid. The
+    // reason is correctness. `graph_utils::node` returns a *stored* record without validating it
+    // and self-heals only a miss, so ascending-generation is topological exactly as far as those
+    // records are right. Sorting against the edges the membership sweep itself read cannot
+    // disagree with membership even in principle, which is a stronger discharge of the same
+    // obligation. That it also costs no additional read is a bonus, not the argument.
     let ordered = parents_first(&parcels, &parents_of)
         .ok_or_else(|| format!("The history behind {} has a cycle; the warehouse is corrupt.", head))?;
 
@@ -1516,11 +1475,9 @@ pub fn verify_parcel_closure_with(
 
     // Each parcel's tree hash, remembered as it is audited. The parents-first order means every
     // in-segment parent has already passed through this loop by the time a child needs its tree,
-    // so a candidate base costs a map lookup rather than an object read. That is not a micro-
-    // optimization: on the AWS head this loop runs inside the commit Lambda against object
-    // storage, and a `load_parcel` per parent per parcel is a synchronous round trip apiece.
-    // Only boundary parents — the fork points just below `known_complete`, which the segment
-    // excludes — fall through to a read.
+    // so a candidate base costs a map lookup rather than a re-decode of a parcel this walk has
+    // already read. Only boundary parents — the fork points just below `known_complete`, which the
+    // segment excludes — fall through to a load.
     let mut tree_of: HashMap<String, String> = HashMap::new();
 
     // Seed with `known_complete`: it is the boundary parent of every linear push, and its tree was
@@ -1578,6 +1535,61 @@ pub fn verify_parcel_closure_with(
     }
 
     Ok(())
+}
+
+/// Order a push's new segment so every parcel follows the parents that are in the segment with it.
+///
+/// Kahn's algorithm over the induced subgraph. Only in-segment parents constrain anything: a parent
+/// outside it is at or below `known_complete`, which the audit already trusts. A `BTreeSet` ready
+/// set makes the emitted order a function of the DAG alone, so which failure an audit reports
+/// stays reproducible across runs. `None` means the segment contains a cycle.
+///
+/// The standing premise, stated because it is the one thing here that is assumed rather than
+/// established: a parent *outside* the segment is trusted on the strength of being reachable from
+/// `known_complete`, and that reachability is decided from commit-graph records this walk does not
+/// validate. Under a wrong record a boundary parent could explain content nothing has audited —
+/// the union then hides more than the single-base prune it replaces. That is accepted rather than
+/// designed away, because the boundary parent is exactly what explains the common case this prune
+/// exists to make cheap; the exposure is the commit graph's correctness, which the audit already
+/// leans on to decide segment membership at all.
+fn parents_first(segment: &[String],
+                 parents_of: &HashMap<String, Vec<String>>) -> Option<Vec<String>> {
+    let in_segment: HashSet<&str> = segment.iter().map(String::as_str).collect();
+    let mut pending: HashMap<&str, usize> = HashMap::new();
+    let mut children_of: HashMap<&str, Vec<&str>> = HashMap::new();
+
+    for hash in segment {
+        let mut count = 0;
+
+        for parent in parents_of.get(hash).into_iter().flatten() {
+            if in_segment.contains(parent.as_str()) {
+                children_of.entry(parent.as_str()).or_default().push(hash.as_str());
+                count += 1;
+            }
+        }
+
+        pending.insert(hash.as_str(), count);
+    }
+
+    let mut ready: std::collections::BTreeSet<&str> = pending.iter()
+        .filter(|(_, count)| **count == 0)
+        .map(|(hash, _)| *hash)
+        .collect();
+    let mut ordered: Vec<String> = Vec::with_capacity(segment.len());
+
+    while let Some(hash) = ready.pop_first() {
+        ordered.push(hash.to_string());
+
+        for child in children_of.get(hash).into_iter().flatten() {
+            let count = pending.get_mut(*child)?;
+            *count -= 1;
+            if *count == 0 {
+                ready.insert(child);
+            }
+        }
+    }
+
+    (ordered.len() == segment.len()).then_some(ordered)
 }
 
 /// [`verify_parcel_closure`], scoped to a sparse warehouse's fetch scope.
