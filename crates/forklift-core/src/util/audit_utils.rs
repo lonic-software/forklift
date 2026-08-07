@@ -783,15 +783,28 @@ const KNOWN: u8 = 2;
 /// * `Ok(Vec<String>)` - The new parcels, breadth-first from `head`.
 /// * `Err(String)`     - If a parcel is in neither the commit-graph nor the object store.
 pub fn new_parcels(head: &str, known_verified: Option<&str>) -> Result<Vec<String>, String> {
+    Ok(new_parcels_with_edges(head, known_verified)?.0)
+}
+
+/// [`new_parcels`], also returning the parent edges the walk read on its way.
+///
+/// The edges are not a convenience: `graph_utils::parents` falls back to decoding the parcel when
+/// the commit-graph has no record, so a caller that needs them too — the closure audit, whose
+/// candidate bases *are* the parents — would otherwise pay a second read per parcel. On the AWS
+/// head that second read is a synchronous object-storage round trip inside the commit Lambda, and
+/// a pooled-scratch test measures it.
+fn new_parcels_with_edges(head: &str, known_verified: Option<&str>)
+                          -> Result<(Vec<String>, HashMap<String, Vec<String>>), String> {
     let fresh: Option<HashSet<String>> = match known_verified {
         None => None,
-        Some(bound) if bound == head => return Ok(Vec::new()),
+        Some(bound) if bound == head => return Ok((Vec::new(), HashMap::new())),
         Some(bound) => Some(fresh_frontier(head, bound)?),
     };
 
     // Breadth-first from `head`, so the order — and therefore the first failure an audit
     // reports — is exactly what the unbounded walk produced.
     let mut order: Vec<String> = Vec::new();
+    let mut edges: HashMap<String, Vec<String>> = HashMap::new();
     let mut queue: VecDeque<String> = VecDeque::new();
     let mut visited: HashSet<String> = HashSet::new();
 
@@ -806,14 +819,17 @@ pub fn new_parcels(head: &str, known_verified: Option<&str>) -> Result<Vec<Strin
             continue;
         }
 
-        for parent in graph_utils::parents(&hash)? {
-            queue.push_back(parent);
+        let parents = graph_utils::parents(&hash)?;
+
+        for parent in &parents {
+            queue.push_back(parent.clone());
         }
 
+        edges.insert(hash.clone(), parents);
         order.push(hash);
     }
 
-    Ok(order)
+    Ok((order, edges))
 }
 
 /// The set behind [`new_parcels`]: parcels reachable from `head` but not from `bound`.
@@ -1396,6 +1412,52 @@ pub fn verify_parcel_closure(head: &str, known_complete: Option<&str>) -> Result
 ///                          scratch — so, like the recipe read, this reads them from object storage
 ///                          on that head and from the local store on the self-host head. Never
 ///                          called for a creation (`known_complete: None`), where there is no base.
+/// Order a push's new segment so every parcel follows the parents that are in the segment with it.
+///
+/// Kahn's algorithm over the induced subgraph. Only in-segment parents constrain anything: a parent
+/// outside it is at or below `known_complete`, which the audit already trusts. A `BTreeSet` ready
+/// set makes the emitted order a function of the DAG alone, so which failure an audit reports
+/// stays reproducible across runs. `None` means the segment contains a cycle.
+fn parents_first(segment: &[String],
+                 parents_of: &HashMap<String, Vec<String>>) -> Option<Vec<String>> {
+    let in_segment: HashSet<&str> = segment.iter().map(String::as_str).collect();
+    let mut pending: HashMap<&str, usize> = HashMap::new();
+    let mut children_of: HashMap<&str, Vec<&str>> = HashMap::new();
+
+    for hash in segment {
+        let mut count = 0;
+
+        for parent in parents_of.get(hash).into_iter().flatten() {
+            if in_segment.contains(parent.as_str()) {
+                children_of.entry(parent.as_str()).or_default().push(hash.as_str());
+                count += 1;
+            }
+        }
+
+        pending.insert(hash.as_str(), count);
+    }
+
+    let mut ready: std::collections::BTreeSet<&str> = pending.iter()
+        .filter(|(_, count)| **count == 0)
+        .map(|(hash, _)| *hash)
+        .collect();
+    let mut ordered: Vec<String> = Vec::with_capacity(segment.len());
+
+    while let Some(hash) = ready.pop_first() {
+        ordered.push(hash.to_string());
+
+        for child in children_of.get(hash).into_iter().flatten() {
+            let count = pending.get_mut(*child)?;
+            *count -= 1;
+            if *count == 0 {
+                ready.insert(child);
+            }
+        }
+    }
+
+    (ordered.len() == segment.len()).then_some(ordered)
+}
+
 pub fn verify_parcel_closure_with(
     head: &str,
     known_complete: Option<&str>,
@@ -1408,22 +1470,27 @@ pub fn verify_parcel_closure_with(
     // that head was committed. This walk used to build its prune set with
     // `collect_reachable(known_complete)`, which decoded every parcel body in the ancestry —
     // O(history) on every ref update, however little the lift added.
-    let parcels = new_parcels(head, known_complete)
+    let (parcels, parents_of) = new_parcels_with_edges(head, known_complete)
         .map_err(|e| format!("The history behind {} is incomplete: {}", head, e))?;
 
     // Parents first. `new_parcels` returns the segment breadth-first *from head*, so a child
     // precedes the parent that explains it — the order the ordinary audit reports failures in, and
     // deliberately left alone there. This walk needs the opposite, because a parcel's own parents
     // are candidate bases below and may only explain content their own top-level audit has already
-    // settled. Sorting by ascending generation is genuinely topological: a parent's generation is
-    // strictly less than its child's. Read through `graph_utils::node`, the record-preferring
-    // self-healing accessor, so a creation push — which has no precomputed generations — computes
-    // them rather than falling back to an order that merely looks right.
-    let mut ordered: Vec<(u32, &String)> = parcels.iter()
-        .map(|hash| graph_utils::generation(hash).map(|generation| (generation, hash)))
-        .collect::<Result<_, _>>()
-        .map_err(|e| format!("The history behind {} is incomplete: {}", head, e))?;
-    ordered.sort();
+    // settled.
+    //
+    // The edges come through `graph_utils::parents`, the same accessor `new_parcels` swept with,
+    // so the prune cannot see a parent edge the sweep did not — and they are read once here and
+    // reused as the candidate bases below.
+    //
+    // Ordered by a topological sort of the segment against its own edges, deliberately *not* by
+    // commit-graph generation number. Generations are also topological, but reading one calls
+    // `graph_utils::ensure`, which walks below the segment loading every parcel without a stored
+    // record — and on the AWS head this loop runs inside the commit Lambda against object storage,
+    // where each of those is a synchronous round trip. A pooled-scratch test measures exactly that
+    // and refuses the generation form. Sorting against edges already in hand costs no read at all.
+    let ordered = parents_first(&parcels, &parents_of)
+        .ok_or_else(|| format!("The history behind {} has a cycle; the warehouse is corrupt.", head))?;
 
     // The candidate bases a parcel's tree is pruned against (§9.4b W1): `known_complete`'s root
     // tree, **and** the parcel's own immediate parents' root trees.
@@ -1447,9 +1514,27 @@ pub fn verify_parcel_closure_with(
 
     let mut visited_trees: HashSet<String> = HashSet::new();
 
-    for (_, hash) in &ordered {
+    // Each parcel's tree hash, remembered as it is audited. The parents-first order means every
+    // in-segment parent has already passed through this loop by the time a child needs its tree,
+    // so a candidate base costs a map lookup rather than an object read. That is not a micro-
+    // optimization: on the AWS head this loop runs inside the commit Lambda against object
+    // storage, and a `load_parcel` per parent per parcel is a synchronous round trip apiece.
+    // Only boundary parents — the fork points just below `known_complete`, which the segment
+    // excludes — fall through to a read.
+    let mut tree_of: HashMap<String, String> = HashMap::new();
+
+    // Seed with `known_complete`: it is the boundary parent of every linear push, and its tree was
+    // already loaded above for `base_root`. Without this the common case pays a second read of the
+    // same parcel purely to learn a hash already in hand.
+    if let (Some(known), Some(root)) = (known_complete, base_root.as_ref()) {
+        tree_of.insert(known.to_string(), root.clone());
+    }
+
+    for hash in &ordered {
         let parcel = object_utils::load_parcel(hash)
             .map_err(|e| format!("The history behind {} is incomplete: {}", head, e))?;
+
+        tree_of.insert(hash.clone(), parcel.tree_hash.clone());
 
         // Parents through `graph_utils::parents` — the same accessor `new_parcels` swept with, so
         // the prune cannot see a parent edge the sweep did not. Reading the parcel body directly
@@ -1459,12 +1544,30 @@ pub fn verify_parcel_closure_with(
         // explanations, so the walk verifies more rather than less.
         let mut bases: Vec<String> = base_root.iter().cloned().collect();
 
-        for parent in graph_utils::parents(hash)
-            .map_err(|e| format!("The history behind {} is incomplete: {}", head, e))? {
-            if let Ok(parent_parcel) = object_utils::load_parcel(&parent) {
-                bases.push(parent_parcel.tree_hash);
+        // Parent bases are the incremental gate's optimization, and only its. With no
+        // `known_complete` this call is the unbounded walk — the one an operator runs to prove a
+        // warehouse whole, and the one these tests use as the control that a deleted object really
+        // was deleted. Pruning it against parents would still be *sound* by the same induction
+        // (a root parcel has no parents and is walked whole, and every child only skips what an
+        // already-audited ancestor carries), but it would no longer walk every object, and a
+        // control that prunes is not a control. Left full on purpose.
+        if known_complete.is_some() {
+            for parent in parents_of.get(hash).into_iter().flatten() {
+                match tree_of.get(parent) {
+                    Some(tree) => bases.push(tree.clone()),
+                    None => if let Ok(parent_parcel) = object_utils::load_parcel(parent) {
+                        bases.push(parent_parcel.tree_hash);
+                    },
+                }
             }
         }
+
+        // A linear push's only parent *is* `known_complete`, so the two candidates coincide and
+        // every changed level below would otherwise load the identical base tree twice — a read
+        // apiece on the AWS head. Dedupe rather than special-case the linear shape: a merge whose
+        // sides share a tree at some path hits the same waste one level down.
+        bases.sort();
+        bases.dedup();
 
         verify_tree_closure(
             &parcel.tree_hash, &bases, &mut visited_trees,
@@ -1755,7 +1858,13 @@ fn verify_tree_closure(tree_hash: &str,
             base_files.entry(name.clone()).or_default().insert(file.hash.clone());
         }
         for (name, subtree) in base_tree.get_subtrees() {
-            base_subtrees.entry(name.clone()).or_default().push(subtree.hash.clone());
+            let candidates = base_subtrees.entry(name.clone()).or_default();
+
+            // Same reason as the parcel-level dedupe: two candidate bases carrying the identical
+            // child at this name would otherwise each be loaded again one level down.
+            if !candidates.contains(&subtree.hash) {
+                candidates.push(subtree.hash.clone());
+            }
         }
     }
 
