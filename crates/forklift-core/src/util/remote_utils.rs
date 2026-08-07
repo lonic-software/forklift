@@ -22,7 +22,7 @@ use crate::globals::{self, StorageRootScope};
 use crate::util::office_utils::OFFICE_PALLET_NAME;
 use crate::util::scope_utils::{self, MaterializationScope, ScopeClass};
 use crate::util::{
-    bundle_utils, config_utils, file_utils, merge_utils, object_utils, office_utils,
+    bundle_utils, config_utils, file_utils, graph_utils, merge_utils, object_utils, office_utils,
     pack_utils, pallet_utils, sign_utils,
 };
 
@@ -4347,35 +4347,10 @@ async fn lift_pallet_inner(client: &RemoteClient,
         }
     }
 
-    // The new parcels: everything reachable from the local head that the remote does not
-    // already have — the remote head, and every ancestor of it. The walk stops at the remote
-    // head and at any ancestor of it (a merge's other side rejoins below the remote head), so a
-    // linear lift touches O(new parcels) and a merge never re-walks the shared slice. Pruning at
-    // every ancestor — not just the remote head hash — is also what keeps a sparse workspace
-    // liftable: an interior parcel the remote already has may carry an out-of-scope change whose
-    // object this workspace never fetched, and re-walking it would try to load that sealed object.
-    // The remote provably has it (it is an ancestor of the remote head, whose closure is
-    // complete there), so it is correctly never uploaded and never walked.
-    let mut new_parcels: Vec<String> = Vec::new();
-    let mut queue: Vec<String> = vec![local_head.to_string()];
-    let mut visited: HashSet<String> = HashSet::new();
-
-    while let Some(hash) = queue.pop() {
-        if Some(hash.as_str()) == remote_head || !visited.insert(hash.clone()) {
-            continue;
-        }
-
-        if let Some(remote_head) = remote_head {
-            if merge_utils::is_ancestor(&hash, remote_head)? {
-                continue;
-            }
-        }
-
-        let parcel = object_utils::load_parcel(&hash)?;
-
-        queue.extend(parcel.parents);
-        new_parcels.push(hash);
-    }
+    // The new parcels the remote does not have, ordered parents-first — see
+    // `new_parcels_parents_first`, which owns both the walk and the order the candidate
+    // loop below depends on.
+    let new_parcels = new_parcels_parents_first(local_head, remote_head)?;
 
     // Candidate objects for the negotiation: each new parcel's tree, walked against
     // its parents' trees — a subtree identical to *any* parent's at the same path is
@@ -4387,9 +4362,12 @@ async fn lift_pallet_inner(client: &RemoteClient,
     let mut seen_blobs: HashSet<String> = HashSet::new();
     let mut seen_recipes: HashSet<String> = HashSet::new();
 
-    // Oldest first: a parcel's parents are remote-known or already processed, so
-    // everything a base "explains" is on the remote or in the candidates already.
-    for parcel_hash in new_parcels.iter().rev() {
+    // Parents first, guaranteed by `new_parcels_parents_first`: every parent of the parcel
+    // being walked is remote-known or already processed, so everything a base "explains" is
+    // on the remote or in the candidates already. Do not reorder this loop — a base that
+    // explains a subtree of a parcel not yet processed drops that subtree from the candidate
+    // set, and the push then fails the server's closure audit identically on every retry.
+    for parcel_hash in &new_parcels {
         let parcel = object_utils::load_parcel(parcel_hash)?;
 
         // Every parent's tree, not just the first. A merge parcel that
@@ -4443,6 +4421,73 @@ async fn lift_pallet_inner(client: &RemoteClient,
         uploaded_signatures,
         old_head: remote_head.map(|hash| hash.to_string()),
     }))
+}
+
+/// The new parcels of a lift — everything reachable from the local head that the remote does
+/// not already have — **ordered parents-first**.
+///
+/// The walk stops at the remote head and at any ancestor of it (a merge's other side rejoins
+/// below the remote head), so a linear lift touches O(new parcels) and a merge never re-walks
+/// the shared slice. Pruning at every ancestor — not just the remote head hash — is also what
+/// keeps a sparse workspace liftable: an interior parcel the remote already has may carry an
+/// out-of-scope change whose object this workspace never fetched, and re-walking it would try
+/// to load that sealed object. The remote provably has it (it is an ancestor of the remote
+/// head, whose closure is complete there), so it is correctly never uploaded and never walked.
+///
+/// The order is the caller's whole reason for this being one function. The candidate walk
+/// prunes each parcel's subtrees against its parents' trees, and it may only do so once those
+/// parents are on the remote or already in the candidate set — otherwise a base "explains"
+/// content that is nowhere, the content is never negotiated or uploaded, and the push fails
+/// the server's closure audit **identically on every retry**, wedging the lift fail-closed.
+///
+/// Sorting by ascending generation number is what makes that true, and it is genuinely
+/// topological: a parent's generation is strictly less than its child's. The walk itself is a
+/// stack-driven DFS, and reversing a DFS preorder is *not* a topological order — an
+/// unequal-branch merge (two parents sharing a grandparent, one branch longer) puts a parcel
+/// before its own parent. That was FORK-109; the fix is the order, not the walk.
+///
+/// Generations are read through `graph_utils::generation`, which computes and caches a missing
+/// record on demand — a first lift of a fresh chain has no precomputed generations, and would
+/// otherwise be exactly the case that silently falls back to an arbitrary order.
+///
+/// # Arguments
+/// * `local_head`  - The local head parcel of the pallet.
+/// * `remote_head` - The remote's current head, if the pallet exists there.
+///
+/// # Returns
+/// * `Ok(Vec<String>)` - The new parcels, every parcel preceded by all of its in-set parents.
+/// * `Err(String)`     - If a parcel could not be read, or the graph is corrupt (cycle).
+fn new_parcels_parents_first(local_head: &str,
+                             remote_head: Option<&str>) -> Result<Vec<String>, String> {
+    let mut new_parcels: Vec<String> = Vec::new();
+    let mut queue: Vec<String> = vec![local_head.to_string()];
+    let mut visited: HashSet<String> = HashSet::new();
+
+    while let Some(hash) = queue.pop() {
+        if Some(hash.as_str()) == remote_head || !visited.insert(hash.clone()) {
+            continue;
+        }
+
+        if let Some(remote_head) = remote_head {
+            if merge_utils::is_ancestor(&hash, remote_head)? {
+                continue;
+            }
+        }
+
+        let parcel = object_utils::load_parcel(&hash)?;
+
+        queue.extend(parcel.parents);
+        new_parcels.push(hash);
+    }
+
+    // Ties broken by hash purely for determinism: two parcels sharing a generation can never be
+    // parent and child, so any order between them satisfies the contract.
+    let mut keyed: Vec<(u32, String)> = new_parcels.into_iter()
+        .map(|hash| graph_utils::generation(&hash).map(|generation| (generation, hash)))
+        .collect::<Result<_, _>>()?;
+    keyed.sort();
+
+    Ok(keyed.into_iter().map(|(_, hash)| hash).collect())
 }
 
 /// Collect the objects of a tree that its bases — the trees at the same path in the parcel's
@@ -5935,6 +5980,88 @@ mod tests {
         let mut object = LooseObjectBuilder::build_tree(&tree);
         object.store().unwrap();
         object.hash
+    }
+
+    /// FORK-109. The candidate walk may only prune a parcel's subtrees against its parents'
+    /// trees once those parents are on the remote or already in the candidate set. The walk
+    /// that feeds it is a stack-driven DFS, and the code used to reverse its preorder under a
+    /// comment claiming "oldest first" — which reversing a preorder does not give you.
+    ///
+    /// The fixture is the smallest DAG that discriminates: an unequal-branch merge, where both
+    /// parents share a grandparent and the DFS descends one branch to the bottom before
+    /// touching the other. The test asserts the property in both directions — that the shipped
+    /// order satisfies parents-first, and that the reversed preorder it replaced does not — so
+    /// a revert to `.rev()` fails here rather than passing quietly.
+    ///
+    /// A linear chain and an equal-branch merge both pass under either order, which is why
+    /// this went unnoticed: any fixture simpler than this one is green before and after.
+    #[test]
+    fn new_parcels_are_ordered_parents_first_across_an_unequal_branch_merge() {
+        let _scratch = Scratch::new("fork109-parents-first");
+
+        // R is the remote head. M merges A and B; both descend from P, whose parent is R.
+        // The DFS pops from the back, so it descends B's side fully before reaching A.
+        let r = stack(Vec::new(), "R remote head");
+        let p = stack(vec![r.clone()], "P shared grandparent");
+        let a = stack(vec![p.clone()], "A short branch");
+        let b = stack(vec![p.clone()], "B other branch");
+        let m = stack(vec![a.clone(), b.clone()], "M merge head");
+
+        let parents_of: HashMap<&str, Vec<&str>> = HashMap::from([
+            (m.as_str(), vec![a.as_str(), b.as_str()]),
+            (a.as_str(), vec![p.as_str()]),
+            (b.as_str(), vec![p.as_str()]),
+            (p.as_str(), vec![r.as_str()]),
+        ]);
+
+        // Every parcel must appear after each of its parents that is also being pushed. A
+        // parent outside the set is on the remote already, so it constrains nothing.
+        let parents_first = |order: &[String]| -> bool {
+            let position: HashMap<&str, usize> = order.iter()
+                .enumerate()
+                .map(|(index, hash)| (hash.as_str(), index))
+                .collect();
+            order.iter().enumerate().all(|(index, hash)| {
+                parents_of.get(hash.as_str()).into_iter().flatten().all(|parent| {
+                    position.get(parent).is_none_or(|parent_index| *parent_index < index)
+                })
+            })
+        };
+
+        let shipped = new_parcels_parents_first(&m, Some(&r))
+            .expect("the walk must succeed on a well-formed DAG");
+
+        assert_eq!(shipped.len(), 4, "R is the remote head, so the push carries M, A, B and P");
+        assert!(
+            parents_first(&shipped),
+            "the shipped order must put every parcel after its parents; got {:?}",
+            shipped
+        );
+
+        // The other direction: the order this replaced, reconstructed exactly — the DFS
+        // preorder, reversed. Without this the test above could pass for the wrong reason,
+        // e.g. if the fixture happened to be order-insensitive.
+        let mut preorder: Vec<String> = Vec::new();
+        let mut queue: Vec<String> = vec![m.clone()];
+        let mut visited: HashSet<String> = HashSet::new();
+        while let Some(hash) = queue.pop() {
+            if hash == r || !visited.insert(hash.clone()) {
+                continue;
+            }
+            queue.extend(parents_of.get(hash.as_str()).into_iter().flatten()
+                .map(|parent| parent.to_string()));
+            preorder.push(hash);
+        }
+        let reversed: Vec<String> = preorder.into_iter().rev().collect();
+
+        assert_eq!(reversed.len(), 4, "the two orders must range over the same parcels");
+        assert!(
+            !parents_first(&reversed),
+            "the fixture must discriminate: reversing the DFS preorder is expected to put a \
+             parcel before its own parent, but this order satisfies parents-first, so the \
+             assertion above proves nothing. Order was {:?}",
+            reversed
+        );
     }
 
     /// The lift closure walk prunes a subtree against **every** parent, not just the
