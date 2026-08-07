@@ -442,11 +442,17 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                     .map(|chunk| chunk.hash)
                     .collect())
             };
-            // The subtree prune (§9.4b W1) reads the prior head's trees to skip unchanged subtrees.
-            // Like recipes, those trees are already-audited history and are never mirrored into the
-            // audit scratch, so they are read from the object store here — and (the point of the
-            // prune) an unchanged large chunked file below such a subtree is skipped whole, sparing
-            // the ~million per-chunk S3 `HEAD`s its recipe descent would otherwise cost per push.
+            // The subtree prune (§9.4b W1) reads a candidate base's trees to skip subtrees some
+            // candidate already carries at that path. The candidates are the prior head's tree and
+            // each parcel's own immediate parents' — the first already-audited history, the second
+            // audited earlier in the same call by the parents-first order. Neither is mirrored into
+            // the audit scratch (which keeps parcel bodies, not their trees), so both are read from
+            // the object store here — and (the point of the prune) an unchanged large chunked file
+            // below such a subtree is skipped whole, sparing the ~million per-chunk S3 `HEAD`s its
+            // recipe descent would otherwise cost per push. Reads must stay on this seam: a direct
+            // object_utils::load_tree would pass every self-host test and every warm-container run,
+            // then fail on a cold scratch — which the prune's tolerant fallback would turn into a
+            // silent full walk, reopening on this head the very asymmetry the prune closes.
             let load_base_tree = |hash: &str| -> Result<TreeItem, String> {
                 let bytes = self
                     .objects

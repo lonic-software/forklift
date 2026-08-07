@@ -1405,13 +1405,15 @@ pub fn verify_parcel_closure(head: &str, known_complete: Option<&str>) -> Result
 ///                          head reads it from object storage (its recipes are not mirrored into the
 ///                          audit scratch), which is why the read is a parameter, not a hard-coded
 ///                          load.
-/// * `load_base_tree`     - Reads a tree object of the **prior head** (`known_complete`) for the
-///                          subtree prune (§9.4b W1): a new parcel's subtree unchanged from the
-///                          prior head is skipped whole. The prior head's subtrees are already-
-///                          audited history — the AWS head never mirrors them into the audit
-///                          scratch — so, like the recipe read, this reads them from object storage
-///                          on that head and from the local store on the self-host head. Never
-///                          called for a creation (`known_complete: None`), where there is no base.
+/// * `load_base_tree`     - Reads a **candidate base's** tree for the subtree prune (§9.4b W1): a
+///                          new parcel's subtree that some candidate carries at the same path is
+///                          skipped whole. The candidates are `known_complete`'s subtree and the
+///                          parcel's own immediate parents' — already-audited history in the first
+///                          case, a member of this same call that the parents-first order has
+///                          already audited in the second. Neither is mirrored into the AWS head's
+///                          audit scratch, so this reads them from object storage there and from
+///                          the local store on the self-host head. Never called for a creation
+///                          (`known_complete: None`), which takes no candidates at all.
 pub fn verify_parcel_closure_with(
     head: &str,
     known_complete: Option<&str>,
@@ -1766,14 +1768,16 @@ fn child_path(prefix: &str, name: &str) -> String {
 }
 
 /// Verify that a tree and everything below it is present in the object store, **pruning any
-/// subtree unchanged from the prior head** (§9.4b W1).
+/// subtree some candidate base already carries at that path** (§9.4b W1).
 ///
 /// **The prune, and its soundness invariant.** [`verify_parcel_closure_with`] bounds *which
 /// parcels* this runs for (only the new segment behind `known_complete`); this bounds *how much of
-/// each new parcel's tree* is walked. A subtree whose hash equals the prior head's subtree at the
+/// each new parcel's tree* is walked. A subtree whose hash equals a candidate base's subtree at the
 /// same path is skipped whole — the invariant that makes this sound: *a subtree hash identical to
-/// one under an already-complete head has, by content-addressing, the identical closure, and that
-/// closure was proven present when the prior head was committed.* Re-checking it here would not be
+/// one whose closure has already been established has, by content-addressing, the identical
+/// closure.* The establishing act differs by candidate: for `known_complete` it was proven when
+/// that head was committed; for an immediate parent it was proven by that parent's own top-level
+/// audit earlier in this same call, which is what the parents-first order guarantees.* Re-checking it here would not be
 /// meaningless — it would catch bit-rot the store suffered *since* that commit — but that guarantee
 /// was never this walk's job: store durability between commits is a store property (`gc`/`audit`
 /// re-prove it independently, and a periodic `audit --full` re-reads content precisely because a
@@ -1789,7 +1793,9 @@ fn child_path(prefix: &str, name: &str) -> String {
 /// synchronous presence checks (an S3 `HEAD` apiece on the AWS head) inside the commit Lambda's
 /// own invocation. With the prune, an unchanged chunked file's subtree is pruned by pure hash
 /// comparison, loading neither its tree nor its recipe and checking none of its chunks. It mirrors
-/// `collect_changed_closure`'s client-side prune against the prior head's trees.
+/// `collect_changed_closure`'s client-side prune, which prunes against the same candidate set —
+/// every immediate parent's tree at that path — and settles a hash before checking it, for the
+/// same reason this walk does.
 ///
 /// **Completeness (W4 preserved).** A subtree or file that is explained by no candidate base is
 /// walked exactly as before — a changed chunked file still descends its recipe and presence-checks
@@ -1901,7 +1907,7 @@ fn verify_tree_closure(tree_hash: &str,
         // present, or the file becomes silently unmaterializable the moment someone fetches it.
         // (gc's own descent is presence-*tolerant*; this one is the opposite, exactly because a
         // ref move is a durability promise a fetch is not.) The prune above only reaches this for
-        // a file the prior head does not already vouch for, so W4 is never weakened.
+        // a file no candidate base already vouches for, so W4 is never weakened.
         if file.item_type.is_chunked() {
             verify_chunked_file(&file.hash, reverify, load_recipe_chunks, chunks_missing)?;
         }
