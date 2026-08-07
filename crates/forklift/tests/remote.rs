@@ -356,6 +356,77 @@ fn prepare_warehouse(area: &TestArea, name: &str, remote_url: &str) {
     assert_success(&area.forklift(name, &["config", "remote.url", remote_url]));
 }
 
+/// FORK-109, at the site the bug actually lived: `lift_pallet_inner`'s candidate loop.
+///
+/// The loop walks each new parcel's tree against its parents' trees, and shares one
+/// `seen_trees` ledger across the whole push — recording a subtree as visited *before* the
+/// base-explained check, so a hash pruned once is never collected again. That is correct only
+/// if parents are walked before their children. The old code iterated a reversed DFS preorder,
+/// which is not a topological order.
+///
+/// The DAG below is the smallest one that exposes it end to end. `P` introduces `shared/`; `A`
+/// and `B` both descend from `P` and leave `shared/` alone; `M` merges them:
+///
+/// ```text
+///   R (remote head) → P → A ┐
+///                     └─ B ─┴→ M (local head)
+/// ```
+///
+/// The DFS emits `[M, B, P, A]`, so reversing it walks `A` before its own parent `P`. `A`
+/// prunes `shared/` as explained by `P` and marks the hash seen; `P`'s own walk then reaches
+/// `shared/` — genuinely new, since `R` has never seen it — finds it already marked, and skips
+/// it. The subtree and its blob are never uploaded, the server's closure audit refuses the
+/// push, and because the walk is deterministic the retry fails identically.
+///
+/// A unit test on the ordering function cannot catch a regression here: the loop can be
+/// rewritten `for parcel_hash in new_parcels.iter().rev()` and still compile, with every
+/// ordering test green. This one fails.
+#[test]
+fn a_lift_uploads_a_subtree_introduced_by_a_parent_of_both_merge_sides() {
+    let area = TestArea::new("fork109-merge-order");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "a", &server.url);
+    area.write_file("a/base.txt", "base\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "base"]));
+    assert_success(&area.forklift("a", &["office", "enroll"]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    // P — introduces `shared/`, which neither branch below will touch. Not lifted, so it is
+    // part of the push under test.
+    area.write_file("a/shared/s.txt", "introduced by P\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "P adds shared/"]));
+    let p = pallet_head(&area, "a", "main");
+
+    // B — a second line off P, touching only a root file.
+    assert_success(&area.forklift("a", &["palletize", "side", &p])); // palletize also shifts
+    area.write_file("a/b.txt", "b\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "B edits b.txt"]));
+
+    // A — back on main, also off P, also touching only a root file.
+    assert_success(&area.forklift("a", &["shift", "main"]));
+    area.write_file("a/a.txt", "a\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "A edits a.txt"]));
+
+    // M — the merge. Its ancestry re-reaches P through both sides.
+    assert_success(&area.forklift("a", &["consolidate", "side"]));
+
+    // The push carries M, A, B and P against a remote still at the base. If `shared/` is
+    // dropped from the candidate set, the server's closure audit refuses this.
+    let lifted = area.forklift("a", &["lift"]);
+    assert_success(&lifted);
+
+    // And the content really arrived: a fresh franchise materializes the subtree P introduced.
+    assert_success(&area.forklift(".", &["franchise", &server.url, "verify"]));
+    assert_eq!(area.read_file("verify/shared/s.txt"), "introduced by P\n");
+    assert_eq!(area.read_file("verify/a.txt"), "a\n");
+    assert_eq!(area.read_file("verify/b.txt"), "b\n");
+}
+
 #[test]
 fn lift_franchise_lower_round_trip() {
     let area = TestArea::new("round-trip");

@@ -22,7 +22,7 @@ use crate::globals::{self, StorageRootScope};
 use crate::util::office_utils::OFFICE_PALLET_NAME;
 use crate::util::scope_utils::{self, MaterializationScope, ScopeClass};
 use crate::util::{
-    bundle_utils, config_utils, file_utils, graph_utils, merge_utils, object_utils, office_utils,
+    bundle_utils, config_utils, file_utils, merge_utils, object_utils, office_utils,
     pack_utils, pallet_utils, sign_utils,
 };
 
@@ -4440,15 +4440,28 @@ async fn lift_pallet_inner(client: &RemoteClient,
 /// content that is nowhere, the content is never negotiated or uploaded, and the push fails
 /// the server's closure audit **identically on every retry**, wedging the lift fail-closed.
 ///
-/// Sorting by ascending generation number is what makes that true, and it is genuinely
-/// topological: a parent's generation is strictly less than its child's. The walk itself is a
-/// stack-driven DFS, and reversing a DFS preorder is *not* a topological order — an
-/// unequal-branch merge (two parents sharing a grandparent, one branch longer) puts a parcel
-/// before its own parent. That was FORK-109; the fix is the order, not the walk.
+/// The order comes from a topological sort of the walked set against **its own** parent edges,
+/// which the walk has already loaded. Only parents inside the set constrain anything: a parent
+/// outside it is on the remote already, so it explains content that is provably there.
 ///
-/// Generations are read through `graph_utils::generation`, which computes and caches a missing
-/// record on demand — a first lift of a fresh chain has no precomputed generations, and would
-/// otherwise be exactly the case that silently falls back to an arbitrary order.
+/// Deliberately *not* a sort by commit-graph generation number, though that is also
+/// topological and was this fix's first form. Reading generations calls `graph_utils::ensure`,
+/// which walks below the lifted set to the first parcel carrying a stored record, computes a
+/// record for every parcel on the way, and persists the lot. On a first lift — `remote_head`
+/// `None`, where `is_ancestor` never runs — that is a whole commit-graph build and shard flush
+/// newly attached to the lift path. Ordering the walked set against its own edges costs no
+/// object read the walk has not already paid for and writes nothing.
+///
+/// What that choice is *not* is a fix for absent ancestors, and the tempting version of this
+/// comment said otherwise. See
+/// `an_absent_ancestor_fails_the_walk_itself_whatever_the_order_is`: the walk already requires
+/// the remote head's whole ancestry to be readable, because `is_ancestor` can only answer
+/// *false* by exhausting it. A sealed-absent ancestor fails the lift under either ordering, and
+/// it fails before any ordering happens.
+///
+/// The walk itself is a stack-driven DFS, and reversing a DFS preorder is *not* a topological
+/// order — an unequal-branch merge (two parents sharing a grandparent, one branch longer) puts
+/// a parcel before its own parent. That was FORK-109; the fix is the order, not the walk.
 ///
 /// # Arguments
 /// * `local_head`  - The local head parcel of the pallet.
@@ -4456,10 +4469,11 @@ async fn lift_pallet_inner(client: &RemoteClient,
 ///
 /// # Returns
 /// * `Ok(Vec<String>)` - The new parcels, every parcel preceded by all of its in-set parents.
-/// * `Err(String)`     - If a parcel could not be read, or the graph is corrupt (cycle).
+/// * `Err(String)`     - If a parcel could not be read, or the walked set contains a cycle.
 fn new_parcels_parents_first(local_head: &str,
                              remote_head: Option<&str>) -> Result<Vec<String>, String> {
     let mut new_parcels: Vec<String> = Vec::new();
+    let mut parents_of: HashMap<String, Vec<String>> = HashMap::new();
     let mut queue: Vec<String> = vec![local_head.to_string()];
     let mut visited: HashSet<String> = HashSet::new();
 
@@ -4476,18 +4490,59 @@ fn new_parcels_parents_first(local_head: &str,
 
         let parcel = object_utils::load_parcel(&hash)?;
 
-        queue.extend(parcel.parents);
+        queue.extend(parcel.parents.iter().cloned());
+        parents_of.insert(hash.clone(), parcel.parents);
         new_parcels.push(hash);
     }
 
-    // Ties broken by hash purely for determinism: two parcels sharing a generation can never be
-    // parent and child, so any order between them satisfies the contract.
-    let mut keyed: Vec<(u32, String)> = new_parcels.into_iter()
-        .map(|hash| graph_utils::generation(&hash).map(|generation| (generation, hash)))
-        .collect::<Result<_, _>>()?;
-    keyed.sort();
+    // Kahn's algorithm over the walked set. `pending` counts only in-set parents, so a parcel
+    // whose parents are all on the remote is ready immediately. `ready` is a BTreeSet rather
+    // than a stack so the emitted order is a function of the DAG alone — two runs over the same
+    // history produce the same order, which keeps a failure reproducible.
+    let in_set: HashSet<&str> = new_parcels.iter().map(|hash| hash.as_str()).collect();
+    let mut pending: HashMap<&str, usize> = HashMap::new();
+    let mut children_of: HashMap<&str, Vec<&str>> = HashMap::new();
 
-    Ok(keyed.into_iter().map(|(_, hash)| hash).collect())
+    for hash in &new_parcels {
+        let in_set_parents = parents_of[hash].iter()
+            .filter(|parent| in_set.contains(parent.as_str()));
+
+        let mut count = 0;
+        for parent in in_set_parents {
+            children_of.entry(parent.as_str()).or_default().push(hash.as_str());
+            count += 1;
+        }
+        pending.insert(hash.as_str(), count);
+    }
+
+    let mut ready: std::collections::BTreeSet<&str> = pending.iter()
+        .filter(|(_, count)| **count == 0)
+        .map(|(hash, _)| *hash)
+        .collect();
+
+    let mut ordered: Vec<String> = Vec::with_capacity(new_parcels.len());
+
+    while let Some(hash) = ready.pop_first() {
+        ordered.push(hash.to_string());
+
+        for child in children_of.get(hash).into_iter().flatten() {
+            let count = pending.get_mut(*child).expect("every walked parcel has a pending count");
+            *count -= 1;
+            if *count == 0 {
+                ready.insert(child);
+            }
+        }
+    }
+
+    if ordered.len() != new_parcels.len() {
+        return Err(format!(
+            "The parcel graph has a cycle among the {} parcels being lifted (only {} could be \
+             ordered after their parents); the warehouse is corrupt.",
+            new_parcels.len(), ordered.len()
+        ));
+    }
+
+    Ok(ordered)
 }
 
 /// Collect the objects of a tree that its bases — the trees at the same path in the parcel's
@@ -6061,6 +6116,47 @@ mod tests {
              parcel before its own parent, but this order satisfies parents-first, so the \
              assertion above proves nothing. Order was {:?}",
             reversed
+        );
+    }
+
+    /// A review of FORK-109 proposed that ordering by commit-graph generation would regress a
+    /// sparse, shallow or narrowed warehouse, on the reasoning that `graph_utils::ensure` reads
+    /// below the lifted set where an ancestor can be legitimately absent, while the walk prunes
+    /// at every ancestor of the remote head and never goes there.
+    ///
+    /// **It does not, and this test is why the claim is not repeated in the doc comment above.**
+    /// The walk prunes via `merge_utils::is_ancestor`, which can only answer *false* — the
+    /// answer every new parcel needs — by exhausting the remote head's entire ancestry. So the
+    /// walk already demands exactly the objects the argument assumes it avoids, and a
+    /// sealed-absent ancestor fails the lift before any ordering happens, under either order.
+    ///
+    /// The reason to order against the walked set's own edges is cost, not this: it reads
+    /// nothing the walk has not already read and persists no graph shard. Pinned here so the
+    /// generation sort is not re-proposed on a correctness argument that does not hold.
+    #[test]
+    fn an_absent_ancestor_fails_the_walk_itself_whatever_the_order_is() {
+        let _scratch = Scratch::new("fork109-absent-ancestor");
+
+        // R is the remote head and its parent was never stored — a sealed or narrowed slice.
+        let absent = "f".repeat(64);
+        let r = stack(vec![absent], "R remote head over an absent parent");
+        let a = stack(vec![r.clone()], "A new");
+        let m = stack(vec![a.clone()], "M head");
+
+        let walked = new_parcels_parents_first(&m, Some(&r));
+        assert!(
+            walked.is_err(),
+            "the walk itself must fail on an unreadable ancestor of the remote head — if this \
+             ever succeeds, the ordering choice becomes load-bearing for sparse warehouses and \
+             the doc comment above needs revisiting. Got {:?}",
+            walked
+        );
+
+        // And the generation route fails on the very same object, so it was never the cause.
+        let via_generation = crate::util::graph_utils::generation(&m);
+        assert!(
+            via_generation.is_err(),
+            "the generation route must fail on the same absent ancestor, not survive it"
         );
     }
 
