@@ -185,6 +185,49 @@ fn office() -> (office_utils::TrustAnchor, office_utils::OfficeState) {
     (anchor, state)
 }
 
+/// The unbounded audit reports the newest failure, because it walks breadth-first from `head`.
+///
+/// FORK-94 gave the *incremental* gate a parents-first sort, which its candidate bases require.
+/// The unbounded walk needs no such order — with no `known_complete` its base set is empty at
+/// every parcel — and applying the sort there anyway would have silently swapped which of several
+/// missing objects an operator is told about, from newest-first to genesis-first. That is the mode
+/// several tests above use as their control, so the sort is gated and this pins the order that
+/// gating preserves. Ungate it and this test names the wrong blob.
+#[test]
+fn the_unbounded_audit_reports_the_newest_missing_object_not_the_oldest() {
+    let warehouse = Warehouse::new("fork94-unbounded-order");
+
+    let old = warehouse.stack_files(&[("old.txt", "old\n")], "K introduces old.txt");
+    let new = warehouse.stack_files(&[("new.txt", "new\n")], "N introduces new.txt");
+
+    warehouse.scoped(|| {
+        graph_utils::build_from_heads(std::slice::from_ref(&new)).expect("warm the graph");
+
+        let old_tree = object_utils::load_parcel(&old).unwrap().tree_hash;
+        let new_tree = object_utils::load_parcel(&new).unwrap().tree_hash;
+
+        // One blob per parcel, so which one the error names says which parcel was walked first.
+        let (old_blob, _) = object_utils::resolve_tree_file(&old_tree, "old.txt")
+            .unwrap()
+            .expect("old.txt is tracked");
+        let (new_blob, _) = object_utils::resolve_tree_file(&new_tree, "new.txt")
+            .unwrap()
+            .expect("new.txt is tracked");
+        assert_ne!(old_blob, new_blob, "the two blobs must differ or the order is unobservable");
+
+        warehouse.delete_object(&old_blob);
+        warehouse.delete_object(&new_blob);
+
+        let err = audit_utils::verify_parcel_closure(&new, None)
+            .expect_err("both blobs are gone, so the unbounded walk must fail");
+        assert!(
+            err.contains(&new_blob) && !err.contains(&old_blob),
+            "the unbounded audit must name the newest failure ({}), not the oldest ({}): {}",
+            new_blob, old_blob, err
+        );
+    });
+}
+
 /// A linear lift audits only its new parcels: the ancestry behind `old_head` is not read,
 /// so deleting it changes nothing.
 #[test]
@@ -385,10 +428,6 @@ fn the_prune_skips_an_unchanged_chunked_file_but_a_touching_push_still_catches_a
     });
 }
 
-/// `audit --full` re-reads every present chunk's bytes (§9.4b): a chunk whose on-disk bytes are
-/// corrupted — but still *present* — passes a normal (presence-only) audit yet fails a `--full`
-/// audit, because the content-addressed re-read re-hashes it and finds the mismatch. This is the
-/// integrity a normal audit deliberately does not pay for, made explicit.
 /// FORK-94, the soundness half: a child must never shield its own parent's audit.
 ///
 /// The prune's candidate bases now include the parcel's **immediate parents**, not only
@@ -577,6 +616,10 @@ fn a_copied_subtree_is_free_once_its_source_has_been_settled_but_not_before() {
     });
 }
 
+/// `audit --full` re-reads every present chunk's bytes (§9.4b): a chunk whose on-disk bytes are
+/// corrupted — but still *present* — passes a normal (presence-only) audit yet fails a `--full`
+/// audit, because the content-addressed re-read re-hashes it and finds the mismatch. This is the
+/// integrity a normal audit deliberately does not pay for, made explicit.
 #[test]
 fn full_audit_re_reads_chunks_and_catches_corruption_a_presence_check_misses() {
     let warehouse = Warehouse::new("full-audit-chunk");

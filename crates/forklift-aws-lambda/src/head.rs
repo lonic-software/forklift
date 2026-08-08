@@ -445,11 +445,20 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             // The subtree prune (§9.4b W1) reads a candidate base's trees to skip subtrees some
             // candidate already carries at that path. The candidates are the prior head's tree and
             // each parcel's own immediate parents' — the first already-audited history, the second
-            // audited earlier in the same call by the parents-first order. Neither is mirrored into
-            // the audit scratch (which keeps parcel bodies, not their trees), so both are read from
-            // the object store here — and (the point of the prune) an unchanged large chunked file
-            // below such a subtree is skipped whole, sparing the ~million per-chunk S3 `HEAD`s its
-            // recipe descent would otherwise cost per push. Reads must stay on this seam: a direct
+            // audited earlier in the same call by the parents-first order.
+            //
+            // The prior head's tree is *not* in the audit scratch — `scratch::materialize` stops
+            // expanding at the bound, and below it mirrors parcel bodies only — so that read has
+            // to come from the object store. An in-segment parent's trees, by contrast, are
+            // mirrored (such a parcel is expanded `full`), so those reads re-fetch bytes already
+            // on local disk. That waste is accepted rather than special-cased: reading a parent's
+            // base locally and the bound's remotely would make this one seam two, and the local
+            // one would be correct only for as long as `materialize` keeps expanding every
+            // in-segment parent. One seam, one rule.
+            //
+            // The prune's point, either way: an unchanged large chunked file below such a subtree
+            // is skipped whole, sparing the ~million per-chunk S3 `HEAD`s its recipe descent would
+            // otherwise cost per push. Reads must stay on this seam: a direct
             // object_utils::load_tree would pass every self-host test and every warm-container run,
             // then fail on a cold scratch — which the prune's tolerant fallback would turn into a
             // silent full walk, reopening on this head the very asymmetry the prune closes.
