@@ -1403,18 +1403,27 @@ pub fn verify_parcel_closure(head: &str, known_complete: Option<&str>) -> Result
 ///                          file's thousands of chunks verify in a second or two rather than one
 ///                          slow round trip apiece under API Gateway's hard timeout.
 /// * `load_recipe_chunks` - Returns the ordered chunk hashes of a recipe (the list `chunks_missing`
-///                          probes). The local path reads the recipe from the object store; the AWS
-///                          head reads it from object storage (its recipes are not mirrored into the
-///                          audit scratch), which is why the read is a parameter, not a hard-coded
-///                          load.
+///                          probes). The local path reads the recipe from the object store; so does
+///                          the AWS head, which is why the read is a parameter and not a hard-coded
+///                          load. A recipe is a file-entry object, so the audit scratch holds one
+///                          only when the mirror was told to take file blobs — which it is for a
+///                          meta pallet and is not for a working one. Reading through the parameter
+///                          is correct in both modes; assuming either is not.
 /// * `load_base_tree`     - Reads a **candidate base's** tree for the subtree prune (§9.4b W1): a
 ///                          new parcel's subtree that some candidate carries at the same path is
 ///                          skipped whole. The candidates are `known_complete`'s subtree and the
 ///                          parcel's own immediate parents' — already-audited history in the first
 ///                          case, a member of this same call that the parents-first order has
-///                          already audited in the second. Neither is mirrored into the AWS head's
-///                          audit scratch, so this reads them from object storage there and from
-///                          the local store on the self-host head. Never called for a creation
+///                          already audited in the second. On the AWS head, a working pallet's
+///                          `known_complete` tree is *not* in the audit scratch — the mirror
+///                          stops expanding at the bound — so this must read from object
+///                          storage; an in-segment parent's trees *are* mirrored, and the
+///                          re-fetch is the accepted price of one seam rather than two. Neither
+///                          half is a rule to lean on: the office chain gets its own unbounded
+///                          mirror, so on a meta push the bound's tree may be present after all.
+///                          Read through this parameter and the mode stops mattering. On the
+///                          self-host head
+///                          everything comes from the local store. Never called for a creation
 ///                          (`known_complete: None`), which takes no candidates at all.
 pub fn verify_parcel_closure_with(
     head: &str,
@@ -1443,9 +1452,12 @@ pub fn verify_parcel_closure_with(
     // empty at every parcel), only which of several missing objects it names first — which is a
     // documented property of that mode, is what the tests using it as a control read, and is not
     // this change's to alter. So the unbounded walk keeps its order, and pays for no sort. The
-    // one thing that rides with the gate is the cycle check: an unbounded audit of a cyclic
-    // warehouse still terminates (the sweep's `visited` set closes it) and still closure-checks
-    // every parcel it reaches, it simply does not name the cycle.
+    // one thing that rides with the gate is the cycle check, and it is cycle *refusal*, not merely
+    // cycle naming: against the ungated form an unbounded audit of a cyclic record view turns Err
+    // into Ok. Against what ships today it forfeits nothing — the replaced code had no cycle
+    // check in either mode — but the honest statement is the stronger one. Such an audit still
+    // terminates (the sweep's `visited` set closes it) and still closure-checks every parcel it
+    // reaches; it just no longer refuses on the cycle itself.
     //
     // The edges come through `graph_utils::parents`, the same accessor `new_parcels` swept with,
     // so the prune cannot see a parent edge the sweep did not — and they are read once here and
@@ -1484,6 +1496,14 @@ pub fn verify_parcel_closure_with(
     // Content can move away and come back, so a parcel that reverts a path to `known_complete`'s
     // content is explained free today and would cost a full descent under a parents-only prune.
     // Keeping both makes the skip set a superset of the current one by construction.
+    // `.ok()` is the walk's *third* mirror-dependent local read, and the quietest: the boundary-
+    // parent arm below at least names itself, and the per-member load is loud (it errors). This one
+    // fails to a `None` that reads as "creation, no candidates". On a linear push the sole parent
+    // *is* `known_complete`, so the arm below re-reads this same parcel and fails the same way —
+    // the candidate list ends up empty and every push walks whole. Tolerant in the safe direction
+    // (more is verified, never less) but invisible, so any future bounding of the AWS ancestry
+    // mirror has to cover this read and the arm below together; covering only the named one leaves
+    // the common case silently unpruned.
     let base_root: Option<String> = match known_complete {
         Some(known) => object_utils::load_parcel(known).ok().map(|parcel| parcel.tree_hash),
         None => None,

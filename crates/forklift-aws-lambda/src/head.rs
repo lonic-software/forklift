@@ -459,9 +459,13 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             // The prune's point, either way: an unchanged large chunked file below such a subtree
             // is skipped whole, sparing the ~million per-chunk S3 `HEAD`s its recipe descent would
             // otherwise cost per push. Reads must stay on this seam: a direct
-            // object_utils::load_tree would pass every self-host test and every warm-container run,
-            // then fail on a cold scratch — which the prune's tolerant fallback would turn into a
-            // silent full walk, reopening on this head the very asymmetry the prune closes.
+            // object_utils::load_tree would pass every self-host test, and pass or fail here by
+            // container history rather than by anything a test can name — the pool is keyed per
+            // warehouse and per process, so whether the bound's tree happens to be on disk depends
+            // on which pushes this container served before, not on "cold" versus "warm". The prune
+            // then turns the failures it does hit into a silent full walk, reopening on this head
+            // the very asymmetry the prune closes. There is no environment class that reliably
+            // catches it, which is why the rule is the seam and not a test.
             let load_base_tree = |hash: &str| -> Result<TreeItem, String> {
                 let bytes = self
                     .objects
