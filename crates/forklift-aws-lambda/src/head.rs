@@ -442,11 +442,33 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                     .map(|chunk| chunk.hash)
                     .collect())
             };
-            // The subtree prune (§9.4b W1) reads the prior head's trees to skip unchanged subtrees.
-            // Like recipes, those trees are already-audited history and are never mirrored into the
-            // audit scratch, so they are read from the object store here — and (the point of the
-            // prune) an unchanged large chunked file below such a subtree is skipped whole, sparing
-            // the ~million per-chunk S3 `HEAD`s its recipe descent would otherwise cost per push.
+            // The subtree prune (§9.4b W1) reads a candidate base's trees to skip subtrees some
+            // candidate already carries at that path. The candidates are the prior head's tree and
+            // each parcel's own immediate parents' — the first already-audited history, the second
+            // audited earlier in the same call by the parents-first order.
+            //
+            // The prior head's tree is *not* in the audit scratch, so that read has to come from
+            // the object store. `materialize` clears `full` at the bound *hash*, not at the fresh
+            // frontier — so it stops expanding along paths through the bound and nowhere else. A
+            // merge's second parent is below no bound, so it and its whole ancestry are expanded
+            // full; the property this seam rests on is only ever about `known_complete` itself.
+            //
+            // An in-segment parent's trees, by contrast, are mirrored (such a parcel is expanded
+            // `full`), so those reads re-fetch bytes already on local disk. That waste is accepted
+            // rather than special-cased: reading a parent's base locally and the bound's remotely
+            // would make this one seam two, and the local one would be correct only for as long as
+            // `materialize` keeps expanding every in-segment parent. One seam, one rule.
+            //
+            // The prune's point, either way: an unchanged large chunked file below such a subtree
+            // is skipped whole, sparing the ~million per-chunk S3 `HEAD`s its recipe descent would
+            // otherwise cost per push. Reads must stay on this seam: a direct
+            // object_utils::load_tree would pass every self-host test, and pass or fail here by
+            // container history rather than by anything a test can name — the pool is keyed per
+            // warehouse and per process, so whether the bound's tree happens to be on disk depends
+            // on which pushes this container served before, not on "cold" versus "warm". The prune
+            // then turns the failures it does hit into a silent full walk, reopening on this head
+            // the very asymmetry the prune closes. There is no environment class that reliably
+            // catches it, which is why the rule is the seam and not a test.
             let load_base_tree = |hash: &str| -> Result<TreeItem, String> {
                 let bytes = self
                     .objects

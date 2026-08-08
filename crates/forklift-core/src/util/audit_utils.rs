@@ -783,15 +783,30 @@ const KNOWN: u8 = 2;
 /// * `Ok(Vec<String>)` - The new parcels, breadth-first from `head`.
 /// * `Err(String)`     - If a parcel is in neither the commit-graph nor the object store.
 pub fn new_parcels(head: &str, known_verified: Option<&str>) -> Result<Vec<String>, String> {
+    Ok(new_parcels_with_edges(head, known_verified)?.0)
+}
+
+/// [`new_parcels`], also returning the parent edges the walk read on its way.
+///
+/// The edges are not a convenience: `graph_utils::parents` falls back to decoding the parcel when
+/// the commit-graph has no record, so a caller that needs them too — the closure audit, whose
+/// candidate bases *are* the parents — would otherwise decode every parcel of the segment twice.
+/// Returning them makes the audit's ordering and its candidate bases share one view of who a
+/// parent is, which is the property the ordering's soundness actually rests on.
+fn new_parcels_with_edges(head: &str, known_verified: Option<&str>)
+                          -> Result<(Vec<String>, HashMap<String, Vec<String>>), String> {
     let fresh: Option<HashSet<String>> = match known_verified {
         None => None,
-        Some(bound) if bound == head => return Ok(Vec::new()),
+        Some(bound) if bound == head => return Ok((Vec::new(), HashMap::new())),
         Some(bound) => Some(fresh_frontier(head, bound)?),
     };
 
-    // Breadth-first from `head`, so the order — and therefore the first failure an audit
-    // reports — is exactly what the unbounded walk produced.
+    // Breadth-first from `head`, so the order — and therefore the first failure reported — is
+    // exactly what the unbounded walk produced. Callers that need a different order sort this;
+    // `verify_parcel_closure_with` does, but only for the incremental gate, precisely so that the
+    // unbounded audit's reported failure stays the one this order picks.
     let mut order: Vec<String> = Vec::new();
+    let mut edges: HashMap<String, Vec<String>> = HashMap::new();
     let mut queue: VecDeque<String> = VecDeque::new();
     let mut visited: HashSet<String> = HashSet::new();
 
@@ -806,14 +821,17 @@ pub fn new_parcels(head: &str, known_verified: Option<&str>) -> Result<Vec<Strin
             continue;
         }
 
-        for parent in graph_utils::parents(&hash)? {
-            queue.push_back(parent);
+        let parents = graph_utils::parents(&hash)?;
+
+        for parent in &parents {
+            queue.push_back(parent.clone());
         }
 
+        edges.insert(hash.clone(), parents);
         order.push(hash);
     }
 
-    Ok(order)
+    Ok((order, edges))
 }
 
 /// The set behind [`new_parcels`]: parcels reachable from `head` but not from `bound`.
@@ -1385,17 +1403,28 @@ pub fn verify_parcel_closure(head: &str, known_complete: Option<&str>) -> Result
 ///                          file's thousands of chunks verify in a second or two rather than one
 ///                          slow round trip apiece under API Gateway's hard timeout.
 /// * `load_recipe_chunks` - Returns the ordered chunk hashes of a recipe (the list `chunks_missing`
-///                          probes). The local path reads the recipe from the object store; the AWS
-///                          head reads it from object storage (its recipes are not mirrored into the
-///                          audit scratch), which is why the read is a parameter, not a hard-coded
-///                          load.
-/// * `load_base_tree`     - Reads a tree object of the **prior head** (`known_complete`) for the
-///                          subtree prune (§9.4b W1): a new parcel's subtree unchanged from the
-///                          prior head is skipped whole. The prior head's subtrees are already-
-///                          audited history — the AWS head never mirrors them into the audit
-///                          scratch — so, like the recipe read, this reads them from object storage
-///                          on that head and from the local store on the self-host head. Never
-///                          called for a creation (`known_complete: None`), where there is no base.
+///                          probes). The local path reads the recipe from the object store; so does
+///                          the AWS head, which is why the read is a parameter and not a hard-coded
+///                          load. A recipe is a file-entry object, so the audit scratch holds one
+///                          only when the mirror was told to take file blobs — which it is for a
+///                          meta pallet and is not for a working one. Reading through the parameter
+///                          is correct in both modes; assuming either is not.
+/// * `load_base_tree`     - Reads a **candidate base's** tree for the subtree prune (§9.4b W1): a
+///                          new parcel's subtree that some candidate carries at the same path is
+///                          skipped whole. The candidates are `known_complete`'s subtree and the
+///                          parcel's own immediate parents' — already-audited history in the first
+///                          case, a member of this same call that the parents-first order has
+///                          already audited in the second. On the AWS head, a working pallet's
+///                          `known_complete` tree is *not* in the audit scratch — the mirror
+///                          clears its full-expansion flag at that one *hash*, so the bound
+///                          alone is spared — and this must read it from object storage. An
+///                          in-segment parent's trees *are* mirrored, and the re-fetch is the
+///                          accepted price of one seam rather than two. Neither half is a rule
+///                          to lean on: the office chain gets its own unbounded mirror, so on a
+///                          meta push the bound's tree may be present after all. Read through
+///                          this parameter and the mode stops mattering. On the self-host head
+///                          everything comes from the local store. Never called for a creation
+///                          (`known_complete: None`), which takes no candidates at all.
 pub fn verify_parcel_closure_with(
     head: &str,
     known_complete: Option<&str>,
@@ -1408,17 +1437,84 @@ pub fn verify_parcel_closure_with(
     // that head was committed. This walk used to build its prune set with
     // `collect_reachable(known_complete)`, which decoded every parcel body in the ancestry —
     // O(history) on every ref update, however little the lift added.
-    let parcels = new_parcels(head, known_complete)
+    let (parcels, parents_of) = new_parcels_with_edges(head, known_complete)
         .map_err(|e| format!("The history behind {} is incomplete: {}", head, e))?;
 
-    // The base each new parcel's tree is pruned against (§9.4b W1): the prior head's root tree.
-    // Soundness — a subtree byte-identical to the prior head's at the same path has, by content-
-    // addressing, the identical closure, and that closure was proven present when `known_complete`
-    // was committed; so skipping it re-checks nothing that was not already checked. Completeness —
-    // any subtree that is *not* identical is walked (once, deduped by `visited_trees`), so every
-    // object the new segment introduces is still presence-checked. `known_complete` is trusted
-    // ancestry the audit never re-verifies (a parcel lost behind it does not fail this walk today),
-    // so a base that cannot be read degrades to no base — a full walk, always sound.
+    // Parents first — but only for the incremental gate, and for the same reason the parent bases
+    // below are gated: it is the parent bases that need the order, and with `known_complete: None`
+    // there are none. `new_parcels` returns the segment breadth-first *from head*, so a child
+    // precedes the parent that explains it — the order the ordinary audit reports failures in, and
+    // deliberately left alone there. This walk needs the opposite, because a parcel's own parents
+    // are candidate bases below and may only explain content their own top-level audit has already
+    // settled.
+    //
+    // Reordering the unbounded walk would change nothing about what it *accepts* (its base set is
+    // empty at every parcel), only which of several missing objects it names first — which is a
+    // documented property of that mode, is what the tests using it as a control read, and is not
+    // this change's to alter. So the unbounded walk keeps its order, and pays for no sort. The
+    // one thing that rides with the gate is the cycle check, and it is cycle *refusal*, not merely
+    // cycle naming: against the ungated form an unbounded audit of a cyclic record view turns Err
+    // into Ok. Against what ships today it forfeits nothing — the replaced code had no cycle
+    // check in either mode — but the honest statement is the stronger one. Such an audit still
+    // terminates (the sweep's `visited` set closes it) and still closure-checks every parcel it
+    // reaches; it just no longer refuses on the cycle itself.
+    //
+    // Which leaves the refusal on the push gate and not on the command chartered to find
+    // corruption: `forklift audit` goes through `verify_parcel_closure_scoped`, which builds its
+    // segment with `new_parcels` and so has no edges to check, gate or no gate. That is not this
+    // change's doing — that path never had a cycle check — but it is where one belongs, and
+    // putting it there is its own change with its own test (FORK-111).
+    //
+    // The edges come through `graph_utils::parents`, the same accessor `new_parcels` swept with,
+    // so the prune cannot see a parent edge the sweep did not — and they are read once here and
+    // reused as the candidate bases below.
+    //
+    // Ordered by a topological sort of the segment against its own edges, deliberately *not* by
+    // commit-graph generation number.
+    //
+    // Not for cost: at the AWS gate the scratch mirrors ancestry parcel bodies, so `ensure`'s loads
+    // are local decodes, and `fresh_frontier` above already calls `node` on every parcel it first
+    // sees — an ordering that read generations would mostly be paying a bill already paid. The
+    // reason is correctness. `graph_utils::node` returns a *stored* record without validating it
+    // and self-heals only a miss, so ascending-generation is topological exactly as far as those
+    // records are right. Sorting against the edges the membership sweep itself read cannot
+    // disagree with membership even in principle, which is a stronger discharge of the same
+    // obligation. That it also costs no additional read is a bonus, not the argument.
+    let ordered = match known_complete {
+        Some(_) => parents_first(&parcels, &parents_of).ok_or_else(|| {
+            format!("The history behind {} has a cycle; the warehouse is corrupt.", head)
+        })?,
+        None => parcels,
+    };
+
+    // The candidate bases a parcel's tree is pruned against (§9.4b W1): `known_complete`'s root
+    // tree, **and** the parcel's own immediate parents' root trees.
+    //
+    // Soundness — a subtree byte-identical to a candidate's at the same path has, by content-
+    // addressing, the identical closure. For `known_complete` that closure was proven present when
+    // it was committed; for a parent inside this segment it was proven by that parent's own
+    // top-level audit, which the parents-first order has already run. Completeness — a subtree no
+    // candidate explains is walked (once, deduped by `visited_trees`), so the audit never advances
+    // a ref over content whose presence neither an accepted push nor an earlier-audited member of
+    // this same call has established.
+    //
+    // Why the union rather than replacing the root: dropping `known_complete` is not never-worse.
+    // Content can move away and come back, so a parcel that reverts a path to `known_complete`'s
+    // content is explained free today and would cost a full descent under a parents-only prune.
+    // Keeping both makes the skip set a superset of the current one by construction.
+    // `.ok()` is the walk's *third* mirror-dependent local read, and the quietest: the boundary-
+    // parent arm below at least names itself, and the per-member load is loud (it errors). This one
+    // fails to a `None` that reads as "creation, no candidates". On a linear push the sole parent
+    // *is* `known_complete`, so the arm below re-reads this same parcel and fails the same way —
+    // the candidate list ends up empty and every push walks whole. Tolerant in the safe direction
+    // (more is verified, never less) but invisible.
+    //
+    // The obligation this creates is *not* "cover the tolerant reads". The membership sweep's own
+    // body reads — `graph_utils::node`'s `ensure` and `graph_utils::parents`'s load — reach
+    // below the bound too and are **not** tolerant, so bounding the ancestry mirror to exactly the
+    // reads named here would break the audit at its first step rather than degrade it. Tolerance
+    // sorts these reads by how their failure *presents*, loud or silent; it does not sort them by
+    // which ones the mirror has to keep answering. It has to answer all of them.
     let base_root: Option<String> = match known_complete {
         Some(known) => object_utils::load_parcel(known).ok().map(|parcel| parcel.tree_hash),
         None => None,
@@ -1426,12 +1522,82 @@ pub fn verify_parcel_closure_with(
 
     let mut visited_trees: HashSet<String> = HashSet::new();
 
-    for hash in &parcels {
+    // Each parcel's tree hash, remembered as it is audited. The parents-first order means every
+    // in-segment parent has already passed through this loop by the time a child needs its tree,
+    // so a candidate base costs a map lookup rather than a re-decode of a parcel this walk has
+    // already read. Only boundary parents — the fork points just below `known_complete`, which the
+    // segment excludes — fall through to a load.
+    let mut tree_of: HashMap<String, String> = HashMap::new();
+
+    // Seed with `known_complete`: it is the boundary parent of every linear push, and its tree was
+    // already loaded above for `base_root`. Without this the common case pays a second read of the
+    // same parcel purely to learn a hash already in hand.
+    if let (Some(known), Some(root)) = (known_complete, base_root.as_ref()) {
+        tree_of.insert(known.to_string(), root.clone());
+    }
+
+    for hash in &ordered {
         let parcel = object_utils::load_parcel(hash)
             .map_err(|e| format!("The history behind {} is incomplete: {}", head, e))?;
 
+        tree_of.insert(hash.clone(), parcel.tree_hash.clone());
+
+        // Parents through `graph_utils::parents` — the same accessor `new_parcels` swept with, so
+        // the prune cannot see a parent edge the sweep did not. Reading the parcel body directly
+        // here would be a second, uncorroborated view of "who is a parent", and a parent visible to
+        // one and not the other is exactly the case the soundness induction has no third arm for.
+        // Each parent's tree is read tolerantly: a candidate that cannot be resolved contributes no
+        // explanations, so the walk verifies more rather than less.
+        let mut bases: Vec<String> = base_root.iter().cloned().collect();
+
+        // Parent bases are the incremental gate's optimization, and only its. With no
+        // `known_complete` this call is the unbounded walk — the one an operator runs to prove a
+        // warehouse whole, and the one these tests use as the control that a deleted object really
+        // was deleted. Pruning it against parents would still be *sound* by the same induction
+        // (a root parcel has no parents and is walked whole, and every child only skips what an
+        // already-audited ancestor carries), but it would no longer walk every object, and a
+        // control that prunes is not a control. Left full on purpose.
+        if known_complete.is_some() {
+            for parent in parents_of.get(hash).into_iter().flatten() {
+                match tree_of.get(parent) {
+                    Some(tree) => bases.push(tree.clone()),
+                    // A boundary parent, and the walk's *second* store seam — this one local, not
+                    // the `load_base_tree` closure the candidate trees come through. On the AWS
+                    // head it resolves only because `scratch::materialize` mirrors parcel bodies
+                    // for the whole ancestry, below the bound included. That is an obligation on
+                    // the scratch, not a coincidence: bound the ancestry mirror (an obvious
+                    // future move — it is O(history) `GET`s on a cold scratch) and this arm
+                    // starts failing, tolerantly, dropping the boundary parent's base on every
+                    // merge push and silently widening the walk. See `base_root` above for why
+                    // that obligation covers every body read below the bound, not just the two
+                    // that fail quietly.
+                    // Memoized like an in-segment parent's, so a fork point shared by n children
+                    // of this segment is decoded once rather than once per edge naming it.
+                    None => if let Ok(parent_parcel) = object_utils::load_parcel(parent) {
+                        tree_of.insert(parent.clone(), parent_parcel.tree_hash.clone());
+                        bases.push(parent_parcel.tree_hash);
+                    },
+                }
+            }
+        }
+
+        // `bases` holds *tree* hashes, so what collapses here is two candidates naming the same
+        // tree — not a parent that happens to be `known_complete`. The first parcel of a linear
+        // push is the obvious case (its only parent *is* the bound), but so is any later parcel
+        // whose ancestors left the root tree untouched. Without this, every changed level below
+        // such a parcel would load the identical base tree twice — a read apiece on the AWS head.
+        //
+        // What the dedupe does not remove: where the trees genuinely differ — the ordinary case
+        // for `N2..Nk` in a k-parcel segment, and for both sides of a merge — each changed level
+        // costs two base reads where the single-base prune cost one. That is the union's price,
+        // paid where the union is what buys the pruning. Dedupe rather than special-case any of
+        // these shapes: a merge whose sides share a tree at some path hits the same waste one level
+        // down.
+        bases.sort();
+        bases.dedup();
+
         verify_tree_closure(
-            &parcel.tree_hash, base_root.as_deref(), &mut visited_trees,
+            &parcel.tree_hash, &bases, &mut visited_trees,
             blob_exists, chunks_missing, load_recipe_chunks, load_base_tree,
             // The commit gate presence-checks; content re-verification is `audit --full` only.
             false,
@@ -1439,6 +1605,66 @@ pub fn verify_parcel_closure_with(
     }
 
     Ok(())
+}
+
+/// Order a push's new segment so every parcel follows the parents that are in the segment with it.
+///
+/// Kahn's algorithm over the induced subgraph. Only in-segment parents constrain anything: a parent
+/// outside it is at or below `known_complete`, which the audit already trusts. A `BTreeSet` ready
+/// set makes the emitted order a function of the DAG alone, so which failure an audit reports
+/// stays reproducible across runs. `None` means the segment contains a cycle.
+///
+/// The standing premise, stated because it is the one thing here that is assumed rather than
+/// established: a parent *outside* the segment is trusted on the strength of being reachable from
+/// `known_complete`, and that reachability is decided from commit-graph records this walk does not
+/// validate. Under a wrong record a boundary parent could explain content nothing has audited —
+/// the union then hides more than the single-base prune it replaces. That is accepted rather than
+/// designed away, because the boundary parent is exactly what explains the common case this prune
+/// exists to make cheap; the exposure is the commit graph's correctness, which the audit already
+/// leans on to decide segment membership at all.
+fn parents_first(segment: &[String],
+                 parents_of: &HashMap<String, Vec<String>>) -> Option<Vec<String>> {
+    let in_segment: HashSet<&str> = segment.iter().map(String::as_str).collect();
+    let mut pending: HashMap<&str, usize> = HashMap::new();
+    let mut children_of: HashMap<&str, Vec<&str>> = HashMap::new();
+
+    for hash in segment {
+        let mut count = 0;
+
+        for parent in parents_of.get(hash).into_iter().flatten() {
+            if in_segment.contains(parent.as_str()) {
+                children_of.entry(parent.as_str()).or_default().push(hash.as_str());
+                count += 1;
+            }
+        }
+
+        pending.insert(hash.as_str(), count);
+    }
+
+    let mut ready: std::collections::BTreeSet<&str> = pending.iter()
+        .filter(|(_, count)| **count == 0)
+        .map(|(hash, _)| *hash)
+        .collect();
+    let mut ordered: Vec<String> = Vec::with_capacity(segment.len());
+
+    while let Some(hash) = ready.pop_first() {
+        ordered.push(hash.to_string());
+
+        for child in children_of.get(hash).into_iter().flatten() {
+            // Not `?`: `None` is this function's cycle channel, and a missing key is not a cycle.
+            // Every key in `children_of` was inserted from `segment`, which also seeded `pending`,
+            // so a miss is a bug here — and reporting it as "the warehouse is corrupt" would send
+            // an operator to scrub a warehouse that is fine.
+            let count = pending.get_mut(*child)
+                .expect("every in-segment child has a pending count");
+            *count -= 1;
+            if *count == 0 {
+                ready.insert(child);
+            }
+        }
+    }
+
+    (ordered.len() == segment.len()).then_some(ordered)
 }
 
 /// [`verify_parcel_closure`], scoped to a sparse warehouse's fetch scope.
@@ -1548,9 +1774,12 @@ fn verify_tree_closure_scoped(tree_hash: &str,
     match scope.classify(prefix) {
         ScopeClass::InScope => {
             // A sparse audit always runs full (no `known_complete`), so there is no base to prune
-            // against — pass `None`, and the full closure of this in-scope subtree is walked.
+            // against — pass an empty candidate set, and the full closure of this in-scope subtree
+            // is walked. This stays empty when the push gate's candidate set widens: the sparse
+            // path's behaviour is required to be bit-for-bit unchanged, and it is the widening's
+            // one hard boundary.
             return verify_tree_closure(
-                tree_hash, None, verified, blob_exists, chunks_missing, load_recipe_chunks,
+                tree_hash, &[], verified, blob_exists, chunks_missing, load_recipe_chunks,
                 load_base_tree, reverify,
             )
         }
@@ -1612,18 +1841,29 @@ fn child_path(prefix: &str, name: &str) -> String {
 }
 
 /// Verify that a tree and everything below it is present in the object store, **pruning any
-/// subtree unchanged from the prior head** (§9.4b W1).
+/// subtree some candidate base already carries at that path, and any whose hash this walk has
+/// already settled anywhere** (§9.4b W1).
+///
+/// Those are two prunes, and only the first is path-keyed. A hash settled once — by matching a
+/// base at its own path, or by being walked in full — is settled for every later occurrence of
+/// that hash at any path, because a closure is a property of content and content is what a hash
+/// names. So a directory copied to a second path is free once its source has been settled, and
+/// descended in full when the copy is reached first (sibling order decides which, and the
+/// relocation test asserts both directions rather than the flattering one).
 ///
 /// **The prune, and its soundness invariant.** [`verify_parcel_closure_with`] bounds *which
 /// parcels* this runs for (only the new segment behind `known_complete`); this bounds *how much of
-/// each new parcel's tree* is walked. A subtree whose hash equals the prior head's subtree at the
+/// each new parcel's tree* is walked. A subtree whose hash equals a candidate base's subtree at the
 /// same path is skipped whole — the invariant that makes this sound: *a subtree hash identical to
-/// one under an already-complete head has, by content-addressing, the identical closure, and that
-/// closure was proven present when the prior head was committed.* Re-checking it here would not be
-/// meaningless — it would catch bit-rot the store suffered *since* that commit — but that guarantee
-/// was never this walk's job: store durability between commits is a store property (`gc`/`audit`
-/// re-prove it independently, and a periodic `audit --full` re-reads content precisely because a
-/// push never re-scrubs it), not something the commit-gate closure check was ever chartered to
+/// one whose closure has already been established has, by content-addressing, the identical
+/// closure.* The establishing act differs by candidate: for `known_complete` it was proven when
+/// that head was committed; for an immediate parent it was proven by that parent's own top-level
+/// audit earlier in this same call, which is what the parents-first order guarantees.
+/// Re-checking it here would not be meaningless — it would catch bit-rot the store suffered
+/// *since* that commit — but that guarantee was never this walk's job: store durability between
+/// commits is a store property (`gc`/`audit` re-prove it independently, and a periodic
+/// `audit --full` re-reads content precisely because a push never re-scrubs it), not
+/// something the commit-gate closure check was ever chartered to
 /// re-verify on every push. This is the same induction the incremental audit already rests on (a
 /// parcel lost behind `known_complete` does not fail this walk either), extended from parcels down
 /// through the tree.
@@ -1635,33 +1875,48 @@ fn child_path(prefix: &str, name: &str) -> String {
 /// synchronous presence checks (an S3 `HEAD` apiece on the AWS head) inside the commit Lambda's
 /// own invocation. With the prune, an unchanged chunked file's subtree is pruned by pure hash
 /// comparison, loading neither its tree nor its recipe and checking none of its chunks. It mirrors
-/// `collect_changed_closure`'s client-side prune against the prior head's trees.
+/// `collect_changed_closure`'s client-side prune, which settles a hash before checking it for the
+/// same reason this walk does. The two candidate sets are deliberately *not* the same: the client
+/// prunes against the immediate parents only, this walk against those **plus** `known_complete`
+/// (see [`verify_parcel_closure_with`] on why the union rather than a replacement). The server's
+/// set is the superset, so nothing the client uploads is refused here for want of an explanation.
 ///
-/// **Completeness (W4 preserved).** A subtree or file that is *not* identical to the base is walked
-/// exactly as before — a changed chunked file still descends its recipe and presence-checks every
-/// chunk **non-tolerantly**, so a ref still never advances over a changed chunked file whose chunks
-/// did not all reach the store. The prune only ever skips content the prior head already vouches
-/// for, never content this push introduces.
+/// **Completeness (W4 preserved).** A subtree or file that is explained by no candidate base is
+/// walked exactly as before — a changed chunked file still descends its recipe and presence-checks
+/// every chunk **non-tolerantly**. The audit never advances a ref over content whose presence
+/// neither an accepted push nor an earlier-audited member of the same call has established.
+///
+/// That sentence replaces an accepted-push-only one, and the difference is the whole point of the
+/// candidate set. A base is no longer only `known_complete`'s subtree: it is that **plus** the
+/// parcel's own immediate parents' subtrees at the same path. A parent inside this same push
+/// vouches for content only once its own top-level audit has run, which is why
+/// [`verify_parcel_closure_with`] orders the segment parents-first — the marking discipline below
+/// is sound under that order and not otherwise.
 ///
 /// # Arguments
-/// * `tree_hash`      - The root of the subtree to verify.
-/// * `base_tree_hash` - The prior head's subtree at this same path, or `None` (a creation, or a
-///                      newly-introduced path). Equal to `tree_hash` ⟹ the subtree is unchanged
-///                      and pruned without a load.
-/// * `visited_trees`  - Trees already verified (shared across parcels of one walk, so unchanged
-///                      subtrees are not walked twice).
-/// * `load_base_tree` - Reads a prior-head tree (from the local store, or object storage on the
-///                      AWS head) so a *changed* subtree's children can be compared to the base's;
-///                      tolerant, because the base is trusted ancestry the audit never re-verifies.
-/// * `reverify`       - The `audit --full` content level for a changed chunked file (see
-///                      [`verify_chunked_file`]); the commit gate always passes `false`.
+/// * `tree_hash`        - The root of the subtree to verify.
+/// * `base_tree_hashes` - The candidate bases' subtrees at this same path: `known_complete`'s, and
+///                        each immediate parent's. Empty for a creation or a newly-introduced path.
+///                        A match against **any** of them prunes the subtree without a load.
+/// * `visited_trees`    - Trees already settled (shared across parcels of one walk). Recorded
+///                        **before** the base check, matching `collect_changed_closure`: the same
+///                        subtree hash can recur at another path in the same walk, and that
+///                        recurrence must be recognized. Sound only parents-first — a child that
+///                        marked a parent-explained hash would otherwise short-circuit the
+///                        explaining parent's own audit.
+/// * `load_base_tree`   - Reads a candidate base's tree (from the local store, or object storage on
+///                        the AWS head) so a changed subtree's children can be compared to the
+///                        bases'; tolerant per base, because a base is either already-audited
+///                        ancestry or a parcel this same call has audited.
+/// * `reverify`         - The `audit --full` content level for a changed chunked file (see
+///                        [`verify_chunked_file`]); the commit gate always passes `false`.
 ///
 /// # Returns
 /// * `Ok(())`      - If the whole (changed) subtree is present.
 /// * `Err(String)` - If a tree or blob is missing (or unreadable).
 #[allow(clippy::too_many_arguments)]
 fn verify_tree_closure(tree_hash: &str,
-                       base_tree_hash: Option<&str>,
+                       base_tree_hashes: &[String],
                        visited_trees: &mut HashSet<String>,
                        blob_exists: &dyn Fn(&str) -> Result<bool, String>,
                        chunks_missing: &dyn Fn(&[String]) -> Result<Vec<String>, String>,
@@ -1669,45 +1924,66 @@ fn verify_tree_closure(tree_hash: &str,
                        load_base_tree: &dyn Fn(&str) -> Result<TreeItem, String>,
                        reverify: bool)
                        -> Result<(), String> {
-    // Unchanged from the prior head at this path: identical hash ⟹ identical closure ⟹ proven
-    // present when `known_complete` was committed. Pruned without loading either tree — this is the
-    // whole W1 saving, and it is exactly where an untouched large chunked file's ~million chunks
-    // are NOT re-presence-checked on a push that never touched it.
-    if base_tree_hash == Some(tree_hash) {
+    // Record the visit before checking base-explained, not after — the same discipline
+    // `collect_changed_closure` states on the client side. Content-addressing means one subtree
+    // hash can recur at another path in the same walk (a merge adopting one side's subtree under
+    // two names), and a hash settled once needs no second descent. Marking before the check is
+    // what makes the recurrence free; it is sound only because `verify_parcel_closure_with`
+    // processes the segment parents-first, so a hash a child pruned against a parent is one that
+    // parent's own audit has already settled.
+    if !visited_trees.insert(tree_hash.to_string()) {
         return Ok(());
     }
 
-    if !visited_trees.insert(tree_hash.to_string()) {
+    // Explained by some candidate base at this path: identical hash ⟹ identical closure ⟹ present,
+    // either because `known_complete` vouched for it or because an earlier-audited parcel of this
+    // same call did. Pruned without loading any tree — this is the whole W1 saving, and it is
+    // exactly where an untouched large chunked file's ~million chunks are NOT re-presence-checked.
+    if base_tree_hashes.iter().any(|base| base == tree_hash) {
         return Ok(());
     }
 
     let tree = object_utils::load_tree(tree_hash)
         .map_err(|e| format!("Tree {} is missing or unreadable: {}", tree_hash, e))?;
 
-    // The prior head's entries at this path, by name — the base a changed tree's children are
-    // pruned against. Loaded only for a *changed* tree (the identical case returned above already),
-    // and tolerantly: the base is already-audited history, so a base object that cannot be read
-    // yields no explanations and the walk simply verifies everything below, which is always sound.
-    let (base_files, base_subtrees) = match base_tree_hash {
-        Some(base) => match load_base_tree(base) {
-            Ok(base_tree) => (
-                base_tree.get_files()
-                    .map(|(name, file)| (name.clone(), file.hash.clone()))
-                    .collect::<HashMap<String, String>>(),
-                base_tree.get_subtrees()
-                    .map(|(name, subtree)| (name.clone(), subtree.hash.clone()))
-                    .collect::<HashMap<String, String>>(),
-            ),
-            Err(_) => (HashMap::new(), HashMap::new()),
-        },
-        None => (HashMap::new(), HashMap::new()),
-    };
+    // The candidate bases' entries at this path, by name, unioned — a child is explained if *any*
+    // base carries that name at that hash. Loaded only for a tree no base explained whole, and
+    // tolerantly per base: a base that cannot be read contributes no explanations, so the walk
+    // verifies more rather than less, which is always sound.
+    //
+    // Sound is not free. A base is trusted ancestry or a parcel this same call just audited, so on
+    // the AWS head a failure here means a transient store error, not a missing object — and the
+    // `continue` converts that blip into a full descent of everything the base would have
+    // explained, up to an untouched multi-gigabyte file's recipe and every chunk `HEAD` under the
+    // 29 s gateway ceiling. The operator then sees a timeout rather than the store error that
+    // caused it. Two to three bases per parcel instead of one scales the chance of hitting it, so
+    // the tolerance is a deliberate trade of a rare slow refusal against a wrong fast one, not a
+    // free win.
+    let mut base_files: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut base_subtrees: HashMap<String, Vec<String>> = HashMap::new();
+
+    for base in base_tree_hashes {
+        let Ok(base_tree) = load_base_tree(base) else { continue };
+
+        for (name, file) in base_tree.get_files() {
+            base_files.entry(name.clone()).or_default().insert(file.hash.clone());
+        }
+        for (name, subtree) in base_tree.get_subtrees() {
+            let candidates = base_subtrees.entry(name.clone()).or_default();
+
+            // Same reason as the parcel-level dedupe: two candidate bases carrying the identical
+            // child at this name would otherwise each be loaded again one level down.
+            if !candidates.contains(&subtree.hash) {
+                candidates.push(subtree.hash.clone());
+            }
+        }
+    }
 
     for (name, file) in tree.get_files() {
-        // Base-explained: this exact file hash sits at this path under the already-complete prior
-        // head, so its blob — and, for a chunked file, its whole recipe→chunk closure — is present
-        // by induction. Skipping it is what makes an unchanged file cost nothing on a push.
-        if base_files.get(name) == Some(&file.hash) {
+        // Base-explained: this exact file hash sits at this path under some candidate base, so its
+        // blob — and, for a chunked file, its whole recipe→chunk closure — is present by induction.
+        // Skipping it is what makes an unchanged file cost nothing on a push.
+        if base_files.get(name).is_some_and(|hashes| hashes.contains(&file.hash)) {
             continue;
         }
 
@@ -1724,7 +2000,7 @@ fn verify_tree_closure(tree_hash: &str,
         // present, or the file becomes silently unmaterializable the moment someone fetches it.
         // (gc's own descent is presence-*tolerant*; this one is the opposite, exactly because a
         // ref move is a durability promise a fetch is not.) The prune above only reaches this for
-        // a file the prior head does not already vouch for, so W4 is never weakened.
+        // a file no candidate base already vouches for, so W4 is never weakened.
         if file.item_type.is_chunked() {
             verify_chunked_file(&file.hash, reverify, load_recipe_chunks, chunks_missing)?;
         }
@@ -1732,7 +2008,7 @@ fn verify_tree_closure(tree_hash: &str,
 
     for (name, subtree) in tree.get_subtrees() {
         verify_tree_closure(
-            &subtree.hash, base_subtrees.get(name).map(String::as_str), visited_trees,
+            &subtree.hash, base_subtrees.get(name).map_or(&[][..], Vec::as_slice), visited_trees,
             blob_exists, chunks_missing, load_recipe_chunks, load_base_tree, reverify,
         )?;
     }
