@@ -447,14 +447,17 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             // each parcel's own immediate parents' — the first already-audited history, the second
             // audited earlier in the same call by the parents-first order.
             //
-            // The prior head's tree is *not* in the audit scratch — `scratch::materialize` stops
-            // expanding at the bound, and below it mirrors parcel bodies only — so that read has
-            // to come from the object store. An in-segment parent's trees, by contrast, are
-            // mirrored (such a parcel is expanded `full`), so those reads re-fetch bytes already
-            // on local disk. That waste is accepted rather than special-cased: reading a parent's
-            // base locally and the bound's remotely would make this one seam two, and the local
-            // one would be correct only for as long as `materialize` keeps expanding every
-            // in-segment parent. One seam, one rule.
+            // The prior head's tree is *not* in the audit scratch, so that read has to come from
+            // the object store. `materialize` clears `full` at the bound *hash*, not at the fresh
+            // frontier — so it stops expanding along paths through the bound and nowhere else. A
+            // merge's second parent is below no bound, so it and its whole ancestry are expanded
+            // full; the property this seam rests on is only ever about `known_complete` itself.
+            //
+            // An in-segment parent's trees, by contrast, are mirrored (such a parcel is expanded
+            // `full`), so those reads re-fetch bytes already on local disk. That waste is accepted
+            // rather than special-cased: reading a parent's base locally and the bound's remotely
+            // would make this one seam two, and the local one would be correct only for as long as
+            // `materialize` keeps expanding every in-segment parent. One seam, one rule.
             //
             // The prune's point, either way: an unchanged large chunked file below such a subtree
             // is skipped whole, sparing the ~million per-chunk S3 `HEAD`s its recipe descent would

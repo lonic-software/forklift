@@ -1459,6 +1459,12 @@ pub fn verify_parcel_closure_with(
     // terminates (the sweep's `visited` set closes it) and still closure-checks every parcel it
     // reaches; it just no longer refuses on the cycle itself.
     //
+    // Which leaves the refusal on the push gate and not on the command chartered to find
+    // corruption: `forklift audit` goes through `verify_parcel_closure_scoped`, which builds its
+    // segment with `new_parcels` and so has no edges to check, gate or no gate. That is not this
+    // change's doing — that path never had a cycle check — but it is where one belongs, and
+    // putting it there is its own change with its own test (FORK-111).
+    //
     // The edges come through `graph_utils::parents`, the same accessor `new_parcels` swept with,
     // so the prune cannot see a parent edge the sweep did not — and they are read once here and
     // reused as the candidate bases below.
@@ -1559,17 +1565,25 @@ pub fn verify_parcel_closure_with(
                     // starts failing, tolerantly, dropping the boundary parent's base on every
                     // merge push and silently widening the walk. If that mirror is ever
                     // narrowed, this arm needs a closure of its own.
+                    // Memoized like an in-segment parent's, so a fork point shared by n children
+                    // of this segment is decoded once rather than once per edge naming it.
                     None => if let Ok(parent_parcel) = object_utils::load_parcel(parent) {
+                        tree_of.insert(parent.clone(), parent_parcel.tree_hash.clone());
                         bases.push(parent_parcel.tree_hash);
                     },
                 }
             }
         }
 
-        // A linear push's only parent *is* `known_complete`, so the two candidates coincide and
-        // every changed level below would otherwise load the identical base tree twice — a read
-        // apiece on the AWS head. Dedupe rather than special-case the linear shape: a merge whose
-        // sides share a tree at some path hits the same waste one level down.
+        // The *first* parcel of a linear push has `known_complete` as its only parent, so its two
+        // candidates coincide and every changed level below would otherwise load the identical
+        // base tree twice — a read apiece on the AWS head. Only that parcel: `N2`'s parent is
+        // `N1`, so a k-parcel segment still carries two distinct bases for its last k-1 members,
+        // and each changed level in them costs two base reads where the single-base prune cost
+        // one. That is the union's price, paid where the union is what buys the pruning; the
+        // dedupe is not claimed to remove it. Dedupe rather than special-case the linear shape
+        // anyway: a merge whose sides share a tree at some path hits the same waste one level
+        // down.
         bases.sort();
         bases.dedup();
 
@@ -1927,6 +1941,15 @@ fn verify_tree_closure(tree_hash: &str,
     // base carries that name at that hash. Loaded only for a tree no base explained whole, and
     // tolerantly per base: a base that cannot be read contributes no explanations, so the walk
     // verifies more rather than less, which is always sound.
+    //
+    // Sound is not free. A base is trusted ancestry or a parcel this same call just audited, so on
+    // the AWS head a failure here means a transient store error, not a missing object — and the
+    // `continue` converts that blip into a full descent of everything the base would have
+    // explained, up to an untouched multi-gigabyte file's recipe and every chunk `HEAD` under the
+    // 29 s gateway ceiling. The operator then sees a timeout rather than the store error that
+    // caused it. Two to three bases per parcel instead of one scales the chance of hitting it, so
+    // the tolerance is a deliberate trade of a rare slow refusal against a wrong fast one, not a
+    // free win.
     let mut base_files: HashMap<String, HashSet<String>> = HashMap::new();
     let mut base_subtrees: HashMap<String, Vec<String>> = HashMap::new();
 
