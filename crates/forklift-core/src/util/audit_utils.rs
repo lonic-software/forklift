@@ -1416,13 +1416,13 @@ pub fn verify_parcel_closure(head: &str, known_complete: Option<&str>) -> Result
 ///                          case, a member of this same call that the parents-first order has
 ///                          already audited in the second. On the AWS head, a working pallet's
 ///                          `known_complete` tree is *not* in the audit scratch — the mirror
-///                          stops expanding at the bound — so this must read from object
-///                          storage; an in-segment parent's trees *are* mirrored, and the
-///                          re-fetch is the accepted price of one seam rather than two. Neither
-///                          half is a rule to lean on: the office chain gets its own unbounded
-///                          mirror, so on a meta push the bound's tree may be present after all.
-///                          Read through this parameter and the mode stops mattering. On the
-///                          self-host head
+///                          clears its full-expansion flag at that one *hash*, so the bound
+///                          alone is spared — and this must read it from object storage. An
+///                          in-segment parent's trees *are* mirrored, and the re-fetch is the
+///                          accepted price of one seam rather than two. Neither half is a rule
+///                          to lean on: the office chain gets its own unbounded mirror, so on a
+///                          meta push the bound's tree may be present after all. Read through
+///                          this parameter and the mode stops mattering. On the self-host head
 ///                          everything comes from the local store. Never called for a creation
 ///                          (`known_complete: None`), which takes no candidates at all.
 pub fn verify_parcel_closure_with(
@@ -1507,9 +1507,14 @@ pub fn verify_parcel_closure_with(
     // fails to a `None` that reads as "creation, no candidates". On a linear push the sole parent
     // *is* `known_complete`, so the arm below re-reads this same parcel and fails the same way —
     // the candidate list ends up empty and every push walks whole. Tolerant in the safe direction
-    // (more is verified, never less) but invisible, so any future bounding of the AWS ancestry
-    // mirror has to cover this read and the arm below together; covering only the named one leaves
-    // the common case silently unpruned.
+    // (more is verified, never less) but invisible.
+    //
+    // The obligation this creates is *not* "cover the tolerant reads". The membership sweep's own
+    // body reads — `graph_utils::node`'s `ensure` and `graph_utils::parents`'s load — reach
+    // below the bound too and are **not** tolerant, so bounding the ancestry mirror to exactly the
+    // reads named here would break the audit at its first step rather than degrade it. Tolerance
+    // sorts these reads by how their failure *presents*, loud or silent; it does not sort them by
+    // which ones the mirror has to keep answering. It has to answer all of them.
     let base_root: Option<String> = match known_complete {
         Some(known) => object_utils::load_parcel(known).ok().map(|parcel| parcel.tree_hash),
         None => None,
@@ -1563,8 +1568,9 @@ pub fn verify_parcel_closure_with(
                     // the scratch, not a coincidence: bound the ancestry mirror (an obvious
                     // future move — it is O(history) `GET`s on a cold scratch) and this arm
                     // starts failing, tolerantly, dropping the boundary parent's base on every
-                    // merge push and silently widening the walk. If that mirror is ever
-                    // narrowed, this arm needs a closure of its own.
+                    // merge push and silently widening the walk. See `base_root` above for why
+                    // that obligation covers every body read below the bound, not just the two
+                    // that fail quietly.
                     // Memoized like an in-segment parent's, so a fork point shared by n children
                     // of this segment is decoded once rather than once per edge naming it.
                     None => if let Ok(parent_parcel) = object_utils::load_parcel(parent) {
@@ -1575,14 +1581,17 @@ pub fn verify_parcel_closure_with(
             }
         }
 
-        // The *first* parcel of a linear push has `known_complete` as its only parent, so its two
-        // candidates coincide and every changed level below would otherwise load the identical
-        // base tree twice — a read apiece on the AWS head. Only that parcel: `N2`'s parent is
-        // `N1`, so a k-parcel segment still carries two distinct bases for its last k-1 members,
-        // and each changed level in them costs two base reads where the single-base prune cost
-        // one. That is the union's price, paid where the union is what buys the pruning; the
-        // dedupe is not claimed to remove it. Dedupe rather than special-case the linear shape
-        // anyway: a merge whose sides share a tree at some path hits the same waste one level
+        // `bases` holds *tree* hashes, so what collapses here is two candidates naming the same
+        // tree — not a parent that happens to be `known_complete`. The first parcel of a linear
+        // push is the obvious case (its only parent *is* the bound), but so is any later parcel
+        // whose ancestors left the root tree untouched. Without this, every changed level below
+        // such a parcel would load the identical base tree twice — a read apiece on the AWS head.
+        //
+        // What the dedupe does not remove: where the trees genuinely differ — the ordinary case
+        // for `N2..Nk` in a k-parcel segment, and for both sides of a merge — each changed level
+        // costs two base reads where the single-base prune cost one. That is the union's price,
+        // paid where the union is what buys the pruning. Dedupe rather than special-case any of
+        // these shapes: a merge whose sides share a tree at some path hits the same waste one level
         // down.
         bases.sort();
         bases.dedup();
