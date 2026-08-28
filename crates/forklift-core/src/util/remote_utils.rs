@@ -5691,9 +5691,6 @@ mod tests {
         }
     }
 
-    /// Store a minimal parcel (a dummy, shared tree hash — ancestry never reads the
-    /// tree) with the given parents, tagged so otherwise-identical parcels still hash
-    /// distinctly. Mirrors the idiom already used by `merge_utils`'s own ancestry tests.
     /// [`stack`], but with a real tree, for the walks that actually descend one.
     fn stack_with_tree(parents: Vec<String>, tree_hash: &str, tag: &str) -> String {
         let parcel = crate::model::parcel::Parcel {
@@ -5707,6 +5704,9 @@ mod tests {
         object.hash
     }
 
+    /// Store a minimal parcel (a dummy, shared tree hash — ancestry never reads the
+    /// tree) with the given parents, tagged so otherwise-identical parcels still hash
+    /// distinctly. Mirrors the idiom already used by `merge_utils`'s own ancestry tests.
     fn stack(parents: Vec<String>, tag: &str) -> String {
         let parcel = crate::model::parcel::Parcel {
             tree_hash: "0".repeat(64),
