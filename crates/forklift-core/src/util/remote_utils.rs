@@ -5691,6 +5691,19 @@ mod tests {
         }
     }
 
+    /// [`stack`], but with a real tree, for the walks that actually descend one.
+    fn stack_with_tree(parents: Vec<String>, tree_hash: &str, tag: &str) -> String {
+        let parcel = crate::model::parcel::Parcel {
+            tree_hash: tree_hash.to_string(),
+            parents,
+            actions: Vec::new(),
+            description: Some(tag.to_string()),
+        };
+        let mut object = LooseObjectBuilder::build_parcel(&parcel);
+        object.store().unwrap();
+        object.hash
+    }
+
     /// Store a minimal parcel (a dummy, shared tree hash — ancestry never reads the
     /// tree) with the given parents, tagged so otherwise-identical parcels still hash
     /// distinctly. Mirrors the idiom already used by `merge_utils`'s own ancestry tests.
@@ -6221,6 +6234,166 @@ mod tests {
 
         assert!(multi.len() < single.len(),
             "the multi-parent base prunes strictly more here: {} vs {}", multi.len(), single.len());
+    }
+
+    /// FORK-94's walk-cardinality spike, made permanent: **every blob the server's audit
+    /// presence-checks is one the client already priced.**
+    ///
+    /// This is the property FORK-92's keystone needs from `update_ref`, and the reason that call
+    /// was split out of it. For the four negotiation/fetch calls the priced quantity equals the
+    /// server's workload by construction, because the request body enumerates the workload. For
+    /// `update_ref` the quantity is *derived* — a walk on each side — so it holds only if the
+    /// two walks prune compatibly. Before FORK-94 they did not: the client pruned against every
+    /// parent, the server against `known_complete`'s root alone, so a sparse merge could under-
+    /// price by orders of magnitude and false-trip identically on every retry.
+    ///
+    /// A count comparison would be the weaker test — two numbers can pass while the sets differ.
+    /// This asserts **containment**: the set of blobs the server presence-checks is a subset of
+    /// the client's candidate set. That is what makes the client's count an honest upper bound.
+    ///
+    /// Discriminating in both directions: the unbounded audit (`known_complete: None`) is the
+    /// same walk with an empty base set at every parcel, and it reaches blobs the client never
+    /// priced — so the containment fails there, and the assertion is not vacuous.
+    ///
+    /// **The fixture forks the branch *below* the bound, and that is load-bearing for the
+    /// parent-bases half of the union, not the `known_complete` half.** A merge whose two sides
+    /// both descend from `known_complete` does not discriminate: each side's own walk descends
+    /// and marks the content it introduces, so `visited_trees` alone keeps the server off
+    /// anything unpriced even with the parent bases removed. It is the *boundary* parent — `G`,
+    /// the fork point below the bound, which no walk in this segment covers — that only the
+    /// per-parcel immediate-parent loop can explain: `B`'s unchanged `api` entry matches `G`'s
+    /// tree, and `known_complete`'s own tree (`K`) disagrees with `B` on `api`, so it explains
+    /// nothing there. Gate off the parent-bases loop and the server has only `K`'s tree to prune
+    /// `B` against; `api` stops being explained, the server descends it, and `blob_exists`
+    /// touches the unchanged `api` blob the client correctly never priced. That is the
+    /// sparse-merge under-pricing FORK-94's ticket described, and it is this fixture's falsifier
+    /// for the parent-bases half: disabling that loop turns this test red on it.
+    ///
+    /// The `known_complete` half (`base_root`) is not, and cannot be made, load-bearing by this
+    /// property, on any fixture: adding a base to the union only ever prunes the server's walk
+    /// *further*, so removing `base_root` can only widen the server's touched set toward — never
+    /// past — the client's, because a server audit without `base_root` still prunes against the
+    /// same immediate-parent trees the client's own walk prunes against. Containment is
+    /// `server ⊆ client`; `base_root` is slack with respect to that inequality on every topology,
+    /// so no fixture can pin it here.
+    ///
+    /// What this does not establish: `load_base_tree` reaches candidate-base trees — already-
+    /// remote ancestry (`K` and `G`'s subtrees) the client correctly never prices — so those
+    /// loads sit outside this property by construction, not by an oversight in the fixture; only
+    /// the `blob_exists` closure below records into `touched`. `chunks_missing` and
+    /// `load_recipe_chunks` are stubs returning empty, and no chunked file is in this fixture, so
+    /// the recipe → chunk arm on both sides is uncovered. And both walks mark-before-check on
+    /// their tree sets (`collect_changed_closure`'s `seen_trees`, `verify_tree_closure`'s
+    /// `visited_trees`), so containment only holds while the client's `new_parcels_parents_first`
+    /// and the server's `parents_first` — two independently written topological sorts over two
+    /// independently derived edge sets — agree on order; this fixture's segment has exactly one
+    /// valid order (`B` before `merge`, forced by the parent edge between them), so it cannot
+    /// detect a regression that makes the two sorts disagree.
+    #[test]
+    fn every_blob_the_server_presence_checks_was_priced_by_the_client_walk() {
+        use crate::enums::dir_entry_type::DirEntryType::{Normal, Tree};
+        use std::cell::RefCell;
+
+        let _scratch = Scratch::new("fork94-walk-cardinality");
+
+        let api_v1 = store_blob("api v1");
+        let api_v2 = store_blob("api v2");
+        let web_v0 = store_blob("web v0");
+        let web_v1 = store_blob("web v1");
+
+        let api_base = store_tree(&[("a.txt", &api_v1, Normal)]);
+        let api_k = store_tree(&[("a.txt", &api_v2, Normal)]);
+        let web_base = store_tree(&[("w.txt", &web_v0, Normal)]);
+        let web_b = store_tree(&[("w.txt", &web_v1, Normal)]);
+
+        // G is the fork point, below the bound. K (the bound) edits api; the branch B edits web
+        // off G, never seeing K's api; the merge adopts one subtree from each.
+        let root_g = store_tree(&[("api", &api_base, Tree), ("web", &web_base, Tree)]);
+        let root_k = store_tree(&[("api", &api_k, Tree), ("web", &web_base, Tree)]);
+        let root_b = store_tree(&[("api", &api_base, Tree), ("web", &web_b, Tree)]);
+        let root_merge = store_tree(&[("api", &api_k, Tree), ("web", &web_b, Tree)]);
+
+        let g = stack_with_tree(Vec::new(), &root_g, "G");
+        let k = stack_with_tree(vec![g.clone()], &root_k, "K");
+        let b = stack_with_tree(vec![g.clone()], &root_b, "B");
+        let merge = stack_with_tree(vec![k.clone(), b.clone()], &root_merge, "merge");
+
+        crate::util::graph_utils::build_from_heads(std::slice::from_ref(&merge))
+            .expect("warm the commit graph");
+
+        // The client's priced quantity, computed exactly as `lift_pallet_inner` computes it.
+        let new_parcels = new_parcels_parents_first(&merge, Some(&k))
+            .expect("the segment walk must succeed");
+        let mut candidates: Vec<String> = new_parcels.clone();
+        let mut seen_trees = HashSet::new();
+        let mut seen_blobs = HashSet::new();
+        let mut seen_recipes = HashSet::new();
+        for parcel_hash in &new_parcels {
+            let parcel = object_utils::load_parcel(parcel_hash).expect("a parcel");
+            let base_trees: Vec<String> = parcel.parents.iter()
+                .map(|parent| object_utils::load_parcel(parent).map(|p| p.tree_hash))
+                .collect::<Result<_, _>>()
+                .expect("every parent resolves");
+            collect_changed_closure(&parcel.tree_hash, "", &base_trees, &mut seen_trees,
+                                    &mut seen_blobs, &mut seen_recipes, &mut candidates, true)
+                .expect("the client walk must not load a pruned object");
+        }
+        let priced: HashSet<String> = candidates.iter().cloned().collect();
+
+        // The server's audit, with every store read counted through the closures it already
+        // takes — no production instrumentation, so this number is reproducible from the tree.
+        let audit = |known_complete: Option<&str>| -> Vec<String> {
+            let touched: RefCell<Vec<String>> = RefCell::new(Vec::new());
+            let blob_exists = |hash: &str| -> Result<bool, String> {
+                touched.borrow_mut().push(hash.to_string());
+                Ok(true)
+            };
+            let chunks_missing = |_: &[String]| -> Result<Vec<String>, String> { Ok(Vec::new()) };
+            let load_recipe_chunks =
+                |_: &str| -> Result<Vec<String>, String> { Ok(Vec::new()) };
+            let load_base_tree = |hash: &str| object_utils::load_tree(hash);
+
+            crate::util::audit_utils::verify_parcel_closure_with(
+                &merge, known_complete, &blob_exists, &chunks_missing,
+                &load_recipe_chunks, &load_base_tree,
+            ).expect("the fixture is complete, so the audit must pass");
+
+            touched.into_inner()
+        };
+
+        let bounded = audit(Some(&k));
+
+        // The property. Stated as containment, not as a count.
+        for hash in &bounded {
+            assert!(
+                priced.contains(hash),
+                "the audit presence-checked {} which the client never priced; the walks have \
+                 diverged again and `update_ref` cannot rejoin FORK-92's mechanism. \
+                 priced={:?} touched={:?}",
+                hash, candidates, bounded
+            );
+        }
+
+        // The server reaches exactly one blob's worth of leaf work: `B`'s `api` entry is pruned
+        // by `G`'s tree (see the doc comment above), so only the changed `web` blob is
+        // presence-checked. The client's priced set is six objects, of which only that one is a
+        // blob — the rest are the segment's two parcels and the three trees the closure walk
+        // adds. Pinned as numbers too, so a regression that keeps containment while inflating
+        // either walk still fails.
+        assert_eq!(bounded.len(), 1, "only the branch's changed blob is reached: {:?}", bounded);
+        assert_eq!(priced.len(), 6, "2 parcels + the branch root, its web subtree and blob, \
+                   + the merge root: {:?}", candidates);
+
+        // The falsifier: the unbounded audit is the same walk with no bases, and it reaches the
+        // *unchanged* blobs the client correctly declined to price. If this ever stops finding
+        // an unpriced object, the containment assertion above has gone vacuous.
+        let unbounded = audit(None);
+        assert!(
+            unbounded.iter().any(|hash| !priced.contains(hash)),
+            "the unbounded audit must touch something the client never priced, or the \
+             containment assertion above proves nothing: {:?}",
+            unbounded
+        );
     }
 
     /// A base-explained tree must be recorded as seen even though it returns early — otherwise
