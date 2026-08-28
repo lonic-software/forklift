@@ -6236,8 +6236,8 @@ mod tests {
             "the multi-parent base prunes strictly more here: {} vs {}", multi.len(), single.len());
     }
 
-    /// FORK-94's walk-cardinality spike, made permanent: **every object the server's audit
-    /// touches is one the client already priced.**
+    /// FORK-94's walk-cardinality spike, made permanent: **every blob the server's audit
+    /// presence-checks is one the client already priced.**
     ///
     /// This is the property FORK-92's keystone needs from `update_ref`, and the reason that call
     /// was split out of it. For the four negotiation/fetch calls the priced quantity equals the
@@ -6255,15 +6255,42 @@ mod tests {
     /// same walk with an empty base set at every parcel, and it reaches blobs the client never
     /// priced — so the containment fails there, and the assertion is not vacuous.
     ///
-    /// **The fixture forks the branch *below* the bound, and that is load-bearing.** A merge whose
-    /// two sides both descend from `known_complete` does not discriminate: each side's own walk
-    /// descends and marks the content it introduces, so `visited_trees` alone keeps the server
-    /// off anything unpriced even with the parent bases removed. It is the *boundary* parent —
+    /// **The fixture forks the branch *below* the bound, and that is load-bearing for the
+    /// parent-bases half of the union, not the `known_complete` half.** A merge whose two sides
+    /// both descend from `known_complete` does not discriminate: each side's own walk descends
+    /// and marks the content it introduces, so `visited_trees` alone keeps the server off
+    /// anything unpriced even with the parent bases removed. It is the *boundary* parent — `G`,
     /// the fork point below the bound, which no walk in this segment covers — that only the
-    /// union can explain. That is the sparse-merge under-pricing FORK-94's ticket described, and
-    /// disabling the parent bases turns this test red on it.
+    /// per-parcel immediate-parent loop can explain: `B`'s unchanged `api` entry matches `G`'s
+    /// tree, and `known_complete`'s own tree (`K`) disagrees with `B` on `api`, so it explains
+    /// nothing there. Gate off the parent-bases loop and the server has only `K`'s tree to prune
+    /// `B` against; `api` stops being explained, the server descends it, and `blob_exists`
+    /// touches the unchanged `api` blob the client correctly never priced. That is the
+    /// sparse-merge under-pricing FORK-94's ticket described, and it is this fixture's falsifier
+    /// for the parent-bases half: disabling that loop turns this test red on it.
+    ///
+    /// The `known_complete` half (`base_root`) is not, and cannot be made, load-bearing by this
+    /// property, on any fixture: adding a base to the union only ever prunes the server's walk
+    /// *further*, so removing `base_root` can only widen the server's touched set toward — never
+    /// past — the client's, because a server audit without `base_root` still prunes against the
+    /// same immediate-parent trees the client's own walk prunes against. Containment is
+    /// `server ⊆ client`; `base_root` is slack with respect to that inequality on every topology,
+    /// so no fixture can pin it here.
+    ///
+    /// What this does not establish: `load_base_tree` reaches candidate-base trees — already-
+    /// remote ancestry (`K` and `G`'s subtrees) the client correctly never prices — so those
+    /// loads sit outside this property by construction, not by an oversight in the fixture; only
+    /// the `blob_exists` closure below records into `touched`. `chunks_missing` and
+    /// `load_recipe_chunks` are stubs returning empty, and no chunked file is in this fixture, so
+    /// the recipe → chunk arm on both sides is uncovered. And both walks mark-before-check on
+    /// their tree sets (`collect_changed_closure`'s `seen_trees`, `verify_tree_closure`'s
+    /// `visited_trees`), so containment only holds while the client's `new_parcels_parents_first`
+    /// and the server's `parents_first` — two independently written topological sorts over two
+    /// independently derived edge sets — agree on order; this fixture's segment has exactly one
+    /// valid order (`B` before `merge`, forced by the parent edge between them), so it cannot
+    /// detect a regression that makes the two sorts disagree.
     #[test]
-    fn every_object_the_server_audit_touches_was_priced_by_the_client_walk() {
+    fn every_blob_the_server_presence_checks_was_priced_by_the_client_walk() {
         use crate::enums::dir_entry_type::DirEntryType::{Normal, Tree};
         use std::cell::RefCell;
 
@@ -6347,9 +6374,12 @@ mod tests {
             );
         }
 
-        // Each side reaches exactly the two changed blobs' worth of leaf work, and the server
-        // does no more than the client priced. Pinned as numbers too, so a regression that keeps
-        // containment while inflating the walk still fails.
+        // The server reaches exactly one blob's worth of leaf work: `B`'s `api` entry is pruned
+        // by `G`'s tree (see the doc comment above), so only the changed `web` blob is
+        // presence-checked. The client's priced set is six objects, of which only that one is a
+        // blob — the rest are the segment's two parcels and the three trees the closure walk
+        // adds. Pinned as numbers too, so a regression that keeps containment while inflating
+        // either walk still fails.
         assert_eq!(bounded.len(), 1, "only the branch's changed blob is reached: {:?}", bounded);
         assert_eq!(priced.len(), 6, "2 parcels + the branch root, its web subtree and blob, \
                    + the merge root: {:?}", candidates);
