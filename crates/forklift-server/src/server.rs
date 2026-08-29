@@ -780,44 +780,97 @@ fn emit_event(state: &Arc<AppState>, event: HookEvent) {
     });
 }
 
-/// Look up an operator's user record in this warehouse's office (runs under the
-/// warehouse's storage-root scope). `None` when the warehouse has no trust yet — no
-/// office means no roles, and the transport token is the whole gate.
-fn office_user_of(identifier: &str) -> Result<Option<office_utils::UserRecord>, HandlerError> {
-    if office_utils::read_trust_anchor().map_err(internal)?.is_none() {
+/// Test-only seam (FORK-95 falsifier): a rendezvous, not a fixed sleep like
+/// `remote_utils::test_retrieval_delay` — what a test needs to pin here is not a
+/// duration but an ordering (is the write lock already held at this instant, or not
+/// yet?), and a duration long enough to be safe against scheduling jitter would also
+/// be long enough to slow every other test that happens to call `office_user_of`
+/// while it runs. Keyed by identifier, not a bare on/off flag: several other tests in
+/// this file exercise `office_user_of` concurrently (different threads, same
+/// process), and an unkeyed seam would occasionally rendezvous with one of *their*
+/// calls instead of the armed test's own, hanging it. `Mutex`, not thread-local:
+/// `office_user_of` runs on whichever `spawn_blocking` thread tokio schedules the
+/// request onto, which is never the thread a test arms this from.
+#[cfg(test)]
+static OFFICE_LOOKUP_TEST_SEAM: Mutex<
+    Option<(String, std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>
+> = Mutex::new(None);
+
+#[cfg(test)]
+fn office_lookup_test_checkpoint(identifier: &str) {
+    let armed = {
+        let mut slot = OFFICE_LOOKUP_TEST_SEAM.lock().unwrap_or_else(|e| e.into_inner());
+
+        match slot.as_ref() {
+            Some((armed_for, _, _)) if armed_for == identifier => slot.take(),
+            _ => None,
+        }
+    };
+
+    if let Some((_, reached, gate)) = armed {
+        let _ = reached.send(());
+        let _ = gate.recv();
+    }
+}
+
+#[cfg(not(test))]
+fn office_lookup_test_checkpoint(_identifier: &str) {}
+
+/// Look up an operator's user record in this warehouse's office, against the trust
+/// anchor and office state a caller's own audit consumed — never re-read here. A
+/// caller with no audit of its own to agree with (`require_uploader`) reads both for
+/// itself and passes them through; a caller whose commit an audit guards (the ref
+/// update) must pass the very values that audit will check, not a second, independent
+/// read of them, or the two could disagree about what the office currently says.
+/// `None` when the warehouse has no trust yet — no office means no roles, and the
+/// transport token is the whole gate.
+fn office_user_of(identifier: &str,
+                  anchor: &Option<office_utils::TrustAnchor>,
+                  office_state: &office_utils::OfficeState) -> Result<Option<office_utils::UserRecord>, HandlerError> {
+    if anchor.is_none() {
         return Ok(None);
     }
-
-    let state = office_utils::read_office_state().map_err(internal)?;
 
     // The bootstrap window: the anchor is set but the office itself has not been
     // lifted yet (a lift PUTs trust before it uploads the office chain). With no
     // roster there are no roles to enforce — the token stays the gate, and the
     // office ref update still verifies the chain against the anchor, so only the
     // enrolling operator's office can land.
-    if state.users.is_empty() {
+    if office_state.users.is_empty() {
         return Ok(None);
     }
 
-    let user = state.users.into_iter()
+    let user = office_state.users.iter()
         .find(|user| user.identifier == identifier)
+        .cloned()
         .ok_or((
             StatusCode::FORBIDDEN,
             format!("\"{}\" is not enrolled in this warehouse's office.", identifier)
         ))?;
+
+    // No-op outside a test that has armed the seam for this identifier (see
+    // `office_lookup_test_checkpoint`'s doc): a falsifier's rendezvous point, right
+    // where this decision is fixed and about to be handed back.
+    office_lookup_test_checkpoint(identifier);
 
     Ok(Some(user))
 }
 
 /// Authorize an upload (objects, signatures) — runs under the warehouse's storage-root
 /// scope. Uploads are not pallet-scoped, so any non-reader may upload; the ref update
-/// is where pallet grants bite.
+/// is where pallet grants bite. Unlike the ref update, this commits nothing and guards
+/// no audit, so it has no consumed values to agree with — it reads the anchor and
+/// office state for itself, deliberately, rather than threading them through from a
+/// caller that has none to give it.
 fn require_uploader(principal: &Principal) -> Result<(), HandlerError> {
     let Principal::Operator(identifier) = principal else {
         return Ok(());
     };
 
-    match office_user_of(identifier)? {
+    let anchor = office_utils::read_trust_anchor().map_err(internal)?;
+    let office_state = office_utils::read_office_state().map_err(internal)?;
+
+    match office_user_of(identifier, &anchor, &office_state)? {
         Some(user) if user.role == office_utils::Role::Reader => Err((
             StatusCode::FORBIDDEN,
             format!("\"{}\" is a reader; readers cannot upload.", identifier)
@@ -1596,10 +1649,35 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
         let is_meta = namespace == pallet_utils::PalletNamespace::Meta;
         let is_office = is_meta && bare == OFFICE_PALLET_NAME;
 
-        // Transport authorization: may this principal move this ref? The
-        // role and the pallet grants come from the office — signed, tracked metadata.
+        // The CAS read-check-write is one critical section. The trust anchor and
+        // office state are read here too, once, so transport authorization below and
+        // the audit that follows consume exactly the same values — the lock that
+        // already keeps a running audit's inputs from moving is what makes a single
+        // read enough; a second, earlier read outside the lock could disagree with
+        // what the audit below settles on.
+        let _guard = handle.writes.lock()
+            .map_err(|_| internal("The write lock is poisoned.".to_string()))?;
+
+        let anchor = office_utils::read_trust_anchor().map_err(internal)?;
+
+        // The office head, read once, is an `Option`: `Some` derives the state
+        // through the hash-taking accessor (content-addressed reads only, no second
+        // head lookup); `None` is the ordinary bootstrap window — trust established
+        // but the office not yet lifted — not an error.
+        let office_head = pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).map_err(internal)?;
+        let office_state = match &office_head {
+            Some(head) => office_utils::read_office_state_of(head).map_err(internal)?,
+            None => office_utils::OfficeState { users: Vec::new(), keys: Vec::new() },
+        };
+
+        // Transport authorization: may this principal move this ref? The role and
+        // the pallet grants come from the office — signed, tracked metadata — read
+        // against the anchor and office state the audit below consumes, not a second,
+        // independent read of them. Decided before the CAS and object-presence checks
+        // below, as it always was: an unauthorized request is refused on authorization
+        // and never leaks whether some other precondition also happened to fail.
         if let Principal::Operator(identifier) = &principal {
-            if let Some(user) = office_user_of(identifier)? {
+            if let Some(user) = office_user_of(identifier, &anchor, &office_state)? {
                 let allowed = if is_meta {
                     // Anyone but a reader may transport a meta pallet's history; whether
                     // its *content* is authorized is verified below, per parcel, against
@@ -1620,10 +1698,6 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
                 }
             }
         }
-
-        // The CAS read-check-write is one critical section.
-        let _guard = handle.writes.lock()
-            .map_err(|_| internal("The write lock is poisoned.".to_string()))?;
 
         let current = pallet_utils::get_pallet_head_in(namespace, &bare).map_err(internal)?;
 
@@ -1648,8 +1722,6 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
         // A ref must never point at missing history.
         audit_utils::verify_parcel_closure(&request.new_head, request.old_head.as_deref())
             .map_err(unprocessable)?;
-
-        let anchor = office_utils::read_trust_anchor().map_err(internal)?;
 
         if let Some(old_head) = &request.old_head {
             // The one sanctioned non-fast-forward: the office lift right after a
@@ -1699,11 +1771,12 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
                 &request.new_head
             ).map_err(|reason| (StatusCode::FORBIDDEN, reason))?;
 
-            // Newly revoked keys (active before, revoked after) become events.
-            let old_office_state = match request.old_head.is_some() {
-                true => office_utils::read_office_state().map_err(internal)?,
-                false => office_utils::OfficeState { users: Vec::new(), keys: Vec::new() },
-            };
+            // Newly revoked keys (active before, revoked after) become events. The
+            // pre-lift roster is the office state already read above: on this branch
+            // the office pallet *is* the target pallet, so its pre-lift head is
+            // exactly the request's old head, which the pallet-head check above
+            // already pinned this update to.
+            let old_office_state = office_state;
 
             for key in &new_office_state.keys {
                 let was_active = old_office_state.find_key(&key.key_id)
@@ -1723,13 +1796,12 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
         } else if let Some(anchor) = anchor {
             // A trusted warehouse accepts nothing a local audit would reject. This is the
             // user-pallet path (the office took the branch above); a future non-office
-            // meta pallet will bring its own verification here.
-            let office_head = pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME)
-                .map_err(internal)?
-                .ok_or(unprocessable(
-                    "Trust is established but the office pallet is missing; lift the \
-                    office first.".to_string()
-                ))?;
+            // meta pallet will bring its own verification here. The office head is the
+            // one already read above, not a second lookup.
+            let office_head = office_head.ok_or(unprocessable(
+                "Trust is established but the office pallet is missing; lift the \
+                office first.".to_string()
+            ))?;
 
             let office_state = audit_utils::verify_office_chain_memoized(&anchor, &office_head)
                 .map_err(unprocessable)?;
@@ -1910,6 +1982,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use forklift_core::globals::{StorageRootScope, FOLDER_NAME_FORKLIFT_ROOT};
     use forklift_core::model::operator::Operator;
+    use forklift_core::model::tree_item::TreeItem;
     use forklift_core::util::{office_utils, scope_utils, warehouse_utils};
     use forklift_core::util::office_utils::{IdentityClass, OfficeState, Role, TrustAnchor, UserRecord};
 
@@ -2764,12 +2837,15 @@ mod tests {
         }
 
         /// Admit an additional user onto the chain (mirrors `office admit`).
+        /// Returns the admitted user's own key id, so a caller that needs to sign as
+        /// them (a falsifier pushing a real parcel under their identity) doesn't have
+        /// to re-derive it.
         fn admit(&self,
                 identifier: &str,
                 role: Role,
                 pallets: Vec<String>,
                 class: IdentityClass,
-                supervisor: Option<String>) {
+                supervisor: Option<String>) -> String {
             let mut state = office_utils::read_office_state().unwrap();
 
             let (key_id, public_key) = forklift_core::util::sign_utils::generate_keypair(identifier).unwrap();
@@ -2783,7 +2859,7 @@ mod tests {
                 enrolled_at: 1_700_000_001,
                 role,
                 pallets,
-                identity_root: key_id,
+                identity_root: key_id.clone(),
                 class,
                 supervisor,
             });
@@ -2792,6 +2868,8 @@ mod tests {
             office_utils::stack_office_parcel(
                 &state, &self.admin, format!("admit {}", identifier), &self.admin_key_id
             ).unwrap();
+
+            key_id
         }
     }
 
@@ -2856,13 +2934,23 @@ mod tests {
         }
     }
 
+    /// `office_user_of` no longer reads the anchor and office state for itself — its
+    /// production callers pass in the values their own audit consumed. These tests
+    /// have no audit of their own to agree with, so they read fresh, exactly as
+    /// `require_uploader` now does, and pass the result straight through.
+    fn office_user_of_now(identifier: &str) -> Result<Option<office_utils::UserRecord>, HandlerError> {
+        let anchor = office_utils::read_trust_anchor().map_err(internal)?;
+        let office_state = office_utils::read_office_state().map_err(internal)?;
+        office_user_of(identifier, &anchor, &office_state)
+    }
+
     #[test]
     fn no_trust_anchor_means_office_user_of_is_none() {
         let root = scratch_dir("office-none-anchor");
         let _scope = StorageRootScope::enter(&root);
         std::fs::create_dir_all(root.join(FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
 
-        assert!(office_user_of("anyone").unwrap().is_none());
+        assert!(office_user_of_now("anyone").unwrap().is_none());
         assert!(require_uploader(&Principal::Operator("anyone".to_string())).is_ok());
 
         drop(_scope);
@@ -2885,7 +2973,7 @@ mod tests {
             adopts: None,
         }).unwrap();
 
-        assert!(office_user_of("anyone").unwrap().is_none());
+        assert!(office_user_of_now("anyone").unwrap().is_none());
         assert!(require_uploader(&Principal::Operator("anyone".to_string())).is_ok());
 
         drop(_scope);
@@ -2906,7 +2994,7 @@ mod tests {
             "bob", Role::Reader, Vec::new(), IdentityClass::Agent, Some("alice".to_string())
         );
 
-        let user = office_user_of("bob").unwrap().expect("bob must be enrolled");
+        let user = office_user_of_now("bob").unwrap().expect("bob must be enrolled");
         assert_eq!(user.role, Role::Reader);
         assert_eq!(user.class, IdentityClass::Agent);
         assert_eq!(user.supervisor.as_deref(), Some("alice"));
@@ -2920,7 +3008,7 @@ mod tests {
     fn an_unenrolled_operator_is_forbidden_once_an_office_exists() {
         let fixture = OfficeFixture::genesis("office-unenrolled");
 
-        let error = office_user_of("mallory").err().unwrap();
+        let error = office_user_of_now("mallory").err().unwrap();
         assert_eq!(error.0, StatusCode::FORBIDDEN);
         assert!(error.1.contains("is not enrolled"), "{}", error.1);
 
@@ -3015,6 +3103,263 @@ mod tests {
         let status = response.into_response().status();
         assert_ne!(status, StatusCode::FORBIDDEN, "an in-grant writer must clear the auth gate");
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "it must instead fail on the missing object");
+    }
+
+    // ---------------------------------------------------------------------------------
+    // FORK-95 slice 1 falsifiers: `office_user_of` consumes the audit's own values
+    // instead of reading a second, independent copy of its own.
+    // ---------------------------------------------------------------------------------
+
+    /// Build, store and sign a minimal (empty-tree) parcel — content the audit will
+    /// accept without needing a real working copy — and return its hash. Unlike
+    /// `office_utils::stack_office_parcel`, this never advances any ref: a falsifier
+    /// needs the object *present* (so `does_object_exist` and the deep audit have
+    /// something real to check) without the pallet already having moved, so it can
+    /// drive the move itself through `post_ref_update`.
+    fn store_signed_parcel(actor: &Operator,
+                           signing_key_id: &str,
+                           parents: Vec<String>,
+                           description: &str) -> String {
+        use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
+        use forklift_core::enums::dir_entry_type::DirEntryType;
+        use forklift_core::enums::parcel_action_type::ParcelActionType;
+        use forklift_core::model::parcel::Parcel;
+        use forklift_core::model::parcel_action::ParcelAction;
+
+        let root_tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        let mut root_object = LooseObjectBuilder::build_tree(&root_tree);
+        root_object.store().unwrap();
+
+        let timestamp = chrono::Utc::now();
+        let parcel = Parcel {
+            tree_hash: root_object.hash,
+            parents,
+            actions: vec![
+                ParcelAction {
+                    operator: actor.clone(),
+                    action: ParcelActionType::Author,
+                    description: None,
+                    timestamp,
+                },
+                ParcelAction {
+                    operator: actor.clone(),
+                    action: ParcelActionType::Stack,
+                    description: None,
+                    timestamp,
+                },
+            ],
+            description: Some(description.to_string()),
+        };
+
+        let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
+        parcel_object.store().unwrap();
+
+        let signature = forklift_core::util::sign_utils::sign_parcel_hash(
+            signing_key_id, &parcel_object.hash
+        ).unwrap();
+        forklift_core::util::sign_utils::store_parcel_signature(&parcel_object.hash, &signature).unwrap();
+
+        parcel_object.hash
+    }
+
+    /// Arm the checkpoint in `office_user_of` for one identifier, returning the
+    /// "reached" receiver and the "proceed" sender a test drives the rendezvous with.
+    /// See `office_lookup_test_checkpoint`'s doc for why this is keyed by identifier
+    /// rather than a bare on/off flag.
+    fn arm_office_lookup_checkpoint(identifier: &str)
+        -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel();
+
+        *OFFICE_LOOKUP_TEST_SEAM.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((identifier.to_string(), reached_tx, gate_rx));
+
+        (reached_rx, gate_tx)
+    }
+
+    /// Falsifier 1 (reverted → red): a stale, pre-lock authorization read must not be
+    /// able to let a push commit after the grant it relied on was revoked.
+    ///
+    /// This is deliberately not a wall-clock race — the interleaving it needs is
+    /// exactly the one this fix closes, and no fixed delay can be sized against the
+    /// window it produces: on the fixed shape that window has zero width, so any
+    /// wall-clock trigger either always loses the race (proving nothing) or is
+    /// flaky. Instead it drives a real, lock-respecting office revocation into the
+    /// checkpoint `office_user_of` reaches right after fixing its decision, and asks
+    /// the one question that actually distinguishes the two shapes: is `handle.writes`
+    /// — the very mutex quinn's own commit is about to take — already held at that
+    /// instant?
+    ///
+    /// - Reverted (`office_user_of` reads for itself, called before the lock): the
+    ///   answer is no — nothing has taken the lock yet. A revocation lands in that
+    ///   free window, through the same lock a real `post_ref_update("@office", ...)`
+    ///   would use, and quinn's push still commits on data read before it.
+    /// - Fixed: the answer is yes — quinn's own request already holds it, so nothing
+    ///   lock-respecting can have landed here, and the push must simply succeed on
+    ///   what it legitimately read.
+    ///
+    /// A fake, never-uploaded `new_head` (the trick several sibling tests use to stop
+    /// short of the deep audit) can't stand in here: it fails on object presence
+    /// before authorization would ever matter, in *both* shapes, so the two would be
+    /// indistinguishable. This needs a push that can really commit if authorization
+    /// wrongly lets it through — hence a real, signed, already-uploaded parcel.
+    // Multi-threaded runtime, not the default current-thread one: the test body
+    // below blocks its own thread synchronously on `reached.recv_timeout` while
+    // `push` (spawned, not awaited yet) needs an executor thread free to poll it —
+    // on a current-thread runtime the test's own blocking wait would starve the
+    // only thread able to make `push` progress at all, and the checkpoint would
+    // never fire.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grant_revoked_through_the_write_lock_cannot_land_in_an_unlocked_window() {
+        let fixture = OfficeFixture::genesis("post-ref-revoke-race");
+        let quinn_key_id = fixture.admit(
+            "quinn", Role::Writer, vec!["main".to_string()], IdentityClass::Human, None
+        );
+        let quinn = Operator { name: "quinn".to_string(), identifier: "quinn".to_string() };
+        let new_head = store_signed_parcel(&quinn, &quinn_key_id, Vec::new(), "quinn's push");
+
+        let mut operator_tokens = HashMap::new();
+        operator_tokens.insert("tok-quinn".to_string(), "quinn".to_string());
+        let state = Arc::new(AppState { operator_tokens, ..single_mode_state(fixture.root.clone()) });
+        let ServeMode::Single(handle) = &state.mode else {
+            unreachable!("single_mode_state always builds ServeMode::Single")
+        };
+        let handle = Arc::clone(handle);
+
+        let (reached, gate) = arm_office_lookup_checkpoint("quinn");
+
+        let params = ref_update_params("main");
+        let body = RefUpdateRequest { old_head: None, new_head };
+        let push = tokio::spawn(post_ref_update(
+            State(Arc::clone(&state)), headers_with_bearer("tok-quinn"), Path(params), Json(body)
+        ));
+
+        reached.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("office_user_of must reach its test checkpoint");
+
+        let expected_status = match handle.writes.try_lock() {
+            Ok(guard) => {
+                // The vulnerable window: the lock is free even though quinn's push
+                // already has its authorization answer. Revoke her through the same
+                // lock a real concurrent office update would use.
+                let mut office_state = office_utils::read_office_state().unwrap();
+                office_state.users.iter_mut()
+                    .find(|user| user.identifier == "quinn")
+                    .expect("quinn must be enrolled")
+                    .role = Role::Reader;
+                office_utils::stack_office_parcel(
+                    &office_state, &fixture.admin, "revoke quinn".to_string(), &fixture.admin_key_id
+                ).unwrap();
+                drop(guard);
+
+                StatusCode::FORBIDDEN
+            }
+            Err(_) => {
+                // No window: quinn's own request already holds the lock, so nothing
+                // lock-respecting could have landed here. Nothing to revoke against —
+                // the push must simply succeed.
+                StatusCode::OK
+            }
+        };
+
+        gate.send(()).expect("the push's checkpoint must still be waiting on the gate");
+        let status = push.await.unwrap().into_response().status();
+
+        assert_eq!(
+            status, expected_status,
+            "quinn's grant was revoked through the write lock; the push's own status ({}) \
+            must match what that lock's state at decision time predicted", status
+        );
+    }
+
+    /// Falsifier 2 (reverted → red): the office-head `Option` this fix reads once has
+    /// two arms, and the `None` arm — trust established, office not yet lifted, the
+    /// ordinary bootstrap window reached on every enrollment — must still let that
+    /// first office lift commit. C9's own prose names the wrong implementation this
+    /// guards against: naming only the hash-taking accessor leaves nothing to call in
+    /// the `None` case, tempting an unwrap that panics right where the bootstrap
+    /// window is not an error at all.
+    ///
+    /// This is the "must still commit" half of the over-tightened direction: nothing
+    /// races here (there is no concurrent writer), so a naive implementation cannot
+    /// blame a stale read — the only way to make this push fail is to get the `None`
+    /// arm itself wrong, which is exactly the mistake this test is built to catch.
+    #[tokio::test]
+    async fn the_bootstrap_window_office_lift_still_commits() {
+        let root = scratch_dir("post-ref-bootstrap-lift");
+        let _scope = StorageRootScope::enter(&root);
+        let keys_lock = KEYS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let keys_dir = root.join("keys");
+        std::fs::create_dir_all(&keys_dir).unwrap();
+        let previous_keys_dir = std::env::var("FORKLIFT_KEYS_DIR").ok();
+        std::env::set_var("FORKLIFT_KEYS_DIR", &keys_dir);
+
+        warehouse_utils::prepare_warehouse().unwrap();
+
+        let admin = Operator { name: "alice".to_string(), identifier: "alice".to_string() };
+        let (key_id, public_key) =
+            forklift_core::util::sign_utils::generate_keypair(&admin.identifier).unwrap();
+        let pop = office_utils::sign_key_pop(&key_id, &public_key, &admin.identifier).unwrap();
+        let root_key = office_utils::endorse_key(
+            &public_key, &admin.identifier, &key_id, &pop, 1_700_000_000
+        ).unwrap();
+
+        // Trust is established; the office pallet itself has never been lifted —
+        // `get_meta_pallet_head(OFFICE_PALLET_NAME)` is `None` here, the bootstrap
+        // window this test targets. `build_and_sign_office_parcel` builds the same
+        // tree shape a real `office enroll` produces, stored and signed, without
+        // `stack_office_genesis`'s side effect of also advancing the ref — this test
+        // must drive that move itself, through `post_ref_update`, to exercise its own
+        // handling of the bootstrap window. The anchor names this parcel as its
+        // genesis (built first, exactly as `OfficeFixture::build` orders it), or the
+        // office-chain audit refuses a chain that does not descend from it.
+        let genesis_state = OfficeState {
+            users: vec![UserRecord {
+                identifier: admin.identifier.clone(),
+                enrolled_at: 1_700_000_000,
+                role: Role::Admin,
+                pallets: Vec::new(),
+                identity_root: key_id.clone(),
+                class: IdentityClass::Human,
+                supervisor: None,
+            }],
+            keys: vec![root_key],
+        };
+        let genesis_hash = office_utils::build_and_sign_office_parcel(
+            &genesis_state, &admin, "genesis".to_string(), &key_id, Vec::new()
+        ).unwrap();
+
+        office_utils::write_trust_anchor(&TrustAnchor {
+            genesis: genesis_hash.clone(),
+            enabled_at: 1_700_000_000,
+            boundary: Vec::new(),
+            prior_genesis: None,
+            adopts: None,
+        }).unwrap();
+
+        let mut operator_tokens = HashMap::new();
+        operator_tokens.insert("tok-alice".to_string(), "alice".to_string());
+        let state = Arc::new(AppState { operator_tokens, ..single_mode_state(root.clone()) });
+
+        let params = ref_update_params("@office");
+        let body = RefUpdateRequest { old_head: None, new_head: genesis_hash };
+
+        let response = post_ref_update(
+            State(state), headers_with_bearer("tok-alice"), Path(params), Json(body)
+        ).await;
+
+        assert_eq!(
+            response.into_response().status(), StatusCode::OK,
+            "the first office lift, in the ordinary bootstrap window, must commit"
+        );
+
+        match &previous_keys_dir {
+            Some(previous) => std::env::set_var("FORKLIFT_KEYS_DIR", previous),
+            None => std::env::remove_var("FORKLIFT_KEYS_DIR"),
+        }
+        drop(keys_lock);
+        drop(_scope);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // ---------------------------------------------------------------------------------
