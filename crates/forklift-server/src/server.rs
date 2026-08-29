@@ -3362,6 +3362,62 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Coverage (over-tightened direction, second half): two writers pushing to two
+    /// *different* pallets, concurrently, must each commit on their own — neither
+    /// push's audit may be forced to re-run, or refused, because of the other's
+    /// activity. `office_head`/`office_state`/`anchor` are read fresh into local
+    /// variables inside each request's own closure (never shared or cached across
+    /// requests), so there is no channel through which one push could observe or be
+    /// blocked by another's *unrelated* pallet — the shared write lock still
+    /// serializes the two commits (as it always has, unaffected by this slice), but
+    /// serialization is not refusal: both must still land as 200s.
+    ///
+    /// Unlike the other two falsifiers, this one is not known to discriminate a
+    /// plausible wrong implementation of *this* diff — see this test's mention in the
+    /// handoff report for why: slice 1 never introduces anything shared across
+    /// requests or pallets for a mistake to leak through, so there is no "revert this
+    /// hunk" story that turns it red. It stands as coverage against a *different*
+    /// class of regression (a cache or shared state introduced by a future change).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_pushes_to_different_pallets_do_not_force_each_other_into_a_re_audit() {
+        let fixture = OfficeFixture::genesis("post-ref-unrelated-pallets");
+        let quinn_key_id = fixture.admit(
+            "quinn", Role::Writer, vec!["main".to_string()], IdentityClass::Human, None
+        );
+        let roger_key_id = fixture.admit(
+            "roger", Role::Writer, vec!["side".to_string()], IdentityClass::Human, None
+        );
+
+        let quinn = Operator { name: "quinn".to_string(), identifier: "quinn".to_string() };
+        let roger = Operator { name: "roger".to_string(), identifier: "roger".to_string() };
+        let quinn_head = store_signed_parcel(&quinn, &quinn_key_id, Vec::new(), "quinn's push");
+        let roger_head = store_signed_parcel(&roger, &roger_key_id, Vec::new(), "roger's push");
+
+        let mut operator_tokens = HashMap::new();
+        operator_tokens.insert("tok-quinn".to_string(), "quinn".to_string());
+        operator_tokens.insert("tok-roger".to_string(), "roger".to_string());
+        let state = Arc::new(AppState { operator_tokens, ..single_mode_state(fixture.root.clone()) });
+
+        let quinn_push = tokio::spawn(post_ref_update(
+            State(Arc::clone(&state)),
+            headers_with_bearer("tok-quinn"),
+            Path(ref_update_params("main")),
+            Json(RefUpdateRequest { old_head: None, new_head: quinn_head }),
+        ));
+        let roger_push = tokio::spawn(post_ref_update(
+            State(Arc::clone(&state)),
+            headers_with_bearer("tok-roger"),
+            Path(ref_update_params("side")),
+            Json(RefUpdateRequest { old_head: None, new_head: roger_head }),
+        ));
+
+        let quinn_status = quinn_push.await.unwrap().into_response().status();
+        let roger_status = roger_push.await.unwrap().into_response().status();
+
+        assert_eq!(quinn_status, StatusCode::OK, "quinn's push to \"main\" must commit on its own");
+        assert_eq!(roger_status, StatusCode::OK, "roger's push to \"side\" must commit on its own");
+    }
+
     // ---------------------------------------------------------------------------------
     // startup_bind_warning
     // ---------------------------------------------------------------------------------
