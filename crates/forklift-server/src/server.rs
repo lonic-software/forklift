@@ -791,10 +791,13 @@ fn emit_event(state: &Arc<AppState>, event: HookEvent) {
 /// calls instead of the armed test's own, hanging it. `Mutex`, not thread-local:
 /// `office_user_of` runs on whichever `spawn_blocking` thread tokio schedules the
 /// request onto, which is never the thread a test arms this from.
+/// The armed seam: the identifier to rendezvous on, the channel the checkpoint
+/// signals it has been reached, and the gate it then waits on.
 #[cfg(test)]
-static OFFICE_LOOKUP_TEST_SEAM: Mutex<
-    Option<(String, std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>
-> = Mutex::new(None);
+type OfficeLookupSeam = Option<(String, std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>;
+
+#[cfg(test)]
+static OFFICE_LOOKUP_TEST_SEAM: Mutex<OfficeLookupSeam> = Mutex::new(None);
 
 #[cfg(test)]
 fn office_lookup_test_checkpoint(identifier: &str) {
@@ -3284,6 +3287,11 @@ mod tests {
     /// races here (there is no concurrent writer), so a naive implementation cannot
     /// blame a stale read — the only way to make this push fail is to get the `None`
     /// arm itself wrong, which is exactly the mistake this test is built to catch.
+    // `KEYS_ENV_LOCK` is deliberately held across the request under test: it serialises
+    // mutation of the process-global `FORKLIFT_KEYS_DIR`, so dropping it before the await
+    // would let a concurrent test in this binary swap the key directory mid-request. The
+    // guard protects an env var, never an async resource, so it cannot deadlock the runtime.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn the_bootstrap_window_office_lift_still_commits() {
         let root = scratch_dir("post-ref-bootstrap-lift");
