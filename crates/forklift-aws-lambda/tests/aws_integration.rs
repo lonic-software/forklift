@@ -44,6 +44,7 @@ use forklift_aws_lambda::{
 
 use forklift_core::globals::StorageRootScope;
 use forklift_core::model::remote::{CommitLiftRequest, RefUpdateRequest, TrustAnchorDto};
+use forklift_core::util::office_utils::OFFICE_PALLET_NAME;
 use forklift_core::util::pallet_utils::{self, PalletNamespace};
 use forklift_core::util::{file_utils, object_utils, sign_utils};
 
@@ -580,6 +581,224 @@ async fn dynamo_ref_store_upholds_the_cas_and_the_trust_door() {
         // replace_trust is the sanctioned overwrite.
         refs.replace_trust(&different).expect("replace");
         assert_eq!(refs.get_trust().expect("re-read").expect("present").0.genesis, two);
+    })
+    .await
+    .expect("the blocking assertions");
+}
+
+/// FORK-95 slice 2's *new* commit preconditions — the office and anchor `ConditionCheck`s
+/// [`DynamoRefStore::compare_and_set_head`] folds into the transaction alongside the pallet's
+/// own head — exercised against **real** DynamoDB rather than the in-memory fake. Every other
+/// CAS in this suite runs on a fresh warehouse with neither an office pallet nor a trust anchor,
+/// so it passes `None, None` and never builds either `ConditionCheck` at all; `memory.rs`'s own
+/// unit tests already cover the same outcomes against `MemoryRefStore`, in Rust, by construction.
+/// Neither proves what this test proves: that `classify_cancellation`'s *positional* reading of
+/// `TransactionCanceledException::cancellation_reasons()` matches what DynamoDB actually returns
+/// for the order `compare_and_set_head` requests actions in (pallet `Update` at position 0, the
+/// office `ConditionCheck` at position 1 when built, the anchor `ConditionCheck` last). A backend
+/// that did not preserve that ordering would still pass every fake-backed test in this crate and
+/// would silently attribute a moved office to the pallet, or a moved anchor to the office.
+#[tokio::test(flavor = "multi_thread")]
+async fn dynamo_ref_store_attributes_a_moved_precondition_to_its_position() {
+    let Some(endpoint) = endpoint() else {
+        eprintln!("skipping: FORKLIFT_AWS_TEST_ENDPOINT is unset");
+        return;
+    };
+
+    let config = test_config(&endpoint);
+    provision(&config).await;
+
+    let bridge = AsyncBridge::current().expect("a multi-thread runtime");
+    let (_objects, refs) = build_stores(&config, bridge).await.expect("stores");
+
+    tokio::task::spawn_blocking(move || {
+        let office_o1 = "a".repeat(64);
+        let office_o2 = "b".repeat(64);
+        let main_m1 = "c".repeat(64);
+        let main_m2 = "d".repeat(64);
+        let side_s1 = "e".repeat(64);
+        let side_s2 = "f".repeat(64);
+        let genesis_g1 = "1".repeat(64);
+        let genesis_g2 = "2".repeat(64);
+
+        // Provision an office pallet and a trust anchor — the precondition every other CAS in
+        // this suite runs without, and the reason those calls never build either new
+        // `ConditionCheck`.
+        assert_eq!(
+            refs.compare_and_set_head(
+                PalletNamespace::Meta,
+                OFFICE_PALLET_NAME,
+                None,
+                &office_o1,
+                None,
+                None,
+            )
+            .expect("plant the office"),
+            CasOutcome::Committed
+        );
+
+        let anchor_v1 = TrustAnchorDto {
+            genesis: genesis_g1.clone(),
+            enabled_at: 1_780_000_000,
+            boundary: vec![],
+            prior_genesis: None,
+            adopts: None,
+        }
+        .to_anchor();
+        assert_eq!(
+            refs.put_trust_if_absent(&anchor_v1).expect("plant trust"),
+            TrustOutcome::Established
+        );
+        let (_decoded, bytes_a1) = refs.get_trust().expect("read trust").expect("present");
+
+        // 1. Matching preconditions commit: create `main`, conditioned on the office head and
+        // anchor bytes exactly as stored.
+        assert_eq!(
+            refs.compare_and_set_head(
+                PalletNamespace::User,
+                "main",
+                None,
+                &main_m1,
+                Some(&office_o1),
+                Some(&bytes_a1),
+            )
+            .expect("create main under matching preconditions"),
+            CasOutcome::Committed
+        );
+
+        // 2. Move the office head after the snapshot above, then commit `main` with the now-stale
+        // `office_head`. `main`'s own expected head still holds (`main_m1`) — position 0 passes —
+        // so the only failing condition is the office `ConditionCheck` at position 1 (`main` is
+        // not `@office`, so a separate office check IS built here). The anchor is untouched and
+        // still matches, so a misreading of position 1 as the anchor's position — or vice versa —
+        // would surface as the wrong variant, not merely the wrong `current`.
+        //
+        // Moving `@office` itself is necessarily a single-item CAS: the target IS the office
+        // pallet, so no separate office `ConditionCheck` is built for it — DynamoDB refuses two
+        // actions on the same item, and the pallet `Update`'s own condition already pins that
+        // exact item. The anchor `ConditionCheck` is still always built, though, so its bytes must
+        // still be supplied and correct here.
+        assert_eq!(
+            refs.compare_and_set_head(
+                PalletNamespace::Meta,
+                OFFICE_PALLET_NAME,
+                Some(&office_o1),
+                &office_o2,
+                None,
+                Some(&bytes_a1),
+            )
+            .expect("move the office"),
+            CasOutcome::Committed
+        );
+
+        assert_eq!(
+            refs.compare_and_set_head(
+                PalletNamespace::User,
+                "main",
+                Some(&main_m1),
+                &main_m2,
+                Some(&office_o1), // stale: the office moved to office_o2 just above
+                Some(&bytes_a1),
+            )
+            .expect("stale office precondition"),
+            CasOutcome::OfficeMoved { current: Some(office_o2.clone()) }
+        );
+        // The transaction is all-or-nothing: `main` did not move.
+        assert_eq!(
+            refs.get_head(PalletNamespace::User, "main").expect("get").as_deref(),
+            Some(main_m1.as_str())
+        );
+
+        // 3. Replace the trust anchor, then commit `main` with the now-stale anchor bytes but the
+        // now-*current* office head. Position 0 and position 1 both pass this time; only the
+        // anchor `ConditionCheck` — the last position — fails, proving `AnchorMoved` is read from
+        // the last slot rather than conflated with the office slot immediately before it.
+        let anchor_v2 = TrustAnchorDto {
+            genesis: genesis_g2.clone(),
+            enabled_at: 1_780_000_001,
+            boundary: vec![genesis_g1.clone()],
+            prior_genesis: Some(genesis_g1.clone()),
+            adopts: Some(office_o1.clone()),
+        }
+        .to_anchor();
+        refs.replace_trust(&anchor_v2).expect("replace trust");
+        let (_decoded, bytes_a2) = refs.get_trust().expect("read trust").expect("present");
+        assert_ne!(bytes_a1, bytes_a2, "the replacement actually changed the stored bytes");
+
+        assert_eq!(
+            refs.compare_and_set_head(
+                PalletNamespace::User,
+                "main",
+                Some(&main_m1),
+                &main_m2,
+                Some(&office_o2), // current: matches
+                Some(&bytes_a1),  // stale: the anchor was replaced just above
+            )
+            .expect("stale anchor precondition"),
+            CasOutcome::AnchorMoved
+        );
+        assert_eq!(
+            refs.get_head(PalletNamespace::User, "main").expect("get").as_deref(),
+            Some(main_m1.as_str()),
+            "still uncommitted"
+        );
+
+        // 4. An unrelated pallet moving under matching preconditions must not refuse `main`'s own
+        // commit, which never names it — `side` is created and moved here, immediately before
+        // `main`'s own successful commit, and does not stand in its way.
+        assert_eq!(
+            refs.compare_and_set_head(
+                PalletNamespace::User,
+                "side",
+                None,
+                &side_s1,
+                Some(&office_o2),
+                Some(&bytes_a2),
+            )
+            .expect("create side"),
+            CasOutcome::Committed
+        );
+        assert_eq!(
+            refs.compare_and_set_head(
+                PalletNamespace::User,
+                "side",
+                Some(&side_s1),
+                &side_s2,
+                Some(&office_o2),
+                Some(&bytes_a2),
+            )
+            .expect("move side"),
+            CasOutcome::Committed
+        );
+        assert_eq!(
+            refs.compare_and_set_head(
+                PalletNamespace::User,
+                "main",
+                Some(&main_m1),
+                &main_m2,
+                Some(&office_o2),
+                Some(&bytes_a2),
+            )
+            .expect("main commits under matching preconditions despite side's concurrent moves"),
+            CasOutcome::Committed
+        );
+
+        // 5. A moved pallet head is still attributed to the pallet itself — position 0 — when the
+        // office and anchor both match, so position 0 is not being read for the wrong thing.
+        // `main` is now at `main_m2`; retry with the stale `main_m1` expectation and otherwise
+        // fully current preconditions.
+        assert_eq!(
+            refs.compare_and_set_head(
+                PalletNamespace::User,
+                "main",
+                Some(&main_m1),
+                &main_m2,
+                Some(&office_o2),
+                Some(&bytes_a2),
+            )
+            .expect("stale pallet-head precondition, office and anchor both current"),
+            CasOutcome::Conflict { current: Some(main_m2.clone()) }
+        );
     })
     .await
     .expect("the blocking assertions");
