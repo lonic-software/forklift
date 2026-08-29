@@ -39,8 +39,8 @@ use forklift_core::util::{
 use crate::error::{HeadError, HeadResult};
 use crate::scratch::{materialize, Mirror, Scratch};
 use crate::store::{
-    CasOutcome, ObjectAccess, ObjectStore, PromoteOutcome, PutTarget, RefStore, SignatureOutcome,
-    TrustOutcome,
+    CasOutcome, ObjectAccess, ObjectStore, OfficePrecondition, PromoteOutcome, PutTarget,
+    RefStore, SignatureOutcome, TrustOutcome,
 };
 
 /// How the head answers a byte read: the bytes, or a redirect to a storage URL.
@@ -558,12 +558,16 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
 
         // The commit conditions on the office head only when the audit above actually
         // consumed it — an untrusted warehouse's audit never reads it (both the office-chain
-        // mirror and the whole trust block are gated on `anchor.is_some()`), so passing it
-        // unconditionally would refuse a push for an office move the audit never depended on,
-        // or worse: an untrusted office pallet may carry a real, unaudited head, and
-        // conditioning on it as if `None` meant "must be unborn" would refuse *every* such
-        // push, race or not. `RefStore::compare_and_set_head`'s own docs record this contract.
-        let office_head_for_commit = if anchor.is_some() { office_head.as_deref() } else { None };
+        // mirror and the whole trust block are gated on `anchor.is_some()`), so conditioning
+        // on it unconditionally would refuse a push for an office move the audit never
+        // depended on, or worse: an untrusted office pallet may carry a real, unaudited head,
+        // and treating "not consumed" as "must be unborn" would refuse *every* such push, race
+        // or not. `OfficePrecondition`'s own docs (`store.rs`) record why `NotConsumed` and
+        // "the office pallet is unborn" cannot be the same value.
+        let office_head_for_commit = match (anchor.is_some(), office_head.as_deref()) {
+            (true, Some(head)) => OfficePrecondition::At(head),
+            _ => OfficePrecondition::NotConsumed,
+        };
 
         // The commit: one DynamoDB transaction conditioned on every movable input the audit
         // above consumed — the pallet's own head, the office head (when read), and the trust
@@ -782,11 +786,22 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// often another push racing this one for the shared office item. Unlike `moved`/
     /// `office_moved`/`anchor_moved`, this does not claim any value changed, so it must never
     /// be worded as one of those: a retry may succeed with nothing having moved at all.
+    ///
+    /// **The message must not promise automation this crate does not have** (PR #116 review,
+    /// finding 4). No client-side retry loop or classifier recognizes this status yet — the
+    /// client's `update_ref` (`forklift-core`'s `remote_utils.rs`) has no retry path at all to
+    /// extend, unlike `commit_lift`'s blob-not-ready case, which already owns one
+    /// (`is_transient_commit_failure` plus `commit_one_batch`'s bounded backoff loop); building
+    /// an equivalent for ref updates is new retry machinery this design gives to FORK-95 slice
+    /// 3 (arm two, claim C14), not this one. So the wording below says "run the push again",
+    /// never "retry" bare — an instruction a human (or a script) can act on without implying a
+    /// client-side mechanism that does not exist.
     fn transient_contention(&self) -> HeadError {
         HeadError::service_unavailable(
-            "The commit could not complete because of contention on a shared item, likely a \
-            concurrent push to this warehouse's office pallet. Retry the push; nothing may \
-            have moved."
+            "The commit could not complete: another push is concurrently touching a shared \
+            item on this warehouse, likely its office pallet. No input is known to have \
+            moved. Run the push again once the other push has settled — this client does not \
+            retry ref updates automatically."
                 .to_string(),
         )
     }

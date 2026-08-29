@@ -61,7 +61,7 @@ use forklift_core::util::pallet_utils::{PalletNamespace, PalletRef};
 use crate::aws::dynamo_ops::DynamoOps;
 use crate::aws::sdk::describe;
 use crate::blocking::AsyncBridge;
-use crate::store::{CasOutcome, RefStore, TrustOutcome};
+use crate::store::{CasOutcome, OfficePrecondition, RefStore, TrustOutcome};
 
 /// The partition-key attribute: the warehouse id.
 const ATTR_WAREHOUSE: &str = "wh";
@@ -349,7 +349,7 @@ impl RefStore for DynamoRefStore {
         name: &str,
         expected: Option<&str>,
         new: &str,
-        office_head: Option<&str>,
+        office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
     ) -> Result<CasOutcome, String> {
         let entity = pallet_entity(namespace, name);
@@ -358,12 +358,16 @@ impl RefStore for DynamoRefStore {
         // which must hold. Structural: DynamoDB refuses a transaction where two actions target
         // the same item ("you cannot both `ConditionCheck` and `Update` the same item" — AWS
         // API Reference), and lifting `@office` itself is that case — the office precondition
-        // IS the pallet precondition the `Update` action already encodes. Semantic: `None`
-        // means the caller's own audit never consumed an office head at all (an untrusted
-        // warehouse never reads one — see `RefStore::compare_and_set_head`'s docs), and
-        // conditioning on it anyway would refuse a commit over a state the audit never
-        // depended on.
-        let builds_office_check = entity != office_entity && office_head.is_some();
+        // IS the pallet precondition the `Update` action already encodes. Semantic:
+        // `OfficePrecondition::NotConsumed` means the caller's own audit never consumed an
+        // office head at all (an untrusted warehouse never reads one — see
+        // `RefStore::compare_and_set_head`'s docs), and conditioning on it anyway would refuse
+        // a commit over a state the audit never depended on.
+        let office_head_value = match office_head {
+            OfficePrecondition::At(head) if entity != office_entity => Some(head),
+            _ => None,
+        };
+        let builds_office_check = office_head_value.is_some();
 
         self.bridge.block_on(async {
             // Position 0 is always the pallet's own head; the office `ConditionCheck` (when
@@ -371,13 +375,8 @@ impl RefStore for DynamoRefStore {
             // `classify_cancellation`'s docs for why that ordering is load-bearing.
             let mut items = vec![self.pallet_update(&entity, expected, new)];
 
-            if builds_office_check {
-                // `office_head.is_some()` is exactly `builds_office_check`'s own condition
-                // (the structural half only rules the check *out*, never back in), so this
-                // never panics.
-                items.push(
-                    self.office_condition_check(&office_entity, office_head.expect("checked above")),
-                );
+            if let Some(office_head) = office_head_value {
+                items.push(self.office_condition_check(&office_entity, office_head));
             }
 
             items.push(self.anchor_condition_check(anchor));

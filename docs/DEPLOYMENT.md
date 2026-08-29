@@ -356,9 +356,19 @@ below is that attested `2×` multiplied by the transaction's item count, so a re
 the premise can see which number moves if it turns out wrong. A trusted lift to a non-office
 pallet touches three items (the pallet `Update`, the office `ConditionCheck`, the anchor
 `ConditionCheck`) for 6 WCU; a lift to `@office` itself or any push on an untrusted warehouse
-touches two (no office `ConditionCheck` is built) for 4 WCU. On-demand billing absorbs this
-without a capacity-planning step; on provisioned capacity, size write throughput against the
-higher number.
+touches two (no office `ConditionCheck` is built) for 4 WCU. **These are a floor, not a
+ceiling: both figures assume every item is ≤ 1 KB, and AWS's own write-unit definition
+(`provisioned-capacity-mode.md`, verified) is one WCU per item *per KB*, rounded up — a bigger
+item costs proportionally more, doubled again by the transactional multiplier above.** The
+trust item is the one likely to cross that line in practice: it carries the anchor's
+`boundary` — the head of every pallet that existed the moment trust was established or last
+re-genesised (`TrustAnchor::boundary`'s own doc), fixed at that size afterward rather than
+growing with ordinary lifts. Each boundary hash costs roughly 70 bytes of JSON, so a warehouse
+with on the order of 16 pallets at enrollment already exceeds 1 KB there — pushing a trusted
+lift's cost above 6 WCU for that item alone, with no change to the item *count* this section
+derives from. On-demand billing absorbs this without a capacity-planning step; on provisioned
+capacity, size write throughput against how many pallets this warehouse had at its last
+enrollment or re-genesis, not just the fixed item count.
 
 ### TTL
 

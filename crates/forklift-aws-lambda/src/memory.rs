@@ -23,8 +23,8 @@ use forklift_core::util::office_utils::{TrustAnchor, OFFICE_PALLET_NAME};
 use forklift_core::util::pallet_utils::{PalletNamespace, PalletRef, DEFAULT_PALLET_NAME};
 
 use crate::store::{
-    CasOutcome, ObjectAccess, ObjectStore, PromoteOutcome, PutOutcome, PutTarget, RefStore,
-    SignatureOutcome, TrustOutcome,
+    CasOutcome, ObjectAccess, ObjectStore, OfficePrecondition, PromoteOutcome, PutOutcome,
+    PutTarget, RefStore, SignatureOutcome, TrustOutcome,
 };
 
 /// An in-memory [`ObjectStore`]. Object bytes are the uncompressed wire form, keyed by hash.
@@ -291,22 +291,26 @@ impl RefStore for MemoryRefStore {
         name: &str,
         expected: Option<&str>,
         new: &str,
-        office_head: Option<&str>,
+        office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
     ) -> Result<CasOutcome, String> {
         let key = Self::key(namespace, name);
         let office_key = Self::key(PalletNamespace::Meta, OFFICE_PALLET_NAME);
-        // The office precondition is checked for two independent reasons at once. Structural:
-        // a lift to `@office` itself needs no separate office check — the pallet-head check
-        // below already pins that exact entry, the fake's mirror of the reason
-        // `DynamoRefStore` drops the redundant `ConditionCheck` there (two actions on one item
-        // is refused by DynamoDB; here it would just be checking the same key twice). Semantic:
-        // `office_head: None` means the caller's audit never consumed an office head at all —
-        // not "expect the office pallet to be unborn" — so it must not be compared against
-        // whatever the office key currently holds; see `RefStore::compare_and_set_head`'s docs
-        // for why treating `None` as "unborn" here would refuse an untrusted push whose office
-        // pallet genuinely (if unaudited) has a real head, every time, not just under a race.
-        let checks_office_separately = key != office_key;
+        // The office precondition is checked only when both hold at once. Structural: a lift
+        // to `@office` itself needs no separate office check — the pallet-head check below
+        // already pins that exact entry, the fake's mirror of the reason `DynamoRefStore`
+        // drops the redundant `ConditionCheck` there (two actions on one item is refused by
+        // DynamoDB; here it would just be checking the same key twice). Semantic:
+        // `OfficePrecondition::NotConsumed` means the caller's audit never consumed an office
+        // head at all — not "expect the office pallet to be unborn" — so it must not be
+        // compared against whatever the office key currently holds; see
+        // `RefStore::compare_and_set_head`'s docs for why treating it as "unborn" here would
+        // refuse an untrusted push whose office pallet genuinely (if unaudited) has a real
+        // head, every time, not just under a race.
+        let office_head = match office_head {
+            OfficePrecondition::At(head) if key != office_key => Some(head),
+            _ => None,
+        };
 
         let mut state = self.state.lock().unwrap();
 
@@ -318,13 +322,11 @@ impl RefStore for MemoryRefStore {
             return Ok(CasOutcome::Conflict { current });
         }
 
-        if checks_office_separately {
-            if let Some(office_head) = office_head {
-                let current_office = state.heads.get(&office_key).cloned();
+        if let Some(office_head) = office_head {
+            let current_office = state.heads.get(&office_key).cloned();
 
-                if current_office.as_deref() != Some(office_head) {
-                    return Ok(CasOutcome::OfficeMoved { current: current_office });
-                }
+            if current_office.as_deref() != Some(office_head) {
+                return Ok(CasOutcome::OfficeMoved { current: current_office });
             }
         }
 

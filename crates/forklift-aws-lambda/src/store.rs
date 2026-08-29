@@ -105,6 +105,33 @@ pub enum PromoteOutcome {
     },
 }
 
+/// Whether a ref-update audit consumed the office head at all, and what it consumed if so.
+///
+/// Before this type existed, `compare_and_set_head` took a plain `office_head: Option<&str>`
+/// alongside `anchor: Option<&str>` — two adjacent parameters of the same type, but `None`
+/// meant opposite things on each: for `anchor`, "the trust item must be absent"; for
+/// `office_head`, "this commit's own audit never looked at the office head at all", which is
+/// not the same claim as "the office pallet is unborn" (a warehouse can have a real, if
+/// unaudited, office head that this particular commit simply never consumed — an untrusted
+/// push, principally). A future caller reading `office_head: None` as "unborn" rather than
+/// "not consumed" would compile clean and fail only at runtime, refusing pushes it should not.
+/// This type makes that reading impossible to get backwards: there is no `None` to misread.
+///
+/// `anchor` keeps its plain `Option<&str>` shape rather than getting the same treatment,
+/// because the asymmetry it would paper over is real: the office head is *conditionally*
+/// consumed (only once trust is established — see `ref_update`'s own gates in `head.rs`),
+/// while the anchor is *unconditionally* consumed by every ref update, trusted or not — an
+/// untrusted commit's own precondition is exactly "the anchor is still absent". There is no
+/// "anchor not consumed" state to represent: the anchor's `None` already means one thing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OfficePrecondition<'a> {
+    /// The caller's audit never read an office head (an untrusted warehouse's audit touches
+    /// nothing office-related). No office precondition is built at all — not "expect unborn".
+    NotConsumed,
+    /// The caller's audit read this office head; the commit must condition on it unchanged.
+    At(&'a str),
+}
+
 /// The outcome of a commit that conditions on every movable input a ref-update audit
 /// consumed — the pallet's own head, the office head, and the trust anchor (FORK-95 design
 /// memo, "The movable inputs: exactly three" / claim C6). A caller needs to know *which*
@@ -261,20 +288,20 @@ pub trait RefStore {
     /// DynamoDB `TransactWriteItems`; FORK-95 design memo, claim C13):
     ///
     /// * `expected` — the pallet's own head. `None` means "the pallet must not exist yet".
-    /// * `office_head` — the office pallet's head the audit read, precisely when the audit
-    ///   read one at all — `None` means "the audit never consumed the office head", not
-    ///   "the office pallet is unborn": an untrusted warehouse's audit never reads it (every
-    ///   office-touching step is gated on trust being established), so conditioning on
-    ///   "unborn" there would refuse a push over an office state the audit never depended on,
-    ///   possibly *every* push, since an untrusted office pallet may well carry a real,
-    ///   unaudited head. The caller must pass `None` here whenever its own audit did not read
-    ///   the office head, never merely because the office pallet happens to be unborn. Also
-    ///   skipped (regardless of value) when `namespace`/`name` name the office pallet itself —
-    ///   the `expected` condition above already pins that exact item.
+    /// * `office_head` — see [`OfficePrecondition`]. `NotConsumed` when the caller's own audit
+    ///   never read an office head at all (an untrusted warehouse's audit touches nothing
+    ///   office-related), never merely because the office pallet happens to be unborn — an
+    ///   untrusted office pallet may carry a real, unaudited head, and conditioning on
+    ///   "unborn" for a state the audit never depended on would refuse *every* such push, race
+    ///   or not. Also `NotConsumed` (regardless of what the caller's audit read) when
+    ///   `namespace`/`name` name the office pallet itself — the `expected` condition above
+    ///   already pins that exact item.
     /// * `anchor` — the trust anchor's *stored serialization*, exactly as
     ///   [`get_trust`](RefStore::get_trust) returned it, or `None` if untrusted. Never a
     ///   re-serialization of the decoded value: a `serde` field reorder must not fail every
-    ///   push's anchor check for no anchor that actually moved.
+    ///   push's anchor check for no anchor that actually moved. Unlike `office_head`, the
+    ///   anchor has no "not consumed" state — every ref update, trusted or not, conditions on
+    ///   it (an untrusted push's own precondition is exactly "the anchor is still absent").
     ///
     /// A mismatch on any of the three commits nothing and reports *which* input moved via
     /// [`CasOutcome`] — the caller cannot tell a moved pallet head from a moved office head
@@ -286,7 +313,7 @@ pub trait RefStore {
         name: &str,
         expected: Option<&str>,
         new: &str,
-        office_head: Option<&str>,
+        office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
     ) -> Result<CasOutcome, String>;
 

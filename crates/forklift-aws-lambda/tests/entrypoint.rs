@@ -21,8 +21,8 @@ use serde::Serialize;
 
 use forklift_aws_lambda::memory::{MemoryObjectStore, MemoryRefStore};
 use forklift_aws_lambda::store::{
-    CasOutcome, ObjectAccess, ObjectStore, PromoteOutcome, PutOutcome, PutTarget, RefStore,
-    SignatureOutcome, TrustOutcome,
+    CasOutcome, ObjectAccess, ObjectStore, OfficePrecondition, PromoteOutcome, PutOutcome,
+    PutTarget, RefStore, SignatureOutcome, TrustOutcome,
 };
 use forklift_aws_lambda::{handle, AuthConfig, Head, Routing};
 
@@ -92,7 +92,7 @@ impl RefStore for SharedRefs {
         name: &str,
         expected: Option<&str>,
         new: &str,
-        office_head: Option<&str>,
+        office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
     ) -> Result<CasOutcome, String> {
         self.0.compare_and_set_head(namespace, name, expected, new, office_head, anchor)

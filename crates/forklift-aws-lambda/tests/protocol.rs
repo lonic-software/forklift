@@ -20,7 +20,8 @@ use forklift_aws_lambda::head::{ObjectReadResult, ObjectWriteResult, TrustResult
 use forklift_aws_lambda::memory::{MemoryObjectStore, MemoryRefStore};
 use forklift_aws_lambda::scratch::Scratch;
 use forklift_aws_lambda::store::{
-    CasOutcome, ObjectStore, PromoteOutcome, PutOutcome, RefStore, SignatureOutcome, TrustOutcome,
+    CasOutcome, ObjectStore, OfficePrecondition, PromoteOutcome, PutOutcome, RefStore,
+    SignatureOutcome, TrustOutcome,
 };
 use forklift_aws_lambda::{AsyncBridge, BatchResult, Head};
 
@@ -1231,7 +1232,7 @@ impl RefStore for AsyncRefStore {
         name: &str,
         expected: Option<&str>,
         new: &str,
-        office_head: Option<&str>,
+        office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
     ) -> Result<CasOutcome, String> {
         self.bridge.block_on(suspending(|| {
@@ -1341,7 +1342,7 @@ impl RefStore for SharedMemoryRefs {
         name: &str,
         expected: Option<&str>,
         new: &str,
-        office_head: Option<&str>,
+        office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
     ) -> Result<CasOutcome, String> {
         self.0.compare_and_set_head(namespace, name, expected, new, office_head, anchor)
@@ -1410,7 +1411,7 @@ impl RefStore for OfficeMovesAfterTheSnapshot {
                         OFFICE_PALLET_NAME,
                         current.as_deref(),
                         &self.move_to,
-                        None,
+                        OfficePrecondition::NotConsumed,
                         anchor_bytes.as_deref(),
                     )
                     .expect("inject the concurrent office move");
@@ -1431,7 +1432,7 @@ impl RefStore for OfficeMovesAfterTheSnapshot {
         name: &str,
         expected: Option<&str>,
         new: &str,
-        office_head: Option<&str>,
+        office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
     ) -> Result<CasOutcome, String> {
         self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor)
@@ -1482,7 +1483,7 @@ impl RefStore for AnchorMovesAfterTheSnapshot {
         name: &str,
         expected: Option<&str>,
         new: &str,
-        office_head: Option<&str>,
+        office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
     ) -> Result<CasOutcome, String> {
         self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor)
@@ -1513,6 +1514,86 @@ impl RefStore for AnchorMovesAfterTheSnapshot {
     fn replace_trust(&self, anchor: &office_utils::TrustAnchor) -> Result<(), String> {
         self.inner.replace_trust(anchor)
     }
+}
+
+/// A [`RefStore`] that forwards everything except `compare_and_set_head`, which always
+/// answers [`CasOutcome::Transient`] regardless of its arguments. `MemoryRefStore` itself
+/// never produces this variant (see its own docs), so it is otherwise unreachable through
+/// `Head::ref_update` in this crate's test suite — only a fake built to return it can prove
+/// `transient_contention()` and the `Status::ServiceUnavailable -> 503` mapping actually fire,
+/// rather than that variant silently falling through to a default match arm.
+struct AlwaysTransientOnCommit {
+    inner: MemoryRefStore,
+}
+
+impl RefStore for AlwaysTransientOnCommit {
+    fn get_head(
+        &self,
+        namespace: pallet_utils::PalletNamespace,
+        name: &str,
+    ) -> Result<Option<String>, String> {
+        self.inner.get_head(namespace, name)
+    }
+
+    fn compare_and_set_head(
+        &self,
+        _namespace: pallet_utils::PalletNamespace,
+        _name: &str,
+        _expected: Option<&str>,
+        _new: &str,
+        _office_head: OfficePrecondition<'_>,
+        _anchor: Option<&str>,
+    ) -> Result<CasOutcome, String> {
+        Ok(CasOutcome::Transient)
+    }
+
+    fn list_refs(&self) -> Result<Vec<(pallet_utils::PalletRef, String)>, String> {
+        self.inner.list_refs()
+    }
+
+    fn default_pallet(&self) -> Result<String, String> {
+        self.inner.default_pallet()
+    }
+
+    fn get_trust(&self) -> Result<Option<(office_utils::TrustAnchor, String)>, String> {
+        self.inner.get_trust()
+    }
+
+    fn put_trust_if_absent(&self, anchor: &office_utils::TrustAnchor) -> Result<TrustOutcome, String> {
+        self.inner.put_trust_if_absent(anchor)
+    }
+
+    fn replace_trust(&self, anchor: &office_utils::TrustAnchor) -> Result<(), String> {
+        self.inner.replace_trust(anchor)
+    }
+}
+
+/// PR #116 review, finding 2: `CasOutcome::Transient` reaches `head.rs::transient_contention`
+/// and `Status::ServiceUnavailable`'s `503` only through this test — an edit remapping the
+/// `Transient` arm in `ref_update`'s match to `self.moved(...)` or `HeadError::internal(...)`
+/// would otherwise pass the entire suite, since nothing else in this crate ever observes that
+/// arm running.
+#[test]
+fn a_transient_cas_outcome_maps_to_a_503_through_ref_update() {
+    let area = Area::new("transient-cas-outcome");
+    prepare(&area, "wh");
+    area.write_file("wh/app.txt", "v1\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "first"]);
+
+    let harvested = harvest(&area.path("wh"));
+    let main_head = harvested.head_of("main").expect("main head");
+
+    let head =
+        Head::new(MemoryObjectStore::new(), AlwaysTransientOnCommit { inner: MemoryRefStore::new() });
+    upload_all(&head, &harvested);
+
+    let err = head
+        .ref_update("main", &RefUpdateRequest { old_head: None, new_head: main_head })
+        .expect_err("a Transient CasOutcome must refuse the commit, not accept it");
+
+    assert_eq!(err.status, Status::ServiceUnavailable);
+    assert_eq!(err.status.as_u16(), 503);
 }
 
 /// Falsifier 1a (office): the ref update must be refused, and refused as a **moved office**,
@@ -1796,7 +1877,7 @@ fn a_concurrently_moved_unrelated_pallet_does_not_refuse_the_commit() {
                 "unrelated",
                 None,
                 &"a".repeat(64),
-                Some(&office_head),
+                OfficePrecondition::At(&office_head),
                 Some(&anchor_bytes),
             )
             .expect("plant an unrelated pallet"),

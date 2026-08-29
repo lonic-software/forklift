@@ -35,8 +35,8 @@ use http::{Request, Response};
 
 use forklift_aws_lambda::aws::{build_clients, build_stores, AwsConfig, DynamoOps, S3Ops};
 use forklift_aws_lambda::store::{
-    CasOutcome, ObjectAccess, ObjectStore, PromoteOutcome, PutOutcome, PutTarget, RefStore,
-    SignatureOutcome, TrustOutcome,
+    CasOutcome, ObjectAccess, ObjectStore, OfficePrecondition, PromoteOutcome, PutOutcome,
+    PutTarget, RefStore, SignatureOutcome, TrustOutcome,
 };
 use forklift_aws_lambda::{
     handle, AsyncBridge, AuthConfig, DynamoRefStore, Head, HeadResult, Routing, S3ObjectStore,
@@ -476,17 +476,19 @@ async fn dynamo_ref_store_upholds_the_cas_and_the_trust_door() {
         // never an error (the `UpdateItem` condition `#h = :old` simply cannot hold against an
         // item with no `head` attribute).
         // No office and no trust anchor exist yet on this warehouse, so every CAS below passes
-        // `None, None` for the two new preconditions — the office/anchor `ConditionCheck`s this
-        // fresh warehouse would build both resolve to their "unborn"/"absent" mode regardless.
+        // `OfficePrecondition::NotConsumed` and `None` for the two new preconditions: the
+        // office `ConditionCheck` is not built at all (there is no "audit consumed the office
+        // being unborn" mode — see `OfficePrecondition`'s docs), while the anchor
+        // `ConditionCheck` is always built and resolves to its "absent" mode.
         assert_eq!(
-            refs.compare_and_set_head(PalletNamespace::User, "main", Some(&one), &two, None, None)
+            refs.compare_and_set_head(PalletNamespace::User, "main", Some(&one), &two, OfficePrecondition::NotConsumed, None)
                 .expect("cas against a genuinely missing item"),
             CasOutcome::Conflict { current: None }
         );
 
         // Create with expected None.
         assert_eq!(
-            refs.compare_and_set_head(PalletNamespace::User, "main", None, &one, None, None)
+            refs.compare_and_set_head(PalletNamespace::User, "main", None, &one, OfficePrecondition::NotConsumed, None)
                 .expect("create"),
             CasOutcome::Committed
         );
@@ -497,21 +499,21 @@ async fn dynamo_ref_store_upholds_the_cas_and_the_trust_door() {
 
         // A replay with expected None now conflicts, reporting the current head.
         assert_eq!(
-            refs.compare_and_set_head(PalletNamespace::User, "main", None, &two, None, None)
+            refs.compare_and_set_head(PalletNamespace::User, "main", None, &two, OfficePrecondition::NotConsumed, None)
                 .expect("replay"),
             CasOutcome::Conflict { current: Some(one.clone()) }
         );
 
         // A fast-forward from the right expected commits.
         assert_eq!(
-            refs.compare_and_set_head(PalletNamespace::User, "main", Some(&one), &two, None, None)
+            refs.compare_and_set_head(PalletNamespace::User, "main", Some(&one), &two, OfficePrecondition::NotConsumed, None)
                 .expect("ff"),
             CasOutcome::Committed
         );
 
         // A stale expected conflicts, again reporting the actual head.
         assert_eq!(
-            refs.compare_and_set_head(PalletNamespace::User, "main", Some(&one), &one, None, None)
+            refs.compare_and_set_head(PalletNamespace::User, "main", Some(&one), &one, OfficePrecondition::NotConsumed, None)
                 .expect("stale"),
             CasOutcome::Conflict { current: Some(two.clone()) }
         );
@@ -521,7 +523,7 @@ async fn dynamo_ref_store_upholds_the_cas_and_the_trust_door() {
         // `ConditionCheck` is built regardless of what `office_head` names (the FORK-95 design
         // memo: "no two actions may target the same item").
         assert_eq!(
-            refs.compare_and_set_head(PalletNamespace::Meta, "office", None, &one, None, None)
+            refs.compare_and_set_head(PalletNamespace::Meta, "office", None, &one, OfficePrecondition::NotConsumed, None)
                 .expect("office"),
             CasOutcome::Committed
         );
@@ -631,7 +633,7 @@ async fn dynamo_ref_store_attributes_a_moved_precondition_to_its_position() {
                 OFFICE_PALLET_NAME,
                 None,
                 &office_o1,
-                None,
+                OfficePrecondition::NotConsumed,
                 None,
             )
             .expect("plant the office"),
@@ -660,7 +662,7 @@ async fn dynamo_ref_store_attributes_a_moved_precondition_to_its_position() {
                 "main",
                 None,
                 &main_m1,
-                Some(&office_o1),
+                OfficePrecondition::At(&office_o1),
                 Some(&bytes_a1),
             )
             .expect("create main under matching preconditions"),
@@ -685,7 +687,7 @@ async fn dynamo_ref_store_attributes_a_moved_precondition_to_its_position() {
                 OFFICE_PALLET_NAME,
                 Some(&office_o1),
                 &office_o2,
-                None,
+                OfficePrecondition::NotConsumed,
                 Some(&bytes_a1),
             )
             .expect("move the office"),
@@ -698,7 +700,7 @@ async fn dynamo_ref_store_attributes_a_moved_precondition_to_its_position() {
                 "main",
                 Some(&main_m1),
                 &main_m2,
-                Some(&office_o1), // stale: the office moved to office_o2 just above
+                OfficePrecondition::At(&office_o1), // stale: the office moved to office_o2 just above
                 Some(&bytes_a1),
             )
             .expect("stale office precondition"),
@@ -732,7 +734,7 @@ async fn dynamo_ref_store_attributes_a_moved_precondition_to_its_position() {
                 "main",
                 Some(&main_m1),
                 &main_m2,
-                Some(&office_o2), // current: matches
+                OfficePrecondition::At(&office_o2), // current: matches
                 Some(&bytes_a1),  // stale: the anchor was replaced just above
             )
             .expect("stale anchor precondition"),
@@ -753,7 +755,7 @@ async fn dynamo_ref_store_attributes_a_moved_precondition_to_its_position() {
                 "side",
                 None,
                 &side_s1,
-                Some(&office_o2),
+                OfficePrecondition::At(&office_o2),
                 Some(&bytes_a2),
             )
             .expect("create side"),
@@ -765,7 +767,7 @@ async fn dynamo_ref_store_attributes_a_moved_precondition_to_its_position() {
                 "side",
                 Some(&side_s1),
                 &side_s2,
-                Some(&office_o2),
+                OfficePrecondition::At(&office_o2),
                 Some(&bytes_a2),
             )
             .expect("move side"),
@@ -777,7 +779,7 @@ async fn dynamo_ref_store_attributes_a_moved_precondition_to_its_position() {
                 "main",
                 Some(&main_m1),
                 &main_m2,
-                Some(&office_o2),
+                OfficePrecondition::At(&office_o2),
                 Some(&bytes_a2),
             )
             .expect("main commits under matching preconditions despite side's concurrent moves"),
@@ -794,7 +796,7 @@ async fn dynamo_ref_store_attributes_a_moved_precondition_to_its_position() {
                 "main",
                 Some(&main_m1),
                 &main_m2,
-                Some(&office_o2),
+                OfficePrecondition::At(&office_o2),
                 Some(&bytes_a2),
             )
             .expect("stale pallet-head precondition, office and anchor both current"),
