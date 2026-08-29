@@ -8,10 +8,12 @@
 //! CAS, and the full offline audit reused via the scratch bridge) against abstracted
 //! storage, no S3 or DynamoDB required.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use forklift_aws_lambda::error::Status;
 use forklift_aws_lambda::head::{ObjectReadResult, ObjectWriteResult, TrustResult};
@@ -1229,9 +1231,12 @@ impl RefStore for AsyncRefStore {
         name: &str,
         expected: Option<&str>,
         new: &str,
+        office_head: Option<&str>,
+        anchor: Option<&str>,
     ) -> Result<CasOutcome, String> {
-        self.bridge
-            .block_on(suspending(|| self.inner.compare_and_set_head(namespace, name, expected, new)))
+        self.bridge.block_on(suspending(|| {
+            self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor)
+        }))
     }
 
     fn list_refs(&self) -> Result<Vec<(pallet_utils::PalletRef, String)>, String> {
@@ -1242,7 +1247,7 @@ impl RefStore for AsyncRefStore {
         self.bridge.block_on(suspending(|| self.inner.default_pallet()))
     }
 
-    fn get_trust(&self) -> Result<Option<office_utils::TrustAnchor>, String> {
+    fn get_trust(&self) -> Result<Option<(office_utils::TrustAnchor, String)>, String> {
         self.bridge.block_on(suspending(|| self.inner.get_trust()))
     }
 
@@ -1296,4 +1301,439 @@ async fn a_trusted_lift_runs_over_async_backed_stores_from_a_blocking_thread() {
     })
     .await
     .expect("the head runs to completion on a blocking thread");
+}
+
+// ---------------------------------------------------------------------------------------
+// FORK-95 slice 2: the commit precondition across the office head and the trust anchor.
+//
+// `ref_update` snapshots the office head and the trust anchor once, before its audit runs,
+// then commits conditioned on both still holding those values (`compare_and_set_head`). The
+// tests below prove that both directions of the precondition actually bind:
+//
+// * a concurrent office lift or re-genesis landing after the snapshot and before the commit
+//   refuses the update, distinguishably from an ordinary moved-pallet-head conflict;
+// * a concurrent move of a pallet the transaction never names does not.
+//
+// The two wrapper `RefStore`s below make the interleaving deterministic rather than a real
+// race: each hooks the exact snapshot read `ref_update` performs and injects the "concurrent"
+// move immediately after that read returns — the earliest point a real race could land it, and
+// strictly before `ref_update` issues its commit (nothing between that snapshot and the commit
+// reads the ref store again; see `head.rs`'s `ref_update`).
+// ---------------------------------------------------------------------------------------
+
+/// Forwards every [`RefStore`] call to a shared [`MemoryRefStore`] — the plumbing that lets a
+/// "setup" [`Head`] and an "attack" [`Head`] below operate on the same warehouse state.
+#[derive(Clone)]
+struct SharedMemoryRefs(Arc<MemoryRefStore>);
+
+impl RefStore for SharedMemoryRefs {
+    fn get_head(
+        &self,
+        namespace: pallet_utils::PalletNamespace,
+        name: &str,
+    ) -> Result<Option<String>, String> {
+        self.0.get_head(namespace, name)
+    }
+
+    fn compare_and_set_head(
+        &self,
+        namespace: pallet_utils::PalletNamespace,
+        name: &str,
+        expected: Option<&str>,
+        new: &str,
+        office_head: Option<&str>,
+        anchor: Option<&str>,
+    ) -> Result<CasOutcome, String> {
+        self.0.compare_and_set_head(namespace, name, expected, new, office_head, anchor)
+    }
+
+    fn list_refs(&self) -> Result<Vec<(pallet_utils::PalletRef, String)>, String> {
+        self.0.list_refs()
+    }
+
+    fn default_pallet(&self) -> Result<String, String> {
+        self.0.default_pallet()
+    }
+
+    fn get_trust(&self) -> Result<Option<(office_utils::TrustAnchor, String)>, String> {
+        self.0.get_trust()
+    }
+
+    fn put_trust_if_absent(&self, anchor: &office_utils::TrustAnchor) -> Result<TrustOutcome, String> {
+        self.0.put_trust_if_absent(anchor)
+    }
+
+    fn replace_trust(&self, anchor: &office_utils::TrustAnchor) -> Result<(), String> {
+        self.0.replace_trust(anchor)
+    }
+}
+
+/// Wraps a shared [`MemoryRefStore`]; the first time `ref_update`'s office-head snapshot read
+/// fires, injects a concurrent office lift to `move_to` immediately afterward, using the
+/// snapshot's own answer as the CAS's `expected` — so the injected move is itself a genuine,
+/// uncontested commit, not a forced write. Forwards every other call.
+struct OfficeMovesAfterTheSnapshot {
+    inner: Arc<MemoryRefStore>,
+    move_to: String,
+    fired: Cell<bool>,
+}
+
+impl RefStore for OfficeMovesAfterTheSnapshot {
+    fn get_head(
+        &self,
+        namespace: pallet_utils::PalletNamespace,
+        name: &str,
+    ) -> Result<Option<String>, String> {
+        let result = self.inner.get_head(namespace, name);
+
+        if namespace == pallet_utils::PalletNamespace::Meta
+            && name == OFFICE_PALLET_NAME
+            && !self.fired.replace(true)
+        {
+            if let Ok(current) = &result {
+                // This injected CAS is itself subject to the same three-way precondition —
+                // the anchor is checked unconditionally, regardless of which pallet is being
+                // updated — so it must supply the anchor's *current* bytes to commit
+                // uncontested. `office_head` is irrelevant here: the target *is* `@office`
+                // itself, so `checks_office_separately` is false and that parameter is never
+                // consulted.
+                let anchor_bytes = self
+                    .inner
+                    .get_trust()
+                    .expect("read the anchor for the injected move")
+                    .map(|(_, bytes)| bytes);
+
+                let outcome = self
+                    .inner
+                    .compare_and_set_head(
+                        pallet_utils::PalletNamespace::Meta,
+                        OFFICE_PALLET_NAME,
+                        current.as_deref(),
+                        &self.move_to,
+                        None,
+                        anchor_bytes.as_deref(),
+                    )
+                    .expect("inject the concurrent office move");
+                assert_eq!(
+                    outcome,
+                    CasOutcome::Committed,
+                    "the injected office move must itself succeed uncontested"
+                );
+            }
+        }
+
+        result
+    }
+
+    fn compare_and_set_head(
+        &self,
+        namespace: pallet_utils::PalletNamespace,
+        name: &str,
+        expected: Option<&str>,
+        new: &str,
+        office_head: Option<&str>,
+        anchor: Option<&str>,
+    ) -> Result<CasOutcome, String> {
+        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor)
+    }
+
+    fn list_refs(&self) -> Result<Vec<(pallet_utils::PalletRef, String)>, String> {
+        self.inner.list_refs()
+    }
+
+    fn default_pallet(&self) -> Result<String, String> {
+        self.inner.default_pallet()
+    }
+
+    fn get_trust(&self) -> Result<Option<(office_utils::TrustAnchor, String)>, String> {
+        self.inner.get_trust()
+    }
+
+    fn put_trust_if_absent(&self, anchor: &office_utils::TrustAnchor) -> Result<TrustOutcome, String> {
+        self.inner.put_trust_if_absent(anchor)
+    }
+
+    fn replace_trust(&self, anchor: &office_utils::TrustAnchor) -> Result<(), String> {
+        self.inner.replace_trust(anchor)
+    }
+}
+
+/// Wraps a shared [`MemoryRefStore`]; the first time `ref_update`'s anchor snapshot read
+/// (`get_trust`) fires, injects a concurrent re-genesis to `move_to` immediately afterward.
+/// Forwards every other call.
+struct AnchorMovesAfterTheSnapshot {
+    inner: Arc<MemoryRefStore>,
+    move_to: office_utils::TrustAnchor,
+    fired: Cell<bool>,
+}
+
+impl RefStore for AnchorMovesAfterTheSnapshot {
+    fn get_head(
+        &self,
+        namespace: pallet_utils::PalletNamespace,
+        name: &str,
+    ) -> Result<Option<String>, String> {
+        self.inner.get_head(namespace, name)
+    }
+
+    fn compare_and_set_head(
+        &self,
+        namespace: pallet_utils::PalletNamespace,
+        name: &str,
+        expected: Option<&str>,
+        new: &str,
+        office_head: Option<&str>,
+        anchor: Option<&str>,
+    ) -> Result<CasOutcome, String> {
+        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor)
+    }
+
+    fn list_refs(&self) -> Result<Vec<(pallet_utils::PalletRef, String)>, String> {
+        self.inner.list_refs()
+    }
+
+    fn default_pallet(&self) -> Result<String, String> {
+        self.inner.default_pallet()
+    }
+
+    fn get_trust(&self) -> Result<Option<(office_utils::TrustAnchor, String)>, String> {
+        let result = self.inner.get_trust();
+
+        if !self.fired.replace(true) {
+            self.inner.replace_trust(&self.move_to).expect("inject the concurrent re-genesis");
+        }
+
+        result
+    }
+
+    fn put_trust_if_absent(&self, anchor: &office_utils::TrustAnchor) -> Result<TrustOutcome, String> {
+        self.inner.put_trust_if_absent(anchor)
+    }
+
+    fn replace_trust(&self, anchor: &office_utils::TrustAnchor) -> Result<(), String> {
+        self.inner.replace_trust(anchor)
+    }
+}
+
+/// Falsifier 1a (office): the ref update must be refused, and refused as a **moved office**,
+/// not as an ordinary moved-pallet-head conflict — the pallet's own head never moved.
+#[test]
+fn a_concurrent_office_move_refuses_the_commit_as_office_moved_not_pallet_moved() {
+    let area = Area::new("office-races-the-commit");
+    prepare(&area, "wh");
+    area.forklift("wh", &["office", "enroll"]);
+    area.write_file("wh/app.txt", "v1\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "signed one"]);
+
+    let main_v1 = harvest(&area.path("wh")).head_of("main").expect("main v1");
+
+    area.write_file("wh/app.txt", "v2\n");
+    area.forklift("wh", &["load", "app.txt"]);
+    area.forklift("wh", &["stack", "signed two"]);
+
+    let latest = harvest(&area.path("wh"));
+    let anchor = latest.trust.clone().expect("trust established");
+    let office_head = latest.head_of(&format!("@{}", OFFICE_PALLET_NAME)).expect("office head");
+    let main_v2 = latest.head_of("main").expect("main v2");
+    assert_ne!(main_v1, main_v2);
+
+    let store = Arc::new(MemoryRefStore::new());
+
+    // Setup: establish trust, lift the office, lift main to v1 — nothing races here.
+    let setup = Head::new(MemoryObjectStore::new(), SharedMemoryRefs(store.clone()));
+    upload_all(&setup, &latest);
+    setup.put_trust(&anchor).expect("put trust");
+    setup
+        .ref_update(&format!("@{}", OFFICE_PALLET_NAME), &RefUpdateRequest {
+            old_head: None,
+            new_head: office_head.clone(),
+        })
+        .expect("lift office");
+    setup
+        .ref_update("main", &RefUpdateRequest { old_head: None, new_head: main_v1.clone() })
+        .expect("lift main v1");
+
+    // Attack: lift main v1 -> v2 while an office lift lands right after the audit's
+    // office-head snapshot — landing before the commit `ref_update` issues once its (still
+    // valid, still v1-office-audited) audit finishes.
+    let attack = Head::new(
+        MemoryObjectStore::new(),
+        OfficeMovesAfterTheSnapshot {
+            inner: store.clone(),
+            move_to: "f".repeat(64),
+            fired: Cell::new(false),
+        },
+    );
+    upload_all(&attack, &latest);
+
+    let err = attack
+        .ref_update("main", &RefUpdateRequest {
+            old_head: Some(main_v1.clone()),
+            new_head: main_v2.clone(),
+        })
+        .expect_err("the office moved between the audit and the commit");
+    assert_eq!(err.status, Status::Conflict);
+    assert!(
+        err.message.to_lowercase().contains("office"),
+        "the refusal must name the office: {}",
+        err.message
+    );
+    assert!(
+        !err.message.contains("The pallet moved"),
+        "an office-moved refusal must not be indistinguishable from an ordinary moved-pallet \
+        conflict: {}",
+        err.message
+    );
+
+    // The control: main's own head is unaffected by the refused commit or the injected move.
+    assert_eq!(
+        store.get_head(pallet_utils::PalletNamespace::User, "main").expect("get").as_deref(),
+        Some(main_v1.as_str())
+    );
+}
+
+/// Falsifier 1b (anchor): likewise for the trust anchor — the ref update must be refused as a
+/// **moved anchor**, not as an ordinary moved-pallet-head conflict.
+#[test]
+fn a_concurrent_trust_anchor_change_refuses_the_commit_as_anchor_moved_not_pallet_moved() {
+    let area = Area::new("anchor-races-the-commit");
+    prepare(&area, "wh");
+    area.forklift("wh", &["office", "enroll"]);
+    area.write_file("wh/app.txt", "v1\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "signed one"]);
+
+    let main_v1 = harvest(&area.path("wh")).head_of("main").expect("main v1");
+
+    area.write_file("wh/app.txt", "v2\n");
+    area.forklift("wh", &["load", "app.txt"]);
+    area.forklift("wh", &["stack", "signed two"]);
+
+    let latest = harvest(&area.path("wh"));
+    let anchor = latest.trust.clone().expect("trust established");
+    let office_head = latest.head_of(&format!("@{}", OFFICE_PALLET_NAME)).expect("office head");
+    let main_v2 = latest.head_of("main").expect("main v2");
+
+    let store = Arc::new(MemoryRefStore::new());
+
+    let setup = Head::new(MemoryObjectStore::new(), SharedMemoryRefs(store.clone()));
+    upload_all(&setup, &latest);
+    setup.put_trust(&anchor).expect("put trust");
+    setup
+        .ref_update(&format!("@{}", OFFICE_PALLET_NAME), &RefUpdateRequest {
+            old_head: None,
+            new_head: office_head.clone(),
+        })
+        .expect("lift office");
+    setup
+        .ref_update("main", &RefUpdateRequest { old_head: None, new_head: main_v1.clone() })
+        .expect("lift main v1");
+
+    // A well-formed but different anchor — `MemoryRefStore::replace_trust` is unconditional
+    // this slice (its own conditional write is FORK-95 claim C22, a later slice), so its
+    // content need not be a valid re-genesis chain, only different from the incumbent, to
+    // exercise the store-level byte-equality precondition `compare_and_set_head` enforces.
+    let different_anchor = TrustAnchorDto {
+        genesis: "f".repeat(64),
+        enabled_at: anchor.enabled_at + 1,
+        boundary: vec![],
+        prior_genesis: Some(anchor.genesis.clone()),
+        adopts: Some(office_head.clone()),
+    }
+    .to_anchor();
+
+    let attack = Head::new(
+        MemoryObjectStore::new(),
+        AnchorMovesAfterTheSnapshot {
+            inner: store.clone(),
+            move_to: different_anchor,
+            fired: Cell::new(false),
+        },
+    );
+    upload_all(&attack, &latest);
+
+    let err = attack
+        .ref_update("main", &RefUpdateRequest {
+            old_head: Some(main_v1.clone()),
+            new_head: main_v2.clone(),
+        })
+        .expect_err("the trust anchor moved between the audit and the commit");
+    assert_eq!(err.status, Status::Conflict);
+    assert!(
+        err.message.to_lowercase().contains("anchor"),
+        "the refusal must name the trust anchor: {}",
+        err.message
+    );
+    assert!(
+        !err.message.contains("The pallet moved"),
+        "an anchor-moved refusal must not be indistinguishable from an ordinary moved-pallet \
+        conflict: {}",
+        err.message
+    );
+}
+
+/// Falsifier 2 (over-tightened): a pallet the transaction never names moving concurrently must
+/// never refuse this commit — the precondition is scoped to exactly three inputs (the target
+/// pallet, the office pallet, the trust anchor), never to "nothing else in the warehouse
+/// moved" (FORK-95 design memo, "The movable inputs: exactly three").
+#[test]
+fn a_concurrently_moved_unrelated_pallet_does_not_refuse_the_commit() {
+    let area = Area::new("unrelated-pallet-races");
+    prepare(&area, "wh");
+    area.forklift("wh", &["office", "enroll"]);
+    area.write_file("wh/app.txt", "v1\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "signed one"]);
+
+    let main_v1 = harvest(&area.path("wh")).head_of("main").expect("main v1");
+
+    area.write_file("wh/app.txt", "v2\n");
+    area.forklift("wh", &["load", "app.txt"]);
+    area.forklift("wh", &["stack", "signed two"]);
+
+    let latest = harvest(&area.path("wh"));
+    let anchor = latest.trust.clone().expect("trust established");
+    let office_head = latest.head_of(&format!("@{}", OFFICE_PALLET_NAME)).expect("office head");
+    let main_v2 = latest.head_of("main").expect("main v2");
+
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    upload_all(&head, &latest);
+    head.put_trust(&anchor).expect("put trust");
+    head.ref_update(&format!("@{}", OFFICE_PALLET_NAME), &RefUpdateRequest {
+        old_head: None,
+        new_head: office_head.clone(),
+    })
+    .expect("lift office");
+    head.ref_update("main", &RefUpdateRequest { old_head: None, new_head: main_v1.clone() })
+        .expect("lift main v1");
+
+    // A pallet this transaction never names moves concurrently. Planting it is itself a
+    // commit through the same upgraded `compare_and_set_head`, so — like any other commit on
+    // a trusted warehouse — it must supply the office head and anchor *currently* in the
+    // store to succeed; that is the general rule this test exists to distinguish from
+    // ("everything must stay still") rather than a special case of it.
+    let anchor_bytes =
+        head.refs.get_trust().expect("read anchor").map(|(_, bytes)| bytes).expect("trust");
+    assert_eq!(
+        head.refs
+            .compare_and_set_head(
+                pallet_utils::PalletNamespace::User,
+                "unrelated",
+                None,
+                &"a".repeat(64),
+                Some(&office_head),
+                Some(&anchor_bytes),
+            )
+            .expect("plant an unrelated pallet"),
+        CasOutcome::Committed
+    );
+
+    head.ref_update("main", &RefUpdateRequest {
+        old_head: Some(main_v1),
+        new_head: main_v2.clone(),
+    })
+    .expect("an unrelated pallet moving must never refuse this commit");
+
+    assert_eq!(head.handshake().expect("handshake").pallets.get("main"), Some(&main_v2));
 }

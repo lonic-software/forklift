@@ -24,22 +24,35 @@
 //! # The CAS
 //!
 //! [`compare_and_set_head`](RefStore::compare_and_set_head) is a real DynamoDB conditional
-//! write, never a read-then-write: an `UpdateItem` whose `ConditionExpression` encodes the
-//! caller's `expected`. When the condition fails, DynamoDB returns the current item (via
-//! `ReturnValuesOnConditionCheckFailure=ALL_OLD`), so the store reports the actual head in
-//! the `Conflict` without a second round trip — and the whole check-and-set is atomic, which
-//! is the CAS that lets the serverless head scale horizontally where the server head needs a
-//! mutex. [`put_trust_if_absent`](RefStore::put_trust_if_absent) is the same shape: a
-//! conditional `PutItem` guarding the one-way trust door.
+//! write, never a read-then-write — and, as of FORK-95, never a single-item one either. It is
+//! a `TransactWriteItems` of up to three actions: an `Update` on the target pallet's own item
+//! whose `ConditionExpression` encodes the caller's `expected` (exactly the prior single-item
+//! shape), a `ConditionCheck` on the office pallet's item at the office head the audit
+//! consumed (skipped when the target pallet *is* the office pallet — the `Update` above
+//! already pins that item), and a `ConditionCheck` on the trust item at the anchor's stored
+//! serialization. DynamoDB either applies the whole transaction with every condition holding
+//! or applies nothing; on a condition failure `ReturnValuesOnConditionCheckFailure=ALL_OLD`
+//! hands back the failed item, so the store reports which precondition moved without a
+//! second round trip. [`put_trust_if_absent`](RefStore::put_trust_if_absent) is still the
+//! single-item shape: a conditional `PutItem` guarding the one-way trust door.
+//!
+//! Cancellation reasons on a `TransactionCanceledException` are ordered by the order actions
+//! were requested (AWS API Reference and the pinned `aws-sdk-dynamodb` model agree on this),
+//! so the index an action is pushed at in [`DynamoRefStore::compare_and_set_head`] is the
+//! index its refusal comes back at — see that method's own comment for exactly where that
+//! ordering is encoded.
 
 use std::collections::HashMap;
 
 use aws_sdk_dynamodb::operation::put_item::PutItemError;
-use aws_sdk_dynamodb::operation::update_item::UpdateItemError;
-use aws_sdk_dynamodb::types::{AttributeValue, ReturnValuesOnConditionCheckFailure};
+use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
+use aws_sdk_dynamodb::types::{
+    AttributeValue, CancellationReason, ConditionCheck, ReturnValuesOnConditionCheckFailure,
+    TransactWriteItem, Update,
+};
 
 use forklift_core::model::remote::TrustAnchorDto;
-use forklift_core::util::office_utils::TrustAnchor;
+use forklift_core::util::office_utils::{TrustAnchor, OFFICE_PALLET_NAME};
 use forklift_core::util::pallet_utils::{PalletNamespace, PalletRef};
 
 use crate::aws::dynamo_ops::DynamoOps;
@@ -123,16 +136,13 @@ impl DynamoRefStore {
     /// decide what to audit against, and an eventually-consistent read could hand back an
     /// office head DynamoDB had already moved past.
     ///
-    /// It does **not** close the other half. `ref_update`'s audit-then-CAS shape reads the
-    /// office head, audits against it, and only *afterwards* CASes the target pallet's own
-    /// head — the CAS is conditioned on the target pallet's `old_head`, not on the office head
-    /// staying put across those two round trips. A concurrent office re-key between the read
-    /// and the CAS is still possible, consistent read or not; closing that would mean
-    /// conditioning the pallet CAS on the office head too (a DynamoDB transaction across both
-    /// items), which changes what the CAS commits and is a design question for `Head`
-    /// (`head.rs`), not something this store can decide unilaterally. This is pre-existing —
-    /// [`crate::memory::MemoryRefStore`] has the identical property, since nothing in the
-    /// trait ties the two reads to the CAS either.
+    /// The other half — a concurrent office re-key or re-genesis landing between that read and
+    /// the commit — used to be an open window at this commit's ancestor: `compare_and_set_head`
+    /// conditioned on the target pallet's own head alone, so the office head and the anchor
+    /// could move freely underneath a running audit. FORK-95 closed it by folding both into the
+    /// same `TransactWriteItems` the pallet head CAS already needed (see this module's own
+    /// docs), so the commit now conditions on everything the audit consumed, not only the one
+    /// input the caller happened to be updating.
     async fn get_item(
         &self,
         entity: &str,
@@ -149,6 +159,149 @@ impl DynamoRefStore {
 
         Ok(output.item)
     }
+
+    /// The `Update` action against the target pallet's own item: `SET head = :new`, guarded by
+    /// `expected` exactly as the pre-FORK-95 single-item `UpdateItem` was. Always position 0 of
+    /// the transaction `compare_and_set_head` builds.
+    fn pallet_update(&self, entity: &str, expected: Option<&str>, new: &str) -> TransactWriteItem {
+        let mut builder = Update::builder()
+            .set_key(Some(self.key(entity)))
+            .table_name(&self.table)
+            .update_expression("SET #h = :new")
+            .expression_attribute_names("#h", ATTR_HEAD)
+            .expression_attribute_values(":new", s(new))
+            .return_values_on_condition_check_failure(ReturnValuesOnConditionCheckFailure::AllOld);
+
+        builder = match expected {
+            // The pallet must currently hold exactly `old`. A missing item fails this too
+            // (there is no `head` to equal `old`), reported as a conflict with no current
+            // head — the fake's `current (None) != expected (Some)` branch.
+            Some(old) => builder
+                .condition_expression("#h = :old")
+                .expression_attribute_values(":old", s(old)),
+            // The pallet must not exist yet.
+            None => builder
+                .condition_expression("attribute_not_exists(#e)")
+                .expression_attribute_names("#e", ATTR_ENTITY),
+        };
+
+        TransactWriteItem::builder()
+            .update(builder.build().expect("every required Update field is set"))
+            .build()
+    }
+
+    /// The `ConditionCheck` on the office pallet's item: its head must still equal
+    /// `office_head`, `None` meaning "the office pallet must still be unborn". Never built for
+    /// a lift to `@office` itself — see `compare_and_set_head`, which drops this action there
+    /// because the `Update` above already pins that exact item (AWS refuses two actions on one
+    /// item in the same transaction).
+    fn office_condition_check(
+        &self,
+        office_entity: &str,
+        office_head: Option<&str>,
+    ) -> TransactWriteItem {
+        let mut builder = ConditionCheck::builder()
+            .set_key(Some(self.key(office_entity)))
+            .table_name(&self.table)
+            .return_values_on_condition_check_failure(ReturnValuesOnConditionCheckFailure::AllOld);
+
+        builder = match office_head {
+            Some(head) => builder
+                .condition_expression("#h = :h")
+                .expression_attribute_names("#h", ATTR_HEAD)
+                .expression_attribute_values(":h", s(head)),
+            None => builder
+                .condition_expression("attribute_not_exists(#e)")
+                .expression_attribute_names("#e", ATTR_ENTITY),
+        };
+
+        TransactWriteItem::builder()
+            .condition_check(builder.build().expect("every required ConditionCheck field is set"))
+            .build()
+    }
+
+    /// The `ConditionCheck` on the trust item: its *stored bytes* must still equal `anchor`,
+    /// `None` meaning "no anchor exists". Built from the bytes the head read, never a
+    /// re-serialization of the decoded value (this module's docs / `RefStore::get_trust`).
+    /// `attribute_not_exists(#a)` names the anchor *attribute*, not the item's existence —
+    /// `get_trust` treats an item with no readable `ATTR_ANCHOR` string identically to a
+    /// missing item (below), so the absent-anchor condition must test the same thing it does.
+    fn anchor_condition_check(&self, anchor: Option<&str>) -> TransactWriteItem {
+        let mut builder = ConditionCheck::builder()
+            .set_key(Some(self.key(ENTITY_TRUST)))
+            .table_name(&self.table)
+            .return_values_on_condition_check_failure(ReturnValuesOnConditionCheckFailure::AllOld);
+
+        builder = match anchor {
+            Some(bytes) => builder
+                .condition_expression("#a = :a")
+                .expression_attribute_names("#a", ATTR_ANCHOR)
+                .expression_attribute_values(":a", s(bytes)),
+            None => builder
+                .condition_expression("attribute_not_exists(#a)")
+                .expression_attribute_names("#a", ATTR_ANCHOR),
+        };
+
+        TransactWriteItem::builder()
+            .condition_check(builder.build().expect("every required ConditionCheck field is set"))
+            .build()
+    }
+}
+
+/// Attribute a `TransactWriteItems` cancellation to the precondition it names, using the
+/// positional mapping [`DynamoRefStore::compare_and_set_head`] builds: position 0 is always
+/// the pallet's own head, position 1 is the office `ConditionCheck` when
+/// `checks_office_separately` (else the anchor's), and the anchor's is always last. That
+/// ordering is not incidental — `TransactionCanceledException::cancellation_reasons` is
+/// documented ordered by the order actions were requested (AWS API Reference, corroborated by
+/// the pinned `aws-sdk-dynamodb` model) — so the index an action is pushed at in
+/// `compare_and_set_head` IS the index its refusal comes back at here, and the two must never
+/// drift apart independently.
+///
+/// A cancellation that names no moved precondition — every position reads "no error" (both the
+/// literal string `"None"` and an absent code mean that; the API Reference and the pinned SDK
+/// model disagree on which one DynamoDB actually sends, so both must read the same way here),
+/// or a transient DynamoDB cause (`TransactionConflict`, a throttle, the client's own request
+/// token racing itself) — is reported as a fault rather than guessed at: attributing it to one
+/// of the three inputs would be wrong, and retrying it is FORK-95 slice 3's job (arm two, claim
+/// C14) — this slice does not retry, so SDK-level retry is left exactly as it is today.
+fn classify_cancellation(
+    reasons: &[CancellationReason],
+    checks_office_separately: bool,
+) -> Result<CasOutcome, String> {
+    let expected_len = if checks_office_separately { 3 } else { 2 };
+
+    if reasons.len() != expected_len {
+        return Err(format!(
+            "DynamoDB transact_write_items was cancelled with {} cancellation reason(s), \
+            expected {}: the cancellation cannot be attributed to a specific precondition.",
+            reasons.len(),
+            expected_len
+        ));
+    }
+
+    let is_condition_failed =
+        |reason: &CancellationReason| reason.code() == Some("ConditionalCheckFailed");
+
+    if is_condition_failed(&reasons[0]) {
+        return Ok(CasOutcome::Conflict { current: reasons[0].item().and_then(head_of) });
+    }
+
+    if checks_office_separately && is_condition_failed(&reasons[1]) {
+        return Ok(CasOutcome::OfficeMoved { current: reasons[1].item().and_then(head_of) });
+    }
+
+    let anchor_position = if checks_office_separately { 2 } else { 1 };
+
+    if is_condition_failed(&reasons[anchor_position]) {
+        return Ok(CasOutcome::AnchorMoved);
+    }
+
+    Err(format!(
+        "DynamoDB transact_write_items was cancelled for a reason that names no moved \
+        precondition: {:?}",
+        reasons.iter().map(CancellationReason::code).collect::<Vec<_>>()
+    ))
 }
 
 impl RefStore for DynamoRefStore {
@@ -166,48 +319,41 @@ impl RefStore for DynamoRefStore {
         name: &str,
         expected: Option<&str>,
         new: &str,
+        office_head: Option<&str>,
+        anchor: Option<&str>,
     ) -> Result<CasOutcome, String> {
         let entity = pallet_entity(namespace, name);
+        let office_entity = pallet_entity(PalletNamespace::Meta, OFFICE_PALLET_NAME);
+        // DynamoDB refuses a transaction where two actions target the same item ("you cannot
+        // both `ConditionCheck` and `Update` the same item" — AWS API Reference). Lifting
+        // `@office` itself is that case: the office precondition IS the pallet precondition the
+        // `Update` action already encodes, so it is dropped rather than duplicated.
+        let checks_office_separately = entity != office_entity;
 
         self.bridge.block_on(async {
-            // Always `SET head = :new`; the condition encodes `expected`. `#h`/`#e` alias the
-            // attribute names so a reserved word could never break the expression.
-            let mut request = self
-                .client
-                .update_item()
-                .table_name(&self.table)
-                .set_key(Some(self.key(&entity)))
-                .update_expression("SET #h = :new")
-                .expression_attribute_names("#h", ATTR_HEAD)
-                .expression_attribute_values(":new", s(new))
-                .return_values_on_condition_check_failure(
-                    ReturnValuesOnConditionCheckFailure::AllOld,
-                );
+            // Position 0 is always the pallet's own head; the office `ConditionCheck` (when
+            // present) and the anchor `ConditionCheck` follow in exactly this push order. See
+            // `classify_cancellation`'s docs for why that ordering is load-bearing.
+            let mut items = vec![self.pallet_update(&entity, expected, new)];
 
-            request = match expected {
-                // The pallet must currently hold exactly `old`. A missing item fails this too
-                // (there is no `head` to equal `old`), reported as a conflict with no current
-                // head — the fake's `current (None) != expected (Some)` branch.
-                Some(old) => request
-                    .condition_expression("#h = :old")
-                    .expression_attribute_values(":old", s(old)),
-                // The pallet must not exist yet.
-                None => request
-                    .condition_expression("attribute_not_exists(#e)")
-                    .expression_attribute_names("#e", ATTR_ENTITY),
-            };
+            if checks_office_separately {
+                items.push(self.office_condition_check(&office_entity, office_head));
+            }
+
+            items.push(self.anchor_condition_check(anchor));
+
+            let request = self.client.transact_write_items().set_transact_items(Some(items));
 
             match request.send().await {
                 Ok(_) => Ok(CasOutcome::Committed),
                 Err(err) => match err.as_service_error() {
-                    Some(UpdateItemError::ConditionalCheckFailedException(failure)) => {
-                        // ALL_OLD carries the item that failed the condition; its `head` is the
-                        // actual current head (absent when the item did not exist).
-                        let current = failure.item().and_then(head_of);
-
-                        Ok(CasOutcome::Conflict { current })
+                    Some(TransactWriteItemsError::TransactionCanceledException(failure)) => {
+                        classify_cancellation(
+                            failure.cancellation_reasons(),
+                            checks_office_separately,
+                        )
                     }
-                    _ => Err(describe("DynamoDB update_item", err)),
+                    _ => Err(describe("DynamoDB transact_write_items", err)),
                 },
             }
         })
@@ -261,7 +407,7 @@ impl RefStore for DynamoRefStore {
         Ok(self.default_pallet.clone())
     }
 
-    fn get_trust(&self) -> Result<Option<TrustAnchor>, String> {
+    fn get_trust(&self) -> Result<Option<(TrustAnchor, String)>, String> {
         self.bridge.block_on(async {
             let Some(item) = self.get_item(ENTITY_TRUST).await? else {
                 return Ok(None);
@@ -274,7 +420,12 @@ impl RefStore for DynamoRefStore {
             let dto: TrustAnchorDto = serde_json::from_str(json)
                 .map_err(|err| format!("decoding the stored trust anchor failed: {}", err))?;
 
-            Ok(Some(dto.to_anchor()))
+            // The decoded anchor is what an audit consumes; `json` — the exact bytes this item
+            // holds — is what `compare_and_set_head`'s anchor precondition later compares by
+            // string equality (this module's docs / claim C13). Never re-serialize `dto` here
+            // in its place: a `serde` field reorder must not fail a commit for no anchor that
+            // actually moved.
+            Ok(Some((dto.to_anchor(), json.clone())))
         })
     }
 

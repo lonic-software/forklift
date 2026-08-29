@@ -474,15 +474,19 @@ async fn dynamo_ref_store_upholds_the_cas_and_the_trust_door() {
         // head — not a special "missing item" case distinct from an ordinary CAS mismatch, and
         // never an error (the `UpdateItem` condition `#h = :old` simply cannot hold against an
         // item with no `head` attribute).
+        // No office and no trust anchor exist yet on this warehouse, so every CAS below passes
+        // `None, None` for the two new preconditions — the office/anchor `ConditionCheck`s this
+        // fresh warehouse would build both resolve to their "unborn"/"absent" mode regardless.
         assert_eq!(
-            refs.compare_and_set_head(PalletNamespace::User, "main", Some(&one), &two)
+            refs.compare_and_set_head(PalletNamespace::User, "main", Some(&one), &two, None, None)
                 .expect("cas against a genuinely missing item"),
             CasOutcome::Conflict { current: None }
         );
 
         // Create with expected None.
         assert_eq!(
-            refs.compare_and_set_head(PalletNamespace::User, "main", None, &one).expect("create"),
+            refs.compare_and_set_head(PalletNamespace::User, "main", None, &one, None, None)
+                .expect("create"),
             CasOutcome::Committed
         );
         assert_eq!(
@@ -492,28 +496,32 @@ async fn dynamo_ref_store_upholds_the_cas_and_the_trust_door() {
 
         // A replay with expected None now conflicts, reporting the current head.
         assert_eq!(
-            refs.compare_and_set_head(PalletNamespace::User, "main", None, &two).expect("replay"),
+            refs.compare_and_set_head(PalletNamespace::User, "main", None, &two, None, None)
+                .expect("replay"),
             CasOutcome::Conflict { current: Some(one.clone()) }
         );
 
         // A fast-forward from the right expected commits.
         assert_eq!(
-            refs.compare_and_set_head(PalletNamespace::User, "main", Some(&one), &two)
+            refs.compare_and_set_head(PalletNamespace::User, "main", Some(&one), &two, None, None)
                 .expect("ff"),
             CasOutcome::Committed
         );
 
         // A stale expected conflicts, again reporting the actual head.
         assert_eq!(
-            refs.compare_and_set_head(PalletNamespace::User, "main", Some(&one), &one)
+            refs.compare_and_set_head(PalletNamespace::User, "main", Some(&one), &one, None, None)
                 .expect("stale"),
             CasOutcome::Conflict { current: Some(two.clone()) }
         );
 
         // A meta pallet lives in the same partition without colliding, and enumeration returns
-        // both, qualified.
+        // both, qualified. This is the office pallet itself, so no separate office
+        // `ConditionCheck` is built regardless of what `office_head` names (the FORK-95 design
+        // memo: "no two actions may target the same item").
         assert_eq!(
-            refs.compare_and_set_head(PalletNamespace::Meta, "office", None, &one).expect("office"),
+            refs.compare_and_set_head(PalletNamespace::Meta, "office", None, &one, None, None)
+                .expect("office"),
             CasOutcome::Committed
         );
         let mut listed: Vec<(String, String)> = refs
@@ -558,14 +566,20 @@ async fn dynamo_ref_store_upholds_the_cas_and_the_trust_door() {
             TrustOutcome::Conflict
         );
 
-        // The stored anchor round-trips.
-        let read = refs.get_trust().expect("read trust").expect("present");
+        // The stored anchor round-trips, decoded value and bytes alike.
+        let (read, read_bytes) = refs.get_trust().expect("read trust").expect("present");
         assert_eq!(read.genesis, one);
         assert_eq!(read.boundary, vec![two.clone()]);
+        assert_eq!(
+            read_bytes,
+            serde_json::to_string(&TrustAnchorDto::from(&read)).expect("re-encode for comparison"),
+            "the bytes get_trust returns must be exactly what compare_and_set_head's anchor \
+            precondition would compare against"
+        );
 
         // replace_trust is the sanctioned overwrite.
         refs.replace_trust(&different).expect("replace");
-        assert_eq!(refs.get_trust().expect("re-read").expect("present").genesis, two);
+        assert_eq!(refs.get_trust().expect("re-read").expect("present").0.genesis, two);
     })
     .await
     .expect("the blocking assertions");

@@ -309,16 +309,34 @@ table; DynamoDB is schemaless beyond the key.
 
 ### The CAS
 
-`compare_and_set_head` is a real conditional `UpdateItem` (`ConditionExpression` encoding the
-caller's expected head), not a read-then-write — the atomicity that lets this head scale
-horizontally where `forklift-server` needs an in-process mutex. On a condition failure,
-`ReturnValuesOnConditionCheckFailure=ALL_OLD` hands back the actual current item in the same
-round trip, so a conflict never costs a second read. `put_trust_if_absent` is the identical
-shape for the one-way trust door. **No DynamoDB transaction and no secondary index are used or
-needed:** every conditional write conditions on a single item's own attribute, and ref
-enumeration (`list_refs`) is answered by a plain `Query` on the base table
-(`wh = … AND begins_with(entity, "pallet#")`) — the partition key plus a sort-key prefix, which
-needs no GSI.
+`compare_and_set_head` is a real conditional write, not a read-then-write — the atomicity that
+lets this head scale horizontally where `forklift-server` needs an in-process mutex. As of
+FORK-95 it is a `TransactWriteItems` of up to three actions rather than a single-item
+`UpdateItem`: an `Update` on the target pallet's own item (`ConditionExpression` encoding the
+caller's expected head, exactly the prior single-item shape), a `ConditionCheck` on the office
+pallet's item at the office head a ref update's audit consumed (skipped when the target pallet
+*is* the office pallet — the `Update` above already pins that item, and DynamoDB refuses two
+actions on one item in the same transaction), and a `ConditionCheck` on the trust item at the
+anchor's stored serialization. DynamoDB either applies the whole transaction with every
+condition holding or applies nothing; on a condition failure
+`ReturnValuesOnConditionCheckFailure=ALL_OLD` hands back the failed item, so the store reports
+which precondition moved without a second round trip. `put_trust_if_absent` is still the
+single-item shape (a conditional `PutItem`) for the one-way trust door — `replace_trust`'s own
+conditional write is a later slice (FORK-95 claim C22). **No secondary index is used or
+needed:** every action conditions on a single item's own attribute(s), and ref enumeration
+(`list_refs`) is answered by a plain `Query` on the base table (`wh = … AND begins_with(entity,
+"pallet#")`) — the partition key plus a sort-key prefix, which needs no GSI.
+
+**There is no `dynamodb:TransactWriteItems` IAM action to grant.** AWS's own model —
+verified against the "Using IAM with DynamoDB transactions" developer guide (none of its four
+example policies grant it) and the Service Authorization Reference (whose `TransactWriteItems`
+row maps the *operation* onto the IAM actions `ConditionCheckItem`/`DeleteItem`/`PutItem`/
+`UpdateItem`, and lists no `TransactWriteItems` action at all) — is that permission to call
+`TransactWriteItems` is governed entirely by the permissions for the underlying per-item action
+types the transaction contains. This transaction always carries one `Update` and one or two
+`ConditionCheck`s, so the deployed role needs `dynamodb:UpdateItem` (already granted, for the
+pallet head write it always performed) and `dynamodb:ConditionCheckItem` (newly granted, for
+the office/anchor checks) — see the derivation table below.
 
 ### Capacity mode
 
@@ -448,8 +466,12 @@ Where each action in `iam/control-plane.policy.json` comes from: `HeadObject`/`G
 `staging/*`; `DeleteObject` (staged cleanup, session sweep) → `s3:DeleteObject`; `ListObjectsV2`
 (`discard_session`'s sweep) and `HeadObject`/`GetObject` 404-vs-403 semantics (below) →
 `s3:ListBucket` on the **bucket** resource (not `bucket/*`); `GetItem`/`Query` (ref reads,
-enumeration) and `PutItem`/`UpdateItem` (trust, the ref CAS) → the table ARN, no index ARN needed
-(see "The CAS" above); the `Logs` statement (`logs:CreateLogGroup`/`logs:CreateLogStream`/
+enumeration) → the table ARN, no index ARN needed; `PutItem` (the one-way trust door) and the
+ref-update commit's `TransactWriteItems` (below) → `UpdateItem` (the target pallet's own head)
+and `ConditionCheckItem` (the office head and trust anchor `ConditionCheck`s the same
+transaction carries) — **not** `dynamodb:TransactWriteItems`, which is not a real IAM action;
+see "The CAS" above for why granting it would have been a no-op that left the transaction still
+refused. The `Logs` statement (`logs:CreateLogGroup`/`logs:CreateLogStream`/
 `logs:PutLogEvents`) is the standard Lambda execution-role grant every function needs to write to
 its own CloudWatch log group.
 

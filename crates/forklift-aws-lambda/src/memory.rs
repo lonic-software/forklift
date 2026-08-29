@@ -19,7 +19,7 @@ use std::sync::Mutex;
 
 use forklift_core::model::remote::TrustAnchorDto;
 use forklift_core::util::object_utils;
-use forklift_core::util::office_utils::TrustAnchor;
+use forklift_core::util::office_utils::{TrustAnchor, OFFICE_PALLET_NAME};
 use forklift_core::util::pallet_utils::{PalletNamespace, PalletRef, DEFAULT_PALLET_NAME};
 
 use crate::store::{
@@ -224,19 +224,34 @@ impl ObjectStore for MemoryObjectStore {
     }
 }
 
+/// The state a [`MemoryRefStore`] guards behind **one** mutex — not two, as an earlier shape
+/// of this fake held. A check-and-commit that spans a head and the trust anchor (FORK-95
+/// design memo, claim C13) cannot be atomic across two independent locks: a caller taking them
+/// in sequence would open a window between the two acquisitions for `replace_trust` to land
+/// in — the very race this design exists to close, reproduced inside the reference store the
+/// falsifying tests run against, where it would let an anchor precondition pass for the wrong
+/// reason. Folding both into one guard is what makes `compare_and_set_head` genuinely atomic
+/// here, the same property `DynamoRefStore` gets from a real `TransactWriteItems`.
+struct RefState {
+    heads: HashMap<String, String>,
+    /// The trust anchor's *stored serialization* — the same representation `DynamoRefStore`
+    /// keeps (the JSON text of the DTO), not the decoded value. The commit's anchor
+    /// precondition is string equality on stored bytes; a fake that kept only a decoded value
+    /// could never represent the comparison the real store enforces.
+    trust: Option<String>,
+}
+
 /// An in-memory [`RefStore`]. Pallet heads are keyed by their qualified wire reference
 /// (`main`, `@office`), which is unique across the two namespaces.
 pub struct MemoryRefStore {
-    heads: Mutex<HashMap<String, String>>,
-    trust: Mutex<Option<TrustAnchorDto>>,
+    state: Mutex<RefState>,
     default_pallet: String,
 }
 
 impl Default for MemoryRefStore {
     fn default() -> MemoryRefStore {
         MemoryRefStore {
-            heads: Mutex::new(HashMap::new()),
-            trust: Mutex::new(None),
+            state: Mutex::new(RefState { heads: HashMap::new(), trust: None }),
             default_pallet: DEFAULT_PALLET_NAME.to_string(),
         }
     }
@@ -251,11 +266,23 @@ impl MemoryRefStore {
     fn key(namespace: PalletNamespace, name: &str) -> String {
         PalletRef { namespace, name: name.to_string() }.to_wire()
     }
+
+    /// Decode a stored anchor serialization, the same way `DynamoRefStore::get_trust` does.
+    fn decode(json: &str) -> Result<TrustAnchorDto, String> {
+        serde_json::from_str(json)
+            .map_err(|err| format!("decoding the stored trust anchor failed: {}", err))
+    }
+
+    /// Encode an anchor to the form this store keeps, the same way `DynamoRefStore` does.
+    fn encode(anchor: &TrustAnchor) -> Result<String, String> {
+        serde_json::to_string(&TrustAnchorDto::from(anchor))
+            .map_err(|err| format!("encoding the trust anchor failed: {}", err))
+    }
 }
 
 impl RefStore for MemoryRefStore {
     fn get_head(&self, namespace: PalletNamespace, name: &str) -> Result<Option<String>, String> {
-        Ok(self.heads.lock().unwrap().get(&Self::key(namespace, name)).cloned())
+        Ok(self.state.lock().unwrap().heads.get(&Self::key(namespace, name)).cloned())
     }
 
     fn compare_and_set_head(
@@ -264,24 +291,49 @@ impl RefStore for MemoryRefStore {
         name: &str,
         expected: Option<&str>,
         new: &str,
+        office_head: Option<&str>,
+        anchor: Option<&str>,
     ) -> Result<CasOutcome, String> {
-        let mut heads = self.heads.lock().unwrap();
         let key = Self::key(namespace, name);
-        let current = heads.get(&key).cloned();
+        let office_key = Self::key(PalletNamespace::Meta, OFFICE_PALLET_NAME);
+        // A lift to `@office` itself needs no separate office check: the pallet-head check
+        // below already pins that exact entry — the fake's mirror of the reason
+        // `DynamoRefStore` drops the redundant `ConditionCheck` there (two actions on one item
+        // is refused by DynamoDB; here it would just be checking the same key twice).
+        let checks_office_separately = key != office_key;
+
+        let mut state = self.state.lock().unwrap();
+
+        // All three preconditions are evaluated, and the commit made, under this one guard —
+        // the property this whole struct exists to provide (see `RefState`'s docs).
+        let current = state.heads.get(&key).cloned();
 
         if current.as_deref() != expected {
             return Ok(CasOutcome::Conflict { current });
         }
 
-        heads.insert(key, new.to_string());
+        if checks_office_separately {
+            let current_office = state.heads.get(&office_key).cloned();
+
+            if current_office.as_deref() != office_head {
+                return Ok(CasOutcome::OfficeMoved { current: current_office });
+            }
+        }
+
+        if state.trust.as_deref() != anchor {
+            return Ok(CasOutcome::AnchorMoved);
+        }
+
+        state.heads.insert(key, new.to_string());
 
         Ok(CasOutcome::Committed)
     }
 
     fn list_refs(&self) -> Result<Vec<(PalletRef, String)>, String> {
-        self.heads
+        self.state
             .lock()
             .unwrap()
+            .heads
             .iter()
             .map(|(wire, head)| Ok((PalletRef::parse(wire)?, head.clone())))
             .collect()
@@ -291,26 +343,50 @@ impl RefStore for MemoryRefStore {
         Ok(self.default_pallet.clone())
     }
 
-    fn get_trust(&self) -> Result<Option<TrustAnchor>, String> {
-        Ok(self.trust.lock().unwrap().as_ref().map(|dto| dto.to_anchor()))
+    fn get_trust(&self) -> Result<Option<(TrustAnchor, String)>, String> {
+        let state = self.state.lock().unwrap();
+
+        let Some(json) = state.trust.as_ref() else {
+            return Ok(None);
+        };
+
+        let dto = Self::decode(json)?;
+
+        Ok(Some((dto.to_anchor(), json.clone())))
     }
 
     fn put_trust_if_absent(&self, anchor: &TrustAnchor) -> Result<TrustOutcome, String> {
         let incoming = TrustAnchorDto::from(anchor);
-        let mut trust = self.trust.lock().unwrap();
+        let json = Self::encode(anchor)?;
+        let mut state = self.state.lock().unwrap();
 
-        match trust.as_ref() {
-            Some(existing) if *existing == incoming => Ok(TrustOutcome::AlreadyIdentical),
-            Some(_) => Ok(TrustOutcome::Conflict),
+        match &state.trust {
+            Some(existing_json) => {
+                let existing = Self::decode(existing_json)?;
+
+                if existing == incoming {
+                    Ok(TrustOutcome::AlreadyIdentical)
+                } else {
+                    Ok(TrustOutcome::Conflict)
+                }
+            }
             None => {
-                *trust = Some(incoming);
+                state.trust = Some(json);
                 Ok(TrustOutcome::Established)
             }
         }
     }
 
     fn replace_trust(&self, anchor: &TrustAnchor) -> Result<(), String> {
-        *self.trust.lock().unwrap() = Some(TrustAnchorDto::from(anchor));
+        let json = Self::encode(anchor)?;
+
+        // Unconditional, exactly as `DynamoRefStore::replace_trust` still is this slice — its
+        // conditional write is FORK-95 claim C22, a later slice. Taking the *same* guard
+        // `compare_and_set_head` does is what matters here: it is what lets a falsifying test
+        // interleave this write into the window between an audit's anchor read and the commit
+        // that conditions on it.
+        self.state.lock().unwrap().trust = Some(json);
+
         Ok(())
     }
 }

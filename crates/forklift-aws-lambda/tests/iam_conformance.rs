@@ -164,6 +164,22 @@ const VERIFIER_POLICY: &str = include_str!("../iam/verifier.policy.json");
 
 /// Every non-constructor op method's name is required to appear here, mapped to the IAM
 /// action(s) it needs; see the module docs (direction A/B).
+///
+/// **`transact_write_items` needs a correction to the FORK-95 design memo, found here rather
+/// than assumed from it.** The memo's claim C26 says the missing grant is
+/// `dynamodb:TransactWriteItems`. That is not a real IAM action: verified against three
+/// independent AWS sources (the "Using IAM with DynamoDB transactions" developer guide page,
+/// none of whose four example policies grant it; the Service Authorization Reference's
+/// `TransactWriteItems` row, which maps the *operation* onto the IAM actions
+/// `ConditionCheckItem`/`DeleteItem`/`PutItem`/`UpdateItem` and lists no `TransactWriteItems`
+/// action; and the machine-readable `servicereference` JSON, which has no action of that name
+/// at all). AWS's own model is: permission to call `TransactWriteItems` is governed entirely by
+/// the permissions for the underlying per-item action types it contains — `ConditionCheckItem`
+/// for every `ConditionCheck`, `UpdateItem` for every `Update` — there is no separate
+/// transaction-level action to grant. This op's transaction always carries one `Update` (the
+/// pallet head) and one or two `ConditionCheck`s (office, anchor), so it needs both.
+/// `dynamodb:UpdateItem` moves here from the now-deleted `update_item` op (nothing calls the
+/// raw single-item `UpdateItem` any more — see `dynamo_ops.rs`), not newly granted.
 fn op_actions() -> BTreeMap<&'static str, &'static [&'static str]> {
     BTreeMap::from([
         // S3 (`aws/s3_ops.rs`).
@@ -178,8 +194,8 @@ fn op_actions() -> BTreeMap<&'static str, &'static [&'static str]> {
         // DynamoDB (`aws/dynamo_ops.rs`).
         ("get_item", &["dynamodb:GetItem"][..]),
         ("put_item", &["dynamodb:PutItem"][..]),
-        ("update_item", &["dynamodb:UpdateItem"][..]),
         ("query", &["dynamodb:Query"][..]),
+        ("transact_write_items", &["dynamodb:ConditionCheckItem", "dynamodb:UpdateItem"][..]),
     ])
 }
 

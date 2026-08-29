@@ -138,7 +138,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 .refs
                 .get_trust()
                 .map_err(HeadError::internal)?
-                .map(|anchor| TrustAnchorDto::from(&anchor)),
+                .map(|(anchor, _bytes)| TrustAnchorDto::from(&anchor)),
             // This head serves and stores chunked large files: chunks and recipes ride the byte
             // plane as ordinary content-addressed objects, and the commit-gate closure audit
             // (`ref_update`) descends a recipe to presence-check its chunks before a ref moves. A
@@ -309,7 +309,11 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     pub fn put_trust(&self, anchor: &TrustAnchorDto) -> HeadResult<TrustResult> {
         let existing = self.refs.get_trust().map_err(HeadError::internal)?;
 
-        let Some(existing) = existing else {
+        // The stored bytes travel with `get_trust` for the ref-update commit's anchor
+        // precondition (FORK-95, claim C13); this read-validate-write path is untouched this
+        // slice — its own conditional write is claim C22, deferred to a later slice — so the
+        // bytes go unused here.
+        let Some((existing, _existing_bytes)) = existing else {
             return match self
                 .refs
                 .put_trust_if_absent(&anchor.to_anchor())
@@ -383,7 +387,14 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             )));
         }
 
-        let anchor = self.refs.get_trust().map_err(HeadError::internal)?;
+        // The anchor's stored bytes travel alongside the decoded value: the commit below
+        // conditions on exactly what was read here, never a re-serialization of it (FORK-95
+        // design memo, claim C13) — a `serde` field reorder must never fail a push's anchor
+        // check for no anchor that actually moved.
+        let (anchor, anchor_bytes) = match self.refs.get_trust().map_err(HeadError::internal)? {
+            Some((anchor, bytes)) => (Some(anchor), Some(bytes)),
+            None => (None, None),
+        };
         let office_head = self
             .refs
             .get_head(PalletNamespace::Meta, OFFICE_PALLET_NAME)
@@ -545,14 +556,27 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             Ok(())
         })?;
 
-        // The commit: a conditional write that fails if the head moved during the audit.
+        // The commit: one DynamoDB transaction conditioned on every movable input the audit
+        // above consumed — the pallet's own head, the office head, and the trust anchor — so a
+        // concurrent office lift or re-genesis refuses this update exactly as a concurrent lift
+        // to this same pallet always has (FORK-95 design memo, "Two instantiations of one
+        // invariant" / claim C13).
         match self
             .refs
-            .compare_and_set_head(namespace, &bare, request.old_head.as_deref(), &request.new_head)
+            .compare_and_set_head(
+                namespace,
+                &bare,
+                request.old_head.as_deref(),
+                &request.new_head,
+                office_head.as_deref(),
+                anchor_bytes.as_deref(),
+            )
             .map_err(HeadError::internal)?
         {
             CasOutcome::Committed => Ok(()),
             CasOutcome::Conflict { current } => Err(self.moved(&current, &request.old_head)),
+            CasOutcome::OfficeMoved { current } => Err(self.office_moved(&current)),
+            CasOutcome::AnchorMoved => Err(self.anchor_moved()),
         }
     }
 
@@ -723,6 +747,24 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             current.as_deref().unwrap_or("unborn"),
             expected.as_deref().unwrap_or("unborn")
         ))
+    }
+
+    /// The `409` for an office lift landing between the audit and the commit: the pallet
+    /// itself did not move, but the office state the audit trusted did.
+    fn office_moved(&self, current: &Option<String>) -> HeadError {
+        HeadError::conflict(format!(
+            "The office pallet moved during the audit: its head is now {}. Lower and retry.",
+            current.as_deref().unwrap_or("unborn")
+        ))
+    }
+
+    /// The `409` for the trust anchor changing between the audit and the commit (established,
+    /// or replaced by a re-genesis).
+    fn anchor_moved(&self) -> HeadError {
+        HeadError::conflict(
+            "The trust anchor changed during the audit; re-read the warehouse and retry."
+                .to_string(),
+        )
     }
 
     /// The `409` for trying to replace an established trust anchor.
