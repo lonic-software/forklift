@@ -819,6 +819,23 @@ fn office_lookup_test_checkpoint(identifier: &str) {
 #[cfg(not(test))]
 fn office_lookup_test_checkpoint(_identifier: &str) {}
 
+/// Derive the office state from a head **already read once by the caller** — the two
+/// arms C9 requires, in one place so neither can be reinstated independently. `Some`
+/// goes through the hash-taking accessor (content-addressed reads only, never a second
+/// head lookup); `None` is the ordinary bootstrap window, trust established and the
+/// office not yet lifted, which is not an error.
+///
+/// Derived at each use rather than eagerly: on a ref update by a non-operator principal
+/// to a user pallet nothing consumes it, and the read costs one object per enrolled user
+/// and per key — paid inside the write lock, where it lengthens the section every other
+/// push serializes behind.
+fn office_state_at(office_head: &Option<String>) -> Result<office_utils::OfficeState, HandlerError> {
+    match office_head {
+        Some(head) => office_utils::read_office_state_of(head).map_err(internal),
+        None => Ok(office_utils::OfficeState { users: Vec::new(), keys: Vec::new() }),
+    }
+}
+
 /// Look up an operator's user record in this warehouse's office, against the trust
 /// anchor and office state a caller's own audit consumed — never re-read here. A
 /// caller with no audit of its own to agree with (`require_uploader`) reads both for
@@ -1668,10 +1685,6 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
         // head lookup); `None` is the ordinary bootstrap window — trust established
         // but the office not yet lifted — not an error.
         let office_head = pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).map_err(internal)?;
-        let office_state = match &office_head {
-            Some(head) => office_utils::read_office_state_of(head).map_err(internal)?,
-            None => office_utils::OfficeState { users: Vec::new(), keys: Vec::new() },
-        };
 
         // Transport authorization: may this principal move this ref? The role and
         // the pallet grants come from the office — signed, tracked metadata — read
@@ -1680,6 +1693,7 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
         // below, as it always was: an unauthorized request is refused on authorization
         // and never leaks whether some other precondition also happened to fail.
         if let Principal::Operator(identifier) = &principal {
+            let office_state = office_state_at(&office_head)?;
             if let Some(user) = office_user_of(identifier, &anchor, &office_state)? {
                 let allowed = if is_meta {
                     // Anyone but a reader may transport a meta pallet's history; whether
@@ -1779,7 +1793,7 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
             // the office pallet *is* the target pallet, so its pre-lift head is
             // exactly the request's old head, which the pallet-head check above
             // already pinned this update to.
-            let old_office_state = office_state;
+            let old_office_state = office_state_at(&office_head)?;
 
             for key in &new_office_state.keys {
                 let was_active = old_office_state.find_key(&key.key_id)
@@ -3165,19 +3179,49 @@ mod tests {
         parcel_object.hash
     }
 
-    /// Arm the checkpoint in `office_user_of` for one identifier, returning the
-    /// "reached" receiver and the "proceed" sender a test drives the rendezvous with.
-    /// See `office_lookup_test_checkpoint`'s doc for why this is keyed by identifier
-    /// rather than a bare on/off flag.
+    /// Restores `FORKLIFT_KEYS_DIR` when the test's scope ends, including on panic.
+    /// A falsifier that does its job *fails*, and a straight-line restore placed after
+    /// the assertion never runs on the one path that matters — leaving the process-global
+    /// key directory pointing at a scratch root that is about to be deleted, for every
+    /// later test in this binary. `OfficeFixture` carries the same guard for the same
+    /// reason; this test cannot use the fixture because it must run with the office
+    /// *not* lifted.
+    struct KeysDirRestore(Option<String>);
+
+    impl Drop for KeysDirRestore {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(previous) => std::env::set_var("FORKLIFT_KEYS_DIR", previous),
+                None => std::env::remove_var("FORKLIFT_KEYS_DIR"),
+            }
+        }
+    }
+
+    /// Clears the armed seam when the test's scope ends — including on panic, so a
+    /// timed-out or failed rendezvous cannot leave a live arm for the next test in
+    /// this binary to consume silently.
+    struct OfficeLookupSeamGuard;
+
+    impl Drop for OfficeLookupSeamGuard {
+        fn drop(&mut self) {
+            *OFFICE_LOOKUP_TEST_SEAM.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+
+    /// Arm the checkpoint in `office_user_of` for one identifier, returning a disarm
+    /// guard plus the "reached" receiver and "proceed" sender the test drives the
+    /// rendezvous with. Keyed by identifier so an unrelated concurrent lookup cannot
+    /// consume the arm — but the key is only sound while no other test pushes as the
+    /// same operator, so seam tests use an identifier of their own.
     fn arm_office_lookup_checkpoint(identifier: &str)
-        -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        -> (OfficeLookupSeamGuard, std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
         let (reached_tx, reached_rx) = std::sync::mpsc::channel();
         let (gate_tx, gate_rx) = std::sync::mpsc::channel();
 
         *OFFICE_LOOKUP_TEST_SEAM.lock().unwrap_or_else(|e| e.into_inner()) =
             Some((identifier.to_string(), reached_tx, gate_rx));
 
-        (reached_rx, gate_tx)
+        (OfficeLookupSeamGuard, reached_rx, gate_tx)
     }
 
     /// Falsifier 1 (reverted → red): a stale, pre-lock authorization read must not be
@@ -3216,25 +3260,25 @@ mod tests {
     async fn a_grant_revoked_through_the_write_lock_cannot_land_in_an_unlocked_window() {
         let fixture = OfficeFixture::genesis("post-ref-revoke-race");
         let quinn_key_id = fixture.admit(
-            "quinn", Role::Writer, vec!["main".to_string()], IdentityClass::Human, None
+            "quinn-seam", Role::Writer, vec!["main".to_string()], IdentityClass::Human, None
         );
-        let quinn = Operator { name: "quinn".to_string(), identifier: "quinn".to_string() };
-        let new_head = store_signed_parcel(&quinn, &quinn_key_id, Vec::new(), "quinn's push");
+        let quinn = Operator { name: "quinn-seam".to_string(), identifier: "quinn-seam".to_string() };
+        let new_head = store_signed_parcel(&quinn, &quinn_key_id, Vec::new(), "quinn-seam's push");
 
         let mut operator_tokens = HashMap::new();
-        operator_tokens.insert("tok-quinn".to_string(), "quinn".to_string());
+        operator_tokens.insert("tok-quinn-seam".to_string(), "quinn-seam".to_string());
         let state = Arc::new(AppState { operator_tokens, ..single_mode_state(fixture.root.clone()) });
         let ServeMode::Single(handle) = &state.mode else {
             unreachable!("single_mode_state always builds ServeMode::Single")
         };
         let handle = Arc::clone(handle);
 
-        let (reached, gate) = arm_office_lookup_checkpoint("quinn");
+        let (_seam, reached, gate) = arm_office_lookup_checkpoint("quinn-seam");
 
         let params = ref_update_params("main");
         let body = RefUpdateRequest { old_head: None, new_head };
         let push = tokio::spawn(post_ref_update(
-            State(Arc::clone(&state)), headers_with_bearer("tok-quinn"), Path(params), Json(body)
+            State(Arc::clone(&state)), headers_with_bearer("tok-quinn-seam"), Path(params), Json(body)
         ));
 
         reached.recv_timeout(std::time::Duration::from_secs(5))
@@ -3242,13 +3286,13 @@ mod tests {
 
         let expected_status = match handle.writes.try_lock() {
             Ok(guard) => {
-                // The vulnerable window: the lock is free even though quinn's push
+                // The vulnerable window: the lock is free even though quinn-seam's push
                 // already has its authorization answer. Revoke her through the same
                 // lock a real concurrent office update would use.
                 let mut office_state = office_utils::read_office_state().unwrap();
                 office_state.users.iter_mut()
-                    .find(|user| user.identifier == "quinn")
-                    .expect("quinn must be enrolled")
+                    .find(|user| user.identifier == "quinn-seam")
+                    .expect("quinn-seam must be enrolled")
                     .role = Role::Reader;
                 office_utils::stack_office_parcel(
                     &office_state, &fixture.admin, "revoke quinn".to_string(), &fixture.admin_key_id
@@ -3299,7 +3343,8 @@ mod tests {
         let keys_lock = KEYS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let keys_dir = root.join("keys");
         std::fs::create_dir_all(&keys_dir).unwrap();
-        let previous_keys_dir = std::env::var("FORKLIFT_KEYS_DIR").ok();
+        // Declared after `keys_lock`, so it restores while the lock is still held.
+        let _keys_restore = KeysDirRestore(std::env::var("FORKLIFT_KEYS_DIR").ok());
         std::env::set_var("FORKLIFT_KEYS_DIR", &keys_dir);
 
         warehouse_utils::prepare_warehouse().unwrap();
@@ -3361,13 +3406,14 @@ mod tests {
             "the first office lift, in the ordinary bootstrap window, must commit"
         );
 
-        match &previous_keys_dir {
-            Some(previous) => std::env::set_var("FORKLIFT_KEYS_DIR", previous),
-            None => std::env::remove_var("FORKLIFT_KEYS_DIR"),
-        }
-        drop(keys_lock);
         drop(_scope);
         let _ = std::fs::remove_dir_all(&root);
+        // `keys_lock` is NOT dropped here. It must outlive `_keys_restore`, which runs at
+        // scope end — releasing the lock first would let another test acquire it and set
+        // its own FORKLIFT_KEYS_DIR, only for this test's restore to clobber it mid-run.
+        // Declaration order (lock, then restore) gives the reverse drop order that is
+        // correct on both the passing and the panicking path.
+        drop(keys_lock);
     }
 
     /// Coverage (over-tightened direction, second half): two writers pushing to two
