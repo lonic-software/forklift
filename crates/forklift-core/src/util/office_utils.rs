@@ -688,6 +688,27 @@ fn stack_office_parcel_with_parents(state: &OfficeState,
                                     description: String,
                                     signing_key_id: &str,
                                     parents: Vec<String>) -> Result<String, String> {
+    let hash = build_and_sign_office_parcel(state, actor, description, signing_key_id, parents)?;
+
+    pallet_utils::set_meta_pallet_head(OFFICE_PALLET_NAME, &hash)?;
+
+    Ok(hash)
+}
+
+/// Build, store and sign an office parcel — everything [`stack_office_parcel_with_parents`]
+/// does except advancing the office ref. A caller that must drive the ref move itself
+/// (a test exercising `post_ref_update`'s own handling of a lift, rather than landing
+/// one out of band) needs the exact tree shape a real office lift produces without
+/// this function landing it first.
+///
+/// # Returns
+/// * `Ok(String)`  - The hash of the new (unlinked) office parcel.
+/// * `Err(String)` - If an object could not be built, stored or signed.
+pub fn build_and_sign_office_parcel(state: &OfficeState,
+                                    actor: &Operator,
+                                    description: String,
+                                    signing_key_id: &str,
+                                    parents: Vec<String>) -> Result<String, String> {
     let mut users_tree = TreeItem::new(TREE_NAME_USERS.to_string(), String::new(), DirEntryType::Tree);
 
     for user in &state.users {
@@ -750,8 +771,6 @@ fn stack_office_parcel_with_parents(state: &OfficeState,
 
     let signature = sign_utils::sign_parcel_hash(signing_key_id, &parcel_object.hash)?;
     sign_utils::store_parcel_signature(&parcel_object.hash, &signature)?;
-
-    pallet_utils::set_meta_pallet_head(OFFICE_PALLET_NAME, &parcel_object.hash)?;
 
     Ok(parcel_object.hash)
 }

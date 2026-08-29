@@ -29,3 +29,9 @@ tower-http = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 subtle = { workspace = true }
+
+[dev-dependencies]
+# Only for test-only parcel construction (FORK-95 falsifiers) — `ParcelAction`'s
+# timestamp is a `chrono::DateTime<Utc>`, and forklift-server has no production need
+# for the crate itself.
+chrono = { workspace = true }
