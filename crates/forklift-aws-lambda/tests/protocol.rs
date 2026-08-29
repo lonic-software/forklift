@@ -1593,6 +1593,80 @@ fn a_concurrent_office_move_refuses_the_commit_as_office_moved_not_pallet_moved(
     );
 }
 
+/// PR #116 review, finding 2: on an **untrusted** warehouse the audit never reads the office
+/// head at all — both the office-chain mirror and the whole trust block in `ref_update` are
+/// gated on `anchor.is_some()` — so the commit must not condition on it either. Sibling to
+/// `a_concurrent_office_move_refuses_the_commit_as_office_moved_not_pallet_moved`, which pins
+/// the opposite: the *trusted* case where the same race must refuse. Neither
+/// `a_concurrently_moved_unrelated_pallet_does_not_refuse_the_commit` nor any other existing
+/// test reaches this — that test only moves an unrelated *user* pallet on a *trusted*
+/// warehouse, never the office pallet itself on an untrusted one.
+#[test]
+fn an_untrusted_warehouses_concurrent_office_move_does_not_refuse_the_commit() {
+    let area = Area::new("untrusted-office-races-the-commit");
+    prepare(&area, "wh");
+    area.forklift("wh", &["office", "enroll"]);
+    area.write_file("wh/app.txt", "v1\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "first"]);
+
+    let main_v1 = harvest(&area.path("wh")).head_of("main").expect("main v1");
+
+    area.write_file("wh/app.txt", "v2\n");
+    area.forklift("wh", &["load", "app.txt"]);
+    area.forklift("wh", &["stack", "second"]);
+
+    let latest = harvest(&area.path("wh"));
+    let office_head = latest.head_of(&format!("@{}", OFFICE_PALLET_NAME)).expect("office head");
+    let main_v2 = latest.head_of("main").expect("main v2");
+    assert_ne!(main_v1, main_v2);
+
+    let store = Arc::new(MemoryRefStore::new());
+
+    // Setup: lift the office pallet and main v1 — no `put_trust` anywhere in this test, so
+    // neither lift is ever audited (an untrusted warehouse verifies nothing, office included).
+    let setup = Head::new(MemoryObjectStore::new(), SharedMemoryRefs(store.clone()));
+    upload_all(&setup, &latest);
+    setup
+        .ref_update(&format!("@{}", OFFICE_PALLET_NAME), &RefUpdateRequest {
+            old_head: None,
+            new_head: office_head,
+        })
+        .expect("lift office (untrusted, unaudited)");
+    setup
+        .ref_update("main", &RefUpdateRequest { old_head: None, new_head: main_v1.clone() })
+        .expect("lift main v1 (untrusted, unaudited)");
+
+    // Attack: lift main v1 -> v2 while the office pallet moves right after `ref_update`'s
+    // office-head snapshot read — the same injection the trusted sibling test uses. There the
+    // move refuses the commit; here it must not, because this warehouse's audit never
+    // consumed the office head to begin with.
+    let attack = Head::new(
+        MemoryObjectStore::new(),
+        OfficeMovesAfterTheSnapshot {
+            inner: store.clone(),
+            move_to: "f".repeat(64),
+            fired: Cell::new(false),
+        },
+    );
+    upload_all(&attack, &latest);
+
+    attack
+        .ref_update("main", &RefUpdateRequest {
+            old_head: Some(main_v1),
+            new_head: main_v2.clone(),
+        })
+        .expect(
+            "an untrusted push must never be refused for an office move its audit never \
+            consumed",
+        );
+
+    assert_eq!(
+        store.get_head(pallet_utils::PalletNamespace::User, "main").expect("get").as_deref(),
+        Some(main_v2.as_str())
+    );
+}
+
 /// Falsifier 1b (anchor): likewise for the trust anchor — the ref update must be refused as a
 /// **moved anchor**, not as an ordinary moved-pallet-head conflict.
 #[test]

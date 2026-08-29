@@ -256,7 +256,8 @@
                   are queued to ECS instead. Nothing unverified is ever fetchable at a hash key.
 5  client → API:  POST /lift/{session}/commit
 6  API/Lambda:    verify parcel signature (FORK-13), privileges (FORK-10), tree completeness
-                  → DynamoDB conditional write: pallet head = new hash IF head == expected old hash
+                  → DynamoDB TransactWriteItems (FORK-95): pallet head = new hash IF head ==
+                  expected old hash, AND office head/anchor unchanged since the audit read them
                   → 409 on race (client rebases and retries) — this CAS is the ONLY mutable state
 </pre></div>
 <p><b>Lower (pull/clone)</b> is the mirror: the API returns the pallet head + a walk manifest (or a bundle reference, §4.3); the client fetches objects in parallel from S3/CloudFront via presigned or public URLs and verifies every hash locally.</p>
@@ -318,7 +319,7 @@
 <p><b>Component sketch:</b></p>
 <ul>
   <li><b>Control-plane function</b> (<code>lambda_http</code>): serves the <code>/v1</code> endpoints. Object <code>GET</code>/<code>PUT</code> answer <code>307</code> presigned S3 URLs (the redirect room is already in the protocol spec); everything else is the same JSON control plane the server head speaks. Multi-warehouse by construction — the warehouse id is a path prefix (<code>/warehouses/{id}/v1/…</code>, the same shape as the server head's planned multi-warehouse mode in §4.5), carried inside <code>remote.url</code> so clients need nothing new.</li>
-  <li><b>Refs in DynamoDB</b> — the single consistency point: partition key = warehouse id, sort key = <code>pallet#&lt;name&gt;</code> (plus a <code>trust</code> item per warehouse); the CAS is a conditional write on the head attribute. Tiny items, exactly what §4.4 rule 3 demands.</li>
+  <li><b>Refs in DynamoDB</b> — the single consistency point: partition key = warehouse id, sort key = <code>pallet#&lt;name&gt;</code> (plus a <code>trust</code> item per warehouse); the CAS is a <code>TransactWriteItems</code> conditioned on the head attribute of the target pallet, the office pallet's head, and the trust anchor's stored bytes — every movable input a ref-update audit consumed, not the target pallet's own head alone (FORK-95). Tiny items, exactly what §4.4 rule 3 demands.</li>
   <li><b>S3 layout</b> per warehouse: <code>objects/&lt;hash&gt;</code> (canonical, immutable), <code>staging/&lt;session&gt;/&lt;hash&gt;</code> (unverified uploads), <code>signatures/&lt;hash&gt;</code>, <code>bundles/…</code>.</li>
   <li><b>Verifier function</b>: S3 staging event → stream the object, check <code>Blake3(content) == claimed hash</code>, copy to canonical, delete staging. Objects over a size threshold queue to ECS (the hosted infra provides the queue/cluster; the head provides the verification code both run).</li>
   <li><b>Verification reuse</b>: ref updates run the same <code>audit_utils</code> checks as everywhere else. Parcels, signatures and office metadata are small — the function mirrors them into a warehouse-shaped cache in Lambda <code>/tmp</code> (warm containers amortize it) and reuses the existing filesystem-based verification; tree-completeness existence checks go straight to S3 (<code>HEAD</code>), which needs a small core addition: closure verification with a pluggable existence check.</li>

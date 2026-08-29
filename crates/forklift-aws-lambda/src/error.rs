@@ -26,6 +26,10 @@ pub enum Status {
     Conflict,
     /// `422` — a verification failure: a bad hash, a missing closure, a failed audit.
     Unprocessable,
+    /// `503` — a transient refusal that does not claim any input moved (DynamoDB transaction
+    /// contention, principally): retrying may succeed with nothing having changed. Distinct
+    /// from `409`, which asserts a movable input's value differs from what was consumed.
+    ServiceUnavailable,
     /// `500` — an internal storage error (never a client's fault).
     Internal,
 }
@@ -42,6 +46,7 @@ impl Status {
             Status::NotFound => 404,
             Status::Conflict => 409,
             Status::Unprocessable => 422,
+            Status::ServiceUnavailable => 503,
             Status::Internal => 500,
         }
     }
@@ -84,6 +89,11 @@ impl HeadError {
     /// A `403 Forbidden` — an authorization failure.
     pub fn forbidden(message: impl Into<String>) -> HeadError {
         HeadError { status: Status::Forbidden, message: message.into() }
+    }
+
+    /// A `503 Service Unavailable` — a transient refusal (contention, not a moved value).
+    pub fn service_unavailable(message: impl Into<String>) -> HeadError {
+        HeadError { status: Status::ServiceUnavailable, message: message.into() }
     }
 
     /// A `500 Internal Server Error` — a storage-layer failure. Storage errors bubble up

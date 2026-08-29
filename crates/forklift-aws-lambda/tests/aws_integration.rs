@@ -590,12 +590,13 @@ async fn dynamo_ref_store_upholds_the_cas_and_the_trust_door() {
 /// [`DynamoRefStore::compare_and_set_head`] folds into the transaction alongside the pallet's
 /// own head — exercised against **real** DynamoDB rather than the in-memory fake. Every other
 /// CAS in this suite runs on a fresh warehouse with neither an office pallet nor a trust anchor,
-/// so it passes `None, None` and never builds either `ConditionCheck` at all; `memory.rs`'s own
-/// unit tests already cover the same outcomes against `MemoryRefStore`, in Rust, by construction.
-/// Neither proves what this test proves: that `classify_cancellation`'s *positional* reading of
-/// `TransactionCanceledException::cancellation_reasons()` matches what DynamoDB actually returns
-/// for the order `compare_and_set_head` requests actions in (pallet `Update` at position 0, the
-/// office `ConditionCheck` at position 1 when built, the anchor `ConditionCheck` last). A backend
+/// so it passes `None, None` and never builds either `ConditionCheck` at all; `tests/protocol.rs`
+/// already covers the same outcomes against `MemoryRefStore` through `Head::ref_update`, in
+/// Rust, by construction. Neither proves what this test proves: that `classify_cancellation`'s
+/// *positional* reading of `TransactionCanceledException::cancellation_reasons()` matches what
+/// DynamoDB actually returns for the order `compare_and_set_head` requests actions in (pallet
+/// `Update` at position 0, the office `ConditionCheck` at position 1 when built, the anchor
+/// `ConditionCheck` last). A backend
 /// that did not preserve that ordering would still pass every fake-backed test in this crate and
 /// would silently attribute a moved office to the pallet, or a moved anchor to the office.
 #[tokio::test(flavor = "multi_thread")]

@@ -126,6 +126,14 @@ pub enum CasOutcome {
     /// call site needs the anchor's new bytes — the caller re-reads and re-decides — so
     /// unlike its two siblings this variant carries no payload.
     AnchorMoved,
+    /// The commit was refused for a reason that establishes nothing about whether any of the
+    /// three inputs actually moved — on DynamoDB, `TransactionConflict` (another transaction
+    /// concurrently touching one of this commit's items, the shared office item principally).
+    /// A retry may succeed with nothing having changed, unlike the three variants above, each
+    /// of which asserts a specific value differs from what was consumed. `MemoryRefStore`
+    /// never produces this: its single mutex makes every commit either succeed or lose to a
+    /// real, attributable mismatch, never a transaction-level conflict with no value to blame.
+    Transient,
 }
 
 /// The outcome of establishing the trust anchor (a one-way door, §4.4 / §8.7).
@@ -253,8 +261,15 @@ pub trait RefStore {
     /// DynamoDB `TransactWriteItems`; FORK-95 design memo, claim C13):
     ///
     /// * `expected` — the pallet's own head. `None` means "the pallet must not exist yet".
-    /// * `office_head` — the office pallet's head the audit read, or `None` if the office
-    ///   pallet is unborn. Skipped when `namespace`/`name` name the office pallet itself —
+    /// * `office_head` — the office pallet's head the audit read, precisely when the audit
+    ///   read one at all — `None` means "the audit never consumed the office head", not
+    ///   "the office pallet is unborn": an untrusted warehouse's audit never reads it (every
+    ///   office-touching step is gated on trust being established), so conditioning on
+    ///   "unborn" there would refuse a push over an office state the audit never depended on,
+    ///   possibly *every* push, since an untrusted office pallet may well carry a real,
+    ///   unaudited head. The caller must pass `None` here whenever its own audit did not read
+    ///   the office head, never merely because the office pallet happens to be unborn. Also
+    ///   skipped (regardless of value) when `namespace`/`name` name the office pallet itself —
     ///   the `expected` condition above already pins that exact item.
     /// * `anchor` — the trust anchor's *stored serialization*, exactly as
     ///   [`get_trust`](RefStore::get_trust) returned it, or `None` if untrusted. Never a

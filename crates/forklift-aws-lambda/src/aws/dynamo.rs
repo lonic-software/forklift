@@ -27,14 +27,17 @@
 //! write, never a read-then-write — and, as of FORK-95, never a single-item one either. It is
 //! a `TransactWriteItems` of up to three actions: an `Update` on the target pallet's own item
 //! whose `ConditionExpression` encodes the caller's `expected` (exactly the prior single-item
-//! shape), a `ConditionCheck` on the office pallet's item at the office head the audit
-//! consumed (skipped when the target pallet *is* the office pallet — the `Update` above
-//! already pins that item), and a `ConditionCheck` on the trust item at the anchor's stored
-//! serialization. DynamoDB either applies the whole transaction with every condition holding
-//! or applies nothing; on a condition failure `ReturnValuesOnConditionCheckFailure=ALL_OLD`
-//! hands back the failed item, so the store reports which precondition moved without a
-//! second round trip. [`put_trust_if_absent`](RefStore::put_trust_if_absent) is still the
-//! single-item shape: a conditional `PutItem` guarding the one-way trust door.
+//! shape), a `ConditionCheck` on the office pallet's item at the office head the caller's
+//! audit consumed, and a `ConditionCheck` on the trust item at the anchor's stored
+//! serialization. The office check is skipped for two independent reasons: the target pallet
+//! *is* the office pallet (the `Update` above already pins that item; DynamoDB refuses two
+//! actions on one item), or the caller's audit never read an office head at all (an untrusted
+//! warehouse's audit never touches it) — see `RefStore::compare_and_set_head`'s docs. DynamoDB
+//! either applies the whole transaction with every condition holding or applies nothing; on a
+//! condition failure `ReturnValuesOnConditionCheckFailure=ALL_OLD` hands back the failed item,
+//! so the store reports which precondition moved without a second round trip.
+//! [`put_trust_if_absent`](RefStore::put_trust_if_absent) is still the single-item shape: a
+//! conditional `PutItem` guarding the one-way trust door.
 //!
 //! Cancellation reasons on a `TransactionCanceledException` are ordered by the order actions
 //! were requested (AWS API Reference and the pinned `aws-sdk-dynamodb` model agree on this),
@@ -191,33 +194,27 @@ impl DynamoRefStore {
     }
 
     /// The `ConditionCheck` on the office pallet's item: its head must still equal
-    /// `office_head`, `None` meaning "the office pallet must still be unborn". Never built for
-    /// a lift to `@office` itself — see `compare_and_set_head`, which drops this action there
-    /// because the `Update` above already pins that exact item (AWS refuses two actions on one
-    /// item in the same transaction).
-    fn office_condition_check(
-        &self,
-        office_entity: &str,
-        office_head: Option<&str>,
-    ) -> TransactWriteItem {
-        let mut builder = ConditionCheck::builder()
+    /// `office_head` exactly. Built only when the caller's audit actually consumed an office
+    /// head — see `compare_and_set_head`, which skips this action both when the target *is*
+    /// `@office` itself (the `Update` above already pins that exact item; AWS refuses two
+    /// actions on one item in the same transaction) and when the caller passed no office head
+    /// at all, meaning its audit never read one. There is deliberately no "office pallet must
+    /// be unborn" mode here: the only reachable caller of this method already holds a real
+    /// head (an audit that found the office pallet missing refuses before reaching the
+    /// commit — see `head.rs::ref_update`), so a fabricated `attribute_not_exists` condition
+    /// would test a state no audit this store serves ever actually consumed.
+    fn office_condition_check(&self, office_entity: &str, office_head: &str) -> TransactWriteItem {
+        let condition_check = ConditionCheck::builder()
             .set_key(Some(self.key(office_entity)))
             .table_name(&self.table)
-            .return_values_on_condition_check_failure(ReturnValuesOnConditionCheckFailure::AllOld);
-
-        builder = match office_head {
-            Some(head) => builder
-                .condition_expression("#h = :h")
-                .expression_attribute_names("#h", ATTR_HEAD)
-                .expression_attribute_values(":h", s(head)),
-            None => builder
-                .condition_expression("attribute_not_exists(#e)")
-                .expression_attribute_names("#e", ATTR_ENTITY),
-        };
-
-        TransactWriteItem::builder()
-            .condition_check(builder.build().expect("every required ConditionCheck field is set"))
+            .return_values_on_condition_check_failure(ReturnValuesOnConditionCheckFailure::AllOld)
+            .condition_expression("#h = :h")
+            .expression_attribute_names("#h", ATTR_HEAD)
+            .expression_attribute_values(":h", s(office_head))
             .build()
+            .expect("every required ConditionCheck field is set");
+
+        TransactWriteItem::builder().condition_check(condition_check).build()
     }
 
     /// The `ConditionCheck` on the trust item: its *stored bytes* must still equal `anchor`,
@@ -250,26 +247,48 @@ impl DynamoRefStore {
 
 /// Attribute a `TransactWriteItems` cancellation to the precondition it names, using the
 /// positional mapping [`DynamoRefStore::compare_and_set_head`] builds: position 0 is always
-/// the pallet's own head, position 1 is the office `ConditionCheck` when
-/// `checks_office_separately` (else the anchor's), and the anchor's is always last. That
-/// ordering is not incidental — `TransactionCanceledException::cancellation_reasons` is
-/// documented ordered by the order actions were requested (AWS API Reference, corroborated by
-/// the pinned `aws-sdk-dynamodb` model) — so the index an action is pushed at in
-/// `compare_and_set_head` IS the index its refusal comes back at here, and the two must never
-/// drift apart independently.
+/// the pallet's own head, position 1 is the office `ConditionCheck` when `builds_office_check`
+/// (else the anchor's), and the anchor's is always last. That ordering is not incidental —
+/// `TransactionCanceledException::cancellation_reasons` is documented ordered by the order
+/// actions were requested (AWS API Reference, corroborated by the pinned `aws-sdk-dynamodb`
+/// model) — so the index an action is pushed at in `compare_and_set_head` IS the index its
+/// refusal comes back at here, and the two must never drift apart independently.
 ///
 /// A cancellation that names no moved precondition — every position reads "no error" (both the
 /// literal string `"None"` and an absent code mean that; the API Reference and the pinned SDK
-/// model disagree on which one DynamoDB actually sends, so both must read the same way here),
-/// or a transient DynamoDB cause (`TransactionConflict`, a throttle, the client's own request
-/// token racing itself) — is reported as a fault rather than guessed at: attributing it to one
-/// of the three inputs would be wrong, and retrying it is FORK-95 slice 3's job (arm two, claim
-/// C14) — this slice does not retry, so SDK-level retry is left exactly as it is today.
+/// model disagree on which one DynamoDB actually sends, so both must read the same way here) —
+/// is reported as a fault rather than guessed at: attributing it to one of the three inputs
+/// would be wrong. `TransactionConflict` is the one transient cause classified explicitly
+/// rather than falling into that fault, because it is not merely inherited risk but a
+/// **contention this slice's own change introduces**: every `ConditionCheck` this method now
+/// builds shares the single `@office` item across every concurrent ref update in the
+/// warehouse, so an office lift racing *any* other pallet's push can cancel one of them for a
+/// reason that establishes nothing about whether that pallet's own commit was ever actually
+/// wrong — see [`CasOutcome::Transient`]'s docs for why that is answered as a retryable
+/// refusal, not a fault. Every other transient cause (a throttle, the client's own request
+/// token racing itself) still falls to the fault arm below: FORK-95 slice 3 (arm two, claim
+/// C14) *inherits* the retry loop that answers all of them uniformly and gives it a request
+/// token to de-duplicate against; this slice does not build that loop, so SDK-level retry is
+/// left exactly as it is today, and a same-token re-issue of a cancelled transaction — the
+/// premise that retry would need — is untested here (see this crate's own residuals).
+///
+/// **Recorded gap, not built here**: `compare_and_set_head`'s `TransactWriteItems` carries no
+/// `ClientRequestToken`. `TransactWriteItems` is the one DynamoDB call AWS documents an
+/// idempotency token for; without one, an SDK-level retry of a request that actually committed
+/// re-issues it as a *new* transaction, the pallet `Update`'s own condition then fails (the
+/// head it just moved to no longer equals the `expected` it retried with), and the client is
+/// told `409 "The pallet moved"` for a push that succeeded. This is **not a regression** — the
+/// single-item `UpdateItem` this replaced had the identical hazard, unconditioned on any
+/// token, for the identical reason (a `PutItem`/`UpdateItem` call's SDK-level retry is not
+/// itself idempotent-by-token either) — but it is real, and giving it a token per sub-cause is
+/// exactly the policy FORK-95 slice 3 owns; recording it here is what keeps this note's "SDK
+/// retry left exactly as it is today" from reading as though this call site already has the
+/// coverage a token would need to give it.
 fn classify_cancellation(
     reasons: &[CancellationReason],
-    checks_office_separately: bool,
+    builds_office_check: bool,
 ) -> Result<CasOutcome, String> {
-    let expected_len = if checks_office_separately { 3 } else { 2 };
+    let expected_len = if builds_office_check { 3 } else { 2 };
 
     if reasons.len() != expected_len {
         return Err(format!(
@@ -287,14 +306,25 @@ fn classify_cancellation(
         return Ok(CasOutcome::Conflict { current: reasons[0].item().and_then(head_of) });
     }
 
-    if checks_office_separately && is_condition_failed(&reasons[1]) {
+    if builds_office_check && is_condition_failed(&reasons[1]) {
         return Ok(CasOutcome::OfficeMoved { current: reasons[1].item().and_then(head_of) });
     }
 
-    let anchor_position = if checks_office_separately { 2 } else { 1 };
+    let anchor_position = if builds_office_check { 2 } else { 1 };
 
     if is_condition_failed(&reasons[anchor_position]) {
         return Ok(CasOutcome::AnchorMoved);
+    }
+
+    // No position names a moved precondition. `ConditionalCheckFailed` takes precedence over
+    // any transient code by construction above (checked first, at every position) — a
+    // transaction that was going to be refused for a moved input would be refused again on
+    // re-issue, so reporting the transient code first would spend a retry budget on a `409`
+    // wearing a `503`'s clothes. Only once no position failed a condition does a
+    // `TransactionConflict` anywhere in the list read as this slice's own introduced
+    // contention rather than a moved value.
+    if reasons.iter().any(|reason| reason.code() == Some("TransactionConflict")) {
+        return Ok(CasOutcome::Transient);
     }
 
     Err(format!(
@@ -324,20 +354,30 @@ impl RefStore for DynamoRefStore {
     ) -> Result<CasOutcome, String> {
         let entity = pallet_entity(namespace, name);
         let office_entity = pallet_entity(PalletNamespace::Meta, OFFICE_PALLET_NAME);
-        // DynamoDB refuses a transaction where two actions target the same item ("you cannot
-        // both `ConditionCheck` and `Update` the same item" — AWS API Reference). Lifting
-        // `@office` itself is that case: the office precondition IS the pallet precondition the
-        // `Update` action already encodes, so it is dropped rather than duplicated.
-        let checks_office_separately = entity != office_entity;
+        // The office `ConditionCheck` is built for two independent reasons at once, both of
+        // which must hold. Structural: DynamoDB refuses a transaction where two actions target
+        // the same item ("you cannot both `ConditionCheck` and `Update` the same item" — AWS
+        // API Reference), and lifting `@office` itself is that case — the office precondition
+        // IS the pallet precondition the `Update` action already encodes. Semantic: `None`
+        // means the caller's own audit never consumed an office head at all (an untrusted
+        // warehouse never reads one — see `RefStore::compare_and_set_head`'s docs), and
+        // conditioning on it anyway would refuse a commit over a state the audit never
+        // depended on.
+        let builds_office_check = entity != office_entity && office_head.is_some();
 
         self.bridge.block_on(async {
             // Position 0 is always the pallet's own head; the office `ConditionCheck` (when
-            // present) and the anchor `ConditionCheck` follow in exactly this push order. See
+            // built) and the anchor `ConditionCheck` follow in exactly this push order. See
             // `classify_cancellation`'s docs for why that ordering is load-bearing.
             let mut items = vec![self.pallet_update(&entity, expected, new)];
 
-            if checks_office_separately {
-                items.push(self.office_condition_check(&office_entity, office_head));
+            if builds_office_check {
+                // `office_head.is_some()` is exactly `builds_office_check`'s own condition
+                // (the structural half only rules the check *out*, never back in), so this
+                // never panics.
+                items.push(
+                    self.office_condition_check(&office_entity, office_head.expect("checked above")),
+                );
             }
 
             items.push(self.anchor_condition_check(anchor));
@@ -348,10 +388,7 @@ impl RefStore for DynamoRefStore {
                 Ok(_) => Ok(CasOutcome::Committed),
                 Err(err) => match err.as_service_error() {
                     Some(TransactWriteItemsError::TransactionCanceledException(failure)) => {
-                        classify_cancellation(
-                            failure.cancellation_reasons(),
-                            checks_office_separately,
-                        )
+                        classify_cancellation(failure.cancellation_reasons(), builds_office_check)
                     }
                     _ => Err(describe("DynamoDB transact_write_items", err)),
                 },
@@ -551,5 +588,42 @@ mod tests {
         let without_head =
             HashMap::from([(ATTR_ANCHOR.to_string(), s("{}"))]);
         assert_eq!(head_of(&without_head), None);
+    }
+
+    /// A synthetic cancellation reason carrying `code` and nothing else — no SDK call, no
+    /// network. Mirrors `aws/s3.rs`'s `synthetic_head_object_error` pattern for the same
+    /// purpose: exercising a classifier against constructed SDK types.
+    fn reason(code: &str) -> CancellationReason {
+        CancellationReason::builder().code(code).build()
+    }
+
+    /// PR #116 review, finding 1: `TransactionConflict` — DynamoDB's own concurrency control
+    /// when another transaction concurrently touches one of this commit's items (the shared
+    /// `@office` item, principally) — must classify as `Transient`, not fall to the generic
+    /// fault this function's `Err` branch answers as a `500`. No position failed a condition,
+    /// so nothing here is attributable to a moved value.
+    #[test]
+    fn a_transaction_conflict_with_no_moved_precondition_is_transient() {
+        let reasons = vec![reason("None"), reason("TransactionConflict"), reason("None")];
+
+        assert_eq!(
+            classify_cancellation(&reasons, true).expect("a transient cause, not a fault"),
+            CasOutcome::Transient
+        );
+    }
+
+    /// `ConditionalCheckFailed` takes precedence over a `TransactionConflict` elsewhere in the
+    /// list: a transaction that was going to be refused for a moved input would be refused
+    /// again on re-issue, so reporting the transient code instead would answer `503` for what
+    /// is really a `409`.
+    #[test]
+    fn a_moved_precondition_is_attributed_even_alongside_a_transaction_conflict() {
+        let reasons =
+            vec![reason("ConditionalCheckFailed"), reason("TransactionConflict"), reason("None")];
+
+        assert_eq!(
+            classify_cancellation(&reasons, true).expect("attributed to the pallet"),
+            CasOutcome::Conflict { current: None }
+        );
     }
 }

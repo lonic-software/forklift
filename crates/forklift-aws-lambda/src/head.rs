@@ -556,11 +556,20 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             Ok(())
         })?;
 
+        // The commit conditions on the office head only when the audit above actually
+        // consumed it — an untrusted warehouse's audit never reads it (both the office-chain
+        // mirror and the whole trust block are gated on `anchor.is_some()`), so passing it
+        // unconditionally would refuse a push for an office move the audit never depended on,
+        // or worse: an untrusted office pallet may carry a real, unaudited head, and
+        // conditioning on it as if `None` meant "must be unborn" would refuse *every* such
+        // push, race or not. `RefStore::compare_and_set_head`'s own docs record this contract.
+        let office_head_for_commit = if anchor.is_some() { office_head.as_deref() } else { None };
+
         // The commit: one DynamoDB transaction conditioned on every movable input the audit
-        // above consumed — the pallet's own head, the office head, and the trust anchor — so a
-        // concurrent office lift or re-genesis refuses this update exactly as a concurrent lift
-        // to this same pallet always has (FORK-95 design memo, "Two instantiations of one
-        // invariant" / claim C13).
+        // above consumed — the pallet's own head, the office head (when read), and the trust
+        // anchor — so a concurrent office lift or re-genesis refuses this update exactly as a
+        // concurrent lift to this same pallet always has (FORK-95 design memo, "Two
+        // instantiations of one invariant" / claim C13).
         match self
             .refs
             .compare_and_set_head(
@@ -568,7 +577,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 &bare,
                 request.old_head.as_deref(),
                 &request.new_head,
-                office_head.as_deref(),
+                office_head_for_commit,
                 anchor_bytes.as_deref(),
             )
             .map_err(HeadError::internal)?
@@ -577,6 +586,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             CasOutcome::Conflict { current } => Err(self.moved(&current, &request.old_head)),
             CasOutcome::OfficeMoved { current } => Err(self.office_moved(&current)),
             CasOutcome::AnchorMoved => Err(self.anchor_moved()),
+            CasOutcome::Transient => Err(self.transient_contention()),
         }
     }
 
@@ -763,6 +773,20 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     fn anchor_moved(&self) -> HeadError {
         HeadError::conflict(
             "The trust anchor changed during the audit; re-read the warehouse and retry."
+                .to_string(),
+        )
+    }
+
+    /// The `503` for a commit cancelled by DynamoDB's own concurrency control
+    /// (`TransactionConflict`) rather than by any of the three preconditions moving — most
+    /// often another push racing this one for the shared office item. Unlike `moved`/
+    /// `office_moved`/`anchor_moved`, this does not claim any value changed, so it must never
+    /// be worded as one of those: a retry may succeed with nothing having moved at all.
+    fn transient_contention(&self) -> HeadError {
+        HeadError::service_unavailable(
+            "The commit could not complete because of contention on a shared item, likely a \
+            concurrent push to this warehouse's office pallet. Retry the push; nothing may \
+            have moved."
                 .to_string(),
         )
     }

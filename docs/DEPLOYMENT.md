@@ -346,6 +346,20 @@ steady, and on-demand avoids provisioning (and paying for) idle read/write capac
 warehouse. Switch to provisioned capacity only if you have enough steady traffic to make it
 cheaper and are willing to manage auto-scaling.
 
+**A ref-update commit moved from 1 write capacity unit to 4–6, once FORK-95's
+`TransactWriteItems` replaced the single-item `UpdateItem`.** AWS's Developer Guide states that
+DynamoDB performs two underlying reads or writes of every item in a transaction (one to
+prepare, one to commit), consumed whether or not the transaction succeeds — that multiplier is
+attested by the operator, not something this deployment can verify offline (no pinned SDK
+source states it, and no execution against a real table has measured it here). Every figure
+below is that attested `2×` multiplied by the transaction's item count, so a reader who doubts
+the premise can see which number moves if it turns out wrong. A trusted lift to a non-office
+pallet touches three items (the pallet `Update`, the office `ConditionCheck`, the anchor
+`ConditionCheck`) for 6 WCU; a lift to `@office` itself or any push on an untrusted warehouse
+touches two (no office `ConditionCheck` is built) for 4 WCU. On-demand billing absorbs this
+without a capacity-planning step; on provisioned capacity, size write throughput against the
+higher number.
+
 ### TTL
 
 **None used.** No item this crate writes ever needs to expire — a pallet head and the trust

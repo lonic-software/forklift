@@ -296,10 +296,16 @@ impl RefStore for MemoryRefStore {
     ) -> Result<CasOutcome, String> {
         let key = Self::key(namespace, name);
         let office_key = Self::key(PalletNamespace::Meta, OFFICE_PALLET_NAME);
-        // A lift to `@office` itself needs no separate office check: the pallet-head check
-        // below already pins that exact entry — the fake's mirror of the reason
+        // The office precondition is checked for two independent reasons at once. Structural:
+        // a lift to `@office` itself needs no separate office check — the pallet-head check
+        // below already pins that exact entry, the fake's mirror of the reason
         // `DynamoRefStore` drops the redundant `ConditionCheck` there (two actions on one item
-        // is refused by DynamoDB; here it would just be checking the same key twice).
+        // is refused by DynamoDB; here it would just be checking the same key twice). Semantic:
+        // `office_head: None` means the caller's audit never consumed an office head at all —
+        // not "expect the office pallet to be unborn" — so it must not be compared against
+        // whatever the office key currently holds; see `RefStore::compare_and_set_head`'s docs
+        // for why treating `None` as "unborn" here would refuse an untrusted push whose office
+        // pallet genuinely (if unaudited) has a real head, every time, not just under a race.
         let checks_office_separately = key != office_key;
 
         let mut state = self.state.lock().unwrap();
@@ -313,10 +319,12 @@ impl RefStore for MemoryRefStore {
         }
 
         if checks_office_separately {
-            let current_office = state.heads.get(&office_key).cloned();
+            if let Some(office_head) = office_head {
+                let current_office = state.heads.get(&office_key).cloned();
 
-            if current_office.as_deref() != office_head {
-                return Ok(CasOutcome::OfficeMoved { current: current_office });
+                if current_office.as_deref() != Some(office_head) {
+                    return Ok(CasOutcome::OfficeMoved { current: current_office });
+                }
             }
         }
 
