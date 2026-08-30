@@ -536,6 +536,16 @@ established are tolerated as "legacy"). Any tampering — stripped or corrupted
 signatures, an unknown key, a chain that doesn't reach genesis — fails with a
 non-zero exit. See [`trust-and-identity.md`](trust-and-identity.md).
 
+"Legacy" is decided by ancestry from the trust boundary the anchor pins, and the
+same honesty rule applies there as to revocations below. If this store cannot
+resolve that boundary — the attesting head was collected, or was never fetched
+here — `audit` refuses rather than concluding the parcel was stacked after trust:
+it names the specific boundary parcel it could not find and says it cannot tell
+which side of trust the parcel falls on. Still fail-closed, still a non-zero exit,
+but not an accusation. The named parcel is content-addressed, so supplying that
+one object resolves it — you do not need to re-establish trust, which would break
+every clone's ability to sync.
+
 A parcel signed by a *revoked* key is checked against that revocation's distrust
 boundary — exact ancestry, so a forged timestamp changes nothing. If the boundary
 genuinely does not cover the parcel, that is real tampering and `audit` fails
