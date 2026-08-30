@@ -2244,17 +2244,20 @@ impl RefStore for AlwaysTransientOnAnchorWrite {
     }
 }
 
-/// Wraps a shared [`MemoryRefStore`] and answers the anchor write as though the incumbent had
-/// vanished — `AnchorMoved { current: None }`.
+/// Wraps a shared [`MemoryRefStore`] and answers the anchor write with a chosen
+/// `AnchorMoved { current }`, so the head's three-way refusal can be driven into each of its
+/// arms.
 ///
-/// No real interleaving reaches this today (nothing deletes the anchor), but the variant is
-/// representable, `store.rs` says so explicitly, and the head's refusal branches on it. A branch
-/// that only exists in prose is the shape this PR has already been caught by three times.
-struct AnchorVanishesOnAnchorWrite {
+/// Two of the three are not reachable through a real interleaving today — nothing deletes the
+/// anchor, and nothing writes undecodable bytes — but both are representable, `store.rs` says so
+/// explicitly, and the head branches on them with *different remedies*. A branch that exists only
+/// in prose is the shape this PR has already been caught by four times.
+struct AnchorMovedOnAnchorWrite {
     inner: Arc<MemoryRefStore>,
+    current: Option<String>,
 }
 
-impl RefStore for AnchorVanishesOnAnchorWrite {
+impl RefStore for AnchorMovedOnAnchorWrite {
     fn get_head(
         &self,
         namespace: pallet_utils::PalletNamespace,
@@ -2300,7 +2303,7 @@ impl RefStore for AnchorVanishesOnAnchorWrite {
         _expected_anchor: &str,
         _office_head: Option<&str>,
     ) -> Result<TrustWriteOutcome, String> {
-        Ok(TrustWriteOutcome::AnchorMoved { current: None })
+        Ok(TrustWriteOutcome::AnchorMoved { current: self.current.clone() })
     }
 }
 
@@ -2319,20 +2322,76 @@ fn an_absent_incumbent_is_not_reported_as_an_unreadable_one() {
     let mine = re_genesis(&anchor_v1, &office_head, 'c');
     let head = Head::new(
         MemoryObjectStore::new(),
-        AnchorVanishesOnAnchorWrite { inner: store },
+        AnchorMovedOnAnchorWrite { inner: store, current: None },
     );
 
     let err = head.put_trust(&mine).expect_err("the incumbent is gone");
 
     assert_eq!(err.status, Status::Conflict);
     assert!(
-        !err.message.contains("unreadable") && !err.message.contains("genesis is now"),
-        "an absent anchor must not be described as an unreadable or replaced one: {}",
+        err.message.contains("no anchor is present"),
+        "the refusal must say the anchor is absent: {}",
+        err.message
+    );
+
+    // The *remedy*, not just the description — which is what the defect was actually about, and
+    // what the first version of this test failed to pin. A message describing the absent state
+    // correctly while still carrying the replaced state's "re-run the re-genesis" advice is the
+    // exact wrong-remedy bug, and it passed every assertion above.
+    assert!(
+        err.message.contains("Establish trust"),
+        "the refusal must give the remedy for an absent anchor: {}",
+        err.message
+    );
+    // Named as the replaced case's specific advice rather than the bare word "re-run": the
+    // correct absent-anchor message says "Establish trust rather than re-running the
+    // re-genesis", so a substring check on "re-run" rejects the right answer.
+    assert!(
+        !err.message.contains("re-run the re-genesis against the new incumbent"),
+        "an absent anchor must not be given the replaced anchor's remedy — there is nothing \
+        to re-read: {}",
+        err.message
+    );
+}
+
+/// PR #117 round 4, finding 4: an incumbent whose bytes will not decode must not be told to
+/// re-run either — that advice provably fails.
+///
+/// Both stores' `get_trust` returns `Err` on undecodable bytes, so `put_trust` maps a re-run to a
+/// `500` and never reaches the anchor write again. An earlier revision gave this state the
+/// replaced state's tail, promising a remedy the code cannot deliver. Three states, three
+/// remedies — this is the third.
+#[test]
+fn an_undecodable_incumbent_is_not_told_to_re_run() {
+    let office_head = "0".repeat(64);
+    let (store, anchor_v1, _bytes) = seeded_trust(&office_head);
+
+    let mine = re_genesis(&anchor_v1, &office_head, 'c');
+    let head = Head::new(
+        MemoryObjectStore::new(),
+        AnchorMovedOnAnchorWrite {
+            inner: store,
+            current: Some("{not valid json".to_string()),
+        },
+    );
+
+    let err = head.put_trust(&mine).expect_err("the incumbent cannot be decoded");
+
+    assert_eq!(err.status, Status::Conflict);
+    assert!(
+        err.message.contains("cannot be decoded"),
+        "the refusal must name the decode failure: {}",
         err.message
     );
     assert!(
-        err.message.contains("no anchor is present"),
-        "the refusal must say the anchor is absent: {}",
+        !err.message.contains("re-run the re-genesis against the new incumbent"),
+        "an undecodable anchor must not be given the replaced anchor's remedy — reading it \
+        fails outright: {}",
+        err.message
+    );
+    assert!(
+        !err.message.contains("no anchor is present"),
+        "an undecodable anchor is present; it must not be reported as absent: {}",
         err.message
     );
 }
