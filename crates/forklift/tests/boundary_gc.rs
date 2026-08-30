@@ -700,3 +700,98 @@ fn a_torn_taint_alone_on_an_untouched_warehouse_is_the_control() {
         String::from_utf8_lossy(&ordinary.stderr)
     );
 }
+
+/// FORK-83 IS FILED TOO NARROWLY — the wedge needs no tag, and this is the minimal case.
+///
+/// `collect_walk_roots` roots **every bay's staged inventory shards** and records, in terms, that
+/// gc "deliberately does not root" them — "an unstacked staged shard is a pre-existing, accepted
+/// gc design choice, not a bug this walk needs to match" (`recovery_utils.rs:1224-1233`).
+///
+/// That asymmetry was accepted for the *walk*, where its only effect is a conservative extra
+/// root. Nobody re-checked it against the **torn rescan**, which folds every referenced-but-absent
+/// hash into a remainder and turns a non-empty remainder into a store-wide refusal
+/// (`recovery_utils.rs:953`, `:981-985`, `:1024`). Under the rescan, the same asymmetry bricks
+/// the warehouse.
+///
+/// So the reachable sequence is not "tag, undo, collect" — it is:
+///
+/// 1. `load` a file and do not stack it yet (ordinary work in progress).
+/// 2. Collection runs (`maintenance: auto on`, or any `forklift compact`).
+/// 3. A crash tears the taint record.
+///
+/// The tag-subject leg above is one instance of this class. The `undo` path reaches it too, for
+/// the same reason: a soft `undo` leaves the undone content staged.
+///
+/// **And the remedy is inside the wedge.** Unlike a tag, a staged shard *can* be dropped —
+/// `restore --staged` is exactly the command that would clear the dangling reference — but
+/// entry-heal refuses every command but `heal`/`audit`, so it cannot be run. `heal` refuses, and
+/// `audit` reports the warehouse clean.
+#[test]
+fn staging_a_file_and_then_collecting_wedges_the_warehouse_with_no_tag_involved() {
+    let warehouse = Warehouse::new("staged");
+
+    warehouse.stack("app.txt", "v1\n", "first");
+
+    // Stage a new file and never stack it — the ordinary work-in-progress state.
+    std::fs::write(warehouse.root.join("wip.txt"), "work in progress\n").unwrap();
+    warehouse.run_ok(&["load", "."]);
+
+    let stats = warehouse.scoped(|| gc_utils::collect_garbage(0).expect("gc runs"));
+    println!("STAGED: gc deleted {} object(s)", stats.deleted);
+    assert!(
+        stats.deleted > 0,
+        "gc must collect the staged-but-unstacked blob for this fixture to mean anything — if it \
+         stopped doing so, the gc/walk asymmetry is gone and this whole leg inverts"
+    );
+
+    // The torn taint: crash debris, per `parse_taint_content` (taint_utils.rs:623).
+    let taint_dir = warehouse.root.join(".forklift").join("taint");
+    std::fs::create_dir_all(&taint_dir).unwrap();
+    std::fs::write(taint_dir.join("taint-99999-0"), b"objects/ab/cdef\n").unwrap();
+
+    let healed = warehouse.run(&["heal"]);
+    let heal_err = String::from_utf8_lossy(&healed.stderr).to_string();
+    println!("STAGED: heal exit = {:?}\n  stderr: {}", healed.status.code(), heal_err.trim());
+
+    assert_eq!(
+        healed.status.code(), Some(21),
+        "`heal` must refuse over the stranded staged blob, with NO tag anywhere in this fixture. \
+         If this passes, the rescan stopped folding staged-shard references into the remainder. \
+         stderr: {}",
+        heal_err
+    );
+    assert!(
+        heal_err.contains("genuinely dangling"),
+        "expected the torn-rescan dangling refusal; stderr: {}", heal_err
+    );
+
+    // The refusal is store-wide, and — the part that makes it a wedge rather than an error — it
+    // also blocks `restore --staged`, the one command that would clear the dangling reference.
+    for attempt in [
+        vec!["stocktake"],
+        vec!["restore", "--staged", "."],
+        vec!["restore", "."],
+    ] {
+        let out = warehouse.run(&attempt);
+        println!("STAGED: `{}` exit = {:?}", attempt.join(" "), out.status.code());
+        assert_eq!(
+            out.status.code(), Some(21),
+            "`{}` must be refused by entry-heal — it is `restore --staged` being unreachable that \
+             makes this unescapable. If this one succeeds, the wedge has an in-tool exit and this \
+             leg inverts. stderr: {}",
+            attempt.join(" "), String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // The contradiction worth keeping: the one non-heal command that IS allowed reports the
+    // warehouse healthy, while every other command refuses it as tainted.
+    let audit = warehouse.run(&["audit"]);
+    println!("STAGED: `audit` exit = {:?}", audit.status.code());
+    assert!(
+        audit.status.success(),
+        "`audit` is expected to report this warehouse CLEAN while every other command refuses it \
+         as tainted — two shipped commands giving opposite verdicts on one store. If audit starts \
+         refusing too, invert this leg. stderr: {}",
+        String::from_utf8_lossy(&audit.stderr)
+    );
+}
