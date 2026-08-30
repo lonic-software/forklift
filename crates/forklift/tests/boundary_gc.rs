@@ -10,7 +10,7 @@
 //! | member | reader kind | leg here |
 //! | --- | --- | --- |
 //! | revocation `distrust_boundary` | verifying | the two `a_boundary_pin_*` legs (FORK-63/64 spike) |
-//! | `audit`'s boundary head | verifying | `the_false_tampering_state_*`, `a_legacy_parcel_*` (FORK-81) |
+//! | `audit`'s boundary head | verifying | `a_collected_boundary_head_*`, `a_legacy_parcel_*` (**FORK-81, fixed**) |
 //! | `CherryPickState.source` | **acting** | `a_collected_cherry_pick_source_*` (FORK-82) |
 //! | `Tag.subject` under a torn taint | **healing** | `a_torn_taint_over_an_absent_tag_subject_*` (FORK-83) |
 //! | staged inventory shard under a torn taint | **healing** | `staging_a_file_and_then_collecting_*` (FORK-83, widened) |
@@ -299,17 +299,30 @@ fn a_boundary_pin_is_collected_once_its_pallet_ref_is_deleted() {
     assert!(!resolvable, "and the boundary is now unresolvable");
 }
 
-/// IS THE ANCHOR-`boundary` FALSE-TAMPERING STATE REACHABLE WITH SHIPPED COMMANDS ONLY?
+/// FORK-81, FIXED — a collected boundary head is now named, not treated as tampering.
 ///
-/// The design claimed it needs a ref unlink, i.e. that it is a hazard the not-yet-built deletion verb
-/// introduces rather than a live defect. Review disagreed: `undo` moves a head *backwards*
-/// (`journal_utils.rs:191`) — the same move the tag leg uses — which orphans the boundary head with no
-/// unlink at all, and `compact --all` then drops it once it has been packed.
+/// The state is reachable with **six shipped commands and no deletion verb**: `undo` moves a head
+/// *backwards* (`journal_utils.rs:191`) — the same move the tag leg uses — orphaning the boundary
+/// head with no unlink at all, and `compact --all` then drops it once packed. No
+/// `delete_pallet_ref` here and no direct `collect_garbage` call; every step is a CLI command a
+/// user runs. That reachability is unchanged by the fix and is still what this leg builds.
 ///
-/// No `delete_pallet_ref` here, and no direct `collect_garbage` call: every step is a CLI command a
-/// user runs. If this passes, the anchor reader is a live defect, not a prerequisite of the verb.
+/// What changed is the verdict. The trust-boundary arm built its legacy set from a **present-only**
+/// reachability walk and read non-membership as tampering — a negative drawn from a walk that only
+/// ever grows, which the distrust-boundary arm ten lines below had already ruled proves nothing.
+/// The arm now keeps that walk's gap list (`collect_reachable_present_noting_gaps`, whose plain
+/// wrapper was discarding it) and, when a gap stands, returns an error naming the absent boundary
+/// parcel instead of an accusation.
+///
+/// **Still a refusal** — nothing is silenced, and `audit` still exits non-zero. But the remedy is
+/// now reachable: the boundary parcel is content-addressed, so supplying that one object resolves
+/// it, where the accusation's only escape was a re-genesis that resets trust and breaks every
+/// clone's ability to sync.
+///
+/// This leg previously asserted both false claims and was inverted when the fix landed, exactly as
+/// its own note said it would have to be.
 #[test]
-fn the_false_tampering_state_is_reachable_with_shipped_commands_only() {
+fn a_collected_boundary_head_is_named_not_treated_as_tampering() {
     let warehouse = Warehouse::new_unenrolled("live");
 
     let legacy = warehouse.stack("app.txt", "v1\n", "legacy one");
@@ -363,26 +376,46 @@ fn the_false_tampering_state_is_reachable_with_shipped_commands_only() {
         !audit.status.success(),
         "audit succeeded — the state is NOT reachable without a ref unlink after all"
     );
-    assert!(out.contains("tampered"), "expected the tampering accusation: {}", out);
+    // INVERTED when FORK-81 landed. This leg used to assert the two false claims; it now asserts
+    // they are gone and that the honest refusal replaced them. The reachability of the STATE is
+    // unchanged — that is still what the six shipped commands build — so what moved is only what
+    // `audit` says about it.
+    assert!(
+        !out.contains("tampered"),
+        "the tampering accusation is back: a present-only walk's negative is being read as \
+         tampering again. {}",
+        out
+    );
+    assert!(
+        !out.contains("was stacked after trust was established"),
+        "the misdating is back: this parcel is pre-trust, and the message says otherwise. {}",
+        out
+    );
 
-    // WHICH parcel is accused, not merely that something is. The claim under test is that the
-    // LEGACY, pre-trust parcel is falsely accused once its boundary attestation is collected; an
-    // `audit` that accused some other parcel, or accused this one on a different ground while
-    // still saying "tampered", would leave the leg green with its claim gone. The sibling leg
-    // below already pins this; both prior review rounds passed over the gap here.
+    // WHICH parcel, not merely that something is named. The claim under test is about the
+    // LEGACY, pre-trust parcel; a refusal naming some other parcel would leave this green with
+    // its claim gone.
     assert!(
         out.contains(&legacy),
-        "the accusation must name the legacy parcel {}: {}",
+        "the refusal must name the legacy parcel {}: {}",
         legacy, out
     );
 
-    // The second false claim, asserted rather than printed — review found this one printed-only in
-    // the leg below, for the third time in this document's history.
+    // AND the remedy must be reachable. This is the half that makes the fix worth making: the
+    // accusation's only escape was a re-genesis, which resets trust and breaks every clone's
+    // ability to sync. Naming the absent, content-addressed boundary parcel means supplying that
+    // one object resolves it instead.
     assert!(
-        out.contains("was stacked after trust was established"),
-        "expected the post-trust misdating of a pre-trust parcel: {}",
+        out.contains(&b),
+        "the refusal must name the absent boundary parcel {} so the operator can supply it: {}",
+        b, out
+    );
+    assert!(
+        out.contains("not present locally"),
+        "the refusal must say the boundary could not be resolved, not merely name a hash: {}",
         out
     );
+
 }
 
 /// §4.1b: is the anchor-`boundary` false-tampering state CONSTRUCTIBLE?
@@ -456,24 +489,32 @@ fn a_legacy_parcel_outlives_the_boundary_head_that_attested_it() {
         "audit SUCCEEDED over a legacy parcel with no surviving boundary attestation — the \
          false-tampering hazard is NOT constructible this way"
     );
+    // INVERTED when FORK-81 landed, as this leg's own note predicted. The refusal stays — the
+    // state is still one this store cannot resolve — but it stops being an accusation.
     assert!(
-        out.contains("tampered"),
-        "audit failed for some other reason than the boundary attestation: {}",
+        !out.contains("tampered"),
+        "the tampering accusation is back: {}",
         out
     );
     assert!(
         out.contains(&legacy),
-        "the tampering error must name the legacy parcel {}: {}",
+        "the refusal must name the legacy parcel {}: {}",
         legacy, out
     );
 
-    // The SECOND false claim, asserted rather than printed. Review found this printed-only — the
-    // third occurrence of that error in this work — so the "two false claims, not one" statement had
-    // no falsifier: rewording `audit_utils.rs:362-366` would have left this leg green while the
-    // claim quietly stopped being about anything.
+    // The SECOND false claim. Review found this printed-only — the third occurrence of that
+    // error in this work — so "two false claims, not one" had no falsifier: rewording
+    // `audit_utils.rs` would have left this leg green while the claim stopped being about
+    // anything. Now inverted: the misdating must be gone too. Both false claims had to go, and
+    // a fix that removed only the word "tampered" would still fail here.
     assert!(
-        out.contains("was stacked after trust was established"),
-        "the message must also misdate this pre-trust parcel as post-trust: {}",
+        !out.contains("was stacked after trust was established"),
+        "the pre-trust parcel is still being misdated as post-trust: {}",
+        out
+    );
+    assert!(
+        out.contains("not present locally"),
+        "the refusal must say the boundary could not be resolved: {}",
         out
     );
 }

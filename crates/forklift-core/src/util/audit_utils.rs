@@ -332,6 +332,12 @@ pub fn verify_pallet_history(head: &str,
     // all-signed, all-active history never pays to collect them.
     let mut legacy_parcels: Option<HashSet<String>> = None;
 
+    // The first reference the trust-boundary walk found absent, if any — read off that same
+    // walk, exactly as the distrust arm below reads `unresolved_head` off its own. A gap here
+    // means the walk's negative is unproven rather than false, which is the difference between
+    // naming a missing object and accusing an operator of tampering.
+    let mut boundary_gap: Option<String> = None;
+
     // Per revoked key: the parcels its distrust boundary vouches for (lazy — an
     // all-active-keys history never pays for it). Shared with the query engine's
     // `signer.boundary` predicate via [`DistrustBoundaryMemo`]; this use is unmodified.
@@ -353,11 +359,50 @@ pub fn verify_pallet_history(head: &str,
             // both are what they always were: tampering.
             Verdict::TrustBoundary(reason) => {
                 if legacy_parcels.is_none() {
-                    legacy_parcels = Some(collect_reachable_present(&anchor.boundary)?);
+                    // `_noting_gaps` rather than the plain wrapper: the wrapper is literally
+                    // `Ok(collect_reachable_present_noting_gaps(heads)?.0)`, so the gap list is
+                    // already computed by the walk this arm was running anyway and is thrown
+                    // away. Keeping the second element costs nothing and is what lets the
+                    // negative below be told apart from an unproven one. Do NOT change the
+                    // wrapper itself — `gc_utils` and `prune_utils` call it too, and neither
+                    // wants this behaviour.
+                    let (reachable, gaps) =
+                        collect_reachable_present_noting_gaps(&anchor.boundary)?;
+
+                    legacy_parcels = Some(reachable);
+                    boundary_gap = gaps.into_iter().next();
                 }
 
                 if legacy_parcels.as_ref().unwrap().contains(hash) {
                     legacy += 1;
+                } else if let Some(missing) = boundary_gap.as_ref() {
+                    // The same discipline the distrust arm applies ten lines below: a
+                    // present-only reachability walk only ever *grows* as more ancestry becomes
+                    // present, so a positive is trustworthy and a negative is ambiguous. With a
+                    // gap standing, this parcel's absence from the closure may be exactly what
+                    // the missing object would have explained — so this is a store that cannot
+                    // answer, not a warehouse that was tampered with.
+                    //
+                    // Still a refusal, so nothing is silenced; it simply stops being an
+                    // accusation. And the remedy is reachable: the boundary parcel is
+                    // content-addressed, so supplying that object resolves it, where the
+                    // accusation's only escape was a re-genesis that resets trust and breaks
+                    // every clone's ability to sync.
+                    return Err(format!(
+                        "Parcel {} {}, and this store cannot resolve the trust boundary \
+                        (boundary parcel {} is not present locally), so it cannot tell whether \
+                        this parcel predates trust or was stacked after it. Supply the missing \
+                        parcel, or verify against a store with the full history.",
+                        hash,
+                        match &reason {
+                            TrustBoundaryReason::Unsigned => "carries no signature".to_string(),
+                            TrustBoundaryReason::UnknownKey(key_id) => format!(
+                                "is signed with key {}, which is not tracked in the office",
+                                key_id
+                            ),
+                        },
+                        missing
+                    ));
                 } else {
                     return Err(match reason {
                         TrustBoundaryReason::Unsigned => format!(

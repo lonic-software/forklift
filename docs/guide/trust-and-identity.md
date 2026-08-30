@@ -237,6 +237,13 @@ forklift office retire <key-id> --compromised   # revoke a key that may be in ot
   parcels reachable from that boundary — decided by **exact ancestry, never
   timestamps**, so a shifted clock can't forge validity. A `--compromised` key's
   signatures beyond the boundary fail every future audit.
+- The same rule governs the **trust** boundary that decides which parcels count
+  as pre-trust "legacy". If the attesting boundary head has been collected, or was
+  never fetched into this store, `audit` names the missing boundary parcel and
+  says it cannot tell whether the parcel predates trust — rather than reporting
+  that it was stacked after trust and the warehouse may have been tampered with.
+  Supplying that one object resolves it; re-establishing trust is not required and
+  would break every clone's ability to sync.
 - If a store cannot resolve the boundary at all — a head is missing outright, or
   an ancestor behind one is, and the gap happens to matter for the parcel in
   question — `audit` still refuses (fail-closed), but says so honestly: it names
