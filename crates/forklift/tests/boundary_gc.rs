@@ -19,8 +19,10 @@
 //!
 //! **Four legs carry a canary** — a parcel pinned by nothing — and assert it was collected, so
 //! "the pin survived" can never be satisfied by a collector that swept nothing. The canary check
-//! holds both before and after any fix; it is the legs' own assertions that invert. (Six legs
-//! drive collection, so "gc-driven" is not the dividing line.)
+//! holds both before and after any fix; it is the legs' own assertions that invert. (**Seven** of
+//! the eight legs drive collection — six call `collect_garbage`, and the false-tampering leg drives
+//! the same sweep through `compact --all` — so "gc-driven" is not the dividing line. Only the
+//! torn-taint control collects nothing.)
 //!
 //! The other four discriminate differently: the two anchor legs assert `!b_present &&
 //! legacy_present`, which is already two-sided; `a_torn_taint_alone_...` is a matched companion to
@@ -363,6 +365,17 @@ fn the_false_tampering_state_is_reachable_with_shipped_commands_only() {
     );
     assert!(out.contains("tampered"), "expected the tampering accusation: {}", out);
 
+    // WHICH parcel is accused, not merely that something is. The claim under test is that the
+    // LEGACY, pre-trust parcel is falsely accused once its boundary attestation is collected; an
+    // `audit` that accused some other parcel, or accused this one on a different ground while
+    // still saying "tampered", would leave the leg green with its claim gone. The sibling leg
+    // below already pins this; both prior review rounds passed over the gap here.
+    assert!(
+        out.contains(&legacy),
+        "the accusation must name the legacy parcel {}: {}",
+        legacy, out
+    );
+
     // The second false claim, asserted rather than printed — review found this one printed-only in
     // the leg below, for the third time in this document's history.
     assert!(
@@ -574,8 +587,10 @@ fn a_collected_cherry_pick_source_makes_the_completing_stack_fail_unattributed()
     //                                 the abort text the code already prints is `or remove
     //                                 ".forklift/cherry-pick" to abort it`
     //                                 (`commands/cherry_pick.rs:224`), and that PATH contains the
-    //                                 substring "cherry-pick", so any error advertising the abort
-    //                                 also trips the attribution claim.
+    //                                 substring "cherry-pick", so an error advertising the abort
+    //                                 BY THAT PATH also trips the attribution claim. Not every
+    //                                 possible wording does: "remove the in-progress pick state"
+    //                                 would invert claim 4 alone.
     assert!(
         !completing.status.success(),
         "the completing `stack` succeeded, so the source survived collection — either the pick \
@@ -694,9 +709,11 @@ fn a_torn_taint_over_an_absent_tag_subject_wedges_the_whole_warehouse() {
 
     // THE WEDGE, asserted. The four claims are: heal exits 21, the refusal names `tagged`,
     // an ordinary command is refused too, and the remedy is circular. (The `tag` subcommand
-    // assertion further down is NOT one of them — it pins the missing in-tool exit and inverts
-    // only when `tag` grows a retire verb, never on a rescan change. The isolation assertion
-    // above is likewise a property of the fixture, not a claim about the defect.)
+    // assertion further down is NOT one of them — it pins the missing in-tool exit, and being an
+    // exact-set equality it reddens on ANY change to the subcommand list: a retire verb, but also
+    // an unrelated addition, a rename, or a reordering of `TagAction`'s variants, since clap
+    // prints declaration order. Never on a rescan change. The isolation assertion BELOW is
+    // likewise a property of the fixture, not a claim about the defect.)
     //
     // It is worth being exact about how they invert, because an earlier version of this comment
     // was not.
@@ -709,12 +726,20 @@ fn a_torn_taint_over_an_absent_tag_subject_wedges_the_whole_warehouse() {
     // The four claims below invert on the fixes actually on the table, all of which change what
     // the RESCAN does with a referenced-absent subject while leaving it collected.
     //
-    // What pins their contingency on the DANGLING REFERENCE rather than on torn-ness is
-    // `staging_a_file_and_then_collecting_...`: same torn taint, no tag and no `undo`, exactly one
-    // dangling blob, exit 21. It varies one thing against this leg. The control leg below is a
-    // weaker companion and is NOT that argument — it differs in five variables at once (no tag, no
-    // canary, no undo, no unstage, no collection), so it establishes only "torn-ness alone does
-    // not refuse", which is what its own doc now says and no more.
+    // Two companion legs, and they support DIFFERENT things. This sentence has now been wrong
+    // twice, in opposite directions, so it is worth spelling out which is which:
+    //
+    //   * `a_torn_taint_alone_...` (the control) is the only leg that varies DANGLING-NESS: torn
+    //     taint, nothing dangling, exit 0. Paired with this leg's exit 21 it is what separates the
+    //     dangling reference from torn-ness — the contingency asserted here. It is a weak pair
+    //     (it differs in several variables at once, which is why it cannot show anything about the
+    //     TAG specifically), but on this one axis it is the only evidence there is.
+    //   * `staging_a_file_and_then_collecting_...` holds dangling-ness CONSTANT and varies the tag
+    //     and the `undo`. It therefore shows the wedge is not tag-specific, and it cannot speak to
+    //     torn-ness at all.
+    //
+    // Round 1 corrected the control's doc for claiming the second of these; round 2 then demoted
+    // the control out of the first, which it does support. Both halves are stated above.
     let heal_err = String::from_utf8_lossy(&healed.stderr).to_string();
     let ordinary_err = String::from_utf8_lossy(&ordinary.stderr).to_string();
 
@@ -733,8 +758,11 @@ fn a_torn_taint_over_an_absent_tag_subject_wedges_the_whole_warehouse() {
     // dangling reference — that is what restores invertibility to the claims below. Asserting
     // only that `tagged` appears would stay green if a future change re-introduced a second
     // dangling root, silently losing the property round 1 was fixed to gain.
+    // "and 1 reference(s)", not "1 reference(s)": the latter is a substring of "11 reference(s)"
+    // and "101 reference(s)", so it would go green in exactly the case it exists to catch — a
+    // change that re-roots a whole class and pushes the remainder into double digits.
     assert!(
-        heal_err.contains("1 reference(s)"),
+        heal_err.contains("and 1 reference(s)"),
         "the tag subject must be the ONLY dangling reference; more than one means the unstage no \
          longer isolates it and three of the four claims below stop inverting. stderr: {}",
         heal_err
@@ -755,7 +783,11 @@ fn a_torn_taint_over_an_absent_tag_subject_wedges_the_whole_warehouse() {
         .lines()
         .skip_while(|line| !line.starts_with("Commands:"))
         .skip(1)
-        .take_while(|line| line.starts_with("  ") && !line.trim().is_empty())
+        // Exactly two leading spaces then a non-space. Clap wraps a long description onto a
+        // continuation line indented far deeper (`forklift --help` renders one as
+        // `               bl]`), which also starts with two spaces — so the looser test emits
+        // "bl]" as a subcommand and reddens the equality below with the wrong explanation.
+        .take_while(|line| line.starts_with("  ") && !line.starts_with("   "))
         .map(|line| line.trim().split_whitespace().next().unwrap_or("").to_string())
         .collect();
 
@@ -769,7 +801,8 @@ fn a_torn_taint_over_an_absent_tag_subject_wedges_the_whole_warehouse() {
     // EXACT SET, not a blocklist. Round 1 narrowed an over-broad substring sweep to equality
     // against delete/retire/remove — which is under-broad in the other direction: `rm`, `drop`,
     // `forget` or `revoke` would give the wedge an in-tool exit while this stayed green. The
-    // exact set is both narrow and self-updating: any new verb reddens here and gets read.
+    // exact set is narrow AND total: any change to the list reddens here and gets read. It needs
+    // a manual edit when the list legitimately changes, which is the intended cost.
     assert_eq!(
         subcommands, vec!["create", "show", "list"],
         "`tag`'s subcommand list changed. If a retire/delete verb landed, the wedge now has an \
