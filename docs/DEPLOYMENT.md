@@ -364,17 +364,28 @@ cheaper and are willing to manage auto-scaling.
 DynamoDB performs two underlying reads or writes of every item in a transaction (one to
 prepare, one to commit), consumed whether or not the transaction succeeds.
 
-**That `2x` multiplier has been measured and is no longer attested.** On 2026-08-30, against a
-real DynamoDB table with `ReturnConsumedCapacity: TOTAL`, on items all under 1 KB: a single
-conditional `UpdateItem` consumed **1.0** capacity unit; the *same* single conditional update
-issued as a one-action `TransactWriteItems` consumed **2.0**; a two-action transaction **4.0**;
-and a three-action transaction **6.0**. So the multiplier is real, applies per action, and
-applies to `ConditionCheck` as well — the response reports it as `WriteCapacityUnits`, so a
-`ConditionCheck` bills against write capacity despite writing nothing. Every figure below is
-that measured `2x` multiplied by the transaction's item count. A trusted lift to a non-office
+**That `2x` multiplier has been measured and is no longer attested — and the measurement is
+re-runnable rather than reported.** `bin/measure-transaction-capacity` creates a throwaway
+`PAY_PER_REQUEST` table, issues the four operations below with `ReturnConsumedCapacity: TOTAL`,
+and deletes the table; run it against real AWS (LocalStack's consumed-capacity numbers are
+synthetic and settle nothing). Results on 2026-08-30 in `eu-central-1`, items all under 1 KB:
+
+| operation | capacity |
+| --- | --- |
+| single conditional `UpdateItem` | 1.0 |
+| `TransactWriteItems`, 1 action | 2.0 |
+| `TransactWriteItems`, 2 actions | 4.0 |
+| `TransactWriteItems`, 3 actions | 6.0 |
+
+The one-action transaction against the bare `UpdateItem` isolates the multiplier from the action
+count, and the rest show it applies **per action** and to `ConditionCheck` as well — reported as
+`WriteCapacityUnits`, so a `ConditionCheck` bills against write capacity despite writing
+nothing. Every figure below is that measured `2x` multiplied by the transaction's item count. A trusted lift to a non-office
 pallet touches three items (the pallet `Update`, the office `ConditionCheck`, the anchor
 `ConditionCheck`) for 6 WCU; a lift to `@office` itself or any push on an untrusted warehouse
-touches two (no office `ConditionCheck` is built) for 4 WCU. **These are a floor, not a
+touches two (no office `ConditionCheck` is built) for 4 WCU. **A re-genesis** — `replace_trust`'s
+own transaction, a `Put` on the trust item plus a `ConditionCheck` on the office item — is always
+two actions, so 4 WCU, on the rarest write this warehouse ever takes. **These are a floor, not a
 ceiling: both figures assume every item is ≤ 1 KB, and AWS's own write-unit definition
 (`provisioned-capacity-mode.md`, verified) is one WCU per item *per KB*, rounded up — a bigger
 item costs proportionally more, doubled again by the transactional multiplier above.** The

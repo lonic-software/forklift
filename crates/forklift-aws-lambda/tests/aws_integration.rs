@@ -978,6 +978,113 @@ async fn dynamo_ref_store_attributes_the_anchor_writes_preconditions_to_their_po
     .expect("the blocking assertions");
 }
 
+/// FORK-95 slice 4, PR #117 round 2 finding 5: the office `ConditionCheck`'s **unborn** arm,
+/// against real DynamoDB.
+///
+/// `office_condition_check`'s `None` arm builds `attribute_not_exists(#h)`, and `replace_trust`
+/// is its only reachable caller — a re-genesis whose anchor adopts nothing, against a warehouse
+/// whose office pallet has not been lifted yet. Every other integration case in this file runs
+/// with the office already lifted, so that arm was exercised only by `MemoryRefStore`, which
+/// evaluates it as an ordinary `Option` comparison and therefore establishes nothing about how
+/// DynamoDB evaluates a `ConditionCheck` against an item that **does not exist**.
+///
+/// Both directions, since an `attribute_not_exists` condition can fail in either: it must hold
+/// while the office is unborn, and it must stop holding the moment the office is lifted.
+#[tokio::test(flavor = "multi_thread")]
+async fn dynamo_ref_store_conditions_an_anchor_write_on_an_unborn_office() {
+    let Some(endpoint) = endpoint() else {
+        eprintln!("skipping: FORKLIFT_AWS_TEST_ENDPOINT is unset");
+        return;
+    };
+
+    let config = test_config(&endpoint);
+    provision(&config).await;
+
+    let bridge = AsyncBridge::current().expect("a multi-thread runtime");
+    let (_objects, refs) = build_stores(&config, bridge).await.expect("stores");
+
+    tokio::task::spawn_blocking(move || {
+        let genesis_g1 = "7".repeat(64);
+        let genesis_g2 = "8".repeat(64);
+        let office_o1 = "9".repeat(64);
+
+        let anchor_v1 = TrustAnchorDto {
+            genesis: genesis_g1.clone(),
+            enabled_at: 1_780_000_000,
+            boundary: vec![],
+            prior_genesis: None,
+            adopts: None,
+        }
+        .to_anchor();
+
+        assert_eq!(
+            refs.put_trust_if_absent(&anchor_v1).expect("plant anchor"),
+            TrustOutcome::Established
+        );
+        let (_decoded, bytes_a1) = refs.get_trust().expect("read trust").expect("present");
+
+        // The office pallet has never been lifted, so nothing was ever written at its key.
+        assert_eq!(
+            refs.get_head(PalletNamespace::Meta, OFFICE_PALLET_NAME).expect("get office"),
+            None
+        );
+
+        let adopting_nothing = TrustAnchorDto {
+            genesis: genesis_g2.clone(),
+            enabled_at: 1_780_000_001,
+            boundary: vec![],
+            prior_genesis: Some(genesis_g1.clone()),
+            adopts: None,
+        }
+        .to_anchor();
+
+        // 1. Unborn office, conditioned on unborn: `attribute_not_exists` holds against an item
+        // that is not there, and the re-genesis commits.
+        assert_eq!(
+            refs.replace_trust(&adopting_nothing, &bytes_a1, None)
+                .expect("re-genesis against an unborn office"),
+            TrustWriteOutcome::Replaced
+        );
+        let (_decoded, bytes_a2) = refs.get_trust().expect("re-read").expect("present");
+
+        // 2. Lift the office, then condition on unborn again: the same condition must now fail,
+        // and be attributed to the office rather than to the anchor at position 0. Without this
+        // the first assertion is equally satisfied by a condition that always holds.
+        assert_eq!(
+            refs.compare_and_set_head(
+                PalletNamespace::Meta,
+                OFFICE_PALLET_NAME,
+                None,
+                &office_o1,
+                OfficePrecondition::NotConsumed,
+                Some(&bytes_a2),
+            )
+            .expect("lift office"),
+            CasOutcome::Committed
+        );
+
+        let still_adopting_nothing = TrustAnchorDto {
+            genesis: "a".repeat(64),
+            enabled_at: 1_780_000_002,
+            boundary: vec![],
+            prior_genesis: Some(genesis_g2.clone()),
+            adopts: None,
+        }
+        .to_anchor();
+
+        assert_eq!(
+            refs.replace_trust(&still_adopting_nothing, &bytes_a2, None)
+                .expect("the office is no longer unborn"),
+            TrustWriteOutcome::OfficeMoved { current: Some(office_o1.clone()) }
+        );
+
+        let (survivor, _) = refs.get_trust().expect("re-read").expect("present");
+        assert_eq!(survivor.genesis, genesis_g2, "a refused write must not have landed");
+    })
+    .await
+    .expect("the blocking assertions");
+}
+
 // ---------------------------------------------------------------------------------------
 // End to end: a real Head untrusted lift over the real stores, from a CLI-built warehouse.
 // ---------------------------------------------------------------------------------------

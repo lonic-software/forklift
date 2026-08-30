@@ -393,6 +393,7 @@ impl RefStore for MemoryRefStore {
         expected_anchor: &str,
         office_head: Option<&str>,
     ) -> Result<TrustWriteOutcome, String> {
+        let incoming = TrustAnchorDto::from(anchor);
         let json = Self::encode(anchor)?;
         let office_key = Self::key(PalletNamespace::Meta, OFFICE_PALLET_NAME);
 
@@ -408,10 +409,16 @@ impl RefStore for MemoryRefStore {
         // represent it (see `RefState::trust`).
         if state.trust.as_deref() != Some(expected_anchor) {
             // Mirrors `DynamoRefStore`: an incumbent that moved to exactly what this call was
-            // going to write is the caller's desired state, not a conflict. Compared on stored
-            // bytes for the same reason, and reached from the same branch — the anchor
-            // precondition is position 0 there, so it is what fails first.
-            if state.trust.as_deref() == Some(json.as_str()) {
+            // going to write is the caller's desired state, not a conflict. Compared as decoded
+            // values for the reason given there, and reached from the same branch — the anchor
+            // precondition is position 0 in that transaction, so it is what fails first.
+            let identical = state
+                .trust
+                .as_deref()
+                .and_then(|bytes| Self::decode(bytes).ok())
+                .is_some_and(|incumbent| incumbent == incoming);
+
+            if identical {
                 return Ok(TrustWriteOutcome::AlreadyIdentical);
             }
 

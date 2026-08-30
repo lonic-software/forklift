@@ -658,7 +658,8 @@ impl RefStore for DynamoRefStore {
         expected_anchor: &str,
         office_head: Option<&str>,
     ) -> Result<TrustWriteOutcome, String> {
-        let json = serde_json::to_string(&TrustAnchorDto::from(anchor))
+        let dto = TrustAnchorDto::from(anchor);
+        let json = serde_json::to_string(&dto)
             .map_err(|err| format!("encoding the trust anchor failed: {}", err))?;
         let office_entity = pallet_entity(PalletNamespace::Meta, OFFICE_PALLET_NAME);
 
@@ -685,10 +686,22 @@ impl RefStore for DynamoRefStore {
 
                     // The incumbent moved — but if it moved *to what this call was going to
                     // write*, the caller's desired state holds and there is no conflict to
-                    // report. See `TrustWriteOutcome::AlreadyIdentical`. Checked here rather
-                    // than in the head because the bytes being compared are the ones this
-                    // method encoded, and the head never sees them.
-                    if current.as_deref() == Some(json.as_str()) {
+                    // report. See `TrustWriteOutcome::AlreadyIdentical`.
+                    //
+                    // Compared as decoded values, not as bytes, because that is the comparison
+                    // its three siblings make for the same question — `put_trust_if_absent` in
+                    // both stores, and `put_trust`'s own read-side check. A byte comparison is
+                    // strictly narrower and would answer `409` for an incumbent that differs
+                    // only in encoding, which is the same spurious refusal this variant exists
+                    // to remove. An incumbent that will not decode falls through to
+                    // `AnchorMoved` rather than erroring: this is a refusal already decided, and
+                    // a `?` here would turn today's `409` into a `500`.
+                    let identical = current
+                        .as_deref()
+                        .and_then(|bytes| serde_json::from_str::<TrustAnchorDto>(bytes).ok())
+                        .is_some_and(|incumbent| incumbent == dto);
+
+                    if identical {
                         TrustWriteOutcome::AlreadyIdentical
                     } else {
                         TrustWriteOutcome::AnchorMoved { current }
