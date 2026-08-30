@@ -534,3 +534,117 @@ fn a_collected_cherry_pick_source_makes_the_completing_stack_fail_unattributed()
         err
     );
 }
+
+/// FORK-83 — THE HEALING READER, and the only member of this class that takes the whole
+/// warehouse down.
+///
+/// `recovery_utils::collect_walk_roots` roots every tag's subject (`recovery_utils.rs:1277-1279`)
+/// — deliberately, because heal's walk must be a superset of gc's live set. The torn-taint rescan
+/// builds its roots from that walk (`:1418-1419`) and folds every referenced-but-absent hash into
+/// the remainder (`:953`, `:981-985`); a non-empty remainder returns
+/// `Err(torn_rescan_dangling_refusal(...))` (`:1024`), which is a store-wide refusal rather than
+/// one command's exit code.
+///
+/// So an absent tag subject plus a torn taint bricks the store. And it cannot be cleared:
+/// `TagAction` is `Create`/`Show`/`List` only (`cli.rs:1011-1038`) — no delete, names immutable —
+/// and `heal` cannot restore an object nobody holds.
+///
+/// The taint is written directly rather than driven through a command because a torn taint is by
+/// definition crash debris: `parse_taint_content` (`taint_utils.rs:623`) calls a file torn when it
+/// lacks the `END\n` suffix, which is exactly what a crash mid-write leaves. Everything else here
+/// is a shipped command. Note `crates/forklift/src/main.rs:60` calls `taint_utils::activate()`, so
+/// the CLI really does read these files.
+#[test]
+fn a_torn_taint_over_an_absent_tag_subject_wedges_the_whole_warehouse() {
+    let warehouse = Warehouse::new("torn");
+
+    warehouse.stack("app.txt", "v1\n", "first");
+
+    // The canary, as in every other leg.
+    warehouse.run_ok(&["palletize", "canary"]);
+    let canary = warehouse.stack("canary.txt", "c1\n", "canary work");
+    warehouse.run_ok(&["shift", "main"]);
+    warehouse.delete_pallet_ref("canary");
+
+    let tagged = warehouse.stack("app.txt", "v2\n", "second");
+    warehouse.run_ok(&["tag", "create", "v1.0", &tagged, "-m", "release"]);
+
+    // Orphan and collect the subject: `undo` moves the head back past the tagged parcel.
+    warehouse.run_ok(&["undo"]);
+    let stats = warehouse.scoped(|| gc_utils::collect_garbage(0).expect("gc runs"));
+    let present = warehouse.scoped(|| file_utils::does_object_exist(&tagged).unwrap());
+
+    println!(
+        "TORN: gc deleted {} object(s); tag subject {} present = {}\n      canary was {}",
+        stats.deleted, tagged, present, canary
+    );
+    assert_the_sweep_ran(&warehouse, &canary, stats.deleted);
+    assert!(!present, "the fixture needs the tag subject collected");
+
+    // The torn taint: a parseable prefix with no `END\n` suffix, which is what a crash
+    // mid-write-of-a-line leaves behind.
+    let taint_dir = warehouse.root.join(".forklift").join("taint");
+    std::fs::create_dir_all(&taint_dir).unwrap();
+    std::fs::write(taint_dir.join("taint-99999-0"), b"objects/ab/cdef\n").unwrap();
+
+    let healed = warehouse.run(&["heal"]);
+    println!(
+        "TORN: `heal` exit = {:?}\n  stdout: {}\n  stderr: {}",
+        healed.status.code(),
+        String::from_utf8_lossy(&healed.stdout).trim(),
+        String::from_utf8_lossy(&healed.stderr).trim()
+    );
+
+    // An ordinary command, to show the refusal is store-wide rather than heal's own.
+    let ordinary = warehouse.run(&["stocktake"]);
+    println!(
+        "TORN: `stocktake` exit = {:?}\n  stdout: {}\n  stderr: {}",
+        ordinary.status.code(),
+        String::from_utf8_lossy(&ordinary.stdout).trim(),
+        String::from_utf8_lossy(&ordinary.stderr).trim()
+    );
+
+    // And there is no in-tool exit: no way to retire the tag whose subject is the blocker.
+    let tag_help = warehouse.run(&["tag", "--help"]);
+    println!(
+        "TORN: `tag --help` subcommands:\n{}",
+        String::from_utf8_lossy(&tag_help.stdout)
+    );
+}
+
+/// CONTROL for the leg above: is the *tag* actually necessary to wedge the store?
+///
+/// The wedge leg reports TWO dangling references, and only one of them is the tag subject. The
+/// other is byte-identical across runs whose every other hash differs, so it is a fixed-content
+/// object rather than anything this fixture created. This leg removes the tag, the `undo` and the
+/// collection entirely — a warehouse that has done nothing but `stack` — and applies only the
+/// torn taint.
+///
+/// If this refuses, the wedge is not a tag-subject defect at all and FORK-83's framing is too
+/// narrow; if it heals cleanly, the tag subject is load-bearing and the second hash is incidental
+/// to it.
+#[test]
+fn a_torn_taint_alone_on_an_untouched_warehouse_is_the_control() {
+    let warehouse = Warehouse::new("torn-control");
+
+    warehouse.stack("app.txt", "v1\n", "first");
+
+    let taint_dir = warehouse.root.join(".forklift").join("taint");
+    std::fs::create_dir_all(&taint_dir).unwrap();
+    std::fs::write(taint_dir.join("taint-99999-0"), b"objects/ab/cdef\n").unwrap();
+
+    let healed = warehouse.run(&["heal"]);
+    println!(
+        "CONTROL: `heal` exit = {:?}\n  stdout: {}\n  stderr: {}",
+        healed.status.code(),
+        String::from_utf8_lossy(&healed.stdout).trim(),
+        String::from_utf8_lossy(&healed.stderr).trim()
+    );
+
+    let ordinary = warehouse.run(&["stocktake"]);
+    println!(
+        "CONTROL: `stocktake` exit = {:?}\n  stderr: {}",
+        ordinary.status.code(),
+        String::from_utf8_lossy(&ordinary.stderr).trim()
+    );
+}
