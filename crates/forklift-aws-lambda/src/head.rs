@@ -40,8 +40,17 @@ use crate::error::{HeadError, HeadResult};
 use crate::scratch::{materialize, Mirror, Scratch};
 use crate::store::{
     CasOutcome, ObjectAccess, ObjectStore, OfficePrecondition, PromoteOutcome, PutTarget,
-    RefStore, SignatureOutcome, TrustOutcome,
+    RefStore, SignatureOutcome, TrustOutcome, TrustWriteOutcome,
 };
+
+/// The `genesis` of a stored anchor's bytes.
+///
+/// Used only to name the incumbent in a refusal message. Bytes that will not decode yield `None`
+/// rather than an error: the refusal is already decided by the time this is called, so a
+/// malformed incumbent must degrade the message, never the outcome.
+fn genesis_of(json: &str) -> Option<String> {
+    serde_json::from_str::<TrustAnchorDto>(json).ok().map(|dto| dto.genesis)
+}
 
 /// How the head answers a byte read: the bytes, or a redirect to a storage URL.
 #[derive(Debug)]
@@ -309,11 +318,11 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     pub fn put_trust(&self, anchor: &TrustAnchorDto) -> HeadResult<TrustResult> {
         let existing = self.refs.get_trust().map_err(HeadError::internal)?;
 
-        // The stored bytes travel with `get_trust` for the ref-update commit's anchor
-        // precondition (FORK-95, claim C13); this read-validate-write path is untouched this
-        // slice — its own conditional write is claim C22, deferred to a later slice — so the
-        // bytes go unused here.
-        let Some((existing, _existing_bytes)) = existing else {
+        // The stored bytes travel with `get_trust` so a write can condition on exactly what was
+        // read (FORK-95, claim C13). This path is a read-validate-write, and validating is not
+        // holding: the incumbent read here is the value the chain-of-custody test below runs
+        // against, and `replace_trust` conditions the write on it being unmoved.
+        let Some((existing, existing_bytes)) = existing else {
             return match self
                 .refs
                 .put_trust_if_absent(&anchor.to_anchor())
@@ -345,18 +354,123 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             .map_err(HeadError::internal)?;
 
         if anchor.adopts.as_deref() != office_head.as_deref() {
-            return Err(HeadError::unprocessable(format!(
-                "The re-genesis anchor adopts office head {}, but this warehouse's office \
-                head is {}. The reset would drop history; re-run the re-genesis from a \
-                warehouse in sync with this one.",
-                anchor.adopts.as_deref().unwrap_or("(none)"),
-                office_head.as_deref().unwrap_or("(unborn)")
-            )));
+            return Err(self.adopts_mismatch(anchor.adopts.as_deref(), office_head.as_deref()));
         }
 
-        self.refs.replace_trust(&anchor.to_anchor()).map_err(HeadError::internal)?;
+        // The two tests above ran against values that can move underneath them, so the write
+        // conditions on both and this match is where those refusals land. Before FORK-95 the
+        // write was a bare unconditional `put_item`: two concurrent re-geneses could each pass
+        // the `prior_genesis` test and both write, one genesis silently overwriting another
+        // through a door this code calls one-way; and the office head could move between the
+        // `adopts` test and the write, planting an anchor that drops precisely the history that
+        // test protects.
+        match self
+            .refs
+            .replace_trust(&anchor.to_anchor(), &existing_bytes, office_head.as_deref())
+            .map_err(HeadError::internal)?
+        {
+            TrustWriteOutcome::Replaced => Ok(TrustResult::Established),
+            // Someone else planted the identical anchor inside this request's window. The
+            // read-side `existing_dto == *anchor` check above answers exactly this case with
+            // `Unchanged` when the anchor was already identical when read; answering it any
+            // differently here would make the documented idempotency of `PUT /v1/trust` hold
+            // only when no one else is asking for the same thing at the same time.
+            TrustWriteOutcome::AlreadyIdentical => Ok(TrustResult::Unchanged),
+            // The same `409` the read-side test gives, but *not* the same message. This arm is
+            // reached by a re-genesis that was authorized and validated correctly and merely lost
+            // a race; `trust_one_way_door` says the replacement is impossible, which would tell
+            // an operator to stop when the remedy is to re-read and re-run.
+            TrustWriteOutcome::AnchorMoved { current } => {
+                Err(self.regenesis_lost_the_race(current.as_deref()))
+            }
+            // Same `422`, from the same helper, as the read-side `adopts` test — a caller cannot
+            // tell whether the mismatch was there when it arrived or opened underneath it, and
+            // does not need to: the remedy is identical.
+            TrustWriteOutcome::OfficeMoved { current } => {
+                Err(self.adopts_mismatch(anchor.adopts.as_deref(), current.as_deref()))
+            }
+            TrustWriteOutcome::Transient => Err(self.anchor_write_contention()),
+        }
+    }
 
-        Ok(TrustResult::Established)
+    /// A re-genesis refused because another one replaced the incumbent it validated against.
+    ///
+    /// Deliberately not [`trust_one_way_door`](Self::trust_one_way_door), which this arm used to
+    /// share. That message says trust "cannot be replaced" — true of an unsanctioned anchor
+    /// arriving at an established warehouse, and false here: this caller *was* entitled to
+    /// replace, and the only thing wrong with its request is that it names an incumbent that is
+    /// one re-genesis out of date. Telling it the door is closed points at giving up; the
+    /// actionable answer is to re-read and re-run.
+    /// `current` is the incumbent's stored bytes as the refused write found them, or `None` when
+    /// no anchor is present at all.
+    ///
+    /// Three states, three **remedies** — which is the point of separating them, and the reason
+    /// they cannot share a tail. Only the replaced case can be answered by re-running: an absent
+    /// anchor has nothing to re-read, and an undecodable one cannot even be read, because both
+    /// stores' `get_trust` returns `Err` on bytes that will not decode, so `put_trust` would map
+    /// a re-run to a `500` rather than reaching this path again. Telling an operator to re-run in
+    /// either case is advice that provably cannot be followed.
+    fn regenesis_lost_the_race(&self, current: Option<&str>) -> HeadError {
+        let Some(bytes) = current else {
+            return HeadError::conflict(
+                "This warehouse's trust anchor is no longer the one this re-genesis was \
+                validated against, and no anchor is present now. Nothing was changed. \
+                Establish trust rather than re-running the re-genesis."
+                    .to_string(),
+            );
+        };
+
+        let Some(genesis) = genesis_of(bytes) else {
+            return HeadError::conflict(
+                "This warehouse's trust anchor changed while this re-genesis was being \
+                validated, and the anchor now stored cannot be decoded. Nothing was changed. \
+                Re-running will not help — reading a trust anchor that will not decode fails \
+                outright — so the warehouse's stored trust needs repairing before any \
+                re-genesis can proceed."
+                    .to_string(),
+            );
+        };
+
+        HeadError::conflict(format!(
+            "Another re-genesis replaced this warehouse's trust anchor while this one was \
+            being validated; its genesis is now {}. Nothing was changed. Re-read the anchor \
+            and re-run the re-genesis against the new incumbent if it should still be \
+            replaced.",
+            genesis
+        ))
+    }
+
+    /// The transient refusal of the *anchor write*, as opposed to a ref-update commit.
+    ///
+    /// Separate from [`transient_contention`](Self::transient_contention) because that message
+    /// names a push, a commit and a ref update, and this path is none of the three — a client
+    /// told to "run the push again" for a re-genesis it issued would be looking for an operation
+    /// it never performed.
+    fn anchor_write_contention(&self) -> HeadError {
+        HeadError::service_unavailable(
+            "The trust anchor could not be replaced: another request is concurrently touching \
+            a shared item on this warehouse, likely its office pallet. Neither the anchor nor \
+            the office head is known to have moved, and nothing was changed. Run the \
+            re-genesis again once the other request has settled — this client does not retry \
+            it automatically."
+                .to_string(),
+        )
+    }
+
+    /// The re-genesis refusal for an anchor whose `adopts` does not name the warehouse's office
+    /// head — `422`, since the reset would silently drop history.
+    ///
+    /// One helper for both the read-side test and the write's own `OfficeMoved` refusal. They are
+    /// the same refusal about the same mismatch, and two hand-written copies of a message this
+    /// specific would drift.
+    fn adopts_mismatch(&self, adopts: Option<&str>, office_head: Option<&str>) -> HeadError {
+        HeadError::unprocessable(format!(
+            "The re-genesis anchor adopts office head {}, but this warehouse's office \
+            head is {}. The reset would drop history; re-run the re-genesis from a \
+            warehouse in sync with this one.",
+            adopts.unwrap_or("(none)"),
+            office_head.unwrap_or("(unborn)")
+        ))
     }
 
     /// `POST /v1/pallets/{name}` — the CAS ref update, the commit point of a lift and the

@@ -22,7 +22,7 @@ use serde::Serialize;
 use forklift_aws_lambda::memory::{MemoryObjectStore, MemoryRefStore};
 use forklift_aws_lambda::store::{
     CasOutcome, ObjectAccess, ObjectStore, OfficePrecondition, PromoteOutcome, PutOutcome,
-    PutTarget, RefStore, SignatureOutcome, TrustOutcome,
+    PutTarget, RefStore, SignatureOutcome, TrustOutcome, TrustWriteOutcome,
 };
 use forklift_aws_lambda::{handle, AuthConfig, Head, Routing};
 
@@ -112,8 +112,13 @@ impl RefStore for SharedRefs {
     ) -> Result<TrustOutcome, String> {
         self.0.put_trust_if_absent(anchor)
     }
-    fn replace_trust(&self, anchor: &office_utils::TrustAnchor) -> Result<(), String> {
-        self.0.replace_trust(anchor)
+    fn replace_trust(
+        &self,
+        anchor: &office_utils::TrustAnchor,
+        expected_anchor: &str,
+        office_head: Option<&str>,
+    ) -> Result<TrustWriteOutcome, String> {
+        self.0.replace_trust(anchor, expected_anchor, office_head)
     }
 }
 

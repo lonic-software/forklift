@@ -257,6 +257,21 @@ exactly when the head being moved away from is the anchor's `adopts` pin. Client
 pinned the old anchor refuse to sync until their holder consciously re-accepts
 (`office accept-regenesis`).
 
+Both conditions the replacement is granted under are re-checked **at the write**, not just
+when the request is read, so a re-genesis is refused if either moves underneath it. A second
+re-genesis that lands first takes the incumbent the request validated against, and a loser
+naming a **different** anchor gets `409` — of two concurrent re-geneses to different anchors,
+exactly one wins. Two concurrent requests carrying the **same** anchor both succeed, one `201`
+and one `200`: the second is refused nothing, because the state it asked for is the state that
+now holds. That is the same idempotence a first contact has, where two clients planting the
+identical anchor also get `201` and `200` rather than a conflict. An office ref update that
+lands between the `adopts` check and the write gets `422`, the same status as an `adopts`
+mismatch present from the start: the remedy is identical, and the client cannot usefully tell
+the two apart.
+A remote may also answer `503` when the write loses to unrelated concurrent traffic rather than
+to either value actually moving; that establishes nothing about the anchor and the request may
+simply be repeated. Clients do not retry it automatically.
+
 A client that establishes trust locally (`office enroll`) while a remote is configured
 includes the remote's pallet heads in the anchor's boundary (and refuses to enroll when
 the remote is unreachable, or already has an anchor of its own): unsigned history that

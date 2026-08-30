@@ -163,6 +163,63 @@ pub enum CasOutcome {
     Transient,
 }
 
+/// The outcome of the trust anchor's own conditional write — [`RefStore::replace_trust`].
+///
+/// This exists for the same reason [`CasOutcome`] does, and its absence was the more serious
+/// half of the defect: conditions that detect a race but have nowhere to report it collapse into
+/// a `500`, so the writer would refuse correctly and describe the refusal as a server fault.
+/// `replace_trust` was the one ref-store writer returning `Result<(), String>` while both its
+/// siblings returned classified outcomes (FORK-95 design memo, "The anchor's own writer": *"a
+/// mechanism whose refusal has nowhere to go"*).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrustWriteOutcome {
+    /// Both preconditions held; the incumbent anchor was replaced by the re-genesis anchor.
+    Replaced,
+    /// Nothing was written because the incumbent is *already* the anchor this call was asked to
+    /// plant — a concurrent request planted the identical one first.
+    ///
+    /// This is not a race the caller lost; it is the state it wanted, reached by someone else.
+    /// `put_trust` documents itself as idempotent for an identical anchor
+    /// (`docs/format/REMOTE_PROTOCOL.md`), and its read-side `existing_dto == *anchor` check
+    /// honours that only when the incumbent is already identical *at the time of the read*.
+    /// Without this variant the same request answered `409 "trust cannot be replaced silently"`
+    /// whenever the identical anchor landed inside the window instead of before it — a refusal
+    /// naming a conflict that does not exist, for a request whose desired state holds.
+    ///
+    /// The comparison is on **decoded values**, matching the three other places that answer the
+    /// same question — [`put_trust_if_absent`](RefStore::put_trust_if_absent) in both stores, and
+    /// `put_trust`'s own read-side check. Two byte strings that decode equal but differ (an
+    /// anchor written by some other encoder, or by a build whose `serde` field order differs) are
+    /// therefore *identical* here and answer `200`. An earlier revision compared bytes; it was
+    /// strictly narrower, so it answered `409` for an incumbent that differed only in encoding —
+    /// a smaller instance of the spurious refusal this variant exists to remove.
+    AlreadyIdentical,
+    /// The incumbent anchor is no longer the one the chain-of-custody check validated against —
+    /// a concurrent re-genesis won this race. Carries the incumbent's actual current stored
+    /// bytes, or `None` if the anchor is now absent entirely (unreachable today, since nothing
+    /// deletes it, but representable and so not guessed at).
+    ///
+    /// This is the state that made the one-way door a door only by convention: two re-geneses
+    /// reading the same incumbent both passed the `prior_genesis` test, and both wrote, so one
+    /// genesis silently overwrote another.
+    AnchorMoved { current: Option<String> },
+    /// The office head moved between the `adopts` check and this write — the state that would
+    /// have planted an anchor dropping precisely the history that check exists to protect.
+    /// Carries the office pallet's actual current head.
+    OfficeMoved { current: Option<String> },
+    /// Refused for a reason establishing nothing about whether either input moved — on DynamoDB,
+    /// `TransactionConflict`. Note this write condition-checks the *same* shared office item
+    /// every trusted lift now touches, so a re-genesis merely running alongside an ordinary push
+    /// can land here having raced nothing that matters.
+    ///
+    /// As at the ref-update commit, this slice answers it immediately rather than retrying:
+    /// FORK-95's retry arm owns the bounded budget that would make it recoverable, and both
+    /// transaction call sites now carry that identical debt rather than one having a budget the
+    /// other lacks. `MemoryRefStore` never produces this, for the reason
+    /// [`CasOutcome::Transient`] gives.
+    Transient,
+}
+
 /// The outcome of establishing the trust anchor (a one-way door, §4.4 / §8.7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrustOutcome {
@@ -336,7 +393,30 @@ pub trait RefStore {
     /// identical anchor; a conflicting one is refused. Atomic, like the head CAS.
     fn put_trust_if_absent(&self, anchor: &TrustAnchor) -> Result<TrustOutcome, String>;
 
-    /// Replace the trust anchor — the one sanctioned overwrite, a re-genesis (§8.7). The
-    /// head validates the chain-of-custody before calling this.
-    fn replace_trust(&self, anchor: &TrustAnchor) -> Result<(), String>;
+    /// Replace the trust anchor — the one sanctioned overwrite, a re-genesis (§8.7).
+    ///
+    /// The head validates the chain of custody before calling this, but validating is not the
+    /// same as holding: between the head's reads and this write, another re-genesis can plant a
+    /// different anchor over the same incumbent, and the office head the new anchor promises to
+    /// `adopt` can move. Both are refused here rather than trusted, by the same invariant the
+    /// ref-update commit enforces — *a write commits only if every movable input its validation
+    /// consumed still holds the value it consumed* (FORK-95 design memo, "The anchor's own
+    /// writer" / claim C22).
+    ///
+    /// * `expected_anchor` — the incumbent's **stored bytes**, exactly as
+    ///   [`get_trust`](RefStore::get_trust) returned them, never a re-encoding of the decoded
+    ///   value (claim C13, for the reason that method's own docs give). There is no `None`
+    ///   case: this method is reached only once an incumbent has been read, and planting the
+    ///   first anchor is [`put_trust_if_absent`](RefStore::put_trust_if_absent)'s job.
+    /// * `office_head` — the office head the `adopts` check consumed. Unlike
+    ///   [`OfficePrecondition`], a plain `Option` is right here and `None` genuinely means
+    ///   "consumed as unborn": `put_trust` reads the office head *unconditionally* on this
+    ///   path, so there is no "never consumed" state to confuse it with, and an anchor that
+    ///   adopts nothing is one whose validation depended on the office still being unborn.
+    fn replace_trust(
+        &self,
+        anchor: &TrustAnchor,
+        expected_anchor: &str,
+        office_head: Option<&str>,
+    ) -> Result<TrustWriteOutcome, String>;
 }

@@ -21,7 +21,7 @@ use forklift_aws_lambda::memory::{MemoryObjectStore, MemoryRefStore};
 use forklift_aws_lambda::scratch::Scratch;
 use forklift_aws_lambda::store::{
     CasOutcome, ObjectStore, OfficePrecondition, PromoteOutcome, PutOutcome, RefStore,
-    SignatureOutcome, TrustOutcome,
+    SignatureOutcome, TrustOutcome, TrustWriteOutcome,
 };
 use forklift_aws_lambda::{AsyncBridge, BatchResult, Head};
 
@@ -1256,8 +1256,13 @@ impl RefStore for AsyncRefStore {
         self.bridge.block_on(suspending(|| self.inner.put_trust_if_absent(anchor)))
     }
 
-    fn replace_trust(&self, anchor: &office_utils::TrustAnchor) -> Result<(), String> {
-        self.bridge.block_on(suspending(|| self.inner.replace_trust(anchor)))
+    fn replace_trust(
+        &self,
+        anchor: &office_utils::TrustAnchor,
+        expected_anchor: &str,
+        office_head: Option<&str>,
+    ) -> Result<TrustWriteOutcome, String> {
+        self.bridge.block_on(suspending(|| self.inner.replace_trust(anchor, expected_anchor, office_head)))
     }
 }
 
@@ -1364,8 +1369,13 @@ impl RefStore for SharedMemoryRefs {
         self.0.put_trust_if_absent(anchor)
     }
 
-    fn replace_trust(&self, anchor: &office_utils::TrustAnchor) -> Result<(), String> {
-        self.0.replace_trust(anchor)
+    fn replace_trust(
+        &self,
+        anchor: &office_utils::TrustAnchor,
+        expected_anchor: &str,
+        office_head: Option<&str>,
+    ) -> Result<TrustWriteOutcome, String> {
+        self.0.replace_trust(anchor, expected_anchor, office_head)
     }
 }
 
@@ -1454,8 +1464,13 @@ impl RefStore for OfficeMovesAfterTheSnapshot {
         self.inner.put_trust_if_absent(anchor)
     }
 
-    fn replace_trust(&self, anchor: &office_utils::TrustAnchor) -> Result<(), String> {
-        self.inner.replace_trust(anchor)
+    fn replace_trust(
+        &self,
+        anchor: &office_utils::TrustAnchor,
+        expected_anchor: &str,
+        office_head: Option<&str>,
+    ) -> Result<TrustWriteOutcome, String> {
+        self.inner.replace_trust(anchor, expected_anchor, office_head)
     }
 }
 
@@ -1501,7 +1516,30 @@ impl RefStore for AnchorMovesAfterTheSnapshot {
         let result = self.inner.get_trust();
 
         if !self.fired.replace(true) {
-            self.inner.replace_trust(&self.move_to).expect("inject the concurrent re-genesis");
+            // The injected re-genesis is itself a conditional write now, so this fake has to
+            // supply the preconditions any real caller would: the incumbent bytes it replaces —
+            // the very ones this read is about to return — and the office head it lands against.
+            // A fake still able to write unconditionally would be modelling a store this crate
+            // no longer has, and the interleaving it injects would be one no real client could
+            // produce.
+            let expected = result
+                .as_ref()
+                .ok()
+                .and_then(|trust| trust.as_ref().map(|(_, bytes)| bytes.clone()))
+                .expect("an incumbent anchor to replace");
+            let office_head = self
+                .inner
+                .get_head(pallet_utils::PalletNamespace::Meta, OFFICE_PALLET_NAME)
+                .expect("read the office head");
+
+            assert_eq!(
+                self.inner
+                    .replace_trust(&self.move_to, &expected, office_head.as_deref())
+                    .expect("inject the concurrent re-genesis"),
+                TrustWriteOutcome::Replaced,
+                "the injected re-genesis must actually land, or the test it feeds proves \
+                nothing about a moved anchor"
+            );
         }
 
         result
@@ -1511,8 +1549,13 @@ impl RefStore for AnchorMovesAfterTheSnapshot {
         self.inner.put_trust_if_absent(anchor)
     }
 
-    fn replace_trust(&self, anchor: &office_utils::TrustAnchor) -> Result<(), String> {
-        self.inner.replace_trust(anchor)
+    fn replace_trust(
+        &self,
+        anchor: &office_utils::TrustAnchor,
+        expected_anchor: &str,
+        office_head: Option<&str>,
+    ) -> Result<TrustWriteOutcome, String> {
+        self.inner.replace_trust(anchor, expected_anchor, office_head)
     }
 }
 
@@ -1563,8 +1606,13 @@ impl RefStore for AlwaysTransientOnCommit {
         self.inner.put_trust_if_absent(anchor)
     }
 
-    fn replace_trust(&self, anchor: &office_utils::TrustAnchor) -> Result<(), String> {
-        self.inner.replace_trust(anchor)
+    fn replace_trust(
+        &self,
+        anchor: &office_utils::TrustAnchor,
+        expected_anchor: &str,
+        office_head: Option<&str>,
+    ) -> Result<TrustWriteOutcome, String> {
+        self.inner.replace_trust(anchor, expected_anchor, office_head)
     }
 }
 
@@ -1785,10 +1833,12 @@ fn a_concurrent_trust_anchor_change_refuses_the_commit_as_anchor_moved_not_palle
         .ref_update("main", &RefUpdateRequest { old_head: None, new_head: main_v1.clone() })
         .expect("lift main v1");
 
-    // A well-formed but different anchor — `MemoryRefStore::replace_trust` is unconditional
-    // this slice (its own conditional write is FORK-95 claim C22, a later slice), so its
-    // content need not be a valid re-genesis chain, only different from the incumbent, to
-    // exercise the store-level byte-equality precondition `compare_and_set_head` enforces.
+    // A well-formed but different anchor. Its content need not be a valid re-genesis chain —
+    // this test drives `replace_trust` at the *store* level, below `put_trust`'s
+    // chain-of-custody validation — only different from the incumbent, to exercise the
+    // byte-equality precondition `compare_and_set_head` enforces. The injecting fake supplies
+    // the incumbent bytes and office head that `replace_trust`'s own conditions now require, so
+    // the injected write is a genuine uncontested commit rather than a forced one.
     let different_anchor = TrustAnchorDto {
         genesis: "f".repeat(64),
         enabled_at: anchor.enabled_at + 1,
@@ -1891,4 +1941,474 @@ fn a_concurrently_moved_unrelated_pallet_does_not_refuse_the_commit() {
     .expect("an unrelated pallet moving must never refuse this commit");
 
     assert_eq!(head.handshake().expect("handshake").pallets.get("main"), Some(&main_v2));
+}
+
+// ---------------------------------------------------------------------------------------------
+// FORK-95 slice 4: the trust anchor's own write is conditional too.
+//
+// `put_trust`'s re-genesis path is a read-validate-write — read the incumbent anchor, test that
+// the new one names it as `prior_genesis`, read the office head, test that the new one `adopts`
+// it, write — and validating is not holding. Until this slice the write was a bare unconditional
+// `put_item`, so both values could move underneath the tests that had just passed.
+//
+// These tests reuse the two fakes the ref-update falsifiers already use, because `put_trust`
+// makes exactly the reads they fire on: `get_trust` for the incumbent, `get_head(@office)` for
+// the `adopts` check. That reuse is the point — the same injected interleaving that the commit
+// refuses must now be refused here.
+// ---------------------------------------------------------------------------------------------
+
+/// Seed a store with an established anchor and an office head, returning both plus the anchor's
+/// stored bytes. No fixture warehouse: this path never touches the object store, and driving it
+/// through a real audit would only add ways for the test to fail for other reasons.
+fn seeded_trust(office_head: &str) -> (Arc<MemoryRefStore>, TrustAnchorDto, String) {
+    let store = Arc::new(MemoryRefStore::new());
+
+    let anchor_v1 = TrustAnchorDto {
+        genesis: "a".repeat(64),
+        enabled_at: 1_780_000_000,
+        boundary: vec![],
+        prior_genesis: None,
+        adopts: None,
+    };
+
+    assert_eq!(
+        store.put_trust_if_absent(&anchor_v1.to_anchor()).expect("plant the incumbent anchor"),
+        TrustOutcome::Established
+    );
+
+    let (_decoded, bytes) = store.get_trust().expect("read trust").expect("present");
+
+    assert_eq!(
+        store
+            .compare_and_set_head(
+                pallet_utils::PalletNamespace::Meta,
+                OFFICE_PALLET_NAME,
+                None,
+                office_head,
+                OfficePrecondition::NotConsumed,
+                Some(&bytes),
+            )
+            .expect("lift the office pallet"),
+        CasOutcome::Committed
+    );
+
+    (store, anchor_v1, bytes)
+}
+
+/// A re-genesis anchor succeeding `prior` and adopting `office_head`, distinguished by `genesis`
+/// so two racing re-geneses are tellable apart.
+fn re_genesis(prior: &TrustAnchorDto, office_head: &str, genesis: char) -> TrustAnchorDto {
+    TrustAnchorDto {
+        genesis: genesis.to_string().repeat(64),
+        enabled_at: prior.enabled_at + 1,
+        boundary: vec![],
+        prior_genesis: Some(prior.genesis.clone()),
+        adopts: Some(office_head.to_string()),
+    }
+}
+
+/// Falsifier 1 (reverted direction): two re-geneses reading the same incumbent must not both
+/// land. Before this slice they did — each passed the `prior_genesis` test against the same value
+/// and then wrote unconditionally, so one genesis silently overwrote another through a door this
+/// code calls one-way.
+///
+/// Mutate `DynamoRefStore`/`MemoryRefStore::replace_trust` back to an unconditional write and
+/// this returns `TrustResult::Established` (`201`) instead of the `409` asserted here — the
+/// loser's anchor wins, and nothing anywhere reports it.
+#[test]
+fn a_concurrent_re_genesis_refuses_the_second_one() {
+    let office_head = "0".repeat(64);
+    let (store, anchor_v1, _bytes) = seeded_trust(&office_head);
+
+    let theirs = re_genesis(&anchor_v1, &office_head, 'b');
+    let mine = re_genesis(&anchor_v1, &office_head, 'c');
+
+    // Their re-genesis lands the instant this request reads the incumbent — after the read that
+    // feeds the chain-of-custody test, before the write that acts on it.
+    let head = Head::new(
+        MemoryObjectStore::new(),
+        AnchorMovesAfterTheSnapshot {
+            inner: store.clone(),
+            move_to: theirs.to_anchor(),
+            fired: Cell::new(false),
+        },
+    );
+
+    let err = head
+        .put_trust(&mine)
+        .expect_err("the incumbent anchor moved between the validation and the write");
+
+    assert_eq!(err.status, Status::Conflict);
+
+    // The winner's anchor is the one that stands. Asserting the *state*, not just the status: a
+    // refusal that still wrote would be the very defect this test exists for, and a status
+    // assertion alone cannot see it.
+    let (survivor, _) = store.get_trust().expect("read trust").expect("present");
+    assert_eq!(
+        survivor.genesis, theirs.genesis,
+        "the refused re-genesis must not have overwritten the one that won the race"
+    );
+}
+
+/// Falsifier 2 (reverted direction): the office head moving between the `adopts` test and the
+/// write must refuse. That write would plant an anchor dropping precisely the history the
+/// `adopts` test exists to protect, and it is a `422` — the same refusal, from the same helper,
+/// that the read-side test gives for the same mismatch.
+#[test]
+fn a_concurrent_office_move_refuses_the_re_genesis() {
+    let office_head = "0".repeat(64);
+    let (store, anchor_v1, _bytes) = seeded_trust(&office_head);
+
+    let mine = re_genesis(&anchor_v1, &office_head, 'c');
+
+    let head = Head::new(
+        MemoryObjectStore::new(),
+        OfficeMovesAfterTheSnapshot {
+            inner: store.clone(),
+            move_to: "9".repeat(64),
+            fired: Cell::new(false),
+        },
+    );
+
+    let err = head
+        .put_trust(&mine)
+        .expect_err("the office head moved between the adopts check and the write");
+
+    assert_eq!(err.status, Status::Unprocessable);
+    assert!(
+        err.message.contains("adopts"),
+        "the refusal must name the adopts mismatch: {}",
+        err.message
+    );
+
+    let (survivor, _) = store.get_trust().expect("read trust").expect("present");
+    assert_eq!(
+        survivor.genesis, anchor_v1.genesis,
+        "a refused re-genesis must leave the incumbent anchor in place"
+    );
+}
+
+/// Falsifier 3a (over-tightened direction), and the case the other over-tightened tests did not
+/// reach: losing the race to a *identical* anchor is not a conflict.
+///
+/// `PUT /v1/trust` documents itself as idempotent for an identical anchor
+/// (`docs/format/REMOTE_PROTOCOL.md`). `put_trust`'s read-side `existing_dto == *anchor` check
+/// honours that when the anchor is already identical at the time of the read. Conditioning the
+/// write re-opened it for the window: with no `AlreadyIdentical` outcome, an identical anchor
+/// landing *inside* the window fails the anchor precondition and the client is told `409 "trust
+/// cannot be replaced silently"` for a request whose desired state already holds.
+///
+/// Delete `TrustWriteOutcome::AlreadyIdentical`'s branch in either store and this reds with a
+/// `409` — while every other test in this file stays green, which is why the gap survived the
+/// first round of both-direction falsification.
+#[test]
+fn a_concurrent_identical_re_genesis_is_idempotent_not_a_conflict() {
+    let office_head = "0".repeat(64);
+    let (store, anchor_v1, _bytes) = seeded_trust(&office_head);
+
+    let mine = re_genesis(&anchor_v1, &office_head, 'c');
+
+    // Someone else plants exactly the anchor this request is asking for, inside its window.
+    let head = Head::new(
+        MemoryObjectStore::new(),
+        AnchorMovesAfterTheSnapshot {
+            inner: store.clone(),
+            move_to: mine.to_anchor(),
+            fired: Cell::new(false),
+        },
+    );
+
+    assert_eq!(
+        head.put_trust(&mine).expect("the desired state holds; this is not a conflict"),
+        TrustResult::Unchanged
+    );
+
+    let (survivor, _) = store.get_trust().expect("read trust").expect("present");
+    assert_eq!(survivor.genesis, mine.genesis);
+}
+
+/// Falsifier 3 (over-tightened direction): a re-genesis whose two inputs both hold must still
+/// commit. Without this, an implementation that refuses every re-genesis passes both tests above
+/// — the failure mode a conditional write makes easy, since "refuse more" is exactly what the
+/// conditions do.
+#[test]
+fn an_uncontended_re_genesis_still_commits() {
+    let office_head = "0".repeat(64);
+    let (store, anchor_v1, _bytes) = seeded_trust(&office_head);
+
+    let mine = re_genesis(&anchor_v1, &office_head, 'c');
+
+    let head = Head::new(MemoryObjectStore::new(), SharedMemoryRefs(store.clone()));
+
+    assert_eq!(
+        head.put_trust(&mine).expect("nothing moved; the re-genesis must land"),
+        TrustResult::Established
+    );
+
+    let (survivor, _) = store.get_trust().expect("read trust").expect("present");
+    assert_eq!(survivor.genesis, mine.genesis);
+}
+
+/// Falsifier 4 (over-tightened direction): a pallet the anchor write never names moving
+/// concurrently must not refuse it. This transaction conditions on exactly two inputs — the
+/// incumbent anchor and the office head — never on "nothing else in the warehouse moved".
+#[test]
+fn a_concurrently_moved_unrelated_pallet_does_not_refuse_the_re_genesis() {
+    let office_head = "0".repeat(64);
+    let (store, anchor_v1, bytes) = seeded_trust(&office_head);
+
+    // An ordinary pallet is lifted while the re-genesis is in flight. The anchor write names no
+    // pallet item at all, so this must be invisible to it.
+    assert_eq!(
+        store
+            .compare_and_set_head(
+                pallet_utils::PalletNamespace::User,
+                "main",
+                None,
+                &"e".repeat(64),
+                OfficePrecondition::NotConsumed,
+                Some(&bytes),
+            )
+            .expect("lift an unrelated pallet"),
+        CasOutcome::Committed
+    );
+
+    let mine = re_genesis(&anchor_v1, &office_head, 'c');
+    let head = Head::new(MemoryObjectStore::new(), SharedMemoryRefs(store.clone()));
+
+    assert_eq!(
+        head.put_trust(&mine).expect("an unrelated pallet's move must not refuse the re-genesis"),
+        TrustResult::Established
+    );
+}
+
+/// Wraps a shared [`MemoryRefStore`] and answers the anchor write — and only the anchor write —
+/// as transient contention, the way DynamoDB's `TransactionConflict` reaches this crate.
+///
+/// `MemoryRefStore` cannot produce that outcome itself (its single mutex makes every write either
+/// succeed or lose to a real, attributable mismatch), so the status it maps to has no other way
+/// to be pinned. Separate from `AlwaysTransientOnCommit` rather than folded into it: that fake
+/// pins the *commit's* transient path, and one fake answering both would let either test pass on
+/// the other's code path.
+struct AlwaysTransientOnAnchorWrite {
+    inner: Arc<MemoryRefStore>,
+}
+
+impl RefStore for AlwaysTransientOnAnchorWrite {
+    fn get_head(
+        &self,
+        namespace: pallet_utils::PalletNamespace,
+        name: &str,
+    ) -> Result<Option<String>, String> {
+        self.inner.get_head(namespace, name)
+    }
+
+    fn compare_and_set_head(
+        &self,
+        namespace: pallet_utils::PalletNamespace,
+        name: &str,
+        expected: Option<&str>,
+        new: &str,
+        office_head: OfficePrecondition<'_>,
+        anchor: Option<&str>,
+    ) -> Result<CasOutcome, String> {
+        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor)
+    }
+
+    fn list_refs(&self) -> Result<Vec<(pallet_utils::PalletRef, String)>, String> {
+        self.inner.list_refs()
+    }
+
+    fn default_pallet(&self) -> Result<String, String> {
+        self.inner.default_pallet()
+    }
+
+    fn get_trust(&self) -> Result<Option<(office_utils::TrustAnchor, String)>, String> {
+        self.inner.get_trust()
+    }
+
+    fn put_trust_if_absent(
+        &self,
+        anchor: &office_utils::TrustAnchor,
+    ) -> Result<TrustOutcome, String> {
+        self.inner.put_trust_if_absent(anchor)
+    }
+
+    fn replace_trust(
+        &self,
+        _anchor: &office_utils::TrustAnchor,
+        _expected_anchor: &str,
+        _office_head: Option<&str>,
+    ) -> Result<TrustWriteOutcome, String> {
+        Ok(TrustWriteOutcome::Transient)
+    }
+}
+
+/// Wraps a shared [`MemoryRefStore`] and answers the anchor write with a chosen
+/// `AnchorMoved { current }`, so the head's three-way refusal can be driven into each of its
+/// arms.
+///
+/// Two of the three are not reachable through a real interleaving today — nothing deletes the
+/// anchor, and nothing writes undecodable bytes — but both are representable, `store.rs` says so
+/// explicitly, and the head branches on them with *different remedies*. A branch that exists only
+/// in prose is the shape this PR has already been caught by four times.
+struct AnchorMovedOnAnchorWrite {
+    inner: Arc<MemoryRefStore>,
+    current: Option<String>,
+}
+
+impl RefStore for AnchorMovedOnAnchorWrite {
+    fn get_head(
+        &self,
+        namespace: pallet_utils::PalletNamespace,
+        name: &str,
+    ) -> Result<Option<String>, String> {
+        self.inner.get_head(namespace, name)
+    }
+
+    fn compare_and_set_head(
+        &self,
+        namespace: pallet_utils::PalletNamespace,
+        name: &str,
+        expected: Option<&str>,
+        new: &str,
+        office_head: OfficePrecondition<'_>,
+        anchor: Option<&str>,
+    ) -> Result<CasOutcome, String> {
+        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor)
+    }
+
+    fn list_refs(&self) -> Result<Vec<(pallet_utils::PalletRef, String)>, String> {
+        self.inner.list_refs()
+    }
+
+    fn default_pallet(&self) -> Result<String, String> {
+        self.inner.default_pallet()
+    }
+
+    fn get_trust(&self) -> Result<Option<(office_utils::TrustAnchor, String)>, String> {
+        self.inner.get_trust()
+    }
+
+    fn put_trust_if_absent(
+        &self,
+        anchor: &office_utils::TrustAnchor,
+    ) -> Result<TrustOutcome, String> {
+        self.inner.put_trust_if_absent(anchor)
+    }
+
+    fn replace_trust(
+        &self,
+        _anchor: &office_utils::TrustAnchor,
+        _expected_anchor: &str,
+        _office_head: Option<&str>,
+    ) -> Result<TrustWriteOutcome, String> {
+        Ok(TrustWriteOutcome::AnchorMoved { current: self.current.clone() })
+    }
+}
+
+/// PR #117 round 3, finding 4: an anchor that is *absent* must not be reported as one that is
+/// *unreadable*.
+///
+/// Both states arrive as `AnchorMoved { current: None }`, and an earlier revision collapsed them
+/// into "its genesis is now (unreadable)" — which asserts to the operator that an incumbent
+/// exists and is corrupt, and points at re-running the re-genesis. For an absent anchor the
+/// correct remedy is the opposite: there is nothing to re-read, and trust must be established.
+#[test]
+fn an_absent_incumbent_is_not_reported_as_an_unreadable_one() {
+    let office_head = "0".repeat(64);
+    let (store, anchor_v1, _bytes) = seeded_trust(&office_head);
+
+    let mine = re_genesis(&anchor_v1, &office_head, 'c');
+    let head = Head::new(
+        MemoryObjectStore::new(),
+        AnchorMovedOnAnchorWrite { inner: store, current: None },
+    );
+
+    let err = head.put_trust(&mine).expect_err("the incumbent is gone");
+
+    assert_eq!(err.status, Status::Conflict);
+    assert!(
+        err.message.contains("no anchor is present"),
+        "the refusal must say the anchor is absent: {}",
+        err.message
+    );
+
+    // The *remedy*, not just the description — which is what the defect was actually about, and
+    // what the first version of this test failed to pin. A message describing the absent state
+    // correctly while still carrying the replaced state's "re-run the re-genesis" advice is the
+    // exact wrong-remedy bug, and it passed every assertion above.
+    assert!(
+        err.message.contains("Establish trust"),
+        "the refusal must give the remedy for an absent anchor: {}",
+        err.message
+    );
+    // Named as the replaced case's specific advice rather than the bare word "re-run": the
+    // correct absent-anchor message says "Establish trust rather than re-running the
+    // re-genesis", so a substring check on "re-run" rejects the right answer.
+    assert!(
+        !err.message.contains("re-run the re-genesis against the new incumbent"),
+        "an absent anchor must not be given the replaced anchor's remedy — there is nothing \
+        to re-read: {}",
+        err.message
+    );
+}
+
+/// PR #117 round 4, finding 4: an incumbent whose bytes will not decode must not be told to
+/// re-run either — that advice provably fails.
+///
+/// Both stores' `get_trust` returns `Err` on undecodable bytes, so `put_trust` maps a re-run to a
+/// `500` and never reaches the anchor write again. An earlier revision gave this state the
+/// replaced state's tail, promising a remedy the code cannot deliver. Three states, three
+/// remedies — this is the third.
+#[test]
+fn an_undecodable_incumbent_is_not_told_to_re_run() {
+    let office_head = "0".repeat(64);
+    let (store, anchor_v1, _bytes) = seeded_trust(&office_head);
+
+    let mine = re_genesis(&anchor_v1, &office_head, 'c');
+    let head = Head::new(
+        MemoryObjectStore::new(),
+        AnchorMovedOnAnchorWrite {
+            inner: store,
+            current: Some("{not valid json".to_string()),
+        },
+    );
+
+    let err = head.put_trust(&mine).expect_err("the incumbent cannot be decoded");
+
+    assert_eq!(err.status, Status::Conflict);
+    assert!(
+        err.message.contains("cannot be decoded"),
+        "the refusal must name the decode failure: {}",
+        err.message
+    );
+    assert!(
+        !err.message.contains("re-run the re-genesis against the new incumbent"),
+        "an undecodable anchor must not be given the replaced anchor's remedy — reading it \
+        fails outright: {}",
+        err.message
+    );
+    assert!(
+        !err.message.contains("no anchor is present"),
+        "an undecodable anchor is present; it must not be reported as absent: {}",
+        err.message
+    );
+}
+
+/// A transient refusal of the anchor write is a `503`, not the `500` every refusal on this path
+/// used to be. It establishes nothing about whether either input moved, so it must not wear a
+/// `409` or a `422` either — both of those tell a client something specific and false.
+#[test]
+fn a_transient_refusal_of_the_anchor_write_is_a_503() {
+    let office_head = "0".repeat(64);
+    let (store, anchor_v1, _bytes) = seeded_trust(&office_head);
+
+    let mine = re_genesis(&anchor_v1, &office_head, 'c');
+    let head =
+        Head::new(MemoryObjectStore::new(), AlwaysTransientOnAnchorWrite { inner: store });
+
+    let err = head.put_trust(&mine).expect_err("transient contention");
+
+    assert_eq!(err.status, Status::ServiceUnavailable);
 }
