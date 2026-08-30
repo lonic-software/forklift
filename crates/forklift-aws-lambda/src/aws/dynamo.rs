@@ -52,10 +52,12 @@
 //! re-geneses could both pass the same `prior_genesis` test and both write.
 //!
 //! Cancellation reasons on a `TransactionCanceledException` are ordered by the order actions
-//! were requested (AWS API Reference and the pinned `aws-sdk-dynamodb` model agree on this),
-//! so the index an action is pushed at in [`DynamoRefStore::compare_and_set_head`] is the
-//! index its refusal comes back at — see that method's own comment for exactly where that
-//! ordering is encoded.
+//! were requested (AWS API Reference and the pinned `aws-sdk-dynamodb` model agree on this), so
+//! the index an action is pushed at is the index its refusal comes back at. Both transactions
+//! above depend on that, and they order their preconditions *differently* — position 0 is the
+//! target pallet's head in a ref-update commit and the trust anchor in an anchor write. Neither
+//! restates the mapping: each action is pushed together with the precondition it conditions on,
+//! and the refusal is read back off that same layout. See `ConditionedTransaction`.
 
 use std::collections::HashMap;
 
@@ -219,17 +221,18 @@ impl DynamoRefStore {
     /// head — see `compare_and_set_head`, which skips this action both when the target *is*
     /// `@office` itself (the `Update` above already pins that exact item; AWS refuses two
     /// actions on one item in the same transaction) and when the caller passed no office head
-    /// at all, meaning its audit never read one. There is deliberately no "office pallet must
-    /// be unborn" mode here: the only reachable caller of this method already holds a real
-    /// head (an audit that found the office pallet missing refuses before reaching the
-    /// commit — see `head.rs::ref_update`), so a fabricated `attribute_not_exists` condition
-    /// would test a state no audit this store serves ever actually consumed.
-    /// The anchor's own write is the caller that *does* reach the `None` arm, and legitimately:
-    /// `put_trust` reads the office head unconditionally to run its `adopts` check, so an anchor
-    /// adopting nothing is one whose validation genuinely consumed "the office is unborn" and
-    /// must condition on it. The distinction is carried in the two callers' own parameter types —
-    /// [`OfficePrecondition`] where a head may go unconsumed, a plain `Option` where it never
-    /// does — not in this method, which only builds what it is told.
+    /// at all, meaning its audit never read one.
+    ///
+    /// The `None` arm builds "the office pallet must be unborn", and exactly one of this method's
+    /// two callers may use it. **Not `compare_and_set_head`**: an audit that found the office
+    /// pallet missing refuses before reaching the commit (`head.rs::ref_update`), so its caller
+    /// always holds a real head, and an `attribute_not_exists` condition there would test a state
+    /// no audit this store serves ever consumed — which is why that caller passes
+    /// [`OfficePrecondition`], a type with no `None` to reach this arm with. **`replace_trust`
+    /// may**, and legitimately: `put_trust` reads the office head unconditionally to run its
+    /// `adopts` check, so an anchor adopting nothing is one whose validation genuinely consumed
+    /// "the office is unborn" and must condition on it. The distinction lives in the two callers'
+    /// parameter types, not in this method, which only builds what it is told.
     fn office_condition_check(
         &self,
         office_entity: &str,
@@ -678,7 +681,18 @@ impl RefStore for DynamoRefStore {
                 None => TrustWriteOutcome::Replaced,
                 Some(Refusal::Transient) => TrustWriteOutcome::Transient,
                 Some(Refusal::Moved(Precondition::Anchor, item)) => {
-                    TrustWriteOutcome::AnchorMoved { current: item.as_ref().and_then(anchor_of) }
+                    let current = item.as_ref().and_then(anchor_of);
+
+                    // The incumbent moved — but if it moved *to what this call was going to
+                    // write*, the caller's desired state holds and there is no conflict to
+                    // report. See `TrustWriteOutcome::AlreadyIdentical`. Checked here rather
+                    // than in the head because the bytes being compared are the ones this
+                    // method encoded, and the head never sees them.
+                    if current.as_deref() == Some(json.as_str()) {
+                        TrustWriteOutcome::AlreadyIdentical
+                    } else {
+                        TrustWriteOutcome::AnchorMoved { current }
+                    }
                 }
                 Some(Refusal::Moved(Precondition::OfficeHead, item)) => {
                     TrustWriteOutcome::OfficeMoved { current: item.as_ref().and_then(head_of) }

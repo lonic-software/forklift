@@ -361,6 +361,12 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             .map_err(HeadError::internal)?
         {
             TrustWriteOutcome::Replaced => Ok(TrustResult::Established),
+            // Someone else planted the identical anchor inside this request's window. The
+            // read-side `existing_dto == *anchor` check above answers exactly this case with
+            // `Unchanged` when the anchor was already identical when read; answering it any
+            // differently here would make the documented idempotency of `PUT /v1/trust` hold
+            // only when no one else is asking for the same thing at the same time.
+            TrustWriteOutcome::AlreadyIdentical => Ok(TrustResult::Unchanged),
             // Losing the race to another re-genesis is the same refusal as arriving after one:
             // the incumbent this request validated against is not the incumbent any more, so its
             // chain of custody no longer reaches. Same `409` the read-side test gives.

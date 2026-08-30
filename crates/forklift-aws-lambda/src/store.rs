@@ -175,6 +175,22 @@ pub enum CasOutcome {
 pub enum TrustWriteOutcome {
     /// Both preconditions held; the incumbent anchor was replaced by the re-genesis anchor.
     Replaced,
+    /// Nothing was written because the incumbent is *already* the anchor this call was asked to
+    /// plant — a concurrent request planted the identical one first.
+    ///
+    /// This is not a race the caller lost; it is the state it wanted, reached by someone else.
+    /// `put_trust` documents itself as idempotent for an identical anchor
+    /// (`docs/format/REMOTE_PROTOCOL.md`), and its read-side `existing_dto == *anchor` check
+    /// honours that only when the incumbent is already identical *at the time of the read*.
+    /// Without this variant the same request answered `409 "trust cannot be replaced silently"`
+    /// whenever the identical anchor landed inside the window instead of before it — a refusal
+    /// naming a conflict that does not exist, for a request whose desired state holds.
+    ///
+    /// The comparison is on stored bytes rather than decoded values, because that is what the
+    /// conditional write itself compares. Two byte strings that decode equal but differ (an
+    /// anchor written by some other encoder) fall through to [`AnchorMoved`](Self::AnchorMoved)
+    /// and its `409`, which is the conservative direction: refuse rather than silently accept.
+    AlreadyIdentical,
     /// The incumbent anchor is no longer the one the chain-of-custody check validated against —
     /// a concurrent re-genesis won this race. Carries the incumbent's actual current stored
     /// bytes, or `None` if the anchor is now absent entirely (unreachable today, since nothing

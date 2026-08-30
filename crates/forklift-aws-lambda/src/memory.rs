@@ -407,6 +407,14 @@ impl RefStore for MemoryRefStore {
         // comparison `DynamoRefStore` makes, and a fake comparing decoded values could not
         // represent it (see `RefState::trust`).
         if state.trust.as_deref() != Some(expected_anchor) {
+            // Mirrors `DynamoRefStore`: an incumbent that moved to exactly what this call was
+            // going to write is the caller's desired state, not a conflict. Compared on stored
+            // bytes for the same reason, and reached from the same branch — the anchor
+            // precondition is position 0 there, so it is what fails first.
+            if state.trust.as_deref() == Some(json.as_str()) {
+                return Ok(TrustWriteOutcome::AlreadyIdentical);
+            }
+
             return Ok(TrustWriteOutcome::AnchorMoved { current: state.trust.clone() });
         }
 

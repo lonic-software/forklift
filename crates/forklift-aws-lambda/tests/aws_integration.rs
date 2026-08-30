@@ -943,7 +943,18 @@ async fn dynamo_ref_store_attributes_the_anchor_writes_preconditions_to_their_po
         assert_eq!(decoded_v2.genesis, genesis_g2);
         assert_ne!(bytes_a2, bytes_a1, "the write actually changed the stored bytes");
 
-        // 4. An unrelated pallet moving must not refuse the anchor write — this transaction
+        // 4. Re-issuing the *same* re-genesis against the anchor it already planted is
+        // idempotent, not a conflict: the anchor precondition fails (the incumbent is no longer
+        // `bytes_a1`), but the incumbent is exactly what this call would write. Against real
+        // DynamoDB because the comparison is on the bytes DynamoDB actually stored and returned
+        // through `ALL_OLD`, which no fake can establish.
+        assert_eq!(
+            refs.replace_trust(&re_genesis(&genesis_g2, &office_o1), &bytes_a1, Some(&office_o1))
+                .expect("re-issue of an already-planted anchor"),
+            TrustWriteOutcome::AlreadyIdentical
+        );
+
+        // 5. An unrelated pallet moving must not refuse the anchor write — this transaction
         // names the trust item and the office item, and nothing else in the warehouse.
         assert_eq!(
             refs.compare_and_set_head(

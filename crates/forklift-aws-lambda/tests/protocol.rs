@@ -2088,6 +2088,45 @@ fn a_concurrent_office_move_refuses_the_re_genesis() {
     );
 }
 
+/// Falsifier 3a (over-tightened direction), and the case the other over-tightened tests did not
+/// reach: losing the race to a *identical* anchor is not a conflict.
+///
+/// `PUT /v1/trust` documents itself as idempotent for an identical anchor
+/// (`docs/format/REMOTE_PROTOCOL.md`). `put_trust`'s read-side `existing_dto == *anchor` check
+/// honours that when the anchor is already identical at the time of the read. Conditioning the
+/// write re-opened it for the window: with no `AlreadyIdentical` outcome, an identical anchor
+/// landing *inside* the window fails the anchor precondition and the client is told `409 "trust
+/// cannot be replaced silently"` for a request whose desired state already holds.
+///
+/// Delete `TrustWriteOutcome::AlreadyIdentical`'s branch in either store and this reds with a
+/// `409` — while every other test in this file stays green, which is why the gap survived the
+/// first round of both-direction falsification.
+#[test]
+fn a_concurrent_identical_re_genesis_is_idempotent_not_a_conflict() {
+    let office_head = "0".repeat(64);
+    let (store, anchor_v1, _bytes) = seeded_trust(&office_head);
+
+    let mine = re_genesis(&anchor_v1, &office_head, 'c');
+
+    // Someone else plants exactly the anchor this request is asking for, inside its window.
+    let head = Head::new(
+        MemoryObjectStore::new(),
+        AnchorMovesAfterTheSnapshot {
+            inner: store.clone(),
+            move_to: mine.to_anchor(),
+            fired: Cell::new(false),
+        },
+    );
+
+    assert_eq!(
+        head.put_trust(&mine).expect("the desired state holds; this is not a conflict"),
+        TrustResult::Unchanged
+    );
+
+    let (survivor, _) = store.get_trust().expect("read trust").expect("present");
+    assert_eq!(survivor.genesis, mine.genesis);
+}
+
 /// Falsifier 3 (over-tightened direction): a re-genesis whose two inputs both hold must still
 /// commit. Without this, an implementation that refuses every re-genesis passes both tests above
 /// — the failure mode a conditional write makes easy, since "refuse more" is exactly what the
