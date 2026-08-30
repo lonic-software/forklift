@@ -606,9 +606,46 @@ fn a_torn_taint_over_an_absent_tag_subject_wedges_the_whole_warehouse() {
 
     // And there is no in-tool exit: no way to retire the tag whose subject is the blocker.
     let tag_help = warehouse.run(&["tag", "--help"]);
-    println!(
-        "TORN: `tag --help` subcommands:\n{}",
-        String::from_utf8_lossy(&tag_help.stdout)
+    let help = String::from_utf8_lossy(&tag_help.stdout).to_string();
+
+    // THE WEDGE, asserted. Four separate claims; the control leg below is what makes them
+    // attributable to the absent tag subject rather than to torn-ness.
+    let heal_err = String::from_utf8_lossy(&healed.stderr).to_string();
+    let ordinary_err = String::from_utf8_lossy(&ordinary.stderr).to_string();
+
+    assert_eq!(
+        healed.status.code(), Some(21),
+        "`heal` must refuse with the durability-taint exit; got {:?}, stderr: {}",
+        healed.status.code(), heal_err
+    );
+    assert!(
+        heal_err.contains(&tagged),
+        "the refusal must name the collected tag subject {} as dangling — that is the whole \
+         finding. stderr: {}",
+        tagged, heal_err
+    );
+    assert_eq!(
+        ordinary.status.code(), Some(21),
+        "the refusal must be STORE-WIDE, not heal's own exit code: an ordinary `stocktake` has \
+         to be refused too. got {:?}, stderr: {}",
+        ordinary.status.code(), ordinary_err
+    );
+
+    // No in-tool exit. If a retire/delete verb ever lands, this is the assertion to invert —
+    // and the wedge stops being a wedge.
+    assert!(
+        !help.contains("delete") && !help.contains("retire") && !help.contains("remove"),
+        "`tag` grew a way to retire a tag, so the wedge now has an in-tool exit — invert this \
+         leg and revisit FORK-83's premise. help was:\n{}",
+        help
+    );
+
+    // AND THE REMEDY IS CIRCULAR — the part the ticket does not state. The refusal that blocks
+    // every command tells the operator to run the one command that just refused.
+    assert!(
+        ordinary_err.contains("forklift heal"),
+        "expected the store-wide refusal to direct the operator to `forklift heal`; stderr: {}",
+        ordinary_err
     );
 }
 
@@ -646,5 +683,20 @@ fn a_torn_taint_alone_on_an_untouched_warehouse_is_the_control() {
         "CONTROL: `stocktake` exit = {:?}\n  stderr: {}",
         ordinary.status.code(),
         String::from_utf8_lossy(&ordinary.stderr).trim()
+    );
+
+    // The distinguishing half. Same torn taint, same shipped commands, no absent tag subject:
+    // the store heals and stays usable. Without this leg the wedge leg above is satisfied just
+    // as well by "a torn taint bricks any warehouse", which is false.
+    assert!(
+        healed.status.success(),
+        "a torn taint alone must heal cleanly — if this refuses, the wedge is not about tag \
+         subjects at all and FORK-83 is filed too narrowly. stdout: {} / stderr: {}",
+        String::from_utf8_lossy(&healed.stdout), String::from_utf8_lossy(&healed.stderr)
+    );
+    assert!(
+        ordinary.status.success(),
+        "with the taint cleared, ordinary commands must work again; stderr: {}",
+        String::from_utf8_lossy(&ordinary.stderr)
     );
 }
