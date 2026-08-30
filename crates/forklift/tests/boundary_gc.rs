@@ -412,3 +412,125 @@ fn a_legacy_parcel_outlives_the_boundary_head_that_attested_it() {
         out
     );
 }
+
+/// FORK-82 — THE ACTING READER. `CherryPickState.source` is a durable parcel hash with no GC
+/// root, and unlike the rendering members of this class its reader *acts* on the hash rather
+/// than printing it.
+///
+/// The pin: `CherryPickState.source` (`cherry_pick_utils.rs:33`) is written to disk by
+/// `write_state` (`:88-90`). It is not rooted — `gc_utils::collect_live_set` roots pallet heads,
+/// bay-scoped parcels and `anchor.adopts` (`gc_utils.rs:136-171`), and a `grep` for "cherry" in
+/// `gc_utils.rs`/`bay_utils.rs` returns nothing.
+///
+/// The reader: the completing `stack` calls `collect_source_authors` (`stack_utils.rs:233`),
+/// which calls `object_utils::load_parcel(source)?` (`cherry_pick_utils.rs:120`) and propagates
+/// whatever that returns.
+///
+/// The ticket reached this by reading and explicitly owed an execution. This is it. Note the
+/// orphaning uses `undo`, not `delete_pallet_ref` — so, as with the anchor leg above, this needs
+/// no deletion verb and is live today rather than a hazard the verb would introduce.
+#[test]
+fn a_collected_cherry_pick_source_makes_the_completing_stack_fail_unattributed() {
+    let warehouse = Warehouse::new("pick");
+
+    warehouse.stack("app.txt", "base\n", "base");
+
+    // The canary, as in every other leg: pinned by nothing, so its collection witnesses that the
+    // sweep actually ran rather than bailing early.
+    warehouse.run_ok(&["palletize", "canary"]);
+    let canary = warehouse.stack("canary.txt", "c1\n", "canary work");
+    warehouse.run_ok(&["shift", "main"]);
+    warehouse.delete_pallet_ref("canary");
+
+    // The source, on its own pallet, touching the file `main` is about to touch so the pick
+    // conflicts and a state file is written.
+    warehouse.run_ok(&["palletize", "feature"]);
+    let source = warehouse.stack("app.txt", "from-feature\n", "feature work");
+
+    // Orphan the source with a shipped command. `undo` moves the head back to `pre_head`
+    // (`journal_utils.rs:191`), so nothing reachable from a ref names `source` — but the object
+    // is still on disk, so the pick below can still resolve it. No shift between the stack and
+    // the undo: `shift` is journaled, and one here would make `undo` revert the shift instead.
+    warehouse.run_ok(&["undo"]);
+
+    // `undo` is soft: the head moves back but the feature content stays in the working tree, so
+    // `shift` would refuse over local changes. Unstage, then discard, so the shift is clean.
+    warehouse.run_ok(&["restore", "--staged", "."]);
+    warehouse.run_ok(&["restore", "."]);
+    warehouse.run_ok(&["shift", "main"]);
+
+    warehouse.stack("app.txt", "from-main\n", "main work");
+
+    // 1. The pick conflicts, so the state file is written and the pick is left in progress.
+    let pick = warehouse.run(&["cherry-pick", &source]);
+    println!(
+        "PICK: `cherry-pick` exit = {:?}\n  stdout: {}\n  stderr: {}",
+        pick.status.code(),
+        String::from_utf8_lossy(&pick.stdout).trim(),
+        String::from_utf8_lossy(&pick.stderr).trim()
+    );
+
+    let state_file = warehouse.root.join(".forklift").join("cherry-pick");
+    println!("PICK: state file present = {}", state_file.exists());
+
+    assert!(
+        state_file.exists(),
+        "the pick must be left in progress with its state on disk — that durable `source` hash is \
+         the pin under test. If this fails the pick did not conflict and the fixture is wrong."
+    );
+
+    // 2. Collect. Nothing roots the source.
+    let stats = warehouse.scoped(|| gc_utils::collect_garbage(0).expect("gc runs"));
+    let present = warehouse.scoped(|| file_utils::does_object_exist(&source).unwrap());
+
+    println!(
+        "PICK: gc deleted {} object(s); source {} present = {}",
+        stats.deleted, source, present
+    );
+
+    assert_the_sweep_ran(&warehouse, &canary, stats.deleted);
+
+    // 3. Resolve the conflict and complete the pick, which is where the acting read happens.
+    std::fs::write(warehouse.root.join("app.txt"), "resolved\n").unwrap();
+    warehouse.run_ok(&["load", "."]);
+    let completing = warehouse.run(&["stack", "completed pick"]);
+
+    let err = String::from_utf8_lossy(&completing.stderr).to_string();
+
+    println!(
+        "PICK: completing `stack` exit = {:?}\n  stdout: {}\n  stderr: {}",
+        completing.status.code(),
+        String::from_utf8_lossy(&completing.stdout).trim(),
+        err.trim()
+    );
+
+    // THE DEFECT, asserted rather than printed. Three separate claims, because the candidate
+    // fixes invert different subsets of them and a single assertion would not say which landed:
+    //
+    //   * root the pick source      -> `stack` SUCCEEDS; all three below invert.
+    //   * presence check + remedy   -> `stack` still fails; the first holds, the last two invert.
+    //   * abort path only           -> `stack` still fails; only the "abort" leg inverts.
+    assert!(
+        !completing.status.success(),
+        "the completing `stack` succeeded, so the source survived collection — either the pick \
+         source became a GC root (FORK-82 fixed by rooting) or the fixture stopped orphaning it"
+    );
+    assert!(
+        err.contains("Error while reading object from file"),
+        "expected the raw object-read error `load_parcel` propagates from \
+         `collect_source_authors` (cherry_pick_utils.rs:120); got: {}",
+        err
+    );
+    assert!(
+        !err.to_lowercase().contains("cherry-pick"),
+        "the error now names the cherry-pick, so it is no longer unattributed — invert this leg. \
+         stderr: {}",
+        err
+    );
+    assert!(
+        !err.to_lowercase().contains("abort"),
+        "the error now advertises an abort path, so the user is no longer stranded with resolved \
+         conflicts and no way out — invert this leg. stderr: {}",
+        err
+    );
+}
