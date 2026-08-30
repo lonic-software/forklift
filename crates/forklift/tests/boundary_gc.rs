@@ -1,0 +1,414 @@
+//! SPIKE for the pallet-lifecycle design (FORK-63/FORK-64): is a revocation's distrust
+//! boundary a GC root?
+//!
+//! A revocation snapshots pallet heads into `distrust_boundary` (`office.rs:526-557`), but
+//! `gc_utils::collect_live_set` roots only pallet refs, bay-scoped parcels and the anchor's
+//! `adopts` pin (`gc_utils.rs:136-171`). Today those pins survive only because nothing ever
+//! deletes a ref. This test builds the state a pallet-deletion verb would create — a boundary
+//! pin whose ref is gone — and asks what the collector actually does with it.
+
+use std::path::PathBuf;
+use std::process::{Command, Output};
+
+use forklift_core::globals::StorageRootScope;
+use forklift_core::util::{audit_utils, file_utils, gc_utils, office_utils};
+
+const FORKLIFT: &str = env!("CARGO_BIN_EXE_forklift");
+
+struct Warehouse {
+    root: PathBuf,
+    home: PathBuf,
+}
+
+impl Warehouse {
+    fn new(name: &str) -> Warehouse {
+        let warehouse = Warehouse::new_unenrolled(name);
+        warehouse.run_ok(&["office", "enroll"]);
+
+        warehouse
+    }
+
+    /// A prepared, configured warehouse with **no trust established**, so parcels stacked on it
+    /// are unsigned and become "legacy" once an anchor is written. The anchor-boundary leg needs
+    /// pre-trust history; every other leg wants `new`.
+    fn new_unenrolled(name: &str) -> Warehouse {
+        let base =
+            std::env::temp_dir().join(format!("forklift-boundary-gc-{}-{}", name, std::process::id()));
+        let root = base.join("warehouse");
+        let home = base.join("home");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+
+        let warehouse = Warehouse { root, home };
+        warehouse.run_ok(&["prepare"]);
+        warehouse.run_ok(&["config", "operator.name", "spike@forklift"]);
+        warehouse.run_ok(&["config", "operator.identifier", "spike@forklift"]);
+
+        warehouse
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        Command::new(FORKLIFT)
+            .args(args)
+            .current_dir(&self.root)
+            .env("FORKLIFT_GLOBAL_CONFIG", self.home.join("global-config.toml"))
+            .env("FORKLIFT_KEYS_DIR", self.home.join("keys"))
+            .output()
+            .unwrap()
+    }
+
+    fn run_ok(&self, args: &[&str]) -> Output {
+        let output = self.run(args);
+        assert!(
+            output.status.success(),
+            "`{}` failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
+    fn stack(&self, file: &str, content: &str, message: &str) -> String {
+        let path = self.root.join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+        self.run_ok(&["load", "."]);
+        self.run_ok(&["stack", message]);
+
+        self.head(&self.current_pallet())
+    }
+
+    fn current_pallet(&self) -> String {
+        std::fs::read_to_string(self.root.join(".forklift").join("pallet"))
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+
+    fn head(&self, pallet: &str) -> String {
+        std::fs::read_to_string(self.root.join(".forklift").join("pallets").join(pallet))
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+
+    /// What a pallet-deletion verb would do: unlink the ref file.
+    fn delete_pallet_ref(&self, pallet: &str) {
+        std::fs::remove_file(self.root.join(".forklift").join("pallets").join(pallet))
+            .expect("the ref existed");
+    }
+
+    fn scoped<T>(&self, work: impl FnOnce() -> T) -> T {
+        let _scope = StorageRootScope::enter(&self.root);
+
+        work()
+    }
+}
+
+/// The fixture both legs share.
+///
+/// Two pallets are built and one is thrown away *before* the revocation, so the fixture carries
+/// a **canary**: a parcel that is genuinely unreachable and pinned by nothing. Every leg asserts
+/// the canary was collected, which is what proves the collector actually swept — without it,
+/// "the pin is still present" is satisfied just as well by a collector that did nothing at all,
+/// and the inverted post-fix assertion would pass against an early-bailing `collect_live_set`.
+///
+/// Returns the retired key, the pinned `side` head, and the canary hash.
+fn warehouse_with_a_pinned_side_head(name: &str)
+    -> (Warehouse, office_utils::KeyRecord, String, String) {
+    let warehouse = Warehouse::new(name);
+
+    warehouse.stack("app.txt", "v1\n", "first");
+
+    // The canary: built, then orphaned before the revocation snapshot, so no boundary names it.
+    warehouse.run_ok(&["palletize", "canary"]);
+    let canary = warehouse.stack("canary.txt", "c1\n", "canary work");
+    warehouse.run_ok(&["shift", "main"]);
+    warehouse.delete_pallet_ref("canary");
+
+    warehouse.run_ok(&["palletize", "side"]);
+    let side_head = warehouse.stack("side.txt", "s1\n", "side work");
+    warehouse.run_ok(&["shift", "main"]);
+
+    // A revocation pins every local pallet head as its distrust boundary.
+    warehouse.run_ok(&["office", "rotate", "--offline"]);
+
+    let retired_key = warehouse.scoped(|| {
+        office_utils::read_office_state()
+            .unwrap()
+            .keys
+            .iter()
+            .find(|key| !key.distrust_boundary.is_empty())
+            .expect("the rotation retired a key with a boundary")
+            .clone()
+    });
+
+    assert!(
+        retired_key.distrust_boundary.contains(&side_head),
+        "the side head must be pinned: {:?}",
+        retired_key.distrust_boundary
+    );
+
+    // The canary must NOT be pinned, or it could not witness a sweep.
+    assert!(
+        !retired_key.distrust_boundary.contains(&canary),
+        "the canary must be unpinned: {:?}",
+        retired_key.distrust_boundary
+    );
+
+    // The pin is present and the boundary resolves before anything is collected — the control
+    // that keeps the deletion leg below from being red for an unrelated reason. The canary is
+    // present too, so its later absence is attributable to the sweep.
+    warehouse.scoped(|| {
+        assert!(file_utils::does_object_exist(&side_head).unwrap(), "the pin is present");
+        assert!(file_utils::does_object_exist(&canary).unwrap(), "the canary is present");
+
+        let mut memo = audit_utils::DistrustBoundaryMemo::new();
+        assert!(memo.resolvable(&retired_key).unwrap(), "the boundary resolves to begin with");
+    });
+
+    (warehouse, retired_key, side_head, canary)
+}
+
+/// Assert the sweep actually ran: the unpinned, unreachable canary is gone. Every leg calls
+/// this, before and after any fix — it is what stops "the pin survived" from being satisfiable
+/// by a collector that deleted nothing.
+fn assert_the_sweep_ran(warehouse: &Warehouse, canary: &str, deleted: usize) {
+    let canary_present = warehouse.scoped(|| file_utils::does_object_exist(canary).unwrap());
+
+    assert!(
+        !canary_present,
+        "the collector did not sweep: the unpinned, unreachable canary {} survived",
+        canary
+    );
+    assert!(deleted > 0, "the collector reported deleting nothing");
+}
+
+/// Read the pin's fate after a collection.
+fn present_and_resolvable(warehouse: &Warehouse,
+                          key: &office_utils::KeyRecord,
+                          head: &str) -> (bool, bool) {
+    warehouse.scoped(|| {
+        let present = file_utils::does_object_exist(head).unwrap();
+
+        let mut memo = audit_utils::DistrustBoundaryMemo::new();
+        let resolvable = memo.resolvable(key).unwrap();
+
+        (present, resolvable)
+    })
+}
+
+/// CONTROL. With the ref in place, `gc` keeps the pin while still sweeping the canary — so the
+/// collector is neither indiscriminate nor inert, and the deletion leg's result below is
+/// attributable to the deletion and to nothing else.
+#[test]
+fn a_boundary_pin_survives_gc_while_its_pallet_ref_exists() {
+    let (warehouse, key, side_head, canary) = warehouse_with_a_pinned_side_head("control");
+
+    let stats = warehouse.scoped(|| gc_utils::collect_garbage(0).expect("gc runs"));
+    let (present, resolvable) = present_and_resolvable(&warehouse, &key, &side_head);
+
+    println!(
+        "CONTROL: gc deleted {} object(s); pin present = {}; boundary resolvable = {}",
+        stats.deleted, present, resolvable
+    );
+
+    assert_the_sweep_ran(&warehouse, &canary, stats.deleted);
+    assert!(present, "the pin must survive gc while its ref exists");
+    assert!(resolvable, "the boundary must still resolve while its ref exists");
+}
+
+/// THE DEFECT. Unlink the ref — exactly what a pallet-deletion verb would do — and the same
+/// `gc` collects a hash that a signed revocation still names, leaving the boundary permanently
+/// unresolvable: the parcels that exculpated the revoked key's signatures are gone.
+///
+/// Green today, and it is the two `!` assertions that must be **inverted** when boundary pins
+/// become GC roots. Reverting that fix reddens the inverted form; that is the pairing. The
+/// canary check does NOT invert — it holds in both worlds, which is the point of it.
+#[test]
+fn a_boundary_pin_is_collected_once_its_pallet_ref_is_deleted() {
+    let (warehouse, key, side_head, canary) = warehouse_with_a_pinned_side_head("deleted");
+
+    warehouse.delete_pallet_ref("side");
+
+    let stats = warehouse.scoped(|| gc_utils::collect_garbage(0).expect("gc runs"));
+    let (present, resolvable) = present_and_resolvable(&warehouse, &key, &side_head);
+
+    println!(
+        "DEFECT: gc deleted {} object(s); pin present = {}; boundary resolvable = {}",
+        stats.deleted, present, resolvable
+    );
+
+    assert_the_sweep_ran(&warehouse, &canary, stats.deleted);
+    assert!(!present, "the pin was collected once its ref was deleted");
+    assert!(!resolvable, "and the boundary is now unresolvable");
+}
+
+/// IS THE ANCHOR-`boundary` FALSE-TAMPERING STATE REACHABLE WITH SHIPPED COMMANDS ONLY?
+///
+/// The design claimed it needs a ref unlink, i.e. that it is a hazard the not-yet-built deletion verb
+/// introduces rather than a live defect. Review disagreed: `undo` moves a head *backwards*
+/// (`journal_utils.rs:191`) — the same move the tag leg uses — which orphans the boundary head with no
+/// unlink at all, and `compact --all` then drops it once it has been packed.
+///
+/// No `delete_pallet_ref` here, and no direct `collect_garbage` call: every step is a CLI command a
+/// user runs. If this passes, the anchor reader is a live defect, not a prerequisite of the verb.
+#[test]
+fn the_false_tampering_state_is_reachable_with_shipped_commands_only() {
+    let warehouse = Warehouse::new_unenrolled("live");
+
+    let legacy = warehouse.stack("app.txt", "v1\n", "legacy one");
+    let b = warehouse.stack("app.txt", "v2\n", "legacy two");
+
+    warehouse.run_ok(&["office", "enroll"]);
+
+    let boundary = warehouse.scoped(|| {
+        office_utils::read_trust_anchor().unwrap().expect("an anchor").boundary
+    });
+    assert_eq!(boundary, vec![b.clone()], "the boundary must be exactly [b]");
+
+    // Pack, so the repack sweep is able to drop `b` (a repack only drops already-packed garbage —
+    // `pack_utils.rs:1659-1660`).
+    warehouse.run_ok(&["compact"]);
+
+    // Soft undo moves `main` back off `b`, orphaning it. No second ref is needed: `main` itself
+    // lands on `legacy`, keeping it alive.
+    //
+    // ORDERING MATTERS, and getting it wrong is what made a first attempt at this leg pass
+    // spuriously: `shift` is journaled too (`cli.rs:1639`), so a `shift` between the stack and the
+    // `undo` makes `undo` revert the *shift* and leave `main` still on `b`. The stack must be the
+    // newest journal entry.
+    warehouse.run_ok(&["undo"]);
+
+    // The shipped client-side collector.
+    warehouse.run_ok(&["compact", "--all"]);
+
+    let (b_present, legacy_present) = warehouse.scoped(|| {
+        (
+            file_utils::does_object_exist(&b).unwrap(),
+            file_utils::does_object_exist(&legacy).unwrap(),
+        )
+    });
+
+    let audit = warehouse.run(&["audit"]);
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&audit.stdout),
+        String::from_utf8_lossy(&audit.stderr)
+    );
+
+    println!(
+        "LIVE: b present = {}; legacy present = {}; audit exit = {:?}\n{}",
+        b_present, legacy_present, audit.status.code(), out.trim()
+    );
+
+    assert!(!b_present, "the boundary head must have been reclaimed by `compact --all`");
+    assert!(legacy_present, "the legacy parcel must survive as `main`'s head");
+    assert!(
+        !audit.status.success(),
+        "audit succeeded — the state is NOT reachable without a ref unlink after all"
+    );
+    assert!(out.contains("tampered"), "expected the tampering accusation: {}", out);
+
+    // The second false claim, asserted rather than printed — review found this one printed-only in
+    // the leg below, for the third time in this document's history.
+    assert!(
+        out.contains("was stacked after trust was established"),
+        "expected the post-trust misdating of a pre-trust parcel: {}",
+        out
+    );
+}
+
+/// §4.1b: is the anchor-`boundary` false-tampering state CONSTRUCTIBLE?
+///
+/// The design claimed a legacy (pre-trust) parcel whose attesting boundary head has been collected
+/// makes `audit` fail the whole warehouse with "may have been tampered with"
+/// (`audit_utils.rs:354-375`). Review objected that the conditions fight each other: gc drops what is
+/// unreachable from the refs, and the boundary walk is reachability over the *same* parent edges, so a
+/// legacy parcel whose only attesting head was collected is normally collected with it.
+///
+/// The seam that separates them: the boundary is a **snapshot at enroll time**. Create a second ref at
+/// an *ancestor* AFTER the snapshot, then drop the ref holding the boundary head. The ancestor stays
+/// alive (the new ref holds it) while its only boundary attestation is collected.
+#[test]
+fn a_legacy_parcel_outlives_the_boundary_head_that_attested_it() {
+    let warehouse = Warehouse::new_unenrolled("anchor");
+
+    // Pre-trust, unsigned history on `main`: legacy <- b.
+    let legacy = warehouse.stack("app.txt", "v1\n", "legacy one");
+    let b = warehouse.stack("app.txt", "v2\n", "legacy two");
+
+    // Enroll NOW. Only `main` exists, so the anchor's boundary is exactly [b].
+    warehouse.run_ok(&["office", "enroll"]);
+
+    let boundary = warehouse.scoped(|| {
+        office_utils::read_trust_anchor().unwrap().expect("an anchor").boundary
+    });
+
+    assert_eq!(
+        boundary,
+        vec![b.clone()],
+        "the fixture requires the boundary to be exactly [b], not to contain `legacy`"
+    );
+
+    // A second ref at `legacy`, created AFTER the snapshot: `legacy` is ref-reachable but is not
+    // itself a boundary entry — its only attestation is being an ancestor of `b`.
+    warehouse.run_ok(&["palletize", "keep", &legacy]);
+
+    // Drop `main`. `b` becomes reachable from no ref; `legacy` stays alive through `keep`.
+    warehouse.delete_pallet_ref("main");
+
+    let stats = warehouse.scoped(|| gc_utils::collect_garbage(0).expect("gc runs"));
+
+    let (b_present, legacy_present) = warehouse.scoped(|| {
+        (
+            file_utils::does_object_exist(&b).unwrap(),
+            file_utils::does_object_exist(&legacy).unwrap(),
+        )
+    });
+
+    let audit = warehouse.run(&["audit"]);
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&audit.stdout),
+        String::from_utf8_lossy(&audit.stderr)
+    );
+
+    println!(
+        "ANCHOR: gc deleted {}; b present = {}; legacy present = {}; audit exit = {:?}\n{}",
+        stats.deleted, b_present, legacy_present, audit.status.code(), out.trim()
+    );
+
+    // The fixture itself: the attesting head is gone, the attested parcel is not.
+    assert!(!b_present, "the boundary head must have been collected");
+    assert!(legacy_present, "the legacy parcel must survive through `keep`");
+
+    // THE CLAIM UNDER TEST. If this fails, the review's objection stands and §4.1b's hazard is not
+    // constructible this way — which retires the last argument for changing any root set.
+    assert!(
+        !audit.status.success(),
+        "audit SUCCEEDED over a legacy parcel with no surviving boundary attestation — the \
+         false-tampering hazard is NOT constructible this way"
+    );
+    assert!(
+        out.contains("tampered"),
+        "audit failed for some other reason than the boundary attestation: {}",
+        out
+    );
+    assert!(
+        out.contains(&legacy),
+        "the tampering error must name the legacy parcel {}: {}",
+        legacy, out
+    );
+
+    // The SECOND false claim, asserted rather than printed. Review found this printed-only — the
+    // third occurrence of that error in this work — so the "two false claims, not one" statement had
+    // no falsifier: rewording `audit_utils.rs:362-366` would have left this leg green while the
+    // claim quietly stopped being about anything.
+    assert!(
+        out.contains("was stacked after trust was established"),
+        "the message must also misdate this pre-trust parcel as post-trust: {}",
+        out
+    );
+}
