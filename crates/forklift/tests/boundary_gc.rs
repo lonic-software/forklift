@@ -672,8 +672,19 @@ fn a_torn_taint_over_an_absent_tag_subject_wedges_the_whole_warehouse() {
     let tag_help = warehouse.run(&["tag", "--help"]);
     let help = String::from_utf8_lossy(&tag_help.stdout).to_string();
 
-    // THE WEDGE, asserted. Four separate claims; the control leg below is what makes them
-    // attributable to the absent tag subject rather than to torn-ness.
+    // THE WEDGE, asserted. Four claims — and it is worth being exact about how they invert,
+    // because an earlier version of this comment was not.
+    //
+    // Two of the assertions above (`assert_the_sweep_ran`, `!present`) are FIXTURE PRECONDITIONS,
+    // not claims: they say the store really reached the state under test. A mutation that stops
+    // the subject being collected reddens THERE, which is correct and is what happens if the fix
+    // chosen is to root tag subjects — a remedy FORK-83 explicitly rules out.
+    //
+    // The four claims below invert on the fixes actually on the table, all of which change what
+    // the RESCAN does with a referenced-absent subject while leaving it collected. That they are
+    // contingent on the dangling reference — rather than on torn-ness — is pinned by the control
+    // leg below, which runs the same torn taint with nothing dangling and gets exit 0. The two
+    // legs are a distinguishing pair; neither establishes this alone.
     let heal_err = String::from_utf8_lossy(&healed.stderr).to_string();
     let ordinary_err = String::from_utf8_lossy(&ordinary.stderr).to_string();
 
@@ -840,6 +851,8 @@ fn staging_a_file_and_then_collecting_wedges_the_warehouse_with_no_tag_involved(
 
     let stats = warehouse.scoped(|| gc_utils::collect_garbage(0).expect("gc runs"));
     println!("STAGED: gc deleted {} object(s)", stats.deleted);
+    // Precondition, not a claim — see the wedge leg's note. If gc stops collecting the staged
+    // blob the asymmetry is gone and this leg reddens here, which is the honest place for it.
     assert!(
         stats.deleted > 0,
         "gc must collect the staged-but-unstacked blob for this fixture to mean anything — if it \
