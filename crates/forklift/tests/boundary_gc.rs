@@ -17,13 +17,15 @@
 //!
 //! `Tag.subject`'s *rendering* reader is pinned separately in `tag_subject_gc.rs` (FORK-79).
 //!
-//! **The four gc-driven legs** carry a **canary** — a parcel pinned by nothing — and assert it was
-//! collected, so "the pin survived" can never be satisfied by a collector that swept nothing. The
-//! canary check holds both before and after any fix; it is the legs' own assertions that invert.
+//! **Four legs carry a canary** — a parcel pinned by nothing — and assert it was collected, so
+//! "the pin survived" can never be satisfied by a collector that swept nothing. The canary check
+//! holds both before and after any fix; it is the legs' own assertions that invert. (Six legs
+//! drive collection, so "gc-driven" is not the dividing line.)
 //!
-//! The other legs discriminate differently and do not need one: the two anchor legs assert
-//! `!b_present && legacy_present`, which is already two-sided, and the two torn-taint legs are a
-//! matched pair whose contrast is the discriminator.
+//! The other four discriminate differently: the two anchor legs assert `!b_present &&
+//! legacy_present`, which is already two-sided; `a_torn_taint_alone_...` is a matched companion to
+//! the wedge leg rather than a canary user; and `staging_a_file_...` names the exact blob it
+//! staged and asserts that specific object was collected, which is a canary's job done directly.
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -120,6 +122,12 @@ impl Warehouse {
     /// Every loose object hash currently in the store, as `<dir><file>`. Used to name the exact
     /// object a fixture created, so a leg can assert *which* hash a refusal is about rather than
     /// that some hash is.
+    ///
+    /// **Only the two-hex fan-out directories.** `.forklift/objects` also holds `pack/`
+    /// (`pack_utils.rs:45`), so an unfiltered walk returns pack filenames alongside hashes — which
+    /// would silently bind a caller's "the object I just created" to `packab12cd.pack` after any
+    /// `compact`. No current caller runs one, but this is a `Warehouse` method and a sibling leg
+    /// does.
     fn loose_objects(&self) -> std::collections::BTreeSet<String> {
         let mut found = std::collections::BTreeSet::new();
         let objects = self.root.join(".forklift").join("objects");
@@ -127,8 +135,13 @@ impl Warehouse {
         let Ok(fan_out) = std::fs::read_dir(&objects) else { return found; };
 
         for prefix in fan_out.flatten() {
-            let Ok(entries) = std::fs::read_dir(prefix.path()) else { continue; };
             let head = prefix.file_name().to_string_lossy().to_string();
+
+            if head.len() != 2 || !head.bytes().all(|b| b.is_ascii_hexdigit()) {
+                continue;
+            }
+
+            let Ok(entries) = std::fs::read_dir(prefix.path()) else { continue; };
 
             for object in entries.flatten() {
                 found.insert(format!("{}{}", head, object.file_name().to_string_lossy()));
@@ -557,7 +570,12 @@ fn a_collected_cherry_pick_source_makes_the_completing_stack_fail_unattributed()
     //   * presence check + remedy  -> `stack` still fails. Claim 1 holds; claim 2 ALSO inverts,
     //                                 because a presence check is precisely what replaces the
     //                                 raw propagated string; claims 3/4 invert.
-    //   * abort path only          -> `stack` still fails; claim 4 inverts.
+    //   * abort path only          -> `stack` still fails; claims 3 AND 4 invert. Not just 4:
+    //                                 the abort text the code already prints is `or remove
+    //                                 ".forklift/cherry-pick" to abort it`
+    //                                 (`commands/cherry_pick.rs:224`), and that PATH contains the
+    //                                 substring "cherry-pick", so any error advertising the abort
+    //                                 also trips the attribution claim.
     assert!(
         !completing.status.success(),
         "the completing `stack` succeeded, so the source survived collection — either the pick \
@@ -571,9 +589,11 @@ fn a_collected_cherry_pick_source_makes_the_completing_stack_fail_unattributed()
     );
 
     // Claims 3 and 4 are about the CONTENT of a failure, so they are only meaningful while there
-    // is a failure. Asserted unconditionally they are decoration: any fix that makes `stack`
-    // succeed empties stderr and satisfies both without saying anything.
-    assert!(!err.trim().is_empty(), "the failure must carry a message to make claims about");
+    // is one. What makes them non-trivial is assertion 2 above, not any guard here: in a world
+    // where `stack` succeeds, stderr is empty and both negatives hold vacuously — but assertions
+    // 1 and 2 have already failed by then, so the leg is red for the right reason regardless.
+    // (Round 1 added an `err.is_empty()` gate here for this; it was unreachable for exactly that
+    // reason and has been removed rather than left as reassuring dead weight.)
     assert!(
         !err.to_lowercase().contains("cherry-pick"),
         "the error now names the cherry-pick, so it is no longer unattributed — invert this leg. \
@@ -672,8 +692,14 @@ fn a_torn_taint_over_an_absent_tag_subject_wedges_the_whole_warehouse() {
     let tag_help = warehouse.run(&["tag", "--help"]);
     let help = String::from_utf8_lossy(&tag_help.stdout).to_string();
 
-    // THE WEDGE, asserted. Four claims — and it is worth being exact about how they invert,
-    // because an earlier version of this comment was not.
+    // THE WEDGE, asserted. The four claims are: heal exits 21, the refusal names `tagged`,
+    // an ordinary command is refused too, and the remedy is circular. (The `tag` subcommand
+    // assertion further down is NOT one of them — it pins the missing in-tool exit and inverts
+    // only when `tag` grows a retire verb, never on a rescan change. The isolation assertion
+    // above is likewise a property of the fixture, not a claim about the defect.)
+    //
+    // It is worth being exact about how they invert, because an earlier version of this comment
+    // was not.
     //
     // Two of the assertions above (`assert_the_sweep_ran`, `!present`) are FIXTURE PRECONDITIONS,
     // not claims: they say the store really reached the state under test. A mutation that stops
@@ -681,10 +707,14 @@ fn a_torn_taint_over_an_absent_tag_subject_wedges_the_whole_warehouse() {
     // chosen is to root tag subjects — a remedy FORK-83 explicitly rules out.
     //
     // The four claims below invert on the fixes actually on the table, all of which change what
-    // the RESCAN does with a referenced-absent subject while leaving it collected. That they are
-    // contingent on the dangling reference — rather than on torn-ness — is pinned by the control
-    // leg below, which runs the same torn taint with nothing dangling and gets exit 0. The two
-    // legs are a distinguishing pair; neither establishes this alone.
+    // the RESCAN does with a referenced-absent subject while leaving it collected.
+    //
+    // What pins their contingency on the DANGLING REFERENCE rather than on torn-ness is
+    // `staging_a_file_and_then_collecting_...`: same torn taint, no tag and no `undo`, exactly one
+    // dangling blob, exit 21. It varies one thing against this leg. The control leg below is a
+    // weaker companion and is NOT that argument — it differs in five variables at once (no tag, no
+    // canary, no undo, no unstage, no collection), so it establishes only "torn-ness alone does
+    // not refuse", which is what its own doc now says and no more.
     let heal_err = String::from_utf8_lossy(&healed.stderr).to_string();
     let ordinary_err = String::from_utf8_lossy(&ordinary.stderr).to_string();
 
@@ -698,6 +728,16 @@ fn a_torn_taint_over_an_absent_tag_subject_wedges_the_whole_warehouse() {
         "the refusal must name the collected tag subject {} as dangling — that is the whole \
          finding. stderr: {}",
         tagged, heal_err
+    );
+    // THE ISOLATION ITSELF, pinned. The unstage above exists so the tag subject is the SOLE
+    // dangling reference — that is what restores invertibility to the claims below. Asserting
+    // only that `tagged` appears would stay green if a future change re-introduced a second
+    // dangling root, silently losing the property round 1 was fixed to gain.
+    assert!(
+        heal_err.contains("1 reference(s)"),
+        "the tag subject must be the ONLY dangling reference; more than one means the unstage no \
+         longer isolates it and three of the four claims below stop inverting. stderr: {}",
+        heal_err
     );
     assert_eq!(
         ordinary.status.code(), Some(21),
@@ -726,11 +766,15 @@ fn a_torn_taint_over_an_absent_tag_subject_wedges_the_whole_warehouse() {
          what broke. help was:\n{}",
         help
     );
-    assert!(
-        !subcommands.iter().any(|name| name == "delete" || name == "retire" || name == "remove"),
-        "`tag` grew a way to retire a tag, so the wedge now has an in-tool exit — invert this \
-         leg and revisit FORK-83's premise. subcommands were: {:?}",
-        subcommands
+    // EXACT SET, not a blocklist. Round 1 narrowed an over-broad substring sweep to equality
+    // against delete/retire/remove — which is under-broad in the other direction: `rm`, `drop`,
+    // `forget` or `revoke` would give the wedge an in-tool exit while this stayed green. The
+    // exact set is both narrow and self-updating: any new verb reddens here and gets read.
+    assert_eq!(
+        subcommands, vec!["create", "show", "list"],
+        "`tag`'s subcommand list changed. If a retire/delete verb landed, the wedge now has an \
+         in-tool exit — invert this leg and revisit FORK-83's premise. If the change is unrelated, \
+         update the expected set."
     );
 
     // AND THE REMEDY IS CIRCULAR — the part the ticket does not state. The refusal that blocks
@@ -851,12 +895,17 @@ fn staging_a_file_and_then_collecting_wedges_the_warehouse_with_no_tag_involved(
 
     let stats = warehouse.scoped(|| gc_utils::collect_garbage(0).expect("gc runs"));
     println!("STAGED: gc deleted {} object(s)", stats.deleted);
-    // Precondition, not a claim — see the wedge leg's note. If gc stops collecting the staged
-    // blob the asymmetry is gone and this leg reddens here, which is the honest place for it.
+    // Precondition, not a claim — see the wedge leg's note. Names the blob rather than counting
+    // deletions: `stats.deleted > 0` passes on ANY garbage, so in a world where gc started
+    // rooting staged shards this leg would sail past here and die at the `exit 21` assertion
+    // below, whose message blames the rescan — the wrong cause. It works today only because this
+    // fixture happens to have exactly one piece of garbage.
     assert!(
-        stats.deleted > 0,
-        "gc must collect the staged-but-unstacked blob for this fixture to mean anything — if it \
-         stopped doing so, the gc/walk asymmetry is gone and this whole leg inverts"
+        !warehouse.scoped(|| file_utils::does_object_exist(&wip_blob).unwrap()),
+        "gc must collect the staged-but-unstacked blob {} for this fixture to mean anything — if \
+         it stopped doing so, the gc/walk asymmetry is gone and this whole leg inverts \
+         (gc deleted {} object(s))",
+        wip_blob, stats.deleted
     );
 
     // The torn taint: crash debris, per `parse_taint_content` (taint_utils.rs:623).
