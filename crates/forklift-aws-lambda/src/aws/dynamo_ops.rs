@@ -21,7 +21,7 @@
 use aws_sdk_dynamodb::operation::get_item::builders::GetItemFluentBuilder;
 use aws_sdk_dynamodb::operation::put_item::builders::PutItemFluentBuilder;
 use aws_sdk_dynamodb::operation::query::builders::QueryFluentBuilder;
-use aws_sdk_dynamodb::operation::update_item::builders::UpdateItemFluentBuilder;
+use aws_sdk_dynamodb::operation::transact_write_items::builders::TransactWriteItemsFluentBuilder;
 
 /// The sanctioned DynamoDB capability: a private client, and one method per operation this
 /// crate is allowed to perform. Both halves of the privacy — the field carrying no `pub`, and
@@ -50,11 +50,16 @@ impl DynamoOps {
         self.0.put_item()
     }
 
-    pub(crate) fn update_item(&self) -> UpdateItemFluentBuilder {
-        self.0.update_item()
-    }
-
     pub(crate) fn query(&self) -> QueryFluentBuilder {
         self.0.query()
+    }
+
+    /// The commit for [`RefStore::compare_and_set_head`](crate::store::RefStore::compare_and_set_head)
+    /// (FORK-95 design memo, claim C13): one transaction conditioned on every movable input a
+    /// ref-update audit consumed, replacing what was a bare `update_item()` call before this
+    /// wrapper method existed — `update_item` is gone from this file because nothing calls it
+    /// any more (`#![deny(dead_code)]`, above, would refuse to compile it otherwise).
+    pub(crate) fn transact_write_items(&self) -> TransactWriteItemsFluentBuilder {
+        self.0.transact_write_items()
     }
 }

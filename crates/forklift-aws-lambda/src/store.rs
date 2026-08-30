@@ -17,11 +17,15 @@
 //! `put_target` needs a session.
 //!
 //! [`RefStore`] is the single consistency point — pallet heads and the trust anchor. On
-//! AWS it is DynamoDB, and its one non-idempotent operation, [`RefStore::compare_and_set_head`],
-//! is a conditional write: exactly the CAS that lets the serverless head scale
-//! horizontally where the server head needs an in-process mutex (§4.5, §4.6). Unlike the
-//! filesystem, object storage has no directory walk, so ref enumeration is an explicit
-//! primitive ([`RefStore::list_refs`]).
+//! AWS it is DynamoDB, and its one non-idempotent operation,
+//! [`RefStore::compare_and_set_head`], is a conditional write: exactly the CAS that lets the
+//! serverless head scale horizontally where the server head needs an in-process mutex
+//! (§4.5, §4.6). It conditions on all three of a ref update's movable inputs at once — the
+//! pallet's own head, the office head, and the trust anchor — as one DynamoDB transaction,
+//! so nothing this store cannot see move can make a commit outlive the audit it followed
+//! (FORK-95 design memo, "The invariant" / claim C6). Unlike the filesystem, object storage
+//! has no directory walk, so ref enumeration is an explicit primitive
+//! ([`RefStore::list_refs`]).
 //!
 //! Every method returns `Result<_, String>`: storage failures are opaque strings that the
 //! [`Head`](crate::Head) turns into a `500`. The verification and CAS *semantics* live in
@@ -101,14 +105,62 @@ pub enum PromoteOutcome {
     },
 }
 
-/// The outcome of a compare-and-set on a pallet head.
+/// Whether a ref-update audit consumed the office head at all, and what it consumed if so.
+///
+/// Before this type existed, `compare_and_set_head` took a plain `office_head: Option<&str>`
+/// alongside `anchor: Option<&str>` — two adjacent parameters of the same type, but `None`
+/// meant opposite things on each: for `anchor`, "the trust item must be absent"; for
+/// `office_head`, "this commit's own audit never looked at the office head at all", which is
+/// not the same claim as "the office pallet is unborn" (a warehouse can have a real, if
+/// unaudited, office head that this particular commit simply never consumed — an untrusted
+/// push, principally). A future caller reading `office_head: None` as "unborn" rather than
+/// "not consumed" would compile clean and fail only at runtime, refusing pushes it should not.
+/// This type makes that reading impossible to get backwards: there is no `None` to misread.
+///
+/// `anchor` keeps its plain `Option<&str>` shape rather than getting the same treatment,
+/// because the asymmetry it would paper over is real: the office head is *conditionally*
+/// consumed (only once trust is established — see `ref_update`'s own gates in `head.rs`),
+/// while the anchor is *unconditionally* consumed by every ref update, trusted or not — an
+/// untrusted commit's own precondition is exactly "the anchor is still absent". There is no
+/// "anchor not consumed" state to represent: the anchor's `None` already means one thing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OfficePrecondition<'a> {
+    /// The caller's audit never read an office head (an untrusted warehouse's audit touches
+    /// nothing office-related). No office precondition is built at all — not "expect unborn".
+    NotConsumed,
+    /// The caller's audit read this office head; the commit must condition on it unchanged.
+    At(&'a str),
+}
+
+/// The outcome of a commit that conditions on every movable input a ref-update audit
+/// consumed — the pallet's own head, the office head, and the trust anchor (FORK-95 design
+/// memo, "The movable inputs: exactly three" / claim C6). A caller needs to know *which*
+/// precondition failed, not just that one did: a moved office head means the pallet itself
+/// never budged but something it was audited against did, and the client-facing refusal
+/// differs accordingly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CasOutcome {
-    /// The head moved from `expected` to the new value.
+    /// Every precondition held; the head moved from `expected` to the new value.
     Committed,
-    /// The head was not `expected`; nothing moved. Carries the actual current head so
-    /// the client can report the divergence.
+    /// The pallet's own head was not `expected`; nothing moved. Carries the actual current
+    /// head so the client can report the divergence.
     Conflict { current: Option<String> },
+    /// The office head the audit consumed has since moved (or the office pallet was born or
+    /// retired underneath it). Carries the office pallet's actual current head.
+    OfficeMoved { current: Option<String> },
+    /// The trust anchor the audit consumed has since moved: established, replaced by a
+    /// re-genesis, or (unreachable today, since nothing deletes it) removed. Nothing at this
+    /// call site needs the anchor's new bytes — the caller re-reads and re-decides — so
+    /// unlike its two siblings this variant carries no payload.
+    AnchorMoved,
+    /// The commit was refused for a reason that establishes nothing about whether any of the
+    /// three inputs actually moved — on DynamoDB, `TransactionConflict` (another transaction
+    /// concurrently touching one of this commit's items, the shared office item principally).
+    /// A retry may succeed with nothing having changed, unlike the three variants above, each
+    /// of which asserts a specific value differs from what was consumed. `MemoryRefStore`
+    /// never produces this: its single mutex makes every commit either succeed or lose to a
+    /// real, attributable mismatch, never a transaction-level conflict with no value to blame.
+    Transient,
 }
 
 /// The outcome of establishing the trust anchor (a one-way door, §4.4 / §8.7).
@@ -231,15 +283,38 @@ pub trait RefStore {
     /// The current head of a pallet, or `None` if it is unborn.
     fn get_head(&self, namespace: PalletNamespace, name: &str) -> Result<Option<String>, String>;
 
-    /// Atomically move a pallet head from `expected` to `new` (a DynamoDB conditional
-    /// write). `expected: None` means "the pallet must not exist yet". A mismatch commits
-    /// nothing and reports the actual head — the CAS that catches concurrent lifts.
+    /// Atomically move a pallet head from `expected` to `new`, conditioned on all three of
+    /// the invariant's movable inputs still holding what a ref-update audit consumed (a
+    /// DynamoDB `TransactWriteItems`; FORK-95 design memo, claim C13):
+    ///
+    /// * `expected` — the pallet's own head. `None` means "the pallet must not exist yet".
+    /// * `office_head` — see [`OfficePrecondition`]. `NotConsumed` when the caller's own audit
+    ///   never read an office head at all (an untrusted warehouse's audit touches nothing
+    ///   office-related), never merely because the office pallet happens to be unborn — an
+    ///   untrusted office pallet may carry a real, unaudited head, and conditioning on
+    ///   "unborn" for a state the audit never depended on would refuse *every* such push, race
+    ///   or not. Also `NotConsumed` (regardless of what the caller's audit read) when
+    ///   `namespace`/`name` name the office pallet itself — the `expected` condition above
+    ///   already pins that exact item.
+    /// * `anchor` — the trust anchor's *stored serialization*, exactly as
+    ///   [`get_trust`](RefStore::get_trust) returned it, or `None` if untrusted. Never a
+    ///   re-serialization of the decoded value: a `serde` field reorder must not fail every
+    ///   push's anchor check for no anchor that actually moved. Unlike `office_head`, the
+    ///   anchor has no "not consumed" state — every ref update, trusted or not, conditions on
+    ///   it (an untrusted push's own precondition is exactly "the anchor is still absent").
+    ///
+    /// A mismatch on any of the three commits nothing and reports *which* input moved via
+    /// [`CasOutcome`] — the caller cannot tell a moved pallet head from a moved office head
+    /// or a moved anchor without that distinction, and the client-facing refusal differs
+    /// per case.
     fn compare_and_set_head(
         &self,
         namespace: PalletNamespace,
         name: &str,
         expected: Option<&str>,
         new: &str,
+        office_head: OfficePrecondition<'_>,
+        anchor: Option<&str>,
     ) -> Result<CasOutcome, String>;
 
     /// Every pallet with something stacked, across both namespaces. Explicit because
@@ -249,8 +324,13 @@ pub trait RefStore {
     /// The pallet a franchise checks out when the user does not choose (git's `HEAD`).
     fn default_pallet(&self) -> Result<String, String>;
 
-    /// The warehouse's trust anchor, or `None` before trust is established.
-    fn get_trust(&self) -> Result<Option<TrustAnchor>, String>;
+    /// The warehouse's trust anchor, decoded — alongside the exact bytes it is stored as, or
+    /// `None` before trust is established. The decoded value is what an audit consumes; the
+    /// bytes are what [`compare_and_set_head`](RefStore::compare_and_set_head)'s anchor
+    /// precondition later compares by string equality, so a caller that needs to condition a
+    /// commit on "the anchor I just read" must carry the bytes forward rather than re-encode
+    /// the decoded value (FORK-95 design memo, claim C13).
+    fn get_trust(&self) -> Result<Option<(TrustAnchor, String)>, String>;
 
     /// Plant the trust anchor iff none exists yet (the one-way door). Idempotent for an
     /// identical anchor; a conflicting one is refused. Atomic, like the head CAS.

@@ -21,8 +21,8 @@ use serde::Serialize;
 
 use forklift_aws_lambda::memory::{MemoryObjectStore, MemoryRefStore};
 use forklift_aws_lambda::store::{
-    CasOutcome, ObjectAccess, ObjectStore, PromoteOutcome, PutOutcome, PutTarget, RefStore,
-    SignatureOutcome, TrustOutcome,
+    CasOutcome, ObjectAccess, ObjectStore, OfficePrecondition, PromoteOutcome, PutOutcome,
+    PutTarget, RefStore, SignatureOutcome, TrustOutcome,
 };
 use forklift_aws_lambda::{handle, AuthConfig, Head, Routing};
 
@@ -92,8 +92,10 @@ impl RefStore for SharedRefs {
         name: &str,
         expected: Option<&str>,
         new: &str,
+        office_head: OfficePrecondition<'_>,
+        anchor: Option<&str>,
     ) -> Result<CasOutcome, String> {
-        self.0.compare_and_set_head(namespace, name, expected, new)
+        self.0.compare_and_set_head(namespace, name, expected, new, office_head, anchor)
     }
     fn list_refs(&self) -> Result<Vec<(pallet_utils::PalletRef, String)>, String> {
         self.0.list_refs()
@@ -101,7 +103,7 @@ impl RefStore for SharedRefs {
     fn default_pallet(&self) -> Result<String, String> {
         self.0.default_pallet()
     }
-    fn get_trust(&self) -> Result<Option<office_utils::TrustAnchor>, String> {
+    fn get_trust(&self) -> Result<Option<(office_utils::TrustAnchor, String)>, String> {
         self.0.get_trust()
     }
     fn put_trust_if_absent(

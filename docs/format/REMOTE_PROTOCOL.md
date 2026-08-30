@@ -297,6 +297,17 @@ generation numbers rather than by stopping at a single hash, which is the exact 
 of a linear lift but not of a merge (whose frontier is the merge-base set). A creation
 (`old_head` absent) audits the full history.
 
+On the AWS serverless head, the CAS in step 1 also conditions on the office head and the
+trust anchor the audit above consumed, atomically with the pallet's own head — so a
+concurrent office lift or re-genesis is caught at commit time even after the audit
+already passed, and is reported `409` there too. That same head can additionally answer
+**`503`**: its commit is a single backend transaction, and the backend's own concurrency
+control can cancel it for a reason that establishes nothing about whether any input
+actually changed (contention from another push touching a shared item, principally the
+office pallet, rather than a value having moved). Unlike every other status in this
+section, `503` makes no claim about server or request state — a client should retry the
+identical request rather than treat it as a fault or re-read anything first.
+
 The consequence, stated plainly: a remote that has *lost* an object behind `old_head` no
 longer fails at ref-update time. It never failed on a lost tree or blob behind it either —
 that ancestry is trusted, by the same induction. The `audit` command is what re-proves a

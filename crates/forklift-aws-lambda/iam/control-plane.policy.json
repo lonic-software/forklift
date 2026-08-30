@@ -26,7 +26,13 @@
     {
       "Sid": "RefsAndTrust",
       "Effect": "Allow",
-      "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:Query"],
+      "Action": [
+        "dynamodb:GetItem",
+        "dynamodb:PutItem",
+        "dynamodb:UpdateItem",
+        "dynamodb:Query",
+        "dynamodb:ConditionCheckItem"
+      ],
       "Resource": "${table_arn}"
     },
     {
