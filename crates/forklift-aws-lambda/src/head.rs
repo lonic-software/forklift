@@ -380,9 +380,9 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             // reached by a re-genesis that was authorized and validated correctly and merely lost
             // a race; `trust_one_way_door` says the replacement is impossible, which would tell
             // an operator to stop when the remedy is to re-read and re-run.
-            TrustWriteOutcome::AnchorMoved { current } => Err(self.regenesis_lost_the_race(
-                current.as_deref().and_then(genesis_of).as_deref(),
-            )),
+            TrustWriteOutcome::AnchorMoved { current } => {
+                Err(self.regenesis_lost_the_race(current.as_deref()))
+            }
             // Same `422`, from the same helper, as the read-side `adopts` test — a caller cannot
             // tell whether the mismatch was there when it arrived or opened underneath it, and
             // does not need to: the remedy is identical.
@@ -401,13 +401,31 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// replace, and the only thing wrong with its request is that it names an incumbent that is
     /// one re-genesis out of date. Telling it the door is closed points at giving up; the
     /// actionable answer is to re-read and re-run.
-    fn regenesis_lost_the_race(&self, current_genesis: Option<&str>) -> HeadError {
+    /// `current` is the incumbent's stored bytes as the refused write found them, or `None` when
+    /// no anchor is present at all. The three states are reported apart rather than collapsed:
+    /// `AnchorMoved { current: None }` means there is nothing to re-read and the remedy is to
+    /// establish trust, not to re-run a re-genesis — the opposite advice from the other two.
+    fn regenesis_lost_the_race(&self, current: Option<&str>) -> HeadError {
+        let incumbent = match current {
+            None => {
+                return HeadError::conflict(
+                    "This warehouse's trust anchor is no longer the one this re-genesis was \
+                    validated against, and no anchor is present now. Nothing was changed. \
+                    Establish trust rather than re-running the re-genesis."
+                        .to_string(),
+                )
+            }
+            Some(bytes) => match genesis_of(bytes) {
+                Some(genesis) => format!("its genesis is now {}", genesis),
+                None => "its stored anchor cannot be decoded".to_string(),
+            },
+        };
+
         HeadError::conflict(format!(
             "Another re-genesis replaced this warehouse's trust anchor while this one was \
-            being validated; its genesis is now {}. Nothing was changed. Re-read the anchor \
-            and re-run the re-genesis against the new incumbent if it should still be \
-            replaced.",
-            current_genesis.unwrap_or("(unreadable)")
+            being validated; {}. Nothing was changed. Re-read the anchor and re-run the \
+            re-genesis against the new incumbent if it should still be replaced.",
+            incumbent
         ))
     }
 

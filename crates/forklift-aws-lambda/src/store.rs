@@ -186,10 +186,13 @@ pub enum TrustWriteOutcome {
     /// whenever the identical anchor landed inside the window instead of before it — a refusal
     /// naming a conflict that does not exist, for a request whose desired state holds.
     ///
-    /// The comparison is on stored bytes rather than decoded values, because that is what the
-    /// conditional write itself compares. Two byte strings that decode equal but differ (an
-    /// anchor written by some other encoder) fall through to [`AnchorMoved`](Self::AnchorMoved)
-    /// and its `409`, which is the conservative direction: refuse rather than silently accept.
+    /// The comparison is on **decoded values**, matching the three other places that answer the
+    /// same question — [`put_trust_if_absent`](RefStore::put_trust_if_absent) in both stores, and
+    /// `put_trust`'s own read-side check. Two byte strings that decode equal but differ (an
+    /// anchor written by some other encoder, or by a build whose `serde` field order differs) are
+    /// therefore *identical* here and answer `200`. An earlier revision compared bytes; it was
+    /// strictly narrower, so it answered `409` for an incumbent that differed only in encoding —
+    /// a smaller instance of the spurious refusal this variant exists to remove.
     AlreadyIdentical,
     /// The incumbent anchor is no longer the one the chain-of-custody check validated against —
     /// a concurrent re-genesis won this race. Carries the incumbent's actual current stored

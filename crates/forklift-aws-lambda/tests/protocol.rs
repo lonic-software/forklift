@@ -2244,6 +2244,99 @@ impl RefStore for AlwaysTransientOnAnchorWrite {
     }
 }
 
+/// Wraps a shared [`MemoryRefStore`] and answers the anchor write as though the incumbent had
+/// vanished — `AnchorMoved { current: None }`.
+///
+/// No real interleaving reaches this today (nothing deletes the anchor), but the variant is
+/// representable, `store.rs` says so explicitly, and the head's refusal branches on it. A branch
+/// that only exists in prose is the shape this PR has already been caught by three times.
+struct AnchorVanishesOnAnchorWrite {
+    inner: Arc<MemoryRefStore>,
+}
+
+impl RefStore for AnchorVanishesOnAnchorWrite {
+    fn get_head(
+        &self,
+        namespace: pallet_utils::PalletNamespace,
+        name: &str,
+    ) -> Result<Option<String>, String> {
+        self.inner.get_head(namespace, name)
+    }
+
+    fn compare_and_set_head(
+        &self,
+        namespace: pallet_utils::PalletNamespace,
+        name: &str,
+        expected: Option<&str>,
+        new: &str,
+        office_head: OfficePrecondition<'_>,
+        anchor: Option<&str>,
+    ) -> Result<CasOutcome, String> {
+        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor)
+    }
+
+    fn list_refs(&self) -> Result<Vec<(pallet_utils::PalletRef, String)>, String> {
+        self.inner.list_refs()
+    }
+
+    fn default_pallet(&self) -> Result<String, String> {
+        self.inner.default_pallet()
+    }
+
+    fn get_trust(&self) -> Result<Option<(office_utils::TrustAnchor, String)>, String> {
+        self.inner.get_trust()
+    }
+
+    fn put_trust_if_absent(
+        &self,
+        anchor: &office_utils::TrustAnchor,
+    ) -> Result<TrustOutcome, String> {
+        self.inner.put_trust_if_absent(anchor)
+    }
+
+    fn replace_trust(
+        &self,
+        _anchor: &office_utils::TrustAnchor,
+        _expected_anchor: &str,
+        _office_head: Option<&str>,
+    ) -> Result<TrustWriteOutcome, String> {
+        Ok(TrustWriteOutcome::AnchorMoved { current: None })
+    }
+}
+
+/// PR #117 round 3, finding 4: an anchor that is *absent* must not be reported as one that is
+/// *unreadable*.
+///
+/// Both states arrive as `AnchorMoved { current: None }`, and an earlier revision collapsed them
+/// into "its genesis is now (unreadable)" — which asserts to the operator that an incumbent
+/// exists and is corrupt, and points at re-running the re-genesis. For an absent anchor the
+/// correct remedy is the opposite: there is nothing to re-read, and trust must be established.
+#[test]
+fn an_absent_incumbent_is_not_reported_as_an_unreadable_one() {
+    let office_head = "0".repeat(64);
+    let (store, anchor_v1, _bytes) = seeded_trust(&office_head);
+
+    let mine = re_genesis(&anchor_v1, &office_head, 'c');
+    let head = Head::new(
+        MemoryObjectStore::new(),
+        AnchorVanishesOnAnchorWrite { inner: store },
+    );
+
+    let err = head.put_trust(&mine).expect_err("the incumbent is gone");
+
+    assert_eq!(err.status, Status::Conflict);
+    assert!(
+        !err.message.contains("unreadable") && !err.message.contains("genesis is now"),
+        "an absent anchor must not be described as an unreadable or replaced one: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains("no anchor is present"),
+        "the refusal must say the anchor is absent: {}",
+        err.message
+    );
+}
+
 /// A transient refusal of the anchor write is a `503`, not the `500` every refusal on this path
 /// used to be. It establishes nothing about whether either input moved, so it must not wear a
 /// `409` or a `422` either — both of those tell a client something specific and false.

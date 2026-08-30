@@ -18,15 +18,24 @@
 # ConditionCheck, which bills as *write* capacity despite writing nothing.
 #
 # Requires real AWS: LocalStack's consumed-capacity numbers are synthetic and would settle
-# nothing. Touches NO deployed stack — it creates one throwaway PAY_PER_REQUEST table, measures,
-# and deletes it on exit (trap). Cost is a handful of on-demand write units, well under $0.01;
-# table create and delete are free.
+# nothing. Cost is a handful of on-demand write units, well under $0.01; table create and delete
+# are free.
+#
+# It touches NO deployed stack. The table it measures is created by this run, under a name unique
+# to it, and the teardown deletes only a table this run actually created — so a name collision
+# with anything already in the account cannot cause a deletion. If teardown genuinely cannot
+# remove it, the script says so on stderr with the table name and exits non-zero rather than
+# leaving a billable table behind a silent success.
 #
 #   AWS_PROFILE=<profile> bin/measure-transaction-capacity
 set -euo pipefail
 
-T=forklift-fork95-capacity-probe
+# A fresh name per run. Not cosmetic: a fixed name can collide with a table left by an
+# interrupted or concurrent run, and the failed create would then drop this script into a
+# teardown for a table it did not create. Unique naming makes that state unreachable rather
+# than merely guarded against.
 R=eu-central-1
+T="forklift-capacity-probe-$(date +%s)-$$"
 WH=probe-warehouse
 
 # Realistic 64-hex heads, so item sizes resemble production items.
@@ -41,10 +50,41 @@ echo "### account/region"
 aws sts get-caller-identity --query 'Account' --output text
 echo "region: $R"
 
+# Set only once `create-table` has actually returned. The teardown must be able to tell "I made
+# this table" from "a table of this name was already here", and arming the trap before the create
+# cannot: a create that fails under `set -e` exits straight into the trap.
+CREATED=0
+
+# The transaction payloads go here rather than to fixed /tmp paths — same reasoning as the table
+# name above, and removed by the same teardown so the script leaves nothing behind at all.
+SCRATCH=$(mktemp -d)
+
 cleanup() {
+  rm -rf "$SCRATCH"
+
+  if [ "$CREATED" -ne 1 ]; then
+    return 0
+  fi
+
   echo
   echo "### teardown"
-  aws dynamodb delete-table --table-name "$T" --region "$R" --output text --query 'TableDescription.TableStatus' || true
+
+  # Deliberately not `|| true`. The most likely failure is deleting while the table is still
+  # CREATING (an interrupt during the wait below), which returns ResourceInUseException — and a
+  # swallowed error there leaves a billable table in the account behind a zero exit status. Retry
+  # across the CREATING window, then fail loudly with the name so it can be removed by hand.
+  local attempt
+  for attempt in 1 2 3 4 5 6 7 8 9 10; do
+    if aws dynamodb delete-table --table-name "$T" --region "$R" \
+        --output text --query 'TableDescription.TableStatus' 2>/dev/null; then
+      return 0
+    fi
+    sleep 5
+  done
+
+  echo "TEARDOWN FAILED: table $T ($R) still exists and is billable. Delete it:" >&2
+  echo "  aws dynamodb delete-table --table-name $T --region $R" >&2
+  exit 1
 }
 trap cleanup EXIT
 
@@ -56,6 +96,7 @@ aws dynamodb create-table --table-name "$T" --region "$R" \
   --key-schema AttributeName=wh,KeyType=HASH AttributeName=entity,KeyType=RANGE \
   --tags Key=purpose,Value=FORK-95-capacity-probe Key=ephemeral,Value=true \
   --query 'TableDescription.TableStatus' --output text
+CREATED=1
 aws dynamodb wait table-exists --table-name "$T" --region "$R"
 
 echo
@@ -81,7 +122,7 @@ aws dynamodb update-item --table-name "$T" --region "$R" \
 
 echo
 echo "### B. THREE-ACTION transaction - Update(pallet) + ConditionCheck(office) + ConditionCheck(anchor)"
-cat > /tmp/fork95-txn3.json <<JSON
+cat > "$SCRATCH/txn3.json" <<JSON
 [
   {"Update": {"TableName":"$T",
     "Key":{"wh":{"S":"$WH"},"entity":{"S":"pallet#main"}},
@@ -104,13 +145,13 @@ cat > /tmp/fork95-txn3.json <<JSON
 ]
 JSON
 aws dynamodb transact-write-items --region "$R" \
-  --transact-items file:///tmp/fork95-txn3.json \
+  --transact-items "file://$SCRATCH/txn3.json" \
   --return-consumed-capacity TOTAL \
   --query 'ConsumedCapacity' --output json
 
 echo
 echo "### C. TWO-ACTION transaction - the target-is-@office case (office check dropped)"
-cat > /tmp/fork95-txn2.json <<JSON
+cat > "$SCRATCH/txn2.json" <<JSON
 [
   {"Update": {"TableName":"$T",
     "Key":{"wh":{"S":"$WH"},"entity":{"S":"pallet#@office"}},
@@ -127,13 +168,13 @@ cat > /tmp/fork95-txn2.json <<JSON
 ]
 JSON
 aws dynamodb transact-write-items --region "$R" \
-  --transact-items file:///tmp/fork95-txn2.json \
+  --transact-items "file://$SCRATCH/txn2.json" \
   --return-consumed-capacity TOTAL \
   --query 'ConsumedCapacity' --output json
 
 echo
 echo "### D. SINGLE-ACTION transaction - isolates the transaction multiplier from action count"
-cat > /tmp/fork95-txn1.json <<JSON
+cat > "$SCRATCH/txn1.json" <<JSON
 [
   {"Update": {"TableName":"$T",
     "Key":{"wh":{"S":"$WH"},"entity":{"S":"pallet#main"}},
@@ -145,7 +186,7 @@ cat > /tmp/fork95-txn1.json <<JSON
 ]
 JSON
 aws dynamodb transact-write-items --region "$R" \
-  --transact-items file:///tmp/fork95-txn1.json \
+  --transact-items "file://$SCRATCH/txn1.json" \
   --return-consumed-capacity TOTAL \
   --query 'ConsumedCapacity' --output json
 
