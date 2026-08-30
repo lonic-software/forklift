@@ -195,7 +195,20 @@ fn op_actions() -> BTreeMap<&'static str, &'static [&'static str]> {
         ("get_item", &["dynamodb:GetItem"][..]),
         ("put_item", &["dynamodb:PutItem"][..]),
         ("query", &["dynamodb:Query"][..]),
-        ("transact_write_items", &["dynamodb:ConditionCheckItem", "dynamodb:UpdateItem"][..]),
+        // This one op issues both of the store's transactions — the ref-update commit
+        // (`Update` + `ConditionCheck`s) and the anchor write (`Put` + `ConditionCheck`) — so
+        // the row is the union of what all three action types need.
+        //
+        // `dynamodb:PutItem` is listed even though the `put_item` op already requires it, and
+        // listing it is not redundant. Deriving it only from that op would make the anchor
+        // write's permission an accident of `put_trust_if_absent` still having a caller: retire
+        // that one, `put_item` goes dead under `#![deny(dead_code)]`, `PutItem` leaves the
+        // policy as a dead grant — and the anchor write starts failing `AccessDenied` in
+        // production with every check in this file still green.
+        (
+            "transact_write_items",
+            &["dynamodb:ConditionCheckItem", "dynamodb:PutItem", "dynamodb:UpdateItem"][..],
+        ),
     ])
 }
 

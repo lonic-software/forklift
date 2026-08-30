@@ -24,7 +24,7 @@ use forklift_core::util::pallet_utils::{PalletNamespace, PalletRef, DEFAULT_PALL
 
 use crate::store::{
     CasOutcome, ObjectAccess, ObjectStore, OfficePrecondition, PromoteOutcome, PutOutcome,
-    PutTarget, RefStore, SignatureOutcome, TrustOutcome,
+    PutTarget, RefStore, SignatureOutcome, TrustOutcome, TrustWriteOutcome,
 };
 
 /// An in-memory [`ObjectStore`]. Object bytes are the uncompressed wire form, keyed by hash.
@@ -387,17 +387,42 @@ impl RefStore for MemoryRefStore {
         }
     }
 
-    fn replace_trust(&self, anchor: &TrustAnchor) -> Result<(), String> {
+    fn replace_trust(
+        &self,
+        anchor: &TrustAnchor,
+        expected_anchor: &str,
+        office_head: Option<&str>,
+    ) -> Result<TrustWriteOutcome, String> {
         let json = Self::encode(anchor)?;
+        let office_key = Self::key(PalletNamespace::Meta, OFFICE_PALLET_NAME);
 
-        // Unconditional, exactly as `DynamoRefStore::replace_trust` still is this slice — its
-        // conditional write is FORK-95 claim C22, a later slice. Taking the *same* guard
-        // `compare_and_set_head` does is what matters here: it is what lets a falsifying test
-        // interleave this write into the window between an audit's anchor read and the commit
-        // that conditions on it.
-        self.state.lock().unwrap().trust = Some(json);
+        let mut state = self.state.lock().unwrap();
 
-        Ok(())
+        // Both preconditions are evaluated, and the write made, under this one guard — the
+        // mirror of the transaction being atomic over both actions. It is also what lets a
+        // falsifying test interleave this write into the window between an audit's anchor read
+        // and the commit that conditions on it.
+        //
+        // The incumbent is compared as *stored bytes*, never as a decoded anchor: that is the
+        // comparison `DynamoRefStore` makes, and a fake comparing decoded values could not
+        // represent it (see `RefState::trust`).
+        if state.trust.as_deref() != Some(expected_anchor) {
+            return Ok(TrustWriteOutcome::AnchorMoved { current: state.trust.clone() });
+        }
+
+        // Unlike `compare_and_set_head`'s, this office precondition has no "not consumed"
+        // state: `put_trust` reads the office head unconditionally, so `None` here genuinely
+        // means the validation consumed an unborn office and the write must condition on it
+        // still being unborn.
+        let current_office = state.heads.get(&office_key).cloned();
+
+        if current_office.as_deref() != office_head {
+            return Ok(TrustWriteOutcome::OfficeMoved { current: current_office });
+        }
+
+        state.trust = Some(json);
+
+        Ok(TrustWriteOutcome::Replaced)
     }
 }
 

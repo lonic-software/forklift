@@ -40,7 +40,7 @@ use crate::error::{HeadError, HeadResult};
 use crate::scratch::{materialize, Mirror, Scratch};
 use crate::store::{
     CasOutcome, ObjectAccess, ObjectStore, OfficePrecondition, PromoteOutcome, PutTarget,
-    RefStore, SignatureOutcome, TrustOutcome,
+    RefStore, SignatureOutcome, TrustOutcome, TrustWriteOutcome,
 };
 
 /// How the head answers a byte read: the bytes, or a redirect to a storage URL.
@@ -309,11 +309,11 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     pub fn put_trust(&self, anchor: &TrustAnchorDto) -> HeadResult<TrustResult> {
         let existing = self.refs.get_trust().map_err(HeadError::internal)?;
 
-        // The stored bytes travel with `get_trust` for the ref-update commit's anchor
-        // precondition (FORK-95, claim C13); this read-validate-write path is untouched this
-        // slice — its own conditional write is claim C22, deferred to a later slice — so the
-        // bytes go unused here.
-        let Some((existing, _existing_bytes)) = existing else {
+        // The stored bytes travel with `get_trust` so a write can condition on exactly what was
+        // read (FORK-95, claim C13). This path is a read-validate-write, and validating is not
+        // holding: the incumbent read here is the value the chain-of-custody test below runs
+        // against, and `replace_trust` conditions the write on it being unmoved.
+        let Some((existing, existing_bytes)) = existing else {
             return match self
                 .refs
                 .put_trust_if_absent(&anchor.to_anchor())
@@ -345,18 +345,50 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             .map_err(HeadError::internal)?;
 
         if anchor.adopts.as_deref() != office_head.as_deref() {
-            return Err(HeadError::unprocessable(format!(
-                "The re-genesis anchor adopts office head {}, but this warehouse's office \
-                head is {}. The reset would drop history; re-run the re-genesis from a \
-                warehouse in sync with this one.",
-                anchor.adopts.as_deref().unwrap_or("(none)"),
-                office_head.as_deref().unwrap_or("(unborn)")
-            )));
+            return Err(self.adopts_mismatch(anchor.adopts.as_deref(), office_head.as_deref()));
         }
 
-        self.refs.replace_trust(&anchor.to_anchor()).map_err(HeadError::internal)?;
+        // The two tests above ran against values that can move underneath them, so the write
+        // conditions on both and this match is where those refusals land. Before FORK-95 the
+        // write was a bare unconditional `put_item`: two concurrent re-geneses could each pass
+        // the `prior_genesis` test and both write, one genesis silently overwriting another
+        // through a door this code calls one-way; and the office head could move between the
+        // `adopts` test and the write, planting an anchor that drops precisely the history that
+        // test protects.
+        match self
+            .refs
+            .replace_trust(&anchor.to_anchor(), &existing_bytes, office_head.as_deref())
+            .map_err(HeadError::internal)?
+        {
+            TrustWriteOutcome::Replaced => Ok(TrustResult::Established),
+            // Losing the race to another re-genesis is the same refusal as arriving after one:
+            // the incumbent this request validated against is not the incumbent any more, so its
+            // chain of custody no longer reaches. Same `409` the read-side test gives.
+            TrustWriteOutcome::AnchorMoved { .. } => Err(self.trust_one_way_door()),
+            // Same `422`, from the same helper, as the read-side `adopts` test — a caller cannot
+            // tell whether the mismatch was there when it arrived or opened underneath it, and
+            // does not need to: the remedy is identical.
+            TrustWriteOutcome::OfficeMoved { current } => {
+                Err(self.adopts_mismatch(anchor.adopts.as_deref(), current.as_deref()))
+            }
+            TrustWriteOutcome::Transient => Err(self.transient_contention()),
+        }
+    }
 
-        Ok(TrustResult::Established)
+    /// The re-genesis refusal for an anchor whose `adopts` does not name the warehouse's office
+    /// head — `422`, since the reset would silently drop history.
+    ///
+    /// One helper for both the read-side test and the write's own `OfficeMoved` refusal. They are
+    /// the same refusal about the same mismatch, and two hand-written copies of a message this
+    /// specific would drift.
+    fn adopts_mismatch(&self, adopts: Option<&str>, office_head: Option<&str>) -> HeadError {
+        HeadError::unprocessable(format!(
+            "The re-genesis anchor adopts office head {}, but this warehouse's office \
+            head is {}. The reset would drop history; re-run the re-genesis from a \
+            warehouse in sync with this one.",
+            adopts.unwrap_or("(none)"),
+            office_head.unwrap_or("(unborn)")
+        ))
     }
 
     /// `POST /v1/pallets/{name}` — the CAS ref update, the commit point of a lift and the

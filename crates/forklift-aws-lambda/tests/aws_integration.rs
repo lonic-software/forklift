@@ -36,7 +36,7 @@ use http::{Request, Response};
 use forklift_aws_lambda::aws::{build_clients, build_stores, AwsConfig, DynamoOps, S3Ops};
 use forklift_aws_lambda::store::{
     CasOutcome, ObjectAccess, ObjectStore, OfficePrecondition, PromoteOutcome, PutOutcome,
-    PutTarget, RefStore, SignatureOutcome, TrustOutcome,
+    PutTarget, RefStore, SignatureOutcome, TrustOutcome, TrustWriteOutcome,
 };
 use forklift_aws_lambda::{
     handle, AsyncBridge, AuthConfig, DynamoRefStore, Head, HeadResult, Routing, S3ObjectStore,
@@ -580,8 +580,16 @@ async fn dynamo_ref_store_upholds_the_cas_and_the_trust_door() {
             precondition would compare against"
         );
 
-        // replace_trust is the sanctioned overwrite.
-        refs.replace_trust(&different).expect("replace");
+        // replace_trust is the sanctioned overwrite — and, since FORK-95 slice 4, a conditional
+        // one: it names the incumbent bytes it replaces and the office head it lands against.
+        let office_head = refs
+            .get_head(PalletNamespace::Meta, OFFICE_PALLET_NAME)
+            .expect("read the office head");
+        assert_eq!(
+            refs.replace_trust(&different, &read_bytes, office_head.as_deref())
+                .expect("replace"),
+            TrustWriteOutcome::Replaced
+        );
         assert_eq!(refs.get_trust().expect("re-read").expect("present").0.genesis, two);
     })
     .await
@@ -724,7 +732,14 @@ async fn dynamo_ref_store_attributes_a_moved_precondition_to_its_position() {
             adopts: Some(office_o1.clone()),
         }
         .to_anchor();
-        refs.replace_trust(&anchor_v2).expect("replace trust");
+        let office_now = refs
+            .get_head(PalletNamespace::Meta, OFFICE_PALLET_NAME)
+            .expect("read the office head");
+        assert_eq!(
+            refs.replace_trust(&anchor_v2, &bytes_a1, office_now.as_deref())
+                .expect("replace trust"),
+            TrustWriteOutcome::Replaced
+        );
         let (_decoded, bytes_a2) = refs.get_trust().expect("read trust").expect("present");
         assert_ne!(bytes_a1, bytes_a2, "the replacement actually changed the stored bytes");
 
