@@ -1,11 +1,25 @@
-//! SPIKE for the pallet-lifecycle design (FORK-63/FORK-64): is a revocation's distrust
-//! boundary a GC root?
+//! Executed evidence for the **collected-referent class**: a durable hash pin whose referent has
+//! been garbage-collected.
 //!
-//! A revocation snapshots pallet heads into `distrust_boundary` (`office.rs:526-557`), but
-//! `gc_utils::collect_live_set` roots only pallet refs, bay-scoped parcels and the anchor's
-//! `adopts` pin (`gc_utils.rs:136-171`). Today those pins survive only because nothing ever
-//! deletes a ref. This test builds the state a pallet-deletion verb would create — a boundary
-//! pin whose ref is gone — and asks what the collector actually does with it.
+//! `gc_utils::collect_live_set` roots pallet refs, bay-scoped parcels and the anchor's `adopts`
+//! pin (`gc_utils.rs:136-171`). Several other places write a parcel or object hash durably and
+//! later read it back. When gc collects the referent, each reader fails differently — and the
+//! members disagree about what correct behaviour even is, which is why the pallet-lifecycle
+//! design replaced its class invariant with a per-member ledger.
+//!
+//! | member | reader kind | leg here |
+//! | --- | --- | --- |
+//! | revocation `distrust_boundary` | verifying | the two `a_boundary_pin_*` legs (FORK-63/64 spike) |
+//! | `audit`'s boundary head | verifying | `the_false_tampering_state_*`, `a_legacy_parcel_*` (FORK-81) |
+//! | `CherryPickState.source` | **acting** | `a_collected_cherry_pick_source_*` (FORK-82) |
+//! | `Tag.subject` under a torn taint | **healing** | `a_torn_taint_over_an_absent_tag_subject_*` (FORK-83) |
+//! | staged inventory shard under a torn taint | **healing** | `staging_a_file_and_then_collecting_*` (FORK-83, widened) |
+//!
+//! `Tag.subject`'s *rendering* reader is pinned separately in `tag_subject_gc.rs` (FORK-79).
+//!
+//! Every leg carries a **canary** — a parcel pinned by nothing — and asserts it was collected, so
+//! "the pin survived" can never be satisfied by a collector that swept nothing. The canary check
+//! holds both before and after any fix; it is the legs' own assertions that invert.
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
