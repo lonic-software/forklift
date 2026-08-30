@@ -822,6 +822,151 @@ async fn dynamo_ref_store_attributes_a_moved_precondition_to_its_position() {
     .expect("the blocking assertions");
 }
 
+/// FORK-95 slice 4: the anchor write's own two preconditions are attributed to *their*
+/// positions, against real DynamoDB.
+///
+/// This is the companion to `dynamo_ref_store_attributes_a_moved_precondition_to_its_position`
+/// and it exists because the two transactions this store issues **order their preconditions
+/// differently**. In a ref-update commit position 0 is the target pallet's head; in an anchor
+/// write position 0 is the trust anchor and position 1 the office head. A classifier that had
+/// been written against the first transaction's layout — the natural thing to do when the
+/// second one arrived — would report a moved *pallet* for a re-genesis that lost its race, a
+/// `409` naming a pallet the request never mentioned. Nothing in the Rust types prevents that;
+/// only the layout the transaction is built with does, and only a real backend can confirm
+/// DynamoDB returns cancellation reasons in the order this store pushes actions.
+///
+/// `MemoryRefStore` cannot prove any of this: it evaluates the two preconditions as ordinary
+/// `if` statements under a mutex and has no positional reason list at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn dynamo_ref_store_attributes_the_anchor_writes_preconditions_to_their_positions() {
+    let Some(endpoint) = endpoint() else {
+        eprintln!("skipping: FORKLIFT_AWS_TEST_ENDPOINT is unset");
+        return;
+    };
+
+    let config = test_config(&endpoint);
+    provision(&config).await;
+
+    let bridge = AsyncBridge::current().expect("a multi-thread runtime");
+    let (_objects, refs) = build_stores(&config, bridge).await.expect("stores");
+
+    tokio::task::spawn_blocking(move || {
+        let office_o1 = "1".repeat(64);
+        let office_o2 = "2".repeat(64);
+        let genesis_g1 = "3".repeat(64);
+        let genesis_g2 = "4".repeat(64);
+        let genesis_g3 = "5".repeat(64);
+
+        // Setup: an incumbent anchor, and an office pallet at `office_o1`.
+        let anchor_v1 = TrustAnchorDto {
+            genesis: genesis_g1.clone(),
+            enabled_at: 1_780_000_000,
+            boundary: vec![],
+            prior_genesis: None,
+            adopts: None,
+        }
+        .to_anchor();
+
+        assert_eq!(
+            refs.put_trust_if_absent(&anchor_v1).expect("plant anchor"),
+            TrustOutcome::Established
+        );
+        let (_decoded, bytes_a1) = refs.get_trust().expect("read trust").expect("present");
+
+        assert_eq!(
+            refs.compare_and_set_head(
+                PalletNamespace::Meta,
+                OFFICE_PALLET_NAME,
+                None,
+                &office_o1,
+                OfficePrecondition::NotConsumed,
+                Some(&bytes_a1),
+            )
+            .expect("lift office to o1"),
+            CasOutcome::Committed
+        );
+
+        let re_genesis = |genesis: &str, adopts: &str| {
+            TrustAnchorDto {
+                genesis: genesis.to_string(),
+                enabled_at: 1_780_000_001,
+                boundary: vec![genesis_g1.clone()],
+                prior_genesis: Some(genesis_g1.clone()),
+                adopts: Some(adopts.to_string()),
+            }
+            .to_anchor()
+        };
+
+        // 1. A stale *anchor* precondition — position 0 — with the office head current. Only
+        // position 0 fails, and it must be read as the anchor rather than as anything the
+        // ref-update layout would put there.
+        assert_eq!(
+            refs.replace_trust(
+                &re_genesis(&genesis_g2, &office_o1),
+                &"0".repeat(64), // never the stored bytes
+                Some(&office_o1),
+            )
+            .expect("stale anchor precondition"),
+            TrustWriteOutcome::AnchorMoved {
+                current: Some(bytes_a1.clone())
+            },
+            "the refusal must carry the incumbent's actual stored bytes, read off ALL_OLD"
+        );
+        let (_still, bytes_now) = refs.get_trust().expect("re-read").expect("present");
+        assert_eq!(bytes_now, bytes_a1, "a refused write must not have landed");
+
+        // 2. A stale *office* precondition — position 1 — with the anchor current. Only
+        // position 1 fails, and it must not be conflated with position 0's anchor.
+        assert_eq!(
+            refs.replace_trust(
+                &re_genesis(&genesis_g2, &office_o2),
+                &bytes_a1,
+                Some(&office_o2), // stale: the office is still at o1
+            )
+            .expect("stale office precondition"),
+            TrustWriteOutcome::OfficeMoved {
+                current: Some(office_o1.clone())
+            },
+            "the refusal must carry the office pallet's actual current head"
+        );
+        let (_still, bytes_now) = refs.get_trust().expect("re-read").expect("present");
+        assert_eq!(bytes_now, bytes_a1, "a refused write must not have landed");
+
+        // 3. Both preconditions current: the re-genesis lands. Without this the two refusals
+        // above are also satisfied by a store that refuses everything.
+        assert_eq!(
+            refs.replace_trust(&re_genesis(&genesis_g2, &office_o1), &bytes_a1, Some(&office_o1))
+                .expect("both preconditions current"),
+            TrustWriteOutcome::Replaced
+        );
+        let (decoded_v2, bytes_a2) = refs.get_trust().expect("re-read").expect("present");
+        assert_eq!(decoded_v2.genesis, genesis_g2);
+        assert_ne!(bytes_a2, bytes_a1, "the write actually changed the stored bytes");
+
+        // 4. An unrelated pallet moving must not refuse the anchor write — this transaction
+        // names the trust item and the office item, and nothing else in the warehouse.
+        assert_eq!(
+            refs.compare_and_set_head(
+                PalletNamespace::User,
+                "main",
+                None,
+                &"6".repeat(64),
+                OfficePrecondition::At(&office_o1),
+                Some(&bytes_a2),
+            )
+            .expect("lift an unrelated pallet"),
+            CasOutcome::Committed
+        );
+        assert_eq!(
+            refs.replace_trust(&re_genesis(&genesis_g3, &office_o1), &bytes_a2, Some(&office_o1))
+                .expect("an unrelated pallet's move must not refuse the anchor write"),
+            TrustWriteOutcome::Replaced
+        );
+    })
+    .await
+    .expect("the blocking assertions");
+}
+
 // ---------------------------------------------------------------------------------------
 // End to end: a real Head untrusted lift over the real stores, from a CLI-built warehouse.
 // ---------------------------------------------------------------------------------------
