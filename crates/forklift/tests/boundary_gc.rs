@@ -1,16 +1,18 @@
 //! Executed evidence for the **collected-referent class**: a durable hash pin whose referent has
 //! been garbage-collected.
 //!
-//! `gc_utils::collect_live_set` roots pallet refs, bay-scoped parcels and the anchor's `adopts`
-//! pin (`gc_utils.rs:136-171`). Several other places write a parcel or object hash durably and
-//! later read it back. When gc collects the referent, each reader fails differently — and the
-//! members disagree about what correct behaviour even is, which is why the pallet-lifecycle
-//! design replaced its class invariant with a per-member ledger.
+//! `gc_utils::collect_live_set` roots pallet refs, bay-scoped parcels and every trust-pin root
+//! (`office_utils::collect_trust_pin_roots`: the anchor's `adopts` pin, its `boundary` snapshot,
+//! and every key's revocation `distrust_boundary`) (`gc_utils.rs:136-171`). Several other places
+//! still write a parcel or object hash durably with no such root, and read it back regardless.
+//! When gc collects an unrooted referent, each reader fails differently — and the members
+//! disagree about what correct behaviour even is, which is why the pallet-lifecycle design
+//! replaced its class invariant with a per-member ledger.
 //!
 //! | member | reader kind | leg here |
 //! | --- | --- | --- |
-//! | revocation `distrust_boundary` | verifying | the two `a_boundary_pin_*` legs (FORK-63/64 spike) |
-//! | `audit`'s boundary head | verifying | `the_false_tampering_state_*`, `a_legacy_parcel_*` (FORK-81) |
+//! | revocation `distrust_boundary` | verifying | **FIXED (FORK-81)** — rooted; the two `a_boundary_pin_*`/`a_distrust_boundary_pin_*` legs (FORK-63/64 spike) |
+//! | `audit`'s boundary head | verifying | **FIXED (FORK-81)** — rooted; `an_undone_boundary_head_*`, `a_boundary_head_and_the_legacy_parcel_*` |
 //! | `CherryPickState.source` | **acting** | `a_collected_cherry_pick_source_*` (FORK-82) |
 //! | `Tag.subject` under a torn taint | **healing** | `a_torn_taint_over_an_absent_tag_subject_*` (FORK-83) |
 //! | staged inventory shard under a torn taint | **healing** | `staging_a_file_and_then_collecting_*` (FORK-83, widened) |
@@ -20,14 +22,17 @@
 //! **Four legs carry a canary** — a parcel pinned by nothing — and assert it was collected, so
 //! "the pin survived" can never be satisfied by a collector that swept nothing. The canary check
 //! holds both before and after any fix; it is the legs' own assertions that invert. (**Seven** of
-//! the eight legs drive collection — six call `collect_garbage`, and the false-tampering leg drives
-//! the same sweep through `compact --all` — so "gc-driven" is not the dividing line. Only the
-//! torn-taint control collects nothing.)
+//! the eight legs drive collection — six call `collect_garbage`, and
+//! `an_undone_boundary_head_survives_the_sweep_and_audit_passes` drives the same sweep through
+//! `compact --all` — so "gc-driven" is not the dividing line. Only the torn-taint control collects
+//! nothing.)
 //!
-//! The other four discriminate differently: the two anchor legs assert `!b_present &&
-//! legacy_present`, which is already two-sided; `a_torn_taint_alone_...` is a matched companion to
-//! the wedge leg rather than a canary user; and `staging_a_file_...` names the exact blob it
-//! staged and asserts that specific object was collected, which is a canary's job done directly.
+//! The other four discriminate differently: the two anchor legs now assert `b_present &&
+//! legacy_present && audit succeeds` (FORK-81 rooted the boundary pin, so both survive together;
+//! before the fix this was `!b_present && legacy_present`, already two-sided in the other
+//! direction); `a_torn_taint_alone_...` is a matched companion to the wedge leg rather than a
+//! canary user; and `staging_a_file_...` names the exact blob it staged and asserts that specific
+//! object was collected, which is a canary's job done directly.
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -273,15 +278,20 @@ fn a_boundary_pin_survives_gc_while_its_pallet_ref_exists() {
     assert!(resolvable, "the boundary must still resolve while its ref exists");
 }
 
-/// THE DEFECT. Unlink the ref — exactly what a pallet-deletion verb would do — and the same
-/// `gc` collects a hash that a signed revocation still names, leaving the boundary permanently
-/// unresolvable: the parcels that exculpated the revoked key's signatures are gone.
+/// THE FIX (FORK-81). Unlink the ref — exactly what a pallet-deletion verb would do — and
+/// `gc` now keeps a hash that a signed revocation still names: `office_utils::
+/// collect_trust_pin_roots` roots every key's `distrust_boundary`, so the parcels that
+/// exculpated the revoked key's signatures stay reachable regardless of what happens to any
+/// pallet ref.
 ///
-/// Green today, and it is the two `!` assertions that must be **inverted** when boundary pins
-/// become GC roots. Reverting that fix reddens the inverted form; that is the pairing. The
-/// canary check does NOT invert — it holds in both worlds, which is the point of it.
+/// This was `a_boundary_pin_is_collected_once_its_pallet_ref_is_deleted`, and it was green
+/// pinning the DEFECT: the same two assertions read `!present`/`!resolvable`. Reverting the
+/// production fix (rooting `distrust_boundary` in `collect_live_set`) reddens both `assert!`s
+/// below — `present` first (the pin itself no longer survives), so `resolvable` never even
+/// gets checked against a live boundary. The canary check does NOT invert — it holds in both
+/// worlds, which is the point of it.
 #[test]
-fn a_boundary_pin_is_collected_once_its_pallet_ref_is_deleted() {
+fn a_distrust_boundary_pin_survives_its_pallet_ref_being_deleted() {
     let (warehouse, key, side_head, canary) = warehouse_with_a_pinned_side_head("deleted");
 
     warehouse.delete_pallet_ref("side");
@@ -290,26 +300,32 @@ fn a_boundary_pin_is_collected_once_its_pallet_ref_is_deleted() {
     let (present, resolvable) = present_and_resolvable(&warehouse, &key, &side_head);
 
     println!(
-        "DEFECT: gc deleted {} object(s); pin present = {}; boundary resolvable = {}",
+        "FIXED: gc deleted {} object(s); pin present = {}; boundary resolvable = {}",
         stats.deleted, present, resolvable
     );
 
     assert_the_sweep_ran(&warehouse, &canary, stats.deleted);
-    assert!(!present, "the pin was collected once its ref was deleted");
-    assert!(!resolvable, "and the boundary is now unresolvable");
+    assert!(present, "the pin must survive gc even once its pallet ref is deleted");
+    assert!(resolvable, "and the distrust boundary must still resolve");
 }
 
-/// IS THE ANCHOR-`boundary` FALSE-TAMPERING STATE REACHABLE WITH SHIPPED COMMANDS ONLY?
+/// THE FIX (FORK-81): does an undone boundary head survive `compact --all`, and does `audit`
+/// then pass with the pre-trust parcel counted as legacy?
 ///
-/// The design claimed it needs a ref unlink, i.e. that it is a hazard the not-yet-built deletion verb
-/// introduces rather than a live defect. Review disagreed: `undo` moves a head *backwards*
-/// (`journal_utils.rs:191`) — the same move the tag leg uses — which orphans the boundary head with no
-/// unlink at all, and `compact --all` then drops it once it has been packed.
+/// Before the fix, `undo` moving a head *backwards* (`journal_utils.rs:191`) orphaned the
+/// boundary head with no ref-deletion verb at all, and `compact --all` then dropped it once it
+/// had been packed — which left `audit` unable to resolve the trust boundary. Now `anchor.
+/// boundary` is itself a GC root (`office_utils::collect_trust_pin_roots`), so the same repack
+/// keeps it, and the boundary always resolves.
 ///
-/// No `delete_pallet_ref` here, and no direct `collect_garbage` call: every step is a CLI command a
-/// user runs. If this passes, the anchor reader is a live defect, not a prerequisite of the verb.
+/// This was `the_false_tampering_state_is_reachable_with_shipped_commands_only`, and it was
+/// green pinning the DEFECT (the boundary head reclaimed, `audit` refusing with a tampering
+/// accusation). Reverting the production fix reddens `b_present` first — the boundary head is
+/// collected again — so `audit`'s own assertion never gets exercised against a live boundary.
+///
+/// No `delete_pallet_ref` here: every step is a CLI command a user runs.
 #[test]
-fn the_false_tampering_state_is_reachable_with_shipped_commands_only() {
+fn an_undone_boundary_head_survives_the_sweep_and_audit_passes() {
     let warehouse = Warehouse::new_unenrolled("live");
 
     let legacy = warehouse.stack("app.txt", "v1\n", "legacy one");
@@ -322,12 +338,13 @@ fn the_false_tampering_state_is_reachable_with_shipped_commands_only() {
     });
     assert_eq!(boundary, vec![b.clone()], "the boundary must be exactly [b]");
 
-    // Pack, so the repack sweep is able to drop `b` (a repack only drops already-packed garbage —
-    // `pack_utils.rs:1679-1680`).
+    // Pack. Before the fix a repack only drops already-packed garbage (`pack_utils.rs:1679-
+    // 1680`), so this step made `compact --all` below able to drop `b`; now `b` is rooted and
+    // survives the repack regardless.
     warehouse.run_ok(&["compact"]);
 
-    // Soft undo moves `main` back off `b`, orphaning it. No second ref is needed: `main` itself
-    // lands on `legacy`, keeping it alive.
+    // Soft undo moves `main` back off `b`, orphaning it (no pallet ref reaches `b` any more).
+    // No second ref is needed: `main` itself lands on `legacy`, keeping it alive.
     //
     // ORDERING MATTERS, and getting it wrong is what made a first attempt at this leg pass
     // spuriously: `shift` is journaled too (`cli.rs:1639`), so a `shift` between the stack and the
@@ -353,51 +370,48 @@ fn the_false_tampering_state_is_reachable_with_shipped_commands_only() {
     );
 
     println!(
-        "LIVE: b present = {}; legacy present = {}; audit exit = {:?}\n{}",
+        "FIXED: b present = {}; legacy present = {}; audit exit = {:?}\n{}",
         b_present, legacy_present, audit.status.code(), out.trim()
     );
 
-    assert!(!b_present, "the boundary head must have been reclaimed by `compact --all`");
+    assert!(b_present, "the boundary head must survive `compact --all` now that it is rooted");
     assert!(legacy_present, "the legacy parcel must survive as `main`'s head");
     assert!(
-        !audit.status.success(),
-        "audit succeeded — the state is NOT reachable without a ref unlink after all"
+        audit.status.success(),
+        "audit must succeed: the boundary head survived, so the trust boundary still resolves. \
+        output: {}",
+        out
     );
-    assert!(out.contains("tampered"), "expected the tampering accusation: {}", out);
+    assert!(!out.contains("tampered"), "no tampering accusation is expected: {}", out);
 
-    // WHICH parcel is accused, not merely that something is. The claim under test is that the
-    // LEGACY, pre-trust parcel is falsely accused once its boundary attestation is collected; an
-    // `audit` that accused some other parcel, or accused this one on a different ground while
-    // still saying "tampered", would leave the leg green with its claim gone. The sibling leg
-    // below already pins this; both prior review rounds passed over the gap here.
+    // The pre-trust parcel reachable from `main` (`legacy` itself) must be counted as legacy, not
+    // silently dropped from the tally — a `verified` audit that stopped mentioning legacy parcels
+    // at all would still pass the two assertions above while losing the claim under test.
     assert!(
-        out.contains(&legacy),
-        "the accusation must name the legacy parcel {}: {}",
-        legacy, out
-    );
-
-    // The second false claim, asserted rather than printed — review found this one printed-only in
-    // the leg below, for the third time in this document's history.
-    assert!(
-        out.contains("was stacked after trust was established"),
-        "expected the post-trust misdating of a pre-trust parcel: {}",
+        out.contains("1 legacy parcel(s) predate trust and are unsigned"),
+        "expected the legacy tally to count exactly the one pre-trust parcel reachable from \
+        `main`: {}",
         out
     );
 }
 
-/// §4.1b: is the anchor-`boundary` false-tampering state CONSTRUCTIBLE?
+/// THE FIX (FORK-81): does the boundary head survive gc even when the *pallet ref* that
+/// happened to reach it is dropped entirely — not merely undone — and does `audit` still pass?
 ///
-/// The design claimed a legacy (pre-trust) parcel whose attesting boundary head has been collected
-/// makes `audit` fail the whole warehouse with "may have been tampered with"
-/// (`audit_utils.rs:354-375`). Review objected that the conditions fight each other: gc drops what is
-/// unreachable from the refs, and the boundary walk is reachability over the *same* parent edges, so a
-/// legacy parcel whose only attesting head was collected is normally collected with it.
+/// The boundary is a **snapshot at enroll time**, so it can name a head no ref currently
+/// reaches even without `undo`: create a second ref at an *ancestor* after the snapshot, then
+/// drop the ref that held the boundary head outright (`delete_pallet_ref`, not a shipped verb —
+/// this leg is the direct-deletion sibling of the CLI-only leg above). Before the fix, `b`'s
+/// only tie to gc's live set was that ref, so dropping it collected `b` even though a signed
+/// revocation-free anchor still named it as the boundary. Now `anchor.boundary` is a GC root in
+/// its own right (`office_utils::collect_trust_pin_roots`), independent of any pallet ref, so
+/// `b` survives regardless.
 ///
-/// The seam that separates them: the boundary is a **snapshot at enroll time**. Create a second ref at
-/// an *ancestor* AFTER the snapshot, then drop the ref holding the boundary head. The ancestor stays
-/// alive (the new ref holds it) while its only boundary attestation is collected.
+/// This was `a_legacy_parcel_outlives_the_boundary_head_that_attested_it`, and it was green
+/// pinning the DEFECT (`b` collected, `legacy` outliving it, `audit` refusing with a tampering
+/// accusation naming `legacy`). Reverting the production fix reddens `b_present` first.
 #[test]
-fn a_legacy_parcel_outlives_the_boundary_head_that_attested_it() {
+fn a_boundary_head_and_the_legacy_parcel_it_attested_both_survive_gc() {
     let warehouse = Warehouse::new_unenrolled("anchor");
 
     // Pre-trust, unsigned history on `main`: legacy <- b.
@@ -421,7 +435,7 @@ fn a_legacy_parcel_outlives_the_boundary_head_that_attested_it() {
     // itself a boundary entry — its only attestation is being an ancestor of `b`.
     warehouse.run_ok(&["palletize", "keep", &legacy]);
 
-    // Drop `main`. `b` becomes reachable from no ref; `legacy` stays alive through `keep`.
+    // Drop `main` outright. No ref reaches `b` any more; `legacy` stays alive through `keep`.
     warehouse.delete_pallet_ref("main");
 
     let stats = warehouse.scoped(|| gc_utils::collect_garbage(0).expect("gc runs"));
@@ -441,39 +455,25 @@ fn a_legacy_parcel_outlives_the_boundary_head_that_attested_it() {
     );
 
     println!(
-        "ANCHOR: gc deleted {}; b present = {}; legacy present = {}; audit exit = {:?}\n{}",
+        "FIXED: gc deleted {}; b present = {}; legacy present = {}; audit exit = {:?}\n{}",
         stats.deleted, b_present, legacy_present, audit.status.code(), out.trim()
     );
 
-    // The fixture itself: the attesting head is gone, the attested parcel is not.
-    assert!(!b_present, "the boundary head must have been collected");
+    assert!(b_present, "the boundary head must survive gc even with no ref reaching it");
     assert!(legacy_present, "the legacy parcel must survive through `keep`");
 
-    // THE CLAIM UNDER TEST. If this fails, the review's objection stands and §4.1b's hazard is not
-    // constructible this way — which retires the last argument for changing any root set.
+    // THE CLAIM UNDER TEST.
     assert!(
-        !audit.status.success(),
-        "audit SUCCEEDED over a legacy parcel with no surviving boundary attestation — the \
-         false-tampering hazard is NOT constructible this way"
-    );
-    assert!(
-        out.contains("tampered"),
-        "audit failed for some other reason than the boundary attestation: {}",
+        audit.status.success(),
+        "audit must succeed: the boundary head survived, so the trust boundary still resolves \
+        and the legacy parcel is not falsely accused. output: {}",
         out
     );
+    assert!(!out.contains("tampered"), "no tampering accusation is expected: {}", out);
     assert!(
-        out.contains(&legacy),
-        "the tampering error must name the legacy parcel {}: {}",
-        legacy, out
-    );
-
-    // The SECOND false claim, asserted rather than printed. Review found this printed-only — the
-    // third occurrence of that error in this work — so the "two false claims, not one" statement had
-    // no falsifier: rewording `audit_utils.rs:362-366` would have left this leg green while the
-    // claim quietly stopped being about anything.
-    assert!(
-        out.contains("was stacked after trust was established"),
-        "the message must also misdate this pre-trust parcel as post-trust: {}",
+        out.contains("1 legacy parcel(s) predate trust and are unsigned"),
+        "expected the legacy tally to count exactly the one pre-trust parcel reachable from \
+        `keep`: {}",
         out
     );
 }

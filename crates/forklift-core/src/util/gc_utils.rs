@@ -162,13 +162,15 @@ pub(crate) fn collect_live_set() -> Result<HashSet<String>, String> {
     // collect_walk_roots`) is allowed to differ.
     roots.extend(bay_utils::collect_bay_scoped_parcel_roots(&bay_dirs, bay_utils::BayReadPolicy::FailClosed)?.roots);
 
-    // A re-genesis anchor (§8.7) pins the replaced office chain as attested history;
-    // the pin is a GC root, or the attested chain would be collected as unreachable.
-    if let Some(anchor) = crate::util::office_utils::read_trust_anchor()? {
-        if let Some(adopts) = anchor.adopts {
-            roots.push(adopts);
-        }
-    }
+    // The trust anchor's durable hash pins — the re-genesis `adopts` pin, the enrollment
+    // `boundary` snapshot, and every key's revocation `distrust_boundary` — are GC roots,
+    // or the attested/pre-trust/vouched-for history they pin would be collected as
+    // unreachable the moment the pallet ref that happens to also reach it moves away.
+    // Shared with `recovery_utils::collect_walk_roots` via `office_utils::
+    // collect_trust_pin_roots` (FORK-81) so the two root lists can never drift on this
+    // portion — see that helper's own doc comment, and re-check it before editing this
+    // list; it documents the superset invariant this list must stay a subset of.
+    roots.extend(crate::util::office_utils::collect_trust_pin_roots()?);
 
     let parcels = audit_utils::collect_reachable_present(&roots)?;
 

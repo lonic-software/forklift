@@ -1196,7 +1196,9 @@ fn classify_vanished(relative: &Path) -> VanishedClass {
 struct WalkRoots {
     /// Parcel hashes to walk ancestry-and-tree-closure from: every pallet head (both namespaces),
     /// every bay's parked parcels, every tag's subject parcel, every bay's in-progress
-    /// consolidation `their_head`, and the trust anchor's adopted head (if any).
+    /// consolidation `their_head`, and every trust-pin root (the trust anchor's adopted head, its
+    /// enrollment boundary, and every key's revocation distrust boundary — see
+    /// `office_utils::collect_trust_pin_roots`), if any.
     parcels: Vec<String>,
     /// Object hashes a staged inventory shard (of any bay) references directly (never through a
     /// parcel), with the entry's type (so a chunked file's recipe is still descended into for its
@@ -1223,23 +1225,25 @@ struct WalkRoots {
 ///
 /// **Invariant with [`gc_utils::collect_live_set`](crate::util::gc_utils::collect_live_set):**
 /// this walk's roots must stay a *superset* of gc's live-set roots (every pallet head, every
-/// bay's parked parcels, every bay's in-progress consolidation `their_head`, and the shared
-/// trust-anchor `adopts`) — plus every tag's subject and every bay's staged inventory shards,
-/// sources gc deliberately does not root (tags are not a gc root today; an unstacked staged
-/// shard is a pre-existing, accepted gc design choice, not a bug this walk needs to match). If
-/// gc ever treats an object as live, this walk must never call the same object safe to drop —
-/// otherwise `forklift heal` could clear a taint over an object `forklift gc` would refuse to
-/// delete. The parked-parcels/consolidation portion of that shared root list is not duplicated
-/// here — both this function and `collect_live_set` call
+/// bay's parked parcels, every bay's in-progress consolidation `their_head`, and every trust-pin
+/// root — the shared trust-anchor `adopts`, its `boundary` snapshot, and every key's revocation
+/// `distrust_boundary`, FORK-81) — plus every tag's subject and every bay's staged inventory
+/// shards, sources gc deliberately does not root (tags are not a gc root today; an unstacked
+/// staged shard is a pre-existing, accepted gc design choice, not a bug this walk needs to
+/// match). If gc ever treats an object as live, this walk must never call the same object safe
+/// to drop — otherwise `forklift heal` could clear a taint over an object `forklift gc` would
+/// refuse to delete. The parked-parcels/consolidation portion of that shared root list is not
+/// duplicated here — both this function and `collect_live_set` call
 /// [`bay_utils::collect_bay_scoped_parcel_roots`] for it, so the two can never drift apart on
-/// that portion by construction. That helper takes the bay dirs as a parameter rather than
-/// enumerating them itself specifically so a caller that also needs those dirs for something
-/// else — this function, for staged inventory shards — can enumerate them once
-/// ([`bay_utils::all_bay_state_dirs`]) and feed the same `Vec` to both the helper and its own
-/// extra loop, instead of `bay_utils::list_bays` running twice per heal. **A future edit adding a
-/// new bay-local ref source should still re-check both callers of the shared helper, and re-check
-/// the other function's root list for anything not routed through it (tags, shards, the trust
-/// anchor).**
+/// that portion by construction; the trust-pin portion is likewise shared through
+/// [`office_utils::collect_trust_pin_roots`], for the same reason. That helper takes the bay
+/// dirs as a parameter rather than enumerating them itself specifically so a caller that also
+/// needs those dirs for something else — this function, for staged inventory shards — can
+/// enumerate them once ([`bay_utils::all_bay_state_dirs`]) and feed the same `Vec` to both the
+/// helper and its own extra loop, instead of `bay_utils::list_bays` running twice per heal.
+/// **A future edit adding a new bay-local or trust-pin ref source should still re-check both
+/// callers of the relevant shared helper, and re-check the other function's root list for
+/// anything not routed through one (tags, shards).**
 ///
 /// **Tolerant, unlike `collect_live_set`.** This call passes [`bay_utils::BayReadPolicy::
 /// Tolerate`], not `FailClosed`: `forklift heal` is the very command a standing taint tells
@@ -1294,12 +1298,11 @@ fn collect_walk_roots() -> Result<WalkRoots, String> {
         walk_shard_files(&dir.join(FOLDER_NAME_INVENTORY_ROOT), &mut shard_referenced)?;
     }
 
-    // The trust anchor is shared (warehouse-global): read once, not per bay.
-    if let Some(anchor) = office_utils::read_trust_anchor()? {
-        if let Some(adopts) = anchor.adopts {
-            parcels.push(adopts);
-        }
-    }
+    // The trust anchor's pins are shared (warehouse-global): read once, not per bay, via
+    // the same `office_utils::collect_trust_pin_roots` gc's live set calls (FORK-81) — the
+    // `adopts` pin, the enrollment `boundary` snapshot, and every key's revocation
+    // `distrust_boundary` — so the two root lists can never drift on this portion either.
+    parcels.extend(office_utils::collect_trust_pin_roots()?);
 
     Ok(WalkRoots { parcels, shard_referenced, degraded_bays: bay_scope.degraded })
 }

@@ -234,7 +234,9 @@ pub struct BayScopeOutcome {
 /// data loss (`heal` clearing a taint over an object `gc` still refuses to delete, or `gc`
 /// deleting an object `heal` would have called live). Recovery additionally walks per-bay
 /// staged inventory shards and adds every tag's subject (sources gc deliberately does not
-/// root); both additionally add the shared trust-anchor `adopts`. Neither of those is part of
+/// root); both additionally add the shared trust-pin roots (`adopts`, the enrollment `boundary`
+/// snapshot, and every key's revocation `distrust_boundary` — FORK-81) via `office_utils::
+/// collect_trust_pin_roots`. Neither of those is part of
 /// this helper — only the portion the two loops had in common.
 ///
 /// **`policy` decides what an unreadable bay does — see [`BayReadPolicy`].** gc's call site

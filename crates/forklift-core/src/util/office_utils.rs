@@ -510,6 +510,56 @@ pub fn read_trust_anchor() -> Result<Option<TrustAnchor>, String> {
     }))
 }
 
+/// Every durable hash pin the trust anchor and the key registry hold: the re-genesis
+/// `adopts` pin, the enrollment `boundary` snapshot, and every key's revocation
+/// `distrust_boundary` (§8.11). All three are pallet-head hashes a signed record commits
+/// to by value, with no other pointer keeping them alive — a pallet ref that moves away
+/// (or is deleted) leaves nothing else naming them, so a walk that only follows refs
+/// would collect the very history these pins attest.
+///
+/// Shared by [`gc_utils::collect_live_set`](crate::util::gc_utils::collect_live_set) and
+/// [`recovery_utils::collect_walk_roots`](crate::util::recovery_utils::collect_walk_roots)
+/// so the two root lists can never drift apart on this portion — the same reason
+/// [`bay_utils::collect_bay_scoped_parcel_roots`](crate::util::bay_utils::collect_bay_scoped_parcel_roots)
+/// is shared between them for the bay-scoped portion; see that function's doc comment for
+/// the superset invariant this helper's callers must both keep true.
+///
+/// Fail-closed: an unreadable trust file or office record errors rather than silently
+/// returning fewer roots than the door actually holds — every caller feeds either a
+/// sweep that deletes objects or a walk whose "not referenced" answer other code trusts,
+/// so under-counting here is unsafe in exactly the way it is for `collect_live_set`
+/// itself. **No anchor means no roots**: signing has not been established, so there is no
+/// boundary snapshot and (since a key can only be revoked once the office pallet exists)
+/// no revocation to pin either.
+///
+/// # Returns
+/// * `Ok(Vec<String>)` - Every trust/distrust pin hash, in no particular order and with
+///                        no deduplication (callers push these onto a larger root bag
+///                        alongside other sources, which already tolerates duplicates).
+///                        Empty if no trust anchor exists.
+/// * `Err(String)`      - If the trust anchor or the office state could not be read.
+pub fn collect_trust_pin_roots() -> Result<Vec<String>, String> {
+    let Some(anchor) = read_trust_anchor()? else {
+        return Ok(Vec::new());
+    };
+
+    let mut roots: Vec<String> = Vec::new();
+
+    if let Some(adopts) = anchor.adopts {
+        roots.push(adopts);
+    }
+
+    roots.extend(anchor.boundary);
+
+    let office = read_office_state()?;
+
+    for key in &office.keys {
+        roots.extend(key.distrust_boundary.iter().cloned());
+    }
+
+    Ok(roots)
+}
+
 /// Write the trust anchor. This is a one-way door: once signing is established it can
 /// never be disabled (admin lockout is handled by archive + re-genesis, not by an
 /// unsigned escape hatch), so overwriting an existing anchor is refused.
