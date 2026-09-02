@@ -133,6 +133,21 @@ pub fn collect_garbage(grace_seconds: u64) -> Result<GcStats, String> {
 /// scope away from is still ordinary reachable history — reachable from a pallet head, therefore
 /// live, therefore never freed here. Reclaiming disk for narrowed-away content is a separate,
 /// deliberate, destructive operation; it is never something this reachability sweep does.
+///
+/// **The office chain is the one root set that must be *loadable*, not merely tolerated-if-
+/// absent.** The tolerance above is about descending into an already-collected root's tree/blob
+/// closure — an ordinary pallet head that itself cannot be read is simply skipped by the
+/// reachability walk below it (`audit_utils::collect_reachable_present` treats an absent head as
+/// a gap, contributing nothing, never an error). Computing the *root set itself* is different:
+/// every revoked key's `distrust_boundary` pin can only be found by reading the office pallet's
+/// own head parcel, tracked-keys tree and key-record blobs (`office_utils::
+/// collect_trust_pin_roots`), and this call passes it `TrustPinReadPolicy::FailClosed` — an
+/// unreadable office record aborts `collect_live_set` outright rather than silently returning a
+/// pin list gc cannot prove complete, because under-counting here means sweeping a hash a signed
+/// revocation still names. `forklift heal`'s own root collection
+/// (`recovery_utils::collect_walk_roots`) needs the opposite call for the same read — see that
+/// function's own doc comment for why a sweep and a non-deleting recovery walk are allowed to
+/// differ here the way they already differ on an unreadable bay (`bay_utils::BayReadPolicy`).
 pub(crate) fn collect_live_set() -> Result<HashSet<String>, String> {
     let mut roots: Vec<String> = Vec::new();
 
@@ -168,9 +183,13 @@ pub(crate) fn collect_live_set() -> Result<HashSet<String>, String> {
     // unreachable the moment the pallet ref that happens to also reach it moves away.
     // Shared with `recovery_utils::collect_walk_roots` via `office_utils::
     // collect_trust_pin_roots` (FORK-81) so the two root lists can never drift on this
-    // portion — see that helper's own doc comment, and re-check it before editing this
-    // list; it documents the superset invariant this list must stay a subset of.
-    roots.extend(crate::util::office_utils::collect_trust_pin_roots()?);
+    // portion — see `recovery_utils::collect_walk_roots`'s own doc comment (the single place
+    // the superset invariant this list must stay a subset of is actually stated) before
+    // editing this list. `FailClosed` here, unconditionally — see this function's own doc
+    // comment on why the office chain, unlike an ordinary pallet head, must be loadable.
+    roots.extend(crate::util::office_utils::collect_trust_pin_roots(
+        crate::util::office_utils::TrustPinReadPolicy::FailClosed
+    )?.roots);
 
     let parcels = audit_utils::collect_reachable_present(&roots)?;
 
@@ -630,6 +649,38 @@ mod tests {
         assert!(gc_result.is_err(), "gc must refuse rather than reclaim when a bay's ref source is unreadable");
         assert!(loose_path(&garbage).exists(),
             "gc must delete nothing when the live set could not be computed, even unrelated garbage");
+    }
+
+    /// Finding 6 (round 1, PR #120): `collect_live_set` must ERROR, not silently narrow the
+    /// trust-pin roots, when the office record backing every revoked key's `distrust_boundary`
+    /// pin cannot be read — see this module's own doc comment (above `collect_live_set`) on why
+    /// the office chain is the one root set this sweep requires to be loadable, unlike an
+    /// ordinary pallet head. Fixture: a trust anchor exists (so `collect_trust_pin_roots`
+    /// proceeds past the "no anchor, no roots" early return) but the office pallet ref names a
+    /// parcel hash never actually stored — the same ref-advanced-before-parcel-durable crash
+    /// window `forklift heal` exists to recover from (Finding 1's own fixture, on the tolerant
+    /// side of this exact split).
+    #[test]
+    fn collect_live_set_errors_when_the_office_head_object_is_absent() {
+        let _scratch = Scratch::new("gc-office-head-absent");
+
+        crate::util::office_utils::write_trust_anchor(&crate::util::office_utils::TrustAnchor {
+            genesis: "0".repeat(64),
+            enabled_at: 0,
+            boundary: Vec::new(),
+            prior_genesis: None,
+            adopts: None,
+        }).unwrap();
+
+        let never_stored_office_head = "f".repeat(64);
+        pallet_utils::set_meta_pallet_head(
+            crate::util::office_utils::OFFICE_PALLET_NAME, &never_stored_office_head
+        ).unwrap();
+
+        let result = collect_live_set();
+        assert!(result.is_err(),
+            "an unreadable office record must fail collect_live_set closed, not silently narrow \
+             the trust-pin roots");
     }
 
     /// DESIGN.html §5.0 D item 10, finding #3: a `WriteBatch`-staged write that never reaches

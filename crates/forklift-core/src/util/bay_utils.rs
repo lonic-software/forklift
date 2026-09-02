@@ -190,7 +190,9 @@ pub fn all_bay_state_dirs() -> Result<Vec<PathBuf>, String> {
 /// using `Tolerate` must independently refuse to treat any "not referenced" verdict from a run
 /// with a non-empty [`BayScopeOutcome::degraded`] as proof of anything** — see
 /// `recovery_utils::resolve_the_rest`'s and `recovery_utils::rescan_torn_taint`'s own handling of
-/// their walk's `degraded_bays` for how that plays out at each call site.
+/// their walk's `degraded_sources` (which folds this bay-scoped source together with the
+/// office-record source — see `recovery_utils::WalkRoots::degraded_sources`) for how that plays
+/// out at each call site.
 pub enum BayReadPolicy {
     /// Abort the whole call on the first unreadable bay — see this enum's doc comment. Required
     /// wherever the result feeds a destructive sweep.

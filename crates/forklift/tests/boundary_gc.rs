@@ -3,7 +3,7 @@
 //!
 //! `gc_utils::collect_live_set` roots pallet refs, bay-scoped parcels and every trust-pin root
 //! (`office_utils::collect_trust_pin_roots`: the anchor's `adopts` pin, its `boundary` snapshot,
-//! and every key's revocation `distrust_boundary`) (`gc_utils.rs:136-171`). Several other places
+//! and every key's revocation `distrust_boundary`). Several other places
 //! still write a parcel or object hash durably with no such root, and read it back regardless.
 //! When gc collects an unrooted referent, each reader fails differently — and the members
 //! disagree about what correct behaviour even is, which is why the pallet-lifecycle design
@@ -314,9 +314,10 @@ fn a_distrust_boundary_pin_survives_its_pallet_ref_being_deleted() {
 ///
 /// Before the fix, `undo` moving a head *backwards* (`journal_utils.rs:191`) orphaned the
 /// boundary head with no ref-deletion verb at all, and `compact --all` then dropped it once it
-/// had been packed — which left `audit` unable to resolve the trust boundary. Now `anchor.
-/// boundary` is itself a GC root (`office_utils::collect_trust_pin_roots`), so the same repack
-/// keeps it, and the boundary always resolves.
+/// had been packed — which left `audit` refusing with a tampering accusation, since the boundary
+/// head it needed to resolve the pre-trust legacy tally was gone. Now `anchor.boundary` is itself
+/// a GC root (`office_utils::collect_trust_pin_roots`), so the same repack keeps it, and the
+/// boundary always resolves.
 ///
 /// This was `the_false_tampering_state_is_reachable_with_shipped_commands_only`, and it was
 /// green pinning the DEFECT (the boundary head reclaimed, `audit` refusing with a tampering
@@ -338,9 +339,12 @@ fn an_undone_boundary_head_survives_the_sweep_and_audit_passes() {
     });
     assert_eq!(boundary, vec![b.clone()], "the boundary must be exactly [b]");
 
-    // Pack. Before the fix a repack only drops already-packed garbage (`pack_utils.rs:1679-
-    // 1680`), so this step made `compact --all` below able to drop `b`; now `b` is rooted and
-    // survives the repack regardless.
+    // Pack. NOT vestigial: `compact --all` below only ever reclaims already-PACKED garbage, never
+    // loose objects (`pack_utils.rs:1678-1679`) — so without this step `b` would still be loose
+    // when `compact --all` runs, which would leave it present regardless of whether `b` is
+    // actually rooted. This step is what makes the leg a falsifier at all: it is what makes `b`'s
+    // survival below actually depend on the fix under test, rather than passing vacuously either
+    // way (stuck-green).
     warehouse.run_ok(&["compact"]);
 
     // Soft undo moves `main` back off `b`, orphaning it (no pallet ref reaches `b` any more).
@@ -484,8 +488,9 @@ fn a_boundary_head_and_the_legacy_parcel_it_attested_both_survive_gc() {
 ///
 /// The pin: `CherryPickState.source` (`cherry_pick_utils.rs:33`) is written to disk by
 /// `write_state` (`:88-90`). It is not rooted — `gc_utils::collect_live_set` roots pallet heads,
-/// bay-scoped parcels and `anchor.adopts` (`gc_utils.rs:136-171`), and a `grep` for "cherry" in
-/// `gc_utils.rs`/`bay_utils.rs` returns nothing.
+/// bay-scoped parcels and every trust-pin root (`anchor.adopts`, its `boundary` snapshot, and
+/// every key's `distrust_boundary` — `office_utils::collect_trust_pin_roots`), and a `grep` for
+/// "cherry" in `gc_utils.rs`/`bay_utils.rs`/`office_utils.rs` returns nothing.
 ///
 /// The reader: the completing `stack` calls `collect_source_authors` (`stack_utils.rs:233`),
 /// which calls `object_utils::load_parcel(source)?` (`cherry_pick_utils.rs:120`) and propagates

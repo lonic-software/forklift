@@ -487,15 +487,14 @@ pub fn read_trust_anchor() -> Result<Option<TrustAnchor>, String> {
     let enabled_at = doc.get("enabled_at").and_then(|item| item.as_integer())
         .ok_or("The trust file has no \"enabled_at\" entry.".to_string())?;
 
-    let boundary: Vec<String> = doc.get("boundary")
-        .and_then(|item| item.as_array())
-        .map(|array| {
-            array.iter()
-                .filter_map(|entry| entry.as_str())
-                .map(|hash| hash.to_string())
-                .collect()
-        })
-        .unwrap_or_default();
+    // Required and strict: `write_trust_anchor_file` always writes this key, even when the
+    // boundary is empty (an empty array, never an omitted key) — so a trust file missing it, or
+    // carrying a non-string entry, is corrupt, never merely "an old/lenient shape" to shrug off.
+    // Silently dropping a non-string entry (the previous `filter_map` behavior) would under-count
+    // roots and let `gc` collect a pinned head — exactly what this helper's callers rely on this
+    // parse never doing (CLAUDE.md: fail loudly on anything no longer understood, never fall back
+    // to a permissive default).
+    let boundary = read_required_string_array(&doc, "boundary", "trust file")?;
 
     let field = |name: &str| doc.get(name)
         .and_then(|item| item.as_str())
@@ -510,6 +509,47 @@ pub fn read_trust_anchor() -> Result<Option<TrustAnchor>, String> {
     }))
 }
 
+/// How [`collect_trust_pin_roots`] treats an unreadable office record (the parcel history that
+/// carries every revoked key's own `distrust_boundary` pin) — mirrors
+/// [`bay_utils::BayReadPolicy`](crate::util::bay_utils::BayReadPolicy)'s `FailClosed`/`Tolerate`
+/// split, and for the same underlying reason: the office chain can be unreadable *exactly* when
+/// it is mid-crash — `office admit`/`office rotate`/`office revoke` advance the office pallet ref
+/// before its parcel object is durable, the textbook case `forklift heal` exists to recover from
+/// (DESIGN.html §3.1.1) — so a caller that always failed closed on that would brick the very
+/// command a standing taint tells the operator to run.
+///
+/// The trust *file* itself (`read_trust_anchor`, and therefore the `adopts`/`boundary` pins) is
+/// never covered by this policy: it is a plain local file, not an object-store parcel subject to
+/// the ref-before-parcel crash window, so an unreadable trust file stays an unconditional `Err`
+/// under both variants.
+pub enum TrustPinReadPolicy {
+    /// Abort on an unreadable office record. Required wherever the result feeds a destructive
+    /// sweep ([`gc_utils::collect_live_set`](crate::util::gc_utils::collect_live_set)) — an
+    /// unreadable source cannot be proven not to pin some object, so skipping it to keep a sweep
+    /// going would silently under-count roots.
+    FailClosed,
+    /// Skip an unreadable office record — contributing only the trust anchor's own `adopts` and
+    /// `boundary` pins, never a revoked key's `distrust_boundary` (that requires reading the
+    /// office record itself) — and report the omission via the returned outcome's `degraded`,
+    /// instead of aborting. Sound only for a caller — `forklift heal`
+    /// ([`recovery_utils::collect_walk_roots`](crate::util::recovery_utils::collect_walk_roots))
+    /// — that treats a `Some` `degraded` the same way it already treats a degraded bay: as "this
+    /// run's negative answers are not proof," never as license to clear or delete anything.
+    Tolerate,
+}
+
+/// [`collect_trust_pin_roots`]'s result.
+pub struct TrustPinRootsOutcome {
+    /// Every trust/distrust pin hash this call could establish, in no particular order and with
+    /// no deduplication (callers push these onto a larger root bag alongside other sources, which
+    /// already tolerates duplicates). Empty if no trust anchor exists.
+    pub roots: Vec<String>,
+    /// A plain-language note if the office record could not be read this run — only ever
+    /// populated under [`TrustPinReadPolicy::Tolerate`] (`FailClosed` returns `Err` instead of
+    /// populating this). `None` on the common path.
+    pub degraded: Option<String>,
+}
+
 /// Every durable hash pin the trust anchor and the key registry hold: the re-genesis
 /// `adopts` pin, the enrollment `boundary` snapshot, and every key's revocation
 /// `distrust_boundary` (§8.11). All three are pallet-head hashes a signed record commits
@@ -521,26 +561,26 @@ pub fn read_trust_anchor() -> Result<Option<TrustAnchor>, String> {
 /// [`recovery_utils::collect_walk_roots`](crate::util::recovery_utils::collect_walk_roots)
 /// so the two root lists can never drift apart on this portion — the same reason
 /// [`bay_utils::collect_bay_scoped_parcel_roots`](crate::util::bay_utils::collect_bay_scoped_parcel_roots)
-/// is shared between them for the bay-scoped portion; see that function's doc comment for
-/// the superset invariant this helper's callers must both keep true.
+/// is shared between them for the bay-scoped portion; see
+/// [`recovery_utils::collect_walk_roots`](crate::util::recovery_utils::collect_walk_roots)'s own
+/// doc comment for the superset invariant this helper's callers must both keep true — that is the
+/// single place the full invariant is actually stated; `bay_utils`'s own doc comment covers only
+/// the bay-scoped portion.
 ///
-/// Fail-closed: an unreadable trust file or office record errors rather than silently
-/// returning fewer roots than the door actually holds — every caller feeds either a
-/// sweep that deletes objects or a walk whose "not referenced" answer other code trusts,
-/// so under-counting here is unsafe in exactly the way it is for `collect_live_set`
-/// itself. **No anchor means no roots**: signing has not been established, so there is no
-/// boundary snapshot and (since a key can only be revoked once the office pallet exists)
-/// no revocation to pin either.
+/// `policy` decides what an unreadable **office record** does — see [`TrustPinReadPolicy`]. The
+/// trust file itself (`adopts`/`boundary`) is unconditionally fail-closed regardless of `policy` —
+/// see that enum's own doc comment for why. **No anchor means no roots**: signing has not been
+/// established, so there is no boundary snapshot and (since a key can only be revoked once the
+/// office pallet exists) no revocation to pin either.
 ///
 /// # Returns
-/// * `Ok(Vec<String>)` - Every trust/distrust pin hash, in no particular order and with
-///                        no deduplication (callers push these onto a larger root bag
-///                        alongside other sources, which already tolerates duplicates).
-///                        Empty if no trust anchor exists.
-/// * `Err(String)`      - If the trust anchor or the office state could not be read.
-pub fn collect_trust_pin_roots() -> Result<Vec<String>, String> {
+/// * `Ok(TrustPinRootsOutcome)` - The pin hashes this call could establish, plus (under
+///                                `Tolerate`) a note if the office record itself was unreadable.
+/// * `Err(String)`              - If the trust file could not be read, or (under `FailClosed`)
+///                                the office record could not be read.
+pub fn collect_trust_pin_roots(policy: TrustPinReadPolicy) -> Result<TrustPinRootsOutcome, String> {
     let Some(anchor) = read_trust_anchor()? else {
-        return Ok(Vec::new());
+        return Ok(TrustPinRootsOutcome { roots: Vec::new(), degraded: None });
     };
 
     let mut roots: Vec<String> = Vec::new();
@@ -551,13 +591,36 @@ pub fn collect_trust_pin_roots() -> Result<Vec<String>, String> {
 
     roots.extend(anchor.boundary);
 
-    let office = read_office_state()?;
+    match read_office_state() {
+        Ok(office) => {
+            for key in &office.keys {
+                roots.extend(key.distrust_boundary.iter().cloned());
+            }
 
-    for key in &office.keys {
-        roots.extend(key.distrust_boundary.iter().cloned());
+            Ok(TrustPinRootsOutcome { roots, degraded: None })
+        }
+        Err(e) => match policy {
+            TrustPinReadPolicy::FailClosed => Err(e),
+            TrustPinReadPolicy::Tolerate => Ok(TrustPinRootsOutcome {
+                roots,
+                degraded: Some(degraded_office_note(&e)),
+            }),
+        },
     }
+}
 
-    Ok(roots)
+/// Plain-language note for an office record [`collect_trust_pin_roots`] could not read under
+/// [`TrustPinReadPolicy::Tolerate`] — names the mechanical error and what it means for the roots
+/// this call still returned (the trust anchor's own `adopts`/`boundary` pins, unaffected), never a
+/// Rust path or internal identifier. Mirrors `bay_utils::degraded_bay_note`'s shape.
+fn degraded_office_note(error: &str) -> String {
+    format!(
+        "the office record could not be read this run ({}); every revoked key's own distrust \
+        boundary pin was treated as missing rather than blocking this command (the trust \
+        anchor's own \"adopts\"/\"boundary\" pins are unaffected). Run \"forklift heal\" again \
+        once the office record is restaged.",
+        error
+    )
 }
 
 /// Write the trust anchor. This is a one-way door: once signing is established it can
@@ -986,15 +1049,14 @@ fn parse_key_record(toml: &str) -> Result<KeyRecord, String> {
         None => None,
     };
 
-    let distrust_boundary = doc.get("distrust_boundary")
-        .and_then(|item| item.as_array())
-        .map(|array| {
-            array.iter()
-                .filter_map(|entry| entry.as_str())
-                .map(|hash| hash.to_string())
-                .collect()
-        })
-        .unwrap_or_default();
+    // Optional, unlike the trust anchor's `boundary`: `key_record_to_toml` omits this key
+    // entirely for an active (never-revoked) key — the overwhelming majority of records — so a
+    // missing key here is the normal, expected shape and must parse as an empty boundary, not an
+    // error. What must still fail loudly is a *present* entry that is malformed: a non-array
+    // value, or any non-string element, silently dropped by the previous `filter_map` — exactly
+    // the same under-counting hazard `boundary`'s strict parse above closes, just for a field
+    // that is legitimately absent instead of always-present.
+    let distrust_boundary = read_optional_string_array(&doc, "distrust_boundary", "key record")?;
 
     Ok(KeyRecord {
         key_id: read_string(&doc, "key_id", "key record")?,
@@ -1023,6 +1085,45 @@ fn read_integer(doc: &DocumentMut, field: &str, record_kind: &str) -> Result<i64
     doc.get(field)
         .and_then(|item| item.as_integer())
         .ok_or(format!("A {} has no \"{}\" entry.", record_kind, field))
+}
+
+/// Read a required array-of-hashes field, strictly: the key must be present and every entry must
+/// be a string, or this errors naming the record kind, the field and (for a bad entry) its index
+/// — never silently drops an entry the way a `filter_map` would. For a field the writer always
+/// serializes (even when empty), a missing key is corruption, not an old/lenient shape.
+fn read_required_string_array(doc: &DocumentMut, field: &str, record_kind: &str) -> Result<Vec<String>, String> {
+    let array = doc.get(field)
+        .and_then(|item| item.as_array())
+        .ok_or_else(|| format!("A {} has no \"{}\" array entry.", record_kind, field))?;
+
+    strict_string_array(array, field, record_kind)
+}
+
+/// Read an optional array-of-hashes field, strictly: an absent key is a valid empty list (the
+/// field's normal, expected shape when the writer omits it), but a *present* key must be an
+/// array of strings, or this errors the same way [`read_required_string_array`] does — an absent
+/// field and a malformed one are never conflated.
+fn read_optional_string_array(doc: &DocumentMut, field: &str, record_kind: &str) -> Result<Vec<String>, String> {
+    let Some(item) = doc.get(field) else { return Ok(Vec::new()); };
+
+    let array = item.as_array()
+        .ok_or_else(|| format!("A {}'s \"{}\" entry is present but is not an array.", record_kind, field))?;
+
+    strict_string_array(array, field, record_kind)
+}
+
+/// Shared body: every entry of `array` must be a string, or this errors naming the record kind,
+/// the field and the offending entry's index — the strict counterpart of a `filter_map` that
+/// would otherwise silently drop a non-string entry (under-counting whatever this array roots).
+fn strict_string_array(array: &toml_edit::Array, field: &str, record_kind: &str) -> Result<Vec<String>, String> {
+    array.iter()
+        .enumerate()
+        .map(|(index, entry)| entry.as_str()
+            .map(|s| s.to_string())
+            .ok_or_else(|| format!(
+                "A {} has a non-string entry in \"{}\" at index {}.", record_kind, field, index
+            )))
+        .collect()
 }
 
 #[cfg(test)]
@@ -1124,5 +1225,81 @@ mod tests {
                 "field at index {} does not affect UserRecord equality", index
             );
         }
+    }
+
+    /// Finding 5 (round 1, PR #120): `read_trust_anchor` used to parse `boundary` with
+    /// `filter_map(|e| e.as_str())`, silently dropping a non-string entry instead of erroring —
+    /// under-counting roots on a damaged trust file and letting `gc` collect a pinned head, the
+    /// opposite of what `collect_trust_pin_roots`'s own doc comment claims. `boundary` is a
+    /// required, always-serialized field (`write_trust_anchor_file` writes it even when empty),
+    /// so a malformed entry must fail loudly rather than be quietly dropped.
+    #[test]
+    fn a_non_string_boundary_entry_in_the_trust_file_errors_naming_it() {
+        use crate::globals::StorageRootScope;
+
+        let dir = std::env::temp_dir()
+            .join(format!("forklift-office-utils-malformed-boundary-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        let _scope = StorageRootScope::enter(&dir);
+
+        let path = forklift_root().join(FILE_NAME_TRUST);
+        std::fs::write(&path,
+            "genesis = \"genesis-hash\"\n\
+             enabled_at = 1\n\
+             boundary = [\"a-real-hash\", 7]\n"
+        ).unwrap();
+
+        let error = match read_trust_anchor() {
+            Err(e) => e,
+            Ok(_) => panic!("a non-string boundary entry must error, not be silently dropped"),
+        };
+        assert!(error.contains("\"boundary\""), "the error must name the field: {}", error);
+        assert!(error.contains("index 1"), "the error must name the offending index: {}", error);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The `distrust_boundary` twin of the test above — same lenience, same fix. Unlike
+    /// `boundary`, this field is legitimately *absent* for every active (never-revoked) key
+    /// (`key_record_to_toml` omits it), so only a present-but-malformed entry must error — see
+    /// the sibling test below for the missing-key case staying valid.
+    #[test]
+    fn a_non_string_distrust_boundary_entry_in_a_key_record_errors_naming_it() {
+        let toml = "key_id = \"k1\"\n\
+            operator = \"op@x\"\n\
+            public_key = \"ab\"\n\
+            issued_at = 1\n\
+            distrust_boundary = [\"a-real-hash\", 42]\n\
+            authorized_by = \"k1\"\n\
+            endorsement = \"ee\"\n\
+            proof_of_possession = \"pp\"\n";
+
+        let error = match parse_key_record(toml) {
+            Err(e) => e,
+            Ok(_) => panic!("a non-string distrust_boundary entry must error, not be silently dropped"),
+        };
+        assert!(error.contains("\"distrust_boundary\""), "the error must name the field: {}", error);
+        assert!(error.contains("index 1"), "the error must name the offending index: {}", error);
+    }
+
+    /// The other half of `distrust_boundary`'s strictness: unlike `boundary` (always written),
+    /// `key_record_to_toml` omits `distrust_boundary` entirely for an active key — the ordinary,
+    /// overwhelmingly common shape — so a record with no such key must still parse, as an empty
+    /// boundary, never as an error. Guards against over-correcting the lenience fix above into
+    /// breaking every active key's record.
+    #[test]
+    fn a_key_record_with_no_distrust_boundary_key_parses_as_empty() {
+        let toml = "key_id = \"k1\"\n\
+            operator = \"op@x\"\n\
+            public_key = \"ab\"\n\
+            issued_at = 1\n\
+            authorized_by = \"k1\"\n\
+            endorsement = \"ee\"\n\
+            proof_of_possession = \"pp\"\n";
+
+        let parsed = parse_key_record(toml)
+            .expect("a record with no distrust_boundary key must still parse");
+        assert!(parsed.distrust_boundary.is_empty());
     }
 }
