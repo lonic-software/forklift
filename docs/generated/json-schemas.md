@@ -1338,7 +1338,7 @@ A command not listed here either reports only the generic human-message shape `{
   "description": "The result of a `heal` run that fully resolved (or found nothing to resolve).",
   "properties": {
     "notes": {
-      "description": "Advisory notes that never blocked clearing: the \"re-run the load\" remedy for each vanished\ninventory shard in `resolved`, and a note for each bay whose local state could not be\nread this run (skipped rather than blocking recovery) naming the bay and how to clean it up.",
+      "description": "Advisory notes that never blocked clearing: the \"re-run the load\" remedy for each vanished\ninventory shard in `resolved`, a note for each bay whose local state could not be\nread this run (skipped rather than blocking recovery) naming the bay and how to clean it\nup, and a note for each trust pin (a trust or distrust boundary) this run confirmed is not\nheld locally.",
       "items": {
         "type": "string"
       },
