@@ -268,10 +268,11 @@ pub struct HealOutcome {
     pub resolved: Vec<String>,
     /// Advisory notes that never block clearing: the "re-run the load" remedy note for each
     /// vanished inventory shard, a note for each bay whose local state could not be read this run
-    /// (see `collect_walk_roots`'s `Tolerate` policy) naming the bay and how to clean it up, and
+    /// (see `collect_walk_roots`'s `Tolerate` policy) naming the bay and how to clean it up,
     /// (FORK-47, DESIGN.html §3.1.1) one line per quarantined or unenumerable pack index this run
     /// found — emitted unconditionally, whether or not this run's own taint touches it (see
-    /// [`run`]'s own doc comment).
+    /// [`run`]'s own doc comment) — and (F6, PR #120 round 2) one line per trust-pin root this run
+    /// confirmed is genuinely never held locally (see [`never_held_pin_note`]).
     pub notes: Vec<String>,
 }
 
@@ -797,6 +798,13 @@ async fn resolve_the_rest(
             relative.to_string_lossy()
         ));
     }
+    // F6, PR #120 round 2: a trust-pin root this run confirmed is genuinely never held locally
+    // never blocks clearing (it is exactly the gap `WalkRoots::pin_parcels` already tolerates —
+    // see `walk_closure_for`'s own doc comment), but it is still worth a note rather than staying
+    // completely silent — see `never_held_pin_note`'s own doc comment.
+    for hash in &walk.never_held_pins {
+        notes.push(never_held_pin_note(hash));
+    }
     // Any source `collect_walk_roots` had to skip can *never* reach here with `remainder`
     // empty — `roots_incomplete` above forces every hash the walk could not positively clear into
     // `remainder`, so a non-empty `walk.degraded_sources` always implies a non-empty `remainder`,
@@ -822,6 +830,23 @@ async fn resolve_the_rest(
     } else {
         Err(dangling_refusal(root, &dangling_lines, &walk.degraded_sources))
     }
+}
+
+/// Plain-language note for a trust-pin root [`walk_closure_for`] confirmed is genuinely never
+/// held locally (F6, PR #120 round 2) — see [`WalkClosureOutcome::never_held_pins`]'s own doc
+/// comment for exactly what "confirmed" means. Non-blocking by design: this is precisely the gap
+/// [`WalkRoots::pin_parcels`] already tolerates, never a dangling reference, so it is folded into
+/// [`HealOutcome::notes`] rather than [`WalkRoots::degraded_sources`] (which forces a refusal).
+/// Named because a standing gap here is exactly the state `forklift audit` names as an
+/// unresolvable trust boundary the next time it runs, and heal is the first point in the pipeline
+/// that actually knows about it.
+fn never_held_pin_note(hash: &str) -> String {
+    format!(
+        "trust pin \"{}\" is not held locally; this is expected for a boundary or distrust-\
+        boundary snapshot that was only ever declared, never fetched — if it should be held, \
+        fetch its history explicitly (a franchise, or an ordinary fetch of that head).",
+        hash
+    )
 }
 
 /// Record `hash`'s recorded taint path(s) — its loose path, or its pack data file plus
@@ -1005,12 +1030,17 @@ fn rescan_torn_taint(
         // `walk.degraded_sources` is guaranteed empty by this point — the guard above already
         // returned early otherwise — so there is no degraded-source note left to fold in here; a
         // rescan can only reach this `Ok` branch once every source was actually readable.
-        let notes = vec![format!(
+        let mut notes = vec![format!(
             "a torn taint was resolved by a full store-wide rescan: {} loose object(s), {} \
             pack file(s), and {} inventory shard file(s) were candidates, of which {} were \
             (re)restaged; individual paths are not listed here to keep this report readable",
             loose_count, packs_count, shards_count, restaged.len(),
         )];
+        // F6, PR #120 round 2 — see `resolve_the_rest`'s identical fold-in for why this is a note,
+        // never a reason to hold the taint open.
+        for hash in &walk.never_held_pins {
+            notes.push(never_held_pin_note(hash));
+        }
 
         Ok(HealOutcome {
             was_tainted: true,
@@ -1204,17 +1234,22 @@ struct WalkRoots {
     /// unlike [`Self::pin_parcels`] below.
     parcels: Vec<String>,
     /// Every trust-pin root — the trust anchor's adopted head, its enrollment boundary, and every
-    /// key's revocation distrust boundary (see [`office_utils::collect_trust_pin_roots`]) — walked
-    /// separately from [`Self::parcels`] above. Unlike an ordinary ref root, a trust boundary can
-    /// legitimately *name* a head this warehouse never actually fetched: `office enroll`/`office
-    /// revoke` snapshot a remote's or a revoker's *declared* pallet heads by hash, not by pulling
-    /// their history first (DESIGN.html §8.7/§8.11). So an absent hash in this list is a **gap**,
-    /// not a dangling reference — see [`walk_closure_for`]'s own doc comment for the exact rule,
+    /// key's revocation distrust boundary — paired with its own
+    /// [`office_utils::PinAbsencePolicy`] (see [`office_utils::collect_trust_pin_roots`]), walked
+    /// by the same queue and drain as [`Self::parcels`] above (unified since PR #120 round 2 — see
+    /// [`walk_closure_for`]'s own doc comment for why one shared drain, rather than the previous
+    /// two, is what makes the per-entry policy correct). Unlike an ordinary ref root, a `Gap`-
+    /// policy trust boundary can legitimately *name* a head this warehouse never actually fetched:
+    /// `office enroll`/`office revoke` snapshot a remote's or a revoker's *declared* pallet heads
+    /// by hash, not by pulling their history first (DESIGN.html §8.7/§8.11). So an absent
+    /// `Gap`-policy hash is never fed to `sink` and never enters `referenced` (unless it is itself
+    /// a hunted `targets` member — see below) **unless some other, genuine ancestry edge also
+    /// reaches it** — see [`walk_closure_for`]'s own doc comment for exactly when that applies,
     /// and its residual honesty note (indistinguishable here from a pin lost to real corruption).
     /// A **present** pin root's own ancestry and tree are still walked with the walk's ordinary
     /// tolerance, exactly like any other reachable parcel — the gc⊆heal superset invariant (see
     /// this struct's own home, [`collect_walk_roots`]'s doc comment) requires it.
-    pin_parcels: Vec<String>,
+    pin_parcels: Vec<(String, office_utils::PinAbsencePolicy)>,
     /// Object hashes a staged inventory shard (of any bay) references directly (never through a
     /// parcel), with the entry's type (so a chunked file's recipe is still descended into for its
     /// chunks).
@@ -1229,6 +1264,86 @@ struct WalkRoots {
     /// `adopts`/`boundary` pins (which come from the local trust file, not the office record, and
     /// so are unaffected).
     degraded_sources: Vec<String>,
+}
+
+/// [`gc_root_sources`]'s result — see that function's own doc comment.
+pub(crate) struct GcRootSources {
+    /// Every pallet head (both namespaces) plus every readable bay's parked-parcel and
+    /// in-progress-consolidation `their_head` roots.
+    pub parcels: Vec<String>,
+    /// Every trust-pin root this call could establish, each paired with its own
+    /// [`office_utils::PinAbsencePolicy`] — see [`gc_root_sources`]'s own doc comment for why the
+    /// policy tag rides along instead of being stripped here.
+    pub pin_parcels: Vec<(String, office_utils::PinAbsencePolicy)>,
+    /// One plain-language note per bay or office-record read this call had to skip rather than
+    /// abort on — only ever populated when both `bay_policy` and `pin_policy` were passed as
+    /// their respective `Tolerate` variant.
+    pub degraded: Vec<String>,
+}
+
+/// The pallet-head, bay-scoped-parcel, and trust-pin root sources shared, hash for hash, between
+/// [`gc_utils::collect_live_set`](crate::util::gc_utils::collect_live_set) and this module's own
+/// [`collect_walk_roots`] (F8, PR #120 round 2). Before this helper existed, both callers
+/// open-coded the same three-source assembly by hand: the bay-scoped and trust-pin portions were
+/// already routed through their own shared helpers
+/// ([`bay_utils::collect_bay_scoped_parcel_roots`], [`office_utils::collect_trust_pin_roots`]),
+/// but the *pallet-head* loop and the *act of combining all three into one list* were duplicated
+/// verbatim in both functions — so a future source added to only one copy could silently break
+/// the superset invariant [`collect_walk_roots`]'s own doc comment states in full (that is still
+/// the single place the invariant is stated; this comment only covers the portion this helper
+/// itself is responsible for).
+///
+/// `pin_parcels` is returned separately from `parcels` (never merged) because the two callers need
+/// different things from it: gc's own
+/// [`audit_utils::collect_reachable_present`](crate::util::audit_utils::collect_reachable_present)
+/// folds every root into one undifferentiated presence-tolerant walk — no policy distinction
+/// needed there, an absent root is just a gap either way, see `collect_live_set`'s own doc comment
+/// — so its caller simply drops the [`office_utils::PinAbsencePolicy`] tag and concatenates the
+/// two lists; [`collect_walk_roots`]'s own caller ([`walk_closure_for`]) needs to keep that tag,
+/// to apply the per-entry gap-vs-report rule (see that function's own doc comment).
+///
+/// `bay_policy`/`pin_policy` let each caller keep its own fail-closed/tolerant contract — see
+/// [`bay_utils::BayReadPolicy`] and [`office_utils::TrustPinReadPolicy`] for the full reasoning
+/// (gc's `FailClosed`/`FailClosed`, heal's `Tolerate`/`Tolerate`); this helper is policy-agnostic,
+/// it only decides *what* to read, never *how hard* to insist on reading it successfully.
+///
+/// # Arguments
+/// * `bay_dirs`   - The bay-local state dirs to read, in order — the caller's own
+///                  [`bay_utils::all_bay_state_dirs`] result (a parameter, not an internal
+///                  enumeration, for the same reason [`bay_utils::collect_bay_scoped_parcel_roots`]
+///                  takes one: a caller that needs the same dirs for another per-bay source too
+///                  only lists bays once).
+/// * `bay_policy` - What to do with a bay whose state cannot be read.
+/// * `pin_policy` - What to do with an unreadable office record backing the revoked-key
+///                  `distrust_boundary` pins.
+///
+/// # Returns
+/// * `Ok(GcRootSources)` - Every pallet head, every readable bay's parked-parcel/consolidation
+///                         roots, and every trust-pin root this call could establish.
+/// * `Err(String)`        - Under either policy's fail-closed branch, or if the trust file itself
+///                         could not be read (always fail-closed regardless of `pin_policy` — see
+///                         [`office_utils::TrustPinReadPolicy`]).
+pub(crate) fn gc_root_sources(
+    bay_dirs: &[PathBuf],
+    bay_policy: bay_utils::BayReadPolicy,
+    pin_policy: office_utils::TrustPinReadPolicy,
+) -> Result<GcRootSources, String> {
+    let mut parcels: Vec<String> = Vec::new();
+
+    for (_, head) in pallet_utils::all_pallet_refs()? {
+        parcels.push(head);
+    }
+
+    let bay_scope = bay_utils::collect_bay_scoped_parcel_roots(bay_dirs, bay_policy)?;
+    parcels.extend(bay_scope.roots);
+    let mut degraded = bay_scope.degraded;
+
+    let trust_pins = office_utils::collect_trust_pin_roots(pin_policy)?;
+    if let Some(note) = trust_pins.degraded {
+        degraded.push(note);
+    }
+
+    Ok(GcRootSources { parcels, pin_parcels: trust_pins.roots, degraded })
 }
 
 /// Collect every durable ref source's roots — see [`WalkRoots`].
@@ -1252,18 +1367,13 @@ struct WalkRoots {
 /// staged shard is a pre-existing, accepted gc design choice, not a bug this walk needs to
 /// match). If gc ever treats an object as live, this walk must never call the same object safe
 /// to drop — otherwise `forklift heal` could clear a taint over an object `forklift gc` would
-/// refuse to delete. The parked-parcels/consolidation portion of that shared root list is not
-/// duplicated here — both this function and `collect_live_set` call
-/// [`bay_utils::collect_bay_scoped_parcel_roots`] for it, so the two can never drift apart on
-/// that portion by construction; the trust-pin portion is likewise shared through
-/// [`office_utils::collect_trust_pin_roots`], for the same reason. That helper takes the bay
-/// dirs as a parameter rather than enumerating them itself specifically so a caller that also
-/// needs those dirs for something else — this function, for staged inventory shards — can
-/// enumerate them once ([`bay_utils::all_bay_state_dirs`]) and feed the same `Vec` to both the
-/// helper and its own extra loop, instead of `bay_utils::list_bays` running twice per heal.
+/// refuse to delete. The pallet-head/parked-parcels/consolidation/trust-pin portion of that
+/// shared root list is not duplicated here — both this function and `collect_live_set` call the
+/// shared [`gc_root_sources`] for it (F8, PR #120 round 2 — see that function's own doc comment),
+/// so the two can never drift apart on that portion by construction.
 /// **A future edit adding a new bay-local or trust-pin ref source should still re-check both
-/// callers of the relevant shared helper, and re-check the other function's root list for
-/// anything not routed through one (tags, shards).**
+/// callers of [`gc_root_sources`], and re-check the other function's root list for anything not
+/// routed through it (tags, shards).**
 ///
 /// **Tolerant, unlike `collect_live_set`.** This call passes [`bay_utils::BayReadPolicy::
 /// Tolerate`] for the bay-scoped sources, and [`office_utils::TrustPinReadPolicy::Tolerate`] for
@@ -1296,48 +1406,31 @@ struct WalkRoots {
 /// wart §3.2 calls out by name; a walk that trusted the ledger could silently miss a real
 /// dangling reference).
 fn collect_walk_roots() -> Result<WalkRoots, String> {
-    let mut parcels: Vec<String> = Vec::new();
     let mut shard_referenced: Vec<(String, DirEntryType)> = Vec::new();
 
-    for (_, head) in pallet_utils::all_pallet_refs()? {
-        parcels.push(head);
-    }
+    // One `all_bay_state_dirs` enumeration, fed to both `gc_root_sources` (the parked/
+    // consolidation portion) and this function's own staged-shard loop below, so `list_bays` runs
+    // exactly once per heal. `Tolerate`/`Tolerate` — see this function's own doc comment for why
+    // heal, unlike gc, must not brick on a single unreadable bay or office record.
+    let bay_dirs = bay_utils::all_bay_state_dirs()?;
+    let sources = gc_root_sources(
+        &bay_dirs, bay_utils::BayReadPolicy::Tolerate, office_utils::TrustPinReadPolicy::Tolerate,
+    )?;
 
+    let mut parcels = sources.parcels;
+
+    // Tags are recovery-only (gc deliberately does not root them) and stay a heal-specific
+    // addition on top of the shared sources above.
     for tag in tag_utils::read_tags()? {
         parcels.push(tag.tag.subject);
     }
 
-    // Bay-local sources, read across every bay — see this function's doc comment. One
-    // `all_bay_state_dirs` enumeration, fed to both the shared parked/consolidation helper and
-    // this function's own staged-shard loop, so `list_bays` runs exactly once per heal. Parked
-    // parcels and in-progress-consolidation `their_head` are the portion shared with gc's live
-    // set — see `bay_utils::collect_bay_scoped_parcel_roots`'s doc comment for the shared-helper
-    // rationale. `Tolerate`, not `FailClosed` — see this function's own doc comment. Staged
-    // inventory shards are recovery-only (gc deliberately does not root them) and stay a separate
-    // per-bay loop here.
-    let bay_dirs = bay_utils::all_bay_state_dirs()?;
-    let bay_scope = bay_utils::collect_bay_scoped_parcel_roots(&bay_dirs, bay_utils::BayReadPolicy::Tolerate)?;
-    parcels.extend(bay_scope.roots);
-
+    // Staged inventory shards are likewise recovery-only.
     for dir in &bay_dirs {
         walk_shard_files(&dir.join(FOLDER_NAME_INVENTORY_ROOT), &mut shard_referenced)?;
     }
 
-    let mut degraded_sources = bay_scope.degraded;
-
-    // The trust anchor's pins are shared (warehouse-global): read once, not per bay, via
-    // the same `office_utils::collect_trust_pin_roots` gc's live set calls (FORK-81) — the
-    // `adopts` pin, the enrollment `boundary` snapshot, and every key's revocation
-    // `distrust_boundary` — so the two root lists can never drift on this portion either.
-    // `Tolerate`, not `FailClosed` — see this function's own doc comment. Kept in their own
-    // `pin_parcels` list, never folded into `parcels` above: see `WalkRoots::pin_parcels`'s own
-    // doc comment for why an absent one is a gap rather than a dangling reference.
-    let trust_pins = office_utils::collect_trust_pin_roots(office_utils::TrustPinReadPolicy::Tolerate)?;
-    if let Some(note) = trust_pins.degraded {
-        degraded_sources.push(note);
-    }
-
-    Ok(WalkRoots { parcels, pin_parcels: trust_pins.roots, shard_referenced, degraded_sources })
+    Ok(WalkRoots { parcels, pin_parcels: sources.pin_parcels, shard_referenced, degraded_sources: sources.degraded })
 }
 
 fn walk_shard_files(folder: &Path, hashes: &mut Vec<(String, DirEntryType)>) -> Result<(), String> {
@@ -1397,6 +1490,15 @@ pub(crate) struct ClosureWalkResult {
     pub hashes: BTreeSet<String>,
     /// Plain-language notes, one per degraded source — see [`collect_walk_roots`]'s doc comment.
     pub degraded_sources: Vec<String>,
+    /// Every `Gap`-policy trust-pin root (F6, PR #120 round 2) this run could confirm is
+    /// genuinely never held locally: absent, and never resolved by any genuine ancestry edge
+    /// either — see [`walk_closure_for`]'s own doc comment for exactly what "confirm" means here.
+    /// Never blocking (this is exactly the gap [`WalkRoots::pin_parcels`] already tolerates), but
+    /// worth surfacing: a standing gap here is precisely the state `forklift audit` names as an
+    /// unresolvable trust boundary the next time it runs, and this is the first point in the
+    /// pipeline that actually knows about it. Callers fold this into [`HealOutcome::notes`] on
+    /// their `Ok` path only — see [`never_held_pin_note`].
+    pub never_held_pins: BTreeSet<String>,
 }
 
 /// Walk every durable ref source's closure looking for `targets`, returning the subset actually
@@ -1409,7 +1511,9 @@ pub(crate) struct ClosureWalkResult {
 /// for (the descent guards — parcel, subtree, chunked-leaf's recipe — still run regardless).
 pub(crate) fn closure_references_any(targets: &BTreeSet<String>) -> Result<ClosureWalkResult, String> {
     if targets.is_empty() {
-        return Ok(ClosureWalkResult { hashes: BTreeSet::new(), degraded_sources: Vec::new() });
+        return Ok(ClosureWalkResult {
+            hashes: BTreeSet::new(), degraded_sources: Vec::new(), never_held_pins: BTreeSet::new(),
+        });
     }
 
     let roots = collect_walk_roots()?;
@@ -1419,8 +1523,12 @@ pub(crate) fn closure_references_any(targets: &BTreeSet<String>) -> Result<Closu
     // corrupt reachable object must keep failing this walk loud, exactly as before the carve-out
     // existed — see `tests::a_present_but_corrupt_pallet_head_fails_the_walk_loudly`.
     let no_corrupt: BTreeSet<String> = BTreeSet::new();
-    let hashes = walk_closure_for(targets, &roots, &no_corrupt, None)?;
-    Ok(ClosureWalkResult { hashes, degraded_sources: roots.degraded_sources })
+    let outcome = walk_closure_for(targets, &roots, &no_corrupt, None)?;
+    Ok(ClosureWalkResult {
+        hashes: outcome.referenced,
+        degraded_sources: roots.degraded_sources,
+        never_held_pins: outcome.never_held_pins,
+    })
 }
 
 /// The targetless sibling of [`closure_references_any`]: enumerate every hash the walk finds
@@ -1455,11 +1563,15 @@ pub(crate) fn enumerate_absent_reachable(corrupt: &BTreeSet<String>) -> Result<C
     let roots = collect_walk_roots()?;
     let empty_targets: BTreeSet<String> = BTreeSet::new();
     let mut absent: BTreeSet<String> = BTreeSet::new();
-    {
+    let outcome = {
         let mut collecting_sink = |hash: &str| { absent.insert(hash.to_string()); };
-        walk_closure_for(&empty_targets, &roots, corrupt, Some(&mut collecting_sink))?;
-    }
-    Ok(ClosureWalkResult { hashes: absent, degraded_sources: roots.degraded_sources })
+        walk_closure_for(&empty_targets, &roots, corrupt, Some(&mut collecting_sink))?
+    };
+    Ok(ClosureWalkResult {
+        hashes: absent,
+        degraded_sources: roots.degraded_sources,
+        never_held_pins: outcome.never_held_pins,
+    })
 }
 
 /// Re-borrow an `Option<&mut dyn FnMut(&str)>` for one call, without moving the original out of
@@ -1495,42 +1607,63 @@ fn reborrow_sink<'a>(sink: &'a mut Option<&mut dyn FnMut(&str)>) -> Option<&'a m
 /// don't.** An ordinary root — a pallet head, a parked parcel, a tag subject, an in-progress
 /// consolidation's `their_head` — is a ref *this warehouse's own commands* set, so its being
 /// raw-absent is genuine local loss and is reported via `sink` exactly like any other descent-
-/// guard absence (unchanged from before this rule existed). A trust-pin root is different: a
-/// trust/distrust boundary can legitimately *name* a head this warehouse never actually fetched
-/// (`office enroll`/`office revoke` snapshot a remote's or a revoker's *declared* heads by hash,
-/// not by pulling their history first) — so an absent pin root is a **gap**, not a dangling
-/// reference, and this function never feeds one to `sink`, never lets it enter `referenced`
-/// (unless it is itself a hunted `targets` member — see below), and never enqueues anything past
-/// it (there is nothing local to enqueue). A **present** pin root's own ancestry and tree are
-/// walked with the walk's ordinary tolerance, exactly like any other reachable parcel — the
-/// pin-root rule only ever changes what happens to the root hash itself.
+/// guard absence: it always carries [`AbsencePolicy::Report`]. A `Gap`-policy trust-pin root
+/// (`boundary`, every key's `distrust_boundary` — see [`office_utils::PinAbsencePolicy`]) is
+/// different: it can legitimately *name* a head this warehouse never actually fetched (`office
+/// enroll`/`office revoke` snapshot a remote's or a revoker's *declared* heads by hash, not by
+/// pulling their history first), so it is queued with [`AbsencePolicy::Gap`] instead — meaning an
+/// absence found *for that specific queue entry* is never fed to `sink` and never enters
+/// `referenced` (unless it is itself a hunted `targets` member — see below). A `Loss`-policy pin
+/// (`adopts`) is queued as `Report`, exactly like an ordinary root, and its own doc comment
+/// explains why.
 ///
-/// Processed as its own pass, seeded into the *same* `queue`/`visited_parcels`/`referenced` state
-/// [`drain_parcel_queue`] uses for `roots.parcels`, but only **after** that ordinary walk has
-/// already run to completion: a hash that is both an ordinary root (or turns up as one of an
-/// ordinary root's own ancestors) and a trust-pin root is left entirely to the ordinary walk's
-/// verdict — `visited_parcels` already contains it by the time the pin pass runs, so the pin
-/// pass's own `insert` fails and it is skipped. The gap rule therefore only ever applies to a
-/// hash no ordinary path reached at all. The §8.3 corrupt-boundary carve-out is unaffected by any
-/// of this: a pin root already known corrupt (step 1's hash-verify found real, present, wrong
-/// bytes at that path — never "maybe never fetched"; an absence and a corruption cannot both be
-/// true of the same path) is reported exactly like an ordinary corrupt node, not tolerated as a
-/// gap.
+/// **A present pin root's own ancestry and tree are walked with the walk's ordinary tolerance,
+/// exactly like any other reachable parcel — every parent [`drain_parcel_queue`] discovers this
+/// way is *always* re-queued as `Report`, regardless of what policy found the parcel that named
+/// it.** This is also what fixes the bug [`AbsencePolicy::Gap`]'s own doc comment names (F1, PR
+/// #120 round 2): a hash that is itself a declared `Gap`-policy pin root can *also* be a genuine
+/// ancestor of some other (possibly also pin-rooted) present parcel — e.g. two boundary entries
+/// `P1`/`P2` where `P1` is present with parent `P2`, and `P2` is itself absent. Before this fix,
+/// the pin pass ran as a *second*, separate drain after the ordinary one, and its own `for hash in
+/// &roots.pin_parcels` loop marked an absent pin **visited** the moment it decided "gap" — so when
+/// the *same* hash was *also* reached moments later as `P1`'s genuine parent, the trailing drain's
+/// `visited_parcels.insert` failed and the real reference was silently dropped, regardless of
+/// which of the two entries the loop happened to reach first. See
+/// [`AbsencePolicy::Gap`]'s own doc comment for exactly how deferring the "visited" decision fixes
+/// this, and `tests::a_lost_parcel_reachable_both_as_its_own_boundary_pin_and_as_a_present_sibling_pins_parent_is_still_reported`
+/// for the falsifying fixture.
+///
+/// One shared queue and one shared [`drain_parcel_queue`] call now handle every root — ordinary
+/// and pin alike — seeded together up front, rather than the two-pass, two-drain shape this
+/// module used before F1's fix (which is also what the ~25-line duplicate drain body this rewrite
+/// removed was for). Final results are identical to the old two-pass ordering for every case that
+/// ordering used to get right: a hash that is both an ordinary root (or one of its own ancestors)
+/// and a pin root still lands on the ordinary walk's verdict either way, because whichever queue
+/// entry for it is dequeued first marks it visited and the other becomes a same-result no-op — see
+/// [`AbsencePolicy`]'s own doc comment for the mechanics that make this order-independent.
+///
+/// The §8.3 corrupt-boundary carve-out is unaffected by any of this: a pin root already known
+/// corrupt (step 1's hash-verify found real, present, wrong bytes at that path — never "maybe
+/// never fetched"; an absence and a corruption cannot both be true of the same path) is reported
+/// exactly like an ordinary corrupt node, regardless of its queue entry's policy — never tolerated
+/// as a gap.
 ///
 /// **Residual honesty, stated plainly (this is the follow-up this fix does not attempt):** once a
-/// pin's own hash is genuinely absent, this walk cannot tell "never held" apart from "held once,
-/// then lost to corruption in an otherwise-full store" — both read as raw-absent here, and the
-/// gap rule tolerates both the same way. `audit`'s own trust-boundary resolution already lives
-/// with exactly this ambiguity for gc's live set
-/// (`audit_utils::collect_reachable_present`'s own doc comment: "a trust boundary may name heads
-/// this warehouse never had"); giving heal's own remainder a narrower verdict specific to that
-/// case is a distinct piece of work, not this one.
+/// `Gap`-policy pin's own hash is genuinely absent *and never reached by any genuine ancestry edge
+/// either*, this walk cannot tell "never held" apart from "held once, then lost to corruption in
+/// an otherwise-full store" — both read as raw-absent here, and the gap rule tolerates both the
+/// same way. `audit`'s own trust-boundary resolution already lives with exactly this ambiguity for
+/// gc's live set (`audit_utils::collect_reachable_present`'s own doc comment: "a trust boundary
+/// may name heads this warehouse never had"); giving heal's own remainder a narrower verdict
+/// specific to that case is a distinct piece of work, not this one. What this fix *does* surface
+/// (F6, same round): every hash this walk can positively confirm falls into that residual case —
+/// see [`WalkClosureOutcome::never_held_pins`].
 fn walk_closure_for(
     targets: &BTreeSet<String>,
     roots: &WalkRoots,
     corrupt: &BTreeSet<String>,
     mut sink: Option<&mut dyn FnMut(&str)>,
-) -> Result<BTreeSet<String>, String> {
+) -> Result<WalkClosureOutcome, String> {
     let mut referenced: BTreeSet<String> = BTreeSet::new();
     let mut visited_trees: HashSet<String> = HashSet::new();
     let mut visited_parcels: HashSet<String> = HashSet::new();
@@ -1539,62 +1672,88 @@ fn walk_closure_for(
         check_leaf(hash, *item_type, targets, corrupt, &mut referenced, reborrow_sink(&mut sink))?;
     }
 
-    let mut queue: VecDeque<String> = roots.parcels.iter().cloned().collect();
-    drain_parcel_queue(
-        &mut queue, targets, corrupt, &mut referenced, &mut visited_parcels, &mut visited_trees,
-        reborrow_sink(&mut sink),
-    )?;
+    // One combined queue, ordinary and pin roots alike — see this function's own doc comment for
+    // why seeding them together (rather than the previous two-pass, two-drain shape) is both
+    // simpler and what actually fixes F1.
+    let mut queue: VecDeque<(String, AbsencePolicy)> = roots.parcels.iter()
+        .cloned()
+        .map(|hash| (hash, AbsencePolicy::Report))
+        .chain(roots.pin_parcels.iter().map(|(hash, policy)| (hash.clone(), AbsencePolicy::from(*policy))))
+        .collect();
 
-    // Trust-pin roots — see this function's own doc comment above for the gap rule and why this
-    // pass runs only now, after `visited_parcels` already reflects everything the ordinary walk
-    // reached.
-    for hash in &roots.pin_parcels {
-        if targets.contains(hash) {
-            referenced.insert(hash.clone());
-            continue;
-        }
-        if !visited_parcels.insert(hash.clone()) {
-            continue;
-        }
-        if corrupt.contains(hash) {
-            // Present, but step 1 already proved it corrupt — unambiguous local corruption, never
-            // "never held" (that ambiguity only ever applies to an absence). Reported exactly like
-            // any other corrupt-boundary node, not tolerated as a gap.
-            if let Some(s) = reborrow_sink(&mut sink) { s(hash); }
-            continue;
-        }
-        if !file_utils::raw_object_present(hash)? {
-            // A gap, not a dangling reference — see this function's own doc comment. Never fed to
-            // `sink`, never enqueued further.
-            continue;
-        }
-
-        let parcel = object_utils::load_parcel(hash)?;
-        walk_tree(&parcel.tree_hash, targets, corrupt, &mut referenced, &mut visited_trees, reborrow_sink(&mut sink))?;
-
-        for parent in parcel.parents {
-            queue.push_back(parent);
-        }
-    }
-
-    // Whatever a present pin root's own parents added above is drained here, with the walk's
-    // ordinary (report-on-absence) semantics — a present pin's ancestry is walked exactly like any
-    // other reachable parcel's, per this function's own doc comment.
     drain_parcel_queue(
         &mut queue, targets, corrupt, &mut referenced, &mut visited_parcels, &mut visited_trees, sink,
     )?;
 
-    Ok(referenced)
+    // F6: every declared pin root this run can positively confirm is genuinely never held — see
+    // `AbsencePolicy::Gap`'s own doc comment for why "not in `visited_parcels`" is exactly that
+    // condition once the drain above has fully run (a hash the drain ever resolved — present,
+    // corrupt, or `Report`-absent — is always marked visited; only a `Gap`-absent hash no `Report`
+    // path ever reached stays unmarked). `referenced` is excluded too: a pin root that is itself a
+    // hunted `targets` member never touches `visited_parcels` at all (the targets-check in
+    // `drain_parcel_queue` returns before reaching it), so it would otherwise show up here despite
+    // already being surfaced, more specifically, via `referenced`.
+    let never_held_pins: BTreeSet<String> = roots.pin_parcels.iter()
+        .map(|(hash, _)| hash.clone())
+        .filter(|hash| !visited_parcels.contains(hash) && !referenced.contains(hash))
+        .collect();
+
+    Ok(WalkClosureOutcome { referenced, never_held_pins })
 }
 
-/// The ordinary (report-on-absence) parcel-ancestry descent [`walk_closure_for`] shares between
-/// its two seeding passes — the `roots.parcels` queue, and whatever a present trust-pin root's own
-/// parents add afterward — so the actual descent logic (and its I3/corrupt-boundary tolerance) is
-/// written exactly once. Drains `queue` to empty; calling it again on a queue seeded afterward
-/// (as [`walk_closure_for`] does for the pin pass) simply continues the same walk with the same
-/// `visited_parcels`/`visited_trees`/`referenced` state.
+/// [`walk_closure_for`]'s full result — see that function's own doc comment.
+struct WalkClosureOutcome {
+    referenced: BTreeSet<String>,
+    never_held_pins: BTreeSet<String>,
+}
+
+/// Whether a queued parcel hash's own absence, if found, is reported to `sink` (`Report`) or
+/// tolerated silently (`Gap`) — see [`walk_closure_for`]'s own doc comment for the fix this
+/// enables (F1, PR #120 round 2). Converted per entry from [`office_utils::PinAbsencePolicy`] when
+/// seeding the queue (`Loss` → `Report`, `Gap` → `Gap`); every ordinary root, and every parent
+/// [`drain_parcel_queue`] discovers by loading a present parcel, is always `Report` — see
+/// [`Report`](Self::Report)'s own doc comment for why that must never depend on which policy
+/// found the parcel that named the parent.
+#[derive(Clone, Copy)]
+enum AbsencePolicy {
+    /// This queue entry is a ref *this warehouse's own commands* set (an ordinary root), a
+    /// `Loss`-policy pin (`adopts`), or a parent parcel discovered by loading some other present
+    /// parcel — an ancestry edge is always a genuine local reference, regardless of whether the
+    /// parcel that names it arrived at `Report` or `Gap` policy itself (a present pin root's own
+    /// ancestry is walked with the ordinary tolerance — see [`walk_closure_for`]'s own doc
+    /// comment). An absent hash under this policy is fed to `sink` and marked visited immediately.
+    Report,
+    /// This queue entry is a declared `Gap`-policy trust-pin root itself (`boundary`, a key's
+    /// `distrust_boundary`), which can legitimately name a head never actually fetched. An absent
+    /// hash under this policy is deliberately **not** marked visited: leaving it out of
+    /// `visited_parcels` lets a *different* queue entry for the very same hash — a genuine
+    /// ancestry edge, always queued `Report` — still resolve and report it normally, whenever such
+    /// an edge exists anywhere else in this same walk (queued earlier, later, or discovered only
+    /// after this entry has already been dequeued). Only a hash no `Report` entry ever reaches
+    /// stays unvisited through to the end of the walk — see
+    /// [`WalkClosureOutcome::never_held_pins`], which relies on exactly that.
+    Gap,
+}
+
+impl From<office_utils::PinAbsencePolicy> for AbsencePolicy {
+    fn from(policy: office_utils::PinAbsencePolicy) -> Self {
+        match policy {
+            office_utils::PinAbsencePolicy::Loss => AbsencePolicy::Report,
+            office_utils::PinAbsencePolicy::Gap => AbsencePolicy::Gap,
+        }
+    }
+}
+
+/// The shared parcel-ancestry descent [`walk_closure_for`] drives with its one combined queue
+/// (ordinary and pin roots together, since F1's fix — see that function's own doc comment). Drains
+/// `queue` to empty, including any parent entries `queue` itself grows while draining.
+///
+/// Unlike a plain "insert-and-skip-if-already-present" visited check, marking a hash visited is
+/// deferred for a `Gap`-policy absence specifically (see [`AbsencePolicy::Gap`]'s own doc comment)
+/// — every *other* outcome (a target match, a corrupt-boundary hit, a `Report`-policy absence, or
+/// a present parcel) marks `visited_parcels` immediately, exactly as before F1's fix.
 fn drain_parcel_queue(
-    queue: &mut VecDeque<String>,
+    queue: &mut VecDeque<(String, AbsencePolicy)>,
     targets: &BTreeSet<String>,
     corrupt: &BTreeSet<String>,
     referenced: &mut BTreeSet<String>,
@@ -1602,35 +1761,56 @@ fn drain_parcel_queue(
     visited_trees: &mut HashSet<String>,
     mut sink: Option<&mut dyn FnMut(&str)>,
 ) -> Result<(), String> {
-    while let Some(hash) = queue.pop_front() {
+    while let Some((hash, policy)) = queue.pop_front() {
         // Targets-check FIRST: a vanished hash that is itself a root ref (a pallet head, a parked
-        // parcel, a tag subject, …) is still a genuine reference to it — the presence guard below
-        // must never pre-empt this, or a root reference to a raw-absent target would be silently
-        // dropped instead of reported. See
+        // parcel, a tag subject, a trust-pin root, …) is still a genuine reference to it — the
+        // presence guard below must never pre-empt this, or a root reference to a raw-absent
+        // target would be silently dropped instead of reported. See
         // [`tests::a_vanished_pallet_head_that_is_itself_the_target_is_still_reported_referenced`].
+        // Deliberately does not touch `visited_parcels` — a target match is decided independent of
+        // (and does not need) the visited-dedup this loop otherwise relies on.
         if targets.contains(&hash) {
             referenced.insert(hash);
             continue;
         }
-        if !visited_parcels.insert(hash.clone()) {
+        if visited_parcels.contains(&hash) {
             continue;
         }
-        // Presence-tolerant (I3), plus the §8.3 corrupt-boundary carve-out: a parent parcel
-        // reached by ancestry can be legitimately absent (sparse/shallow/narrowed), or already
-        // known corrupt by the caller (`corrupt`) — either way, record it via `sink` (if any) and
-        // stop; do not enqueue its parents, since neither an absent nor a corrupt parcel's own
-        // parent list can be trusted. Unconditional in both modes — this is a descent guard, not a
-        // sink-feeding-only stat.
-        if corrupt.contains(&hash) || !file_utils::raw_object_present(&hash)? {
+        // Presence-tolerant (I3), plus the §8.3 corrupt-boundary carve-out: a parcel reached by
+        // ancestry (or a declared pin root) can be legitimately absent (sparse/shallow/narrowed,
+        // or — under `AbsencePolicy::Gap` — never actually fetched), or already known corrupt by
+        // the caller (`corrupt`). Corrupt is unambiguous local corruption regardless of policy —
+        // always reported, always marked visited, exactly like any other corrupt-boundary node,
+        // never tolerated as a gap.
+        if corrupt.contains(&hash) {
+            visited_parcels.insert(hash.clone());
             if let Some(s) = reborrow_sink(&mut sink) { s(&hash); }
             continue;
         }
+        if !file_utils::raw_object_present(&hash)? {
+            match policy {
+                AbsencePolicy::Report => {
+                    visited_parcels.insert(hash.clone());
+                    if let Some(s) = reborrow_sink(&mut sink) { s(&hash); }
+                }
+                // Deliberately does NOT mark `hash` visited — see `AbsencePolicy::Gap`'s own doc
+                // comment for why leaving it open is exactly what lets a genuine ancestry edge
+                // discovered elsewhere in this same walk still resolve and report it.
+                AbsencePolicy::Gap => {}
+            }
+            continue;
+        }
 
+        // Present: never ambiguous, regardless of which policy found it — mark visited and
+        // descend, exactly like before F1's fix.
+        visited_parcels.insert(hash.clone());
         let parcel = object_utils::load_parcel(&hash)?;
         walk_tree(&parcel.tree_hash, targets, corrupt, referenced, visited_trees, reborrow_sink(&mut sink))?;
 
         for parent in parcel.parents {
-            queue.push_back(parent);
+            // An ancestry edge is always a genuine local reference — see `AbsencePolicy::Report`'s
+            // own doc comment for why this must never inherit the parent's own queue policy.
+            queue.push_back((parent, AbsencePolicy::Report));
         }
     }
 
@@ -2788,6 +2968,84 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Finding 3 (round 2, PR #120): the two `walk_finds_a_trust_anchor_*` tests above (and
+    /// `walk_finds_a_keys_distrust_boundary_hash` below) put the pin hash itself in `targets`, so
+    /// they are satisfied by the `targets.contains` short-circuit at the very top of the drain
+    /// loop — never actually exercising a PRESENT pin root's own descent (loading it, walking its
+    /// tree, or queuing its parents). Replacing that whole block with a bare `continue;` would
+    /// leave every one of those tests green. This test targets a hash *reachable through* a
+    /// present pin root instead: a blob under its tree, and a parcel that is its ancestry parent —
+    /// neither of which is itself a pin root or `targets` member at any point but the very last.
+    ///
+    /// Fixture: parcel Q (parentless, trivial tree), parcel P (tree → blob B, parent Q), neither
+    /// with any pallet ref — reachable ONLY through the trust boundary `[P]`. Mutation: replace
+    /// the present-branch body in `drain_parcel_queue` (the `load_parcel`/`walk_tree`/parent-queue
+    /// block) with a bare `continue;` → P's tree is never walked and its parents are never queued
+    /// → neither `closure_references_any({B})` nor `closure_references_any({Q})` finds its target
+    /// → both assertions below go red (confirmed by hand).
+    #[test]
+    fn walk_finds_a_present_pin_roots_own_tree_and_ancestry_descent() {
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+        use crate::globals::StorageRootScope;
+        use crate::model::blob::Blob;
+        use crate::model::parcel::Parcel;
+        use crate::model::tree_item::TreeItem;
+        use crate::util::office_utils::{self, TrustAnchor};
+
+        let dir = std::env::temp_dir()
+            .join(format!("forklift-recovery-utils-present-pin-descent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        let _scope = StorageRootScope::enter(&dir);
+
+        // Q: parentless, a trivial empty tree — the ancestry target.
+        let q_tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        let mut q_tree_object = LooseObjectBuilder::build_tree(&q_tree);
+        q_tree_object.store().unwrap();
+        let mut q_object = LooseObjectBuilder::build_parcel(&Parcel {
+            tree_hash: q_tree_object.hash, parents: Vec::new(), actions: Vec::new(), description: None,
+        });
+        q_object.store().unwrap();
+        let q_hash = q_object.hash;
+
+        // B: a blob, referenced by P's own tree — the tree-descent target.
+        let mut blob_object = LooseObjectBuilder::build_blob(&Blob { content: b"B's content".to_vec() });
+        blob_object.store().unwrap();
+        let b_hash = blob_object.hash;
+
+        // P: present, tree → B, parent → Q. Its own hash is the boundary's declared pin; neither
+        // B nor Q is ever itself a boundary/targets member.
+        let mut p_tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        p_tree.add_child(TreeItem::new("b.txt".to_string(), b_hash.clone(), DirEntryType::Normal));
+        let mut p_tree_object = LooseObjectBuilder::build_tree(&p_tree);
+        p_tree_object.store().unwrap();
+        let mut p_object = LooseObjectBuilder::build_parcel(&Parcel {
+            tree_hash: p_tree_object.hash, parents: vec![q_hash.clone()], actions: Vec::new(), description: None,
+        });
+        p_object.store().unwrap();
+        let p_hash = p_object.hash;
+
+        office_utils::write_trust_anchor(&TrustAnchor {
+            genesis: "0".repeat(64),
+            enabled_at: 0,
+            boundary: vec![p_hash],
+            prior_genesis: None,
+            adopts: None,
+        }).unwrap();
+
+        let b_targets: BTreeSet<String> = [b_hash.clone()].into_iter().collect();
+        assert!(closure_references_any(&b_targets).unwrap().hashes.contains(&b_hash),
+            "a blob under a present pin root's own tree must be found by descending that tree, \
+             not merely by the pin root's own hash matching `targets`");
+
+        let q_targets: BTreeSet<String> = [q_hash.clone()].into_iter().collect();
+        assert!(closure_references_any(&q_targets).unwrap().hashes.contains(&q_hash),
+            "a present pin root's own parent must be found by ordinary ancestry descent, not \
+             merely by the pin root's own hash matching `targets`");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Build a minimal, unsigned office parcel recording one key whose `distrust_boundary` is
     /// `[boundary_hash]`, and point the office pallet ref at it — enough for `read_office_state`
     /// (and therefore `office_utils::collect_trust_pin_roots`) to find it, without needing a real
@@ -2948,6 +3206,106 @@ mod tests {
              yield fewer roots");
         assert!(walk.degraded_sources.iter().any(|note| note.contains("office record")),
             "the degraded-source note must name the office record: {:?}", walk.degraded_sources);
+        // Finding 4 (round 2, PR #120): a never-durable object gets the "roll @office back / \
+        // fetch" remedy, never the old "restage" wording (restaging cannot repair an absence —
+        // there is nothing present to rewrite).
+        assert!(
+            walk.degraded_sources.iter().any(|note| note.contains("@office") && note.contains("fetch")),
+            "an absent-object office read failure must word the \"roll @office back, or fetch\" \
+             remedy, never the old blanket \"restaged\" wording: {:?}", walk.degraded_sources
+        );
+        assert!(walk.degraded_sources.iter().all(|note| !note.contains("rather than blocking")),
+            "the misleading \"rather than blocking\" clause must be gone — every consumer of a \
+             non-empty degraded_sources actually refuses: {:?}", walk.degraded_sources);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Finding 4 (round 2, PR #120), the `UnparseableRecord` sibling of the `AbsentObject` case
+    /// above: a key record that loaded and verified fine but does not parse as its expected shape
+    /// must word the "fix the record" remedy — restaging cannot help, since the durably-written
+    /// bytes are already exactly what is on disk.
+    #[test]
+    fn collect_walk_roots_words_the_fix_the_record_remedy_for_an_unparseable_key_record() {
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+        use crate::globals::StorageRootScope;
+        use crate::model::blob::Blob;
+        use crate::model::parcel::Parcel;
+        use crate::model::tree_item::TreeItem;
+        use crate::util::office_utils::{self, TrustAnchor};
+
+        let dir = std::env::temp_dir()
+            .join(format!("forklift-recovery-utils-unparseable-key-record-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        let _scope = StorageRootScope::enter(&dir);
+
+        // A key record missing its required "key_id" field — present and verified as a blob, but
+        // does not parse as a key record.
+        let malformed_key_toml =
+            "operator = \"op@x\"\npublic_key = \"deadbeef\"\nissued_at = 1\n\
+             authorized_by = \"k\"\nendorsement = \"ee\"\nproof_of_possession = \"pp\"\n";
+        let mut key_blob = LooseObjectBuilder::build_blob(&Blob { content: malformed_key_toml.as_bytes().to_vec() });
+        key_blob.store().unwrap();
+
+        let mut keys_tree = TreeItem::new("keys".to_string(), String::new(), DirEntryType::Tree);
+        keys_tree.add_child(TreeItem::new("broken.toml".to_string(), key_blob.hash, DirEntryType::Normal));
+        let mut keys_object = LooseObjectBuilder::build_tree(&keys_tree);
+        keys_object.store().unwrap();
+        keys_tree.hash = keys_object.hash;
+
+        let mut users_tree = TreeItem::new("users".to_string(), String::new(), DirEntryType::Tree);
+        let mut users_object = LooseObjectBuilder::build_tree(&users_tree);
+        users_object.store().unwrap();
+        users_tree.hash = users_object.hash;
+
+        let mut tracked_tree = TreeItem::new("tracked".to_string(), String::new(), DirEntryType::Tree);
+        tracked_tree.add_child(users_tree);
+        tracked_tree.add_child(keys_tree);
+        let mut tracked_object = LooseObjectBuilder::build_tree(&tracked_tree);
+        tracked_object.store().unwrap();
+        tracked_tree.hash = tracked_object.hash;
+
+        let mut forklift_tree = TreeItem::new(".forklift".to_string(), String::new(), DirEntryType::Tree);
+        forklift_tree.add_child(tracked_tree);
+        let mut forklift_object = LooseObjectBuilder::build_tree(&forklift_tree);
+        forklift_object.store().unwrap();
+        forklift_tree.hash = forklift_object.hash;
+
+        let mut root_tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        root_tree.add_child(forklift_tree);
+        let mut root_object = LooseObjectBuilder::build_tree(&root_tree);
+        root_object.store().unwrap();
+
+        let parcel = Parcel {
+            tree_hash: root_object.hash, parents: Vec::new(), actions: Vec::new(),
+            description: Some("office with an unparseable key record".to_string()),
+        };
+        let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
+        parcel_object.store().unwrap();
+        pallet_utils::set_meta_pallet_head(office_utils::OFFICE_PALLET_NAME, &parcel_object.hash).unwrap();
+
+        office_utils::write_trust_anchor(&TrustAnchor {
+            genesis: "0".repeat(64),
+            enabled_at: 0,
+            boundary: Vec::new(),
+            prior_genesis: None,
+            adopts: None,
+        }).unwrap();
+
+        let walk = collect_walk_roots().expect(
+            "an unparseable key record must not abort heal's root collection either — tolerated \
+             and recorded, exactly like an absent object"
+        );
+        assert!(
+            walk.degraded_sources.iter().any(|note| note.contains("fix") && note.contains("record")),
+            "an unparseable-record office read failure must word the \"fix the record\" remedy, \
+             never the \"roll @office back\" one (there is nothing absent to roll back to): {:?}",
+            walk.degraded_sources
+        );
+        assert!(walk.degraded_sources.iter().all(|note| !note.contains("@office\" back")),
+            "the absent-object remedy must not be worded for a present-but-malformed record: {:?}",
+            walk.degraded_sources);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3194,6 +3552,180 @@ mod tests {
         assert!(!state.torn, "the taint must no longer be torn after a clean rescan");
         assert!(state.recorded.is_empty(),
             "the never-held pin must not be folded into the remainder as a dangling reference");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Finding 1 (round 2, PR #120): a lost parcel that is reachable BOTH as its own boundary pin
+    /// AND as the parent of a present sibling pin must still be reported dangling — never silently
+    /// tolerated as a gap just because it also happens to be independently declared. Before this
+    /// fix, the pin pass's own `for hash in &roots.pin_parcels` loop marked an absent pin visited
+    /// the instant it decided "gap" (whichever of the two boundary entries the loop happened to
+    /// reach first): when the SAME hash was ALSO reached moments later as the OTHER entry's
+    /// genuine parent, the trailing drain's `visited_parcels.insert` failed and the real reference
+    /// was silently dropped — regardless of which of the two boundary entries was processed
+    /// first (verified both orderings by hand while designing this fixture; both reddened).
+    ///
+    /// Fixture: boundary = [P1, P2], P1 present with parent P2, P2 itself a second boundary entry
+    /// AND deleted after being stored once ("held once and lost", per this finding's own scenario).
+    /// Contrast with `torn_taint_clears_when_the_only_reference_is_a_never_held_trust_pin` above,
+    /// where the only reference to the lost hash IS its own boundary declaration (correctly a
+    /// gap) — here P2 is ALSO a genuine ancestor of P1, which must win.
+    ///
+    /// Mutation: revert `drain_parcel_queue` to mark a `Gap`-policy absence visited immediately
+    /// (the pre-fix behavior — i.e. move the `visited_parcels.insert` above the `match policy`
+    /// instead of only inside the `Report` arm) → P2's absence is silently dropped → `run_heal()`
+    /// returns `Ok` with `recorded: []` instead of refusing → both assertions below go red
+    /// (confirmed by hand: reverting produces exactly that, for both boundary orderings).
+    #[test]
+    fn a_lost_parcel_reachable_both_as_its_own_boundary_pin_and_as_a_present_sibling_pins_parent_is_still_reported() {
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+        use crate::globals::StorageRootScope;
+        use crate::model::parcel::Parcel;
+        use crate::model::tree_item::TreeItem;
+        use crate::util::office_utils::{self, TrustAnchor};
+
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        let root = std::env::temp_dir()
+            .join(format!("forklift-recovery-utils-pin-to-pin-edge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        let _scope = StorageRootScope::enter(&root);
+        let forklift = forklift_root();
+
+        // A trivial, shared tree for both parcels — its own content does not matter to this
+        // fixture.
+        let root_tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        let mut tree_object = LooseObjectBuilder::build_tree(&root_tree);
+        tree_object.store().unwrap();
+        let tree_hash = tree_object.hash;
+
+        // P2: stored once (so its hash is real and content-addressed), then deleted — "held once
+        // and lost", never a pallet ref, reachable only through the boundary and P1's own parent
+        // list.
+        let mut p2_object = LooseObjectBuilder::build_parcel(&Parcel {
+            tree_hash: tree_hash.clone(), parents: Vec::new(), actions: Vec::new(), description: None,
+        });
+        p2_object.store().unwrap();
+        let p2_hash = p2_object.hash.clone();
+        let (folder, file_name) = file_utils::get_path_for_object(&p2_hash).unwrap();
+        let p2_absolute = PathBuf::from(&folder).join(&file_name);
+        let p2_relative = p2_absolute.strip_prefix(&forklift).unwrap().to_path_buf();
+        std::fs::remove_file(&p2_absolute).unwrap();
+
+        // P1: present, and its own parent IS P2 — a genuine ancestry edge to the same hash the
+        // boundary also declares.
+        let mut p1_object = LooseObjectBuilder::build_parcel(&Parcel {
+            tree_hash, parents: vec![p2_hash.clone()], actions: Vec::new(), description: None,
+        });
+        p1_object.store().unwrap();
+        let p1_hash = p1_object.hash;
+
+        // Neither parcel is a pallet ref — both are reachable ONLY through the trust boundary
+        // (and, for P2, P1's own ancestry), exactly like `office enroll`/`office revoke`'s
+        // declared-heads shape this whole gap rule exists for.
+        office_utils::write_trust_anchor(&TrustAnchor {
+            genesis: "0".repeat(64),
+            enabled_at: 0,
+            boundary: vec![p1_hash, p2_hash.clone()],
+            prior_genesis: None,
+            adopts: None,
+        }).unwrap();
+
+        plant_torn_taint(&forklift, &[]);
+        assert!(taint_utils::read_taints(&forklift).unwrap().torn, "sanity: the fixture is torn");
+
+        let error = run_heal().expect_err(
+            "a lost parcel reachable both as its own boundary pin AND as a present sibling \
+             pin's genuine parent must still be reported dangling — the ancestry edge is a real \
+             local reference, and the gap rule must never suppress it just because the SAME hash \
+             also happens to be independently declared as a boundary pin"
+        );
+        assert_durability_taint(&error, &[p2_hash.as_str()]);
+
+        let state = taint_utils::read_taints(&forklift).unwrap();
+        assert!(!state.torn, "the taint must no longer be torn — the rescan resolved its scope");
+        let expected: BTreeSet<PathBuf> = [p2_relative].into_iter().collect();
+        assert_eq!(state.recorded, expected,
+            "the remainder must name exactly P2's loose path — reached via P1's genuine \
+             ancestry, never silently swallowed by the gap rule for P2's OWN boundary \
+             declaration");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Finding 2 (round 2, PR #120): `adopts` must keep its pre-FORK-81 (main-branch) strict
+    /// semantics — reported when absent, exactly like an ordinary ref — never the `Gap` tolerance
+    /// `boundary`/`distrust_boundary` get. `office regenesis` sets `adopts` to THIS warehouse's
+    /// own prior office head (present by construction on the warehouse performing the re-genesis),
+    /// so its absence is genuine local loss, not a "maybe never fetched" declared snapshot.
+    /// Contrast with `torn_taint_clears_when_the_only_reference_is_a_never_held_trust_pin` above
+    /// (a `boundary` hash, correctly a gap) — this fixture is the same shape but for `adopts`, and
+    /// must refuse instead of clearing.
+    ///
+    /// Mutation: change `PinAbsencePolicy::Loss` to `PinAbsencePolicy::Gap` for the `adopts` push
+    /// in `office_utils::collect_trust_pin_roots` → the lost `adopts` target is silently tolerated
+    /// → `run_heal()` returns `Ok` with `recorded: []` instead of refusing → both assertions below
+    /// go red (confirmed by hand).
+    #[test]
+    fn torn_taint_reports_a_lost_adopts_target_as_dangling_not_a_gap() {
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+        use crate::globals::StorageRootScope;
+        use crate::model::parcel::Parcel;
+        use crate::model::tree_item::TreeItem;
+        use crate::util::office_utils::{self, TrustAnchor};
+
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        let root = std::env::temp_dir()
+            .join(format!("forklift-recovery-utils-lost-adopts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        let _scope = StorageRootScope::enter(&root);
+        let forklift = forklift_root();
+
+        let root_tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        let mut tree_object = LooseObjectBuilder::build_tree(&root_tree);
+        tree_object.store().unwrap();
+
+        // The adopted office head: stored once (a real, content-addressed hash — this warehouse
+        // genuinely held it, matching `adopts`'s own re-genesis provenance), then lost.
+        let mut adopted_object = LooseObjectBuilder::build_parcel(&Parcel {
+            tree_hash: tree_object.hash, parents: Vec::new(), actions: Vec::new(), description: None,
+        });
+        adopted_object.store().unwrap();
+        let adopted_hash = adopted_object.hash.clone();
+        let (folder, file_name) = file_utils::get_path_for_object(&adopted_hash).unwrap();
+        let adopted_absolute = PathBuf::from(&folder).join(&file_name);
+        let adopted_relative = adopted_absolute.strip_prefix(&forklift).unwrap().to_path_buf();
+        std::fs::remove_file(&adopted_absolute).unwrap();
+
+        office_utils::write_trust_anchor(&TrustAnchor {
+            genesis: "0".repeat(64),
+            enabled_at: 0,
+            boundary: Vec::new(),
+            prior_genesis: None,
+            adopts: Some(adopted_hash.clone()),
+        }).unwrap();
+
+        plant_torn_taint(&forklift, &[]);
+        assert!(taint_utils::read_taints(&forklift).unwrap().torn, "sanity: the fixture is torn");
+
+        let error = run_heal().expect_err(
+            "a lost `adopts` target must be reported dangling — this warehouse's own commands \
+             set it, so its absence is genuine local loss, not a legitimately-never-fetched \
+             boundary snapshot"
+        );
+        assert_durability_taint(&error, &[adopted_hash.as_str()]);
+
+        let state = taint_utils::read_taints(&forklift).unwrap();
+        assert!(!state.torn, "the taint must no longer be torn — the rescan resolved its scope");
+        let expected: BTreeSet<PathBuf> = [adopted_relative].into_iter().collect();
+        assert_eq!(state.recorded, expected,
+            "the remainder must name exactly the lost adopts target's loose path");
 
         std::fs::remove_dir_all(&root).ok();
     }

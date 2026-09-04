@@ -53,8 +53,10 @@ pub(crate) struct HealReport {
     resolved: Vec<String>,
 
     /// Advisory notes that never blocked clearing: the "re-run the load" remedy for each vanished
-    /// inventory shard in `resolved`, and a note for each bay whose local state could not be
-    /// read this run (skipped rather than blocking recovery) naming the bay and how to clean it up.
+    /// inventory shard in `resolved`, a note for each bay whose local state could not be
+    /// read this run (skipped rather than blocking recovery) naming the bay and how to clean it
+    /// up, and a note for each trust pin (a trust or distrust boundary) this run confirmed is not
+    /// held locally.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     notes: Vec<String>,
 }

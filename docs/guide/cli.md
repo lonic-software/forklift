@@ -1247,7 +1247,8 @@ still good.
 
 Run `forklift heal` when a command keeps refusing with `durability_taint`. It repeats that
 same restage pass and, for whatever it still cannot resolve on its own, walks every pallet
-head, parked change, tag, and staged file to work out whether the affected object is still
+head, parked change, tag, staged file, and trust pin (the anchor's boundary, and every
+revoked key's own distrust boundary) to work out whether the affected object is still
 needed by anything. If a remote is configured, `heal` also tries fetching from it itself, right
 here, before giving up on anything — you never need to run `lower` by hand for this (and it
 would not help: `lower` is subject to the very same taint check, so it would just hit the same
@@ -1266,13 +1267,21 @@ refusal before ever reaching its own fetch):
   it named everything) — this is rare; it needs a second, unrelated crash on top of the original
   failure. `heal` no longer treats this as a dead end: it re-derives the full scope itself by
   checking every object actually present in the warehouse and re-walking every pallet head,
-  parked change, tag, and staged file to see what is still needed, then records exactly what
-  came out dangling. This can take noticeably longer than the ordinary case (it is checking the
-  whole object store, not just the affected paths), and it prints progress as it goes. If nothing
-  turns out to be missing, the taint clears — exit 0, same as any other clean heal. If something
-  is genuinely gone and still needed, the taint stays standing on exactly that (no longer
-  incomplete) remainder; running `heal` again resolves it exactly like the "something is
-  genuinely gone" case above, including trying a configured remote.
+  parked change, tag, staged file, and trust pin to see what is still needed, then records
+  exactly what came out dangling. This can take noticeably longer than the ordinary case (it is
+  checking the whole object store, not just the affected paths), and it prints progress as it
+  goes. If nothing turns out to be missing, the taint clears — exit 0, same as any other clean
+  heal. If something is genuinely gone and still needed, the taint stays standing on exactly
+  that (no longer incomplete) remainder; running `heal` again resolves it exactly like the
+  "something is genuinely gone" case above, including trying a configured remote.
+- **A source `heal` itself needs could not be read** — a bay's own saved state, or the office
+  record behind a revoked key's distrust boundary. `heal` refuses rather than guess, naming what
+  was unreadable and the actual remedy: a bay names the in-tool cleanup route; the office record
+  gets one of two remedies depending on what actually went wrong — an object that was never
+  written durably says to roll the office pallet back to a head you actually hold, or fetch the
+  missing object from a configured remote, while a record that loaded fine but does not parse
+  says to fix (or restore a good copy of) that record — running `heal` again alone does not
+  change either. Re-run once the named source is fixed.
 
 `heal` and the read-only `audit` are the only two commands that run while a taint is standing —
 every other command refuses first, precisely so nothing durable is ever recorded on top of

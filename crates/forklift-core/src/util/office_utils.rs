@@ -538,12 +538,44 @@ pub enum TrustPinReadPolicy {
     Tolerate,
 }
 
+/// Whether a trust-pin root's own absence, if genuine, is real local loss (report it, exactly
+/// like an ordinary ref this warehouse's own commands set) or a legitimate gap (a snapshot of a
+/// remote's or a revoker's *declared* heads, never pulled first — see each variant's own doc
+/// comment for which pin gets which and why). Carried per pin entry in
+/// [`TrustPinRootsOutcome::roots`] rather than one policy for the whole call, because the three
+/// pin sources do not share this property (F2, PR #120 round 2: folding `adopts` into the same
+/// gap treatment as `boundary`/`distrust_boundary` silently weakened its pre-existing, main-branch
+/// semantics — this warehouse's own commands set `adopts`, so its absence was always reported
+/// there, and still is under this policy).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PinAbsencePolicy {
+    /// This warehouse's own commands set this pin to a head it held at the moment of writing: the
+    /// re-genesis `adopts` pin (`office regenesis`, office.rs) names *this warehouse's own* prior
+    /// office head — present by construction on the warehouse that performed the re-genesis. Its
+    /// absence is genuine local loss and is reported exactly like any ordinary ref.
+    ///
+    /// The one documented exception is a franchise's verbatim copy of a remote's already-
+    /// re-genesis'd anchor (`remote_utils::adopt_remote_trust`'s `write_trust_anchor(&remote_trust
+    /// .to_anchor())`): that franchise's own `fetch_history` call only follows the *new* chain's
+    /// ancestry, never the adopted, pre-re-genesis one, so it can legitimately never hold that
+    /// object. This policy still reports it there — matching `adopts`'s pre-FORK-81 (main-branch)
+    /// behavior exactly, not a new regression; recovering that specific case is a distinct piece
+    /// of work, not this one.
+    Loss,
+    /// This pin names a head *declared* by a remote or a revoker at the moment of enrollment or
+    /// revocation, never pulled first (`office enroll`/`office revoke`, DESIGN.html §8.7/§8.11):
+    /// the trust anchor's `boundary` snapshot and every key's own `distrust_boundary`. Its absence
+    /// can be entirely legitimate, so it is never reported as a dangling reference.
+    Gap,
+}
+
 /// [`collect_trust_pin_roots`]'s result.
 pub struct TrustPinRootsOutcome {
-    /// Every trust/distrust pin hash this call could establish, in no particular order and with
-    /// no deduplication (callers push these onto a larger root bag alongside other sources, which
-    /// already tolerates duplicates). Empty if no trust anchor exists.
-    pub roots: Vec<String>,
+    /// Every trust/distrust pin hash this call could establish, paired with its
+    /// [`PinAbsencePolicy`], in no particular order and with no deduplication (callers push these
+    /// onto a larger root bag alongside other sources, which already tolerates duplicates). Empty
+    /// if no trust anchor exists.
+    pub roots: Vec<(String, PinAbsencePolicy)>,
     /// A plain-language note if the office record could not be read this run — only ever
     /// populated under [`TrustPinReadPolicy::Tolerate`] (`FailClosed` returns `Err` instead of
     /// populating this). `None` on the common path.
@@ -573,6 +605,13 @@ pub struct TrustPinRootsOutcome {
 /// established, so there is no boundary snapshot and (since a key can only be revoked once the
 /// office pallet exists) no revocation to pin either.
 ///
+/// Reads only the office record's **keys**, never its users (F5, PR #120 round 2): only a key's
+/// own `distrust_boundary` is a pin this call needs, so it walks the tracked-keys tree directly
+/// ([`read_trust_pin_keys`]) instead of [`read_office_state`]'s full user-and-key parse — which
+/// would otherwise cost every gc/heal/compact run U extra object loads for user records this call
+/// never reads, and (under [`TrustPinReadPolicy::FailClosed`]) can abort a sweep on a malformed
+/// user record that pins nothing at all.
+///
 /// # Returns
 /// * `Ok(TrustPinRootsOutcome)` - The pin hashes this call could establish, plus (under
 ///                                `Tolerate`) a note if the office record itself was unreadable.
@@ -583,43 +622,176 @@ pub fn collect_trust_pin_roots(policy: TrustPinReadPolicy) -> Result<TrustPinRoo
         return Ok(TrustPinRootsOutcome { roots: Vec::new(), degraded: None });
     };
 
-    let mut roots: Vec<String> = Vec::new();
+    let mut roots: Vec<(String, PinAbsencePolicy)> = Vec::new();
 
     if let Some(adopts) = anchor.adopts {
-        roots.push(adopts);
+        roots.push((adopts, PinAbsencePolicy::Loss));
     }
 
-    roots.extend(anchor.boundary);
+    roots.extend(anchor.boundary.into_iter().map(|hash| (hash, PinAbsencePolicy::Gap)));
 
-    match read_office_state() {
-        Ok(office) => {
-            for key in &office.keys {
-                roots.extend(key.distrust_boundary.iter().cloned());
+    match read_trust_pin_keys() {
+        Ok(keys) => {
+            for key in &keys {
+                roots.extend(
+                    key.distrust_boundary.iter().cloned().map(|hash| (hash, PinAbsencePolicy::Gap))
+                );
             }
 
             Ok(TrustPinRootsOutcome { roots, degraded: None })
         }
-        Err(e) => match policy {
-            TrustPinReadPolicy::FailClosed => Err(e),
+        Err(office_error) => match policy {
+            TrustPinReadPolicy::FailClosed => Err(office_error.message),
             TrustPinReadPolicy::Tolerate => Ok(TrustPinRootsOutcome {
                 roots,
-                degraded: Some(degraded_office_note(&e)),
+                degraded: Some(degraded_office_note(office_error.kind, &office_error.message)),
             }),
         },
     }
 }
 
+/// Why an office-record read failed — see [`read_trust_pin_keys`] and
+/// [`degraded_office_note`] (F4, PR #120 round 2). Replaces one opaque error string: the previous
+/// single "restage" remedy never actually fit either real cause (a never-durable object cannot be
+/// restaged — there is nothing present to rewrite — and a strictly-rejected record is rewritten
+/// byte for byte, so restaging changes nothing about it either), so the note now says something
+/// that can actually be acted on, chosen by which of these a run actually hit.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OfficeReadErrorKind {
+    /// An object the read needs — the office pallet's own head parcel, a tracked-tree node, or a
+    /// key record blob — is not present in this store at all. The textbook shape: `office
+    /// admit`/`office rotate`/`office revoke` advance the office ref before its parcel object is
+    /// durable, and a crash in that window leaves exactly this (`forklift heal`'s own reason to
+    /// exist, DESIGN.html §3.1.1). Remedy: roll `@office` back to a durable head this warehouse
+    /// actually holds, or fetch the missing object from a configured remote.
+    AbsentObject,
+    /// Every object along the path loaded and verified, but a key record's own content does not
+    /// parse as its expected shape (bad TOML, a missing/invalid required field, a non-string
+    /// `distrust_boundary` entry — see `parse_key_record`). The bytes on disk are exactly what was
+    /// durably written; restaging cannot change them. Remedy: fix (or hand-restore a good copy of)
+    /// the record itself.
+    UnparseableRecord,
+    /// Any other read failure (a present-but-corrupt object, an I/O error) that does not fit
+    /// either of the two more specific — and more actionable — kinds above.
+    Other,
+}
+
+/// [`OfficeReadErrorKind`] paired with the underlying plain-language error.
+pub struct OfficeReadError {
+    pub kind: OfficeReadErrorKind,
+    pub message: String,
+}
+
+impl OfficeReadError {
+    fn other(message: String) -> Self {
+        OfficeReadError { kind: OfficeReadErrorKind::Other, message }
+    }
+}
+
+/// Load an object by hash, classifying an absence explicitly — via a presence check run *before*
+/// the load itself — rather than trying to infer "absent" from whatever a deeper loader's error
+/// text happens to say. The one distinction [`read_trust_pin_keys`] actually needs in order to
+/// word [`degraded_office_note`]'s remedy correctly (F4, PR #120 round 2). A present object that
+/// still fails to load (wrong object type, corrupt content) is [`OfficeReadErrorKind::Other`] — it
+/// is not the "restage the missing dentry" case [`OfficeReadErrorKind::AbsentObject`] names, but
+/// it is also not a record *parse* failure, since nothing here has reached record content yet.
+fn load_object_classified<T>(
+    hash: &str,
+    loader: impl FnOnce(&str) -> Result<T, String>,
+) -> Result<T, OfficeReadError> {
+    match file_utils::does_object_exist(hash) {
+        Ok(true) => {}
+        Ok(false) => return Err(OfficeReadError {
+            kind: OfficeReadErrorKind::AbsentObject,
+            message: format!("object {} is not present", hash),
+        }),
+        Err(e) => return Err(OfficeReadError::other(e)),
+    }
+
+    loader(hash).map_err(OfficeReadError::other)
+}
+
+/// [`resolve_subtree`], classified the same way [`load_object_classified`] classifies a single
+/// object load — every tree along `path` is checked for presence before it is loaded, so an
+/// absent one is [`OfficeReadErrorKind::AbsentObject`] by construction, never guessed from a
+/// deeper loader's error text.
+fn resolve_subtree_classified(root_tree_hash: &str, path: &[&str]) -> Result<Option<TreeItem>, OfficeReadError> {
+    let mut current = load_object_classified(root_tree_hash, object_utils::load_tree)?;
+
+    for component in path {
+        let subtree_hash = current.get_subtrees()
+            .find(|(name, _)| name == component)
+            .map(|(_, item)| item.hash.clone());
+
+        match subtree_hash {
+            Some(hash) => current = load_object_classified(&hash, object_utils::load_tree)?,
+            None => return Ok(None),
+        }
+    }
+
+    Ok(Some(current))
+}
+
+/// The trust-pin-relevant slice of the office record: every key's own `distrust_boundary` — the
+/// only thing [`collect_trust_pin_roots`] consumes from the office chain, never a user record (F5,
+/// PR #120 round 2 — see [`collect_trust_pin_roots`]'s own doc comment for why that matters).
+/// Walks `.forklift/tracked/keys` directly ([`resolve_subtree_classified`] returns `Ok(None)` for
+/// a missing component, per its shared [`resolve_subtree`] counterpart) rather than
+/// [`read_office_state`]'s full users-and-keys parse. Classified per [`OfficeReadErrorKind`] so
+/// [`collect_trust_pin_roots`]'s `Tolerate` branch can word its remedy correctly (F4, same round).
+fn read_trust_pin_keys() -> Result<Vec<KeyRecord>, OfficeReadError> {
+    let head = pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).map_err(OfficeReadError::other)?;
+    let Some(head) = head else { return Ok(Vec::new()); };
+
+    let parcel = load_object_classified(&head, object_utils::load_parcel)?;
+
+    let Some(keys_tree) = resolve_subtree_classified(
+        &parcel.tree_hash, &[TREE_NAME_FORKLIFT, TREE_NAME_TRACKED, TREE_NAME_KEYS],
+    )? else {
+        return Ok(Vec::new());
+    };
+
+    let mut keys = Vec::new();
+
+    for (_, file) in keys_tree.get_files() {
+        let record = load_object_classified(&file.hash, load_record)?;
+        keys.push(parse_key_record(&record).map_err(|e| OfficeReadError {
+            kind: OfficeReadErrorKind::UnparseableRecord,
+            message: e,
+        })?);
+    }
+
+    keys.sort_by(|a, b| a.issued_at.cmp(&b.issued_at));
+
+    Ok(keys)
+}
+
 /// Plain-language note for an office record [`collect_trust_pin_roots`] could not read under
-/// [`TrustPinReadPolicy::Tolerate`] — names the mechanical error and what it means for the roots
-/// this call still returned (the trust anchor's own `adopts`/`boundary` pins, unaffected), never a
-/// Rust path or internal identifier. Mirrors `bay_utils::degraded_bay_note`'s shape.
-fn degraded_office_note(error: &str) -> String {
+/// [`TrustPinReadPolicy::Tolerate`] — names the mechanical error and, per `kind`, the remedy that
+/// actually applies to it (F4, PR #120 round 2). The previous version's "restage" wording never
+/// matched either real cause — a never-durable object cannot be restaged (there is nothing present
+/// to rewrite) and a strictly-rejected record is rewritten byte for byte — and its "treated as
+/// missing rather than blocking this command" clause was actively misleading: every consumer of a
+/// non-empty `degraded_sources` refuses (see `recovery_utils::collect_walk_roots`'s own doc
+/// comment), so this note only ever appears *inside* a refusal, never instead of one. Mirrors
+/// `bay_utils::degraded_bay_note`'s shape.
+fn degraded_office_note(kind: OfficeReadErrorKind, error: &str) -> String {
+    let remedy = match kind {
+        OfficeReadErrorKind::AbsentObject =>
+            "roll \"@office\" back to a durable head this warehouse actually holds, or fetch the \
+             missing object from a configured remote, then re-run \"forklift heal\"",
+        OfficeReadErrorKind::UnparseableRecord =>
+            "fix (or hand-restore a good copy of) the record itself — its bytes are exactly what \
+             was durably written, so re-running heal alone will not change them",
+        OfficeReadErrorKind::Other =>
+            "resolve the error named below, then re-run \"forklift heal\"",
+    };
+
     format!(
         "the office record could not be read this run ({}); every revoked key's own distrust \
-        boundary pin was treated as missing rather than blocking this command (the trust \
-        anchor's own \"adopts\"/\"boundary\" pins are unaffected). Run \"forklift heal\" again \
-        once the office record is restaged.",
-        error
+        boundary pin could not be established (the trust anchor's own \"adopts\"/\"boundary\" \
+        pins are unaffected). {}.",
+        error, remedy
     )
 }
 
