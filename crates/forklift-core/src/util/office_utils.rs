@@ -726,9 +726,11 @@ fn load_object_classified<T>(
 }
 
 /// [`resolve_subtree`], classified the same way [`load_object_classified`] classifies a single
-/// object load — every tree along `path` is checked for presence before it is loaded, so an
-/// absent one is [`OfficeReadErrorKind::AbsentObject`] by construction, never guessed from a
-/// deeper loader's error text.
+/// object load — each tree along `path` is read through the one classified read, so an absent one
+/// is [`OfficeReadErrorKind::AbsentObject`] by construction (from
+/// [`file_utils::StoreReadOutcome::Absent`]), never guessed from a deeper loader's error text.
+/// There is deliberately no separate presence check before the load: that check-then-load shape
+/// used the taint-gated predicate and had a window between the two, both of which round 3 removed.
 fn resolve_subtree_classified(root_tree_hash: &str, path: &[&str]) -> Result<Option<TreeItem>, OfficeReadError> {
     let mut current = load_object_classified(root_tree_hash, object_utils::parse_local_tree_bytes)?;
 

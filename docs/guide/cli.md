@@ -1275,13 +1275,16 @@ refusal before ever reaching its own fetch):
   that (no longer incomplete) remainder; running `heal` again resolves it exactly like the
   "something is genuinely gone" case above, including trying a configured remote.
 - **A source `heal` itself needs could not be read** — a bay's own saved state, or the office
-  record behind a revoked key's distrust boundary. `heal` refuses rather than guess, naming what
-  was unreadable and the actual remedy: a bay names the in-tool cleanup route; the office record
-  gets one of two remedies depending on what actually went wrong — an object that was never
-  written durably says to roll the office pallet back to a head you actually hold, or fetch the
-  missing object from a configured remote, while a record that loaded fine but does not parse
-  says to fix (or restore a good copy of) that record — running `heal` again alone does not
-  change either. Re-run once the named source is fixed.
+  record behind a revoked key's distrust boundary. When this run actually needs that source,
+  `heal` refuses rather than guess, naming what was unreadable and the actual remedy: a bay names
+  the in-tool cleanup route; the office record gets the remedy that fits what went wrong — an
+  object that was never written durably says to roll the office pallet back to a head you
+  actually hold, or fetch the missing object from a configured remote; a record that loaded fine
+  but does not parse says to fix (or restore a good copy of) that record, since running `heal`
+  again alone does not change its bytes; anything else names the underlying error to resolve.
+  Re-run once the named source is fixed. A run that has nothing to look up — every recorded entry
+  resolved on its own, so no reachability question was ever asked — clears without consulting
+  these sources at all, and so never reports on them.
 
 `heal` and the read-only `audit` are the only two commands that run while a taint is standing —
 every other command refuses first, precisely so nothing durable is ever recorded on top of

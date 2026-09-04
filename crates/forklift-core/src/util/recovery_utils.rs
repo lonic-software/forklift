@@ -3293,6 +3293,16 @@ mod tests {
              shard-only path rather than some other one: {:?}", outcome.resolved
         );
 
+        // POSITIVE CONTROL for the assertion below. Without it, a fixture that silently stopped
+        // registering the pin (a changed office-pallet shape, a dropped anchor write) would leave
+        // the negative assertion passing while the claim under test evaporated — the test would
+        // be asserting "no note" about a warehouse that has no pin to report in the first place.
+        let pins = collect_walk_roots().unwrap().pin_parcels;
+        assert!(pins.iter().any(|(hash, _)| hash == &never_held_hash),
+            "sanity: the fixture must actually hold a never-held pin for the negative assertion \
+             below to mean anything: {:?}", pins
+        );
+
         assert!(outcome.notes.iter().all(|note| !note.contains("trust pin")),
             "with nothing to drive the closure walk this run, no pin note can be produced — even \
              though a genuinely never-held pin exists in the office record — matching \
@@ -3691,6 +3701,18 @@ mod tests {
         assert!(!state.torn, "the taint must no longer be torn after a clean rescan");
         assert!(state.recorded.is_empty(),
             "the never-held pin must not be folded into the remainder as a dangling reference");
+
+        // THE POSITIVE SIDE of `HealReport::notes`'s narrowed promise. Its sibling
+        // `heal_reports_no_pin_note_when_nothing_this_run_needed_the_closure_walk` asserts only
+        // the ABSENCE of a pin note; without this assertion both fold-in sites
+        // (`resolve_the_rest` and `rescan_torn_taint`) could be deleted outright and the whole
+        // suite would stay green, leaving the doc comment — and the committed JSON schema that
+        // mirrors it — with no falsifier at all. This is that fixture: a Gap pin the store never
+        // held, on the rescan path, which is exactly when the note must be produced.
+        assert!(outcome.notes.iter().any(|note| note.contains(&never_held)),
+            "the run must NAME the never-held pin it tolerated, or clearing silently hides the \
+             very state the next `audit` will refuse over: {:?}", outcome.notes
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }
