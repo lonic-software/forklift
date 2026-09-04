@@ -560,7 +560,8 @@ pub enum PinAbsencePolicy {
     /// ancestry, never the adopted, pre-re-genesis one, so it can legitimately never hold that
     /// object. This policy still reports it there — matching `adopts`'s pre-FORK-81 (main-branch)
     /// behavior exactly, not a new regression; recovering that specific case is a distinct piece
-    /// of work, not this one.
+    /// of work, not this one — tracked as FORK-114 (PR #120 round 3, F3): on such a franchise,
+    /// every `forklift heal` reports the adopted head dangling and refuses to clear, forever.
     Loss,
     /// This pin names a head *declared* by a remote or a revoker at the moment of enrollment or
     /// revocation, never pulled first (`office enroll`/`office revoke`, DESIGN.html §8.7/§8.11):
@@ -688,27 +689,40 @@ impl OfficeReadError {
     }
 }
 
-/// Load an object by hash, classifying an absence explicitly — via a presence check run *before*
-/// the load itself — rather than trying to infer "absent" from whatever a deeper loader's error
-/// text happens to say. The one distinction [`read_trust_pin_keys`] actually needs in order to
-/// word [`degraded_office_note`]'s remedy correctly (F4, PR #120 round 2). A present object that
-/// still fails to load (wrong object type, corrupt content) is [`OfficeReadErrorKind::Other`] — it
-/// is not the "restage the missing dentry" case [`OfficeReadErrorKind::AbsentObject`] names, but
-/// it is also not a record *parse* failure, since nothing here has reached record content yet.
+/// Load an object by hash, classifying an absence explicitly — via a single classified read
+/// ([`file_utils::read_object_classified`]) rather than trying to infer "absent" from whatever a
+/// deeper loader's error text happens to say. The one distinction [`read_trust_pin_keys`] actually
+/// needs in order to word [`degraded_office_note`]'s remedy correctly (F4, PR #120 round 2). A
+/// present object that still fails to parse (wrong object type, corrupt content) is
+/// [`OfficeReadErrorKind::Other`] — it is not the "restage the missing dentry" case
+/// [`OfficeReadErrorKind::AbsentObject`] names, but it is also not a record *parse* failure, since
+/// nothing here has reached record content yet.
+///
+/// **Gate-free, deliberately (F1, PR #120 round 3).** This is reached from
+/// [`recovery_utils::collect_walk_roots`](crate::util::recovery_utils::collect_walk_roots) — the
+/// durability-taint recovery walk, which necessarily runs while a taint gate may be standing under
+/// this very root (that is the walk's whole reason to exist; see that module's own doc comment).
+/// [`file_utils::does_object_exist`] would refuse on its very first loose-object call under a
+/// standing gate, degrading a perfectly intact office record for no reason — exactly the class of
+/// bug [`file_utils::raw_object_present`]'s own doc comment already names as its "one sanctioned
+/// exception." [`file_utils::read_object_classified`] is the same core the ordinary read path is
+/// itself expressed through and never consults the gate at all, so using it here both fixes that
+/// and — as a byproduct — folds the old two-step "check, then separately load" window into one
+/// classified read: `Verified` hands back bytes to parse directly, rather than this function's
+/// caller re-reading the same hash a second time through `loader`.
 fn load_object_classified<T>(
     hash: &str,
-    loader: impl FnOnce(&str) -> Result<T, String>,
+    parse: impl FnOnce(&str, &[u8]) -> Result<T, String>,
 ) -> Result<T, OfficeReadError> {
-    match file_utils::does_object_exist(hash) {
-        Ok(true) => {}
-        Ok(false) => return Err(OfficeReadError {
+    match file_utils::read_object_classified(hash) {
+        Ok(file_utils::StoreReadOutcome::Verified(bytes)) => parse(hash, &bytes).map_err(OfficeReadError::other),
+        Ok(file_utils::StoreReadOutcome::Absent) => Err(OfficeReadError {
             kind: OfficeReadErrorKind::AbsentObject,
             message: format!("object {} is not present", hash),
         }),
-        Err(e) => return Err(OfficeReadError::other(e)),
+        Ok(file_utils::StoreReadOutcome::Unverifiable(reason)) => Err(OfficeReadError::other(reason)),
+        Err(e) => Err(OfficeReadError::other(e)),
     }
-
-    loader(hash).map_err(OfficeReadError::other)
 }
 
 /// [`resolve_subtree`], classified the same way [`load_object_classified`] classifies a single
@@ -716,7 +730,7 @@ fn load_object_classified<T>(
 /// absent one is [`OfficeReadErrorKind::AbsentObject`] by construction, never guessed from a
 /// deeper loader's error text.
 fn resolve_subtree_classified(root_tree_hash: &str, path: &[&str]) -> Result<Option<TreeItem>, OfficeReadError> {
-    let mut current = load_object_classified(root_tree_hash, object_utils::load_tree)?;
+    let mut current = load_object_classified(root_tree_hash, object_utils::parse_local_tree_bytes)?;
 
     for component in path {
         let subtree_hash = current.get_subtrees()
@@ -724,7 +738,7 @@ fn resolve_subtree_classified(root_tree_hash: &str, path: &[&str]) -> Result<Opt
             .map(|(_, item)| item.hash.clone());
 
         match subtree_hash {
-            Some(hash) => current = load_object_classified(&hash, object_utils::load_tree)?,
+            Some(hash) => current = load_object_classified(&hash, object_utils::parse_local_tree_bytes)?,
             None => return Ok(None),
         }
     }
@@ -743,7 +757,7 @@ fn read_trust_pin_keys() -> Result<Vec<KeyRecord>, OfficeReadError> {
     let head = pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).map_err(OfficeReadError::other)?;
     let Some(head) = head else { return Ok(Vec::new()); };
 
-    let parcel = load_object_classified(&head, object_utils::load_parcel)?;
+    let parcel = load_object_classified(&head, object_utils::parse_local_parcel_bytes)?;
 
     let Some(keys_tree) = resolve_subtree_classified(
         &parcel.tree_hash, &[TREE_NAME_FORKLIFT, TREE_NAME_TRACKED, TREE_NAME_KEYS],
@@ -754,7 +768,7 @@ fn read_trust_pin_keys() -> Result<Vec<KeyRecord>, OfficeReadError> {
     let mut keys = Vec::new();
 
     for (_, file) in keys_tree.get_files() {
-        let record = load_object_classified(&file.hash, load_record)?;
+        let record = load_object_classified(&file.hash, parse_record_bytes)?;
         keys.push(parse_key_record(&record).map_err(|e| OfficeReadError {
             kind: OfficeReadErrorKind::UnparseableRecord,
             message: e,
@@ -1082,6 +1096,15 @@ fn store_record(toml: &str) -> Result<String, String> {
 /// Load one record blob as a string.
 fn load_record(hash: &str) -> Result<String, String> {
     String::from_utf8(object_utils::load_blob(hash)?.content)
+        .map_err(|_| format!("The metadata record {} is not valid UTF-8.", hash))
+}
+
+/// [`load_record`]'s bytes-in-hand sibling — parses a record blob's content as a string from an
+/// already-in-hand classified read's bytes, rather than triggering a second, independent read of
+/// the same hash. See [`object_utils::parse_local_tree_bytes`]'s own doc comment for why
+/// [`load_object_classified`] needs this shape.
+fn parse_record_bytes(hash: &str, bytes: &[u8]) -> Result<String, String> {
+    String::from_utf8(object_utils::parse_local_blob_bytes(hash, bytes)?.content)
         .map_err(|_| format!("The metadata record {} is not valid UTF-8.", hash))
 }
 

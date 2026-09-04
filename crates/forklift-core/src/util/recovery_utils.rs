@@ -3163,6 +3163,145 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// F1 (PR #120 round 3): heal's own root collection must never call the taint-**gated**
+    /// presence check (`file_utils::does_object_exist`) while reading the office record for
+    /// trust-pin roots — this walk necessarily runs under a root a taint may be standing for
+    /// (that is the whole reason it exists), and the office pallet head this fixture plants is
+    /// loose, exactly the shape `does_object_exist`'s gate consults. Pre-fix,
+    /// `office_utils::load_object_classified` used `does_object_exist` for its presence check, so
+    /// the very first load in `read_trust_pin_keys` (the office parcel head) tripped the standing
+    /// gate and reported an `Other`-kind office-read error — `collect_walk_roots` (called with
+    /// `TrustPinReadPolicy::Tolerate`) then degraded rather than reading the perfectly intact
+    /// record. Mutation: swap `load_object_classified`'s `file_utils::read_object_classified` back
+    /// for `file_utils::does_object_exist` → `walk.degraded_sources` is non-empty and
+    /// `walk.pin_parcels` never gets the key's `distrust_boundary` hash → the two assertions below
+    /// both fail → red (this is the reddening assertion, verified both directions: red on the
+    /// pre-fix `does_object_exist` call, green on the post-fix `read_object_classified` call).
+    #[test]
+    fn collect_walk_roots_reads_the_office_record_past_a_standing_gate() {
+        use crate::globals::StorageRootScope;
+        use crate::util::office_utils::{self, TrustAnchor};
+
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        let dir = std::env::temp_dir()
+            .join(format!("forklift-recovery-utils-office-past-gate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        let _scope = StorageRootScope::enter(&dir);
+        let forklift = forklift_root();
+
+        let target_hash = "3".repeat(64);
+
+        // An anchor must exist — `collect_trust_pin_roots` only reads the office record once
+        // signing has been established.
+        office_utils::write_trust_anchor(&TrustAnchor {
+            genesis: "0".repeat(64),
+            enabled_at: 0,
+            boundary: Vec::new(),
+            prior_genesis: None,
+            adopts: None,
+        }).unwrap();
+
+        // Every object this plants (parcel, trees, key blob) is loose — never packed — matching
+        // the exact shape `does_object_exist`'s gate check consults.
+        plant_minimal_office_pallet_with_distrust_boundary(&target_hash);
+
+        // A standing taint gate for this same root — the state `rescan_torn_taint`'s own step 1
+        // can leave behind on a durable-write failure (see this module's own doc comment on why
+        // the walk must tolerate this), reproduced directly here via the one production path that
+        // sets the gate: an in-process `record_taint` call. The path itself need not exist; only
+        // its root (`forklift_root()`) matters to `resolve_root_for`.
+        let fabricated_path = forklift.join("objects").join("ab").join("gate-fixture-path");
+        taint_utils::record_taint(&[fabricated_path.as_path()]).unwrap();
+        assert!(taint_utils::gate_check(&forklift).is_err(),
+            "sanity: the gate must actually be standing for this root before the walk runs");
+
+        let walk = collect_walk_roots().expect(
+            "collect_walk_roots itself must not error even if a source degrades"
+        );
+
+        assert!(walk.degraded_sources.is_empty(),
+            "a standing taint gate must never degrade the office-record read — the office record \
+             is fully intact and loose objects need no gate check to be read back verified: {:?}",
+            walk.degraded_sources
+        );
+        assert!(walk.pin_parcels.iter().any(|(hash, _)| hash == &target_hash),
+            "the key's distrust_boundary hash must still be collected as a pin root past a \
+             standing gate: {:?}", walk.pin_parcels
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// F2 (PR #120 round 3): `HealReport::notes`'s own doc comment (`heal.rs`) is narrowed to
+    /// promise a trust-pin note only when this run's closure walk actually ran and confirmed one —
+    /// never unconditionally. `closure_references_any` (~:1512) early-returns before
+    /// `collect_walk_roots` runs at all when `targets` is empty, which `resolve_the_rest` passes
+    /// whenever nothing fell into `loose_candidates`/`pack_candidates` this run. A vanished staged
+    /// inventory shard is exactly that case: `classify_vanished` routes it to `shard_vanished`
+    /// (never `loose_candidates`) and it resolves unconditionally, with no recheck and no closure
+    /// walk at all (see the `for relative in &shard_vanished` loop above `walk.never_held_pins`'s
+    /// own fold-in). This test pins that a genuinely never-held trust pin, sitting right there in
+    /// the office record, produces no note on such a run — proving the narrowed doc comment
+    /// accurate rather than merely asserted. Not a red/green mutation test (no code changed for
+    /// F2 — the doc was narrowed to match this pre-existing behavior, per F2's own "prefer
+    /// narrowing over adding a walk to a fast path" instruction), but still a real falsifier of the
+    /// *old*, unconditional doc claim: this assertion would have failed against it.
+    #[test]
+    fn heal_reports_no_pin_note_when_nothing_this_run_needed_the_closure_walk() {
+        use crate::globals::StorageRootScope;
+        use crate::util::office_utils::{self, TrustAnchor};
+
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        let root = std::env::temp_dir()
+            .join(format!("forklift-recovery-utils-no-walk-no-pin-note-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        let _scope = StorageRootScope::enter(&root);
+        let forklift = forklift_root();
+
+        let never_held_hash = "5".repeat(64);
+
+        office_utils::write_trust_anchor(&TrustAnchor {
+            genesis: "0".repeat(64),
+            enabled_at: 0,
+            boundary: Vec::new(),
+            prior_genesis: None,
+            adopts: None,
+        }).unwrap();
+
+        // A genuine Gap-policy pin this store never held: the key's `distrust_boundary` names a
+        // hash that is never stored anywhere in this fixture.
+        plant_minimal_office_pallet_with_distrust_boundary(&never_held_hash);
+
+        // The taint's only recorded entry is a vanished staged-inventory shard — a path
+        // `classify_vanished` recognizes and `resolve_the_rest` resolves unconditionally, never
+        // touching `loose_candidates`/`truly_missing`, which is what keeps
+        // `closure_references_any` on its empty-targets fast path.
+        plant_complete_taint(&forklift, &["bays/main/inventory/staged/data"]);
+
+        let outcome = run_heal().expect(
+            "a vanished shard with nothing else recorded must clear cleanly"
+        );
+        assert!(outcome.was_tainted);
+        assert!(outcome.resolved.iter().any(|p| p.contains("data")),
+            "sanity: the vanished shard must actually resolve, confirming this run took the \
+             shard-only path rather than some other one: {:?}", outcome.resolved
+        );
+
+        assert!(outcome.notes.iter().all(|note| !note.contains("trust pin")),
+            "with nothing to drive the closure walk this run, no pin note can be produced — even \
+             though a genuinely never-held pin exists in the office record — matching \
+             `HealReport::notes`'s narrowed doc comment: {:?}", outcome.notes
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// Finding 1 (round 1, PR #120): heal's root collection must be TOLERANT of an unreadable
     /// office record — `collect_walk_roots`'s own doc comment says "Tolerant, unlike
     /// `collect_live_set`", but pre-fix it called `office_utils::collect_trust_pin_roots` with no
