@@ -190,7 +190,9 @@ pub fn all_bay_state_dirs() -> Result<Vec<PathBuf>, String> {
 /// using `Tolerate` must independently refuse to treat any "not referenced" verdict from a run
 /// with a non-empty [`BayScopeOutcome::degraded`] as proof of anything** — see
 /// `recovery_utils::resolve_the_rest`'s and `recovery_utils::rescan_torn_taint`'s own handling of
-/// their walk's `degraded_bays` for how that plays out at each call site.
+/// their walk's `degraded_sources` (which folds this bay-scoped source together with the
+/// office-record source — see `recovery_utils::WalkRoots::degraded_sources`) for how that plays
+/// out at each call site.
 pub enum BayReadPolicy {
     /// Abort the whole call on the first unreadable bay — see this enum's doc comment. Required
     /// wherever the result feeds a destructive sweep.
@@ -234,7 +236,9 @@ pub struct BayScopeOutcome {
 /// data loss (`heal` clearing a taint over an object `gc` still refuses to delete, or `gc`
 /// deleting an object `heal` would have called live). Recovery additionally walks per-bay
 /// staged inventory shards and adds every tag's subject (sources gc deliberately does not
-/// root); both additionally add the shared trust-anchor `adopts`. Neither of those is part of
+/// root); both additionally add the shared trust-pin roots (`adopts`, the enrollment `boundary`
+/// snapshot, and every key's revocation `distrust_boundary` — FORK-81) via `office_utils::
+/// collect_trust_pin_roots`. Neither of those is part of
 /// this helper — only the portion the two loops had in common.
 ///
 /// **`policy` decides what an unreadable bay does — see [`BayReadPolicy`].** gc's call site

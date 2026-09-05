@@ -18,7 +18,13 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::time::SystemTime;
-use crate::util::{audit_utils, bay_utils, file_utils, object_utils, pallet_utils};
+use crate::util::{audit_utils, bay_utils, file_utils, object_utils};
+// Test-only: `collect_live_set`'s own pallet-head root gathering moved into the shared
+// `recovery_utils::gc_root_sources` (F8, PR #120 round 2), so this module's non-test code no
+// longer calls `pallet_utils` directly — only its own test fixtures still build pallet refs by
+// hand.
+#[cfg(test)]
+use crate::util::pallet_utils;
 
 /// What a collection did.
 pub struct GcStats {
@@ -133,42 +139,44 @@ pub fn collect_garbage(grace_seconds: u64) -> Result<GcStats, String> {
 /// scope away from is still ordinary reachable history — reachable from a pallet head, therefore
 /// live, therefore never freed here. Reclaiming disk for narrowed-away content is a separate,
 /// deliberate, destructive operation; it is never something this reachability sweep does.
+///
+/// **The office chain is the one root set that must be *loadable*, not merely tolerated-if-
+/// absent.** The tolerance above is about descending into an already-collected root's tree/blob
+/// closure — an ordinary pallet head that itself cannot be read is simply skipped by the
+/// reachability walk below it (`audit_utils::collect_reachable_present` treats an absent head as
+/// a gap, contributing nothing, never an error). Computing the *root set itself* is different:
+/// every revoked key's `distrust_boundary` pin can only be found by reading the office pallet's
+/// own head parcel, tracked-keys tree and key-record blobs (`office_utils::
+/// collect_trust_pin_roots`), and this call passes it `TrustPinReadPolicy::FailClosed` — an
+/// unreadable office record aborts `collect_live_set` outright rather than silently returning a
+/// pin list gc cannot prove complete, because under-counting here means sweeping a hash a signed
+/// revocation still names. `forklift heal`'s own root collection
+/// (`recovery_utils::collect_walk_roots`) needs the opposite call for the same read — see that
+/// function's own doc comment for why a sweep and a non-deleting recovery walk are allowed to
+/// differ here the way they already differ on an unreadable bay (`bay_utils::BayReadPolicy`).
 pub(crate) fn collect_live_set() -> Result<HashSet<String>, String> {
-    let mut roots: Vec<String> = Vec::new();
-
-    // Every pallet head across both namespaces — user *and* meta (the office chain is a
-    // GC root, or its keys would be collected as unreachable).
-    for (_, head) in pallet_utils::all_pallet_refs()? {
-        roots.push(head);
-    }
-
-    // Parked parcels and an in-progress consolidation are bay-local
-    // (`.forklift/bays/<name>/…`; the main tree keeps them directly under `.forklift/`), so gc
-    // must read every bay's state, not just the active one — otherwise a `gc`/`compact --all`
-    // run from the main tree would delete an object only a *different* bay's parked or
-    // in-progress-consolidation state still references (present-tense data loss, not merely a
-    // stale record). This is the same per-bay loop `recovery_utils::collect_walk_roots` needs,
-    // so both call the shared `bay_utils::collect_bay_scoped_parcel_roots` — see its doc comment
-    // for the shared-helper rationale, the superset invariant this list must stay a subset of,
-    // and the fail-closed contract on an unreadable bay source (by design, not a bug: re-check
-    // that doc comment before changing this list, and never make it skip-and-continue). The
-    // helper takes the enumerated dirs rather than listing bays itself, so a caller that (like
-    // `collect_walk_roots`) needs the same dirs for another per-bay source too only lists bays
-    // once — this caller has no such second source today, but still enumerates once, up front.
+    // Pallet heads (both namespaces), bay-scoped parcel roots, and trust-pin roots — the three
+    // sources this function shares, hash for hash, with `recovery_utils::collect_walk_roots`
+    // (F8, PR #120 round 2: before this, both callers open-coded the same three-source assembly
+    // by hand — see `recovery_utils::gc_root_sources`'s own doc comment for why that duplication
+    // was worth closing, and for the superset invariant this list must stay a subset of). GC does
+    // not need the pin/ordinary distinction `collect_walk_roots` cares about (an absent root, pin
+    // or ordinary, is just a gap to `audit_utils::collect_reachable_present` below — see this
+    // function's own doc comment), so both lists are flattened into one plain `roots` bag.
+    //
+    // `FailClosed` for both policies, unconditionally — this feeds a sweep that deletes objects,
+    // so an incompletely known live set must abort rather than under-count. See
+    // `bay_utils::BayReadPolicy`'s and `office_utils::TrustPinReadPolicy`'s own doc comments for
+    // the full reasoning, and why `forklift heal`'s own call site is allowed to differ.
     let bay_dirs = bay_utils::all_bay_state_dirs()?;
-    // FailClosed, unconditionally — this feeds a sweep that deletes objects, so an incompletely
-    // known live set must abort rather than under-count. See `bay_utils::BayReadPolicy`'s own doc
-    // comment for the full reasoning and why `forklift heal`'s own call site (`recovery_utils::
-    // collect_walk_roots`) is allowed to differ.
-    roots.extend(bay_utils::collect_bay_scoped_parcel_roots(&bay_dirs, bay_utils::BayReadPolicy::FailClosed)?.roots);
+    let sources = crate::util::recovery_utils::gc_root_sources(
+        &bay_dirs,
+        bay_utils::BayReadPolicy::FailClosed,
+        crate::util::office_utils::TrustPinReadPolicy::FailClosed,
+    )?;
 
-    // A re-genesis anchor (§8.7) pins the replaced office chain as attested history;
-    // the pin is a GC root, or the attested chain would be collected as unreachable.
-    if let Some(anchor) = crate::util::office_utils::read_trust_anchor()? {
-        if let Some(adopts) = anchor.adopts {
-            roots.push(adopts);
-        }
-    }
+    let mut roots: Vec<String> = sources.parcels;
+    roots.extend(sources.pin_parcels.into_iter().map(|(hash, _policy)| hash));
 
     let parcels = audit_utils::collect_reachable_present(&roots)?;
 
@@ -628,6 +636,142 @@ mod tests {
         assert!(gc_result.is_err(), "gc must refuse rather than reclaim when a bay's ref source is unreadable");
         assert!(loose_path(&garbage).exists(),
             "gc must delete nothing when the live set could not be computed, even unrelated garbage");
+    }
+
+    /// Finding 6 (round 1, PR #120): `collect_live_set` must ERROR, not silently narrow the
+    /// trust-pin roots, when the office record backing every revoked key's `distrust_boundary`
+    /// pin cannot be read — see this module's own doc comment (above `collect_live_set`) on why
+    /// the office chain is the one root set this sweep requires to be loadable, unlike an
+    /// ordinary pallet head. Fixture: a trust anchor exists (so `collect_trust_pin_roots`
+    /// proceeds past the "no anchor, no roots" early return) but the office pallet ref names a
+    /// parcel hash never actually stored — the same ref-advanced-before-parcel-durable crash
+    /// window `forklift heal` exists to recover from (Finding 1's own fixture, on the tolerant
+    /// side of this exact split).
+    #[test]
+    fn collect_live_set_errors_when_the_office_head_object_is_absent() {
+        let _scratch = Scratch::new("gc-office-head-absent");
+
+        crate::util::office_utils::write_trust_anchor(&crate::util::office_utils::TrustAnchor {
+            genesis: "0".repeat(64),
+            enabled_at: 0,
+            boundary: Vec::new(),
+            prior_genesis: None,
+            adopts: None,
+        }).unwrap();
+
+        let never_stored_office_head = "f".repeat(64);
+        pallet_utils::set_meta_pallet_head(
+            crate::util::office_utils::OFFICE_PALLET_NAME, &never_stored_office_head
+        ).unwrap();
+
+        let result = collect_live_set();
+        assert!(result.is_err(),
+            "an unreadable office record must fail collect_live_set closed, not silently narrow \
+             the trust-pin roots");
+    }
+
+    /// Finding 5 (round 2, PR #120): `office_utils::collect_trust_pin_roots` only ever consumes a
+    /// key's own `distrust_boundary` — never a user record — so it must read the office record's
+    /// **keys** subtree alone, not the full `read_office_state` (users and keys both). Before the
+    /// fix, a malformed user record (bad role/identifier/enrolled_at/class — any of the strict
+    /// field errors `parse_user_record` can raise) aborted `read_office_state` outright, which
+    /// under `TrustPinReadPolicy::FailClosed` aborted `collect_live_set` too, even though that
+    /// same record pins nothing this sweep needs at all.
+    ///
+    /// Fixture: one office parcel with a user record missing its required `role` field (malformed)
+    /// alongside a well-formed key record naming a real `distrust_boundary` — `collect_live_set`
+    /// must still succeed (and still find the distrust-boundary pin), never trip on the sibling
+    /// user record it never needed to read.
+    #[test]
+    fn collect_live_set_succeeds_past_a_malformed_user_record_when_only_keys_are_readable() {
+        let _scratch = Scratch::new("gc-malformed-user-readable-keys");
+
+        // A parcel this sweep's own trust-pin walk must find live: reachable ONLY through the
+        // valid key's `distrust_boundary`, unreferenced by any pallet ref.
+        let pinned_tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        let mut pinned_tree_object = LooseObjectBuilder::build_tree(&pinned_tree);
+        pinned_tree_object.store().unwrap();
+        let mut pinned_object = LooseObjectBuilder::build_parcel(&Parcel {
+            tree_hash: pinned_tree_object.hash, parents: Vec::new(), actions: Vec::new(), description: None,
+        });
+        pinned_object.store().unwrap();
+        let pinned_hash = pinned_object.hash;
+
+        let malformed_user_toml =
+            "identifier = \"op@broken\"\nenrolled_at = 1\nidentity_root = \"r\"\n"; // no "role"
+        let valid_key_toml = format!(
+            "key_id = \"test-key-1\"\n\
+             operator = \"op@x\"\n\
+             public_key = \"deadbeef\"\n\
+             issued_at = 1\n\
+             distrust_boundary = [\"{}\"]\n\
+             authorized_by = \"test-key-1\"\n\
+             endorsement = \"ee\"\n\
+             proof_of_possession = \"pp\"\n",
+            pinned_hash
+        );
+
+        let user_blob = store_blob(&malformed_user_toml);
+        let key_blob = store_blob(&valid_key_toml);
+
+        let mut users_tree = TreeItem::new("users".to_string(), String::new(), DirEntryType::Tree);
+        users_tree.add_child(TreeItem::new("broken.toml".to_string(), user_blob, DirEntryType::Normal));
+        let mut users_object = LooseObjectBuilder::build_tree(&users_tree);
+        users_object.store().unwrap();
+        users_tree.hash = users_object.hash;
+
+        let mut keys_tree = TreeItem::new("keys".to_string(), String::new(), DirEntryType::Tree);
+        keys_tree.add_child(TreeItem::new("key1.toml".to_string(), key_blob, DirEntryType::Normal));
+        let mut keys_object = LooseObjectBuilder::build_tree(&keys_tree);
+        keys_object.store().unwrap();
+        keys_tree.hash = keys_object.hash;
+
+        let mut tracked_tree = TreeItem::new("tracked".to_string(), String::new(), DirEntryType::Tree);
+        tracked_tree.add_child(users_tree);
+        tracked_tree.add_child(keys_tree);
+        let mut tracked_object = LooseObjectBuilder::build_tree(&tracked_tree);
+        tracked_object.store().unwrap();
+        tracked_tree.hash = tracked_object.hash;
+
+        let mut forklift_tree = TreeItem::new(".forklift".to_string(), String::new(), DirEntryType::Tree);
+        forklift_tree.add_child(tracked_tree);
+        let mut forklift_object = LooseObjectBuilder::build_tree(&forklift_tree);
+        forklift_object.store().unwrap();
+        forklift_tree.hash = forklift_object.hash;
+
+        let mut root_tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        root_tree.add_child(forklift_tree);
+        let mut root_object = LooseObjectBuilder::build_tree(&root_tree);
+        root_object.store().unwrap();
+
+        let office_parcel = Parcel {
+            tree_hash: root_object.hash, parents: Vec::new(), actions: Vec::new(),
+            description: Some("office with a malformed user record".to_string()),
+        };
+        let mut office_parcel_object = LooseObjectBuilder::build_parcel(&office_parcel);
+        office_parcel_object.store().unwrap();
+
+        crate::util::office_utils::write_trust_anchor(&crate::util::office_utils::TrustAnchor {
+            genesis: "0".repeat(64),
+            enabled_at: 0,
+            boundary: Vec::new(),
+            prior_genesis: None,
+            adopts: None,
+        }).unwrap();
+        pallet_utils::set_meta_pallet_head(
+            crate::util::office_utils::OFFICE_PALLET_NAME, &office_parcel_object.hash
+        ).unwrap();
+
+        // Sanity: the malformed user record really would abort the FULL office-state reader.
+        assert!(crate::util::office_utils::read_office_state().is_err(),
+            "sanity: the fixture's user record must actually be malformed");
+
+        let live = collect_live_set().expect(
+            "a malformed user record must never abort collect_live_set — the trust-pin walk only \
+             needs the office record's keys, never its users"
+        );
+        assert!(live.contains(&pinned_hash),
+            "the valid key's own distrust_boundary pin must still be found live: {:?}", live);
     }
 
     /// DESIGN.html §5.0 D item 10, finding #3: a `WriteBatch`-staged write that never reaches
