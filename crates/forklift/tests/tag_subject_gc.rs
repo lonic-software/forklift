@@ -1,6 +1,8 @@
 //! FORK-79: `Tag.subject` is a bare parcel hash inside `@tags` (tag_utils.rs:51). Nothing roots
-//! it — `gc_utils::collect_live_set` marks only pallet heads, bay-scoped parcels and the
-//! anchor's `adopts` pin (gc_utils.rs:136-171). `undo` moves a pallet head *backwards* to
+//! it — `gc_utils::collect_live_set` marks pallet heads, bay-scoped parcels and the trust pins
+//! (`office_utils::collect_trust_pin_roots`: the anchor's `adopts`, its enrollment `boundary`,
+//! and every key's revocation `distrust_boundary` — FORK-81). A tag subject is in none of those
+//! sets, which is what this file is about. `undo` moves a pallet head *backwards* to
 //! `pre_head` (journal_utils.rs:191), so tagging a parcel and then undoing the stack that
 //! created it leaves the tag's subject reachable from no ref at all — and gc collects it.
 //!

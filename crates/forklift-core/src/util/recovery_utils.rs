@@ -54,12 +54,23 @@
 //! vanished *target* must still be reported as referenced — see
 //! [`tests::a_vanished_pallet_head_that_is_itself_the_target_is_still_reported_referenced`]),
 //! **unconditionally in both modes below**, and on absence skips descending — it does **not**
-//! error. This is sound to *clear* on, not merely tolerate: `collect_walk_roots`'s own doc comment
+//! error.
+//!
+//! **One rule sits outside that sentence, and it is the surprising one.** A *root* carrying
+//! [`crate::util::office_utils::PinAbsencePolicy::Gap`] — a trust or distrust boundary, which may
+//! name a head this store was never going to hold — is, when absent, neither reported through the
+//! sink nor marked visited (FORK-81). Not marking it is deliberate: the same hash reached later as
+//! a genuine parent edge carries the reporting policy and must still resolve. `adopts` is the
+//! exception among the pins and keeps the ordinary reporting behaviour, because a warehouse that
+//! performed its own re-genesis held that object by construction.
+//!
+//! This is sound to *clear* on, not merely tolerate: `collect_walk_roots`'s own doc comment
 //! establishes that this walk's root set is a superset of
-//! [`crate::util::gc_utils::collect_live_set`]'s, so with identical tolerance any target this walk
-//! calls unreferenced is unreferenced under gc's smaller root set too — gc is already entitled to
-//! collect it, so a heal that instead kept it tainted forever would brick every command over an
-//! object the store's own collector calls garbage. A **present**-but-unloadable object still fails
+//! [`crate::util::gc_utils::collect_live_set`]'s, and the absence policy above changes only
+//! whether an absence is *reported*, never what is reachable — an absent object is outside gc's
+//! live set too. So any target this walk calls unreferenced is unreferenced under gc's smaller
+//! root set too — gc is already entitled to collect it, so a heal that instead kept it tainted
+//! forever would brick every command over an object the store's own collector calls garbage. A **present**-but-unloadable object still fails
 //! loud (the ordinary `?` after the presence check returns `true`) — tolerance is for absence only,
 //! never for corruption.
 //!
