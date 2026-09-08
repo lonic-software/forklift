@@ -316,17 +316,13 @@ fn parse_tag(toml: &str) -> Result<Tag, String> {
     let doc: DocumentMut = toml.parse()
         .map_err(|e| format!("A tag record is not valid TOML: {}", e))?;
 
-    let read_string = |field: &str| -> Result<String, String> {
-        doc.get(field)
-            .and_then(|item| item.as_str())
-            .map(|s| s.to_string())
-            .ok_or(format!("A tag record has no \"{}\" entry.", field))
-    };
-
+    // FORK-81 follow-up (the class sweep PR #122 missed): shares the office's required-string
+    // reader instead of duplicating it as a private per-module closure. `Tag` has no optional
+    // fields, so this is pure de-duplication — no parse behaviour changes.
     Ok(Tag {
-        name: read_string("name")?,
-        subject: read_string("subject")?,
-        message: read_string("message")?,
+        name: office_utils::read_string(&doc, "name", "tag record")?,
+        subject: office_utils::read_string(&doc, "subject", "tag record")?,
+        message: office_utils::read_string(&doc, "message", "tag record")?,
         tagged_at: doc.get("tagged_at")
             .and_then(|item| item.as_integer())
             .ok_or("A tag record has no \"tagged_at\" entry.".to_string())?,

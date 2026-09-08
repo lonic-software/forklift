@@ -1187,7 +1187,9 @@ fn parse_user_record(toml: &str) -> Result<UserRecord, String> {
     // .unwrap_or_default()` did — that would turn a writer meant to be restricted to one pallet
     // into an unrestricted one the moment their grant record is damaged, exactly backwards from
     // CLAUDE.md's fail-loudly rule for an authorization check. Mirrors `distrust_boundary`'s
-    // absent-vs-malformed split above.
+    // absent-vs-malformed split below (`parse_key_record`) — not `boundary`'s just above, which
+    // is required and has the opposite absent-case policy (a missing key is corruption, not a
+    // default).
     let pallets = read_optional_string_array(&doc, "pallets", "user record")?;
 
     // Optional, strict, same shape as `pallets`: `user_record_to_toml` omits `class` entirely
@@ -1301,8 +1303,11 @@ fn parse_key_record(toml: &str) -> Result<KeyRecord, String> {
     })
 }
 
-/// Read a required string field from a TOML document.
-fn read_string(doc: &DocumentMut, field: &str, record_kind: &str) -> Result<String, String> {
+/// Read a required string field from a TOML document. `pub(crate)`: `haul_utils`,
+/// `manifest_utils` and `tag_utils` share this instead of duplicating it as a private
+/// per-module closure (FORK-81 follow-up: the class sweep this PR's own strictness fix
+/// missed).
+pub(crate) fn read_string(doc: &DocumentMut, field: &str, record_kind: &str) -> Result<String, String> {
     doc.get(field)
         .and_then(|item| item.as_str())
         .map(|s| s.to_string())
@@ -1320,8 +1325,10 @@ fn read_integer(doc: &DocumentMut, field: &str, record_kind: &str) -> Result<i64
 /// shape for a field the writer genuinely omits — but a *present* key must be a string, or
 /// this errors naming the record kind and field. Never conflates "absent" with "present but
 /// the wrong type" the way `doc.get(field).and_then(|item| item.as_str())` collapsing both
-/// cases to `None` would (FORK-81 follow-up: the same lenience `pallets` had).
-fn read_optional_string(doc: &DocumentMut, field: &str, record_kind: &str) -> Result<Option<String>, String> {
+/// cases to `None` would (FORK-81 follow-up: the same lenience `pallets` had). `pub(crate)`:
+/// `haul_utils` and `manifest_utils` share this instead of duplicating the same lenient
+/// shape as a private per-module `optional_string` closure.
+pub(crate) fn read_optional_string(doc: &DocumentMut, field: &str, record_kind: &str) -> Result<Option<String>, String> {
     let Some(item) = doc.get(field) else { return Ok(None); };
 
     item.as_str()
