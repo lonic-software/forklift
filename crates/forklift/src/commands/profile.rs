@@ -24,14 +24,14 @@ pub fn list() -> Result<(), String> {
             name: "default".to_string(),
             identifier: Some(identifier.clone()),
             display_name: None,
-            local_keys: sign_utils::keys_owned_by(identifier)?.len(),
+            local_keys: Some(sign_utils::keys_owned_by(identifier)?.len()),
             error: None,
         },
         None => ProfileEntry {
             name: "default".to_string(),
             identifier: None,
             display_name: None,
-            local_keys: 0,
+            local_keys: Some(0),
             error: None,
         },
     };
@@ -44,17 +44,19 @@ pub fn list() -> Result<(), String> {
                 name: name.clone(),
                 identifier: Some(identity.identifier.clone()),
                 display_name: (!identity.name.is_empty()).then(|| identity.name.clone()),
-                local_keys: sign_utils::keys_owned_by(&identity.identifier)?.len(),
+                local_keys: Some(sign_utils::keys_owned_by(&identity.identifier)?.len()),
                 error: None,
             },
             // A malformed profile (e.g. a hand-edited, unquoted field) is reported in
             // place rather than silently dropped, or aborting the whole listing — this
             // is the command a user reaches for to find out which profile is broken.
+            // `local_keys: None` (not a fabricated 0) so a consumer that skips `error`
+            // cannot read this as "zero local keys" instead of "unknown".
             Err(error) => ProfileEntry {
                 name: name.clone(),
                 identifier: None,
                 display_name: None,
-                local_keys: 0,
+                local_keys: None,
                 error: Some(error.clone()),
             },
         });
@@ -87,7 +89,11 @@ pub(crate) struct ProfileEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     display_name: Option<String>,
 
-    local_keys: usize,
+    /// `null` for a profile that failed to parse — see `error`. A consumer that reads
+    /// this without checking `error` first must not be able to mistake the absence for
+    /// a real count of zero local keys.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    local_keys: Option<usize>,
 
     /// Set instead of `identifier`/`display_name`/`local_keys` when the profile's
     /// section in the global configuration is present but malformed (e.g. a
@@ -101,7 +107,7 @@ impl CommandOutput for ProfileList {
     fn render_human(&self) {
         match &self.default.identifier {
             Some(identifier) => println!(
-                "default — {} ({} local key(s))", identifier, self.default.local_keys
+                "default — {} ({} local key(s))", identifier, self.default.local_keys.unwrap_or(0)
             ),
             None => println!("default — no identity yet (an id is minted on first use)"),
         }
@@ -122,7 +128,7 @@ impl CommandOutput for ProfileList {
                 entry.name,
                 entry.identifier.as_deref().unwrap_or(""),
                 display,
-                entry.local_keys
+                entry.local_keys.unwrap_or(0)
             );
         }
 

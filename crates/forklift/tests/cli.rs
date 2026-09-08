@@ -2906,6 +2906,51 @@ fn profile_list_reports_a_malformed_profile_without_aborting_the_whole_listing()
     assert!(error.contains("bad"), "the error must name the profile: {}", error);
 }
 
+/// PR #122 round 4 finding F4: a profile section that is not a table at all (`profile.old = 5`,
+/// as opposed to `[profile.old]` with a malformed field) used to vanish from `profile list`
+/// entirely — `get_profile` reads that shape as `Ok(None)`, and the old loop discarded it —
+/// while `profile use old` claimed it "does not exist" and `profile create old` would have
+/// proceeded straight past the existence guard. `list_profiles` must report it like any other
+/// broken entry instead.
+#[test]
+fn profile_list_reports_a_non_table_profile_section_instead_of_dropping_it() {
+    let warehouse = TestWarehouse::new("profile-list-non-table");
+
+    assert_success(&warehouse.run(&["profile", "create", "good", "--name", "Good One"]));
+
+    // A profile section that is a scalar, not a table — `profile.old = 5`, added under the
+    // `[profile]` header `profile create` already writes. A second, later `[profile]` header
+    // (or a dotted key written after `[profile.good]`) would instead be redefining an
+    // already-opened table, which TOML rejects outright.
+    let global_config = warehouse.home.join("global-config.toml");
+    let content = std::fs::read_to_string(&global_config).unwrap();
+    let content = content.replacen("[profile]\n", "[profile]\nold = 5\n", 1);
+    std::fs::write(&global_config, &content).unwrap();
+
+    let human = warehouse.run(&["profile", "list"]);
+    assert_success(&human);
+    let text = stdout(&human);
+    assert!(
+        text.lines().any(|line| line.starts_with("good — ") && line.contains("Good One")),
+        "the good profile must still be listed: {}", text
+    );
+    let old_line = text.lines().find(|line| line.starts_with("old — "))
+        .unwrap_or_else(|| panic!("the non-table profile must be listed, marked as broken: {}", text));
+    assert!(old_line.contains("error:"), "the entry must carry its error: {}", old_line);
+
+    let envelope = json(&warehouse.run(&["--json", "profile", "list"]));
+    assert_eq!(envelope["ok"], true, "the listing itself must not fail: {}", envelope);
+
+    let profiles = envelope["data"]["profiles"].as_array().unwrap();
+    let old = profiles.iter().find(|p| p["name"] == "old")
+        .unwrap_or_else(|| panic!("\"old\" missing from --json listing (silently dropped): {}", envelope));
+    assert!(old.get("identifier").is_none(), "a non-table profile must carry no identifier: {}", old);
+    assert!(old.get("local_keys").is_none(), "a non-table profile must carry no local_keys: {}", old);
+    let error = old["error"].as_str()
+        .unwrap_or_else(|| panic!("a non-table profile must carry its error: {}", old));
+    assert!(error.contains("old"), "the error must name the profile: {}", error);
+}
+
 /// PR #122 finding F4: the end-to-end regression the field-level strictness (round 2) exists
 /// to prevent. `get_operator` must still refuse outright on a malformed selected profile
 /// (unlike `list_profiles`, which is the tolerant, diagnostic exception) — and, the part
@@ -2942,6 +2987,44 @@ fn a_malformed_selected_profile_refuses_without_writing_back_to_the_global_confi
     assert_eq!(
         before, after,
         "a refused get_operator must never write back to the global config file"
+    );
+}
+
+/// PR #122 round 4 finding F1: round 2's fix (`read_profile_field`) only closed the *profile*
+/// branch of this mint-and-overwrite hazard. The non-profile branch — no `operator.profile`
+/// set, `operator.identifier` read straight off `get_effective_value`/`get_scoped_value` via
+/// `get_value_from_document` — used to collapse "present but not a string" into "absent" the
+/// same way, so a hand-edited, unquoted global `identifier = 12345` made `get_operator` mint a
+/// fresh UUID and write it back over the value, on the *more common* code path (no profile
+/// configured at all). Mirrors
+/// `a_malformed_selected_profile_refuses_without_writing_back_to_the_global_config` for the
+/// branch it didn't cover.
+#[test]
+fn a_malformed_default_identifier_refuses_without_writing_back_to_the_global_config() {
+    let warehouse = TestWarehouse::new("default-identifier-malformed-no-writeback");
+    warehouse.write_file("a.txt", "one\n");
+    assert_success(&warehouse.run(&["prepare"]));
+
+    // A hand-edited, unquoted global operator.identifier, written directly — no profile
+    // selected, so get_operator falls straight to the non-profile branch.
+    let global_config = warehouse.home.join("global-config.toml");
+    std::fs::write(&global_config, "[operator]\nidentifier = 12345\n").unwrap();
+
+    let before = std::fs::read(&global_config).unwrap();
+
+    // Any command resolving the operator hits this: "office enroll" is the simplest one
+    // that needs nothing else prepared.
+    let enroll = warehouse.run(&["office", "enroll"]);
+    assert!(!enroll.status.success(), "a malformed operator.identifier must refuse: {}", stdout(&enroll));
+    let error = stderr(&enroll);
+    assert!(error.contains("operator.identifier"), "the refusal must name the key: {}", error);
+
+    // The real regression this pins: no UUID was minted and written back over the value.
+    // The malformed, hand-edited value survives exactly as written.
+    let after = std::fs::read(&global_config).unwrap();
+    assert_eq!(
+        before, after,
+        "a refused get_operator must never mint and write back to the global config file"
     );
 }
 

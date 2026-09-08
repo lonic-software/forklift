@@ -182,7 +182,7 @@ pub fn get_scoped_value(key: &str, scope: ConfigScope) -> Result<Option<String>,
         return Ok(None);
     };
 
-    Ok(get_value_from_document(&document, section, field))
+    get_value_from_document(&document, section, field, &path)
 }
 
 /// Get the effective value of a configuration key: the warehouse configuration is
@@ -397,10 +397,19 @@ pub fn get_profile(profile: &str) -> Result<Option<Operator>, String> {
 /// way propagating [`get_profile`]'s error with `?` would. `get_operator` and
 /// `create_profile` keep refusing outright — only this diagnostic path is tolerant.
 ///
+/// A profile section that is not a table at all (e.g. `profile.old = 5`, as opposed to
+/// `[profile.old]` with a malformed field inside it) is diagnosable here too: `get_profile`
+/// reads that shape as `Ok(None)` — correct for its other caller, `create_profile`, which
+/// must treat it as "free to use" — but iterating this table already proves the name is
+/// present, so `None` here can only mean "not a table", never "does not exist". Reporting it
+/// used to mean silently dropping the entry, which let `profile use old` claim it "does not
+/// exist" and `profile create old` create a second, shadowing `[profile.old]` table right
+/// past the damaged scalar — the opposite of what this command exists for.
+///
 /// # Returns
 /// * `Ok(Vec<(String, Result<Operator, String>)>)` - The profile names in file order,
 ///   each paired with its identity or, for a profile with a present-but-malformed
-///   field, the error naming the profile and field.
+///   field (or a section that is not a table at all), the error naming the profile.
 /// * `Err(String)`                                  - If the global configuration
 ///   itself could not be read.
 pub fn list_profiles() -> Result<Vec<(String, Result<Operator, String>)>, String> {
@@ -419,8 +428,12 @@ pub fn list_profiles() -> Result<Vec<(String, Result<Operator, String>)>, String
     for (name, _) in profiles.iter() {
         match get_profile(name) {
             Ok(Some(identity)) => result.push((name.to_string(), Ok(identity))),
-            // Not a table (e.g. `profile.old = 5`): nothing to report, same as before.
-            Ok(None) => {}
+            // `name` is a key of `profiles`, so this can only mean "not a table".
+            Ok(None) => result.push((name.to_string(), Err(format!(
+                "The profile \"{}\" is not a table (e.g. \"{}.{} = ...\" instead of \"[{}.{}]\"), \
+                in {}. Fix it by hand, or remove it.",
+                name, SECTION_PROFILE, name, SECTION_PROFILE, name, path.display()
+            )))),
             Err(error) => result.push((name.to_string(), Err(error))),
         }
     }
@@ -575,24 +588,52 @@ fn load_document(path: &Path) -> Result<Option<DocumentMut>, String> {
         .map_err(|e| format!("Error while parsing configuration file \"{}\": {}", path.to_string_lossy(), e))
 }
 
-/// Get a string value from a parsed configuration document.
-/// Values of other types (numbers, tables, …) are treated as unset: every known
-/// configuration key holds a string.
+/// Get a string value from a parsed configuration document, strictly on a **present**
+/// field.
+///
+/// An absent section or field is a defined shape every caller relies on — a warehouse or
+/// operator with nothing configured must read as "unset", not error — but a present field
+/// that is not a string must not collapse into that same unset case. It used to: an
+/// `identifier = 12345` (unquoted by hand) in `[operator]` read back as `None`, and
+/// `get_operator` treats an absent identifier as "mint one" — silently minting a fresh UUID
+/// and writing it back over the hand-written value on the very next command, the same
+/// severing-from-identity hazard `read_profile_field` closes for a named profile's own
+/// fields. This is the general reader every known key goes through, `remote.tor` included —
+/// `validate_value` only polices that key's value at set time, so a hand-edited `remote.tor =
+/// 3` used to silently read back as unset (degrading to the `auto` default) rather than
+/// naming the damage. A section present but not a table (e.g. `operator = 1`) is left as
+/// `None`, not an error: `set_value_in_document`/`remove_value_from_document` already name
+/// that case explicitly for the callers (`set`/`unset`) that would otherwise silently repair
+/// it.
 ///
 /// # Arguments
 /// * `document` - The parsed configuration document.
 /// * `section`  - The section (table) name.
 /// * `field`    - The field name inside the section.
+/// * `path`     - The file the document was read from (named in the error).
 ///
 /// # Returns
-/// * `Some(String)` - The value of the field.
-/// * `None`         - If the section or field does not exist (or is not a string).
-fn get_value_from_document(document: &DocumentMut, section: &str, field: &str) -> Option<String> {
-    document.get(section)
-        .and_then(|section_item| section_item.as_table_like())
-        .and_then(|table| table.get(field))
-        .and_then(|field_item| field_item.as_str())
-        .map(|value| value.to_string())
+/// * `Ok(Some(String))` - The value of the field.
+/// * `Ok(None)`         - If the section or field does not exist (or the section is not a
+///                        table).
+/// * `Err(String)`      - If the field is present but not a string.
+fn get_value_from_document(document: &DocumentMut,
+                           section: &str,
+                           field: &str,
+                           path: &Path) -> Result<Option<String>, String> {
+    let Some(table) = document.get(section).and_then(|section_item| section_item.as_table_like()) else {
+        return Ok(None);
+    };
+
+    match table.get(field) {
+        None => Ok(None),
+        Some(field_item) => field_item.as_str()
+            .map(|value| Some(value.to_string()))
+            .ok_or_else(|| format!(
+                "\"{}.{}\" is present but is not a string, in {}. Quote it, or remove it to leave it unset.",
+                section, field, path.display()
+            )),
+    }
 }
 
 /// Set a string value in a parsed configuration document, creating the section if needed.
@@ -701,14 +742,39 @@ mod tests {
     }
 
     #[test]
+    fn a_present_but_non_string_value_errors_instead_of_reading_as_unset() {
+        // The general-reader counterpart of the profile-field test above: this used to be
+        // exactly the hazard read_profile_field's fix left standing on the non-profile branch
+        // — `operator.identifier = 12345` read back as `None`, and `get_operator` treats an
+        // absent identifier as "mint one", silently overwriting the hand-written value.
+        let document: DocumentMut = "[operator]\nidentifier = 12345\n".parse().unwrap();
+
+        let error = match get_value_from_document(&document, "operator", "identifier", Path::new("/cfg")) {
+            Err(error) => error,
+            Ok(value) => panic!(
+                "a present, non-string value must error rather than read as {:?}", value
+            ),
+        };
+
+        assert!(error.contains("operator.identifier"), "the error must name the key: {}", error);
+        assert!(error.contains("/cfg"), "the error must name the file: {}", error);
+
+        // The absent case is unchanged.
+        assert_eq!(
+            get_value_from_document(&document, "operator", "name", Path::new("/cfg")).unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn values_can_be_set_and_read_back() {
         let mut document = DocumentMut::default();
 
         set_value_in_document(&mut document, "operator", "name", "Máté").unwrap();
 
-        assert_eq!(get_value_from_document(&document, "operator", "name"), Some("Máté".to_string()));
-        assert_eq!(get_value_from_document(&document, "operator", "identifier"), None);
-        assert_eq!(get_value_from_document(&document, "missing", "name"), None);
+        assert_eq!(get_value_from_document(&document, "operator", "name", Path::new("/cfg")).unwrap(), Some("Máté".to_string()));
+        assert_eq!(get_value_from_document(&document, "operator", "identifier", Path::new("/cfg")).unwrap(), None);
+        assert_eq!(get_value_from_document(&document, "missing", "name", Path::new("/cfg")).unwrap(), None);
     }
 
     #[test]
@@ -723,8 +789,8 @@ mod tests {
         let written = document.to_string();
         assert!(written.contains("# A comment that must survive."));
         assert!(written.contains("# untouched comment"));
-        assert_eq!(get_value_from_document(&document, "operator", "name"), Some("New Name".to_string()));
-        assert_eq!(get_value_from_document(&document, "operator", "identifier"), Some("old@id".to_string()));
+        assert_eq!(get_value_from_document(&document, "operator", "name", Path::new("/cfg")).unwrap(), Some("New Name".to_string()));
+        assert_eq!(get_value_from_document(&document, "operator", "identifier", Path::new("/cfg")).unwrap(), Some("old@id".to_string()));
     }
 
     #[test]
@@ -735,11 +801,11 @@ mod tests {
         assert!(remove_value_from_document(&mut document, "remote", "token").unwrap());
 
         // The token is gone; everything else survives.
-        assert_eq!(get_value_from_document(&document, "remote", "token"), None);
+        assert_eq!(get_value_from_document(&document, "remote", "token", Path::new("/cfg")).unwrap(), None);
         let written = document.to_string();
         assert!(written.contains("# Keep me."));
         assert!(!written.contains("secret"));
-        assert_eq!(get_value_from_document(&document, "operator", "name"), Some("Name".to_string()));
+        assert_eq!(get_value_from_document(&document, "operator", "name", Path::new("/cfg")).unwrap(), Some("Name".to_string()));
 
         // Removing an absent field (or an absent section) reports "not present".
         assert!(!remove_value_from_document(&mut document, "remote", "token").unwrap());
@@ -752,7 +818,7 @@ mod tests {
         // an `[operator]` section; both spellings must be readable.
         let document: DocumentMut = "operator.name = \"Dotted\"\n".parse().unwrap();
 
-        assert_eq!(get_value_from_document(&document, "operator", "name"), Some("Dotted".to_string()));
+        assert_eq!(get_value_from_document(&document, "operator", "name", Path::new("/cfg")).unwrap(), Some("Dotted".to_string()));
     }
 
     #[test]

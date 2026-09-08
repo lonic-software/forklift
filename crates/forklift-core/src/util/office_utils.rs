@@ -1301,15 +1301,33 @@ fn parse_key_record(toml: &str) -> Result<KeyRecord, String> {
     })
 }
 
-/// Read a required string field from a TOML document. `pub(crate)`: `haul_utils`,
-/// `manifest_utils` and `tag_utils` share this instead of duplicating it as a private
-/// per-module closure (FORK-81 follow-up: the class sweep this PR's own strictness fix
-/// missed).
+/// Read a required string field from a TOML document, strictly: an absent key errors naming
+/// the record kind and field ("has no ... entry"), and so does a *present* key that is not a
+/// string — but with its own wording ("is present but is not a string"), so a hand-edited
+/// `genesis = 7` is never reported as missing. Same two-arm shape as [`read_integer`], for a
+/// field this record kind always writes. `pub(crate)`: `haul_utils`, `manifest_utils` and
+/// `tag_utils` share this instead of duplicating it as a private per-module closure
+/// (FORK-81 follow-up: the class sweep this PR's own strictness fix missed).
 pub(crate) fn read_string(doc: &DocumentMut, field: &str, record_kind: &str) -> Result<String, String> {
-    doc.get(field)
-        .and_then(|item| item.as_str())
+    let Some(item) = doc.get(field) else {
+        return Err(format!("{} has no \"{}\" entry.", record_kind_prefix(record_kind), field));
+    };
+
+    item.as_str()
         .map(|s| s.to_string())
-        .ok_or(format!("A {} has no \"{}\" entry.", record_kind, field))
+        .ok_or_else(|| format!(
+            "{}'s \"{}\" entry is present but is not a string.", record_kind_prefix(record_kind), field
+        ))
+}
+
+/// The record-kind noun phrase for a message like `"{} has no ... entry."`, with its article.
+/// Every record kind here recurs many times across a warehouse (`"a haul event"`, `"a tag
+/// record"`, ...) except the trust file, which is unique per warehouse — `"a trust file"`
+/// would misleadingly suggest there could be more than one, so it alone takes the definite
+/// article ("the trust file"). Capitalized: every caller uses this at the start of a sentence.
+fn record_kind_prefix(record_kind: &str) -> String {
+    let article = if record_kind == "trust file" { "The" } else { "A" };
+    format!("{} {}", article, record_kind)
 }
 
 /// Read a required integer field from a TOML document, strictly: an absent key errors
@@ -1320,11 +1338,13 @@ pub(crate) fn read_string(doc: &DocumentMut, field: &str, record_kind: &str) -> 
 /// kind always writes.
 pub(crate) fn read_integer(doc: &DocumentMut, field: &str, record_kind: &str) -> Result<i64, String> {
     let Some(item) = doc.get(field) else {
-        return Err(format!("A {} has no \"{}\" entry.", record_kind, field));
+        return Err(format!("{} has no \"{}\" entry.", record_kind_prefix(record_kind), field));
     };
 
     item.as_integer()
-        .ok_or_else(|| format!("A {}'s \"{}\" entry is present but is not an integer.", record_kind, field))
+        .ok_or_else(|| format!(
+            "{}'s \"{}\" entry is present but is not an integer.", record_kind_prefix(record_kind), field
+        ))
 }
 
 /// Read an optional string field, strictly: an absent key is `None` — a defined, expected
@@ -1339,7 +1359,9 @@ pub(crate) fn read_optional_string(doc: &DocumentMut, field: &str, record_kind: 
 
     item.as_str()
         .map(|s| Some(s.to_string()))
-        .ok_or_else(|| format!("A {}'s \"{}\" entry is present but is not a string.", record_kind, field))
+        .ok_or_else(|| format!(
+            "{}'s \"{}\" entry is present but is not a string.", record_kind_prefix(record_kind), field
+        ))
 }
 
 /// [`read_optional_string`]'s integer counterpart: an absent key is `None`, a present
@@ -1349,7 +1371,9 @@ fn read_optional_integer(doc: &DocumentMut, field: &str, record_kind: &str) -> R
 
     item.as_integer()
         .map(Some)
-        .ok_or_else(|| format!("A {}'s \"{}\" entry is present but is not an integer.", record_kind, field))
+        .ok_or_else(|| format!(
+            "{}'s \"{}\" entry is present but is not an integer.", record_kind_prefix(record_kind), field
+        ))
 }
 
 /// Read a required array-of-hashes field, strictly: the key must be present and every entry must
@@ -1359,7 +1383,7 @@ fn read_optional_integer(doc: &DocumentMut, field: &str, record_kind: &str) -> R
 fn read_required_string_array(doc: &DocumentMut, field: &str, record_kind: &str) -> Result<Vec<String>, String> {
     let array = doc.get(field)
         .and_then(|item| item.as_array())
-        .ok_or_else(|| format!("A {} has no \"{}\" array entry.", record_kind, field))?;
+        .ok_or_else(|| format!("{} has no \"{}\" array entry.", record_kind_prefix(record_kind), field))?;
 
     strict_string_array(array, field, record_kind)
 }
@@ -1372,7 +1396,9 @@ fn read_optional_string_array(doc: &DocumentMut, field: &str, record_kind: &str)
     let Some(item) = doc.get(field) else { return Ok(Vec::new()); };
 
     let array = item.as_array()
-        .ok_or_else(|| format!("A {}'s \"{}\" entry is present but is not an array.", record_kind, field))?;
+        .ok_or_else(|| format!(
+            "{}'s \"{}\" entry is present but is not an array.", record_kind_prefix(record_kind), field
+        ))?;
 
     strict_string_array(array, field, record_kind)
 }
@@ -1386,7 +1412,7 @@ fn strict_string_array(array: &toml_edit::Array, field: &str, record_kind: &str)
         .map(|(index, entry)| entry.as_str()
             .map(|s| s.to_string())
             .ok_or_else(|| format!(
-                "A {} has a non-string entry in \"{}\" at index {}.", record_kind, field, index
+                "{} has a non-string entry in \"{}\" at index {}.", record_kind_prefix(record_kind), field, index
             )))
         .collect()
 }
@@ -1737,6 +1763,39 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// PR #122 round 4 finding F2: `read_string` still said "has no ... entry" for BOTH an
+    /// absent key and a present, wrong-typed one — the exact conflation `read_integer` was
+    /// given a two-arm shape to fix — so a hand-edited `genesis = 7` reported "has no
+    /// \"genesis\" entry" while the key is plainly there, misdirecting the fix. It must
+    /// distinguish the two the same way `read_integer` does.
+    #[test]
+    fn read_string_reports_an_absent_key_as_missing() {
+        let doc: DocumentMut = "other = \"x\"\n".parse().unwrap();
+
+        let error = match read_string(&doc, "genesis", "trust file") {
+            Err(e) => e,
+            Ok(v) => panic!("an absent key must error, not read as {:?}", v),
+        };
+        assert!(error.contains("has no"), "must report absence, not type: {}", error);
+        assert!(error.contains("\"genesis\""), "the error must name the field: {}", error);
+    }
+
+    #[test]
+    fn read_string_reports_a_present_non_string_as_wrongly_typed_not_missing() {
+        let doc: DocumentMut = "genesis = 7\n".parse().unwrap();
+
+        let error = match read_string(&doc, "genesis", "trust file") {
+            Err(e) => e,
+            Ok(v) => panic!("a present, non-string value must error, not read as {:?}", v),
+        };
+        assert!(
+            !error.contains("has no"),
+            "a present-but-wrong-type value must not be reported as absent: {}", error
+        );
+        assert!(error.contains("is present but is not a string"), "unexpected error: {}", error);
+        assert!(error.contains("\"genesis\""), "the error must name the field: {}", error);
+    }
+
     /// `read_integer` used to say "has no ... entry" for BOTH an absent key and a present,
     /// wrong-typed one — so a hand-edited, quoted `tagged_at = "1700000000"` was reported as
     /// missing, misdirecting the fix. It must distinguish the two the same way
@@ -1799,5 +1858,34 @@ mod tests {
         assert!(error.contains("\"enabled_at\""), "the error must name the field: {}", error);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// PR #122 round 4 finding F5: routing `genesis`/`enabled_at` through the shared reader
+    /// changed `The trust file has no "genesis" entry.` to `A trust file has no ...` — two
+    /// lines below the surviving, hardcoded `The trust file is not valid TOML`. There is
+    /// exactly one trust file per warehouse, so it takes the definite article like every other
+    /// message about it; a record kind that recurs across a warehouse (a haul event, a tag
+    /// record, ...) keeps the indefinite one.
+    #[test]
+    fn trust_file_errors_take_the_definite_article_other_record_kinds_the_indefinite() {
+        let doc: DocumentMut = "other = \"x\"\n".parse().unwrap();
+
+        let trust_file_error = read_string(&doc, "genesis", "trust file").unwrap_err();
+        assert!(
+            trust_file_error.starts_with("The trust file has no"),
+            "the trust file is unique per warehouse and must take \"The\": {}", trust_file_error
+        );
+
+        let haul_event_error = read_string(&doc, "haul", "haul event").unwrap_err();
+        assert!(
+            haul_event_error.starts_with("A haul event has no"),
+            "a haul event recurs across a warehouse and must keep \"A\": {}", haul_event_error
+        );
+
+        let tag_record_error = read_string(&doc, "subject", "tag record").unwrap_err();
+        assert!(
+            tag_record_error.starts_with("A tag record has no"),
+            "a tag record recurs across a warehouse and must keep \"A\": {}", tag_record_error
+        );
     }
 }

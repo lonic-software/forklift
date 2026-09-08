@@ -2444,17 +2444,20 @@ A command not listed here either reports only the generic human-message shape `{
           ]
         },
         "local_keys": {
+          "description": "`null` for a profile that failed to parse — see `error`. A consumer that reads\nthis without checking `error` first must not be able to mistake the absence for\na real count of zero local keys.",
           "format": "uint",
           "minimum": 0,
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "name": {
           "type": "string"
         }
       },
       "required": [
-        "name",
-        "local_keys"
+        "name"
       ],
       "type": "object"
     }
