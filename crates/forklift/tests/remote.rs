@@ -2274,9 +2274,22 @@ fn a_sparse_franchise_degrades_touches_to_unknown_out_of_scope() {
 }
 
 #[test]
-fn a_partial_clone_missing_a_boundary_head_reads_signer_boundary_as_unresolved() {
-    // The presence guard, end to end: a distrust boundary can name a head this store never
-    // has at all.
+fn a_partial_clone_missing_an_unrelated_boundary_head_still_reads_signer_boundary_as_vouched() {
+    // The presence guard, end to end, narrowed (PR #121 round 1): a distrust boundary can name
+    // a head this store never has at all, and that HEAD-ONLY gap alone must never turn a
+    // parcel a present boundary head already vouches for into "unresolved" — let alone
+    // "suspect". Only an INTERIOR gap (a hash reached as a parent edge from a present node)
+    // may do that; see `audit_utils::DistrustBoundaryMemo`'s struct doc.
+    //
+    // This was `a_partial_clone_missing_a_boundary_head_reads_signer_boundary_as_unresolved`,
+    // which pinned the PRE-NARROWING behaviour: `resolvable` used to treat any gap, head or
+    // interior, as un-resolving, so this exact scenario read "unresolved" even though the
+    // agent's parcel was always trivially vouched by `main`'s own present boundary head. That
+    // was needlessly conservative — worse, it is the same shape as PR #121's franchise/Lambda
+    // regression on the `audit` side (a multi-pallet warehouse's `distrust_boundary`, like
+    // `anchor.boundary`, unions every LOCAL and REMOTE pallet head — see `office::
+    // revocation_boundary` — so an ordinary franchised clone carries this gap forever). The
+    // fixture is unchanged; only the assertions invert.
     //
     // Construction note (a deviation from the original sketch, which tried to manufacture
     // this with `undo`): un-stacking a side-pallet parcel with `undo` *after* retiring past
@@ -2293,12 +2306,9 @@ fn a_partial_clone_missing_a_boundary_head_reads_signer_boundary_as_unresolved()
     //
     // So: a second local-only pallet ("side") supplies the boundary head that a plain
     // (non-sparse) franchise of `main` alone will never even hear about, let alone fetch —
-    // it is flatly absent on the clone, not merely "not reachable from here". Silently
-    // treating that absence as "not reachable" (the way an ordinary reachability walk
-    // always would) must not happen: it would misclassify the agent's still-perfectly-
-    // vouched main-line parcel as suspect. It must read "unresolved" instead. On the
-    // origin, where the side pallet (and its head) are still right there, the same parcel
-    // is fully resolvable and reads its real answer: vouched.
+    // it is flatly absent on the clone, not merely "not reachable from here". That absence
+    // is irrelevant to the agent's main-line parcel, which `main`'s own present boundary
+    // head vouches for regardless — on both the origin and the clone.
     let area = TestArea::new("boundary-unresolved");
     let server = Server::start(&area, None);
 
@@ -2397,47 +2407,56 @@ fn a_partial_clone_missing_a_boundary_head_reads_signer_boundary_as_unresolved()
         .unwrap_or_else(|| panic!("no match for the agent parcel on the clone: {}", clone_report));
     assert_eq!(clone_entry["author"]["trust"], "signed-revoked");
     assert_eq!(
-        clone_entry["signer"]["boundary"], "unresolved",
-        "on a clone missing the orphaned boundary head, the question must read unresolved, \
-         never suspect: {}",
+        clone_entry["signer"]["boundary"], "vouched",
+        "the orphaned side-pallet boundary head is absent but irrelevant: `main`'s own \
+         present boundary head already vouches for the agent parcel, so an absent, unrelated \
+         HEAD must not read as unresolved (let alone suspect): {}",
         clone_report
     );
 
-    // A `signer.boundary eq suspect` predicate must not match the unresolved parcel on the
-    // clone (unresolved reads Unknown for this leaf, which never matches either value).
-    let suspect_on_clone = area.forklift("clone", &[
-        "--json", "query", "main", "--where",
-        r#"{"field":"signer.boundary","op":"eq","value":"suspect"}"#,
-    ]);
-    assert_success(&suspect_on_clone);
-    let suspect_report: serde_json::Value = serde_json::from_str(&stdout(&suspect_on_clone)).unwrap();
-    let suspect_matches: std::collections::HashSet<String> = suspect_report["data"]["matches"]
-        .as_array().unwrap().iter()
-        .map(|entry| entry["parcel"].as_str().unwrap().to_string())
-        .collect();
-    assert!(
-        !suspect_matches.contains(&agent_parcel),
-        "an unresolved boundary must never satisfy signer.boundary eq suspect: {}",
-        suspect_report
-    );
+    // A `signer.boundary eq suspect` predicate must not match, and `eq vouched` must (the
+    // predicate only ever compares against "vouched" or "suspect" — "unresolved" is not a
+    // valid comparison value at all, since an unresolved boundary reads Unknown for this leaf
+    // and never matches either literal; that path is covered by the origin/clone comparison
+    // above rather than a third `--where` case here).
+    for (value, must_match) in [("suspect", false), ("vouched", true)] {
+        let where_clause = format!(
+            r#"{{"field":"signer.boundary","op":"eq","value":"{}"}}"#,
+            value
+        );
+        let report = area.forklift("clone", &["--json", "query", "main", "--where", &where_clause]);
+        assert_success(&report);
+        let report: serde_json::Value = serde_json::from_str(&stdout(&report)).unwrap();
+        let matches: std::collections::HashSet<String> = report["data"]["matches"]
+            .as_array().unwrap().iter()
+            .map(|entry| entry["parcel"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            matches.contains(&agent_parcel), must_match,
+            "signer.boundary eq {}: expected match = {}: {}",
+            value, must_match, report
+        );
+    }
 }
 
 #[test]
 fn a_partial_clone_missing_an_unrelated_boundary_head_still_audits_the_vouched_parcel() {
-    // `audit`'s side of the presence guard is asymmetric, on purpose (see
-    // `audit_utils::DistrustBoundaryMemo`'s doc): a distrust boundary can name a head this
-    // store never has, but `audit` (unlike `query`) must not refuse just because *some*
-    // boundary head is missing — only when the parcel under test cannot be vouched *without*
-    // it. This construction reuses the query engine's own partial-clone fixture (a
-    // never-lifted local "side" pallet's head sits in the boundary alongside main's own) to
-    // pin exactly that: the agent's main-line parcel is vouched by main's own boundary
-    // snapshot alone, so `audit` must pass on the clone even though `side`'s head never
-    // arrived there — the missing head is irrelevant to this parcel, and an audit that
-    // refused anyway would be a regression (the same construction's `lift`, run against the
-    // very same gap, must keep succeeding: see
-    // `a_partial_clone_missing_a_boundary_head_reads_signer_boundary_as_unresolved`, which
-    // shares this scenario and predates this test). The complementary case — a boundary that
-    // truly *cannot* be resolved, where `audit` must refuse honestly rather than allege
+    // `audit` must not refuse just because *some* boundary head is missing — only when the
+    // parcel under test cannot be vouched *without* it. `query`'s `fill_boundary` now agrees
+    // for the same structural reason (an absent HEAD alone never un-resolves a boundary — see
+    // `audit_utils::DistrustBoundaryMemo`'s struct doc), though it still asks `resolvable`
+    // unconditionally rather than lazily (see the doc there); `audit`'s own asymmetric,
+    // vouched-first ordering (below) means it never even needs to ask in the common case. This
+    // construction reuses the query engine's own partial-clone fixture (a never-lifted local
+    // "side" pallet's head sits in the boundary alongside main's own) to pin exactly that: the
+    // agent's main-line parcel is vouched by main's own boundary snapshot alone, so `audit`
+    // must pass on the clone even though `side`'s head never arrived there — the missing head
+    // is irrelevant to this parcel, and an audit that refused anyway would be a regression
+    // (the same construction's `lift`, run against the very same gap, must keep succeeding:
+    // see
+    // `a_partial_clone_missing_an_unrelated_boundary_head_still_reads_signer_boundary_as_vouched`,
+    // which shares this scenario and predates this test). The complementary case — a boundary
+    // that truly *cannot* be resolved, where `audit` must refuse honestly rather than allege
     // tampering — is exercised directly against `verify_pallet_history` in
     // `audit_utils::tests`, because (as the reasoning above implies) a same-pallet parcel's
     // vouching can never genuinely hinge on a head absent from a plain, non-sparse clone of

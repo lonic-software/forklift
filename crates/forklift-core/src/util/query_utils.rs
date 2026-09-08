@@ -355,14 +355,18 @@ impl QueryContext {
     /// key's distrust boundary (`Vouched`), outside it (`Suspect`), or is the question
     /// unanswerable on this store at all (`Unresolved`)? A no-op for any other trust.
     ///
-    /// Presence-guarded: the boundary must be fully resolvable — every `distrust_boundary`
-    /// head present, and every interior ancestor the walk crosses to decide membership too —
-    /// before its answer is trusted, or a gap this store never fetched (an orphaned head, or
-    /// an ancestor behind one) could silently shrink the vouched set and misclassify a
-    /// parcel plainly vouched on the origin as suspicious. Both the presence guard and the
-    /// reachability walk it guards are the shared [`audit_utils::DistrustBoundaryMemo`] — the
-    /// same primitive `audit`'s own phase 3 uses, reading off the very same walk, so the two
-    /// can never disagree on what "vouched" or "resolvable" means.
+    /// Presence-guarded: the boundary must be resolvable — no *interior* ancestor the walk
+    /// crosses to decide membership missing — before its answer is trusted, or such a gap this
+    /// store never fetched (or has since lost) could silently shrink the vouched set and
+    /// misclassify a parcel plainly vouched on the origin as suspicious. An absent
+    /// `distrust_boundary` *head* alone does not un-resolve the boundary: `key.distrust_boundary`
+    /// can legitimately name a head this store never fetched (a revocation snapshots every
+    /// local *and* remote pallet head, exactly as trust establishment does — see
+    /// [`audit_utils::collect_reachable_present`]'s doc), so its absence never shrinks what a
+    /// present head already vouches for. Both the presence guard and the reachability walk it
+    /// guards are the shared [`audit_utils::DistrustBoundaryMemo`] — the same primitive `audit`'s
+    /// own phase 3 uses, reading off the very same walk, so the two can never disagree on what
+    /// "vouched" or "resolvable" means.
     ///
     /// Deliberately lazy at the call site (see `run_query`): called for every `SignedRevoked`
     /// resolution only when the predicate itself reads `signer.boundary` (correctness — the

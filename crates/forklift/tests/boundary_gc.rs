@@ -12,7 +12,7 @@
 //! | member | reader kind | leg here |
 //! | --- | --- | --- |
 //! | revocation `distrust_boundary` | verifying | **FIXED (FORK-81)** — rooted; the two `a_boundary_pin_*`/`a_distrust_boundary_pin_*` legs (FORK-63/64 spike) |
-//! | `audit`'s boundary head | verifying | **FIXED (FORK-81)** — rooted; `an_undone_boundary_head_*`, `a_boundary_head_and_the_legacy_parcel_*`. The residual gap a *rooted* pin can still reach — never fetched, or genuinely lost, since gc can no longer produce it — is a separate finding with its own two legs (not gc-driven, no canary): `an_absent_boundary_head_is_named_not_accused_of_tampering`, `a_genuine_violation_beside_an_unrelated_gap_still_refuses_honestly` |
+//! | `audit`'s boundary head | verifying | **FIXED (FORK-81)** — rooted; `an_undone_boundary_head_*`, `a_boundary_head_and_the_legacy_parcel_*`. The residual gap a *rooted* pin can still reach — never fetched, or genuinely lost, since gc can no longer produce it — is a separate finding with its own legs (not gc-driven, no canary): `an_absent_interior_ancestor_behind_a_present_boundary_head_is_named_not_accused_of_tampering`, `a_genuine_violation_beside_an_unrelated_absent_head_is_accused_of_tampering`, `the_accusation_still_fires_with_no_gap_at_all`. **Narrowed again (PR #121 round 1, FORK-81 continued):** only an *interior* gap (a hash reached as a parent edge from a present parcel) may excuse a non-member from the tampering accusation — an absent *boundary head* alone never does, because `anchor.boundary`/`distrust_boundary` can legitimately name heads this store never fetched (a franchised clone of a multi-pallet warehouse always carries such a gap). See `audit_utils::BoundaryGaps` |
 //! | `CherryPickState.source` | **acting** | `a_collected_cherry_pick_source_*` (FORK-82) |
 //! | `Tag.subject` under a torn taint | **healing** | `a_torn_taint_over_an_absent_tag_subject_*` (FORK-83) |
 //! | staged inventory shard under a torn taint | **healing** | `staging_a_file_and_then_collecting_*` (FORK-83, widened) |
@@ -34,12 +34,14 @@
 //! canary user; and `staging_a_file_...` names the exact blob it staged and asserts that specific
 //! object was collected, which is a canary's job done directly.
 //!
-//! **Two further legs, added for FORK-81's second finding, sit outside this counting
-//! entirely.** They delete an object directly rather than driving `collect_garbage` — the state
-//! they construct (a rooted pin's referent simply never held locally, or genuinely lost) is not
-//! something gc can produce any more, so there is no sweep for a canary to witness and none is
-//! used. See `an_absent_boundary_head_is_named_not_accused_of_tampering` and
-//! `a_genuine_violation_beside_an_unrelated_gap_still_refuses_honestly`.
+//! **Three further legs, added for FORK-81's second finding (and its PR #121 round-1
+//! narrowing), sit outside this counting entirely.** They delete an object directly rather than
+//! driving `collect_garbage` — the state they construct (a rooted pin's referent simply never
+//! held locally, or genuinely lost) is not something gc can produce any more, so there is no
+//! sweep for a canary to witness and none is used. See
+//! `an_absent_interior_ancestor_behind_a_present_boundary_head_is_named_not_accused_of_tampering`,
+//! `a_genuine_violation_beside_an_unrelated_absent_head_is_accused_of_tampering` and
+//! `the_accusation_still_fires_with_no_gap_at_all`.
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -517,38 +519,39 @@ fn a_boundary_head_and_the_legacy_parcel_it_attested_both_survive_gc() {
     );
 }
 
-/// FORK-81 (finding 2): once a rooted pin can no longer be gc'd, what does an ACTUAL gap in it
-/// mean, and what does `audit` say about it? A gap now arises only from a store that never held
-/// the head to begin with — `office enroll` (with a remote configured) pins the remote's
-/// *declared* heads by hash without fetching them, and `franchise` copies the anchor verbatim
-/// while fetching only the one pallet it franchises — or from genuine object loss. Neither cause
-/// is reachable through gc any more (the legs above prove the opposite: a rooted pin survives),
-/// so this leg constructs the state directly: delete the boundary head's object from the store.
+/// FORK-81 (finding 2), narrowed (PR #121 round 1): once a rooted pin can no longer be gc'd,
+/// what does an ACTUAL INTERIOR gap in it mean, and what does `audit` say about it? Only an
+/// interior gap — a hash the boundary walk reaches as a *parent* edge from a parcel it found
+/// present — may excuse a parcel from the tampering accusation; an absent boundary HEAD alone
+/// never does any more (see `an_absent_interior_ancestor_behind_a_present_boundary_head_is_
+/// named_not_accused_of_tampering`'s own doc for why, and the sibling leg below for the
+/// head-only case). This leg constructs the interior case directly: `b` (the boundary head)
+/// stays present; `mid`, `b`'s own parent, is deleted instead — exactly as it would be from
+/// genuine object loss, or a store that never fetched that far back.
 ///
 /// The pallet actually audited must NOT itself need to read the deleted object's body — if it
 /// did, `audit` would fail at the ordinary "this parcel's own body is missing" presence check
 /// (`classify_parcel_trust`'s `object_utils::load_parcel`, which every discovered parcel of the
-/// audited pallet must pass) before ever reaching the boundary-gap logic under test, which would
-/// make this leg pass for the wrong reason. So `b` here belongs to `main`, and the pallet
-/// actually audited (`audit-target`) is palletized directly at `legacy`, `b`'s ancestor — `b` is
-/// never part of `audit-target`'s own history, only of `anchor.boundary`.
+/// audited pallet must pass) before ever reaching the boundary-gap logic under test, which
+/// would make this leg pass for the wrong reason. So `mid` and `b` belong to `main`, and the
+/// pallet actually audited (`audit-target`) is palletized directly at `legacy`, `mid`'s
+/// ancestor — neither `mid` nor `b` is ever part of `audit-target`'s own history, only of
+/// `anchor.boundary`'s ancestry.
 ///
-/// THE FIX (FORK-81, second finding). Before it, `verify_pallet_history`'s `Verdict::
-/// TrustBoundary` arm called `collect_reachable_present(&anchor.boundary)` and, on a
-/// non-member, unconditionally accused: "was stacked after trust was established … The
-/// warehouse may have been tampered with." Now it calls `collect_reachable_present_noting_gaps`
-/// instead (the plain wrapper is literally `Ok(collect_reachable_present_noting_gaps(heads)?.0)`,
-/// so the gap list was already being computed and thrown away) and, when a parcel is not in the
-/// reachable set AND the walk crossed a gap, refuses by naming the missing boundary parcel and
-/// saying this store cannot tell which side of trust the parcel falls on — instead of accusing
-/// tampering it never actually proved.
+/// This was `an_absent_boundary_head_is_named_not_accused_of_tampering`, which deleted the
+/// boundary HEAD itself (`b`) — a head-only gap. Under this round's narrowing that exact
+/// scenario now accuses instead of refusing (an absent head alone never excuses anything), so
+/// this leg was rebuilt around a genuinely interior gap to keep exercising the "cannot resolve"
+/// refusal at all; see `a_genuine_violation_beside_an_unrelated_absent_head_is_accused_of_
+/// tampering` for the head-only case, now inverted.
 #[test]
-fn an_absent_boundary_head_is_named_not_accused_of_tampering() {
-    let warehouse = Warehouse::new_unenrolled("gap");
+fn an_absent_interior_ancestor_behind_a_present_boundary_head_is_named_not_accused_of_tampering() {
+    let warehouse = Warehouse::new_unenrolled("interior-gap");
 
-    // Pre-trust, unsigned history on `main`: legacy <- b.
+    // Pre-trust, unsigned history on `main`: legacy <- mid <- b.
     let legacy = warehouse.stack("app.txt", "v1\n", "legacy one");
-    let b = warehouse.stack("app.txt", "v2\n", "legacy two");
+    let mid = warehouse.stack("app.txt", "v2\n", "legacy two");
+    let b = warehouse.stack("app.txt", "v3\n", "legacy three");
 
     // Enroll now. Only `main` exists, so the anchor's boundary is exactly [b].
     warehouse.run_ok(&["office", "enroll"]);
@@ -558,15 +561,13 @@ fn an_absent_boundary_head_is_named_not_accused_of_tampering() {
     });
     assert_eq!(boundary, vec![b.clone()], "the fixture requires the boundary to be exactly [b]");
 
-    // A second pallet at `legacy` — `b`'s ancestor, not `b` itself — so the pallet this leg
-    // actually audits never needs `b`'s own body to be present.
+    // A second pallet at `legacy` — two hops behind `b`, via `mid` — so the pallet this leg
+    // actually audits never needs `mid`'s or `b`'s own body to be present.
     warehouse.run_ok(&["palletize", "audit-target", &legacy]);
 
-    // Simulate the never-fetched/lost case directly. `b` was a real, present boundary entry
-    // when `office enroll` captured it above; only now does it vanish — exactly as it would
-    // from an `office enroll` behind a remote that declared the head but was never asked to
-    // fetch it, or from genuine loss.
-    warehouse.delete_object(&b);
+    // The interior gap: `b` (the boundary head) stays present; `mid`, reached only as a parent
+    // edge from `b`, is deleted.
+    warehouse.delete_object(&mid);
 
     let audit = warehouse.run(&["audit", "audit-target"]);
     let out = format!(
@@ -575,11 +576,11 @@ fn an_absent_boundary_head_is_named_not_accused_of_tampering() {
         String::from_utf8_lossy(&audit.stderr)
     );
 
-    println!("GAP: audit exit = {:?}\n{}", audit.status.code(), out.trim());
+    println!("INTERIOR GAP: audit exit = {:?}\n{}", audit.status.code(), out.trim());
 
     assert!(
         !audit.status.success(),
-        "audit must refuse: `legacy` cannot be proven pre-trust with `b` absent. output: {}",
+        "audit must refuse: `legacy` cannot be proven pre-trust with `mid` absent. output: {}",
         out
     );
     assert!(
@@ -595,43 +596,43 @@ fn an_absent_boundary_head_is_named_not_accused_of_tampering() {
         out
     );
     assert!(
-        out.contains(&b),
-        "the refusal must name the missing boundary parcel {}: {}",
-        b, out
+        out.contains(&mid),
+        "the refusal must name the missing interior parcel {}: {}",
+        mid, out
+    );
+    assert!(
+        out.contains(&legacy),
+        "the refusal must name the parcel actually under audit {}: {}",
+        legacy, out
     );
 }
 
-/// FORK-81 (finding 2), THE FAIL-OPEN GUARD — the deliberate trade this fix makes, pinned
-/// honestly so nobody later mistakes it for accidental fail-open behaviour.
+/// FORK-81 (finding 2), narrowed (PR #121 round 1) — THE FRANCHISE/LAMBDA SHAPE, now the
+/// opposite of a fail-open guard. Before this round, the gap flag `verify_pallet_history`
+/// computed was GLOBAL TO THE WHOLE WALK and blind to head-vs-interior, so ANY absent
+/// reference anywhere silenced a genuine tampering accusation (that was the trade this test
+/// used to pin, as `a_genuine_violation_beside_an_unrelated_gap_still_refuses_honestly`). That
+/// over-fired: `remote_utils::adopt_remote_trust` writes the remote's anchor verbatim while
+/// `franchise` fetches only one pallet, so EVERY franchised clone of a multi-pallet warehouse
+/// carries an absent-head gap for life — under the old logic, the accusation this leg exercises
+/// would have been permanently unreachable on such a clone. The same shape recurs on the AWS
+/// head: `forklift-aws-lambda/src/scratch.rs` mirrors only the audited pallet's ancestry plus
+/// the office chain, never `boundary`, so `boundary_gap` was always set there too.
 ///
-/// The gap flag `verify_pallet_history` computes is GLOBAL TO THE WHOLE WALK (one
-/// `collect_reachable_present_noting_gaps(&anchor.boundary)` call, memoized for the entire
-/// audit — see `legacy_parcels`/`boundary_gap` in `audit_utils.rs`), not per parcel. So a
-/// parcel that is GENUINELY outside the boundary — stacked after trust, carrying no valid
-/// signature, unreachable from any boundary head no matter what is present — gets the same
-/// "cannot resolve" refusal as a merely-unprovable one, the instant the SAME audit's boundary
-/// walk crosses an unrelated gap anywhere else. This leg constructs exactly that: `outside` is
-/// a genuine violation — a stripped signature on a parcel stacked after trust, a strict
+/// Now only an INTERIOR gap can excuse a parcel; an absent boundary HEAD (`s`, a different
+/// pallet's own pre-trust head — never an ancestor of `outside`) does not. `outside` is a
+/// genuine violation — a stripped signature on a parcel stacked after trust, a strict
 /// DESCENDANT of the boundary head `b` (no boundary walk, gapped or not, could ever reach a
 /// descendant of a boundary head, since the walk only ever follows `.parents`) — audited
-/// alongside an UNRELATED absent boundary entry (`s`, a different pallet's own pre-trust head).
-///
-/// This is the same trade the shipped distrust-boundary arm already makes (`unresolved_head`,
-/// ~15 lines below the arm under test): an "unprovable" negative and a "genuinely outside" one
-/// are indistinguishable from inside the walk once anything at all is missing, so both get the
-/// same honest "cannot resolve" refusal rather than risk a real tampering accusation caused by
-/// a self-inflicted gap. It is a deliberate UNDER-claim on an ALREADY-FAILING path — the audit
-/// still refuses, non-zero, naming the actual gap — never a fail-OPEN one: nothing here makes a
-/// bad history pass. A refusal that cannot say which kind of violation it found is strictly
-/// better than one that guesses wrong and calls an unprovable case "tampered" when the operator
-/// did nothing wrong.
+/// alongside the unrelated absent head `s`. The fixture is unchanged from the old fail-open-
+/// guard version; only the assertions invert.
 ///
 /// No shipped command can create a genuinely-unsigned, genuinely-out-of-boundary parcel once
 /// trust is established — that refusal is the whole point of enrolling — so `outside` is
 /// stacked normally (signed) and its `.sig` sidecar is then deleted directly.
 #[test]
-fn a_genuine_violation_beside_an_unrelated_gap_still_refuses_honestly() {
-    let warehouse = Warehouse::new_unenrolled("guard");
+fn a_genuine_violation_beside_an_unrelated_absent_head_is_accused_of_tampering() {
+    let warehouse = Warehouse::new_unenrolled("franchise-shape");
 
     // Pre-trust, unsigned history: legacy <- b, on `main`.
     let legacy = warehouse.stack("app.txt", "v1\n", "legacy one");
@@ -658,10 +659,10 @@ fn a_genuine_violation_beside_an_unrelated_gap_still_refuses_honestly() {
     let outside = warehouse.stack("app.txt", "v3\n", "after trust");
     warehouse.delete_signature(&outside);
 
-    // The UNRELATED gap: `s` is never an ancestor of `outside` (a descendant of `b`, on a
-    // completely different branch) — its absence cannot legitimately change whether `outside`
-    // is inside or outside the boundary. It is a self-inflicted gap the boundary walk crosses
-    // anyway, because the walk is global to the whole audit rather than scoped per parcel.
+    // The UNRELATED, HEAD-ONLY gap: `s` is never an ancestor of `outside` (a descendant of `b`,
+    // on a completely different branch), and `s` is itself one of `anchor.boundary`'s own
+    // entries — the walk never gets to look past it, so its absence can only ever be a
+    // head-only gap, never an interior one.
     warehouse.delete_object(&s);
 
     let audit = warehouse.run(&["audit", "main"]);
@@ -671,26 +672,83 @@ fn a_genuine_violation_beside_an_unrelated_gap_still_refuses_honestly() {
         String::from_utf8_lossy(&audit.stderr)
     );
 
-    println!("GUARD: audit exit = {:?}\n{}", audit.status.code(), out.trim());
+    println!("FRANCHISE SHAPE: audit exit = {:?}\n{}", audit.status.code(), out.trim());
 
     assert!(
         !audit.status.success(),
-        "audit must still refuse: `outside` is a genuine violation regardless of the \
-        unrelated gap. output: {}",
+        "audit must refuse: `outside` is a genuine violation. output: {}",
         out
     );
     assert!(
-        !out.contains("tampered"),
-        "by design, this refusal does NOT accuse tampering — the unrelated gap makes the \
-        store unable to distinguish this genuine violation from a merely-unprovable one, and \
-        an honest \"cannot resolve\" is preferred over a guess. This is the leg that pins that \
-        trade; if this assertion reddens the trade has been abandoned. output: {}",
+        out.contains("tampered"),
+        "an absent, unrelated boundary HEAD must not block the tampering accusation for a \
+        parcel the present portion of the boundary already settles as outside it — this is \
+        the franchise/Lambda shape, and it must not make a real accusation unreachable. \
+        output: {}",
         out
     );
     assert!(
-        out.contains(&s),
-        "the refusal must name the actual (unrelated) gap {}: {}",
-        s, out
+        out.contains(&outside),
+        "the accusation must name the actual violation {}: {}",
+        outside, out
+    );
+}
+
+/// The positive control: nothing else in this suite pins the accusation actually firing.
+/// `"was stacked after trust"` appears only as a NEGATIVE assertion across every other
+/// trust-boundary leg here — each of them is specifically about a refusal, or about a gap that
+/// must not block an accusation — so a regression that silenced
+/// `verify_pallet_history`'s accusation arm outright, or that widened `boundary_gap` back to
+/// "any gap at all" (head included), would leave this suite green. This leg has no gap of
+/// either kind: every boundary entry stays present, and the accusation still fires, naming the
+/// violating parcel.
+#[test]
+fn the_accusation_still_fires_with_no_gap_at_all() {
+    let warehouse = Warehouse::new_unenrolled("no-gap");
+
+    // Pre-trust, unsigned history: legacy <- b, on `main`. `legacy` itself is not asserted on
+    // below (unlike the other legs) — this leg only cares that the boundary resolves cleanly
+    // and that the genuine violation is still accused.
+    warehouse.stack("app.txt", "v1\n", "legacy one");
+    let b = warehouse.stack("app.txt", "v2\n", "legacy two");
+
+    // Enroll now. Only `main` exists, so the anchor's boundary is exactly [b].
+    warehouse.run_ok(&["office", "enroll"]);
+
+    let boundary = warehouse.scoped(|| {
+        office_utils::read_trust_anchor().unwrap().expect("an anchor").boundary
+    });
+    assert_eq!(boundary, vec![b.clone()], "the fixture requires the boundary to be exactly [b]");
+
+    // The genuine violation: signed at `stack` time (trust is established), then its signature
+    // is stripped directly. Nothing else in the store is touched — the boundary resolves
+    // cleanly, with no gap of either kind.
+    let outside = warehouse.stack("app.txt", "v3\n", "after trust");
+    warehouse.delete_signature(&outside);
+
+    let audit = warehouse.run(&["audit", "main"]);
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&audit.stdout),
+        String::from_utf8_lossy(&audit.stderr)
+    );
+
+    println!("NO GAP: audit exit = {:?}\n{}", audit.status.code(), out.trim());
+
+    assert!(
+        !audit.status.success(),
+        "audit must refuse: `outside` is a genuine violation. output: {}",
+        out
+    );
+    assert!(
+        out.contains("tampered"),
+        "a clean boundary walk (no gap at all) must still accuse a genuine violation: {}",
+        out
+    );
+    assert!(
+        out.contains(&outside),
+        "the accusation must name the actual violation {}: {}",
+        outside, out
     );
 }
 
