@@ -617,9 +617,7 @@ fn parse_event(toml: &str) -> Result<HaulEvent, String> {
     Ok(HaulEvent {
         haul: office_utils::read_string(&doc, "haul", "haul event")?,
         kind: HaulEventKind::parse(&office_utils::read_string(&doc, "kind", "haul event")?)?,
-        recorded_at: doc.get("recorded_at")
-            .and_then(|item| item.as_integer())
-            .ok_or("A haul event has no \"recorded_at\" field.".to_string())?,
+        recorded_at: office_utils::read_integer(&doc, "recorded_at", "haul event")?,
         body: office_utils::read_string(&doc, "body", "haul event")?,
         source: office_utils::read_optional_string(&doc, "source", "haul event")?,
         target: office_utils::read_optional_string(&doc, "target", "haul event")?,

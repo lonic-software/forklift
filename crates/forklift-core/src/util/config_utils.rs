@@ -330,6 +330,34 @@ pub fn get_operator() -> Result<Operator, String> {
 ///                          unset — `get_operator` fills them in).
 /// * `Ok(None)`           - If no such profile exists.
 /// * `Err(String)`        - If the global configuration could not be read.
+/// Read one field of a named profile, strictly on a **present** key.
+///
+/// An absent field is a defined shape the callers rely on — [`get_operator`] mints an
+/// identifier when it is empty and falls back to the identifier for an empty name — but a
+/// present field that is not a string must not collapse into that same empty case. It used
+/// to: an `identifier = 12345` written unquoted by hand read back as `""`, and
+/// [`get_operator`] then minted a fresh UUID and *wrote it back over the profile*, silently
+/// severing the operator from the identity their office enrolment knows them by. Damaged
+/// config now says so rather than being quietly repaired into a different person. Same rule
+/// the record parsers follow (`office_utils::read_optional_string`), for the same reason.
+fn read_profile_field(
+    table: &dyn toml_edit::TableLike,
+    profile: &str,
+    name: &str,
+    path: &Path,
+) -> Result<String, String> {
+    match table.get(name) {
+        None => Ok(String::new()),
+        Some(item) => item.as_str()
+            .map(|value| value.to_string())
+            .ok_or(format!(
+                "The profile \"{}\" has a \"{}\" that is not a string, in {}. \
+                 Quote it, or remove it to have one generated.",
+                profile, name, path.display()
+            )),
+    }
+}
+
 pub fn get_profile(profile: &str) -> Result<Option<Operator>, String> {
     let path = get_config_path(ConfigScope::Global)?;
 
@@ -345,14 +373,9 @@ pub fn get_profile(profile: &str) -> Result<Option<Operator>, String> {
         return Ok(None);
     };
 
-    let field = |name: &str| table.get(name)
-        .and_then(|item| item.as_str())
-        .unwrap_or("")
-        .to_string();
-
     Ok(Some(Operator {
-        name: field(PROFILE_FIELD_NAME),
-        identifier: field(PROFILE_FIELD_IDENTIFIER),
+        name: read_profile_field(table, profile, PROFILE_FIELD_NAME, &path)?,
+        identifier: read_profile_field(table, profile, PROFILE_FIELD_IDENTIFIER, &path)?,
     }))
 }
 
@@ -607,6 +630,53 @@ fn remove_value_from_document(document: &mut DocumentMut,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_present_but_non_string_profile_field_errors_instead_of_reading_as_empty() {
+        // The silent path this replaced: `identifier = 12345` (unquoted by hand) read back as
+        // "", and `get_operator` treats an empty identifier as unset — minting a fresh UUID and
+        // writing it back over the profile, so the operator quietly becomes a different person
+        // than their office enrolment knows. An absent field must still be the empty default,
+        // because that is the case the minting exists to serve.
+        let document: DocumentMut =
+            "[profile.work]\nidentifier = 12345\n".parse().unwrap();
+        let table = document.get("profile").unwrap()
+            .as_table_like().unwrap()
+            .get("work").unwrap()
+            .as_table_like().unwrap();
+
+        let error = match read_profile_field(table, "work", "identifier", Path::new("/cfg")) {
+            Err(error) => error,
+            Ok(value) => panic!(
+                "a present, non-string identifier must error rather than read as {:?}", value
+            ),
+        };
+
+        assert!(error.contains("identifier"), "the error must name the field: {}", error);
+        assert!(error.contains("work"), "the error must name the profile: {}", error);
+
+        // The absent case is unchanged — this is what keeps minting working.
+        assert_eq!(
+            read_profile_field(table, "work", "name", Path::new("/cfg")).unwrap(),
+            "",
+            "an absent field must still read as empty, or a profile without a name would refuse"
+        );
+    }
+
+    #[test]
+    fn a_present_string_profile_field_reads_back_verbatim() {
+        let document: DocumentMut =
+            "[profile.work]\nidentifier = \"someone@example.com\"\n".parse().unwrap();
+        let table = document.get("profile").unwrap()
+            .as_table_like().unwrap()
+            .get("work").unwrap()
+            .as_table_like().unwrap();
+
+        assert_eq!(
+            read_profile_field(table, "work", "identifier", Path::new("/cfg")).unwrap(),
+            "someone@example.com"
+        );
+    }
 
     #[test]
     fn values_can_be_set_and_read_back() {

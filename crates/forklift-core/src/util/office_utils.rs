@@ -1315,7 +1315,7 @@ pub(crate) fn read_string(doc: &DocumentMut, field: &str, record_kind: &str) -> 
 }
 
 /// Read a required integer field from a TOML document.
-fn read_integer(doc: &DocumentMut, field: &str, record_kind: &str) -> Result<i64, String> {
+pub(crate) fn read_integer(doc: &DocumentMut, field: &str, record_kind: &str) -> Result<i64, String> {
     doc.get(field)
         .and_then(|item| item.as_integer())
         .ok_or(format!("A {} has no \"{}\" entry.", record_kind, field))

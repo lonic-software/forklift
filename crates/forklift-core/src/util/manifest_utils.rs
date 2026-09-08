@@ -464,9 +464,7 @@ fn parse_entry(toml: &str) -> Result<ManifestEntry, String> {
         ManifestKind::Delivery => Some(Delivery {
             source: office_utils::read_string(&doc, "source", "manifest entry")?,
             trail_head: office_utils::read_string(&doc, "trail_head", "manifest entry")?,
-            checkpoints: doc.get("checkpoints")
-                .and_then(|item| item.as_integer())
-                .ok_or("A delivery entry has no \"checkpoints\" entry.".to_string())?,
+            checkpoints: office_utils::read_integer(&doc, "checkpoints", "delivery entry")?,
         }),
         _ => None,
     };
@@ -474,9 +472,7 @@ fn parse_entry(toml: &str) -> Result<ManifestEntry, String> {
     Ok(ManifestEntry {
         subject: office_utils::read_string(&doc, "subject", "manifest entry")?,
         kind,
-        recorded_at: doc.get("recorded_at")
-            .and_then(|item| item.as_integer())
-            .ok_or("A manifest entry has no \"recorded_at\" entry.".to_string())?,
+        recorded_at: office_utils::read_integer(&doc, "recorded_at", "manifest entry")?,
         body: office_utils::read_string(&doc, "body", "manifest entry")?,
         provenance,
         delivery,

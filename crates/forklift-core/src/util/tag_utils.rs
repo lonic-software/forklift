@@ -323,9 +323,7 @@ fn parse_tag(toml: &str) -> Result<Tag, String> {
         name: office_utils::read_string(&doc, "name", "tag record")?,
         subject: office_utils::read_string(&doc, "subject", "tag record")?,
         message: office_utils::read_string(&doc, "message", "tag record")?,
-        tagged_at: doc.get("tagged_at")
-            .and_then(|item| item.as_integer())
-            .ok_or("A tag record has no \"tagged_at\" entry.".to_string())?,
+        tagged_at: office_utils::read_integer(&doc, "tagged_at", "tag record")?,
     })
 }
 
