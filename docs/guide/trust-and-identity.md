@@ -146,6 +146,12 @@ forklift office role <operator-id> reader
 forklift office role <operator-id> writer --pallet main --pallet release
 ```
 
+**No `--pallet` means unrestricted, not "none."** A writer's grant list is empty
+by default, and an empty list means *every* working pallet — `--pallet` narrows
+it. Re-running `office role <operator-id> writer` with no `--pallet` flags
+clears any earlier restriction back to unrestricted, rather than leaving it
+untouched.
+
 The office always keeps at least one admin (lockout protection). Non-admins can
 only change their own keys; a remote enforces the same rule on every lift, so a
 parcel can never grant its own author privileges.
