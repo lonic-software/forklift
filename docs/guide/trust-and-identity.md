@@ -65,6 +65,9 @@ this warehouse must be signed** — this cannot be undone.
   reachable — or pass `--offline` if it's gone for good.
 - Protect your key with a passphrase (recommended for a human): add
   `--passphrase` (see §6).
+- That trust boundary keeps every parcel it names alive across `gc` and
+  `compact` — even one no pallet points at any more — so the pre-trust history
+  it attests can't be swept out from under a future audit.
 
 ---
 
@@ -246,6 +249,12 @@ forklift office retire <key-id> --compromised   # revoke a key that may be in ot
   the full history for a definitive answer.
 - Revocations are append-once for everyone (including admins) and a revoked key
   can no longer extend the office chain or endorse new keys.
+- Like the anchor's own boundary, a distrust boundary keeps the history it
+  names alive across `gc` and `compact`, so a parcel it vouches for can't be
+  swept just because no pallet points at it any more. `gc` and `compact --all`
+  both refuse outright — rather than sweep with an incomplete picture — if the
+  office record behind these pins can't be read; `heal` (see [`cli.md`](cli.md))
+  is more forgiving and will usually resolve it first.
 
 ---
 

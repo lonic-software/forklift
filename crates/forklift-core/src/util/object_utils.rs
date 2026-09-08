@@ -368,6 +368,59 @@ pub fn load_blob(hash: &str) -> Result<Blob, String> {
     }
 }
 
+/// Parse an already-in-hand tree object's bytes read from *this warehouse's own local store*,
+/// without any store read of its own — the bytes-in-hand sibling of [`load_tree`], for a caller
+/// that already holds a classified read's verified bytes
+/// ([`file_utils::read_object_classified`]) and would otherwise have to trigger a second,
+/// independent read of the same hash just to get from "bytes" to "parsed tree"
+/// (`office_utils::load_object_classified`, FORK-81 PR #120 round 3, F1).
+///
+/// **Not [`parse_tree_bytes`]** — deliberately no [`enforce_object_ceiling`] call, matching
+/// [`load_tree`]'s own read path (`retrieve_object_by_hash_shared` → … →
+/// [`file_utils::read_object_classified`], the very core this function's bytes came from), which
+/// never enforces the ceiling either (see [`MAX_OBJECT_BYTES`]'s own "gates the way in only" doc
+/// comment: a pre-existing over-ceiling object authored before that policy existed must stay fully
+/// readable). [`parse_tree_bytes`] enforces it because *its* bytes arrive from an external,
+/// not-yet-store-validated source (a bundle import, a remote fetch); this function's bytes are
+/// already-accepted local content, exactly as trusted as any other local read.
+///
+/// # Returns
+/// * `Ok(TreeItem)` - The parsed tree.
+/// * `Err(String)`  - If `bytes` could not be parsed, or is not a tree.
+pub(crate) fn parse_local_tree_bytes(hash: &str, bytes: &[u8]) -> Result<TreeItem, String> {
+    match parser::object::loose_object_parser::parse(bytes)? {
+        ParsedObject::Tree(tree) => Ok(tree),
+        other => Err(format!("Object {} is a {}, not a tree.", hash, other.get_type())),
+    }
+}
+
+/// [`parse_local_tree_bytes`]'s parcel sibling — see that function's own doc comment for why this
+/// is not the ceiling-enforcing form (parcels are stored full and read via the same
+/// never-enforces-on-read core [`load_parcel`] uses).
+///
+/// # Returns
+/// * `Ok(Parcel)`  - The parsed parcel.
+/// * `Err(String)` - If `bytes` could not be parsed, or is not a parcel.
+pub(crate) fn parse_local_parcel_bytes(hash: &str, bytes: &[u8]) -> Result<Parcel, String> {
+    match parser::object::loose_object_parser::parse(bytes)? {
+        ParsedObject::Parcel(parcel) => Ok(parcel),
+        other => Err(format!("Object {} is a {}, not a parcel.", hash, other.get_type())),
+    }
+}
+
+/// [`parse_local_tree_bytes`]'s blob sibling — see that function's own doc comment for why this is
+/// not the ceiling-enforcing form (matches [`load_blob`]'s own never-enforces-on-read core).
+///
+/// # Returns
+/// * `Ok(Blob)`    - The parsed blob.
+/// * `Err(String)` - If `bytes` could not be parsed, or is not a blob.
+pub(crate) fn parse_local_blob_bytes(hash: &str, bytes: &[u8]) -> Result<Blob, String> {
+    match parser::object::loose_object_parser::parse(bytes)? {
+        ParsedObject::Blob(blob) => Ok(blob),
+        other => Err(format!("Object {} is a {}, not a blob.", hash, other.get_type())),
+    }
+}
+
 /// Load and parse the recipe object with the given hash from the object store. The recipe's
 /// structural invariants are enforced by the parser at this point (`sum(chunk_sizes)` equals
 /// the declared total, every chunk hash is valid ASCII hex, no chunk exceeds the per-chunk
