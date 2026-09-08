@@ -536,6 +536,18 @@ established are tolerated as "legacy"). Any tampering — stripped or corrupted
 signatures, an unknown key, a chain that doesn't reach genesis — fails with a
 non-zero exit. See [`trust-and-identity.md`](trust-and-identity.md).
 
+"Legacy" is decided by ancestry from the trust boundary the anchor pins, and the
+same honesty rule applies there as to revocations below. This store can lack a
+boundary head outright — `enroll` pins a remote's declared heads by hash without
+fetching them, and `franchise` copies the anchor verbatim while fetching only the
+one pallet it franchises — or can have genuinely lost one it once held. When that
+gap happens to matter for a parcel this audit is checking, `audit` refuses
+instead of concluding the parcel was stacked after trust: it names the specific
+boundary parcel it could not find and says plainly that it cannot tell whether
+the parcel predates trust or was stacked after it. Still fail-closed, still a
+non-zero exit, but not an accusation. Verify against a store with the full
+history for a definitive answer.
+
 A parcel signed by a *revoked* key is checked against that revocation's distrust
 boundary — exact ancestry, so a forged timestamp changes nothing. If the boundary
 genuinely does not cover the parcel, that is real tampering and `audit` fails

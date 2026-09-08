@@ -63,6 +63,15 @@ this warehouse must be signed** — this cannot be undone.
 - If a remote is configured, its pallet heads are folded into the trust boundary
   (history the remote already has stays valid unsigned), so the remote must be
   reachable — or pass `--offline` if it's gone for good.
+- If this store cannot resolve that trust boundary — it never held one of the
+  named heads (`enroll` pins a remote's declared heads without fetching them,
+  and `franchise` copies the anchor verbatim while fetching only the one pallet
+  it franchises), or has genuinely lost one it once held — `audit` refuses
+  rather than concluding a parcel was stacked after trust: it names the
+  specific boundary parcel it could not find and says plainly that it cannot
+  tell whether the parcel predates trust or was stacked after it. Still
+  fail-closed, still a non-zero exit, but not an accusation. Verify against a
+  store with the full history for a definitive answer.
 - Protect your key with a passphrase (recommended for a human): add
   `--passphrase` (see §6).
 - That trust boundary keeps every parcel it names alive across `gc` and
