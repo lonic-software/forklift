@@ -25,23 +25,38 @@ pub fn list() -> Result<(), String> {
             identifier: Some(identifier.clone()),
             display_name: None,
             local_keys: sign_utils::keys_owned_by(identifier)?.len(),
+            error: None,
         },
         None => ProfileEntry {
             name: "default".to_string(),
             identifier: None,
             display_name: None,
             local_keys: 0,
+            error: None,
         },
     };
 
     let mut named = Vec::new();
 
     for (name, identity) in &profiles {
-        named.push(ProfileEntry {
-            name: name.clone(),
-            identifier: Some(identity.identifier.clone()),
-            display_name: (!identity.name.is_empty()).then(|| identity.name.clone()),
-            local_keys: sign_utils::keys_owned_by(&identity.identifier)?.len(),
+        named.push(match identity {
+            Ok(identity) => ProfileEntry {
+                name: name.clone(),
+                identifier: Some(identity.identifier.clone()),
+                display_name: (!identity.name.is_empty()).then(|| identity.name.clone()),
+                local_keys: sign_utils::keys_owned_by(&identity.identifier)?.len(),
+                error: None,
+            },
+            // A malformed profile (e.g. a hand-edited, unquoted field) is reported in
+            // place rather than silently dropped, or aborting the whole listing — this
+            // is the command a user reaches for to find out which profile is broken.
+            Err(error) => ProfileEntry {
+                name: name.clone(),
+                identifier: None,
+                display_name: None,
+                local_keys: 0,
+                error: Some(error.clone()),
+            },
         });
     }
 
@@ -64,7 +79,8 @@ pub(crate) struct ProfileList {
 pub(crate) struct ProfileEntry {
     name: String,
 
-    /// The operator id (`null` for the default before any id is minted).
+    /// The operator id (`null` for the default before any id is minted, or for a
+    /// profile that failed to parse — see `error`).
     #[serde(skip_serializing_if = "Option::is_none")]
     identifier: Option<String>,
 
@@ -72,6 +88,13 @@ pub(crate) struct ProfileEntry {
     display_name: Option<String>,
 
     local_keys: usize,
+
+    /// Set instead of `identifier`/`display_name`/`local_keys` when the profile's
+    /// section in the global configuration is present but malformed (e.g. a
+    /// present-but-non-string field). The listing still reports every other profile;
+    /// only this entry is unusable until the field is fixed by hand.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 impl CommandOutput for ProfileList {
@@ -84,6 +107,11 @@ impl CommandOutput for ProfileList {
         }
 
         for entry in &self.profiles {
+            if let Some(error) = &entry.error {
+                println!("{} — error: {}", entry.name, error);
+                continue;
+            }
+
             let display = match &entry.display_name {
                 Some(name) => format!(" \"{}\"", name),
                 None => String::new(),

@@ -482,10 +482,8 @@ pub fn read_trust_anchor() -> Result<Option<TrustAnchor>, String> {
     let doc: DocumentMut = content.parse()
         .map_err(|e| format!("The trust file is not valid TOML: {}", e))?;
 
-    let genesis = doc.get("genesis").and_then(|item| item.as_str())
-        .ok_or("The trust file has no \"genesis\" entry.".to_string())?;
-    let enabled_at = doc.get("enabled_at").and_then(|item| item.as_integer())
-        .ok_or("The trust file has no \"enabled_at\" entry.".to_string())?;
+    let genesis = read_string(&doc, "genesis", "trust file")?;
+    let enabled_at = read_integer(&doc, "enabled_at", "trust file")?;
 
     // Required and strict: `write_trust_anchor_file` always writes this key, even when the
     // boundary is empty (an empty array, never an omitted key) — so a trust file missing it, or
@@ -506,7 +504,7 @@ pub fn read_trust_anchor() -> Result<Option<TrustAnchor>, String> {
     let adopts = read_optional_string(&doc, "adopts", "trust file")?;
 
     Ok(Some(TrustAnchor {
-        genesis: genesis.to_string(),
+        genesis,
         enabled_at,
         boundary,
         prior_genesis,
@@ -1314,11 +1312,19 @@ pub(crate) fn read_string(doc: &DocumentMut, field: &str, record_kind: &str) -> 
         .ok_or(format!("A {} has no \"{}\" entry.", record_kind, field))
 }
 
-/// Read a required integer field from a TOML document.
+/// Read a required integer field from a TOML document, strictly: an absent key errors
+/// naming the record kind and field ("has no ... entry"), and so does a *present* key
+/// that is not an integer — but with its own wording ("is present but is not an
+/// integer"), so a hand-edited, quoted `tagged_at = "1700000000"` is never reported as
+/// missing. Same two-arm shape as [`read_optional_integer`], for a field this record
+/// kind always writes.
 pub(crate) fn read_integer(doc: &DocumentMut, field: &str, record_kind: &str) -> Result<i64, String> {
-    doc.get(field)
-        .and_then(|item| item.as_integer())
-        .ok_or(format!("A {} has no \"{}\" entry.", record_kind, field))
+    let Some(item) = doc.get(field) else {
+        return Err(format!("A {} has no \"{}\" entry.", record_kind, field));
+    };
+
+    item.as_integer()
+        .ok_or_else(|| format!("A {}'s \"{}\" entry is present but is not an integer.", record_kind, field))
 }
 
 /// Read an optional string field, strictly: an absent key is `None` — a defined, expected
@@ -1727,6 +1733,70 @@ mod tests {
             Ok(_) => panic!("a non-string adopts value must error, not silently become none"),
         };
         assert!(error.contains("\"adopts\""), "the error must name the field: {}", error);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `read_integer` used to say "has no ... entry" for BOTH an absent key and a present,
+    /// wrong-typed one — so a hand-edited, quoted `tagged_at = "1700000000"` was reported as
+    /// missing, misdirecting the fix. It must distinguish the two the same way
+    /// `read_optional_integer` already does.
+    #[test]
+    fn read_integer_reports_an_absent_key_as_missing() {
+        let doc: DocumentMut = "other = 1\n".parse().unwrap();
+
+        let error = match read_integer(&doc, "tagged_at", "tag record") {
+            Err(e) => e,
+            Ok(v) => panic!("an absent key must error, not read as {:?}", v),
+        };
+        assert!(error.contains("has no"), "must report absence, not type: {}", error);
+        assert!(error.contains("\"tagged_at\""), "the error must name the field: {}", error);
+    }
+
+    #[test]
+    fn read_integer_reports_a_present_non_integer_as_wrongly_typed_not_missing() {
+        let doc: DocumentMut = "tagged_at = \"1700000000\"\n".parse().unwrap();
+
+        let error = match read_integer(&doc, "tagged_at", "tag record") {
+            Err(e) => e,
+            Ok(v) => panic!("a present, non-integer value must error, not read as {:?}", v),
+        };
+        assert!(
+            !error.contains("has no"),
+            "a present-but-wrong-type value must not be reported as absent: {}", error
+        );
+        assert!(error.contains("is present but is not an integer"), "unexpected error: {}", error);
+        assert!(error.contains("\"tagged_at\""), "the error must name the field: {}", error);
+    }
+
+    /// Finding F7 (round 3): the trust file's `genesis`/`enabled_at` used to be hand-rolled
+    /// required reads with the same `and_then(...).ok_or(...)` shape the four retired sites
+    /// used, directly under a comment insisting the parse must be strict. They now route
+    /// through the shared `read_string`/`read_integer`, and the error text still names the
+    /// trust file (not a generic "record").
+    #[test]
+    fn a_present_non_integer_enabled_at_in_the_trust_file_errors_naming_it() {
+        use crate::globals::StorageRootScope;
+
+        let dir = std::env::temp_dir()
+            .join(format!("forklift-office-utils-malformed-enabled-at-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        let _scope = StorageRootScope::enter(&dir);
+
+        let path = forklift_root().join(FILE_NAME_TRUST);
+        std::fs::write(&path,
+            "genesis = \"genesis-hash\"\n\
+             enabled_at = \"soon\"\n\
+             boundary = []\n"
+        ).unwrap();
+
+        let error = match read_trust_anchor() {
+            Err(e) => e,
+            Ok(_) => panic!("a non-integer enabled_at value must error, not silently drop the record"),
+        };
+        assert!(error.contains("trust file"), "the error must name the record kind: {}", error);
+        assert!(error.contains("\"enabled_at\""), "the error must name the field: {}", error);
 
         std::fs::remove_dir_all(&dir).ok();
     }

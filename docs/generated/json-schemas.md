@@ -2429,8 +2429,15 @@ A command not listed here either reports only the generic human-message shape `{
             "null"
           ]
         },
+        "error": {
+          "description": "Set instead of `identifier`/`display_name`/`local_keys` when the profile's\nsection in the global configuration is present but malformed (e.g. a\npresent-but-non-string field). The listing still reports every other profile;\nonly this entry is unusable until the field is fixed by hand.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "identifier": {
-          "description": "The operator id (`null` for the default before any id is minted).",
+          "description": "The operator id (`null` for the default before any id is minted, or for a\nprofile that failed to parse — see `error`).",
           "type": [
             "string",
             "null"

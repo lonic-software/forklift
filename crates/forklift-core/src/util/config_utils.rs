@@ -320,16 +320,6 @@ pub fn get_operator() -> Result<Operator, String> {
     Ok(Operator { name, identifier })
 }
 
-/// Read a named profile from the global configuration.
-///
-/// # Arguments
-/// * `profile` - The profile name (the `<name>` of a `[profile.<name>]` section).
-///
-/// # Returns
-/// * `Ok(Some(Operator))` - The profile's identity (fields may be empty strings when
-///                          unset — `get_operator` fills them in).
-/// * `Ok(None)`           - If no such profile exists.
-/// * `Err(String)`        - If the global configuration could not be read.
 /// Read one field of a named profile, strictly on a **present** key.
 ///
 /// An absent field is a defined shape the callers rely on — [`get_operator`] mints an
@@ -350,14 +340,34 @@ fn read_profile_field(
         None => Ok(String::new()),
         Some(item) => item.as_str()
             .map(|value| value.to_string())
-            .ok_or(format!(
-                "The profile \"{}\" has a \"{}\" that is not a string, in {}. \
-                 Quote it, or remove it to have one generated.",
-                profile, name, path.display()
-            )),
+            .ok_or_else(|| {
+                // `identifier` empties into a mint; `name` empties into the identifier
+                // fallback (`get_operator`) — nothing is generated for it, so the hint
+                // must not claim it is.
+                let hint = if name == PROFILE_FIELD_IDENTIFIER {
+                    "Quote it, or remove it to have one generated."
+                } else {
+                    "Quote it, or remove it to fall back to the identifier."
+                };
+
+                format!(
+                    "The profile \"{}\" has a \"{}\" that is not a string, in {}. {}",
+                    profile, name, path.display(), hint
+                )
+            }),
     }
 }
 
+/// Read a named profile from the global configuration.
+///
+/// # Arguments
+/// * `profile` - The profile name (the `<name>` of a `[profile.<name>]` section).
+///
+/// # Returns
+/// * `Ok(Some(Operator))` - The profile's identity (fields may be empty strings when
+///                          unset — `get_operator` fills them in).
+/// * `Ok(None)`           - If no such profile exists.
+/// * `Err(String)`        - If the global configuration could not be read.
 pub fn get_profile(profile: &str) -> Result<Option<Operator>, String> {
     let path = get_config_path(ConfigScope::Global)?;
 
@@ -381,10 +391,19 @@ pub fn get_profile(profile: &str) -> Result<Option<Operator>, String> {
 
 /// List the named profiles in the global configuration (in file order).
 ///
+/// This is the command that exists to tell a user which profile is broken, so it must
+/// not itself refuse over one bad entry: a malformed profile is reported per-entry
+/// (`Err`) alongside the good ones (`Ok`), rather than aborting the whole listing the
+/// way propagating [`get_profile`]'s error with `?` would. `get_operator` and
+/// `create_profile` keep refusing outright — only this diagnostic path is tolerant.
+///
 /// # Returns
-/// * `Ok(Vec<(String, Operator)>)` - The profile names and their identities.
-/// * `Err(String)`                 - If the global configuration could not be read.
-pub fn list_profiles() -> Result<Vec<(String, Operator)>, String> {
+/// * `Ok(Vec<(String, Result<Operator, String>)>)` - The profile names in file order,
+///   each paired with its identity or, for a profile with a present-but-malformed
+///   field, the error naming the profile and field.
+/// * `Err(String)`                                  - If the global configuration
+///   itself could not be read.
+pub fn list_profiles() -> Result<Vec<(String, Result<Operator, String>)>, String> {
     let path = get_config_path(ConfigScope::Global)?;
 
     let Some(document) = load_document(&path)? else {
@@ -398,8 +417,11 @@ pub fn list_profiles() -> Result<Vec<(String, Operator)>, String> {
     let mut result = Vec::new();
 
     for (name, _) in profiles.iter() {
-        if let Some(identity) = get_profile(name)? {
-            result.push((name.to_string(), identity));
+        match get_profile(name) {
+            Ok(Some(identity)) => result.push((name.to_string(), Ok(identity))),
+            // Not a table (e.g. `profile.old = 5`): nothing to report, same as before.
+            Ok(None) => {}
+            Err(error) => result.push((name.to_string(), Err(error))),
         }
     }
 

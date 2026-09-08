@@ -2852,6 +2852,99 @@ fn profiles_select_the_identity_a_warehouse_acts_under() {
     assert!(work_line.contains("1 local key(s)"), "unexpected profile list: {}", list);
 }
 
+/// PR #122 finding F3: `list_profiles` used to loop `get_profile(name)?`, so ONE malformed
+/// profile (a hand-edited, unquoted `identifier = 12345`) made `forklift profile list` —
+/// the command a user reaches for to find out WHICH profile is broken — return `Err` and
+/// print nothing at all: no default identity, no good profiles, no `--json` `ProfileList`.
+/// The listing must instead surface the bad entry in place and keep listing everything else,
+/// in both output modes.
+#[test]
+fn profile_list_reports_a_malformed_profile_without_aborting_the_whole_listing() {
+    let warehouse = TestWarehouse::new("profile-list-malformed");
+
+    // A good, ordinary profile.
+    assert_success(&warehouse.run(&["profile", "create", "good", "--name", "Good One"]));
+
+    // Hand-corrupt the global config with a second, malformed profile — the shape a
+    // human editing the TOML by hand produces (an unquoted numeric identifier).
+    let global_config = warehouse.home.join("global-config.toml");
+    let mut content = std::fs::read_to_string(&global_config).unwrap();
+    content.push_str("\n[profile.bad]\nidentifier = 12345\n");
+    std::fs::write(&global_config, &content).unwrap();
+
+    // Human mode: the command still succeeds, still lists "good", and marks "bad" with
+    // its error instead of going silent or dropping the entry.
+    let human = warehouse.run(&["profile", "list"]);
+    assert_success(&human);
+    let text = stdout(&human);
+    assert!(
+        text.lines().any(|line| line.starts_with("good — ") && line.contains("Good One")),
+        "the good profile must still be listed: {}", text
+    );
+    let bad_line = text.lines().find(|line| line.starts_with("bad — "))
+        .unwrap_or_else(|| panic!("the malformed profile must be listed, marked as broken: {}", text));
+    assert!(bad_line.contains("identifier"), "the error must name the field: {}", bad_line);
+
+    // `--json` mode: the envelope still emits (`ok: true`), "good" carries its identifier
+    // and no `error`, and "bad" carries an `error` naming the profile/field instead of an
+    // identifier.
+    let envelope = json(&warehouse.run(&["--json", "profile", "list"]));
+    assert_eq!(envelope["ok"], true, "the listing itself must not fail: {}", envelope);
+
+    let profiles = envelope["data"]["profiles"].as_array().unwrap();
+    let good = profiles.iter().find(|p| p["name"] == "good")
+        .unwrap_or_else(|| panic!("\"good\" missing from --json listing: {}", envelope));
+    assert!(good["identifier"].is_string(), "unexpected good entry: {}", good);
+    assert!(good.get("error").is_none(), "a good profile must carry no error: {}", good);
+
+    let bad = profiles.iter().find(|p| p["name"] == "bad")
+        .unwrap_or_else(|| panic!("\"bad\" missing from --json listing: {}", envelope));
+    assert!(bad.get("identifier").is_none(), "a malformed profile must carry no identifier: {}", bad);
+    let error = bad["error"].as_str()
+        .unwrap_or_else(|| panic!("a malformed profile must carry its error: {}", bad));
+    assert!(error.contains("identifier"), "the error must name the field: {}", error);
+    assert!(error.contains("bad"), "the error must name the profile: {}", error);
+}
+
+/// PR #122 finding F4: the end-to-end regression the field-level strictness (round 2) exists
+/// to prevent. `get_operator` must still refuse outright on a malformed selected profile
+/// (unlike `list_profiles`, which is the tolerant, diagnostic exception) — and, the part
+/// that was unpinned, it must never mint a replacement identifier and write it back over
+/// the profile: the global config file must be byte-identical after the refusal.
+#[test]
+fn a_malformed_selected_profile_refuses_without_writing_back_to_the_global_config() {
+    let warehouse = TestWarehouse::new("profile-malformed-no-writeback");
+    warehouse.write_file("a.txt", "one\n");
+    assert_success(&warehouse.run(&["prepare"]));
+
+    // A profile with a hand-edited, unquoted identifier, written directly (bypassing
+    // "profile create", which would refuse on the same non-string value).
+    let global_config = warehouse.home.join("global-config.toml");
+    std::fs::write(&global_config, "[profile.work]\nidentifier = 12345\n").unwrap();
+
+    // Select it via the plain "config" key (not "profile use", which itself calls
+    // get_profile and would already refuse before ever setting operator.profile).
+    assert_success(&warehouse.run(&["config", "operator.profile", "work"]));
+
+    let before = std::fs::read(&global_config).unwrap();
+
+    // Any command resolving the operator hits this: "office enroll" is the simplest one
+    // that needs nothing else prepared.
+    let enroll = warehouse.run(&["office", "enroll"]);
+    assert!(!enroll.status.success(), "a malformed selected profile must refuse: {}", stdout(&enroll));
+    let error = stderr(&enroll);
+    assert!(error.contains("work"), "the refusal must name the profile: {}", error);
+    assert!(error.contains("identifier"), "the refusal must name the field: {}", error);
+
+    // The real regression this pins: no UUID was minted and written back over the
+    // profile. The malformed, hand-edited value survives exactly as written.
+    let after = std::fs::read(&global_config).unwrap();
+    assert_eq!(
+        before, after,
+        "a refused get_operator must never write back to the global config file"
+    );
+}
+
 #[test]
 fn office_link_endorses_a_second_device_key() {
     let warehouse = TestWarehouse::new("link");
