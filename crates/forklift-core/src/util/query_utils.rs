@@ -122,13 +122,17 @@ impl MatchTrust {
 /// errors on a suspect parcel; a read-only query was only asked to read the history, so it
 /// cannot refuse it — it labels the parcel loudly instead.
 ///
-/// `Unresolved` is the third, store-relative answer: at least one of the revoking key's
-/// distrust-boundary heads was never fetched onto *this* store (a partial clone whose
-/// franchise brought over only reachable history — an orphaned head never arrives), so the
-/// question cannot be answered here at all. This must never be reported as `Suspect`: a
-/// parcel that is, on the origin, plainly vouched would otherwise be misclassified as
-/// suspicious purely because this clone is incomplete. Run the query against the origin (or
-/// fetch the full history) for a definitive answer.
+/// `Unresolved` is the third, store-relative answer: the boundary walk crossed a gap — an
+/// absent `distrust_boundary` head, or an absent interior ancestor behind one, either from a
+/// partial clone whose franchise brought over only reachable history or from genuine object
+/// loss — that stood between the walk and a definitive answer for this parcel, so the question
+/// cannot be answered here at all. This must never be reported as `Suspect`: a parcel that is,
+/// on the origin, plainly vouched would otherwise be misclassified as suspicious purely because
+/// this store is incomplete. It is also never reported for a parcel a *present* part of the
+/// boundary already vouches for, even when some other, unrelated part of the same boundary has
+/// a gap — [`QueryContext::fill_boundary`] asks the walk's vouched-membership question before
+/// its resolvable-boundary question for exactly this reason (see that method's doc). Run the
+/// query against the origin (or fetch the full history) for a definitive answer.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Boundary {
     Vouched,
@@ -355,14 +359,28 @@ impl QueryContext {
     /// key's distrust boundary (`Vouched`), outside it (`Suspect`), or is the question
     /// unanswerable on this store at all (`Unresolved`)? A no-op for any other trust.
     ///
-    /// Presence-guarded: the boundary must be fully resolvable — every `distrust_boundary`
-    /// head present, and every interior ancestor the walk crosses to decide membership too —
-    /// before its answer is trusted, or a gap this store never fetched (an orphaned head, or
-    /// an ancestor behind one) could silently shrink the vouched set and misclassify a
-    /// parcel plainly vouched on the origin as suspicious. Both the presence guard and the
-    /// reachability walk it guards are the shared [`audit_utils::DistrustBoundaryMemo`] — the
-    /// same primitive `audit`'s own phase 3 uses, reading off the very same walk, so the two
-    /// can never disagree on what "vouched" or "resolvable" means.
+    /// Presence-guarded: the boundary walk may cross a gap — an absent `distrust_boundary`
+    /// head, or an absent interior ancestor behind a present one — that this store never
+    /// fetched or has since lost. Such a gap can only ever *shrink* the vouched set the walk
+    /// computes, never grow it, so a `Vouched` answer is trustworthy no matter what else is
+    /// missing — including an absent head elsewhere in the same boundary, which is exactly why
+    /// this asks `vouched` before `resolvable` (see below). Both the reachability walk and its
+    /// gap record are the shared [`audit_utils::DistrustBoundaryMemo`] — the same primitive
+    /// `audit`'s own phase 3 uses, reading off the very same walk, so the two can never disagree
+    /// on what "vouched" or "resolvable" means.
+    ///
+    /// **Ask `vouched` first, `resolvable` only on a `false`** — matching `audit`'s own
+    /// ordering, and for the same reason. This engine used to ask `resolvable` unconditionally,
+    /// on the theory that a read-only reporting tool should rather call a subtle case
+    /// "unresolved" a little too eagerly than ever risk trusting a `true` that turns out to
+    /// have been lucky. That reasoning does not survive contact with what `resolvable` actually
+    /// measures: it is boundary-wide, not per-parcel, so a single unrelated gap anywhere in
+    /// `key.distrust_boundary`'s ancestry made every `SignedRevoked` match under that key read
+    /// `Unresolved`, even one a present boundary head plainly vouches for on its own —
+    /// `resolvable`'s own gap-collection is asked *unconditionally before* `vouched` has had a
+    /// chance to answer `true`. `vouched`'s walk carries the identical monotonic guarantee a
+    /// positive `resolvable` would (a `true` can never be a false positive — see the struct
+    /// doc), so asking it first costs nothing in soundness and stops the over-fire.
     ///
     /// Deliberately lazy at the call site (see `run_query`): called for every `SignedRevoked`
     /// resolution only when the predicate itself reads `signer.boundary` (correctness — the
@@ -383,17 +401,18 @@ impl QueryContext {
         let key = office.find_key(key_id)
             .expect("resolve_verified already found this key to classify the signature");
 
-        // `resolvable` is what forces the walk (memoized in `boundary_memo`) for this engine:
-        // asking it first, unconditionally, is the deliberately more cautious posture a
-        // read-only reporting tool takes (see the struct docs on `boundary_memo`). The borrow
-        // it takes is released before `vouched`'s own `borrow_mut()` below — never held across
-        // it — so there is no double-borrow hazard even though both go through one `RefCell`.
-        let resolvable = self.boundary_memo.borrow_mut().resolvable(key)?;
+        // `vouched` is what forces the walk (memoized in `boundary_memo`) for this engine now —
+        // its `true` is trustworthy regardless of any gap elsewhere in the boundary, so it must
+        // be asked before `resolvable` gets a chance to call the case "unresolved" on a gap that
+        // never actually mattered to this parcel. The borrow it takes is released before
+        // `resolvable`'s own `borrow_mut()` below — never held across it — so there is no
+        // double-borrow hazard even though both go through one `RefCell`.
+        let vouched = self.boundary_memo.borrow_mut().vouched(key, hash)?;
 
-        resolution.boundary = Some(if !resolvable {
-            Boundary::Unresolved
-        } else if self.boundary_memo.borrow_mut().vouched(key, hash)? {
+        resolution.boundary = Some(if vouched {
             Boundary::Vouched
+        } else if !self.boundary_memo.borrow_mut().resolvable(key)? {
+            Boundary::Unresolved
         } else {
             Boundary::Suspect
         });
@@ -468,10 +487,11 @@ pub enum Leaf {
     /// `signer.boundary`: for a `signed-revoked` match, whether the parcel sits inside the
     /// revoking key's distrust boundary (`vouched`) or outside it (`suspect`) — see
     /// [`Boundary`]. `values` is restricted to exactly `vouched`/`suspect` at parse time:
-    /// `unresolved` is an answer this leaf can read (a partial clone missing a boundary
-    /// head), never a question it can be asked, and reads `Unknown` regardless of `values`.
-    /// A live `verified` match reads `False` (definitively not revoked-key); anything
-    /// without a forge-proof identity reads `Unknown`, same as every other signer leaf.
+    /// `unresolved` is an answer this leaf can read (a store whose boundary walk crossed a gap
+    /// it could not get past for this parcel — an absent boundary head or an absent interior
+    /// ancestor behind one), never a question it can be asked, and reads `Unknown` regardless
+    /// of `values`. A live `verified` match reads `False` (definitively not revoked-key);
+    /// anything without a forge-proof identity reads `Unknown`, same as every other signer leaf.
     SignerBoundary { values: Vec<Boundary> },
 
     /// `description`: glob/substring over the parcel description and action descriptions.
@@ -1175,10 +1195,11 @@ fn evaluate_leaf(
             // A `SignedRevoked` match compares against the boundary `QueryContext::fill_boundary`
             // filled before this call (`run_query` guarantees the fill runs whenever the
             // predicate reads this leaf, regardless of what else decides the match — see its
-            // lazy-fill note). `Unresolved` (a partial clone missing one of the key's
-            // boundary heads) is honestly `Unknown`, never a match for either input value —
-            // "unresolved" is an *answer* this leaf can read, not a *question* it can be
-            // asked (the parser refuses any predicate value other than vouched/suspect). A
+            // lazy-fill note). `Unresolved` (the boundary walk crossed a gap it could not get
+            // past for this parcel, never merely a gap elsewhere in the boundary — see
+            // `fill_boundary`'s doc) is honestly `Unknown`, never a match for either input
+            // value — "unresolved" is an *answer* this leaf can read, not a *question* it can
+            // be asked (the parser refuses any predicate value other than vouched/suspect). A
             // live `Verified` match is definitively not a revoked-key one (`False`, not
             // `Unknown` — the signer facts are fully resolved either way); anything else
             // identity-resolved here (only `Recorded`, which never reaches this leaf — signer

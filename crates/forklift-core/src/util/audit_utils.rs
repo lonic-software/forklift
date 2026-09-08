@@ -332,6 +332,32 @@ pub fn verify_pallet_history(head: &str,
     // all-signed, all-active history never pays to collect them.
     let mut legacy_parcels: Option<HashSet<String>> = None;
 
+    // The first reference the trust-boundary walk found absent, if any (`None` once the walk
+    // has run and crossed no gap at all). Read off the very same walk that builds
+    // `legacy_parcels` — never a separate pre-scan — exactly as the distrust arm below reads
+    // `unresolved_head` off `DistrustBoundaryMemo`'s own walk. A gap here means the walk's
+    // negative on some other parcel is unproven rather than false: the difference between
+    // naming a missing object and accusing an operator of tampering.
+    //
+    // Deliberately ANY absent reference the walk met — a head or an interior ancestor alike,
+    // never narrowed to interior-only. A present-only reachability walk answers "is P reachable
+    // from the boundary", and a positive is always sound (only content-committed `.parents` are
+    // followed, so a present record's parents are exactly the real ones). A negative is sound
+    // only if the walk met NO absent reference at all: once it crosses one absent head b', this
+    // store holds nothing that bounds `anc*(b')` — a present head only ever tells you about its
+    // *own* ancestry. There is no such thing as an "unrelated" absent head here: relatedness to
+    // P is precisely the question a boundary walk exists to answer, so an absent head can
+    // absolutely be the one thing that would have put P inside the boundary. Narrowing this to
+    // interior-only gaps was tried (PR #121 round 1) and reverted (round 2): it produced false
+    // tampering accusations from two ordinary sequences of shipped commands — an ordinary
+    // `office enroll` + `palletize` + `lift` to a fresh remote (the trust arm, server-side), and
+    // an ordinary `office retire` + `palletize` + `lift` that never lifts the retired signer's
+    // side pallet (the distrust arm) — see `crates/forklift/tests/remote.rs`'s
+    // `enrolling_then_lifting_to_a_fresh_remote_with_an_unlifted_other_pallet_refuses_instead_of_accusing`
+    // and `retiring_a_signer_then_lifting_only_a_replacement_pallet_refuses_instead_of_accusing`,
+    // both of which reproduce the false accusation on the *origin* server, not merely a clone.
+    let mut boundary_gap: Option<String> = None;
+
     // Per revoked key: the parcels its distrust boundary vouches for (lazy — an
     // all-active-keys history never pays for it). Shared with the query engine's
     // `signer.boundary` predicate via [`DistrustBoundaryMemo`]; this use is unmodified.
@@ -350,14 +376,55 @@ pub fn verify_pallet_history(head: &str,
             // re-genesis (§8.7) the prior chain's keys are gone, and the parcels they
             // signed are *attested* by the new anchor's boundary pin rather than verified
             // — the same standing as unsigned pre-trust history. Outside the boundary,
-            // both are what they always were: tampering.
+            // both are what they always were: tampering — unless this store cannot actually
+            // resolve the boundary itself (a gap below), in which case it is not this
+            // store's place to accuse.
             Verdict::TrustBoundary(reason) => {
                 if legacy_parcels.is_none() {
-                    legacy_parcels = Some(collect_reachable_present(&anchor.boundary)?);
+                    // `_noting_gaps` rather than the plain wrapper: the wrapper is literally
+                    // `Ok(collect_reachable_present_noting_gaps(heads)?.0)`, so the gap list
+                    // is already computed by the walk this arm was running anyway and would
+                    // otherwise be thrown away. Keeping it costs nothing extra. Do NOT change
+                    // the wrapper itself — `gc_utils` and `prune_utils` call it too, and
+                    // neither wants this behaviour.
+                    let (reachable, gaps) = collect_reachable_present_noting_gaps(&anchor.boundary)?;
+
+                    legacy_parcels = Some(reachable);
+                    boundary_gap = gaps.into_iter().next();
                 }
 
                 if legacy_parcels.as_ref().unwrap().contains(hash) {
                     legacy += 1;
+                } else if let Some(missing) = boundary_gap.as_ref() {
+                    // The same discipline the distrust arm applies ~15 lines below: a
+                    // present-only reachability walk only ever *grows* as more ancestry
+                    // becomes present, so a positive is trustworthy and a negative is
+                    // ambiguous once the walk has crossed a gap. With one standing, this
+                    // parcel's absence from the closure may be exactly what the missing
+                    // object would have explained — so this is a store that cannot answer,
+                    // not a warehouse that was tampered with.
+                    //
+                    // Still a refusal (nothing here is silenced), and it does not promise
+                    // that supplying `missing` alone resolves it: `gaps` can hold more than
+                    // one entry and only the first is ever named here, so an interior
+                    // ancestor further back may be missing too — supplying this one object
+                    // can simply uncover the next gap on a rerun.
+                    return Err(format!(
+                        "Parcel {} {}, and this store cannot resolve the trust boundary \
+                        (boundary parcel {} is not present locally), so it cannot tell \
+                        whether this parcel predates trust or was stacked after it. Verify \
+                        against a store with the full history.",
+                        hash,
+                        match &reason {
+                            TrustBoundaryReason::Unsigned =>
+                                "carries no signature".to_string(),
+                            TrustBoundaryReason::UnknownKey(key_id) => format!(
+                                "is signed with key {}, which is not tracked in the office",
+                                key_id
+                            ),
+                        },
+                        missing
+                    ));
                 } else {
                     return Err(match reason {
                         TrustBoundaryReason::Unsigned => format!(
@@ -1030,25 +1097,33 @@ pub fn collect_reachable_present_noting_gaps(
 ///
 /// **Presence-guarded, asymmetrically, and gap-aware.** A partial store may be missing part
 /// of a key's distrust-boundary ancestry — not only a boundary head itself, but any interior
-/// ancestor the walk would otherwise have to cross to decide a parcel's membership. Either
-/// kind of gap can only ever shrink the vouched set the walk computes, never grow it, so a
-/// `true` from [`Self::vouched`] is trustworthy no matter what else is missing; a `false` is
-/// ambiguous — genuinely outside the boundary, or an artifact of this store's own gaps — and
+/// ancestor the walk would otherwise have to cross to decide a parcel's membership. Neither
+/// kind of gap can ever be dismissed as "irrelevant" up front: relatedness to the parcel under
+/// test is precisely what the walk exists to determine (see `verify_pallet_history`'s
+/// `boundary_gap` doc for the full argument — it applies here verbatim). Either kind of gap
+/// can only ever shrink the vouched set the walk computes, never grow it, so a `true` from
+/// [`Self::vouched`] is trustworthy no matter what else is missing; a `false` is ambiguous —
+/// genuinely outside the boundary, or an artifact of this store's own gaps — and
 /// [`Self::resolvable`]/[`Self::unresolved_head`] are the tie-breaker for exactly that case.
 /// Both read off the *same* walk [`Self::vouched`] runs (via
 /// [`collect_reachable_present_noting_gaps`]), so a head-only pre-scan can never miss a gap
 /// that only shows up once the walk actually crosses it.
 ///
-/// The two callers weigh the vouched/resolvable asymmetry differently. `audit`'s phase 3
-/// (below) — shared with every server's ref-update check — consults `resolvable`/
-/// `unresolved_head` only once `vouched` has already answered `false`, so an ordinary lift
-/// whose boundary happens to name some unrelated, never-to-be-lifted pallet's head never pays
-/// for (or fails) a presence check it does not need — and by the time it does ask, the walk
-/// (and its gap record) already exist from computing `vouched`, so there is no extra walk to
-/// pay for. The query engine's `fill_boundary` checks `resolvable` unconditionally instead —
-/// it would rather label a subtle case "unresolved" a little too eagerly than ever risk
-/// reading a `true` that later turns out to have been lucky; for it, asking `resolvable` first
-/// is what *forces* the walk (see the method docs).
+/// Both callers ask `vouched` first and consult `resolvable`/`unresolved_head` only once
+/// `vouched` has already answered `false` — never the reverse. `audit`'s phase 3 (below,
+/// shared with every server's ref-update check) has always worked this way: an ordinary lift
+/// whose boundary happens to name some unrelated, never-to-be-lifted pallet's head must not
+/// pay for (or fail) a presence check it does not need. The query engine's `fill_boundary`
+/// used to check `resolvable` unconditionally instead, on the theory that a read-only reporting
+/// tool should rather label a subtle case "unresolved" a little too eagerly than ever risk
+/// reading a `true` that later turns out to have been lucky — but that reasoning proves too
+/// much: `resolvable` is boundary-wide, not per-parcel, so it went `Unresolved` for a parcel a
+/// present head plainly vouches for whenever *any other* part of the same boundary had a gap,
+/// which is exactly the "irrelevant" mistake this doc's first paragraph rules out. `vouched`'s
+/// own reachability walk already carries the same monotonic guarantee (`true` can never be a
+/// false positive), so asking it first loses no safety and fixes the over-fire; `query` now
+/// matches `audit`'s ordering (see `query_utils`'s `fill_boundary` doc for the query-side
+/// history of this bug).
 #[derive(Default)]
 pub struct DistrustBoundaryMemo {
     vouched_sets: HashMap<String, HashSet<String>>,

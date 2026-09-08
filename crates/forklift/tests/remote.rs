@@ -2274,9 +2274,25 @@ fn a_sparse_franchise_degrades_touches_to_unknown_out_of_scope() {
 }
 
 #[test]
-fn a_partial_clone_missing_a_boundary_head_reads_signer_boundary_as_unresolved() {
-    // The presence guard, end to end: a distrust boundary can name a head this store never
-    // has at all.
+fn a_partial_clone_missing_an_unrelated_boundary_head_still_reads_signer_boundary_as_vouched() {
+    // The presence guard, end to end: a distrust boundary can name a head this store never has
+    // at all, and that absent head must never turn a parcel a *present* boundary head already
+    // vouches for into "unresolved" — let alone "suspect" — even though `audit_utils`'s own
+    // gap-tolerance is any-gap, not narrowed to interior gaps (PR #121 round 1 tried narrowing
+    // to interior-only and PR #121 round 2 reverted it — see `audit_utils::verify_pallet_
+    // history`'s `boundary_gap` doc: an absent head can genuinely be the thing that would have
+    // vouched for some OTHER parcel, so the walk-wide gap flag has to stay any-gap).
+    //
+    // What actually makes THIS parcel read "vouched" rather than "unresolved" is
+    // `QueryContext::fill_boundary` asking `vouched` before `resolvable` (see that method's
+    // doc): the agent's main-line parcel is vouched by `main`'s own present boundary head
+    // directly, so `vouched` answers `true` regardless of the unrelated, absent `side`-pallet
+    // head elsewhere in the same boundary — `resolvable` is never even consulted for this
+    // parcel. This was `a_partial_clone_missing_a_boundary_head_reads_signer_boundary_as_
+    // unresolved`, which pinned the PRE-REORDER behaviour: `fill_boundary` used to ask
+    // `resolvable` unconditionally, so a single absent head anywhere in the boundary — however
+    // irrelevant to this parcel — made every parcel under that key read "unresolved". The
+    // fixture is unchanged; only the assertions invert.
     //
     // Construction note (a deviation from the original sketch, which tried to manufacture
     // this with `undo`): un-stacking a side-pallet parcel with `undo` *after* retiring past
@@ -2293,13 +2309,10 @@ fn a_partial_clone_missing_a_boundary_head_reads_signer_boundary_as_unresolved()
     //
     // So: a second local-only pallet ("side") supplies the boundary head that a plain
     // (non-sparse) franchise of `main` alone will never even hear about, let alone fetch —
-    // it is flatly absent on the clone, not merely "not reachable from here". Silently
-    // treating that absence as "not reachable" (the way an ordinary reachability walk
-    // always would) must not happen: it would misclassify the agent's still-perfectly-
-    // vouched main-line parcel as suspect. It must read "unresolved" instead. On the
-    // origin, where the side pallet (and its head) are still right there, the same parcel
-    // is fully resolvable and reads its real answer: vouched.
-    let area = TestArea::new("boundary-unresolved");
+    // it is flatly absent on the clone, not merely "not reachable from here". That absence
+    // is irrelevant to the agent's main-line parcel, which `main`'s own present boundary
+    // head vouches for regardless — on both the origin and the clone.
+    let area = TestArea::new("boundary-vouched-past-an-absent-head");
     let server = Server::start(&area, None);
 
     prepare_warehouse(&area, "dev", &server.url);
@@ -2397,52 +2410,71 @@ fn a_partial_clone_missing_a_boundary_head_reads_signer_boundary_as_unresolved()
         .unwrap_or_else(|| panic!("no match for the agent parcel on the clone: {}", clone_report));
     assert_eq!(clone_entry["author"]["trust"], "signed-revoked");
     assert_eq!(
-        clone_entry["signer"]["boundary"], "unresolved",
-        "on a clone missing the orphaned boundary head, the question must read unresolved, \
-         never suspect: {}",
+        clone_entry["signer"]["boundary"], "vouched",
+        "the orphaned side-pallet boundary head is absent but irrelevant: `main`'s own \
+         present boundary head already vouches for the agent parcel, so an absent, unrelated \
+         HEAD must not read as unresolved (let alone suspect): {}",
         clone_report
     );
 
-    // A `signer.boundary eq suspect` predicate must not match the unresolved parcel on the
-    // clone (unresolved reads Unknown for this leaf, which never matches either value).
-    let suspect_on_clone = area.forklift("clone", &[
-        "--json", "query", "main", "--where",
-        r#"{"field":"signer.boundary","op":"eq","value":"suspect"}"#,
-    ]);
-    assert_success(&suspect_on_clone);
-    let suspect_report: serde_json::Value = serde_json::from_str(&stdout(&suspect_on_clone)).unwrap();
-    let suspect_matches: std::collections::HashSet<String> = suspect_report["data"]["matches"]
-        .as_array().unwrap().iter()
-        .map(|entry| entry["parcel"].as_str().unwrap().to_string())
-        .collect();
-    assert!(
-        !suspect_matches.contains(&agent_parcel),
-        "an unresolved boundary must never satisfy signer.boundary eq suspect: {}",
-        suspect_report
-    );
+    // A `signer.boundary eq suspect` predicate must not match, and `eq vouched` must (the
+    // predicate only ever compares against "vouched" or "suspect" — "unresolved" is not a
+    // valid comparison value at all, since an unresolved boundary reads Unknown for this leaf
+    // and never matches either literal). This test no longer reaches that path at all: after
+    // the vouched-first reorder BOTH the origin and the clone read "vouched" here, which is
+    // the point of the fixture. The Unknown arm is covered by the distrust construction
+    // further down, whose parcel is genuinely unvouched behind an absent boundary head.
+    for (value, must_match) in [("suspect", false), ("vouched", true)] {
+        let where_clause = format!(
+            r#"{{"field":"signer.boundary","op":"eq","value":"{}"}}"#,
+            value
+        );
+        let report = area.forklift("clone", &["--json", "query", "main", "--where", &where_clause]);
+        assert_success(&report);
+        let report: serde_json::Value = serde_json::from_str(&stdout(&report)).unwrap();
+        let matches: std::collections::HashSet<String> = report["data"]["matches"]
+            .as_array().unwrap().iter()
+            .map(|entry| entry["parcel"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            matches.contains(&agent_parcel), must_match,
+            "signer.boundary eq {}: expected match = {}: {}",
+            value, must_match, report
+        );
+    }
 }
 
 #[test]
 fn a_partial_clone_missing_an_unrelated_boundary_head_still_audits_the_vouched_parcel() {
-    // `audit`'s side of the presence guard is asymmetric, on purpose (see
-    // `audit_utils::DistrustBoundaryMemo`'s doc): a distrust boundary can name a head this
-    // store never has, but `audit` (unlike `query`) must not refuse just because *some*
-    // boundary head is missing — only when the parcel under test cannot be vouched *without*
-    // it. This construction reuses the query engine's own partial-clone fixture (a
-    // never-lifted local "side" pallet's head sits in the boundary alongside main's own) to
-    // pin exactly that: the agent's main-line parcel is vouched by main's own boundary
-    // snapshot alone, so `audit` must pass on the clone even though `side`'s head never
-    // arrived there — the missing head is irrelevant to this parcel, and an audit that
-    // refused anyway would be a regression (the same construction's `lift`, run against the
-    // very same gap, must keep succeeding: see
-    // `a_partial_clone_missing_a_boundary_head_reads_signer_boundary_as_unresolved`, which
-    // shares this scenario and predates this test). The complementary case — a boundary that
-    // truly *cannot* be resolved, where `audit` must refuse honestly rather than allege
-    // tampering — is exercised directly against `verify_pallet_history` in
-    // `audit_utils::tests`, because (as the reasoning above implies) a same-pallet parcel's
-    // vouching can never genuinely hinge on a head absent from a plain, non-sparse clone of
-    // that same pallet: the pallet's own retirement-time snapshot is always present and
-    // always sufficient for anything on it that predates the retirement.
+    // `audit` must not refuse just because *some* boundary head is missing — only when the
+    // parcel under test cannot be vouched *without* it. `audit`'s own asymmetric, vouched-first
+    // ordering (below, `verify_pallet_history`'s `DistrustBoundary` arm) means it never even
+    // asks whether the boundary is resolvable in the common case: `vouched` decides it directly.
+    // `query`'s `fill_boundary` now asks in the same order (see that method's doc) — before
+    // this fix it asked `resolvable` unconditionally, which made the *whole boundary's*
+    // resolvability (not just what this parcel needs) the gate, over-firing "unresolved" for
+    // parcels an absent, unrelated head had nothing to do with; see
+    // `a_partial_clone_missing_an_unrelated_boundary_head_still_reads_signer_boundary_as_vouched`,
+    // which shares this fixture and pins that fix directly. This construction reuses that same
+    // partial-clone fixture (a never-lifted local "side" pallet's head sits in the boundary
+    // alongside main's own) to pin the `audit`-side analogue: the agent's main-line parcel is
+    // vouched by main's own boundary snapshot alone, so `audit` must pass on the clone even
+    // though `side`'s head never arrived there — the missing head is irrelevant to this parcel,
+    // and an audit that refused anyway would be a regression.
+    //
+    // The complementary case — a boundary that genuinely *cannot* be resolved for the parcel
+    // under test, where `audit` must refuse honestly rather than allege tampering — is exercised
+    // both directly against `verify_pallet_history` in `audit_utils::tests` (a hand-built
+    // `KeyRecord` and object store, chosen there because a shipped `office retire` always folds
+    // the audited pallet's OWN current head into the boundary, so that particular entry is
+    // trivially present through ordinary tooling) and, end to end through real CLI/server
+    // machinery, by `retiring_a_signer_then_lifting_only_a_replacement_pallet_refuses_instead_
+    // of_accusing` below (Construction D): there, the audited parcel's own pallet is never
+    // lifted at all, so even its own retirement-time boundary entry is absent on the server —
+    // the "same pallet's own snapshot is always present" shape this fixture relies on is a
+    // property of THIS construction (the audited pallet, main, is the one that keeps getting
+    // lifted), not a universal guarantee; a pallet that stops being the one advanced and lifted
+    // can lose even its own boundary entry.
     let area = TestArea::new("audit-boundary-unresolved");
     let server = Server::start(&area, None);
 
@@ -2535,6 +2567,319 @@ fn a_partial_clone_missing_an_unrelated_boundary_head_still_audits_the_vouched_p
         stdout(&audit_on_clone).contains("verified"),
         "{}",
         stdout(&audit_on_clone)
+    );
+}
+
+/// Construction T (PR #121 round 2): the trust-arm honest refusal, reproduced end to end
+/// against the ORIGIN SERVER from two entirely ordinary commands — `office enroll`,
+/// `palletize`, `lift` — never a hand-built fixture and never a deleted object. This is the
+/// direct falsifier of PR #121 round 1's interior-only narrowing: under that narrowing this
+/// exact, unremarkable sequence made the origin ACCUSE a genuinely pre-trust, legacy parcel of
+/// tampering, and the defect was not confined to clones or the AWS Lambda head — it fired here
+/// from the origin server itself, round-tripped through two ordinary commands.
+///
+/// `w` stacks three unsigned parcels on `main` (U1 <- U2 <- U3, no office yet), enrolls with no
+/// remote configured (`office enroll`'s boundary is then purely local: exactly `[U3]`, per
+/// `commands/office.rs`'s `enroll`), then `palletize`s "feature" at U1 — an OLDER ancestor of
+/// `main`'s current head, not `main`'s head itself. Only now is a fresh remote configured, and
+/// `lift` (current pallet: "feature") uploads U1's own closure, which does NOT include U2 or U3
+/// (they are U1's descendants, not its ancestors).
+///
+/// `push_local_trust` (`remote_utils.rs`) sends only the anchor DTO; the server's `put_trust`
+/// (`forklift-server/src/server.rs`) writes it with no presence check on any boundary head. So
+/// the server ends up holding `anchor.boundary = [U3]` with U3 itself absent — a HEAD gap. When
+/// the "feature" ref update is then audited server-side
+/// (`verify_pallet_history(U1, anchor, office_state, None)`), U1 is unsigned (pre-office) and
+/// the boundary walk cannot even start (its one entry, U3, is absent) — under any-gap semantics
+/// the server refuses honestly, naming U3; under the reverted interior-only narrowing it would
+/// accuse U1 of tampering instead, because a head-only gap never set `boundary_gap` there.
+///
+/// Resolution: lifting `main` too (its own closure includes U1, U2 and U3) puts U3 on the
+/// server. Retrying the very same `feature` lift then succeeds — the identical command that
+/// just refused — and a fresh clone franchised from the server afterwards audits `main` as
+/// fully legacy: the definitive, resolved answer.
+#[test]
+fn enrolling_then_lifting_to_a_fresh_remote_with_an_unlifted_other_pallet_refuses_instead_of_accusing() {
+    let area = TestArea::new("construction-t");
+    let server = Server::start(&area, None);
+
+    // `w` is prepared with NO remote configured yet — `office enroll` below must see no
+    // remote and skip the remote-heads union entirely, so the boundary is exactly `[U3]`.
+    std::fs::create_dir_all(area.path("w")).unwrap();
+    assert_success(&area.forklift("w", &["prepare"]));
+    assert_success(&area.forklift("w", &["config", "--global", "operator.name", "Origin Tester"]));
+    assert_success(&area.forklift("w", &["config", "--global", "operator.identifier", "tester@forklift"]));
+
+    // U1, U2, U3: three unsigned, pre-office stacks on `main`.
+    area.write_file("w/app.txt", "v1\n");
+    assert_success(&area.forklift("w", &["load", "."]));
+    assert_success(&area.forklift("w", &["stack", "U1"]));
+    let u1 = pallet_head(&area, "w", "main");
+
+    area.write_file("w/app.txt", "v2\n");
+    assert_success(&area.forklift("w", &["load", "."]));
+    assert_success(&area.forklift("w", &["stack", "U2"]));
+
+    area.write_file("w/app.txt", "v3\n");
+    assert_success(&area.forklift("w", &["load", "."]));
+    assert_success(&area.forklift("w", &["stack", "U3"]));
+    let u3 = pallet_head(&area, "w", "main");
+
+    assert_success(&area.forklift("w", &["office", "enroll"]));
+    let anchor_boundary = area.read_file("w/.forklift/trust");
+    assert!(
+        anchor_boundary.contains(&format!("boundary = [\"{}\"]", u3)),
+        "the fixture requires the boundary to be exactly [U3]: {}",
+        anchor_boundary
+    );
+
+    // "feature" starts at U1 — an ancestor of `main`'s current head, not the head itself — so
+    // lifting it never touches U2 or U3.
+    assert_success(&area.forklift("w", &["palletize", "feature", &u1]));
+
+    // The remote is configured only now, AFTER enroll: it plays no part in the boundary.
+    assert_success(&area.forklift("w", &["config", "remote.url", &server.url]));
+
+    let first_lift = area.forklift("w", &["lift"]);
+    let out = format!("{}{}", stdout(&first_lift), stderr(&first_lift));
+
+    println!("CONSTRUCTION T, first lift: exit = {:?}\n{}", first_lift.status.code(), out.trim());
+
+    assert!(
+        !first_lift.status.success(),
+        "the origin server must refuse: it cannot resolve the trust boundary for U1. output: {}",
+        out
+    );
+    assert!(
+        !out.to_lowercase().contains("tampered"),
+        "no tampering accusation is expected — the server never proved U1 was stacked after \
+        trust, it simply cannot resolve the boundary. output: {}",
+        out
+    );
+    assert!(out.contains(&u1), "names the parcel under audit {}: {}", u1, out);
+    assert!(out.contains(&u3), "names the missing boundary parcel {}: {}", u3, out);
+
+    // Resolution: lift `main` too, so U3 (and U2) reach the server.
+    assert_success(&area.forklift("w", &["shift", "main"]));
+    assert_success(&area.forklift("w", &["lift"]));
+
+    // The identical command that just refused now succeeds.
+    assert_success(&area.forklift("w", &["shift", "feature"]));
+    let second_lift = area.forklift("w", &["lift"]);
+    assert!(
+        second_lift.status.success(),
+        "with U3 now on the server, the same lift must succeed: {}",
+        stderr(&second_lift)
+    );
+
+    // The definitive, resolved answer: a fresh clone franchised from the server now audits
+    // `main` as fully legacy.
+    let franchised = area.forklift(".", &["franchise", &server.url, "clone"]);
+    assert_success(&franchised);
+    let audit_on_clone = area.forklift("clone", &["audit"]);
+    assert_success(&audit_on_clone);
+    assert!(
+        stdout(&audit_on_clone).contains("3 legacy parcel(s) predate trust and are unsigned"),
+        "{}",
+        stdout(&audit_on_clone)
+    );
+}
+
+/// Construction D (PR #121 round 2) — the distrust-arm twin of Construction T above, and a
+/// REGRESSION rather than a fresh defect: `main`'s own `unresolved_head` already returned the
+/// first of ALL absent references (confirmed by reading
+/// `git show main:crates/forklift-core/src/util/audit_utils.rs`), so this exact sequence was
+/// already handled soundly before PR #121 round 1 narrowed it to interior-only gaps.
+///
+/// `w` is trusted, with admin `admin@forklift` and agent key `A`. `side` is palletized from
+/// `main`'s current head (call it M1); as `A`, two parcels are stacked on `side`: A0, then A1
+/// (`side`'s new head). Back on `main` (still at M1, untouched), the admin retires `A`:
+/// `revocation_boundary` (`commands/office.rs`) snapshots every LOCAL pallet head at that
+/// moment — `main`'s M1 and `side`'s A1 — so `A.distrust_boundary = [M1, A1]`. A THIRD pallet,
+/// "tmp", is then palletized at A0 (an ancestor of A1, not A1 itself) and lifted: the office
+/// parcel and "tmp" (closure of A0) reach the server, but `side` — and so A1 — never do.
+///
+/// M1 being present is irrelevant to A0: reachability only ever follows `.parents` (backward),
+/// and A0 is a DESCENDANT of M1 (on a branch M1 never leads to), not an ancestor, so a present
+/// M1 can never vouch for it either way. A1 is the entry that would matter — A0 is its direct
+/// parent — and it is exactly the one absent, a HEAD gap the walk cannot see past. Server-side,
+/// `verify_pallet_history(A0, anchor, office_state, None)` classifies A0 as
+/// `Verdict::DistrustBoundary(A)`; `vouched` reads `false` (M1's own ancestry never reaches A0);
+/// under any-gap semantics `unresolved_head` names the absent A1 and the server refuses
+/// honestly; under the reverted interior-only narrowing, A1's absence is a head-only gap that
+/// never lands in `interior_gaps`, so `unresolved_head` reports `None` and the server accuses
+/// A0 of tampering instead — a genuinely pre-revocation parcel branded a forged backdate.
+///
+/// Resolution: lifting `side` (bringing A1, and so A0's presence via A1's own ancestry, fully
+/// onto the server) and retrying the identical `tmp` lift succeeds. A clone franchised scoped
+/// to "tmp" alone still reads A0 as `unresolved` (it never fetches `side`'s A1 either — a
+/// franchise fetches only the resolved pallet's own ancestry); fetching A1's history directly
+/// into that same clone (`remote_utils::fetch_history`, the in-process idiom used elsewhere in
+/// this file) flips the SAME query's answer to `vouched` — the resolved, definitive read.
+#[test]
+fn retiring_a_signer_then_lifting_only_a_replacement_pallet_refuses_instead_of_accusing() {
+    let area = TestArea::new("construction-d");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "w", &server.url);
+    assert_success(&area.forklift("w", &["config", "--global", "operator.name", "Admin"]));
+    assert_success(&area.forklift("w", &["config", "--global", "operator.identifier", "admin@forklift"]));
+
+    area.write_file("w/base.txt", "base\n");
+    assert_success(&area.forklift("w", &["load", "."]));
+    assert_success(&area.forklift("w", &["stack", "base"]));
+    assert_success(&area.forklift("w", &["office", "enroll"]));
+    assert_success(&area.forklift("w", &["lift"]));
+    let m1 = pallet_head(&area, "w", "main");
+
+    // Admit the agent.
+    assert_success(&area.forklift("w", &["config", "--global", "operator.identifier", "agent@forklift"]));
+    let keygen = area.forklift("w", &["office", "keygen"]);
+    assert_success(&keygen);
+    let admit_args: Vec<String> = stdout(&keygen)
+        .lines()
+        .find(|line| line.trim_start().starts_with("office admit "))
+        .expect("keygen prints the admit line")
+        .split_whitespace()
+        .skip(2)
+        .map(str::to_string)
+        .collect();
+    assert_success(&area.forklift("w", &["config", "--global", "operator.identifier", "admin@forklift"]));
+    assert_success(&area.forklift("w", &[
+        "office", "admit", &admit_args[0], &admit_args[1], &admit_args[2],
+        "--agent", "--supervisor", "admin@forklift",
+    ]));
+
+    // "side" starts at M1 (main's current head). As the agent, stack A0 then A1 on it.
+    assert_success(&area.forklift("w", &["palletize", "side"]));
+    assert_success(&area.forklift("w", &["config", "--global", "operator.identifier", "agent@forklift"]));
+    area.write_file("w/side.txt", "a0\n");
+    assert_success(&area.forklift("w", &["load", "."]));
+    assert_success(&area.forklift("w", &["stack", "A0"]));
+    let a0 = pallet_head(&area, "w", "side");
+
+    area.write_file("w/side.txt", "a1\n");
+    assert_success(&area.forklift("w", &["load", "."]));
+    assert_success(&area.forklift("w", &["stack", "A1"]));
+    let a1 = pallet_head(&area, "w", "side");
+
+    // Back on `main` (still exactly M1 — untouched since it was lifted above), retire the
+    // agent's key: the distrust boundary snapshots every LOCAL pallet head right now, main's
+    // and side's alike.
+    assert_success(&area.forklift("w", &["config", "--global", "operator.identifier", "admin@forklift"]));
+    assert_success(&area.forklift("w", &["shift", "main"]));
+    assert_eq!(pallet_head(&area, "w", "main"), m1, "main must be untouched since its own lift");
+
+    let listing = area.forklift("w", &["--json", "office", "list"]);
+    assert_success(&listing);
+    let listing: serde_json::Value = serde_json::from_str(&stdout(&listing)).unwrap();
+    let agent_key_id = listing["data"]["users"]
+        .as_array().unwrap().iter()
+        .find(|user| user["identifier"] == "agent@forklift")
+        .expect("the agent is enrolled")
+        ["keys"][0]["key_id"]
+        .as_str().unwrap().to_string();
+    assert_success(&area.forklift("w", &["office", "retire", &agent_key_id, "--offline"]));
+
+    // "tmp" starts at A0 — `side`'s own earlier parcel, never its current head — and is lifted.
+    // `side` itself is never lifted, so A1 never reaches the server.
+    assert_success(&area.forklift("w", &["palletize", "tmp", &a0]));
+
+    let first_lift = area.forklift("w", &["lift"]);
+    let out = format!("{}{}", stdout(&first_lift), stderr(&first_lift));
+
+    println!("CONSTRUCTION D, first lift: exit = {:?}\n{}", first_lift.status.code(), out.trim());
+
+    assert!(
+        !first_lift.status.success(),
+        "the origin server must refuse: it cannot resolve the distrust boundary for A0. \
+        output: {}",
+        out
+    );
+    assert!(
+        !out.to_lowercase().contains("tampered"),
+        "no tampering accusation is expected — the server never proved A0 was signed after \
+        the revocation, it simply cannot resolve the boundary. output: {}",
+        out
+    );
+    assert!(out.contains(&a0), "names the parcel under audit {}: {}", a0, out);
+    assert!(out.contains(&a1), "names the missing boundary parcel {}: {}", a1, out);
+
+    // Resolution: lift `side` too, so A1 (and A0's presence via A1's own ancestry) reach the
+    // server.
+    assert_success(&area.forklift("w", &["shift", "side"]));
+    assert_success(&area.forklift("w", &["lift"]));
+
+    // The identical command that just refused now succeeds.
+    assert_success(&area.forklift("w", &["shift", "tmp"]));
+    let second_lift = area.forklift("w", &["lift"]);
+    assert!(
+        second_lift.status.success(),
+        "with A1 now on the server, the same lift must succeed: {}",
+        stderr(&second_lift)
+    );
+
+    // A clone scoped to "tmp" alone still never fetches `side`'s A1 (franchise fetches only
+    // the resolved pallet's own ancestry) — so the SAME unresolved read reproduces here too,
+    // pinning that this is genuinely about A1's absence, not some artifact of the origin.
+    let franchised = area.forklift(".", &["franchise", &server.url, "tmp-clone", "--pallet", "tmp"]);
+    assert_success(&franchised);
+
+    let query_before = area.forklift("tmp-clone", &["--json", "query", "tmp"]);
+    assert_success(&query_before);
+    let report: serde_json::Value = serde_json::from_str(&stdout(&query_before)).unwrap();
+    let a0_entry = report["data"]["matches"].as_array().unwrap().iter()
+        .find(|entry| entry["parcel"] == a0)
+        .unwrap_or_else(|| panic!("no match for A0 on the tmp-only clone: {}", report));
+    assert_eq!(
+        a0_entry["signer"]["boundary"], "unresolved",
+        "a clone that never fetched `side`'s A1 must read A0 as unresolved, not vouched: {}",
+        report
+    );
+
+    // The dead branch this leg exists to cover: `Leaf::SignerBoundary`'s
+    // `Some(Boundary::Unresolved) => Truth::Unknown` (`query_utils.rs`) — an `Unresolved`
+    // parcel must match NEITHER literal a `--where` predicate can even ask for ("unresolved"
+    // itself is refused at parse time, so this is the only way to reach that arm at all).
+    for value in ["vouched", "suspect"] {
+        let where_clause = format!(r#"{{"field":"signer.boundary","op":"eq","value":"{}"}}"#, value);
+        let filtered = area.forklift("tmp-clone", &["--json", "query", "tmp", "--where", &where_clause]);
+        assert_success(&filtered);
+        let filtered: serde_json::Value = serde_json::from_str(&stdout(&filtered)).unwrap();
+        let matched: std::collections::HashSet<String> = filtered["data"]["matches"]
+            .as_array().unwrap().iter()
+            .map(|entry| entry["parcel"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            !matched.contains(&a0),
+            "an unresolved boundary must match neither \"eq {}\" (Unknown, not True): {}",
+            value, filtered
+        );
+    }
+
+    // Fetch A1's own ancestry directly into the SAME clone (the in-process idiom used
+    // elsewhere in this file — `remote_utils::fetch_history`), without a second franchise or
+    // a `side` pallet ref: this puts A1 (and so A0, already present) fully in reach and flips
+    // the identical query's answer.
+    {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let _scope = forklift_core::globals::StorageRootScope::enter(&area.path("tmp-clone"));
+        let client = forklift_core::util::remote_utils::RemoteClient::new(&server.url, None).unwrap();
+        runtime
+            .block_on(forklift_core::util::remote_utils::fetch_history(&client, &a1))
+            .expect("fetch A1's ancestry");
+    }
+
+    let query_after = area.forklift("tmp-clone", &["--json", "query", "tmp"]);
+    assert_success(&query_after);
+    let report: serde_json::Value = serde_json::from_str(&stdout(&query_after)).unwrap();
+    let a0_entry = report["data"]["matches"].as_array().unwrap().iter()
+        .find(|entry| entry["parcel"] == a0)
+        .unwrap_or_else(|| panic!("no match for A0 after fetching A1: {}", report));
+    assert_eq!(
+        a0_entry["signer"]["boundary"], "vouched",
+        "with A1's ancestry now present, the identical query must read A0 as vouched: {}",
+        report
     );
 }
 

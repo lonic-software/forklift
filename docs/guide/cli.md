@@ -453,8 +453,14 @@ trust label per match (`verified`, `signed-revoked`, `unsigned`, `unknown-key`, 
 the revoking key's distrust boundary, or `"suspect"` when it sits outside it (a forged
 backdate, or the key's holder kept signing after the revocation); `audit` refuses a
 suspect parcel outright, but a read-only query labels it loudly instead. It can also
-read `"unresolved"`, when a partial clone is simply missing one of the revocation's
-boundary heads — never treat that as `"suspect"`; query the origin, or fetch the full
+read `"unresolved"`, when this store cannot settle *this parcel's* place in the
+boundary at all — the parcel is not reachable from any part of the boundary this
+store actually holds, and the boundary walk also crossed a gap (an absent
+boundary head, or an absent ancestor behind one) that could have been exactly
+what would have vouched for it. A boundary can legitimately name a head for a
+pallet this store never fetched at all; that alone never turns a parcel a
+*present* boundary head already vouches for into `"unresolved"` — never treat
+`"unresolved"` as `"suspect"` either way; query the origin, or fetch the full
 history, for a definitive answer. Filter on it with
 `--where '{"field":"signer.boundary","op":"eq","value":"suspect"}'`.
 
@@ -536,18 +542,37 @@ established are tolerated as "legacy"). Any tampering — stripped or corrupted
 signatures, an unknown key, a chain that doesn't reach genesis — fails with a
 non-zero exit. See [`trust-and-identity.md`](trust-and-identity.md).
 
+"Legacy" is decided by ancestry from the trust boundary the anchor pins, and the
+same honesty rule applies there as to revocations below. This store can lack a
+boundary head outright — `enroll` pins a remote's declared heads by hash without
+fetching them, and `franchise` copies the anchor verbatim while fetching only the
+one pallet it franchises — or can have genuinely lost one it once held, or lost
+an ancestor behind one it does have. Any of those is a gap the boundary walk
+cannot see past: `audit` refuses instead of concluding a parcel was stacked
+after trust whenever it cannot otherwise place that parcel inside the boundary,
+because there is no such thing as a boundary reference that is "unrelated" to a
+given parcel — whether it would have vouched for the parcel is exactly the
+question the walk cannot answer once it has met an absence. It names the
+specific boundary parcel it could not find and says plainly that it cannot tell
+whether the parcel predates trust or was stacked after it. Still fail-closed,
+still a non-zero exit, but not an accusation. The walk covers the whole
+boundary once per audit, not once per parcel, so the object it names is not
+necessarily the one this specific parcel needed — supplying it does not
+guarantee resolution, since another gap may surface behind it on a rerun.
+Verify against a store with the full history for a definitive answer.
+
 A parcel signed by a *revoked* key is checked against that revocation's distrust
 boundary — exact ancestry, so a forged timestamp changes nothing. If the boundary
 genuinely does not cover the parcel, that is real tampering and `audit` fails
-saying so. But if this store cannot resolve the boundary at all — it is missing
-one of the boundary's heads, or an ancestor behind one, and that gap happens to
-matter for this parcel — `audit` refuses instead, naming the specific missing
-boundary parcel and saying plainly that it cannot tell whether the parcel
-predates the revocation or the key kept signing after it: a real fail-closed
-refusal, but not a claim that tampering occurred. Verify against a store with
-the full history for a definitive answer. A gap that turns out to be irrelevant
-to the parcel in question (the boundary already resolves some other way) never
-trips this at all.
+saying so. A parcel a boundary head this store *does* hold already vouches for
+passes as before, whatever else is missing — the check asks that first. It is
+only when the parcel is not vouched **and** this store cannot resolve the
+boundary — it is missing one of the boundary's heads, or an ancestor behind one
+— that `audit` refuses instead, naming the specific missing boundary parcel and
+saying plainly that it cannot tell whether the parcel predates the revocation or
+the key kept signing after it: a real fail-closed refusal, but not a claim that
+tampering occurred.
+Verify against a store with the full history for a definitive answer.
 
 A large file is stored as chunks indexed by a recipe. A normal audit **presence-checks**
 those chunks (confirms each is present without re-reading its bytes) — bounded and fast.

@@ -63,6 +63,23 @@ this warehouse must be signed** — this cannot be undone.
 - If a remote is configured, its pallet heads are folded into the trust boundary
   (history the remote already has stays valid unsigned), so the remote must be
   reachable — or pass `--offline` if it's gone for good.
+- A gap in that boundary does not by itself make `audit` refuse: a fully-signed
+  pallet never asks the question, and an unsigned parcel still reachable from a
+  boundary head this store holds is counted as legacy as usual. It is when an
+  unsigned parcel is **not** reachable from anything present, **and** this store
+  cannot resolve the boundary — it never held one of the named heads (`enroll`
+  pins a remote's declared heads without fetching them, and `franchise` copies
+  the anchor verbatim while fetching only the one pallet it franchises), or has
+  genuinely lost one it once held, or an ancestor behind one — that `audit`
+  refuses rather than concluding the parcel was stacked after
+  trust: it names the specific boundary parcel it could not find and says
+  plainly that it cannot tell whether the parcel predates trust or was stacked
+  after it. Still fail-closed, still a non-zero exit, but not an accusation.
+  The walk covers the whole boundary once per audit, not once per parcel, so
+  the object it names is not a promise that it is the one a given parcel
+  actually needed — supplying it does not guarantee resolution, since another
+  gap may surface behind it on a rerun. Verify against a store with the full
+  history for a definitive answer.
 - Protect your key with a passphrase (recommended for a human): add
   `--passphrase` (see §6).
 - That trust boundary keeps every parcel it names alive across `gc` and
@@ -240,13 +257,19 @@ forklift office retire <key-id> --compromised   # revoke a key that may be in ot
   parcels reachable from that boundary — decided by **exact ancestry, never
   timestamps**, so a shifted clock can't forge validity. A `--compromised` key's
   signatures beyond the boundary fail every future audit.
-- If a store cannot resolve the boundary at all — a head is missing outright, or
-  an ancestor behind one is, and the gap happens to matter for the parcel in
-  question — `audit` still refuses (fail-closed), but says so honestly: it names
-  the specific boundary parcel it could not find and says it cannot tell whether
-  the parcel predates the revocation or the key kept signing after it, rather
-  than asserting tampering it cannot actually prove. Verify against a store with
-  the full history for a definitive answer.
+- A parcel that a boundary head this store *does* hold already vouches for passes
+  regardless of what else is missing — that question is asked first, and a yes is
+  trustworthy however incomplete the store is. It is only for a parcel that is
+  **not** vouched, in a store that cannot resolve the boundary — a head missing
+  outright, or an ancestor behind one — that `audit` refuses (still fail-closed)
+  and says so honestly: it names the specific boundary parcel it could not find
+  and says it cannot tell whether the parcel predates the revocation or the key
+  kept signing after it, rather than asserting tampering it cannot actually prove.
+  The walk covers the whole boundary once per audit, not once per parcel, so
+  the object it names is not a promise that it is the one this specific
+  signature needed — supplying it does not guarantee resolution, since another
+  gap may surface behind it on a rerun. Verify against a store with the full
+  history for a definitive answer.
 - Revocations are append-once for everyone (including admins) and a revoked key
   can no longer extend the office chain or endorse new keys.
 - Like the anchor's own boundary, a distrust boundary keeps the history it
