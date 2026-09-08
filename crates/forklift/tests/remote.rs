@@ -2312,7 +2312,7 @@ fn a_partial_clone_missing_an_unrelated_boundary_head_still_reads_signer_boundar
     // it is flatly absent on the clone, not merely "not reachable from here". That absence
     // is irrelevant to the agent's main-line parcel, which `main`'s own present boundary
     // head vouches for regardless — on both the origin and the clone.
-    let area = TestArea::new("boundary-unresolved");
+    let area = TestArea::new("boundary-vouched-past-an-absent-head");
     let server = Server::start(&area, None);
 
     prepare_warehouse(&area, "dev", &server.url);
@@ -2420,8 +2420,10 @@ fn a_partial_clone_missing_an_unrelated_boundary_head_still_reads_signer_boundar
     // A `signer.boundary eq suspect` predicate must not match, and `eq vouched` must (the
     // predicate only ever compares against "vouched" or "suspect" — "unresolved" is not a
     // valid comparison value at all, since an unresolved boundary reads Unknown for this leaf
-    // and never matches either literal; that path is covered by the origin/clone comparison
-    // above rather than a third `--where` case here).
+    // and never matches either literal). This test no longer reaches that path at all: after
+    // the vouched-first reorder BOTH the origin and the clone read "vouched" here, which is
+    // the point of the fixture. The Unknown arm is covered by the distrust construction
+    // further down, whose parcel is genuinely unvouched behind an absent boundary head.
     for (value, must_match) in [("suspect", false), ("vouched", true)] {
         let where_clause = format!(
             r#"{{"field":"signer.boundary","op":"eq","value":"{}"}}"#,
