@@ -182,7 +182,7 @@ pub fn get_scoped_value(key: &str, scope: ConfigScope) -> Result<Option<String>,
         return Ok(None);
     };
 
-    get_value_from_document(&document, section, field, &path)
+    Ok(get_value_from_document(&document, section, field))
 }
 
 /// Get the effective value of a configuration key: the warehouse configuration is
@@ -278,6 +278,18 @@ pub fn unset_value(key: &str, scope: ConfigScope) -> Result<(), String> {
 /// 2. `operator.identifier` / `operator.name` (warehouse overrides global), minting a
 ///    global identifier on first use.
 ///
+/// The identifier read (both branches) is strict on a present-but-malformed value — see
+/// [`read_profile_field`] and [`get_effective_operator_identifier`] — because leniency there
+/// is destructive: an absent identifier reads as "mint one", and minting *writes the fresh
+/// UUID back over the file*, so treating a hand-edited, unquoted value as absent would
+/// silently sever the operator from the identity their office enrolment knows them by. The
+/// name read stays lenient (`get_effective_value`): nothing is ever written back for it, a
+/// malformed name only ever falls back to the identifier, exactly as an absent one does (PR
+/// #122 round 5 — round 4 had made every known key strict this way, which broke two
+/// legitimate uses of "malformed reads as absent" elsewhere: `TorSettings` falling through a
+/// malformed warehouse `remote.tor` to a valid global one, and a malformed `maintenance.*`
+/// threshold falling back to its default instead of disabling maintenance forever).
+///
 /// # Returns
 /// * `Ok(Operator)` - The resolved operator.
 /// * `Err(String)`  - If a configuration file could not be read or written, or the
@@ -304,7 +316,7 @@ pub fn get_operator() -> Result<Operator, String> {
         return Ok(identity);
     }
 
-    let identifier = match get_effective_value(KEY_OPERATOR_IDENTIFIER)? {
+    let identifier = match get_effective_operator_identifier()? {
         Some((identifier, _)) => identifier,
         None => {
             let minted = mint_uuid_v4();
@@ -358,6 +370,29 @@ fn read_profile_field(
     }
 }
 
+/// Build a profile's identity from its already-located `[profile.<name>]` item — shared by
+/// [`get_profile`] (which still has to locate the table itself) and [`list_profiles`] (which
+/// already has the whole `profiles` table parsed and must not re-open and re-parse the global
+/// configuration file once per entry, see FORK-81 follow-up PR #122 round 5 F7).
+///
+/// # Returns
+/// * `Ok(Some(Operator))` - The profile's identity (fields may be empty strings when
+///                          unset — `get_operator` fills them in).
+/// * `Ok(None)`           - If `item` is absent, or present but not a table.
+/// * `Err(String)`        - If a present field is not a string.
+fn profile_from_item(item: Option<&toml_edit::Item>,
+                     profile: &str,
+                     path: &Path) -> Result<Option<Operator>, String> {
+    let Some(table) = item.and_then(|item| item.as_table_like()) else {
+        return Ok(None);
+    };
+
+    Ok(Some(Operator {
+        name: read_profile_field(table, profile, PROFILE_FIELD_NAME, path)?,
+        identifier: read_profile_field(table, profile, PROFILE_FIELD_IDENTIFIER, path)?,
+    }))
+}
+
 /// Read a named profile from the global configuration.
 ///
 /// # Arguments
@@ -375,18 +410,11 @@ pub fn get_profile(profile: &str) -> Result<Option<Operator>, String> {
         return Ok(None);
     };
 
-    let Some(table) = document.get(SECTION_PROFILE)
-        .and_then(|item| item.as_table_like())
-        .and_then(|profiles| profiles.get(profile))
-        .and_then(|item| item.as_table_like())
-    else {
+    let Some(profiles) = document.get(SECTION_PROFILE).and_then(|item| item.as_table_like()) else {
         return Ok(None);
     };
 
-    Ok(Some(Operator {
-        name: read_profile_field(table, profile, PROFILE_FIELD_NAME, &path)?,
-        identifier: read_profile_field(table, profile, PROFILE_FIELD_IDENTIFIER, &path)?,
-    }))
+    profile_from_item(profiles.get(profile), profile, &path)
 }
 
 /// List the named profiles in the global configuration (in file order).
@@ -394,17 +422,21 @@ pub fn get_profile(profile: &str) -> Result<Option<Operator>, String> {
 /// This is the command that exists to tell a user which profile is broken, so it must
 /// not itself refuse over one bad entry: a malformed profile is reported per-entry
 /// (`Err`) alongside the good ones (`Ok`), rather than aborting the whole listing the
-/// way propagating [`get_profile`]'s error with `?` would. `get_operator` and
-/// `create_profile` keep refusing outright — only this diagnostic path is tolerant.
+/// way propagating an error with `?` would. `get_operator` and `create_profile` keep
+/// refusing outright — only this diagnostic path is tolerant.
 ///
 /// A profile section that is not a table at all (e.g. `profile.old = 5`, as opposed to
-/// `[profile.old]` with a malformed field inside it) is diagnosable here too: `get_profile`
-/// reads that shape as `Ok(None)` — correct for its other caller, `create_profile`, which
-/// must treat it as "free to use" — but iterating this table already proves the name is
-/// present, so `None` here can only mean "not a table", never "does not exist". Reporting it
-/// used to mean silently dropping the entry, which let `profile use old` claim it "does not
-/// exist" and `profile create old` create a second, shadowing `[profile.old]` table right
-/// past the damaged scalar — the opposite of what this command exists for.
+/// `[profile.old]` with a malformed field inside it) is diagnosable here too:
+/// [`profile_from_item`] reads that shape as `Ok(None)` — correct for `get_profile`'s other
+/// caller, `create_profile`, which must treat it as "free to use" — but iterating this table
+/// already proves the name is present, so `None` here can only mean "not a table", never
+/// "does not exist" (unlike `get_profile`, which re-opens the file on every call, this loop
+/// shares one already-parsed snapshot with every entry, so there is no window for a concurrent
+/// rewrite to change that). Reporting it used to mean silently dropping the entry, which let
+/// `profile use old` claim it "does not exist" — the opposite of what this command exists
+/// for. `profile create old` was never at risk the same way: `set_profile_field` already
+/// refuses to write through a non-table `profile.old`, naming it "is not a table; please fix
+/// the file by hand", rather than creating a second, shadowing `[profile.old]` table past it.
 ///
 /// # Returns
 /// * `Ok(Vec<(String, Result<Operator, String>)>)` - The profile names in file order,
@@ -425,8 +457,8 @@ pub fn list_profiles() -> Result<Vec<(String, Result<Operator, String>)>, String
 
     let mut result = Vec::new();
 
-    for (name, _) in profiles.iter() {
-        match get_profile(name) {
+    for (name, item) in profiles.iter() {
+        match profile_from_item(Some(item), name, &path) {
             Ok(Some(identity)) => result.push((name.to_string(), Ok(identity))),
             // `name` is a key of `profiles`, so this can only mean "not a table".
             Ok(None) => result.push((name.to_string(), Err(format!(
@@ -588,23 +620,49 @@ fn load_document(path: &Path) -> Result<Option<DocumentMut>, String> {
         .map_err(|e| format!("Error while parsing configuration file \"{}\": {}", path.to_string_lossy(), e))
 }
 
-/// Get a string value from a parsed configuration document, strictly on a **present**
-/// field.
+/// Get a string value from a parsed configuration document. Values of other types (numbers,
+/// tables, …) are treated as unset, exactly like an absent field — deliberately lenient (PR
+/// #122 round 5): this is the general reader every known key goes through
+/// (`get_scoped_value` → `get_effective_value`), and for most of them "malformed reads as
+/// absent" is the behavior callers actually need, not an oversight:
+///   - `remote.tor`/`remote.torProxy`: `TorSettings::from_config` consults the warehouse
+///     scope, then falls back to the global one. A malformed warehouse-scope value must read
+///     as absent so that fallback still reaches a perfectly valid global value — erroring
+///     there instead (as a stricter general reader once did) stops the scope walk on the
+///     first bad entry and *masks* the good one, degrading to `TorMode::Auto` and un-proxying
+///     a remote the user configured to always route through Tor.
+///   - `maintenance.loose`/`maintenance.packs`/`maintenance.auto`: a malformed value must
+///     fall back to the built-in default and let maintenance keep running, not propagate an
+///     `Err` that `maintenance.rs` swallows into "maintenance is off", silently and
+///     permanently, with no message on any command.
+/// The one read where this leniency is actively harmful — the operator identifier, where
+/// "reads as absent" is also "mint a fresh one and write it back over the hand-edited value"
+/// — does not go through this reader; see [`get_value_from_document_strict`] and
+/// [`get_effective_operator_identifier`].
 ///
-/// An absent section or field is a defined shape every caller relies on — a warehouse or
-/// operator with nothing configured must read as "unset", not error — but a present field
-/// that is not a string must not collapse into that same unset case. It used to: an
-/// `identifier = 12345` (unquoted by hand) in `[operator]` read back as `None`, and
-/// `get_operator` treats an absent identifier as "mint one" — silently minting a fresh UUID
-/// and writing it back over the hand-written value on the very next command, the same
-/// severing-from-identity hazard `read_profile_field` closes for a named profile's own
-/// fields. This is the general reader every known key goes through, `remote.tor` included —
-/// `validate_value` only polices that key's value at set time, so a hand-edited `remote.tor =
-/// 3` used to silently read back as unset (degrading to the `auto` default) rather than
-/// naming the damage. A section present but not a table (e.g. `operator = 1`) is left as
-/// `None`, not an error: `set_value_in_document`/`remove_value_from_document` already name
-/// that case explicitly for the callers (`set`/`unset`) that would otherwise silently repair
-/// it.
+/// # Arguments
+/// * `document` - The parsed configuration document.
+/// * `section`  - The section (table) name.
+/// * `field`    - The field name inside the section.
+///
+/// # Returns
+/// * `Some(String)` - The value of the field.
+/// * `None`         - If the section or field does not exist, the section is not a table, or
+///                    the field is present but not a string.
+fn get_value_from_document(document: &DocumentMut, section: &str, field: &str) -> Option<String> {
+    document.get(section)
+        .and_then(|section_item| section_item.as_table_like())
+        .and_then(|table| table.get(field))
+        .and_then(|field_item| field_item.as_str())
+        .map(|value| value.to_string())
+}
+
+/// [`get_value_from_document`]'s strict counterpart: a present-but-non-string field is an
+/// error rather than being read as unset. Used only to resolve the operator identifier (see
+/// [`get_effective_operator_identifier`], [`get_operator`]) — the one read where degrading a
+/// malformed value into "unset" is destructive, not merely surprising. Every other known key
+/// goes through the lenient reader instead; see its doc comment for why leniency there is
+/// load-bearing.
 ///
 /// # Arguments
 /// * `document` - The parsed configuration document.
@@ -617,10 +675,10 @@ fn load_document(path: &Path) -> Result<Option<DocumentMut>, String> {
 /// * `Ok(None)`         - If the section or field does not exist (or the section is not a
 ///                        table).
 /// * `Err(String)`      - If the field is present but not a string.
-fn get_value_from_document(document: &DocumentMut,
-                           section: &str,
-                           field: &str,
-                           path: &Path) -> Result<Option<String>, String> {
+fn get_value_from_document_strict(document: &DocumentMut,
+                                  section: &str,
+                                  field: &str,
+                                  path: &Path) -> Result<Option<String>, String> {
     let Some(table) = document.get(section).and_then(|section_item| section_item.as_table_like()) else {
         return Ok(None);
     };
@@ -634,6 +692,39 @@ fn get_value_from_document(document: &DocumentMut,
                 section, field, path.display()
             )),
     }
+}
+
+/// Get the effective operator identifier, strictly: like [`get_effective_value`] the
+/// warehouse scope is consulted first and the global scope is the fallback, but a
+/// present-but-non-string value in *either* scope refuses immediately instead of falling
+/// through to the next scope. Falling through would still be wrong here, unlike the
+/// legitimate Tor/maintenance fallback [`get_value_from_document`]'s doc comment describes:
+/// it would silently resolve to a *different* value than the one actually configured — the
+/// other scope's, or (once the caller sees `None`) a freshly minted one — instead of naming
+/// the damage.
+///
+/// # Returns
+/// * `Ok(Some((String, ConfigScope)))` - The identifier and the scope it came from.
+/// * `Ok(None)`                        - If `operator.identifier` is not set in either scope.
+/// * `Err(String)`                     - If a configuration file could not be read or
+///                                       parsed, or `operator.identifier` is present in some
+///                                       scope but not a string.
+fn get_effective_operator_identifier() -> Result<Option<(String, ConfigScope)>, String> {
+    let (section, field) = split_key(KEY_OPERATOR_IDENTIFIER)?;
+
+    for scope in [ConfigScope::Warehouse, ConfigScope::Global] {
+        let path = get_config_path(scope)?;
+
+        let Some(document) = load_document(&path)? else {
+            continue;
+        };
+
+        if let Some(value) = get_value_from_document_strict(&document, section, field, &path)? {
+            return Ok(Some((value, scope)));
+        }
+    }
+
+    Ok(None)
 }
 
 /// Set a string value in a parsed configuration document, creating the section if needed.
@@ -742,14 +833,32 @@ mod tests {
     }
 
     #[test]
-    fn a_present_but_non_string_value_errors_instead_of_reading_as_unset() {
-        // The general-reader counterpart of the profile-field test above: this used to be
-        // exactly the hazard read_profile_field's fix left standing on the non-profile branch
-        // — `operator.identifier = 12345` read back as `None`, and `get_operator` treats an
-        // absent identifier as "mint one", silently overwriting the hand-written value.
+    fn a_present_but_non_string_value_reads_as_unset_on_the_general_reader() {
+        // PR #122 round 5: round 4 made this reader strict generally (matching the assertion
+        // this test used to make), but that broke two legitimate callers of "malformed reads
+        // as absent" — `TorSettings::from_config` falling through a malformed warehouse
+        // `remote.tor` to a valid global one, and a malformed `maintenance.*` threshold
+        // falling back to its default instead of disabling maintenance forever. Reverted to
+        // lenient; strictness is now scoped to the operator identifier alone, which is the
+        // one read where "absent" also means "mint a fresh one and write it back over the
+        // hand-edited value" — see `a_present_but_non_string_value_errors_on_the_strict_reader`.
         let document: DocumentMut = "[operator]\nidentifier = 12345\n".parse().unwrap();
 
-        let error = match get_value_from_document(&document, "operator", "identifier", Path::new("/cfg")) {
+        assert_eq!(get_value_from_document(&document, "operator", "identifier"), None);
+        // The absent case reads the same way.
+        assert_eq!(get_value_from_document(&document, "operator", "name"), None);
+    }
+
+    #[test]
+    fn a_present_but_non_string_value_errors_on_the_strict_reader() {
+        // The strict counterpart used only for the operator identifier: this is exactly the
+        // hazard `read_profile_field`'s fix closes for a named profile's own fields, on the
+        // non-profile branch — `operator.identifier = 12345` must not read as `None`, because
+        // `get_operator` treats an absent identifier as "mint one", silently overwriting the
+        // hand-written value.
+        let document: DocumentMut = "[operator]\nidentifier = 12345\n".parse().unwrap();
+
+        let error = match get_value_from_document_strict(&document, "operator", "identifier", Path::new("/cfg")) {
             Err(error) => error,
             Ok(value) => panic!(
                 "a present, non-string value must error rather than read as {:?}", value
@@ -761,7 +870,7 @@ mod tests {
 
         // The absent case is unchanged.
         assert_eq!(
-            get_value_from_document(&document, "operator", "name", Path::new("/cfg")).unwrap(),
+            get_value_from_document_strict(&document, "operator", "name", Path::new("/cfg")).unwrap(),
             None
         );
     }
@@ -772,9 +881,9 @@ mod tests {
 
         set_value_in_document(&mut document, "operator", "name", "Máté").unwrap();
 
-        assert_eq!(get_value_from_document(&document, "operator", "name", Path::new("/cfg")).unwrap(), Some("Máté".to_string()));
-        assert_eq!(get_value_from_document(&document, "operator", "identifier", Path::new("/cfg")).unwrap(), None);
-        assert_eq!(get_value_from_document(&document, "missing", "name", Path::new("/cfg")).unwrap(), None);
+        assert_eq!(get_value_from_document(&document, "operator", "name"), Some("Máté".to_string()));
+        assert_eq!(get_value_from_document(&document, "operator", "identifier"), None);
+        assert_eq!(get_value_from_document(&document, "missing", "name"), None);
     }
 
     #[test]
@@ -789,8 +898,8 @@ mod tests {
         let written = document.to_string();
         assert!(written.contains("# A comment that must survive."));
         assert!(written.contains("# untouched comment"));
-        assert_eq!(get_value_from_document(&document, "operator", "name", Path::new("/cfg")).unwrap(), Some("New Name".to_string()));
-        assert_eq!(get_value_from_document(&document, "operator", "identifier", Path::new("/cfg")).unwrap(), Some("old@id".to_string()));
+        assert_eq!(get_value_from_document(&document, "operator", "name"), Some("New Name".to_string()));
+        assert_eq!(get_value_from_document(&document, "operator", "identifier"), Some("old@id".to_string()));
     }
 
     #[test]
@@ -801,11 +910,11 @@ mod tests {
         assert!(remove_value_from_document(&mut document, "remote", "token").unwrap());
 
         // The token is gone; everything else survives.
-        assert_eq!(get_value_from_document(&document, "remote", "token", Path::new("/cfg")).unwrap(), None);
+        assert_eq!(get_value_from_document(&document, "remote", "token"), None);
         let written = document.to_string();
         assert!(written.contains("# Keep me."));
         assert!(!written.contains("secret"));
-        assert_eq!(get_value_from_document(&document, "operator", "name", Path::new("/cfg")).unwrap(), Some("Name".to_string()));
+        assert_eq!(get_value_from_document(&document, "operator", "name"), Some("Name".to_string()));
 
         // Removing an absent field (or an absent section) reports "not present".
         assert!(!remove_value_from_document(&mut document, "remote", "token").unwrap());
@@ -818,7 +927,7 @@ mod tests {
         // an `[operator]` section; both spellings must be readable.
         let document: DocumentMut = "operator.name = \"Dotted\"\n".parse().unwrap();
 
-        assert_eq!(get_value_from_document(&document, "operator", "name", Path::new("/cfg")).unwrap(), Some("Dotted".to_string()));
+        assert_eq!(get_value_from_document(&document, "operator", "name"), Some("Dotted".to_string()));
     }
 
     #[test]

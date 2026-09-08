@@ -1320,13 +1320,35 @@ pub(crate) fn read_string(doc: &DocumentMut, field: &str, record_kind: &str) -> 
         ))
 }
 
+/// Record kinds that exist exactly once per warehouse, so `"a {kind}"` would misleadingly
+/// suggest there could be more than one — these take the definite article instead. Every
+/// other record kind recurs many times (`"a haul event"`, `"a tag record"`, ...). Explicit
+/// list, not a single hardcoded comparison (PR #122 round 5 F6): a future unique-per-
+/// warehouse kind must be added here, or it silently falls through to the indefinite article
+/// below.
+const UNIQUE_RECORD_KINDS: [&str; 1] = ["trust file"];
+
+/// Record kinds whose first *letter* is a vowel but whose first *sound* is not — a leading
+/// "y" glide, as in "user" ("yoo-zer") — so English picks "a", not the "an" a spelling-only
+/// check below would otherwise pick. The reverse (a consonant letter with a vowel sound, e.g.
+/// "hour") does not occur among today's record kinds; add it here if it ever does.
+const CONSONANT_SOUNDING_RECORD_KINDS: [&str; 1] = ["user record"];
+
 /// The record-kind noun phrase for a message like `"{} has no ... entry."`, with its article.
-/// Every record kind here recurs many times across a warehouse (`"a haul event"`, `"a tag
-/// record"`, ...) except the trust file, which is unique per warehouse — `"a trust file"`
-/// would misleadingly suggest there could be more than one, so it alone takes the definite
-/// article ("the trust file"). Capitalized: every caller uses this at the start of a sentence.
+/// Capitalized: every caller uses this at the start of a sentence.
+///
+/// The indefinite article is picked from the record kind's first letter (PR #122 round 5 F6):
+/// hardcoding "A" for everything is correct only by coincidence for today's seven kinds — a
+/// future vowel-initial kind (e.g. "office record") would silently read "A office record".
 fn record_kind_prefix(record_kind: &str) -> String {
-    let article = if record_kind == "trust file" { "The" } else { "A" };
+    if UNIQUE_RECORD_KINDS.contains(&record_kind) {
+        return format!("The {}", record_kind);
+    }
+
+    let starts_with_vowel_sound = record_kind.starts_with(|c: char| "aeiouAEIOU".contains(c))
+        && !CONSONANT_SOUNDING_RECORD_KINDS.contains(&record_kind);
+
+    let article = if starts_with_vowel_sound { "An" } else { "A" };
     format!("{} {}", article, record_kind)
 }
 
@@ -1887,5 +1909,30 @@ mod tests {
             tag_record_error.starts_with("A tag record has no"),
             "a tag record recurs across a warehouse and must keep \"A\": {}", tag_record_error
         );
+    }
+
+    /// PR #122 round 5 finding F6: hardcoding "A" for everything but the literal "trust
+    /// file" was correct only by coincidence for today's seven record kinds. A future
+    /// vowel-initial kind must take "An", and a future unique-per-warehouse kind must be
+    /// added to the explicit list rather than falling through to the indefinite article.
+    #[test]
+    fn record_kind_prefix_picks_the_article_from_the_first_letter_and_an_explicit_uniqueness_list() {
+        assert_eq!(record_kind_prefix("office record"), "An office record");
+        assert_eq!(record_kind_prefix("audit entry"), "An audit entry");
+
+        // "user record" starts with a vowel *letter* but a consonant *sound* ("yoo-zer") —
+        // English picks the article by sound, so a bare first-letter check would get this
+        // wrong; it must stay "A", not flip to "An".
+        assert_eq!(record_kind_prefix("user record"), "A user record");
+
+        // The explicit uniqueness list decides the definite article, not the first letter.
+        assert_eq!(record_kind_prefix("trust file"), "The trust file");
+
+        // Ordinary consonant-initial kinds are unaffected.
+        assert_eq!(record_kind_prefix("haul event"), "A haul event");
+        assert_eq!(record_kind_prefix("tag record"), "A tag record");
+        assert_eq!(record_kind_prefix("key record"), "A key record");
+        assert_eq!(record_kind_prefix("manifest entry"), "A manifest entry");
+        assert_eq!(record_kind_prefix("delivery entry"), "A delivery entry");
     }
 }

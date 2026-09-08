@@ -454,6 +454,80 @@ fn config_values_are_scoped_and_the_warehouse_overrides_the_global_scope() {
     assert!(stderr(&unset).contains("not set"));
 }
 
+/// PR #122 round 5: round 4 made the general config reader (`get_value_from_document`)
+/// strict for every known key, not just the operator identifier. That broke the legitimate
+/// warehouse-then-global fallback `get_effective_value` performs: a present-but-non-string
+/// value in the *first* scope made the whole lookup refuse instead of falling through to a
+/// valid value in the next scope. For `remote.tor`, `TorSettings::from_config` swallows that
+/// refusal via `.ok().flatten()` and defaults to `TorMode::Auto` — so a hand-edited warehouse
+/// `remote.tor = true` (a TOML boolean; `TorMode::parse` also accepts the *string* "true" as
+/// On, so this is a natural edit) silently masked a perfectly valid global `remote.tor =
+/// "on"`, un-proxying a remote the user configured to always route through Tor. This test
+/// exercises the same `get_effective_value` call through `config remote.tor` (warehouse
+/// scope, no `--global`), which is the direct, CLI-observable surface of the mechanism.
+///
+/// Falsified both directions: reverting `get_value_from_document` to round 4's strict
+/// behavior reddens this at the `assert_eq!` (the command refuses instead of printing "on");
+/// restoring the lenient reader returns it to green.
+#[test]
+fn a_malformed_warehouse_remote_tor_falls_through_to_a_valid_global_value_instead_of_masking_it() {
+    let warehouse = TestWarehouse::new("tor-fallthrough");
+    assert_success(&warehouse.run(&["prepare"]));
+
+    // A hand-edited, unquoted warehouse remote.tor (a TOML boolean, not the string the
+    // reader expects) sitting in front of a validly-set global one.
+    std::fs::write(
+        warehouse.root.join(".forklift/config/warehouse.toml"),
+        "[remote]\ntor = true\n",
+    ).unwrap();
+    std::fs::write(warehouse.home.join("global-config.toml"), "[remote]\ntor = \"on\"\n").unwrap();
+
+    let effective = warehouse.run(&["config", "remote.tor"]);
+    assert_success(&effective);
+    assert_eq!(
+        stdout(&effective).trim(), "on",
+        "a malformed warehouse-scope remote.tor must fall through to the valid global value, \
+        not mask it and refuse"
+    );
+}
+
+/// PR #122 round 5: the same over-broad strictness made `pack_utils::config_threshold`
+/// propagate `Err` for a present-but-non-string `maintenance.*` value. `auto_compaction_action`
+/// propagates that, and `maintenance.rs` swallows it with `.unwrap_or(AutoCompaction::None)` —
+/// background maintenance silently off forever, with no message on any command.
+/// `store status` shares `config_threshold` (and `maintenance_auto_enabled`) directly, so it
+/// is the CLI-observable surface: it must still succeed and report the *default* threshold on
+/// a malformed value, not refuse.
+///
+/// Falsified both directions: reverting `get_value_from_document` to round 4's strict
+/// behavior reddens this at the `assert_eq!` (the command refuses instead of reporting the
+/// default threshold); restoring the lenient reader returns it to green.
+#[test]
+fn a_malformed_maintenance_loose_threshold_falls_back_to_the_default_instead_of_disabling_maintenance() {
+    let warehouse = TestWarehouse::new("maintenance-fallback");
+    assert_success(&warehouse.run(&["prepare"]));
+
+    // A hand-edited, unquoted maintenance.loose (a bare TOML integer, not the string the
+    // reader expects).
+    std::fs::write(
+        warehouse.root.join(".forklift/config/warehouse.toml"),
+        "[maintenance]\nloose = 12345\n",
+    ).unwrap();
+
+    let status = warehouse.run(&["--json", "store"]);
+    assert_success(&status);
+    let data = json(&status);
+    assert_eq!(
+        data["data"]["maintenance"]["loose_threshold"].as_u64(), Some(6700),
+        "a malformed maintenance.loose must fall back to the built-in default, not disable \
+        maintenance or refuse the command: {}", data
+    );
+    assert_eq!(
+        data["data"]["maintenance"]["auto"].as_bool(), Some(true),
+        "maintenance.auto is unset here and must default to on: {}", data
+    );
+}
+
 #[test]
 fn identity_is_zero_configuration_an_id_is_minted_on_first_use() {
     let warehouse = TestWarehouse::new("mint");
