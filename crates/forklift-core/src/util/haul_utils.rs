@@ -601,35 +601,30 @@ fn parse_event(toml: &str) -> Result<HaulEvent, String> {
     let doc: DocumentMut = toml.parse()
         .map_err(|e| format!("A haul event is not valid TOML: {}", e))?;
 
-    let read_string = |field: &str| -> Result<String, String> {
-        doc.get(field)
-            .and_then(|item| item.as_str())
-            .map(|s| s.to_string())
-            .ok_or(format!("A haul event has no \"{}\" field.", field))
-    };
-
-    let optional_string = |field: &str| -> Option<String> {
-        doc.get(field).and_then(|item| item.as_str()).map(|s| s.to_string())
-    };
-
-    let verdict = match optional_string("verdict") {
+    // Optional, strict (FORK-81 follow-up: the class sweep PR #122 missed): `event_to_toml`
+    // omits each of these five keys entirely when the event carries no value for them, so an
+    // absent key legitimately means `None`. A *present* non-string value must still error
+    // rather than silently collapse to that same `None` — for `verdict` specifically, a
+    // present-but-malformed value would otherwise be read as "no verdict" by `fold_haul`
+    // instead of naming the actual damage, exactly the `revocation_reason` shape PR #122 fixed
+    // in `office_utils`. Uses the office's shared strict reader rather than a duplicated
+    // per-module `optional_string` closure with the old lenient shape.
+    let verdict = match office_utils::read_optional_string(&doc, "verdict", "haul event")? {
         Some(value) => Some(ReviewVerdict::parse(&value)?),
         None => None,
     };
 
     Ok(HaulEvent {
-        haul: read_string("haul")?,
-        kind: HaulEventKind::parse(&read_string("kind")?)?,
-        recorded_at: doc.get("recorded_at")
-            .and_then(|item| item.as_integer())
-            .ok_or("A haul event has no \"recorded_at\" field.".to_string())?,
-        body: read_string("body")?,
-        source: optional_string("source"),
-        target: optional_string("target"),
-        title: optional_string("title"),
-        head: optional_string("head"),
+        haul: office_utils::read_string(&doc, "haul", "haul event")?,
+        kind: HaulEventKind::parse(&office_utils::read_string(&doc, "kind", "haul event")?)?,
+        recorded_at: office_utils::read_integer(&doc, "recorded_at", "haul event")?,
+        body: office_utils::read_string(&doc, "body", "haul event")?,
+        source: office_utils::read_optional_string(&doc, "source", "haul event")?,
+        target: office_utils::read_optional_string(&doc, "target", "haul event")?,
+        title: office_utils::read_optional_string(&doc, "title", "haul event")?,
+        head: office_utils::read_optional_string(&doc, "head", "haul event")?,
         verdict,
-        merge_parcel: optional_string("merge_parcel"),
+        merge_parcel: office_utils::read_optional_string(&doc, "merge_parcel", "haul event")?,
     })
 }
 
@@ -666,6 +661,107 @@ mod tests {
             merge_parcel: None,
         };
         assert_eq!(parse_event(&event_to_toml(&review)).unwrap(), review);
+    }
+
+    /// A minimal, otherwise-valid haul event TOML string with one extra clause spliced in —
+    /// the shared fixture for the strictness tests below.
+    fn haul_event_toml(extra_clause: &str) -> String {
+        format!(
+            "haul = \"h\"\n\
+             kind = \"opened\"\n\
+             recorded_at = 1\n\
+             body = \"b\"\n\
+             {}",
+            extra_clause
+        )
+    }
+
+    /// FORK-81 follow-up (the class sweep PR #122's own strictness fix missed): a present but
+    /// non-string `verdict` must error, never silently parse as "no verdict" the way the old
+    /// `optional_string` closure's `.and_then(as_str)` would — `fold_haul` folds `verdict` into
+    /// the review's recorded stance, so a damaged review would otherwise be dropped rather than
+    /// reported.
+    #[test]
+    fn a_present_non_string_verdict_in_a_haul_event_errors_naming_it() {
+        let toml = haul_event_toml("verdict = 7\n");
+
+        let error = match parse_event(&toml) {
+            Err(e) => e,
+            Ok(_) => panic!("a non-string verdict value must error, not silently become none"),
+        };
+        assert!(error.contains("\"verdict\""), "the error must name the field: {}", error);
+    }
+
+    #[test]
+    fn a_present_non_string_source_in_a_haul_event_errors_naming_it() {
+        let toml = haul_event_toml("source = 7\n");
+
+        let error = match parse_event(&toml) {
+            Err(e) => e,
+            Ok(_) => panic!("a non-string source value must error, not silently become none"),
+        };
+        assert!(error.contains("\"source\""), "the error must name the field: {}", error);
+    }
+
+    #[test]
+    fn a_present_non_string_target_in_a_haul_event_errors_naming_it() {
+        let toml = haul_event_toml("target = 7\n");
+
+        let error = match parse_event(&toml) {
+            Err(e) => e,
+            Ok(_) => panic!("a non-string target value must error, not silently become none"),
+        };
+        assert!(error.contains("\"target\""), "the error must name the field: {}", error);
+    }
+
+    #[test]
+    fn a_present_non_string_title_in_a_haul_event_errors_naming_it() {
+        let toml = haul_event_toml("title = 7\n");
+
+        let error = match parse_event(&toml) {
+            Err(e) => e,
+            Ok(_) => panic!("a non-string title value must error, not silently become none"),
+        };
+        assert!(error.contains("\"title\""), "the error must name the field: {}", error);
+    }
+
+    #[test]
+    fn a_present_non_string_head_in_a_haul_event_errors_naming_it() {
+        let toml = haul_event_toml("head = 7\n");
+
+        let error = match parse_event(&toml) {
+            Err(e) => e,
+            Ok(_) => panic!("a non-string head value must error, not silently become none"),
+        };
+        assert!(error.contains("\"head\""), "the error must name the field: {}", error);
+    }
+
+    #[test]
+    fn a_present_non_string_merge_parcel_in_a_haul_event_errors_naming_it() {
+        let toml = haul_event_toml("merge_parcel = 7\n");
+
+        let error = match parse_event(&toml) {
+            Err(e) => e,
+            Ok(_) => panic!("a non-string merge_parcel value must error, not silently become none"),
+        };
+        assert!(error.contains("\"merge_parcel\""), "the error must name the field: {}", error);
+    }
+
+    /// The absent-key case must stay exactly as lenient as before: `event_to_toml` omits every
+    /// one of these six keys when the event carries no value for them (proven for all six by
+    /// `events_round_trip_through_toml` above), and a record with none of them present must
+    /// still parse with every one of them `None` — the strictness fix above must not narrow that.
+    #[test]
+    fn a_haul_event_with_none_of_the_optional_keys_parses_with_all_none() {
+        let toml = haul_event_toml("");
+
+        let parsed = parse_event(&toml).expect("a record with no optional keys must still parse");
+        assert_eq!(parsed.source, None);
+        assert_eq!(parsed.target, None);
+        assert_eq!(parsed.title, None);
+        assert_eq!(parsed.head, None);
+        assert_eq!(parsed.verdict, None);
+        assert_eq!(parsed.merge_parcel, None);
     }
 
     #[test]
