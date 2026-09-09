@@ -1403,9 +1403,17 @@ fn read_optional_integer(doc: &DocumentMut, field: &str, record_kind: &str) -> R
 /// — never silently drops an entry the way a `filter_map` would. For a field the writer always
 /// serializes (even when empty), a missing key is corruption, not an old/lenient shape.
 fn read_required_string_array(doc: &DocumentMut, field: &str, record_kind: &str) -> Result<Vec<String>, String> {
-    let array = doc.get(field)
-        .and_then(|item| item.as_array())
-        .ok_or_else(|| format!("{} has no \"{}\" array entry.", record_kind_prefix(record_kind), field))?;
+    // Two arms, like every other reader here: collapsing them would report `boundary = 7` as
+    // "has no boundary array entry" while the key is plainly there, sending the reader to add a
+    // field that already exists. This was the last single-arm reader in the file.
+    let Some(item) = doc.get(field) else {
+        return Err(format!("{} has no \"{}\" array entry.", record_kind_prefix(record_kind), field));
+    };
+
+    let array = item.as_array()
+        .ok_or_else(|| format!(
+            "{}'s \"{}\" entry is present but is not an array.", record_kind_prefix(record_kind), field
+        ))?;
 
     strict_string_array(array, field, record_kind)
 }
@@ -1541,6 +1549,34 @@ mod tests {
     }
 
     /// Finding 5 (round 1, PR #120): `read_trust_anchor` used to parse `boundary` with
+    /// The last single-arm reader in this file: `boundary = 7` used to report "has no
+    /// \"boundary\" array entry" while the key was plainly present, sending the reader to add a
+    /// field that already exists — the exact misdirection `read_string`'s own doc comment cites as
+    /// the reason its arms were split. This pins the present-but-wrong-type arm; the absent arm is
+    /// pinned by the parse of a trust file written without the key.
+    #[test]
+    fn a_present_but_non_array_boundary_is_distinguished_from_an_absent_one() {
+        let doc: DocumentMut = "boundary = 7\n".parse().unwrap();
+
+        let error = match read_required_string_array(&doc, "boundary", "trust file") {
+            Err(error) => error,
+            Ok(value) => panic!("a present, non-array boundary must error, not read as {:?}", value),
+        };
+
+        assert!(error.contains("present but is not an array"),
+            "the error must say the key is present and wrongly typed, not that it is missing: {}",
+            error
+        );
+        assert!(error.contains("boundary"), "the error must name the field: {}", error);
+
+        // The absent arm still reports absence, and still says so in the old words.
+        let empty: DocumentMut = "".parse().unwrap();
+        let absent = read_required_string_array(&empty, "boundary", "trust file").unwrap_err();
+
+        assert!(absent.contains("has no"),
+            "an absent required array must still report absence: {}", absent);
+    }
+
     /// `filter_map(|e| e.as_str())`, silently dropping a non-string entry instead of erroring —
     /// under-counting roots on a damaged trust file and letting `gc` collect a pinned head, the
     /// opposite of what `collect_trust_pin_roots`'s own doc comment claims. `boundary` is a
