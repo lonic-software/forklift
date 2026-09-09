@@ -14,25 +14,35 @@ use crate::output::{self, CommandOutput};
 pub fn list() -> Result<(), String> {
     let profiles = config_utils::list_profiles()?;
 
-    let default_identifier = config_utils::get_scoped_value(
+    // Strict, not `get_scoped_value`: this is the command a user runs to find out what
+    // identity they have, so a present-but-non-string `operator.identifier` must be
+    // reported as malformed, not conflated with "no identity yet" — the latter promises a
+    // mint on first use that `get_operator` would in fact refuse to perform (PR #122 round
+    // 6, F3).
+    let default = match config_utils::get_scoped_value_strict(
         config_utils::KEY_OPERATOR_IDENTIFIER,
         ConfigScope::Global
-    )?;
-
-    let default = match &default_identifier {
-        Some(identifier) => ProfileEntry {
+    ) {
+        Ok(Some(identifier)) => ProfileEntry {
             name: "default".to_string(),
             identifier: Some(identifier.clone()),
             display_name: None,
-            local_keys: Some(sign_utils::keys_owned_by(identifier)?.len()),
+            local_keys: Some(sign_utils::keys_owned_by(&identifier)?.len()),
             error: None,
         },
-        None => ProfileEntry {
+        Ok(None) => ProfileEntry {
             name: "default".to_string(),
             identifier: None,
             display_name: None,
             local_keys: Some(0),
             error: None,
+        },
+        Err(error) => ProfileEntry {
+            name: "default".to_string(),
+            identifier: None,
+            display_name: None,
+            local_keys: None,
+            error: Some(error),
         },
     };
 
@@ -105,11 +115,12 @@ pub(crate) struct ProfileEntry {
 
 impl CommandOutput for ProfileList {
     fn render_human(&self) {
-        match &self.default.identifier {
-            Some(identifier) => println!(
+        match (&self.default.identifier, &self.default.error) {
+            (Some(identifier), _) => println!(
                 "default — {} ({} local key(s))", identifier, self.default.local_keys.unwrap_or(0)
             ),
-            None => println!("default — no identity yet (an id is minted on first use)"),
+            (None, Some(error)) => println!("default — error: {}", error),
+            (None, None) => println!("default — no identity yet (an id is minted on first use)"),
         }
 
         for entry in &self.profiles {

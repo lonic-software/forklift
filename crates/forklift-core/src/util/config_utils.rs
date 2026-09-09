@@ -278,24 +278,38 @@ pub fn unset_value(key: &str, scope: ConfigScope) -> Result<(), String> {
 /// 2. `operator.identifier` / `operator.name` (warehouse overrides global), minting a
 ///    global identifier on first use.
 ///
-/// The identifier read (both branches) is strict on a present-but-malformed value — see
-/// [`read_profile_field`] and [`get_effective_operator_identifier`] — because leniency there
-/// is destructive: an absent identifier reads as "mint one", and minting *writes the fresh
-/// UUID back over the file*, so treating a hand-edited, unquoted value as absent would
-/// silently sever the operator from the identity their office enrolment knows them by. The
-/// name read stays lenient (`get_effective_value`): nothing is ever written back for it, a
-/// malformed name only ever falls back to the identifier, exactly as an absent one does (PR
-/// #122 round 5 — round 4 had made every known key strict this way, which broke two
-/// legitimate uses of "malformed reads as absent" elsewhere: `TorSettings` falling through a
-/// malformed warehouse `remote.tor` to a valid global one, and a malformed `maintenance.*`
-/// threshold falling back to its default instead of disabling maintenance forever).
+/// # The strict-read rule
+/// A config read is strict — a present-but-non-string value refuses instead of being read
+/// as absent — exactly when a malformed value could (a) trigger a destructive write, or
+/// (b) silently change *which identity* the warehouse acts as. Everywhere else a swallowed
+/// or propagated error only ever picks a different *wrong* value, never a destructive or
+/// identity-changing one, so the general reader stays lenient (see
+/// [`get_value_from_document`]'s doc for the two keys where that leniency is load-bearing:
+/// `remote.tor`/`remote.torProxy` and `maintenance.*`). That makes the strict set exactly
+/// two keys, read the same way regardless of which branch reaches them
+/// ([`read_profile_field`] on the profile branch, [`get_effective_value_strict`] on both):
+///   - `operator.profile` picks *which* branch runs at all (the profile identity vs. the
+///     plain operator identity) — a malformed value reading as absent would silently fall
+///     through to a different identity instead of refusing (PR #122 round 6, F1).
+///   - `operator.identifier` (both as the plain key and as a profile's own `identifier`
+///     field) feeds the same mint-and-write-back: an absent identifier means "mint one and
+///     write it into the file", so misreading a malformed value as absent overwrites a
+///     hand-edited identity with a random one.
+///
+/// `operator.name` (in both branches) fails neither test: nothing is ever written back for
+/// it, and a malformed value only ever falls back to the identifier, exactly as an absent
+/// one does — so it stays lenient on both branches (PR #122 round 6 reverses round 3's
+/// position, which had made the profile branch's `name` strict on the reasoning that a
+/// malformed *display* value silently becoming the identifier felt wrong; the deciding
+/// factor is the write-back, not whether the field is cosmetic, and there is none for
+/// `name`, so both branches must agree).
 ///
 /// # Returns
 /// * `Ok(Operator)` - The resolved operator.
 /// * `Err(String)`  - If a configuration file could not be read or written, or the
 ///                    selected profile does not exist.
 pub fn get_operator() -> Result<Operator, String> {
-    if let Some((profile, _)) = get_effective_value(KEY_OPERATOR_PROFILE)? {
+    if let Some((profile, _)) = get_effective_value_strict(KEY_OPERATOR_PROFILE)? {
         let Some(mut identity) = get_profile(&profile)? else {
             return Err(format!(
                 "The selected profile \"{}\" does not exist in the global configuration. \
@@ -316,7 +330,7 @@ pub fn get_operator() -> Result<Operator, String> {
         return Ok(identity);
     }
 
-    let identifier = match get_effective_operator_identifier()? {
+    let identifier = match get_effective_value_strict(KEY_OPERATOR_IDENTIFIER)? {
         Some((identifier, _)) => identifier,
         None => {
             let minted = mint_uuid_v4();
@@ -332,41 +346,45 @@ pub fn get_operator() -> Result<Operator, String> {
     Ok(Operator { name, identifier })
 }
 
-/// Read one field of a named profile, strictly on a **present** key.
+/// Read one field of a named profile. Whether a **present** but non-string value refuses
+/// or reads as absent (the same as an unset field) depends on the strict-read rule at
+/// [`get_operator`]: `identifier` feeds a mint-and-write-back (an absent value is minted
+/// and *written back over the profile*), so it is read `strict`; `name` is display-only —
+/// a malformed value falls back to the identifier exactly as an absent one does, with no
+/// write-back and no identity change — so it is read leniently.
 ///
-/// An absent field is a defined shape the callers rely on — [`get_operator`] mints an
-/// identifier when it is empty and falls back to the identifier for an empty name — but a
-/// present field that is not a string must not collapse into that same empty case. It used
-/// to: an `identifier = 12345` written unquoted by hand read back as `""`, and
-/// [`get_operator`] then minted a fresh UUID and *wrote it back over the profile*, silently
-/// severing the operator from the identity their office enrolment knows them by. Damaged
-/// config now says so rather than being quietly repaired into a different person. Same rule
-/// the record parsers follow (`office_utils::read_optional_string`), for the same reason.
+/// An absent field is a defined shape either way — [`get_operator`] mints an identifier
+/// when it is empty and falls back to the identifier for an empty name. `identifier`
+/// strictness exists because a present-but-malformed value must not collapse into that
+/// same empty case: an `identifier = 12345` written unquoted by hand used to read back as
+/// `""`, and [`get_operator`] then minted a fresh UUID and *wrote it back over the
+/// profile*, silently severing the operator from the identity their office enrolment knows
+/// them by. Damaged config now says so rather than being quietly repaired into a different
+/// person. Same rule the record parsers follow (`office_utils::read_optional_string`), for
+/// the same reason.
+///
+/// # Arguments
+/// * `strict` - `true` for `identifier`, `false` for `name` — see above.
 fn read_profile_field(
     table: &dyn toml_edit::TableLike,
     profile: &str,
     name: &str,
     path: &Path,
+    strict: bool,
 ) -> Result<String, String> {
     match table.get(name) {
         None => Ok(String::new()),
-        Some(item) => item.as_str()
-            .map(|value| value.to_string())
-            .ok_or_else(|| {
-                // `identifier` empties into a mint; `name` empties into the identifier
-                // fallback (`get_operator`) — nothing is generated for it, so the hint
-                // must not claim it is.
-                let hint = if name == PROFILE_FIELD_IDENTIFIER {
-                    "Quote it, or remove it to have one generated."
-                } else {
-                    "Quote it, or remove it to fall back to the identifier."
-                };
-
-                format!(
-                    "The profile \"{}\" has a \"{}\" that is not a string, in {}. {}",
-                    profile, name, path.display(), hint
-                )
-            }),
+        Some(item) => match item.as_str() {
+            Some(value) => Ok(value.to_string()),
+            // Lenient field (`name`): a malformed value reads as absent, exactly like one
+            // that was never set — there is nothing to write back and no identity at stake.
+            None if !strict => Ok(String::new()),
+            None => Err(format!(
+                "The profile \"{}\" has a \"{}\" that is not a string, in {}. \
+                Quote it, or remove it to have one generated.",
+                profile, name, path.display()
+            )),
+        },
     }
 }
 
@@ -388,8 +406,8 @@ fn profile_from_item(item: Option<&toml_edit::Item>,
     };
 
     Ok(Some(Operator {
-        name: read_profile_field(table, profile, PROFILE_FIELD_NAME, path)?,
-        identifier: read_profile_field(table, profile, PROFILE_FIELD_IDENTIFIER, path)?,
+        name: read_profile_field(table, profile, PROFILE_FIELD_NAME, path, false)?,
+        identifier: read_profile_field(table, profile, PROFILE_FIELD_IDENTIFIER, path, true)?,
     }))
 }
 
@@ -635,10 +653,11 @@ fn load_document(path: &Path) -> Result<Option<DocumentMut>, String> {
 ///     fall back to the built-in default and let maintenance keep running, not propagate an
 ///     `Err` that `maintenance.rs` swallows into "maintenance is off", silently and
 ///     permanently, with no message on any command.
-/// The one read where this leniency is actively harmful — the operator identifier, where
-/// "reads as absent" is also "mint a fresh one and write it back over the hand-edited value"
-/// — does not go through this reader; see [`get_value_from_document_strict`] and
-/// [`get_effective_operator_identifier`].
+/// The two reads where this leniency is actively harmful — `operator.identifier`, where
+/// "reads as absent" is also "mint a fresh one and write it back over the hand-edited
+/// value", and `operator.profile`, where "reads as absent" silently switches which identity
+/// the warehouse acts as — do not go through this reader; see the strict-read rule at
+/// [`get_operator`], [`get_value_from_document_strict`] and [`get_effective_value_strict`].
 ///
 /// # Arguments
 /// * `document` - The parsed configuration document.
@@ -658,11 +677,12 @@ fn get_value_from_document(document: &DocumentMut, section: &str, field: &str) -
 }
 
 /// [`get_value_from_document`]'s strict counterpart: a present-but-non-string field is an
-/// error rather than being read as unset. Used only to resolve the operator identifier (see
-/// [`get_effective_operator_identifier`], [`get_operator`]) — the one read where degrading a
-/// malformed value into "unset" is destructive, not merely surprising. Every other known key
-/// goes through the lenient reader instead; see its doc comment for why leniency there is
-/// load-bearing.
+/// error rather than being read as unset. Used only to resolve `operator.identifier` and
+/// `operator.profile` (see [`get_effective_value_strict`], [`get_scoped_value_strict`],
+/// [`get_operator`]) — the two reads where degrading a malformed value into "unset" is
+/// destructive or identity-changing, not merely surprising (see the strict-read rule at
+/// [`get_operator`]). Every other known key goes through the lenient reader instead; see
+/// its doc comment for why leniency there is load-bearing.
 ///
 /// # Arguments
 /// * `document` - The parsed configuration document.
@@ -694,32 +714,45 @@ fn get_value_from_document_strict(document: &DocumentMut,
     }
 }
 
-/// Get the effective operator identifier, strictly: like [`get_effective_value`] the
-/// warehouse scope is consulted first and the global scope is the fallback, but a
-/// present-but-non-string value in *either* scope refuses immediately instead of falling
-/// through to the next scope. Falling through would still be wrong here, unlike the
-/// legitimate Tor/maintenance fallback [`get_value_from_document`]'s doc comment describes:
-/// it would silently resolve to a *different* value than the one actually configured — the
-/// other scope's, or (once the caller sees `None`) a freshly minted one — instead of naming
-/// the damage.
+/// [`get_scoped_value`]'s strict counterpart, for the two keys the strict-read rule at
+/// [`get_operator`] covers (`operator.identifier`, `operator.profile`): a present-but-non-
+/// string value refuses instead of being read as unset.
 ///
 /// # Returns
-/// * `Ok(Some((String, ConfigScope)))` - The identifier and the scope it came from.
-/// * `Ok(None)`                        - If `operator.identifier` is not set in either scope.
+/// * `Ok(Some(String))` - The value of the key in this scope.
+/// * `Ok(None)`         - If the key (or the configuration file) does not exist in this scope.
+/// * `Err(String)`      - If the key is unknown, the file could not be read or parsed, or the
+///                        key is present but not a string.
+pub fn get_scoped_value_strict(key: &str, scope: ConfigScope) -> Result<Option<String>, String> {
+    let (section, field) = split_key(key)?;
+    let path = get_config_path(scope)?;
+
+    let Some(document) = load_document(&path)? else {
+        return Ok(None);
+    };
+
+    get_value_from_document_strict(&document, section, field, &path)
+}
+
+/// [`get_effective_value`]'s strict counterpart: the warehouse scope is consulted first and
+/// the global scope is the fallback, but a present-but-non-string value in *either* scope
+/// refuses immediately instead of falling through to the next scope. Used for the two keys
+/// the strict-read rule at [`get_operator`] covers (`operator.identifier`,
+/// `operator.profile`). Falling through would still be wrong for them, unlike the legitimate
+/// Tor/maintenance fallback [`get_value_from_document`]'s doc comment describes: it would
+/// silently resolve to a *different* value than the one actually configured — the other
+/// scope's, or (once the caller sees `None`) a freshly minted one, or (for the profile
+/// selector) a different identity altogether — instead of naming the damage.
+///
+/// # Returns
+/// * `Ok(Some((String, ConfigScope)))` - The value and the scope it came from.
+/// * `Ok(None)`                        - If the key is not set in either scope.
 /// * `Err(String)`                     - If a configuration file could not be read or
-///                                       parsed, or `operator.identifier` is present in some
-///                                       scope but not a string.
-fn get_effective_operator_identifier() -> Result<Option<(String, ConfigScope)>, String> {
-    let (section, field) = split_key(KEY_OPERATOR_IDENTIFIER)?;
-
+///                                       parsed, or the key is present in some scope but not
+///                                       a string.
+pub fn get_effective_value_strict(key: &str) -> Result<Option<(String, ConfigScope)>, String> {
     for scope in [ConfigScope::Warehouse, ConfigScope::Global] {
-        let path = get_config_path(scope)?;
-
-        let Some(document) = load_document(&path)? else {
-            continue;
-        };
-
-        if let Some(value) = get_value_from_document_strict(&document, section, field, &path)? {
+        if let Some(value) = get_scoped_value_strict(key, scope)? {
             return Ok(Some((value, scope)));
         }
     }
@@ -799,7 +832,7 @@ mod tests {
             .get("work").unwrap()
             .as_table_like().unwrap();
 
-        let error = match read_profile_field(table, "work", "identifier", Path::new("/cfg")) {
+        let error = match read_profile_field(table, "work", "identifier", Path::new("/cfg"), true) {
             Err(error) => error,
             Ok(value) => panic!(
                 "a present, non-string identifier must error rather than read as {:?}", value
@@ -811,10 +844,45 @@ mod tests {
 
         // The absent case is unchanged — this is what keeps minting working.
         assert_eq!(
-            read_profile_field(table, "work", "name", Path::new("/cfg")).unwrap(),
+            read_profile_field(table, "work", "name", Path::new("/cfg"), false).unwrap(),
             "",
             "an absent field must still read as empty, or a profile without a name would refuse"
         );
+    }
+
+    /// PR #122 round 6, F2: `name` writes nothing back and selects no identity, so by the
+    /// strict-read rule it must be lenient — a malformed value reads as empty (falling back
+    /// to the identifier in `get_operator`, exactly as an absent one does) instead of
+    /// refusing. This reverses round 3, which had made the profile branch's `name` strict;
+    /// see `get_operator`'s doc for why the write-back, not cosmetic-ness, is the deciding
+    /// factor. `identifier`'s strictness on the same document is unaffected.
+    #[test]
+    fn a_malformed_profile_name_reads_as_empty_while_the_identifier_stays_strict() {
+        let document: DocumentMut =
+            "[profile.work]\nidentifier = \"someone@example.com\"\nname = 5\n".parse().unwrap();
+        let table = document.get("profile").unwrap()
+            .as_table_like().unwrap()
+            .get("work").unwrap()
+            .as_table_like().unwrap();
+
+        assert_eq!(
+            read_profile_field(table, "work", "name", Path::new("/cfg"), false).unwrap(),
+            "",
+            "a malformed name must read as empty, not refuse"
+        );
+
+        assert_eq!(
+            read_profile_field(table, "work", "identifier", Path::new("/cfg"), true).unwrap(),
+            "someone@example.com",
+            "the identifier read must be unaffected by the name's leniency"
+        );
+
+        // `profile_from_item` wires the two policies together and must not refuse either.
+        let identity = profile_from_item(Some(document.get("profile").unwrap().as_table_like().unwrap().get("work").unwrap()), "work", Path::new("/cfg"))
+            .unwrap()
+            .expect("a table item must produce an identity");
+        assert_eq!(identity.name, "", "the malformed name must not block the whole profile read");
+        assert_eq!(identity.identifier, "someone@example.com");
     }
 
     #[test]
@@ -827,7 +895,7 @@ mod tests {
             .as_table_like().unwrap();
 
         assert_eq!(
-            read_profile_field(table, "work", "identifier", Path::new("/cfg")).unwrap(),
+            read_profile_field(table, "work", "identifier", Path::new("/cfg"), true).unwrap(),
             "someone@example.com"
         );
     }
@@ -839,9 +907,9 @@ mod tests {
         // as absent" — `TorSettings::from_config` falling through a malformed warehouse
         // `remote.tor` to a valid global one, and a malformed `maintenance.*` threshold
         // falling back to its default instead of disabling maintenance forever. Reverted to
-        // lenient; strictness is now scoped to the operator identifier alone, which is the
-        // one read where "absent" also means "mint a fresh one and write it back over the
-        // hand-edited value" — see `a_present_but_non_string_value_errors_on_the_strict_reader`.
+        // lenient; strictness is now scoped to `operator.identifier` and `operator.profile`
+        // alone (PR #122 round 6) — see the strict-read rule at `get_operator`'s doc and
+        // `a_present_but_non_string_value_errors_on_the_strict_reader`.
         let document: DocumentMut = "[operator]\nidentifier = 12345\n".parse().unwrap();
 
         assert_eq!(get_value_from_document(&document, "operator", "identifier"), None);
@@ -851,11 +919,12 @@ mod tests {
 
     #[test]
     fn a_present_but_non_string_value_errors_on_the_strict_reader() {
-        // The strict counterpart used only for the operator identifier: this is exactly the
-        // hazard `read_profile_field`'s fix closes for a named profile's own fields, on the
-        // non-profile branch — `operator.identifier = 12345` must not read as `None`, because
-        // `get_operator` treats an absent identifier as "mint one", silently overwriting the
-        // hand-written value.
+        // The strict counterpart used only for `operator.identifier` and `operator.profile`
+        // (see `get_effective_value_strict`, `get_scoped_value_strict`): this is exactly the
+        // hazard `read_profile_field`'s fix closes for a named profile's own `identifier`
+        // field, on the non-profile branch — `operator.identifier = 12345` must not read as
+        // `None`, because `get_operator` treats an absent identifier as "mint one", silently
+        // overwriting the hand-written value.
         let document: DocumentMut = "[operator]\nidentifier = 12345\n".parse().unwrap();
 
         let error = match get_value_from_document_strict(&document, "operator", "identifier", Path::new("/cfg")) {

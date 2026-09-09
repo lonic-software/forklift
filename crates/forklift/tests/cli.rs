@@ -3025,6 +3025,93 @@ fn profile_list_reports_a_non_table_profile_section_instead_of_dropping_it() {
     assert!(error.contains("old"), "the error must name the profile: {}", error);
 }
 
+/// PR #122 round 6, F3: with a malformed global `operator.identifier` (present but not a
+/// string), `profile list` used to read it via the lenient `get_scoped_value` and report
+/// "default — no identity yet (an id is minted on first use)" at exit 0 — a false promise:
+/// `office enroll` (and every other command resolving the operator) refuses on the very
+/// same value, naming it "present but not a string". `profile list` is a diagnostic command
+/// — the one a user runs to find out what identity they have — so it must report the
+/// malformed state honestly instead of claiming a mint that will not happen.
+///
+/// Falsified both directions: reverting the default entry to `get_scoped_value` reddens
+/// this (human output claims "no identity yet"; the `--json` entry carries no `error`);
+/// the strict, diagnostic read returns it to green.
+#[test]
+fn profile_list_reports_a_malformed_default_identifier_instead_of_claiming_no_identity() {
+    let warehouse = TestWarehouse::new("profile-list-malformed-default");
+    assert_success(&warehouse.run(&["prepare"]));
+
+    let global_config = warehouse.home.join("global-config.toml");
+    std::fs::write(&global_config, "[operator]\nidentifier = 12345\n").unwrap();
+
+    let human = warehouse.run(&["profile", "list"]);
+    assert_success(&human);
+    let text = stdout(&human);
+    assert!(
+        !text.contains("no identity yet"),
+        "a malformed identifier must not be reported as \"no identity yet\": {}", text
+    );
+    let default_line = text.lines().find(|line| line.starts_with("default — "))
+        .unwrap_or_else(|| panic!("the default entry must be listed: {}", text));
+    assert!(default_line.contains("error:"), "the default entry must carry its error: {}", default_line);
+    assert!(default_line.contains("identifier"), "the error must name the field: {}", default_line);
+
+    let envelope = json(&warehouse.run(&["--json", "profile", "list"]));
+    assert_eq!(envelope["ok"], true, "the listing itself must not fail: {}", envelope);
+    let default = &envelope["data"]["default"];
+    assert!(default.get("identifier").is_none(), "a malformed default identity must carry no identifier: {}", default);
+    let error = default["error"].as_str()
+        .unwrap_or_else(|| panic!("the malformed default must carry its error: {}", default));
+    assert!(error.contains("identifier"), "the error must name the field: {}", error);
+}
+
+/// PR #122 round 6, F3: with the same malformed `operator.identifier`, `config
+/// operator.identifier` used to fall through the lenient `get_effective_value`/
+/// `get_scoped_value` reader to "not set" — the same false promise as `profile list`'s, on
+/// the command that exists to answer exactly this question. It must report the malformed
+/// state (and still succeed — this is a diagnostic read, not a refusal) instead.
+///
+/// Falsified both directions: reverting `print_value` to the lenient reader for this key
+/// reddens this (`stderr` says "is not set" and the command fails); the strict, diagnostic
+/// read returns it to green.
+#[test]
+fn config_reports_a_malformed_identifier_instead_of_claiming_it_is_not_set() {
+    let warehouse = TestWarehouse::new("config-malformed-identifier-report");
+    assert_success(&warehouse.run(&["prepare"]));
+
+    let global_config = warehouse.home.join("global-config.toml");
+    std::fs::write(&global_config, "[operator]\nidentifier = 12345\n").unwrap();
+
+    // Warehouse scope (the effective read, no `--global`).
+    let effective = warehouse.run(&["config", "operator.identifier"]);
+    assert_success(&effective);
+    let text = stdout(&effective);
+    assert!(!text.contains("is not set"), "a malformed value must not be reported as unset: {}", text);
+    assert!(text.contains("not a string"), "the report must name the malformed shape: {}", text);
+
+    // Global scope, explicitly.
+    let global = warehouse.run(&["config", "--global", "operator.identifier"]);
+    assert_success(&global);
+    let text = stdout(&global);
+    assert!(!text.contains("is not set"), "a malformed value must not be reported as unset: {}", text);
+    assert!(text.contains("not a string"), "the report must name the malformed shape: {}", text);
+
+    // The bare listing must not silently mark it "(not set)" either.
+    let listing = stdout(&warehouse.run(&["config"]));
+    let identifier_line = listing.lines().find(|line| line.starts_with("operator.identifier"))
+        .unwrap_or_else(|| panic!("operator.identifier must be listed: {}", listing));
+    assert!(!identifier_line.contains("(not set)"), "unexpected listing line: {}", identifier_line);
+    assert!(identifier_line.contains("malformed"), "unexpected listing line: {}", identifier_line);
+
+    // `--json` carries the malformed reason, not a `value`.
+    let envelope = json(&warehouse.run(&["--json", "config", "operator.identifier"]));
+    assert_eq!(envelope["ok"], true, "a diagnostic read must not fail: {}", envelope);
+    assert!(envelope["data"].get("value").is_none(), "unexpected envelope: {}", envelope);
+    let malformed = envelope["data"]["malformed"].as_str()
+        .unwrap_or_else(|| panic!("the envelope must carry \"malformed\": {}", envelope));
+    assert!(malformed.contains("not a string"), "unexpected malformed text: {}", malformed);
+}
+
 /// PR #122 finding F4: the end-to-end regression the field-level strictness (round 2) exists
 /// to prevent. `get_operator` must still refuse outright on a malformed selected profile
 /// (unlike `list_profiles`, which is the tolerant, diagnostic exception) — and, the part
@@ -3100,6 +3187,91 @@ fn a_malformed_default_identifier_refuses_without_writing_back_to_the_global_con
         before, after,
         "a refused get_operator must never mint and write back to the global config file"
     );
+}
+
+/// PR #122 round 6, F1: `get_operator`'s profile *selector* (`operator.profile`) used to be
+/// read leniently (`get_effective_value`), so a present-but-non-string value — a warehouse
+/// `profile = 2024` written unquoted by hand — read as absent and the profile selection was
+/// silently discarded: `get_operator` fell through to the non-profile branch, minted a fresh
+/// UUID, and wrote it into the global config as `operator.identifier` — the same
+/// mint-and-write-back hazard `operator.identifier` was already protected against,
+/// reached through the one key that was still lenient. `operator.profile` picks *which*
+/// identity is read at all, so by the strict-read rule at `config_utils::get_operator`'s
+/// doc it must refuse instead of silently switching to a different identity.
+///
+/// Falsified both directions: reverting `get_operator` to read `operator.profile` via
+/// `get_effective_value` reddens this (`office enroll` succeeds, minting a fresh UUID and
+/// writing an `[operator]` section into a global config that only ever had `[profile.2024]`
+/// in it); the strict read returns it to green.
+#[test]
+fn a_malformed_operator_profile_refuses_without_writing_back_to_the_global_config() {
+    let warehouse = TestWarehouse::new("profile-selector-malformed-no-writeback");
+    warehouse.write_file("a.txt", "one\n");
+    assert_success(&warehouse.run(&["prepare"]));
+
+    // A valid named profile in the global config...
+    let global_config = warehouse.home.join("global-config.toml");
+    std::fs::write(&global_config, "[profile.2024]\nidentifier = \"op-1\"\n").unwrap();
+
+    // ...selected by a hand-edited, unquoted (numeric) warehouse `operator.profile`.
+    std::fs::write(
+        warehouse.root.join(".forklift/config/warehouse.toml"),
+        "[operator]\nprofile = 2024\n",
+    ).unwrap();
+
+    let before = std::fs::read(&global_config).unwrap();
+
+    let enroll = warehouse.run(&["office", "enroll"]);
+    assert!(!enroll.status.success(), "a malformed operator.profile must refuse: {}", stdout(&enroll));
+    let error = stderr(&enroll);
+    assert!(error.contains("operator.profile"), "the refusal must name the key: {}", error);
+
+    // The real regression this pins: no UUID was minted and no `[operator]` section was
+    // written into the global config (which only ever had the named profile in it).
+    let after = std::fs::read(&global_config).unwrap();
+    assert_eq!(
+        before, after,
+        "a refused get_operator must never fall through to a different identity and mint one"
+    );
+}
+
+/// PR #122 round 6, F2: a malformed *display* `name` on a selected profile must not block
+/// every command in the warehouse. Round 3 had made the profile branch's `name` read
+/// strict, so `[profile.work] name = 5` refused `office enroll` (and everything else that
+/// resolves the operator) over a field nothing is ever written back for and that selects no
+/// identity — the opposite of the non-profile branch, where a malformed `operator.name`
+/// simply falls back to the identifier. The two branches must agree: the name reads
+/// leniently in both, falls back to the identifier, and nothing is ever written back for it.
+/// The identifier's own strictness (a different, well-formed field on the same profile) is
+/// unaffected.
+///
+/// Falsified both directions: making the profile branch's `name` read strict (round 3's
+/// position) reddens this at the `assert_success` (`office enroll` refuses); the lenient
+/// read returns it to green.
+#[test]
+fn a_malformed_profile_name_falls_back_to_the_identifier_instead_of_blocking_commands() {
+    let warehouse = TestWarehouse::new("profile-name-malformed-lenient");
+    warehouse.write_file("a.txt", "one\n");
+    assert_success(&warehouse.run(&["prepare"]));
+
+    let global_config = warehouse.home.join("global-config.toml");
+    std::fs::write(&global_config, "[profile.work]\nidentifier = \"op-1\"\nname = 5\n").unwrap();
+    std::fs::write(
+        warehouse.root.join(".forklift/config/warehouse.toml"),
+        "[operator]\nprofile = \"work\"\n",
+    ).unwrap();
+
+    let before = std::fs::read(&global_config).unwrap();
+
+    let enroll = warehouse.run(&["office", "enroll"]);
+    assert_success(&enroll);
+    // The identity used is the profile's own identifier — the malformed name simply falls
+    // back to it, exactly as an absent name would.
+    assert!(stdout(&enroll).contains("op-1"), "unexpected enroll output: {}", stdout(&enroll));
+
+    // No write-back for the malformed name (nothing is ever generated for it).
+    let after = std::fs::read(&global_config).unwrap();
+    assert_eq!(before, after, "a malformed profile name must never be written back");
 }
 
 #[test]

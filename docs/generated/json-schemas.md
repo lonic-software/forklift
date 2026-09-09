@@ -595,13 +595,23 @@ A command not listed here either reports only the generic human-message shape `{
     "key": {
       "type": "string"
     },
+    "malformed": {
+      "description": "Set instead of `value` when an identity-selecting key (`operator.identifier`,\n`operator.profile`) is present but not a string. `config` is a diagnostic command,\nso it reports this rather than refusing — unlike a command that actually resolves\nthe identity (e.g. `office enroll`), which refuses outright.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "value": {
-      "type": "string"
+      "description": "`None` when the key is present but not a string — see `malformed`. Never `None`\nalongside `malformed` also being `None`; an actually-unset key is an `Err`, not\nthis envelope (see `print_value`).",
+      "type": [
+        "string",
+        "null"
+      ]
     }
   },
   "required": [
-    "key",
-    "value"
+    "key"
   ],
   "title": "ConfigValue",
   "type": "object"
@@ -618,6 +628,13 @@ A command not listed here either reports only the generic human-message shape `{
       "properties": {
         "key": {
           "type": "string"
+        },
+        "malformed": {
+          "description": "Set instead of `value`/`scope` when an identity-selecting key (`operator.identifier`,\n`operator.profile`) is present but not a string — see `ConfigValue::malformed`.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "scope": {
           "description": "Which scope the value came from (`warehouse` or `global`), when set.",

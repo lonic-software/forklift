@@ -102,6 +102,16 @@ pub async fn handle_command() -> Result<(), String> {
 /// fail late and confusingly. Refusing up front, with the origin named, is the clearer failure.
 /// A no-op for a full (non-sparse) warehouse, which holds the whole closure and can lift
 /// anywhere, and for a sparse warehouse still pointed at its origin.
+///
+/// `remote.origin` is read leniently on purpose (PR #122 round 6, F4): by the strict-read
+/// rule at `config_utils::get_operator`'s doc, a read is strict only when a malformed value
+/// could trigger a destructive write or silently change which identity the warehouse acts
+/// as. A malformed `remote.origin` does neither — the read here is a `None`-means-"predates
+/// this guard" fallback already, so a malformed value collapsing into that same `None` just
+/// re-enables the fallback: the lift proceeds and, if the remote genuinely lacks the sparse
+/// closure, still fails at the remote's own closure check, only later and with a less
+/// specific message than this guard gives. That is a worse error message, not a wrong
+/// action silently taken — the case this rule leaves lenient.
 fn ensure_origin_remote() -> Result<(), CoreError> {
     if !scope_utils::is_warehouse_sparse()? {
         return Ok(());
