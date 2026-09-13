@@ -465,8 +465,14 @@ fn config_values_are_scoped_and_the_warehouse_overrides_the_global_scope() {
 /// through to and exited **1** saying the key was "not set". One file, one defect, two answers,
 /// neither of them the truth.
 ///
-/// Falsified both directions: restoring the lenient reader reddens this at the first
-/// `assert_eq!` (the identifier read exits 0 and prints the global value).
+/// The fixture is a *typed* fault (`identifier = 12345`), not a TOML syntax error, because a
+/// syntax error was never the bug: `load_document` already refused those, identically for both
+/// keys. Only the per-key leniency layered on top of a file that parsed fine as TOML could
+/// produce the split above — so a syntax-error fixture here would pass before the change as
+/// well as after it, and prove nothing.
+///
+/// Falsified both directions: measured against `origin/main`'s binary on this exact fixture —
+/// `config operator.identifier` exits 0 printing `global@id`, `config remote.url` exits 1.
 #[test]
 fn a_configuration_file_either_parses_completely_or_every_read_of_it_refuses() {
     let warehouse = TestWarehouse::new("config-whole-file-or-nothing");
@@ -479,10 +485,10 @@ fn a_configuration_file_either_parses_completely_or_every_read_of_it_refuses() {
         "[operator]\nidentifier = \"global@id\"\n",
     ).unwrap();
 
-    // A warehouse file that does not parse at all (an unterminated string).
+    // A hand-edited, unquoted warehouse identifier: valid TOML, wrong type for the key.
     std::fs::write(
         warehouse.root.join(".forklift/config/warehouse.toml"),
-        "[operator]\nidentifier = \"unterminated\n",
+        "[operator]\nidentifier = 12345\n",
     ).unwrap();
 
     let identifier = warehouse.run(&["config", "operator.identifier"]);
@@ -525,8 +531,10 @@ fn a_configuration_file_either_parses_completely_or_every_read_of_it_refuses() {
 /// property. With nothing behind it, the only two possible outcomes are a silent clearnet dial
 /// and a refusal.
 ///
-/// Falsified both directions: restoring `.ok().flatten()` reddens this — the command reaches
-/// the network and fails with a connection error instead of naming `remote.tor`.
+/// Falsified both directions: this test file was appended to a worktree of `origin/main` and
+/// run against that binary, where it fails — `lower` reaches the network and reports
+/// "Error while reaching the remote http://127.0.0.1:9: Connection refused", never naming
+/// `remote.tor`.
 #[test]
 fn a_malformed_remote_tor_refuses_instead_of_silently_dialling_the_remote_directly() {
     let warehouse = TestWarehouse::new("config-tor-no-silent-clearnet");
@@ -561,8 +569,9 @@ fn a_malformed_remote_tor_refuses_instead_of_silently_dialling_the_remote_direct
 /// is exactly the state in which the old code went quiet. The warning rides stderr, so `--json`
 /// stdout is still exactly one document.
 ///
-/// Falsified both directions: restoring `.unwrap_or(AutoCompaction::None)` reddens this at the
-/// stderr assertion (the command succeeds and says nothing at all).
+/// Falsified both directions: run against an `origin/main` worktree's binary it fails at the
+/// stderr assertion — `load` exits 0 with empty stderr, and `store` exits 0 reporting a store
+/// census as though the configuration had been read.
 #[test]
 fn unreadable_maintenance_settings_are_announced_rather_than_silently_disabling_maintenance() {
     let warehouse = TestWarehouse::new("config-maintenance-not-silent");
@@ -3108,9 +3117,9 @@ fn a_malformed_operator_profile_refuses_without_writing_back_to_the_global_confi
 /// The global scope holds a perfectly good identifier here on purpose: that is what makes the
 /// mint observable as a rewrite of a file the command had no business touching.
 ///
-/// Falsified both directions: restoring the lenient reader reddens this at `assert!(!success)`
-/// — `office enroll` succeeds, using the global identity, and the warehouse's own configuration
-/// is silently ignored.
+/// Falsified both directions: run against an `origin/main` worktree's binary it fails at
+/// `assert!(!success)` — `office enroll` succeeds with `Enrolled "global@id"`, silently ignoring
+/// the warehouse's own configuration.
 #[test]
 fn a_warehouse_section_that_is_not_a_table_refuses_instead_of_reading_as_unconfigured() {
     let warehouse = TestWarehouse::new("operator-section-not-a-table");
@@ -3145,8 +3154,9 @@ fn a_warehouse_section_that_is_not_a_table_refuses_instead_of_reading_as_unconfi
 /// closes it: `identifer = "alice"` is a typo away from `identifier`, and a reader that skips
 /// what it does not recognize reports the identity as unset — then mints one over it.
 ///
-/// Falsified both directions: dropping the unknown-key arm from `parse_config` reddens this
-/// (`office enroll` succeeds and the global file grows a minted `operator.identifier`).
+/// Falsified both directions: run against an `origin/main` worktree's binary it fails at
+/// `assert!(!success)` — `office enroll` succeeds, having minted a fresh UUID and written it
+/// into the global file beside the typo.
 #[test]
 fn a_mistyped_configuration_key_refuses_instead_of_reading_as_unset() {
     let warehouse = TestWarehouse::new("config-mistyped-key");
