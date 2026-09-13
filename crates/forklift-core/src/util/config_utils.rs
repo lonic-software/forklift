@@ -56,11 +56,16 @@ pub const KEY_REMOTE_ORIGIN: &str = "remote.origin";
 /// `crate::util::remote_utils::TorMode`.
 pub const KEY_REMOTE_TOR: &str = "remote.tor";
 
-/// The values [`KEY_REMOTE_TOR`] accepts at set time. The runtime parse
-/// (`remote_utils::TorMode::parse`) is deliberately tolerant — an unrecognized value degrades
-/// to `auto` — as defense in depth for hand-edited files; the `config` command is strict so a
-/// privacy-relevant typo (`onn` silently meaning `auto`, leaving non-onion remotes un-proxied
-/// when the user believes everything is routed through Tor) can't pass silently.
+/// The values [`KEY_REMOTE_TOR`] accepts — at set time *and* on every read, which is the whole
+/// point: this is the one key where a typo is a privacy failure. `onn` is a perfectly good
+/// string, so type-strictness alone would let it through, and `remote_utils::TorMode::parse`
+/// answers anything it does not recognize with `auto` — leaving non-onion remotes un-proxied
+/// while the user believes everything is routed through Tor. [`parse_config`] therefore refuses
+/// an out-of-range value in the file, not merely a wrongly-typed one.
+///
+/// This is deliberately narrower than `TorMode::parse`'s own vocabulary (which also takes
+/// `true`/`yes`/`1` and `false`/`no`/`0`): one spelling per meaning, and anything else named as
+/// an error rather than guessed at.
 pub const REMOTE_TOR_VALUES: [&str; 3] = ["auto", "on", "off"];
 
 /// The Tor SOCKS proxy the client dials when [`KEY_REMOTE_TOR`] applies (default
@@ -249,54 +254,6 @@ impl ConfigFile {
     }
 }
 
-/// Both configuration scopes, each fully parsed — the warehouse file and the global one.
-///
-/// Scope fallback is a lookup across two typed values, not a retry that reaches for the next
-/// file when the first one could not be read. That is the whole point: a malformed warehouse
-/// file cannot fall through to a valid global value and go unnoticed, because loading it is
-/// already the error.
-pub struct Config {
-    /// The warehouse-scope file (defaulted when it does not exist).
-    pub warehouse: ConfigFile,
-    /// The global-scope file (defaulted when it does not exist).
-    pub global: ConfigFile,
-}
-
-impl Config {
-    /// Load and parse both configuration files. Requires a warehouse (the warehouse-scope
-    /// path is derived from the warehouse root); use [`load_scope`] for a global-only read.
-    ///
-    /// # Returns
-    /// * `Ok(Config)`  - Both files parsed (an absent file parses as empty).
-    /// * `Err(String)` - Either file could not be read or parsed.
-    pub fn load() -> Result<Config, String> {
-        Ok(Config {
-            warehouse: load_scope(ConfigScope::Warehouse)?,
-            global: load_scope(ConfigScope::Global)?,
-        })
-    }
-
-    /// The value of `key` in one scope.
-    pub fn scoped(&self, key: &str, scope: ConfigScope) -> Option<&str> {
-        match scope {
-            ConfigScope::Warehouse => self.warehouse.get(key),
-            ConfigScope::Global => self.global.get(key),
-        }
-    }
-
-    /// The effective value of `key`: the warehouse scope wins, the global scope is the
-    /// fallback — and the scope it came from, which callers report.
-    pub fn effective(&self, key: &str) -> Option<(&str, ConfigScope)> {
-        for scope in [ConfigScope::Warehouse, ConfigScope::Global] {
-            if let Some(value) = self.scoped(key, scope) {
-                return Some((value, scope));
-            }
-        }
-
-        None
-    }
-}
-
 /// Load and parse the configuration file of one scope.
 ///
 /// # Arguments
@@ -367,9 +324,14 @@ fn parse_config(document: &DocumentMut, path: &Path) -> Result<ConfigFile, Strin
             }
 
             let value = value.as_str().ok_or_else(|| not_valid(path, format!(
-                "\"{}\" must be a string, not {}. Quote the value: {} = \"…\".",
-                key, value.type_name(), field
+                "\"{}\" must be a string, not {}. Every configuration value is a string — \
+                 write it quoted.",
+                key, value.type_name()
             )))?;
+
+            // A fixed-value key is as damaged by an out-of-range *string* as by a wrong type, and
+            // for `remote.tor` that damage is a silent clearnet dial rather than a wrong default.
+            validate_value(&key, value).map_err(|detail| not_valid(path, detail))?;
 
             config.store(&key, value)?;
         }
@@ -406,8 +368,9 @@ fn parse_profiles(item: &toml_edit::Item, path: &Path) -> Result<Vec<(String, Pr
             }
 
             let value = value.as_str().ok_or_else(|| not_valid(path, format!(
-                "\"{}.{}.{}\" must be a string, not {}. Quote the value: {} = \"…\".",
-                SECTION_PROFILE, name, field, value.type_name(), field
+                "\"{}.{}.{}\" must be a string, not {}. Every configuration value is a string — \
+                 write it quoted.",
+                SECTION_PROFILE, name, field, value.type_name()
             )))?;
 
             match field {
@@ -550,11 +513,17 @@ pub fn get_scoped_value(key: &str, scope: ConfigScope) -> Result<Option<String>,
 /// Get the effective value of a configuration key: the warehouse configuration is
 /// consulted first, and the global configuration is the fallback.
 ///
-/// **Both files are loaded, whichever one supplies the value.** The fallback is a lookup
-/// across two parsed files, not a retry that reaches for the next file when the first one
-/// could not be read — so a malformed warehouse file is an error even when the global scope
-/// happens to hold a perfectly good value for this key, instead of silently handing back a
-/// value from a scope the user was not configuring.
+/// **The warehouse scope is always loaded, and its failure is always the answer.** That
+/// ordering — not a merge of both files — is what stops a malformed warehouse file from falling
+/// through to a valid global value and going unnoticed: the fallback is only ever reached from a
+/// warehouse file that parsed completely and simply did not set this key.
+///
+/// The global scope is consulted only when the warehouse scope did not answer, which is the
+/// case where its content can still change the result. An earlier version of this loaded both
+/// unconditionally, on the theory that reporting a broken file the user is not currently reading
+/// from is a service. It is not worth its cost: an unreadable `~/.forkliftconfig` — root-owned
+/// after one `sudo forklift`, say — would then fail *every* command in *every* warehouse,
+/// including ones whose own configuration answers the question completely.
 ///
 /// # Arguments
 /// * `key` - The configuration key, in `section.key` form (must be a known key).
@@ -562,14 +531,18 @@ pub fn get_scoped_value(key: &str, scope: ConfigScope) -> Result<Option<String>,
 /// # Returns
 /// * `Ok(Some((String, ConfigScope)))` - The value and the scope it came from.
 /// * `Ok(None)`                        - If the key is not set in either scope.
-/// * `Err(String)`                     - If the key is unknown, or either file could not be
-///                                       read or does not parse completely.
+/// * `Err(String)`                     - If the key is unknown, or a file that had to be
+///                                       consulted could not be read or does not parse.
 pub fn get_effective_value(key: &str) -> Result<Option<(String, ConfigScope)>, String> {
     require_known_key(key)?;
 
-    Ok(Config::load()?
-        .effective(key)
-        .map(|(value, scope)| (value.to_string(), scope)))
+    for scope in [ConfigScope::Warehouse, ConfigScope::Global] {
+        if let Some(value) = load_scope(scope)?.get(key) {
+            return Ok(Some((value.to_string(), scope)));
+        }
+    }
+
+    Ok(None)
 }
 
 /// Set the value of a configuration key in the configuration file of the given scope.
@@ -725,7 +698,9 @@ pub fn list_profiles() -> Result<Vec<(String, Operator)>, String> {
 ///
 /// # Returns
 /// * `Ok(())`      - If the field was written.
-/// * `Err(String)` - If the file could not be read, parsed or written.
+/// * `Err(String)` - If the file could not be read, parsed or written. Its two "is not a table"
+///                   arms are unreachable from the CLI for the reason given on
+///                   [`set_value_in_document`].
 pub fn set_profile_field(profile: &str, field: &str, value: &str) -> Result<(), String> {
     let path = get_config_path(ConfigScope::Global)?;
     let mut document = load_document_for_edit(&path)?.unwrap_or_default();
@@ -839,13 +814,16 @@ fn require_known_key(key: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Reject an out-of-range value for a key whose value is a fixed set, so a typo fails loudly at
-/// set time instead of degrading silently at runtime. Keys with a free-form value pass through.
+/// Reject an out-of-range value for a key whose value is a fixed set, so a typo fails loudly
+/// instead of degrading silently at runtime. Keys with a free-form value pass through.
+///
+/// Applied at **both** ends: [`set_value`] refuses to write one, and [`parse_config`] refuses to
+/// read one. Set-time strictness alone only ever covered values this tool wrote; the file is
+/// hand-editable, which is where the typo actually comes from.
 fn validate_value(key: &str, value: &str) -> Result<(), String> {
     if key == KEY_REMOTE_TOR && !REMOTE_TOR_VALUES.contains(&value.trim().to_ascii_lowercase().as_str()) {
         return Err(format!(
-            "\"{}\" is not a valid value for {}. Use one of: {}. \
-             A typo here would silently fall back to \"auto\", leaving non-onion remotes un-proxied.",
+            "\"{}\" is not a valid value for {}. Use one of: {}.",
             value, KEY_REMOTE_TOR, REMOTE_TOR_VALUES.join(", ")
         ));
     }
@@ -911,6 +889,11 @@ fn load_document_for_edit(path: &Path) -> Result<Option<DocumentMut>, String> {
 /// # Returns
 /// * `Ok(())`      - If the value was set.
 /// * `Err(String)` - If the section exists but is not a table (e.g. `operator = 1`).
+///
+/// **That `Err` is unreachable from the CLI.** Every caller reaches this through
+/// [`load_document_for_edit`], and [`parse_config`] refuses a non-table section first, with a
+/// message that names the file. The arm is kept as defense in depth for a direct caller — but
+/// it is not the text a user sees for that fixture, so do not test it as if it were.
 fn set_value_in_document(document: &mut DocumentMut,
                          section: &str,
                          field: &str,
@@ -938,7 +921,8 @@ fn set_value_in_document(document: &mut DocumentMut,
 /// # Returns
 /// * `Ok(true)`    - If the field was present and removed.
 /// * `Ok(false)`   - If the section or field was not present.
-/// * `Err(String)` - If the section exists but is not a table.
+/// * `Err(String)` - If the section exists but is not a table — unreachable from the CLI for the
+///                   reason given on [`set_value_in_document`].
 fn remove_value_from_document(document: &mut DocumentMut,
                               section: &str,
                               field: &str) -> Result<bool, String> {
@@ -1019,8 +1003,11 @@ mod tests {
         assert_eq!(parse("operator.name = \"Dotted\"\n").unwrap().get(KEY_OPERATOR_NAME), Some("Dotted"));
     }
 
+    /// A direct-caller guard, not the user-visible behaviour: `forklift config` never reaches
+    /// this arm, because `load_document_for_edit` refuses `operator = 1` first (see
+    /// `a_section_that_is_not_a_table_refuses`, which is the message a user actually gets).
     #[test]
-    fn setting_a_value_in_a_section_that_is_not_a_table_is_reported() {
+    fn setting_a_value_in_a_section_that_is_not_a_table_is_reported_to_a_direct_caller() {
         let mut document: DocumentMut = "operator = 1\n".parse().unwrap();
 
         let result = set_value_in_document(&mut document, "operator", "name", "x");
@@ -1070,7 +1057,15 @@ mod tests {
     fn every_known_key_round_trips_through_the_typed_file() {
         for key in KNOWN_KEYS {
             let (section, field) = key.split_once('.').unwrap();
-            let value = format!("value-of-{}", key);
+
+            // A key with a fixed value set has to round-trip one of *its* values: `validate_value`
+            // runs inside the parse now, so an arbitrary marker string is refused on the way in.
+            let value = if key == KEY_REMOTE_TOR {
+                REMOTE_TOR_VALUES[0].to_string()
+            } else {
+                format!("value-of-{}", key)
+            };
+
             let content = format!("[{}]\n{} = \"{}\"\n", section, field, value);
 
             let config = parse(&content)
@@ -1166,6 +1161,68 @@ mod tests {
         // An absent field becomes the empty string the identity resolver treats as "fill in".
         assert_eq!(config.profile("home").unwrap().to_operator().identifier, "");
         assert_eq!(config.profile("work").unwrap().to_operator().name, "Work");
+    }
+
+    /// The privacy case type-strictness alone does not reach: `onn` is a perfectly good string,
+    /// so nothing about its *type* is wrong — but `TorMode::parse` answers it with `Auto`, which
+    /// silently un-proxies every non-onion remote. The file parse has to know the value set.
+    #[test]
+    fn an_out_of_range_remote_tor_value_refuses_even_though_it_is_a_string() {
+        for spelling in ["onn", "of", "yes", "true", ""] {
+            let error = parse(&format!("[remote]\ntor = \"{}\"\n", spelling))
+                .expect_err(&format!("\"{spelling}\" must be refused"));
+
+            assert!(error.contains("not a valid value"), "unexpected refusal for \"{spelling}\": {error}");
+            assert!(error.contains("auto, on, off"), "the refusal must list the values: {error}");
+        }
+
+        for spelling in ["auto", "on", "off", "  OFF  "] {
+            assert_eq!(
+                parse(&format!("[remote]\ntor = \"{}\"\n", spelling)).unwrap().get(KEY_REMOTE_TOR),
+                Some(spelling),
+                "\"{spelling}\" must be accepted, and stored exactly as written"
+            );
+        }
+    }
+
+    /// `docs/guide/cli.md` §9 tabulates what a configuration file may not contain. A table of
+    /// examples in prose is exactly the shape that rots — so every row of it is a case here, and
+    /// a change that quietly starts accepting one of them fails this test rather than leaving the
+    /// guide lying. Keep the two in step: a row added there gets a case here.
+    #[test]
+    fn every_refusal_the_guide_tabulates_is_actually_refused() {
+        let rows = [
+            ("[opperator]\nidentifier = \"ada\"\n",   "unknown section"),
+            ("[operator]\nidentifer = \"ada\"\n",     "unknown key in a known section"),
+            ("[[operator]]\nname = \"ada\"\n",        "array-of-tables where a table belongs"),
+            ("[[profile.work]]\nname = \"ada\"\n",    "array-of-tables under profile"),
+            ("operator = 5\n",                         "section that is not a table"),
+            ("[maintenance]\nloose = 6700\n",          "bare integer"),
+            ("[remote]\ntor = true\n",                 "bare boolean"),
+            ("[remote]\ntorproxy = \"socks5h://x\"\n", "case-variant key"),
+            ("[remote]\ntor = \"onn\"\n",             "out-of-range value"),
+            ("[profile.work]\nnickname = \"w\"\n",    "unknown profile field"),
+        ];
+
+        for (content, why) in rows {
+            let error = parse(content)
+                .expect_err(&format!("the guide says this is refused ({why}): {content:?}"));
+            assert!(
+                error.contains("config.toml"),
+                "every refusal must name the file ({why}): {error}"
+            );
+        }
+
+        // The counterpart the guide promises: the same values, written the documented way, parse.
+        let good = parse(
+            "[operator]\nidentifier = \"ada\"\n\n[maintenance]\nloose = \"6700\"\n\n\
+             [remote]\ntor = \"on\"\ntorProxy = \"socks5h://127.0.0.1:9050\"\n\n\
+             [profile.work]\nname = \"Work\"\n"
+        ).unwrap();
+
+        assert_eq!(good.get(KEY_MAINTENANCE_LOOSE), Some("6700"));
+        assert_eq!(good.get(KEY_REMOTE_TOR), Some("on"));
+        assert_eq!(good.get(KEY_REMOTE_TOR_PROXY), Some("socks5h://127.0.0.1:9050"));
     }
 
     /// The section list an error offers is derived from `KNOWN_KEYS`, not maintained beside it.

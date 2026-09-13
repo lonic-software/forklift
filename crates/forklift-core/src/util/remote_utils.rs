@@ -171,9 +171,15 @@ pub enum TorMode {
 impl TorMode {
     /// Parse a `remote.tor` value. `auto` (or anything unrecognized) → [`TorMode::Auto`];
     /// `on`/`true`/`yes`/`1` → [`TorMode::On`]; `off`/`false`/`no`/`0` → [`TorMode::Off`].
-    /// Case- and surrounding-whitespace-insensitive. An unrecognized value falls back to the
-    /// safe default (`Auto`): it never forces traffic through a proxy the user did not ask for,
-    /// and never blocks an onion remote.
+    /// Case- and surrounding-whitespace-insensitive.
+    ///
+    /// **The unrecognized-value fallback is no longer reachable from configuration.**
+    /// `config_utils::parse_config` refuses any `remote.tor` outside
+    /// `config_utils::REMOTE_TOR_VALUES` (`auto`/`on`/`off`) while reading the file, precisely
+    /// because falling back to `Auto` here is a silent privacy failure — it leaves every
+    /// non-onion remote un-proxied for a user who believes they configured `on`. The fallback
+    /// survives for a direct caller, and so does the wider vocabulary (`true`/`yes`/`1`), which
+    /// the file parse does *not* accept.
     fn parse(value: &str) -> TorMode {
         match value.trim().to_ascii_lowercase().as_str() {
             "on" | "true" | "yes" | "1" => TorMode::On,

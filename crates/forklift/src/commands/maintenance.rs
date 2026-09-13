@@ -16,8 +16,7 @@ use forklift_core::util::taint_utils;
 /// failure never fails the command that just succeeded. Two kinds of failure are still
 /// *reported* on stderr rather than swallowed (neither changes an exit code): one that left a
 /// durability taint standing (see below), and one that stopped maintenance from deciding
-/// whether it was due at all — an unreadable `maintenance.*` configuration, which is permanent
-/// and would otherwise disable packing forever in silence.
+/// whether it was due at all, which would otherwise turn packing off in silence.
 ///
 /// Never redeltas: `redelta` re-reads and re-compresses the whole live set (CPU-bound, minutes
 /// at scale), which is never appropriate for a background trigger a routine command incurs
@@ -48,12 +47,13 @@ use forklift_core::util::taint_utils;
 /// resolves it. Keeping this command's exit at 0 and surfacing the taint as a loud warning keeps
 /// that enforcement intact while never punishing the command that merely triggered maintenance.
 pub fn run_if_due() {
-    // Deciding whether maintenance is due reads `maintenance.*` from configuration. A failure
-    // there is not the best-effort no-op the rest of this function documents: it is permanent
-    // (a configuration file that does not parse stays broken until someone edits it) and
-    // otherwise completely silent — the store would simply never be packed again, on every
-    // command, with nothing said on any of them. So it is reported, not swallowed. The
-    // triggering command's own exit code is still untouched, for the reason spelled out above.
+    // Deciding whether maintenance is due reads `maintenance.*` from configuration *and* scans
+    // the object store (`estimate_loose_count`, `count_pack_files`), so this arm covers an
+    // unparseable config file, a permission error and a dead mount alike. None of them is the
+    // best-effort no-op the rest of this function documents: nothing was attempted, so there is
+    // no outcome for anything else to report, and the store simply stops being packed with
+    // nothing said on any command. So it is reported, not swallowed — the message names which of
+    // those it was. The triggering command's own exit code is still untouched, per the doc above.
     let action = match pack_utils::auto_compaction_action() {
         Ok(action) => action,
         Err(error) => {

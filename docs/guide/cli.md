@@ -1347,16 +1347,28 @@ value. Known keys:
 | `maintenance.packs` | Pack count that triggers an auto consolidating repack (default 20). |
 
 **A configuration file either parses completely, or the command that needed it refuses**, naming
-the file and the offending key. There is no partial read: an unknown section, a mistyped key
-(`identifer`), or a value that is not a string is an error, not a key that silently reads as
-unset. That matters because "unset" is not inert — an unset `operator.identifier` mints a fresh
-id and writes it back, so a typo that read as absent would quietly replace the identity you
-configured.
+the file and the offending key. There is no partial read. That matters because "unset" is not
+inert — an unset `operator.identifier` mints a fresh id and writes it back, so a key that read as
+absent because it was damaged would quietly replace the identity you configured.
 
-Every value is a **string on disk**, including the numeric and boolean ones — so a hand-edited
-`maintenance.loose = 6700` or `remote.tor = true` is refused; write `"6700"` and `"on"`. Setting
-values through `forklift config` quotes them for you, which is why this only ever bites a
-hand-edited file.
+Refused, in either file:
+
+| Written | Why |
+|---------|-----|
+| `[opperator]`, or any other unknown section | a mistyped section header hides every key inside it |
+| `identifer = "ada"` | an unknown key inside a known section — the typo that mints over your identity |
+| `[[operator]]`, `[[profile.work]]` | an array-of-tables where a table is expected |
+| `operator = 5` | a section that is not a table at all |
+| `loose = 6700`, `tor = true` | every value is a **string on disk**, including the numeric and boolean ones — write `"6700"` and `"on"` |
+| `torProxy` spelled `torproxy` | keys are case-sensitive |
+| `tor = "onn"` | `remote.tor` accepts only `auto`, `on` or `off`. A typo here used to mean `auto` silently, un-proxying every non-onion remote |
+| an unknown field in a `[profile.<name>]` section | profiles hold `identifier` and `name`, nothing else |
+
+**`forklift config` cannot repair a file it cannot parse** — reading and writing refuse alike, on
+purpose, so a write never lands beside something Forklift could not account for. Fix a broken
+file in a text editor; the refusal names the file and the key. Values set *through* `forklift
+config` are quoted and range-checked for you, which is why none of the above can bite a file you
+have only ever edited with the command.
 
 Set / read / remove:
 

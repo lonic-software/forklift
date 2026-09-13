@@ -544,12 +544,18 @@ fn standing_taint_warning_text(mode: OutputMode, gate_message: &str) -> String {
 }
 
 /// The `--json` warning code for background maintenance that could not even decide whether it
-/// was due — today, because a configuration file it has to read does not parse.
+/// was due. Its commonest cause is a configuration file that does not parse, but it is **not**
+/// a config-only code: `auto_compaction_action` also fails on the object-store scans it makes to
+/// answer the question (`estimate_loose_count`, `count_pack_files`), so a permission error, an
+/// exhausted descriptor table or a dead mount under `.forklift/objects` reaches it too. Treat it
+/// as "the decision could not be made", and read `message` for which.
 pub const CODE_MAINTENANCE_UNAVAILABLE: &str = "maintenance_unavailable";
 
-/// What to do about [`CODE_MAINTENANCE_UNAVAILABLE`].
+/// What to do about [`CODE_MAINTENANCE_UNAVAILABLE`]. Deliberately does not promise the cause is
+/// permanent: a broken configuration file is, a transient I/O fault is not, and this code covers
+/// both.
 pub const MAINTENANCE_UNAVAILABLE_NEXT_STEP: &str =
-    "Maintenance stays skipped until the problem above is fixed.";
+    "Packing is skipped while this lasts; the command's own work is unaffected.";
 
 /// Surface background auto-maintenance that could not run at all
 /// (`commands::maintenance::run_if_due`), on the same stderr side-channel — and for the same
@@ -557,17 +563,23 @@ pub const MAINTENANCE_UNAVAILABLE_NEXT_STEP: &str =
 ///
 /// Auto-maintenance is best-effort: a *failed* compaction stays quiet unless it left a taint
 /// standing. This is the different case — maintenance never got as far as deciding whether it
-/// was due, because reading `maintenance.auto`/`maintenance.loose`/`maintenance.packs` failed.
-/// That condition does not clear on its own and is invisible in every other surface: the store
-/// simply never gets packed again, on every command, forever, with nothing said. Silence there
-/// is what this warning exists to end, and the message names the file to fix.
+/// was **due**, so nothing was attempted and nothing can report on it.
+///
+/// The reason that deserves a warning where a failed compaction does not: this outcome is
+/// invisible in every other surface. The store simply stops being packed, on every command,
+/// with nothing said on any of them. When the cause is a configuration file that does not parse
+/// it also does not clear on its own; when it is an I/O fault under `.forklift/objects` it may.
+/// Either way the message names what actually failed, which is the part a reader can act on.
 pub fn warn_maintenance_unavailable(error: &str) {
     eprintln!("{}", maintenance_unavailable_warning_text(mode(), error));
 }
 
 /// The pure half of [`warn_maintenance_unavailable`], split out for the same reason
-/// [`standing_taint_warning_text`] is: a test asserts the produced text in both modes without
-/// capturing the process's real stderr.
+/// [`standing_taint_warning_text`] is:
+/// `the_maintenance_unavailable_warning_carries_the_cause_in_both_modes` asserts the produced
+/// text in both modes without capturing the process's real stderr. The end-to-end `--json` shape
+/// is covered separately by `cli.rs`; the `Human` arm is covered only here, which is the gap
+/// that test closes.
 fn maintenance_unavailable_warning_text(mode: OutputMode, error: &str) -> String {
     match mode {
         OutputMode::Human => format!(
@@ -770,5 +782,36 @@ mod tests {
             value["next_step"].as_str().unwrap().contains("forklift heal"),
             "next_step: {}", value["next_step"]
         );
+    }
+
+    /// The sibling of the test above, for the second warning on the same channel. The `Human` arm
+    /// has no other coverage anywhere — `cli.rs` exercises `--json` end-to-end — so without this
+    /// a change that dropped the cause from the human line would ship green.
+    #[test]
+    fn the_maintenance_unavailable_warning_carries_the_cause_in_both_modes() {
+        let error = "Configuration file \"/warehouse/.forklift/config/warehouse.toml\" is not \
+            valid: \"maintenance.loose\" must be a string, not integer.";
+
+        let human = maintenance_unavailable_warning_text(OutputMode::Human, error);
+        assert!(human.contains(error), "the human line must carry the cause: {}", human);
+        assert!(human.contains(MAINTENANCE_UNAVAILABLE_NEXT_STEP), "human text: {}", human);
+
+        let json_text = maintenance_unavailable_warning_text(OutputMode::Json, error);
+        let value: serde_json::Value = serde_json::from_str(&json_text)
+            .unwrap_or_else(|e| panic!("json warning is not valid JSON ({}): {}", e, json_text));
+        assert_eq!(value["forklift_json"], SCHEMA_VERSION);
+        assert_eq!(value["warning"], CODE_MAINTENANCE_UNAVAILABLE);
+        assert_eq!(value["message"], error);
+        assert_eq!(value["next_step"], MAINTENANCE_UNAVAILABLE_NEXT_STEP);
+
+        // Both warnings on this channel carry the same four fields, which is the contract a
+        // consumer switches on. Pinned here so a third warning cannot quietly take a new shape.
+        let taint = standing_taint_warning_text(OutputMode::Json, "a taint is standing.");
+        let taint: serde_json::Value = serde_json::from_str(&taint).unwrap();
+        let mut fields: Vec<&String> = value.as_object().unwrap().keys().collect();
+        let mut taint_fields: Vec<&String> = taint.as_object().unwrap().keys().collect();
+        fields.sort();
+        taint_fields.sort();
+        assert_eq!(fields, taint_fields, "the two stderr warnings must share one shape");
     }
 }
