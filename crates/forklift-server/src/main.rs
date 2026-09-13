@@ -49,8 +49,9 @@ enum Command {
         #[arg(long)]
         tokens: Option<String>,
 
-        /// Refuse request bodies over this size (MiB; default: unlimited — the hash
-        /// check gates correctness, this gates disk-fill abuse)
+        /// Refuse request bodies over this size (MiB; default: 64 MiB, the largest
+        /// legitimate object after chunking — the hash check gates correctness, this
+        /// gates disk-fill abuse)
         #[arg(long)]
         max_body_mb: Option<u64>,
 
@@ -119,6 +120,33 @@ async fn main() {
     }
 }
 
+/// The static token as it enters the program: two independent sources (the `--token` flag, the
+/// config file's `token` key), each normalized individually — an empty string is not a
+/// credential (`server::check_auth`'s doc, `server::ServeOptions::token`'s doc) — *before*
+/// precedence between them is decided, rather than after the two are already merged into one
+/// `Option<String>`.
+///
+/// That ordering is the actual fix, not a stylistic preference: `Option::or` only sees "was a
+/// value supplied at all", so `Some("")` (a blank `--token`) counts as supplied and wins over a
+/// real `Some("admin-secret")` from the config file — filtering *after* that merge, as the
+/// single call site this replaces used to, can no longer recover the real value the merge
+/// already discarded. Filtering each source first means an empty flag falls through to a real
+/// config-file token exactly the way an *absent* flag already does.
+///
+/// Returns the merged, already-normalized token, plus whether either raw source was
+/// present-but-empty — carried only so `serve`'s startup refusal can name that case correctly
+/// (F2 of PR #124 round 2: "no --token/token" is a misdiagnosis when a blank one was in fact
+/// passed). It plays no role in authentication itself: by the time this returns, an empty
+/// value from either source has already been discarded from the merged token.
+fn merge_static_token(flag: Option<String>, file: Option<String>) -> (Option<String>, bool) {
+    let flag_was_blank = matches!(flag.as_deref(), Some(""));
+    let file_was_blank = matches!(file.as_deref(), Some(""));
+
+    let non_empty = |value: Option<String>| value.filter(|v| !v.is_empty());
+
+    (non_empty(flag).or(non_empty(file)), flag_was_blank || file_was_blank)
+}
+
 /// Merge the flags with the config file (flags win) and serve.
 #[allow(clippy::too_many_arguments)]
 async fn serve(root: Option<String>,
@@ -135,11 +163,13 @@ async fn serve(root: Option<String>,
         None => ConfigFile::default(),
     };
 
+    let (token, blank_token_supplied) = merge_static_token(token, file.token);
+
     let options = server::ServeOptions {
         root: root.or(file.root),
         warehouses: warehouses.or(file.warehouses),
         addr: addr.or(file.addr).unwrap_or("127.0.0.1:9418".to_string()),
-        token: token.or(file.token),
+        token,
         tokens: tokens.or(file.tokens),
         max_body_mb: max_body_mb.or(file.max_body_mb),
         rebuild_after_lifts: rebuild_after_lifts.or(file.rebuild_after_lifts),
@@ -154,6 +184,7 @@ async fn serve(root: Option<String>,
         // "a flag can supply a value", never "a flag can unset one") — remove it from the
         // file to close that hole.
         open: open || file.open.unwrap_or(false),
+        blank_token_supplied,
     };
 
     server::serve(options).await
@@ -177,12 +208,21 @@ async fn serve(root: Option<String>,
 /// resolution_secret = "…"
 /// authentication_cache_secs = 60
 /// ```
-#[derive(Default, Debug)]
+#[derive(Default)]
 struct ConfigFile {
     root: Option<String>,
     warehouses: Option<String>,
     addr: Option<String>,
+
+    /// The static bearer token, verbatim from the config file — the primary credential this
+    /// head has (worth more than a hook's MAC key: it grants full access, including warehouse
+    /// creation). `Debug` is hand-written below specifically so this field redacts: see
+    /// `server::HookEndpoint`'s own hand-written `Debug` for the identical rationale (a future
+    /// `tracing::debug!(?file)`, a panic message) — it applies verbatim here, and doubly so
+    /// since every `parse_config(...).unwrap_err()` in this module's own tests would otherwise
+    /// dump a real token straight into CI output the moment a test fixture used one.
     token: Option<String>,
+
     tokens: Option<String>,
     max_body_mb: Option<u64>,
     rebuild_after_lifts: Option<u32>,
@@ -200,6 +240,26 @@ struct ConfigFile {
     events_hook: Option<server::HookEndpoint>,
     resolution_hook: Option<server::HookEndpoint>,
     authentication_cache_secs: Option<u64>,
+}
+
+impl std::fmt::Debug for ConfigFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConfigFile")
+            .field("root", &self.root)
+            .field("warehouses", &self.warehouses)
+            .field("addr", &self.addr)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("tokens", &self.tokens)
+            .field("max_body_mb", &self.max_body_mb)
+            .field("rebuild_after_lifts", &self.rebuild_after_lifts)
+            .field("open", &self.open)
+            .field("authentication_hook", &self.authentication_hook)
+            .field("admission_hook", &self.admission_hook)
+            .field("events_hook", &self.events_hook)
+            .field("resolution_hook", &self.resolution_hook)
+            .field("authentication_cache_secs", &self.authentication_cache_secs)
+            .finish()
+    }
 }
 
 /// Read an optional string field from a parsed TOML item, strictly: an absent key is `None`
@@ -813,5 +873,165 @@ mod tests {
         let path = scratch_config("invalid-toml", "not [ valid toml");
         assert!(parse_config(path.to_str().unwrap()).is_err());
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ---------------------------------------------------------------------------------
+    // merge_static_token (F1 of PR #124 round 2): normalize each source before merging
+    // ---------------------------------------------------------------------------------
+
+    /// The exact repro from the finding: a blank `--token` must not beat a real config-file
+    /// token. Before this fix, the merge was `token.or(file.token)` with the empty-string
+    /// filter applied only afterward — `Option::or` sees `Some("")` as "a value was supplied"
+    /// and picks it over `file.token`, so the real token was discarded and never recovered.
+    #[test]
+    fn a_blank_flag_token_falls_back_to_a_real_file_token() {
+        let (token, blank) = merge_static_token(Some(String::new()), Some("admin-secret".to_string()));
+        assert_eq!(token.as_deref(), Some("admin-secret"));
+        assert!(blank, "the flag source was blank, even though a real token resulted");
+    }
+
+    /// The symmetric case: a blank config-file token must not beat a real `--token` flag either
+    /// — normalization applies to both sources, not just the flag.
+    #[test]
+    fn a_blank_file_token_falls_back_to_a_real_flag_token() {
+        let (token, blank) = merge_static_token(Some("flag-secret".to_string()), Some(String::new()));
+        assert_eq!(token.as_deref(), Some("flag-secret"));
+        assert!(blank, "the file source was blank, even though a real token resulted");
+    }
+
+    #[test]
+    fn two_blank_sources_merge_to_no_token_and_report_blank() {
+        let (token, blank) = merge_static_token(Some(String::new()), Some(String::new()));
+        assert_eq!(token, None);
+        assert!(blank);
+    }
+
+    #[test]
+    fn two_absent_sources_merge_to_no_token_and_do_not_report_blank() {
+        let (token, blank) = merge_static_token(None, None);
+        assert_eq!(token, None);
+        assert!(!blank, "nothing was ever supplied, blank or otherwise");
+    }
+
+    #[test]
+    fn a_real_flag_token_wins_over_a_real_file_token() {
+        let (token, blank) = merge_static_token(
+            Some("flag-secret".to_string()), Some("file-secret".to_string())
+        );
+        assert_eq!(token.as_deref(), Some("flag-secret"), "the flag must still win between two real tokens");
+        assert!(!blank);
+    }
+
+    // ---------------------------------------------------------------------------------
+    // serve: the F1/F2 precedence fix, observed end to end through the merged options
+    // ---------------------------------------------------------------------------------
+
+    /// The full-stack version of `a_blank_flag_token_falls_back_to_a_real_file_token`: with the
+    /// precedence bug, the real config-file token is discarded, no other auth source is
+    /// configured, and `server::serve`'s startup gate refuses with "No authentication is
+    /// configured". Fixed, the real token survives, the auth gate passes, and the function
+    /// fails downstream instead — at root resolution, since the configured root does not exist.
+    /// Distinguishing by which error comes back is the same technique `server.rs`'s own
+    /// `serve_with_open_true_passes_the_auth_gate` uses; fully starting the server is out of
+    /// scope for a fast unit test.
+    #[tokio::test]
+    async fn serve_falls_back_to_a_real_file_token_when_the_flag_token_is_blank() {
+        let path = scratch_config("blank-flag-real-file-token", "token = \"admin-secret\"\n");
+
+        let error = serve(
+            Some("/does/not/exist/and/does/not/matter".to_string()),
+            None,
+            None,
+            Some(String::new()),
+            None,
+            None,
+            None,
+            false,
+            Some(path.to_str().unwrap().to_string()),
+        ).await.unwrap_err();
+
+        assert!(!error.contains("No authentication is configured"), "{}", error);
+        assert!(error.contains("Error while resolving"), "{}", error);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// F2: when a blank `--token` is the *only* auth-flavored thing supplied (no real token
+    /// anywhere, nothing else configured), the startup refusal must name that case correctly —
+    /// "an empty --token/token", not "no --token/token", which sends an operator who passed the
+    /// flag looking for a flag they never passed at all.
+    #[tokio::test]
+    async fn serve_names_a_blank_flag_token_distinctly_from_no_token_at_all() {
+        let error = serve(
+            Some("/does/not/exist/and/does/not/matter".to_string()),
+            None,
+            None,
+            Some(String::new()),
+            None,
+            None,
+            None,
+            false,
+            None,
+        ).await.unwrap_err();
+
+        assert!(error.contains("No authentication is configured"), "{}", error);
+        assert!(error.contains("an empty --token/token"), "{}", error);
+        assert!(!error.contains("no --token/token"), "{}", error);
+    }
+
+    // ---------------------------------------------------------------------------------
+    // ConfigFile::fmt (F3 of PR #124 round 2): the static token must never print
+    // ---------------------------------------------------------------------------------
+
+    /// The same class `HookEndpoint::fmt` closes (`server.rs`'s
+    /// `hook_endpoint_debug_never_prints_the_secret`), applied to the higher-value secret: the
+    /// static bearer token, which grants full access including warehouse creation, versus a
+    /// hook's MAC key which only signs requests. Checks both the value's absence and the field
+    /// name's presence, so a future edit cannot "fix" the struct literal without the test
+    /// noticing the field itself vanished too.
+    #[test]
+    fn config_file_debug_never_prints_the_token() {
+        let path = scratch_config("debug-redaction", "token = \"s3cr3t-value\"\n");
+        let file = parse_config(path.to_str().unwrap()).unwrap();
+        let formatted = format!("{:?}", file);
+
+        assert!(!formatted.contains("s3cr3t-value"), "{}", formatted);
+        assert!(formatted.contains("token"), "{}", formatted);
+        assert!(formatted.contains("redacted"), "{}", formatted);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ---------------------------------------------------------------------------------
+    // F6: the max_body_mb default is documented accurately (it is NOT unlimited)
+    // ---------------------------------------------------------------------------------
+
+    /// `serve` falls back to `DefaultBodyLimit::max(object_utils::MAX_OBJECT_BYTES)` when
+    /// `max_body_mb` is unset — the disk-fill cap defaults ON, not off. Both the clap `--help`
+    /// text and `docs/SERVER.md`'s worked example used to say "unlimited", the opposite of the
+    /// truth. Mechanized against the real constant (rather than a hand-typed "64" in this test
+    /// too) so the two prose surfaces cannot drift from it silently again.
+    #[test]
+    fn the_max_body_mb_default_is_documented_correctly_everywhere() {
+        let expected_mib = forklift_core::util::object_utils::MAX_OBJECT_BYTES / (1024 * 1024);
+        let expected_phrase = format!("default: {} MiB", expected_mib);
+
+        let command = <Cli as clap::CommandFactory>::command();
+        let serve_command = command.find_subcommand("serve").expect("a \"serve\" subcommand");
+        let arg = serve_command.get_arguments()
+            .find(|a| a.get_id().as_str() == "max_body_mb")
+            .expect("a \"max_body_mb\" argument");
+        let help = arg.get_help().map(|s| s.to_string()).unwrap_or_default();
+
+        assert!(help.contains(&expected_phrase), "{}", help);
+        assert!(!help.to_lowercase().contains("unlimited"), "{}", help);
+
+        let server_md = include_str!("../../../docs/SERVER.md");
+        let line = server_md.lines()
+            .find(|line| line.trim_start().starts_with("max_body_mb"))
+            .expect("docs/SERVER.md documents max_body_mb");
+
+        assert!(line.contains(&expected_phrase), "{}", line);
+        assert!(!line.to_lowercase().contains("unlimited"), "{}", line);
     }
 }

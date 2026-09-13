@@ -92,7 +92,8 @@ root = "/srv/forklift/wh"        # or: warehouses = "/srv/forklift"
 addr = "127.0.0.1:9418"
 token = "<secret>"               # static token: full access, gates creation
 tokens = "/etc/forklift/tokens.toml"  # per-operator tokens (below)
-max_body_mb = 4096               # refuse larger request bodies (default: unlimited)
+max_body_mb = 4096               # refuse larger request bodies (default: 64 MiB, the largest
+                                  # legitimate object after chunking — never unlimited)
 rebuild_after_lifts = 20         # rebuild the bundle in the background (default: never)
 open = false                     # explicit opt-out of authentication (default: false — see
                                   # "Authentication" above; a config with none of token, tokens,

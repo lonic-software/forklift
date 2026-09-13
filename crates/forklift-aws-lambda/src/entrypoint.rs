@@ -128,7 +128,12 @@ fn require_env(name: &str) -> Result<String, String> {
 /// and threaded into every request by [`handle`]. Full multi-tenant policy (resolving a bearer
 /// to a principal, per-warehouse admission) is tracked privately and stays out of scope here —
 /// this is the single-tenant seam: is *a* configured token present and correct at all.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// `Debug` is hand-written, not derived — see the `impl` just below — so redaction is
+/// structural rather than a claim about which paths happen to print this type today: this is
+/// this head's own primary bearer token, the same class `forklift-server`'s `HookEndpoint` and
+/// `ConfigFile` redact (PR #124 round 2, F3), and every `assert_eq!` in this module's own tests
+/// against a `Token(...)` value already formats it on any failure.
+#[derive(Clone, PartialEq, Eq)]
 pub enum AuthConfig {
     /// A configured bearer token; every request must present it via
     /// `Authorization: Bearer <token>`.
@@ -144,6 +149,16 @@ pub enum AuthConfig {
     /// request is refused (`401`) — a forgotten `FORKLIFT_TOKEN` fails closed instead of
     /// silently serving the world from a public endpoint.
     Closed,
+}
+
+impl std::fmt::Debug for AuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthConfig::Token(_) => f.debug_tuple("Token").field(&"<redacted>").finish(),
+            AuthConfig::Open => write!(f, "Open"),
+            AuthConfig::Closed => write!(f, "Closed"),
+        }
+    }
 }
 
 /// Read the auth configuration from the environment:
@@ -839,6 +854,20 @@ mod tests {
             AuthConfig::Closed,
             "only the literal \"1\" opts out"
         );
+    }
+
+    /// `AuthConfig::Token`'s `Debug` must never print the bearer token — the same class of leak
+    /// `forklift-server::HookEndpoint`/`ConfigFile` close, applied to this head's own primary
+    /// credential (PR #124 round 2, F3). Checks both the value's absence and the field name's
+    /// presence, so a future edit cannot "fix" the match arm without the test noticing the
+    /// variant's own name vanished too.
+    #[test]
+    fn auth_config_debug_never_prints_the_token() {
+        let formatted = format!("{:?}", AuthConfig::Token("s3cr3t-value".to_string()));
+
+        assert!(!formatted.contains("s3cr3t-value"), "{}", formatted);
+        assert!(formatted.contains("Token"), "{}", formatted);
+        assert!(formatted.contains("redacted"), "{}", formatted);
     }
 
     /// Pins the equality semantics a timing side channel can't be asserted in a unit test:

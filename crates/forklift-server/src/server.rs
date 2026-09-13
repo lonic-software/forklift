@@ -209,13 +209,32 @@ pub struct ServeOptions {
     /// The address to bind (port 0 picks a free port).
     pub addr: String,
 
-    /// The static bearer token (full access), if any.
+    /// The static bearer token (full access), if any. Already normalized by the time it
+    /// reaches here when built through `main.rs::serve` (`main.rs::merge_static_token`
+    /// filters an empty string out of *each* of the flag and config-file sources before
+    /// deciding precedence between them — filtering only the already-merged value, as `serve`
+    /// below alone used to, cannot recover a real value that precedence already discarded in
+    /// favor of an empty one from the other source). `serve` below still filters again — this
+    /// struct is `pub`, so any other constructor (a test, a future embedder) gets the same
+    /// "an empty string is not a credential" guarantee regardless of whether it normalized its
+    /// own sources first.
     pub token: Option<String>,
 
     /// The path of the per-operator token file, if any.
     pub tokens: Option<String>,
 
-    /// Refuse request bodies over this size (MiB); `None` = unlimited.
+    /// Whether either of `token`'s two raw sources (the `--token` flag, the config file's
+    /// `token` key) was present but an empty string — i.e. whether `token` above is `None`
+    /// *because* a blank credential was supplied, as opposed to nothing being supplied at all.
+    /// Computed by `main.rs::merge_static_token`, alongside the normalization above; used only
+    /// by `serve`'s startup refusal, to name that case as "an empty --token/token" rather than
+    /// the misdiagnosing "no --token/token" (PR #124 round 2, F2). Never consulted for
+    /// authentication itself.
+    pub blank_token_supplied: bool,
+
+    /// Refuse request bodies over this size (MiB); `None` = the default cap
+    /// (`object_utils::MAX_OBJECT_BYTES`, currently 64 MiB) applies — never unlimited. See
+    /// `body_limit_bytes`.
     pub max_body_mb: Option<u64>,
 
     /// Rebuild a warehouse's bundle after this many accepted lifts; `None` = never.
@@ -286,6 +305,34 @@ fn build_hook_client() -> Result<reqwest::Client, String> {
         .map_err(|e| format!("Error while building the hook HTTP client: {}", e))
 }
 
+/// Convert `max_body_mb` (MiB) to the byte count `axum`'s `DefaultBodyLimit` wants, refusing
+/// rather than silently wrapping when the conversion overflows. This is the magnitude half of
+/// the "an unsigned config value overflows the arithmetic built on it" class (PR #124 round 1
+/// closed the sign half — a negative `max_body_mb` — in `main.rs::optional_non_negative_integer`,
+/// which cannot reach this hole: it only ever runs against the config-file `max_body_mb` key, not
+/// the `--max-body-mb` flag, which clap already parses straight into `u64`, and it only ever
+/// checks the sign, never the magnitude after conversion). `mb.checked_mul(1024 * 1024)` catches
+/// the arithmetic overflow directly (`mb >= 2^44` overflows a `u64` byte count); the
+/// `usize::try_from` after it additionally catches a 32-bit target, where a byte count that fits
+/// in `u64` may still not fit in `usize`. Left unguarded, `(mb as usize) * 1024 * 1024` — the
+/// code this replaces — panics at startup on a debug build (what `bin/serve` runs, since
+/// overflow checks are on by default in the dev profile) and silently wraps to a *smaller* limit
+/// on a release build (`(1u64 << 44) as usize * 1024 * 1024` wraps to exactly `0` on a 64-bit
+/// target, rejecting every request body).
+fn body_limit_bytes(max_body_mb: Option<u64>) -> Result<usize, String> {
+    match max_body_mb {
+        Some(mb) => mb
+            .checked_mul(1024 * 1024)
+            .and_then(|bytes| usize::try_from(bytes).ok())
+            .ok_or_else(|| format!(
+                "\"max_body_mb\" is {} MiB, which overflows converting to a byte count; pick a \
+                smaller value.",
+                mb
+            )),
+        None => Ok(object_utils::MAX_OBJECT_BYTES),
+    }
+}
+
 /// Serve one warehouse root, or every warehouse under a base folder.
 ///
 /// # Returns
@@ -314,14 +361,16 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
         None => HashMap::new(),
     };
 
-    // An empty string is not a credential: `--token ""` (or `token = ""` in the config file,
-    // which the strict reader in main.rs accepts — it is a validly-typed string) must not become
-    // a token any request can present. Without this, `strip_bearer_prefix("Bearer ")` yields
+    // Defense-in-depth, not the primary enforcement point (see `ServeOptions::token`'s doc): an
+    // empty string is not a credential — without this, `strip_bearer_prefix("Bearer ")` yields
     // `Some("")`, `tokens_match("", "")` is `true`, and a request carrying the literal header
-    // `Authorization: Bearer ` (no credential after the scheme) authenticates as
-    // `Principal::Static` with full privileges. Filtering here — before `auth_configured` is
-    // computed — means an empty token is treated exactly like an absent one and participates in
-    // the startup refusal below instead of silently opening the server. Mirrors
+    // `Authorization: Bearer ` (no credential after the scheme) would authenticate as
+    // `Principal::Static` with full privileges. `main.rs::merge_static_token` already normalizes
+    // both of the token's raw sources individually before this ever runs (PR #124 round 2, F1:
+    // filtering only here, after the flag and the config file were already merged by precedence,
+    // could not recover a real token that precedence had already discarded in favor of an empty
+    // one from the other source) — this line stays so `ServeOptions`, which is `pub`, gives the
+    // same guarantee to any other constructor of it. Mirrors
     // `forklift-aws-lambda::entrypoint::auth_from`'s `token.filter(|value| !value.is_empty())`.
     let token = options.token.filter(|value| !value.is_empty());
 
@@ -336,6 +385,19 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
         token.is_some() || !operator_tokens.is_empty() || options.authentication_hook.is_some();
 
     if !auth_configured && !options.open {
+        // F2 of PR #124 round 2: an operator who passed `--token ""` (or `token = ""`) must be
+        // told that specifically — "no --token/token" sends them looking for a flag they
+        // already passed, the same misdiagnosis this fixed for the empty-`[operators]`-table
+        // case below. Reachable here only when the merge in `main.rs::merge_static_token`
+        // discarded a blank value from *and never found a real token in* either source: a real
+        // token from the other source would have made `auth_configured` true above, and this
+        // whole branch would never run.
+        let token_clause = if options.blank_token_supplied {
+            "an empty --token/token (an empty string is not a credential)"
+        } else {
+            "no --token/token"
+        };
+
         let tokens_clause = if tokens_supplied {
             "a --tokens/tokens file whose [operators] table defines no entries"
         } else {
@@ -343,11 +405,11 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
         };
 
         return Err(format!(
-            "No authentication is configured: no --token/token, {}, and no authentication \
+            "No authentication is configured: {}, {}, and no authentication \
             hook. Refusing to start serving requests unauthenticated by accident — set one \
             of those, or pass --open (or `open = true` in the config file) to explicitly run \
             this server with no authentication at all.",
-            tokens_clause
+            token_clause, tokens_clause
         ));
     }
 
@@ -451,10 +513,7 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
     // a chunk is at most `MAX_CHUNK_BYTES`), so this is a principled default value rather than the
     // old "unlimited unless an operator remembers to cap it". An operator may still raise it for a
     // grandfathered-giant read path or lower it, via `max_body_mb`.
-    let body_limit = match options.max_body_mb {
-        Some(mb) => DefaultBodyLimit::max((mb as usize) * 1024 * 1024),
-        None => DefaultBodyLimit::max(object_utils::MAX_OBJECT_BYTES),
-    };
+    let body_limit = DefaultBodyLimit::max(body_limit_bytes(options.max_body_mb)?);
 
     let app = app
         // Liveness only — deliberately unauthenticated and warehouse-free.
@@ -576,6 +635,22 @@ fn parse_operator_tokens(path: &str) -> Result<HashMap<String, String>, String> 
                 "The token file \"{}\" maps an empty token to \"{}\": an empty string is not a \
                 credential — remove that entry.",
                 path, identifier
+            ));
+        }
+
+        // F4 of PR #124 round 2: an identity is not a credential — nothing compares it
+        // byte-exactly against a configured value the way a token is compared, it is *recorded*
+        // (into `Principal::Operator`, then admission/event payloads, `post_resolve`'s `caller`)
+        // as a legitimate-looking actor. Whitespace-only is rejected too, unlike the token check
+        // above: the token side only ever needs an exact-byte comparison and so has no
+        // equivalent whitespace hole. Deliberately does not echo `token` into the message —
+        // unlike the empty-token case above, `token` here is a real, live credential, and
+        // printing it would leak it into the server's own startup-failure output and logs.
+        if identifier.trim().is_empty() {
+            return Err(format!(
+                "The token file \"{}\" maps a token to a blank identifier: an identity must not \
+                be empty or whitespace-only — remove that entry.",
+                path
             ));
         }
 
@@ -750,6 +825,22 @@ async fn authenticate_via_hook(state: &AppState,
             "The authentication service is unavailable; try again later.".to_string()
         )
     })?;
+
+    // F4 of PR #124 round 2: a well-formed but blank identifier is exactly as unusable as
+    // malformed JSON — fail closed the same way, before the cache insert below, so a blank
+    // answer is never cached and repeatedly accepted for the TTL. Unlike the token this hook is
+    // answering *for*, nothing later compares an identifier byte-exactly against a configured
+    // value; it is recorded (`Principal::Operator`, then admission/event payloads,
+    // `post_resolve`'s `caller`) as a legitimate-looking actor, so whitespace-only (`"   "`) is
+    // rejected here too, not just the empty string.
+    if answer.identifier.trim().is_empty() {
+        tracing::warn!("the authentication hook answered a blank identifier; failing closed");
+
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "The authentication service is unavailable; try again later.".to_string()
+        ));
+    }
 
     if let Ok(mut cache) = state.authentication_cache.lock() {
         // The cache is bounded by the set of live tokens; expired entries are
@@ -2591,6 +2682,58 @@ mod tests {
         assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
     }
 
+    /// F4 of PR #124 round 2: a well-formed but blank identifier must fail closed exactly like
+    /// malformed JSON — `Principal::Operator("")` is not a real identity, and unlike the token
+    /// side (fail-closed via an exact, untrimmed byte comparison — see
+    /// `an_empty_bearer_credential_never_authenticates_even_against_an_empty_static_token`),
+    /// nothing later compares an identifier byte-exactly against a configured value; it is
+    /// recorded (`caller`, `operator` in admission/event payloads) as if it were a legitimate
+    /// actor.
+    #[tokio::test]
+    async fn a_hook_answer_with_an_empty_identifier_fails_closed() {
+        let (url, _received, _hits) = spawn_hook(StatusCode::OK, r#"{"identifier":""}"#).await;
+        let state = AppState {
+            authentication_hook: Some(HookEndpoint { url, secret: "s".to_string() }),
+            ..single_mode_state(PathBuf::from("/unused"))
+        };
+
+        let error = check_auth(&state, &headers_with_bearer("tok")).await.err().unwrap();
+        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// Whitespace-only is exactly as much "not an identity" as empty — this is the whitespace
+    /// half the token side never needs (an exact byte comparison already refuses any
+    /// whitespace-padded guess).
+    #[tokio::test]
+    async fn a_hook_answer_with_a_whitespace_only_identifier_fails_closed() {
+        let (url, _received, _hits) = spawn_hook(StatusCode::OK, r#"{"identifier":"   "}"#).await;
+        let state = AppState {
+            authentication_hook: Some(HookEndpoint { url, secret: "s".to_string() }),
+            ..single_mode_state(PathBuf::from("/unused"))
+        };
+
+        let error = check_auth(&state, &headers_with_bearer("tok")).await.err().unwrap();
+        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// The check must reject only *all-whitespace* identifiers, not merely trim and accept —
+    /// an identifier with incidental leading/trailing whitespace around real content is still a
+    /// real identity and must authenticate, verbatim (untrimmed): `office_user_of` matches an
+    /// operator's identifier by exact equality against the tracked office roster, so silently
+    /// trimming it here would make this check the reason a legitimately-enrolled " bob " never
+    /// matches.
+    #[tokio::test]
+    async fn a_hook_answer_with_incidental_whitespace_around_a_real_identifier_still_authenticates() {
+        let (url, _received, _hits) = spawn_hook(StatusCode::OK, r#"{"identifier":" bob "}"#).await;
+        let state = AppState {
+            authentication_hook: Some(HookEndpoint { url, secret: "s".to_string() }),
+            ..single_mode_state(PathBuf::from("/unused"))
+        };
+
+        let principal = check_auth(&state, &headers_with_bearer("tok")).await.unwrap();
+        assert!(principal == Principal::Operator(" bob ".to_string()));
+    }
+
     // ---------------------------------------------------------------------------------
     // check_admission
     // ---------------------------------------------------------------------------------
@@ -2839,6 +2982,53 @@ mod tests {
         let error = parse_operator_tokens(path.to_str().unwrap()).unwrap_err();
         assert!(error.contains("empty"), "{}", error);
         assert!(error.contains("alice"), "{}", error);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F4 of PR #124 round 2: `"tok-a" = ""` used to parse fine — only the token (key) side was
+    /// checked for emptiness, never the identifier (value). An empty identifier is not merely
+    /// unenrolled (which `office_user_of` already 403s): it flows into admission/event payloads
+    /// and `post_resolve`'s `caller` as a legitimate-looking actor.
+    #[test]
+    fn rejects_a_token_mapped_to_a_blank_identifier() {
+        let dir = scratch_dir("tokens-blank-identifier");
+        let path = dir.join("tokens.toml");
+        std::fs::write(&path, "[operators]\n\"tok-a\" = \"\"\n\"tok-b\" = \"bob\"\n").unwrap();
+
+        let error = parse_operator_tokens(path.to_str().unwrap()).unwrap_err();
+        assert!(error.contains("blank"), "{}", error);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Whitespace-only is exactly as much "not an identity" as empty — unlike the token (key)
+    /// check, which only ever needs a byte-exact comparison and so has no equivalent whitespace
+    /// hole (see `authenticate_via_hook`'s doc comment on the same asymmetry).
+    #[test]
+    fn rejects_a_token_mapped_to_a_whitespace_only_identifier() {
+        let dir = scratch_dir("tokens-whitespace-identifier");
+        let path = dir.join("tokens.toml");
+        std::fs::write(&path, "[operators]\n\"tok-a\" = \"   \"\n").unwrap();
+
+        let error = parse_operator_tokens(path.to_str().unwrap()).unwrap_err();
+        assert!(error.contains("blank"), "{}", error);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The blank-identifier error must never echo the token — unlike the empty-*token* error
+    /// above (safe to echo, since the token there is itself empty), the token in this scenario
+    /// is a real, live credential, and printing it would leak it into the server's own
+    /// startup-failure output and logs.
+    #[test]
+    fn a_blank_identifier_error_never_echoes_the_token() {
+        let dir = scratch_dir("tokens-blank-identifier-no-leak");
+        let path = dir.join("tokens.toml");
+        std::fs::write(&path, "[operators]\n\"super-secret-token\" = \"\"\n").unwrap();
+
+        let error = parse_operator_tokens(path.to_str().unwrap()).unwrap_err();
+        assert!(!error.contains("super-secret-token"), "{}", error);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3665,6 +3855,7 @@ mod tests {
             addr: "127.0.0.1:0".to_string(),
             token: None,
             tokens: None,
+            blank_token_supplied: false,
             max_body_mb: None,
             rebuild_after_lifts: None,
             authentication_hook: None,
@@ -3687,6 +3878,10 @@ mod tests {
 
         assert!(error.contains("No authentication is configured"), "{}", error);
         assert!(error.contains("--open"), "{}", error);
+        // Locks the "absent" phrasing distinctly from the "blank" phrasing
+        // `serve_with_an_empty_token_does_not_pass_the_auth_gate` pins below (F2 of PR #124
+        // round 2) — no token was supplied at all here, blank or otherwise.
+        assert!(error.contains("no --token/token"), "{}", error);
     }
 
     /// The explicit opt-in must still work: `open: true` with nothing else configured must
@@ -3718,12 +3913,24 @@ mod tests {
     /// as a configured token. Before the fix, `options.token.is_some()` was `true` for
     /// `Some("")`, so this bypassed the gate entirely and the server would have started fully
     /// open to any request carrying `Authorization: Bearer ` (empty credential).
+    ///
+    /// `blank_token_supplied: true` here mirrors what `main.rs::merge_static_token` would have
+    /// computed for this scenario — this test constructs `ServeOptions` directly, bypassing
+    /// that merge, so it sets the signal by hand. F2 of PR #124 round 2: the refusal must name
+    /// this case as "an empty --token/token", not the misdiagnosing "no --token/token" (which
+    /// `serve_refuses_to_start_with_no_auth_and_no_open` pins for the genuinely-absent case).
     #[tokio::test]
     async fn serve_with_an_empty_token_does_not_pass_the_auth_gate() {
-        let options = ServeOptions { token: Some(String::new()), ..bare_serve_options() };
+        let options = ServeOptions {
+            token: Some(String::new()),
+            blank_token_supplied: true,
+            ..bare_serve_options()
+        };
         let error = serve(options).await.unwrap_err();
 
         assert!(error.contains("No authentication is configured"), "{}", error);
+        assert!(error.contains("an empty --token/token"), "{}", error);
+        assert!(!error.contains("no --token/token"), "{}", error);
     }
 
     /// The empty-`[operators]`-table case must be named distinctly from "no --tokens/tokens
@@ -3772,5 +3979,38 @@ mod tests {
 
         let without_auth = startup_bind_warning(&bound, false).expect("a warning with no auth");
         assert!(without_auth.contains("Principal::Open"), "{}", without_auth);
+    }
+
+    // ---------------------------------------------------------------------------------
+    // body_limit_bytes (F5 of PR #124 round 2): the magnitude half of the overflow class
+    // ---------------------------------------------------------------------------------
+
+    #[test]
+    fn body_limit_bytes_converts_an_ordinary_value() {
+        assert_eq!(body_limit_bytes(Some(4096)).unwrap(), 4096 * 1024 * 1024);
+    }
+
+    #[test]
+    fn body_limit_bytes_defaults_to_the_object_ceiling_when_unset() {
+        assert_eq!(body_limit_bytes(None).unwrap(), object_utils::MAX_OBJECT_BYTES);
+    }
+
+    /// The exact boundary the finding names: `2^44` MiB is the smallest `max_body_mb` whose
+    /// byte count overflows a `u64` (`2^44 * 2^20 == 2^64`). `(mb as usize) * 1024 * 1024` — the
+    /// code this replaces — silently wraps to exactly `0` here on a 64-bit target (rejecting
+    /// every request body) instead of refusing to start.
+    #[test]
+    fn body_limit_bytes_refuses_an_overflowing_value_naming_the_key() {
+        let error = body_limit_bytes(Some(1u64 << 44)).unwrap_err();
+        assert!(error.contains("max_body_mb"), "{}", error);
+    }
+
+    #[test]
+    fn body_limit_bytes_accepts_the_largest_value_that_does_not_overflow() {
+        // The largest `mb` whose `* 1024 * 1024` still fits in a `u64` (one MiB short of the
+        // overflowing boundary above) must still convert cleanly, not be caught by an
+        // off-by-one in the overflow check.
+        let mb = (1u64 << 44) - 1;
+        assert_eq!(body_limit_bytes(Some(mb)).unwrap(), (mb as usize) * 1024 * 1024);
     }
 }
