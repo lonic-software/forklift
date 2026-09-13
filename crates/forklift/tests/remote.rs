@@ -188,9 +188,20 @@ impl Server {
     }
 
     fn spawn(mut args: Vec<String>, token: Option<&str>) -> Server {
-        if let Some(token) = token {
-            args.push("--token".to_string());
-            args.push(token.to_string());
+        match token {
+            Some(token) => {
+                args.push("--token".to_string());
+                args.push(token.to_string());
+            }
+            // No token on the command line: every caller here that passes `None` is either
+            // testing genuinely open (`Principal::Open`) server behavior, or already configures
+            // auth another way via `--config` (a file `token`, `[hooks]` authentication, or
+            // `--tokens`) — forklift-server no longer infers "open" from an empty auth config
+            // (it refuses to start instead), so this harness must say so explicitly. When auth
+            // *is* configured some other way, a configured token/tokens/authentication hook
+            // always takes precedence over `open` in `check_auth`, so this flag is inert there
+            // and load-bearing only for the genuinely-open callers.
+            None => args.push("--open".to_string()),
         }
 
         let mut child = Command::new(server_binary())
@@ -1528,9 +1539,11 @@ fn a_second_server_and_gc_are_refused_while_serving_but_bundle_is_allowed() {
 
     // A second server on the same root is refused up front (it would silently break the first
     // server's in-process ref-update CAS). The acquire happens before the serve loop, so this
-    // fails fast rather than blocking.
+    // fails fast rather than blocking. --open: this is a raw `Command`, not `Server::spawn`, so
+    // it needs its own explicit opt-out of authentication to reach the serve-lock refusal this
+    // test is actually about, rather than the auth-config refusal (checked even earlier).
     let second = Command::new(server_binary())
-        .args(["serve", "--root", &root_str, "--addr", "127.0.0.1:0"])
+        .args(["serve", "--root", &root_str, "--addr", "127.0.0.1:0", "--open"])
         .output()
         .unwrap();
     assert!(!second.status.success(),

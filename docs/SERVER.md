@@ -24,9 +24,11 @@ docker run -d -p 9418:9418 -v forklift-data:/data forklift-server \
     serve --warehouses /data --addr 0.0.0.0:9418 --token <admin-secret>
 ```
 
-The default command is `serve --warehouses /data --addr 0.0.0.0:9418`; override it (as above)
-to set a token, or to serve a single warehouse (`serve --root /data/wh`). Create warehouses
-against the running container with the admin token:
+The image's baked-in default command is `serve --warehouses /data --addr 0.0.0.0:9418` — with
+no token, that command **refuses to start** (see "Authentication" above), so you always
+override it: as above to set a token, with `--open` for a throwaway/local container, or to
+serve a single warehouse (`serve --root /data/wh --token <secret>`). Create warehouses against
+the running container with the admin token:
 
 ```sh
 curl -X PUT -H "Authorization: Bearer <admin-secret>" http://localhost:9418/warehouses/<id>
@@ -63,6 +65,24 @@ curl -X PUT -H "Authorization: Bearer <admin-secret>" http://…/warehouses/<id>
 
 Creation requires the static token; an open server refuses it (`403`).
 
+## Authentication
+
+**Some authentication is required to start the server at all.** Configure at least one of a
+static `--token`/`token`, a `--tokens`/`tokens` operator-token file, or an `authentication` hook
+(below) — or the server refuses to start, naming the missing piece. This is not "auth defaults
+to a static token"; there is no default at all, on purpose.
+
+To run with **no authentication** — local development, a LocalStack/CI throwaway, an internal
+network you fully trust — pass `--open` (or `open = true` in the config file) explicitly:
+
+```sh
+forklift-server serve --root /srv/forklift/wh --addr 127.0.0.1:9418 --open
+```
+
+Every request is then served as a fully-privileged principal. There is no partial or inferred
+form of this: omitting every auth setting *without* `--open` is a startup error, not an open
+server — a forgotten token must fail loud, never silently serve the world.
+
 ## Configuration
 
 Flags, or a TOML file (`--config server.toml`; flags override the file):
@@ -74,7 +94,14 @@ token = "<secret>"               # static token: full access, gates creation
 tokens = "/etc/forklift/tokens.toml"  # per-operator tokens (below)
 max_body_mb = 4096               # refuse larger request bodies (default: unlimited)
 rebuild_after_lifts = 20         # rebuild the bundle in the background (default: never)
+open = false                     # explicit opt-out of authentication (default: false — see
+                                  # "Authentication" above; a config with none of token, tokens,
+                                  # or an authentication hook, and this unset, refuses to start)
 ```
+
+Every key here is validated strictly: a key set to a value of the wrong type (e.g. an
+unquoted `token = 12345`) is a startup error naming the file and the key, never silently
+treated as unset — and an unrecognized key name (a typo) is refused the same way.
 
 ## Per-operator tokens (FORK-10)
 

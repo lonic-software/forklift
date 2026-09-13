@@ -213,6 +213,11 @@ authentication_cache_secs = 60   # optional
 All four hooks are configured the same way, on the server. Each is independent;
 configure any subset. A URL without a secret (or the reverse) is a startup error.
 
+Only the `authentication` hook counts as configuring authentication (see docs/SERVER.md,
+"Authentication"): a server whose `[hooks]` table has `admission`, `events`, and/or
+`resolution` but no `authentication_url`, and no `--token`/`--tokens` either, still has *no
+authentication configured* and refuses to start unless `--open` (or `open = true`) is also set.
+
 **Client**: nothing to configure. A client resolves names by asking its configured
 remote (`POST /v1/resolve`); with no remote, or a server without a resolution hook,
 it simply shows pseudonyms.

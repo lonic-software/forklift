@@ -58,6 +58,12 @@ enum Command {
         #[arg(long)]
         rebuild_after_lifts: Option<u32>,
 
+        /// Serve with no authentication at all: the explicit opt-out. Without this (and
+        /// without --token/--tokens/a configured authentication hook), the server refuses
+        /// to start rather than infer "open" from an empty auth config.
+        #[arg(long)]
+        open: bool,
+
         /// A TOML config file with the same keys as these flags; flags override it
         #[arg(long)]
         config: Option<String>,
@@ -100,8 +106,8 @@ async fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Command::Serve { root, warehouses, addr, token, tokens, max_body_mb, rebuild_after_lifts, config } =>
-            serve(root, warehouses, addr, token, tokens, max_body_mb, rebuild_after_lifts, config).await,
+        Command::Serve { root, warehouses, addr, token, tokens, max_body_mb, rebuild_after_lifts, open, config } =>
+            serve(root, warehouses, addr, token, tokens, max_body_mb, rebuild_after_lifts, open, config).await,
         Command::Prepare { root } => prepare(&root),
         Command::Bundle { root } => bundle(&root),
         Command::Gc { root, grace_hours } => gc(&root, grace_hours),
@@ -122,6 +128,7 @@ async fn serve(root: Option<String>,
                tokens: Option<String>,
                max_body_mb: Option<u64>,
                rebuild_after_lifts: Option<u32>,
+               open: bool,
                config: Option<String>) -> Result<(), String> {
     let file = match config {
         Some(path) => parse_config(&path)?,
@@ -141,6 +148,12 @@ async fn serve(root: Option<String>,
         events_hook: file.events_hook,
         resolution_hook: file.resolution_hook,
         authentication_cache_secs: file.authentication_cache_secs,
+        // The flag is the affirmative case: passing `--open` always opts out, regardless of
+        // the config file. There is no flag-side way to *cancel* `open = true` in the file
+        // (matching every other flag/file pair here, where "flags override" only ever means
+        // "a flag can supply a value", never "a flag can unset one") — remove it from the
+        // file to close that hole.
+        open: open || file.open.unwrap_or(false),
     };
 
     server::serve(options).await
@@ -151,6 +164,8 @@ async fn serve(root: Option<String>,
 /// pairs, which flags handle poorly:
 ///
 /// ```toml
+/// open = true    # explicit opt-out of authentication — see ConfigFile::open
+///
 /// [hooks]
 /// authentication_url = "https://provider/hooks/auth"
 /// authentication_secret = "…"
@@ -162,7 +177,7 @@ async fn serve(root: Option<String>,
 /// resolution_secret = "…"
 /// authentication_cache_secs = 60
 /// ```
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct ConfigFile {
     root: Option<String>,
     warehouses: Option<String>,
@@ -171,6 +186,15 @@ struct ConfigFile {
     tokens: Option<String>,
     max_body_mb: Option<u64>,
     rebuild_after_lifts: Option<u32>,
+
+    /// The explicit opt-out of authentication (`server::ServeOptions::open`'s config-file
+    /// counterpart). `Option<bool>`, like every other field here, rather than a bare `bool`
+    /// defaulting to `false`: that would make an absent key and a present-but-wrong-typed
+    /// `open = "yes"` parse identically, which is the exact class of bug this fix exists to
+    /// close. `optional_bool` below keeps them distinguishable; `serve` collapses `None` to
+    /// `false` only after parsing has already rejected a malformed value.
+    open: Option<bool>,
+
     authentication_hook: Option<server::HookEndpoint>,
     admission_hook: Option<server::HookEndpoint>,
     events_hook: Option<server::HookEndpoint>,
@@ -178,7 +202,108 @@ struct ConfigFile {
     authentication_cache_secs: Option<u64>,
 }
 
-/// Parse the serve config file.
+/// Read an optional string field from a parsed TOML item, strictly: an absent key is `None`
+/// (every key in this config file is optional, with a defined default the caller applies), but
+/// a *present* key that is not a string is an error naming the file and the key — never
+/// silently collapsed to `None` the way `.and_then(|item| item.as_str())` did. That collapse is
+/// exactly how a hand-edited, unquoted `token = 12345` used to vanish into "no token
+/// configured": every caller downstream of this reader treats an absent value as license to
+/// serve `Principal::Open`, so a present-but-wrong-typed value must never be reported the same
+/// way an absent one is.
+fn optional_string(item: Option<&toml_edit::Item>, path: &str, key: &str) -> Result<Option<String>, String> {
+    let Some(item) = item else { return Ok(None); };
+
+    item.as_str()
+        .map(|s| Some(s.to_string()))
+        .ok_or_else(|| format!(
+            "The config file \"{}\" has a \"{}\" entry that is present but is not a string.",
+            path, key
+        ))
+}
+
+/// [`optional_string`]'s integer counterpart, same absent-vs-malformed split.
+fn optional_integer(item: Option<&toml_edit::Item>, path: &str, key: &str) -> Result<Option<i64>, String> {
+    let Some(item) = item else { return Ok(None); };
+
+    item.as_integer()
+        .map(Some)
+        .ok_or_else(|| format!(
+            "The config file \"{}\" has a \"{}\" entry that is present but is not an integer.",
+            path, key
+        ))
+}
+
+/// [`optional_string`]'s boolean counterpart, for `open`.
+fn optional_bool(item: Option<&toml_edit::Item>, path: &str, key: &str) -> Result<Option<bool>, String> {
+    let Some(item) = item else { return Ok(None); };
+
+    item.as_bool()
+        .map(Some)
+        .ok_or_else(|| format!(
+            "The config file \"{}\" has a \"{}\" entry that is present but is not a boolean \
+            (true or false).",
+            path, key
+        ))
+}
+
+/// The top-level keys `parse_config` understands (including `hooks`, whose own nested keys are
+/// [`HOOKS_KEYS`]). Not documentation only: [`reject_unknown_keys`] checks every key actually
+/// present in the file against this list, so `tokenn = "…"` (a typo `parse_config`'s strict
+/// per-field readers cannot catch on their own, since the misspelled key is simply never looked
+/// up) is a startup error rather than a silently no-op setting.
+const CONFIG_TOP_LEVEL_KEYS: [&str; 9] = [
+    "root", "warehouses", "addr", "token", "tokens", "max_body_mb", "rebuild_after_lifts",
+    "open", "hooks",
+];
+
+/// The keys `parse_config` understands inside `[hooks]` — four independent `{name}_url` /
+/// `{name}_secret` pairs (`docs/format/HOOK_PROTOCOL.md`) plus the one shared cache setting.
+/// Same role as [`CONFIG_TOP_LEVEL_KEYS`]: a typo'd `autentication_url` is a startup error, not
+/// a silently-never-configured hook (the second fail-open path this fix closes — with no other
+/// auth configured, a hook that silently failed to parse used to leave `check_auth` reading
+/// "nothing is configured" and serving every request as `Principal::Open`).
+const HOOKS_KEYS: [&str; 9] = [
+    "authentication_url", "authentication_secret",
+    "admission_url", "admission_secret",
+    "events_url", "events_secret",
+    "resolution_url", "resolution_secret",
+    "authentication_cache_secs",
+];
+
+/// Refuse a key that is not in `known` — the mechanism behind [`CONFIG_TOP_LEVEL_KEYS`] and
+/// [`HOOKS_KEYS`]: every key actually present in the parsed table must be one this function
+/// recognizes, or this errors naming the file, the offending key and where it was found.
+fn reject_unknown_keys(table: &toml_edit::Table,
+                       known: &[&str],
+                       path: &str,
+                       location: &str) -> Result<(), String> {
+    for (key, _) in table.iter() {
+        if !known.contains(&key) {
+            return Err(format!(
+                "The config file \"{}\" has an unrecognized key \"{}\" in {}. Recognized keys: \
+                {}.",
+                path, key, location, known.join(", ")
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Parse the serve config file, strictly: an absent key keeps its defined default, but a
+/// *present* key of the wrong type — or a key this function does not recognize at all — is
+/// always an error naming the file, the key and what was expected, never silently treated as
+/// absent. Before this, every reader here was `doc.get(key).and_then(|item| item.as_str())`
+/// (or `.as_integer()`), which conflates "key not set" with "key set to garbage": a hand-edited
+/// `token = 12345` (a natural typo — dropping the quotes around a numeric-looking token) parsed
+/// as `None`, and with no `tokens` file and no hook configured, `check_auth` reads that as "no
+/// auth configured at all" and serves `Principal::Open` to every request, silently and without
+/// warning. The same collapse dropped a mistyped hook key (`autentication_url`) to "no hook
+/// configured" instead of erroring — [`reject_unknown_keys`] is what catches that one, since a
+/// misspelled key is never looked up by the per-field readers at all. `hooks` itself gets the
+/// wrong-type treatment too: a present-but-not-a-table value (`hooks = "oops"`) used to
+/// silently read as "no hooks configured" via `.and_then(|item| item.as_table())`; it is now an
+/// error.
 fn parse_config(path: &str) -> Result<ConfigFile, String> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("Error while reading the config file \"{}\": {}", path, e))?;
@@ -186,21 +311,32 @@ fn parse_config(path: &str) -> Result<ConfigFile, String> {
     let doc: toml_edit::DocumentMut = content.parse()
         .map_err(|e| format!("The config file \"{}\" is not valid TOML: {}", path, e))?;
 
-    let string_of = |key: &str| doc.get(key).and_then(|item| item.as_str()).map(|s| s.to_string());
-    let integer_of = |key: &str| doc.get(key).and_then(|item| item.as_integer());
+    reject_unknown_keys(doc.as_table(), &CONFIG_TOP_LEVEL_KEYS, path, "the top-level config")?;
 
-    let hooks = doc.get("hooks").and_then(|item| item.as_table());
+    let hooks = match doc.get("hooks") {
+        None => None,
+        Some(item) => Some(item.as_table().ok_or_else(|| format!(
+            "The config file \"{}\" has a \"hooks\" entry that is present but is not a table.",
+            path
+        ))?),
+    };
+
+    if let Some(hooks) = hooks {
+        reject_unknown_keys(hooks, &HOOKS_KEYS, path, "the [hooks] table")?;
+    }
 
     let hook_of = |name: &str| -> Result<Option<server::HookEndpoint>, String> {
         let Some(hooks) = hooks else {
             return Ok(None);
         };
 
-        let field = |suffix: &str| hooks.get(&format!("{}_{}", name, suffix))
-            .and_then(|item| item.as_str())
-            .map(|s| s.to_string());
+        let url_key = format!("hooks.{}_url", name);
+        let secret_key = format!("hooks.{}_secret", name);
 
-        match (field("url"), field("secret")) {
+        let url = optional_string(hooks.get(&format!("{}_url", name)), path, &url_key)?;
+        let secret = optional_string(hooks.get(&format!("{}_secret", name)), path, &secret_key)?;
+
+        match (url, secret) {
             (None, None) => Ok(None),
             (Some(url), Some(secret)) => Ok(Some(server::HookEndpoint { url, secret })),
             _ => Err(format!(
@@ -211,22 +347,28 @@ fn parse_config(path: &str) -> Result<ConfigFile, String> {
         }
     };
 
+    let authentication_cache_secs = match hooks {
+        None => None,
+        Some(table) => optional_integer(
+            table.get("authentication_cache_secs"), path, "hooks.authentication_cache_secs"
+        )?.map(|v| v as u64),
+    };
+
     Ok(ConfigFile {
-        root: string_of("root"),
-        warehouses: string_of("warehouses"),
-        addr: string_of("addr"),
-        token: string_of("token"),
-        tokens: string_of("tokens"),
-        max_body_mb: integer_of("max_body_mb").map(|v| v as u64),
-        rebuild_after_lifts: integer_of("rebuild_after_lifts").map(|v| v as u32),
+        root: optional_string(doc.get("root"), path, "root")?,
+        warehouses: optional_string(doc.get("warehouses"), path, "warehouses")?,
+        addr: optional_string(doc.get("addr"), path, "addr")?,
+        token: optional_string(doc.get("token"), path, "token")?,
+        tokens: optional_string(doc.get("tokens"), path, "tokens")?,
+        max_body_mb: optional_integer(doc.get("max_body_mb"), path, "max_body_mb")?.map(|v| v as u64),
+        rebuild_after_lifts: optional_integer(doc.get("rebuild_after_lifts"), path, "rebuild_after_lifts")?
+            .map(|v| v as u32),
+        open: optional_bool(doc.get("open"), path, "open")?,
         authentication_hook: hook_of("authentication")?,
         admission_hook: hook_of("admission")?,
         events_hook: hook_of("events")?,
         resolution_hook: hook_of("resolution")?,
-        authentication_cache_secs: hooks
-            .and_then(|table| table.get("authentication_cache_secs"))
-            .and_then(|item| item.as_integer())
-            .map(|v| v as u64),
+        authentication_cache_secs,
     })
 }
 
@@ -303,4 +445,245 @@ fn gc(root: &str, grace_hours: u64) -> Result<(), String> {
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A unique scratch file for one test's config (never shared across tests, so parallel
+    /// tests never collide on disk) — same shape as `server::tests::scratch_dir`, duplicated
+    /// here rather than shared because that helper is private to `server`'s own test module.
+    fn scratch_config(name: &str, contents: &str) -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        let path = std::env::temp_dir().join(format!(
+            "forklift-server-main-test-{}-{}-{}.toml", name, std::process::id(), id
+        ));
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    // ---------------------------------------------------------------------------------
+    // parse_config: absence keeps defaults
+    // ---------------------------------------------------------------------------------
+
+    #[test]
+    fn an_empty_config_parses_to_every_default() {
+        let path = scratch_config("empty", "");
+        let file = parse_config(path.to_str().unwrap()).unwrap();
+
+        assert_eq!(file.root, None);
+        assert_eq!(file.warehouses, None);
+        assert_eq!(file.addr, None);
+        assert_eq!(file.token, None);
+        assert_eq!(file.tokens, None);
+        assert_eq!(file.max_body_mb, None);
+        assert_eq!(file.rebuild_after_lifts, None);
+        assert_eq!(file.open, None);
+        assert!(file.authentication_hook.is_none());
+        assert!(file.admission_hook.is_none());
+        assert!(file.events_hook.is_none());
+        assert!(file.resolution_hook.is_none());
+        assert_eq!(file.authentication_cache_secs, None);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_fully_populated_config_round_trips() {
+        let path = scratch_config("full", r#"
+            root = "/srv/forklift/wh"
+            addr = "127.0.0.1:9418"
+            token = "secret"
+            tokens = "/etc/forklift/tokens.toml"
+            max_body_mb = 4096
+            rebuild_after_lifts = 20
+            open = true
+
+            [hooks]
+            authentication_url = "https://provider.example/hooks/auth"
+            authentication_secret = "s1"
+            admission_url = "https://provider.example/hooks/admission"
+            admission_secret = "s2"
+            events_url = "https://provider.example/hooks/events"
+            events_secret = "s3"
+            resolution_url = "https://provider.example/hooks/resolve"
+            resolution_secret = "s4"
+            authentication_cache_secs = 60
+        "#);
+
+        let file = parse_config(path.to_str().unwrap()).unwrap();
+
+        assert_eq!(file.root.as_deref(), Some("/srv/forklift/wh"));
+        assert_eq!(file.token.as_deref(), Some("secret"));
+        assert_eq!(file.max_body_mb, Some(4096));
+        assert_eq!(file.rebuild_after_lifts, Some(20));
+        assert_eq!(file.open, Some(true));
+        assert_eq!(file.authentication_hook.as_ref().map(|h| h.url.as_str()),
+                   Some("https://provider.example/hooks/auth"));
+        assert_eq!(file.authentication_cache_secs, Some(60));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ---------------------------------------------------------------------------------
+    // parse_config: present-but-wrong-typed values error (Part 1 of the fix)
+    // ---------------------------------------------------------------------------------
+
+    /// The exact reproduction from the fail-open finding: a hand-edited, unquoted
+    /// `token = 12345` must be a startup error naming the file and the key, never silently
+    /// parsed as "no token configured".
+    #[test]
+    fn a_present_but_numeric_token_is_an_error_naming_the_key() {
+        let path = scratch_config("token-numeric", "token = 12345\n");
+        let error = parse_config(path.to_str().unwrap()).unwrap_err();
+
+        assert!(error.contains("\"token\""), "{}", error);
+        assert!(error.contains("not a string"), "{}", error);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_present_but_stringy_max_body_mb_is_an_error() {
+        let path = scratch_config("max-body-mb-stringy", "max_body_mb = \"4096\"\n");
+        let error = parse_config(path.to_str().unwrap()).unwrap_err();
+
+        assert!(error.contains("\"max_body_mb\""), "{}", error);
+        assert!(error.contains("not an integer"), "{}", error);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_present_but_stringy_rebuild_after_lifts_is_an_error() {
+        let path = scratch_config("rebuild-after-lifts-stringy", "rebuild_after_lifts = \"20\"\n");
+        let error = parse_config(path.to_str().unwrap()).unwrap_err();
+
+        assert!(error.contains("\"rebuild_after_lifts\""), "{}", error);
+        assert!(error.contains("not an integer"), "{}", error);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Part 2's own opt-in field gets the same strict treatment as every other scalar: a
+    /// present-but-wrong-typed `open` must error rather than silently collapse to `false` (or,
+    /// worse, to something truthy by accident).
+    #[test]
+    fn a_present_but_stringy_open_is_an_error() {
+        let path = scratch_config("open-stringy", "open = \"yes\"\n");
+        let error = parse_config(path.to_str().unwrap()).unwrap_err();
+
+        assert!(error.contains("\"open\""), "{}", error);
+        assert!(error.contains("not a boolean"), "{}", error);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A present-but-not-a-table `hooks` entry must error rather than silently read as "no
+    /// hooks configured" — the same fail-open shape as `token = 12345`, one level up: with no
+    /// other auth configured, a hooks table that silently vanished used to leave `check_auth`
+    /// reading "nothing is configured" and serving `Principal::Open`.
+    #[test]
+    fn a_present_but_non_table_hooks_is_an_error() {
+        let path = scratch_config("hooks-non-table", "hooks = \"oops\"\n");
+        let error = parse_config(path.to_str().unwrap()).unwrap_err();
+
+        assert!(error.contains("\"hooks\""), "{}", error);
+        assert!(error.contains("not a table"), "{}", error);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_present_but_numeric_hook_url_is_an_error() {
+        let path = scratch_config("hook-url-numeric", "[hooks]\nauthentication_url = 5\n");
+        let error = parse_config(path.to_str().unwrap()).unwrap_err();
+
+        assert!(error.contains("authentication_url"), "{}", error);
+        assert!(error.contains("not a string"), "{}", error);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_present_but_stringy_authentication_cache_secs_is_an_error() {
+        let path = scratch_config(
+            "cache-secs-stringy",
+            "[hooks]\nauthentication_url = \"https://x\"\nauthentication_secret = \"s\"\n\
+            authentication_cache_secs = \"60\"\n"
+        );
+        let error = parse_config(path.to_str().unwrap()).unwrap_err();
+
+        assert!(error.contains("authentication_cache_secs"), "{}", error);
+        assert!(error.contains("not an integer"), "{}", error);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Pre-existing behaviour (not new in this fix): a hook configured with only one of its
+    /// URL/secret pair is refused — hook requests are signed, so a partial pair can never work.
+    #[test]
+    fn a_hook_with_only_a_url_is_an_error() {
+        let path = scratch_config("hook-url-only", "[hooks]\nauthentication_url = \"https://x\"\n");
+        let error = parse_config(path.to_str().unwrap()).unwrap_err();
+
+        assert!(error.contains("authentication"), "{}", error);
+        assert!(error.contains("only one of"), "{}", error);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ---------------------------------------------------------------------------------
+    // parse_config: unrecognized keys error (Part 1(b) of the fix)
+    // ---------------------------------------------------------------------------------
+
+    /// The second reproduction from the fail-open finding: a mistyped top-level key must be a
+    /// startup error, never a silently-never-applied setting.
+    #[test]
+    fn a_misspelled_top_level_key_is_an_error() {
+        let path = scratch_config("misspelled-top-level", "tokenn = \"secret\"\n");
+        let error = parse_config(path.to_str().unwrap()).unwrap_err();
+
+        assert!(error.contains("\"tokenn\""), "{}", error);
+        assert!(error.contains("top-level"), "{}", error);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The mistyped-hook-key reproduction: `autentication_url` (missing an "h") must never be
+    /// treated as "no authentication hook configured".
+    #[test]
+    fn a_misspelled_hooks_key_is_an_error() {
+        let path = scratch_config(
+            "misspelled-hooks",
+            "[hooks]\nautentication_url = \"https://x\"\nautentication_secret = \"s\"\n"
+        );
+        let error = parse_config(path.to_str().unwrap()).unwrap_err();
+
+        assert!(error.contains("\"autentication_url\""), "{}", error);
+        assert!(error.contains("[hooks]"), "{}", error);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ---------------------------------------------------------------------------------
+    // parse_config: pre-existing failure modes untouched by this fix
+    // ---------------------------------------------------------------------------------
+
+    #[test]
+    fn a_missing_config_file_is_an_error() {
+        let path = std::env::temp_dir().join("forklift-server-main-test-does-not-exist.toml");
+        let _ = std::fs::remove_file(&path);
+        assert!(parse_config(path.to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn invalid_toml_is_an_error() {
+        let path = scratch_config("invalid-toml", "not [ valid toml");
+        assert!(parse_config(path.to_str().unwrap()).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
 }

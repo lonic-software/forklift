@@ -141,6 +141,14 @@ struct AppState {
     /// credential outlives its revocation by at most the TTL.
     authentication_cache: Mutex<HashMap<String, (String, std::time::Instant)>>,
     authentication_cache_ttl: std::time::Duration,
+
+    /// The explicit opt-out of authentication — see [`ServeOptions::open`]. `check_auth` reads
+    /// this, and only this, to decide whether an otherwise-empty auth config means `Open`;
+    /// `serve` refuses to start rather than ever construct an `AppState` with this `false` and
+    /// no token/operator tokens/hook configured (see the check right after this struct's
+    /// construction below), so in a server built through `serve` this field being `false`
+    /// guarantees at least one of those three is `Some`/non-empty.
+    open: bool,
 }
 
 /// Who a request is: the transport-level identity. Content-level authorization (roles,
@@ -166,8 +174,10 @@ type PathParams = HashMap<String, String>;
 
 /// One configured hook endpoint. The secret is mandatory: every hook request is
 /// signed (Blake3 keyed MAC over timestamp + body), because a spoofable
-/// authentication hook is game over (§8.13).
-#[derive(Clone)]
+/// authentication hook is game over (§8.13). `Debug` is derived only so `ConfigFile`
+/// (main.rs) can derive it too for test assertions (`unwrap_err`'s trait bound) — this struct
+/// is never logged or printed on any path the running binary actually takes.
+#[derive(Clone, Debug)]
 pub struct HookEndpoint {
     pub url: String,
     pub secret: String,
@@ -213,6 +223,14 @@ pub struct ServeOptions {
 
     /// How long a positive authentication-hook answer is cached (seconds; default 60).
     pub authentication_cache_secs: Option<u64>,
+
+    /// The explicit opt-out of authentication (`--open` / `open = true`). This is the ONLY
+    /// way [`check_auth`] ever returns [`Principal::Open`] — an empty auth config (no token, no
+    /// operator tokens, no authentication hook) with this unset is a startup error, never a
+    /// silent "serve openly". Mirrors `forklift-aws-lambda`'s `AuthConfig::Open`
+    /// (`FORKLIFT_OPEN_ACCESS=1`): the explicit local/LocalStack opt-out, never inferred from
+    /// an absent or malformed setting.
+    pub open: bool,
 }
 
 /// The flat request timeout this head arms on the `reqwest::Client` it calls every hook
@@ -274,6 +292,25 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
         Some(path) => parse_operator_tokens(&path)?,
         None => HashMap::new(),
     };
+
+    // Refuse to start rather than ever construct an `AppState` that would fall through to
+    // `Principal::Open` by accident: `check_auth` only returns `Open` when `options.open` is
+    // set, so an operator who forgot to configure a token/tokens file/hook — or who typo'd its
+    // key name past `parse_config`'s strict readers — gets a startup error naming the remedy,
+    // never a server that quietly serves the world unauthenticated (the fail-open finding this
+    // check exists to close: a hand-edited `token = 12345` used to parse as "no token" and,
+    // with nothing else configured, serve every request openly with no warning at all).
+    let auth_configured =
+        options.token.is_some() || !operator_tokens.is_empty() || options.authentication_hook.is_some();
+
+    if !auth_configured && !options.open {
+        return Err(
+            "No authentication is configured: no --token/token, no --tokens/tokens file, and \
+            no authentication hook. Refusing to start serving requests unauthenticated by \
+            accident — set one of those, or pass --open (or `open = true` in the config file) \
+            to explicitly run this server with no authentication at all.".to_string()
+        );
+    }
 
     let mode = match (options.root, options.warehouses) {
         (Some(root), None) => {
@@ -341,12 +378,12 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
         authentication_cache_ttl: std::time::Duration::from_secs(
             options.authentication_cache_secs.unwrap_or(60)
         ),
+        open: options.open,
     });
 
-    // Captured before `state` moves into the router below — used only for the startup-bind
-    // warning once the address is actually bound.
-    let auth_configured =
-        state.token.is_some() || !state.operator_tokens.is_empty() || state.authentication_hook.is_some();
+    // `auth_configured` was computed above, before the startup refusal, and is still valid here
+    // (a `bool` copy) — used only for the startup-bind warning once the address is actually
+    // bound. Reaching this point at all means `auth_configured || options.open` held.
 
     let protocol = Router::new()
         .route("/warehouse", get(get_warehouse))
@@ -421,8 +458,9 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
 /// single-team self-host case this head is designed for); a non-loopback bind always is, on
 /// either side of the auth question: with a token configured, requests — including the bearer
 /// itself — still travel as plaintext HTTP unless the operator puts a TLS-terminating proxy in
-/// front of this process; with none configured, every request is served as `Principal::Open` to
-/// whoever can reach the address at all.
+/// front of this process; with none configured — which, since `serve`'s startup check above
+/// refuses to bind at all otherwise, can only mean the operator passed `--open`/`open = true` —
+/// every request is served as `Principal::Open` to whoever can reach the address at all.
 fn startup_bind_warning(bound: &std::net::SocketAddr, auth_configured: bool) -> Option<&'static str> {
     if bound.ip().is_loopback() {
         return None;
@@ -436,7 +474,8 @@ fn startup_bind_warning(bound: &std::net::SocketAddr, auth_configured: bool) -> 
     } else {
         Some(
             "serving a non-loopback address with no token, operator tokens, or authentication \
-            hook configured: every request is served as Principal::Open"
+            hook configured, and `open` explicitly set: every request is served as \
+            Principal::Open"
         )
     }
 }
@@ -566,21 +605,31 @@ fn strip_bearer_prefix(value: &str) -> Option<&str> {
 /// `require_uploader` and the ref-update handler). Tokens unknown locally are asked
 /// of the authentication hook, when one is configured (fail closed: a hook failure
 /// refuses the request, it never waves it through).
+///
+/// `Principal::Open` is returned in exactly one case: no token, operator tokens, or
+/// authentication hook is configured, AND `state.open` is explicitly `true`. It is never
+/// inferred from the absence of auth config alone — `serve`'s startup check refuses to run a
+/// server that would reach that state with `open` unset, so in practice this function's
+/// `Open` branch and its `unauthorized` fallback are reachable only via the deliberately open
+/// path or a test harness that builds an `AppState` directly. This is the fix for the fail-open
+/// finding where a present-but-wrong-typed config value (e.g. an unquoted `token = 12345`) used
+/// to parse as "no token", collapse into "nothing is configured", and serve every request as
+/// `Principal::Open` with no warning at all.
 async fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<Principal, HandlerError> {
+    let unauthorized = || (
+        StatusCode::UNAUTHORIZED,
+        "A valid bearer token is required.".to_string()
+    );
+
     if state.token.is_none()
         && state.operator_tokens.is_empty()
         && state.authentication_hook.is_none() {
-        return Ok(Principal::Open);
+        return if state.open { Ok(Principal::Open) } else { Err(unauthorized()) };
     }
 
     let provided = headers.get("authorization")
         .and_then(|value| value.to_str().ok())
         .and_then(strip_bearer_prefix);
-
-    let unauthorized = || (
-        StatusCode::UNAUTHORIZED,
-        "A valid bearer token is required.".to_string()
-    );
 
     match provided {
         Some(token) if state.token.as_deref().is_some_and(|expected| tokens_match(token, expected)) =>
@@ -2083,6 +2132,13 @@ mod tests {
     /// exercising the bound `serve` actually arms in production. Routing both through one function
     /// makes that drift structurally impossible rather than a fact the suite has to happen to
     /// keep testing.
+    ///
+    /// `open: true` here is a test-fixture convenience only, never the production default (see
+    /// `ServeOptions::open`'s doc comment and `serve`'s startup refusal): almost none of the
+    /// handler tests built on this are testing authentication, so they need the pre-existing
+    /// "no auth configured" fixture to keep answering requests with no bearer header. The
+    /// `check_auth` section below overrides this explicitly, in both directions, to test the
+    /// actual auth decision.
     fn base_state(mode: ServeMode) -> AppState {
         AppState {
             mode,
@@ -2100,6 +2156,7 @@ mod tests {
             ),
             authentication_cache: Mutex::new(HashMap::new()),
             authentication_cache_ttl: std::time::Duration::from_secs(60),
+            open: true,
         }
     }
 
@@ -2223,10 +2280,24 @@ mod tests {
     // ---------------------------------------------------------------------------------
 
     #[tokio::test]
-    async fn no_auth_configured_is_fully_open() {
-        let state = single_mode_state(PathBuf::from("/unused"));
+    async fn no_auth_configured_and_explicitly_open_is_fully_open() {
+        let state = AppState { open: true, ..single_mode_state(PathBuf::from("/unused")) };
         let principal = check_auth(&state, &HeaderMap::new()).await.unwrap();
         assert!(principal == Principal::Open);
+    }
+
+    /// The fail-open finding this fix closes: an empty auth config (no token, no operator
+    /// tokens, no authentication hook) must never be silently read as "serve openly" — that is
+    /// exactly the state a present-but-wrong-typed config value (`token = 12345`) or a mistyped
+    /// hook key used to collapse into via `parse_config`'s old lenient `.and_then(as_str)`
+    /// readers. `check_auth` itself must refuse a request in this state unless `open` is
+    /// explicitly `true`; `serve`'s startup check (this module, above) is the belt to this
+    /// braces — it refuses to construct a server in this configuration at all.
+    #[tokio::test]
+    async fn no_auth_configured_and_not_open_is_unauthorized() {
+        let state = AppState { open: false, ..single_mode_state(PathBuf::from("/unused")) };
+        let error = check_auth(&state, &HeaderMap::new()).await.err().unwrap();
+        assert_eq!(error.0, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -3470,6 +3541,69 @@ mod tests {
 
         assert_eq!(quinn_status, StatusCode::OK, "quinn's push to \"main\" must commit on its own");
         assert_eq!(roger_status, StatusCode::OK, "roger's push to \"side\" must commit on its own");
+    }
+
+    // ---------------------------------------------------------------------------------
+    // serve: the startup refusal to ever infer Principal::Open
+    // ---------------------------------------------------------------------------------
+
+    /// A minimal `ServeOptions` with no auth of any kind and `open: false` — every field a
+    /// test overrides with struct-update syntax to exercise one dimension of the startup
+    /// auth gate at a time.
+    fn bare_serve_options() -> ServeOptions {
+        ServeOptions {
+            root: Some("/does/not/exist/and/does/not/matter".to_string()),
+            warehouses: None,
+            addr: "127.0.0.1:0".to_string(),
+            token: None,
+            tokens: None,
+            max_body_mb: None,
+            rebuild_after_lifts: None,
+            authentication_hook: None,
+            admission_hook: None,
+            events_hook: None,
+            resolution_hook: None,
+            authentication_cache_secs: None,
+            open: false,
+        }
+    }
+
+    /// The startup half of the fail-open fix: `serve` must refuse before ever binding a
+    /// listener or constructing an `AppState` when no auth is configured and `open` is not
+    /// set — naming the remedy, not silently starting `Principal::Open`. The auth gate runs
+    /// before root resolution (see `serve`'s ordering), so an invalid root does not mask this:
+    /// if the gate were bypassed, this would fail with "Error while resolving" instead.
+    #[tokio::test]
+    async fn serve_refuses_to_start_with_no_auth_and_no_open() {
+        let error = serve(bare_serve_options()).await.unwrap_err();
+
+        assert!(error.contains("No authentication is configured"), "{}", error);
+        assert!(error.contains("--open"), "{}", error);
+    }
+
+    /// The explicit opt-in must still work: `open: true` with nothing else configured must
+    /// pass the auth gate rather than be refused. Distinguished from a refusal by which error
+    /// comes back — the deliberately-invalid root's resolution error, not the auth one — since
+    /// fully starting the server (binding, serving, shutting down) is out of scope for a fast
+    /// unit test.
+    #[tokio::test]
+    async fn serve_with_open_true_passes_the_auth_gate() {
+        let options = ServeOptions { open: true, ..bare_serve_options() };
+        let error = serve(options).await.unwrap_err();
+
+        assert!(!error.contains("No authentication is configured"), "{}", error);
+        assert!(error.contains("Error while resolving"), "{}", error);
+    }
+
+    /// The same bypass, via a configured static token instead of `open` — confirms the gate
+    /// looks at all three auth sources (token, operator tokens, hook), not just `open`.
+    #[tokio::test]
+    async fn serve_with_a_token_passes_the_auth_gate_even_without_open() {
+        let options = ServeOptions { token: Some("secret".to_string()), ..bare_serve_options() };
+        let error = serve(options).await.unwrap_err();
+
+        assert!(!error.contains("No authentication is configured"), "{}", error);
+        assert!(error.contains("Error while resolving"), "{}", error);
     }
 
     // ---------------------------------------------------------------------------------
