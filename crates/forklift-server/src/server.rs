@@ -2027,9 +2027,12 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
             let office_state = office_state_at(&office_head)?;
             if let Some(user) = office_user_of(identifier, &anchor, &office_state)? {
                 let allowed = if is_meta {
-                    // Anyone but a reader may transport a meta pallet's history; whether
-                    // its *content* is authorized is verified below, per parcel, against
-                    // the signer's role.
+                    // Anyone but a reader may transport a meta pallet's history. Content
+                    // authorization below differs by meta pallet, not a uniform "signer's
+                    // role" check: only @office's parcels are checked, per parcel, against
+                    // the signer's role (`verify_office_privileges`); @manifest/@haul/@tags
+                    // take the same `verify_pallet_history` path as an ordinary working
+                    // pallet and get no role or grant check at all.
                     user.role != office_utils::Role::Reader
                 } else {
                     user.may_write_pallet(&bare)

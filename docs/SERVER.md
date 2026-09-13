@@ -119,6 +119,45 @@ What an operator may do derives from their **role** in the target warehouse's of
 `docs/format/TRACKED_METADATA.md`. Roles are managed with `forklift office admit
 --role …` and `forklift office role …`.
 
+**Per-pallet grants apply only to a request that resolves to an office operator identity** —
+one authenticated via this token file or an `authentication` hook, never to the shared static
+`--token` or an `--open` server. Every row below is a distinct check `post_ref_update`
+(`crates/forklift-server/src/server.rs`) runs against a ref-update request, in the order it
+runs:
+
+| # | Check | Function (file:line) | Runs when | What it verifies | What it does *not* cover |
+|---|-------|----------------------|-----------|-------------------|---------------------------|
+| 1 | Authentication | `check_auth`, `server.rs:868` | every request | resolves the request to a `Principal`: `Operator(id)` (a per-operator token or `authentication` hook), `Static` (the shared `--token`), or `Open` (no auth configured, `--open`) | nothing about what that principal may do |
+| 2 | Admission hook | `check_admission`, `server.rs:1015`, called for a ref update at `server.rs:1981` | every principal, every ref update, only when `[hooks] admission_url` is configured (below) | a deployer-supplied soft-policy decision (quotas, plan limits, suspensions), given the pallet name — regardless of how the caller authenticated | not an office role/grant check; a no-op when unconfigured |
+| 3 | Transport authorization | `server.rs:2029` (the block starting `server.rs:2020`; `user.may_write_pallet` itself is called only at `server.rs:2038`, the non-meta arm) | **only** for `Principal::Operator` that `office_user_of` resolves to `Some` — trust established (the anchor is set) and the office roster non-empty; an authenticated operator pushing to an untrusted warehouse, or during the bootstrap window before the office is lifted, clears this check with no test run at all (`office_user_of`'s two `None` arms, `server.rs:1181` and `server.rs:1191`) | for a **working** pallet: the operator's `role`/`pallets` grant permits moving *this* pallet ref (`may_write_pallet`); for a **meta** pallet — any `@`-qualified name, routed by namespace rather than a fixed list (`server.rs:2000`); today `@office`, `@manifest`, `@haul`, `@tags`, but an unknown `@name` is created the same way — `may_write_pallet` is never consulted — only `role != Reader` is required, so a `writer` granted only some other pallet may still transport any meta pallet's ref | never runs for `Principal::Static` (the shared token) or an unauthenticated `--open` caller — they clear this check by never being subject to it; and for a meta pallet, never checks the `pallets` grant list at all, regardless of principal |
+| 4 | Office chain authenticity | `verify_office_chain_memoized`, `server.rs:2112` (office update) / `server.rs:2157` (any other pallet, to obtain the office state) | only once the warehouse is trusted | every office parcel is signed by a key active in the office at the point it signed, chain reaches genesis | a non-office parcel's own signer's role — nothing below checks it: check 6 explicitly finds no role check in any of its three arms |
+| 5 | Office privilege | `verify_office_privileges`, `server.rs:2119` | only for an office-pallet update, only once trusted | each office-modifying parcel is well-formed and authorized: signed by a key tracked at that point, with a parent, in a readable chain; its key-permanence obligations honored (a key is never removed or altered, and a revocation is never undone or added without a reason — binds admins too); and its *signer* held the office role (or self-service right) it needed as of that parcel's own signing (`verify_office_privileges`, `crates/forklift-core/src/util/audit_utils.rs:1202-1218` — the implementation both heads call) | applies **only** to the office pallet's own chain — never to a working pallet's content or transport |
+| 6 | Pallet history validity | `verify_pallet_history`, `server.rs:2162` | only for a non-office pallet, only once trusted | the same three-arm acceptance `docs/DEPLOYMENT.md`'s guarantee table documents for the AWS head's identical check (valid signature by a tracked, non-revoked key; or unsigned/untracked-key inside the trust boundary; or revoked-key inside that revocation's distrust boundary) | no role check and no per-pallet grant check, in any of the three arms |
+
+The consequence: a caller authenticated with the static token is *not* resolved to
+`Principal::Operator`, so row 3 never runs for it — absent an admission hook (row 2), it gets
+uniform, full access to every pallet this server serves, subject only to rows 4–6. It is not,
+however, equivalent to an unauthenticated `--open` server — it is strictly **more** privileged:
+in multi-warehouse mode only the static token may create a warehouse at all (`put_warehouse`
+refuses any principal but `Principal::Static`, so `--open` cannot create one — see "Serving many
+warehouses" above). If you want per-pallet *transport* enforcement on a **working** pallet,
+every caller that should be limited needs an operator token or hook identity — issuing the
+static token to more than the server administrator defeats it, unless row 2's admission hook is
+configured to compensate. That enforcement does not extend to meta pallets: row 3 never checks
+the `pallets` grant list for `@office`, `@manifest`, `@haul`, or `@tags`, so an operator token
+does not by itself restrict who may move those refs — only row 2's admission hook (refusing by
+pallet name) reaches them.
+
+Row 2 is the one mechanism that already restricts a static-token (or `--open`) caller per
+pallet: configure `[hooks] admission_url` (below) to refuse by pallet name and it applies
+regardless of how the caller authenticated. It is a soft-policy seam, not an office role/grant
+check, but it is real per-pallet transport enforcement available today, not merely a gap. This
+is the same shared-privilege property `docs/DEPLOYMENT.md` documents for the AWS serverless
+head: that head's rows 4–6 (content-level, audit) still run on every push, but it has no
+operator-identity mechanism and so has no equivalent of rows 2 or 3 — nothing shipped in this
+repository adds one for that head either, short of a deployer-supplied API Gateway authorizer
+(`docs/DEPLOYMENT.md`, "Auth at the gateway").
+
 ## Hooks (provider integration)
 
 `docs/format/HOOK_PROTOCOL.md` — the typed seam a hosting provider (or any

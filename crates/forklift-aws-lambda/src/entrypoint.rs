@@ -281,12 +281,34 @@ fn unauthorized() -> HeadError {
 /// The transport-authentication seam. Multi-tenant policy is tracked privately and is out
 /// of scope here.
 ///
-/// The protocol carries auth as `Authorization: Bearer <token>`; in the hosted deployment the
-/// API Gateway authorizer in front of this function is an additional gate, and the office
-/// roles the ref-update handler already consults decide *what* an authenticated caller may
-/// move. This function decides the one thing prior to both: does the request carry the
-/// configured bearer at all. [`AuthConfig::Open`] passes everything (the explicit local/
-/// LocalStack opt-out); [`AuthConfig::Closed`] (no token configured, no opt-out) refuses
+/// The protocol carries auth as `Authorization: Bearer <token>`; in the hosted deployment an
+/// API Gateway authorizer in front of this function is an optional additional gate on top of
+/// this check. Neither this function nor anything downstream of it distinguishes *who* holds
+/// the bearer: this head has no caller-identity concept at all (no `Principal`, no operator
+/// identifier), so every request that carries the configured token gets identical privileges
+/// to every other. What actually constrains a push is content-level, run by [`Head::ref_update`]
+/// after authentication has already passed: closure presence (`verify_parcel_closure_with`),
+/// fast-forward-only refs, and — on a trusted warehouse — `verify_office_chain_memoized` +
+/// `verify_office_privileges` for an office-pallet update, or `verify_office_chain_memoized` +
+/// `verify_pallet_history` for any other pallet (an ordinary working pallet, or a meta pallet
+/// such as `@manifest`). Those two checks differ: `verify_office_privileges` checks each
+/// office-modifying parcel's *signer* against the office role they held as of that parcel's own
+/// signing; `verify_pallet_history` accepts a parcel when it is either (a) validly signed
+/// by a key the office currently tracks and has not revoked, (b) unsigned or signed by an
+/// untracked key but reachable from the trust anchor's boundary (tolerated as pre-trust
+/// "legacy" history), or (c) signed by a *revoked* key but reachable from that revocation's own
+/// distrust boundary — no role, no grant, in any of the three arms
+/// (`audit_utils::classify_signature_trust`, `verify_pallet_history`). Either way, neither
+/// checks anything about the caller of *this* request, so a caller who can produce a
+/// validly-signed history for a pallet
+/// can move it regardless of whether an office role would have allowed *them* to — and, outside
+/// the office pallet, regardless of what it would say about the *signer* either. Per-pallet
+/// enforcement of the kind `forklift-server` offers to `Principal::Operator` callers needs an
+/// operator-identity mechanism this head does not have.
+///
+/// This function itself decides only the one thing prior to all of that: does the request
+/// carry the configured bearer at all. [`AuthConfig::Open`] passes everything (the explicit
+/// local/LocalStack opt-out); [`AuthConfig::Closed`] (no token configured, no opt-out) refuses
 /// everything; [`AuthConfig::Token`] requires an exact, constant-time match.
 fn authenticate<B>(auth: &AuthConfig, request: &Request<B>) -> HeadResult<()> {
     let expected = match auth {

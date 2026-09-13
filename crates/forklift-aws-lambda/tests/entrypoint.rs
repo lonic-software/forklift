@@ -606,6 +606,133 @@ fn a_trusted_lift_runs_the_audit_through_http() {
     assert!(info.trust.is_some());
 }
 
+/// **Pins the documented current posture** (`entrypoint::authenticate`'s doc comment,
+/// `docs/DEPLOYMENT.md`'s "What the bearer token does — and does not — control"): this head has
+/// no per-pallet authorization. Every request in this test carries nothing but the shared
+/// bearer token — no operator identity is ever presented, because this head has no mechanism to
+/// present one (no `Principal`, no per-operator token file, no authentication hook) — and that
+/// single secret is sufficient to move the office pallet itself, the most privileged pallet a
+/// warehouse has, exactly as it is sufficient to move an ordinary one. The content-level audit
+/// (closure presence, fast-forward, the signed office chain) still runs and still passes,
+/// because the pushed history really is validly signed; what this test isolates is that nothing
+/// *in addition* to that content check ever asks who transported the bytes.
+///
+/// The two pushes run against **two independent fixtures**, not one shared warehouse. On a
+/// trusted warehouse, the non-office `ref_update` arm refuses with a 422 ("the office pallet is
+/// missing") whenever the ref store has no office head yet (that check lives inside
+/// `if let Some(anchor) = &anchor`, so an untrusted warehouse never reaches it) — so a single
+/// shared fixture would make the `main` assertion
+/// causally dependent on the `@office` HTTP push above it having already landed — a future gate
+/// that refused the office push with `403` would flip the `main` assertion to `422` for an
+/// unrelated reason (a missing office head), not the `403` that would actually signal a
+/// per-pallet gate. To keep the two assertions independent, `main_fixture`'s office head is
+/// seeded directly through `RefStore::compare_and_set_head`, never through the office HTTP
+/// endpoint, so it exists regardless of what that endpoint would do.
+///
+/// **Invert this when operator identity lands:** the day this head grows a caller-identity
+/// mechanism and a `may_write_pallet`-style transport gate (mirroring `forklift-server`'s
+/// `Principal::Operator` path), a request carrying only the shared bearer — resolving to no
+/// operator identity — should be refused for at least one pallet class, and that assertion's
+/// `200` must become a `403`. Each assertion below flips independently: the office push flipping
+/// says nothing about whether the main push would too, and vice versa, which is the point of
+/// keeping them on separate fixtures.
+#[test]
+fn a_shared_bearer_holder_may_move_any_pallet_including_the_office() {
+    let area = Area::new("shared-bearer-full-access");
+    prepare(&area, "wh");
+    area.forklift("wh", &["office", "enroll"]);
+    area.write_file("wh/app.txt", "v1\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "signed"]);
+
+    let harvest = harvest(&area.path("wh"));
+    let anchor = harvest.trust.clone().expect("trust established");
+    let office_head = harvest.head_of(&format!("@{}", OFFICE_PALLET_NAME)).expect("office head");
+    let main_head = harvest.head_of("main").expect("main head");
+
+    // Every request below carries only `Authorization: Bearer shared-secret` — the same header
+    // any other holder of this one deployment-wide secret would send. Nothing else identifies
+    // the caller.
+    let bearer = |method: &str, uri: &str, body: Vec<u8>| {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(http::header::AUTHORIZATION, "Bearer shared-secret")
+            .body(body)
+            .unwrap()
+    };
+
+    // A fresh fixture per assertion, each seeded with the same objects and signatures (bulk, as
+    // `a_trusted_lift_runs_the_audit_through_http` does above); the interesting path here is the
+    // bearer-only auth, not upload.
+    let seeded_fixture = || {
+        let fixture = Fixture {
+            objects: Arc::new(MemoryObjectStore::new()),
+            refs: Arc::new(MemoryRefStore::new()),
+            routing: Routing::Single("wh".to_string()),
+            auth: AuthConfig::Token(BearerToken::new("shared-secret".to_string()).unwrap()),
+        };
+        for (hash, bytes) in &harvest.objects {
+            fixture.objects.put_verified(hash, bytes).expect("seed object");
+        }
+        for (hash, sidecar) in &harvest.signatures {
+            fixture.objects.put_signature(hash, sidecar).expect("seed signature");
+        }
+        fixture
+    };
+
+    // --- Assertion 1: the office pallet itself moves on the shared bearer alone, through the
+    // real HTTP office-pallet endpoint, from an unborn office ref.
+    let office_fixture = seeded_fixture();
+    assert_eq!(
+        status(&office_fixture.call(bearer("PUT", "/v1/trust", serde_json::to_vec(&anchor).unwrap()))),
+        201,
+        "trust established on the shared bearer alone"
+    );
+
+    let office = RefUpdateRequest { old_head: None, new_head: office_head.clone() };
+    assert_eq!(
+        status(&office_fixture.call(bearer(
+            "POST",
+            &format!("/v1/pallets/@{}", OFFICE_PALLET_NAME),
+            serde_json::to_vec(&office).unwrap()
+        ))),
+        200,
+        "the office pallet moved on the shared bearer alone — no caller-role check ran"
+    );
+
+    // --- Assertion 2: an ordinary pallet moves on the identical bearer too. The office head is
+    // seeded directly into this fixture's ref store, bypassing the HTTP endpoint assertion 1
+    // exercises, so this assertion is independent of assertion 1's outcome.
+    let main_fixture = seeded_fixture();
+    assert_eq!(
+        main_fixture
+            .refs
+            .compare_and_set_head(
+                PalletNamespace::Meta,
+                OFFICE_PALLET_NAME,
+                None,
+                &office_head,
+                OfficePrecondition::NotConsumed,
+                None,
+            )
+            .expect("seed the office ref directly"),
+        CasOutcome::Committed,
+        "seeding the office ref outside the HTTP path must not itself be refused"
+    );
+    assert_eq!(
+        status(&main_fixture.call(bearer("PUT", "/v1/trust", serde_json::to_vec(&anchor).unwrap()))),
+        201
+    );
+
+    let main = RefUpdateRequest { old_head: None, new_head: main_head.clone() };
+    assert_eq!(
+        status(&main_fixture.call(bearer("POST", "/v1/pallets/main", serde_json::to_vec(&main).unwrap()))),
+        200,
+        "an ordinary pallet moved on the identical bearer, independently of the office push above"
+    );
+}
+
 // -------------------------------------------------------------------------------------------
 // The additive/degrading endpoints and the routing surface.
 // -------------------------------------------------------------------------------------------

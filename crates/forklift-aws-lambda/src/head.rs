@@ -9,11 +9,24 @@
 //! with a `307` redirect to a presigned storage URL when the [`ObjectStore`] is S3-backed,
 //! exactly as the protocol's redirect room allows.
 //!
-//! Authentication and the transport-level role/grant checks are the adapter's
-//! concern (the API Gateway authorizer decides *who* the caller is, then the same office
-//! roles the server head consults gate *what* they may move). This type enforces the
-//! provider-independent content invariants: hash-verified objects, a fast-forward-only CAS,
-//! and — on a trusted warehouse — the full offline audit before a ref moves.
+//! Authentication is the adapter's concern (`entrypoint::authenticate` — an optional API
+//! Gateway authorizer on top of it, if configured). There is no transport-level role/grant
+//! check anywhere in this crate to be the adapter's concern *of*: this type has no caller-
+//! identity concept at all, so it cannot consult an office role for who is calling. It is not
+//! a uniform "role for who signed" either: the office pallet's own parcels are checked against
+//! their signer's role, as of that parcel's own signing (`verify_office_privileges`); every
+//! other pallet's parcels are accepted when they are either validly signed by a key the
+//! office currently tracks and has not revoked, or unsigned/untracked-key but reachable from
+//! the trust boundary (tolerated as legacy), or signed by a revoked key but reachable from that
+//! revocation's own distrust boundary — no role, no grant, in any of the three arms
+//! (`verify_pallet_history`). What it enforces is exactly that — the provider-independent
+//! content invariants: hash-verified objects, a
+//! fast-forward-only CAS, and — on a trusted warehouse — the full offline audit (the signed
+//! office chain and, for any non-office pallet, only its pushed history's own signature
+//! validity) before a ref moves. See [`Head::ref_update`]'s own doc comment and
+//! `docs/DEPLOYMENT.md`'s "What the bearer token does — and does not — control" for the
+//! caller-privilege consequence: every caller holding the transport bearer gets identical
+//! privileges over every pallet.
 //!
 //! **Every method here is synchronous and must be called from a blocking thread**
 //! (`tokio::task::spawn_blocking`), exactly as `forklift-server` runs its handlers' storage
@@ -476,8 +489,23 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// `POST /v1/pallets/{name}` — the CAS ref update, the commit point of a lift and the
     /// place the head enforces everything (DESIGN.html §4.2 step 6): closure presence,
     /// fast-forward-ness, and — on a trusted warehouse — the same audit the CLI runs
-    /// offline. The audit runs against a scratch warehouse mirrored from the object store;
-    /// the atomic CAS is the DynamoDB conditional write of [`RefStore::compare_and_set_head`].
+    /// offline. "Everything" is content-level only, exactly what the CLI's own offline audit
+    /// checks, and it differs by pallet: for the office pallet, every office-modifying parcel's
+    /// *signer* is checked against the office role it held as of that parcel's own signing
+    /// (`verify_office_privileges`); for any other pallet, a parcel is accepted when it is
+    /// either validly signed by a key the office currently tracks and has not revoked, or
+    /// unsigned/untracked-key but reachable from the trust boundary (tolerated as legacy), or
+    /// signed by a revoked key but reachable from that revocation's own distrust boundary — no
+    /// role, no grant, in any of the three arms
+    /// (`verify_pallet_history` → `classify_signature_trust`). There is no check on who
+    /// transported this request either way — this type takes no caller parameter at all — so a
+    /// caller who can produce a validly-signed history for a pallet can move it regardless of
+    /// what an office role would say about *that caller*, and — outside the office pallet —
+    /// regardless of what it would say about the *signer* too: an operator enrolled as
+    /// `reader`, or a `writer` granted only some other pallet, can sign and push this pallet's
+    /// history because nothing here consults `may_write_pallet` at all. The
+    /// audit runs against a scratch warehouse mirrored from the object store; the atomic CAS is
+    /// the DynamoDB conditional write of [`RefStore::compare_and_set_head`].
     pub fn ref_update(&self, name: &str, request: &RefUpdateRequest) -> HeadResult<()> {
         let pallet_ref = PalletRef::parse(name).map_err(HeadError::unprocessable)?;
         let namespace = pallet_ref.namespace;
@@ -645,7 +673,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                     )
                     .map_err(HeadError::forbidden)?;
                 } else {
-                    // A user pallet: audit its new history against the office state.
+                    // Any non-office pallet: audit its new history against the office state.
                     let office_head = office_head.as_deref().ok_or_else(|| {
                         HeadError::unprocessable(
                             "Trust is established but the office pallet is missing; lift the \

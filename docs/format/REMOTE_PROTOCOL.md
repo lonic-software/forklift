@@ -45,7 +45,8 @@ The server head accepts a static token (full access) and per-operator tokens
 (`--tokens`, a server-side file mapping token → office identifier — tokens are
 transport secrets and never enter the tracked metadata). What an operator token may
 *do* derives from the operator's role in the target warehouse's office (FORK-10):
-readers read, writers upload and move their granted pallets, admins move anything;
+readers read, writers upload and move their granted working pallets (the grant does
+not scope `@`-qualified pallets — see `docs/SERVER.md`), admins move anything;
 office lifts additionally verify per parcel that the *signer* stayed within their
 privileges (non-admins may only touch their own keys), a content invariant that holds
 no matter which token transported the chain. On a warehouse without trust there are no
