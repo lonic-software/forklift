@@ -25,7 +25,7 @@ docker run -d -p 9418:9418 -v forklift-data:/data forklift-server \
 ```
 
 The image's baked-in default command is `serve --warehouses /data --addr 0.0.0.0:9418` — with
-no token, that command **refuses to start** (see "Authentication" above), so you always
+no token, that command **refuses to start** (see "Authentication" below), so you always
 override it: as above to set a token, with `--open` for a throwaway/local container, or to
 serve a single warehouse (`serve --root /data/wh --token <secret>`). Create warehouses against
 the running container with the admin token:

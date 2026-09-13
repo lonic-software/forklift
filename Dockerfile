@@ -43,7 +43,10 @@ WORKDIR /data
 VOLUME /data
 EXPOSE 9418
 
-# Multi-warehouse mode by default. Override the command for a single-warehouse root
-# (`serve --root /data/wh`), to set a token (`--token …`), or to point at a config file.
+# Multi-warehouse mode by default, with no auth setting (see the note above — this refuses to
+# start on its own). Override the full command to serve a single-warehouse root instead
+# (`serve --root /data/wh --token <secret>`), to change the token/tokens/hook, or to point at a
+# config file — every override still needs its own auth setting or --open, the root/warehouses
+# choice does not carry one.
 ENTRYPOINT ["forklift-server"]
 CMD ["serve", "--warehouses", "/data", "--addr", "0.0.0.0:9418"]

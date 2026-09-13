@@ -233,6 +233,26 @@ fn optional_integer(item: Option<&toml_edit::Item>, path: &str, key: &str) -> Re
         ))
 }
 
+/// [`optional_integer`]'s non-negative counterpart, for every integer field that is cast to an
+/// unsigned type downstream (`authentication_cache_secs`, `max_body_mb`, `rebuild_after_lifts` —
+/// all read via this function below). A negative `i64` surviving to `as u64`/`as u32` does not
+/// error, it wraps: `-1i64 as u64` is `u64::MAX`. For `authentication_cache_secs` specifically
+/// that wrap is an auth-path hole, not just a display glitch — `Duration::from_secs(u64::MAX)`
+/// makes the authentication-hook cache TTL effectively infinite, so a credential the provider has
+/// revoked is never re-checked again for the life of the process. Rejecting the negative value
+/// here, before the cast, closes it the same way `optional_string`/`optional_bool` already close
+/// the analogous "present but wrong shape" gap for their own types.
+fn optional_non_negative_integer(item: Option<&toml_edit::Item>, path: &str, key: &str) -> Result<Option<i64>, String> {
+    match optional_integer(item, path, key)? {
+        Some(v) if v < 0 => Err(format!(
+            "The config file \"{}\" has a \"{}\" entry that is negative ({}); it must be zero or \
+            positive.",
+            path, key, v
+        )),
+        other => Ok(other),
+    }
+}
+
 /// [`optional_string`]'s boolean counterpart, for `open`.
 fn optional_bool(item: Option<&toml_edit::Item>, path: &str, key: &str) -> Result<Option<bool>, String> {
     let Some(item) = item else { return Ok(None); };
@@ -273,7 +293,12 @@ const HOOKS_KEYS: [&str; 9] = [
 /// Refuse a key that is not in `known` — the mechanism behind [`CONFIG_TOP_LEVEL_KEYS`] and
 /// [`HOOKS_KEYS`]: every key actually present in the parsed table must be one this function
 /// recognizes, or this errors naming the file, the offending key and where it was found.
-fn reject_unknown_keys(table: &toml_edit::Table,
+///
+/// Takes `&dyn TableLike` rather than `&toml_edit::Table` so it works on an inline table too
+/// (`hooks = { authentication_url = "…", authentication_secret = "…" }`), not only the
+/// `[hooks]` form — `Table` and `InlineTable` are two distinct types in this crate, and only
+/// `TableLike` is implemented by both.
+fn reject_unknown_keys(table: &dyn toml_edit::TableLike,
                        known: &[&str],
                        path: &str,
                        location: &str) -> Result<(), String> {
@@ -303,7 +328,11 @@ fn reject_unknown_keys(table: &toml_edit::Table,
 /// misspelled key is never looked up by the per-field readers at all. `hooks` itself gets the
 /// wrong-type treatment too: a present-but-not-a-table value (`hooks = "oops"`) used to
 /// silently read as "no hooks configured" via `.and_then(|item| item.as_table())`; it is now an
-/// error.
+/// error. `hooks` accepts either TOML shape a table can take — `[hooks]` (`Item::Table`) or an
+/// inline table (`hooks = { … }`, `Value::InlineTable`) — via `as_table_like()` rather than
+/// `as_table()`, which matches only the former: an inline `hooks` is legal, present, correctly
+/// typed TOML, and `as_table()` used to reject it with the same "is not a table" message a
+/// genuinely wrong-typed value gets.
 fn parse_config(path: &str) -> Result<ConfigFile, String> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("Error while reading the config file \"{}\": {}", path, e))?;
@@ -315,7 +344,7 @@ fn parse_config(path: &str) -> Result<ConfigFile, String> {
 
     let hooks = match doc.get("hooks") {
         None => None,
-        Some(item) => Some(item.as_table().ok_or_else(|| format!(
+        Some(item) => Some(item.as_table_like().ok_or_else(|| format!(
             "The config file \"{}\" has a \"hooks\" entry that is present but is not a table.",
             path
         ))?),
@@ -349,7 +378,7 @@ fn parse_config(path: &str) -> Result<ConfigFile, String> {
 
     let authentication_cache_secs = match hooks {
         None => None,
-        Some(table) => optional_integer(
+        Some(table) => optional_non_negative_integer(
             table.get("authentication_cache_secs"), path, "hooks.authentication_cache_secs"
         )?.map(|v| v as u64),
     };
@@ -360,9 +389,11 @@ fn parse_config(path: &str) -> Result<ConfigFile, String> {
         addr: optional_string(doc.get("addr"), path, "addr")?,
         token: optional_string(doc.get("token"), path, "token")?,
         tokens: optional_string(doc.get("tokens"), path, "tokens")?,
-        max_body_mb: optional_integer(doc.get("max_body_mb"), path, "max_body_mb")?.map(|v| v as u64),
-        rebuild_after_lifts: optional_integer(doc.get("rebuild_after_lifts"), path, "rebuild_after_lifts")?
-            .map(|v| v as u32),
+        max_body_mb: optional_non_negative_integer(doc.get("max_body_mb"), path, "max_body_mb")?
+            .map(|v| v as u64),
+        rebuild_after_lifts: optional_non_negative_integer(
+            doc.get("rebuild_after_lifts"), path, "rebuild_after_lifts"
+        )?.map(|v| v as u32),
         open: optional_bool(doc.get("open"), path, "open")?,
         authentication_hook: hook_of("authentication")?,
         admission_hook: hook_of("admission")?,
@@ -528,6 +559,50 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// The inline-table form of `hooks` (`hooks = { … }`, `Value::InlineTable`) is legal TOML
+    /// and must configure the hook identically to the `[hooks]` table form — `as_table()` used
+    /// to accept only the latter (`Item::Table`) and reject this with "is not a table", the same
+    /// message a genuinely wrong-typed `hooks` value gets. Round-trips the same fields as
+    /// `a_fully_populated_config_round_trips`, as an inline table, to confirm parity.
+    #[test]
+    fn an_inline_table_hooks_is_accepted_and_configures_the_hook() {
+        let path = scratch_config("hooks-inline", r#"
+            hooks = { authentication_url = "https://provider.example/hooks/auth", authentication_secret = "s1", authentication_cache_secs = 60 }
+        "#);
+
+        let file = parse_config(path.to_str().unwrap()).unwrap();
+
+        assert_eq!(
+            file.authentication_hook.as_ref().map(|h| h.url.as_str()),
+            Some("https://provider.example/hooks/auth")
+        );
+        assert_eq!(
+            file.authentication_hook.as_ref().map(|h| h.secret.as_str()),
+            Some("s1")
+        );
+        assert_eq!(file.authentication_cache_secs, Some(60));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The inline-table form must still reject an unrecognized key inside it, the same as the
+    /// `[hooks]` form does (`reject_unknown_keys` runs against `TableLike`, not `Table`
+    /// specifically) — otherwise an inline `hooks` would silently accept a typo the table form
+    /// catches.
+    #[test]
+    fn an_inline_table_hooks_still_rejects_an_unrecognized_key() {
+        let path = scratch_config(
+            "hooks-inline-misspelled",
+            "hooks = { autentication_url = \"https://x\", autentication_secret = \"s\" }\n"
+        );
+        let error = parse_config(path.to_str().unwrap()).unwrap_err();
+
+        assert!(error.contains("\"autentication_url\""), "{}", error);
+        assert!(error.contains("[hooks]"), "{}", error);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     // ---------------------------------------------------------------------------------
     // parse_config: present-but-wrong-typed values error (Part 1 of the fix)
     // ---------------------------------------------------------------------------------
@@ -619,6 +694,59 @@ mod tests {
 
         assert!(error.contains("authentication_cache_secs"), "{}", error);
         assert!(error.contains("not an integer"), "{}", error);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The auth-path instance of the negative-integer-wraps-to-huge-unsigned hole:
+    /// `optional_integer` returns `i64`, and `.map(|v| v as u64)` turns a negative value into a
+    /// value near `u64::MAX` instead of erroring. For `authentication_cache_secs` specifically
+    /// this is a revocation-cache hole, not just a display glitch:
+    /// `Duration::from_secs(u64::MAX)` (`server::serve`) makes the authentication-hook cache TTL
+    /// effectively infinite, so a credential the provider has revoked is never re-checked again
+    /// for the life of the process.
+    #[test]
+    fn a_negative_authentication_cache_secs_is_an_error() {
+        let path = scratch_config(
+            "cache-secs-negative",
+            "[hooks]\nauthentication_url = \"https://x\"\nauthentication_secret = \"s\"\n\
+            authentication_cache_secs = -1\n"
+        );
+        let error = parse_config(path.to_str().unwrap()).unwrap_err();
+
+        assert!(error.contains("authentication_cache_secs"), "{}", error);
+        assert!(error.contains("negative"), "{}", error);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The same negative-wraps-to-huge-unsigned hole, applied to `max_body_mb` (`as u64`) while
+    /// `optional_non_negative_integer` already exists to close it for `authentication_cache_secs`
+    /// — a one-liner once the helper is there. `-1i64 as u64` would otherwise raise the body-size
+    /// cap to `u64::MAX` MiB, silently defeating the disk-fill protection (§9.4b R9/D7) the cap
+    /// exists for.
+    #[test]
+    fn a_negative_max_body_mb_is_an_error() {
+        let path = scratch_config("max-body-mb-negative", "max_body_mb = -1\n");
+        let error = parse_config(path.to_str().unwrap()).unwrap_err();
+
+        assert!(error.contains("\"max_body_mb\""), "{}", error);
+        assert!(error.contains("negative"), "{}", error);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Same again for `rebuild_after_lifts` (`as u32`): closes the negative-wraps-to-huge-unsigned
+    /// case. Not addressed here: a positive value above `u32::MAX` still silently truncates on
+    /// the `as u32` cast — that upper-bound case needs a field-specific ceiling, not the same
+    /// zero-or-positive check, so it is left for a future round.
+    #[test]
+    fn a_negative_rebuild_after_lifts_is_an_error() {
+        let path = scratch_config("rebuild-after-lifts-negative", "rebuild_after_lifts = -20\n");
+        let error = parse_config(path.to_str().unwrap()).unwrap_err();
+
+        assert!(error.contains("\"rebuild_after_lifts\""), "{}", error);
+        assert!(error.contains("negative"), "{}", error);
 
         let _ = std::fs::remove_file(&path);
     }

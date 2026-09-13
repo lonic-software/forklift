@@ -174,13 +174,27 @@ type PathParams = HashMap<String, String>;
 
 /// One configured hook endpoint. The secret is mandatory: every hook request is
 /// signed (Blake3 keyed MAC over timestamp + body), because a spoofable
-/// authentication hook is game over (§8.13). `Debug` is derived only so `ConfigFile`
-/// (main.rs) can derive it too for test assertions (`unwrap_err`'s trait bound) — this struct
-/// is never logged or printed on any path the running binary actually takes.
-#[derive(Clone, Debug)]
+/// authentication hook is game over (§8.13).
+///
+/// `Debug` is hand-written, not derived, so that redaction is structural rather than a claim
+/// about which paths happen to print this type today: `main.rs`'s `ConfigFile` derives `Debug`
+/// solely for a test's `unwrap_err()` trait bound, and a derived `Debug` here would print
+/// `secret` in full the moment anything — that test, a future `tracing::debug!(?options)`, a
+/// panic message — formats a value that contains one. See
+/// `tests::hook_endpoint_debug_never_prints_the_secret`.
+#[derive(Clone)]
 pub struct HookEndpoint {
     pub url: String,
     pub secret: String,
+}
+
+impl std::fmt::Debug for HookEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HookEndpoint")
+            .field("url", &self.url)
+            .field("secret", &"<redacted>")
+            .finish()
+    }
 }
 
 /// What to serve and how (the merged flags/config of the `serve` subcommand).
@@ -288,10 +302,28 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
         .with_writer(std::io::stderr)
         .try_init();
 
+    // Kept past the `match` below (which consumes `options.tokens`) so the startup refusal can
+    // name the empty-`[operators]`-table case distinctly from "no --tokens/tokens file at all":
+    // an operator who passed `--tokens ops.toml` and got an empty map back (the file parsed, its
+    // `[operators]` table just has no entries) should not be told to look for a flag they already
+    // passed.
+    let tokens_supplied = options.tokens.is_some();
+
     let operator_tokens = match options.tokens {
         Some(path) => parse_operator_tokens(&path)?,
         None => HashMap::new(),
     };
+
+    // An empty string is not a credential: `--token ""` (or `token = ""` in the config file,
+    // which the strict reader in main.rs accepts — it is a validly-typed string) must not become
+    // a token any request can present. Without this, `strip_bearer_prefix("Bearer ")` yields
+    // `Some("")`, `tokens_match("", "")` is `true`, and a request carrying the literal header
+    // `Authorization: Bearer ` (no credential after the scheme) authenticates as
+    // `Principal::Static` with full privileges. Filtering here — before `auth_configured` is
+    // computed — means an empty token is treated exactly like an absent one and participates in
+    // the startup refusal below instead of silently opening the server. Mirrors
+    // `forklift-aws-lambda::entrypoint::auth_from`'s `token.filter(|value| !value.is_empty())`.
+    let token = options.token.filter(|value| !value.is_empty());
 
     // Refuse to start rather than ever construct an `AppState` that would fall through to
     // `Principal::Open` by accident: `check_auth` only returns `Open` when `options.open` is
@@ -301,15 +333,22 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
     // check exists to close: a hand-edited `token = 12345` used to parse as "no token" and,
     // with nothing else configured, serve every request openly with no warning at all).
     let auth_configured =
-        options.token.is_some() || !operator_tokens.is_empty() || options.authentication_hook.is_some();
+        token.is_some() || !operator_tokens.is_empty() || options.authentication_hook.is_some();
 
     if !auth_configured && !options.open {
-        return Err(
-            "No authentication is configured: no --token/token, no --tokens/tokens file, and \
-            no authentication hook. Refusing to start serving requests unauthenticated by \
-            accident — set one of those, or pass --open (or `open = true` in the config file) \
-            to explicitly run this server with no authentication at all.".to_string()
-        );
+        let tokens_clause = if tokens_supplied {
+            "a --tokens/tokens file whose [operators] table defines no entries"
+        } else {
+            "no --tokens/tokens file"
+        };
+
+        return Err(format!(
+            "No authentication is configured: no --token/token, {}, and no authentication \
+            hook. Refusing to start serving requests unauthenticated by accident — set one \
+            of those, or pass --open (or `open = true` in the config file) to explicitly run \
+            this server with no authentication at all.",
+            tokens_clause
+        ));
     }
 
     let mode = match (options.root, options.warehouses) {
@@ -365,7 +404,7 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
 
     let state = Arc::new(AppState {
         mode,
-        token: options.token,
+        token,
         operator_tokens,
         rebuild_after_lifts: options.rebuild_after_lifts,
         warehouses: Mutex::new(HashMap::new()),
@@ -528,6 +567,18 @@ fn parse_operator_tokens(path: &str) -> Result<HashMap<String, String>, String> 
             "The token file \"{}\" maps a token to a non-string value.", path
         ))?;
 
+        // An empty string is not a credential (the same hole as `--token ""`, see `serve`): a
+        // request carrying the literal header `Authorization: Bearer ` (no credential after the
+        // scheme) would otherwise match this entry via `state.operator_tokens.get("")` and
+        // authenticate as `identifier` with no credential presented at all.
+        if token.is_empty() {
+            return Err(format!(
+                "The token file \"{}\" maps an empty token to \"{}\": an empty string is not a \
+                credential — remove that entry.",
+                path, identifier
+            ));
+        }
+
         tokens.insert(token.to_string(), identifier.to_string());
     }
 
@@ -627,9 +678,19 @@ async fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<Principal, 
         return if state.open { Ok(Principal::Open) } else { Err(unauthorized()) };
     }
 
+    // An empty credential is not a credential: `Authorization: Bearer ` (no bytes after the
+    // scheme, so `strip_bearer_prefix` yields `Some("")`) must never match anything — not the
+    // static token, not an operator-tokens entry, not the hook. `serve`'s options filter
+    // (`options.token.filter(|v| !v.is_empty())`) and `parse_operator_tokens`'s empty-key
+    // rejection already keep an empty string out of `state.token`/`state.operator_tokens` in the
+    // first place; this is the belt-and-braces guard at the one checkpoint every
+    // principal-granting comparison goes through, so a future change that reintroduces an empty
+    // credential upstream (a new construction path for `AppState`, a relaxed parser) still cannot
+    // authenticate an empty-credential request.
     let provided = headers.get("authorization")
         .and_then(|value| value.to_str().ok())
-        .and_then(strip_bearer_prefix);
+        .and_then(strip_bearer_prefix)
+        .filter(|token| !token.is_empty());
 
     match provided {
         Some(token) if state.token.as_deref().is_some_and(|expected| tokens_match(token, expected)) =>
@@ -2094,6 +2155,20 @@ mod tests {
         }
     }
 
+    /// `HookEndpoint`'s `Debug` is hand-written specifically so this holds structurally rather
+    /// than by nobody happening to print one with the secret in scope: the derived `Debug` this
+    /// replaces would print `secret` in full. Checks both fields' formatted output, so a future
+    /// edit cannot "fix" the struct literal without noticing the field name is still there too.
+    #[test]
+    fn hook_endpoint_debug_never_prints_the_secret() {
+        let hook = HookEndpoint { url: "https://provider.example/hook".to_string(), secret: "s3cr3t-value".to_string() };
+        let formatted = format!("{:?}", hook);
+
+        assert!(!formatted.contains("s3cr3t-value"), "{}", formatted);
+        assert!(formatted.contains("https://provider.example/hook"), "{}", formatted);
+        assert!(formatted.contains("redacted"), "{}", formatted);
+    }
+
     /// A classified refusal a core operation raised reaches this head as a sentinel-framed message;
     /// `error_body` threads its stable code and next step onto the wire (additive) with the de-framed
     /// human text in `error` — the raw frame never leaks (fixing the latent leak where a framed
@@ -2316,6 +2391,22 @@ mod tests {
     async fn an_equal_length_near_miss_token_is_unauthorized() {
         let state = AppState { token: Some("secret".to_string()), ..single_mode_state(PathBuf::from("/unused")) };
         let error = check_auth(&state, &headers_with_bearer("secrft")).await.err().unwrap();
+        assert_eq!(error.0, StatusCode::UNAUTHORIZED);
+    }
+
+    /// Belt-and-braces for the empty-credential fail-open finding: even if `state.token` were
+    /// somehow `Some("")` — `serve`'s options filter is meant to make this unreachable in
+    /// practice, but this pins the deeper guard directly, in case a future construction path for
+    /// `AppState` reintroduces it — a request presenting the literal header
+    /// `Authorization: Bearer ` (empty credential, no bytes after the scheme) must still be
+    /// refused, not authenticate as `Principal::Static` via `tokens_match("", "")`.
+    #[tokio::test]
+    async fn an_empty_bearer_credential_never_authenticates_even_against_an_empty_static_token() {
+        let state = AppState {
+            token: Some(String::new()),
+            ..single_mode_state(PathBuf::from("/unused"))
+        };
+        let error = check_auth(&state, &headers_with_bearer("")).await.err().unwrap();
         assert_eq!(error.0, StatusCode::UNAUTHORIZED);
     }
 
@@ -2732,6 +2823,23 @@ mod tests {
         std::fs::write(&path, "[operators]\n\"tok-a\" = 42\n").unwrap();
 
         assert!(parse_operator_tokens(path.to_str().unwrap()).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The operator-tokens counterpart of the empty-`--token` fail-open finding: an empty
+    /// string key is not a credential. Left unrejected, `state.operator_tokens.get("")` would
+    /// match a request carrying the literal header `Authorization: Bearer ` (empty credential),
+    /// authenticating it as whatever identifier the empty key maps to.
+    #[test]
+    fn rejects_a_token_file_with_an_empty_token_key() {
+        let dir = scratch_dir("tokens-empty-key");
+        let path = dir.join("tokens.toml");
+        std::fs::write(&path, "[operators]\n\"\" = \"alice\"\n\"tok-b\" = \"bob\"\n").unwrap();
+
+        let error = parse_operator_tokens(path.to_str().unwrap()).unwrap_err();
+        assert!(error.contains("empty"), "{}", error);
+        assert!(error.contains("alice"), "{}", error);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3604,6 +3712,40 @@ mod tests {
 
         assert!(!error.contains("No authentication is configured"), "{}", error);
         assert!(error.contains("Error while resolving"), "{}", error);
+    }
+
+    /// The fail-open finding: `--token ""` (or `token = ""` in the config file) must not count
+    /// as a configured token. Before the fix, `options.token.is_some()` was `true` for
+    /// `Some("")`, so this bypassed the gate entirely and the server would have started fully
+    /// open to any request carrying `Authorization: Bearer ` (empty credential).
+    #[tokio::test]
+    async fn serve_with_an_empty_token_does_not_pass_the_auth_gate() {
+        let options = ServeOptions { token: Some(String::new()), ..bare_serve_options() };
+        let error = serve(options).await.unwrap_err();
+
+        assert!(error.contains("No authentication is configured"), "{}", error);
+    }
+
+    /// The empty-`[operators]`-table case must be named distinctly from "no --tokens/tokens
+    /// file" (F4): the operator did pass `--tokens`, the file just defines no entries. Telling
+    /// them to pass a flag they already passed sends them looking in the wrong place.
+    #[tokio::test]
+    async fn serve_with_an_empty_tokens_file_names_that_case_distinctly() {
+        let dir = scratch_dir("serve-empty-tokens-file");
+        let path = dir.join("tokens.toml");
+        std::fs::write(&path, "[operators]\n").unwrap();
+
+        let options = ServeOptions {
+            tokens: Some(path.to_str().unwrap().to_string()),
+            ..bare_serve_options()
+        };
+        let error = serve(options).await.unwrap_err();
+
+        assert!(error.contains("No authentication is configured"), "{}", error);
+        assert!(error.contains("defines no entries"), "{}", error);
+        assert!(!error.contains("no --tokens/tokens file"), "{}", error);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---------------------------------------------------------------------------------
