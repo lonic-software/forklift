@@ -682,8 +682,8 @@ this head has no built-in mechanism for it. Use `forklift-server` instead, with 
 tokens file (`docs/SERVER.md`, "Per-operator tokens") or an `authentication` hook
 (`docs/format/HOOK_PROTOCOL.md`), either of which resolves a bearer to an office operator
 identity that the per-pallet gate can then check — but only when B is a **working** pallet: a
-per-operator token does not give you "may write A but not meta-pallet B" (`@office`,
-`@manifest`, `@haul`, `@tags`). `docs/SERVER.md`'s "Per-operator tokens" section (row 3 and the
+per-operator token does not give you "may write A but not meta-pallet B" (any `@`-qualified
+name; today `@office`, `@manifest`, `@haul`, `@tags`). `docs/SERVER.md`'s "Per-operator tokens" section (row 3 and the
 paragraph below the table) is the authoritative statement of that meta-pallet exemption — in
 short, it holds **at transport** only (any non-`reader` may move a meta pallet's ref regardless
 of grants), and on top of that only `@office` gets any content-level role check at all

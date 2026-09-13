@@ -136,14 +136,14 @@ Every operator has a role (recorded in their signed office record):
 | Role | May do |
 |------|--------|
 | `admin` | Manage the office (admit, roles, others' keys) and move any pallet. |
-| `writer` | Move working pallets (all, or a granted list); also **transport** any meta pallet (`@office`, `@manifest`, `@haul`, `@tags`) regardless of grants — content rules differ per pallet, see below. Manage their own keys. |
+| `writer` | Move working pallets (all, or a granted list); also **transport** any `@`-qualified pallet (today `@office`, `@manifest`, `@haul`, `@tags`) regardless of grants — content rules differ per pallet, see below. Manage their own keys. |
 | `reader` | Move nothing; key self-service (rotation) still applies. |
 
 **This table is a transport rule a server enforces for a caller it resolves to that
 operator's own identity** — a per-operator token, or an `authentication` hook — not a
 property of the signature itself. The `--pallet` grant is scoped to working pallets
 only: a `writer`'s granted-pallet list restricts which *working* pallets they may move, but
-every meta pallet (`@office`, `@manifest`, `@haul`, `@tags`) is exempt from it **at transport**
+every `@`-qualified pallet is exempt from it **at transport** (the server routes by namespace, not by a fixed list, so an unknown `@name` is exempt too; today the set is `@office`, `@manifest`, `@haul`, `@tags`)
 — any non-`reader` may move a meta pallet's ref regardless of what working pallets they are
 granted. `docs/SERVER.md`'s "Per-operator tokens" section (row 3 and the paragraph below the
 table) is the authoritative statement of that transport rule and of what the content-level

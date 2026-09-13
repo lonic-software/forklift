@@ -74,7 +74,11 @@ supervisor = "alice@lonic" # automated identities only: the responsible human (a
 Roles (FORK-10) are tracked, signed metadata like everything else in the office:
 **admin** manages the office (admissions, roles, others' keys) and may move any pallet;
 **writer** moves working pallets (all, or the `pallets` grants) and manages their own
-keys; **reader** moves nothing (key self-service still applies). A record without a
+keys; **reader** moves nothing (key self-service still applies). **The `pallets` grant
+scopes working pallets only:** any operator who is not a `reader` may transport a ref
+update to any `@`-qualified pallet whatever their grant list says, because the server
+routes that decision by namespace and never consults the grant there. What lands in
+`@office` is still constrained, per parcel, against the *signer*'s role. A record without a
 `role` predates privileges and reads as admin — exactly the pre-privilege behavior.
 
 **"May move any pallet" (and the `writer`/`reader` transport rules above it) is a transport
