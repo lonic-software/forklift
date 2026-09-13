@@ -9,11 +9,17 @@
 //! with a `307` redirect to a presigned storage URL when the [`ObjectStore`] is S3-backed,
 //! exactly as the protocol's redirect room allows.
 //!
-//! Authentication and the transport-level role/grant checks are the adapter's
-//! concern (the API Gateway authorizer decides *who* the caller is, then the same office
-//! roles the server head consults gate *what* they may move). This type enforces the
+//! Authentication is the adapter's concern (`entrypoint::authenticate` — an optional API
+//! Gateway authorizer on top of it, if configured). There is no transport-level role/grant
+//! check anywhere in this crate to be the adapter's concern *of*: this type has no caller-
+//! identity concept at all, so it cannot consult an office role for who is calling, only for
+//! who *signed* the content being pushed. What it enforces is exactly that — the
 //! provider-independent content invariants: hash-verified objects, a fast-forward-only CAS,
-//! and — on a trusted warehouse — the full offline audit before a ref moves.
+//! and — on a trusted warehouse — the full offline audit (the signed office chain and, for a
+//! user pallet, the pushed history's own signatures) before a ref moves. See
+//! [`Head::ref_update`]'s own doc comment and `docs/DEPLOYMENT.md`'s "What the bearer token
+//! does — and does not — control" for the caller-privilege consequence: every caller holding
+//! the transport bearer gets identical privileges over every pallet.
 //!
 //! **Every method here is synchronous and must be called from a blocking thread**
 //! (`tokio::task::spawn_blocking`), exactly as `forklift-server` runs its handlers' storage
@@ -476,8 +482,13 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// `POST /v1/pallets/{name}` — the CAS ref update, the commit point of a lift and the
     /// place the head enforces everything (DESIGN.html §4.2 step 6): closure presence,
     /// fast-forward-ness, and — on a trusted warehouse — the same audit the CLI runs
-    /// offline. The audit runs against a scratch warehouse mirrored from the object store;
-    /// the atomic CAS is the DynamoDB conditional write of [`RefStore::compare_and_set_head`].
+    /// offline. "Everything" is content-level only, exactly what the CLI's own offline audit
+    /// checks: every parcel's signature against the office's tracked roles at the time it was
+    /// signed. There is no check on who transported this request — this type takes no caller
+    /// parameter at all — so a caller who can produce a validly-signed history for a pallet
+    /// can move it regardless of what an office role would say about *that caller*. The audit
+    /// runs against a scratch warehouse mirrored from the object store; the atomic CAS is the
+    /// DynamoDB conditional write of [`RefStore::compare_and_set_head`].
     pub fn ref_update(&self, name: &str, request: &RefUpdateRequest) -> HeadResult<()> {
         let pallet_ref = PalletRef::parse(name).map_err(HeadError::unprocessable)?;
         let namespace = pallet_ref.namespace;
