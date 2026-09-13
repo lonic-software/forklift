@@ -233,7 +233,7 @@ pub struct ServeOptions {
     /// `token` key) was present but blank (empty or whitespace-only) — i.e. whether `token`
     /// above is `None` *because* a blank credential was supplied, as opposed to nothing being
     /// supplied at all. Computed by `main.rs::merge_static_token`, alongside the normalization
-    /// above; used only by `serve`'s startup refusal, to name that case as "an empty
+    /// above; used only by `serve`'s startup refusal, to name that case as "a blank
     /// --token/token" rather than the misdiagnosing "no --token/token" (PR #124 round 2, F2).
     /// Never consulted for authentication itself.
     pub blank_token_supplied: bool,
@@ -325,8 +325,26 @@ fn build_hook_client() -> Result<reqwest::Client, String> {
 /// overflow checks are on by default in the dev profile) and silently wraps to a *smaller* limit
 /// on a release build (`(1u64 << 44) as usize * 1024 * 1024` wraps to exactly `0` on a 64-bit
 /// target, rejecting every request body).
+///
+/// Zero is refused outright, for the identical reason (PR #124 round 4, F6): `max_body_mb`'s own
+/// sign check (`optional_non_negative_integer`) only ever rejected negative values, so `0` — a
+/// value this comment used to argue was safe because it "needs no equivalent ceiling", true only
+/// of the overflow half of the class — sailed through and reached `DefaultBodyLimit::max(0)`. The
+/// server then starts normally and 413s every request carrying a body, a 1-byte lift included:
+/// non-negative but nonsensical, the same class this PR already closed for
+/// `authentication_cache_secs` (a value can be in-range and still make the field meaningless).
+/// There is no legitimate deployment that wants every write refused this way — that is what
+/// leaving `authentication`/`admission`/`tokens` unconfigured (or simply not running the write
+/// paths) is for — so this is a refusal, not a default substitution: `Some(0)` almost certainly
+/// means a config typo (`400` meant to be MiB, mistyped as `0`; a template value never filled
+/// in), and silently swapping in a default would hide exactly that.
 fn body_limit_bytes(max_body_mb: Option<u64>) -> Result<usize, String> {
     match max_body_mb {
+        Some(0) => Err(
+            "\"max_body_mb\" is 0, which would reject every request carrying a body (even a \
+            1-byte lift); pick a real limit, or leave it unset to use the default."
+                .to_string()
+        ),
         Some(mb) => mb
             .checked_mul(1024 * 1024)
             .and_then(|bytes| usize::try_from(bytes).ok())
@@ -397,12 +415,17 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
         // F2 of PR #124 round 2: an operator who passed `--token ""` (or `token = ""`) must be
         // told that specifically — "no --token/token" sends them looking for a flag they
         // already passed, the same misdiagnosis this fixed for the empty-`[operators]`-table
-        // case below. Reachable here only when the merge in `main.rs::merge_static_token`
+        // case below. "Blank" covers both an empty string and a whitespace-only one (PR #124
+        // round 4, F1): round 3 widened `blank_token_supplied` to catch `--token "   "` but left
+        // this clause hardcoded to "an empty ... (an empty string is not a credential)", so a
+        // whitespace-only token was told it was literally empty — a wrong diagnosis pinned by a
+        // passing test until this round. Reachable here only when the merge in
+        // `main.rs::merge_static_token`
         // discarded a blank value from *and never found a real token in* either source: a real
         // token from the other source would have made `auth_configured` true above, and this
         // whole branch would never run.
         let token_clause = if options.blank_token_supplied {
-            "an empty --token/token (an empty string is not a credential)"
+            "a blank --token/token (an empty or whitespace-only string is not a credential)"
         } else {
             "no --token/token"
         };
@@ -454,6 +477,18 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
 
     let is_multi = matches!(mode, ServeMode::Multi { .. });
 
+    // Blank (empty or whitespace-only) is treated as absent for both fields, applying the same
+    // rule this PR unified everywhere else a string is checked for "is this configured at all"
+    // (PR #124 round 4, F4). This is a config-completeness gate, not a credential comparison —
+    // the secret is outbound MAC key material (`hook_utils::hook_request_headers`), never
+    // compared against attacker-supplied input, so a whitespace-only one is merely weak, not
+    // silently-absent the way a bearer credential is; a whitespace-only *url*, though, was worse
+    // than weak: it made `auth_configured` (above) true, so the server believed authentication
+    // was configured and started, only to 503 every request at `authenticate_via_hook` because
+    // `reqwest` cannot build a client request against a blank/whitespace URL. Failing closed, so
+    // not a hole — but a startup refusal here, naming the hook, beats a server that starts and
+    // then always fails every request with no diagnostic at start time. Covers all four hook
+    // endpoints (authentication, admission, events, resolution) via this one shared loop.
     for (name, hook) in [
         ("authentication", &options.authentication_hook),
         ("admission", &options.admission_hook),
@@ -461,7 +496,7 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
         ("resolution", &options.resolution_hook),
     ] {
         if let Some(hook) = hook {
-            if hook.url.is_empty() || hook.secret.is_empty() {
+            if hook.url.trim().is_empty() || hook.secret.trim().is_empty() {
                 return Err(format!(
                     "The {} hook needs both a URL and a secret: hook requests are \
                     signed, and an unsigned hook would be spoofable.",
@@ -3102,6 +3137,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// PR #124 round 4, F5: the symmetric control for the *key* side of the same claim — the
+    /// comment above (`"a real, non-blank token key is still matched byte-for-byte, verbatim …
+    /// nothing here trims it"`) has never had a test pinning it, only the two rejection tests
+    /// above (which exercise *entirely*-blank keys). Without this, a future
+    /// `token.trim().to_string()` edit at the `tokens.insert(...)` call below would silently make
+    /// every whitespace-padded operator token permanently unauthenticatable — `check_auth` looks
+    /// up the presented, untrimmed header value via `state.operator_tokens.get(token)`, so a
+    /// stored, trimmed key can never match again — with no test in this file catching it.
+    #[test]
+    fn a_token_file_key_with_incidental_whitespace_is_stored_untrimmed() {
+        let dir = scratch_dir("tokens-key-whitespace-preserved");
+        let path = dir.join("tokens.toml");
+        std::fs::write(&path, "[operators]\n\" tok a \" = \"bob\"\n").unwrap();
+
+        let tokens = parse_operator_tokens(path.to_str().unwrap()).unwrap();
+        assert_eq!(tokens.get(" tok a ").map(String::as_str), Some("bob"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The blank-identifier error must never echo the token — unlike the empty-*token* error
     /// above (safe to echo, since the token there is itself empty), the token in this scenario
     /// is a real, live credential, and printing it would leak it into the server's own
@@ -4002,7 +4057,7 @@ mod tests {
     /// `blank_token_supplied: true` here mirrors what `main.rs::merge_static_token` would have
     /// computed for this scenario — this test constructs `ServeOptions` directly, bypassing
     /// that merge, so it sets the signal by hand. F2 of PR #124 round 2: the refusal must name
-    /// this case as "an empty --token/token", not the misdiagnosing "no --token/token" (which
+    /// this case as "a blank --token/token", not the misdiagnosing "no --token/token" (which
     /// `serve_refuses_to_start_with_no_auth_and_no_open` pins for the genuinely-absent case).
     #[tokio::test]
     async fn serve_with_an_empty_token_does_not_pass_the_auth_gate() {
@@ -4014,13 +4069,17 @@ mod tests {
         let error = serve(options).await.unwrap_err();
 
         assert!(error.contains("No authentication is configured"), "{}", error);
-        assert!(error.contains("an empty --token/token"), "{}", error);
+        assert!(error.contains("a blank --token/token"), "{}", error);
         assert!(!error.contains("no --token/token"), "{}", error);
     }
 
     /// The whitespace-only sibling (PR #124 round 3, F1): `--token "   "` must be treated exactly
     /// like `--token ""` at this gate too — `blank_token_supplied` is set the same way
-    /// `main.rs::merge_static_token` would set it for this scenario.
+    /// `main.rs::merge_static_token` would set it for this scenario. PR #124 round 4, F1: this
+    /// test used to assert the same "an empty --token/token" wording as the empty-string case
+    /// above, which was true of the code (a single hardcoded clause covered both) but not of the
+    /// scenario — an operator who set `token = "   "` was told their token was an empty string.
+    /// Now asserts the corrected, case-covering wording instead of pinning that misdiagnosis.
     #[tokio::test]
     async fn serve_with_a_whitespace_only_token_does_not_pass_the_auth_gate() {
         let options = ServeOptions {
@@ -4031,7 +4090,7 @@ mod tests {
         let error = serve(options).await.unwrap_err();
 
         assert!(error.contains("No authentication is configured"), "{}", error);
-        assert!(error.contains("an empty --token/token"), "{}", error);
+        assert!(error.contains("a blank --token/token"), "{}", error);
         assert!(!error.contains("no --token/token"), "{}", error);
     }
 
@@ -4055,6 +4114,57 @@ mod tests {
         assert!(!error.contains("no --tokens/tokens file"), "{}", error);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PR #124 round 4, F4: a whitespace-only `authentication_url` used to pass the hook
+    /// completeness gate (`is_empty()` only), which then made `auth_configured` true and let the
+    /// server start believing authentication was configured — only to 503 every request at
+    /// `authenticate_via_hook`, since a blank URL can never be posted to. Fail-closed, so not a
+    /// hole, but the wrong refusal point: this must be caught here, at startup, naming the hook,
+    /// rather than at the first request with no diagnostic at start time.
+    ///
+    /// Uses `--warehouses` (an existing, empty scratch folder) rather than `bare_serve_options`'s
+    /// deliberately-nonexistent `--root`: the hook-completeness gate runs *after* root/warehouses
+    /// resolution (see `serve`'s ordering), so a fake root would fail with "Error while
+    /// resolving" before ever reaching the check this test targets.
+    #[tokio::test]
+    async fn serve_refuses_a_whitespace_only_hook_url() {
+        let base = scratch_dir("serve-hook-url-whitespace");
+        let options = ServeOptions {
+            root: None,
+            warehouses: Some(base.to_str().unwrap().to_string()),
+            authentication_hook: Some(HookEndpoint {
+                url: "   ".to_string(),
+                secret: "s".to_string(),
+            }),
+            ..bare_serve_options()
+        };
+        let error = serve(options).await.unwrap_err();
+
+        assert!(error.contains("authentication hook needs both a URL and a secret"), "{}", error);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The secret-side sibling: a whitespace-only secret is weaker than a real one but must
+    /// still be refused as "not configured", the same rule the URL side now gets (F4 above).
+    #[tokio::test]
+    async fn serve_refuses_a_whitespace_only_hook_secret() {
+        let base = scratch_dir("serve-hook-secret-whitespace");
+        let options = ServeOptions {
+            root: None,
+            warehouses: Some(base.to_str().unwrap().to_string()),
+            authentication_hook: Some(HookEndpoint {
+                url: "https://provider.example/hooks/auth".to_string(),
+                secret: "   ".to_string(),
+            }),
+            ..bare_serve_options()
+        };
+        let error = serve(options).await.unwrap_err();
+
+        assert!(error.contains("authentication hook needs both a URL and a secret"), "{}", error);
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     // ---------------------------------------------------------------------------------
@@ -4114,5 +4224,23 @@ mod tests {
         // off-by-one in the overflow check.
         let mb = (1u64 << 44) - 1;
         assert_eq!(body_limit_bytes(Some(mb)).unwrap(), (mb as usize) * 1024 * 1024);
+    }
+
+    /// PR #124 round 4, F6: `max_body_mb`'s sign check only ever rejected negative values, so
+    /// `Some(0)` sailed through, round-tripped losslessly through the cast, and reached
+    /// `DefaultBodyLimit::max(0)` — the server starts normally and then 413s every request
+    /// carrying a body, a 1-byte lift included. Non-negative but nonsensical, the same class
+    /// `authentication_cache_secs`'s ceiling closes for that field.
+    #[test]
+    fn body_limit_bytes_refuses_zero_naming_the_key() {
+        let error = body_limit_bytes(Some(0)).unwrap_err();
+        assert!(error.contains("max_body_mb"), "{}", error);
+    }
+
+    #[test]
+    fn body_limit_bytes_accepts_the_smallest_nonzero_value() {
+        // The boundary right above the refusal above: `1` MiB must still convert cleanly, not be
+        // caught by an off-by-one in the zero check.
+        assert_eq!(body_limit_bytes(Some(1)).unwrap(), 1024 * 1024);
     }
 }

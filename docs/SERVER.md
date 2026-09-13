@@ -134,7 +134,7 @@ events_url = "https://provider.example/hooks/events"         # lift/trust/revoca
 events_secret = "…"
 resolution_url = "https://provider.example/hooks/resolve"    # operator id → display name
 resolution_secret = "…"
-authentication_cache_secs = 60                               # optional
+authentication_cache_secs = 60                               # optional, 0-86400 (24h max)
 ```
 
 Every hook is invoked by the **server**, never the client — the server holds the URLs
@@ -146,6 +146,12 @@ at-least-once with backoff and logged when dropped. `resolution` powers
 resolution policy is enforced, and best-effort so a failure just shows pseudonyms.
 Verification (signatures, office chain, privileges) is never hookable — a hook can
 refuse a request, it cannot make an invalid one verify.
+
+`authentication_cache_secs` is a revocation-latency budget, not a general cache knob: it
+bounds how long a credential the provider has already revoked can keep authenticating
+before the server checks with the hook again. The server refuses to start with a value
+over 24 hours (86400 seconds) — a revoked credential must not be able to outlive its
+revocation by more than about a day.
 
 ## Operations
 

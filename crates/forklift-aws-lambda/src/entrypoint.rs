@@ -143,32 +143,44 @@ fn require_env(name: &str) -> Result<String, String> {
 /// whitespace off header values, so the deployment is silently locked out with no diagnostic, or
 /// a transport that does *not* trim (this crate makes no assumption either way about the Lambda
 /// runtime's header handling) lets a trivially-guessable all-whitespace value authenticate.
-#[derive(Clone, PartialEq, Eq)]
-pub struct BearerToken(String);
+///
+/// The struct lives in its own private submodule, not directly in `entrypoint`, so the
+/// constructor is the only way to obtain one even *inside this file* (PR #124 round 4, F3): a
+/// tuple field private to `entrypoint` would still be visible to `entrypoint::tests` (a child
+/// module sees its ancestors' private items), so this file's own tests — the ones most likely to
+/// be edited next in this area — could otherwise write `BearerToken(String::new())` directly. A
+/// field private to `bearer_token` is invisible to `entrypoint` and to `entrypoint::tests` alike,
+/// both of which are siblings of `bearer_token`, not descendants of it — so `BearerToken::new` is
+/// structurally the only path to an instance, not merely the only path anyone happens to use.
+mod bearer_token {
+    #[derive(Clone, PartialEq, Eq)]
+    pub struct BearerToken(String);
 
-impl BearerToken {
-    /// The one constructor: rejects an empty or whitespace-only token rather than silently
-    /// treating it as unset, so a caller that reaches here — already past the "is a token even
-    /// configured" question `auth_from` asks first — gets back the actual problem instead of
-    /// having it discarded.
-    pub fn new(token: String) -> Result<BearerToken, String> {
-        if token.trim().is_empty() {
-            Err("a bearer token must not be empty or whitespace-only".to_string())
-        } else {
-            Ok(BearerToken(token))
+    impl BearerToken {
+        /// The one constructor: rejects an empty or whitespace-only token rather than silently
+        /// treating it as unset, so a caller that reaches here — already past the "is a token
+        /// even configured" question `auth_from` asks first — gets back the actual problem
+        /// instead of having it discarded.
+        pub fn new(token: String) -> Result<BearerToken, String> {
+            if token.trim().is_empty() {
+                Err("a bearer token must not be empty or whitespace-only".to_string())
+            } else {
+                Ok(BearerToken(token))
+            }
+        }
+
+        pub(super) fn as_str(&self) -> &str {
+            &self.0
         }
     }
 
-    fn as_str(&self) -> &str {
-        &self.0
+    impl std::fmt::Debug for BearerToken {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "<redacted>")
+        }
     }
 }
-
-impl std::fmt::Debug for BearerToken {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "<redacted>")
-    }
-}
+pub use bearer_token::BearerToken;
 
 /// The transport-authentication configuration, resolved once at cold start ([`auth_from_env`])
 /// and threaded into every request by [`handle`]. Full multi-tenant policy (resolving a bearer

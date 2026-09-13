@@ -528,7 +528,11 @@ fn parse_config(path: &str) -> Result<ConfigFile, String> {
         // value, so `v` here ranges over `0..=i64::MAX` — which is a strict subset of
         // `0..=u64::MAX` (`i64::MAX` is about half of `u64::MAX`). Every value that reaches this
         // cast round-trips losslessly; there is no magnitude this cast can silently misread the
-        // way `rebuild_after_lifts`'s `as u32` can (PR #124 round 3, F4).
+        // way `rebuild_after_lifts`'s `as u32` can (PR #124 round 3, F4). That covers only the
+        // overflow half of "non-negative but nonsensical" — `0` is non-negative, round-trips
+        // losslessly, and is still nonsensical (it would reject every request body); that half is
+        // refused downstream, in `server::body_limit_bytes`, the one place both this config-file
+        // path and the `--max-body-mb` flag path converge (PR #124 round 4, F6).
         max_body_mb: optional_non_negative_integer(doc.get("max_body_mb"), path, "max_body_mb")?
             .map(|v| v as u64),
         rebuild_after_lifts: optional_u32(
@@ -1186,7 +1190,7 @@ mod tests {
 
     /// F2: when a blank `--token` is the *only* auth-flavored thing supplied (no real token
     /// anywhere, nothing else configured), the startup refusal must name that case correctly —
-    /// "an empty --token/token", not "no --token/token", which sends an operator who passed the
+    /// "a blank --token/token", not "no --token/token", which sends an operator who passed the
     /// flag looking for a flag they never passed at all.
     #[tokio::test]
     async fn serve_names_a_blank_flag_token_distinctly_from_no_token_at_all() {
@@ -1203,7 +1207,7 @@ mod tests {
         ).await.unwrap_err();
 
         assert!(error.contains("No authentication is configured"), "{}", error);
-        assert!(error.contains("an empty --token/token"), "{}", error);
+        assert!(error.contains("a blank --token/token"), "{}", error);
         assert!(!error.contains("no --token/token"), "{}", error);
     }
 
