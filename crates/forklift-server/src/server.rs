@@ -357,6 +357,45 @@ fn body_limit_bytes(max_body_mb: Option<u64>) -> Result<usize, String> {
     }
 }
 
+/// The ceiling on `authentication_cache_secs`: how long a revoked credential can keep
+/// authenticating after the hook stops vouching for it (`docs/format/HOOK_PROTOCOL.md`: "a
+/// revoked credential outlives its revocation by at most the TTL") — it is a revocation-latency
+/// budget, not a general-purpose cache knob, and its documented default is 60 seconds. One day
+/// is three orders of magnitude past that default — room for any legitimate "reduce hook
+/// chatter" setting — while matching the one other day-scale staleness window this same binary
+/// already accepts (`Gc`'s `--grace-hours`, default 24) rather than inventing an unrelated
+/// number.
+///
+/// Defined here, not in `main.rs`, because this is the single source of truth both call sites
+/// share (PR #124 round 5, F4): `main.rs::bounded_authentication_cache_secs` re-exports this
+/// same value into its own, config-file-specific error message rather than keeping a second
+/// copy of the number.
+pub const MAX_AUTHENTICATION_CACHE_SECS: u64 = 24 * 60 * 60;
+
+/// [`body_limit_bytes`]'s sibling for `authentication_cache_secs`: enforced here, at the
+/// `ServeOptions` boundary, not only in `main.rs::bounded_authentication_cache_secs` (the TOML
+/// reader) (PR #124 round 5, F4). Every other bound this PR added is deliberately re-enforced
+/// here — the blank-token filter above exists so "`ServeOptions`, which is `pub`, gives the
+/// same guarantee to any other constructor of it", and `body_limit_bytes` just above is called
+/// from `serve` for the identical reason — but this ceiling used to live only in the config-file
+/// path, so SERVER.md's and HOOK_PROTOCOL.md's flat claim that the server refuses to start with
+/// a value over 24 hours was true only of that one path: `ServeOptions { authentication_cache_secs:
+/// Some(u64::MAX), .. }`, built directly (a future CLI flag, a test, another head embedding this
+/// crate), sailed straight past `main.rs`'s check and reached `Duration::from_secs` uncontested,
+/// making the cache TTL effectively infinite — the same "a revoked credential is never
+/// re-checked again" hole `main.rs`'s sign and magnitude checks close for the config-file path.
+fn authentication_cache_ttl(secs: Option<u64>) -> Result<std::time::Duration, String> {
+    match secs {
+        Some(v) if v > MAX_AUTHENTICATION_CACHE_SECS => Err(format!(
+            "\"authentication_cache_secs\" is {} seconds, which is over the {}-second (24h) \
+            ceiling: a revoked credential must not be able to outlive its revocation by more \
+            than about a day.",
+            v, MAX_AUTHENTICATION_CACHE_SECS
+        )),
+        _ => Ok(std::time::Duration::from_secs(secs.unwrap_or(60))),
+    }
+}
+
 /// Serve one warehouse root, or every warehouse under a base folder.
 ///
 /// # Returns
@@ -400,6 +439,11 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
     // gives the same guarantee to any other constructor of it. Mirrors
     // `forklift-aws-lambda::entrypoint::BearerToken::new`'s identical blank check.
     let token = options.token.filter(|value| !value.trim().is_empty());
+
+    // PR #124 round 5, F4: re-enforced here, beside the blank-token filter just above, rather
+    // than trusting `main.rs::bounded_authentication_cache_secs` (the TOML reader) to be the
+    // only path into this value — see `authentication_cache_ttl`'s own doc for why.
+    let authentication_cache_ttl = authentication_cache_ttl(options.authentication_cache_secs)?;
 
     // Refuse to start rather than ever construct an `AppState` that would fall through to
     // `Principal::Open` by accident: `check_auth` only returns `Open` when `options.open` is
@@ -489,6 +533,14 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
     // not a hole — but a startup refusal here, naming the hook, beats a server that starts and
     // then always fails every request with no diagnostic at start time. Covers all four hook
     // endpoints (authentication, admission, events, resolution) via this one shared loop.
+    //
+    // The message below names the check that actually ran — "a blank URL or secret" — rather
+    // than `parse_config::hook_of`'s own, superficially similar "only one of {name}_url and
+    // {name}_secret" message: that one fires when a config-file operator sets only one of the
+    // two keys at all, a different rule from this one, which fires when both keys are present
+    // but one is blank (PR #124 round 5, F1). An operator who left `authentication_secret = ""`
+    // behind from a template has both keys set and was, before this fix, told the hook "needs
+    // both a URL and a secret" — sending them looking for a key they already have.
     for (name, hook) in [
         ("authentication", &options.authentication_hook),
         ("admission", &options.admission_hook),
@@ -498,9 +550,26 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
         if let Some(hook) = hook {
             if hook.url.trim().is_empty() || hook.secret.trim().is_empty() {
                 return Err(format!(
-                    "The {} hook needs both a URL and a secret: hook requests are \
-                    signed, and an unsigned hook would be spoofable.",
+                    "The {} hook has a blank URL or secret (an empty or whitespace-only \
+                    string is not a hook credential): hook requests are signed, and an \
+                    unsigned hook would be spoofable.",
                     name
+                ));
+            }
+
+            // PR #124 round 5, F2: a non-blank but non-absolute URL (scheme omitted, e.g.
+            // "provider.example/hooks/auth" — far likelier in practice than an all-whitespace
+            // one) passes the check above yet produces exactly the failure this whole loop
+            // exists to catch at startup rather than at request time: `post_hook` dials the URL
+            // via `state.http.post(&hook.url)`, whose `IntoUrl` impl parses it with
+            // `Url::parse` and fails the request (surfaced as a 503 on every call) when that
+            // parse fails. Re-running the identical parser here means a startup refusal and a
+            // request-time failure can never disagree about which URLs are dialable.
+            if let Err(e) = reqwest::Url::parse(&hook.url) {
+                return Err(format!(
+                    "The {} hook's URL \"{}\" is not a valid absolute URL ({}): hook requests \
+                    are sent to it directly, and a URL that cannot be parsed cannot be dialed.",
+                    name, hook.url, e
                 ));
             }
         }
@@ -520,9 +589,7 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
         resolution_hook: options.resolution_hook,
         http,
         authentication_cache: Mutex::new(HashMap::new()),
-        authentication_cache_ttl: std::time::Duration::from_secs(
-            options.authentication_cache_secs.unwrap_or(60)
-        ),
+        authentication_cache_ttl,
         open: options.open,
     });
 
@@ -4127,6 +4194,15 @@ mod tests {
     /// deliberately-nonexistent `--root`: the hook-completeness gate runs *after* root/warehouses
     /// resolution (see `serve`'s ordering), so a fake root would fail with "Error while
     /// resolving" before ever reaching the check this test targets.
+    ///
+    /// PR #124 round 5, F3: because this test (unlike almost every other `serve` test in this
+    /// file) points at a real, existing `--warehouses` folder, the blank-hook refusal is the
+    /// only thing standing between `serve` and actually binding and entering the axum server
+    /// loop — if that refusal ever regressed, `.unwrap_err()` below would never be reached and
+    /// this test would hang forever instead of failing, so a regression here would show up in CI
+    /// as a timeout, not a red assertion. Verified empirically (PR #124 round 5 review): with
+    /// the guard removed, this test hangs rather than failing. `tokio::time::timeout` turns that
+    /// hang into a fast, named failure in both directions.
     #[tokio::test]
     async fn serve_refuses_a_whitespace_only_hook_url() {
         let base = scratch_dir("serve-hook-url-whitespace");
@@ -4139,15 +4215,23 @@ mod tests {
             }),
             ..bare_serve_options()
         };
-        let error = serve(options).await.unwrap_err();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), serve(options)).await;
 
-        assert!(error.contains("authentication hook needs both a URL and a secret"), "{}", error);
+        let error = outcome
+            .unwrap_or_else(|_| panic!(
+                "serve() did not return within 5s — the blank-hook-URL startup refusal has \
+                regressed and serve is binding and running the axum server loop instead"
+            ))
+            .unwrap_err();
+        assert!(error.contains("has a blank URL or secret"), "{}", error);
 
         let _ = std::fs::remove_dir_all(&base);
     }
 
     /// The secret-side sibling: a whitespace-only secret is weaker than a real one but must
     /// still be refused as "not configured", the same rule the URL side now gets (F4 above).
+    /// Same hang-shape hazard as `serve_refuses_a_whitespace_only_hook_url` above (F3): a real
+    /// `--warehouses` folder means a regressed guard hangs the test instead of failing it.
     #[tokio::test]
     async fn serve_refuses_a_whitespace_only_hook_secret() {
         let base = scratch_dir("serve-hook-secret-whitespace");
@@ -4160,9 +4244,47 @@ mod tests {
             }),
             ..bare_serve_options()
         };
-        let error = serve(options).await.unwrap_err();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), serve(options)).await;
 
-        assert!(error.contains("authentication hook needs both a URL and a secret"), "{}", error);
+        let error = outcome
+            .unwrap_or_else(|_| panic!(
+                "serve() did not return within 5s — the blank-hook-secret startup refusal has \
+                regressed and serve is binding and running the axum server loop instead"
+            ))
+            .unwrap_err();
+        assert!(error.contains("has a blank URL or secret"), "{}", error);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// PR #124 round 5, F2: a non-blank but non-absolute hook URL (scheme omitted) passes the
+    /// blank check above yet produces exactly the failure that check exists to catch at
+    /// startup — `reqwest::Url::parse` (called both here and, transitively, by `post_hook` via
+    /// `state.http.post`) rejects a schemeless string as a relative URL without a base. Same
+    /// real-`--warehouses`-folder hang hazard as the two tests above (F3): wrapped in a timeout
+    /// so a regressed guard fails fast instead of hanging.
+    #[tokio::test]
+    async fn serve_refuses_a_non_absolute_hook_url() {
+        let base = scratch_dir("serve-hook-url-non-absolute");
+        let options = ServeOptions {
+            root: None,
+            warehouses: Some(base.to_str().unwrap().to_string()),
+            authentication_hook: Some(HookEndpoint {
+                url: "provider.example/hooks/auth".to_string(),
+                secret: "s".to_string(),
+            }),
+            ..bare_serve_options()
+        };
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), serve(options)).await;
+
+        let error = outcome
+            .unwrap_or_else(|_| panic!(
+                "serve() did not return within 5s — the non-absolute-hook-URL startup refusal \
+                has regressed and serve is binding and running the axum server loop instead"
+            ))
+            .unwrap_err();
+        assert!(error.contains("is not a valid absolute URL"), "{}", error);
+        assert!(error.contains("provider.example/hooks/auth"), "{}", error);
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -4242,5 +4364,51 @@ mod tests {
         // The boundary right above the refusal above: `1` MiB must still convert cleanly, not be
         // caught by an off-by-one in the zero check.
         assert_eq!(body_limit_bytes(Some(1)).unwrap(), 1024 * 1024);
+    }
+
+    // ---------------------------------------------------------------------------------
+    // authentication_cache_ttl (PR #124 round 5, F4): the ceiling re-enforced at the
+    // `ServeOptions` boundary, not just in `main.rs`'s TOML reader
+    // ---------------------------------------------------------------------------------
+
+    #[test]
+    fn authentication_cache_ttl_defaults_to_60s_when_unset() {
+        assert_eq!(authentication_cache_ttl(None).unwrap(), std::time::Duration::from_secs(60));
+    }
+
+    #[test]
+    fn authentication_cache_ttl_accepts_the_ceiling() {
+        assert_eq!(
+            authentication_cache_ttl(Some(MAX_AUTHENTICATION_CACHE_SECS)).unwrap(),
+            std::time::Duration::from_secs(MAX_AUTHENTICATION_CACHE_SECS)
+        );
+    }
+
+    #[test]
+    fn authentication_cache_ttl_refuses_a_value_over_the_ceiling() {
+        let error = authentication_cache_ttl(Some(MAX_AUTHENTICATION_CACHE_SECS + 1)).unwrap_err();
+        assert!(error.contains("authentication_cache_secs"), "{}", error);
+        assert!(error.contains("ceiling"), "{}", error);
+    }
+
+    /// The finding itself: a `ServeOptions` built directly (not through `main.rs`'s TOML
+    /// reader — the only path `bounded_authentication_cache_secs` guards) with an
+    /// over-the-ceiling `authentication_cache_secs` must still be refused, by `serve` itself.
+    /// Before this fix, this construction sailed straight past every check and reached
+    /// `Duration::from_secs` uncontested, making SERVER.md's and HOOK_PROTOCOL.md's "refuses to
+    /// start over 24h" claim false for any caller other than the config-file path. Uses
+    /// `bare_serve_options`'s deliberately-nonexistent `--root`: this check runs before root
+    /// resolution, so no real warehouse folder — and no hang risk — is needed to observe it.
+    #[tokio::test]
+    async fn serve_refuses_an_authentication_cache_secs_over_the_ceiling() {
+        let options = ServeOptions {
+            authentication_cache_secs: Some(MAX_AUTHENTICATION_CACHE_SECS + 1),
+            ..bare_serve_options()
+        };
+        let error = serve(options).await.unwrap_err();
+
+        assert!(error.contains("authentication_cache_secs"), "{}", error);
+        assert!(error.contains("ceiling"), "{}", error);
+        assert!(!error.contains("No authentication is configured"), "{}", error);
     }
 }

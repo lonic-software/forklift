@@ -338,30 +338,24 @@ fn optional_non_negative_integer(item: Option<&toml_edit::Item>, path: &str, key
     }
 }
 
-/// The ceiling [`bounded_authentication_cache_secs`] enforces on top of
-/// [`optional_non_negative_integer`]'s sign check (PR #124 round 3, F3). This field bounds how
-/// long a revoked credential can keep authenticating after the hook stops vouching for it
-/// (`docs/format/HOOK_PROTOCOL.md`: "a revoked credential outlives its revocation by at most the
-/// TTL") — it is a revocation-latency budget, not a general-purpose cache knob, and its
-/// documented default is 60 seconds. One day is three orders of magnitude past that default —
-/// room for any legitimate "reduce hook chatter" setting — while matching the one other
-/// day-scale staleness window this same binary already accepts (`Gc`'s `--grace-hours`, default
-/// 24) rather than inventing an unrelated number; it is nowhere near `i64::MAX` seconds (about
-/// 292 billion years), which is what a sign check alone still lets through.
-const MAX_AUTHENTICATION_CACHE_SECS: i64 = 24 * 60 * 60;
-
 /// [`optional_non_negative_integer`]'s ceilinged counterpart for `authentication_cache_secs`
-/// specifically: see [`MAX_AUTHENTICATION_CACHE_SECS`] for why that field, alone among the three
-/// this module casts to an unsigned type, needs a magnitude check in addition to the sign check.
+/// specifically: this field, alone among the three this module casts to an unsigned type, needs
+/// a magnitude check in addition to the sign check (a value can be non-negative and still be
+/// nonsensical — `i64::MAX` seconds is the "never re-checked again" hole with the sign flip
+/// removed). The ceiling itself is [`server::MAX_AUTHENTICATION_CACHE_SECS`], not a local copy
+/// (PR #124 round 5, F4): `server::serve` re-enforces the identical bound at the `ServeOptions`
+/// boundary, and a config-file-specific error message here is the reason this function still
+/// exists rather than every caller going straight through `server`'s check — see that
+/// constant's own doc for the rationale behind the number.
 fn bounded_authentication_cache_secs(
     item: Option<&toml_edit::Item>, path: &str, key: &str
 ) -> Result<Option<u64>, String> {
     match optional_non_negative_integer(item, path, key)? {
-        Some(v) if v > MAX_AUTHENTICATION_CACHE_SECS => Err(format!(
+        Some(v) if v > server::MAX_AUTHENTICATION_CACHE_SECS as i64 => Err(format!(
             "The config file \"{}\" has a \"{}\" entry of {} seconds, which is over the \
             {}-second (24h) ceiling: a revoked credential must not be able to outlive its \
             revocation by more than about a day.",
-            path, key, v, MAX_AUTHENTICATION_CACHE_SECS
+            path, key, v, server::MAX_AUTHENTICATION_CACHE_SECS
         )),
         other => Ok(other.map(|v| v as u64)),
     }
@@ -877,7 +871,7 @@ mod tests {
             &format!(
                 "[hooks]\nauthentication_url = \"https://x\"\nauthentication_secret = \"s\"\n\
                 authentication_cache_secs = {}\n",
-                MAX_AUTHENTICATION_CACHE_SECS + 1
+                server::MAX_AUTHENTICATION_CACHE_SECS + 1
             )
         );
         let error = parse_config(path.to_str().unwrap()).unwrap_err();
@@ -897,12 +891,12 @@ mod tests {
             &format!(
                 "[hooks]\nauthentication_url = \"https://x\"\nauthentication_secret = \"s\"\n\
                 authentication_cache_secs = {}\n",
-                MAX_AUTHENTICATION_CACHE_SECS
+                server::MAX_AUTHENTICATION_CACHE_SECS
             )
         );
         let file = parse_config(path.to_str().unwrap()).unwrap();
 
-        assert_eq!(file.authentication_cache_secs, Some(MAX_AUTHENTICATION_CACHE_SECS as u64));
+        assert_eq!(file.authentication_cache_secs, Some(server::MAX_AUTHENTICATION_CACHE_SECS));
 
         let _ = std::fs::remove_file(&path);
     }
