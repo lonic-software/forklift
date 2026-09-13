@@ -15,9 +15,12 @@
 //! identity concept at all, so it cannot consult an office role for who is calling. It is not
 //! a uniform "role for who signed" either: the office pallet's own parcels are checked against
 //! their signer's role, as of that parcel's own signing (`verify_office_privileges`); every
-//! other pallet's parcels are checked only for a valid signature by a key the office currently
-//! tracks and has not revoked — no role, no grant (`verify_pallet_history`). What it enforces
-//! is exactly that — the provider-independent content invariants: hash-verified objects, a
+//! other pallet's parcels are rejected only when they are neither validly signed by a key the
+//! office currently tracks and has not revoked, nor unsigned/untracked-key but reachable from
+//! the trust boundary (tolerated as legacy), nor signed by a revoked key but reachable from that
+//! revocation's own distrust boundary — no role, no grant, in any of the three arms
+//! (`verify_pallet_history`). What it enforces is exactly that — the provider-independent
+//! content invariants: hash-verified objects, a
 //! fast-forward-only CAS, and — on a trusted warehouse — the full offline audit (the signed
 //! office chain and, for any non-office pallet, only its pushed history's own signature
 //! validity) before a ref moves. See [`Head::ref_update`]'s own doc comment and
@@ -489,8 +492,11 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// offline. "Everything" is content-level only, exactly what the CLI's own offline audit
     /// checks, and it differs by pallet: for the office pallet, every office-modifying parcel's
     /// *signer* is checked against the office role it held as of that parcel's own signing
-    /// (`verify_office_privileges`); for any other pallet, each parcel need only carry a valid
-    /// signature by a key the office currently tracks and has not revoked — no role, no grant
+    /// (`verify_office_privileges`); for any other pallet, a parcel is rejected only when it is
+    /// neither validly signed by a key the office currently tracks and has not revoked, nor
+    /// unsigned/untracked-key but reachable from the trust boundary (tolerated as legacy), nor
+    /// signed by a revoked key but reachable from that revocation's own distrust boundary — no
+    /// role, no grant, in any of the three arms
     /// (`verify_pallet_history` → `classify_signature_trust`). There is no check on who
     /// transported this request either way — this type takes no caller parameter at all — so a
     /// caller who can produce a validly-signed history for a pallet can move it regardless of
@@ -667,7 +673,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                     )
                     .map_err(HeadError::forbidden)?;
                 } else {
-                    // A user pallet: audit its new history against the office state.
+                    // Any non-office pallet: audit its new history against the office state.
                     let office_head = office_head.as_deref().ok_or_else(|| {
                         HeadError::unprocessable(
                             "Trust is established but the office pallet is missing; lift the \

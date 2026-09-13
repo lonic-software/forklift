@@ -659,38 +659,47 @@ this warehouse serves, including the office pallet, subject only to the content-
 below.
 
 What actually constrains a push is run by `Head::ref_update` after authentication has already
-passed, and it verifies the *content*, never the *caller*: closure presence (every object the
-new head reaches must already be uploaded), fast-forward-only refs, and — once the warehouse is
-trusted — the office chain's own signature verification (`verify_office_chain_memoized` +
-`verify_office_privileges` for an office-pallet update, or `verify_office_chain_memoized` +
-`verify_pallet_history` for any other pallet — an ordinary working pallet, or a meta pallet such
-as `@manifest`). Those two checks are not the same guarantee. `verify_office_privileges` checks
-each office-modifying parcel's *signer* against the office role they held as of that parcel's
-own signing — a real per-signer role check, but only for the office pallet's own chain.
-`verify_pallet_history` (`classify_signature_trust`,
-`crates/forklift-core/src/util/audit_utils.rs`) checks only that each parcel carries a valid
-signature by a key the office currently tracks and has not revoked — no role, no grant, no
-"as of signing" state. Either way, neither says who *transported* the bytes: a caller holding
-the shared bearer token can push any validly-signed history for any pallet — an operator
-enrolled as `reader`, or a `writer` granted only some other pallet, can sign and push it here,
-because the office's per-pallet grants (`office role`, `may_write_pallet`) are consulted nowhere
-in this content path, and there is no per-caller identity to check them against as a transport
-gate either.
+passed. Every row below is a distinct check, in the order it runs; none of them consult who
+transported the request:
+
+| # | Check | Function (file:line) | Runs when | What it verifies | What it does *not* cover |
+|---|-------|----------------------|-----------|-------------------|---------------------------|
+| 1 | New-head presence | `Head::ref_update`, `crates/forklift-aws-lambda/src/head.rs:525` | every ref update | the pushed head object itself has been uploaded | ancestry, signatures, or content |
+| 2 | Closure presence | `audit_utils::verify_parcel_closure_with`, called at `head.rs:633` | every ref update | every blob, chunk and tree the new history reaches is present in the object store (§9.4b: chunk lists are checked non-tolerantly) | signatures, roles, grants |
+| 3 | Fast-forward-only | `merge_utils::is_ancestor`, called at `head.rs:650` | every ref update carrying `old_head`, except the sanctioned re-genesis office move (`head.rs:646`) | the new head is a descendant of `old_head` | content validity |
+| 4 | Office chain authenticity | `audit_utils::verify_office_chain_memoized`, called at `head.rs:666` (office update) and `head.rs:685` (any other pallet, to obtain the office state) | only once the warehouse is trusted (`anchor.is_some()`) | every office parcel is signed by a key active in the office at the point it signed, and the chain reaches genesis | whether a *working*-pallet parcel's own signer held any particular role — that is checks 5/6 below |
+| 5 | Office privilege | `audit_utils::verify_office_privileges`, called at `head.rs:669` | only for an office-pallet update, only once trusted | each office-modifying parcel's *signer* held the office role (or self-service right) it needed as of that parcel's own signing | applies **only** to the office pallet's own chain — never to a working pallet's content |
+| 6 | Pallet history validity | `audit_utils::verify_pallet_history`, called at `head.rs:688` | only for a non-office pallet, only once trusted | each parcel is accepted when it is either (a) validly signed by a key the office currently tracks and has not revoked, (b) unsigned or signed by an untracked key but reachable from the trust anchor's boundary (tolerated as pre-trust "legacy" history, `audit_utils.rs:~396`), or (c) signed by a *revoked* key but reachable from that revocation's own distrust boundary (`audit_utils.rs:~446`) | no role check and no per-pallet grant check, in any of the three arms — and the boundary arms (b)/(c) mean the real precondition is weaker, and the exposure larger, than "every parcel carries a valid signature by a currently-tracked, non-revoked key" alone would suggest |
+| 7 | Per-pallet transport gate | `may_write_pallet` | **never called anywhere in this crate** | n/a | this head has no per-pallet transport gate at all — `may_write_pallet` has exactly one call site in the whole workspace outside its own unit test, `forklift-server`'s `server.rs:2035` |
+
+The consequence: a caller holding the shared bearer token can push any history that clears rows
+1–6 for any pallet — an operator enrolled as `reader`, or a `writer` granted only some other
+pallet, can sign and push it here, because row 7 never runs in this crate and there is no
+per-caller identity to check a grant against even if it did.
 
 If you need per-pallet enforcement today — "this token may write pallet A but not pallet B" —
 this head has no built-in mechanism for it. Use `forklift-server` instead, with a per-operator
 tokens file (`docs/SERVER.md`, "Per-operator tokens") or an `authentication` hook
 (`docs/format/HOOK_PROTOCOL.md`), either of which resolves a bearer to an office operator
-identity that the per-pallet gate can then check — or add an API Gateway Lambda authorizer in
-front of this head ("Auth at the gateway" above), which can inspect the pallet name in the
-request path and deny per route; that is a deployer-supplied, out-of-repo mechanism, not
-something this head or this repository ships. Note the same shared-privilege property holds
-for `forklift-server` too, whenever it is run with only the single static `--token` rather than
-per-operator tokens: a caller authenticating with the static token is *not* resolved to an
-office identity either, so the per-pallet gate never fires for it and it gets the same
-uniform, full access described above. Per-pallet enforcement is a property of per-operator
-identity, not of either head as such — it is only that `forklift-server` has a mechanism to
-produce that identity today, and this head does not ship one.
+identity that the per-pallet gate can then check; or configure `forklift-server`'s
+`admission_url` hook (`docs/SERVER.md`, "Per-operator tokens" / `docs/format/HOOK_PROTOCOL.md`)
+— it runs before the per-pallet transport gate, for *every* principal including one
+authenticated by the shared static token, and can refuse a ref update by pallet name regardless
+of how the caller authenticated (a soft-policy seam — quotas, plan limits, suspensions — not an
+office role/grant check, but real per-pallet enforcement available today); or add an API
+Gateway Lambda authorizer in front of this head ("Auth at the gateway" above), which can
+inspect the pallet name in the request path and deny per route; that is a deployer-supplied,
+out-of-repo mechanism, not something this head or this repository ships (this head has no
+admission-hook equivalent either). Note the same shared-privilege property holds for
+`forklift-server` too, whenever it is run with only the single static `--token` rather than
+per-operator tokens *and with no admission hook configured*: a caller authenticating with the
+static token is *not* resolved to an office identity, so the per-pallet role/grant gate never
+fires for it and — absent an admission hook — it gets the same uniform, full access described
+above. Per-pallet role/grant enforcement is a property of per-operator identity, not of either
+head as such — it is only that `forklift-server` has a mechanism to produce that identity
+today, and this head does not ship one; the admission hook is the one mechanism that constrains
+a static-token (or fully unauthenticated) caller per pallet without needing operator identity
+at all, and only `forklift-server` ships it.
 
 ## Operational notes
 

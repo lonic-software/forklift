@@ -77,6 +77,16 @@ Roles (FORK-10) are tracked, signed metadata like everything else in the office:
 keys; **reader** moves nothing (key self-service still applies). A record without a
 `role` predates privileges and reads as admin — exactly the pre-privilege behavior.
 
+**"May move any pallet" (and the `writer`/`reader` transport rules above it) is a transport
+rule a server enforces only for a caller it resolves to that operator's own identity** — a
+per-operator token, or an `authentication` hook — never a property of the signature itself.
+A validly-signed, non-revoked parcel on an ordinary pallet passes `audit`/`verify_pallet_history`
+regardless of its signer's role or `pallets` grant; those are checked nowhere in content audit
+(`may_write_pallet` has exactly one call site in the workspace outside its own unit test, the
+server's transport gate). A server run with only the shared static token, an `--open` server, or
+the AWS serverless head does not resolve a caller to an operator identity at all, so none of
+them enforce this table.
+
 `class` (§7.1) is *provenance*, orthogonal to `role` (*authority*): human (the default,
 so human records keep their historical shape), agent, bot or service. Because the class
 rides in the admin-signed record, "an agent authored this, supervised by <human>" is

@@ -142,14 +142,15 @@ Every operator has a role (recorded in their signed office record):
 **This table is a transport rule a server enforces for a caller it resolves to that
 operator's own identity** — a per-operator token, or an `authentication` hook — not a
 property of the signature itself. A validly-signed, non-revoked parcel on an ordinary
-(working) pallet passes the audit regardless of its signer's role: role and per-pallet
-grants are checked against the *office* pallet's own chain (each office-modifying parcel
-against its signer's role as of that signing), never against a `reader`'s or
-grant-restricted `writer`'s parcel on some other pallet. A server run with only the
-shared static token, an `--open` server, or the AWS serverless head does not resolve a
-caller to an operator identity at all, so none of them enforce this table — a `reader`
-who can reach the store directly (or hold that shared credential) can sign and push an
-ordinary pallet's history like anyone else.
+(working) pallet passes the audit regardless of its signer's role or grants: role is
+checked only within the *office* pallet's own chain (each office-modifying parcel against
+its signer's role as of that signing), never against a `reader`'s or grant-restricted
+`writer`'s parcel on some other pallet. Per-pallet grants are checked in no audit at
+all — they are enforced only by the transport gate above, which has exactly one call
+site outside its own unit test. A server run with only the shared static token, an `--open`
+server, or the AWS serverless head does not resolve a caller to an operator identity at
+all, so none of them run that gate — a `reader` who can reach the store directly (or hold
+that shared credential) can sign and push an ordinary pallet's history like anyone else.
 
 Change a role, or restrict a writer to specific pallets:
 

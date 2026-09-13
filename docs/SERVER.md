@@ -120,29 +120,39 @@ What an operator may do derives from their **role** in the target warehouse's of
 --role …` and `forklift office role …`.
 
 **Per-pallet grants apply only to a request that resolves to an office operator identity** —
-one authenticated via this token file or an `authentication` hook. A request authenticated with
-the single static `token` instead resolves to no identity at all, so `may_write_pallet`'s
-per-pallet role/grant gate never runs for it (the ref-update handler in `server.rs` consults it
-only inside `if let Principal::Operator(identifier) = &principal`): the static token is
-uniformly full access to every pallet's *content* this server serves. It is not, however,
-equivalent to an unauthenticated `--open` server — it is strictly **more** privileged: in
-multi-warehouse mode only the static token may create a warehouse at all (`put_warehouse`
-refuses any principal but `Principal::Static`, so `--open` cannot create one — see "Serving many
-warehouses" above). If you want per-pallet *content* enforcement, every caller that should be
-limited needs an operator token or hook identity — issuing the static token to more than the
-server administrator defeats it.
+one authenticated via this token file or an `authentication` hook, never to the shared static
+`--token` or an `--open` server. Every row below is a distinct check `post_ref_update`
+(`crates/forklift-server/src/server.rs`) runs against a ref-update request, in the order it
+runs:
 
-The one mechanism that already restricts a static-token (or `--open`) caller per pallet is the
-admission hook: `check_admission` runs before the per-pallet content gate, for every principal,
-with the pallet name in the request (`action: "ref_update"`, `pallet: Some(&name)`) — configure
-`[hooks] admission_url` (below) to refuse by pallet and it applies regardless of how the caller
-authenticated. It is a soft-policy seam (quotas, plan limits, suspensions), not an office
-role/grant check, but it is real per-pallet transport enforcement available today, not merely a
-gap. This is the same shared-privilege property `docs/DEPLOYMENT.md` documents for the AWS
-serverless head's *content* checks, which has no operator-identity mechanism and so has no
-per-pallet content gate of its own — nothing shipped in this repository adds one for that head
-either, short of a deployer-supplied API Gateway authorizer (`docs/DEPLOYMENT.md`, "Auth at the
-gateway").
+| # | Check | Function (file:line) | Runs when | What it verifies | What it does *not* cover |
+|---|-------|----------------------|-----------|-------------------|---------------------------|
+| 1 | Authentication | `check_auth`, `server.rs:868` | every request | resolves the request to a `Principal`: `Operator(id)` (a per-operator token or `authentication` hook), `Static` (the shared `--token`), or `Open` (no auth configured, `--open`) | nothing about what that principal may do |
+| 2 | Admission hook | `check_admission`, `server.rs:1015`, called for a ref update at `server.rs:1981` | every principal, every ref update, only when `[hooks] admission_url` is configured (below) | a deployer-supplied soft-policy decision (quotas, plan limits, suspensions), given the pallet name — regardless of how the caller authenticated | not an office role/grant check; a no-op when unconfigured |
+| 3 | Transport authorization | `user.may_write_pallet`, `server.rs:2035` (the block starting `server.rs:2020`) | **only** for `Principal::Operator` | the operator's `role`/`pallets` grant permits moving *this* pallet ref | never runs for `Principal::Static` (the shared token) or an unauthenticated `--open` caller — they clear this check by never being subject to it |
+| 4 | Office chain authenticity | `verify_office_chain_memoized`, `server.rs:2109` (office update) / `server.rs:2154` (any other pallet, to obtain the office state) | only once the warehouse is trusted | every office parcel is signed by a key active in the office at the point it signed, chain reaches genesis | a non-office parcel's own signer's role — that is check 6 |
+| 5 | Office privilege | `verify_office_privileges`, `server.rs:2116` | only for an office-pallet update, only once trusted | each office-modifying parcel's *signer* held the office role (or self-service right) it needed as of that parcel's own signing | applies **only** to the office pallet's own chain |
+| 6 | Pallet history validity | `verify_pallet_history`, `server.rs:2159` | only for a non-office pallet, only once trusted | the same three-arm acceptance `docs/DEPLOYMENT.md`'s guarantee table documents for the AWS head's identical check (valid signature by a tracked, non-revoked key; or unsigned/untracked-key inside the trust boundary; or revoked-key inside that revocation's distrust boundary) | no role check and no per-pallet grant check, in any of the three arms |
+
+The consequence: a caller authenticated with the static token is *not* resolved to
+`Principal::Operator`, so row 3 never runs for it — absent an admission hook (row 2), it gets
+uniform, full access to every pallet this server serves, subject only to rows 4–6. It is not,
+however, equivalent to an unauthenticated `--open` server — it is strictly **more** privileged:
+in multi-warehouse mode only the static token may create a warehouse at all (`put_warehouse`
+refuses any principal but `Principal::Static`, so `--open` cannot create one — see "Serving many
+warehouses" above). If you want per-pallet *transport* enforcement, every caller that should be
+limited needs an operator token or hook identity — issuing the static token to more than the
+server administrator defeats it, unless row 2's admission hook is configured to compensate.
+
+Row 2 is the one mechanism that already restricts a static-token (or `--open`) caller per
+pallet: configure `[hooks] admission_url` (below) to refuse by pallet name and it applies
+regardless of how the caller authenticated. It is a soft-policy seam, not an office role/grant
+check, but it is real per-pallet transport enforcement available today, not merely a gap. This
+is the same shared-privilege property `docs/DEPLOYMENT.md` documents for the AWS serverless
+head: that head's rows 4–6 (content-level, audit) still run on every push, but it has no
+operator-identity mechanism and so has no equivalent of rows 2 or 3 — nothing shipped in this
+repository adds one for that head either, short of a deployer-supplied API Gateway authorizer
+(`docs/DEPLOYMENT.md`, "Auth at the gateway").
 
 ## Hooks (provider integration)
 

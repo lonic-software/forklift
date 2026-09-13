@@ -617,9 +617,11 @@ fn a_trusted_lift_runs_the_audit_through_http() {
 /// because the pushed history really is validly signed; what this test isolates is that nothing
 /// *in addition* to that content check ever asks who transported the bytes.
 ///
-/// The two pushes run against **two independent fixtures**, not one shared warehouse. The
-/// non-office `ref_update` arm refuses with a 422 ("the office pallet is missing") whenever the
-/// ref store has no office head yet, so a single shared fixture would make the `main` assertion
+/// The two pushes run against **two independent fixtures**, not one shared warehouse. On a
+/// trusted warehouse, the non-office `ref_update` arm refuses with a 422 ("the office pallet is
+/// missing") whenever the ref store has no office head yet (that check lives inside
+/// `if let Some(anchor) = &anchor`, so an untrusted warehouse never reaches it) — so a single
+/// shared fixture would make the `main` assertion
 /// causally dependent on the `@office` HTTP push above it having already landed — a future gate
 /// that refused the office push with `403` would flip the `main` assertion to `422` for an
 /// unrelated reason (a missing office head), not the `403` that would actually signal a
