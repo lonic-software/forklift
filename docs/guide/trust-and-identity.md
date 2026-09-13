@@ -136,29 +136,24 @@ Every operator has a role (recorded in their signed office record):
 | Role | May do |
 |------|--------|
 | `admin` | Manage the office (admit, roles, others' keys) and move any pallet. |
-| `writer` | Move working pallets (all, or a granted list); also move any meta pallet (`@office`, `@manifest`, `@haul`, `@tags`) regardless of grants — see below. Manage their own keys. |
+| `writer` | Move working pallets (all, or a granted list); also **transport** any meta pallet (`@office`, `@manifest`, `@haul`, `@tags`) regardless of grants — content rules differ per pallet, see below. Manage their own keys. |
 | `reader` | Move nothing; key self-service (rotation) still applies. |
 
 **This table is a transport rule a server enforces for a caller it resolves to that
 operator's own identity** — a per-operator token, or an `authentication` hook — not a
 property of the signature itself. The `--pallet` grant is scoped to working pallets
-only: a `writer`'s granted-pallet list restricts which *working* pallets they may move,
-but every meta pallet (`@office`, `@manifest`, `@haul`, `@tags`) is exempt from it at
-transport — any non-`reader` may move a meta pallet's ref regardless of what working
-pallets they are granted (`may_write_pallet` is never consulted for a meta pallet; only
-the role check `!= reader` is). Content-side, a validly-signed, non-revoked parcel on an
-ordinary (working) pallet passes the audit regardless of its signer's role or grants: role
-is checked only within the *office* pallet's own chain (each office-modifying parcel
-against its signer's role as of that signing), never against a `reader`'s or
-grant-restricted `writer`'s parcel on some other pallet — and `@manifest`, `@haul`, and
-`@tags` get no role or grant check either, the same authenticity-only audit as any
-working pallet. Per-pallet grants are checked in no audit at all — the transport gate
-above (`may_write_pallet`) is the only place they are enforced, and only for working
-pallets; it has exactly one call site outside its own unit test. A server run with only
-the shared static token, an `--open` server, or the AWS serverless head does not resolve
-a caller to an operator identity at all, so none of them run that gate — a `reader` who
-can reach the store directly (or hold that shared credential) can sign and push an
-ordinary pallet's history like anyone else.
+only: a `writer`'s granted-pallet list restricts which *working* pallets they may move, but
+every meta pallet (`@office`, `@manifest`, `@haul`, `@tags`) is exempt from it **at transport**
+— any non-`reader` may move a meta pallet's ref regardless of what working pallets they are
+granted. `docs/SERVER.md`'s "Per-operator tokens" section (row 3 and the paragraph below the
+table) is the authoritative statement of that transport rule and of what the content-level
+audit checks on top of it — in short, only `@office` gets a content-level signer-role check
+there (`verify_office_privileges`); `@manifest`, `@haul`, and `@tags` get none, the same
+authenticity-only audit as an ungranted working pallet, and per-pallet grants are checked in
+no audit at all. A server run with only the shared static token, an `--open` server, or the
+AWS serverless head does not resolve a caller to an operator identity at all, so none of them
+run this transport gate — a `reader` who can reach the store directly (or hold that shared
+credential) can sign and push an ordinary pallet's history like anyone else.
 
 Change a role, or restrict a writer to specific pallets:
 

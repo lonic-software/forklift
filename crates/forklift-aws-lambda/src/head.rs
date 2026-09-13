@@ -15,9 +15,9 @@
 //! identity concept at all, so it cannot consult an office role for who is calling. It is not
 //! a uniform "role for who signed" either: the office pallet's own parcels are checked against
 //! their signer's role, as of that parcel's own signing (`verify_office_privileges`); every
-//! other pallet's parcels are rejected only when they are neither validly signed by a key the
-//! office currently tracks and has not revoked, nor unsigned/untracked-key but reachable from
-//! the trust boundary (tolerated as legacy), nor signed by a revoked key but reachable from that
+//! other pallet's parcels are accepted when they are either validly signed by a key the
+//! office currently tracks and has not revoked, or unsigned/untracked-key but reachable from
+//! the trust boundary (tolerated as legacy), or signed by a revoked key but reachable from that
 //! revocation's own distrust boundary — no role, no grant, in any of the three arms
 //! (`verify_pallet_history`). What it enforces is exactly that — the provider-independent
 //! content invariants: hash-verified objects, a
@@ -492,9 +492,9 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// offline. "Everything" is content-level only, exactly what the CLI's own offline audit
     /// checks, and it differs by pallet: for the office pallet, every office-modifying parcel's
     /// *signer* is checked against the office role it held as of that parcel's own signing
-    /// (`verify_office_privileges`); for any other pallet, a parcel is rejected only when it is
-    /// neither validly signed by a key the office currently tracks and has not revoked, nor
-    /// unsigned/untracked-key but reachable from the trust boundary (tolerated as legacy), nor
+    /// (`verify_office_privileges`); for any other pallet, a parcel is accepted when it is
+    /// either validly signed by a key the office currently tracks and has not revoked, or
+    /// unsigned/untracked-key but reachable from the trust boundary (tolerated as legacy), or
     /// signed by a revoked key but reachable from that revocation's own distrust boundary — no
     /// role, no grant, in any of the three arms
     /// (`verify_pallet_history` → `classify_signature_trust`). There is no check on who

@@ -80,12 +80,17 @@ keys; **reader** moves nothing (key self-service still applies). A record withou
 **"May move any pallet" (and the `writer`/`reader` transport rules above it) is a transport
 rule a server enforces only for a caller it resolves to that operator's own identity** — a
 per-operator token, or an `authentication` hook — never a property of the signature itself.
-A validly-signed, non-revoked parcel on an ordinary pallet passes `audit`/`verify_pallet_history`
-regardless of its signer's role or `pallets` grant; those are checked nowhere in content audit
-(`may_write_pallet` has exactly one call site in the workspace outside its own unit test, the
-server's transport gate). A server run with only the shared static token, an `--open` server, or
-the AWS serverless head does not resolve a caller to an operator identity at all, so none of
-them enforce this table.
+`docs/SERVER.md`'s "Per-operator tokens" section is the authoritative statement of what that
+transport rule reaches, and of what the content-level audit checks independently of it. In
+short: a validly-signed, non-revoked parcel on an ordinary pallet passes
+`audit`/`verify_pallet_history` regardless of its signer's role or `pallets` grant — neither is
+checked there (`may_write_pallet` has exactly one call site in the workspace outside its own
+unit test, the server's transport gate) — but the **office** pallet is the exception: every
+office-modifying parcel is checked in content audit against its signer's role
+(`verify_office_privileges`), regardless of how, or whether, the caller authenticated. A server
+run with only the shared static token, an `--open` server, or the AWS serverless head does not
+resolve a caller to an operator identity at all, so none of them run the *transport* rule above
+— but that office content-level check still applies.
 
 `class` (§7.1) is *provenance*, orthogonal to `role` (*authority*): human (the default,
 so human records keep their historical shape), agent, bot or service. Because the class

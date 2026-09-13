@@ -698,7 +698,7 @@ fn a_shared_bearer_holder_may_move_any_pallet_including_the_office() {
             serde_json::to_vec(&office).unwrap()
         ))),
         200,
-        "the office pallet moved on the shared bearer alone — no office-role check ran"
+        "the office pallet moved on the shared bearer alone — no caller-role check ran"
     );
 
     // --- Assertion 2: an ordinary pallet moves on the identical bearer too. The office head is

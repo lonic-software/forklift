@@ -669,8 +669,8 @@ transported the request:
 | 3 | Fast-forward-only | `merge_utils::is_ancestor`, called at `head.rs:650` | every ref update carrying `old_head`, except the sanctioned re-genesis office move (`head.rs:646`) | the new head is a descendant of `old_head` | content validity |
 | 4 | Office chain authenticity | `audit_utils::verify_office_chain_memoized`, called at `head.rs:666` (office update) and `head.rs:685` (any other pallet, to obtain the office state) | only once the warehouse is trusted (`anchor.is_some()`) | every office parcel is signed by a key active in the office at the point it signed, and the chain reaches genesis | whether a *working*-pallet parcel's own signer held any particular role — nothing below checks it: check 5 applies only to the office pallet's own chain, and check 6 explicitly finds no role check in any of its three arms |
 | 5 | Office privilege | `audit_utils::verify_office_privileges`, called at `head.rs:669` | only for an office-pallet update, only once trusted | each office-modifying parcel is well-formed and authorized: signed by a key tracked at that point, with a parent, in a readable chain; its key-permanence obligations honored (a key is never removed or altered, and a revocation is never undone or added without a reason — binds admins too); and its *signer* held the office role (or self-service right) it needed as of that parcel's own signing (`error.rs:21-29`) | applies **only** to the office pallet's own chain — never to a working pallet's content |
-| 6 | Pallet history validity | `audit_utils::verify_pallet_history`, called at `head.rs:688` | only for a non-office pallet, only once trusted | each parcel is accepted when it is either (a) validly signed by a key the office currently tracks and has not revoked, (b) unsigned or signed by an untracked key but reachable from the trust anchor's boundary (tolerated as pre-trust "legacy" history, `audit_utils.rs:~396`), or (c) signed by a *revoked* key but reachable from that revocation's own distrust boundary (`audit_utils.rs:~446`) | no role check and no per-pallet grant check, in any of the three arms — and the boundary arms (b)/(c) mean the real precondition is weaker, and the exposure larger, than "every parcel carries a valid signature by a currently-tracked, non-revoked key" alone would suggest |
-| 7 | Per-pallet transport gate | `may_write_pallet` | **never called anywhere in this crate** | n/a | this head has no per-pallet transport gate at all — `may_write_pallet` has exactly one call site in the whole workspace outside its own unit test, `forklift-server`'s `server.rs:2035` |
+| 6 | Pallet history validity | `audit_utils::verify_pallet_history`, called at `head.rs:688` | only for a non-office pallet, only once trusted | each parcel is accepted when it is either (a) validly signed by a key the office currently tracks and has not revoked, (b) unsigned or signed by an untracked key but reachable from the trust anchor's boundary (tolerated as pre-trust "legacy" history, `crates/forklift-core/src/util/audit_utils.rs:~396`), or (c) signed by a *revoked* key but reachable from that revocation's own distrust boundary (`crates/forklift-core/src/util/audit_utils.rs:~446`) | no role check and no per-pallet grant check, in any of the three arms — and the boundary arms (b)/(c) mean the real precondition is weaker, and the exposure larger, than "every parcel carries a valid signature by a currently-tracked, non-revoked key" alone would suggest |
+| 7 | Per-pallet transport gate | `may_write_pallet` | **never called anywhere in this crate** | n/a | this head has no per-pallet transport gate at all — `may_write_pallet` has exactly one call site in the whole workspace outside its own unit test, `forklift-server`'s `server.rs:2038` |
 
 The consequence: a caller holding the shared bearer token can push any history that clears rows
 1–6 for any pallet — an operator enrolled as `reader`, or a `writer` granted only some other
@@ -681,12 +681,14 @@ If you need per-pallet enforcement today — "this token may write pallet A but 
 this head has no built-in mechanism for it. Use `forklift-server` instead, with a per-operator
 tokens file (`docs/SERVER.md`, "Per-operator tokens") or an `authentication` hook
 (`docs/format/HOOK_PROTOCOL.md`), either of which resolves a bearer to an office operator
-identity that the per-pallet gate can then check — but only when B is a **working** pallet: that
-gate is never consulted for a meta pallet (`@office`, `@manifest`, `@haul`, `@tags`) at all
-(`docs/SERVER.md`, "Per-operator tokens", check 3), so a per-operator token does not give you
-"may write A but not meta-pallet B" — any operator who is not a `reader` may move any meta
-pallet's ref regardless of what working pallets they are granted; or configure `forklift-server`'s
-`admission_url` hook (`docs/SERVER.md`, "Per-operator tokens" / `docs/format/HOOK_PROTOCOL.md`)
+identity that the per-pallet gate can then check — but only when B is a **working** pallet: a
+per-operator token does not give you "may write A but not meta-pallet B" (`@office`,
+`@manifest`, `@haul`, `@tags`). `docs/SERVER.md`'s "Per-operator tokens" section (row 3 and the
+paragraph below the table) is the authoritative statement of that meta-pallet exemption — in
+short, it holds **at transport** only (any non-`reader` may move a meta pallet's ref regardless
+of grants), and on top of that only `@office` gets any content-level role check at all
+(`verify_office_privileges`); see there rather than here for the full rule. Or configure
+`forklift-server`'s `admission_url` hook (`docs/SERVER.md`, "Per-operator tokens" / `docs/format/HOOK_PROTOCOL.md`)
 — it runs before the per-pallet transport gate, for *every* principal including one
 authenticated by the shared static token, and can refuse a ref update by pallet name regardless
 of how the caller authenticated (a soft-policy seam — quotas, plan limits, suspensions — not an
