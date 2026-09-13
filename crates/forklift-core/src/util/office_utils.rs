@@ -482,10 +482,8 @@ pub fn read_trust_anchor() -> Result<Option<TrustAnchor>, String> {
     let doc: DocumentMut = content.parse()
         .map_err(|e| format!("The trust file is not valid TOML: {}", e))?;
 
-    let genesis = doc.get("genesis").and_then(|item| item.as_str())
-        .ok_or("The trust file has no \"genesis\" entry.".to_string())?;
-    let enabled_at = doc.get("enabled_at").and_then(|item| item.as_integer())
-        .ok_or("The trust file has no \"enabled_at\" entry.".to_string())?;
+    let genesis = read_string(&doc, "genesis", "trust file")?;
+    let enabled_at = read_integer(&doc, "enabled_at", "trust file")?;
 
     // Required and strict: `write_trust_anchor_file` always writes this key, even when the
     // boundary is empty (an empty array, never an omitted key) — so a trust file missing it, or
@@ -496,16 +494,21 @@ pub fn read_trust_anchor() -> Result<Option<TrustAnchor>, String> {
     // to a permissive default).
     let boundary = read_required_string_array(&doc, "boundary", "trust file")?;
 
-    let field = |name: &str| doc.get(name)
-        .and_then(|item| item.as_str())
-        .map(|s| s.to_string());
+    // Optional, unlike `boundary`: `write_trust_anchor_file` writes these two only for a
+    // re-genesis anchor, so an absent key is the normal (original-enrollment) shape and must
+    // parse as `None`. A *present* value that is not a string, though, must still fail loudly
+    // rather than be silently treated the same as absent — `.and_then(as_str)` would conflate
+    // "no re-genesis" with "a corrupt re-genesis pin" and hand `collect_trust_pin_roots` a
+    // silently missing `adopts` root (FORK-81 follow-up; same lenience `pallets` had).
+    let prior_genesis = read_optional_string(&doc, "prior_genesis", "trust file")?;
+    let adopts = read_optional_string(&doc, "adopts", "trust file")?;
 
     Ok(Some(TrustAnchor {
-        genesis: genesis.to_string(),
+        genesis,
         enabled_at,
         boundary,
-        prior_genesis: field("prior_genesis"),
-        adopts: field("adopts"),
+        prior_genesis,
+        adopts,
     }))
 }
 
@@ -1172,24 +1175,37 @@ fn parse_user_record(toml: &str) -> Result<UserRecord, String> {
 
     let role = Role::parse(&read_string(&doc, "role", "user record")?)?;
 
-    let pallets = doc.get("pallets")
-        .and_then(|item| item.as_array())
-        .map(|array| {
-            array.iter()
-                .filter_map(|entry| entry.as_str())
-                .map(|s| s.to_string())
-                .collect()
-        })
-        .unwrap_or_default();
+    // Optional, strict (FORK-81 follow-up): `user_record_to_toml` omits `pallets` entirely for
+    // an unrestricted writer (the empty-list case), so an absent key must keep parsing as an
+    // empty list — that is the field's normal, expected shape, not an old/lenient one. But
+    // `may_write_pallet` reads an empty list as "may write ANY pallet" (`Role::Writer =>
+    // self.pallets.is_empty() || …`), so this is an authorization check: a *present* value that
+    // is not an array, or an array with a non-string entry, must never be silently downgraded to
+    // that same empty list the way the previous `.and_then(as_array).map(filter_map(as_str))
+    // .unwrap_or_default()` did — that would turn a writer meant to be restricted to one pallet
+    // into an unrestricted one the moment their grant record is damaged, exactly backwards from
+    // CLAUDE.md's fail-loudly rule for an authorization check. Mirrors `distrust_boundary`'s
+    // absent-vs-malformed split below (`parse_key_record`) — not `boundary`'s just above, which
+    // is required and has the opposite absent-case policy (a missing key is corruption, not a
+    // default).
+    let pallets = read_optional_string_array(&doc, "pallets", "user record")?;
 
-    let class = match doc.get("class").and_then(|item| item.as_str()) {
-        Some(class) => IdentityClass::parse(class)?,
+    // Optional, strict, same shape as `pallets`: `user_record_to_toml` omits `class` entirely
+    // for a human (the default), so an absent key legitimately means `Human`. A *present*
+    // non-string value must still error rather than silently collapse to that same default —
+    // `IdentityClass` gates admission rules (an agent record requires a supervisor, §7.1) and
+    // audit/query classification (`author.class`), so quietly misreading a damaged automated
+    // identity as human would hide exactly the provenance distinction the field exists to carry.
+    let class = match read_optional_string(&doc, "class", "user record")? {
+        Some(class) => IdentityClass::parse(&class)?,
         None => IdentityClass::Human,
     };
 
-    let supervisor = doc.get("supervisor")
-        .and_then(|item| item.as_str())
-        .map(|s| s.to_string());
+    // Optional, strict, same shape again: absent means "no supervisor" (every human, and any
+    // unsupervised bot/service), which stays the parse of a missing key. A present non-string
+    // value must error instead of silently reading as "unsupervised" — that would quietly drop
+    // the one piece of accountability an automated identity's record carries.
+    let supervisor = read_optional_string(&doc, "supervisor", "user record")?;
 
     Ok(UserRecord {
         identifier: read_string(&doc, "identifier", "user record")?,
@@ -1241,8 +1257,16 @@ fn parse_key_record(toml: &str) -> Result<KeyRecord, String> {
     let doc: DocumentMut = toml.parse()
         .map_err(|e| format!("A key record is not valid TOML: {}", e))?;
 
-    let revocation_reason = match doc.get("revocation_reason").and_then(|item| item.as_str()) {
-        Some(reason) => Some(RevocationReason::parse(reason)?),
+    // Optional, strict, same absent-vs-malformed split as `distrust_boundary` below:
+    // `key_record_to_toml` omits `revocation_reason` for an active (never-revoked) key, so an
+    // absent key must keep parsing as `None`. A present non-string value must still error
+    // rather than fall through the same `None` arm — `verify_key_permanence` (audit_utils)
+    // treats a revoked key with `revocation_reason.is_none()` as "revoked without a reason" and
+    // refuses the parcel, so silently losing a present-but-damaged reason to `None` would turn a
+    // legitimately-reasoned revocation into a spurious rejection instead of a loud parse error
+    // naming the actual problem.
+    let revocation_reason = match read_optional_string(&doc, "revocation_reason", "key record")? {
+        Some(reason) => Some(RevocationReason::parse(&reason)?),
         None => None,
     };
 
@@ -1260,7 +1284,15 @@ fn parse_key_record(toml: &str) -> Result<KeyRecord, String> {
         operator: read_string(&doc, "operator", "key record")?,
         public_key: read_string(&doc, "public_key", "key record")?,
         issued_at: read_integer(&doc, "issued_at", "key record")?,
-        retired_at: doc.get("retired_at").and_then(|item| item.as_integer()),
+        // Optional, strict, same split: absent means the key is active (the common case;
+        // `key_record_to_toml` omits it), but a present non-integer value must error rather than
+        // silently read as "active". `retired_at` is documented as display metadata — validity
+        // is decided by the distrust boundary, never by time — but `is_active`/`active_keys_of`/
+        // `signing_key_of` still read it to pick which of an operator's own keys a local sign
+        // uses, and `verify_key_permanence`'s append-once check (audit_utils) compares it across
+        // parcels the same way it compares `revocation_reason`; silently collapsing a damaged
+        // present value to "active" would misinform both instead of naming the actual damage.
+        retired_at: read_optional_integer(&doc, "retired_at", "key record")?,
         revocation_reason,
         distrust_boundary,
         authorized_by: read_string(&doc, "authorized_by", "key record")?,
@@ -1269,19 +1301,101 @@ fn parse_key_record(toml: &str) -> Result<KeyRecord, String> {
     })
 }
 
-/// Read a required string field from a TOML document.
-fn read_string(doc: &DocumentMut, field: &str, record_kind: &str) -> Result<String, String> {
-    doc.get(field)
-        .and_then(|item| item.as_str())
+/// Read a required string field from a TOML document, strictly: an absent key errors naming
+/// the record kind and field ("has no ... entry"), and so does a *present* key that is not a
+/// string — but with its own wording ("is present but is not a string"), so a hand-edited
+/// `genesis = 7` is never reported as missing. Same two-arm shape as [`read_integer`], for a
+/// field this record kind always writes. `pub(crate)`: `haul_utils`, `manifest_utils` and
+/// `tag_utils` share this instead of duplicating it as a private per-module closure
+/// (FORK-81 follow-up: the class sweep this PR's own strictness fix missed).
+pub(crate) fn read_string(doc: &DocumentMut, field: &str, record_kind: &str) -> Result<String, String> {
+    let Some(item) = doc.get(field) else {
+        return Err(format!("{} has no \"{}\" entry.", record_kind_prefix(record_kind), field));
+    };
+
+    item.as_str()
         .map(|s| s.to_string())
-        .ok_or(format!("A {} has no \"{}\" entry.", record_kind, field))
+        .ok_or_else(|| format!(
+            "{}'s \"{}\" entry is present but is not a string.", record_kind_prefix(record_kind), field
+        ))
 }
 
-/// Read a required integer field from a TOML document.
-fn read_integer(doc: &DocumentMut, field: &str, record_kind: &str) -> Result<i64, String> {
-    doc.get(field)
-        .and_then(|item| item.as_integer())
-        .ok_or(format!("A {} has no \"{}\" entry.", record_kind, field))
+/// Record kinds that exist exactly once per warehouse, so `"a {kind}"` would misleadingly
+/// suggest there could be more than one — these take the definite article instead. Every
+/// other record kind recurs many times (`"a haul event"`, `"a tag record"`, ...). Explicit
+/// list, not a single hardcoded comparison (PR #122 round 5 F6): a future unique-per-
+/// warehouse kind must be added here, or it silently falls through to the indefinite article
+/// below.
+const UNIQUE_RECORD_KINDS: [&str; 1] = ["trust file"];
+
+/// Record kinds whose first *letter* is a vowel but whose first *sound* is not — a leading
+/// "y" glide, as in "user" ("yoo-zer") — so English picks "a", not the "an" a spelling-only
+/// check below would otherwise pick. The reverse (a consonant letter with a vowel sound, e.g.
+/// "hour") does not occur among today's record kinds; add it here if it ever does.
+const CONSONANT_SOUNDING_RECORD_KINDS: [&str; 1] = ["user record"];
+
+/// The record-kind noun phrase for a message like `"{} has no ... entry."`, with its article.
+/// Capitalized: every caller uses this at the start of a sentence.
+///
+/// The indefinite article is picked from the record kind's first letter (PR #122 round 5 F6):
+/// hardcoding "A" for everything is correct only by coincidence for today's seven kinds — a
+/// future vowel-initial kind (e.g. "office record") would silently read "A office record".
+fn record_kind_prefix(record_kind: &str) -> String {
+    if UNIQUE_RECORD_KINDS.contains(&record_kind) {
+        return format!("The {}", record_kind);
+    }
+
+    let starts_with_vowel_sound = record_kind.starts_with(|c: char| "aeiouAEIOU".contains(c))
+        && !CONSONANT_SOUNDING_RECORD_KINDS.contains(&record_kind);
+
+    let article = if starts_with_vowel_sound { "An" } else { "A" };
+    format!("{} {}", article, record_kind)
+}
+
+/// Read a required integer field from a TOML document, strictly: an absent key errors
+/// naming the record kind and field ("has no ... entry"), and so does a *present* key
+/// that is not an integer — but with its own wording ("is present but is not an
+/// integer"), so a hand-edited, quoted `tagged_at = "1700000000"` is never reported as
+/// missing. Same two-arm shape as [`read_optional_integer`], for a field this record
+/// kind always writes.
+pub(crate) fn read_integer(doc: &DocumentMut, field: &str, record_kind: &str) -> Result<i64, String> {
+    let Some(item) = doc.get(field) else {
+        return Err(format!("{} has no \"{}\" entry.", record_kind_prefix(record_kind), field));
+    };
+
+    item.as_integer()
+        .ok_or_else(|| format!(
+            "{}'s \"{}\" entry is present but is not an integer.", record_kind_prefix(record_kind), field
+        ))
+}
+
+/// Read an optional string field, strictly: an absent key is `None` — a defined, expected
+/// shape for a field the writer genuinely omits — but a *present* key must be a string, or
+/// this errors naming the record kind and field. Never conflates "absent" with "present but
+/// the wrong type" the way `doc.get(field).and_then(|item| item.as_str())` collapsing both
+/// cases to `None` would (FORK-81 follow-up: the same lenience `pallets` had). `pub(crate)`:
+/// `haul_utils` and `manifest_utils` share this instead of duplicating the same lenient
+/// shape as a private per-module `optional_string` closure.
+pub(crate) fn read_optional_string(doc: &DocumentMut, field: &str, record_kind: &str) -> Result<Option<String>, String> {
+    let Some(item) = doc.get(field) else { return Ok(None); };
+
+    item.as_str()
+        .map(|s| Some(s.to_string()))
+        .ok_or_else(|| format!(
+            "{}'s \"{}\" entry is present but is not a string.", record_kind_prefix(record_kind), field
+        ))
+}
+
+/// [`read_optional_string`]'s integer counterpart: an absent key is `None`, a present
+/// non-integer value errors naming the record kind and field.
+fn read_optional_integer(doc: &DocumentMut, field: &str, record_kind: &str) -> Result<Option<i64>, String> {
+    let Some(item) = doc.get(field) else { return Ok(None); };
+
+    item.as_integer()
+        .map(Some)
+        .ok_or_else(|| format!(
+            "{}'s \"{}\" entry is present but is not an integer.", record_kind_prefix(record_kind), field
+        ))
 }
 
 /// Read a required array-of-hashes field, strictly: the key must be present and every entry must
@@ -1289,9 +1403,17 @@ fn read_integer(doc: &DocumentMut, field: &str, record_kind: &str) -> Result<i64
 /// — never silently drops an entry the way a `filter_map` would. For a field the writer always
 /// serializes (even when empty), a missing key is corruption, not an old/lenient shape.
 fn read_required_string_array(doc: &DocumentMut, field: &str, record_kind: &str) -> Result<Vec<String>, String> {
-    let array = doc.get(field)
-        .and_then(|item| item.as_array())
-        .ok_or_else(|| format!("A {} has no \"{}\" array entry.", record_kind, field))?;
+    // Two arms, like every other reader here: collapsing them would report `boundary = 7` as
+    // "has no boundary array entry" while the key is plainly there, sending the reader to add a
+    // field that already exists. This was the last single-arm reader in the file.
+    let Some(item) = doc.get(field) else {
+        return Err(format!("{} has no \"{}\" array entry.", record_kind_prefix(record_kind), field));
+    };
+
+    let array = item.as_array()
+        .ok_or_else(|| format!(
+            "{}'s \"{}\" entry is present but is not an array.", record_kind_prefix(record_kind), field
+        ))?;
 
     strict_string_array(array, field, record_kind)
 }
@@ -1304,7 +1426,9 @@ fn read_optional_string_array(doc: &DocumentMut, field: &str, record_kind: &str)
     let Some(item) = doc.get(field) else { return Ok(Vec::new()); };
 
     let array = item.as_array()
-        .ok_or_else(|| format!("A {}'s \"{}\" entry is present but is not an array.", record_kind, field))?;
+        .ok_or_else(|| format!(
+            "{}'s \"{}\" entry is present but is not an array.", record_kind_prefix(record_kind), field
+        ))?;
 
     strict_string_array(array, field, record_kind)
 }
@@ -1318,7 +1442,7 @@ fn strict_string_array(array: &toml_edit::Array, field: &str, record_kind: &str)
         .map(|(index, entry)| entry.as_str()
             .map(|s| s.to_string())
             .ok_or_else(|| format!(
-                "A {} has a non-string entry in \"{}\" at index {}.", record_kind, field, index
+                "{} has a non-string entry in \"{}\" at index {}.", record_kind_prefix(record_kind), field, index
             )))
         .collect()
 }
@@ -1425,6 +1549,34 @@ mod tests {
     }
 
     /// Finding 5 (round 1, PR #120): `read_trust_anchor` used to parse `boundary` with
+    /// The last single-arm reader in this file: `boundary = 7` used to report "has no
+    /// \"boundary\" array entry" while the key was plainly present, sending the reader to add a
+    /// field that already exists — the exact misdirection `read_string`'s own doc comment cites as
+    /// the reason its arms were split. This pins the present-but-wrong-type arm; the absent arm is
+    /// pinned by the parse of a trust file written without the key.
+    #[test]
+    fn a_present_but_non_array_boundary_is_distinguished_from_an_absent_one() {
+        let doc: DocumentMut = "boundary = 7\n".parse().unwrap();
+
+        let error = match read_required_string_array(&doc, "boundary", "trust file") {
+            Err(error) => error,
+            Ok(value) => panic!("a present, non-array boundary must error, not read as {:?}", value),
+        };
+
+        assert!(error.contains("present but is not an array"),
+            "the error must say the key is present and wrongly typed, not that it is missing: {}",
+            error
+        );
+        assert!(error.contains("boundary"), "the error must name the field: {}", error);
+
+        // The absent arm still reports absence, and still says so in the old words.
+        let empty: DocumentMut = "".parse().unwrap();
+        let absent = read_required_string_array(&empty, "boundary", "trust file").unwrap_err();
+
+        assert!(absent.contains("has no"),
+            "an absent required array must still report absence: {}", absent);
+    }
+
     /// `filter_map(|e| e.as_str())`, silently dropping a non-string entry instead of erroring —
     /// under-counting roots on a damaged trust file and letting `gc` collect a pinned head, the
     /// opposite of what `collect_trust_pin_roots`'s own doc comment claims. `boundary` is a
@@ -1498,5 +1650,325 @@ mod tests {
         let parsed = parse_key_record(toml)
             .expect("a record with no distrust_boundary key must still parse");
         assert!(parsed.distrust_boundary.is_empty());
+    }
+
+    /// A minimal, otherwise-valid user record TOML string with the given `pallets` clause (or
+    /// none, if `pallets_clause` is empty) spliced in — the shared fixture for the tests below.
+    fn user_record_toml(pallets_clause: &str) -> String {
+        format!(
+            "identifier = \"op@x\"\n\
+             enrolled_at = 1\n\
+             role = \"writer\"\n\
+             identity_root = \"r\"\n\
+             {}",
+            pallets_clause
+        )
+    }
+
+    /// FORK-81 follow-up (the finding this commit fixes): `may_write_pallet` reads an empty
+    /// `pallets` list as "may write ANY pallet" for a `Writer` — the previous parse
+    /// (`.and_then(as_array).unwrap_or_default()`) silently turned a `pallets` value that is
+    /// present but not an array into that same empty list, fail-OPEN on an authorization check.
+    /// A present non-array value must error instead.
+    #[test]
+    fn a_present_non_array_pallets_entry_in_a_user_record_errors_naming_it() {
+        let toml = user_record_toml("pallets = \"main\"\n");
+
+        let error = match parse_user_record(&toml) {
+            Err(e) => e,
+            Ok(_) => panic!("a non-array pallets value must error, not silently become empty"),
+        };
+        assert!(error.contains("\"pallets\""), "the error must name the field: {}", error);
+    }
+
+    /// The other half of the same fail-open hazard: the previous parse's `filter_map(|e| e.
+    /// as_str())` silently dropped a non-string entry rather than erroring, which would have
+    /// narrowed (not widened) `pallets` — still a silent misread of what was actually granted,
+    /// and inconsistent with every other strict array field in this file.
+    #[test]
+    fn a_non_string_pallets_entry_in_a_user_record_errors_naming_it() {
+        let toml = user_record_toml("pallets = [\"main\", 7]\n");
+
+        let error = match parse_user_record(&toml) {
+            Err(e) => e,
+            Ok(_) => panic!("a non-string pallets entry must error, not be silently dropped"),
+        };
+        assert!(error.contains("\"pallets\""), "the error must name the field: {}", error);
+        assert!(error.contains("index 1"), "the error must name the offending index: {}", error);
+    }
+
+    /// The absent-key case must stay exactly as lenient as before: `user_record_to_toml` omits
+    /// `pallets` entirely for an unrestricted writer, so a record with no such key must still
+    /// parse as an empty list — and `may_write_pallet` must still read that empty list as
+    /// "may write any pallet" (the behaviour the strictness fix above must NOT change).
+    #[test]
+    fn a_user_record_with_no_pallets_key_parses_as_empty_and_stays_unrestricted() {
+        let toml = user_record_toml("");
+
+        let parsed = parse_user_record(&toml)
+            .expect("a record with no pallets key must still parse");
+        assert!(parsed.pallets.is_empty());
+        assert!(
+            parsed.may_write_pallet("some-arbitrary-pallet"),
+            "an empty pallets list must still mean unrestricted write"
+        );
+    }
+
+    /// `class` gets the same absent-vs-malformed split as `pallets`: absent legitimately
+    /// defaults to `Human` (covered by `a_record_without_a_class_defaults_to_human` above), but
+    /// a present non-string value must error rather than silently collapse to that same default
+    /// — `IdentityClass` gates admission rules and audit/query classification, so misreading a
+    /// damaged automated identity as human would hide the provenance distinction it exists for.
+    #[test]
+    fn a_present_non_string_class_in_a_user_record_errors_naming_it() {
+        let toml = "identifier = \"op@x\"\nenrolled_at = 1\nrole = \"writer\"\nidentity_root = \"r\"\nclass = 7\n";
+
+        let error = match parse_user_record(toml) {
+            Err(e) => e,
+            Ok(_) => panic!("a non-string class value must error, not silently default to human"),
+        };
+        assert!(error.contains("\"class\""), "the error must name the field: {}", error);
+    }
+
+    /// `supervisor`'s malformed-vs-absent split: absent legitimately means "no supervisor"
+    /// (every human, and any unsupervised bot/service), but a present non-string value must
+    /// error rather than silently read as unsupervised — losing the one accountability field an
+    /// automated identity's record carries.
+    #[test]
+    fn a_present_non_string_supervisor_in_a_user_record_errors_naming_it() {
+        let toml = "identifier = \"op@x\"\nenrolled_at = 1\nrole = \"writer\"\nidentity_root = \"r\"\nsupervisor = 7\n";
+
+        let error = match parse_user_record(toml) {
+            Err(e) => e,
+            Ok(_) => panic!("a non-string supervisor value must error, not silently become none"),
+        };
+        assert!(error.contains("\"supervisor\""), "the error must name the field: {}", error);
+    }
+
+    /// `revocation_reason`'s malformed-vs-absent split, key-record side: absent legitimately
+    /// means "not revoked" (the common, active-key shape), but a present non-string value must
+    /// error rather than fall through the same `None` arm — `verify_key_permanence`
+    /// (audit_utils) treats a revoked key with no reason as invalid, so silently losing a
+    /// present-but-damaged reason would turn a legitimate revocation into a spurious rejection.
+    #[test]
+    fn a_present_non_string_revocation_reason_in_a_key_record_errors_naming_it() {
+        let toml = "key_id = \"k1\"\n\
+            operator = \"op@x\"\n\
+            public_key = \"ab\"\n\
+            issued_at = 1\n\
+            revocation_reason = 7\n\
+            authorized_by = \"k1\"\n\
+            endorsement = \"ee\"\n\
+            proof_of_possession = \"pp\"\n";
+
+        let error = match parse_key_record(toml) {
+            Err(e) => e,
+            Ok(_) => panic!("a non-string revocation_reason value must error, not silently become none"),
+        };
+        assert!(error.contains("\"revocation_reason\""), "the error must name the field: {}", error);
+    }
+
+    /// `retired_at`'s malformed-vs-absent split: absent legitimately means "active" (the common
+    /// shape; `key_record_to_toml` omits it), but a present non-integer value must error rather
+    /// than silently read as active.
+    #[test]
+    fn a_present_non_integer_retired_at_in_a_key_record_errors_naming_it() {
+        let toml = "key_id = \"k1\"\n\
+            operator = \"op@x\"\n\
+            public_key = \"ab\"\n\
+            issued_at = 1\n\
+            retired_at = \"soon\"\n\
+            authorized_by = \"k1\"\n\
+            endorsement = \"ee\"\n\
+            proof_of_possession = \"pp\"\n";
+
+        let error = match parse_key_record(toml) {
+            Err(e) => e,
+            Ok(_) => panic!("a non-integer retired_at value must error, not silently become active"),
+        };
+        assert!(error.contains("\"retired_at\""), "the error must name the field: {}", error);
+    }
+
+    /// `prior_genesis`/`adopts` get the same split as `pallets`, trust-file side: absent
+    /// legitimately means "original enrollment, no re-genesis" (the common shape), but a
+    /// present non-string value must error rather than silently collapse to that same `None` —
+    /// `collect_trust_pin_roots` treats a missing `adopts` as "nothing to pin", so a damaged
+    /// present value must not be misread as the ordinary absent case.
+    #[test]
+    fn a_present_non_string_adopts_in_the_trust_file_errors_naming_it() {
+        use crate::globals::StorageRootScope;
+
+        let dir = std::env::temp_dir()
+            .join(format!("forklift-office-utils-malformed-adopts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        let _scope = StorageRootScope::enter(&dir);
+
+        let path = forklift_root().join(FILE_NAME_TRUST);
+        std::fs::write(&path,
+            "genesis = \"genesis-hash\"\n\
+             enabled_at = 1\n\
+             boundary = []\n\
+             adopts = 7\n"
+        ).unwrap();
+
+        let error = match read_trust_anchor() {
+            Err(e) => e,
+            Ok(_) => panic!("a non-string adopts value must error, not silently become none"),
+        };
+        assert!(error.contains("\"adopts\""), "the error must name the field: {}", error);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// PR #122 round 4 finding F2: `read_string` still said "has no ... entry" for BOTH an
+    /// absent key and a present, wrong-typed one — the exact conflation `read_integer` was
+    /// given a two-arm shape to fix — so a hand-edited `genesis = 7` reported "has no
+    /// \"genesis\" entry" while the key is plainly there, misdirecting the fix. It must
+    /// distinguish the two the same way `read_integer` does.
+    #[test]
+    fn read_string_reports_an_absent_key_as_missing() {
+        let doc: DocumentMut = "other = \"x\"\n".parse().unwrap();
+
+        let error = match read_string(&doc, "genesis", "trust file") {
+            Err(e) => e,
+            Ok(v) => panic!("an absent key must error, not read as {:?}", v),
+        };
+        assert!(error.contains("has no"), "must report absence, not type: {}", error);
+        assert!(error.contains("\"genesis\""), "the error must name the field: {}", error);
+    }
+
+    #[test]
+    fn read_string_reports_a_present_non_string_as_wrongly_typed_not_missing() {
+        let doc: DocumentMut = "genesis = 7\n".parse().unwrap();
+
+        let error = match read_string(&doc, "genesis", "trust file") {
+            Err(e) => e,
+            Ok(v) => panic!("a present, non-string value must error, not read as {:?}", v),
+        };
+        assert!(
+            !error.contains("has no"),
+            "a present-but-wrong-type value must not be reported as absent: {}", error
+        );
+        assert!(error.contains("is present but is not a string"), "unexpected error: {}", error);
+        assert!(error.contains("\"genesis\""), "the error must name the field: {}", error);
+    }
+
+    /// `read_integer` used to say "has no ... entry" for BOTH an absent key and a present,
+    /// wrong-typed one — so a hand-edited, quoted `tagged_at = "1700000000"` was reported as
+    /// missing, misdirecting the fix. It must distinguish the two the same way
+    /// `read_optional_integer` already does.
+    #[test]
+    fn read_integer_reports_an_absent_key_as_missing() {
+        let doc: DocumentMut = "other = 1\n".parse().unwrap();
+
+        let error = match read_integer(&doc, "tagged_at", "tag record") {
+            Err(e) => e,
+            Ok(v) => panic!("an absent key must error, not read as {:?}", v),
+        };
+        assert!(error.contains("has no"), "must report absence, not type: {}", error);
+        assert!(error.contains("\"tagged_at\""), "the error must name the field: {}", error);
+    }
+
+    #[test]
+    fn read_integer_reports_a_present_non_integer_as_wrongly_typed_not_missing() {
+        let doc: DocumentMut = "tagged_at = \"1700000000\"\n".parse().unwrap();
+
+        let error = match read_integer(&doc, "tagged_at", "tag record") {
+            Err(e) => e,
+            Ok(v) => panic!("a present, non-integer value must error, not read as {:?}", v),
+        };
+        assert!(
+            !error.contains("has no"),
+            "a present-but-wrong-type value must not be reported as absent: {}", error
+        );
+        assert!(error.contains("is present but is not an integer"), "unexpected error: {}", error);
+        assert!(error.contains("\"tagged_at\""), "the error must name the field: {}", error);
+    }
+
+    /// Finding F7 (round 3): the trust file's `genesis`/`enabled_at` used to be hand-rolled
+    /// required reads with the same `and_then(...).ok_or(...)` shape the four retired sites
+    /// used, directly under a comment insisting the parse must be strict. They now route
+    /// through the shared `read_string`/`read_integer`, and the error text still names the
+    /// trust file (not a generic "record").
+    #[test]
+    fn a_present_non_integer_enabled_at_in_the_trust_file_errors_naming_it() {
+        use crate::globals::StorageRootScope;
+
+        let dir = std::env::temp_dir()
+            .join(format!("forklift-office-utils-malformed-enabled-at-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        let _scope = StorageRootScope::enter(&dir);
+
+        let path = forklift_root().join(FILE_NAME_TRUST);
+        std::fs::write(&path,
+            "genesis = \"genesis-hash\"\n\
+             enabled_at = \"soon\"\n\
+             boundary = []\n"
+        ).unwrap();
+
+        let error = match read_trust_anchor() {
+            Err(e) => e,
+            Ok(_) => panic!("a non-integer enabled_at value must error, not silently drop the record"),
+        };
+        assert!(error.contains("trust file"), "the error must name the record kind: {}", error);
+        assert!(error.contains("\"enabled_at\""), "the error must name the field: {}", error);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// PR #122 round 4 finding F5: routing `genesis`/`enabled_at` through the shared reader
+    /// changed `The trust file has no "genesis" entry.` to `A trust file has no ...` — two
+    /// lines below the surviving, hardcoded `The trust file is not valid TOML`. There is
+    /// exactly one trust file per warehouse, so it takes the definite article like every other
+    /// message about it; a record kind that recurs across a warehouse (a haul event, a tag
+    /// record, ...) keeps the indefinite one.
+    #[test]
+    fn trust_file_errors_take_the_definite_article_other_record_kinds_the_indefinite() {
+        let doc: DocumentMut = "other = \"x\"\n".parse().unwrap();
+
+        let trust_file_error = read_string(&doc, "genesis", "trust file").unwrap_err();
+        assert!(
+            trust_file_error.starts_with("The trust file has no"),
+            "the trust file is unique per warehouse and must take \"The\": {}", trust_file_error
+        );
+
+        let haul_event_error = read_string(&doc, "haul", "haul event").unwrap_err();
+        assert!(
+            haul_event_error.starts_with("A haul event has no"),
+            "a haul event recurs across a warehouse and must keep \"A\": {}", haul_event_error
+        );
+
+        let tag_record_error = read_string(&doc, "subject", "tag record").unwrap_err();
+        assert!(
+            tag_record_error.starts_with("A tag record has no"),
+            "a tag record recurs across a warehouse and must keep \"A\": {}", tag_record_error
+        );
+    }
+
+    /// PR #122 round 5 finding F6: hardcoding "A" for everything but the literal "trust
+    /// file" was correct only by coincidence for today's seven record kinds. A future
+    /// vowel-initial kind must take "An", and a future unique-per-warehouse kind must be
+    /// added to the explicit list rather than falling through to the indefinite article.
+    #[test]
+    fn record_kind_prefix_picks_the_article_from_the_first_letter_and_an_explicit_uniqueness_list() {
+        assert_eq!(record_kind_prefix("office record"), "An office record");
+        assert_eq!(record_kind_prefix("audit entry"), "An audit entry");
+
+        // "user record" starts with a vowel *letter* but a consonant *sound* ("yoo-zer") —
+        // English picks the article by sound, so a bare first-letter check would get this
+        // wrong; it must stay "A", not flip to "An".
+        assert_eq!(record_kind_prefix("user record"), "A user record");
+
+        // The explicit uniqueness list decides the definite article, not the first letter.
+        assert_eq!(record_kind_prefix("trust file"), "The trust file");
+
+        // Ordinary consonant-initial kinds are unaffected.
+        assert_eq!(record_kind_prefix("haul event"), "A haul event");
+        assert_eq!(record_kind_prefix("tag record"), "A tag record");
+        assert_eq!(record_kind_prefix("key record"), "A key record");
+        assert_eq!(record_kind_prefix("manifest entry"), "A manifest entry");
+        assert_eq!(record_kind_prefix("delivery entry"), "A delivery entry");
     }
 }

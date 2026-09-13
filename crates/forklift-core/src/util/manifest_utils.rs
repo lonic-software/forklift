@@ -440,47 +440,40 @@ fn parse_entry(toml: &str) -> Result<ManifestEntry, String> {
     let doc: DocumentMut = toml.parse()
         .map_err(|e| format!("A manifest entry is not valid TOML: {}", e))?;
 
-    let read_string = |field: &str| -> Result<String, String> {
-        doc.get(field)
-            .and_then(|item| item.as_str())
-            .map(|s| s.to_string())
-            .ok_or(format!("A manifest entry has no \"{}\" entry.", field))
-    };
+    let kind = ManifestKind::parse(&office_utils::read_string(&doc, "kind", "manifest entry")?)?;
 
-    let optional_string = |field: &str| -> Option<String> {
-        doc.get(field).and_then(|item| item.as_str()).map(|s| s.to_string())
-    };
-
-    let kind = ManifestKind::parse(&read_string("kind")?)?;
-
+    // Optional, strict (FORK-81 follow-up: the class sweep PR #122 missed): `entry_to_toml`
+    // omits `tool`/`session`/`transcript` entirely when a provenance entry carries no value for
+    // them, so an absent key legitimately means `None`. A *present* non-string value must still
+    // error rather than silently collapse to that same `None` — a query by tool (or session, or
+    // transcript) would otherwise silently miss a record that actually carries one, exactly the
+    // under-counting hazard PR #122 closed for `office_utils`. Uses the office's shared strict
+    // reader rather than a duplicated per-module `optional_string` closure with the old lenient
+    // shape.
     let provenance = match kind {
         ManifestKind::Provenance => Some(Provenance {
-            model: read_string("model")?,
-            tool: optional_string("tool"),
-            session: optional_string("session"),
-            transcript: optional_string("transcript"),
+            model: office_utils::read_string(&doc, "model", "manifest entry")?,
+            tool: office_utils::read_optional_string(&doc, "tool", "manifest entry")?,
+            session: office_utils::read_optional_string(&doc, "session", "manifest entry")?,
+            transcript: office_utils::read_optional_string(&doc, "transcript", "manifest entry")?,
         }),
         _ => None,
     };
 
     let delivery = match kind {
         ManifestKind::Delivery => Some(Delivery {
-            source: read_string("source")?,
-            trail_head: read_string("trail_head")?,
-            checkpoints: doc.get("checkpoints")
-                .and_then(|item| item.as_integer())
-                .ok_or("A delivery entry has no \"checkpoints\" entry.".to_string())?,
+            source: office_utils::read_string(&doc, "source", "manifest entry")?,
+            trail_head: office_utils::read_string(&doc, "trail_head", "manifest entry")?,
+            checkpoints: office_utils::read_integer(&doc, "checkpoints", "delivery entry")?,
         }),
         _ => None,
     };
 
     Ok(ManifestEntry {
-        subject: read_string("subject")?,
+        subject: office_utils::read_string(&doc, "subject", "manifest entry")?,
         kind,
-        recorded_at: doc.get("recorded_at")
-            .and_then(|item| item.as_integer())
-            .ok_or("A manifest entry has no \"recorded_at\" entry.".to_string())?,
-        body: read_string("body")?,
+        recorded_at: office_utils::read_integer(&doc, "recorded_at", "manifest entry")?,
+        body: office_utils::read_string(&doc, "body", "manifest entry")?,
         provenance,
         delivery,
     })
@@ -523,6 +516,77 @@ mod tests {
         let parsed = parse_entry(&entry_to_toml(&original)).unwrap();
         assert_eq!(parsed, original);
         assert_eq!(parsed.provenance.unwrap().model, "claude-opus-4-8");
+    }
+
+    /// The absent-key case for the two fields the round-trip test above never leaves absent:
+    /// `entry_to_toml` omits `tool` and `session` (as well as `transcript`, already covered
+    /// above) when a provenance entry carries no value for them, so a provenance entry with
+    /// none of the three present must still parse with all three `None` — the strictness fix
+    /// below must not narrow that.
+    #[test]
+    fn a_provenance_entry_with_no_optional_keys_parses_with_all_none() {
+        let mut original = entry(&"a".repeat(64), ManifestKind::Provenance, "generated the module");
+        original.provenance = Some(Provenance {
+            model: "claude-opus-4-8".to_string(),
+            tool: None,
+            session: None,
+            transcript: None,
+        });
+
+        let parsed = parse_entry(&entry_to_toml(&original)).expect("must still parse");
+        assert_eq!(parsed, original);
+    }
+
+    /// A minimal, otherwise-valid provenance manifest entry TOML string with one extra clause
+    /// spliced in — the shared fixture for the strictness tests below.
+    fn provenance_entry_toml(extra_clause: &str) -> String {
+        format!(
+            "subject = \"{}\"\n\
+             kind = \"provenance\"\n\
+             recorded_at = 100\n\
+             body = \"generated the module\"\n\
+             model = \"claude-opus-4-8\"\n\
+             {}",
+            "a".repeat(64),
+            extra_clause
+        )
+    }
+
+    /// FORK-81 follow-up (the class sweep PR #122 missed): a present but non-string `tool` must
+    /// error, never silently vanish from the entry the way the old `optional_string` closure's
+    /// `.and_then(as_str)` would — a query by tool would otherwise silently miss a record that
+    /// actually carries one, exactly the under-counting hazard PR #122 closed for `office_utils`.
+    #[test]
+    fn a_present_non_string_tool_in_a_provenance_entry_errors_naming_it() {
+        let toml = provenance_entry_toml("tool = 7\n");
+
+        let error = match parse_entry(&toml) {
+            Err(e) => e,
+            Ok(_) => panic!("a non-string tool value must error, not silently vanish"),
+        };
+        assert!(error.contains("\"tool\""), "the error must name the field: {}", error);
+    }
+
+    #[test]
+    fn a_present_non_string_session_in_a_provenance_entry_errors_naming_it() {
+        let toml = provenance_entry_toml("session = 7\n");
+
+        let error = match parse_entry(&toml) {
+            Err(e) => e,
+            Ok(_) => panic!("a non-string session value must error, not silently vanish"),
+        };
+        assert!(error.contains("\"session\""), "the error must name the field: {}", error);
+    }
+
+    #[test]
+    fn a_present_non_string_transcript_in_a_provenance_entry_errors_naming_it() {
+        let toml = provenance_entry_toml("transcript = 7\n");
+
+        let error = match parse_entry(&toml) {
+            Err(e) => e,
+            Ok(_) => panic!("a non-string transcript value must error, not silently vanish"),
+        };
+        assert!(error.contains("\"transcript\""), "the error must name the field: {}", error);
     }
 
     #[test]
