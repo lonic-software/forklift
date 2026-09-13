@@ -121,14 +121,28 @@ What an operator may do derives from their **role** in the target warehouse's of
 
 **Per-pallet grants apply only to a request that resolves to an office operator identity** —
 one authenticated via this token file or an `authentication` hook. A request authenticated with
-the single static `token` instead resolves to no identity at all, so the per-pallet gate never
-runs for it: the static token is full access, uniformly, to every pallet this server serves,
-exactly like an unauthenticated `--open` server except that a token is required at all. If you
-want per-pallet enforcement, every caller that should be limited needs an operator token or hook
-identity — issuing the static token to more than the server administrator defeats it. This is
-the same shared-privilege property `docs/DEPLOYMENT.md` documents for the AWS serverless head,
-which has no operator-identity mechanism at all and so cannot offer per-pallet enforcement under
-any configuration.
+the single static `token` instead resolves to no identity at all, so `may_write_pallet`'s
+per-pallet role/grant gate never runs for it (the ref-update handler in `server.rs` consults it
+only inside `if let Principal::Operator(identifier) = &principal`): the static token is
+uniformly full access to every pallet's *content* this server serves. It is not, however,
+equivalent to an unauthenticated `--open` server — it is strictly **more** privileged: in
+multi-warehouse mode only the static token may create a warehouse at all (`put_warehouse`
+refuses any principal but `Principal::Static`, so `--open` cannot create one — see "Serving many
+warehouses" above). If you want per-pallet *content* enforcement, every caller that should be
+limited needs an operator token or hook identity — issuing the static token to more than the
+server administrator defeats it.
+
+The one mechanism that already restricts a static-token (or `--open`) caller per pallet is the
+admission hook: `check_admission` runs before the per-pallet content gate, for every principal,
+with the pallet name in the request (`action: "ref_update"`, `pallet: Some(&name)`) — configure
+`[hooks] admission_url` (below) to refuse by pallet and it applies regardless of how the caller
+authenticated. It is a soft-policy seam (quotas, plan limits, suspensions), not an office
+role/grant check, but it is real per-pallet transport enforcement available today, not merely a
+gap. This is the same shared-privilege property `docs/DEPLOYMENT.md` documents for the AWS
+serverless head's *content* checks, which has no operator-identity mechanism and so has no
+per-pallet content gate of its own — nothing shipped in this repository adds one for that head
+either, short of a deployer-supplied API Gateway authorizer (`docs/DEPLOYMENT.md`, "Auth at the
+gateway").
 
 ## Hooks (provider integration)
 

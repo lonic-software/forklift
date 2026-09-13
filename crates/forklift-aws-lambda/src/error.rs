@@ -18,7 +18,11 @@ pub enum Status {
     TemporaryRedirect,
     /// `401` — no valid bearer token was presented (the transport-authentication seam).
     Unauthorized,
-    /// `403` — authenticated but not authorized (a role or grant refuses it).
+    /// `403` — the office chain itself refuses a parcel: its *signer* lacked the office role
+    /// (or self-service right) it needed as of that parcel's own signing
+    /// (`audit_utils::verify_office_privileges`, the only site that constructs this status).
+    /// Not a caller role or grant — this crate has no caller-identity concept to check one
+    /// against, so this is never about who transported the request.
     Forbidden,
     /// `404` — no such warehouse, object, signature or bundle.
     NotFound,

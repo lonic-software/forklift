@@ -290,12 +290,17 @@ fn unauthorized() -> HeadError {
 /// after authentication has already passed: closure presence (`verify_parcel_closure_with`),
 /// fast-forward-only refs, and — on a trusted warehouse — `verify_office_chain_memoized` +
 /// `verify_office_privileges` for an office-pallet update, or `verify_office_chain_memoized` +
-/// `verify_pallet_history` for a user pallet. Those checks verify *signatures* against the
-/// office's tracked roles; they do not check anything about the caller of this request, so a
-/// caller who can produce a validly-signed history for a pallet can move it regardless of
-/// whether an "office role" concept would have allowed them to. Per-pallet enforcement of the
-/// kind `forklift-server` offers to `Principal::Operator` callers needs an operator-identity
-/// mechanism this head does not have.
+/// `verify_pallet_history` for any other pallet (an ordinary working pallet, or a meta pallet
+/// such as `@manifest`). Those two checks differ: `verify_office_privileges` checks each
+/// office-modifying parcel's *signer* against the office role they held as of that parcel's own
+/// signing; `verify_pallet_history` checks only that each parcel carries a valid signature by a
+/// key the office currently tracks and has not revoked — no role, no grant
+/// (`audit_utils::classify_signature_trust`). Either way, neither checks anything about the
+/// caller of *this* request, so a caller who can produce a validly-signed history for a pallet
+/// can move it regardless of whether an office role would have allowed *them* to — and, outside
+/// the office pallet, regardless of what it would say about the *signer* either. Per-pallet
+/// enforcement of the kind `forklift-server` offers to `Principal::Operator` callers needs an
+/// operator-identity mechanism this head does not have.
 ///
 /// This function itself decides only the one thing prior to all of that: does the request
 /// carry the configured bearer at all. [`AuthConfig::Open`] passes everything (the explicit
