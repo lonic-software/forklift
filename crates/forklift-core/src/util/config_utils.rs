@@ -1191,26 +1191,31 @@ mod tests {
     /// guide lying. Keep the two in step: a row added there gets a case here.
     #[test]
     fn every_refusal_the_guide_tabulates_is_actually_refused() {
+        // Each row carries the phrase the refusal must contain, not merely "it is refused" — a
+        // row that started failing for an *unrelated* reason would otherwise keep this test green
+        // while the guide's explanation of it quietly became wrong.
         let rows = [
-            ("[opperator]\nidentifier = \"ada\"\n",   "unknown section"),
-            ("[operator]\nidentifer = \"ada\"\n",     "unknown key in a known section"),
-            ("[[operator]]\nname = \"ada\"\n",        "array-of-tables where a table belongs"),
-            ("[[profile.work]]\nname = \"ada\"\n",    "array-of-tables under profile"),
-            ("operator = 5\n",                         "section that is not a table"),
-            ("[maintenance]\nloose = 6700\n",          "bare integer"),
-            ("[remote]\ntor = true\n",                 "bare boolean"),
-            ("[remote]\ntorproxy = \"socks5h://x\"\n", "case-variant key"),
-            ("[remote]\ntor = \"onn\"\n",             "out-of-range value"),
-            ("[profile.work]\nnickname = \"w\"\n",    "unknown profile field"),
+            ("[opperator]\nidentifier = \"ada\"\n",   "\"opperator\" is not a known configuration section"),
+            ("[operator]\nidentifer = \"ada\"\n",     "\"operator.identifer\" is not a known configuration key"),
+            ("[[operator]]\nname = \"ada\"\n",        "\"operator\" must be a table (written \"[operator]\"), not array of tables"),
+            ("[[profile.work]]\nname = \"ada\"\n",    "\"profile.work\" must be a table (written \"[profile.work]\"), not array of tables"),
+            ("operator = 5\n",                         "\"operator\" must be a table (written \"[operator]\"), not integer"),
+            ("[maintenance]\nloose = 6700\n",          "\"maintenance.loose\" must be a string, not integer"),
+            ("[remote]\ntor = true\n",                 "\"remote.tor\" must be a string, not boolean"),
+            ("[remote]\ntorproxy = \"socks5h://x\"\n", "\"remote.torproxy\" is not a known configuration key"),
+            ("[remote]\ntor = \"onn\"\n",             "\"onn\" is not a valid value for remote.tor"),
+            ("[profile.work]\nnickname = \"w\"\n",    "\"profile.work.nickname\" is not a known profile field"),
         ];
 
-        for (content, why) in rows {
+        for (content, expected) in rows {
             let error = parse(content)
-                .expect_err(&format!("the guide says this is refused ({why}): {content:?}"));
+                .expect_err(&format!("the guide says this is refused: {content:?}"));
+
             assert!(
-                error.contains("config.toml"),
-                "every refusal must name the file ({why}): {error}"
+                error.contains(expected),
+                "refused, but not for the reason the guide gives.\n  expected: {expected}\n  actual:   {error}"
             );
+            assert!(error.contains("config.toml"), "every refusal must name the file: {error}");
         }
 
         // The counterpart the guide promises: the same values, written the documented way, parse.
