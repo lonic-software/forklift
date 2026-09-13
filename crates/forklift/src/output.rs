@@ -535,20 +535,68 @@ fn standing_taint_warning_text(mode: OutputMode, gate_message: &str) -> String {
              already completed successfully. {}",
             gate_message, heal_utils::DURABILITY_TAINT_NEXT_STEP
         ),
-        OutputMode::Json => {
-            let envelope = serde_json::json!({
-                "forklift_json": SCHEMA_VERSION,
-                "warning": heal_utils::CODE_DURABILITY_TAINT,
-                "message": gate_message,
-                "next_step": heal_utils::DURABILITY_TAINT_NEXT_STEP,
-            });
-
-            serde_json::to_string(&envelope).unwrap_or_else(|_| format!(
-                "{{\"forklift_json\":\"{}\",\"warning\":\"{}\"}}",
-                SCHEMA_VERSION, heal_utils::CODE_DURABILITY_TAINT
-            ))
-        }
+        OutputMode::Json => warning_envelope(
+            heal_utils::CODE_DURABILITY_TAINT,
+            gate_message,
+            heal_utils::DURABILITY_TAINT_NEXT_STEP,
+        ),
     }
+}
+
+/// The `--json` warning code for background maintenance that could not even decide whether it
+/// was due — today, because a configuration file it has to read does not parse.
+pub const CODE_MAINTENANCE_UNAVAILABLE: &str = "maintenance_unavailable";
+
+/// What to do about [`CODE_MAINTENANCE_UNAVAILABLE`].
+pub const MAINTENANCE_UNAVAILABLE_NEXT_STEP: &str =
+    "Maintenance stays skipped until the problem above is fixed.";
+
+/// Surface background auto-maintenance that could not run at all
+/// (`commands::maintenance::run_if_due`), on the same stderr side-channel — and for the same
+/// reasons — as [`warn_standing_taint`].
+///
+/// Auto-maintenance is best-effort: a *failed* compaction stays quiet unless it left a taint
+/// standing. This is the different case — maintenance never got as far as deciding whether it
+/// was due, because reading `maintenance.auto`/`maintenance.loose`/`maintenance.packs` failed.
+/// That condition does not clear on its own and is invisible in every other surface: the store
+/// simply never gets packed again, on every command, forever, with nothing said. Silence there
+/// is what this warning exists to end, and the message names the file to fix.
+pub fn warn_maintenance_unavailable(error: &str) {
+    eprintln!("{}", maintenance_unavailable_warning_text(mode(), error));
+}
+
+/// The pure half of [`warn_maintenance_unavailable`], split out for the same reason
+/// [`standing_taint_warning_text`] is: a test asserts the produced text in both modes without
+/// capturing the process's real stderr.
+fn maintenance_unavailable_warning_text(mode: OutputMode, error: &str) -> String {
+    match mode {
+        OutputMode::Human => format!(
+            "Warning: background object-store maintenance was skipped. {} {}",
+            error, MAINTENANCE_UNAVAILABLE_NEXT_STEP
+        ),
+        OutputMode::Json => warning_envelope(
+            CODE_MAINTENANCE_UNAVAILABLE,
+            error,
+            MAINTENANCE_UNAVAILABLE_NEXT_STEP,
+        ),
+    }
+}
+
+/// The one `--json` warning envelope, shared by every stderr warning so the shape a consumer
+/// parses (`forklift_json`, `warning`, `message`, `next_step`) is defined once — including the
+/// hand-built fallback for the serializer failure that cannot actually happen here.
+fn warning_envelope(code: &str, message: &str, next_step: &str) -> String {
+    let envelope = serde_json::json!({
+        "forklift_json": SCHEMA_VERSION,
+        "warning": code,
+        "message": message,
+        "next_step": next_step,
+    });
+
+    serde_json::to_string(&envelope).unwrap_or_else(|_| format!(
+        "{{\"forklift_json\":\"{}\",\"warning\":\"{}\"}}",
+        SCHEMA_VERSION, code
+    ))
 }
 
 /// Print a progress or prose line in human mode; do nothing under `--json` (progress

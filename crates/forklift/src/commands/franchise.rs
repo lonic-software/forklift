@@ -74,7 +74,7 @@ pub async fn handle_command(url: &str,
     // apply. Falling through to `from_config`'s cascade now would silently make a brand-new
     // clone's Tor routing depend on whatever unrelated warehouse the caller happened to be
     // standing in — a cwd-dependent, security-relevant surprise this preserves against.
-    let client = RemoteClient::new_with_tor(url, token.clone(), TorSettings::from_global_config())?;
+    let client = RemoteClient::new_with_tor(url, token.clone(), TorSettings::from_global_config()?)?;
     let info = client.fetch_info().await?;
 
     // Resolve the pallet from the handshake alone — no I/O — so a `--pallet` typo is refused

@@ -1346,6 +1346,18 @@ value. Known keys:
 | `maintenance.loose` | Loose-object count that triggers an auto incremental compact (default 6700). |
 | `maintenance.packs` | Pack count that triggers an auto consolidating repack (default 20). |
 
+**A configuration file either parses completely, or the command that needed it refuses**, naming
+the file and the offending key. There is no partial read: an unknown section, a mistyped key
+(`identifer`), or a value that is not a string is an error, not a key that silently reads as
+unset. That matters because "unset" is not inert — an unset `operator.identifier` mints a fresh
+id and writes it back, so a typo that read as absent would quietly replace the identity you
+configured.
+
+Every value is a **string on disk**, including the numeric and boolean ones — so a hand-edited
+`maintenance.loose = 6700` or `remote.tor = true` is refused; write `"6700"` and `"on"`. Setting
+values through `forklift config` quotes them for you, which is why this only ever bites a
+hand-edited file.
+
 Set / read / remove:
 
 ```sh

@@ -404,3 +404,10 @@ Example session:
   stderr, not just check the exit code; the taint is enforced regardless on the very next
   command's entry-heal chokepoint (`durability_taint`, exit 21) until `forklift heal`
   resolves it.
+* The same stderr channel carries one other warning, in the same shape:
+  `{ "forklift_json": "2", "warning": "maintenance_unavailable", "message": "…", "next_step":
+  "Maintenance stays skipped until …" }`. It means background auto-maintenance could
+  not even decide whether it was due, because a configuration file it reads does not parse.
+  Unlike the taint above nothing enforces it later — the store just stops being packed — so a
+  script that ignores stderr will never learn about it from any other surface. Every stderr
+  warning uses these four fields; `warning` is the code to switch on.

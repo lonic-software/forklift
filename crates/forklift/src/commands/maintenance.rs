@@ -13,8 +13,11 @@ use forklift_core::util::taint_utils;
 /// warehouse lock is exclusive and fail-fast, so a detached background compaction holding it
 /// would break the user's next command — running here, under the lock we already hold, keeps
 /// it correct and race-free. It is threshold-gated so it fires rarely, and best-effort, so a
-/// failure never fails the command that just succeeded — **except** that a failure which left a
-/// durability taint standing is not silently swallowed: see below.
+/// failure never fails the command that just succeeded. Two kinds of failure are still
+/// *reported* on stderr rather than swallowed (neither changes an exit code): one that left a
+/// durability taint standing (see below), and one that stopped maintenance from deciding
+/// whether it was due at all — an unreadable `maintenance.*` configuration, which is permanent
+/// and would otherwise disable packing forever in silence.
 ///
 /// Never redeltas: `redelta` re-reads and re-compresses the whole live set (CPU-bound, minutes
 /// at scale), which is never appropriate for a background trigger a routine command incurs
@@ -45,7 +48,21 @@ use forklift_core::util::taint_utils;
 /// resolves it. Keeping this command's exit at 0 and surfacing the taint as a loud warning keeps
 /// that enforcement intact while never punishing the command that merely triggered maintenance.
 pub fn run_if_due() {
-    let result = match pack_utils::auto_compaction_action().unwrap_or(AutoCompaction::None) {
+    // Deciding whether maintenance is due reads `maintenance.*` from configuration. A failure
+    // there is not the best-effort no-op the rest of this function documents: it is permanent
+    // (a configuration file that does not parse stays broken until someone edits it) and
+    // otherwise completely silent — the store would simply never be packed again, on every
+    // command, with nothing said on any of them. So it is reported, not swallowed. The
+    // triggering command's own exit code is still untouched, for the reason spelled out above.
+    let action = match pack_utils::auto_compaction_action() {
+        Ok(action) => action,
+        Err(error) => {
+            crate::output::warn_maintenance_unavailable(&error);
+            return;
+        }
+    };
+
+    let result = match action {
         AutoCompaction::Incremental => pack_utils::compact(false, false).map(|_| ()),
         AutoCompaction::Repack => pack_utils::compact(true, false).map(|_| ()),
         AutoCompaction::None => return,

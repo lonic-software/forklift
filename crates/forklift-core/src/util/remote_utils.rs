@@ -198,29 +198,33 @@ impl Default for TorSettings {
 
 impl TorSettings {
     /// Read the Tor settings from configuration (`remote.tor`, `remote.torProxy`), falling back
-    /// to the defaults for anything unset — and, deliberately, for anything *unreadable* too: a
-    /// missing or malformed configuration file must never make constructing a client fail (a
-    /// client is built on hot paths, and in contexts with no warehouse at all), so a read error
-    /// degrades to the defaults, which route only onion remotes through the stock local proxy.
+    /// to the defaults for anything *unset*.
+    ///
+    /// **An unreadable configuration file is an error, not a default.** These two keys decide
+    /// whether a remote is dialled through Tor at all, so the failure direction matters: a
+    /// broken file degrading to [`TorMode::Auto`] silently drops the user out of the mode they
+    /// configured and dials a clearnet remote directly. Absent is a default; unparseable is a
+    /// refusal that names the file and the key.
     ///
     /// The warehouse configuration is consulted first (see [`config_utils::get_effective_value`]):
     /// correct for every caller that already has "a warehouse" of its own to have an opinion —
     /// which is every caller except one. See [`Self::from_global_config`] for that exception.
-    pub fn from_config() -> TorSettings {
-        let mode = config_utils::get_effective_value(config_utils::KEY_REMOTE_TOR)
-            .ok()
-            .flatten()
-            .map(|(value, _)| TorMode::parse(&value))
-            .unwrap_or(TorMode::Auto);
+    ///
+    /// # Returns
+    /// * `Ok(TorSettings)` - The configured settings, defaulted for anything unset.
+    /// * `Err(String)`     - A configuration file could not be read or does not parse.
+    pub fn from_config() -> Result<TorSettings, String> {
+        let mode = match config_utils::get_effective_value(config_utils::KEY_REMOTE_TOR)? {
+            Some((value, _)) => TorMode::parse(&value),
+            None => TorMode::Auto,
+        };
 
-        let proxy = config_utils::get_effective_value(config_utils::KEY_REMOTE_TOR_PROXY)
-            .ok()
-            .flatten()
+        let proxy = config_utils::get_effective_value(config_utils::KEY_REMOTE_TOR_PROXY)?
             .map(|(value, _)| value)
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| DEFAULT_TOR_PROXY.to_string());
 
-        TorSettings { mode, proxy }
+        Ok(TorSettings { mode, proxy })
     }
 
     /// Like [`Self::from_config`], but *global* configuration only — never the warehouse scope.
@@ -234,20 +238,17 @@ impl TorSettings {
     /// moved its handshake earlier, this could never happen: the handshake ran *inside* the fresh
     /// (still-empty) target, whose warehouse scope had never had anything to set — so global was,
     /// in effect, the only scope that could ever apply. This preserves that.
-    pub fn from_global_config() -> TorSettings {
-        let mode = config_utils::get_scoped_value(config_utils::KEY_REMOTE_TOR, ConfigScope::Global)
-            .ok()
-            .flatten()
-            .map(|value| TorMode::parse(&value))
-            .unwrap_or(TorMode::Auto);
+    pub fn from_global_config() -> Result<TorSettings, String> {
+        let mode = match config_utils::get_scoped_value(config_utils::KEY_REMOTE_TOR, ConfigScope::Global)? {
+            Some(value) => TorMode::parse(&value),
+            None => TorMode::Auto,
+        };
 
-        let proxy = config_utils::get_scoped_value(config_utils::KEY_REMOTE_TOR_PROXY, ConfigScope::Global)
-            .ok()
-            .flatten()
+        let proxy = config_utils::get_scoped_value(config_utils::KEY_REMOTE_TOR_PROXY, ConfigScope::Global)?
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| DEFAULT_TOR_PROXY.to_string());
 
-        TorSettings { mode, proxy }
+        Ok(TorSettings { mode, proxy })
     }
 }
 
@@ -2098,7 +2099,7 @@ impl RemoteClient {
     /// * `Ok(RemoteClient)` - The client.
     /// * `Err(String)`      - If the HTTP client could not be built.
     pub fn new(url: &str, token: Option<String>) -> Result<RemoteClient, String> {
-        RemoteClient::new_with_tor(url, token, TorSettings::from_config())
+        RemoteClient::new_with_tor(url, token, TorSettings::from_config()?)
     }
 
     /// Like [`RemoteClient::new`], but with explicit Tor settings rather than reading them from
