@@ -13,8 +13,10 @@ use forklift_core::util::taint_utils;
 /// warehouse lock is exclusive and fail-fast, so a detached background compaction holding it
 /// would break the user's next command — running here, under the lock we already hold, keeps
 /// it correct and race-free. It is threshold-gated so it fires rarely, and best-effort, so a
-/// failure never fails the command that just succeeded — **except** that a failure which left a
-/// durability taint standing is not silently swallowed: see below.
+/// failure never fails the command that just succeeded. Two kinds of failure are still
+/// *reported* on stderr rather than swallowed (neither changes an exit code): one that left a
+/// durability taint standing (see below), and one that stopped maintenance from deciding
+/// whether it was due at all, which would otherwise turn packing off in silence.
 ///
 /// Never redeltas: `redelta` re-reads and re-compresses the whole live set (CPU-bound, minutes
 /// at scale), which is never appropriate for a background trigger a routine command incurs
@@ -45,7 +47,22 @@ use forklift_core::util::taint_utils;
 /// resolves it. Keeping this command's exit at 0 and surfacing the taint as a loud warning keeps
 /// that enforcement intact while never punishing the command that merely triggered maintenance.
 pub fn run_if_due() {
-    let result = match pack_utils::auto_compaction_action().unwrap_or(AutoCompaction::None) {
+    // Deciding whether maintenance is due reads `maintenance.*` from configuration *and* scans
+    // the object store (`estimate_loose_count`, `count_pack_files`), so this arm covers an
+    // unparseable config file, a permission error and a dead mount alike. None of them is the
+    // best-effort no-op the rest of this function documents: nothing was attempted, so there is
+    // no outcome for anything else to report, and the store simply stops being packed with
+    // nothing said on any command. So it is reported, not swallowed — the message names which of
+    // those it was. The triggering command's own exit code is still untouched, per the doc above.
+    let action = match pack_utils::auto_compaction_action() {
+        Ok(action) => action,
+        Err(error) => {
+            crate::output::warn_maintenance_unavailable(&error);
+            return;
+        }
+    };
+
+    let result = match action {
         AutoCompaction::Incremental => pack_utils::compact(false, false).map(|_| ()),
         AutoCompaction::Repack => pack_utils::compact(true, false).map(|_| ()),
         AutoCompaction::None => return,
