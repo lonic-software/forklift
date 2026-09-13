@@ -517,6 +517,57 @@ fn a_configuration_file_either_parses_completely_or_every_read_of_it_refuses() {
     );
 }
 
+/// PR #126 round 2, finding 1: the trap round 1's own fix created. Validating the file *before*
+/// the edit meant `remote.tor = "onn"` refused every write to that file — including
+/// `config remote.tor on`, the command that corrects it. The value blocked its own repair, and a
+/// text editor was the only way out. `write_validated` now parses the document **as edited**, so
+/// the question is whether the file you are about to leave on disk is valid.
+///
+/// The fourth leg is the one that keeps this from being a hole rather than a fix: a write that
+/// leaves the bad value untouched must still be refused, naming it.
+///
+/// Falsified both directions: validating before the edit reddens legs 1 and 3 (both refuse with
+/// the `"onn"` message); accepting unconditionally after it reddens leg 4.
+#[test]
+fn a_write_that_repairs_the_offending_entry_is_allowed_where_one_that_leaves_it_is_not() {
+    let warehouse = TestWarehouse::new("config-repairs-itself");
+    assert_success(&warehouse.run(&["prepare"]));
+
+    let config = warehouse.root.join(".forklift/config/warehouse.toml");
+    let broken = "[remote]\nurl = \"http://example\"\ntor = \"onn\"\n";
+
+    // 1. Overwriting the offending key repairs the file.
+    std::fs::write(&config, broken).unwrap();
+    assert_success(&warehouse.run(&["config", "remote.tor", "on"]));
+    assert!(
+        std::fs::read_to_string(&config).unwrap().contains("tor = \"on\""),
+        "the corrected value must be on disk: {}", std::fs::read_to_string(&config).unwrap()
+    );
+
+    // 2. And the file is ordinary again afterwards.
+    assert_success(&warehouse.run(&["config", "remote.token", "abc"]));
+
+    // 3. Unsetting the offending key repairs it too — it removes exactly what was refusing.
+    std::fs::write(&config, broken).unwrap();
+    assert_success(&warehouse.run(&["config", "--unset", "remote.tor"]));
+    assert!(
+        !std::fs::read_to_string(&config).unwrap().contains("onn"),
+        "the offending entry must be gone"
+    );
+
+    // 4. A write that leaves the bad value in place is still refused, and still names it.
+    std::fs::write(&config, broken).unwrap();
+    let refused = warehouse.run(&["config", "remote.token", "abc"]);
+    assert!(!refused.status.success(), "unrelated writes must not land beside a bad value");
+    let error = stderr(&refused);
+    assert!(error.contains("remote.tor"), "the refusal must name the offending key: {}", error);
+    assert!(error.contains("onn"), "the refusal must quote what was written: {}", error);
+    assert_eq!(
+        std::fs::read_to_string(&config).unwrap(), broken,
+        "a refused write must leave the file byte-identical"
+    );
+}
+
 /// The privacy-relevant half of the same contract, with a fixture that _discriminates_.
 ///
 /// `remote.tor` decides whether a remote is dialled through Tor at all, and

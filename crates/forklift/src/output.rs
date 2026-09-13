@@ -804,14 +804,20 @@ mod tests {
         assert_eq!(value["message"], error);
         assert_eq!(value["next_step"], MAINTENANCE_UNAVAILABLE_NEXT_STEP);
 
-        // Both warnings on this channel carry the same four fields, which is the contract a
-        // consumer switches on. Pinned here so a third warning cannot quietly take a new shape.
-        let taint = standing_taint_warning_text(OutputMode::Json, "a taint is standing.");
-        let taint: serde_json::Value = serde_json::from_str(&taint).unwrap();
-        let mut fields: Vec<&String> = value.as_object().unwrap().keys().collect();
-        let mut taint_fields: Vec<&String> = taint.as_object().unwrap().keys().collect();
-        fields.sort();
-        taint_fields.sort();
-        assert_eq!(fields, taint_fields, "the two stderr warnings must share one shape");
+        // `docs/MACHINE_INTERFACE.md` promises a consumer exactly these four fields on every
+        // stderr warning. Asserted against a literal list, not against the other warning's key
+        // set — both are built by `warning_envelope`, so comparing them to each other would be
+        // true however that helper changed, and would pin nothing at all.
+        let expected = ["forklift_json", "message", "next_step", "warning"];
+
+        for text in [
+            json_text,
+            standing_taint_warning_text(OutputMode::Json, "a taint is standing."),
+        ] {
+            let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+            let mut fields: Vec<&str> = parsed.as_object().unwrap().keys().map(String::as_str).collect();
+            fields.sort();
+            assert_eq!(fields, expected, "documented warning shape changed: {text}");
+        }
     }
 }

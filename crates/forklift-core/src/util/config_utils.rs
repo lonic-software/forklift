@@ -410,11 +410,19 @@ fn known_sections() -> Vec<&'static str> {
 }
 
 /// The one shape every "this file does not parse" refusal takes: the file, what is wrong, and
-/// that a hand edit is the fix (nothing in the tool will rewrite a file it cannot account for).
+/// that a hand edit is the fix.
+///
+/// The path is resolved to an absolute one where it can be. The warehouse-scope path is built
+/// from the warehouse root and is normally relative (`.forklift/config/warehouse.toml`), which
+/// names nothing in particular to anyone who keeps more than one warehouse — and this refusal
+/// can reach a user who is not standing in the one it is about. Canonicalization is best-effort:
+/// a file that has since been removed keeps the relative spelling rather than losing the name.
 fn not_valid(path: &Path, detail: String) -> String {
+    let named = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+
     format!(
         "Configuration file \"{}\" is not valid: {} Fix the file by hand.",
-        path.to_string_lossy(), detail
+        named.to_string_lossy(), detail
     )
 }
 
@@ -521,9 +529,14 @@ pub fn get_scoped_value(key: &str, scope: ConfigScope) -> Result<Option<String>,
 /// The global scope is consulted only when the warehouse scope did not answer, which is the
 /// case where its content can still change the result. An earlier version of this loaded both
 /// unconditionally, on the theory that reporting a broken file the user is not currently reading
-/// from is a service. It is not worth its cost: an unreadable `~/.forkliftconfig` — root-owned
-/// after one `sudo forklift`, say — would then fail *every* command in *every* warehouse,
-/// including ones whose own configuration answers the question completely.
+/// from is a service; it is not worth paying for a scope that cannot change the answer.
+///
+/// **Be precise about what that buys, because it is less than it first appears.** It rescues a
+/// *lookup*, not a command. Commands read several keys, and a warehouse file rarely sets
+/// `operator.profile` or `maintenance.*` — so a broken `~/.forkliftconfig` still fails most
+/// identity- or maintenance-touching commands even in a fully configured warehouse, because
+/// some key they read falls through to it. What is gone is the case where a scope nothing asked
+/// about failed the whole lookup anyway.
 ///
 /// # Arguments
 /// * `key` - The configuration key, in `section.key` form (must be a known key).
@@ -563,8 +576,9 @@ pub fn set_value(key: &str, value: &str, scope: ConfigScope) -> Result<(), Strin
     validate_value(key, value)?;
     let path = get_config_path(scope)?;
 
-    let mut document = load_document_for_edit(&path)?.unwrap_or_default();
-    set_value_in_document(&mut document, section, field, value)?;
+    let mut document = load_document(&path)?.unwrap_or_default();
+    set_value_in_document(&mut document, section, field, value)
+        .map_err(|detail| not_valid(&path, detail))?;
 
     if let Some(parent) = path.parent() {
         // The configuration folder may not exist yet in warehouses prepared before this
@@ -574,8 +588,7 @@ pub fn set_value(key: &str, value: &str, scope: ConfigScope) -> Result<(), Strin
         }
     }
 
-    std::fs::write(&path, document.to_string())
-        .map_err(|e| format!("Error while writing configuration file \"{}\": {}", path.to_string_lossy(), e))
+    write_validated(&path, &document)
 }
 
 /// Remove a configuration key from the configuration file of the given scope (the
@@ -594,16 +607,18 @@ pub fn unset_value(key: &str, scope: ConfigScope) -> Result<(), String> {
     let (section, field) = split_key(key)?;
     let path = get_config_path(scope)?;
 
-    let Some(mut document) = load_document_for_edit(&path)? else {
+    let Some(mut document) = load_document(&path)? else {
         return Err(format!("\"{}\" is not set.", key));
     };
 
-    if !remove_value_from_document(&mut document, section, field)? {
+    let removed = remove_value_from_document(&mut document, section, field)
+        .map_err(|detail| not_valid(&path, detail))?;
+
+    if !removed {
         return Err(format!("\"{}\" is not set.", key));
     }
 
-    std::fs::write(&path, document.to_string())
-        .map_err(|e| format!("Error while writing configuration file \"{}\": {}", path.to_string_lossy(), e))
+    write_validated(&path, &document)
 }
 
 /// Get the operator identity for parcel authorship. Identity is zero-configuration:
@@ -698,38 +713,38 @@ pub fn list_profiles() -> Result<Vec<(String, Operator)>, String> {
 ///
 /// # Returns
 /// * `Ok(())`      - If the field was written.
-/// * `Err(String)` - If the file could not be read, parsed or written. Its two "is not a table"
-///                   arms are unreachable from the CLI for the reason given on
-///                   [`set_value_in_document`].
+/// * `Err(String)` - If the file could not be read, parsed or written, or if `profile` (or the
+///                   `[profile]` section itself) is present but is not a table.
 pub fn set_profile_field(profile: &str, field: &str, value: &str) -> Result<(), String> {
     let path = get_config_path(ConfigScope::Global)?;
-    let mut document = load_document_for_edit(&path)?.unwrap_or_default();
+    let mut document = load_document(&path)?.unwrap_or_default();
 
-    let profiles = document.entry(SECTION_PROFILE)
-        .or_insert(toml_edit::table())
-        .as_table_like_mut()
-        .ok_or(format!(
-            "\"{}\" in the global configuration file is not a table; please fix the \
-            file by hand.",
-            SECTION_PROFILE
-        ))?;
+    let section_item = document.entry(SECTION_PROFILE).or_insert(toml_edit::table());
+    let actual = section_item.type_name();
+
+    let profiles = section_item.as_table_like_mut()
+        .ok_or_else(|| not_valid(&path, format!(
+            "\"{}\" must be a table (written \"[{}.<name>]\"), not {}.",
+            SECTION_PROFILE, SECTION_PROFILE, actual
+        )))?;
 
     if profiles.get(profile).is_none() {
         profiles.insert(profile, toml_edit::table());
     }
 
-    let table = profiles.get_mut(profile)
-        .and_then(|item| item.as_table_like_mut())
-        .ok_or(format!(
-            "\"{}.{}\" in the global configuration file is not a table; please fix \
-            the file by hand.",
-            SECTION_PROFILE, profile
-        ))?;
+    let profile_item = profiles.get_mut(profile).ok_or_else(|| not_valid(&path, format!(
+        "\"{}.{}\" vanished between being created and being written.", SECTION_PROFILE, profile
+    )))?;
+    let actual = profile_item.type_name();
+
+    let table = profile_item.as_table_like_mut().ok_or_else(|| not_valid(&path, format!(
+        "\"{}.{}\" must be a table (written \"[{}.{}]\"), not {}.",
+        SECTION_PROFILE, profile, SECTION_PROFILE, profile, actual
+    )))?;
 
     table.insert(field, toml_edit::value(value));
 
-    std::fs::write(&path, document.to_string())
-        .map_err(|e| format!("Error while writing configuration file \"{}\": {}", path.to_string_lossy(), e))
+    write_validated(&path, &document)
 }
 
 /// Create a named profile: record its display name and identifier, minting an
@@ -853,29 +868,32 @@ fn load_document(path: &Path) -> Result<Option<DocumentMut>, String> {
         .map_err(|e| format!("Error while parsing configuration file \"{}\": {}", path.to_string_lossy(), e))
 }
 
-/// Load a configuration file for *editing*, running the same strict parse every read performs
-/// before handing back the document to modify.
+/// Write a document back to `path`, but only after re-parsing **the document as edited** —
+/// never the one that was read.
 ///
-/// A write is a read too: `config remote.url <url>` rewrites the whole file, and doing that on
-/// a file Forklift cannot fully account for would preserve the broken part verbatim while
-/// reporting success — the user's next command then refuses on a file the tool just wrote. The
-/// refusal belongs at the write, naming what to fix, not one command later.
+/// Validating after the edit rather than before it is what lets `forklift config` repair the
+/// very entry that is refusing. A pre-edit check turned `remote.tor = "onn"` into a trap: the
+/// file refused every write, so `config remote.tor on` — the command that fixes it, at the one
+/// moment it is most needed — was refused by the value it was correcting, and a text editor was
+/// the only way out. A post-edit check accepts that write, because the file it is about to
+/// leave on disk is valid.
+///
+/// Nothing is relaxed by the move. A write that would leave any *other* entry unaccounted for is
+/// still refused, naming that entry, because the contract has always been about what lands on
+/// disk — this is simply the first version that checks exactly that.
 ///
 /// # Arguments
-/// * `path` - The path of the configuration file.
+/// * `path`     - The configuration file to write.
+/// * `document` - The edited document.
 ///
 /// # Returns
-/// * `Ok(Some(DocumentMut))` - The document, which parsed completely.
-/// * `Ok(None)`              - If the file does not exist (the caller starts a fresh one).
-/// * `Err(String)`           - If the file could not be read, or does not parse completely.
-fn load_document_for_edit(path: &Path) -> Result<Option<DocumentMut>, String> {
-    let Some(document) = load_document(path)? else {
-        return Ok(None);
-    };
+/// * `Ok(())`      - The edited document parses completely and was written.
+/// * `Err(String)` - It does not parse (naming the offending key), or the write failed.
+fn write_validated(path: &Path, document: &DocumentMut) -> Result<(), String> {
+    parse_config(document, path)?;
 
-    parse_config(&document, path)?;
-
-    Ok(Some(document))
+    std::fs::write(path, document.to_string())
+        .map_err(|e| format!("Error while writing configuration file \"{}\": {}", path.to_string_lossy(), e))
 }
 
 /// Set a string value in a parsed configuration document, creating the section if needed.
@@ -888,21 +906,19 @@ fn load_document_for_edit(path: &Path) -> Result<Option<DocumentMut>, String> {
 ///
 /// # Returns
 /// * `Ok(())`      - If the value was set.
-/// * `Err(String)` - If the section exists but is not a table (e.g. `operator = 1`).
-///
-/// **That `Err` is unreachable from the CLI.** Every caller reaches this through
-/// [`load_document_for_edit`], and [`parse_config`] refuses a non-table section first, with a
-/// message that names the file. The arm is kept as defense in depth for a direct caller — but
-/// it is not the text a user sees for that fixture, so do not test it as if it were.
+/// * `Err(String)` - If the section exists but is not a table (e.g. `operator = 1`) — a detail
+///                   for [`not_valid`] to wrap, since this function does not know the file.
+///                   This *is* the text a user sees for that fixture: the edit runs before the
+///                   parse now (see [`write_validated`]), so the mutation is what refuses.
 fn set_value_in_document(document: &mut DocumentMut,
                          section: &str,
                          field: &str,
                          value: &str) -> Result<(), String> {
     let section_item = document.entry(section).or_insert(toml_edit::table());
+    let actual = section_item.type_name();
 
     let table = section_item.as_table_like_mut().ok_or(format!(
-        "\"{}\" in the configuration file is not a table; please fix the file by hand.",
-        section
+        "\"{}\" must be a table (written \"[{}]\"), not {}.", section, section, actual
     ))?;
 
     table.insert(field, toml_edit::value(value));
@@ -921,8 +937,8 @@ fn set_value_in_document(document: &mut DocumentMut,
 /// # Returns
 /// * `Ok(true)`    - If the field was present and removed.
 /// * `Ok(false)`   - If the section or field was not present.
-/// * `Err(String)` - If the section exists but is not a table — unreachable from the CLI for the
-///                   reason given on [`set_value_in_document`].
+/// * `Err(String)` - If the section exists but is not a table — a detail for [`not_valid`] to
+///                   wrap, for the reason given on [`set_value_in_document`].
 fn remove_value_from_document(document: &mut DocumentMut,
                               section: &str,
                               field: &str) -> Result<bool, String> {
@@ -930,9 +946,10 @@ fn remove_value_from_document(document: &mut DocumentMut,
         return Ok(false);
     };
 
+    let actual = section_item.type_name();
+
     let table = section_item.as_table_like_mut().ok_or(format!(
-        "\"{}\" in the configuration file is not a table; please fix the file by hand.",
-        section
+        "\"{}\" must be a table (written \"[{}]\"), not {}.", section, section, actual
     ))?;
 
     Ok(table.remove(field).is_some())
@@ -1003,15 +1020,43 @@ mod tests {
         assert_eq!(parse("operator.name = \"Dotted\"\n").unwrap().get(KEY_OPERATOR_NAME), Some("Dotted"));
     }
 
-    /// A direct-caller guard, not the user-visible behaviour: `forklift config` never reaches
-    /// this arm, because `load_document_for_edit` refuses `operator = 1` first (see
-    /// `a_section_that_is_not_a_table_refuses`, which is the message a user actually gets).
+    /// Reachable again, and therefore user-visible: since `write_validated` moved the parse to
+    /// *after* the edit, this mutation is what refuses `operator = 1`, not `parse_config`. Its
+    /// wording has to match the parse's, or the same fault reads as two different problems
+    /// depending on whether you were reading the file or writing it.
     #[test]
-    fn setting_a_value_in_a_section_that_is_not_a_table_is_reported_to_a_direct_caller() {
+    fn setting_a_value_in_a_section_that_is_not_a_table_is_reported() {
         let mut document: DocumentMut = "operator = 1\n".parse().unwrap();
 
-        let result = set_value_in_document(&mut document, "operator", "name", "x");
-        assert!(result.is_err());
+        let error = set_value_in_document(&mut document, "operator", "name", "x").unwrap_err();
+
+        assert!(error.contains("\"operator\" must be a table"), "unexpected error: {error}");
+        assert!(error.contains("not integer"), "the error must name what is there: {error}");
+
+        // The read path's wording for the same fault, minus the file-naming wrapper the caller
+        // adds. Pinned together so the two cannot drift.
+        let read = parse("operator = 1\n").unwrap_err();
+        assert!(read.contains(&error), "read and write must describe this fault identically.\n  \
+            write: {error}\n  read:  {read}");
+    }
+
+    /// The trap `write_validated` exists to remove, at the unit level: a document holding an
+    /// out-of-range value accepts the edit that corrects it, and still refuses an edit that
+    /// leaves the bad value in place.
+    #[test]
+    fn an_edit_that_repairs_the_offending_entry_is_accepted_and_one_that_leaves_it_is_not() {
+        let mut repaired: DocumentMut = "[remote]\ntor = \"onn\"\n".parse().unwrap();
+        set_value_in_document(&mut repaired, "remote", "tor", "on").unwrap();
+        assert!(
+            parse_config(&repaired, Path::new("config.toml")).is_ok(),
+            "the corrected document must parse"
+        );
+
+        let mut untouched: DocumentMut = "[remote]\ntor = \"onn\"\n".parse().unwrap();
+        set_value_in_document(&mut untouched, "remote", "url", "http://example").unwrap();
+        let error = parse_config(&untouched, Path::new("config.toml"))
+            .expect_err("a write that leaves the bad value must still refuse");
+        assert!(error.contains("not a valid value for remote.tor"), "unexpected refusal: {error}");
     }
 
     #[test]

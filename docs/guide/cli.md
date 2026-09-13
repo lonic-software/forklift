@@ -1351,6 +1351,12 @@ the file and the offending key. There is no partial read. That matters because "
 inert — an unset `operator.identifier` mints a fresh id and writes it back, so a key that read as
 absent because it was damaged would quietly replace the identity you configured.
 
+One consumer warns instead of refusing, and only one: **background auto-compaction**, which runs
+after a mutating command's own work has already succeeded. It cannot refuse without taking back
+a result the command already reported, so it prints a `maintenance_unavailable` warning on
+stderr and leaves the exit code alone. A command that reads no damaged key — `load` on a
+warehouse whose *global* file is broken, say — therefore still exits 0, with that warning.
+
 Refused, in either file:
 
 | Written | Why |
