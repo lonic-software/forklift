@@ -606,6 +606,90 @@ fn a_trusted_lift_runs_the_audit_through_http() {
     assert!(info.trust.is_some());
 }
 
+/// **Pins the documented current posture** (`entrypoint::authenticate`'s doc comment,
+/// `docs/DEPLOYMENT.md`'s "What the bearer token does — and does not — control"): this head has
+/// no per-pallet authorization. Every request in this test carries nothing but the shared
+/// bearer token — no operator identity is ever presented, because this head has no mechanism to
+/// present one (no `Principal`, no per-operator token file, no authentication hook) — and that
+/// single secret is sufficient to move the office pallet itself, the most privileged pallet a
+/// warehouse has, exactly as it is sufficient to move an ordinary one. The content-level audit
+/// (closure presence, fast-forward, the signed office chain) still runs and still passes,
+/// because the pushed history really is validly signed; what this test isolates is that nothing
+/// *in addition* to that content check ever asks who transported the bytes.
+///
+/// **Invert this when operator identity lands:** the day this head grows a caller-identity
+/// mechanism and a `may_write_pallet`-style transport gate (mirroring `forklift-server`'s
+/// `Principal::Operator` path), a request carrying only the shared bearer — resolving to no
+/// operator identity — should be refused for at least one of the two pushes below (most likely
+/// the office pallet, the higher-privileged of the two), and this test's `200`s must become a
+/// `403` for that pallet. That flip is the signal this test exists to produce.
+#[test]
+fn a_shared_bearer_holder_may_move_any_pallet_including_the_office() {
+    let area = Area::new("shared-bearer-full-access");
+    prepare(&area, "wh");
+    area.forklift("wh", &["office", "enroll"]);
+    area.write_file("wh/app.txt", "v1\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "signed"]);
+
+    let harvest = harvest(&area.path("wh"));
+    let anchor = harvest.trust.clone().expect("trust established");
+    let office_head = harvest.head_of(&format!("@{}", OFFICE_PALLET_NAME)).expect("office head");
+    let main_head = harvest.head_of("main").expect("main head");
+
+    let fixture = Fixture {
+        objects: Arc::new(MemoryObjectStore::new()),
+        refs: Arc::new(MemoryRefStore::new()),
+        routing: Routing::Single("wh".to_string()),
+        auth: AuthConfig::Token(BearerToken::new("shared-secret".to_string()).unwrap()),
+    };
+
+    // Seed the objects and signatures directly (bulk, as `a_trusted_lift_runs_the_audit_
+    // through_http` does above); the interesting path here is the bearer-only auth, not upload.
+    for (hash, bytes) in &harvest.objects {
+        fixture.objects.put_verified(hash, bytes).expect("seed object");
+    }
+    for (hash, sidecar) in &harvest.signatures {
+        fixture.objects.put_signature(hash, sidecar).expect("seed signature");
+    }
+
+    // Every request below carries only `Authorization: Bearer shared-secret` — the same header
+    // any other holder of this one deployment-wide secret would send. Nothing else identifies
+    // the caller.
+    let bearer = |method: &str, uri: &str, body: Vec<u8>| {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(http::header::AUTHORIZATION, "Bearer shared-secret")
+            .body(body)
+            .unwrap()
+    };
+
+    assert_eq!(
+        status(&fixture.call(bearer("PUT", "/v1/trust", serde_json::to_vec(&anchor).unwrap()))),
+        201,
+        "trust established on the shared bearer alone"
+    );
+
+    let office = RefUpdateRequest { old_head: None, new_head: office_head.clone() };
+    assert_eq!(
+        status(&fixture.call(bearer(
+            "POST",
+            &format!("/v1/pallets/@{}", OFFICE_PALLET_NAME),
+            serde_json::to_vec(&office).unwrap()
+        ))),
+        200,
+        "the office pallet moved on the shared bearer alone — no office-role check ran"
+    );
+
+    let main = RefUpdateRequest { old_head: None, new_head: main_head.clone() };
+    assert_eq!(
+        status(&fixture.call(bearer("POST", "/v1/pallets/main", serde_json::to_vec(&main).unwrap()))),
+        200,
+        "an ordinary pallet moved on the identical bearer, same as the office pallet above"
+    );
+}
+
 // -------------------------------------------------------------------------------------------
 // The additive/degrading endpoints and the routing surface.
 // -------------------------------------------------------------------------------------------

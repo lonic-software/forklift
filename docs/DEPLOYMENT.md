@@ -648,6 +648,40 @@ An API Gateway authorizer or resource policy (see "Auth at the gateway" above) i
 **additional** layer in front of this check, never a substitute for setting `FORKLIFT_TOKEN` —
 the bearer check is what a client actually speaks, and what `forklift-server` speaks too.
 
+### What the bearer token does — and does not — control
+
+**This head has no per-pallet authorization.** The transport check above answers exactly one
+question — does the request carry the configured bearer token — and that is *all* it answers.
+There is no caller-identity concept anywhere in this head: no notion of "operator," no per-pallet
+grant, no reader/writer/admin distinction. Every caller who holds the shared bearer token has
+**identical privileges** to every other caller who holds it: any of them can move any pallet
+this warehouse serves, including the office pallet, subject only to the content-level checks
+below.
+
+What actually constrains a push is run by `Head::ref_update` after authentication has already
+passed, and it verifies the *content*, never the *caller*: closure presence (every object the
+new head reaches must already be uploaded), fast-forward-only refs, and — once the warehouse is
+trusted — the office chain's own signature verification (`verify_office_chain_memoized` +
+`verify_office_privileges` for an office-pallet update, or `verify_office_chain_memoized` +
+`verify_pallet_history` for a user pallet). Those checks require every parcel to be validly
+signed by a key the office's tracked roles recognize for that action — a real guarantee — but
+they say nothing about who *transported* the bytes. A caller holding the shared bearer token
+can push any validly-signed history for any pallet; the office's per-pallet grants (`office
+role`, `may_write_pallet`) are not consulted as a transport gate here, because there is no
+per-caller identity to check them against.
+
+If you need per-pallet enforcement today — "this token may write pallet A but not pallet B" —
+this head cannot give it to you. Use `forklift-server` instead, with a per-operator tokens file
+(`docs/SERVER.md`, "Per-operator tokens") or an `authentication` hook
+(`docs/format/HOOK_PROTOCOL.md`), either of which resolves a bearer to an office operator
+identity that the per-pallet gate can then check. Note the same shared-privilege property holds
+for `forklift-server` too, whenever it is run with only the single static `--token` rather than
+per-operator tokens: a caller authenticating with the static token is *not* resolved to an
+office identity either, so the per-pallet gate never fires for it and it gets the same
+uniform, full access described above. Per-pallet enforcement is a property of per-operator
+identity, not of either head as such — it is only that `forklift-server` has a mechanism to
+produce that identity today, and this head does not.
+
 ## Operational notes
 
 * **The staging lifecycle rule is not optional.** Repeating it here in an operational frame

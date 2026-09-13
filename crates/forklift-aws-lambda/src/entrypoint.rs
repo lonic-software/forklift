@@ -281,12 +281,25 @@ fn unauthorized() -> HeadError {
 /// The transport-authentication seam. Multi-tenant policy is tracked privately and is out
 /// of scope here.
 ///
-/// The protocol carries auth as `Authorization: Bearer <token>`; in the hosted deployment the
-/// API Gateway authorizer in front of this function is an additional gate, and the office
-/// roles the ref-update handler already consults decide *what* an authenticated caller may
-/// move. This function decides the one thing prior to both: does the request carry the
-/// configured bearer at all. [`AuthConfig::Open`] passes everything (the explicit local/
-/// LocalStack opt-out); [`AuthConfig::Closed`] (no token configured, no opt-out) refuses
+/// The protocol carries auth as `Authorization: Bearer <token>`; in the hosted deployment an
+/// API Gateway authorizer in front of this function is an optional additional gate on top of
+/// this check. Neither this function nor anything downstream of it distinguishes *who* holds
+/// the bearer: this head has no caller-identity concept at all (no `Principal`, no operator
+/// identifier), so every request that carries the configured token gets identical privileges
+/// to every other. What actually constrains a push is content-level, run by [`Head::ref_update`]
+/// after authentication has already passed: closure presence (`verify_parcel_closure_with`),
+/// fast-forward-only refs, and — on a trusted warehouse — `verify_office_chain_memoized` +
+/// `verify_office_privileges` for an office-pallet update, or `verify_office_chain_memoized` +
+/// `verify_pallet_history` for a user pallet. Those checks verify *signatures* against the
+/// office's tracked roles; they do not check anything about the caller of this request, so a
+/// caller who can produce a validly-signed history for a pallet can move it regardless of
+/// whether an "office role" concept would have allowed them to. Per-pallet enforcement of the
+/// kind `forklift-server` offers to `Principal::Operator` callers needs an operator-identity
+/// mechanism this head does not have.
+///
+/// This function itself decides only the one thing prior to all of that: does the request
+/// carry the configured bearer at all. [`AuthConfig::Open`] passes everything (the explicit
+/// local/LocalStack opt-out); [`AuthConfig::Closed`] (no token configured, no opt-out) refuses
 /// everything; [`AuthConfig::Token`] requires an exact, constant-time match.
 fn authenticate<B>(auth: &AuthConfig, request: &Request<B>) -> HeadResult<()> {
     let expected = match auth {

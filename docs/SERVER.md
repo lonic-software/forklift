@@ -119,6 +119,17 @@ What an operator may do derives from their **role** in the target warehouse's of
 `docs/format/TRACKED_METADATA.md`. Roles are managed with `forklift office admit
 --role …` and `forklift office role …`.
 
+**Per-pallet grants apply only to a request that resolves to an office operator identity** —
+one authenticated via this token file or an `authentication` hook. A request authenticated with
+the single static `token` instead resolves to no identity at all, so the per-pallet gate never
+runs for it: the static token is full access, uniformly, to every pallet this server serves,
+exactly like an unauthenticated `--open` server except that a token is required at all. If you
+want per-pallet enforcement, every caller that should be limited needs an operator token or hook
+identity — issuing the static token to more than the server administrator defeats it. This is
+the same shared-privilege property `docs/DEPLOYMENT.md` documents for the AWS serverless head,
+which has no operator-identity mechanism at all and so cannot offer per-pallet enforcement under
+any configuration.
+
 ## Hooks (provider integration)
 
 `docs/format/HOOK_PROTOCOL.md` — the typed seam a hosting provider (or any
