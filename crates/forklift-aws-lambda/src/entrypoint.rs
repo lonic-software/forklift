@@ -124,15 +124,78 @@ fn require_env(name: &str) -> Result<String, String> {
         })
 }
 
+/// A verified non-blank bearer token: the *only* way to build [`AuthConfig::Token`]'s payload,
+/// so a blank credential can never reach [`authenticate`]'s comparison from any constructor —
+/// not just [`auth_from_env`]'s (PR #124 round 3, F2). Before this, `AuthConfig::Token` held a
+/// bare `pub String`, so anything that can name the type — a future upstream change, a test, a
+/// fixture — could write `AuthConfig::Token(String::new())` directly, bypassing `auth_from`'s own
+/// filter entirely; a request then presenting `Authorization: Bearer ` (empty credential) would
+/// reach `tokens_match("", "")`, which is `true`. Filtering only at `auth_from` (the *env* path)
+/// left that checkpoint itself unguarded for every other path into the type. Making the payload
+/// this newtype, with its constructor as the sole way to obtain one, closes it structurally
+/// instead of adding a second filter at the usage site that the next new constructor could just
+/// as easily bypass again.
+///
+/// "Blank" here is the same rule `forklift-server` applies to its own static token
+/// (`main.rs::merge_static_token`, PR #124 round 3 F1): empty *or* whitespace-only. A
+/// whitespace-only configured token is exactly as unusable as an empty one — either no request
+/// can ever present a credential that trims to nothing over a transport that trims trailing
+/// whitespace off header values, so the deployment is silently locked out with no diagnostic, or
+/// a transport that does *not* trim (this crate makes no assumption either way about the Lambda
+/// runtime's header handling) lets a trivially-guessable all-whitespace value authenticate.
+///
+/// The struct lives in its own private submodule, not directly in `entrypoint`, so the
+/// constructor is the only way to obtain one even *inside this file* (PR #124 round 4, F3): a
+/// tuple field private to `entrypoint` would still be visible to `entrypoint::tests` (a child
+/// module sees its ancestors' private items), so this file's own tests — the ones most likely to
+/// be edited next in this area — could otherwise write `BearerToken(String::new())` directly. A
+/// field private to `bearer_token` is invisible to `entrypoint` and to `entrypoint::tests` alike,
+/// both of which are siblings of `bearer_token`, not descendants of it — so `BearerToken::new` is
+/// structurally the only path to an instance, not merely the only path anyone happens to use.
+mod bearer_token {
+    #[derive(Clone, PartialEq, Eq)]
+    pub struct BearerToken(String);
+
+    impl BearerToken {
+        /// The one constructor: rejects an empty or whitespace-only token rather than silently
+        /// treating it as unset, so a caller that reaches here — already past the "is a token
+        /// even configured" question `auth_from` asks first — gets back the actual problem
+        /// instead of having it discarded.
+        pub fn new(token: String) -> Result<BearerToken, String> {
+            if token.trim().is_empty() {
+                Err("a bearer token must not be empty or whitespace-only".to_string())
+            } else {
+                Ok(BearerToken(token))
+            }
+        }
+
+        pub(super) fn as_str(&self) -> &str {
+            &self.0
+        }
+    }
+
+    impl std::fmt::Debug for BearerToken {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "<redacted>")
+        }
+    }
+}
+pub use bearer_token::BearerToken;
+
 /// The transport-authentication configuration, resolved once at cold start ([`auth_from_env`])
 /// and threaded into every request by [`handle`]. Full multi-tenant policy (resolving a bearer
 /// to a principal, per-warehouse admission) is tracked privately and stays out of scope here —
 /// this is the single-tenant seam: is *a* configured token present and correct at all.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// `Debug` is hand-written, not derived — see the `impl` just below — so redaction is
+/// structural rather than a claim about which paths happen to print this type today: this is
+/// this head's own primary bearer token, the same class `forklift-server`'s `HookEndpoint` and
+/// `ConfigFile` redact (PR #124 round 2, F3), and every `assert_eq!` in this module's own tests
+/// against a `Token(...)` value already formats it on any failure.
+#[derive(Clone, PartialEq, Eq)]
 pub enum AuthConfig {
     /// A configured bearer token; every request must present it via
-    /// `Authorization: Bearer <token>`.
-    Token(String),
+    /// `Authorization: Bearer <token>`. Never blank — see [`BearerToken::new`].
+    Token(BearerToken),
 
     /// No token is configured and the operator has explicitly opted out
     /// (`FORKLIFT_OPEN_ACCESS=1`): every request passes untouched, mirroring
@@ -146,9 +209,20 @@ pub enum AuthConfig {
     Closed,
 }
 
+impl std::fmt::Debug for AuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthConfig::Token(_) => f.debug_tuple("Token").field(&"<redacted>").finish(),
+            AuthConfig::Open => write!(f, "Open"),
+            AuthConfig::Closed => write!(f, "Closed"),
+        }
+    }
+}
+
 /// Read the auth configuration from the environment:
-/// * `FORKLIFT_TOKEN` (optional) — the bearer token every request must present. An empty
-///   value is treated exactly like an unset one (refuse), never as a valid empty token.
+/// * `FORKLIFT_TOKEN` (optional) — the bearer token every request must present. An empty or
+///   whitespace-only value is treated exactly like an unset one (refuse), never as a valid
+///   blank token (PR #124 round 3, F1/F2).
 /// * `FORKLIFT_OPEN_ACCESS` (optional) — set to `1` to run with no token at all. Only takes
 ///   effect when `FORKLIFT_TOKEN` is unset; LocalStack and local dev use this, a real
 ///   deployment never should.
@@ -156,11 +230,13 @@ pub fn auth_from_env() -> AuthConfig {
     auth_from(std::env::var("FORKLIFT_TOKEN").ok(), std::env::var("FORKLIFT_OPEN_ACCESS").ok())
 }
 
-/// The pure decision behind [`auth_from_env`], split out so the matrix (empty-is-unset, the
+/// The pure decision behind [`auth_from_env`], split out so the matrix (blank-is-unset, the
 /// opt-out, and token-takes-precedence-over-the-opt-out) is testable without touching real
-/// process environment state.
+/// process environment state. Routes the raw env value through [`BearerToken::new`] rather than
+/// filtering it separately — the constructor's blank check is the only one that exists, so this
+/// function cannot drift from it.
 fn auth_from(token: Option<String>, open_access: Option<String>) -> AuthConfig {
-    match token.filter(|value| !value.is_empty()) {
+    match token.and_then(|value| BearerToken::new(value).ok()) {
         Some(token) => AuthConfig::Token(token),
         None if open_access.as_deref() == Some("1") => AuthConfig::Open,
         None => AuthConfig::Closed,
@@ -216,7 +292,7 @@ fn authenticate<B>(auth: &AuthConfig, request: &Request<B>) -> HeadResult<()> {
     let expected = match auth {
         AuthConfig::Open => return Ok(()),
         AuthConfig::Closed => return Err(unauthorized()),
-        AuthConfig::Token(expected) => expected,
+        AuthConfig::Token(expected) => expected.as_str(),
     };
 
     let provided = request
@@ -808,19 +884,53 @@ mod tests {
         Request::builder().body(()).unwrap()
     }
 
-    /// An empty `FORKLIFT_TOKEN` is treated exactly like an unset one — never a valid empty
-    /// token — and the opt-out only takes effect (and only for the literal `"1"`) when there
-    /// is no real token at all: a token, once configured, always wins.
+    /// `AuthConfig::Token(BearerToken::new(s).unwrap())`, spelled out once: every test below
+    /// wants a real, valid token and none of them are testing `BearerToken::new` itself (that is
+    /// `bearer_token_new_rejects_blank_and_keeps_everything_else` below), so the `.unwrap()`
+    /// belongs here, not repeated at every call site.
+    fn token_auth(token: &str) -> AuthConfig {
+        AuthConfig::Token(BearerToken::new(token.to_string()).unwrap())
+    }
+
+    /// [`BearerToken::new`] is the *only* gate a blank credential must pass, from every
+    /// constructor of [`AuthConfig::Token`] — not just `auth_from`'s env path (PR #124 round 3,
+    /// F2: `AuthConfig::Token`'s payload used to be a bare `pub String`, so
+    /// `AuthConfig::Token(String::new())` was directly constructible, bypassing `auth_from`'s
+    /// filter entirely). Empty and whitespace-only are both rejected — the same rule
+    /// `forklift-server` applies to its own static token (PR #124 round 3, F1) — while a real
+    /// token survives untouched, including one with incidental internal whitespace that is not
+    /// entirely blank.
     #[test]
-    fn auth_from_env_treats_an_empty_token_as_unset_and_only_the_opt_out_falls_back_to_open() {
+    fn bearer_token_new_rejects_blank_and_keeps_everything_else() {
+        assert!(BearerToken::new(String::new()).is_err(), "empty must be rejected");
+        assert!(BearerToken::new("   ".to_string()).is_err(), "whitespace-only must be rejected");
         assert_eq!(
-            auth_from(Some("secret".to_string()), None),
-            AuthConfig::Token("secret".to_string())
+            BearerToken::new("secret".to_string()).unwrap().as_str(),
+            "secret",
+            "a real token must survive unchanged"
         );
+        assert_eq!(
+            BearerToken::new(" has spaces ".to_string()).unwrap().as_str(),
+            " has spaces ",
+            "a real, non-blank token must not be trimmed — only entirely-blank is rejected"
+        );
+    }
+
+    /// A blank `FORKLIFT_TOKEN` (empty or whitespace-only) is treated exactly like an unset one
+    /// — never a valid blank token — and the opt-out only takes effect (and only for the literal
+    /// `"1"`) when there is no real token at all: a token, once configured, always wins.
+    #[test]
+    fn auth_from_env_treats_a_blank_token_as_unset_and_only_the_opt_out_falls_back_to_open() {
+        assert_eq!(auth_from(Some("secret".to_string()), None), token_auth("secret"));
         assert_eq!(
             auth_from(Some("".to_string()), None),
             AuthConfig::Closed,
             "an empty token with no opt-out is closed, not a valid empty token"
+        );
+        assert_eq!(
+            auth_from(Some("   ".to_string()), None),
+            AuthConfig::Closed,
+            "a whitespace-only token with no opt-out is closed too — the same rule as empty"
         );
         assert_eq!(auth_from(None, None), AuthConfig::Closed, "no token, no opt-out: closed by default");
         assert_eq!(auth_from(None, Some("1".to_string())), AuthConfig::Open, "the explicit opt-out");
@@ -830,8 +940,13 @@ mod tests {
             "an empty token is unset, so the opt-out still applies"
         );
         assert_eq!(
+            auth_from(Some("   ".to_string()), Some("1".to_string())),
+            AuthConfig::Open,
+            "a whitespace-only token is unset too, so the opt-out still applies"
+        );
+        assert_eq!(
             auth_from(Some("secret".to_string()), Some("1".to_string())),
-            AuthConfig::Token("secret".to_string()),
+            token_auth("secret"),
             "a real token always wins over the opt-out"
         );
         assert_eq!(
@@ -839,6 +954,31 @@ mod tests {
             AuthConfig::Closed,
             "only the literal \"1\" opts out"
         );
+    }
+
+    /// `AuthConfig::Token`'s `Debug` must never print the bearer token — the same class of leak
+    /// `forklift-server::HookEndpoint`/`ConfigFile` close, applied to this head's own primary
+    /// credential (PR #124 round 2, F3). Checks both the value's absence and the field name's
+    /// presence, so a future edit cannot "fix" the match arm without the test noticing the
+    /// variant's own name vanished too.
+    #[test]
+    fn auth_config_debug_never_prints_the_token() {
+        let formatted = format!("{:?}", token_auth("s3cr3t-value"));
+
+        assert!(!formatted.contains("s3cr3t-value"), "{}", formatted);
+        assert!(formatted.contains("Token"), "{}", formatted);
+        assert!(formatted.contains("redacted"), "{}", formatted);
+    }
+
+    /// `BearerToken`'s own `Debug` must redact too, independent of `AuthConfig::Token`'s hand
+    /// -written match arm (which never calls it) — belt-and-braces, in case a future path prints
+    /// a bare `BearerToken` rather than one wrapped in `AuthConfig`.
+    #[test]
+    fn bearer_token_debug_never_prints_the_token() {
+        let formatted = format!("{:?}", BearerToken::new("s3cr3t-value".to_string()).unwrap());
+
+        assert!(!formatted.contains("s3cr3t-value"), "{}", formatted);
+        assert!(formatted.contains("redacted"), "{}", formatted);
     }
 
     /// Pins the equality semantics a timing side channel can't be asserted in a unit test:
@@ -877,7 +1017,7 @@ mod tests {
 
     #[test]
     fn authenticate_token_requires_the_exact_bearer() {
-        let auth = AuthConfig::Token("secret".to_string());
+        let auth = token_auth("secret");
 
         assert!(authenticate(&auth, &request_with_bearer("secret")).is_ok());
         assert!(authenticate(&auth, &request_with_no_header()).is_err());
@@ -898,7 +1038,7 @@ mod tests {
     /// refuse.
     #[test]
     fn authenticate_accepts_the_bearer_scheme_case_insensitively() {
-        let auth = AuthConfig::Token("secret".to_string());
+        let auth = token_auth("secret");
 
         for scheme in ["bearer", "Bearer", "BEARER", "BeArEr"] {
             let request = Request::builder()
@@ -923,7 +1063,7 @@ mod tests {
     fn closed_and_a_wrong_token_answer_the_identical_401() {
         let closed_error = authenticate(&AuthConfig::Closed, &request_with_no_header()).unwrap_err();
         let wrong_token_error = authenticate(
-            &AuthConfig::Token("secret".to_string()),
+            &token_auth("secret"),
             &request_with_bearer("wrong"),
         ).unwrap_err();
 

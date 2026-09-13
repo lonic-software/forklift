@@ -16,7 +16,10 @@ mkdir -p "$root"
 # Idempotent: prepare only creates what is missing, so the warehouse persists.
 ./target/debug/forklift-server prepare --root "$root" >/dev/null 2>&1 || true
 
-echo "serving \"$root\" at http://$addr"
+echo "serving \"$root\" at http://$addr (no authentication — --open, local dev only)"
 echo "  point a warehouse at it:  forklift config remote.url http://$addr"
 echo "  (Ctrl-C to stop; the warehouse persists under .dev/ between runs)"
-exec ./target/debug/forklift-server serve --root "$root" --addr "$addr"
+# --open: this script's whole point is throwaway, unauthenticated local testing. Without it,
+# forklift-server now refuses to start with no token/tokens/authentication hook configured
+# (it no longer infers "open" from an empty auth config) — see docs/SERVER.md#authentication.
+exec ./target/debug/forklift-server serve --root "$root" --addr "$addr" --open

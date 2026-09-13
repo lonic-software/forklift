@@ -98,7 +98,10 @@ Semantics:
   `503`; a non-`200` answer refuses it with `401`. Never `Open`.
 * The server caches positive answers per token (default 60 seconds,
   `authentication_cache_secs`); a revoked credential outlives its revocation by at
-  most the TTL. Negative answers are never cached.
+  most the TTL. Negative answers are never cached. The TTL is a revocation-latency
+  budget, not a general cache knob: the server refuses to start with a value over 24
+  hours (86400 seconds) — a revoked credential must not be able to outlive its
+  revocation by more than about a day.
 
 ## `admission` — soft policy gate (hot, fail closed)
 
@@ -207,11 +210,16 @@ events_url = "https://provider.example/hooks/events"
 events_secret = "…"
 resolution_url = "https://provider.example/hooks/resolve"
 resolution_secret = "…"
-authentication_cache_secs = 60   # optional
+authentication_cache_secs = 60   # optional, 0-86400 (24h max)
 ```
 
 All four hooks are configured the same way, on the server. Each is independent;
 configure any subset. A URL without a secret (or the reverse) is a startup error.
+
+Only the `authentication` hook counts as configuring authentication (see docs/SERVER.md,
+"Authentication"): a server whose `[hooks]` table has `admission`, `events`, and/or
+`resolution` but no `authentication_url`, and no `--token`/`--tokens` either, still has *no
+authentication configured* and refuses to start unless `--open` (or `open = true`) is also set.
 
 **Client**: nothing to configure. A client resolves names by asking its configured
 remote (`POST /v1/resolve`); with no remote, or a server without a resolution hook,

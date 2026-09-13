@@ -24,7 +24,7 @@ use forklift_aws_lambda::store::{
     CasOutcome, ObjectAccess, ObjectStore, OfficePrecondition, PromoteOutcome, PutOutcome,
     PutTarget, RefStore, SignatureOutcome, TrustOutcome, TrustWriteOutcome,
 };
-use forklift_aws_lambda::{handle, AuthConfig, Head, Routing};
+use forklift_aws_lambda::{handle, AuthConfig, BearerToken, Head, Routing};
 
 use forklift_core::globals::StorageRootScope;
 use forklift_core::model::remote::{
@@ -750,7 +750,7 @@ fn the_open_opt_out_passes_every_request() {
 /// equal-length near-miss all refuse identically.
 #[test]
 fn a_configured_token_gates_every_request() {
-    let auth = AuthConfig::Token("secret".to_string());
+    let auth = AuthConfig::Token(BearerToken::new("secret".to_string()).unwrap());
 
     assert_eq!(
         status(&call_with_auth(&auth, get("/v1/warehouse"))),

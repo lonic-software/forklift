@@ -141,6 +141,14 @@ struct AppState {
     /// credential outlives its revocation by at most the TTL.
     authentication_cache: Mutex<HashMap<String, (String, std::time::Instant)>>,
     authentication_cache_ttl: std::time::Duration,
+
+    /// The explicit opt-out of authentication — see [`ServeOptions::open`]. `check_auth` reads
+    /// this, and only this, to decide whether an otherwise-empty auth config means `Open`;
+    /// `serve` refuses to start rather than ever construct an `AppState` with this `false` and
+    /// no token/operator tokens/hook configured (see the check right after this struct's
+    /// construction below), so in a server built through `serve` this field being `false`
+    /// guarantees at least one of those three is `Some`/non-empty.
+    open: bool,
 }
 
 /// Who a request is: the transport-level identity. Content-level authorization (roles,
@@ -167,10 +175,29 @@ type PathParams = HashMap<String, String>;
 /// One configured hook endpoint. The secret is mandatory: every hook request is
 /// signed (Blake3 keyed MAC over timestamp + body), because a spoofable
 /// authentication hook is game over (§8.13).
+///
+/// `Debug` is hand-written, not derived, so that redaction is structural rather than a claim
+/// about which paths happen to print this type today: a derived `Debug` here would print
+/// `secret` in full the moment anything — a test's `unwrap_err()`, a future
+/// `tracing::debug!(?options)`, a panic message — formats a value that contains one. `main.rs`'s
+/// `ConfigFile` hand-writes its own `Debug` for the identical reason (PR #124 round 2, F3): it
+/// used to derive `Debug` solely for a test's `unwrap_err()` trait bound, which round 2 replaced
+/// once that derive was found to print `ConfigFile::token` — the higher-value secret of the two
+/// — in full for the same reason. See `tests::hook_endpoint_debug_never_prints_the_secret` and
+/// `main.rs::tests::config_file_debug_never_prints_the_token`.
 #[derive(Clone)]
 pub struct HookEndpoint {
     pub url: String,
     pub secret: String,
+}
+
+impl std::fmt::Debug for HookEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HookEndpoint")
+            .field("url", &self.url)
+            .field("secret", &"<redacted>")
+            .finish()
+    }
 }
 
 /// What to serve and how (the merged flags/config of the `serve` subcommand).
@@ -185,13 +212,35 @@ pub struct ServeOptions {
     /// The address to bind (port 0 picks a free port).
     pub addr: String,
 
-    /// The static bearer token (full access), if any.
+    /// The static bearer token (full access), if any. Already normalized by the time it
+    /// reaches here when built through `main.rs::serve` (`main.rs::merge_static_token`
+    /// filters an empty-or-whitespace-only string out of *each* of the flag and config-file
+    /// sources before deciding precedence between them — filtering only the already-merged
+    /// value, as `serve` below alone used to, cannot recover a real value that precedence already
+    /// discarded in favor of a blank one from the other source). `serve` below still filters
+    /// again — this struct is `pub`, so any other constructor (a test, a future embedder) gets
+    /// the same "a blank string is not a credential" guarantee regardless of whether it
+    /// normalized its own sources first. Blank means empty *or* whitespace-only (PR #124 round 3,
+    /// F1) — the same rule `parse_operator_tokens` and `authenticate_via_hook` apply to their own
+    /// credential/identity fields, so every blank check in this module agrees on what blank
+    /// means.
     pub token: Option<String>,
 
     /// The path of the per-operator token file, if any.
     pub tokens: Option<String>,
 
-    /// Refuse request bodies over this size (MiB); `None` = unlimited.
+    /// Whether either of `token`'s two raw sources (the `--token` flag, the config file's
+    /// `token` key) was present but blank (empty or whitespace-only) — i.e. whether `token`
+    /// above is `None` *because* a blank credential was supplied, as opposed to nothing being
+    /// supplied at all. Computed by `main.rs::merge_static_token`, alongside the normalization
+    /// above; used only by `serve`'s startup refusal, to name that case as "a blank
+    /// --token/token" rather than the misdiagnosing "no --token/token" (PR #124 round 2, F2).
+    /// Never consulted for authentication itself.
+    pub blank_token_supplied: bool,
+
+    /// Refuse request bodies over this size (MiB); `None` = the default cap
+    /// (`object_utils::MAX_OBJECT_BYTES`, currently 64 MiB) applies — never unlimited. See
+    /// `body_limit_bytes`.
     pub max_body_mb: Option<u64>,
 
     /// Rebuild a warehouse's bundle after this many accepted lifts; `None` = never.
@@ -213,6 +262,14 @@ pub struct ServeOptions {
 
     /// How long a positive authentication-hook answer is cached (seconds; default 60).
     pub authentication_cache_secs: Option<u64>,
+
+    /// The explicit opt-out of authentication (`--open` / `open = true`). This is the ONLY
+    /// way [`check_auth`] ever returns [`Principal::Open`] — an empty auth config (no token, no
+    /// operator tokens, no authentication hook) with this unset is a startup error, never a
+    /// silent "serve openly". Mirrors `forklift-aws-lambda`'s `AuthConfig::Open`
+    /// (`FORKLIFT_OPEN_ACCESS=1`): the explicit local/LocalStack opt-out, never inferred from
+    /// an absent or malformed setting.
+    pub open: bool,
 }
 
 /// The flat request timeout this head arms on the `reqwest::Client` it calls every hook
@@ -254,6 +311,91 @@ fn build_hook_client() -> Result<reqwest::Client, String> {
         .map_err(|e| format!("Error while building the hook HTTP client: {}", e))
 }
 
+/// Convert `max_body_mb` (MiB) to the byte count `axum`'s `DefaultBodyLimit` wants, refusing
+/// rather than silently wrapping when the conversion overflows. This is the magnitude half of
+/// the "an unsigned config value overflows the arithmetic built on it" class (PR #124 round 1
+/// closed the sign half — a negative `max_body_mb` — in `main.rs::optional_non_negative_integer`,
+/// which cannot reach this hole: it only ever runs against the config-file `max_body_mb` key, not
+/// the `--max-body-mb` flag, which clap already parses straight into `u64`, and it only ever
+/// checks the sign, never the magnitude after conversion). `mb.checked_mul(1024 * 1024)` catches
+/// the arithmetic overflow directly (`mb >= 2^44` overflows a `u64` byte count); the
+/// `usize::try_from` after it additionally catches a 32-bit target, where a byte count that fits
+/// in `u64` may still not fit in `usize`. Left unguarded, `(mb as usize) * 1024 * 1024` — the
+/// code this replaces — panics at startup on a debug build (what `bin/serve` runs, since
+/// overflow checks are on by default in the dev profile) and silently wraps to a *smaller* limit
+/// on a release build (`(1u64 << 44) as usize * 1024 * 1024` wraps to exactly `0` on a 64-bit
+/// target, rejecting every request body).
+///
+/// Zero is refused outright, for the identical reason (PR #124 round 4, F6): `max_body_mb`'s own
+/// sign check (`optional_non_negative_integer`) only ever rejected negative values, so `0` — a
+/// value this comment used to argue was safe because it "needs no equivalent ceiling", true only
+/// of the overflow half of the class — sailed through and reached `DefaultBodyLimit::max(0)`. The
+/// server then starts normally and 413s every request carrying a body, a 1-byte lift included:
+/// non-negative but nonsensical, the same class this PR already closed for
+/// `authentication_cache_secs` (a value can be in-range and still make the field meaningless).
+/// There is no legitimate deployment that wants every write refused this way — that is what
+/// leaving `authentication`/`admission`/`tokens` unconfigured (or simply not running the write
+/// paths) is for — so this is a refusal, not a default substitution: `Some(0)` almost certainly
+/// means a config typo (`400` meant to be MiB, mistyped as `0`; a template value never filled
+/// in), and silently swapping in a default would hide exactly that.
+fn body_limit_bytes(max_body_mb: Option<u64>) -> Result<usize, String> {
+    match max_body_mb {
+        Some(0) => Err(
+            "\"max_body_mb\" is 0, which would reject every request carrying a body (even a \
+            1-byte lift); pick a real limit, or leave it unset to use the default."
+                .to_string()
+        ),
+        Some(mb) => mb
+            .checked_mul(1024 * 1024)
+            .and_then(|bytes| usize::try_from(bytes).ok())
+            .ok_or_else(|| format!(
+                "\"max_body_mb\" is {} MiB, which overflows converting to a byte count; pick a \
+                smaller value.",
+                mb
+            )),
+        None => Ok(object_utils::MAX_OBJECT_BYTES),
+    }
+}
+
+/// The ceiling on `authentication_cache_secs`: how long a revoked credential can keep
+/// authenticating after the hook stops vouching for it (`docs/format/HOOK_PROTOCOL.md`: "a
+/// revoked credential outlives its revocation by at most the TTL") — it is a revocation-latency
+/// budget, not a general-purpose cache knob, and its documented default is 60 seconds. One day
+/// is three orders of magnitude past that default — room for any legitimate "reduce hook
+/// chatter" setting — while matching the one other day-scale staleness window this same binary
+/// already accepts (`Gc`'s `--grace-hours`, default 24) rather than inventing an unrelated
+/// number.
+///
+/// Defined here, not in `main.rs`, because this is the single source of truth both call sites
+/// share (PR #124 round 5, F4): `main.rs::bounded_authentication_cache_secs` re-exports this
+/// same value into its own, config-file-specific error message rather than keeping a second
+/// copy of the number.
+pub const MAX_AUTHENTICATION_CACHE_SECS: u64 = 24 * 60 * 60;
+
+/// [`body_limit_bytes`]'s sibling for `authentication_cache_secs`: enforced here, at the
+/// `ServeOptions` boundary, not only in `main.rs::bounded_authentication_cache_secs` (the TOML
+/// reader) (PR #124 round 5, F4). Every other bound this PR added is deliberately re-enforced
+/// here — the blank-token filter above exists so "`ServeOptions`, which is `pub`, gives the
+/// same guarantee to any other constructor of it", and `body_limit_bytes` just above is called
+/// from `serve` for the identical reason — but this ceiling used to live only in the config-file
+/// path, so SERVER.md's and HOOK_PROTOCOL.md's flat claim that the server refuses to start with
+/// a value over 24 hours was true only of that one path: `ServeOptions { authentication_cache_secs:
+/// Some(u64::MAX), .. }`, built directly (a future CLI flag, a test, another head embedding this
+/// crate), sailed straight past `main.rs`'s check and reached `Duration::from_secs` uncontested,
+/// making the cache TTL effectively infinite — the same "a revoked credential is never
+/// re-checked again" hole `main.rs`'s sign and magnitude checks close for the config-file path.
+fn authentication_cache_ttl(secs: Option<u64>) -> Result<std::time::Duration, String> {
+    match secs {
+        Some(v) if v > MAX_AUTHENTICATION_CACHE_SECS => Err(format!(
+            "\"authentication_cache_secs\" is {} seconds, which is over the {}-second (24h) \
+            ceiling: a revoked credential must not be able to outlive its revocation by more \
+            than about a day.",
+            v, MAX_AUTHENTICATION_CACHE_SECS
+        )),
+        _ => Ok(std::time::Duration::from_secs(secs.unwrap_or(60))),
+    }
+}
+
 /// Serve one warehouse root, or every warehouse under a base folder.
 ///
 /// # Returns
@@ -270,10 +412,82 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
         .with_writer(std::io::stderr)
         .try_init();
 
+    // Kept past the `match` below (which consumes `options.tokens`) so the startup refusal can
+    // name the empty-`[operators]`-table case distinctly from "no --tokens/tokens file at all":
+    // an operator who passed `--tokens ops.toml` and got an empty map back (the file parsed, its
+    // `[operators]` table just has no entries) should not be told to look for a flag they already
+    // passed.
+    let tokens_supplied = options.tokens.is_some();
+
     let operator_tokens = match options.tokens {
         Some(path) => parse_operator_tokens(&path)?,
         None => HashMap::new(),
     };
+
+    // Defense-in-depth, not the primary enforcement point (see `ServeOptions::token`'s doc): a
+    // blank (empty or whitespace-only) string is not a credential — without this,
+    // `strip_bearer_prefix("Bearer ")` yields `Some("")`, `tokens_match("", "")` is `true`, and a
+    // request carrying the literal header `Authorization: Bearer ` (no credential after the
+    // scheme) would authenticate as `Principal::Static` with full privileges; a whitespace-only
+    // token has the identical problem one level removed (PR #124 round 3, F1) — either no client
+    // can ever present it at all, or, on a transport this crate makes no assumption about
+    // trimming, a guessable all-whitespace value can. `main.rs::merge_static_token` already
+    // normalizes both of the token's raw sources individually before this ever runs (PR #124
+    // round 2, F1: filtering only here, after the flag and the config file were already merged by
+    // precedence, could not recover a real token that precedence had already discarded in favor
+    // of a blank one from the other source) — this line stays so `ServeOptions`, which is `pub`,
+    // gives the same guarantee to any other constructor of it. Mirrors
+    // `forklift-aws-lambda::entrypoint::BearerToken::new`'s identical blank check.
+    let token = options.token.filter(|value| !value.trim().is_empty());
+
+    // PR #124 round 5, F4: re-enforced here, beside the blank-token filter just above, rather
+    // than trusting `main.rs::bounded_authentication_cache_secs` (the TOML reader) to be the
+    // only path into this value — see `authentication_cache_ttl`'s own doc for why.
+    let authentication_cache_ttl = authentication_cache_ttl(options.authentication_cache_secs)?;
+
+    // Refuse to start rather than ever construct an `AppState` that would fall through to
+    // `Principal::Open` by accident: `check_auth` only returns `Open` when `options.open` is
+    // set, so an operator who forgot to configure a token/tokens file/hook — or who typo'd its
+    // key name past `parse_config`'s strict readers — gets a startup error naming the remedy,
+    // never a server that quietly serves the world unauthenticated (the fail-open finding this
+    // check exists to close: a hand-edited `token = 12345` used to parse as "no token" and,
+    // with nothing else configured, serve every request openly with no warning at all).
+    let auth_configured =
+        token.is_some() || !operator_tokens.is_empty() || options.authentication_hook.is_some();
+
+    if !auth_configured && !options.open {
+        // F2 of PR #124 round 2: an operator who passed `--token ""` (or `token = ""`) must be
+        // told that specifically — "no --token/token" sends them looking for a flag they
+        // already passed, the same misdiagnosis this fixed for the empty-`[operators]`-table
+        // case below. "Blank" covers both an empty string and a whitespace-only one (PR #124
+        // round 4, F1): round 3 widened `blank_token_supplied` to catch `--token "   "` but left
+        // this clause hardcoded to "an empty ... (an empty string is not a credential)", so a
+        // whitespace-only token was told it was literally empty — a wrong diagnosis pinned by a
+        // passing test until this round. Reachable here only when the merge in
+        // `main.rs::merge_static_token`
+        // discarded a blank value from *and never found a real token in* either source: a real
+        // token from the other source would have made `auth_configured` true above, and this
+        // whole branch would never run.
+        let token_clause = if options.blank_token_supplied {
+            "a blank --token/token (an empty or whitespace-only string is not a credential)"
+        } else {
+            "no --token/token"
+        };
+
+        let tokens_clause = if tokens_supplied {
+            "a --tokens/tokens file whose [operators] table defines no entries"
+        } else {
+            "no --tokens/tokens file"
+        };
+
+        return Err(format!(
+            "No authentication is configured: {}, {}, and no authentication \
+            hook. Refusing to start serving requests unauthenticated by accident — set one \
+            of those, or pass --open (or `open = true` in the config file) to explicitly run \
+            this server with no authentication at all.",
+            token_clause, tokens_clause
+        ));
+    }
 
     let mode = match (options.root, options.warehouses) {
         (Some(root), None) => {
@@ -307,6 +521,26 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
 
     let is_multi = matches!(mode, ServeMode::Multi { .. });
 
+    // Blank (empty or whitespace-only) is treated as absent for both fields, applying the same
+    // rule this PR unified everywhere else a string is checked for "is this configured at all"
+    // (PR #124 round 4, F4). This is a config-completeness gate, not a credential comparison —
+    // the secret is outbound MAC key material (`hook_utils::hook_request_headers`), never
+    // compared against attacker-supplied input, so a whitespace-only one is merely weak, not
+    // silently-absent the way a bearer credential is; a whitespace-only *url*, though, was worse
+    // than weak: it made `auth_configured` (above) true, so the server believed authentication
+    // was configured and started, only to 503 every request at `authenticate_via_hook` because
+    // `reqwest` cannot build a client request against a blank/whitespace URL. Failing closed, so
+    // not a hole — but a startup refusal here, naming the hook, beats a server that starts and
+    // then always fails every request with no diagnostic at start time. Covers all four hook
+    // endpoints (authentication, admission, events, resolution) via this one shared loop.
+    //
+    // The message below names the check that actually ran — "a blank URL or secret" — rather
+    // than `parse_config::hook_of`'s own, superficially similar "only one of {name}_url and
+    // {name}_secret" message: that one fires when a config-file operator sets only one of the
+    // two keys at all, a different rule from this one, which fires when both keys are present
+    // but one is blank (PR #124 round 5, F1). An operator who left `authentication_secret = ""`
+    // behind from a template has both keys set and was, before this fix, told the hook "needs
+    // both a URL and a secret" — sending them looking for a key they already have.
     for (name, hook) in [
         ("authentication", &options.authentication_hook),
         ("admission", &options.admission_hook),
@@ -314,11 +548,28 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
         ("resolution", &options.resolution_hook),
     ] {
         if let Some(hook) = hook {
-            if hook.url.is_empty() || hook.secret.is_empty() {
+            if hook.url.trim().is_empty() || hook.secret.trim().is_empty() {
                 return Err(format!(
-                    "The {} hook needs both a URL and a secret: hook requests are \
-                    signed, and an unsigned hook would be spoofable.",
+                    "The {} hook has a blank URL or secret (an empty or whitespace-only \
+                    string is not a hook credential): hook requests are signed, and an \
+                    unsigned hook would be spoofable.",
                     name
+                ));
+            }
+
+            // PR #124 round 5, F2: a non-blank but non-absolute URL (scheme omitted, e.g.
+            // "provider.example/hooks/auth" — far likelier in practice than an all-whitespace
+            // one) passes the check above yet produces exactly the failure this whole loop
+            // exists to catch at startup rather than at request time: `post_hook` dials the URL
+            // via `state.http.post(&hook.url)`, whose `IntoUrl` impl parses it with
+            // `Url::parse` and fails the request (surfaced as a 503 on every call) when that
+            // parse fails. Re-running the identical parser here means a startup refusal and a
+            // request-time failure can never disagree about which URLs are dialable.
+            if let Err(e) = reqwest::Url::parse(&hook.url) {
+                return Err(format!(
+                    "The {} hook's URL \"{}\" is not a valid absolute URL ({}): hook requests \
+                    are sent to it directly, and a URL that cannot be parsed cannot be dialed.",
+                    name, hook.url, e
                 ));
             }
         }
@@ -328,7 +579,7 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
 
     let state = Arc::new(AppState {
         mode,
-        token: options.token,
+        token,
         operator_tokens,
         rebuild_after_lifts: options.rebuild_after_lifts,
         warehouses: Mutex::new(HashMap::new()),
@@ -338,15 +589,13 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
         resolution_hook: options.resolution_hook,
         http,
         authentication_cache: Mutex::new(HashMap::new()),
-        authentication_cache_ttl: std::time::Duration::from_secs(
-            options.authentication_cache_secs.unwrap_or(60)
-        ),
+        authentication_cache_ttl,
+        open: options.open,
     });
 
-    // Captured before `state` moves into the router below — used only for the startup-bind
-    // warning once the address is actually bound.
-    let auth_configured =
-        state.token.is_some() || !state.operator_tokens.is_empty() || state.authentication_hook.is_some();
+    // `auth_configured` was computed above, before the startup refusal, and is still valid here
+    // (a `bool` copy) — used only for the startup-bind warning once the address is actually
+    // bound. Reaching this point at all means `auth_configured || options.open` held.
 
     let protocol = Router::new()
         .route("/warehouse", get(get_warehouse))
@@ -375,10 +624,7 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
     // a chunk is at most `MAX_CHUNK_BYTES`), so this is a principled default value rather than the
     // old "unlimited unless an operator remembers to cap it". An operator may still raise it for a
     // grandfathered-giant read path or lower it, via `max_body_mb`.
-    let body_limit = match options.max_body_mb {
-        Some(mb) => DefaultBodyLimit::max((mb as usize) * 1024 * 1024),
-        None => DefaultBodyLimit::max(object_utils::MAX_OBJECT_BYTES),
-    };
+    let body_limit = DefaultBodyLimit::max(body_limit_bytes(options.max_body_mb)?);
 
     let app = app
         // Liveness only — deliberately unauthenticated and warehouse-free.
@@ -421,8 +667,9 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
 /// single-team self-host case this head is designed for); a non-loopback bind always is, on
 /// either side of the auth question: with a token configured, requests — including the bearer
 /// itself — still travel as plaintext HTTP unless the operator puts a TLS-terminating proxy in
-/// front of this process; with none configured, every request is served as `Principal::Open` to
-/// whoever can reach the address at all.
+/// front of this process; with none configured — which, since `serve`'s startup check above
+/// refuses to bind at all otherwise, can only mean the operator passed `--open`/`open = true` —
+/// every request is served as `Principal::Open` to whoever can reach the address at all.
 fn startup_bind_warning(bound: &std::net::SocketAddr, auth_configured: bool) -> Option<&'static str> {
     if bound.ip().is_loopback() {
         return None;
@@ -436,7 +683,8 @@ fn startup_bind_warning(bound: &std::net::SocketAddr, auth_configured: bool) -> 
     } else {
         Some(
             "serving a non-loopback address with no token, operator tokens, or authentication \
-            hook configured: every request is served as Principal::Open"
+            hook configured, and `open` explicitly set: every request is served as \
+            Principal::Open"
         )
     }
 }
@@ -488,6 +736,47 @@ fn parse_operator_tokens(path: &str) -> Result<HashMap<String, String>, String> 
         let identifier = identifier.as_str().ok_or(format!(
             "The token file \"{}\" maps a token to a non-string value.", path
         ))?;
+
+        // A blank (empty or whitespace-only) string is not a credential (the same hole as
+        // `--token ""`/`--token "   "`, see `serve`): a request carrying the literal header
+        // `Authorization: Bearer ` (no credential after the scheme) would otherwise match an
+        // empty-key entry via `state.operator_tokens.get("")` and authenticate as `identifier`
+        // with no credential presented at all — and a whitespace-only key has the identical
+        // problem one level removed (PR #124 round 3, F1): a client on a transport that trims
+        // trailing whitespace off header values could never present it (the entry is permanently
+        // dead, silently locking "identifier" out), while on one that does not it is a
+        // trivially-guessable credential. This is a presence check only, not a normalization: a
+        // real, non-blank token key is still matched byte-for-byte, verbatim, via
+        // `state.operator_tokens.get(token)` — nothing here trims it.
+        if token.trim().is_empty() {
+            return Err(format!(
+                "The token file \"{}\" maps an empty or whitespace-only token to \"{}\": that is \
+                not a credential — remove that entry.",
+                path, identifier
+            ));
+        }
+
+        // F4 of PR #124 round 2: an identity is not a credential — nothing compares it
+        // byte-exactly against a configured value the way a token is compared, it is *recorded*
+        // (into `Principal::Operator`, then admission/event payloads, `post_resolve`'s `caller`)
+        // as a legitimate-looking actor. Blank is rejected on both sides now (PR #124 round 3, F1
+        // unified the rule the token check above used to lack); what still differs between them
+        // is normalization, not presence — a token's real, non-blank value is compared byte-exact
+        // and never trimmed (above), and an identity's real, non-blank value is *also* never
+        // trimmed: `office_user_of` matches it by exact equality against the tracked office
+        // roster, so trimming a legitimately whitespace-padded identifier here would be the
+        // reason it can never match again (see
+        // `a_token_file_identifier_with_incidental_whitespace_is_stored_untrimmed` below).
+        // Deliberately does not echo `token` into the message — unlike the blank-token case
+        // above, `token` here is a real, live credential, and printing it would leak it into the
+        // server's own startup-failure output and logs.
+        if identifier.trim().is_empty() {
+            return Err(format!(
+                "The token file \"{}\" maps a token to a blank identifier: an identity must not \
+                be empty or whitespace-only — remove that entry.",
+                path
+            ));
+        }
 
         tokens.insert(token.to_string(), identifier.to_string());
     }
@@ -566,21 +855,47 @@ fn strip_bearer_prefix(value: &str) -> Option<&str> {
 /// `require_uploader` and the ref-update handler). Tokens unknown locally are asked
 /// of the authentication hook, when one is configured (fail closed: a hook failure
 /// refuses the request, it never waves it through).
+///
+/// `Principal::Open` is returned in exactly one case: no token, operator tokens, or
+/// authentication hook is configured, AND `state.open` is explicitly `true`. It is never
+/// inferred from the absence of auth config alone — `serve`'s startup check refuses to run a
+/// server that would reach that state with `open` unset, so in practice this function's
+/// `Open` branch and its `unauthorized` fallback are reachable only via the deliberately open
+/// path or a test harness that builds an `AppState` directly. This is the fix for the fail-open
+/// finding where a present-but-wrong-typed config value (e.g. an unquoted `token = 12345`) used
+/// to parse as "no token", collapse into "nothing is configured", and serve every request as
+/// `Principal::Open` with no warning at all.
 async fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<Principal, HandlerError> {
-    if state.token.is_none()
-        && state.operator_tokens.is_empty()
-        && state.authentication_hook.is_none() {
-        return Ok(Principal::Open);
-    }
-
-    let provided = headers.get("authorization")
-        .and_then(|value| value.to_str().ok())
-        .and_then(strip_bearer_prefix);
-
     let unauthorized = || (
         StatusCode::UNAUTHORIZED,
         "A valid bearer token is required.".to_string()
     );
+
+    if state.token.is_none()
+        && state.operator_tokens.is_empty()
+        && state.authentication_hook.is_none() {
+        return if state.open { Ok(Principal::Open) } else { Err(unauthorized()) };
+    }
+
+    // A blank (empty or whitespace-only) credential is not a credential: `Authorization: Bearer `
+    // (no bytes after the scheme, so `strip_bearer_prefix` yields `Some("")`) must never match
+    // anything — not the static token, not an operator-tokens entry, not the hook — and neither
+    // must an all-whitespace one (PR #124 round 3, F1): this checkpoint cannot assume any given
+    // transport trims trailing whitespace off header values before this code ever sees it (axum
+    // also serves h2c, where HPACK does not), so a client presenting `Bearer    ` must be refused
+    // the same way as a client presenting `Bearer `. `serve`'s options filter
+    // (`options.token.filter(|v| !v.trim().is_empty())`) and `parse_operator_tokens`'s blank-key
+    // rejection already keep a blank string out of `state.token`/`state.operator_tokens` in the
+    // first place; this is the belt-and-braces guard at the one checkpoint every
+    // principal-granting comparison goes through, so a future change that reintroduces a blank
+    // credential upstream (a new construction path for `AppState`, a relaxed parser) still cannot
+    // authenticate a blank-credential request. This filters presence only, not the value: a real,
+    // non-blank credential is still compared byte-for-byte, verbatim, by `tokens_match` — nothing
+    // here trims it.
+    let provided = headers.get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(strip_bearer_prefix)
+        .filter(|token| !token.trim().is_empty());
 
     match provided {
         Some(token) if state.token.as_deref().is_some_and(|expected| tokens_match(token, expected)) =>
@@ -640,6 +955,22 @@ async fn authenticate_via_hook(state: &AppState,
             "The authentication service is unavailable; try again later.".to_string()
         )
     })?;
+
+    // F4 of PR #124 round 2: a well-formed but blank identifier is exactly as unusable as
+    // malformed JSON — fail closed the same way, before the cache insert below, so a blank
+    // answer is never cached and repeatedly accepted for the TTL. Unlike the token this hook is
+    // answering *for*, nothing later compares an identifier byte-exactly against a configured
+    // value; it is recorded (`Principal::Operator`, then admission/event payloads,
+    // `post_resolve`'s `caller`) as a legitimate-looking actor, so whitespace-only (`"   "`) is
+    // rejected here too, not just the empty string.
+    if answer.identifier.trim().is_empty() {
+        tracing::warn!("the authentication hook answered a blank identifier; failing closed");
+
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "The authentication service is unavailable; try again later.".to_string()
+        ));
+    }
 
     if let Ok(mut cache) = state.authentication_cache.lock() {
         // The cache is bounded by the set of live tokens; expired entries are
@@ -2045,6 +2376,20 @@ mod tests {
         }
     }
 
+    /// `HookEndpoint`'s `Debug` is hand-written specifically so this holds structurally rather
+    /// than by nobody happening to print one with the secret in scope: the derived `Debug` this
+    /// replaces would print `secret` in full. Checks both fields' formatted output, so a future
+    /// edit cannot "fix" the struct literal without noticing the field name is still there too.
+    #[test]
+    fn hook_endpoint_debug_never_prints_the_secret() {
+        let hook = HookEndpoint { url: "https://provider.example/hook".to_string(), secret: "s3cr3t-value".to_string() };
+        let formatted = format!("{:?}", hook);
+
+        assert!(!formatted.contains("s3cr3t-value"), "{}", formatted);
+        assert!(formatted.contains("https://provider.example/hook"), "{}", formatted);
+        assert!(formatted.contains("redacted"), "{}", formatted);
+    }
+
     /// A classified refusal a core operation raised reaches this head as a sentinel-framed message;
     /// `error_body` threads its stable code and next step onto the wire (additive) with the de-framed
     /// human text in `error` — the raw frame never leaks (fixing the latent leak where a framed
@@ -2083,6 +2428,13 @@ mod tests {
     /// exercising the bound `serve` actually arms in production. Routing both through one function
     /// makes that drift structurally impossible rather than a fact the suite has to happen to
     /// keep testing.
+    ///
+    /// `open: true` here is a test-fixture convenience only, never the production default (see
+    /// `ServeOptions::open`'s doc comment and `serve`'s startup refusal): almost none of the
+    /// handler tests built on this are testing authentication, so they need the pre-existing
+    /// "no auth configured" fixture to keep answering requests with no bearer header. The
+    /// `check_auth` section below overrides this explicitly, in both directions, to test the
+    /// actual auth decision.
     fn base_state(mode: ServeMode) -> AppState {
         AppState {
             mode,
@@ -2100,6 +2452,7 @@ mod tests {
             ),
             authentication_cache: Mutex::new(HashMap::new()),
             authentication_cache_ttl: std::time::Duration::from_secs(60),
+            open: true,
         }
     }
 
@@ -2223,10 +2576,24 @@ mod tests {
     // ---------------------------------------------------------------------------------
 
     #[tokio::test]
-    async fn no_auth_configured_is_fully_open() {
-        let state = single_mode_state(PathBuf::from("/unused"));
+    async fn no_auth_configured_and_explicitly_open_is_fully_open() {
+        let state = AppState { open: true, ..single_mode_state(PathBuf::from("/unused")) };
         let principal = check_auth(&state, &HeaderMap::new()).await.unwrap();
         assert!(principal == Principal::Open);
+    }
+
+    /// The fail-open finding this fix closes: an empty auth config (no token, no operator
+    /// tokens, no authentication hook) must never be silently read as "serve openly" — that is
+    /// exactly the state a present-but-wrong-typed config value (`token = 12345`) or a mistyped
+    /// hook key used to collapse into via `parse_config`'s old lenient `.and_then(as_str)`
+    /// readers. `check_auth` itself must refuse a request in this state unless `open` is
+    /// explicitly `true`; `serve`'s startup check (this module, above) is the belt to this
+    /// braces — it refuses to construct a server in this configuration at all.
+    #[tokio::test]
+    async fn no_auth_configured_and_not_open_is_unauthorized() {
+        let state = AppState { open: false, ..single_mode_state(PathBuf::from("/unused")) };
+        let error = check_auth(&state, &HeaderMap::new()).await.err().unwrap();
+        assert_eq!(error.0, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -2245,6 +2612,38 @@ mod tests {
     async fn an_equal_length_near_miss_token_is_unauthorized() {
         let state = AppState { token: Some("secret".to_string()), ..single_mode_state(PathBuf::from("/unused")) };
         let error = check_auth(&state, &headers_with_bearer("secrft")).await.err().unwrap();
+        assert_eq!(error.0, StatusCode::UNAUTHORIZED);
+    }
+
+    /// Belt-and-braces for the empty-credential fail-open finding: even if `state.token` were
+    /// somehow `Some("")` — `serve`'s options filter is meant to make this unreachable in
+    /// practice, but this pins the deeper guard directly, in case a future construction path for
+    /// `AppState` reintroduces it — a request presenting the literal header
+    /// `Authorization: Bearer ` (empty credential, no bytes after the scheme) must still be
+    /// refused, not authenticate as `Principal::Static` via `tokens_match("", "")`.
+    #[tokio::test]
+    async fn an_empty_bearer_credential_never_authenticates_even_against_an_empty_static_token() {
+        let state = AppState {
+            token: Some(String::new()),
+            ..single_mode_state(PathBuf::from("/unused"))
+        };
+        let error = check_auth(&state, &headers_with_bearer("")).await.err().unwrap();
+        assert_eq!(error.0, StatusCode::UNAUTHORIZED);
+    }
+
+    /// The whitespace-only sibling (PR #124 round 3, F1): even if `state.token` were somehow
+    /// `Some("   ")` — again, upstream filtering is meant to make this unreachable in practice —
+    /// a request presenting an all-whitespace bearer credential must still be refused, not
+    /// authenticate via `tokens_match("   ", "   ")`. This is the h2c/HPACK case the finding
+    /// raised directly: this belt-and-braces guard does not assume any transport trims trailing
+    /// whitespace off header values before `check_auth` ever sees them.
+    #[tokio::test]
+    async fn a_whitespace_only_bearer_credential_never_authenticates_even_against_a_whitespace_only_static_token() {
+        let state = AppState {
+            token: Some("   ".to_string()),
+            ..single_mode_state(PathBuf::from("/unused"))
+        };
+        let error = check_auth(&state, &headers_with_bearer("   ")).await.err().unwrap();
         assert_eq!(error.0, StatusCode::UNAUTHORIZED);
     }
 
@@ -2427,6 +2826,58 @@ mod tests {
 
         let error = check_auth(&state, &headers_with_bearer("tok")).await.err().unwrap();
         assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// F4 of PR #124 round 2: a well-formed but blank identifier must fail closed exactly like
+    /// malformed JSON — `Principal::Operator("")` is not a real identity, and unlike the token
+    /// side (fail-closed via an exact, untrimmed byte comparison — see
+    /// `an_empty_bearer_credential_never_authenticates_even_against_an_empty_static_token`),
+    /// nothing later compares an identifier byte-exactly against a configured value; it is
+    /// recorded (`caller`, `operator` in admission/event payloads) as if it were a legitimate
+    /// actor.
+    #[tokio::test]
+    async fn a_hook_answer_with_an_empty_identifier_fails_closed() {
+        let (url, _received, _hits) = spawn_hook(StatusCode::OK, r#"{"identifier":""}"#).await;
+        let state = AppState {
+            authentication_hook: Some(HookEndpoint { url, secret: "s".to_string() }),
+            ..single_mode_state(PathBuf::from("/unused"))
+        };
+
+        let error = check_auth(&state, &headers_with_bearer("tok")).await.err().unwrap();
+        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// Whitespace-only is exactly as much "not an identity" as empty — this is the whitespace
+    /// half the token side never needs (an exact byte comparison already refuses any
+    /// whitespace-padded guess).
+    #[tokio::test]
+    async fn a_hook_answer_with_a_whitespace_only_identifier_fails_closed() {
+        let (url, _received, _hits) = spawn_hook(StatusCode::OK, r#"{"identifier":"   "}"#).await;
+        let state = AppState {
+            authentication_hook: Some(HookEndpoint { url, secret: "s".to_string() }),
+            ..single_mode_state(PathBuf::from("/unused"))
+        };
+
+        let error = check_auth(&state, &headers_with_bearer("tok")).await.err().unwrap();
+        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// The check must reject only *all-whitespace* identifiers, not merely trim and accept —
+    /// an identifier with incidental leading/trailing whitespace around real content is still a
+    /// real identity and must authenticate, verbatim (untrimmed): `office_user_of` matches an
+    /// operator's identifier by exact equality against the tracked office roster, so silently
+    /// trimming it here would make this check the reason a legitimately-enrolled " bob " never
+    /// matches.
+    #[tokio::test]
+    async fn a_hook_answer_with_incidental_whitespace_around_a_real_identifier_still_authenticates() {
+        let (url, _received, _hits) = spawn_hook(StatusCode::OK, r#"{"identifier":" bob "}"#).await;
+        let state = AppState {
+            authentication_hook: Some(HookEndpoint { url, secret: "s".to_string() }),
+            ..single_mode_state(PathBuf::from("/unused"))
+        };
+
+        let principal = check_auth(&state, &headers_with_bearer("tok")).await.unwrap();
+        assert!(principal == Principal::Operator(" bob ".to_string()));
     }
 
     // ---------------------------------------------------------------------------------
@@ -2661,6 +3112,131 @@ mod tests {
         std::fs::write(&path, "[operators]\n\"tok-a\" = 42\n").unwrap();
 
         assert!(parse_operator_tokens(path.to_str().unwrap()).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The operator-tokens counterpart of the empty-`--token` fail-open finding: an empty
+    /// string key is not a credential. Left unrejected, `state.operator_tokens.get("")` would
+    /// match a request carrying the literal header `Authorization: Bearer ` (empty credential),
+    /// authenticating it as whatever identifier the empty key maps to.
+    #[test]
+    fn rejects_a_token_file_with_an_empty_token_key() {
+        let dir = scratch_dir("tokens-empty-key");
+        let path = dir.join("tokens.toml");
+        std::fs::write(&path, "[operators]\n\"\" = \"alice\"\n\"tok-b\" = \"bob\"\n").unwrap();
+
+        let error = parse_operator_tokens(path.to_str().unwrap()).unwrap_err();
+        assert!(error.contains("empty"), "{}", error);
+        assert!(error.contains("alice"), "{}", error);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The round-3 sibling (F1): a whitespace-only token key is exactly as much "not a
+    /// credential" as an empty one, for the identical reason `merge_static_token`'s static token
+    /// now checks whitespace too — either no client can ever present it (over a transport that
+    /// trims trailing whitespace off header values, silently locking "alice" out forever), or one
+    /// can present a trivially-guessable all-whitespace credential.
+    #[test]
+    fn rejects_a_token_file_with_a_whitespace_only_token_key() {
+        let dir = scratch_dir("tokens-whitespace-key");
+        let path = dir.join("tokens.toml");
+        std::fs::write(&path, "[operators]\n\"   \" = \"alice\"\n\"tok-b\" = \"bob\"\n").unwrap();
+
+        let error = parse_operator_tokens(path.to_str().unwrap()).unwrap_err();
+        assert!(error.contains("whitespace"), "{}", error);
+        assert!(error.contains("alice"), "{}", error);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F4 of PR #124 round 2: `"tok-a" = ""` used to parse fine — only the token (key) side was
+    /// checked for emptiness, never the identifier (value). An empty identifier is not merely
+    /// unenrolled (which `office_user_of` already 403s): it flows into admission/event payloads
+    /// and `post_resolve`'s `caller` as a legitimate-looking actor.
+    #[test]
+    fn rejects_a_token_mapped_to_a_blank_identifier() {
+        let dir = scratch_dir("tokens-blank-identifier");
+        let path = dir.join("tokens.toml");
+        std::fs::write(&path, "[operators]\n\"tok-a\" = \"\"\n\"tok-b\" = \"bob\"\n").unwrap();
+
+        let error = parse_operator_tokens(path.to_str().unwrap()).unwrap_err();
+        assert!(error.contains("blank"), "{}", error);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Whitespace-only is exactly as much "not an identity" as empty — the same blank rule
+    /// `rejects_a_token_file_with_a_whitespace_only_token_key` now applies to the token (key)
+    /// side too (PR #124 round 3, F1 unified them); what still differs is normalization, not
+    /// presence — see `a_token_file_identifier_with_incidental_whitespace_is_stored_untrimmed`
+    /// below for the half of the identity rule this test does not cover.
+    #[test]
+    fn rejects_a_token_mapped_to_a_whitespace_only_identifier() {
+        let dir = scratch_dir("tokens-whitespace-identifier");
+        let path = dir.join("tokens.toml");
+        std::fs::write(&path, "[operators]\n\"tok-a\" = \"   \"\n").unwrap();
+
+        let error = parse_operator_tokens(path.to_str().unwrap()).unwrap_err();
+        assert!(error.contains("blank"), "{}", error);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F6 of PR #124 round 3: the matching control `authenticate_via_hook`'s own identity rule
+    /// already has
+    /// (`a_hook_answer_with_incidental_whitespace_around_a_real_identifier_still_authenticates`),
+    /// missing here until now. Without it, a future edit changing `identifier.to_string()` to
+    /// `identifier.trim().to_string()` above would silently break exact-equality matching against
+    /// the tracked office roster (`office_user_of`) for every legitimately whitespace-padded
+    /// identifier, with no test in this file catching it: the two rejection tests above only
+    /// exercise *entirely*-blank identifiers, never one with real content plus incidental
+    /// surrounding whitespace.
+    #[test]
+    fn a_token_file_identifier_with_incidental_whitespace_is_stored_untrimmed() {
+        let dir = scratch_dir("tokens-identifier-whitespace-preserved");
+        let path = dir.join("tokens.toml");
+        std::fs::write(&path, "[operators]\n\"tok-a\" = \" bob \"\n").unwrap();
+
+        let tokens = parse_operator_tokens(path.to_str().unwrap()).unwrap();
+        assert_eq!(tokens.get("tok-a").map(String::as_str), Some(" bob "));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PR #124 round 4, F5: the symmetric control for the *key* side of the same claim — the
+    /// comment above (`"a real, non-blank token key is still matched byte-for-byte, verbatim …
+    /// nothing here trims it"`) has never had a test pinning it, only the two rejection tests
+    /// above (which exercise *entirely*-blank keys). Without this, a future
+    /// `token.trim().to_string()` edit at the `tokens.insert(...)` call below would silently make
+    /// every whitespace-padded operator token permanently unauthenticatable — `check_auth` looks
+    /// up the presented, untrimmed header value via `state.operator_tokens.get(token)`, so a
+    /// stored, trimmed key can never match again — with no test in this file catching it.
+    #[test]
+    fn a_token_file_key_with_incidental_whitespace_is_stored_untrimmed() {
+        let dir = scratch_dir("tokens-key-whitespace-preserved");
+        let path = dir.join("tokens.toml");
+        std::fs::write(&path, "[operators]\n\" tok a \" = \"bob\"\n").unwrap();
+
+        let tokens = parse_operator_tokens(path.to_str().unwrap()).unwrap();
+        assert_eq!(tokens.get(" tok a ").map(String::as_str), Some("bob"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The blank-identifier error must never echo the token — unlike the empty-*token* error
+    /// above (safe to echo, since the token there is itself empty), the token in this scenario
+    /// is a real, live credential, and printing it would leak it into the server's own
+    /// startup-failure output and logs.
+    #[test]
+    fn a_blank_identifier_error_never_echoes_the_token() {
+        let dir = scratch_dir("tokens-blank-identifier-no-leak");
+        let path = dir.join("tokens.toml");
+        std::fs::write(&path, "[operators]\n\"super-secret-token\" = \"\"\n").unwrap();
+
+        let error = parse_operator_tokens(path.to_str().unwrap()).unwrap_err();
+        assert!(!error.contains("super-secret-token"), "{}", error);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3473,6 +4049,247 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------------
+    // serve: the startup refusal to ever infer Principal::Open
+    // ---------------------------------------------------------------------------------
+
+    /// A minimal `ServeOptions` with no auth of any kind and `open: false` — every field a
+    /// test overrides with struct-update syntax to exercise one dimension of the startup
+    /// auth gate at a time.
+    fn bare_serve_options() -> ServeOptions {
+        ServeOptions {
+            root: Some("/does/not/exist/and/does/not/matter".to_string()),
+            warehouses: None,
+            addr: "127.0.0.1:0".to_string(),
+            token: None,
+            tokens: None,
+            blank_token_supplied: false,
+            max_body_mb: None,
+            rebuild_after_lifts: None,
+            authentication_hook: None,
+            admission_hook: None,
+            events_hook: None,
+            resolution_hook: None,
+            authentication_cache_secs: None,
+            open: false,
+        }
+    }
+
+    /// The startup half of the fail-open fix: `serve` must refuse before ever binding a
+    /// listener or constructing an `AppState` when no auth is configured and `open` is not
+    /// set — naming the remedy, not silently starting `Principal::Open`. The auth gate runs
+    /// before root resolution (see `serve`'s ordering), so an invalid root does not mask this:
+    /// if the gate were bypassed, this would fail with "Error while resolving" instead.
+    #[tokio::test]
+    async fn serve_refuses_to_start_with_no_auth_and_no_open() {
+        let error = serve(bare_serve_options()).await.unwrap_err();
+
+        assert!(error.contains("No authentication is configured"), "{}", error);
+        assert!(error.contains("--open"), "{}", error);
+        // Locks the "absent" phrasing distinctly from the "blank" phrasing
+        // `serve_with_an_empty_token_does_not_pass_the_auth_gate` pins below (F2 of PR #124
+        // round 2) — no token was supplied at all here, blank or otherwise.
+        assert!(error.contains("no --token/token"), "{}", error);
+    }
+
+    /// The explicit opt-in must still work: `open: true` with nothing else configured must
+    /// pass the auth gate rather than be refused. Distinguished from a refusal by which error
+    /// comes back — the deliberately-invalid root's resolution error, not the auth one — since
+    /// fully starting the server (binding, serving, shutting down) is out of scope for a fast
+    /// unit test.
+    #[tokio::test]
+    async fn serve_with_open_true_passes_the_auth_gate() {
+        let options = ServeOptions { open: true, ..bare_serve_options() };
+        let error = serve(options).await.unwrap_err();
+
+        assert!(!error.contains("No authentication is configured"), "{}", error);
+        assert!(error.contains("Error while resolving"), "{}", error);
+    }
+
+    /// The same bypass, via a configured static token instead of `open` — confirms the gate
+    /// looks at all three auth sources (token, operator tokens, hook), not just `open`.
+    #[tokio::test]
+    async fn serve_with_a_token_passes_the_auth_gate_even_without_open() {
+        let options = ServeOptions { token: Some("secret".to_string()), ..bare_serve_options() };
+        let error = serve(options).await.unwrap_err();
+
+        assert!(!error.contains("No authentication is configured"), "{}", error);
+        assert!(error.contains("Error while resolving"), "{}", error);
+    }
+
+    /// The fail-open finding: `--token ""` (or `token = ""` in the config file) must not count
+    /// as a configured token. Before the fix, `options.token.is_some()` was `true` for
+    /// `Some("")`, so this bypassed the gate entirely and the server would have started fully
+    /// open to any request carrying `Authorization: Bearer ` (empty credential).
+    ///
+    /// `blank_token_supplied: true` here mirrors what `main.rs::merge_static_token` would have
+    /// computed for this scenario — this test constructs `ServeOptions` directly, bypassing
+    /// that merge, so it sets the signal by hand. F2 of PR #124 round 2: the refusal must name
+    /// this case as "a blank --token/token", not the misdiagnosing "no --token/token" (which
+    /// `serve_refuses_to_start_with_no_auth_and_no_open` pins for the genuinely-absent case).
+    #[tokio::test]
+    async fn serve_with_an_empty_token_does_not_pass_the_auth_gate() {
+        let options = ServeOptions {
+            token: Some(String::new()),
+            blank_token_supplied: true,
+            ..bare_serve_options()
+        };
+        let error = serve(options).await.unwrap_err();
+
+        assert!(error.contains("No authentication is configured"), "{}", error);
+        assert!(error.contains("a blank --token/token"), "{}", error);
+        assert!(!error.contains("no --token/token"), "{}", error);
+    }
+
+    /// The whitespace-only sibling (PR #124 round 3, F1): `--token "   "` must be treated exactly
+    /// like `--token ""` at this gate too — `blank_token_supplied` is set the same way
+    /// `main.rs::merge_static_token` would set it for this scenario. PR #124 round 4, F1: this
+    /// test used to assert the same "an empty --token/token" wording as the empty-string case
+    /// above, which was true of the code (a single hardcoded clause covered both) but not of the
+    /// scenario — an operator who set `token = "   "` was told their token was an empty string.
+    /// Now asserts the corrected, case-covering wording instead of pinning that misdiagnosis.
+    #[tokio::test]
+    async fn serve_with_a_whitespace_only_token_does_not_pass_the_auth_gate() {
+        let options = ServeOptions {
+            token: Some("   ".to_string()),
+            blank_token_supplied: true,
+            ..bare_serve_options()
+        };
+        let error = serve(options).await.unwrap_err();
+
+        assert!(error.contains("No authentication is configured"), "{}", error);
+        assert!(error.contains("a blank --token/token"), "{}", error);
+        assert!(!error.contains("no --token/token"), "{}", error);
+    }
+
+    /// The empty-`[operators]`-table case must be named distinctly from "no --tokens/tokens
+    /// file" (F4): the operator did pass `--tokens`, the file just defines no entries. Telling
+    /// them to pass a flag they already passed sends them looking in the wrong place.
+    #[tokio::test]
+    async fn serve_with_an_empty_tokens_file_names_that_case_distinctly() {
+        let dir = scratch_dir("serve-empty-tokens-file");
+        let path = dir.join("tokens.toml");
+        std::fs::write(&path, "[operators]\n").unwrap();
+
+        let options = ServeOptions {
+            tokens: Some(path.to_str().unwrap().to_string()),
+            ..bare_serve_options()
+        };
+        let error = serve(options).await.unwrap_err();
+
+        assert!(error.contains("No authentication is configured"), "{}", error);
+        assert!(error.contains("defines no entries"), "{}", error);
+        assert!(!error.contains("no --tokens/tokens file"), "{}", error);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PR #124 round 4, F4: a whitespace-only `authentication_url` used to pass the hook
+    /// completeness gate (`is_empty()` only), which then made `auth_configured` true and let the
+    /// server start believing authentication was configured — only to 503 every request at
+    /// `authenticate_via_hook`, since a blank URL can never be posted to. Fail-closed, so not a
+    /// hole, but the wrong refusal point: this must be caught here, at startup, naming the hook,
+    /// rather than at the first request with no diagnostic at start time.
+    ///
+    /// Uses `--warehouses` (an existing, empty scratch folder) rather than `bare_serve_options`'s
+    /// deliberately-nonexistent `--root`: the hook-completeness gate runs *after* root/warehouses
+    /// resolution (see `serve`'s ordering), so a fake root would fail with "Error while
+    /// resolving" before ever reaching the check this test targets.
+    ///
+    /// PR #124 round 5, F3: because this test (unlike almost every other `serve` test in this
+    /// file) points at a real, existing `--warehouses` folder, the blank-hook refusal is the
+    /// only thing standing between `serve` and actually binding and entering the axum server
+    /// loop — if that refusal ever regressed, `.unwrap_err()` below would never be reached and
+    /// this test would hang forever instead of failing, so a regression here would show up in CI
+    /// as a timeout, not a red assertion. Verified empirically (PR #124 round 5 review): with
+    /// the guard removed, this test hangs rather than failing. `tokio::time::timeout` turns that
+    /// hang into a fast, named failure in both directions.
+    #[tokio::test]
+    async fn serve_refuses_a_whitespace_only_hook_url() {
+        let base = scratch_dir("serve-hook-url-whitespace");
+        let options = ServeOptions {
+            root: None,
+            warehouses: Some(base.to_str().unwrap().to_string()),
+            authentication_hook: Some(HookEndpoint {
+                url: "   ".to_string(),
+                secret: "s".to_string(),
+            }),
+            ..bare_serve_options()
+        };
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), serve(options)).await;
+
+        let error = outcome
+            .unwrap_or_else(|_| panic!(
+                "serve() did not return within 5s — the blank-hook-URL startup refusal has \
+                regressed and serve is binding and running the axum server loop instead"
+            ))
+            .unwrap_err();
+        assert!(error.contains("has a blank URL or secret"), "{}", error);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The secret-side sibling: a whitespace-only secret is weaker than a real one but must
+    /// still be refused as "not configured", the same rule the URL side now gets (F4 above).
+    /// Same hang-shape hazard as `serve_refuses_a_whitespace_only_hook_url` above (F3): a real
+    /// `--warehouses` folder means a regressed guard hangs the test instead of failing it.
+    #[tokio::test]
+    async fn serve_refuses_a_whitespace_only_hook_secret() {
+        let base = scratch_dir("serve-hook-secret-whitespace");
+        let options = ServeOptions {
+            root: None,
+            warehouses: Some(base.to_str().unwrap().to_string()),
+            authentication_hook: Some(HookEndpoint {
+                url: "https://provider.example/hooks/auth".to_string(),
+                secret: "   ".to_string(),
+            }),
+            ..bare_serve_options()
+        };
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), serve(options)).await;
+
+        let error = outcome
+            .unwrap_or_else(|_| panic!(
+                "serve() did not return within 5s — the blank-hook-secret startup refusal has \
+                regressed and serve is binding and running the axum server loop instead"
+            ))
+            .unwrap_err();
+        assert!(error.contains("has a blank URL or secret"), "{}", error);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// PR #124 round 5, F2: a non-blank but non-absolute hook URL (scheme omitted) passes the
+    /// blank check above yet produces exactly the failure that check exists to catch at
+    /// startup — `reqwest::Url::parse` (called both here and, transitively, by `post_hook` via
+    /// `state.http.post`) rejects a schemeless string as a relative URL without a base. Same
+    /// real-`--warehouses`-folder hang hazard as the two tests above (F3): wrapped in a timeout
+    /// so a regressed guard fails fast instead of hanging.
+    #[tokio::test]
+    async fn serve_refuses_a_non_absolute_hook_url() {
+        let base = scratch_dir("serve-hook-url-non-absolute");
+        let options = ServeOptions {
+            root: None,
+            warehouses: Some(base.to_str().unwrap().to_string()),
+            authentication_hook: Some(HookEndpoint {
+                url: "provider.example/hooks/auth".to_string(),
+                secret: "s".to_string(),
+            }),
+            ..bare_serve_options()
+        };
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), serve(options)).await;
+
+        let error = outcome
+            .unwrap_or_else(|_| panic!(
+                "serve() did not return within 5s — the non-absolute-hook-URL startup refusal \
+                has regressed and serve is binding and running the axum server loop instead"
+            ))
+            .unwrap_err();
+        assert!(error.contains("is not a valid absolute URL"), "{}", error);
+        assert!(error.contains("provider.example/hooks/auth"), "{}", error);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ---------------------------------------------------------------------------------
     // startup_bind_warning
     // ---------------------------------------------------------------------------------
 
@@ -3496,5 +4313,102 @@ mod tests {
 
         let without_auth = startup_bind_warning(&bound, false).expect("a warning with no auth");
         assert!(without_auth.contains("Principal::Open"), "{}", without_auth);
+    }
+
+    // ---------------------------------------------------------------------------------
+    // body_limit_bytes (F5 of PR #124 round 2): the magnitude half of the overflow class
+    // ---------------------------------------------------------------------------------
+
+    #[test]
+    fn body_limit_bytes_converts_an_ordinary_value() {
+        assert_eq!(body_limit_bytes(Some(4096)).unwrap(), 4096 * 1024 * 1024);
+    }
+
+    #[test]
+    fn body_limit_bytes_defaults_to_the_object_ceiling_when_unset() {
+        assert_eq!(body_limit_bytes(None).unwrap(), object_utils::MAX_OBJECT_BYTES);
+    }
+
+    /// The exact boundary the finding names: `2^44` MiB is the smallest `max_body_mb` whose
+    /// byte count overflows a `u64` (`2^44 * 2^20 == 2^64`). `(mb as usize) * 1024 * 1024` — the
+    /// code this replaces — silently wraps to exactly `0` here on a 64-bit target (rejecting
+    /// every request body) instead of refusing to start.
+    #[test]
+    fn body_limit_bytes_refuses_an_overflowing_value_naming_the_key() {
+        let error = body_limit_bytes(Some(1u64 << 44)).unwrap_err();
+        assert!(error.contains("max_body_mb"), "{}", error);
+    }
+
+    #[test]
+    fn body_limit_bytes_accepts_the_largest_value_that_does_not_overflow() {
+        // The largest `mb` whose `* 1024 * 1024` still fits in a `u64` (one MiB short of the
+        // overflowing boundary above) must still convert cleanly, not be caught by an
+        // off-by-one in the overflow check.
+        let mb = (1u64 << 44) - 1;
+        assert_eq!(body_limit_bytes(Some(mb)).unwrap(), (mb as usize) * 1024 * 1024);
+    }
+
+    /// PR #124 round 4, F6: `max_body_mb`'s sign check only ever rejected negative values, so
+    /// `Some(0)` sailed through, round-tripped losslessly through the cast, and reached
+    /// `DefaultBodyLimit::max(0)` — the server starts normally and then 413s every request
+    /// carrying a body, a 1-byte lift included. Non-negative but nonsensical, the same class
+    /// `authentication_cache_secs`'s ceiling closes for that field.
+    #[test]
+    fn body_limit_bytes_refuses_zero_naming_the_key() {
+        let error = body_limit_bytes(Some(0)).unwrap_err();
+        assert!(error.contains("max_body_mb"), "{}", error);
+    }
+
+    #[test]
+    fn body_limit_bytes_accepts_the_smallest_nonzero_value() {
+        // The boundary right above the refusal above: `1` MiB must still convert cleanly, not be
+        // caught by an off-by-one in the zero check.
+        assert_eq!(body_limit_bytes(Some(1)).unwrap(), 1024 * 1024);
+    }
+
+    // ---------------------------------------------------------------------------------
+    // authentication_cache_ttl (PR #124 round 5, F4): the ceiling re-enforced at the
+    // `ServeOptions` boundary, not just in `main.rs`'s TOML reader
+    // ---------------------------------------------------------------------------------
+
+    #[test]
+    fn authentication_cache_ttl_defaults_to_60s_when_unset() {
+        assert_eq!(authentication_cache_ttl(None).unwrap(), std::time::Duration::from_secs(60));
+    }
+
+    #[test]
+    fn authentication_cache_ttl_accepts_the_ceiling() {
+        assert_eq!(
+            authentication_cache_ttl(Some(MAX_AUTHENTICATION_CACHE_SECS)).unwrap(),
+            std::time::Duration::from_secs(MAX_AUTHENTICATION_CACHE_SECS)
+        );
+    }
+
+    #[test]
+    fn authentication_cache_ttl_refuses_a_value_over_the_ceiling() {
+        let error = authentication_cache_ttl(Some(MAX_AUTHENTICATION_CACHE_SECS + 1)).unwrap_err();
+        assert!(error.contains("authentication_cache_secs"), "{}", error);
+        assert!(error.contains("ceiling"), "{}", error);
+    }
+
+    /// The finding itself: a `ServeOptions` built directly (not through `main.rs`'s TOML
+    /// reader — the only path `bounded_authentication_cache_secs` guards) with an
+    /// over-the-ceiling `authentication_cache_secs` must still be refused, by `serve` itself.
+    /// Before this fix, this construction sailed straight past every check and reached
+    /// `Duration::from_secs` uncontested, making SERVER.md's and HOOK_PROTOCOL.md's "refuses to
+    /// start over 24h" claim false for any caller other than the config-file path. Uses
+    /// `bare_serve_options`'s deliberately-nonexistent `--root`: this check runs before root
+    /// resolution, so no real warehouse folder — and no hang risk — is needed to observe it.
+    #[tokio::test]
+    async fn serve_refuses_an_authentication_cache_secs_over_the_ceiling() {
+        let options = ServeOptions {
+            authentication_cache_secs: Some(MAX_AUTHENTICATION_CACHE_SECS + 1),
+            ..bare_serve_options()
+        };
+        let error = serve(options).await.unwrap_err();
+
+        assert!(error.contains("authentication_cache_secs"), "{}", error);
+        assert!(error.contains("ceiling"), "{}", error);
+        assert!(!error.contains("No authentication is configured"), "{}", error);
     }
 }
