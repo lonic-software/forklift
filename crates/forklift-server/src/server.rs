@@ -177,11 +177,14 @@ type PathParams = HashMap<String, String>;
 /// authentication hook is game over (§8.13).
 ///
 /// `Debug` is hand-written, not derived, so that redaction is structural rather than a claim
-/// about which paths happen to print this type today: `main.rs`'s `ConfigFile` derives `Debug`
-/// solely for a test's `unwrap_err()` trait bound, and a derived `Debug` here would print
-/// `secret` in full the moment anything — that test, a future `tracing::debug!(?options)`, a
-/// panic message — formats a value that contains one. See
-/// `tests::hook_endpoint_debug_never_prints_the_secret`.
+/// about which paths happen to print this type today: a derived `Debug` here would print
+/// `secret` in full the moment anything — a test's `unwrap_err()`, a future
+/// `tracing::debug!(?options)`, a panic message — formats a value that contains one. `main.rs`'s
+/// `ConfigFile` hand-writes its own `Debug` for the identical reason (PR #124 round 2, F3): it
+/// used to derive `Debug` solely for a test's `unwrap_err()` trait bound, which round 2 replaced
+/// once that derive was found to print `ConfigFile::token` — the higher-value secret of the two
+/// — in full for the same reason. See `tests::hook_endpoint_debug_never_prints_the_secret` and
+/// `main.rs::tests::config_file_debug_never_prints_the_token`.
 #[derive(Clone)]
 pub struct HookEndpoint {
     pub url: String,
@@ -211,25 +214,28 @@ pub struct ServeOptions {
 
     /// The static bearer token (full access), if any. Already normalized by the time it
     /// reaches here when built through `main.rs::serve` (`main.rs::merge_static_token`
-    /// filters an empty string out of *each* of the flag and config-file sources before
-    /// deciding precedence between them — filtering only the already-merged value, as `serve`
-    /// below alone used to, cannot recover a real value that precedence already discarded in
-    /// favor of an empty one from the other source). `serve` below still filters again — this
-    /// struct is `pub`, so any other constructor (a test, a future embedder) gets the same
-    /// "an empty string is not a credential" guarantee regardless of whether it normalized its
-    /// own sources first.
+    /// filters an empty-or-whitespace-only string out of *each* of the flag and config-file
+    /// sources before deciding precedence between them — filtering only the already-merged
+    /// value, as `serve` below alone used to, cannot recover a real value that precedence already
+    /// discarded in favor of a blank one from the other source). `serve` below still filters
+    /// again — this struct is `pub`, so any other constructor (a test, a future embedder) gets
+    /// the same "a blank string is not a credential" guarantee regardless of whether it
+    /// normalized its own sources first. Blank means empty *or* whitespace-only (PR #124 round 3,
+    /// F1) — the same rule `parse_operator_tokens` and `authenticate_via_hook` apply to their own
+    /// credential/identity fields, so every blank check in this module agrees on what blank
+    /// means.
     pub token: Option<String>,
 
     /// The path of the per-operator token file, if any.
     pub tokens: Option<String>,
 
     /// Whether either of `token`'s two raw sources (the `--token` flag, the config file's
-    /// `token` key) was present but an empty string — i.e. whether `token` above is `None`
-    /// *because* a blank credential was supplied, as opposed to nothing being supplied at all.
-    /// Computed by `main.rs::merge_static_token`, alongside the normalization above; used only
-    /// by `serve`'s startup refusal, to name that case as "an empty --token/token" rather than
-    /// the misdiagnosing "no --token/token" (PR #124 round 2, F2). Never consulted for
-    /// authentication itself.
+    /// `token` key) was present but blank (empty or whitespace-only) — i.e. whether `token`
+    /// above is `None` *because* a blank credential was supplied, as opposed to nothing being
+    /// supplied at all. Computed by `main.rs::merge_static_token`, alongside the normalization
+    /// above; used only by `serve`'s startup refusal, to name that case as "an empty
+    /// --token/token" rather than the misdiagnosing "no --token/token" (PR #124 round 2, F2).
+    /// Never consulted for authentication itself.
     pub blank_token_supplied: bool,
 
     /// Refuse request bodies over this size (MiB); `None` = the default cap
@@ -361,18 +367,21 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
         None => HashMap::new(),
     };
 
-    // Defense-in-depth, not the primary enforcement point (see `ServeOptions::token`'s doc): an
-    // empty string is not a credential — without this, `strip_bearer_prefix("Bearer ")` yields
-    // `Some("")`, `tokens_match("", "")` is `true`, and a request carrying the literal header
-    // `Authorization: Bearer ` (no credential after the scheme) would authenticate as
-    // `Principal::Static` with full privileges. `main.rs::merge_static_token` already normalizes
-    // both of the token's raw sources individually before this ever runs (PR #124 round 2, F1:
-    // filtering only here, after the flag and the config file were already merged by precedence,
-    // could not recover a real token that precedence had already discarded in favor of an empty
-    // one from the other source) — this line stays so `ServeOptions`, which is `pub`, gives the
-    // same guarantee to any other constructor of it. Mirrors
-    // `forklift-aws-lambda::entrypoint::auth_from`'s `token.filter(|value| !value.is_empty())`.
-    let token = options.token.filter(|value| !value.is_empty());
+    // Defense-in-depth, not the primary enforcement point (see `ServeOptions::token`'s doc): a
+    // blank (empty or whitespace-only) string is not a credential — without this,
+    // `strip_bearer_prefix("Bearer ")` yields `Some("")`, `tokens_match("", "")` is `true`, and a
+    // request carrying the literal header `Authorization: Bearer ` (no credential after the
+    // scheme) would authenticate as `Principal::Static` with full privileges; a whitespace-only
+    // token has the identical problem one level removed (PR #124 round 3, F1) — either no client
+    // can ever present it at all, or, on a transport this crate makes no assumption about
+    // trimming, a guessable all-whitespace value can. `main.rs::merge_static_token` already
+    // normalizes both of the token's raw sources individually before this ever runs (PR #124
+    // round 2, F1: filtering only here, after the flag and the config file were already merged by
+    // precedence, could not recover a real token that precedence had already discarded in favor
+    // of a blank one from the other source) — this line stays so `ServeOptions`, which is `pub`,
+    // gives the same guarantee to any other constructor of it. Mirrors
+    // `forklift-aws-lambda::entrypoint::BearerToken::new`'s identical blank check.
+    let token = options.token.filter(|value| !value.trim().is_empty());
 
     // Refuse to start rather than ever construct an `AppState` that would fall through to
     // `Principal::Open` by accident: `check_auth` only returns `Open` when `options.open` is
@@ -626,14 +635,21 @@ fn parse_operator_tokens(path: &str) -> Result<HashMap<String, String>, String> 
             "The token file \"{}\" maps a token to a non-string value.", path
         ))?;
 
-        // An empty string is not a credential (the same hole as `--token ""`, see `serve`): a
-        // request carrying the literal header `Authorization: Bearer ` (no credential after the
-        // scheme) would otherwise match this entry via `state.operator_tokens.get("")` and
-        // authenticate as `identifier` with no credential presented at all.
-        if token.is_empty() {
+        // A blank (empty or whitespace-only) string is not a credential (the same hole as
+        // `--token ""`/`--token "   "`, see `serve`): a request carrying the literal header
+        // `Authorization: Bearer ` (no credential after the scheme) would otherwise match an
+        // empty-key entry via `state.operator_tokens.get("")` and authenticate as `identifier`
+        // with no credential presented at all — and a whitespace-only key has the identical
+        // problem one level removed (PR #124 round 3, F1): a client on a transport that trims
+        // trailing whitespace off header values could never present it (the entry is permanently
+        // dead, silently locking "identifier" out), while on one that does not it is a
+        // trivially-guessable credential. This is a presence check only, not a normalization: a
+        // real, non-blank token key is still matched byte-for-byte, verbatim, via
+        // `state.operator_tokens.get(token)` — nothing here trims it.
+        if token.trim().is_empty() {
             return Err(format!(
-                "The token file \"{}\" maps an empty token to \"{}\": an empty string is not a \
-                credential — remove that entry.",
+                "The token file \"{}\" maps an empty or whitespace-only token to \"{}\": that is \
+                not a credential — remove that entry.",
                 path, identifier
             ));
         }
@@ -641,11 +657,17 @@ fn parse_operator_tokens(path: &str) -> Result<HashMap<String, String>, String> 
         // F4 of PR #124 round 2: an identity is not a credential — nothing compares it
         // byte-exactly against a configured value the way a token is compared, it is *recorded*
         // (into `Principal::Operator`, then admission/event payloads, `post_resolve`'s `caller`)
-        // as a legitimate-looking actor. Whitespace-only is rejected too, unlike the token check
-        // above: the token side only ever needs an exact-byte comparison and so has no
-        // equivalent whitespace hole. Deliberately does not echo `token` into the message —
-        // unlike the empty-token case above, `token` here is a real, live credential, and
-        // printing it would leak it into the server's own startup-failure output and logs.
+        // as a legitimate-looking actor. Blank is rejected on both sides now (PR #124 round 3, F1
+        // unified the rule the token check above used to lack); what still differs between them
+        // is normalization, not presence — a token's real, non-blank value is compared byte-exact
+        // and never trimmed (above), and an identity's real, non-blank value is *also* never
+        // trimmed: `office_user_of` matches it by exact equality against the tracked office
+        // roster, so trimming a legitimately whitespace-padded identifier here would be the
+        // reason it can never match again (see
+        // `a_token_file_identifier_with_incidental_whitespace_is_stored_untrimmed` below).
+        // Deliberately does not echo `token` into the message — unlike the blank-token case
+        // above, `token` here is a real, live credential, and printing it would leak it into the
+        // server's own startup-failure output and logs.
         if identifier.trim().is_empty() {
             return Err(format!(
                 "The token file \"{}\" maps a token to a blank identifier: an identity must not \
@@ -753,19 +775,25 @@ async fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<Principal, 
         return if state.open { Ok(Principal::Open) } else { Err(unauthorized()) };
     }
 
-    // An empty credential is not a credential: `Authorization: Bearer ` (no bytes after the
-    // scheme, so `strip_bearer_prefix` yields `Some("")`) must never match anything — not the
-    // static token, not an operator-tokens entry, not the hook. `serve`'s options filter
-    // (`options.token.filter(|v| !v.is_empty())`) and `parse_operator_tokens`'s empty-key
-    // rejection already keep an empty string out of `state.token`/`state.operator_tokens` in the
+    // A blank (empty or whitespace-only) credential is not a credential: `Authorization: Bearer `
+    // (no bytes after the scheme, so `strip_bearer_prefix` yields `Some("")`) must never match
+    // anything — not the static token, not an operator-tokens entry, not the hook — and neither
+    // must an all-whitespace one (PR #124 round 3, F1): this checkpoint cannot assume any given
+    // transport trims trailing whitespace off header values before this code ever sees it (axum
+    // also serves h2c, where HPACK does not), so a client presenting `Bearer    ` must be refused
+    // the same way as a client presenting `Bearer `. `serve`'s options filter
+    // (`options.token.filter(|v| !v.trim().is_empty())`) and `parse_operator_tokens`'s blank-key
+    // rejection already keep a blank string out of `state.token`/`state.operator_tokens` in the
     // first place; this is the belt-and-braces guard at the one checkpoint every
-    // principal-granting comparison goes through, so a future change that reintroduces an empty
+    // principal-granting comparison goes through, so a future change that reintroduces a blank
     // credential upstream (a new construction path for `AppState`, a relaxed parser) still cannot
-    // authenticate an empty-credential request.
+    // authenticate a blank-credential request. This filters presence only, not the value: a real,
+    // non-blank credential is still compared byte-for-byte, verbatim, by `tokens_match` — nothing
+    // here trims it.
     let provided = headers.get("authorization")
         .and_then(|value| value.to_str().ok())
         .and_then(strip_bearer_prefix)
-        .filter(|token| !token.is_empty());
+        .filter(|token| !token.trim().is_empty());
 
     match provided {
         Some(token) if state.token.as_deref().is_some_and(|expected| tokens_match(token, expected)) =>
@@ -2501,6 +2529,22 @@ mod tests {
         assert_eq!(error.0, StatusCode::UNAUTHORIZED);
     }
 
+    /// The whitespace-only sibling (PR #124 round 3, F1): even if `state.token` were somehow
+    /// `Some("   ")` — again, upstream filtering is meant to make this unreachable in practice —
+    /// a request presenting an all-whitespace bearer credential must still be refused, not
+    /// authenticate via `tokens_match("   ", "   ")`. This is the h2c/HPACK case the finding
+    /// raised directly: this belt-and-braces guard does not assume any transport trims trailing
+    /// whitespace off header values before `check_auth` ever sees them.
+    #[tokio::test]
+    async fn a_whitespace_only_bearer_credential_never_authenticates_even_against_a_whitespace_only_static_token() {
+        let state = AppState {
+            token: Some("   ".to_string()),
+            ..single_mode_state(PathBuf::from("/unused"))
+        };
+        let error = check_auth(&state, &headers_with_bearer("   ")).await.err().unwrap();
+        assert_eq!(error.0, StatusCode::UNAUTHORIZED);
+    }
+
     #[test]
     fn tokens_match_requires_an_exact_byte_for_byte_match() {
         assert!(tokens_match("secret", "secret"));
@@ -2986,6 +3030,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The round-3 sibling (F1): a whitespace-only token key is exactly as much "not a
+    /// credential" as an empty one, for the identical reason `merge_static_token`'s static token
+    /// now checks whitespace too — either no client can ever present it (over a transport that
+    /// trims trailing whitespace off header values, silently locking "alice" out forever), or one
+    /// can present a trivially-guessable all-whitespace credential.
+    #[test]
+    fn rejects_a_token_file_with_a_whitespace_only_token_key() {
+        let dir = scratch_dir("tokens-whitespace-key");
+        let path = dir.join("tokens.toml");
+        std::fs::write(&path, "[operators]\n\"   \" = \"alice\"\n\"tok-b\" = \"bob\"\n").unwrap();
+
+        let error = parse_operator_tokens(path.to_str().unwrap()).unwrap_err();
+        assert!(error.contains("whitespace"), "{}", error);
+        assert!(error.contains("alice"), "{}", error);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// F4 of PR #124 round 2: `"tok-a" = ""` used to parse fine — only the token (key) side was
     /// checked for emptiness, never the identifier (value). An empty identifier is not merely
     /// unenrolled (which `office_user_of` already 403s): it flows into admission/event payloads
@@ -3002,9 +3064,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Whitespace-only is exactly as much "not an identity" as empty — unlike the token (key)
-    /// check, which only ever needs a byte-exact comparison and so has no equivalent whitespace
-    /// hole (see `authenticate_via_hook`'s doc comment on the same asymmetry).
+    /// Whitespace-only is exactly as much "not an identity" as empty — the same blank rule
+    /// `rejects_a_token_file_with_a_whitespace_only_token_key` now applies to the token (key)
+    /// side too (PR #124 round 3, F1 unified them); what still differs is normalization, not
+    /// presence — see `a_token_file_identifier_with_incidental_whitespace_is_stored_untrimmed`
+    /// below for the half of the identity rule this test does not cover.
     #[test]
     fn rejects_a_token_mapped_to_a_whitespace_only_identifier() {
         let dir = scratch_dir("tokens-whitespace-identifier");
@@ -3013,6 +3077,27 @@ mod tests {
 
         let error = parse_operator_tokens(path.to_str().unwrap()).unwrap_err();
         assert!(error.contains("blank"), "{}", error);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F6 of PR #124 round 3: the matching control `authenticate_via_hook`'s own identity rule
+    /// already has
+    /// (`a_hook_answer_with_incidental_whitespace_around_a_real_identifier_still_authenticates`),
+    /// missing here until now. Without it, a future edit changing `identifier.to_string()` to
+    /// `identifier.trim().to_string()` above would silently break exact-equality matching against
+    /// the tracked office roster (`office_user_of`) for every legitimately whitespace-padded
+    /// identifier, with no test in this file catching it: the two rejection tests above only
+    /// exercise *entirely*-blank identifiers, never one with real content plus incidental
+    /// surrounding whitespace.
+    #[test]
+    fn a_token_file_identifier_with_incidental_whitespace_is_stored_untrimmed() {
+        let dir = scratch_dir("tokens-identifier-whitespace-preserved");
+        let path = dir.join("tokens.toml");
+        std::fs::write(&path, "[operators]\n\"tok-a\" = \" bob \"\n").unwrap();
+
+        let tokens = parse_operator_tokens(path.to_str().unwrap()).unwrap();
+        assert_eq!(tokens.get("tok-a").map(String::as_str), Some(" bob "));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3923,6 +4008,23 @@ mod tests {
     async fn serve_with_an_empty_token_does_not_pass_the_auth_gate() {
         let options = ServeOptions {
             token: Some(String::new()),
+            blank_token_supplied: true,
+            ..bare_serve_options()
+        };
+        let error = serve(options).await.unwrap_err();
+
+        assert!(error.contains("No authentication is configured"), "{}", error);
+        assert!(error.contains("an empty --token/token"), "{}", error);
+        assert!(!error.contains("no --token/token"), "{}", error);
+    }
+
+    /// The whitespace-only sibling (PR #124 round 3, F1): `--token "   "` must be treated exactly
+    /// like `--token ""` at this gate too — `blank_token_supplied` is set the same way
+    /// `main.rs::merge_static_token` would set it for this scenario.
+    #[tokio::test]
+    async fn serve_with_a_whitespace_only_token_does_not_pass_the_auth_gate() {
+        let options = ServeOptions {
+            token: Some("   ".to_string()),
             blank_token_supplied: true,
             ..bare_serve_options()
         };

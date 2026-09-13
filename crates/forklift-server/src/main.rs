@@ -121,30 +121,45 @@ async fn main() {
 }
 
 /// The static token as it enters the program: two independent sources (the `--token` flag, the
-/// config file's `token` key), each normalized individually — an empty string is not a
-/// credential (`server::check_auth`'s doc, `server::ServeOptions::token`'s doc) — *before*
-/// precedence between them is decided, rather than after the two are already merged into one
-/// `Option<String>`.
+/// config file's `token` key), each normalized individually — an empty *or whitespace-only*
+/// string is not a credential (`server::check_auth`'s doc, `server::ServeOptions::token`'s doc)
+/// — *before* precedence between them is decided, rather than after the two are already merged
+/// into one `Option<String>`.
 ///
 /// That ordering is the actual fix, not a stylistic preference: `Option::or` only sees "was a
 /// value supplied at all", so `Some("")` (a blank `--token`) counts as supplied and wins over a
 /// real `Some("admin-secret")` from the config file — filtering *after* that merge, as the
 /// single call site this replaces used to, can no longer recover the real value the merge
-/// already discarded. Filtering each source first means an empty flag falls through to a real
+/// already discarded. Filtering each source first means a blank flag falls through to a real
 /// config-file token exactly the way an *absent* flag already does.
 ///
+/// Whitespace-only, not just empty (PR #124 round 3, F1): round 2 checked `is_empty()` here
+/// while the identity rule added in the same round (`parse_operator_tokens`,
+/// `authenticate_via_hook`) checked `trim().is_empty()`, on the argument that a token is only
+/// ever compared byte-exact so a whitespace-only one presents no *comparison* hole the way an
+/// untrimmed identity does. That argument answers a different question than the one this
+/// function asks: not "should a real token's bytes be trimmed before comparing" (no — a token's
+/// bytes are never trimmed, before or after this fix), but "does a whitespace-only value count as
+/// a configured credential at all". It does not — a `--token "   "` either can never be
+/// presented by a client at all on a transport that trims trailing whitespace off header values
+/// (a silent lockout dressed up as a configured server), or, on a transport this crate makes no
+/// assumption about *not* trimming, is presentable as a guessable, effectively-public credential.
+/// Either way the server must refuse to start believing it has a real token, exactly as it
+/// already refuses to for an empty one.
+///
 /// Returns the merged, already-normalized token, plus whether either raw source was
-/// present-but-empty — carried only so `serve`'s startup refusal can name that case correctly
+/// present-but-blank — carried only so `serve`'s startup refusal can name that case correctly
 /// (F2 of PR #124 round 2: "no --token/token" is a misdiagnosis when a blank one was in fact
-/// passed). It plays no role in authentication itself: by the time this returns, an empty
+/// passed). It plays no role in authentication itself: by the time this returns, a blank
 /// value from either source has already been discarded from the merged token.
 fn merge_static_token(flag: Option<String>, file: Option<String>) -> (Option<String>, bool) {
-    let flag_was_blank = matches!(flag.as_deref(), Some(""));
-    let file_was_blank = matches!(file.as_deref(), Some(""));
+    let is_blank = |value: &Option<String>| value.as_deref().is_some_and(|v| v.trim().is_empty());
+    let flag_was_blank = is_blank(&flag);
+    let file_was_blank = is_blank(&file);
 
-    let non_empty = |value: Option<String>| value.filter(|v| !v.is_empty());
+    let non_blank = |value: Option<String>| value.filter(|v| !v.trim().is_empty());
 
-    (non_empty(flag).or(non_empty(file)), flag_was_blank || file_was_blank)
+    (non_blank(flag).or(non_blank(file)), flag_was_blank || file_was_blank)
 }
 
 /// Merge the flags with the config file (flags win) and serve.
@@ -295,13 +310,23 @@ fn optional_integer(item: Option<&toml_edit::Item>, path: &str, key: &str) -> Re
 
 /// [`optional_integer`]'s non-negative counterpart, for every integer field that is cast to an
 /// unsigned type downstream (`authentication_cache_secs`, `max_body_mb`, `rebuild_after_lifts` —
-/// all read via this function below). A negative `i64` surviving to `as u64`/`as u32` does not
-/// error, it wraps: `-1i64 as u64` is `u64::MAX`. For `authentication_cache_secs` specifically
-/// that wrap is an auth-path hole, not just a display glitch — `Duration::from_secs(u64::MAX)`
-/// makes the authentication-hook cache TTL effectively infinite, so a credential the provider has
-/// revoked is never re-checked again for the life of the process. Rejecting the negative value
-/// here, before the cast, closes it the same way `optional_string`/`optional_bool` already close
-/// the analogous "present but wrong shape" gap for their own types.
+/// all read via this function below, two of them through the field-specific ceilings just below
+/// it). A negative `i64` surviving to `as u64`/`as u32` does not error, it wraps: `-1i64 as u64`
+/// is `u64::MAX`. For `authentication_cache_secs` specifically that wrap is an auth-path hole,
+/// not just a display glitch — `Duration::from_secs(u64::MAX)` makes the authentication-hook
+/// cache TTL effectively infinite, so a credential the provider has revoked is never re-checked
+/// again for the life of the process. Rejecting the negative value here, before the cast, closes
+/// it the same way `optional_string`/`optional_bool` already close the analogous "present but
+/// wrong shape" gap for their own types.
+///
+/// The sign check alone is not the whole story for either `authentication_cache_secs` or
+/// `rebuild_after_lifts` (PR #124 round 3, F3/F4): a value can be non-negative and still be
+/// nonsensical (`i64::MAX` seconds is the identical "never re-checked again" hole with the sign
+/// removed) or silently truncating (`u32::MAX + 1` "wraps" on the eventual `as u32`, just via a
+/// cast overflow rather than a sign flip). [`bounded_authentication_cache_secs`] and
+/// [`optional_u32`] each layer their own magnitude check on top of this one for exactly those two
+/// fields; `max_body_mb`'s `as u64` needs no equivalent ceiling here — see its own call site in
+/// [`parse_config`] for why.
 fn optional_non_negative_integer(item: Option<&toml_edit::Item>, path: &str, key: &str) -> Result<Option<i64>, String> {
     match optional_integer(item, path, key)? {
         Some(v) if v < 0 => Err(format!(
@@ -310,6 +335,55 @@ fn optional_non_negative_integer(item: Option<&toml_edit::Item>, path: &str, key
             path, key, v
         )),
         other => Ok(other),
+    }
+}
+
+/// The ceiling [`bounded_authentication_cache_secs`] enforces on top of
+/// [`optional_non_negative_integer`]'s sign check (PR #124 round 3, F3). This field bounds how
+/// long a revoked credential can keep authenticating after the hook stops vouching for it
+/// (`docs/format/HOOK_PROTOCOL.md`: "a revoked credential outlives its revocation by at most the
+/// TTL") — it is a revocation-latency budget, not a general-purpose cache knob, and its
+/// documented default is 60 seconds. One day is three orders of magnitude past that default —
+/// room for any legitimate "reduce hook chatter" setting — while matching the one other
+/// day-scale staleness window this same binary already accepts (`Gc`'s `--grace-hours`, default
+/// 24) rather than inventing an unrelated number; it is nowhere near `i64::MAX` seconds (about
+/// 292 billion years), which is what a sign check alone still lets through.
+const MAX_AUTHENTICATION_CACHE_SECS: i64 = 24 * 60 * 60;
+
+/// [`optional_non_negative_integer`]'s ceilinged counterpart for `authentication_cache_secs`
+/// specifically: see [`MAX_AUTHENTICATION_CACHE_SECS`] for why that field, alone among the three
+/// this module casts to an unsigned type, needs a magnitude check in addition to the sign check.
+fn bounded_authentication_cache_secs(
+    item: Option<&toml_edit::Item>, path: &str, key: &str
+) -> Result<Option<u64>, String> {
+    match optional_non_negative_integer(item, path, key)? {
+        Some(v) if v > MAX_AUTHENTICATION_CACHE_SECS => Err(format!(
+            "The config file \"{}\" has a \"{}\" entry of {} seconds, which is over the \
+            {}-second (24h) ceiling: a revoked credential must not be able to outlive its \
+            revocation by more than about a day.",
+            path, key, v, MAX_AUTHENTICATION_CACHE_SECS
+        )),
+        other => Ok(other.map(|v| v as u64)),
+    }
+}
+
+/// [`optional_non_negative_integer`]'s `u32`-bounded counterpart, for every field cast `as u32`
+/// downstream (`rebuild_after_lifts`, the only one today). The sign check alone (round 1) does
+/// not close this class: `optional_non_negative_integer` returns `i64`, and `v as u32` truncates
+/// silently — for any `v` above `u32::MAX` — rather than erroring; `4294967297i64 as u32` is `1`,
+/// not a value a caller could recognize as a wraparound. Unlike `max_body_mb`'s `as u64` (see
+/// that field's call site in [`parse_config`] for why it is lossless and needs no counterpart
+/// here), this cast genuinely can lose information, and silently: `rebuild_after_lifts =
+/// 4294967297` would rebuild the bundle after every single lift instead of never (as configured),
+/// with no warning that anything happened. CLAUDE.md: "silent breakage is still a bug."
+fn optional_u32(item: Option<&toml_edit::Item>, path: &str, key: &str) -> Result<Option<u32>, String> {
+    match optional_non_negative_integer(item, path, key)? {
+        Some(v) => u32::try_from(v).map(Some).map_err(|_| format!(
+            "The config file \"{}\" has a \"{}\" entry of {}, which is over u32::MAX ({}) and \
+            would silently truncate.",
+            path, key, v, u32::MAX
+        )),
+        None => Ok(None),
     }
 }
 
@@ -438,9 +512,9 @@ fn parse_config(path: &str) -> Result<ConfigFile, String> {
 
     let authentication_cache_secs = match hooks {
         None => None,
-        Some(table) => optional_non_negative_integer(
+        Some(table) => bounded_authentication_cache_secs(
             table.get("authentication_cache_secs"), path, "hooks.authentication_cache_secs"
-        )?.map(|v| v as u64),
+        )?,
     };
 
     Ok(ConfigFile {
@@ -449,11 +523,17 @@ fn parse_config(path: &str) -> Result<ConfigFile, String> {
         addr: optional_string(doc.get("addr"), path, "addr")?,
         token: optional_string(doc.get("token"), path, "token")?,
         tokens: optional_string(doc.get("tokens"), path, "tokens")?,
+        // No ceiling wrapper needed here (unlike `rebuild_after_lifts` just below): the cast is
+        // `as u64`, and `optional_non_negative_integer` has already rejected every negative
+        // value, so `v` here ranges over `0..=i64::MAX` — which is a strict subset of
+        // `0..=u64::MAX` (`i64::MAX` is about half of `u64::MAX`). Every value that reaches this
+        // cast round-trips losslessly; there is no magnitude this cast can silently misread the
+        // way `rebuild_after_lifts`'s `as u32` can (PR #124 round 3, F4).
         max_body_mb: optional_non_negative_integer(doc.get("max_body_mb"), path, "max_body_mb")?
             .map(|v| v as u64),
-        rebuild_after_lifts: optional_non_negative_integer(
+        rebuild_after_lifts: optional_u32(
             doc.get("rebuild_after_lifts"), path, "rebuild_after_lifts"
-        )?.map(|v| v as u32),
+        )?,
         open: optional_bool(doc.get("open"), path, "open")?,
         authentication_hook: hook_of("authentication")?,
         admission_hook: hook_of("admission")?,
@@ -780,6 +860,49 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// The magnitude half of the same hole (PR #124 round 3, F3): the sign check alone lets
+    /// `i64::MAX` seconds (about 292 billion years) straight through — non-negative, so
+    /// `optional_non_negative_integer` accepts it — which is the identical
+    /// never-re-checked-again behaviour `a_negative_authentication_cache_secs_is_an_error` closes
+    /// for the negative side, achieved without ever going negative.
+    /// `bounded_authentication_cache_secs` must refuse it instead.
+    #[test]
+    fn an_authentication_cache_secs_over_the_ceiling_is_an_error() {
+        let path = scratch_config(
+            "cache-secs-over-ceiling",
+            &format!(
+                "[hooks]\nauthentication_url = \"https://x\"\nauthentication_secret = \"s\"\n\
+                authentication_cache_secs = {}\n",
+                MAX_AUTHENTICATION_CACHE_SECS + 1
+            )
+        );
+        let error = parse_config(path.to_str().unwrap()).unwrap_err();
+
+        assert!(error.contains("authentication_cache_secs"), "{}", error);
+        assert!(error.contains("ceiling"), "{}", error);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The boundary itself must still be accepted: exactly the ceiling (24h) is a legal, if
+    /// generous, cache TTL — not an off-by-one over the line the previous test pins.
+    #[test]
+    fn an_authentication_cache_secs_at_exactly_the_ceiling_is_accepted() {
+        let path = scratch_config(
+            "cache-secs-at-ceiling",
+            &format!(
+                "[hooks]\nauthentication_url = \"https://x\"\nauthentication_secret = \"s\"\n\
+                authentication_cache_secs = {}\n",
+                MAX_AUTHENTICATION_CACHE_SECS
+            )
+        );
+        let file = parse_config(path.to_str().unwrap()).unwrap();
+
+        assert_eq!(file.authentication_cache_secs, Some(MAX_AUTHENTICATION_CACHE_SECS as u64));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// The same negative-wraps-to-huge-unsigned hole, applied to `max_body_mb` (`as u64`) while
     /// `optional_non_negative_integer` already exists to close it for `authentication_cache_secs`
     /// — a one-liner once the helper is there. `-1i64 as u64` would otherwise raise the body-size
@@ -797,9 +920,9 @@ mod tests {
     }
 
     /// Same again for `rebuild_after_lifts` (`as u32`): closes the negative-wraps-to-huge-unsigned
-    /// case. Not addressed here: a positive value above `u32::MAX` still silently truncates on
-    /// the `as u32` cast — that upper-bound case needs a field-specific ceiling, not the same
-    /// zero-or-positive check, so it is left for a future round.
+    /// case. The upper-bound case this used to defer — a positive value above `u32::MAX` still
+    /// silently truncating on the `as u32` cast — is closed separately, by `optional_u32`; see
+    /// `a_rebuild_after_lifts_over_u32_max_is_an_error` below (PR #124 round 3, F4).
     #[test]
     fn a_negative_rebuild_after_lifts_is_an_error() {
         let path = scratch_config("rebuild-after-lifts-negative", "rebuild_after_lifts = -20\n");
@@ -807,6 +930,40 @@ mod tests {
 
         assert!(error.contains("\"rebuild_after_lifts\""), "{}", error);
         assert!(error.contains("negative"), "{}", error);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The magnitude half of the class the sign check alone does not close (PR #124 round 3,
+    /// F4): `rebuild_after_lifts = 4294967297` (`u32::MAX + 2`) is non-negative, so
+    /// `optional_non_negative_integer` accepts it, and the old `.map(|v| v as u32)` truncated it
+    /// to `1` with no warning — silently rebuilding the bundle after every single lift instead of
+    /// never (as configured). `optional_u32` must refuse it instead.
+    #[test]
+    fn a_rebuild_after_lifts_over_u32_max_is_an_error() {
+        let path = scratch_config(
+            "rebuild-after-lifts-over-u32-max",
+            &format!("rebuild_after_lifts = {}\n", u32::MAX as i64 + 2)
+        );
+        let error = parse_config(path.to_str().unwrap()).unwrap_err();
+
+        assert!(error.contains("\"rebuild_after_lifts\""), "{}", error);
+        assert!(error.contains("u32::MAX"), "{}", error);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The boundary itself must still be accepted: `u32::MAX` is the largest legal value, not an
+    /// off-by-one over the line `a_rebuild_after_lifts_over_u32_max_is_an_error` pins.
+    #[test]
+    fn a_rebuild_after_lifts_of_exactly_u32_max_is_accepted() {
+        let path = scratch_config(
+            "rebuild-after-lifts-at-u32-max",
+            &format!("rebuild_after_lifts = {}\n", u32::MAX)
+        );
+        let file = parse_config(path.to_str().unwrap()).unwrap();
+
+        assert_eq!(file.rebuild_after_lifts, Some(u32::MAX));
 
         let _ = std::fs::remove_file(&path);
     }
@@ -923,6 +1080,52 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------------
+    // merge_static_token (F1 of PR #124 round 3): whitespace-only is blank too, not just empty
+    // ---------------------------------------------------------------------------------
+
+    /// The round-3 finding itself: a whitespace-only `--token` must not beat a real config-file
+    /// token, exactly like a literally-empty one already does not. Before this fix, only
+    /// `is_empty()` was checked here, so `Some("   ")` counted as "a value was supplied" and
+    /// still won over `file.token` — the identical bug `a_blank_flag_token_falls_back_to_a_real_file_token`
+    /// closes for the empty case, left open for whitespace.
+    #[test]
+    fn a_whitespace_only_flag_token_falls_back_to_a_real_file_token() {
+        let (token, blank) = merge_static_token(
+            Some("   ".to_string()), Some("admin-secret".to_string())
+        );
+        assert_eq!(token.as_deref(), Some("admin-secret"));
+        assert!(blank, "the flag source was whitespace-only, even though a real token resulted");
+    }
+
+    /// The symmetric case, for the config-file source.
+    #[test]
+    fn a_whitespace_only_file_token_falls_back_to_a_real_flag_token() {
+        let (token, blank) = merge_static_token(
+            Some("flag-secret".to_string()), Some("   ".to_string())
+        );
+        assert_eq!(token.as_deref(), Some("flag-secret"));
+        assert!(blank, "the file source was whitespace-only, even though a real token resulted");
+    }
+
+    #[test]
+    fn two_whitespace_only_sources_merge_to_no_token_and_report_blank() {
+        let (token, blank) = merge_static_token(Some("  ".to_string()), Some("\t".to_string()));
+        assert_eq!(token, None);
+        assert!(blank);
+    }
+
+    /// A real token is never trimmed, even though a whitespace-*only* one is treated as blank —
+    /// the fix is a presence check, not a normalization: incidental internal or edge whitespace
+    /// around real content must survive verbatim into the merged token (and, downstream, into
+    /// `tokens_match`'s byte-exact comparison).
+    #[test]
+    fn a_flag_token_with_incidental_whitespace_survives_untrimmed() {
+        let (token, blank) = merge_static_token(Some(" has spaces ".to_string()), None);
+        assert_eq!(token.as_deref(), Some(" has spaces "));
+        assert!(!blank, "this is a real, non-blank token");
+    }
+
+    // ---------------------------------------------------------------------------------
     // serve: the F1/F2 precedence fix, observed end to end through the merged options
     // ---------------------------------------------------------------------------------
 
@@ -943,6 +1146,31 @@ mod tests {
             None,
             None,
             Some(String::new()),
+            None,
+            None,
+            None,
+            false,
+            Some(path.to_str().unwrap().to_string()),
+        ).await.unwrap_err();
+
+        assert!(!error.contains("No authentication is configured"), "{}", error);
+        assert!(error.contains("Error while resolving"), "{}", error);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The whitespace-only sibling of the test just above (PR #124 round 3, F1): a
+    /// `--token "   "` must fall back to a real config-file token exactly like `--token ""`
+    /// does — the whole point of round 3 being that round 2's fix only normalized emptiness.
+    #[tokio::test]
+    async fn serve_falls_back_to_a_real_file_token_when_the_flag_token_is_whitespace_only() {
+        let path = scratch_config("whitespace-flag-real-file-token", "token = \"admin-secret\"\n");
+
+        let error = serve(
+            Some("/does/not/exist/and/does/not/matter".to_string()),
+            None,
+            None,
+            Some("   ".to_string()),
             None,
             None,
             None,
