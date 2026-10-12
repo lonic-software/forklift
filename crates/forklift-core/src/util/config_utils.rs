@@ -76,14 +76,64 @@ pub const REMOTE_TOR_VALUES: [&str; 3] = ["auto", "on", "off"];
 pub const KEY_REMOTE_TOR_PROXY: &str = "remote.torProxy";
 
 /// Whether background object-store maintenance (auto-compaction) runs after mutating
-/// commands. Anything falsey (`false`/`0`/`off`/`no`) turns it off; default is on.
+/// commands: one of [`MAINTENANCE_AUTO_ON`] or [`MAINTENANCE_AUTO_OFF`]; default is on.
 pub const KEY_MAINTENANCE_AUTO: &str = "maintenance.auto";
+
+/// The [`KEY_MAINTENANCE_AUTO`] spellings that mean on.
+pub const MAINTENANCE_AUTO_ON: [&str; 4] = ["true", "1", "on", "yes"];
+
+/// The [`KEY_MAINTENANCE_AUTO`] spellings that mean off.
+///
+/// Anything outside the two lists is refused rather than read as one of them. Reading only the
+/// off-list and treating the rest as on made `auto = "flase"` a silent "on" — the opposite of
+/// what was typed, with nothing to say so.
+pub const MAINTENANCE_AUTO_OFF: [&str; 4] = ["false", "0", "off", "no"];
 
 /// The loose-object count above which background maintenance packs the store (default 6700).
 pub const KEY_MAINTENANCE_LOOSE: &str = "maintenance.loose";
 
 /// The pack count above which background maintenance consolidates the packs (default 20).
 pub const KEY_MAINTENANCE_PACKS: &str = "maintenance.packs";
+
+/// What a [`KEY_MAINTENANCE_AUTO`] value means — the one reading the file check and the
+/// maintenance decision share, so a value the file admits is never read as something else.
+/// Case- and surrounding-whitespace-insensitive.
+///
+/// # Returns
+/// * `Ok(bool)`    - Whether background maintenance is on.
+/// * `Err(String)` - If the value is in neither [`MAINTENANCE_AUTO_ON`] nor [`MAINTENANCE_AUTO_OFF`].
+pub fn parse_maintenance_auto(value: &str) -> Result<bool, String> {
+    let normalized = value.trim().to_ascii_lowercase();
+
+    if MAINTENANCE_AUTO_ON.contains(&normalized.as_str()) {
+        return Ok(true);
+    }
+    if MAINTENANCE_AUTO_OFF.contains(&normalized.as_str()) {
+        return Ok(false);
+    }
+
+    Err(format!(
+        "\"{}\" is not a valid value for {}. Use one of: {}.",
+        value, KEY_MAINTENANCE_AUTO,
+        MAINTENANCE_AUTO_ON.iter().chain(MAINTENANCE_AUTO_OFF.iter()).copied().collect::<Vec<_>>().join(", ")
+    ))
+}
+
+/// What a [`KEY_MAINTENANCE_LOOSE`] or [`KEY_MAINTENANCE_PACKS`] value means: a whole,
+/// non-negative count. Surrounding whitespace is ignored.
+///
+/// A value that is not a count is refused, not replaced by the default — `loose = "10k"` was
+/// otherwise read as 6700 with nothing to say the setting had been ignored.
+///
+/// # Returns
+/// * `Ok(usize)`   - The threshold.
+/// * `Err(String)` - If the value is not a non-negative whole number.
+pub fn parse_maintenance_threshold(key: &str, value: &str) -> Result<usize, String> {
+    value.trim().parse().map_err(|_| format!(
+        "\"{}\" is not a valid value for {}. Use a whole number, e.g. \"6700\".",
+        value, key
+    ))
+}
 
 /// The configuration keys Forklift understands, in `section.key` form.
 /// Setting a key outside this list is rejected (it would silently do nothing).
@@ -940,8 +990,10 @@ fn require_known_key(key: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Reject an out-of-range value for a key whose value is a fixed set, so a typo fails loudly
-/// instead of degrading silently at runtime. Keys with a free-form value pass through.
+/// Reject an out-of-range value for a key whose value is constrained — a fixed set
+/// (`remote.tor`, `maintenance.auto`) or a count (`maintenance.loose`, `maintenance.packs`) — so
+/// a typo fails loudly instead of degrading silently at runtime. Keys with a free-form value
+/// pass through.
 ///
 /// Applied at **both** ends: [`set_value`] refuses to write one, and [`parse_config`] refuses to
 /// read one. Set-time strictness alone only ever covered values this tool wrote; the file is
@@ -949,12 +1001,17 @@ fn require_known_key(key: &str) -> Result<(), String> {
 fn validate_value(key: &str, value: &str) -> Result<(), String> {
     require_non_empty(key, value)?;
 
-    if key == KEY_REMOTE_TOR
-        && !REMOTE_TOR_VALUES.contains(&remote_utils::normalize_tor_value(value).as_str()) {
-        return Err(format!(
-            "\"{}\" is not a valid value for {}. Use one of: {}.",
-            value, KEY_REMOTE_TOR, REMOTE_TOR_VALUES.join(", ")
-        ));
+    match key {
+        KEY_REMOTE_TOR
+            if !REMOTE_TOR_VALUES.contains(&remote_utils::normalize_tor_value(value).as_str()) => {
+            return Err(format!(
+                "\"{}\" is not a valid value for {}. Use one of: {}.",
+                value, KEY_REMOTE_TOR, REMOTE_TOR_VALUES.join(", ")
+            ));
+        }
+        KEY_MAINTENANCE_AUTO => { parse_maintenance_auto(value)?; }
+        KEY_MAINTENANCE_LOOSE | KEY_MAINTENANCE_PACKS => { parse_maintenance_threshold(key, value)?; }
+        _ => {}
     }
 
     Ok(())
@@ -1001,8 +1058,9 @@ fn require_non_empty(label: &str, value: &str) -> Result<(), String> {
 
 /// The spelling of `value` that [`set_value`] actually writes for `key`.
 ///
-/// A fixed-value key is stored normalized, so what lands on disk is literally one of the
-/// spellings [`REMOTE_TOR_VALUES`] and the guide both enumerate. `forklift config remote.tor
+/// A constrained key is stored normalized, so what lands on disk is literally one of the
+/// spellings the guide enumerates ([`REMOTE_TOR_VALUES`], [`MAINTENANCE_AUTO_ON`] /
+/// [`MAINTENANCE_AUTO_OFF`]), or a bare number. `forklift config remote.tor
 /// "  ON  "` otherwise left `tor = "  ON  "` in the file: admissible, correctly understood, and
 /// not a member of the documented set — a value whose correctness rested on every reader
 /// applying the same normalization forever. Normalizing once, here, means the stored value
@@ -1011,11 +1069,12 @@ fn require_non_empty(label: &str, value: &str) -> Result<(), String> {
 /// Free-form keys pass through untouched: a token, a URL or a display name is the user's
 /// string, and folding its case would corrupt it.
 fn storable_value(key: &str, value: &str) -> String {
-    if key == KEY_REMOTE_TOR {
-        return remote_utils::normalize_tor_value(value);
+    match key {
+        KEY_REMOTE_TOR => remote_utils::normalize_tor_value(value),
+        KEY_MAINTENANCE_AUTO => value.trim().to_ascii_lowercase(),
+        KEY_MAINTENANCE_LOOSE | KEY_MAINTENANCE_PACKS => value.trim().to_string(),
+        _ => value.to_string(),
     }
-
-    value.to_string()
 }
 
 /// Load and parse the configuration file at the given path, if it exists.
@@ -1027,17 +1086,43 @@ fn storable_value(key: &str, value: &str) -> String {
 /// * `Ok(Some(DocumentMut))` - The parsed configuration file.
 /// * `Ok(None)`              - If the file does not exist.
 /// * `Err(String)`           - If the file could not be read or parsed.
+///
+/// **Absent means nothing is at the path — not even a link.** Asking `path.exists()` answered
+/// `false` for a symlink whose target is gone and for a file in a directory that cannot be
+/// searched — and an absent warehouse file falls through to the global one, so a warehouse's
+/// own identity or remote was silently replaced by the user's global settings. A dangling link
+/// reads as `NotFound` too, so the read error alone cannot tell it from absence; the link itself
+/// is looked up before the file is called absent. Every other failure to read is an error.
+///
+/// A file that is not TOML at all is reported like any other invalid file, through
+/// [`not_valid`], so it is named by its full path and the remedy is the same.
 fn load_document(path: &Path) -> Result<Option<DocumentMut>, String> {
-    if !path.exists() {
-        return Ok(None);
-    }
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) => {
+            let link = std::fs::symlink_metadata(path);
 
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| format!("Error while reading configuration file \"{}\": {}", path.to_string_lossy(), e))?;
+            if matches!(&link, Err(missing) if missing.kind() == std::io::ErrorKind::NotFound) {
+                return Ok(None);
+            }
+
+            let dangling = if error.kind() == std::io::ErrorKind::NotFound
+                && link.is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+                " (it is a symbolic link to a path that does not exist)"
+            } else {
+                ""
+            };
+
+            return Err(format!(
+                "Error while reading configuration file \"{}\": {}{}",
+                path.to_string_lossy(), error, dangling
+            ));
+        }
+    };
 
     content.parse::<DocumentMut>()
         .map(Some)
-        .map_err(|e| format!("Error while parsing configuration file \"{}\": {}", path.to_string_lossy(), e))
+        .map_err(|e| not_valid(path, e.to_string().trim_end().to_string()))
 }
 
 /// Write a document back to `path`, but only after re-parsing **the document as edited** —
@@ -1275,12 +1360,15 @@ mod tests {
         for key in KNOWN_KEYS {
             let (section, field) = key.split_once('.').unwrap();
 
-            // A key with a fixed value set has to round-trip one of *its* values: `validate_value`
-            // runs inside the parse now, so an arbitrary marker string is refused on the way in.
-            let value = if key == KEY_REMOTE_TOR {
-                REMOTE_TOR_VALUES[0].to_string()
-            } else {
-                format!("value-of-{}", key)
+            // A constrained key has to round-trip a value it admits: `validate_value` runs inside
+            // the parse, so an arbitrary marker string is refused on the way in. The two counts
+            // get different numbers, so a field holding the other key's value cannot pass.
+            let value = match key {
+                KEY_REMOTE_TOR => REMOTE_TOR_VALUES[0].to_string(),
+                KEY_MAINTENANCE_AUTO => MAINTENANCE_AUTO_OFF[0].to_string(),
+                KEY_MAINTENANCE_LOOSE => "6701".to_string(),
+                KEY_MAINTENANCE_PACKS => "21".to_string(),
+                _ => format!("value-of-{}", key),
             };
 
             let content = format!("[{}]\n{} = \"{}\"\n", section, field, value);
@@ -1493,23 +1581,68 @@ mod tests {
         assert_eq!(storable_value(KEY_REMOTE_URL, "HTTP://Example.COM"), "HTTP://Example.COM");
     }
 
-    /// The normalization is computed in exactly one place, which is the property that keeps the
-    /// admissibility check and the meaning-assigning read from drifting apart. Pinned as an
-    /// equation between the two surfaces rather than as two independent expectations: were
-    /// `validate_value` to grow its own copy again, a spelling it accepted that `TorMode` read as
-    /// something else would fail here.
+    /// Every spelling the file admits for `remote.tor` is read by `TorMode::parse` as the mode
+    /// it names — checked against the reader itself, since the admissibility check and the read
+    /// live in different modules and a spelling one accepts the other could misread.
     #[test]
     fn what_the_file_admits_for_remote_tor_is_what_the_reader_understands() {
-        for spelling in ["auto", "on", "off", "  OFF  ", "ON", "\tAuto "] {
+        use remote_utils::TorMode;
+
+        for (spelling, mode) in [
+            ("auto", TorMode::Auto), ("on", TorMode::On), ("off", TorMode::Off),
+            ("  OFF  ", TorMode::Off), ("ON", TorMode::On), ("\tAuto ", TorMode::Auto),
+        ] {
             assert!(
                 validate_value(KEY_REMOTE_TOR, spelling).is_ok(),
                 "{spelling:?} should be admissible"
             );
-            assert!(
-                REMOTE_TOR_VALUES.contains(&remote_utils::normalize_tor_value(spelling).as_str()),
-                "{spelling:?} normalizes to something outside the documented set"
-            );
+            assert_eq!(TorMode::parse(spelling), mode, "{spelling:?} is admitted but read as another mode");
         }
+    }
+
+    /// Every `maintenance.*` value the file admits is read as the setting it names, and every
+    /// other value is refused by both the file check and the reader — a typo is never read as
+    /// the default or as the opposite of what was typed.
+    #[test]
+    fn maintenance_values_are_read_as_written_or_refused() {
+        for (spelling, on) in [
+            ("true", true), ("1", true), ("on", true), ("yes", true), (" ON ", true),
+            ("false", false), ("0", false), ("off", false), ("no", false), ("\tNo", false),
+        ] {
+            assert!(validate_value(KEY_MAINTENANCE_AUTO, spelling).is_ok(), "{spelling:?} should be admissible");
+            assert_eq!(parse_maintenance_auto(spelling), Ok(on), "{spelling:?} read as the wrong setting");
+        }
+
+        for typo in ["flase", "of", "enabled", "2"] {
+            let refused = validate_value(KEY_MAINTENANCE_AUTO, typo)
+                .expect_err(&format!("{typo:?} must be refused"));
+            assert_eq!(
+                refused,
+                format!("\"{typo}\" is not a valid value for maintenance.auto. \
+                         Use one of: true, 1, on, yes, false, 0, off, no.")
+            );
+            assert!(parse_maintenance_auto(typo).is_err(), "the reader must refuse {typo:?} too");
+        }
+
+        for key in [KEY_MAINTENANCE_LOOSE, KEY_MAINTENANCE_PACKS] {
+            assert_eq!(parse_maintenance_threshold(key, " 6700 "), Ok(6700));
+            assert_eq!(parse_maintenance_threshold(key, "0"), Ok(0));
+            assert!(validate_value(key, "20").is_ok());
+
+            for typo in ["10k", "-1", "1.5", "lots"] {
+                let refused = validate_value(key, typo)
+                    .expect_err(&format!("{typo:?} must be refused for {key}"));
+                assert_eq!(
+                    refused,
+                    format!("\"{typo}\" is not a valid value for {key}. Use a whole number, e.g. \"6700\".")
+                );
+                assert!(parse_maintenance_threshold(key, typo).is_err(), "the reader must refuse {typo:?} too");
+            }
+        }
+
+        // The setter writes the documented spelling, so the file holds a listed value or a bare number.
+        assert_eq!(storable_value(KEY_MAINTENANCE_AUTO, "  OFF "), "off");
+        assert_eq!(storable_value(KEY_MAINTENANCE_LOOSE, " 6700 "), "6700");
     }
 
     /// The data rows of `docs/guide/cli.md`'s "Refused, in either file" table, in file order,
@@ -1521,7 +1654,7 @@ mod tests {
     /// one; a second table with the same columns would otherwise make this silently arbitrary.
     ///
     /// The rows are returned rather than counted because a count alone is a weak check: swapping
-    /// one guide row for an unrelated refusal, or reordering two, keeps the count at nine while
+    /// one guide row for an unrelated refusal, or reordering two, keeps the count unchanged while
     /// every group below is paired with the wrong row. The caller matches an anchor phrase into
     /// each row, which is the part that makes the correspondence positional.
     fn guide_refusal_rows() -> Vec<String> {
@@ -1555,7 +1688,7 @@ mod tests {
     /// requires exactly one group per row, **paired with that row**: each group carries an
     /// anchor phrase that must appear in the guide row it claims to cover, so reordering the
     /// table or swapping one refusal for another fails here rather than passing on a count that
-    /// happens to still be nine. The *grouping* is what makes the count mean anything at all:
+    /// happens to still match. The *grouping* is what makes the count mean anything at all:
     /// several rows carry two examples, so a flat list of cases could never be compared against
     /// a row count.
     #[test]
@@ -1565,7 +1698,7 @@ mod tests {
         // contain, not merely "it is refused" — a case that started failing for an *unrelated*
         // reason would otherwise keep this test green while the guide's explanation of it
         // quietly became wrong.
-        let rows: [(&str, &[(&str, &str)]); 9] = [
+        let rows: [(&str, &[(&str, &str)]); 10] = [
             ("any other unknown section",
              &[("[opperator]\nidentifier = \"ada\"\n",   "\"opperator\" is not a known configuration section")]),
             ("an unknown key inside a known section",
@@ -1582,6 +1715,9 @@ mod tests {
              &[("[remote]\ntorproxy = \"socks5h://x\"\n", "\"remote.torproxy\" is not a known configuration key")]),
             ("accepts only `auto`, `on` or `off`",
              &[("[remote]\ntor = \"onn\"\n",             "\"onn\" is not a valid value for remote.tor")]),
+            ("`maintenance.auto` accepts only",
+             &[("[maintenance]\nauto = \"flase\"\n",     "\"flase\" is not a valid value for maintenance.auto"),
+               ("[maintenance]\nloose = \"10k\"\n",      "\"10k\" is not a valid value for maintenance.loose")]),
             ("profiles hold `identifier` and `name`, nothing else",
              &[("[profile.work]\nnickname = \"w\"\n",    "\"profile.work.nickname\" is not a known profile field")]),
             ("there is no third state",

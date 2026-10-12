@@ -180,7 +180,7 @@ impl TorMode {
     /// non-onion remote un-proxied for a user who believes they configured `on`. The fallback
     /// survives for a direct caller, and so does the wider vocabulary (`true`/`yes`/`1`), which
     /// the file parse does *not* accept.
-    fn parse(value: &str) -> TorMode {
+    pub(crate) fn parse(value: &str) -> TorMode {
         match normalize_tor_value(value).as_str() {
             "on" | "true" | "yes" | "1" => TorMode::On,
             "off" | "false" | "no" | "0" => TorMode::Off,
@@ -240,7 +240,6 @@ impl TorSettings {
 
         let proxy = config_utils::get_effective_value(config_utils::KEY_REMOTE_TOR_PROXY)?
             .map(|(value, _)| value)
-            .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| DEFAULT_TOR_PROXY.to_string());
 
         Ok(TorSettings { mode, proxy })
@@ -264,7 +263,6 @@ impl TorSettings {
         };
 
         let proxy = config_utils::get_scoped_value(config_utils::KEY_REMOTE_TOR_PROXY, ConfigScope::Global)?
-            .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| DEFAULT_TOR_PROXY.to_string());
 
         Ok(TorSettings { mode, proxy })

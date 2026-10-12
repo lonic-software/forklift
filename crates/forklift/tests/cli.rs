@@ -679,6 +679,94 @@ fn unreadable_maintenance_settings_are_announced_rather_than_silently_disabling_
     assert!(stderr(&store).contains("maintenance.loose"), "unexpected refusal: {}", stderr(&store));
 }
 
+/// A `maintenance.*` value that is a string but not one the setting takes is refused at both
+/// doors — a hand edit fails the command that reads it, and `config` will not write one. Before,
+/// the reader took only the off-spellings and treated anything else as on, so `auto = "flase"`
+/// left maintenance running; and an unparseable threshold was silently replaced by the default.
+#[test]
+fn a_mistyped_maintenance_value_is_refused_rather_than_read_as_a_default() {
+    let warehouse = TestWarehouse::new("config-maintenance-typo");
+    assert_success(&warehouse.run(&["prepare"]));
+    let config = warehouse.root.join(".forklift/config/warehouse.toml");
+
+    for (content, key) in [
+        ("[maintenance]\nauto = \"flase\"\n", "maintenance.auto"),
+        ("[maintenance]\nloose = \"10k\"\n",  "maintenance.loose"),
+        ("[maintenance]\npacks = \"-1\"\n",   "maintenance.packs"),
+    ] {
+        std::fs::write(&config, content).unwrap();
+
+        let store = warehouse.run(&["store"]);
+        assert!(!store.status.success(), "store must refuse {content:?}: {}", stdout(&store));
+        assert!(
+            stderr(&store).contains(&format!("is not a valid value for {key}")),
+            "the refusal must name the key and say why: {}", stderr(&store)
+        );
+    }
+
+    std::fs::write(&config, "").unwrap();
+
+    for (key, value) in [("maintenance.auto", "flase"), ("maintenance.loose", "10k")] {
+        let set = warehouse.run(&["config", key, value]);
+        assert!(!set.status.success(), "config must refuse {key} = {value:?}");
+        assert!(stderr(&set).contains(&format!("is not a valid value for {key}")), "{}", stderr(&set));
+    }
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), "", "a refused set must not touch the file");
+
+    // The documented spellings are accepted, and stored the documented way.
+    assert_success(&warehouse.run(&["config", "maintenance.auto", " OFF "]));
+    assert_eq!(stdout(&warehouse.run(&["config", "maintenance.auto"])).trim(), "off");
+}
+
+/// A warehouse configuration that is present but cannot be read is an error, never "absent".
+/// An absent warehouse file falls through to the global one, so reading a dangling link as
+/// absent replaced the warehouse's own settings with the user's global ones, silently.
+#[cfg(unix)]
+#[test]
+fn a_dangling_warehouse_config_link_is_an_error_not_a_fallback_to_global() {
+    let warehouse = TestWarehouse::new("config-dangling-link");
+    assert_success(&warehouse.run(&["prepare"]));
+    assert_success(&warehouse.run(&["config", "--global", "remote.url", "http://global.example/"]));
+
+    let config = warehouse.root.join(".forklift/config/warehouse.toml");
+    let _ = std::fs::remove_file(&config);
+    std::os::unix::fs::symlink(warehouse.root.join("gone.toml"), &config).unwrap();
+
+    let read = warehouse.run(&["config", "remote.url"]);
+    assert!(
+        !read.status.success(),
+        "a dangling warehouse config must refuse, not answer with the global value: {}", stdout(&read)
+    );
+    assert!(stderr(&read).contains("warehouse.toml"), "the refusal must name the file: {}", stderr(&read));
+    assert!(stderr(&read).contains("symbolic link"), "the refusal must say why: {}", stderr(&read));
+
+    // With nothing at the path at all, the global value applies — that is what absent means.
+    std::fs::remove_file(&config).unwrap();
+    let read = warehouse.run(&["config", "remote.url"]);
+    assert_success(&read);
+    assert_eq!(stdout(&read).trim(), "http://global.example/");
+}
+
+/// A configuration file that is not TOML at all is refused like any other invalid file: named
+/// by its full path, with the same remedy.
+#[test]
+fn a_config_file_that_is_not_toml_is_refused_like_any_invalid_file() {
+    let warehouse = TestWarehouse::new("config-not-toml");
+    assert_success(&warehouse.run(&["prepare"]));
+    std::fs::write(warehouse.root.join(".forklift/config/warehouse.toml"), "[remote\n").unwrap();
+
+    let read = warehouse.run(&["config", "remote.url"]);
+    assert!(!read.status.success(), "a file that is not TOML must refuse: {}", stdout(&read));
+
+    let error = stderr(&read);
+    assert!(error.contains("is not valid"), "unexpected refusal: {error}");
+    assert!(error.contains("Fix the file by hand."), "the refusal must give the remedy: {error}");
+    assert!(
+        error.contains(&format!("config{}warehouse.toml", std::path::MAIN_SEPARATOR)),
+        "the refusal must name the file by its full path: {error}"
+    );
+}
+
 #[test]
 fn identity_is_zero_configuration_an_id_is_minted_on_first_use() {
     let warehouse = TestWarehouse::new("mint");

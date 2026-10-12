@@ -174,11 +174,8 @@ pub enum AutoCompaction {
 pub fn auto_compaction_action() -> Result<AutoCompaction, String> {
     use crate::util::config_utils;
 
-    if let Some((value, _)) = config_utils::get_effective_value(config_utils::KEY_MAINTENANCE_AUTO)? {
-        let value = value.trim().to_ascii_lowercase();
-        if value == "false" || value == "0" || value == "off" || value == "no" {
-            return Ok(AutoCompaction::None);
-        }
+    if !maintenance_auto_enabled()? {
+        return Ok(AutoCompaction::None);
     }
 
     // Thresholds are configurable (like git's gc.auto / gc.autoPackLimit) but default sensibly.
@@ -353,27 +350,26 @@ pub fn store_status() -> Result<StoreStatus, String> {
     })
 }
 
-/// Whether background object-store maintenance is enabled (`maintenance.auto`, on unless set to
-/// a falsey value). Mirrors the check [`auto_compaction_action`] makes.
+/// Whether background object-store maintenance is enabled (`maintenance.auto`, on when unset).
+/// The one check both [`auto_compaction_action`] and the status report make.
 fn maintenance_auto_enabled() -> Result<bool, String> {
     use crate::util::config_utils;
 
-    if let Some((value, _)) = config_utils::get_effective_value(config_utils::KEY_MAINTENANCE_AUTO)? {
-        let value = value.trim().to_ascii_lowercase();
-        if value == "false" || value == "0" || value == "off" || value == "no" {
-            return Ok(false);
-        }
+    match config_utils::get_effective_value(config_utils::KEY_MAINTENANCE_AUTO)? {
+        Some((value, _)) => config_utils::parse_maintenance_auto(&value),
+        None => Ok(true),
     }
-
-    Ok(true)
 }
 
-/// Read a numeric maintenance threshold from configuration, falling back to `default` when it
-/// is unset (an unparseable value also falls back rather than failing maintenance).
+/// Read a numeric maintenance threshold from configuration, falling back to `default` only when
+/// it is unset — a value that is not a count is an error, never the default.
 fn config_threshold(key: &str, default: usize) -> Result<usize, String> {
-    Ok(crate::util::config_utils::get_effective_value(key)?
-        .and_then(|(value, _)| value.trim().parse().ok())
-        .unwrap_or(default))
+    use crate::util::config_utils;
+
+    match config_utils::get_effective_value(key)? {
+        Some((value, _)) => config_utils::parse_maintenance_threshold(key, &value),
+        None => Ok(default),
+    }
 }
 
 /// Estimate the loose object count without a full scan: count one fan-out folder (excluding

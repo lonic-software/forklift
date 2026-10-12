@@ -1342,7 +1342,7 @@ value. Known keys:
 | `remote.token` | The bearer token, when the remote requires one. |
 | `remote.tor` | Reach the remote over Tor: `auto` (default — only `.onion` remotes), `on` (every remote), `off` (never). |
 | `remote.torProxy` | The Tor SOCKS proxy (default `socks5h://127.0.0.1:9050`). |
-| `maintenance.auto` | Auto-compact after mutating commands (`false`/`0`/`off`/`no` to disable; default on). |
+| `maintenance.auto` | Auto-compact after mutating commands: `true`/`1`/`on`/`yes` or `false`/`0`/`off`/`no` (default on). |
 | `maintenance.loose` | Loose-object count that triggers an auto incremental compact (default 6700). |
 | `maintenance.packs` | Pack count that triggers an auto consolidating repack (default 20). |
 
@@ -1368,6 +1368,7 @@ Refused, in either file:
 | `loose = 6700`, `tor = true` | every value is a **string on disk**, including the numeric and boolean ones — write `"6700"` and `"on"` |
 | `torProxy` spelled `torproxy` | keys are case-sensitive |
 | `tor = "onn"` | `remote.tor` accepts only `auto`, `on` or `off`. A typo here used to mean `auto` silently, un-proxying every non-onion remote |
+| `auto = "flase"`, `loose = "10k"` | `maintenance.auto` accepts only the spellings listed above, and `maintenance.loose`/`maintenance.packs` only a whole number. A typo here used to leave maintenance on, or fall back to the default threshold, without a word |
 | an unknown field in a `[profile.<name>]` section | profiles hold `identifier` and `name`, nothing else |
 | any key set to `""` (or to whitespace) | a key holds a value or is absent, there is no third state — an empty `identifier` was read as an identity by one path and as "fill this in" by the other, which minted a new id *over* your entry. Remove a section key with `forklift config --unset <key>` (add `--global` for the global file); a `[profile.<name>]` field the command cannot address, so remove that one in an editor |
 
