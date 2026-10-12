@@ -1354,8 +1354,14 @@ absent because it was damaged would quietly replace the identity you configured.
 One consumer warns instead of refusing, and only one: **background auto-compaction**, which runs
 after a mutating command's own work has already succeeded. It cannot refuse without taking back
 a result the command already reported, so it prints a `maintenance_unavailable` warning on
-stderr and leaves the exit code alone. A command that reads no damaged key — `load` on a
-warehouse whose *global* file is broken, say — therefore still exits 0, with that warning.
+stderr and leaves the exit code alone. A command that reads no configuration of its own — `load`,
+say — therefore still exits 0 on a broken file, with that warning. Every other command refuses,
+whichever key it wanted: what is refused is the **file**, not the damaged key, so a typo in
+`maintenance.auto` in the global file stops a command that only needed your identity from it.
+
+A configuration file that is there but cannot be read is not "absent". That includes a symbolic
+link to a path that does not exist — a dotfiles link whose target you have not created yet — so
+create the target, or remove the link, before the first command that needs it.
 
 Refused, in either file:
 

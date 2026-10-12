@@ -129,10 +129,15 @@ pub fn parse_maintenance_auto(value: &str) -> Result<bool, String> {
 /// * `Ok(usize)`   - The threshold.
 /// * `Err(String)` - If the value is not a non-negative whole number.
 pub fn parse_maintenance_threshold(key: &str, value: &str) -> Result<usize, String> {
-    value.trim().parse().map_err(|_| format!(
-        "\"{}\" is not a valid value for {}. Use a whole number, e.g. \"6700\".",
-        value, key
-    ))
+    let digits = value.trim();
+
+    // `usize::from_str` also takes a leading `+`, which is not a bare number.
+    digits.bytes().all(|byte| byte.is_ascii_digit())
+        .then(|| digits.parse().ok()).flatten()
+        .ok_or_else(|| format!(
+            "\"{}\" is not a valid value for {}. Use a whole number, e.g. \"6700\".",
+            value, key
+        ))
 }
 
 /// The configuration keys Forklift understands, in `section.key` form.
@@ -1072,7 +1077,8 @@ fn storable_value(key: &str, value: &str) -> String {
     match key {
         KEY_REMOTE_TOR => remote_utils::normalize_tor_value(value),
         KEY_MAINTENANCE_AUTO => value.trim().to_ascii_lowercase(),
-        KEY_MAINTENANCE_LOOSE | KEY_MAINTENANCE_PACKS => value.trim().to_string(),
+        KEY_MAINTENANCE_LOOSE | KEY_MAINTENANCE_PACKS => parse_maintenance_threshold(key, value)
+            .map_or_else(|_| value.to_string(), |count| count.to_string()),
         _ => value.to_string(),
     }
 }
@@ -1087,42 +1093,50 @@ fn storable_value(key: &str, value: &str) -> String {
 /// * `Ok(None)`              - If the file does not exist.
 /// * `Err(String)`           - If the file could not be read or parsed.
 ///
-/// **Absent means nothing is at the path — not even a link.** Asking `path.exists()` answered
-/// `false` for a symlink whose target is gone and for a file in a directory that cannot be
-/// searched — and an absent warehouse file falls through to the global one, so a warehouse's
-/// own identity or remote was silently replaced by the user's global settings. A dangling link
-/// reads as `NotFound` too, so the read error alone cannot tell it from absence; the link itself
-/// is looked up before the file is called absent. Every other failure to read is an error.
+/// **Absent means nothing is at the path — not even a link, at any depth.** Asking
+/// `path.exists()` answered `false` for a symlink whose target is gone and for a file in a
+/// directory that cannot be searched — and an absent warehouse file falls through to the global
+/// one, so a warehouse's own identity or remote was silently replaced by the user's global
+/// settings. A dangling link reads as `NotFound` too, wherever it sits in the path, so the read
+/// error alone cannot tell it from absence: see [`dangling_link_in`]. Every other failure to
+/// read is an error.
 ///
 /// A file that is not TOML at all is reported like any other invalid file, through
 /// [`not_valid`], so it is named by its full path and the remedy is the same.
 fn load_document(path: &Path) -> Result<Option<DocumentMut>, String> {
     let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
-        Err(error) => {
-            let link = std::fs::symlink_metadata(path);
-
-            if matches!(&link, Err(missing) if missing.kind() == std::io::ErrorKind::NotFound) {
-                return Ok(None);
-            }
-
-            let dangling = if error.kind() == std::io::ErrorKind::NotFound
-                && link.is_ok_and(|metadata| metadata.file_type().is_symlink()) {
-                " (it is a symbolic link to a path that does not exist)"
-            } else {
-                ""
-            };
-
-            return Err(format!(
-                "Error while reading configuration file \"{}\": {}{}",
-                path.to_string_lossy(), error, dangling
-            ));
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => match dangling_link_in(path) {
+            None => return Ok(None),
+            Some(link) => return Err(format!(
+                "Configuration file \"{}\" cannot be read: \"{}\" is a symbolic link to a path \
+                 that does not exist. Create the target, or remove the link.",
+                path.to_string_lossy(), link.to_string_lossy()
+            )),
+        },
+        Err(error) => return Err(format!(
+            "Error while reading configuration file \"{}\": {}", path.to_string_lossy(), error
+        )),
     };
 
     content.parse::<DocumentMut>()
         .map(Some)
         .map_err(|e| not_valid(path, e.to_string().trim_end().to_string()))
+}
+
+/// The dangling symbolic link that makes `path` unreachable, if one does — the path itself or
+/// any directory above it.
+///
+/// Walks up from `path` to the nearest component that exists *as an entry* (without following
+/// it). Everything above that entry resolved, or the lookup would have failed there; so the
+/// entry is the only place a dangling link can hide. If it is a link and does not resolve, that
+/// link is why `path` reads as missing; otherwise `path` is genuinely absent.
+fn dangling_link_in(path: &Path) -> Option<PathBuf> {
+    let entry = path.ancestors().find(|candidate| std::fs::symlink_metadata(candidate).is_ok())?;
+
+    let is_link = std::fs::symlink_metadata(entry).is_ok_and(|metadata| metadata.file_type().is_symlink());
+
+    (is_link && std::fs::metadata(entry).is_err()).then(|| entry.to_path_buf())
 }
 
 /// Write a document back to `path`, but only after re-parsing **the document as edited** —
@@ -1629,7 +1643,7 @@ mod tests {
             assert_eq!(parse_maintenance_threshold(key, "0"), Ok(0));
             assert!(validate_value(key, "20").is_ok());
 
-            for typo in ["10k", "-1", "1.5", "lots"] {
+            for typo in ["10k", "-1", "1.5", "lots", "+6700"] {
                 let refused = validate_value(key, typo)
                     .expect_err(&format!("{typo:?} must be refused for {key}"));
                 assert_eq!(
@@ -1643,6 +1657,7 @@ mod tests {
         // The setter writes the documented spelling, so the file holds a listed value or a bare number.
         assert_eq!(storable_value(KEY_MAINTENANCE_AUTO, "  OFF "), "off");
         assert_eq!(storable_value(KEY_MAINTENANCE_LOOSE, " 6700 "), "6700");
+        assert_eq!(storable_value(KEY_MAINTENANCE_PACKS, "007"), "7");
     }
 
     /// The data rows of `docs/guide/cli.md`'s "Refused, in either file" table, in file order,

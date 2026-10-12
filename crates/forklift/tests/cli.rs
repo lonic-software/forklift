@@ -740,8 +740,22 @@ fn a_dangling_warehouse_config_link_is_an_error_not_a_fallback_to_global() {
     assert!(stderr(&read).contains("warehouse.toml"), "the refusal must name the file: {}", stderr(&read));
     assert!(stderr(&read).contains("symbolic link"), "the refusal must say why: {}", stderr(&read));
 
-    // With nothing at the path at all, the global value applies — that is what absent means.
+    // The same, one level up: the configuration *folder* is the dangling link, so the file's own
+    // path ends in nothing at all and only the walk up the path can tell it from absence.
+    let folder = warehouse.root.join(".forklift/config");
     std::fs::remove_file(&config).unwrap();
+    std::fs::remove_dir(&folder).unwrap();
+    std::os::unix::fs::symlink(warehouse.root.join("unmounted"), &folder).unwrap();
+
+    let read = warehouse.run(&["config", "remote.url"]);
+    assert!(
+        !read.status.success(),
+        "a dangling config folder must refuse, not answer with the global value: {}", stdout(&read)
+    );
+    assert!(stderr(&read).contains("symbolic link"), "the refusal must say why: {}", stderr(&read));
+
+    // With nothing at the path at all, the global value applies — that is what absent means.
+    std::fs::remove_file(&folder).unwrap();
     let read = warehouse.run(&["config", "remote.url"]);
     assert_success(&read);
     assert_eq!(stdout(&read).trim(), "http://global.example/");
@@ -761,9 +775,10 @@ fn a_config_file_that_is_not_toml_is_refused_like_any_invalid_file() {
     let error = stderr(&read);
     assert!(error.contains("is not valid"), "unexpected refusal: {error}");
     assert!(error.contains("Fix the file by hand."), "the refusal must give the remedy: {error}");
+    let named = error.split('"').nth(1).unwrap_or_default();
     assert!(
-        error.contains(&format!("config{}warehouse.toml", std::path::MAIN_SEPARATOR)),
-        "the refusal must name the file by its full path: {error}"
+        std::path::Path::new(named).is_absolute() && named.ends_with("warehouse.toml"),
+        "the refusal must name the file by its full path, not {named:?}: {error}"
     );
 }
 
