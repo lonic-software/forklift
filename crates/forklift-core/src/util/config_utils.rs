@@ -1001,8 +1001,9 @@ pub fn is_blank(value: &str) -> bool {
 ///   names the file and says to fix it. An `--unset` hint here was wrong twice over: it carried
 ///   no `--global`, so for a global file run inside a warehouse it targeted the wrong one, and it
 ///   could not succeed while any *other* entry in the file was also bad.
-/// * **`forklift config <key> ""`** refuses in the command, which knows its scope, and renders
-///   the exact `--unset` command.
+/// * **`forklift config <key> ""`** gets this refusal from [`set_value`] and the command, which
+///   knows its scope, appends the exact `--unset` — only when the key is set in that scope, since
+///   otherwise that command fails with "not set".
 /// * **`forklift franchise --token ""`** refuses in the command, before the network or the
 ///   filesystem is touched, and says to omit the option.
 /// * **`forklift profile create`** ([`create_profile`]) and **`forklift profile use`** refuse an
