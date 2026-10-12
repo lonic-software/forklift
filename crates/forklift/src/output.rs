@@ -78,26 +78,54 @@ pub fn set_command(command: Option<&str>) {
     let _ = COMMAND.set(command.map(str::to_string));
 }
 
-/// The header every `--json` stdout document starts with. `command` is `null` only for a
-/// usage error whose command line names no known command.
-fn header(ok: bool) -> serde_json::Map<String, serde_json::Value> {
-    let command = COMMAND.get().cloned().flatten();
-    let mut fields = serde_json::Map::new();
+/// One `--json` stdout document. A struct rather than a `serde_json::Map`, because serde_json
+/// here is built without `preserve_order` and its `Map` sorts keys — which would put `command`
+/// first. Fields serialize in declaration order, so every document starts with the header a
+/// consumer gates on: `lonic_json`, `tool`, `schema`, `command`, `ok`, then exactly one of
+/// `data` (success) or `error` (failure). `command` is `null` only when the command line names
+/// no known command: a usage error without one, or top-level `--help` / `--version`.
+#[derive(Serialize)]
+struct Document<'a, T: Serialize> {
+    lonic_json: u32,
+    tool: &'static str,
+    schema: u32,
+    command: Option<&'a str>,
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<&'a T>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<ErrorBody<'a>>,
+}
 
-    fields.insert("lonic_json".to_string(), serde_json::json!(LONIC_JSON));
-    fields.insert("tool".to_string(), serde_json::json!(TOOL));
-    fields.insert("schema".to_string(), serde_json::json!(SCHEMA_VERSION));
-    fields.insert("command".to_string(), serde_json::json!(command));
-    fields.insert("ok".to_string(), serde_json::json!(ok));
-    fields
+/// The `error` object of a failure document, in its documented key order.
+#[derive(Serialize)]
+struct ErrorBody<'a> {
+    code: &'static str,
+    message: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_step: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<&'a serde_json::Value>,
 }
 
 /// Print one document to stdout. Pretty-printed: the consumer is a program, but a human
 /// debugging the pipe reads it too, and JSON parsers do not care about whitespace. The
-/// fallback for the serializer failure that cannot happen on a `Value` still carries the
+/// fallback for a serializer failure (a command's `Serialize` impl can fail) still carries the
 /// header a consumer gates on.
-fn print_document(document: serde_json::Map<String, serde_json::Value>, ok: bool) {
-    match serde_json::to_string_pretty(&serde_json::Value::Object(document)) {
+fn print_document<T: Serialize>(data: Option<&T>, error: Option<ErrorBody>) {
+    let ok = error.is_none();
+    let command = COMMAND.get().and_then(|command| command.as_deref());
+    let document = Document {
+        lonic_json: LONIC_JSON,
+        tool: TOOL,
+        schema: SCHEMA_VERSION,
+        command,
+        ok,
+        data,
+        error,
+    };
+
+    match serde_json::to_string_pretty(&document) {
         Ok(text) => println!("{}", text),
         Err(_) => println!(
             "{{\"lonic_json\":{},\"tool\":\"{}\",\"schema\":{},\"ok\":{}}}",
@@ -186,9 +214,7 @@ pub fn blob_text(content: &[u8]) -> Option<&str> {
 /// Print the success envelope: the header with `ok: true`, then `data`. `ok` says that `data`
 /// is the command's result; it does not report the exit status.
 fn print_envelope<T: Serialize>(data: &T) {
-    let mut document = header(true);
-    document.insert("data".to_string(), serde_json::json!(data));
-    print_document(document, true);
+    print_document(Some(data), None);
 }
 
 /// Report a failed command in the active mode, to stderr (human) or stdout (JSON —
@@ -197,23 +223,12 @@ fn print_envelope<T: Serialize>(data: &T) {
 pub fn report_error(error: &ForkliftError) {
     match mode() {
         OutputMode::Human => eprintln!("{}", error.message),
-        OutputMode::Json => {
-            let mut fields = serde_json::Map::new();
-            fields.insert("code".to_string(), serde_json::json!(error.code.as_str()));
-            fields.insert("message".to_string(), serde_json::json!(error.message));
-
-            if let Some(next_step) = &error.next_step {
-                fields.insert("next_step".to_string(), serde_json::json!(next_step));
-            }
-
-            if let Some(details) = &error.details {
-                fields.insert("details".to_string(), details.clone());
-            }
-
-            let mut document = header(false);
-            document.insert("error".to_string(), serde_json::Value::Object(fields));
-            print_document(document, false);
-        }
+        OutputMode::Json => print_document::<()>(None, Some(ErrorBody {
+            code: error.code.as_str(),
+            message: &error.message,
+            next_step: error.next_step.as_deref(),
+            details: error.details.as_ref(),
+        })),
     }
 }
 
@@ -657,13 +672,17 @@ fn maintenance_unavailable_warning_text(mode: OutputMode, error: &str) -> String
 /// parses (`lonic_json`, `tool`, `warning`, `message`, `next_step`) is defined once — including the
 /// hand-built fallback for the serializer failure that cannot actually happen here.
 fn warning_envelope(code: &str, message: &str, next_step: &str) -> String {
-    let envelope = serde_json::json!({
-        "lonic_json": LONIC_JSON,
-        "tool": TOOL,
-        "warning": code,
-        "message": message,
-        "next_step": next_step,
-    });
+    // A struct, not `json!`: serde_json's `Map` sorts keys, and the header leads.
+    #[derive(Serialize)]
+    struct Warning<'a> {
+        lonic_json: u32,
+        tool: &'static str,
+        warning: &'a str,
+        message: &'a str,
+        next_step: &'a str,
+    }
+
+    let envelope = Warning { lonic_json: LONIC_JSON, tool: TOOL, warning: code, message, next_step };
 
     serde_json::to_string(&envelope).unwrap_or_else(|_| format!(
         "{{\"lonic_json\":{},\"tool\":\"{}\",\"warning\":\"{}\"}}",

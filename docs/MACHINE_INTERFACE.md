@@ -51,8 +51,9 @@ Failure keeps the same header, with `"ok": false` and an `error` in place of `da
   *is* the capability-detection mechanism: check it before relying on a field, rather
   than sniffing for the field's presence.
 - `command` is the command as parsed — the canonical name, never the alias typed
-  (`st` reports `"stocktake"`) — on success and failure alike. It is `null` only for a
-  usage error whose command line names no known command.
+  (`st` reports `"stocktake"`) — on success and failure alike. It is `null` only when
+  the command line names no known command: a usage error without one, or top-level
+  `--help` / `--version`.
 - `ok` says whether `data` is the command's result. It does **not** report the exit
   status: a command whose result is a negative outcome may exit non-zero with
   `ok: true`. Parse stdout first and consult the exit status second.
@@ -66,12 +67,17 @@ them is [`generated/json-schemas.md`](generated/json-schemas.md).
 **Usage errors** (an unknown command, a missing or invalid argument) are `usage`
 failures with exit 2. `message` is the parser's one-line complaint, and
 `details.usage` keeps its full text — the usage line and any "a similar command exists"
-tip. `--help` and `--version` under `--json` are results, not failures: a success
-document whose `data.message` is the text, exit 0.
+tip. `--help`, `--version` and the `help` command under `--json` are results, not
+failures: a success document whose `data.message` is the text, exit 0. The keys of every
+document appear in the order shown above, header first.
+
+Only the bare `--json` token selects JSON when the command line fails to parse:
+`--json=true` is itself a usage error, reported as prose on stderr with an empty stdout.
 
 **Death by signal** (exit 128+n, including 130 from Ctrl-C) is outside the process's
 control and may leave stdout empty. A consumer that finds no document classifies by the
-exit status alone.
+exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
+exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
 **Schema 2** (current): `history` entries carry `parents` (every parcel's parents, in
 stored order, always present — `[]` for a root); the `empty_history` error code exists
@@ -356,9 +362,10 @@ the working directory. It implements `initialize`, `tools/list` and `tools/call`
 
 Each tool re-invokes `forklift … --json` and returns its envelope, so the tools speak
 the exact structured output above (and inherit the warehouse lock and exit-code
-taxonomy). A command that exits non-zero comes back as an MCP tool error (`isError:
+taxonomy). A failure document (`ok: false`) comes back as an MCP tool error (`isError:
 true`) carrying the error envelope — the agent sees the stable `code`/`next_step`, not
-a crashed session.
+a crashed session. `isError` follows `ok`, not the exit status; only a run that wrote no
+document falls back to its exit status.
 
 The tool surface **mirrors the CLI** — every CLI command is exposed as a tool (a
 multi-subcommand command becomes `<command>_<subcommand>` tools) or is on a small

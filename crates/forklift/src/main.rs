@@ -139,11 +139,14 @@ fn parse_or_exit() -> Cli {
 
 /// The canonical name of the top-level command the arguments name, when the parse that would
 /// have said so failed. The global options are all flags that take no value, so the first
-/// argument that is not an option is the command, or an alias of one, or nothing known.
+/// argument that is not an option is the command, or an alias of one, or nothing known. A help
+/// or version flag before it means clap answered at the top level, so no command ran.
 fn named_command(args: &[OsString]) -> Option<String> {
     let token = args.iter().skip(1)
-        .find(|arg| !arg.to_string_lossy().starts_with('-'))?
-        .to_str()?;
+        .map(|arg| arg.to_string_lossy())
+        .take_while(|arg| !matches!(arg.as_ref(), "-h" | "--help" | "-V" | "--version"))
+        .find(|arg| !arg.starts_with('-'))?;
+    let token = token.as_ref();
 
     Cli::command().get_subcommands()
         .find(|command| command.get_name() == token || command.get_all_aliases().any(|alias| alias == token))
@@ -224,6 +227,12 @@ async fn forklift(cli: Cli) -> Result<(), ForkliftError> {
     // command, which never takes the warehouse lock at all.
     let mut _lock: Option<lock_utils::WarehouseLock> = None;
 
+    // Help needs no warehouse, and its one failure (an unknown command name) is a usage error,
+    // which `dispatch`'s plain `String` errors cannot carry.
+    if let Command::Help { command } = &cli.command {
+        return commands::help::handle_command(command);
+    }
+
     if cli.command.requires_warehouse() {
         warehouse_utils::enter_warehouse().map_err(|message| ForkliftError::new(
             ErrorCode::NotAWarehouse,
@@ -298,7 +307,7 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
         Command::CherryPick { revision, message } => commands::cherry_pick::handle_command(&revision, message).await,
         Command::Deliver { target, message } => commands::deliver::handle_command(&target, message),
         Command::Diff { staged, targets } => commands::diff::handle_command(staged, &targets, cli.verbose).await,
-        Command::Help { command } => commands::help::handle_command(&command),
+        Command::Help { .. } => unreachable!("help is answered in `forklift`, before dispatch"),
         Command::Expand { paths } => commands::expand::handle_command(paths).await,
         Command::Narrow { paths } => commands::narrow::handle_command(paths).await,
         Command::Franchise { url, directory, pallet, token, only } =>

@@ -147,9 +147,9 @@ fn initialize(params: &Value, state: &mut ServerState) -> Value {
 }
 
 /// Dispatch a `tools/call`: map the tool and its arguments to a `forklift … --json`
-/// invocation, run it, and return the envelope as the tool result. A command that
-/// exits non-zero is reported as an MCP tool error (`isError: true`) carrying the
-/// error envelope — the agent sees the stable `code`/`next_step`, not a crash.
+/// invocation, run it, and return the envelope as the tool result. A failure document is
+/// reported as an MCP tool error (`isError: true`) carrying the error envelope — the agent
+/// sees the stable `code`/`next_step`, not a crash. See [`tool_failed`] for the rule.
 fn call_tool(params: &Value, state: &ServerState) -> Result<Value, JsonRpcError> {
     let name = params.get("name").and_then(Value::as_str)
         .ok_or_else(|| JsonRpcError::invalid_params("the tool name is required"))?;
@@ -180,8 +180,24 @@ fn call_tool(params: &Value, state: &ServerState) -> Result<Value, JsonRpcError>
 
     Ok(json!({
         "content": [ { "type": "text", "text": text } ],
-        "isError": !output.status.success(),
+        "isError": tool_failed(&output.stdout, output.status.success()),
     }))
+}
+
+/// Whether a `--json` run failed, by the envelope's own rule: `ok` says whether `data` is the
+/// result, and the exit status does not — a command may exit non-zero with `ok: true` to report a
+/// negative outcome as data. Only a run that wrote no document falls back to its exit status.
+///
+/// # Arguments
+/// * `stdout`    - The run's standard output.
+/// * `exited_ok` - Whether the process exited 0.
+///
+/// # Returns
+/// * `bool` - `true` if the agent should see the result as a tool error.
+fn tool_failed(stdout: &[u8], exited_ok: bool) -> bool {
+    serde_json::from_slice::<Value>(stdout).ok()
+        .and_then(|document| document.get("ok").and_then(Value::as_bool))
+        .map_or(!exited_ok, |ok| !ok)
 }
 
 /// Run this same binary with the given arguments plus `--json`, capturing its output.
@@ -719,6 +735,22 @@ impl JsonRpcError {
 #[cfg(test)]
 mod tests {
     use clap::CommandFactory;
+
+    #[test]
+    fn a_tool_error_is_read_from_ok_not_from_the_exit_status() {
+        let success = br#"{"lonic_json":1,"tool":"forklift","schema":2,"command":"x","ok":true,"data":{}}"#;
+        let failure = br#"{"lonic_json":1,"tool":"forklift","schema":2,"command":"x","ok":false,"error":{}}"#;
+
+        // A negative outcome reported as data: non-zero exit, but `data` is the result.
+        assert!(!super::tool_failed(success, false));
+        assert!(super::tool_failed(failure, true));
+        assert!(!super::tool_failed(success, true));
+        assert!(super::tool_failed(failure, false));
+
+        // No document at all: the exit status is all there is.
+        assert!(super::tool_failed(b"", false));
+        assert!(!super::tool_failed(b"", true));
+    }
 
     /// CLI commands intentionally **not** exposed as MCP tools: warehouse/identity setup,
     /// host-machine concerns, and meta commands an agent does not drive through the tool

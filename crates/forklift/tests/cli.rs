@@ -3996,6 +3996,52 @@ fn help_and_version_under_json_are_success_documents() {
     let value = json(&version);
     assert_eq!(value["ok"], true);
     assert!(value["data"]["message"].as_str().unwrap().starts_with("forklift "), "{}", value);
+    assert_eq!(value["command"], serde_json::Value::Null);
+
+    // A help flag before the command name is the top-level help: no command ran, whatever
+    // name follows it.
+    let top = json(&warehouse.run(&["--json", "--help", "st"]));
+    assert_eq!(top["ok"], true);
+    assert_eq!(top["command"], serde_json::Value::Null);
+}
+
+#[test]
+fn the_help_command_under_json_answers_like_the_help_flag() {
+    let warehouse = TestWarehouse::new("json-help-command");
+
+    // `help <command>` (alias `h`) is the same result as `<command> --help`: one success document.
+    let help = warehouse.run(&["--json", "h", "history"]);
+    assert_eq!(help.status.code(), Some(0));
+    let value = json(&help);
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["command"], "help");
+    let help_text = value["data"]["message"].as_str().unwrap();
+    assert!(help_text.contains(" history [OPTIONS]"), "{}", help_text);
+
+    // An unknown name is the same `usage` failure the parser reports for one, not a generic error.
+    let unknown = warehouse.run(&["--json", "help", "bogus"]);
+    assert_eq!(unknown.status.code(), Some(2));
+    let value = json(&unknown);
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["error"]["code"], "usage");
+}
+
+#[test]
+fn every_json_document_starts_with_the_header_in_its_documented_order() {
+    let warehouse = TestWarehouse::new("json-key-order");
+
+    // The order is checked on the raw text: a parsed `Value` would hide it.
+    let header = "{\n  \"lonic_json\": 1,\n  \"tool\": \"forklift\",\n  \"schema\": 2,\n  \"command\": ";
+
+    for args in [&["--json", "version"][..], &["--json", "bogus"], &["--json", "stocktake"]] {
+        let output = warehouse.run(args);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.starts_with(header), "{:?}: {}", args, stdout);
+
+        let after_command = &stdout[header.len()..];
+        let ok = after_command.find("\n  \"ok\": ").expect("ok follows command");
+        assert!(!after_command[..ok].contains("\n  \""), "{:?}: {}", args, stdout);
+    }
 }
 
 #[test]
