@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use serde::Serialize;
 use forklift_core::globals;
 use forklift_core::util::path_utils::WarehousePath;
+use forklift_core::util::progress_utils::Progress;
 use forklift_core::util::scope_utils::{MaterializationScope, ScopeClass};
 use forklift_core::util::{
     bay_utils, file_utils, object_utils, pallet_utils, scope_utils, shift_utils, warehouse_utils,
@@ -99,7 +100,7 @@ fn add(name: &str, path: Option<String>, scope_paths: Vec<String>) -> Result<(),
         scope_utils::set_bay_scope(&scope)?;
     }
 
-    shift_utils::materialize_tree(None, &tree, "Creating the bay")?;
+    shift_utils::materialize_tree(None, &tree, "Creating the bay", &Progress::NONE)?;
 
     output::emit(&BayCreated {
         name: name.to_string(),

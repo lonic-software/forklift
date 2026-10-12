@@ -4,6 +4,7 @@ use forklift_core::enums::config_scope::ConfigScope;
 use forklift_core::error;
 use forklift_core::model::remote::WarehouseInfo;
 use forklift_core::util::path_utils::WarehousePath;
+use forklift_core::util::progress_utils::Progress;
 use forklift_core::util::remote_utils::{RemoteClient, TorSettings};
 use forklift_core::util::scope_utils::MaterializationScope;
 use forklift_core::util::{
@@ -254,7 +255,7 @@ async fn franchise_into_prepared_target(
         return Ok(());
     };
 
-    let stats = remote_utils::fetch_history_scoped(client, &remote_head, &fetch_scope).await?;
+    let stats = remote_utils::fetch_history_scoped(client, &remote_head, &fetch_scope, &Progress::NONE).await?;
 
     let tree_hash = object_utils::load_parcel(&remote_head)?.tree_hash;
 
@@ -297,7 +298,7 @@ async fn franchise_into_prepared_target(
     // own, to justify a franchise failure having two different recovery contracts depending on
     // which step failed. The error is at least pointed at `--only` below, so a retry that hits
     // the same offending path again has a way past it that doesn't require a different target.
-    shift_utils::materialize_tree(None, &tree_hash, "Franchising").map_err(|e| error::append_to_message(
+    shift_utils::materialize_tree(None, &tree_hash, "Franchising", &Progress::NONE).map_err(|e| error::append_to_message(
         e,
         "(the signed history was already fetched and verified; only checking out the working \
         tree failed. A retry re-fetches from scratch rather than resuming — if the same path \

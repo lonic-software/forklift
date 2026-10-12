@@ -3784,7 +3784,7 @@ mod tests {
         let compressed = zstd::encode_all(packed_content.as_slice(), 0).unwrap();
         let (folder, file_name) = get_path_for_object(&packed_hash).unwrap();
         write_object_to_file(Path::new(&folder), &file_name, compressed).unwrap();
-        crate::util::pack_utils::compact(false, false).unwrap();
+        crate::util::pack_utils::compact(false, false, &crate::util::progress_utils::Progress::NONE).unwrap();
 
         // A loose object, written *after* compaction so it stays loose.
         let loose_content = vec![0x33u8; 500];
@@ -4251,7 +4251,7 @@ mod tests {
             let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
             parcel_object.store().unwrap();
             crate::util::pallet_utils::set_pallet_head("main", &parcel_object.hash).unwrap();
-            crate::util::pack_utils::compact(false, false).unwrap();
+            crate::util::pack_utils::compact(false, false, &crate::util::progress_utils::Progress::NONE).unwrap();
 
             let start = Instant::now();
             for hash in &hashes {

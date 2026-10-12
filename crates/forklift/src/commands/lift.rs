@@ -1,12 +1,14 @@
 use serde::Serialize;
 use forklift_core::error::CoreError;
 use forklift_core::enums::config_scope::ConfigScope;
+use forklift_core::util::progress_utils::Progress;
 use forklift_core::util::remote_utils::{LiftResult, RemoteClient};
 use forklift_core::util::{
     config_utils, file_utils, merge_utils, object_utils, pallet_utils,
     remote_utils, scope_utils,
 };
 use crate::commands::consolidate::{self, MergeStatus};
+use crate::events;
 use crate::output::{self, CommandOutput};
 
 /// The most times a single lift will auto-merge a diverged remote before giving up (a
@@ -27,6 +29,7 @@ const MAX_AUTO_MERGES: usize = 5;
 pub async fn handle_command() -> Result<(), String> {
     ensure_origin_remote()?;
 
+    let progress = events::progress();
     let mut auto_merged = 0usize;
 
     // Optimistic lift (§7.7): a diverged push whose merge is clean auto-lowers,
@@ -63,7 +66,7 @@ pub async fn handle_command() -> Result<(), String> {
         // If the remote diverged and the merge is clean, auto-merge and retry rather than
         // stopping. Overlapping changes fall through to the diverged error below.
         if let Some(remote) = &remote_head {
-            if remote != &head && auto_merged < MAX_AUTO_MERGES && try_auto_merge(&client, &pallet, &head, remote).await? {
+            if remote != &head && auto_merged < MAX_AUTO_MERGES && try_auto_merge(&client, &pallet, &head, remote, &progress).await? {
                 auto_merged += 1;
                 continue;
             }
@@ -81,7 +84,7 @@ pub async fn handle_command() -> Result<(), String> {
             uploaded_signatures: 0,
         };
 
-        match remote_utils::lift_pallet(&client, &pallet, &head, remote_head.as_deref(), info.chunking).await? {
+        match remote_utils::lift_pallet(&client, &pallet, &head, remote_head.as_deref(), info.chunking, &progress).await? {
             LiftResult::UpToDate => report.up_to_date = true,
             LiftResult::Lifted(stats) => {
                 report.new_parcels = stats.new_parcels;
@@ -137,13 +140,14 @@ fn ensure_origin_remote() -> Result<(), CoreError> {
 async fn try_auto_merge(client: &RemoteClient,
                         pallet: &str,
                         head: &str,
-                        remote_head: &str) -> Result<bool, String> {
+                        remote_head: &str,
+                        progress: &Progress) -> Result<bool, String> {
     // Their work must be local before we can compare ancestry or merge it. Path-pruned in a
     // sparse workspace (a full fetch scope makes this the whole closure, as before), so an
     // optimistic auto-merge stays as sparse as the workspace it runs in.
     if !file_utils::does_object_exist(remote_head)? {
         let fetch_scope = scope_utils::read_fetch_scope()?;
-        remote_utils::fetch_history_scoped(client, remote_head, &fetch_scope).await?;
+        remote_utils::fetch_history_scoped(client, remote_head, &fetch_scope, progress).await?;
     }
 
     let diverged = !merge_utils::is_ancestor(remote_head, head)?   // we do not already contain them

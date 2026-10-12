@@ -20,6 +20,7 @@ use crate::enums::config_scope::ConfigScope;
 use crate::error::{CoreError, RefusalCode};
 use crate::globals::{self, StorageRootScope};
 use crate::util::office_utils::OFFICE_PALLET_NAME;
+use crate::util::progress_utils::Progress;
 use crate::util::scope_utils::{self, MaterializationScope, ScopeClass};
 use crate::util::{
     bundle_utils, config_utils, file_utils, merge_utils, object_utils, office_utils,
@@ -3677,8 +3678,12 @@ impl Drop for RemoveTempOnDrop<'_> {
 /// # Returns
 /// * `Ok(FetchStats)` - What was actually transferred, and how many parcels were walked.
 /// * `Err(String)`    - If a transfer or verification failed.
-pub async fn fetch_history(client: &RemoteClient, head: &str) -> Result<FetchStats, String> {
+pub async fn fetch_history(client: &RemoteClient,
+                           head: &str,
+                           progress: &Progress) -> Result<FetchStats, String> {
     let mut stats = FetchStats::default();
+
+    progress.status("Fetching history");
 
     // Every local ref head — user pallets and meta pallets alike — and therefore every
     // closure already known complete. Empty for a franchise into a fresh warehouse, which
@@ -3713,6 +3718,7 @@ pub async fn fetch_history(client: &RemoteClient, head: &str) -> Result<FetchSta
         stats.walked_parcels += wave.len();
         stats.fetched_objects += fetch_missing_objects(client, &wave).await?;
         stats.fetched_signatures += fetch_missing_signatures(client, &wave).await?;
+        report_fetch(progress, &stats);
 
         // The parcels are present now; their trees and parents drive the next waves.
         let mut tree_frontier: Vec<String> = Vec::new();
@@ -3760,6 +3766,7 @@ pub async fn fetch_history(client: &RemoteClient, head: &str) -> Result<FetchSta
 
             stats.fetched_objects += fetch_missing_objects(client, &blob_wave).await?;
             stats.fetched_objects += fetch_recipe_chunks(client, &recipe_wave).await?;
+            report_fetch(progress, &stats);
         }
     }
 
@@ -3791,9 +3798,10 @@ pub async fn fetch_history(client: &RemoteClient, head: &str) -> Result<FetchSta
 /// * `Err(String)`    - If a transfer or verification failed.
 pub async fn fetch_history_scoped(client: &RemoteClient,
                                   head: &str,
-                                  scope: &MaterializationScope) -> Result<FetchStats, String> {
+                                  scope: &MaterializationScope,
+                                  progress: &Progress) -> Result<FetchStats, String> {
     if scope.is_full() {
-        return fetch_history(client, head).await;
+        return fetch_history(client, head, progress).await;
     }
 
     // Bound the walk at local ref heads, exactly like `fetch_history`: a closure already known
@@ -3803,7 +3811,7 @@ pub async fn fetch_history_scoped(client: &RemoteClient,
         .map(|(_, head)| head)
         .collect();
 
-    fetch_scoped_from(client, head, scope, &complete).await
+    fetch_scoped_from(client, head, scope, &complete, progress).await
 }
 
 /// Fetch the content newly brought into `scope` across a head's whole history — the walk behind
@@ -3825,10 +3833,10 @@ pub async fn fetch_expanded(client: &RemoteClient,
                             head: &str,
                             scope: &MaterializationScope) -> Result<FetchStats, String> {
     if scope.is_full() {
-        return fetch_history(client, head).await;
+        return fetch_history(client, head, &Progress::NONE).await;
     }
 
-    fetch_scoped_from(client, head, scope, &[]).await
+    fetch_scoped_from(client, head, scope, &[], &Progress::NONE).await
 }
 
 /// The shared path-pruned walk behind [`fetch_history_scoped`] and [`fetch_expanded`]: fetch the
@@ -3838,8 +3846,11 @@ pub async fn fetch_expanded(client: &RemoteClient,
 async fn fetch_scoped_from(client: &RemoteClient,
                            head: &str,
                            scope: &MaterializationScope,
-                           complete: &[String]) -> Result<FetchStats, String> {
+                           complete: &[String],
+                           progress: &Progress) -> Result<FetchStats, String> {
     let mut stats = FetchStats::default();
+
+    progress.status("Fetching history");
 
     let mut parcel_frontier: Vec<String> = vec![head.to_string()];
     let mut seen_parcels: HashSet<String> = HashSet::new();
@@ -3872,6 +3883,7 @@ async fn fetch_scoped_from(client: &RemoteClient,
         stats.walked_parcels += wave.len();
         stats.fetched_objects += fetch_missing_objects(client, &wave).await?;
         stats.fetched_signatures += fetch_missing_signatures(client, &wave).await?;
+        report_fetch(progress, &stats);
 
         // Each parcel's root tree is a spine node (path ""); descend the spine, collecting the
         // in-scope subtree roots whose full closure the batched walk below fetches.
@@ -3970,6 +3982,7 @@ async fn fetch_scoped_from(client: &RemoteClient,
 
             stats.fetched_objects += fetch_missing_objects(client, &blob_wave).await?;
             stats.fetched_objects += fetch_recipe_chunks(client, &recipe_wave).await?;
+            report_fetch(progress, &stats);
         }
     }
 
@@ -3978,6 +3991,14 @@ async fn fetch_scoped_from(client: &RemoteClient,
 
 /// Join a warehouse path key with a child name (root key is the empty string). A local copy of
 /// the same rule the tree walks elsewhere use, kept here so the fetch has no cross-module dep.
+/// Report how far a history fetch has got. Its total is not known until the walk ends, so the
+/// report carries the running counts rather than a percentage.
+fn report_fetch(progress: &Progress, stats: &FetchStats) {
+    progress.indeterminate(|| format!(
+        "{} parcels walked, {} objects fetched", stats.walked_parcels, stats.fetched_objects
+    ));
+}
+
 fn scope_join(key: &str, name: &str) -> String {
     if key.is_empty() {
         name.to_string()
@@ -4321,6 +4342,7 @@ async fn fetch_missing_signatures(client: &RemoteClient,
 /// * `pallet`      - The pallet name on the remote.
 /// * `local_head`  - The local head parcel of the pallet.
 /// * `remote_head` - The remote's current head of the pallet (from the handshake).
+/// * `progress`    - Where to report the lift's phases and how many objects have uploaded.
 ///
 /// # Returns
 /// * `Ok(LiftResult)` - Up to date, or the transfer stats.
@@ -4329,8 +4351,9 @@ pub async fn lift_pallet(client: &RemoteClient,
                          pallet: &str,
                          local_head: &str,
                          remote_head: Option<&str>,
-                         chunking_supported: bool) -> Result<LiftResult, String> {
-    lift_pallet_inner(client, pallet, local_head, remote_head, false, chunking_supported).await
+                         chunking_supported: bool,
+                         progress: &Progress) -> Result<LiftResult, String> {
+    lift_pallet_inner(client, pallet, local_head, remote_head, false, chunking_supported, progress).await
 }
 
 /// `lift_pallet`, allowing one sanctioned non-descendant update: the office lift right
@@ -4342,7 +4365,8 @@ async fn lift_pallet_inner(client: &RemoteClient,
                            local_head: &str,
                            remote_head: Option<&str>,
                            adopted_reset: bool,
-                           chunking_supported: bool) -> Result<LiftResult, String> {
+                           chunking_supported: bool,
+                           progress: &Progress) -> Result<LiftResult, String> {
     if remote_head == Some(local_head) {
         return Ok(LiftResult::UpToDate);
     }
@@ -4368,6 +4392,8 @@ async fn lift_pallet_inner(client: &RemoteClient,
     // The new parcels the remote does not have, ordered parents-first — see
     // `new_parcels_parents_first`, which owns both the walk and the order the candidate
     // loop below depends on.
+    progress.status("Finding objects to lift");
+
     let new_parcels = new_parcels_parents_first(local_head, remote_head)?;
 
     // Candidate objects for the negotiation: each new parcel's tree, walked against
@@ -4416,9 +4442,11 @@ async fn lift_pallet_inner(client: &RemoteClient,
     // One flow serves both heads: negotiate upload targets, PUT the missing objects straight to
     // presigned staging URLs and/or to the control plane, and commit the staged session. Falls
     // back to `missing` + per-object `PUT` against a remote that predates `upload-targets`.
+    progress.status("Uploading objects");
+
     let session = new_lift_session();
     let uploaded_objects = negotiate_and_upload(
-        client, &session, &candidates, &control_plane, chunking_supported,
+        client, &session, &candidates, &control_plane, chunking_supported, progress,
     ).await?;
 
     // The signatures of the new parcels travel with them.
@@ -4788,8 +4816,11 @@ fn set_test_retrieval_delay(delay: std::time::Duration) {
     TEST_RETRIEVAL_DELAY.with(|cell| cell.set(delay));
 }
 
-/// Upload (concurrently) the objects of the given hashes.
-async fn upload_objects(client: &RemoteClient, hashes: &[String]) -> Result<(), String> {
+/// Upload (concurrently) the objects of the given hashes, calling `on_uploaded` once per object
+/// as each upload finishes.
+async fn upload_objects(client: &RemoteClient,
+                        hashes: &[String],
+                        on_uploaded: &mut dyn FnMut()) -> Result<(), String> {
     if hashes.is_empty() {
         return Ok(());
     }
@@ -4819,7 +4850,7 @@ async fn upload_objects(client: &RemoteClient, hashes: &[String]) -> Result<(), 
         });
     }
 
-    join_all(tasks).await.map(|_| ())
+    join_all_with(tasks, on_uploaded).await.map(|_| ())
 }
 
 /// Refuse a lift whose commit would need more than one paginated batch (§9.4b Stage 3, W3) when
@@ -4856,17 +4887,20 @@ fn refuse_if_commit_pagination_unsupported(staged_count: usize,
 /// `chunking_supported` gates nothing about chunked files here (that refusal already fired
 /// earlier, in the closure walk) — it gates whether *this* remote understands paginated commits at
 /// all (§9.4b W3), which matters for *any* large lift, chunked or not.
+///
+/// `progress` hears each finished upload against the total the negotiation settled on.
 async fn negotiate_and_upload(client: &RemoteClient,
                               session: &str,
                               candidates: &[String],
                               control_plane: &HashSet<String>,
-                              chunking_supported: bool) -> Result<usize, String> {
+                              chunking_supported: bool,
+                              progress: &Progress) -> Result<usize, String> {
     let Some(negotiation) = client.upload_targets(session, candidates).await? else {
         // An older remote with no `upload-targets`: negotiate the missing set and PUT each body
         // to the control plane, exactly as before. No staging, no commit batching — each object is
         // verified inline on its own PUT, so the pagination gate below does not apply here.
         let missing = client.missing_objects(candidates).await?;
-        upload_objects(client, &missing).await?;
+        upload_objects(client, &missing, &mut upload_tally(progress, missing.len())).await?;
         return Ok(missing.len());
     };
 
@@ -4883,8 +4917,9 @@ async fn negotiate_and_upload(client: &RemoteClient,
 
     // `present` is already on the remote (skip). `direct` goes to the control plane for inline
     // verification; `targets` go straight to storage under the session's staging prefix.
-    upload_objects(client, &negotiation.direct).await?;
-    upload_to_targets(client, &negotiation.targets).await?;
+    let mut tally = upload_tally(progress, negotiation.direct.len() + negotiation.targets.len());
+    upload_objects(client, &negotiation.direct, &mut tally).await?;
+    upload_to_targets(client, &negotiation.targets, &mut tally).await?;
 
     // Only a staging head hands back targets; a direct head's are empty and it needs no commit
     // (every `direct` PUT was verified inline). When there was staging, the commit verifies and
@@ -4895,6 +4930,16 @@ async fn negotiate_and_upload(client: &RemoteClient,
     }
 
     Ok(negotiation.direct.len() + negotiation.targets.len())
+}
+
+/// A per-upload callback reporting `done/total` into `progress` — one tally shared by every
+/// upload batch of a lift, so its percentage runs once from 0 to 100.
+fn upload_tally(progress: &Progress, total: usize) -> impl FnMut() + '_ {
+    let mut done = 0usize;
+    move || {
+        done += 1;
+        progress.fraction(done, total, || format!("{}/{} objects", done, total));
+    }
 }
 
 /// Split the staged hashes into the control-plane objects (parcels and trees — promoted
@@ -4908,9 +4953,11 @@ fn classify_staged(targets: &BTreeMap<String, String>,
 }
 
 /// Upload (concurrently) the staged objects to their presigned storage URLs — the same bounded
-/// fan-out the fetch and direct-upload paths use ([`CONCURRENT_TRANSFERS`]).
+/// fan-out the fetch and direct-upload paths use ([`CONCURRENT_TRANSFERS`]) — calling
+/// `on_uploaded` once per object as each upload finishes.
 async fn upload_to_targets(client: &RemoteClient,
-                           targets: &BTreeMap<String, String>) -> Result<(), String> {
+                           targets: &BTreeMap<String, String>,
+                           on_uploaded: &mut dyn FnMut()) -> Result<(), String> {
     if targets.is_empty() {
         return Ok(());
     }
@@ -4940,7 +4987,7 @@ async fn upload_to_targets(client: &RemoteClient,
         });
     }
 
-    join_all(tasks).await.map(|_| ())
+    join_all_with(tasks, on_uploaded).await.map(|_| ())
 }
 
 /// Commit a staged lift session, paginating the hash lists and retrying each batch with bounded
@@ -5063,12 +5110,22 @@ fn build_commit_batches(control_plane: &[String],
 /// This guarantee holds only while the returned future is polled to completion: wrapping this
 /// call in `tokio::time::timeout` or a `select!` branch can drop the `JoinSet` without draining
 /// it, reinstating the race this function exists to close.
-async fn join_all<T: Send + 'static>(mut tasks: JoinSet<Result<T, String>>) -> Result<Vec<T>, String> {
+async fn join_all<T: Send + 'static>(tasks: JoinSet<Result<T, String>>) -> Result<Vec<T>, String> {
+    join_all_with(tasks, &mut || {}).await
+}
+
+/// [`join_all`], calling `on_done` once for each task that succeeds, as it is joined — the hook
+/// the upload paths count progress through.
+async fn join_all_with<T: Send + 'static>(mut tasks: JoinSet<Result<T, String>>,
+                                          on_done: &mut dyn FnMut()) -> Result<Vec<T>, String> {
     let mut results: Vec<T> = Vec::new();
 
     while let Some(result) = tasks.join_next().await {
         match result.map_err(|e| format!("A transfer task failed: {}", e)).and_then(|inner| inner) {
-            Ok(value) => results.push(value),
+            Ok(value) => {
+                on_done();
+                results.push(value);
+            }
             Err(first_error) => {
                 return Err(match drain_remaining(tasks).await {
                     Some(panic_note) => format!("{} (additionally, {})", first_error, panic_note),
@@ -5235,7 +5292,7 @@ pub async fn adopt_remote_trust(client: &RemoteClient,
         }
     }
 
-    stats.fetch = fetch_history(client, remote_office_head).await?;
+    stats.fetch = fetch_history(client, remote_office_head, &Progress::NONE).await?;
 
     if office_utils::read_trust_anchor()?.is_none() {
         office_utils::write_trust_anchor(&remote_trust.to_anchor())?;
@@ -5311,7 +5368,7 @@ pub async fn accept_regenesis(client: &RemoteClient) -> Result<(office_utils::Tr
     let remote_office_head = info.pallets.get(&office_utils::office_wire_key())
         .ok_or("The remote has a trust anchor but no office pallet; it is corrupt.".to_string())?;
 
-    fetch_history(client, remote_office_head).await?;
+    fetch_history(client, remote_office_head, &Progress::NONE).await?;
 
     // Never adopt an anchor whose chain does not even verify against itself.
     let new_anchor = remote_trust.to_anchor();
@@ -5396,6 +5453,7 @@ pub async fn push_local_trust(client: &RemoteClient,
         // The office pallet carries only structural, tracked-metadata objects — never a chunked
         // file — so the capability never actually gates it; threaded honestly all the same.
         info.chunking,
+        &Progress::NONE,
     ).await?;
 
     Ok(Some(result))
@@ -5440,7 +5498,7 @@ pub async fn lift_meta_pallets(client: &RemoteClient,
         let remote_head = info.pallets.get(&wire).map(String::as_str);
 
         // Meta pallets never carry a chunked file; the capability is threaded for uniformity.
-        let result = lift_pallet(client, &wire, &local_head, remote_head, info.chunking).await?;
+        let result = lift_pallet(client, &wire, &local_head, remote_head, info.chunking, &Progress::NONE).await?;
         lifts.push(MetaPalletLift { pallet: wire, result });
     }
 
@@ -5487,7 +5545,7 @@ pub async fn adopt_meta_pallets(client: &RemoteClient,
 
         match pallet_utils::get_meta_pallet_head(name)? {
             None => {
-                fetch_history(client, remote_head).await?;
+                fetch_history(client, remote_head, &Progress::NONE).await?;
                 pallet_utils::set_meta_pallet_head(name, remote_head)?;
                 result.adopted.push(key.clone());
             }
@@ -5498,7 +5556,7 @@ pub async fn adopt_meta_pallets(client: &RemoteClient,
             Some(local) => {
                 // A fast-forward or a divergence — deciding either needs the remote head's
                 // ancestry, so fetch it first, then classify.
-                fetch_history(client, remote_head).await?;
+                fetch_history(client, remote_head, &Progress::NONE).await?;
 
                 if merge_utils::is_ancestor(&local, remote_head)? {
                     pallet_utils::set_meta_pallet_head(name, remote_head)?;
@@ -6602,7 +6660,7 @@ mod tests {
         let client = RemoteClient::new("http://127.0.0.1:1", None).unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
 
-        let error = runtime.block_on(upload_objects(&client, &[hash.clone()])).unwrap_err();
+        let error = runtime.block_on(upload_objects(&client, &[hash.clone()], &mut || {})).unwrap_err();
         let (code, message, next_step) = scope_utils::decode_refusal(&error)
             .expect("the refusal must decode via the shared sentinel framing");
 
@@ -6623,7 +6681,7 @@ mod tests {
         targets.insert(hash.clone(), "http://127.0.0.1:1/presigned".to_string());
 
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        let error = runtime.block_on(upload_to_targets(&client, &targets)).unwrap_err();
+        let error = runtime.block_on(upload_to_targets(&client, &targets, &mut || {})).unwrap_err();
         let (code, message, _) = scope_utils::decode_refusal(&error)
             .expect("the refusal must decode via the shared sentinel framing");
 
@@ -6707,7 +6765,7 @@ mod tests {
                 }
             });
 
-            let outcome = upload_objects(&client, &[hash]).await;
+            let outcome = upload_objects(&client, &[hash], &mut || {}).await;
             ticker.abort();
             outcome
         });
@@ -6906,7 +6964,7 @@ mod tests {
 
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let error = runtime.block_on(negotiate_and_upload(
-            &client, "session-1", &candidates, &control_plane, false,
+            &client, "session-1", &candidates, &control_plane, false, &Progress::NONE,
         )).expect_err("a commit needing multiple batches must refuse a non-chunking remote");
 
         let (code, message, _) = scope_utils::decode_refusal(&error)
@@ -6932,7 +6990,7 @@ mod tests {
 
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         runtime.block_on(negotiate_and_upload(
-            &client, "session-3", &candidates, &control_plane, false,
+            &client, "session-3", &candidates, &control_plane, false, &Progress::NONE,
         )).expect("a single-batch lift to an old server is unaffected by the pagination gate");
 
         assert!(
@@ -7491,7 +7549,7 @@ mod tests {
             std::path::Path::new(&resident_folder), &resident_file_name,
             zstd::encode_all(pack_resident_content.as_slice(), 0).unwrap()
         ).unwrap();
-        let stats = pack_utils::compact(false, false).unwrap();
+        let stats = pack_utils::compact(false, false, &crate::util::progress_utils::Progress::NONE).unwrap();
         assert_eq!(stats.objects_packed, 1, "the fixture object must actually land in a pack");
         assert!(pack_utils::is_in_packs(&pack_resident_hash).unwrap(), "fixture precondition: packed");
         let (pack_folder, pack_file_name) = file_utils::get_path_for_object(&pack_resident_hash).unwrap();

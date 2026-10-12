@@ -5,6 +5,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use forklift_core::util::progress_utils::Progress;
 
 /// Path to the compiled forklift binary (provided by cargo for integration tests).
 const FORKLIFT: &str = env!("CARGO_BIN_EXE_forklift");
@@ -2081,7 +2082,7 @@ fn a_sync_walks_the_gap_between_the_heads_not_the_history() {
         let client = forklift_core::util::remote_utils::RemoteClient::new(&server.url, None).unwrap();
 
         runtime
-            .block_on(forklift_core::util::remote_utils::fetch_history(&client, head))
+            .block_on(forklift_core::util::remote_utils::fetch_history(&client, head, &Progress::NONE))
             .expect("fetch")
     };
 
@@ -2879,7 +2880,7 @@ fn retiring_a_signer_then_lifting_only_a_replacement_pallet_refuses_instead_of_a
         let _scope = forklift_core::globals::StorageRootScope::enter(&area.path("tmp-clone"));
         let client = forklift_core::util::remote_utils::RemoteClient::new(&server.url, None).unwrap();
         runtime
-            .block_on(forklift_core::util::remote_utils::fetch_history(&client, &a1))
+            .block_on(forklift_core::util::remote_utils::fetch_history(&client, &a1, &Progress::NONE))
             .expect("fetch A1's ancestry");
     }
 

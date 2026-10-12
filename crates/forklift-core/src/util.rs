@@ -40,6 +40,7 @@ pub mod heal_utils;
 pub mod recovery_utils;
 pub mod path_utils;
 pub mod remote_utils;
+pub mod progress_utils;
 pub mod hook_utils;
 pub mod fanout_utils;
 pub mod chunk_utils;

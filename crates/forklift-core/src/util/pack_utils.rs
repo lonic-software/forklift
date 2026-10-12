@@ -90,6 +90,7 @@ const DELTA_WINDOW_MEMORY: usize = 64 * 1024 * 1024;
 /// Shared with `bundle_utils` and, crucially, enforced on the *read* side by
 /// `delta_utils::decompress_delta`, where it is the decompression-bomb bound.
 use crate::util::delta_utils::MAX_DELTA_TARGET_BYTES as MAX_DELTA_OBJECT_SIZE;
+use crate::util::progress_utils::Progress;
 
 /// The longest delta chain a base may already carry before a new delta refuses to extend it.
 /// Reconstructing a delta reads its base (recursively), so this bounds that recursion — the
@@ -1711,6 +1712,7 @@ struct WindowEntry {
 /// # Arguments
 /// * `all` - Repack existing packs too (drop packed garbage, consolidate), not just the loose set.
 /// * `redelta` - Re-delta every live packed object instead of copying it verbatim (see above).
+/// * `progress` - Where to report the run's phases and how far packing has got.
 ///
 /// # Returns
 /// * `Ok(CompactStats)` - What was packed and removed. Every new pack's directory entries are
@@ -1727,7 +1729,7 @@ struct WindowEntry {
 ///                        ever runs. A later `heal_utils::heal_if_tainted` call restages exactly
 ///                        the affected paths and clears the taint once they are durable again —
 ///                        `compact`'s own destructive sweep stays refused until then either way.
-pub fn compact(all: bool, redelta: bool) -> Result<CompactStats, String> {
+pub fn compact(all: bool, redelta: bool, progress: &Progress) -> Result<CompactStats, String> {
     let pack_folder = pack_folder();
     file_utils::create_folder_if_not_exists(&pack_folder)?;
 
@@ -1740,6 +1742,8 @@ pub fn compact(all: bool, redelta: bool) -> Result<CompactStats, String> {
     let _store_lock = lock_utils::StoreLock::acquire()?;
 
     remove_stale_temp_files(&pack_folder);
+
+    progress.status("Collecting objects");
 
     // The objects to pack, and the old pack files a repack supersedes.
     //
@@ -1832,6 +1836,8 @@ pub fn compact(all: bool, redelta: bool) -> Result<CompactStats, String> {
     // batch bounds the decompressed bytes held in memory at once.
     const BATCH_BYTES: u64 = 16 * 1024 * 1024;
     const BATCH_COUNT: usize = 1024;
+
+    progress.status("Packing objects");
 
     let mut start = 0;
     while start < targets.len() {
@@ -2059,6 +2065,8 @@ pub fn compact(all: bool, redelta: bool) -> Result<CompactStats, String> {
                 }
             }
         }
+
+        progress.fraction(start, targets.len(), || format!("{}/{} objects", start, targets.len()));
     }
 
     if let Some(pack) = writer.take() {
@@ -2100,6 +2108,8 @@ pub fn compact(all: bool, redelta: bool) -> Result<CompactStats, String> {
     // A file already gone is not an error: the `StoreLock` serializes compactions, but the
     // grace-period loose collector or a concurrent read-side cleanup can still have removed a
     // source first — the post-condition ("it is not loose") already holds, so tolerate NotFound.
+    progress.status("Removing packed originals");
+
     for source in &packed_sources {
         match std::fs::remove_file(source) {
             Ok(()) => stats.loose_removed += 1,
@@ -3690,7 +3700,7 @@ mod tests {
 
         // Compaction relocates the bytes (loose → pack), but the content for a hash is
         // immutable, so the cached value stays valid — no stale reads.
-        compact(false, false).unwrap();
+        compact(false, false, &Progress::NONE).unwrap();
         assert_eq!(file_utils::retrieve_object_by_hash(&hash).unwrap(), content);
 
         std::fs::remove_dir_all(&temp).ok();
@@ -3739,7 +3749,7 @@ mod tests {
         // Packs it; loose is removed, so the only path to this hash is now through a pack.
         // `compact`'s own trailing `invalidate_cache()` leaves the registry empty afterward —
         // nothing is mapped yet.
-        compact(false, false).unwrap();
+        compact(false, false, &Progress::NONE).unwrap();
 
         // A read through the real (uncached-content) path: this is what actually populates
         // `PACK_REGISTRY` with a live `Mmap` for the pack just written.
@@ -4030,7 +4040,7 @@ mod tests {
             store_loose(hash, content);
         }
 
-        let stats = compact(false, false).unwrap();
+        let stats = compact(false, false, &Progress::NONE).unwrap();
         assert_eq!(stats.objects_packed, 3);
         assert_eq!(stats.packs_written, 1);
         assert_eq!(stats.loose_removed, 3);
@@ -4088,7 +4098,7 @@ mod tests {
         let genuine_hash = blake3::hash(&genuine_content).to_hex().to_string();
         store_loose(&genuine_hash, &genuine_content);
 
-        let stats = compact(false, false).unwrap();
+        let stats = compact(false, false, &Progress::NONE).unwrap();
 
         assert!(corrupt_path.exists(), "a corrupt loose object must be left in place, never deleted");
         assert!(!is_in_packs(&good_hash).unwrap(),
@@ -4128,7 +4138,7 @@ mod tests {
         let genuine_hash = blake3::hash(&genuine_content).to_hex().to_string();
         store_loose(&genuine_hash, &genuine_content);
 
-        let result = compact(false, false);
+        let result = compact(false, false, &Progress::NONE);
         assert!(result.is_ok(), "one corrupt loose object must not abort the whole compact, got {:?}", result);
         let stats = result.unwrap();
         assert_eq!(stats.corrupt_skipped, 1);
@@ -4160,7 +4170,7 @@ mod tests {
         let (folder, file_name) = file_utils::get_path_for_object(&giant_hash).unwrap();
         let giant_path = Path::new(&folder).join(&file_name);
 
-        let stats = compact(false, false).unwrap();
+        let stats = compact(false, false, &Progress::NONE).unwrap();
 
         assert_eq!(stats.over_ceiling_skipped, 1);
         assert_eq!(stats.corrupt_skipped, 0, "a grandfathered giant is not corruption");
@@ -4216,7 +4226,7 @@ mod tests {
         // this test corrupts below must be the blob: the one object in this fixture the graph
         // build never reads, so the read cache is never warmed with its pre-corruption bytes and
         // the corruption below is guaranteed to actually reach disk on the next read.
-        let stats = compact(false, false).unwrap();
+        let stats = compact(false, false, &Progress::NONE).unwrap();
         assert_eq!(stats.objects_packed, 3);
 
         let pack_path = std::fs::read_dir(pack_folder()).unwrap()
@@ -4240,14 +4250,14 @@ mod tests {
         data[flip_at] ^= 0xFF;
         // Drop the mmap'd pack registry *before* rewriting the pack file: on Windows a file with a
         // user-mapped section open cannot be written (os error 1224) — the same handle constraint
-        // `compact`'s own drop-before-delete guards against. `compact(true, true)` below reloads.
+        // `compact`'s own drop-before-delete guards against. `compact(true, true, &Progress::NONE)` below reloads.
         invalidate_cache();
         std::fs::write(&pack_path, &data).unwrap();
 
         // `--all --redelta` forces every live packed object through `Source::Reconstruct` (see
         // `collect_targets`) -- the same path a dropped-base repack already uses -- never
         // `Source::Loose`, so this can never become `CorruptLoose`.
-        let result = compact(true, true);
+        let result = compact(true, true, &Progress::NONE);
         assert!(result.is_err(), "a corrupt packed record reached via Reconstruct must abort, not skip");
         assert!(pack_path.exists(), "abort must precede old-pack removal -- the corrupt pack must survive");
 
@@ -4359,7 +4369,7 @@ mod tests {
         // genuine pack -- pack A. No existing packs yet, so nothing here is a `CopyRecord`; this
         // just gets X (and its tree/parcel) off loose and into a real pack the way any first
         // `compact --all` would.
-        let first = compact(true, false).unwrap();
+        let first = compact(true, false, &Progress::NONE).unwrap();
         assert_eq!(first.objects_packed, 3, "sanity: blob + tree + parcel all packed");
         assert!(!is_stored_as_delta(&x_hash),
             "sanity: X must land as a full record for this fixture -- a delta would exercise a \
@@ -4438,7 +4448,7 @@ mod tests {
         // enumerates first) and copies it verbatim -- never reconstructed, never hash-checked on
         // this path. Every old pack (the duplicate *and* pack A, the good copy) is deleted once
         // this repack completes.
-        let second = compact(true, false).unwrap();
+        let second = compact(true, false, &Progress::NONE).unwrap();
         assert_eq!(second.objects_packed, 3, "sanity: the repack still carries all three live objects forward");
 
         // The repack did happen: the duplicate's own (distinctly-named) files are gone, and only
@@ -4545,7 +4555,7 @@ mod tests {
 
         // First `compact --all`: X is packed good into pack A. No existing packs yet, so nothing
         // here is a `CopyRecord` -- this is a genuine, verified pack.
-        let first = compact(true, false).unwrap();
+        let first = compact(true, false, &Progress::NONE).unwrap();
         assert_eq!(first.objects_packed, 3, "sanity: blob + tree + parcel all packed");
 
         let (folder, file_name) = file_utils::get_path_for_object(&x_hash).unwrap();
@@ -4560,7 +4570,7 @@ mod tests {
 
         // Second `compact --all`: X is live and present both loose (corrupt) and packed (good,
         // in pack A). Must consolidate to the good copy and delete the corrupt loose duplicate.
-        let second = compact(true, false).unwrap();
+        let second = compact(true, false, &Progress::NONE).unwrap();
         assert_eq!(second.objects_packed, 3, "sanity: the repack still carries all three live objects forward");
 
         assert!(!corrupt_loose_path.exists(),
@@ -4648,7 +4658,7 @@ mod tests {
         parcel_object.store().unwrap();
         pallet_utils::set_pallet_head("main", &parcel_object.hash).unwrap();
 
-        let first = compact(true, false).unwrap();
+        let first = compact(true, false, &Progress::NONE).unwrap();
         assert_eq!(first.objects_packed, 3, "sanity: blob + tree + parcel all packed");
         assert!(!is_stored_as_delta(&x_hash),
             "sanity: X must land as a full record for this fixture, see T1a's doc comment above");
@@ -4710,7 +4720,7 @@ mod tests {
             "fixture defect: X is still servable (warm read cache or corruption did not take) -- \
             the compact under test would be rescued, not exercised");
 
-        let result = compact(true, false);
+        let result = compact(true, false, &Progress::NONE);
         let error = match result {
             Err(e) => e,
             Ok(_) => panic!("compact must abort when no copy of a duplicated live hash verifies, got Ok"),
@@ -4793,7 +4803,7 @@ mod tests {
         parcel_object.store().unwrap();
         pallet_utils::set_pallet_head("main", &parcel_object.hash).unwrap();
 
-        let first = compact(true, false).unwrap();
+        let first = compact(true, false, &Progress::NONE).unwrap();
         assert_eq!(first.objects_packed, 3, "sanity: blob + tree + parcel all packed");
         assert!(!is_stored_as_delta(&x_hash),
             "sanity: X must land as a full record for this fixture, see T1a's doc comment above");
@@ -4845,7 +4855,7 @@ mod tests {
             "fixture defect: X is still servable (warm read cache or corruption did not take) -- \
             the compact under test would be rescued, not exercised");
 
-        let result = compact(true, false);
+        let result = compact(true, false, &Progress::NONE);
         assert!(result.is_ok(),
             "a byte-identical duplicate (even a corrupt one) must keep the verbatim CopyRecord \
             fast path and never abort the repack, got {:?}", result);
@@ -4896,7 +4906,7 @@ mod tests {
         parcel_object.store().unwrap();
         pallet_utils::set_pallet_head("main", &parcel_object.hash).unwrap();
 
-        let first = compact(true, false).unwrap();
+        let first = compact(true, false, &Progress::NONE).unwrap();
         assert_eq!(first.objects_packed, 3, "sanity: blob + tree + parcel all packed");
 
         let folder = pack_folder();
@@ -4925,7 +4935,7 @@ mod tests {
             assert_eq!(loaded.packs[0].data_path, dup_data, "sanity: the duplicate must enumerate first");
         }
 
-        let second = compact(true, false).unwrap();
+        let second = compact(true, false, &Progress::NONE).unwrap();
         assert_eq!(second.objects_packed, 3, "sanity: the repack still carries all three live objects forward");
 
         let packs_remaining: Vec<PathBuf> = std::fs::read_dir(&folder).unwrap()
@@ -5028,7 +5038,7 @@ mod tests {
         assert_eq!(pre_repack, giant, "the pre-repack read must return the giant's real bytes");
 
         let folder = pack_folder();
-        let stats = compact(true, false).unwrap();
+        let stats = compact(true, false, &Progress::NONE).unwrap();
 
         assert_eq!(stats.objects_packed, 3, "sanity: giant + tree + parcel all carried forward");
         assert_eq!(stats.over_ceiling_skipped, 0,
@@ -5082,7 +5092,7 @@ mod tests {
         assert!(loose_path.exists(), "sanity: the loose source exists before compacting");
 
         let _guard = SyncDirFaultGuard::failing("pack");
-        let error = match compact(false, false) {
+        let error = match compact(false, false, &Progress::NONE) {
             Err(e) => e,
             Ok(_) => panic!("a blocked pack directory must fail compact's new-pack sync"),
         };
@@ -5123,7 +5133,7 @@ mod tests {
         std::fs::create_dir_all(&taint_dir).unwrap();
         std::fs::write(taint_dir.join("taint-99999-0"), b"objects/zz/preexisting\nEND\n").unwrap();
 
-        let error = match compact(false, false) {
+        let error = match compact(false, false, &Progress::NONE) {
             Err(e) => e,
             Ok(_) => panic!("a standing taint must fail compact's re-check even with a clean sync"),
         };
@@ -5165,7 +5175,7 @@ mod tests {
 
         let full_size: u64 = contents.iter().map(|c| c.len() as u64).sum();
 
-        let stats = compact(false, false).unwrap();
+        let stats = compact(false, false, &Progress::NONE).unwrap();
         assert_eq!(stats.objects_packed, 30);
         assert!(stats.deltas > 0, "similar objects should be stored as deltas (got {})", stats.deltas);
 
@@ -5525,7 +5535,7 @@ mod tests {
         store_loose(&hash, &content);
 
         // Pack it (loose -> pack, loose file deleted). In-process this also invalidated the cache.
-        compact(false, false).unwrap();
+        compact(false, false, &Progress::NONE).unwrap();
 
         // Simulate the stale peer: poison this process's registry back to "no packs" even though
         // the pack is on disk and the loose file is gone. A naive read now misses on both paths.
@@ -5554,9 +5564,9 @@ mod tests {
         store_loose(&blake3::hash(&content).to_hex().to_string(), &content);
 
         let held = lock_utils::StoreLock::acquire().expect("hold the store lock");
-        assert!(compact(false, false).is_err(), "compact must refuse while the shared store lock is held");
+        assert!(compact(false, false, &Progress::NONE).is_err(), "compact must refuse while the shared store lock is held");
         drop(held);
-        assert!(compact(false, false).is_ok(), "compact runs once the store lock is free");
+        assert!(compact(false, false, &Progress::NONE).is_ok(), "compact runs once the store lock is free");
 
         std::fs::remove_dir_all(&temp).ok();
     }
@@ -5583,11 +5593,11 @@ mod tests {
         // Two separate incremental packs, so the repack has more than one old pack to supersede.
         let content_a = b"first pack content".to_vec();
         store_loose(&blake3::hash(&content_a).to_hex().to_string(), &content_a);
-        compact(false, false).unwrap();
+        compact(false, false, &Progress::NONE).unwrap();
 
         let content_b = b"second pack content".to_vec();
         store_loose(&blake3::hash(&content_b).to_hex().to_string(), &content_b);
-        compact(false, false).unwrap();
+        compact(false, false, &Progress::NONE).unwrap();
 
         let pack_paths_before: Vec<PathBuf> = std::fs::read_dir(pack_folder()).unwrap()
             .filter_map(|e| e.ok())
@@ -5598,7 +5608,7 @@ mod tests {
 
         // No pallet refs exist in this bare store, so the live set is empty: a repack must drop
         // every packed object as garbage and remove both old packs entirely.
-        let stats = compact(true, false).unwrap();
+        let stats = compact(true, false, &Progress::NONE).unwrap();
         assert_eq!(stats.objects_packed, 0, "nothing is reachable, so nothing should be repacked");
 
         for old_pack in &pack_paths_before {
@@ -5687,7 +5697,7 @@ mod tests {
         let wrong_bytes = zstd::encode_all(b"not the bytes that belong at this address".as_slice(), 0).unwrap();
         file_utils::write_object_to_file(Path::new(&folder), &file_name, wrong_bytes).unwrap();
 
-        let stats = compact(false, false).unwrap();
+        let stats = compact(false, false, &Progress::NONE).unwrap();
 
         // v1's blob is corrupt and is skipped, not packed — same invariant clause (a)/(b) pin,
         // just reached as someone else's delta base this time.
@@ -5786,7 +5796,7 @@ mod tests {
 
         pallet_utils::set_pallet_head("main", &parcel_v2_obj.hash).unwrap();
 
-        let stats = compact(false, false).unwrap();
+        let stats = compact(false, false, &Progress::NONE).unwrap();
 
         // The giant is skipped, not corrupt, and left loose exactly as INV-5 already pins in
         // isolation.

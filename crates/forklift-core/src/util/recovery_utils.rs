@@ -230,6 +230,7 @@ use crate::util::{
     bay_utils, file_utils, heal_utils, object_utils, office_utils, pack_utils,
     pallet_utils, remote_utils, scope_utils, sign_utils, tag_utils, taint_utils,
 };
+use crate::util::progress_utils::Progress;
 
 /// How many dangling references a refusal message names individually before summarizing the
 /// rest as "(and N more)" — mirrors `audit_utils::MAX_NAMED_MISSING_CHUNKS`'s reasoning: a pack
@@ -2087,8 +2088,8 @@ async fn attempt_heal_driven_refetch(
 
             for (wire, remote_head) in &info.pallets {
                 let fetched = match wire.strip_prefix(pallet_utils::META_QUALIFIER) {
-                    Some(_) => remote_utils::fetch_history(&client, remote_head).await,
-                    None => remote_utils::fetch_history_scoped(&client, remote_head, &fetch_scope).await,
+                    Some(_) => remote_utils::fetch_history(&client, remote_head, &Progress::NONE).await,
+                    None => remote_utils::fetch_history_scoped(&client, remote_head, &fetch_scope, &Progress::NONE).await,
                 };
 
                 if fetched.is_err() {
@@ -5236,7 +5237,7 @@ mod tests {
         // (`collect_targets` only calls `collect_live_set` under `all` — an incremental compact
         // never repacks against the live set at all, so it would not exercise this fail-closed
         // path). This is `compact --all`'s own fail-closed check, unweakened by this fix.
-        let compact_all_result = pack_utils::compact(true, false);
+        let compact_all_result = pack_utils::compact(true, false, &Progress::NONE);
         assert!(compact_all_result.is_err(),
             "compact --all must still fail closed on an unreadable bay's parked file");
 
