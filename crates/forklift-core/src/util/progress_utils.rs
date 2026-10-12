@@ -195,7 +195,9 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let sink_seen = Arc::clone(&seen);
         let progress = Progress::with_interval(move |event| {
-            sink_seen.lock().unwrap().push(match event {
+            // Tolerates poison: a failed assertion holding the lock must not turn the handle's
+            // final flush into a second panic.
+            sink_seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(match event {
                 Event::Status(phase) => Seen::Status(phase.to_string()),
                 Event::Progress { percent, text } => Seen::Progress(percent, text.to_string()),
             });

@@ -381,7 +381,7 @@ These commands report today, with these phases:
 | Command | Phases |
 |---|---|
 | `compact` | `Collecting objects`, `Packing objects`, `Removing packed originals` |
-| `lift` | `Fetching history` (only when it merges first), `Finding objects to lift`, `Uploading objects` |
+| `lift` | `Fetching history` (only when it merges first), `Finding objects to lift`, `Uploading objects`, `Committing staged objects` (only against a staging remote), `Updating the remote` |
 | `lower` | `Fetching history`, `Writing files`, `Rebuilding the inventory` |
 | `import-git` | `Converting commits`, `Publishing objects`, `Building the inventory` |
 
@@ -406,17 +406,28 @@ when the reader falls behind the queue coalesces instead of waiting.
 
 Within a phase, a percentage never goes down. It starts again from a lower value only after a
 `status` naming the new phase, and even that ordering is best-effort if entries had to be
-dropped. Repeats of the same percentage are thinned to at most ten a second.
+dropped. Repeats of the same percentage are thinned to at most ten a second, but the last
+report of a phase is still sent before the next `status`, so a phase's final count is not
+lost.
 
 **Lines.** Each line is at most 512 bytes, newline included: the smallest write POSIX
 guarantees is atomic on a pipe, so a line never interleaves with another writer's. Longer text
-is cut on a character boundary. Control characters are replaced with spaces. Event text never
+is cut on a character boundary. Control characters, the Unicode line and paragraph separators,
+and bidirectional formatting characters are replaced with spaces. Event text never
 carries credentials. Per-item text such as a file path goes on `progress` lines, never on
 `status`.
 
 **A reader that goes away** costs the operation nothing. Writes that fail stop the channel,
 and the operation finishes and exits normally. It is not killed by `SIGPIPE`, whatever the
-parent's signal disposition. At exit, Forklift gives the writer up to 200 ms to deliver what
+parent's signal disposition. On macOS this takes a setting on the channel itself:
+`F_SETNOSIGPIPE` on a pipe or FIFO, `SO_NOSIGPIPE` on a socket. Both settings belong to the
+shared pipe or socket, not to Forklift's descriptor. Once you hand Forklift the channel, any
+process writing to it, yours included, gets `EPIPE` instead of `SIGPIPE` when the reader is
+gone, even after Forklift exits.
+
+**The channel is Forklift's alone.** Forklift removes `PULT_EVENTS` from its environment and
+marks the descriptor close-on-exec, so nothing it runs (the per-call `forklift` processes of
+`forklift mcp`, `git` during `import-git`) writes to the channel or keeps it open. At exit, Forklift gives the writer up to 200 ms to deliver what
 is still queued, then exits anyway.
 
 The channel exists on macOS and Linux. On other platforms the variable is ignored.
