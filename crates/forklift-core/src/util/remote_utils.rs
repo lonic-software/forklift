@@ -4449,8 +4449,9 @@ async fn lift_pallet_inner(client: &RemoteClient,
         client, &session, &candidates, &control_plane, chunking_supported, progress,
     ).await?;
 
-    // The signatures of the new parcels travel with them.
     progress.status("Updating the remote");
+
+    // The signatures of the new parcels travel with them.
     let mut uploaded_signatures = 0usize;
 
     for parcel_hash in &new_parcels {

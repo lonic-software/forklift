@@ -406,9 +406,10 @@ when the reader falls behind the queue coalesces instead of waiting.
 
 Within a phase, a percentage never goes down. It starts again from a lower value only after a
 `status` naming the new phase, and even that ordering is best-effort if entries had to be
-dropped. Repeats of the same percentage are thinned to at most ten a second, but the last
-report of a phase is still sent before the next `status`, so a phase's final count is not
-lost.
+dropped. Repeats of the same percentage are thinned to at most ten a second. A report held
+back this way is not lost: it goes out with the next report, before the next `status`, or
+when the operation ends. Until then the text you are showing can lag behind the work, for
+as long as the operation stays quiet.
 
 **Lines.** Each line is at most 512 bytes, newline included: the smallest write POSIX
 guarantees is atomic on a pipe, so a line never interleaves with another writer's. Longer text

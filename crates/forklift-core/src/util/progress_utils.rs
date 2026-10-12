@@ -56,7 +56,9 @@ struct PhaseState {
     last_sent: Option<(Instant, Option<u8>)>,
 
     /// The newest report held back since then, passed on before the next status (or when the
-    /// last handle goes) so the phase's final count or item is never lost — only thinned.
+    /// last handle goes) so the phase's final count or item is never lost — only thinned. There
+    /// is no timer: a held report waits for one of those, or is superseded by the next report
+    /// passed on, so a consumer's text can lag through a quiet stretch.
     held: Option<(Option<u8>, String)>,
 }
 
