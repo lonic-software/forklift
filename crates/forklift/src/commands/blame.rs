@@ -69,7 +69,7 @@ pub async fn handle_command(path: &str, revision: Option<String>) -> Result<(), 
         }
     }).collect();
 
-    output::emit("blame", &Blame {
+    output::emit(&Blame {
         path: file_blame.path,
         revision: file_blame.revision,
         parcels,

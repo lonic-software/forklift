@@ -63,7 +63,7 @@ async fn create_pallet(name: &str, revision: Option<&str>) -> Result<(), String>
 
             let head = shift::shift_to(name).await?;
 
-            output::emit("palletize", &Palletized {
+            output::emit(&Palletized {
                 pallet: name.to_string(),
                 head: Some(head),
                 at_revision: Some(parcel_hash),
@@ -84,7 +84,7 @@ async fn create_pallet(name: &str, revision: Option<&str>) -> Result<(), String>
 
             pallet_utils::set_current_pallet_name(name)?;
 
-            output::emit("palletize", &Palletized {
+            output::emit(&Palletized {
                 pallet: name.to_string(),
                 head,
                 at_revision: None,
@@ -169,7 +169,7 @@ fn list_pallets(all: bool) -> Result<(), String> {
         Vec::new()
     };
 
-    output::emit("palletize", &PalletList { current, current_unborn, pallets, meta });
+    output::emit(&PalletList { current, current_unborn, pallets, meta });
 
     Ok(())
 }

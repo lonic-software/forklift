@@ -18,17 +18,27 @@ use serde::Serialize;
 use forklift_core::error::{CoreError, RefusalCode};
 use forklift_core::util::{heal_utils, load_guard_utils, merge_utils, query_utils, scope_utils};
 
-/// The output schema version, carried on every JSON envelope as `forklift_json`.
-/// It changes only when the envelope or a command's `data` shape changes
-/// incompatibly, so an agent can pin it and detect drift.
+/// The version of the envelope every Lonic tool shares, carried as `lonic_json`. A consumer
+/// detects the contract with this one key; it versions the header (`lonic_json`, `tool`,
+/// `schema`, `command`, `ok`, `data`/`error`) and the stderr warning shape, never a
+/// command's `data`.
+pub const LONIC_JSON: u32 = 1;
+
+/// The producing tool's name, carried as `tool` on every document. Mandatory because a
+/// consumer of `pult <command>` cannot otherwise tell Forklift's document from Pult's.
+pub const TOOL: &str = "forklift";
+
+/// Forklift's payload schema version, carried as `schema`. It changes only when a command's
+/// `data` shape or the error-code registry changes incompatibly, so an agent can pin it and
+/// detect drift.
 ///
 /// Version 2 (this one): `history` entries carry `parents` (always present, `[]` for a
 /// root), the `empty_history` error code exists, and `palletize` list entries carry
-/// `head`. A consumer reads this field first, before parsing anything else, to know
-/// whether the command it is about to run supports the capability it needs — the
-/// version bump *is* the capability-detection mechanism, so it is worth pinning rather
-/// than sniffing for a field's presence.
-pub const SCHEMA_VERSION: &str = "2";
+/// `head`. A consumer reads this field before relying on a field, to know whether the
+/// command it is about to run supports the capability it needs — the version bump *is*
+/// the capability-detection mechanism, so it is worth pinning rather than sniffing for a
+/// field's presence.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// How the process renders its output.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -58,6 +68,44 @@ pub fn is_json() -> bool {
     mode() == OutputMode::Json
 }
 
+static COMMAND: OnceLock<Option<String>> = OnceLock::new();
+
+/// Record the command this invocation runs, as clap resolved it (the canonical top-level
+/// name, never an alias), for the `command` field of every document the process writes —
+/// success and failure alike, so the two can never name it differently. `None` when the
+/// command line names no command at all. Called once, from `main`; a second call is ignored.
+pub fn set_command(command: Option<&str>) {
+    let _ = COMMAND.set(command.map(str::to_string));
+}
+
+/// The header every `--json` stdout document starts with. `command` is `null` only for a
+/// usage error whose command line names no known command.
+fn header(ok: bool) -> serde_json::Map<String, serde_json::Value> {
+    let command = COMMAND.get().cloned().flatten();
+    let mut fields = serde_json::Map::new();
+
+    fields.insert("lonic_json".to_string(), serde_json::json!(LONIC_JSON));
+    fields.insert("tool".to_string(), serde_json::json!(TOOL));
+    fields.insert("schema".to_string(), serde_json::json!(SCHEMA_VERSION));
+    fields.insert("command".to_string(), serde_json::json!(command));
+    fields.insert("ok".to_string(), serde_json::json!(ok));
+    fields
+}
+
+/// Print one document to stdout. Pretty-printed: the consumer is a program, but a human
+/// debugging the pipe reads it too, and JSON parsers do not care about whitespace. The
+/// fallback for the serializer failure that cannot happen on a `Value` still carries the
+/// header a consumer gates on.
+fn print_document(document: serde_json::Map<String, serde_json::Value>, ok: bool) {
+    match serde_json::to_string_pretty(&serde_json::Value::Object(document)) {
+        Ok(text) => println!("{}", text),
+        Err(_) => println!(
+            "{{\"lonic_json\":{},\"tool\":\"{}\",\"schema\":{},\"ok\":{}}}",
+            LONIC_JSON, TOOL, SCHEMA_VERSION, ok
+        ),
+    }
+}
+
 /// A command's successful result: serializable for `--json`, renderable as prose for
 /// a person. The `Serialize` shape *is* the public JSON schema — treat a change to it
 /// as a schema change (bump [`SCHEMA_VERSION`]).
@@ -67,23 +115,21 @@ pub trait CommandOutput: Serialize {
 }
 
 /// Emit a command's structured result in the active mode.
-pub fn emit<T: CommandOutput>(command: &str, value: &T) {
+pub fn emit<T: CommandOutput>(value: &T) {
     match mode() {
         OutputMode::Human => value.render_human(),
-        OutputMode::Json => print_envelope(command, value),
+        OutputMode::Json => print_envelope(value),
     }
 }
 
 /// Emit a result whose only content is a human sentence (`{ "message": "…" }` in
 /// JSON). For commands that report an outcome rather than data.
-pub fn message(command: &str, text: impl Into<String>) {
+pub fn message(text: impl Into<String>) {
     let text = text.into();
 
     match mode() {
         OutputMode::Human => println!("{}", text),
-        OutputMode::Json => {
-            print_envelope(command, &serde_json::json!({ "message": text }))
-        }
+        OutputMode::Json => print_envelope(&serde_json::json!({ "message": text })),
     }
 }
 
@@ -137,25 +183,17 @@ pub fn blob_text(content: &[u8]) -> Option<&str> {
     std::str::from_utf8(content).ok()
 }
 
-/// Print the success envelope: `{ forklift_json, command, ok: true, data }`.
-fn print_envelope<T: Serialize>(command: &str, data: &T) {
-    let envelope = serde_json::json!({
-        "forklift_json": SCHEMA_VERSION,
-        "command": command,
-        "ok": true,
-        "data": data,
-    });
-
-    // Pretty-printed: the consumer is a program, but a human debugging the pipe reads
-    // it too, and JSON parsers do not care about whitespace.
-    match serde_json::to_string_pretty(&envelope) {
-        Ok(text) => println!("{}", text),
-        Err(_) => println!("{{\"forklift_json\":\"{}\",\"ok\":true}}", SCHEMA_VERSION),
-    }
+/// Print the success envelope: the header with `ok: true`, then `data`. `ok` says that `data`
+/// is the command's result; it does not report the exit status.
+fn print_envelope<T: Serialize>(data: &T) {
+    let mut document = header(true);
+    document.insert("data".to_string(), serde_json::json!(data));
+    print_document(document, true);
 }
 
 /// Report a failed command in the active mode, to stderr (human) or stdout (JSON —
-/// the error is still the command's one result document). Called once, from `main`.
+/// the error is still the command's one result document). Called from `main`, for a
+/// command's own failure and for a usage error alike.
 pub fn report_error(error: &ForkliftError) {
     match mode() {
         OutputMode::Human => eprintln!("{}", error.message),
@@ -168,18 +206,13 @@ pub fn report_error(error: &ForkliftError) {
                 fields.insert("next_step".to_string(), serde_json::json!(next_step));
             }
 
-            let envelope = serde_json::json!({
-                "forklift_json": SCHEMA_VERSION,
-                "ok": false,
-                "error": serde_json::Value::Object(fields),
-            });
-
-            match serde_json::to_string_pretty(&envelope) {
-                Ok(text) => println!("{}", text),
-                Err(_) => println!(
-                    "{{\"forklift_json\":\"{}\",\"ok\":false}}", SCHEMA_VERSION
-                ),
+            if let Some(details) = &error.details {
+                fields.insert("details".to_string(), details.clone());
             }
+
+            let mut document = header(false);
+            document.insert("error".to_string(), serde_json::Value::Object(fields));
+            print_document(document, false);
         }
     }
 }
@@ -220,6 +253,10 @@ macro_rules! error_codes {
 error_codes! {
     /// Anything without a more specific classification yet.
     Generic,
+
+    /// The command line could not be parsed: an unknown command, a missing or invalid
+    /// argument. Raised by the argument parser before any command runs.
+    Usage,
 
     /// The command must run inside a warehouse, and the working directory is not one.
     NotAWarehouse,
@@ -307,6 +344,7 @@ impl ErrorCode {
     pub fn as_str(&self) -> &'static str {
         match self {
             ErrorCode::Generic              => "error",
+            ErrorCode::Usage                => "usage",
             ErrorCode::NotAWarehouse        => "not_a_warehouse",
             ErrorCode::WarehouseLocked      => "warehouse_locked",
             ErrorCode::Conflict             => "conflict",
@@ -329,10 +367,12 @@ impl ErrorCode {
     }
 
     /// The process exit code — deterministic per class, so a script branches without
-    /// parsing prose (§7.8). `2` is reserved for clap's usage errors; `0` is success.
+    /// parsing prose (§7.8). `0` is success; `2` is a usage error, the meaning every Lonic tool
+    /// shares.
     pub fn exit_code(&self) -> i32 {
         match self {
             ErrorCode::Generic              => 1,
+            ErrorCode::Usage                => 2,
             ErrorCode::NotAWarehouse        => 3,
             ErrorCode::Conflict             => 4,
             ErrorCode::Diverged             => 5,
@@ -361,6 +401,9 @@ impl ErrorCode {
     pub fn description(&self) -> &'static str {
         match self {
             ErrorCode::Generic => "Anything without a more specific classification yet",
+            ErrorCode::Usage =>
+                "The command line could not be parsed (an unknown command, a missing or invalid \
+                 argument)",
             ErrorCode::NotAWarehouse => "The command needs a warehouse; this directory is none",
             ErrorCode::Conflict => "Working state blocks the operation (unresolved / dirty)",
             ErrorCode::Diverged => "A remote ref moved under a lift — lower, retry",
@@ -431,6 +474,9 @@ pub struct ForkliftError {
     pub code: ErrorCode,
     pub message: String,
     pub next_step: Option<String>,
+
+    /// Code-specific structured detail, emitted as `error.details` under `--json` when present.
+    pub details: Option<serde_json::Value>,
 }
 
 impl ForkliftError {
@@ -440,6 +486,7 @@ impl ForkliftError {
             code,
             message: message.into(),
             next_step: Some(next_step.into()),
+            details: None,
         }
     }
 }
@@ -455,9 +502,10 @@ impl From<CoreError> for ForkliftError {
                 code: ErrorCode::from_refusal(code),
                 message,
                 next_step: Some(next_step),
+                details: None,
             },
             CoreError::Other(message) => {
-                ForkliftError { code: ErrorCode::Generic, message, next_step: None }
+                ForkliftError { code: ErrorCode::Generic, message, next_step: None, details: None }
             }
         }
     }
@@ -491,7 +539,7 @@ pub fn empty_history(message: impl Into<String>) -> String {
 impl From<String> for ForkliftError {
     fn from(message: String) -> ForkliftError {
         if let Some(human) = message.strip_prefix(EMPTY_HISTORY_SENTINEL) {
-            return ForkliftError { code: ErrorCode::EmptyHistory, message: human.to_string(), next_step: None };
+            return ForkliftError { code: ErrorCode::EmptyHistory, message: human.to_string(), next_step: None, details: None };
         }
 
         ForkliftError::from(CoreError::from(message))
@@ -556,7 +604,7 @@ pub const CODE_MAINTENANCE_UNAVAILABLE: &str = "maintenance_unavailable";
 /// both.
 ///
 /// It does have to name an **action**, which is the part that was missing: `next_step` is one of
-/// the four fields every stderr warning carries (`docs/MACHINE_INTERFACE.md`), and a consumer
+/// the fields every stderr warning carries (`docs/MACHINE_INTERFACE.md`), and a consumer
 /// that surfaces it to a human had nothing to surface — only a reassurance about the current
 /// state, while the thing to actually do sat in the reported cause. Pointing at that cause is
 /// the most this field can honestly say, because which fault it is only the cause knows.
@@ -606,19 +654,20 @@ fn maintenance_unavailable_warning_text(mode: OutputMode, error: &str) -> String
 }
 
 /// The one `--json` warning envelope, shared by every stderr warning so the shape a consumer
-/// parses (`forklift_json`, `warning`, `message`, `next_step`) is defined once — including the
+/// parses (`lonic_json`, `tool`, `warning`, `message`, `next_step`) is defined once — including the
 /// hand-built fallback for the serializer failure that cannot actually happen here.
 fn warning_envelope(code: &str, message: &str, next_step: &str) -> String {
     let envelope = serde_json::json!({
-        "forklift_json": SCHEMA_VERSION,
+        "lonic_json": LONIC_JSON,
+        "tool": TOOL,
         "warning": code,
         "message": message,
         "next_step": next_step,
     });
 
     serde_json::to_string(&envelope).unwrap_or_else(|_| format!(
-        "{{\"forklift_json\":\"{}\",\"warning\":\"{}\"}}",
-        SCHEMA_VERSION, code
+        "{{\"lonic_json\":{},\"tool\":\"{}\",\"warning\":\"{}\"}}",
+        LONIC_JSON, TOOL, code
     ))
 }
 
@@ -771,7 +820,7 @@ mod tests {
     /// The standing-taint warning (`commands::maintenance::run_if_due`'s surfacing of a taint
     /// left behind by a failed auto-maintenance `compact`) in both output modes: `Human` prose
     /// names the marker and the `forklift heal` remedy; `Json` carries the same information as a
-    /// self-describing object (`forklift_json`/`warning`/`message`/`next_step`) rather than prose
+    /// self-describing object (`lonic_json`/`tool`/`warning`/`message`/`next_step`) rather than prose
     /// a machine consumer would have to parse. Both must always name the remedy — the whole point
     /// of this warning existing is that a consumer (human or agent) knows what to do next.
     #[test]
@@ -786,7 +835,8 @@ mod tests {
         let json_text = standing_taint_warning_text(OutputMode::Json, gate_message);
         let value: serde_json::Value = serde_json::from_str(&json_text)
             .unwrap_or_else(|e| panic!("json warning is not valid JSON ({}): {}", e, json_text));
-        assert_eq!(value["forklift_json"], SCHEMA_VERSION);
+        assert_eq!(value["lonic_json"], 1);
+        assert_eq!(value["tool"], "forklift");
         assert_eq!(value["warning"], heal_utils::CODE_DURABILITY_TAINT);
         assert_eq!(value["message"], gate_message);
         assert!(
@@ -817,7 +867,8 @@ mod tests {
         let json_text = maintenance_unavailable_warning_text(OutputMode::Json, error);
         let value: serde_json::Value = serde_json::from_str(&json_text)
             .unwrap_or_else(|e| panic!("json warning is not valid JSON ({}): {}", e, json_text));
-        assert_eq!(value["forklift_json"], SCHEMA_VERSION);
+        assert_eq!(value["lonic_json"], 1);
+        assert_eq!(value["tool"], "forklift");
         assert_eq!(value["warning"], CODE_MAINTENANCE_UNAVAILABLE);
         assert_eq!(value["message"], error);
         assert_eq!(value["next_step"], MAINTENANCE_UNAVAILABLE_NEXT_STEP);
@@ -846,11 +897,11 @@ mod tests {
             }
         }
 
-        // `docs/MACHINE_INTERFACE.md` promises a consumer exactly these four fields on every
+        // `docs/MACHINE_INTERFACE.md` promises a consumer exactly these five fields on every
         // stderr warning. Asserted against a literal list, not against the other warning's key
         // set — both are built by `warning_envelope`, so comparing them to each other would be
         // true however that helper changed, and would pin nothing at all.
-        let expected = ["forklift_json", "message", "next_step", "warning"];
+        let expected = ["lonic_json", "message", "next_step", "tool", "warning"];
 
         for text in [
             json_text,

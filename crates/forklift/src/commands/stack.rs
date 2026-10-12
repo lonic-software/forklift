@@ -18,7 +18,7 @@ use crate::output::{self, CommandOutput};
 pub async fn handle_command(description: Option<String>) -> Result<(), String> {
     let (parcel, pallet) = stack_utils::stack_parcel(description).await?;
 
-    output::emit("stack", &Stacked { parcel, pallet });
+    output::emit(&Stacked { parcel, pallet });
 
     Ok(())
 }

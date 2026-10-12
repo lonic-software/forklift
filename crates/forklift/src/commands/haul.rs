@@ -59,7 +59,7 @@ fn open(target: &str, source: Option<String>, title: &str, description: String) 
 
     let id = haul_utils::open_haul(&source, target, &head, title, &description, &actor, &signing_key_id)?;
 
-    output::emit("haul", &Opened { id, source, target: target.to_string(), title: title.to_string() });
+    output::emit(&Opened { id, source, target: target.to_string(), title: title.to_string() });
 
     Ok(())
 }
@@ -74,7 +74,7 @@ fn list(state: Option<String>) -> Result<(), String> {
         .map(HaulSummary::of)
         .collect();
 
-    output::emit("haul", &HaulList { state: wanted.to_string(), hauls });
+    output::emit(&HaulList { state: wanted.to_string(), hauls });
 
     Ok(())
 }
@@ -87,7 +87,7 @@ fn show(id: &str) -> Result<(), String> {
     let office = office_utils::read_office_state()
         .unwrap_or(OfficeState { users: Vec::new(), keys: Vec::new() });
 
-    output::emit("haul", &HaulDetail::of(&haul, &office));
+    output::emit(&HaulDetail::of(&haul, &office));
 
     Ok(())
 }
@@ -100,7 +100,7 @@ fn comment(id: &str, message: &str) -> Result<(), String> {
 
     haul_utils::record_comment(&haul.id, message, &actor, &signing_key_id)?;
 
-    output::emit("haul", &Acted { id: haul.id, action: "commented".to_string() });
+    output::emit(&Acted { id: haul.id, action: "commented".to_string() });
 
     Ok(())
 }
@@ -121,7 +121,7 @@ fn review(id: &str, request_changes: bool, comment: bool, message: String) -> Re
 
     haul_utils::record_review(&haul.id, verdict, &message, &actor, &signing_key_id)?;
 
-    output::emit("haul", &Acted { id: haul.id, action: format!("reviewed ({})", verdict.as_str()) });
+    output::emit(&Acted { id: haul.id, action: format!("reviewed ({})", verdict.as_str()) });
 
     Ok(())
 }
@@ -139,7 +139,7 @@ fn set_status(id: &str, closed: bool) -> Result<(), String> {
 
     haul_utils::record_closed(&haul.id, closed, &actor, &signing_key_id)?;
 
-    output::emit("haul", &Acted {
+    output::emit(&Acted {
         id: haul.id,
         action: if closed { "closed".to_string() } else { "reopened".to_string() },
     });
@@ -176,7 +176,7 @@ async fn merge(id: &str) -> Result<(), String> {
     // the source was consolidated another way): just record the merge.
     if merge_utils::is_ancestor(&haul.head, &target_head)? {
         haul_utils::record_merged(&haul.id, &target_head, &actor, &signing_key_id)?;
-        output::emit("haul", &Merged { id: haul.id, merge_parcel: target_head, already: true });
+        output::emit(&Merged { id: haul.id, merge_parcel: target_head, already: true });
         return Ok(());
     }
 
@@ -191,12 +191,12 @@ async fn merge(id: &str) -> Result<(), String> {
     match consolidate::merge_head_into_current(&current, &target_head, &haul.head, &haul.source, true).await? {
         MergeStatus::Merged(parcel) => {
             haul_utils::record_merged(&haul.id, &parcel, &actor, &signing_key_id)?;
-            output::emit("haul", &Merged { id: haul.id, merge_parcel: parcel, already: false });
+            output::emit(&Merged { id: haul.id, merge_parcel: parcel, already: false });
         }
         MergeStatus::Conflicts(paths) => {
             // The consolidation is left in progress; the haul stays open. Resolving and
             // stacking creates the merge parcel — re-run `haul merge` to record it.
-            output::emit("haul", &MergeConflicts { id: haul.id, conflicts: paths });
+            output::emit(&MergeConflicts { id: haul.id, conflicts: paths });
         }
     }
 

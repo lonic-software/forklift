@@ -41,7 +41,7 @@ pub async fn handle_command(summary: bool) -> Result<(), String> {
         summary,
     };
 
-    output::emit("stocktake", &report);
+    output::emit(&report);
 
     Ok(())
 }

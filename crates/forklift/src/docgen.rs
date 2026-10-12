@@ -18,8 +18,9 @@ pub fn render_errors() -> String {
     out.push_str(
         "Every `forklift` failure carries a stable `code` (in the `--json` error envelope) \
          and the process exits with the matching deterministic status, so a script or an agent \
-         branches without parsing prose. `2` is reserved for clap's own argument/usage errors; \
-         `0` is success. Both tables are generated from the single `ErrorCode` enum in \
+         branches without parsing prose. `0` (success), `1`, `2` (`usage`), `130` (cancelled \
+         by the user) and `128`+n (killed by signal n) mean the same for every Lonic tool; every \
+         other number is Forklift's own. Both tables are generated from the single `ErrorCode` enum in \
          `crates/forklift/src/output.rs` — see `docs/guide/cli.md` for how a script is meant to \
          use them.\n\n\
          Exit code 17 is reserved for a future feature and is not yet assigned to any code.\n\n",
@@ -69,8 +70,8 @@ pub fn render_json_schemas() -> Result<String, String> {
     out.push_str(GENERATED_BANNER);
     out.push_str("# `--json` output schemas\n\n");
     out.push_str(
-        "Every command's `--json` result is `{ \"forklift_json\", \"command\", \"ok\": true, \
-         \"data\": … }` on success (see `docs/MACHINE_INTERFACE.md` for the envelope and the \
+        "Every command's `--json` result is `{ \"lonic_json\", \"tool\", \"schema\", \"command\", \
+         \"ok\": true, \"data\": … }` on success (see `docs/MACHINE_INTERFACE.md` for the envelope and the \
          failure shape). This page is the exhaustive reference for each command's `data` — one \
          [JSON Schema](https://json-schema.org/) per shape a command can emit; a command with \
          more than one (e.g. one per subcommand) lists all of them. Descriptions come straight \

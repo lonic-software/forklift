@@ -53,7 +53,7 @@ fn status() -> Result<(), String> {
     let bay_scope = scope_utils::current_scope()?;
     let fetch_scope = scope_utils::read_fetch_scope()?;
 
-    output::emit("scope", &ScopeStatus {
+    output::emit(&ScopeStatus {
         bay: globals::active_bay(),
         scoped: !bay_scope.is_full(),
         materialization_scope: bay_scope.prefixes().to_vec(),

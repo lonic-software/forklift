@@ -43,7 +43,7 @@ async fn undo_from_journal(entry: JournalEntry) -> Result<(), String> {
         let head = shift::shift_to(&entry.current_pallet).await?;
         journal_utils::pop()?;
 
-        output::emit("undo", &Undone {
+        output::emit(&Undone {
             op: entry.op,
             pallet: entry.current_pallet,
             left,
@@ -82,7 +82,7 @@ async fn undo_from_journal(entry: JournalEntry) -> Result<(), String> {
         .and_then(|parcel| parcel.description)
         .unwrap_or_default();
 
-    output::emit("undo", &Undone {
+    output::emit(&Undone {
         op: entry.op,
         pallet: entry.current_pallet,
         left: String::new(),
@@ -117,7 +117,7 @@ fn undo_last_stack() -> Result<(), String> {
 
     pallet_utils::set_pallet_head(&pallet, parent)?;
 
-    output::emit("undo", &Undone {
+    output::emit(&Undone {
         op: "stack".to_string(),
         pallet,
         left: String::new(),

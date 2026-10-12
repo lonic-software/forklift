@@ -249,7 +249,7 @@ async fn franchise_into_prepared_target(
 
         report.pallet = pallet_name;
         report.unborn = true;
-        output::emit("franchise", &report);
+        output::emit(&report);
 
         return Ok(());
     };
@@ -307,7 +307,7 @@ async fn franchise_into_prepared_target(
     report.pallet = pallet_name;
     report.head = Some(remote_head.clone());
     report.fetched_objects = stats.fetched_objects;
-    output::emit("franchise", &report);
+    output::emit(&report);
 
     Ok(())
 }

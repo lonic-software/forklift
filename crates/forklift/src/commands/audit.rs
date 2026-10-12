@@ -90,7 +90,7 @@ pub fn handle_command(pallet: Option<String>, full: bool) -> Result<(), String> 
         }
     }
 
-    output::emit("audit", &report);
+    output::emit(&report);
 
     Ok(())
 }

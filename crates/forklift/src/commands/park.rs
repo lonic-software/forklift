@@ -189,7 +189,7 @@ pub async fn park_changes() -> Result<(), String> {
     let shards = shift_utils::build_inventories_for_tree(&head_tree_hash)?;
     inventory_utils::replace_all_inventories(&shards)?;
 
-    output::message("park", format!(
+    output::message(format!(
         "Parked the work in progress as {} and reset to the pallet head.", object.hash
     ));
 
@@ -291,7 +291,7 @@ pub fn pop_parked() -> Result<(), String> {
     parked.pop();
     park_utils::write_parked(&parked)?;
 
-    output::message("park", format!("Re-applied the parked changes from {} (staged).", parked_hash));
+    output::message(format!("Re-applied the parked changes from {} (staged).", parked_hash));
 
     Ok(())
 }
@@ -310,7 +310,7 @@ pub fn list_parked() -> Result<(), String> {
         entries.push(ParkedEntry { parcel: hash.clone(), description });
     }
 
-    output::emit("park", &ParkedList { parked: entries });
+    output::emit(&ParkedList { parked: entries });
 
     Ok(())
 }

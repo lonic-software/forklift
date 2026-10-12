@@ -77,7 +77,7 @@ pub fn handle_command(target: &str) -> Result<(), String> {
         }
     };
 
-    output::emit("show", &shown);
+    output::emit(&shown);
 
     Ok(())
 }

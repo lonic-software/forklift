@@ -47,13 +47,13 @@ pub async fn handle_command(check: bool) -> Result<(), String> {
 
     // Nothing to do: unknown latest, or already current.
     if !update_available {
-        output::emit("self-update", &report);
+        output::emit(&report);
         return Ok(());
     }
 
     // A check, or a package-manager binary we must not overwrite: report the command and stop.
     if check || method != InstallMethod::Script {
-        output::emit("self-update", &report);
+        output::emit(&report);
         return Ok(());
     }
 
@@ -73,7 +73,7 @@ pub async fn handle_command(check: bool) -> Result<(), String> {
         alias::reinstall_silently(alias::DEFAULT_NAME);
     }
 
-    output::emit("self-update", &SelfUpdate { applied: true, latest: Some(target), ..report });
+    output::emit(&SelfUpdate { applied: true, latest: Some(target), ..report });
 
     Ok(())
 }

@@ -14,7 +14,7 @@ use crate::output::{self, CommandOutput};
 pub fn handle_command(verbose: bool) -> Result<(), String> {
     let created = warehouse_utils::prepare_warehouse()?;
 
-    output::emit("prepare", &Prepared { created, verbose });
+    output::emit(&Prepared { created, verbose });
 
     Ok(())
 }

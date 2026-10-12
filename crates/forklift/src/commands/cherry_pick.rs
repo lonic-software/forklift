@@ -133,11 +133,11 @@ pub async fn handle_command(revision: &str, message: Option<String>) -> Result<(
     if conflicts.is_empty() {
         let (parcel, _) = stack_utils::stack_parcel(description).await?;
 
-        output::emit("cherry-pick", &CherryPicked::applied(&source, &current, &parcel));
+        output::emit(&CherryPicked::applied(&source, &current, &parcel));
     } else {
         conflicts.sort();
 
-        output::emit("cherry-pick", &CherryPicked::conflicts(&source, &current, conflicts));
+        output::emit(&CherryPicked::conflicts(&source, &current, conflicts));
     }
 
     Ok(())

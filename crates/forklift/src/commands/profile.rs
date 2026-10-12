@@ -45,7 +45,7 @@ pub fn list() -> Result<(), String> {
         });
     }
 
-    output::emit("profile", &ProfileList { default, profiles: named });
+    output::emit(&ProfileList { default, profiles: named });
 
     Ok(())
 }
@@ -116,7 +116,7 @@ pub fn create(profile: &str,
         identifier.as_deref()
     )?;
 
-    output::message("profile", format!(
+    output::message(format!(
         "Created profile \"{}\" with operator id {}.\n\
         Select it for a warehouse with \"forklift profile use {}\".",
         profile, identity.identifier, profile
@@ -147,7 +147,7 @@ pub fn use_profile(profile: &str) -> Result<(), String> {
 
     let identity = config_utils::get_operator()?;
 
-    output::message("profile", format!(
+    output::message(format!(
         "This warehouse now acts as profile \"{}\" (operator id {}).",
         profile, identity.identifier
     ));

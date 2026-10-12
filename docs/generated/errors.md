@@ -7,13 +7,14 @@ that affects it (a new error code, or a `--json` output struct).
 
 # Error codes and exit codes
 
-Every `forklift` failure carries a stable `code` (in the `--json` error envelope) and the process exits with the matching deterministic status, so a script or an agent branches without parsing prose. `2` is reserved for clap's own argument/usage errors; `0` is success. Both tables are generated from the single `ErrorCode` enum in `crates/forklift/src/output.rs` — see `docs/guide/cli.md` for how a script is meant to use them.
+Every `forklift` failure carries a stable `code` (in the `--json` error envelope) and the process exits with the matching deterministic status, so a script or an agent branches without parsing prose. `0` (success), `1`, `2` (`usage`), `130` (cancelled by the user) and `128`+n (killed by signal n) mean the same for every Lonic tool; every other number is Forklift's own. Both tables are generated from the single `ErrorCode` enum in `crates/forklift/src/output.rs` — see `docs/guide/cli.md` for how a script is meant to use them.
 
 Exit code 17 is reserved for a future feature and is not yet assigned to any code.
 
 | `code` | exit | Meaning |
 |---|---|---|
 | `error` | 1 | Anything without a more specific classification yet |
+| `usage` | 2 | The command line could not be parsed (an unknown command, a missing or invalid argument) |
 | `not_a_warehouse` | 3 | The command needs a warehouse; this directory is none |
 | `conflict` | 4 | Working state blocks the operation (unresolved / dirty) |
 | `diverged` | 5 | A remote ref moved under a lift — lower, retry |

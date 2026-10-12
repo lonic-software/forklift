@@ -86,7 +86,7 @@ async fn create(name: &str, revision: Option<String>, message: Option<String>) -
 
     let parcel = tag_utils::record_tag(&tag, &operator, &signing_key_id)?;
 
-    output::emit("tag", &Created {
+    output::emit(&Created {
         name: name.to_string(),
         subject,
         parcel,
@@ -119,7 +119,7 @@ async fn list() -> Result<(), String> {
         })
         .collect::<Result<Vec<_>, String>>()?;
 
-    output::emit("tag", &TagList { tags: entries });
+    output::emit(&TagList { tags: entries });
 
     Ok(())
 }
@@ -148,7 +148,7 @@ async fn show(name: &str) -> Result<(), String> {
     let office = office_utils::read_office_state()
         .unwrap_or(OfficeState { users: Vec::new(), keys: Vec::new() });
 
-    output::emit("tag", &TagView::of(&attributed, &names, &office, probe));
+    output::emit(&TagView::of(&attributed, &names, &office, probe));
 
     Ok(())
 }

@@ -12,5 +12,5 @@
 /// * `Ok(())`      - If the command was handled successfully.
 /// * `Err(String)` - If there was an error while handling the command.
 pub fn handle_command(subject: &str) -> Result<(), String> {
-    crate::commands::restore::handle_unstage(subject, "unload")
+    crate::commands::restore::handle_unstage(subject)
 }

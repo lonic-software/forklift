@@ -23,7 +23,7 @@ pub fn handle_command(subject: &str) -> Result<(), String> {
 
     inventory_utils::stage_removal(&path)?;
 
-    output::emit("remove", &Removed { path: path.as_key().to_string() });
+    output::emit(&Removed { path: path.as_key().to_string() });
 
     Ok(())
 }

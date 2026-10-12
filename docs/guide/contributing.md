@@ -177,8 +177,8 @@ changelog), `SERVER.md` (server ops), `MACHINE_INTERFACE.md` (`--json`/MCP),
 3. **Write the handler** in `commands/<name>.rs`. Keep logic in `forklift-core`;
    the handler orchestrates and presents.
 4. **Present through `output`** so `--json` works for free: build a `Serialize`
-   result type implementing `CommandOutput`, and `output::emit("<name>", &result)`
-   — human mode calls `render_human()`, JSON mode wraps it in the envelope. For a
+   result type implementing `CommandOutput`, and `output::emit(&result)` — the
+   envelope's `command` comes from the parsed command line, never the handler; human mode calls `render_human()`, JSON mode wraps it in the envelope. For a
    one-line outcome use `output::message`; for silenced-under-`--json` progress
    lines use the `human!` macro. **Nothing else may print to stdout**, or `--json`
    stops being a single valid document.

@@ -8,7 +8,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// # Returns
 /// * `Ok(())` - The command always succeeds.
 pub fn handle_command() -> Result<(), String> {
-    output::emit("version", &Version { version: VERSION.to_string() });
+    output::emit(&Version { version: VERSION.to_string() });
 
     Ok(())
 }

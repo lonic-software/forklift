@@ -10,7 +10,7 @@ use crate::output::{self, human_bytes, CommandOutput};
 /// * `Ok(())`      - The census was reported.
 /// * `Err(String)` - If the object store could not be read.
 pub fn handle_command() -> Result<(), String> {
-    output::emit("store", &StoreReport::from(pack_utils::store_status()?));
+    output::emit(&StoreReport::from(pack_utils::store_status()?));
 
     Ok(())
 }
