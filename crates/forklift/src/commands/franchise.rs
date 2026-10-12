@@ -42,8 +42,9 @@ use crate::output::{self, CommandOutput};
 ///
 /// # Returns
 /// * `Ok(())` - If the franchise is ready to work in.
-/// * `Err(String)` - If the directory is not empty, the remote is unreachable, the pallet does
-///   not exist, or a transfer failed. The target is left as it was found (see above) either way.
+/// * `Err(String)` - If `--token` is given but empty, the directory is not empty, the remote is
+///   unreachable, the pallet does not exist, or a transfer failed. The target is left as it was
+///   found (see above) either way.
 pub async fn handle_command(url: &str,
                             directory: &str,
                             pallet: Option<String>,
@@ -53,6 +54,16 @@ pub async fn handle_command(url: &str,
     // --only refuses cleanly. An empty list is a full (ordinary) franchise.
     let fetch_scope = resolve_fetch_scope(&only)?;
     let sparse = !fetch_scope.is_full();
+
+    // Likewise refused before anything is created: an empty token is never what was meant, and
+    // left to the configuration write it would fail only after the warehouse existed. The advice
+    // is this command's own — there is no entry yet to remove, only an option to leave out.
+    if token.as_deref().is_some_and(config_utils::is_blank) {
+        return Err(
+            "The access token (--token) cannot be empty. Omit it for a remote that needs none."
+                .to_string()
+        );
+    }
 
     let target = Path::new(directory);
 
@@ -74,7 +85,7 @@ pub async fn handle_command(url: &str,
     // apply. Falling through to `from_config`'s cascade now would silently make a brand-new
     // clone's Tor routing depend on whatever unrelated warehouse the caller happened to be
     // standing in — a cwd-dependent, security-relevant surprise this preserves against.
-    let client = RemoteClient::new_with_tor(url, token.clone(), TorSettings::from_global_config())?;
+    let client = RemoteClient::new_with_tor(url, token.clone(), TorSettings::from_global_config()?)?;
     let info = client.fetch_info().await?;
 
     // Resolve the pallet from the handshake alone — no I/O — so a `--pallet` typo is refused

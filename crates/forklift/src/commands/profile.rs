@@ -128,6 +128,12 @@ pub fn create(profile: &str,
 /// Select a profile for the current warehouse (sets `operator.profile` in the
 /// warehouse configuration).
 pub fn use_profile(profile: &str) -> Result<(), String> {
+    // Before the lookup: a hand-written `[profile.""]` would be found, and the empty selection
+    // then refused by the configuration write with no word on what to do instead.
+    if config_utils::is_blank(profile) {
+        return Err(config_utils::EMPTY_PROFILE_NAME.to_string());
+    }
+
     warehouse_utils::enter_warehouse()?;
 
     if config_utils::get_profile(profile)?.is_none() {

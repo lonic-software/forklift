@@ -454,6 +454,349 @@ fn config_values_are_scoped_and_the_warehouse_overrides_the_global_scope() {
     assert!(stderr(&unset).contains("not set"));
 }
 
+/// FORK-117's contract, at the surface where it is most visible: _a configuration file either
+/// parses completely, or the command that needed it refuses, naming the file and the key._
+///
+/// Before this, `get_value_from_document` collapsed three states — absent, section-is-not-a-table,
+/// field-is-the-wrong-type — into `None`, and each caller decided for itself what `None` meant.
+/// The two reads below took that decision in opposite directions on the very same broken file:
+/// `config operator.identifier` fell through to the global scope and exited **0**, printing a
+/// value from a file the user was not configuring; `config remote.url` had nothing to fall
+/// through to and exited **1** saying the key was "not set". One file, one defect, two answers,
+/// neither of them the truth.
+///
+/// The fixture is a *typed* fault (`identifier = 12345`), not a TOML syntax error, because a
+/// syntax error was never the bug: `load_document` already refused those, identically for both
+/// keys. Only the per-key leniency layered on top of a file that parsed fine as TOML could
+/// produce the split above — so a syntax-error fixture here would pass before the change as
+/// well as after it, and prove nothing.
+///
+/// Falsified both directions: measured against `origin/main`'s binary on this exact fixture —
+/// `config operator.identifier` exits 0 printing `global@id`, `config remote.url` exits 1.
+#[test]
+fn a_configuration_file_either_parses_completely_or_every_read_of_it_refuses() {
+    let warehouse = TestWarehouse::new("config-whole-file-or-nothing");
+    assert_success(&warehouse.run(&["prepare"]));
+
+    // A perfectly good global configuration — the scope a lenient reader would quietly
+    // fall through to.
+    std::fs::write(
+        warehouse.home.join("global-config.toml"),
+        "[operator]\nidentifier = \"global@id\"\n",
+    ).unwrap();
+
+    // A hand-edited, unquoted warehouse identifier: valid TOML, wrong type for the key.
+    std::fs::write(
+        warehouse.root.join(".forklift/config/warehouse.toml"),
+        "[operator]\nidentifier = 12345\n",
+    ).unwrap();
+
+    let identifier = warehouse.run(&["config", "operator.identifier"]);
+    let url = warehouse.run(&["config", "remote.url"]);
+
+    assert_eq!(
+        identifier.status.code(), url.status.code(),
+        "one broken file must produce one answer, not a different one per key.\n\
+         operator.identifier: {:?} / {}\nremote.url: {:?} / {}",
+        identifier.status.code(), stderr(&identifier),
+        url.status.code(), stderr(&url)
+    );
+    assert!(!identifier.status.success(), "a read of an unparseable file must not succeed");
+
+    for output in [&identifier, &url] {
+        let error = stderr(output);
+        assert!(error.contains("warehouse.toml"), "the refusal must name the file: {}", error);
+        assert!(!error.contains("is not set"), "a broken file must not be reported as unset: {}", error);
+    }
+
+    // And nothing leaked the global value the user was not asking about.
+    assert!(
+        !stdout(&identifier).contains("global@id"),
+        "a malformed warehouse scope must not fall through to the global one: {}",
+        stdout(&identifier)
+    );
+}
+
+/// A bad value must not block its own repair. Validating the file *before*
+/// the edit meant `remote.tor = "onn"` refused every write to that file — including
+/// `config remote.tor on`, the command that corrects it. The value blocked its own repair, and a
+/// text editor was the only way out. `write_validated` now parses the document **as edited**, so
+/// the question is whether the file you are about to leave on disk is valid.
+///
+/// The fourth leg is the one that keeps this from being a hole rather than a fix: a write that
+/// leaves the bad value untouched must still be refused, naming it.
+///
+/// Falsified both directions: validating before the edit reddens legs 1 and 3 (both refuse with
+/// the `"onn"` message); accepting unconditionally after it reddens leg 4.
+#[test]
+fn a_write_that_repairs_the_offending_entry_is_allowed_where_one_that_leaves_it_is_not() {
+    let warehouse = TestWarehouse::new("config-repairs-itself");
+    assert_success(&warehouse.run(&["prepare"]));
+
+    let config = warehouse.root.join(".forklift/config/warehouse.toml");
+    let broken = "[remote]\nurl = \"http://example\"\ntor = \"onn\"\n";
+
+    // 1. Overwriting the offending key repairs the file.
+    std::fs::write(&config, broken).unwrap();
+    assert_success(&warehouse.run(&["config", "remote.tor", "on"]));
+    assert!(
+        std::fs::read_to_string(&config).unwrap().contains("tor = \"on\""),
+        "the corrected value must be on disk: {}", std::fs::read_to_string(&config).unwrap()
+    );
+
+    // 2. And the file is ordinary again afterwards.
+    assert_success(&warehouse.run(&["config", "remote.token", "abc"]));
+
+    // 3. Unsetting the offending key repairs it too — it removes exactly what was refusing.
+    std::fs::write(&config, broken).unwrap();
+    assert_success(&warehouse.run(&["config", "--unset", "remote.tor"]));
+    assert!(
+        !std::fs::read_to_string(&config).unwrap().contains("onn"),
+        "the offending entry must be gone"
+    );
+
+    // 4. A write that leaves the bad value in place is still refused, and still names it.
+    std::fs::write(&config, broken).unwrap();
+    let refused = warehouse.run(&["config", "remote.token", "abc"]);
+    assert!(!refused.status.success(), "unrelated writes must not land beside a bad value");
+    let error = stderr(&refused);
+    assert!(error.contains("remote.tor"), "the refusal must name the offending key: {}", error);
+    assert!(error.contains("onn"), "the refusal must quote what was written: {}", error);
+    assert_eq!(
+        std::fs::read_to_string(&config).unwrap(), broken,
+        "a refused write must leave the file byte-identical"
+    );
+}
+
+/// The privacy-relevant half of the same contract, with a fixture that _discriminates_.
+///
+/// `remote.tor` decides whether a remote is dialled through Tor at all, and
+/// `TorSettings::from_config` used to swallow any read failure with `.ok().flatten()` and
+/// default to `TorMode::Auto`. So a hand-edited, unquoted `tor = true` — a natural edit, and
+/// one `TorMode::parse` would have read as "on" had it been quoted — silently dropped the
+/// warehouse out of the mode it was configured in and dialled the clearnet remote **directly**.
+///
+/// The fixture deliberately sets *no* global `remote.tor`: an earlier version of this test put
+/// a valid global value behind the malformed warehouse one, which made a lenient reader look
+/// correct (it "fell through" to something reasonable) and so proved the bug rather than the
+/// property. With nothing behind it, the only two possible outcomes are a silent clearnet dial
+/// and a refusal.
+///
+/// Falsified both directions: this test file was appended to a worktree of `origin/main` and
+/// run against that binary, where it fails — `lower` reaches the network and reports
+/// "Error while reaching the remote http://127.0.0.1:9: Connection refused", never naming
+/// `remote.tor`.
+#[test]
+fn a_malformed_remote_tor_refuses_instead_of_silently_dialling_the_remote_directly() {
+    let warehouse = TestWarehouse::new("config-tor-no-silent-clearnet");
+    assert_success(&warehouse.run(&["prepare"]));
+
+    // Port 9 (discard) is closed on every sane host: if the command reaches the network at
+    // all, it fails with a transport error rather than hanging.
+    std::fs::write(
+        warehouse.root.join(".forklift/config/warehouse.toml"),
+        "[remote]\nurl = \"http://127.0.0.1:9/\"\ntor = true\n",
+    ).unwrap();
+
+    let lower = warehouse.run(&["lower"]);
+
+    assert!(!lower.status.success(), "a malformed remote.tor must refuse: {}", stdout(&lower));
+    let error = stderr(&lower);
+    assert!(error.contains("remote.tor"), "the refusal must name the key: {}", error);
+    assert!(error.contains("warehouse.toml"), "the refusal must name the file: {}", error);
+    assert!(
+        !error.to_lowercase().contains("connect"),
+        "the command must refuse before it dials anything: {}", error
+    );
+}
+
+/// The other half of the ticket's "two silent failures live on main" pair, also with a
+/// discriminating fixture. `maintenance.rs` used to do `.unwrap_or(AutoCompaction::None)`, so a
+/// `maintenance.*` value it could not read turned background packing off — on every command,
+/// forever, with nothing printed anywhere.
+///
+/// `load` is the observable seam because it is a mutating command that resolves no operator
+/// identity, so it still *succeeds* on a warehouse whose configuration does not parse — which
+/// is exactly the state in which the old code went quiet. The warning rides stderr, so `--json`
+/// stdout is still exactly one document.
+///
+/// Falsified both directions: run against an `origin/main` worktree's binary it fails at the
+/// stderr assertion — `load` exits 0 with empty stderr, and `store` exits 0 reporting a store
+/// census as though the configuration had been read.
+#[test]
+fn unreadable_maintenance_settings_are_announced_rather_than_silently_disabling_maintenance() {
+    let warehouse = TestWarehouse::new("config-maintenance-not-silent");
+    assert_success(&warehouse.run(&["prepare"]));
+    warehouse.write_file("a.txt", "one\n");
+
+    // A hand-edited, unquoted threshold (a bare TOML integer, not the string the reader takes).
+    std::fs::write(
+        warehouse.root.join(".forklift/config/warehouse.toml"),
+        "[maintenance]\nloose = 12345\n",
+    ).unwrap();
+
+    let load = warehouse.run(&["--json", "load", "."]);
+    assert_success(&load);
+
+    // stdout is still exactly one JSON document — the warning never shares it.
+    let envelope = json(&load);
+    assert_eq!(envelope["ok"], true, "unexpected envelope: {}", envelope);
+
+    let warning: serde_json::Value = serde_json::from_str(stderr(&load).trim())
+        .unwrap_or_else(|e| panic!("stderr is not the JSON warning ({}): {}", e, stderr(&load)));
+    assert_eq!(warning["warning"], "maintenance_unavailable", "unexpected warning: {}", warning);
+    assert!(
+        warning["message"].as_str().unwrap_or_default().contains("maintenance.loose"),
+        "the warning must name the key: {}", warning
+    );
+
+    // `docs/MACHINE_INTERFACE.md` promises four fields on every stderr warning, and `next_step`
+    // is the one a consumer surfaces to a human — so it has to carry an **action**. It used to
+    // hold only a reassurance about the current state ("packing is skipped while this lasts"),
+    // leaving that consumer nothing to do while the thing to do sat in the reported cause.
+    //
+    // This must not require the word "message": requiring it here once was how the wording came to name a `--json` field in text that is also printed
+    // verbatim to a human. What it must require is the *action* and the agreement with the
+    // constant; `output.rs`'s unit test owns the rule that no envelope field may be named.
+    let next_step = warning["next_step"].as_str().unwrap_or_default();
+    assert!(
+        next_step.contains("Resolve") && next_step.contains("cause"),
+        "next_step must point at an action, not describe the state: {}", warning
+    );
+    assert!(
+        !next_step.contains("message"),
+        "next_step reaches human readers too, so it must not name an envelope field: {}", warning
+    );
+    assert_eq!(
+        warning["forklift_json"], "2",
+        "the warning carries the same envelope version as stdout: {}", warning
+    );
+
+    // And the command that exists to report the store's health refuses outright rather than
+    // reporting a default threshold the tool is not actually using.
+    let store = warehouse.run(&["store"]);
+    assert!(!store.status.success(), "store must refuse on a config it cannot read: {}", stdout(&store));
+    assert!(stderr(&store).contains("maintenance.loose"), "unexpected refusal: {}", stderr(&store));
+}
+
+/// A `maintenance.*` value that is a string but not one the setting takes is refused at both
+/// doors — a hand edit fails the command that reads it, and `config` will not write one. Before,
+/// the reader took only the off-spellings and treated anything else as on, so `auto = "flase"`
+/// left maintenance running; and an unparseable threshold was silently replaced by the default.
+#[test]
+fn a_mistyped_maintenance_value_is_refused_rather_than_read_as_a_default() {
+    let warehouse = TestWarehouse::new("config-maintenance-typo");
+    assert_success(&warehouse.run(&["prepare"]));
+    let config = warehouse.root.join(".forklift/config/warehouse.toml");
+
+    for (content, key) in [
+        ("[maintenance]\nauto = \"flase\"\n", "maintenance.auto"),
+        ("[maintenance]\nloose = \"10k\"\n",  "maintenance.loose"),
+        ("[maintenance]\npacks = \"-1\"\n",   "maintenance.packs"),
+    ] {
+        std::fs::write(&config, content).unwrap();
+
+        let store = warehouse.run(&["store"]);
+        assert!(!store.status.success(), "store must refuse {content:?}: {}", stdout(&store));
+        assert!(
+            stderr(&store).contains(&format!("is not a valid value for {key}")),
+            "the refusal must name the key and say why: {}", stderr(&store)
+        );
+    }
+
+    std::fs::write(&config, "").unwrap();
+
+    for (key, value) in [("maintenance.auto", "flase"), ("maintenance.loose", "10k")] {
+        let set = warehouse.run(&["config", key, value]);
+        assert!(!set.status.success(), "config must refuse {key} = {value:?}");
+        assert!(stderr(&set).contains(&format!("is not a valid value for {key}")), "{}", stderr(&set));
+    }
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), "", "a refused set must not touch the file");
+
+    // The documented spellings are accepted, and stored the documented way.
+    assert_success(&warehouse.run(&["config", "maintenance.auto", " OFF "]));
+    assert_eq!(stdout(&warehouse.run(&["config", "maintenance.auto"])).trim(), "off");
+}
+
+/// A warehouse configuration that is present but cannot be read is an error, never "absent".
+/// An absent warehouse file falls through to the global one, so reading a dangling link as
+/// absent replaced the warehouse's own settings with the user's global ones, silently.
+#[cfg(unix)]
+#[test]
+fn a_dangling_warehouse_config_link_is_an_error_not_a_fallback_to_global() {
+    let warehouse = TestWarehouse::new("config-dangling-link");
+    assert_success(&warehouse.run(&["prepare"]));
+    assert_success(&warehouse.run(&["config", "--global", "remote.url", "http://global.example/"]));
+
+    let config = warehouse.root.join(".forklift/config/warehouse.toml");
+    let _ = std::fs::remove_file(&config);
+    std::os::unix::fs::symlink(warehouse.root.join("gone.toml"), &config).unwrap();
+
+    let read = warehouse.run(&["config", "remote.url"]);
+    assert!(
+        !read.status.success(),
+        "a dangling warehouse config must refuse, not answer with the global value: {}", stdout(&read)
+    );
+    assert!(stderr(&read).contains("warehouse.toml"), "the refusal must name the file: {}", stderr(&read));
+    assert!(stderr(&read).contains("symbolic link"), "the refusal must say why: {}", stderr(&read));
+    let named = stderr(&read).split('"').nth(1).unwrap_or_default().to_string();
+    assert!(
+        std::path::Path::new(&named).is_absolute(),
+        "the refusal must name the file by its full path, not {named:?}: {}", stderr(&read)
+    );
+
+    // A link to a link whose target is gone is dangling too — the whole chain is followed, not
+    // one level of it.
+    std::fs::remove_file(&config).unwrap();
+    std::os::unix::fs::symlink(warehouse.root.join("gone.toml"), warehouse.root.join("middle.toml")).unwrap();
+    std::os::unix::fs::symlink(warehouse.root.join("middle.toml"), &config).unwrap();
+
+    let read = warehouse.run(&["config", "remote.url"]);
+    assert!(!read.status.success(), "a dangling chain must refuse: {}", stdout(&read));
+    assert!(stderr(&read).contains("symbolic link"), "the refusal must say why: {}", stderr(&read));
+
+    // The same, one level up: the configuration *folder* is the dangling link, so the file's own
+    // path ends in nothing at all and only the walk up the path can tell it from absence.
+    let folder = warehouse.root.join(".forklift/config");
+    std::fs::remove_file(&config).unwrap();
+    std::fs::remove_dir(&folder).unwrap();
+    std::os::unix::fs::symlink(warehouse.root.join("unmounted"), &folder).unwrap();
+
+    let read = warehouse.run(&["config", "remote.url"]);
+    assert!(
+        !read.status.success(),
+        "a dangling config folder must refuse, not answer with the global value: {}", stdout(&read)
+    );
+    assert!(stderr(&read).contains("symbolic link"), "the refusal must say why: {}", stderr(&read));
+
+    // With nothing at the path at all, the global value applies — that is what absent means.
+    std::fs::remove_file(&folder).unwrap();
+    let read = warehouse.run(&["config", "remote.url"]);
+    assert_success(&read);
+    assert_eq!(stdout(&read).trim(), "http://global.example/");
+}
+
+/// A configuration file that is not TOML at all is refused like any other invalid file: named
+/// by its full path, with the same remedy.
+#[test]
+fn a_config_file_that_is_not_toml_is_refused_like_any_invalid_file() {
+    let warehouse = TestWarehouse::new("config-not-toml");
+    assert_success(&warehouse.run(&["prepare"]));
+    std::fs::write(warehouse.root.join(".forklift/config/warehouse.toml"), "[remote\n").unwrap();
+
+    let read = warehouse.run(&["config", "remote.url"]);
+    assert!(!read.status.success(), "a file that is not TOML must refuse: {}", stdout(&read));
+
+    let error = stderr(&read);
+    assert!(error.contains("is not valid"), "unexpected refusal: {error}");
+    assert!(error.contains("Fix the file by hand."), "the refusal must give the remedy: {error}");
+    let named = error.split('"').nth(1).unwrap_or_default();
+    assert!(
+        std::path::Path::new(named).is_absolute() && named.ends_with("warehouse.toml"),
+        "the refusal must name the file by its full path, not {named:?}: {error}"
+    );
+}
+
 #[test]
 fn identity_is_zero_configuration_an_id_is_minted_on_first_use() {
     let warehouse = TestWarehouse::new("mint");
@@ -2850,6 +3193,462 @@ fn profiles_select_the_identity_a_warehouse_acts_under() {
     let list = stdout(&warehouse.run(&["profile", "list"]));
     let work_line = list.lines().find(|line| line.starts_with("work — ")).unwrap_or("");
     assert!(work_line.contains("1 local key(s)"), "unexpected profile list: {}", list);
+}
+
+/// The end-to-end regression the strict
+/// parse exists to prevent. `get_operator` must refuse outright on a malformed selected profile
+/// — and, the part that was unpinned, it must never mint a replacement identifier and write it
+/// back over the profile: the global config file must be byte-identical after the refusal.
+#[test]
+fn a_malformed_selected_profile_refuses_without_writing_back_to_the_global_config() {
+    let warehouse = TestWarehouse::new("profile-malformed-no-writeback");
+    warehouse.write_file("a.txt", "one\n");
+    assert_success(&warehouse.run(&["prepare"]));
+
+    // A profile with a hand-edited, unquoted identifier, written directly (bypassing
+    // "profile create", which would refuse on the same non-string value).
+    let global_config = warehouse.home.join("global-config.toml");
+    std::fs::write(&global_config, "[profile.work]\nidentifier = 12345\n").unwrap();
+
+    // Select it via the plain "config" key (not "profile use", which itself calls
+    // get_profile and would already refuse before ever setting operator.profile).
+    assert_success(&warehouse.run(&["config", "operator.profile", "work"]));
+
+    let before = std::fs::read(&global_config).unwrap();
+
+    // Any command resolving the operator hits this: "office enroll" is the simplest one
+    // that needs nothing else prepared.
+    let enroll = warehouse.run(&["office", "enroll"]);
+    assert!(!enroll.status.success(), "a malformed selected profile must refuse: {}", stdout(&enroll));
+    let error = stderr(&enroll);
+    assert!(error.contains("work"), "the refusal must name the profile: {}", error);
+    assert!(error.contains("identifier"), "the refusal must name the field: {}", error);
+
+    // The real regression this pins: no UUID was minted and written back over the
+    // profile. The malformed, hand-edited value survives exactly as written.
+    let after = std::fs::read(&global_config).unwrap();
+    assert_eq!(
+        before, after,
+        "a refused get_operator must never write back to the global config file"
+    );
+}
+
+/// The mint-and-overwrite hazard reached by a
+/// value that **parses perfectly**. An empty `identifier` is not a type fault, so the typed
+/// parse had nothing to say about it — and `ProfileRecord::to_operator` maps an absent field and
+/// an empty one onto the same `""`, which `get_operator` reads as "fill this in". So it minted a
+/// UUID and wrote it over the user's own entry, exactly as the malformed cases above once did.
+///
+/// The counterpart asymmetry is what made it worth a rule rather than a patch: the *direct*
+/// branch took `operator.identifier = ""` verbatim, making the empty string the on-chain
+/// operator id written into every parcel. One spelling, two opposite readings, one destructive.
+#[test]
+fn an_empty_identifier_refuses_rather_than_minting_a_replacement_over_it() {
+    let warehouse = TestWarehouse::new("empty-identifier-no-writeback");
+    warehouse.write_file("a.txt", "one\n");
+    assert_success(&warehouse.run(&["prepare"]));
+
+    let global_config = warehouse.home.join("global-config.toml");
+    std::fs::write(&global_config, "[profile.work]\nidentifier = \"\"\n").unwrap();
+    assert_success(&warehouse.run(&["config", "operator.profile", "work"]));
+
+    let before = std::fs::read(&global_config).unwrap();
+
+    let enroll = warehouse.run(&["office", "enroll"]);
+    assert!(!enroll.status.success(), "an empty identifier must refuse: {}", stdout(&enroll));
+    let error = stderr(&enroll);
+    assert!(error.contains("cannot be empty"), "the refusal must say what is wrong: {}", error);
+    assert!(
+        error.contains("profile.work.identifier"),
+        "the refusal must name the field: {}", error
+    );
+
+    assert_eq!(
+        before, std::fs::read(&global_config).unwrap(),
+        "a refused get_operator must never write back to the global config file"
+    );
+
+    // The write-side door onto the same entry: `profile create --id ""` would otherwise lay down
+    // the very entry the parse refuses.
+    let created = warehouse.run(&["profile", "create", "--id", "", "other"]);
+    assert!(!created.status.success(), "an empty minted identifier must refuse: {}", stdout(&created));
+    assert!(
+        stderr(&created).contains("cannot be empty"),
+        "unexpected refusal: {}", stderr(&created)
+    );
+}
+
+/// Pinned at the call site rather than in the helper: `forklift config` stores a
+/// fixed-value key normalized, so what lands on disk is literally one of the three spellings the
+/// guide enumerates.
+///
+/// `"  ON  "` is the fixture because it discriminates — the range check admits it either way
+/// (`validate_value` normalizes before testing membership), so the *only* difference between
+/// storing normalized and storing raw is the spelling in the file: `on` against `  ON  `. The
+/// read-back then shows the value is understood, which a raw-storing implementation also manages
+/// — that assertion is the counterpart, not the pin.
+#[test]
+fn a_fixed_value_key_is_written_to_disk_in_its_documented_spelling() {
+    let warehouse = TestWarehouse::new("config-normalizes-fixed-values");
+    assert_success(&warehouse.run(&["prepare"]));
+
+    assert_success(&warehouse.run(&["config", "remote.tor", "  ON  "]));
+
+    let config = warehouse.root.join(".forklift/config/warehouse.toml");
+    let content = std::fs::read_to_string(&config).unwrap();
+    assert!(
+        content.contains("tor = \"on\""),
+        "the stored value must be the documented spelling, not what was typed: {content}"
+    );
+    assert!(
+        !content.contains("  ON  "),
+        "the raw argument must not reach the file: {content}"
+    );
+
+    // And the file is an ordinary one afterwards — the stored value is admissible on the way
+    // back in, which is the whole reason for normalizing it on the way out.
+    let read = warehouse.run(&["config", "remote.tor"]);
+    assert_success(&read);
+    assert!(stdout(&read).contains("on"), "unexpected read-back: {}", stdout(&read));
+}
+
+/// The `--json` set envelope must report the spelling that reached the file.
+///
+/// Normalizing on the way out gave the command two answers to the same question — the argument
+/// it was handed and the value it wrote — and the envelope echoed the first. A consumer caching
+/// that echo (the only reason the envelope exists, since human mode prints nothing) held
+/// `"  ON  "` for a file containing `on`, and disagreed with its own next read.
+#[test]
+fn the_json_set_envelope_reports_the_value_that_reached_the_file() {
+    let warehouse = TestWarehouse::new("config-json-echo-is-the-stored-value");
+    assert_success(&warehouse.run(&["prepare"]));
+
+    let set = warehouse.run(&["--json", "config", "remote.tor", "  ON  "]);
+    assert_success(&set);
+
+    let envelope = json(&set);
+    assert_eq!(envelope["data"]["key"], "remote.tor");
+    assert_eq!(
+        envelope["data"]["value"], "on",
+        "the envelope must report what was written, not what was typed: {envelope}"
+    );
+
+    // The pin is the agreement between the three surfaces, so read the other two back here.
+    let content = std::fs::read_to_string(warehouse.root.join(".forklift/config/warehouse.toml"))
+        .unwrap();
+    assert!(content.contains("tor = \"on\""), "unexpected file content: {content}");
+    assert!(stdout(&warehouse.run(&["config", "remote.tor"])).contains("on"));
+}
+
+/// A refused profile creation leaves nothing behind. Creation used to be two writes, and a value
+/// refused by the second left the first on disk.
+///
+/// `profile create --name "" work` minted an identifier, wrote `[profile.work]`, then refused the
+/// empty display name — reporting failure while leaving a profile behind that made the obvious
+/// retry fail too ("the profile \"work\" already exists"), with no command able to remove it.
+/// The fixture is the *second* field for that reason: refusing on the first would prove nothing
+/// about ordering.
+///
+/// Two mechanisms now hold this, and either alone does: `create_profile` refuses its inputs
+/// before writing anything, and creation is a single write of every field. Measured:
+/// with the up-front checks removed this test stays green; with them removed *and* the write split
+/// per field it goes red.
+#[test]
+fn a_refused_profile_field_leaves_no_half_created_profile_behind() {
+    let warehouse = TestWarehouse::new("profile-create-is-all-or-nothing");
+    assert_success(&warehouse.run(&["prepare"]));
+
+    let created = warehouse.run(&["profile", "create", "work", "--name", ""]);
+    assert!(!created.status.success(), "an empty display name must refuse: {}", stdout(&created));
+    assert!(
+        stderr(&created).contains("cannot be empty"),
+        "unexpected refusal: {}", stderr(&created)
+    );
+
+    // Nothing was written: the global file either does not exist or holds no profile section.
+    let global_config = warehouse.home.join("global-config.toml");
+    let content = std::fs::read_to_string(&global_config).unwrap_or_default();
+    assert!(
+        !content.contains("[profile.work]"),
+        "a refused creation must leave no profile behind: {content}"
+    );
+
+    // And the retry that used to be locked out succeeds.
+    let retry = warehouse.run(&["profile", "create", "work", "--name", "Work Me"]);
+    assert_success(&retry);
+}
+
+/// An empty value is refused with the fact alone wherever no advice is true on every path, and with
+/// "omit it" where the value came from an option. `--unset` is never suggested: it needs the right
+/// scope, fails for a key that is not set, and cannot address a profile field, so any hint built
+/// on it was wrong somewhere.
+#[test]
+fn an_empty_value_is_refused_with_advice_only_where_the_advice_is_always_true() {
+    let warehouse = TestWarehouse::new("empty-value-remedy-per-door");
+    assert_success(&warehouse.run(&["prepare"]));
+
+    let global_config = warehouse.home.join("global-config.toml");
+
+    // `config`, both scopes, a key that is set and one that is not: the same bare fact. The
+    // global case runs inside a warehouse, where an `--unset` without `--global` used to be
+    // suggested and would have targeted the wrong file.
+    assert_success(&warehouse.run(&["config", "--global", "operator.name", "Ada"]));
+
+    for (args, key) in [
+        (vec!["config", "--global", "operator.name", ""], "operator.name"),
+        (vec!["config", "operator.name", "   "], "operator.name"),
+        (vec!["config", "remote.token", ""], "remote.token"),
+    ] {
+        let refused = warehouse.run(&args);
+        assert!(!refused.status.success(), "{args:?} must refuse: {}", stdout(&refused));
+        assert_eq!(stderr(&refused).trim(), format!("\"{key}\" cannot be empty."));
+    }
+
+    // The refused write left the value it would have replaced.
+    let read = warehouse.run(&["config", "--global", "operator.name"]);
+    assert_eq!(stdout(&read).trim(), "Ada", "a refused write must leave the file as it was");
+
+    // An unknown key is reported as unknown, not as empty: the key is checked first.
+    let refused = warehouse.run(&["config", "operator.nmae", ""]);
+    assert!(
+        stderr(&refused).contains("Unknown configuration key"),
+        "unexpected: {}", stderr(&refused)
+    );
+
+    // The `profile create` door: nothing is on disk yet, so the advice is about the option.
+    for (args, option) in [
+        (["profile", "create", "work", "--name", ""], "--name"),
+        (["profile", "create", "work", "--id", "  "], "--id"),
+    ] {
+        let refused = warehouse.run(&args);
+        assert!(!refused.status.success(), "{option} \"\" must refuse: {}", stdout(&refused));
+
+        let message = stderr(&refused);
+        assert!(message.contains(option), "the refusal must name the option: {message}");
+        assert!(message.contains("Omit it"), "the refusal must say what to do: {message}");
+        assert!(
+            !message.contains("file") && !message.contains("--unset"),
+            "nothing was written, so there is no entry to remove: {message}"
+        );
+    }
+
+    // The parse door: a bad *global* file read from inside a warehouse. The message names the
+    // file and says to fix it — and offers no `--unset`, which here would carry no `--global`
+    // and could not succeed while another entry in the file was also bad.
+    std::fs::write(&global_config, "[operator]\nidentifier = \"op-1\"\nname = \"\"\n").unwrap();
+
+    let read = warehouse.run(&["config", "operator.name"]);
+    assert!(!read.status.success(), "a file holding an empty value must refuse");
+
+    let message = stderr(&read);
+    assert!(message.contains("global-config.toml"), "the refusal must name the file: {message}");
+    assert!(message.contains("\"operator.name\" cannot be empty."), "unexpected: {message}");
+    assert!(message.contains("Fix the file by hand"), "unexpected: {message}");
+    assert!(!message.contains("--unset"), "the parse door may not suggest --unset: {message}");
+}
+
+/// `franchise --token ""` and `profile use ""` refuse in their own words before doing anything,
+/// rather than reaching the configuration write — whose refusal would name a key the user never
+/// typed.
+#[test]
+fn franchise_and_profile_use_refuse_an_empty_value_in_their_own_words() {
+    let warehouse = TestWarehouse::new("empty-value-franchise-profile-use");
+    assert_success(&warehouse.run(&["prepare"]));
+
+    // Nothing listens here: a refusal that came after the handshake would be a network error,
+    // not the one asserted below.
+    let refused = warehouse.run(&["franchise", "http://127.0.0.1:9/", "clone", "--token", "  "]);
+    assert!(!refused.status.success(), "an empty token must refuse: {}", stdout(&refused));
+
+    let message = stderr(&refused);
+    assert!(message.contains("--token"), "the refusal must name the option: {message}");
+    assert!(message.contains("Omit it"), "the refusal must say what to do: {message}");
+    assert!(!message.contains("--unset"), "there is no entry to remove: {message}");
+    assert!(!warehouse.root.join("clone").exists(), "the refusal must create nothing");
+
+    // A hand-written `[profile.""]` is found by the lookup, so without its own check `profile use`
+    // reached the configuration write and was refused there.
+    let global_config = warehouse.home.join("global-config.toml");
+    std::fs::write(&global_config, "[profile.\"\"]\nidentifier = \"op-1\"\n").unwrap();
+
+    let refused = warehouse.run(&["profile", "use", ""]);
+    assert!(!refused.status.success(), "an empty profile name must refuse: {}", stdout(&refused));
+
+    let message = stderr(&refused);
+    assert!(message.contains("A profile name cannot be empty."), "unexpected: {message}");
+    assert!(!message.contains("--unset"), "there is no entry to remove: {message}");
+
+    let read = warehouse.run(&["config", "operator.profile"]);
+    assert!(!read.status.success(), "nothing may be selected: {}", stdout(&read));
+    assert!(stderr(&read).contains("is not set"), "unexpected read: {}", stderr(&read));
+}
+
+/// An empty profile *name* is refused like an empty value.
+///
+/// `profile create ""` wrote a `[profile.""]` section that no command could then reach: selecting
+/// it means `operator.profile = ""`, which the same rule refuses at both the read and the write
+/// door, and there is no `profile delete`. Creating something unusable and unremovable is worse
+/// than refusing to create it.
+///
+/// Run here rather than in `config_utils`'s unit tests because `set_profile_fields` writes to the
+/// real global configuration, and only this harness scopes HOME to the test.
+#[test]
+fn an_empty_profile_name_is_refused_rather_than_created_unreachable() {
+    let warehouse = TestWarehouse::new("profile-create-empty-name");
+    assert_success(&warehouse.run(&["prepare"]));
+
+    let created = warehouse.run(&["profile", "create", ""]);
+    assert!(!created.status.success(), "an empty profile name must refuse: {}", stdout(&created));
+    assert!(
+        stderr(&created).contains("cannot be empty"),
+        "unexpected refusal: {}", stderr(&created)
+    );
+
+    let content = std::fs::read_to_string(warehouse.home.join("global-config.toml"))
+        .unwrap_or_default();
+    assert!(
+        !content.contains("[profile.\"\"]"),
+        "a refused creation must leave no profile section behind: {content}"
+    );
+}
+
+/// The same mint-and-overwrite hazard on the *more
+/// common* code path — no `operator.profile` set at all, so `get_operator` reads
+/// `operator.identifier` directly. A hand-edited, unquoted global `identifier = 12345` used to
+/// collapse into "absent", mint a fresh UUID, and write it back over the value.
+#[test]
+fn a_malformed_default_identifier_refuses_without_writing_back_to_the_global_config() {
+    let warehouse = TestWarehouse::new("default-identifier-malformed-no-writeback");
+    warehouse.write_file("a.txt", "one\n");
+    assert_success(&warehouse.run(&["prepare"]));
+
+    // A hand-edited, unquoted global operator.identifier, written directly — no profile
+    // selected, so get_operator falls straight to the non-profile branch.
+    let global_config = warehouse.home.join("global-config.toml");
+    std::fs::write(&global_config, "[operator]\nidentifier = 12345\n").unwrap();
+
+    let before = std::fs::read(&global_config).unwrap();
+
+    let enroll = warehouse.run(&["office", "enroll"]);
+    assert!(!enroll.status.success(), "a malformed operator.identifier must refuse: {}", stdout(&enroll));
+    let error = stderr(&enroll);
+    assert!(error.contains("operator.identifier"), "the refusal must name the key: {}", error);
+
+    // The real regression this pins: no UUID was minted and written back over the value.
+    let after = std::fs::read(&global_config).unwrap();
+    assert_eq!(
+        before, after,
+        "a refused get_operator must never mint and write back to the global config file"
+    );
+}
+
+/// The hazard reached through the one key that
+/// selects *which* identity is read at all. A warehouse `profile = 2024` written unquoted used
+/// to read as absent, so the profile selection was silently discarded, `get_operator` fell
+/// through to the non-profile branch, minted a fresh UUID, and wrote an `[operator]` section
+/// into a global config that only ever held `[profile.2024]`.
+#[test]
+fn a_malformed_operator_profile_refuses_without_writing_back_to_the_global_config() {
+    let warehouse = TestWarehouse::new("profile-selector-malformed-no-writeback");
+    warehouse.write_file("a.txt", "one\n");
+    assert_success(&warehouse.run(&["prepare"]));
+
+    // A valid named profile in the global config...
+    let global_config = warehouse.home.join("global-config.toml");
+    std::fs::write(&global_config, "[profile.2024]\nidentifier = \"op-1\"\n").unwrap();
+
+    // ...selected by a hand-edited, unquoted (numeric) warehouse `operator.profile`.
+    std::fs::write(
+        warehouse.root.join(".forklift/config/warehouse.toml"),
+        "[operator]\nprofile = 2024\n",
+    ).unwrap();
+
+    let before = std::fs::read(&global_config).unwrap();
+
+    let enroll = warehouse.run(&["office", "enroll"]);
+    assert!(!enroll.status.success(), "a malformed operator.profile must refuse: {}", stdout(&enroll));
+    let error = stderr(&enroll);
+    assert!(error.contains("operator.profile"), "the refusal must name the key: {}", error);
+
+    let after = std::fs::read(&global_config).unwrap();
+    assert_eq!(
+        before, after,
+        "a refused get_operator must never fall through to a different identity and mint one"
+    );
+}
+
+/// The generalization the three tests above could not express, and the reason FORK-117 replaced
+/// the reader instead of hardening it key by key: damage at the **section** level, where there
+/// is no key to be strict about. `operator = 5` is not a malformed `operator.identifier` — the
+/// identifier is not there at all, and neither is anything else. Every key-level rule reads
+/// this file as "nothing is configured", which for the identity means minting a UUID into the
+/// *global* file over a warehouse the user thought was configured.
+///
+/// The global scope holds a perfectly good identifier here on purpose: that is what makes the
+/// mint observable as a rewrite of a file the command had no business touching.
+///
+/// Falsified both directions: run against an `origin/main` worktree's binary it fails at
+/// `assert!(!success)` — `office enroll` succeeds with `Enrolled "global@id"`, silently ignoring
+/// the warehouse's own configuration.
+#[test]
+fn a_warehouse_section_that_is_not_a_table_refuses_instead_of_reading_as_unconfigured() {
+    let warehouse = TestWarehouse::new("operator-section-not-a-table");
+    warehouse.write_file("a.txt", "one\n");
+    assert_success(&warehouse.run(&["prepare"]));
+
+    let global_config = warehouse.home.join("global-config.toml");
+    std::fs::write(&global_config, "[operator]\nidentifier = \"global@id\"\n").unwrap();
+
+    std::fs::write(
+        warehouse.root.join(".forklift/config/warehouse.toml"),
+        "operator = 5\n",
+    ).unwrap();
+
+    let before = std::fs::read(&global_config).unwrap();
+
+    let enroll = warehouse.run(&["office", "enroll"]);
+    assert!(
+        !enroll.status.success(),
+        "a warehouse section that is not a table must refuse, not read as unconfigured: {}",
+        stdout(&enroll)
+    );
+    let error = stderr(&enroll);
+    assert!(error.contains("operator"), "the refusal must name the section: {}", error);
+    assert!(error.contains("warehouse.toml"), "the refusal must name the file: {}", error);
+
+    let after = std::fs::read(&global_config).unwrap();
+    assert_eq!(before, after, "a refused identity resolution must not touch the global config file");
+}
+
+/// A mistyped key *name* is the same hazard as a mistyped value type, and only name-strictness
+/// closes it: `identifer = "alice"` is a typo away from `identifier`, and a reader that skips
+/// what it does not recognize reports the identity as unset — then mints one over it.
+///
+/// Falsified both directions: run against an `origin/main` worktree's binary it fails at
+/// `assert!(!success)` — `office enroll` succeeds, having minted a fresh UUID and written it
+/// into the global file beside the typo.
+#[test]
+fn a_mistyped_configuration_key_refuses_instead_of_reading_as_unset() {
+    let warehouse = TestWarehouse::new("config-mistyped-key");
+    warehouse.write_file("a.txt", "one\n");
+    assert_success(&warehouse.run(&["prepare"]));
+
+    let global_config = warehouse.home.join("global-config.toml");
+    std::fs::write(&global_config, "[operator]\nidentifer = \"alice\"\n").unwrap();
+
+    let before = std::fs::read(&global_config).unwrap();
+
+    let enroll = warehouse.run(&["office", "enroll"]);
+    assert!(!enroll.status.success(), "a mistyped key must refuse: {}", stdout(&enroll));
+    let error = stderr(&enroll);
+    assert!(error.contains("identifer"), "the refusal must quote what was written: {}", error);
+    assert!(
+        error.contains("operator.identifier"),
+        "the refusal must list the keys forklift does know: {}", error
+    );
+
+    let after = std::fs::read(&global_config).unwrap();
+    assert_eq!(before, after, "a refused identity resolution must not mint over a typo");
 }
 
 #[test]

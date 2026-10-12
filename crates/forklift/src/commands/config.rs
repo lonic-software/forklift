@@ -49,11 +49,16 @@ pub fn handle_command(global: bool,
 
     match (&key, &value) {
         (Some(key), Some(value)) => {
-            config_utils::set_value(key, value, scope)?;
+            let stored = config_utils::set_value(key, value, scope)?;
 
             // Setting a value has always been silent in human mode; keep it so, but
             // give `--json` a confirmation envelope.
-            output::emit("config", &ConfigSet { key: key.clone(), value: value.clone() });
+            //
+            // The envelope reports what was *written*, not what was asked for: a fixed-value key
+            // is stored normalized, so echoing the argument would answer `"  ON  "` for a file
+            // that holds `on` — a disagreement a consumer caching the echo would carry until its
+            // next read. `set_value` returns the stored spelling so this cannot be got wrong.
+            output::emit("config", &ConfigSet { key: key.clone(), value: stored });
 
             Ok(())
         }
@@ -67,6 +72,10 @@ pub fn handle_command(global: bool,
 #[derive(Serialize)]
 pub(crate) struct ConfigSet {
     key: String,
+
+    /// The value as written to the file, which is not always the argument given: a key with a
+    /// fixed set of values (`remote.tor`) is stored in its documented spelling, so `"  ON  "` is
+    /// reported, and stored, as `"on"`. A later `config <key>` read returns this same string.
     value: String,
 }
 
