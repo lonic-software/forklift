@@ -1108,10 +1108,13 @@ fn load_document(path: &Path) -> Result<Option<DocumentMut>, String> {
         Ok(content) => content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => match dangling_link_in(path) {
             None => return Ok(None),
+            // Named absolute, like every other refusal of a configuration file: the warehouse
+            // path is relative to a root the user may not be standing in.
             Some(link) => return Err(format!(
                 "Configuration file \"{}\" cannot be read: \"{}\" is a symbolic link to a path \
                  that does not exist. Create the target, or remove the link.",
-                path.to_string_lossy(), link.to_string_lossy()
+                std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()).to_string_lossy(),
+                std::path::absolute(&link).unwrap_or(link).to_string_lossy()
             )),
         },
         Err(error) => return Err(format!(

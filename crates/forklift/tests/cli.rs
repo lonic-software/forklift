@@ -739,6 +739,21 @@ fn a_dangling_warehouse_config_link_is_an_error_not_a_fallback_to_global() {
     );
     assert!(stderr(&read).contains("warehouse.toml"), "the refusal must name the file: {}", stderr(&read));
     assert!(stderr(&read).contains("symbolic link"), "the refusal must say why: {}", stderr(&read));
+    let named = stderr(&read).split('"').nth(1).unwrap_or_default().to_string();
+    assert!(
+        std::path::Path::new(&named).is_absolute(),
+        "the refusal must name the file by its full path, not {named:?}: {}", stderr(&read)
+    );
+
+    // A link to a link whose target is gone is dangling too — the whole chain is followed, not
+    // one level of it.
+    std::fs::remove_file(&config).unwrap();
+    std::os::unix::fs::symlink(warehouse.root.join("gone.toml"), warehouse.root.join("middle.toml")).unwrap();
+    std::os::unix::fs::symlink(warehouse.root.join("middle.toml"), &config).unwrap();
+
+    let read = warehouse.run(&["config", "remote.url"]);
+    assert!(!read.status.success(), "a dangling chain must refuse: {}", stdout(&read));
+    assert!(stderr(&read).contains("symbolic link"), "the refusal must say why: {}", stderr(&read));
 
     // The same, one level up: the configuration *folder* is the dangling link, so the file's own
     // path ends in nothing at all and only the walk up the path can tell it from absence.
