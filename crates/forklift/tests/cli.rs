@@ -3987,7 +3987,9 @@ fn help_and_version_under_json_are_success_documents() {
     let value = json(&help);
     assert_eq!(value["ok"], true);
     assert_eq!(value["command"], "history");
-    assert!(value["data"]["message"].as_str().unwrap().contains("Usage: forklift history"));
+    // clap names the binary as invoked (`forklift.exe` on Windows), so match around it.
+    let help_text = value["data"]["message"].as_str().unwrap();
+    assert!(help_text.contains("Usage: forklift") && help_text.contains(" history [OPTIONS]"), "{}", help_text);
 
     let version = warehouse.run(&["--json", "--version"]);
     assert_eq!(version.status.code(), Some(0));
