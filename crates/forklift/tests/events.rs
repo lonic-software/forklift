@@ -200,6 +200,26 @@ fn assert_monotonic_within_phases(lines: &[String]) {
     }
 }
 
+/// The statuses seen are `known`'s phases in order, and include every phase in `kept`.
+///
+/// A status still queued when the next status arrives is replaced by it, so a phase with no
+/// progress before the next one may legitimately never reach the reader. `kept` names only the
+/// phases that cannot be replaced that way: one followed by progress, or the run's last.
+fn assert_phases(lines: &[String], known: &[&str], kept: &[&str]) {
+    let seen: Vec<&str> = lines.iter().filter_map(|line| line.strip_prefix("status ")).collect();
+
+    let mut remaining = known.iter();
+    for phase in &seen {
+        assert!(remaining.any(|known| known == phase),
+                "status {:?} is unknown or out of order; expected a subsequence of {:?}, saw {:?}",
+                phase, known, seen);
+    }
+
+    for phase in kept {
+        assert!(seen.contains(phase), "missing status {:?} in {:?}", phase, lines);
+    }
+}
+
 #[test]
 fn compact_reports_its_phases_on_the_channel() {
     let warehouse = TestWarehouse::new("compact");
@@ -211,9 +231,9 @@ fn compact_reports_its_phases_on_the_channel() {
     assert_protocol(&lines);
     assert_monotonic_within_phases(&lines);
 
-    for phase in ["status Collecting objects", "status Packing objects", "status Removing packed originals"] {
-        assert!(lines.iter().any(|line| line == phase), "missing {:?} in {:?}", phase, lines);
-    }
+    assert_phases(&lines,
+                  &["Collecting objects", "Packing objects", "Removing packed originals"],
+                  &["Packing objects", "Removing packed originals"]);
 
     // The channel is separate from stdout, which stays exactly one JSON document.
     let document: serde_json::Value = serde_json::from_slice(&output.stdout)
@@ -255,9 +275,9 @@ fn import_git_reports_its_phases_on_the_channel() {
     assert_protocol(&lines);
     assert_monotonic_within_phases(&lines);
 
-    for phase in ["status Converting commits", "status Publishing objects"] {
-        assert!(lines.iter().any(|line| line == phase), "missing {:?} in {:?}", phase, lines);
-    }
+    assert_phases(&lines,
+                  &["Converting commits", "Publishing objects", "Building the inventory"],
+                  &["Converting commits"]);
 }
 
 #[test]
