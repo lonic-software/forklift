@@ -1112,6 +1112,12 @@ AI agents. Full details — the envelope schema, the error/exit-code taxonomy, t
 `conflicts` content addresses, and wiring `forklift mcp` into a client — are in
 **[`../MACHINE_INTERFACE.md`](../MACHINE_INTERFACE.md)**.
 
+A program running `compact`, `lift`, `lower` or `import-git` can follow its progress
+without parsing stdout: set `PULT_EVENTS` to the number of an inherited pipe's write end
+(above 2), and Forklift writes `status <phase>` and `progress <0-100|?> [text]` lines to
+it. An fd that is not a pipe, FIFO or socket is ignored. See
+[Progress events](../MACHINE_INTERFACE.md#progress-events).
+
 ```sh
 forklift stocktake --json
 forklift stack "x" --json
