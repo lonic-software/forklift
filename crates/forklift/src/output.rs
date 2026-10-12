@@ -807,7 +807,7 @@ mod tests {
         assert!(human.contains(error), "the human line must carry the cause: {}", human);
         assert!(human.contains(MAINTENANCE_UNAVAILABLE_NEXT_STEP), "human text: {}", human);
 
-        // Round 4 finding F5. The two assertions above compare the text against its own
+        // The two assertions above compare the text against its own
         // constant, so they hold for *any* wording — including one that reads as nonsense to the
         // reader this arm exists for. One mechanical part of "it reads correctly in both modes"
         // can be pinned: the shared text is printed verbatim to a human, so it may not direct

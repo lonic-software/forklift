@@ -597,12 +597,6 @@ pub fn get_effective_value(key: &str) -> Result<Option<(String, ConfigScope)>, S
 pub fn set_value(key: &str, value: &str, scope: ConfigScope) -> Result<String, String> {
     let (section, field) = split_key(key)?;
 
-    // No remedy here: this is reached from `config`, `franchise`, `profile use` and
-    // `get_operator`, and the right advice differs at each (see [`require_non_empty`]). `config`
-    // adds its own to this refusal; `franchise --token` and `profile use` refuse a blank value
-    // before calling. The rest cannot pass one as the code stands — `franchise` writes its URL
-    // only after the remote answered at it, `get_operator` writes a minted id — and for them
-    // this bare refusal is the backstop that keeps the file sound.
     validate_value(key, value)?;
     let path = get_config_path(scope)?;
 
@@ -992,26 +986,11 @@ pub fn is_blank(value: &str) -> bool {
 /// door removes the state rather than picking a winner, so neither reading can be reached and
 /// `to_operator`'s collapse stays a question about *presence* only.
 ///
-/// **This states the fact and nothing else. The remedy belongs to the command.** No function in
-/// this module knows which command it is serving — [`set_value`] alone is called by `config`,
-/// `franchise` and `profile use` — so any remedy offered here was wrong somewhere. Where the
-/// refusal surfaces, and who words the advice:
-///
-/// * **Loading a file** ([`parse_config`], [`parse_profiles`]) wraps it in [`not_valid`], which
-///   names the file and says to fix it. An `--unset` hint here was wrong twice over: it carried
-///   no `--global`, so for a global file run inside a warehouse it targeted the wrong one, and it
-///   could not succeed while any *other* entry in the file was also bad.
-/// * **`forklift config <key> ""`** gets this refusal from [`set_value`] and the command, which
-///   knows its scope, appends the exact `--unset` — only when the key is set in that scope, since
-///   otherwise that command fails with "not set".
-/// * **`forklift franchise --token ""`** refuses in the command, before the network or the
-///   filesystem is touched, and says to omit the option.
-/// * **`forklift profile create`** ([`create_profile`]) and **`forklift profile use`** refuse an
-///   empty name ([`EMPTY_PROFILE_NAME`]); `create` names the option to omit for `--id`/`--name`.
-/// * [`set_value`] and [`set_profile_fields`] reach it only as a backstop behind those checks,
-///   so it states the fact.
-///
-/// Each command's wording is pinned by a test that runs that command.
+/// **This states the fact and nothing else.** It is reached from several commands, and no advice
+/// is true at all of them (an `--unset` needs the scope, fails for a key that is not set, and
+/// cannot be run for a profile field), so the refusal names the key and stops. The commands that
+/// take a value as an *option* — `profile create --id`/`--name`, `franchise --token` — refuse it
+/// themselves first and say to omit the option, which is true wherever they print it.
 fn require_non_empty(label: &str, value: &str) -> Result<(), String> {
     if is_blank(value) {
         return Err(format!("\"{}\" cannot be empty.", label));
@@ -1432,14 +1411,11 @@ mod tests {
     /// both spellings.
     ///
     /// **And the validator offers no remedy — that is pinned here, because it is the contract.**
-    /// Rounds 4 and 5 of PR #126 each found a remedy this function printed that was wrong at
-    /// some door: an `--unset` with no `--global` at the parse door, an `--unset` the command
-    /// rejects for a profile field, a "remove the entry" where nothing had been written — and
-    /// round 6 found that even `set_value` is not one door, being called by `franchise` and
-    /// `profile use` as well as `config`. The advice depends on which command is running, which
-    /// this function cannot see, so it may not give any. Each command's own wording is pinned by
-    /// a test that runs it, in `cli.rs` — where HOME is scoped, so a write-path probe cannot
-    /// reach the developer's real configuration.
+    /// Every remedy it once printed was wrong somewhere: an `--unset` with no `--global` for the
+    /// global file, an `--unset` the command rejects for a profile field, a "remove the entry"
+    /// where nothing had been written. It is reached from several commands and cannot see which,
+    /// so it may not give any. The commands' own wording is pinned in `cli.rs`, where HOME is
+    /// scoped, so a write-path probe cannot reach the developer's real configuration.
     #[test]
     fn no_configuration_value_may_be_empty_and_the_shared_refusal_offers_no_remedy() {
         for blank in ["", "   ", "\t"] {
@@ -1472,7 +1448,7 @@ mod tests {
         assert!(require_non_empty("profile.work.name", " A ").is_ok());
     }
 
-    /// Round 6 finding F6: an unknown or repeated profile field is the caller's bug, refused as
+    /// An unknown or repeated profile field is the caller's bug, refused as
     /// such — not written (an unknown one would then be blamed on the user's file by the parse,
     /// and a repeated one would be written twice with the last silently winning).
     ///

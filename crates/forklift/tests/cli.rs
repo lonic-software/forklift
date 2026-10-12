@@ -517,7 +517,7 @@ fn a_configuration_file_either_parses_completely_or_every_read_of_it_refuses() {
     );
 }
 
-/// PR #126 round 2, finding 1: the trap round 1's own fix created. Validating the file *before*
+/// A bad value must not block its own repair. Validating the file *before*
 /// the edit meant `remote.tor = "onn"` refused every write to that file — including
 /// `config remote.tor on`, the command that corrects it. The value blocked its own repair, and a
 /// text editor was the only way out. `write_validated` now parses the document **as edited**, so
@@ -655,8 +655,7 @@ fn unreadable_maintenance_settings_are_announced_rather_than_silently_disabling_
     // hold only a reassurance about the current state ("packing is skipped while this lasts"),
     // leaving that consumer nothing to do while the thing to do sat in the reported cause.
     //
-    // Round 4 finding F5: the first version of this assertion required the word "message" here,
-    // which is how the wording came to name a `--json` field in text that is also printed
+    // This must not require the word "message": requiring it here once was how the wording came to name a `--json` field in text that is also printed
     // verbatim to a human. What it must require is the *action* and the agreement with the
     // constant; `output.rs`'s unit test owns the rule that no envelope field may be named.
     let next_step = warning["next_step"].as_str().unwrap_or_default();
@@ -3078,7 +3077,7 @@ fn profiles_select_the_identity_a_warehouse_acts_under() {
     assert!(work_line.contains("1 local key(s)"), "unexpected profile list: {}", list);
 }
 
-/// PR #122 finding F4, kept verbatim across the rebuild: the end-to-end regression the strict
+/// The end-to-end regression the strict
 /// parse exists to prevent. `get_operator` must refuse outright on a malformed selected profile
 /// — and, the part that was unpinned, it must never mint a replacement identifier and write it
 /// back over the profile: the global config file must be byte-identical after the refusal.
@@ -3116,7 +3115,7 @@ fn a_malformed_selected_profile_refuses_without_writing_back_to_the_global_confi
     );
 }
 
-/// Round 3 finding F4: the third door into the same mint-and-overwrite hazard, reached by a
+/// The mint-and-overwrite hazard reached by a
 /// value that **parses perfectly**. An empty `identifier` is not a type fault, so the typed
 /// parse had nothing to say about it — and `ProfileRecord::to_operator` maps an absent field and
 /// an empty one onto the same `""`, which `get_operator` reads as "fill this in". So it minted a
@@ -3161,7 +3160,7 @@ fn an_empty_identifier_refuses_rather_than_minting_a_replacement_over_it() {
     );
 }
 
-/// Round 3 finding F7, at the call site rather than in the helper: `forklift config` stores a
+/// Pinned at the call site rather than in the helper: `forklift config` stores a
 /// fixed-value key normalized, so what lands on disk is literally one of the three spellings the
 /// guide enumerates.
 ///
@@ -3195,7 +3194,7 @@ fn a_fixed_value_key_is_written_to_disk_in_its_documented_spelling() {
     assert!(stdout(&read).contains("on"), "unexpected read-back: {}", stdout(&read));
 }
 
-/// Round 4 finding F3: the `--json` set envelope must report the spelling that reached the file.
+/// The `--json` set envelope must report the spelling that reached the file.
 ///
 /// Normalizing on the way out gave the command two answers to the same question — the argument
 /// it was handed and the value it wrote — and the envelope echoed the first. A consumer caching
@@ -3223,8 +3222,8 @@ fn the_json_set_envelope_reports_the_value_that_reached_the_file() {
     assert!(stdout(&warehouse.run(&["config", "remote.tor"])).contains("on"));
 }
 
-/// Round 4 finding F2: creating a profile was two writes, and a value refused by the second left
-/// the first on disk.
+/// A refused profile creation leaves nothing behind. Creation used to be two writes, and a value
+/// refused by the second left the first on disk.
 ///
 /// `profile create --name "" work` minted an identifier, wrote `[profile.work]`, then refused the
 /// empty display name — reporting failure while leaving a profile behind that made the obvious
@@ -3233,7 +3232,7 @@ fn the_json_set_envelope_reports_the_value_that_reached_the_file() {
 /// about ordering.
 ///
 /// Two mechanisms now hold this, and either alone does: `create_profile` refuses its inputs
-/// before writing anything, and creation is a single write of every field (round 5, F7). Measured:
+/// before writing anything, and creation is a single write of every field. Measured:
 /// with the up-front checks removed this test stays green; with them removed *and* the write split
 /// per field it goes red.
 #[test]
@@ -3261,82 +3260,42 @@ fn a_refused_profile_field_leaves_no_half_created_profile_behind() {
     assert_success(&retry);
 }
 
-/// Round 5 findings F1–F4: an empty value is refused from several commands, and each must give
-/// advice that is true *for that command*. The shared validator used to supply one remedy for
-/// all of them, and it was wrong at each in a different way. (`franchise` and `profile use`, which
-/// round 6 found also reach the configuration write, are pinned in the next test.)
-///
-/// **The `set` door: the suggested command is executed, not just read.** Asserting the text
-/// contains `--unset` is what let an `--unset` with no `--global` through — it read correctly
-/// and targeted the wrong file. The only check that establishes a remedy is to run it.
+/// An empty value is refused with the fact alone wherever no advice is true on every path, and with
+/// "omit it" where the value came from an option. `--unset` is never suggested: it needs the right
+/// scope, fails for a key that is not set, and cannot address a profile field, so any hint built
+/// on it was wrong somewhere.
 #[test]
-fn the_refusal_for_an_empty_value_suggests_a_command_that_works_at_the_door_it_came_from() {
+fn an_empty_value_is_refused_with_advice_only_where_the_advice_is_always_true() {
     let warehouse = TestWarehouse::new("empty-value-remedy-per-door");
     assert_success(&warehouse.run(&["prepare"]));
 
     let global_config = warehouse.home.join("global-config.toml");
 
-    // The `set` door, global scope, run from *inside* a warehouse — the case where a remedy
-    // without `--global` resolves to the warehouse file and answers "not set".
+    // `config`, both scopes, a key that is set and one that is not: the same bare fact. The
+    // global case runs inside a warehouse, where an `--unset` without `--global` used to be
+    // suggested and would have targeted the wrong file.
     assert_success(&warehouse.run(&["config", "--global", "operator.name", "Ada"]));
 
-    // Positive control: without it, the absence asserted below would hold just as well for a
-    // write that never landed, and the executed remedy would establish nothing.
-    let content = std::fs::read_to_string(&global_config).unwrap();
-    assert!(content.contains("name = \"Ada\""), "the setup write must land: {content}");
+    for (args, key) in [
+        (vec!["config", "--global", "operator.name", ""], "operator.name"),
+        (vec!["config", "operator.name", "   "], "operator.name"),
+        (vec!["config", "remote.token", ""], "remote.token"),
+    ] {
+        let refused = warehouse.run(&args);
+        assert!(!refused.status.success(), "{args:?} must refuse: {}", stdout(&refused));
+        assert_eq!(stderr(&refused).trim(), format!("\"{key}\" cannot be empty."));
+    }
 
-    let refused = warehouse.run(&["config", "--global", "operator.name", ""]);
-    assert!(!refused.status.success(), "an empty value must refuse: {}", stdout(&refused));
-
-    let message = stderr(&refused);
-    let suggested = message.split("run \"").nth(1).and_then(|rest| rest.split('"').next())
-        .unwrap_or_else(|| panic!("the refusal must suggest a command: {message}"));
-    let args: Vec<&str> = suggested.split_whitespace().collect();
-    assert_eq!(args.first(), Some(&"forklift"), "unexpected suggestion: {suggested}");
-
-    let ran = warehouse.run(&args[1..]);
-    assert_success(&ran);
-
-    // Read back through the CLI at the scope the refusal was about, not by grepping the file.
+    // The refused write left the value it would have replaced.
     let read = warehouse.run(&["config", "--global", "operator.name"]);
-    assert!(!read.status.success(), "the suggested command must remove the key: {}", stdout(&read));
-    assert!(stderr(&read).contains("is not set"), "unexpected read: {}", stderr(&read));
+    assert_eq!(stdout(&read).trim(), "Ada", "a refused write must leave the file as it was");
 
-    // The same command at warehouse scope renders without `--global` — and that suggestion is
-    // executed too, against a key set at warehouse scope, so a wrong scope cannot pass.
-    assert_success(&warehouse.run(&["config", "operator.name", "Bea"]));
-    let read = warehouse.run(&["config", "operator.name"]);
-    assert_eq!(stdout(&read).trim(), "Bea", "the warehouse-scope setup write must land");
-
-    let refused = warehouse.run(&["config", "operator.name", "   "]);
-    assert!(!refused.status.success(), "an empty value must refuse: {}", stdout(&refused));
-
-    let message = stderr(&refused);
-    let suggested = message.split("run \"").nth(1).and_then(|rest| rest.split('"').next())
-        .unwrap_or_else(|| panic!("the refusal must suggest a command: {message}"));
-    let args: Vec<&str> = suggested.split_whitespace().collect();
-    assert_eq!(args.first(), Some(&"forklift"), "unexpected suggestion: {suggested}");
-    assert!(!args.contains(&"--global"), "warehouse scope must not suggest --global: {suggested}");
-
-    assert_success(&warehouse.run(&args[1..]));
-
-    let read = warehouse.run(&["config", "operator.name"]);
-    assert!(!read.status.success(), "the suggested command must remove the key: {}", stdout(&read));
-    assert!(stderr(&read).contains("is not set"), "unexpected read: {}", stderr(&read));
-
-    // Round 7 findings F1–F2: the remedy is offered only where it runs. An unknown key is
-    // reported as unknown (its `--unset` would be refused as unknown too), and a key that is not
-    // set in that scope gets no `--unset` (it would fail with "not set").
+    // An unknown key is reported as unknown, not as empty: the key is checked first.
     let refused = warehouse.run(&["config", "operator.nmae", ""]);
-    let message = stderr(&refused);
-    assert!(message.contains("Unknown configuration key"), "unexpected: {message}");
-    assert!(!message.contains("--unset"), "an unknown key has nothing to unset: {message}");
-
-    let refused = warehouse.run(&["config", "remote.token", ""]);
-    let message = stderr(&refused);
-    assert!(message.contains("\"remote.token\" cannot be empty."), "unexpected: {message}");
-    assert!(message.contains("nothing to remove"), "unexpected: {message}");
-    assert!(!message.contains("--unset"), "an unset key has nothing to unset: {message}");
+    assert!(
+        stderr(&refused).contains("Unknown configuration key"),
+        "unexpected: {}", stderr(&refused)
+    );
 
     // The `profile create` door: nothing is on disk yet, so the advice is about the option.
     for (args, option) in [
@@ -3370,10 +3329,9 @@ fn the_refusal_for_an_empty_value_suggests_a_command_that_works_at_the_door_it_c
     assert!(!message.contains("--unset"), "the parse door may not suggest --unset: {message}");
 }
 
-/// Round 6 finding F1: `config` was not the only command that reaches the configuration write.
-/// `franchise --token ""` and `profile use ""` did too, and while the remedy lived in that write
-/// they were told to run `forklift config --unset`, about entries that did not exist. Each now
-/// refuses in its own words, before doing anything.
+/// `franchise --token ""` and `profile use ""` refuse in their own words before doing anything,
+/// rather than reaching the configuration write — whose refusal would name a key the user never
+/// typed.
 #[test]
 fn franchise_and_profile_use_refuse_an_empty_value_in_their_own_words() {
     let warehouse = TestWarehouse::new("empty-value-franchise-profile-use");
@@ -3407,7 +3365,7 @@ fn franchise_and_profile_use_refuse_an_empty_value_in_their_own_words() {
     assert!(stderr(&read).contains("is not set"), "unexpected read: {}", stderr(&read));
 }
 
-/// Round 4 finding F4: the profile *name* was the one door the emptiness rule did not cover.
+/// An empty profile *name* is refused like an empty value.
 ///
 /// `profile create ""` wrote a `[profile.""]` section that no command could then reach: selecting
 /// it means `operator.profile = ""`, which the same rule refuses at both the read and the write
@@ -3436,7 +3394,7 @@ fn an_empty_profile_name_is_refused_rather_than_created_unreachable() {
     );
 }
 
-/// PR #122 round 4 finding F1, kept verbatim: the same mint-and-overwrite hazard on the *more
+/// The same mint-and-overwrite hazard on the *more
 /// common* code path — no `operator.profile` set at all, so `get_operator` reads
 /// `operator.identifier` directly. A hand-edited, unquoted global `identifier = 12345` used to
 /// collapse into "absent", mint a fresh UUID, and write it back over the value.
@@ -3466,7 +3424,7 @@ fn a_malformed_default_identifier_refuses_without_writing_back_to_the_global_con
     );
 }
 
-/// PR #122 round 6 finding F1, kept verbatim: the hazard reached through the one key that
+/// The hazard reached through the one key that
 /// selects *which* identity is read at all. A warehouse `profile = 2024` written unquoted used
 /// to read as absent, so the profile selection was silently discarded, `get_operator` fell
 /// through to the non-profile branch, minted a fresh UUID, and wrote an `[operator]` section

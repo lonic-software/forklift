@@ -49,8 +49,7 @@ pub fn handle_command(global: bool,
 
     match (&key, &value) {
         (Some(key), Some(value)) => {
-            let stored = config_utils::set_value(key, value, scope)
-                .map_err(|refusal| with_removal_hint(refusal, key, value, scope))?;
+            let stored = config_utils::set_value(key, value, scope)?;
 
             // Setting a value has always been silent in human mode; keep it so, but
             // give `--json` a confirmation envelope.
@@ -65,37 +64,6 @@ pub fn handle_command(global: bool,
         }
         (Some(key), None) => print_value(key, scope),
         _                 => list_configuration(scope),
-    }
-}
-
-/// Add this command's remedy to a refused empty value: the `--unset` that removes the key, when
-/// there is one to remove. The refusal itself is `set_value`'s, so it is spelled once, and it is
-/// reached only after the key was checked — an unknown key is reported as unknown, never offered
-/// an `--unset` the command would then reject.
-///
-/// Only this command knows the scope, so only it can name the command that actually removes the
-/// key. `--global` has to be in it: without it, run from inside a warehouse, the suggested command
-/// targets the warehouse file and answers "not set". And it is offered only when the key *is* set
-/// in that scope — otherwise `--unset` fails with "not set", and there is nothing to do but not
-/// set it.
-fn with_removal_hint(refusal: String, key: &str, value: &str, scope: ConfigScope) -> String {
-    if !config_utils::is_blank(value) {
-        return refusal;
-    }
-
-    match config_utils::get_scoped_value(key, scope) {
-        Ok(Some(_)) => {
-            let global = if scope == ConfigScope::Global { " --global" } else { "" };
-
-            format!(
-                "{} To remove it instead, run \"forklift config{} --unset {}\".",
-                refusal, global, key
-            )
-        }
-        Ok(None) => format!("{} It is not set here, so there is nothing to remove.", refusal),
-        // An unknown key (already the refusal's subject, as `set_value` checks the key first), or
-        // a file that cannot be read: there is no command to offer, so the refusal stands alone.
-        Err(_) => refusal,
     }
 }
 
