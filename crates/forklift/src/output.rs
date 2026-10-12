@@ -14,6 +14,7 @@
 //! JSON document.
 
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use serde::Serialize;
 use forklift_core::error::{CoreError, RefusalCode};
 use forklift_core::util::{heal_utils, load_guard_utils, merge_utils, query_utils, scope_utils};
@@ -110,8 +111,8 @@ struct ErrorBody<'a> {
 
 /// Print one document to stdout. Pretty-printed: the consumer is a program, but a human
 /// debugging the pipe reads it too, and JSON parsers do not care about whitespace. The
-/// fallback for a serializer failure (a command's `Serialize` impl can fail) still carries the
-/// header a consumer gates on.
+/// fallback for the serializer failure that cannot happen here (`data` is already a `Value`) is
+/// a failure, never an `ok: true` without `data`.
 fn print_document<T: Serialize>(data: Option<&T>, error: Option<ErrorBody>) {
     let ok = error.is_none();
     let command = COMMAND.get().and_then(|command| command.as_deref());
@@ -128,8 +129,8 @@ fn print_document<T: Serialize>(data: Option<&T>, error: Option<ErrorBody>) {
     match serde_json::to_string_pretty(&document) {
         Ok(text) => println!("{}", text),
         Err(_) => println!(
-            "{{\"lonic_json\":{},\"tool\":\"{}\",\"schema\":{},\"ok\":{}}}",
-            LONIC_JSON, TOOL, SCHEMA_VERSION, ok
+            "{{\"lonic_json\":{},\"tool\":\"{}\",\"schema\":{},\"command\":{},\"ok\":false,\"error\":{{\"code\":\"{}\",\"message\":\"The result could not be serialized.\"}}}}",
+            LONIC_JSON, TOOL, SCHEMA_VERSION, serde_json::json!(command), ErrorCode::Generic.as_str()
         ),
     }
 }
@@ -214,7 +215,42 @@ pub fn blob_text(content: &[u8]) -> Option<&str> {
 /// Print the success envelope: the header with `ok: true`, then `data`. `ok` says that `data`
 /// is the command's result; it does not report the exit status.
 fn print_envelope<T: Serialize>(data: &T) {
-    print_document(Some(data), None);
+    match data_value(data) {
+        Ok(value) => print_document(Some(&value), None),
+        Err(error) => {
+            RESULT_UNSERIALIZABLE.store(true, Ordering::Relaxed);
+            report_error(&error);
+        }
+    }
+}
+
+/// Set when a command's result could not be serialized: its document was a failure, so `main`
+/// must not exit 0 after a command that otherwise returned `Ok`.
+static RESULT_UNSERIALIZABLE: AtomicBool = AtomicBool::new(false);
+
+/// Whether this process reported a result it could not serialize (see [`print_envelope`]).
+pub fn result_unserializable() -> bool {
+    RESULT_UNSERIALIZABLE.load(Ordering::Relaxed)
+}
+
+/// A command's result as the document's `data`. Through `serde_json::Value` on purpose: its map
+/// sorts keys, so a `HashMap` inside a result serializes in the same order on every run rather
+/// than in the process's random hash order. A result that cannot be serialized is a failure,
+/// never an `ok: true` document without `data`.
+///
+/// # Arguments
+/// * `data` - The command's result.
+///
+/// # Returns
+/// * `Ok(Value)`          - The result, with every map's keys in sorted order.
+/// * `Err(ForkliftError)` - A generic failure, when the result does not serialize.
+fn data_value<T: Serialize>(data: &T) -> Result<serde_json::Value, ForkliftError> {
+    serde_json::to_value(data).map_err(|error| ForkliftError {
+        code: ErrorCode::Generic,
+        message: format!("Error while serializing the result: {}", error),
+        next_step: None,
+        details: None,
+    })
 }
 
 /// Report a failed command in the active mode, to stderr (human) or stdout (JSON —
@@ -704,6 +740,26 @@ macro_rules! human {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_result_serializes_in_key_order_or_fails_as_a_generic_error() {
+        // A HashMap's own order is random per process; `data` must not inherit it.
+        let map: std::collections::HashMap<String, u32> =
+            (0..64).map(|i| (format!("k{:02}", i), i)).collect();
+        let value = data_value(&map).ok().expect("a string-keyed map serializes");
+        let text = serde_json::to_string(&value).unwrap();
+        let keys: Vec<&str> = text.match_indices("\"k").map(|(at, _)| &text[at + 1..at + 4]).collect();
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(keys.len(), 64);
+        assert_eq!(keys, sorted);
+
+        // A map whose keys are not strings cannot be a JSON object: a failure, not `ok: true`.
+        let unserializable: std::collections::HashMap<(u8, u8), u8> = [((1, 2), 3)].into_iter().collect();
+        let error = data_value(&unserializable).err().expect("a non-string key cannot serialize");
+        assert_eq!(error.code.as_str(), "error");
+        assert_eq!(error.code.exit_code(), 1);
+    }
 
     #[test]
     fn a_typed_refusal_classifies_and_keeps_the_next_step() {

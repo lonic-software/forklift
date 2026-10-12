@@ -26,7 +26,10 @@ pub fn handle_command(path: &[String]) -> Result<(), ForkliftError> {
 
         command = subcommand.ok_or_else(|| ForkliftError::new(
             ErrorCode::Usage,
-            format!("Unknown command: {}.", path.join(" ")),
+            format!(
+                "Unknown command: {}. Use \"forklift help\" for a list of available commands.",
+                path.join(" ")
+            ),
             "Run \"forklift help\" for a list of available commands.",
         ))?;
 

@@ -4003,6 +4003,11 @@ fn help_and_version_under_json_are_success_documents() {
     let top = json(&warehouse.run(&["--json", "--help", "st"]));
     assert_eq!(top["ok"], true);
     assert_eq!(top["command"], serde_json::Value::Null);
+
+    // The same in a short-flag cluster.
+    let clustered = json(&warehouse.run(&["--json", "-vh", "st"]));
+    assert_eq!(clustered["ok"], true);
+    assert_eq!(clustered["command"], serde_json::Value::Null);
 }
 
 #[test]
@@ -4024,6 +4029,11 @@ fn the_help_command_under_json_answers_like_the_help_flag() {
     let value = json(&unknown);
     assert_eq!(value["ok"], false);
     assert_eq!(value["error"]["code"], "usage");
+
+    // Without --json a person still gets the way forward in the message itself.
+    let human = warehouse.run(&["help", "bogus"]);
+    assert_eq!(human.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&human.stderr).contains("Use \"forklift help\""), "{:?}", human);
 }
 
 #[test]

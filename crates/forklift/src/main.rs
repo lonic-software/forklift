@@ -102,6 +102,12 @@ async fn async_main() {
         output::report_error(&error);
         std::process::exit(error.code.exit_code());
     }
+
+    // The command succeeded but its result did not serialize: the one document written was a
+    // failure, and the exit status agrees with it.
+    if output::result_unserializable() {
+        std::process::exit(ErrorCode::Generic.exit_code());
+    }
 }
 
 /// Parse the command line, recording the resolved command for the output envelope. A parse
@@ -140,11 +146,17 @@ fn parse_or_exit() -> Cli {
 /// The canonical name of the top-level command the arguments name, when the parse that would
 /// have said so failed. The global options are all flags that take no value, so the first
 /// argument that is not an option is the command, or an alias of one, or nothing known. A help
-/// or version flag before it means clap answered at the top level, so no command ran.
+/// or version flag before it, alone or in a short-flag cluster (`-vh`), means clap answered at
+/// the top level, so no command ran.
 fn named_command(args: &[OsString]) -> Option<String> {
+    let asks_help_or_version = |arg: &str| match arg.strip_prefix("--") {
+        Some(long) => long == "help" || long == "version",
+        None => arg.starts_with('-') && arg.contains(['h', 'V']),
+    };
+
     let token = args.iter().skip(1)
         .map(|arg| arg.to_string_lossy())
-        .take_while(|arg| !matches!(arg.as_ref(), "-h" | "--help" | "-V" | "--version"))
+        .take_while(|arg| !asks_help_or_version(arg))
         .find(|arg| !arg.starts_with('-'))?;
     let token = token.as_ref();
 
