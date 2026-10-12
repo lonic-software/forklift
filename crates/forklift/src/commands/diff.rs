@@ -136,7 +136,7 @@ async fn diff_worktree(filter: Option<&WarehousePath>, verbose: bool) -> Result<
             .map(DiffFileSummary::from_change)
             .collect();
 
-        output::emit("diff", &DiffReport { mode: "worktree", files });
+        output::emit(&DiffReport { mode: "worktree", files });
 
         return Ok(());
     }
@@ -199,7 +199,7 @@ async fn diff_staged(filter: Option<&WarehousePath>, verbose: bool) -> Result<()
             .map(DiffFileSummary::from_change)
             .collect();
 
-        output::emit("diff", &DiffReport { mode: "staged", files });
+        output::emit(&DiffReport { mode: "staged", files });
 
         return Ok(());
     }
@@ -273,7 +273,7 @@ fn diff_pallets(from_revision: &str,
 
     if from_tree_hash == to_tree_hash {
         if output::is_json() {
-            output::emit("diff", &DiffReport { mode: "pallets", files: Vec::new() });
+            output::emit(&DiffReport { mode: "pallets", files: Vec::new() });
         } else {
             println!("Revisions \"{}\" and \"{}\" have identical trees.", from_revision, to_revision);
         }
@@ -308,7 +308,7 @@ fn diff_pallets(from_revision: &str,
             })
             .collect();
 
-        output::emit("diff", &DiffReport { mode: "pallets", files });
+        output::emit(&DiffReport { mode: "pallets", files });
 
         return Ok(());
     }

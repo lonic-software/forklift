@@ -1518,13 +1518,14 @@ what you've `load`ed — it doesn't stage for you). `diff`, `restore`, `tag`, `s
 
 ## 11. Exit codes
 
-Errors set a deterministic exit code so scripts branch without parsing prose. `0` is
-success and `2` is clap's own usage/argument error; every other code is one of forklift's
-own classified failures.
+Errors set a deterministic exit code so scripts branch without parsing prose. `0`
+(success), `1` (unclassified failure), `2` (usage error), `130` (cancelled by the user) and
+`128`+n (killed by signal n) mean the same for every Lonic tool; every other code is one of
+forklift's own classified failures.
 
 The full, always-current table — generated from the same enum the binary itself
 branches on, so it can never fall behind — is
 [`../generated/errors.md`](../generated/errors.md).
 
 With `--json`, the same classification appears as `error.code` in the output
-envelope. See [`../MACHINE_INTERFACE.md`](../MACHINE_INTERFACE.md).
+envelope, usage errors included. See [`../MACHINE_INTERFACE.md`](../MACHINE_INTERFACE.md).

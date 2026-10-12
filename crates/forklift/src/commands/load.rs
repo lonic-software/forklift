@@ -21,7 +21,7 @@ pub async fn handle_command(target: &str) -> Result<(), String> {
 
     inventory_utils::add_changes_to_inventory(&path).await?;
 
-    output::emit("load", &Loaded { path: path.as_key().to_string() });
+    output::emit(&Loaded { path: path.as_key().to_string() });
 
     Ok(())
 }

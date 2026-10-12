@@ -25,7 +25,7 @@ pub async fn handle_command() -> Result<(), String> {
     let outcome = recovery_utils::run(Some(&|line: &str| crate::human!("{}", line)))
         .await.map_err(String::from)?;
 
-    output::emit("heal", &HealReport {
+    output::emit(&HealReport {
         was_tainted: outcome.was_tainted,
         restaged: outcome.restaged,
         resolved: outcome.resolved,

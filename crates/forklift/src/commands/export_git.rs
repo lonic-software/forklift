@@ -88,7 +88,7 @@ pub fn handle_command(path: &str) -> Result<(), String> {
         git(path, &["checkout", "-f", "-q", branch])?;
     }
 
-    output::emit("export-git", &ExportReport {
+    output::emit(&ExportReport {
         path: path.to_string(),
         commits: exporter.commits.len(),
         trees: exporter.trees.len(),

@@ -56,7 +56,7 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
 
     if added.is_empty() {
         // Everything requested is already fetched — a clean no-op.
-        output::emit("expand", &ExpandReport {
+        output::emit(&ExpandReport {
             added: Vec::new(),
             scope: current.prefixes().to_vec(),
             fetched_objects: 0,
@@ -102,7 +102,7 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
     // scope.
     scope_utils::set_fetch_scope(&widened)?;
 
-    output::emit("expand", &ExpandReport {
+    output::emit(&ExpandReport {
         added,
         scope: widened.prefixes().to_vec(),
         fetched_objects: stats.fetched_objects,

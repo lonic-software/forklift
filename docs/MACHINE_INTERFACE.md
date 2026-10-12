@@ -8,24 +8,31 @@ an MCP server that exposes every command as a schema-typed tool.
 ## `--json`
 
 `--json` is a global flag: add it to any command and stdout becomes exactly **one**
-JSON document (nothing else prints there). Human prose is unchanged without the flag.
+JSON document (nothing else prints there) on every exit Forklift controls itself —
+usage errors included. Human prose is unchanged without the flag.
 
-Success envelope:
+The envelope is the one every Lonic tool shares. Success:
 
 ```json
 {
-  "forklift_json": "2",
+  "lonic_json": 1,
+  "tool": "forklift",
+  "schema": 2,
   "command": "stocktake",
   "ok": true,
   "data": { "…command-specific…" }
 }
 ```
 
-Failure envelope (also sets the exit code below):
+Failure keeps the same header, with `"ok": false` and an `error` in place of `data`
+(it also sets the exit code below):
 
 ```json
 {
-  "forklift_json": "2",
+  "lonic_json": 1,
+  "tool": "forklift",
+  "schema": 2,
+  "command": "stocktake",
   "ok": false,
   "error": {
     "code": "not_a_warehouse",
@@ -35,14 +42,44 @@ Failure envelope (also sets the exit code below):
 }
 ```
 
-`forklift_json` is the output schema version. It changes only when the envelope or a
-command's `data` shape changes incompatibly, so a consumer can pin it — and it *is* the
-capability-detection mechanism: check the version before relying on a field, rather than
-sniffing for the field's presence. A command's `data` shape is documented by the struct
-it emits (in `crates/forklift/src/commands/`) — the generated, exhaustive reference for
-every one of them is [`generated/json-schemas.md`](generated/json-schemas.md).
+- `lonic_json` versions the envelope itself — the header, and the stderr warning shape
+  below. A consumer detects the contract with this one key.
+- `tool` names the producer, so a document read after `pult <command>` says whether it
+  came from Pult or from the tool Pult ran.
+- `schema` versions Forklift's payloads: every command's `data` and the error-code
+  registry. It changes only on an incompatible change, so a consumer can pin it — and it
+  *is* the capability-detection mechanism: check it before relying on a field, rather
+  than sniffing for the field's presence.
+- `command` is the command as parsed — the canonical name, never the alias typed
+  (`st` reports `"stocktake"`) — on success and failure alike. It is `null` only when
+  the command line names no known command: a usage error without one, or top-level
+  `--help` / `--version`.
+- `ok` says whether `data` is the command's result. It does **not** report the exit
+  status: a command whose result is a negative outcome may exit non-zero with
+  `ok: true`. Parse stdout first and consult the exit status second.
+- `error.next_step` is present where there is a clear recovery; `error.details` is
+  optional, code-specific structured detail.
 
-**Version 2** (current): `history` entries carry `parents` (every parcel's parents, in
+A command's `data` shape is documented by the struct it emits (in
+`crates/forklift/src/commands/`) — the generated, exhaustive reference for every one of
+them is [`generated/json-schemas.md`](generated/json-schemas.md).
+
+**Usage errors** (an unknown command, a missing or invalid argument) are `usage`
+failures with exit 2. `message` is the parser's one-line complaint, and
+`details.usage` keeps its full text — the usage line and any "a similar command exists"
+tip. `--help`, `--version` and the `help` command under `--json` are results, not
+failures: a success document whose `data.message` is the text, exit 0. The keys of every
+document appear in the order shown above, header first.
+
+Only the bare `--json` token selects JSON when the command line fails to parse:
+`--json=true` is itself a usage error, reported as prose on stderr with an empty stdout.
+
+**Death by signal** (exit 128+n, including 130 from Ctrl-C) is outside the process's
+control and may leave stdout empty. A consumer that finds no document classifies by the
+exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
+exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
+
+**Schema 2** (current): `history` entries carry `parents` (every parcel's parents, in
 stored order, always present — `[]` for a root); the `empty_history` error code exists
 (`history` on an unborn pallet); `palletize` list entries carry `head`; the `show`
 command reads a file's content at a revision in one call; `diff` accepts the reserved
@@ -276,8 +313,11 @@ had happened.
 ## Error codes and exit codes
 
 Every failure carries a stable `code` an agent can branch on, and the process exits
-with a deterministic status so a script can branch without parsing prose. `2`
-is reserved for argument/usage errors (clap); `0` is success.
+with a deterministic status so a script can branch without parsing prose. Five statuses
+mean the same for every Lonic tool: `0` success, `1` unclassified failure, `2` usage error,
+`130` cancelled by the user, and `128`+n killed by signal n. Every other number is
+Forklift's own, and only a consumer that ran `forklift` directly may branch on it; a consumer
+classifies a failure by the pair (`tool`, `error.code`).
 
 The full table — generated from the `ErrorCode` enum the binary itself branches on, so
 it can never fall behind as codes are added — is
@@ -322,9 +362,10 @@ the working directory. It implements `initialize`, `tools/list` and `tools/call`
 
 Each tool re-invokes `forklift … --json` and returns its envelope, so the tools speak
 the exact structured output above (and inherit the warehouse lock and exit-code
-taxonomy). A command that exits non-zero comes back as an MCP tool error (`isError:
+taxonomy). A failure document (`ok: false`) comes back as an MCP tool error (`isError:
 true`) carrying the error envelope — the agent sees the stable `code`/`next_step`, not
-a crashed session.
+a crashed session. `isError` follows `ok`, not the exit status; only a run that wrote no
+document falls back to its exit status.
 
 The tool surface **mirrors the CLI** — every CLI command is exposed as a tool (a
 multi-subcommand command becomes `<command>_<subcommand>` tools) or is on a small
@@ -399,17 +440,19 @@ Example session:
   maintenance's own directory sync fails, even though the command's own work already
   succeeded (`ok: true`, exit 0). That case is surfaced on **stderr** — never stdout, so the
   one-document invariant above still holds — as a single-line JSON object:
-  `{ "forklift_json": "2", "warning": "durability_taint", "message": "…", "next_step":
+  `{ "lonic_json": 1, "tool": "forklift", "warning": "durability_taint", "message": "…", "next_step":
   "Run \"forklift heal\" …" }`. A script or agent that wants to catch this should also read
   stderr, not just check the exit code; the taint is enforced regardless on the very next
   command's entry-heal chokepoint (`durability_taint`, exit 21) until `forklift heal`
   resolves it.
 * The same stderr channel carries one other warning, in the same shape:
-  `{ "forklift_json": "2", "warning": "maintenance_unavailable", "message": "…", "next_step":
+  `{ "lonic_json": 1, "tool": "forklift", "warning": "maintenance_unavailable", "message": "…", "next_step":
   "Resolve the reported cause; …" }`. It means background auto-maintenance could not even decide
   whether it was **due**, so nothing was attempted. The commonest cause is a configuration file
   that does not parse, but the same decision also scans the object store, so
   an I/O error there reaches this code too — read `message` for which, and do not assume the
   condition is permanent. Unlike the taint above nothing enforces it later — the store just stops
   being packed — so a script that ignores stderr will never learn about it from any other
-  surface. Every stderr warning uses these four fields; `warning` is the code to switch on.
+  surface. Every stderr warning carries these five fields (`lonic_json`, `tool`, `warning`,
+  `message`, `next_step`), and may carry an optional `details`; `warning` is the code to switch
+  on. Read stderr line by line and keep only the lines that parse.

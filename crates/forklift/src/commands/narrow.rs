@@ -88,7 +88,7 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
         remove_working_subtree(prefix)?;
     }
 
-    output::emit("narrow", &NarrowReport {
+    output::emit(&NarrowReport {
         dropped,
         scope: narrowed.prefixes().to_vec(),
     });

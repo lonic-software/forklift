@@ -137,7 +137,7 @@ pub fn handle_command(path: &str, no_compact: bool) -> Result<(), String> {
     // never track it. Adding the pattern is harmless when the repo lives elsewhere.
     let ignored_git = ignore_git_directory()?;
 
-    output::emit("import-git", &ImportReport {
+    output::emit(&ImportReport {
         commits: converter.commits.len(),
         trees: converter.trees.len(),
         blobs: converter.blobs.len(),

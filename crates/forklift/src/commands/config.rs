@@ -42,7 +42,7 @@ pub fn handle_command(global: bool,
 
         config_utils::unset_value(key, scope)?;
 
-        output::message("config", format!("Unset \"{}\".", key));
+        output::message(format!("Unset \"{}\".", key));
 
         return Ok(());
     }
@@ -58,7 +58,7 @@ pub fn handle_command(global: bool,
             // is stored normalized, so echoing the argument would answer `"  ON  "` for a file
             // that holds `on` — a disagreement a consumer caching the echo would carry until its
             // next read. `set_value` returns the stored spelling so this cannot be got wrong.
-            output::emit("config", &ConfigSet { key: key.clone(), value: stored });
+            output::emit(&ConfigSet { key: key.clone(), value: stored });
 
             Ok(())
         }
@@ -101,7 +101,7 @@ fn print_value(key: &str, scope: ConfigScope) -> Result<(), String> {
 
     match value {
         Some(value) => {
-            output::emit("config", &ConfigValue { key: key.to_string(), value });
+            output::emit(&ConfigValue { key: key.to_string(), value });
             Ok(())
         }
         None => Err(format!("\"{}\" is not set.", key)),
@@ -153,7 +153,7 @@ fn list_configuration(scope: ConfigScope) -> Result<(), String> {
         });
     }
 
-    output::emit("config", &ConfigList { entries });
+    output::emit(&ConfigList { entries });
 
     Ok(())
 }

@@ -99,7 +99,7 @@ pub fn handle_command(paths: Vec<String>, dry_run: bool) -> Result<(), String> {
     let plan = prune_utils::plan_prune(&to_reclaim, &post_prune)?;
 
     if dry_run {
-        output::emit("scope-prune", &PruneReport {
+        output::emit(&PruneReport {
             dry_run: true,
             pruned: to_reclaim,
             scope: post_prune.prefixes().to_vec(),
@@ -123,7 +123,7 @@ pub fn handle_command(paths: Vec<String>, dry_run: bool) -> Result<(), String> {
 
     let stats = prune_utils::free_objects(&plan.to_free)?;
 
-    output::emit("scope-prune", &PruneReport {
+    output::emit(&PruneReport {
         dry_run: false,
         pruned: to_reclaim,
         scope: post_prune.prefixes().to_vec(),

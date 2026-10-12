@@ -167,7 +167,7 @@ pub async fn handle_command(revision: Option<String>, class: Option<String>, lim
         frontier.join(",")
     });
 
-    output::emit("history", &History { entries, next });
+    output::emit(&History { entries, next });
 
     Ok(())
 }

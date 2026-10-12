@@ -95,7 +95,7 @@ pub async fn handle_command(args: QueryArgs) -> Result<(), String> {
         })?;
 
         let scope = scope_block(trust, &outcome, fetch_scope);
-        output::emit("query", &QueryReport { matches: entries, next: outcome.next, scope });
+        output::emit(&QueryReport { matches: entries, next: outcome.next, scope });
         return Ok(());
     }
 

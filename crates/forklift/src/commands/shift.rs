@@ -26,7 +26,7 @@ pub async fn handle_command(target: &str) -> Result<(), String> {
 
     let head = shift_to(target).await?;
 
-    output::emit("shift", &Shifted { pallet: target.to_string(), head });
+    output::emit(&Shifted { pallet: target.to_string(), head });
 
     Ok(())
 }

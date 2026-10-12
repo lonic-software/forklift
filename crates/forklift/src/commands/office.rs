@@ -102,7 +102,7 @@ pub async fn enroll(offline: bool, passphrase: bool) -> Result<(), String> {
         adopts: None,
     })?;
 
-    output::message("office", format!(
+    output::message(format!(
         "Enrolled \"{}\" and established trust.\n\
         Genesis parcel:    {}\n\
         Identity root key: {}\n\n\
@@ -123,7 +123,7 @@ pub fn keygen(passphrase: bool) -> Result<(), String> {
     let (key_id, public_key) = generate_operator_key(&operator.identifier, passphrase)?;
     let pop = office_utils::sign_key_pop(&key_id, &public_key, &operator.identifier)?;
 
-    output::message("office", format!(
+    output::message(format!(
         "Generated a new keypair; the private key stays on this machine.\n\
         Key id:      {key_id}\n\
         Operator id: {identifier}\n\n\
@@ -224,7 +224,7 @@ pub fn admit(operator_id: &str,
     );
     let parcel = office_utils::stack_office_parcel(&state, &actor, description, &signing_key_id)?;
 
-    output::message("office", format!(
+    output::message(format!(
         "Admitted \"{}\" as {}{} with identity root {} (office parcel {}).",
         operator_id, role.as_str(), marked, key_id, parcel
     ));
@@ -282,7 +282,7 @@ pub fn link(public_key: &str, pop: &str) -> Result<(), String> {
     );
     let parcel = office_utils::stack_office_parcel(&state, &actor, description, &signing_key_id)?;
 
-    output::message("office", format!(
+    output::message(format!(
         "Linked key {} to your identity (office parcel {}).", key_id, parcel
     ));
 
@@ -341,7 +341,7 @@ pub fn authorize(operator_id: &str, public_key: &str, pop: &str) -> Result<(), S
     );
     let parcel = office_utils::stack_office_parcel(&state, &actor, description, &signing_key_id)?;
 
-    output::message("office", format!(
+    output::message(format!(
         "Authorized key {} for \"{}\" (office parcel {}).",
         key_id, operator_id, parcel
     ));
@@ -390,7 +390,7 @@ pub fn role(identifier: &str, role: &str, pallets: Vec<String>) -> Result<(), St
     );
     let parcel = office_utils::stack_office_parcel(&state, &actor, description, &signing_key_id)?;
 
-    output::message("office", format!(
+    output::message(format!(
         "\"{}\" is now a(n) {} (office parcel {}).", identifier, role.as_str(), parcel
     ));
 
@@ -432,7 +432,7 @@ pub async fn rotate(offline: bool, passphrase: bool) -> Result<(), String> {
     );
     let parcel = office_utils::stack_office_parcel(&state, &actor, description, &old_key_id)?;
 
-    output::message("office", format!(
+    output::message(format!(
         "Rotated keys (office parcel {}).\nNew key id: {}", parcel, new_key_id
     ));
 
@@ -515,7 +515,7 @@ pub async fn retire(key_id: &str, compromised: bool, offline: bool) -> Result<()
         );
     }
 
-    output::message("office", report);
+    output::message(report);
 
     Ok(())
 }
@@ -561,7 +561,7 @@ pub async fn list() -> Result<(), String> {
     let state = office_utils::read_office_state()?;
 
     if state.users.is_empty() {
-        output::emit("office", &OfficeListing { enrolled: false, users: Vec::new() });
+        output::emit(&OfficeListing { enrolled: false, users: Vec::new() });
 
         return Ok(());
     }
@@ -593,7 +593,7 @@ pub async fn list() -> Result<(), String> {
         }
     }).collect();
 
-    output::emit("office", &OfficeListing { enrolled: true, users });
+    output::emit(&OfficeListing { enrolled: true, users });
 
     Ok(())
 }
@@ -797,7 +797,7 @@ pub fn regenesis(confirm: bool) -> Result<(), String> {
         adopts: Some(old_office_head.clone()),
     })?;
 
-    output::message("office", format!(
+    output::message(format!(
         "TRUST RESET — re-genesis complete.\n\
         New genesis parcel: {}\n\
         Identity root key:  {}\n\
@@ -832,7 +832,7 @@ pub async fn accept_regenesis(confirm: bool) -> Result<(), String> {
         };
 
         if remote_trust.genesis == local.genesis {
-            output::message("office", "The remote's trust anchor matches this warehouse's; nothing to accept.");
+            output::message("The remote's trust anchor matches this warehouse's; nothing to accept.");
 
             return Ok(());
         }
@@ -852,7 +852,7 @@ pub async fn accept_regenesis(confirm: bool) -> Result<(), String> {
 
     let (old, new) = remote_utils::accept_regenesis(&client).await?;
 
-    output::message("office", format!(
+    output::message(format!(
         "Accepted the re-genesis.\n\
         Old genesis: {}\n\
         New genesis: {}\n\

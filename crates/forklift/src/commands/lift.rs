@@ -90,7 +90,7 @@ pub async fn handle_command() -> Result<(), String> {
             }
         }
 
-        output::emit("lift", &report);
+        output::emit(&report);
 
         return Ok(());
     }

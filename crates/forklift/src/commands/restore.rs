@@ -38,7 +38,7 @@ enum HeadEntry {
 /// * `Err(String)` - If there was an error while handling the command.
 pub fn handle_command(staged: bool, target: &str) -> Result<(), String> {
     if staged {
-        return handle_unstage(target, "restore");
+        return handle_unstage(target);
     }
 
     let path = WarehousePath::from_user_input(target)?;
@@ -52,17 +52,15 @@ pub fn handle_command(staged: bool, target: &str) -> Result<(), String> {
 }
 
 /// Unstage a file or directory: reset its inventory entries to the pallet head, leaving
-/// the working directory untouched. Shared by `restore --staged` and `unload`; `command`
-/// labels the output envelope with the verb the user actually ran.
+/// the working directory untouched. Shared by `restore --staged` and `unload`.
 ///
 /// # Arguments
-/// * `target`  - The path of the file or directory to unstage.
-/// * `command` - The invoked command's name, for the output envelope.
+/// * `target` - The path of the file or directory to unstage.
 ///
 /// # Returns
 /// * `Ok(())`      - If the unstage completed successfully.
 /// * `Err(String)` - If there was an error while handling the command.
-pub fn handle_unstage(target: &str, command: &str) -> Result<(), String> {
+pub fn handle_unstage(target: &str) -> Result<(), String> {
     let path = WarehousePath::from_user_input(target)?;
 
     // An out-of-scope path is sealed by hash in a scoped bay and was never materialized;
@@ -70,7 +68,7 @@ pub fn handle_unstage(target: &str, command: &str) -> Result<(), String> {
     // rather than let the walk below silently do the wrong thing.
     crate::commands::scope::ensure_path_in_scope(path.as_key())?;
 
-    restore_staged(&path, command)
+    restore_staged(&path)
 }
 
 /// Restore the working directory from the inventory: rewrite the file (or, for a
@@ -111,7 +109,7 @@ fn restore_worktree(path: &WarehousePath) -> Result<(), String> {
 
     restore_file_and_refresh_entry(parent.as_key(), &item.name, &item.hash, item.item_type)?;
 
-    output::message("restore", format!("Restored \"{}\" from the inventory.", path.as_key()));
+    output::message(format!("Restored \"{}\" from the inventory.", path.as_key()));
 
     Ok(())
 }
@@ -166,7 +164,7 @@ fn restore_worktree_directory(key: &str) -> Result<(), String> {
         ));
     }
 
-    output::message("restore", format!("Restored {} file(s) from the inventory.", restored_count));
+    output::message(format!("Restored {} file(s) from the inventory.", restored_count));
 
     Ok(())
 }
@@ -224,14 +222,13 @@ fn restore_file_and_refresh_entry(parent_key: &str,
 /// somewhere beneath it, keeps the ordinary error.
 ///
 /// # Arguments
-/// * `path`    - The path to unstage.
-/// * `command` - The invoked command's name, for the output envelope.
+/// * `path` - The path to unstage.
 ///
 /// # Returns
 /// * `Ok(())`      - If the unstage completed (including the vacuous-heal no-op case above).
 /// * `Err(String)` - If the path exists neither in the inventory nor in the head, and is not a
 ///                   vacuous-heal case.
-fn restore_staged(path: &WarehousePath, command: &str) -> Result<(), String> {
+fn restore_staged(path: &WarehousePath) -> Result<(), String> {
     let pallet = pallet_utils::get_current_pallet_name()?;
     let head = pallet_utils::get_pallet_head(&pallet)?;
 
@@ -267,7 +264,7 @@ fn restore_staged(path: &WarehousePath, command: &str) -> Result<(), String> {
 
         inventory_utils::replace_subtree_inventories(path.as_key(), &shards)?;
 
-        output::message(command, format!(
+        output::message(format!(
             "Unstaged \"{}\" (inventory reset to the pallet head).",
             load_guard_utils::display_path(path.as_key())
         ));
@@ -311,7 +308,7 @@ fn restore_staged(path: &WarehousePath, command: &str) -> Result<(), String> {
                         .collect::<Vec<_>>()
                         .join(", ");
 
-                    output::message(command, format!(
+                    output::message(format!(
                         "Nothing was staged under \"{}\"; cleared the incomplete-load record for {}.",
                         path.as_key(), roots
                     ));
@@ -336,7 +333,7 @@ fn restore_staged(path: &WarehousePath, command: &str) -> Result<(), String> {
         }
     }
 
-    output::message(command, format!("Unstaged \"{}\".", path.as_key()));
+    output::message(format!("Unstaged \"{}\".", path.as_key()));
 
     Ok(())
 }

@@ -101,7 +101,7 @@ fn add(name: &str, path: Option<String>, scope_paths: Vec<String>) -> Result<(),
 
     shift_utils::materialize_tree(None, &tree, "Creating the bay")?;
 
-    output::emit("bay", &BayCreated {
+    output::emit(&BayCreated {
         name: name.to_string(),
         path: bay_dir.to_string_lossy().into_owned(),
         pallet: name.to_string(),
@@ -222,7 +222,7 @@ fn list() -> Result<(), String> {
         })
         .collect();
 
-    output::emit("bay", &BayList { bays });
+    output::emit(&BayList { bays });
 
     Ok(())
 }
@@ -242,7 +242,7 @@ fn remove(name: &str) -> Result<(), String> {
 
     bay_utils::remove_bay_state(name)?;
 
-    output::emit("bay", &BayRemoved { name: name.to_string() });
+    output::emit(&BayRemoved { name: name.to_string() });
 
     Ok(())
 }

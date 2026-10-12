@@ -668,8 +668,8 @@ fn unreadable_maintenance_settings_are_announced_rather_than_silently_disabling_
         "next_step reaches human readers too, so it must not name an envelope field: {}", warning
     );
     assert_eq!(
-        warning["forklift_json"], "2",
-        "the warning carries the same envelope version as stdout: {}", warning
+        (&warning["lonic_json"], &warning["tool"]), (&serde_json::json!(1), &serde_json::json!("forklift")),
+        "the warning carries the same envelope header as stdout: {}", warning
     );
 
     // And the command that exists to report the store's health refuses outright rather than
@@ -3868,7 +3868,9 @@ fn json_mode_wraps_every_result_in_a_versioned_envelope() {
     let prepared = warehouse.run(&["prepare", "--json"]);
     assert_success(&prepared);
     let value = json(&prepared);
-    assert_eq!(value["forklift_json"], "2");
+    assert_eq!(value["lonic_json"], 1);
+    assert_eq!(value["tool"], "forklift");
+    assert_eq!(value["schema"], 2);
     assert_eq!(value["command"], "prepare");
     assert_eq!(value["ok"], true);
     assert!(value["data"]["created"].is_array());
@@ -3905,6 +3907,151 @@ fn json_errors_carry_a_stable_code_and_a_deterministic_exit_code() {
     assert_eq!(value["error"]["code"], "not_a_warehouse");
     assert!(value["error"]["next_step"].is_string());
     assert!(value["error"]["message"].is_string());
+
+    // A failure keeps the success header, `command` included: it names the command that
+    // failed, so a consumer classifies by the same header on either outcome.
+    assert_eq!(value["lonic_json"], 1);
+    assert_eq!(value["tool"], "forklift");
+    assert_eq!(value["schema"], 2);
+    assert_eq!(value["command"], "stocktake");
+    assert!(value.get("data").is_none(), "a failure carries no data: {}", value);
+}
+
+#[test]
+fn a_json_failure_names_the_command_clap_resolved_not_the_alias_typed() {
+    let warehouse = TestWarehouse::new("json-error-alias");
+
+    // `st` is an alias: the header names the canonical command, the same name a success
+    // document would carry, never the token the caller typed.
+    let outside = warehouse.run(&["--json", "st"]);
+    assert_eq!(outside.status.code(), Some(3));
+    let value = json(&outside);
+    assert_eq!(value["error"]["code"], "not_a_warehouse");
+    assert_eq!(value["command"], "stocktake");
+}
+
+#[test]
+fn a_usage_error_under_json_is_one_failure_document_with_exit_2() {
+    let warehouse = TestWarehouse::new("json-usage-error");
+
+    // An unknown command: the whole of stdout is one document, and it names no command,
+    // because the command line names none clap knows.
+    let unknown = warehouse.run(&["--json", "frobnicate"]);
+    assert_eq!(unknown.status.code(), Some(2));
+    let value = json(&unknown);
+    assert_eq!(value["lonic_json"], 1);
+    assert_eq!(value["tool"], "forklift");
+    assert_eq!(value["schema"], 2);
+    assert_eq!(value["ok"], false);
+    assert!(value["command"].is_null(), "no known command was named: {}", value);
+    assert_eq!(value["error"]["code"], "usage");
+    assert_eq!(value["error"]["message"], "unrecognized subcommand 'frobnicate'");
+    assert!(value["error"]["next_step"].as_str().unwrap().contains("forklift --help"));
+    let usage = value["error"]["details"]["usage"].as_str().unwrap();
+    assert!(usage.contains("Usage: forklift"), "details keep clap's full text: {}", usage);
+    assert!(stderr(&unknown).is_empty(), "nothing else is printed: {}", stderr(&unknown));
+
+    // A bad argument to a command named by alias (`a` is `audit`), with `--json` after the
+    // command: the flag is found wherever it sits, and the header carries the canonical name.
+    let bad_argument = warehouse.run(&["a", "--nope", "--json"]);
+    assert_eq!(bad_argument.status.code(), Some(2));
+    let value = json(&bad_argument);
+    assert_eq!(value["error"]["code"], "usage");
+    assert_eq!(value["command"], "audit");
+    assert_eq!(value["error"]["message"], "unexpected argument '--nope' found");
+
+    // No command at all.
+    let missing = warehouse.run(&["--json"]);
+    assert_eq!(missing.status.code(), Some(2));
+    let value = json(&missing);
+    assert_eq!(value["error"]["code"], "usage");
+    assert!(value["command"].is_null(), "{}", value);
+
+    // Without `--json`, clap reports as it always has: prose on stderr, nothing on stdout.
+    // `--json` after a `--` terminator is an operand, not the flag, so it stays prose too.
+    for args in [&["frobnicate"][..], &["frobnicate", "--", "--json"][..]] {
+        let human = warehouse.run(args);
+        assert_eq!(human.status.code(), Some(2), "{:?}", args);
+        assert!(stdout(&human).is_empty(), "{:?} printed to stdout: {}", args, stdout(&human));
+        assert!(stderr(&human).contains("unrecognized subcommand"), "{:?}: {}", args, stderr(&human));
+    }
+}
+
+#[test]
+fn help_and_version_under_json_are_success_documents() {
+    let warehouse = TestWarehouse::new("json-help");
+
+    // Help is the result the caller asked for, so `ok` is true and `data` carries clap's text.
+    let help = warehouse.run(&["--json", "history", "--help"]);
+    assert_eq!(help.status.code(), Some(0));
+    let value = json(&help);
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["command"], "history");
+    // clap names the binary as invoked (`forklift.exe` on Windows), so match around it.
+    let help_text = value["data"]["message"].as_str().unwrap();
+    assert!(help_text.contains("Usage: forklift") && help_text.contains(" history [OPTIONS]"), "{}", help_text);
+
+    let version = warehouse.run(&["--json", "--version"]);
+    assert_eq!(version.status.code(), Some(0));
+    let value = json(&version);
+    assert_eq!(value["ok"], true);
+    assert!(value["data"]["message"].as_str().unwrap().starts_with("forklift "), "{}", value);
+    assert_eq!(value["command"], serde_json::Value::Null);
+
+    // A help flag before the command name is the top-level help: no command ran, whatever
+    // name follows it.
+    let top = json(&warehouse.run(&["--json", "--help", "st"]));
+    assert_eq!(top["ok"], true);
+    assert_eq!(top["command"], serde_json::Value::Null);
+
+    // The same in a short-flag cluster.
+    let clustered = json(&warehouse.run(&["--json", "-vh", "st"]));
+    assert_eq!(clustered["ok"], true);
+    assert_eq!(clustered["command"], serde_json::Value::Null);
+}
+
+#[test]
+fn the_help_command_under_json_answers_like_the_help_flag() {
+    let warehouse = TestWarehouse::new("json-help-command");
+
+    // `help <command>` (alias `h`) is the same result as `<command> --help`: one success document.
+    let help = warehouse.run(&["--json", "h", "history"]);
+    assert_eq!(help.status.code(), Some(0));
+    let value = json(&help);
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["command"], "help");
+    let help_text = value["data"]["message"].as_str().unwrap();
+    assert!(help_text.contains(" history [OPTIONS]"), "{}", help_text);
+
+    // An unknown name is the same `usage` failure the parser reports for one, not a generic error.
+    let unknown = warehouse.run(&["--json", "help", "bogus"]);
+    assert_eq!(unknown.status.code(), Some(2));
+    let value = json(&unknown);
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["error"]["code"], "usage");
+
+    // Without --json a person still gets the way forward in the message itself.
+    let human = warehouse.run(&["help", "bogus"]);
+    assert_eq!(human.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&human.stderr).contains("Use \"forklift help\""), "{:?}", human);
+}
+
+#[test]
+fn every_json_document_starts_with_the_header_in_its_documented_order() {
+    let warehouse = TestWarehouse::new("json-key-order");
+
+    // The order is checked on the raw text: a parsed `Value` would hide it.
+    let header = "{\n  \"lonic_json\": 1,\n  \"tool\": \"forklift\",\n  \"schema\": 2,\n  \"command\": ";
+
+    for args in [&["--json", "version"][..], &["--json", "bogus"], &["--json", "stocktake"]] {
+        let output = warehouse.run(args);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.starts_with(header), "{:?}: {}", args, stdout);
+
+        let after_command = &stdout[header.len()..];
+        let ok = after_command.find("\n  \"ok\": ").expect("ok follows command");
+        assert!(!after_command[..ok].contains("\n  \""), "{:?}: {}", args, stdout);
+    }
 }
 
 #[test]

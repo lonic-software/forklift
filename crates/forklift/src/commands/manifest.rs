@@ -70,7 +70,7 @@ fn record(revision: &str, kind: ManifestKind, body: String, provenance: Option<P
 
     let manifest_head = manifest_utils::record_entry(&entry, &actor, description, &signing_key_id)?;
 
-    output::emit("manifest", &Recorded {
+    output::emit(&Recorded {
         kind: kind.as_str().to_string(),
         subject,
         operator: actor_id,
@@ -94,7 +94,7 @@ fn show(revision: &str) -> Result<(), String> {
         .map(EntryView::from)
         .collect();
 
-    output::emit("manifest", &ManifestView { subject: Some(subject), entries });
+    output::emit(&ManifestView { subject: Some(subject), entries });
 
     Ok(())
 }
@@ -103,7 +103,7 @@ fn show(revision: &str) -> Result<(), String> {
 fn list() -> Result<(), String> {
     let entries = manifest_utils::read_manifest()?.iter().map(EntryView::from).collect();
 
-    output::emit("manifest", &ManifestView { subject: None, entries });
+    output::emit(&ManifestView { subject: None, entries });
 
     Ok(())
 }

@@ -27,7 +27,7 @@ pub fn handle_command(all: bool, redelta: bool) -> Result<(), String> {
 
     let stats = pack_utils::compact(all, redelta)?;
 
-    output::emit("compact", &Compacted {
+    output::emit(&Compacted {
         all,
         objects_packed: stats.objects_packed,
         packs_written: stats.packs_written,

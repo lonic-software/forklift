@@ -61,7 +61,7 @@ fn peek_inventory(path: &str, verbose: bool) -> Result<(), String> {
             })
             .collect();
 
-        output::emit("peek", &PeekInventory { items });
+        output::emit(&PeekInventory { items });
 
         return Ok(());
     }
@@ -193,7 +193,7 @@ fn peek_object_json(object: ParsedObject) -> Result<(), String> {
         },
     };
 
-    output::emit("peek", &peeked);
+    output::emit(&peeked);
 
     Ok(())
 }

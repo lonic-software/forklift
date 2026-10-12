@@ -27,7 +27,7 @@ pub fn handle_command() -> Result<(), String> {
         conflicts.push(build_conflict(&path)?);
     }
 
-    output::emit("conflicts", &ConflictReport { conflicts });
+    output::emit(&ConflictReport { conflicts });
 
     Ok(())
 }

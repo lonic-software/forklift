@@ -72,7 +72,7 @@ pub async fn handle_command(target: &str) -> Result<(), String> {
     ensure_warehouse_is_clean(&our_tree_hash).await?;
 
     if merge_utils::is_ancestor(&their_head, &our_head)? {
-        output::emit("consolidate", &ConsolidateReport::up_to_date(&current, target));
+        output::emit(&ConsolidateReport::up_to_date(&current, target));
         return Ok(());
     }
 
@@ -85,7 +85,7 @@ pub async fn handle_command(target: &str) -> Result<(), String> {
     if merge_utils::is_ancestor(&our_head, &their_head)? {
         let head = fast_forward(&current, &target, &our_tree_hash, &their_head, &their_tree_hash)?;
 
-        output::emit("consolidate", &ConsolidateReport::fast_forward(&current, target, &head));
+        output::emit(&ConsolidateReport::fast_forward(&current, target, &head));
 
         return Ok(());
     }
@@ -97,9 +97,9 @@ pub async fn handle_command(target: &str) -> Result<(), String> {
     // inside `merge_head_into_current` itself, covering every caller (consolidate/haul/lift).
     match merge_head_into_current(&current, &our_head, &their_head, target, true).await? {
         MergeStatus::Merged(hash) =>
-            output::emit("consolidate", &ConsolidateReport::merged(&current, target, &hash)),
+            output::emit(&ConsolidateReport::merged(&current, target, &hash)),
         MergeStatus::Conflicts(conflicts) =>
-            output::emit("consolidate", &ConsolidateReport::conflicts(&current, target, conflicts)),
+            output::emit(&ConsolidateReport::conflicts(&current, target, conflicts)),
     }
 
     Ok(())

@@ -22,11 +22,12 @@ pub struct Cli {
     #[arg(
         long,
         global = true,
-        long_help = "Emit the command's result as one JSON document on stdout instead of prose. \
-                     The envelope is \
-                     { \"forklift_json\": <schema>, \"command\", \"ok\", \"data\" } on success and \
-                     { \"forklift_json\", \"ok\": false, \"error\": { \"code\", \"message\", \
-                     \"next_step\" } } on failure. Errors also set a deterministic exit code."
+        long_help = "Emit the command's result as one JSON document on stdout instead of prose, \
+                     usage errors included. The header is \
+                     { \"lonic_json\": 1, \"tool\": \"forklift\", \"schema\", \"command\", \"ok\" }, \
+                     followed by \"data\" on success or \"error\": { \"code\", \"message\", \
+                     \"next_step\"?, \"details\"? } on failure. Errors also set a deterministic \
+                     exit code."
     )]
     pub json: bool,
 

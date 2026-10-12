@@ -1,4 +1,6 @@
-use clap::Parser;
+use std::ffi::OsString;
+use clap::error::ErrorKind;
+use clap::{CommandFactory, FromArgMatches};
 use forklift_core::util::{lock_utils, warehouse_utils};
 use crate::cli::{Cli, Command, OfficeAction, ParkAction, ProfileAction};
 use crate::output::{ErrorCode, ForkliftError, OutputMode};
@@ -59,9 +61,9 @@ async fn async_main() {
     // the taint write/gate without ever healing would be strictly worse than today's baseline.
     forklift_core::util::taint_utils::activate();
 
-    // Clap owns the argument errors (usage, suggestions, exit code 2); everything past
-    // parsing reports through the Err path below with a deterministic exit code (§7.8).
-    let cli = Cli::parse();
+    // A usage error is reported here, as a document under `--json`; everything past parsing
+    // reports through the Err path below with a deterministic exit code (§7.8).
+    let cli = parse_or_exit();
 
     output::set_mode(if cli.json { OutputMode::Json } else { OutputMode::Human });
 
@@ -97,9 +99,100 @@ async fn async_main() {
     }
 
     if let Err(error) = result {
-        output::report_error(&error);
+        // A result that failed to serialize already wrote this process's one document.
+        if !output::result_unserializable() {
+            output::report_error(&error);
+        }
         std::process::exit(error.code.exit_code());
     }
+
+    // The command succeeded but its result did not serialize: the one document written was a
+    // failure, and the exit status agrees with it.
+    if output::result_unserializable() {
+        std::process::exit(ErrorCode::Generic.exit_code());
+    }
+}
+
+/// Parse the command line, recording the resolved command for the output envelope. A parse
+/// failure never returns: without `--json` clap prints and exits as it always has; with it, the
+/// failure becomes the process's one stdout document (see [`report_usage_error`]).
+fn parse_or_exit() -> Cli {
+    let args: Vec<OsString> = std::env::args_os().collect();
+
+    let error = match Cli::command().try_get_matches_from(&args) {
+        Ok(mut matches) => {
+            output::set_command(matches.subcommand_name());
+
+            match Cli::from_arg_matches_mut(&mut matches) {
+                Ok(cli) => return cli,
+                Err(error) => error,
+            }
+        }
+        Err(error) => error,
+    };
+
+    // The parse failed, so `cli.json` does not exist: read the flag off the raw arguments. It is
+    // global, so it may sit anywhere before a `--` terminator.
+    let json = args.iter().skip(1)
+        .take_while(|arg| arg.as_os_str() != "--")
+        .any(|arg| arg.as_os_str() == "--json");
+
+    if !json {
+        error.exit();
+    }
+
+    output::set_mode(OutputMode::Json);
+    output::set_command(named_command(&args).as_deref());
+    report_usage_error(&error);
+}
+
+/// The canonical name of the top-level command the arguments name, when the parse that would
+/// have said so failed. The global options are all flags that take no value, so the first
+/// argument that is not an option is the command, or an alias of one, or nothing known. A help
+/// or version flag before it, alone or in a short-flag cluster (`-vh`), means clap answered at
+/// the top level, so no command ran.
+fn named_command(args: &[OsString]) -> Option<String> {
+    let asks_help_or_version = |arg: &str| match arg.strip_prefix("--") {
+        Some(long) => long == "help" || long == "version",
+        None => arg.starts_with('-') && arg.contains(['h', 'V']),
+    };
+
+    let token = args.iter().skip(1)
+        .map(|arg| arg.to_string_lossy())
+        .take_while(|arg| !asks_help_or_version(arg))
+        .find(|arg| !arg.starts_with('-'))?;
+    let token = token.as_ref();
+
+    Cli::command().get_subcommands()
+        .find(|command| command.get_name() == token || command.get_all_aliases().any(|alias| alias == token))
+        .map(|command| command.get_name().to_string())
+}
+
+/// Report a clap parse result as the one `--json` document, then exit. Help and version are
+/// results, not failures: a success document carrying clap's text, exit 0. Every other kind is
+/// a `usage` failure, exit 2, whose `details.usage` keeps clap's full text (the usage line and
+/// any "a similar command exists" tip) that the one-line message leaves out.
+fn report_usage_error(error: &clap::Error) -> ! {
+    let text = error.render().to_string();
+
+    if matches!(error.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
+        output::message(text.trim_end());
+        std::process::exit(0);
+    }
+
+    let first = text.lines().next().unwrap_or_default();
+
+    output::report_error(&ForkliftError {
+        code: ErrorCode::Usage,
+        message: first.strip_prefix("error: ").unwrap_or(first).to_string(),
+        next_step: Some(
+            "Run \"forklift --help\" for the commands, or \"forklift <command> --help\" for a \
+             command's arguments.".to_string()
+        ),
+        details: Some(serde_json::json!({ "usage": text.trim_end() })),
+    });
+
+    std::process::exit(ErrorCode::Usage.exit_code());
 }
 
 /// The main forklift process: enter the warehouse, take the lock when the command mutates, heal
@@ -148,6 +241,12 @@ async fn forklift(cli: Cli) -> Result<(), ForkliftError> {
     // Held for the mutating case (see the doc comment above); stays `None` for a read-only
     // command, which never takes the warehouse lock at all.
     let mut _lock: Option<lock_utils::WarehouseLock> = None;
+
+    // Help needs no warehouse, and its one failure (an unknown command name) is a usage error,
+    // which `dispatch`'s plain `String` errors cannot carry.
+    if let Command::Help { command } = &cli.command {
+        return commands::help::handle_command(command);
+    }
 
     if cli.command.requires_warehouse() {
         warehouse_utils::enter_warehouse().map_err(|message| ForkliftError::new(
@@ -223,7 +322,7 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
         Command::CherryPick { revision, message } => commands::cherry_pick::handle_command(&revision, message).await,
         Command::Deliver { target, message } => commands::deliver::handle_command(&target, message),
         Command::Diff { staged, targets } => commands::diff::handle_command(staged, &targets, cli.verbose).await,
-        Command::Help { command } => commands::help::handle_command(&command),
+        Command::Help { .. } => unreachable!("help is answered in `forklift`, before dispatch"),
         Command::Expand { paths } => commands::expand::handle_command(paths).await,
         Command::Narrow { paths } => commands::narrow::handle_command(paths).await,
         Command::Franchise { url, directory, pallet, token, only } =>

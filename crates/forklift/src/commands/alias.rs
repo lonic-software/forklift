@@ -47,7 +47,7 @@ fn install(name: &str) -> Result<(), String> {
 
     match inspect(&alias_path, &target) {
         Existing::PointsHere => {
-            output::emit("alias", &Installed {
+            output::emit(&Installed {
                 name: name.to_string(),
                 path: display(&alias_path),
                 target: display(&target),
@@ -71,7 +71,7 @@ fn install(name: &str) -> Result<(), String> {
 
     create_alias(&alias_path, &target).map_err(|e| io_hint("create", &alias_path, e))?;
 
-    output::emit("alias", &Installed {
+    output::emit(&Installed {
         name: name.to_string(),
         path: display(&alias_path),
         target: display(&target),
@@ -92,7 +92,7 @@ fn uninstall(name: &str) -> Result<(), String> {
 
     match inspect(&alias_path, &target) {
         Existing::None => {
-            output::emit("alias", &Uninstalled {
+            output::emit(&Uninstalled {
                 name: name.to_string(),
                 path: display(&alias_path),
                 removed: false,
@@ -107,7 +107,7 @@ fn uninstall(name: &str) -> Result<(), String> {
         Existing::PointsHere | Existing::PointsElsewhere(_) => {
             remove_alias(&alias_path).map_err(|e| io_hint("remove", &alias_path, e))?;
 
-            output::emit("alias", &Uninstalled {
+            output::emit(&Uninstalled {
                 name: name.to_string(),
                 path: display(&alias_path),
                 removed: true,
@@ -130,7 +130,7 @@ fn status() -> Result<(), String> {
         Existing::PointsElsewhere(other) => (true, Some(display(&other))),
     };
 
-    output::emit("alias", &StatusReport {
+    output::emit(&StatusReport {
         name: DEFAULT_NAME.to_string(),
         path: display(&alias_path),
         installed,

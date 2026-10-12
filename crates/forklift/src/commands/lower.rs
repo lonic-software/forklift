@@ -57,7 +57,7 @@ pub async fn handle_command() -> Result<(), String> {
     };
 
     if local_head.as_deref() == Some(remote_head.as_str()) {
-        output::emit("lower", &report);
+        output::emit(&report);
         return Ok(());
     }
 
@@ -82,7 +82,7 @@ pub async fn handle_command() -> Result<(), String> {
     if let Some(local) = &local_head {
         if merge_utils::is_ancestor(remote_head, local)? {
             report.outcome = LowerOutcome::Ahead;
-            output::emit("lower", &report);
+            output::emit(&report);
             return Ok(());
         }
 
@@ -103,7 +103,7 @@ pub async fn handle_command() -> Result<(), String> {
     pallet_utils::set_pallet_head(&pallet, remote_head)?;
 
     report.outcome = LowerOutcome::Lowered;
-    output::emit("lower", &report);
+    output::emit(&report);
 
     Ok(())
 }

@@ -21,7 +21,7 @@ use crate::output::{self, CommandOutput};
 pub fn handle_command(target: &str, message: Option<String>) -> Result<(), String> {
     let outcome = deliver_utils::deliver(target, message)?;
 
-    output::emit("deliver", &DeliverReport {
+    output::emit(&DeliverReport {
         delivered: outcome.delivered,
         target: outcome.target,
         source: outcome.source,
