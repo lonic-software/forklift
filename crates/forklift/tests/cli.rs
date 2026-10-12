@@ -3324,6 +3324,20 @@ fn the_refusal_for_an_empty_value_suggests_a_command_that_works_at_the_door_it_c
     assert!(!read.status.success(), "the suggested command must remove the key: {}", stdout(&read));
     assert!(stderr(&read).contains("is not set"), "unexpected read: {}", stderr(&read));
 
+    // Round 7 findings F1–F2: the remedy is offered only where it runs. An unknown key is
+    // reported as unknown (its `--unset` would be refused as unknown too), and a key that is not
+    // set in that scope gets no `--unset` (it would fail with "not set").
+    let refused = warehouse.run(&["config", "operator.nmae", ""]);
+    let message = stderr(&refused);
+    assert!(message.contains("Unknown configuration key"), "unexpected: {message}");
+    assert!(!message.contains("--unset"), "an unknown key has nothing to unset: {message}");
+
+    let refused = warehouse.run(&["config", "remote.token", ""]);
+    let message = stderr(&refused);
+    assert!(message.contains("\"remote.token\" cannot be empty."), "unexpected: {message}");
+    assert!(message.contains("nothing to remove"), "unexpected: {message}");
+    assert!(!message.contains("--unset"), "an unset key has nothing to unset: {message}");
+
     // The `profile create` door: nothing is on disk yet, so the advice is about the option.
     for (args, option) in [
         (["profile", "create", "work", "--name", ""], "--name"),
@@ -3390,6 +3404,7 @@ fn franchise_and_profile_use_refuse_an_empty_value_in_their_own_words() {
 
     let read = warehouse.run(&["config", "operator.profile"]);
     assert!(!read.status.success(), "nothing may be selected: {}", stdout(&read));
+    assert!(stderr(&read).contains("is not set"), "unexpected read: {}", stderr(&read));
 }
 
 /// Round 4 finding F4: the profile *name* was the one door the emptiness rule did not cover.

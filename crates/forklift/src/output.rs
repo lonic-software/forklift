@@ -814,22 +814,6 @@ mod tests {
         // them to a `--json` envelope field they have no way to see. An earlier wording said
         // "resolve what the message names"; `message` is a field name, not anything on screen.
         //
-        // The rule is "no field a human cannot see on screen", matched ignoring case: `message`,
-        // `next_step` (also spelled "next step"), and `forklift_json`. `message` is listed although
-        // it is an ordinary word, because the human line never labels its message — "Message" at
-        // the start of a sentence is the same mistake as "message". `warning` alone is excluded:
-        // the human line starts "Warning:", so "this warning repeats" points at something visible.
-        let lowered = MAINTENANCE_UNAVAILABLE_NEXT_STEP.to_lowercase();
-
-        for field in ["message", "next_step", "next step", "forklift_json"] {
-            assert!(
-                !lowered.contains(field),
-                "the next step is printed to humans too, so it must not name the envelope field \
-                 {field:?}: {}",
-                MAINTENANCE_UNAVAILABLE_NEXT_STEP
-            );
-        }
-
         let json_text = maintenance_unavailable_warning_text(OutputMode::Json, error);
         let value: serde_json::Value = serde_json::from_str(&json_text)
             .unwrap_or_else(|e| panic!("json warning is not valid JSON ({}): {}", e, json_text));
@@ -837,6 +821,30 @@ mod tests {
         assert_eq!(value["warning"], CODE_MAINTENANCE_UNAVAILABLE);
         assert_eq!(value["message"], error);
         assert_eq!(value["next_step"], MAINTENANCE_UNAVAILABLE_NEXT_STEP);
+
+        // The rule is "no field a human cannot see on screen", matched ignoring case and with
+        // `_` also read as a space ("next step"). The fields are taken from the envelope this
+        // warning actually emits, not listed by hand, so a field added later is covered without
+        // anyone remembering to add it here. `message` is covered although it is an ordinary
+        // word, because the human line never labels its message — "Message" at the start of a
+        // sentence is the same mistake as "message". `warning` alone is exempt: the human line
+        // starts "Warning:", so "this warning repeats" points at something visible.
+        let lowered = MAINTENANCE_UNAVAILABLE_NEXT_STEP.to_lowercase();
+        let fields: Vec<&String> = value.as_object().unwrap().keys()
+            .filter(|field| field.as_str() != "warning")
+            .collect();
+        assert!(fields.len() >= 3, "the envelope's fields must be in scope: {fields:?}");
+
+        for field in fields {
+            for spelling in [field.clone(), field.replace('_', " ")] {
+                assert!(
+                    !lowered.contains(&spelling),
+                    "the next step is printed to humans too, so it must not name the envelope \
+                     field {spelling:?}: {}",
+                    MAINTENANCE_UNAVAILABLE_NEXT_STEP
+                );
+            }
+        }
 
         // `docs/MACHINE_INTERFACE.md` promises a consumer exactly these four fields on every
         // stderr warning. Asserted against a literal list, not against the other warning's key

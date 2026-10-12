@@ -597,9 +597,12 @@ pub fn get_effective_value(key: &str) -> Result<Option<(String, ConfigScope)>, S
 pub fn set_value(key: &str, value: &str, scope: ConfigScope) -> Result<String, String> {
     let (section, field) = split_key(key)?;
 
-    // No remedy here: this is reached from `config`, `franchise` and `profile use`, and the
-    // right advice differs at each (see [`require_non_empty`]). Each command refuses a blank
-    // value in its own words before calling; this is the backstop that keeps the file sound.
+    // No remedy here: this is reached from `config`, `franchise`, `profile use` and
+    // `get_operator`, and the right advice differs at each (see [`require_non_empty`]). `config`
+    // adds its own to this refusal; `franchise --token` and `profile use` refuse a blank value
+    // before calling. The rest cannot pass one as the code stands — `franchise` writes its URL
+    // only after the remote answered at it, `get_operator` writes a minted id — and for them
+    // this bare refusal is the backstop that keeps the file sound.
     validate_value(key, value)?;
     let path = get_config_path(scope)?;
 
@@ -762,11 +765,13 @@ pub fn set_profile_fields(profile: &str, fields: &[(&str, &str)]) -> Result<(), 
     // understood, and refusing it on load would turn someone else's harmless litter into a file
     // that no command can read. The strict parse is for values that would be *misread*.
     //
-    // Both checks are a precondition on a public function, not a live defence: swept 2026-10-12,
-    // both callers already exclude every case — `create_profile` validates its inputs with its
-    // own wording before calling, and `get_operator` passes an `operator.profile` that
-    // `validate_value` refuses when empty, with a freshly minted identifier. No falsifier can
-    // reach these through a caller, so the site tests pin `create_profile`'s checks instead.
+    // Every check in this function — the name, the values, and the field checks below — is a
+    // precondition on a public function, not a live defence: swept 2026-10-12, both callers
+    // already exclude every case — `create_profile` validates its inputs with its own wording
+    // before calling and passes only the two known fields once each, and `get_operator` passes an
+    // `operator.profile` that `validate_value` refuses when empty, with a freshly minted
+    // identifier. No caller can reach them, so a unit test calls this function directly — with a
+    // blank value in every call, so that no mutation can make it write the real global file.
     // Re-check this list if a third caller appears.
     if is_blank(profile) {
         return Err(EMPTY_PROFILE_NAME.to_string());
@@ -1484,7 +1489,9 @@ mod tests {
         ).unwrap_err();
         assert!(repeated.contains("more than once"), "unexpected: {repeated}");
 
-        assert_eq!(set_profile_fields(" ", &[]).unwrap_err(), EMPTY_PROFILE_NAME);
+        // A field rides along so that, without the name check, the blank value is still refused
+        // before any path is resolved — an empty list would go on to write the real file.
+        assert_eq!(set_profile_fields(" ", &[(PROFILE_FIELD_NAME, "")]).unwrap_err(), EMPTY_PROFILE_NAME);
     }
 
     /// `remote.tor` is stored normalized, so what lands on disk is literally one of the three

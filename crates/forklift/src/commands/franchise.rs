@@ -42,8 +42,9 @@ use crate::output::{self, CommandOutput};
 ///
 /// # Returns
 /// * `Ok(())` - If the franchise is ready to work in.
-/// * `Err(String)` - If the directory is not empty, the remote is unreachable, the pallet does
-///   not exist, or a transfer failed. The target is left as it was found (see above) either way.
+/// * `Err(String)` - If `--token` is given but empty, the directory is not empty, the remote is
+///   unreachable, the pallet does not exist, or a transfer failed. The target is left as it was
+///   found (see above) either way.
 pub async fn handle_command(url: &str,
                             directory: &str,
                             pallet: Option<String>,
