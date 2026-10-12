@@ -3151,8 +3151,8 @@ fn an_empty_identifier_refuses_rather_than_minting_a_replacement_over_it() {
         "a refused get_operator must never write back to the global config file"
     );
 
-    // The write-side door onto the same entry: `profile create` reaches `set_profile_field`
-    // directly, which would otherwise lay down the very entry the parse refuses.
+    // The write-side door onto the same entry: `profile create --id ""` would otherwise lay down
+    // the very entry the parse refuses.
     let created = warehouse.run(&["profile", "create", "--id", "", "other"]);
     assert!(!created.status.success(), "an empty minted identifier must refuse: {}", stdout(&created));
     assert!(
@@ -3223,14 +3223,19 @@ fn the_json_set_envelope_reports_the_value_that_reached_the_file() {
     assert!(stdout(&warehouse.run(&["config", "remote.tor"])).contains("on"));
 }
 
-/// Round 4 finding F2: creating a profile is two writes, and a value refused by the second used
-/// to leave the first on disk.
+/// Round 4 finding F2: creating a profile was two writes, and a value refused by the second left
+/// the first on disk.
 ///
 /// `profile create --name "" work` minted an identifier, wrote `[profile.work]`, then refused the
 /// empty display name — reporting failure while leaving a profile behind that made the obvious
 /// retry fail too ("the profile \"work\" already exists"), with no command able to remove it.
 /// The fixture is the *second* field for that reason: refusing on the first would prove nothing
 /// about ordering.
+///
+/// Two mechanisms now hold this, and either alone does: `create_profile` refuses its inputs
+/// before writing anything, and creation is a single write of every field (round 5, F7). Measured:
+/// with the up-front checks removed this test stays green; with them removed *and* the write split
+/// per field it goes red.
 #[test]
 fn a_refused_profile_field_leaves_no_half_created_profile_behind() {
     let warehouse = TestWarehouse::new("profile-create-is-all-or-nothing");
@@ -3263,8 +3268,84 @@ fn a_refused_profile_field_leaves_no_half_created_profile_behind() {
 /// door, and there is no `profile delete`. Creating something unusable and unremovable is worse
 /// than refusing to create it.
 ///
-/// Run here rather than in `config_utils`'s unit tests because `set_profile_field` writes to the
+/// Run here rather than in `config_utils`'s unit tests because `set_profile_fields` writes to the
 /// real global configuration, and only this harness scopes HOME to the test.
+/// Round 5 findings F1–F4: an empty value is refused from four doors, and each must give advice
+/// that is true *at that door*. The shared validator used to supply one remedy for all four, and
+/// it was wrong at each in a different way. These pin the three doors a command can reach.
+///
+/// **The `set` door: the suggested command is executed, not just read.** Asserting the text
+/// contains `--unset` is what let an `--unset` with no `--global` through — it read correctly
+/// and targeted the wrong file. The only check that establishes a remedy is to run it.
+#[test]
+fn the_refusal_for_an_empty_value_suggests_a_command_that_works_at_the_door_it_came_from() {
+    let warehouse = TestWarehouse::new("empty-value-remedy-per-door");
+    assert_success(&warehouse.run(&["prepare"]));
+
+    let global_config = warehouse.home.join("global-config.toml");
+
+    // The `set` door, global scope, run from *inside* a warehouse — the case where a remedy
+    // without `--global` resolves to the warehouse file and answers "not set".
+    assert_success(&warehouse.run(&["config", "--global", "operator.name", "Ada"]));
+
+    let refused = warehouse.run(&["config", "--global", "operator.name", ""]);
+    assert!(!refused.status.success(), "an empty value must refuse: {}", stdout(&refused));
+
+    let message = stderr(&refused);
+    let suggested = message.split("run \"").nth(1).and_then(|rest| rest.split('"').next())
+        .unwrap_or_else(|| panic!("the refusal must suggest a command: {message}"));
+    let args: Vec<&str> = suggested.split_whitespace().collect();
+    assert_eq!(args.first(), Some(&"forklift"), "unexpected suggestion: {suggested}");
+
+    let ran = warehouse.run(&args[1..]);
+    assert_success(&ran);
+
+    let content = std::fs::read_to_string(&global_config).unwrap();
+    assert!(
+        !content.contains("name = \"Ada\""),
+        "running the suggested command must remove the key from the file the refusal was about: \
+         {content}"
+    );
+
+    // The same door at warehouse scope renders without `--global`.
+    let refused = warehouse.run(&["config", "operator.name", "   "]);
+    assert!(
+        stderr(&refused).contains("\"forklift config --unset operator.name\""),
+        "unexpected refusal: {}", stderr(&refused)
+    );
+
+    // The `profile create` door: nothing is on disk yet, so the advice is about the option.
+    for (args, option) in [
+        (["profile", "create", "work", "--name", ""], "--name"),
+        (["profile", "create", "work", "--id", "  "], "--id"),
+    ] {
+        let refused = warehouse.run(&args);
+        assert!(!refused.status.success(), "{option} \"\" must refuse: {}", stdout(&refused));
+
+        let message = stderr(&refused);
+        assert!(message.contains(option), "the refusal must name the option: {message}");
+        assert!(message.contains("Omit it"), "the refusal must say what to do: {message}");
+        assert!(
+            !message.contains("file") && !message.contains("--unset"),
+            "nothing was written, so there is no entry to remove: {message}"
+        );
+    }
+
+    // The parse door: a bad *global* file read from inside a warehouse. The message names the
+    // file and says to fix it — and offers no `--unset`, which here would carry no `--global`
+    // and could not succeed while another entry in the file was also bad.
+    std::fs::write(&global_config, "[operator]\nidentifier = \"op-1\"\nname = \"\"\n").unwrap();
+
+    let read = warehouse.run(&["config", "operator.name"]);
+    assert!(!read.status.success(), "a file holding an empty value must refuse");
+
+    let message = stderr(&read);
+    assert!(message.contains("global-config.toml"), "the refusal must name the file: {message}");
+    assert!(message.contains("\"operator.name\" cannot be empty."), "unexpected: {message}");
+    assert!(message.contains("Fix the file by hand"), "unexpected: {message}");
+    assert!(!message.contains("--unset"), "the parse door may not suggest --unset: {message}");
+}
+
 #[test]
 fn an_empty_profile_name_is_refused_rather_than_created_unreachable() {
     let warehouse = TestWarehouse::new("profile-create-empty-name");

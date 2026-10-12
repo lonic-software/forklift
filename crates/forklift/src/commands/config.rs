@@ -72,6 +72,10 @@ pub fn handle_command(global: bool,
 #[derive(Serialize)]
 pub(crate) struct ConfigSet {
     key: String,
+
+    /// The value as written to the file, which is not always the argument given: a key with a
+    /// fixed set of values (`remote.tor`) is stored in its documented spelling, so `"  ON  "` is
+    /// reported, and stored, as `"on"`. A later `config <key>` read returns this same string.
     value: String,
 }
 

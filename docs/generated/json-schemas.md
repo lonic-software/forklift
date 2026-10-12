@@ -573,6 +573,7 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "string"
     },
     "value": {
+      "description": "The value as written to the file, which is not always the argument given: a key with a\nfixed set of values (`remote.tor`) is stored in its documented spelling, so `\"  ON  \"` is\nreported, and stored, as `\"on\"`. A later `config <key>` read returns this same string.",
       "type": "string"
     }
   },

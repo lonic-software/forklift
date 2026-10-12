@@ -813,9 +813,16 @@ mod tests {
         // can be pinned: the shared text is printed verbatim to a human, so it may not direct
         // them to a `--json` envelope field they have no way to see. An earlier wording said
         // "resolve what the message names"; `message` is a field name, not anything on screen.
-        for field in ["message", "next_step", "warning", "forklift_json"] {
+        //
+        // Only the two fields that are *not* also ordinary words a human sees are listed, and the
+        // match ignores case. `warning` is on screen ("Warning: …"), so "this warning repeats"
+        // is a fine sentence and must not trip this; "Message" at the start of a sentence is the
+        // same mistake as "message" and must.
+        let lowered = MAINTENANCE_UNAVAILABLE_NEXT_STEP.to_lowercase();
+
+        for field in ["message", "next_step", "next step"] {
             assert!(
-                !MAINTENANCE_UNAVAILABLE_NEXT_STEP.contains(field),
+                !lowered.contains(field),
                 "the next step is printed to humans too, so it must not name the envelope field \
                  {field:?}: {}",
                 MAINTENANCE_UNAVAILABLE_NEXT_STEP
