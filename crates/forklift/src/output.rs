@@ -558,11 +558,15 @@ pub const CODE_MAINTENANCE_UNAVAILABLE: &str = "maintenance_unavailable";
 /// It does have to name an **action**, which is the part that was missing: `next_step` is one of
 /// the four fields every stderr warning carries (`docs/MACHINE_INTERFACE.md`), and a consumer
 /// that surfaces it to a human had nothing to surface — only a reassurance about the current
-/// state, while the thing to actually do sat inside `message`. Pointing at `message` is the most
-/// this field can honestly say, because which fault it is only `message` knows.
+/// state, while the thing to actually do sat in the reported cause. Pointing at that cause is
+/// the most this field can honestly say, because which fault it is only the cause knows.
+///
+/// It is worded to read correctly in **both** modes, because the `Human` arm prints it too. An
+/// earlier draft said "resolve what the message names", which is a field a `--json` consumer can
+/// look up and a human reader has never heard of.
 pub const MAINTENANCE_UNAVAILABLE_NEXT_STEP: &str =
-    "Resolve what the message names; packing resumes on the next mutating command. \
-     The command's own work is unaffected.";
+    "Resolve the reported cause; packing resumes on the next mutating command. The command's \
+     own work is unaffected.";
 
 /// Surface background auto-maintenance that could not run at all
 /// (`commands::maintenance::run_if_due`), on the same stderr side-channel — and for the same
@@ -802,6 +806,21 @@ mod tests {
         let human = maintenance_unavailable_warning_text(OutputMode::Human, error);
         assert!(human.contains(error), "the human line must carry the cause: {}", human);
         assert!(human.contains(MAINTENANCE_UNAVAILABLE_NEXT_STEP), "human text: {}", human);
+
+        // Round 4 finding F5. The two assertions above compare the text against its own
+        // constant, so they hold for *any* wording — including one that reads as nonsense to the
+        // reader this arm exists for. One mechanical part of "it reads correctly in both modes"
+        // can be pinned: the shared text is printed verbatim to a human, so it may not direct
+        // them to a `--json` envelope field they have no way to see. An earlier wording said
+        // "resolve what the message names"; `message` is a field name, not anything on screen.
+        for field in ["message", "next_step", "warning", "forklift_json"] {
+            assert!(
+                !MAINTENANCE_UNAVAILABLE_NEXT_STEP.contains(field),
+                "the next step is printed to humans too, so it must not name the envelope field \
+                 {field:?}: {}",
+                MAINTENANCE_UNAVAILABLE_NEXT_STEP
+            );
+        }
 
         let json_text = maintenance_unavailable_warning_text(OutputMode::Json, error);
         let value: serde_json::Value = serde_json::from_str(&json_text)

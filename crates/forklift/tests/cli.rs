@@ -653,11 +653,20 @@ fn unreadable_maintenance_settings_are_announced_rather_than_silently_disabling_
     // `docs/MACHINE_INTERFACE.md` promises four fields on every stderr warning, and `next_step`
     // is the one a consumer surfaces to a human — so it has to carry an **action**. It used to
     // hold only a reassurance about the current state ("packing is skipped while this lasts"),
-    // leaving that consumer nothing to do while the thing to do sat inside `message`.
+    // leaving that consumer nothing to do while the thing to do sat in the reported cause.
+    //
+    // Round 4 finding F5: the first version of this assertion required the word "message" here,
+    // which is how the wording came to name a `--json` field in text that is also printed
+    // verbatim to a human. What it must require is the *action* and the agreement with the
+    // constant; `output.rs`'s unit test owns the rule that no envelope field may be named.
     let next_step = warning["next_step"].as_str().unwrap_or_default();
     assert!(
-        next_step.contains("Resolve") && next_step.contains("message"),
+        next_step.contains("Resolve") && next_step.contains("cause"),
         "next_step must point at an action, not describe the state: {}", warning
+    );
+    assert!(
+        !next_step.contains("message"),
+        "next_step reaches human readers too, so it must not name an envelope field: {}", warning
     );
     assert_eq!(
         warning["forklift_json"], "2",
@@ -3184,6 +3193,96 @@ fn a_fixed_value_key_is_written_to_disk_in_its_documented_spelling() {
     let read = warehouse.run(&["config", "remote.tor"]);
     assert_success(&read);
     assert!(stdout(&read).contains("on"), "unexpected read-back: {}", stdout(&read));
+}
+
+/// Round 4 finding F3: the `--json` set envelope must report the spelling that reached the file.
+///
+/// Normalizing on the way out gave the command two answers to the same question — the argument
+/// it was handed and the value it wrote — and the envelope echoed the first. A consumer caching
+/// that echo (the only reason the envelope exists, since human mode prints nothing) held
+/// `"  ON  "` for a file containing `on`, and disagreed with its own next read.
+#[test]
+fn the_json_set_envelope_reports_the_value_that_reached_the_file() {
+    let warehouse = TestWarehouse::new("config-json-echo-is-the-stored-value");
+    assert_success(&warehouse.run(&["prepare"]));
+
+    let set = warehouse.run(&["--json", "config", "remote.tor", "  ON  "]);
+    assert_success(&set);
+
+    let envelope = json(&set);
+    assert_eq!(envelope["data"]["key"], "remote.tor");
+    assert_eq!(
+        envelope["data"]["value"], "on",
+        "the envelope must report what was written, not what was typed: {envelope}"
+    );
+
+    // The pin is the agreement between the three surfaces, so read the other two back here.
+    let content = std::fs::read_to_string(warehouse.root.join(".forklift/config/warehouse.toml"))
+        .unwrap();
+    assert!(content.contains("tor = \"on\""), "unexpected file content: {content}");
+    assert!(stdout(&warehouse.run(&["config", "remote.tor"])).contains("on"));
+}
+
+/// Round 4 finding F2: creating a profile is two writes, and a value refused by the second used
+/// to leave the first on disk.
+///
+/// `profile create --name "" work` minted an identifier, wrote `[profile.work]`, then refused the
+/// empty display name — reporting failure while leaving a profile behind that made the obvious
+/// retry fail too ("the profile \"work\" already exists"), with no command able to remove it.
+/// The fixture is the *second* field for that reason: refusing on the first would prove nothing
+/// about ordering.
+#[test]
+fn a_refused_profile_field_leaves_no_half_created_profile_behind() {
+    let warehouse = TestWarehouse::new("profile-create-is-all-or-nothing");
+    assert_success(&warehouse.run(&["prepare"]));
+
+    let created = warehouse.run(&["profile", "create", "work", "--name", ""]);
+    assert!(!created.status.success(), "an empty display name must refuse: {}", stdout(&created));
+    assert!(
+        stderr(&created).contains("cannot be empty"),
+        "unexpected refusal: {}", stderr(&created)
+    );
+
+    // Nothing was written: the global file either does not exist or holds no profile section.
+    let global_config = warehouse.home.join("global-config.toml");
+    let content = std::fs::read_to_string(&global_config).unwrap_or_default();
+    assert!(
+        !content.contains("[profile.work]"),
+        "a refused creation must leave no profile behind: {content}"
+    );
+
+    // And the retry that used to be locked out succeeds.
+    let retry = warehouse.run(&["profile", "create", "work", "--name", "Work Me"]);
+    assert_success(&retry);
+}
+
+/// Round 4 finding F4: the profile *name* was the one door the emptiness rule did not cover.
+///
+/// `profile create ""` wrote a `[profile.""]` section that no command could then reach: selecting
+/// it means `operator.profile = ""`, which the same rule refuses at both the read and the write
+/// door, and there is no `profile delete`. Creating something unusable and unremovable is worse
+/// than refusing to create it.
+///
+/// Run here rather than in `config_utils`'s unit tests because `set_profile_field` writes to the
+/// real global configuration, and only this harness scopes HOME to the test.
+#[test]
+fn an_empty_profile_name_is_refused_rather_than_created_unreachable() {
+    let warehouse = TestWarehouse::new("profile-create-empty-name");
+    assert_success(&warehouse.run(&["prepare"]));
+
+    let created = warehouse.run(&["profile", "create", ""]);
+    assert!(!created.status.success(), "an empty profile name must refuse: {}", stdout(&created));
+    assert!(
+        stderr(&created).contains("cannot be empty"),
+        "unexpected refusal: {}", stderr(&created)
+    );
+
+    let content = std::fs::read_to_string(warehouse.home.join("global-config.toml"))
+        .unwrap_or_default();
+    assert!(
+        !content.contains("[profile.\"\"]"),
+        "a refused creation must leave no profile section behind: {content}"
+    );
 }
 
 /// PR #122 round 4 finding F1, kept verbatim: the same mint-and-overwrite hazard on the *more

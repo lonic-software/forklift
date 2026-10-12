@@ -582,16 +582,24 @@ pub fn get_effective_value(key: &str) -> Result<Option<(String, ConfigScope)>, S
 /// * `scope` - The configuration scope to write to.
 ///
 /// # Returns
-/// * `Ok(())`      - If the value was set successfully.
+/// * `Ok(String)`  - The spelling actually written, which is not always `value`: a fixed-value
+///                   key is stored normalized (see [`storable_value`]). It is returned rather
+///                   than left for the caller to re-derive because a caller that echoes the
+///                   value it passed in reports something the file does not contain — which is
+///                   exactly what `forklift config --json remote.tor "  ON  "` did, answering
+///                   `"  ON  "` while the file held `on`. A consumer caching that echo
+///                   disagreed with the next read.
 /// * `Err(String)` - If the key is unknown, or the file could not be read, parsed
 ///                   or written.
-pub fn set_value(key: &str, value: &str, scope: ConfigScope) -> Result<(), String> {
+pub fn set_value(key: &str, value: &str, scope: ConfigScope) -> Result<String, String> {
     let (section, field) = split_key(key)?;
     validate_value(key, value)?;
     let path = get_config_path(scope)?;
 
+    let stored = storable_value(key, value);
+
     let mut document = load_document(&path)?.unwrap_or_default();
-    set_value_in_document(&mut document, section, field, &storable_value(key, value))
+    set_value_in_document(&mut document, section, field, &stored)
         .map_err(|detail| not_valid(&path, detail))?;
 
     if let Some(parent) = path.parent() {
@@ -602,7 +610,9 @@ pub fn set_value(key: &str, value: &str, scope: ConfigScope) -> Result<(), Strin
         }
     }
 
-    write_validated(&path, &document)
+    write_validated(&path, &document)?;
+
+    Ok(stored)
 }
 
 /// Remove a configuration key from the configuration file of the given scope (the
@@ -730,8 +740,26 @@ pub fn list_profiles() -> Result<Vec<(String, Operator)>, String> {
 /// * `Err(String)` - If the file could not be read, parsed or written, or if `profile` (or the
 ///                   `[profile]` section itself) is present but is not a table.
 pub fn set_profile_field(profile: &str, field: &str, value: &str) -> Result<(), String> {
-    // The write-side half of the parse's emptiness rule — `profile create --identifier ""`
-    // reaches here, and would otherwise lay down exactly the entry the parse now refuses.
+    // The write-side half of the parse's emptiness rule — `profile create --id ""` reaches here,
+    // and would otherwise lay down exactly the entry the parse now refuses.
+    //
+    // The profile *name* is guarded for a different reason. Profile names are the user's to
+    // choose and nothing constrains their content — but an empty one is not a name a command can
+    // ever select again: `profile use ""` writes `operator.profile = ""`, which `validate_value`
+    // refuses at both doors, so `[profile.""]` could be created and then neither used nor
+    // removed. Refusing it here stops the *command* creating one.
+    //
+    // A hand-written `[profile.""]` still parses, deliberately: it is unreachable but perfectly
+    // understood, and refusing it on load would turn someone else's harmless litter into a file
+    // that no command can read. The strict parse is for values that would be *misread*.
+    //
+    // This particular check is a precondition on a public function, not a live defence: swept
+    // 2026-10-12, both callers already exclude an empty name — `create_profile` validates before
+    // its first write, and `get_operator` passes an `operator.profile` that `validate_value`
+    // refuses when empty. So no falsifier can reach it through a caller, and the site test
+    // `an_empty_profile_name_is_refused_rather_than_created_unreachable` pins `create_profile`'s
+    // guard instead. Re-check this list if a third caller appears.
+    require_non_empty(&format!("{}.<name>", SECTION_PROFILE), profile)?;
     require_non_empty(&format!("{}.{}.{}", SECTION_PROFILE, profile, field), value)?;
 
     let path = get_config_path(ConfigScope::Global)?;
@@ -784,6 +812,22 @@ pub fn create_profile(profile: &str,
     }
 
     let identifier = identifier.map(|id| id.to_string()).unwrap_or_else(mint_uuid_v4);
+
+    // Validate *both* fields before writing either. Creation is two writes, so a value refused
+    // by the second one used to leave the first on disk: `profile create --name "" work` wrote
+    // `[profile.work] identifier = "<uuid>"`, reported failure, and then refused to re-run
+    // because the profile it had half-created already existed. `set_profile_field` checks the
+    // same thing again at its own door — it is public and reached directly — but checking here
+    // is what makes creation all-or-nothing.
+    require_non_empty(&format!("{}.<name>", SECTION_PROFILE), profile)?;
+    require_non_empty(&format!("{}.{}.{}", SECTION_PROFILE, profile, PROFILE_FIELD_IDENTIFIER),
+                      &identifier)?;
+
+    if let Some(name) = name {
+        require_non_empty(&format!("{}.{}.{}", SECTION_PROFILE, profile, PROFILE_FIELD_NAME),
+                          name)?;
+    }
+
     set_profile_field(profile, PROFILE_FIELD_IDENTIFIER, &identifier)?;
 
     if let Some(name) = name {
@@ -888,13 +932,23 @@ fn validate_value(key: &str, value: &str) -> Result<(), String> {
 /// Whitespace-only counts as empty: `identifier = "   "` is no more an identity than `""` is.
 /// The value is only *tested* trimmed, never stored trimmed — a token or a display name is the
 /// user's string.
+///
+/// **The remedy offered depends on whether the command can reach the entry**, because printing
+/// one that cannot run is worse than printing none. `forklift config --unset` goes through
+/// [`split_key`], which refuses anything outside [`KNOWN_KEYS`] — so for a profile field the
+/// `--unset` form names a key the command itself rejects as unknown, and the only route left is
+/// a text editor. Making `forklift config` able to address `profile.<name>.<field>` is the
+/// better answer and is filed as FORK-120; until then this says the true thing.
 fn require_non_empty(label: &str, value: &str) -> Result<(), String> {
     if value.trim().is_empty() {
-        return Err(format!(
-            "\"{}\" cannot be empty. Give it a value, or remove the entry entirely \
-             (\"forklift config --unset {}\" for a key you set with the command).",
-            label, label
-        ));
+        let remedy = if KNOWN_KEYS.contains(&label) {
+            format!("remove the entry entirely (\"forklift config --unset {}\")", label)
+        } else {
+            "remove the entry from the file in a text editor (\"forklift config\" \
+             cannot address a profile field)".to_string()
+        };
+
+        return Err(format!("\"{}\" cannot be empty. Give it a value, or {}.", label, remedy));
     }
 
     Ok(())
@@ -1307,8 +1361,8 @@ mod tests {
     }
 
     /// An empty value is refused at every door, and the write-side doors matter as much as the
-    /// parse: `forklift config operator.identifier ""` and `profile create --identifier ""` both
-    /// reach a writer directly, and either would lay down the entry the parse now refuses.
+    /// parse: `forklift config operator.identifier ""` and `profile create --id ""` both reach a
+    /// writer directly, and either would lay down the entry the parse now refuses.
     ///
     /// The whitespace case is the one a length check would miss, so each door is probed with
     /// both spellings.
@@ -1329,7 +1383,37 @@ mod tests {
                 .expect_err(&format!("{blank:?} must be refused for a profile field"));
             assert!(refused.contains("\"profile.work.identifier\" cannot be empty"),
                 "the refusal must name the field: {refused}");
+
+            // And it must *not* offer `--unset` here. `forklift config --unset
+            // profile.work.identifier` is itself refused as an unknown key, so the remedy the
+            // section-key case prints is, for a profile field, a command that cannot run.
+            assert!(
+                !refused.contains("--unset"),
+                "a profile field has no --unset form; offering one prints a command that always \
+                 fails: {refused}"
+            );
+            assert!(
+                refused.contains("text editor"),
+                "the refusal must name the remedy that does work: {refused}"
+            );
         }
+
+        // The profile *name* is the fourth door: an empty one could be created and then never
+        // selected, because `profile use ""` writes `operator.profile = ""`, which the validator
+        // above refuses.
+        //
+        // Asserted against the label this module passes, not by calling `set_profile_field`:
+        // that function writes to the *real* global configuration, and these tests run with no
+        // scoped HOME. Probing it here passed only because the guard returns before touching the
+        // filesystem — so the test would have been fine and the mutation that removes the guard
+        // wrote `[profile.""]` into the developer's own `~/.forkliftconfig`. A falsifier that
+        // damages the machine it runs on is not a falsifier. `profile create ""` is covered end
+        // to end by `an_empty_profile_name_is_refused_rather_than_created_unreachable` in
+        // `cli.rs`, where HOME is scoped to the test.
+        let refused = require_non_empty(&format!("{}.<name>", SECTION_PROFILE), "")
+            .expect_err("an empty profile name must be refused");
+        assert!(refused.contains("cannot be empty"), "unexpected refusal: {refused}");
+        assert!(refused.contains("profile.<name>"), "the refusal must name what was empty: {refused}");
 
         // The separation that makes the above mean something: a value that merely *contains*
         // whitespace is untouched, and a free-form value is never trimmed on its way in.
@@ -1378,14 +1462,19 @@ mod tests {
         }
     }
 
-    /// The number of data rows in `docs/guide/cli.md`'s "Refused, in either file" table, read
-    /// out of the shipped guide — so the figure
-    /// [`every_refusal_the_guide_tabulates_is_actually_refused`] compares itself against is never
-    /// one a hand edit can get wrong.
+    /// The data rows of `docs/guide/cli.md`'s "Refused, in either file" table, in file order,
+    /// read out of the shipped guide — so neither the number of rows
+    /// [`every_refusal_the_guide_tabulates_is_actually_refused`] checks itself against nor the
+    /// pairing it assumes is one a hand edit can get wrong.
     ///
-    /// Anchored on the table's header line, and the test asserts that line occurs exactly once;
-    /// a second table with the same columns would otherwise make this count silently arbitrary.
-    fn guide_refusal_rows() -> usize {
+    /// Anchored on the table's header line, and the count of that line is asserted to be exactly
+    /// one; a second table with the same columns would otherwise make this silently arbitrary.
+    ///
+    /// The rows are returned rather than counted because a count alone is a weak check: swapping
+    /// one guide row for an unrelated refusal, or reordering two, keeps the count at nine while
+    /// every group below is paired with the wrong row. The caller matches an anchor phrase into
+    /// each row, which is the part that makes the correspondence positional.
+    fn guide_refusal_rows() -> Vec<String> {
         const HEADER: &str = "| Written | Why |";
 
         let guide = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/guide/cli.md");
@@ -1401,7 +1490,8 @@ mod tests {
             .skip_while(|line| line.trim() != HEADER)
             .skip(2)                                        // the header itself, then `|---|---|`
             .take_while(|line| line.starts_with('|'))
-            .count()
+            .map(|line| line.to_string())
+            .collect()
     }
 
     /// `docs/guide/cli.md` §9 tabulates what a configuration file may not contain, and this is
@@ -1412,37 +1502,60 @@ mod tests {
     /// next editor, in a doc comment, to keep the two in step — an obligation in prose, which is
     /// a guard that is not there: a row added to the guide with no case here failed nothing, and
     /// a row deleted from it left an orphan case passing forever. It reads the guide now and
-    /// requires exactly one group per row. The *grouping* is what makes that count mean
-    /// something: several rows carry two examples, so a flat list of cases could never be
-    /// compared against a row count at all.
+    /// requires exactly one group per row, **paired with that row**: each group carries an
+    /// anchor phrase that must appear in the guide row it claims to cover, so reordering the
+    /// table or swapping one refusal for another fails here rather than passing on a count that
+    /// happens to still be nine. The *grouping* is what makes the count mean anything at all:
+    /// several rows carry two examples, so a flat list of cases could never be compared against
+    /// a row count.
     #[test]
     fn every_refusal_the_guide_tabulates_is_actually_refused() {
-        // One group per guide-table row, in the guide's order. Each case carries the phrase the
-        // refusal must contain, not merely "it is refused" — a case that started failing for an
-        // *unrelated* reason would otherwise keep this test green while the guide's explanation
-        // of it quietly became wrong.
-        let rows: [&[(&str, &str)]; 9] = [
-            &[("[opperator]\nidentifier = \"ada\"\n",   "\"opperator\" is not a known configuration section")],
-            &[("[operator]\nidentifer = \"ada\"\n",     "\"operator.identifer\" is not a known configuration key")],
-            &[("[[operator]]\nname = \"ada\"\n",        "\"operator\" must be a table (written \"[operator]\"), not array of tables"),
-              ("[[profile.work]]\nname = \"ada\"\n",    "\"profile.work\" must be a table (written \"[profile.work]\"), not array of tables")],
-            &[("operator = 5\n",                        "\"operator\" must be a table (written \"[operator]\"), not integer")],
-            &[("[maintenance]\nloose = 6700\n",         "\"maintenance.loose\" must be a string, not integer"),
-              ("[remote]\ntor = true\n",                "\"remote.tor\" must be a string, not boolean")],
-            &[("[remote]\ntorproxy = \"socks5h://x\"\n", "\"remote.torproxy\" is not a known configuration key")],
-            &[("[remote]\ntor = \"onn\"\n",             "\"onn\" is not a valid value for remote.tor")],
-            &[("[profile.work]\nnickname = \"w\"\n",    "\"profile.work.nickname\" is not a known profile field")],
-            &[("[operator]\nidentifier = \"\"\n",       "\"operator.identifier\" cannot be empty"),
-              ("[profile.work]\nidentifier = \"   \"\n", "\"profile.work.identifier\" cannot be empty")],
+        // One group per guide-table row, in the guide's order. Each group leads with a phrase
+        // from its guide row, then the cases. Each case carries the phrase the refusal must
+        // contain, not merely "it is refused" — a case that started failing for an *unrelated*
+        // reason would otherwise keep this test green while the guide's explanation of it
+        // quietly became wrong.
+        let rows: [(&str, &[(&str, &str)]); 9] = [
+            ("any other unknown section",
+             &[("[opperator]\nidentifier = \"ada\"\n",   "\"opperator\" is not a known configuration section")]),
+            ("an unknown key inside a known section",
+             &[("[operator]\nidentifer = \"ada\"\n",     "\"operator.identifer\" is not a known configuration key")]),
+            ("an array-of-tables where a table is expected",
+             &[("[[operator]]\nname = \"ada\"\n",        "\"operator\" must be a table (written \"[operator]\"), not array of tables"),
+               ("[[profile.work]]\nname = \"ada\"\n",    "\"profile.work\" must be a table (written \"[profile.work]\"), not array of tables")]),
+            ("a section that is not a table at all",
+             &[("operator = 5\n",                        "\"operator\" must be a table (written \"[operator]\"), not integer")]),
+            ("every value is a **string on disk**",
+             &[("[maintenance]\nloose = 6700\n",         "\"maintenance.loose\" must be a string, not integer"),
+               ("[remote]\ntor = true\n",                "\"remote.tor\" must be a string, not boolean")]),
+            ("keys are case-sensitive",
+             &[("[remote]\ntorproxy = \"socks5h://x\"\n", "\"remote.torproxy\" is not a known configuration key")]),
+            ("accepts only `auto`, `on` or `off`",
+             &[("[remote]\ntor = \"onn\"\n",             "\"onn\" is not a valid value for remote.tor")]),
+            ("profiles hold `identifier` and `name`, nothing else",
+             &[("[profile.work]\nnickname = \"w\"\n",    "\"profile.work.nickname\" is not a known profile field")]),
+            ("there is no third state",
+             &[("[operator]\nidentifier = \"\"\n",       "\"operator.identifier\" cannot be empty"),
+               ("[profile.work]\nidentifier = \"   \"\n", "\"profile.work.identifier\" cannot be empty")]),
         ];
 
+        let guide_rows = guide_refusal_rows();
+
         assert_eq!(
-            rows.len(), guide_refusal_rows(),
+            rows.len(), guide_rows.len(),
             "the guide's refusal table and this test's groups must correspond one to one — \
              a row added there needs a group here, and a row removed there leaves an orphan"
         );
 
-        for (content, expected) in rows.iter().flat_map(|group| group.iter()) {
+        for ((anchor, _), row) in rows.iter().zip(guide_rows.iter()) {
+            assert!(
+                row.contains(anchor),
+                "this test's groups are paired with the guide's rows in order, and group \
+                 {anchor:?} does not match the row it landed on.\n  row: {row}"
+            );
+        }
+
+        for (content, expected) in rows.iter().flat_map(|(_, group)| group.iter()) {
             let error = parse(content)
                 .expect_err(&format!("the guide says this is refused: {content:?}"));
 

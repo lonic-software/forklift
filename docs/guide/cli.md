@@ -1369,7 +1369,7 @@ Refused, in either file:
 | `torProxy` spelled `torproxy` | keys are case-sensitive |
 | `tor = "onn"` | `remote.tor` accepts only `auto`, `on` or `off`. A typo here used to mean `auto` silently, un-proxying every non-onion remote |
 | an unknown field in a `[profile.<name>]` section | profiles hold `identifier` and `name`, nothing else |
-| any key set to `""` (or to whitespace) | set a key or remove it, there is no third state — an empty `identifier` was read as an identity by one path and as "fill this in" by the other, which minted a new id *over* your entry |
+| any key set to `""` (or to whitespace) | a key holds a value or is absent, there is no third state — an empty `identifier` was read as an identity by one path and as "fill this in" by the other, which minted a new id *over* your entry. Clear a section key with `--unset`; a `[profile.<name>]` field the command cannot address, so remove that one in an editor |
 
 **A write is refused unless the file it would leave on disk parses completely.** The check is on
 the result, not on what was there before — so `forklift config` *can* repair a broken entry it is
