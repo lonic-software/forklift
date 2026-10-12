@@ -99,7 +99,10 @@ async fn async_main() {
     }
 
     if let Err(error) = result {
-        output::report_error(&error);
+        // A result that failed to serialize already wrote this process's one document.
+        if !output::result_unserializable() {
+            output::report_error(&error);
+        }
         std::process::exit(error.code.exit_code());
     }
 

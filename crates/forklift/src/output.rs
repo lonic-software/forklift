@@ -247,7 +247,8 @@ pub fn result_unserializable() -> bool {
 fn data_value<T: Serialize>(data: &T) -> Result<serde_json::Value, ForkliftError> {
     serde_json::to_value(data).map_err(|error| ForkliftError {
         code: ErrorCode::Generic,
-        message: format!("Error while serializing the result: {}", error),
+        // The command ran: a caller must not read this failure as "nothing happened" and retry.
+        message: format!("The command completed, but its result could not be serialized: {}", error),
         next_step: None,
         details: None,
     })
