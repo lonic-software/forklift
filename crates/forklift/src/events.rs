@@ -16,9 +16,13 @@
 //! * A reader that has gone away must not kill the process. Forklift runs with `SIGPIPE` at its
 //!   default disposition (see `pager::restore_sigpipe`), so a write to a closed pipe would
 //!   terminate it. No single mechanism prevents that everywhere: Darwin delivers that `SIGPIPE`
-//!   process-wide, so a thread mask does not help and the fd needs `F_SETNOSIGPIPE`; Linux
-//!   delivers it to the writing thread and has no such fd flag, so the writer thread blocks the
-//!   signal. Other platforms have neither mechanism verified, and never open the channel.
+//!   process-wide, so a thread mask does not help and the fd needs `F_SETNOSIGPIPE` (a pipe or
+//!   FIFO) or `SO_NOSIGPIPE` (a socket, which ignores the fd flag); Linux delivers it to the
+//!   writing thread and has no such fd flag, so the writer thread blocks the signal. Other
+//!   platforms have neither mechanism verified, and never open the channel.
+//! * The channel belongs to this process alone. `PULT_EVENTS` is removed from the environment
+//!   and the fd is made close-on-exec, so a child Forklift spawns (a `forklift` per MCP tool call,
+//!   `git`, a shell) neither writes into the channel nor holds it open.
 
 // Off macOS and Linux nothing opens a channel, so the line and queue machinery is unused there.
 #![cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
@@ -36,11 +40,23 @@ static CHANNEL: std::sync::OnceLock<Option<std::sync::Arc<channel::Channel>>> = 
 /// validation is only sound before this process has opened any file descriptor of its own,
 /// since a stale inherited number could otherwise have been reused for one of them.
 pub fn init() {
+    let value = std::env::var_os(VARIABLE);
+
+    // A child must not inherit the variable: it would name a channel this process owns now, or
+    // one this process refused. Sound only because no other thread exists yet to read the
+    // environment concurrently.
+    if value.is_some() {
+        std::env::remove_var(VARIABLE);
+    }
+
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
-        let opened = std::env::var_os(VARIABLE).and_then(|value| channel::open(&value));
+        let opened = value.and_then(|value| channel::open(&value));
         let _ = CHANNEL.set(opened);
     }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let _ = value;
 }
 
 /// A reporting handle for one operation: wired to the channel when there is one, inactive
@@ -108,11 +124,20 @@ impl Entry {
     }
 }
 
+/// Whether `c` must not reach a line: a control character, a character some readers treat as
+/// a line break (U+2028, U+2029), or a bidirectional formatting character, which can make the
+/// displayed text (a file path, say) read differently from what it is.
+fn is_unsafe_in_a_line(c: char) -> bool {
+    c.is_control()
+        || matches!(c, '\u{2028}' | '\u{2029}' | '\u{061C}' | '\u{200E}' | '\u{200F}'
+                       | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+}
+
 /// Build one event line: `head` (the verb and its fixed arguments, ending in a space), then the
-/// text with every control character turned into a space, trimmed, cut to fit
+/// text with every [unsafe character](is_unsafe_in_a_line) turned into a space, trimmed, cut to fit
 /// [`MAX_LINE_BYTES`] on a character boundary, and a newline.
 fn format_line(head: &str, text: &str) -> String {
-    let clean: String = text.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+    let clean: String = text.chars().map(|c| if is_unsafe_in_a_line(c) { ' ' } else { c }).collect();
     let clean = clean.trim();
 
     let mut line = String::with_capacity(head.len() + clean.len() + 1);
@@ -210,22 +235,45 @@ mod channel {
     pub(super) fn open(value: &OsStr) -> Option<Arc<Channel>> {
         let fd = parse_fd(value)?;
 
-        if !is_writable_stream(fd) {
+        let stream = writable_stream(fd)?;
+
+        #[cfg(target_os = "macos")]
+        if !set_no_sigpipe(fd, stream) {
             return None;
         }
 
-        #[cfg(target_os = "macos")]
-        {
-            // SAFETY: `fcntl` on a validated open fd with an integer argument has no memory
-            // effects. The flag lives on the open file description, so it is shared with every
-            // process holding this channel; all it changes for them is that a write to a reader
-            // that has gone returns `EPIPE` instead of raising `SIGPIPE`.
-            if unsafe { libc::fcntl(fd, F_SETNOSIGPIPE, 1) } == -1 {
-                return None;
-            }
+        #[cfg(not(target_os = "macos"))]
+        let _ = stream;
+
+        // SAFETY: `fcntl` on a validated open fd with an integer argument has no memory effects.
+        // The close-on-exec flag belongs to this process's descriptor, not the shared open file
+        // description, so it changes nothing for anyone else holding the channel.
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+            return None;
         }
 
         Some(start(fd))
+    }
+
+    /// Make a write to a reader that has gone return `EPIPE` instead of raising `SIGPIPE`. A pipe
+    /// or FIFO takes the fd flag; a socket ignores that flag (`fcntl` refuses it) and takes the
+    /// socket option instead. Either lives on the shared open file description or socket, so it
+    /// holds for every process writing to this channel, and outlasts this one.
+    #[cfg(target_os = "macos")]
+    fn set_no_sigpipe(fd: RawFd, stream: Stream) -> bool {
+        let on: libc::c_int = 1;
+
+        // SAFETY: `fcntl` with an integer argument has no memory effects; `setsockopt` reads
+        // `size_of::<c_int>()` bytes from `on`, which outlives the call.
+        unsafe {
+            match stream {
+                Stream::Pipe => libc::fcntl(fd, F_SETNOSIGPIPE, 1) != -1,
+                Stream::Socket => libc::setsockopt(
+                    fd, libc::SOL_SOCKET, libc::SO_NOSIGPIPE,
+                    (&on as *const libc::c_int).cast(), std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                ) == 0,
+            }
+        }
     }
 
     /// Start the writer thread over a validated fd.
@@ -261,9 +309,20 @@ mod channel {
         text.parse::<RawFd>().ok().filter(|fd| *fd > 2)
     }
 
-    /// Whether `fd` is open for writing and is a pipe, FIFO or socket — anything else (a regular
-    /// file, a terminal, a closed number) is a stale inheritance, not a channel.
-    pub(super) fn is_writable_stream(fd: RawFd) -> bool {
+    /// What kind of stream a channel fd is.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Stream {
+        /// A pipe or FIFO.
+        Pipe,
+
+        /// A socket.
+        Socket,
+    }
+
+    /// The kind of stream `fd` is, if it is open for writing and is a pipe, FIFO or socket —
+    /// anything else (a regular file, a terminal, a closed number) is a stale inheritance, not a
+    /// channel.
+    pub(super) fn writable_stream(fd: RawFd) -> Option<Stream> {
         // SAFETY: `fstat` writes only into the zeroed `stat` we own; `fcntl(F_GETFL)` reads flags.
         let (stat_ok, mode, flags) = unsafe {
             let mut stat: libc::stat = std::mem::zeroed();
@@ -272,14 +331,19 @@ mod channel {
         };
 
         if !stat_ok || flags == -1 {
-            return false;
+            return None;
         }
 
-        let kind = mode & libc::S_IFMT;
-        let stream = kind == libc::S_IFIFO || kind == libc::S_IFSOCK;
         let access = flags & libc::O_ACCMODE;
+        if access != libc::O_WRONLY && access != libc::O_RDWR {
+            return None;
+        }
 
-        stream && (access == libc::O_WRONLY || access == libc::O_RDWR)
+        match mode & libc::S_IFMT {
+            libc::S_IFIFO => Some(Stream::Pipe),
+            libc::S_IFSOCK => Some(Stream::Socket),
+            _ => None,
+        }
     }
 
     impl Channel {
@@ -438,6 +502,12 @@ mod tests {
     }
 
     #[test]
+    fn line_separators_and_bidi_controls_never_reach_a_line() {
+        let line = progress(None, "a\u{2028}b\u{2029}c\u{202E}d\u{2067}e\u{200F}f").line().to_string();
+        assert_eq!(line, "progress ? a b c d e f\n");
+    }
+
+    #[test]
     fn a_long_line_is_cut_on_a_character_boundary() {
         let text = "é".repeat(MAX_LINE_BYTES);
         let line = progress(Some(5), &text).line().to_string();
@@ -508,7 +578,7 @@ mod tests {
         use std::io::Read;
         use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
         use std::time::{Duration, Instant};
-        use super::super::channel::{is_writable_stream, open, parse_fd, start};
+        use super::super::channel::{open, parse_fd, start, writable_stream, Stream};
         use super::*;
 
         /// A fresh pipe as (read end, write end), both closed on drop.
@@ -532,25 +602,60 @@ mod tests {
         #[test]
         fn the_write_end_of_a_pipe_is_a_channel_and_the_read_end_is_not() {
             let (reader, writer) = pipe();
-            assert!(is_writable_stream(writer.as_raw_fd()));
-            assert!(!is_writable_stream(reader.as_raw_fd()));
+            assert_eq!(writable_stream(writer.as_raw_fd()), Some(Stream::Pipe));
+            assert_eq!(writable_stream(reader.as_raw_fd()), None);
         }
 
         #[test]
         fn a_regular_file_or_a_closed_number_is_not_a_channel() {
             let file = regular_file();
-            assert!(!is_writable_stream(file.as_raw_fd()));
+            assert_eq!(writable_stream(file.as_raw_fd()), None);
 
             let (_, writer) = pipe();
             let closed = writer.as_raw_fd();
             drop(writer);
-            assert!(!is_writable_stream(closed));
+            assert_eq!(writable_stream(closed), None);
         }
 
         #[test]
         fn a_socket_is_a_channel() {
             let (ours, _theirs) = std::os::unix::net::UnixStream::pair().unwrap();
-            assert!(is_writable_stream(ours.as_raw_fd()));
+            assert_eq!(writable_stream(ours.as_raw_fd()), Some(Stream::Socket));
+            assert!(open(OsStr::new(&ours.as_raw_fd().to_string())).is_some(), "a socket channel was refused");
+        }
+
+        #[test]
+        fn opening_makes_the_fd_close_on_exec() {
+            let (_reader, writer) = pipe();
+            let fd = writer.as_raw_fd();
+            // SAFETY: reads the descriptor flags of an fd we own.
+            assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC, 0, "a fresh pipe was already close-on-exec");
+            assert!(open(OsStr::new(&fd.to_string())).is_some());
+            // SAFETY: as above.
+            assert_ne!(unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC, 0);
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn opening_a_socket_sets_its_no_sigpipe_option() {
+            let (ours, _theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+            let fd = ours.as_raw_fd();
+
+            let read_option = || {
+                let mut value: libc::c_int = 0;
+                let mut size = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+                // SAFETY: `getsockopt` writes at most `size` bytes into `value`, which we own.
+                let got = unsafe {
+                    libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_NOSIGPIPE,
+                                     (&mut value as *mut libc::c_int).cast(), &mut size)
+                };
+                assert_eq!(got, 0);
+                value
+            };
+
+            assert_eq!(read_option(), 0, "a fresh socket already had it");
+            assert!(open(OsStr::new(&fd.to_string())).is_some());
+            assert_ne!(read_option(), 0);
         }
 
         #[cfg(target_os = "macos")]

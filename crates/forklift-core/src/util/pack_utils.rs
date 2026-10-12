@@ -4250,7 +4250,7 @@ mod tests {
         data[flip_at] ^= 0xFF;
         // Drop the mmap'd pack registry *before* rewriting the pack file: on Windows a file with a
         // user-mapped section open cannot be written (os error 1224) — the same handle constraint
-        // `compact`'s own drop-before-delete guards against. `compact(true, true, &Progress::NONE)` below reloads.
+        // `compact`'s own drop-before-delete guards against. `compact(true, true)` below reloads.
         invalidate_cache();
         std::fs::write(&pack_path, &data).unwrap();
 

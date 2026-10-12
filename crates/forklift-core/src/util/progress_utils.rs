@@ -54,10 +54,14 @@ struct PhaseState {
 
     /// When a progress report was last passed to the sink, and what percentage it carried.
     last_sent: Option<(Instant, Option<u8>)>,
+
+    /// The newest report held back since then, passed on before the next status (or when the
+    /// last handle goes) so the phase's final count or item is never lost — only thinned.
+    held: Option<(Option<u8>, String)>,
 }
 
 /// How long a repeated percentage is held back. Ten updates a second is as fast as anything
-/// renders text, and keeps a per-item operation over a million items from formatting a million
+/// renders text, and keeps a per-item operation over a million items from sending a million
 /// lines nobody reads.
 const DEFAULT_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -76,7 +80,7 @@ impl Progress {
         Progress(Some(Arc::new(Inner {
             sink: Box::new(sink),
             interval,
-            state: Mutex::new(PhaseState { high_water: None, last_sent: None }),
+            state: Mutex::new(PhaseState { high_water: None, last_sent: None, held: None }),
         })))
     }
 
@@ -85,18 +89,20 @@ impl Progress {
         self.0.is_some()
     }
 
-    /// Report entering a new phase. Starts the phase's percentage afresh.
+    /// Report entering a new phase. Starts the phase's percentage afresh, after passing on the
+    /// last report of the phase ending if it was held back.
     pub fn status(&self, phase: &str) {
         let Some(inner) = &self.0 else { return };
 
         let mut state = lock(&inner.state);
+        inner.flush_held(&mut state);
         state.high_water = None;
         state.last_sent = None;
         (inner.sink)(Event::Status(phase));
     }
 
     /// Report `done` of `total` items through the current phase. `text` is formatted only when
-    /// the report is actually passed on.
+    /// reports go somewhere.
     pub fn fraction(&self, done: usize, total: usize, text: impl FnOnce() -> String) {
         let percent = if total == 0 {
             100
@@ -135,13 +141,36 @@ impl Progress {
             None => false,
         };
 
+        let text = text();
+
         if unchanged {
+            state.held = Some((percent, text));
             return;
         }
 
         state.last_sent = Some((now, percent));
-        let text = text();
+        state.held = None;
         (inner.sink)(Event::Progress { percent, text: &text });
+    }
+}
+
+impl Inner {
+    /// Pass on the report held back since the last one sent, if there is one.
+    fn flush_held(&self, state: &mut PhaseState) {
+        if let Some((percent, text)) = state.held.take() {
+            (self.sink)(Event::Progress { percent, text: &text });
+        }
+    }
+}
+
+impl Drop for Inner {
+    /// The operation is over (every clone of the handle is gone): its last report must not stay
+    /// held back.
+    fn drop(&mut self) {
+        let state = self.state.get_mut().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((percent, text)) = state.held.take() {
+            (self.sink)(Event::Progress { percent, text: &text });
+        }
     }
 }
 
@@ -228,10 +257,10 @@ mod tests {
     }
 
     #[test]
-    fn a_repeated_percentage_inside_the_interval_is_held_back_unformatted() {
+    fn a_repeated_percentage_inside_the_interval_is_held_back() {
         let (progress, seen) = recording(Duration::from_secs(3600));
         progress.fraction(1, 100, || "first".to_string());
-        progress.fraction(1, 100, || panic!("a held-back report was formatted"));
+        progress.fraction(1, 100, || "held".to_string());
         progress.fraction(2, 100, || "second".to_string());
         assert_eq!(*seen.lock().unwrap(), vec![
             Seen::Progress(Some(1), "first".to_string()),
@@ -251,8 +280,46 @@ mod tests {
     fn indeterminate_ticks_are_held_back_like_a_repeated_percentage() {
         let (progress, seen) = recording(Duration::from_secs(3600));
         progress.indeterminate(|| "one".to_string());
-        progress.indeterminate(|| panic!("a held-back tick was formatted"));
+        progress.indeterminate(|| "two".to_string());
         assert_eq!(*seen.lock().unwrap(), vec![Seen::Progress(None, "one".to_string())]);
+    }
+
+    #[test]
+    fn the_last_held_back_report_is_passed_on_before_the_next_status() {
+        let (progress, seen) = recording(Duration::from_secs(3600));
+        progress.indeterminate(|| "1 walked".to_string());
+        progress.indeterminate(|| "2 walked".to_string());
+        progress.indeterminate(|| "3 walked".to_string());
+        progress.status("next");
+        assert_eq!(*seen.lock().unwrap(), vec![
+            Seen::Progress(None, "1 walked".to_string()),
+            Seen::Progress(None, "3 walked".to_string()),
+            Seen::Status("next".to_string()),
+        ]);
+    }
+
+    #[test]
+    fn the_last_held_back_report_is_passed_on_when_the_last_handle_goes() {
+        let (progress, seen) = recording(Duration::from_secs(3600));
+        let clone = progress.clone();
+        progress.fraction(50, 100, || "a".to_string());
+        clone.fraction(50, 100, || "b".to_string());
+
+        drop(progress);
+        assert_eq!(seen.lock().unwrap().len(), 1, "flushed while a clone still reports");
+
+        drop(clone);
+        assert_eq!(seen.lock().unwrap()[1], Seen::Progress(Some(50), "b".to_string()));
+    }
+
+    #[test]
+    fn a_report_passed_on_supersedes_the_held_one() {
+        let (progress, seen) = recording(Duration::from_secs(3600));
+        progress.fraction(1, 100, || "first".to_string());
+        progress.fraction(1, 100, || "held".to_string());
+        progress.fraction(2, 100, || "second".to_string());
+        progress.status("next");
+        assert_eq!(seen.lock().unwrap().len(), 3, "{:?}", seen.lock().unwrap());
     }
 
     #[test]

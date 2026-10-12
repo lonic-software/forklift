@@ -2,17 +2,15 @@
 //! through `PULT_EVENTS`, read back line by line. The channel exists on macOS and Linux only.
 #![cfg(any(target_os = "macos", target_os = "linux"))]
 
-use std::io::Read;
-use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd, RawFd};
-use std::os::unix::process::{CommandExt, ExitStatusExt};
+mod channel;
+
+use std::os::fd::OwnedFd;
+use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 
 /// Path to the compiled forklift binary (provided by cargo for integration tests).
 const FORKLIFT: &str = env!("CARGO_BIN_EXE_forklift");
-
-/// The fd number the child finds its events channel at.
-const CHANNEL_FD: RawFd = 7;
 
 /// The longest line the emitter may write, newline included.
 const MAX_LINE_BYTES: usize = 512;
@@ -62,32 +60,9 @@ impl TestWarehouse {
         self.command(args).output().unwrap()
     }
 
-    /// Run with `fd` installed at [`CHANNEL_FD`] in the child and `PULT_EVENTS` naming it.
-    /// The parent's copy of `fd` is closed once the child has been spawned.
+    /// Run with `fd` as the child's channel (see [`channel::run_with_channel`]).
     fn run_with_channel(&self, args: &[&str], fd: OwnedFd) -> Output {
-        let mut command = self.command(args);
-        command.env("PULT_EVENTS", CHANNEL_FD.to_string());
-
-        let raw = fd.into_raw_fd();
-        unsafe {
-            command.pre_exec(move || {
-                if raw == CHANNEL_FD {
-                    // `dup2` onto itself is a no-op that would leave close-on-exec set.
-                    if libc::fcntl(raw, libc::F_SETFD, 0) == -1 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                } else if libc::dup2(raw, CHANNEL_FD) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-
-                Ok(())
-            });
-        }
-
-        let output = command.output();
-        unsafe { libc::close(raw) };
-
-        output.unwrap()
+        channel::run_with_channel(&mut self.command(args), fd)
     }
 
     /// Prepare the warehouse with an operator and one stacked parcel, so there is something
@@ -123,42 +98,9 @@ fn assert_success(output: &Output) {
     );
 }
 
-/// A pipe whose ends are both close-on-exec, so no other test's child inherits them and
-/// holds the read end open past this test's child.
-fn pipe() -> (OwnedFd, OwnedFd) {
-    let mut fds = [0 as RawFd; 2];
-
-    #[cfg(target_os = "linux")]
-    let created = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
-
-    #[cfg(target_os = "macos")]
-    let created = unsafe {
-        let created = libc::pipe(fds.as_mut_ptr());
-        if created == 0 {
-            libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC);
-            libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC);
-        }
-        created
-    };
-
-    assert_eq!(created, 0, "pipe: {}", std::io::Error::last_os_error());
-
-    unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
-}
-
 /// Run `args` with a fresh pipe as the channel and return the output and every line read.
 fn run_and_collect(warehouse: &TestWarehouse, args: &[&str]) -> (Output, Vec<String>) {
-    let (read_end, write_end) = pipe();
-
-    // Read concurrently so a chatty run can never fill the pipe and stall on the reader.
-    let reader = std::thread::spawn(move || {
-        let mut text = String::new();
-        std::fs::File::from(read_end).read_to_string(&mut text).unwrap();
-        text
-    });
-
-    let output = warehouse.run_with_channel(args, write_end);
-    let text = reader.join().unwrap();
+    let (output, text) = channel::run_and_collect(&mut warehouse.command(args));
 
     assert!(text.is_empty() || text.ends_with('\n'), "a partial line was written: {:?}", text);
 
@@ -286,7 +228,7 @@ fn a_reader_that_has_gone_away_never_kills_the_operation() {
     warehouse.prepare_with_a_parcel();
 
     // Close the read end before the child starts: every write it attempts hits a broken pipe.
-    let (read_end, write_end) = pipe();
+    let (read_end, write_end) = channel::pipe();
     drop(read_end);
 
     let output = warehouse.run_with_channel(&["--json", "compact"], write_end);
@@ -295,6 +237,48 @@ fn a_reader_that_has_gone_away_never_kills_the_operation() {
     assert_success(&output);
     serde_json::from_slice::<serde_json::Value>(&output.stdout)
         .unwrap_or_else(|error| panic!("stdout is not one JSON document ({})", error));
+}
+
+#[test]
+fn a_socket_whose_peer_has_gone_never_kills_the_operation() {
+    let warehouse = TestWarehouse::new("socket-gone");
+    warehouse.prepare_with_a_parcel();
+
+    let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    drop(theirs);
+
+    let output = warehouse.run_with_channel(&["--json", "compact"], OwnedFd::from(ours));
+
+    assert_eq!(output.status.signal(), None, "the process was killed by a signal: {:?}", output.status);
+    assert_success(&output);
+}
+
+#[test]
+fn children_never_write_into_the_channel() {
+    let warehouse = TestWarehouse::new("children");
+    warehouse.prepare_with_a_parcel();
+
+    // The MCP server runs every tool call as a child `forklift`. The server itself reports
+    // nothing, so any line on the channel came from a child that inherited it.
+    let input_path = warehouse.home.join("mcp-input");
+    std::fs::write(&input_path, concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}"#, "\n",
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#, "\n",
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"compact","arguments":{}}}"#, "\n",
+    )).unwrap();
+
+    let mut command = warehouse.command(&["mcp"]);
+    command.stdin(std::fs::File::open(&input_path).unwrap());
+    let (output, text) = channel::run_and_collect(&mut command);
+    assert_success(&output);
+
+    let reply = String::from_utf8_lossy(&output.stdout).lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|message| message["id"] == 2)
+        .expect("a reply to the compact call");
+    assert_eq!(reply["result"]["isError"], false, "compact failed: {}", reply);
+
+    assert_eq!(text, "", "a child wrote into the channel");
 }
 
 #[test]

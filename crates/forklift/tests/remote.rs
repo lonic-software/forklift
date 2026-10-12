@@ -5129,58 +5129,24 @@ fn franchise_into_an_absolute_target_path_succeeds() {
 /// `lift` and `lower` report their phases on a `PULT_EVENTS` channel (the channel itself — fd
 /// validation, a vanished reader — is covered in `tests/events.rs`).
 #[cfg(any(target_os = "macos", target_os = "linux"))]
+#[path = "channel/mod.rs"]
+mod channel;
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod progress_events {
     use super::*;
-    use std::os::fd::{FromRawFd, RawFd};
-    use std::os::unix::process::CommandExt;
 
-    /// The fd number the child finds its events channel at.
-    const CHANNEL_FD: RawFd = 7;
-
-    /// Run the CLI in `relative_dir` with a fresh pipe at [`CHANNEL_FD`], returning the
-    /// output and the status lines read from it.
+    /// Run the CLI in `relative_dir` with a fresh pipe as its channel, returning the output and
+    /// the status lines read from it.
     fn forklift_with_events(area: &TestArea, relative_dir: &str, args: &[&str]) -> (Output, Vec<String>) {
-        let mut fds = [0 as RawFd; 2];
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-
-        // Both ends close-on-exec in the parent, so no concurrently spawned child keeps the
-        // write end (and with it this reader) open.
-        for fd in fds {
-            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
-        }
-        let (read_end, write_end) = (fds[0], fds[1]);
-
-        let reader = std::thread::spawn(move || {
-            let mut text = String::new();
-            unsafe { std::fs::File::from_raw_fd(read_end) }.read_to_string(&mut text).unwrap();
-            text
-        });
-
         let mut command = Command::new(FORKLIFT);
         command.args(args)
             .current_dir(area.path(relative_dir))
             .env("FORKLIFT_GLOBAL_CONFIG", area.path("area-global.toml"))
-            .env("FORKLIFT_KEYS_DIR", area.path("shared-keys"))
-            .env("PULT_EVENTS", CHANNEL_FD.to_string());
+            .env("FORKLIFT_KEYS_DIR", area.path("shared-keys"));
 
-        unsafe {
-            command.pre_exec(move || {
-                let installed = if write_end == CHANNEL_FD {
-                    libc::fcntl(write_end, libc::F_SETFD, 0)
-                } else {
-                    libc::dup2(write_end, CHANNEL_FD)
-                };
-
-                if installed == -1 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
-            });
-        }
-
-        let output = command.output();
-        unsafe { libc::close(write_end) };
-
-        let output = output.unwrap();
-        let statuses = reader.join().unwrap()
-            .lines()
+        let (output, text) = channel::run_and_collect(&mut command);
+        let statuses = text.lines()
             .filter_map(|line| line.strip_prefix("status ").map(str::to_string))
             .collect();
 
@@ -5197,10 +5163,13 @@ mod progress_events {
         assert_success(&area.forklift("a", &["load", "."]));
         assert_success(&area.forklift("a", &["stack", "first parcel"]));
 
-        // "Uploading objects" is lift's last phase, so it is never replaced by a later status.
+        // Uploading is followed by per-object progress, and updating the remote ends the run, so
+        // neither can be replaced by the status after it.
         let (lifted, statuses) = forklift_with_events(&area, "a", &["lift"]);
         assert_success(&lifted);
-        assert!(statuses.iter().any(|status| status == "Uploading objects"), "{:?}", statuses);
+        for phase in ["Uploading objects", "Updating the remote"] {
+            assert!(statuses.iter().any(|status| status == phase), "missing {:?} in {:?}", phase, statuses);
+        }
 
         assert_success(&area.forklift(".", &["franchise", &server.url, "b"]));
 

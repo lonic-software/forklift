@@ -3989,8 +3989,6 @@ async fn fetch_scoped_from(client: &RemoteClient,
     Ok(stats)
 }
 
-/// Join a warehouse path key with a child name (root key is the empty string). A local copy of
-/// the same rule the tree walks elsewhere use, kept here so the fetch has no cross-module dep.
 /// Report how far a history fetch has got. Its total is not known until the walk ends, so the
 /// report carries the running counts rather than a percentage.
 fn report_fetch(progress: &Progress, stats: &FetchStats) {
@@ -3999,6 +3997,8 @@ fn report_fetch(progress: &Progress, stats: &FetchStats) {
     ));
 }
 
+/// Join a warehouse path key with a child name (root key is the empty string). A local copy of
+/// the same rule the tree walks elsewhere use, kept here so the fetch has no cross-module dep.
 fn scope_join(key: &str, name: &str) -> String {
     if key.is_empty() {
         name.to_string()
@@ -4450,6 +4450,7 @@ async fn lift_pallet_inner(client: &RemoteClient,
     ).await?;
 
     // The signatures of the new parcels travel with them.
+    progress.status("Updating the remote");
     let mut uploaded_signatures = 0usize;
 
     for parcel_hash in &new_parcels {
@@ -4888,7 +4889,8 @@ fn refuse_if_commit_pagination_unsupported(staged_count: usize,
 /// earlier, in the closure walk) — it gates whether *this* remote understands paginated commits at
 /// all (§9.4b W3), which matters for *any* large lift, chunked or not.
 ///
-/// `progress` hears each finished upload against the total the negotiation settled on.
+/// `progress` hears each finished upload against the total the negotiation settled on, and a
+/// status when the staged commit starts.
 async fn negotiate_and_upload(client: &RemoteClient,
                               session: &str,
                               candidates: &[String],
@@ -4926,6 +4928,7 @@ async fn negotiate_and_upload(client: &RemoteClient,
     // promotes it before the ref update — nothing staged is fetchable until then.
     if !negotiation.targets.is_empty() {
         let (control, blobs) = classify_staged(&negotiation.targets, control_plane);
+        progress.status("Committing staged objects");
         commit_staged_session(client, session, &control, &blobs).await?;
     }
 
