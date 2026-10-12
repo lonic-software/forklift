@@ -181,12 +181,25 @@ impl TorMode {
     /// survives for a direct caller, and so does the wider vocabulary (`true`/`yes`/`1`), which
     /// the file parse does *not* accept.
     fn parse(value: &str) -> TorMode {
-        match value.trim().to_ascii_lowercase().as_str() {
+        match normalize_tor_value(value).as_str() {
             "on" | "true" | "yes" | "1" => TorMode::On,
             "off" | "false" | "no" | "0" => TorMode::Off,
             _ => TorMode::Auto,
         }
     }
+}
+
+/// The one normalization a `remote.tor` value gets, wherever it is read or checked: surrounding
+/// whitespace trimmed, ASCII case folded.
+///
+/// Exported because the check and the read live in different modules — `config_utils` decides
+/// whether a value is *admissible* (`auto`/`on`/`off`) and [`TorMode::parse`] decides what it
+/// *means*. Both answers have to be computed from the same spelling or the pair silently drifts:
+/// a value the check accepts under one normalization and the reader resolves to [`TorMode::Auto`]
+/// under another is exactly the un-proxied-clearnet-dial failure the check exists to prevent.
+/// They each had their own copy of this line; now there is one.
+pub fn normalize_tor_value(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
 }
 
 /// The client's Tor transport settings, resolved from configuration.

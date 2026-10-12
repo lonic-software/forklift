@@ -650,6 +650,20 @@ fn unreadable_maintenance_settings_are_announced_rather_than_silently_disabling_
         "the warning must name the key: {}", warning
     );
 
+    // `docs/MACHINE_INTERFACE.md` promises four fields on every stderr warning, and `next_step`
+    // is the one a consumer surfaces to a human — so it has to carry an **action**. It used to
+    // hold only a reassurance about the current state ("packing is skipped while this lasts"),
+    // leaving that consumer nothing to do while the thing to do sat inside `message`.
+    let next_step = warning["next_step"].as_str().unwrap_or_default();
+    assert!(
+        next_step.contains("Resolve") && next_step.contains("message"),
+        "next_step must point at an action, not describe the state: {}", warning
+    );
+    assert_eq!(
+        warning["forklift_json"], "2",
+        "the warning carries the same envelope version as stdout: {}", warning
+    );
+
     // And the command that exists to report the store's health refuses outright rather than
     // reporting a default threshold the tool is not actually using.
     let store = warehouse.run(&["store"]);
@@ -3091,6 +3105,85 @@ fn a_malformed_selected_profile_refuses_without_writing_back_to_the_global_confi
         before, after,
         "a refused get_operator must never write back to the global config file"
     );
+}
+
+/// Round 3 finding F4: the third door into the same mint-and-overwrite hazard, reached by a
+/// value that **parses perfectly**. An empty `identifier` is not a type fault, so the typed
+/// parse had nothing to say about it — and `ProfileRecord::to_operator` maps an absent field and
+/// an empty one onto the same `""`, which `get_operator` reads as "fill this in". So it minted a
+/// UUID and wrote it over the user's own entry, exactly as the malformed cases above once did.
+///
+/// The counterpart asymmetry is what made it worth a rule rather than a patch: the *direct*
+/// branch took `operator.identifier = ""` verbatim, making the empty string the on-chain
+/// operator id written into every parcel. One spelling, two opposite readings, one destructive.
+#[test]
+fn an_empty_identifier_refuses_rather_than_minting_a_replacement_over_it() {
+    let warehouse = TestWarehouse::new("empty-identifier-no-writeback");
+    warehouse.write_file("a.txt", "one\n");
+    assert_success(&warehouse.run(&["prepare"]));
+
+    let global_config = warehouse.home.join("global-config.toml");
+    std::fs::write(&global_config, "[profile.work]\nidentifier = \"\"\n").unwrap();
+    assert_success(&warehouse.run(&["config", "operator.profile", "work"]));
+
+    let before = std::fs::read(&global_config).unwrap();
+
+    let enroll = warehouse.run(&["office", "enroll"]);
+    assert!(!enroll.status.success(), "an empty identifier must refuse: {}", stdout(&enroll));
+    let error = stderr(&enroll);
+    assert!(error.contains("cannot be empty"), "the refusal must say what is wrong: {}", error);
+    assert!(
+        error.contains("profile.work.identifier"),
+        "the refusal must name the field: {}", error
+    );
+
+    assert_eq!(
+        before, std::fs::read(&global_config).unwrap(),
+        "a refused get_operator must never write back to the global config file"
+    );
+
+    // The write-side door onto the same entry: `profile create` reaches `set_profile_field`
+    // directly, which would otherwise lay down the very entry the parse refuses.
+    let created = warehouse.run(&["profile", "create", "--id", "", "other"]);
+    assert!(!created.status.success(), "an empty minted identifier must refuse: {}", stdout(&created));
+    assert!(
+        stderr(&created).contains("cannot be empty"),
+        "unexpected refusal: {}", stderr(&created)
+    );
+}
+
+/// Round 3 finding F7, at the call site rather than in the helper: `forklift config` stores a
+/// fixed-value key normalized, so what lands on disk is literally one of the three spellings the
+/// guide enumerates.
+///
+/// `"  ON  "` is the fixture because it discriminates — the range check admits it either way
+/// (`validate_value` normalizes before testing membership), so the *only* difference between
+/// storing normalized and storing raw is the spelling in the file: `on` against `  ON  `. The
+/// read-back then shows the value is understood, which a raw-storing implementation also manages
+/// — that assertion is the counterpart, not the pin.
+#[test]
+fn a_fixed_value_key_is_written_to_disk_in_its_documented_spelling() {
+    let warehouse = TestWarehouse::new("config-normalizes-fixed-values");
+    assert_success(&warehouse.run(&["prepare"]));
+
+    assert_success(&warehouse.run(&["config", "remote.tor", "  ON  "]));
+
+    let config = warehouse.root.join(".forklift/config/warehouse.toml");
+    let content = std::fs::read_to_string(&config).unwrap();
+    assert!(
+        content.contains("tor = \"on\""),
+        "the stored value must be the documented spelling, not what was typed: {content}"
+    );
+    assert!(
+        !content.contains("  ON  "),
+        "the raw argument must not reach the file: {content}"
+    );
+
+    // And the file is an ordinary one afterwards — the stored value is admissible on the way
+    // back in, which is the whole reason for normalizing it on the way out.
+    let read = warehouse.run(&["config", "remote.tor"]);
+    assert_success(&read);
+    assert!(stdout(&read).contains("on"), "unexpected read-back: {}", stdout(&read));
 }
 
 /// PR #122 round 4 finding F1, kept verbatim: the same mint-and-overwrite hazard on the *more

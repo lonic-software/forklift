@@ -1369,12 +1369,18 @@ Refused, in either file:
 | `torProxy` spelled `torproxy` | keys are case-sensitive |
 | `tor = "onn"` | `remote.tor` accepts only `auto`, `on` or `off`. A typo here used to mean `auto` silently, un-proxying every non-onion remote |
 | an unknown field in a `[profile.<name>]` section | profiles hold `identifier` and `name`, nothing else |
+| any key set to `""` (or to whitespace) | set a key or remove it, there is no third state — an empty `identifier` was read as an identity by one path and as "fill this in" by the other, which minted a new id *over* your entry |
 
-**`forklift config` cannot repair a file it cannot parse** — reading and writing refuse alike, on
-purpose, so a write never lands beside something Forklift could not account for. Fix a broken
-file in a text editor; the refusal names the file and the key. Values set *through* `forklift
-config` are quoted and range-checked for you, which is why none of the above can bite a file you
-have only ever edited with the command.
+**A write is refused unless the file it would leave on disk parses completely.** The check is on
+the result, not on what was there before — so `forklift config` *can* repair a broken entry it is
+able to express: with `tor = "onn"` in the file, `forklift config remote.tor on` and `forklift
+config --unset remote.tor` both succeed, because neither leaves the bad value standing. What is
+refused is a write that would preserve it: setting `remote.url` while `tor = "onn"` is still
+there fails, naming the `tor` entry rather than the key you were setting. A fault the command
+cannot express — `operator = 5`, an unknown section, a mistyped key — still needs a text editor;
+the refusal names the file and the key either way. Values set *through* `forklift config` are
+quoted and range-checked for you, which is why none of the above can bite a file you have only
+ever edited with the command.
 
 Set / read / remove:
 

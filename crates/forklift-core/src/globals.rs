@@ -75,33 +75,49 @@ impl StorageRootScope {
     }
 }
 
-/// Normalize a storage root to a form the storage layer's path model can build on.
+/// Strip a `\\?\` verbatim prefix from `path`, yielding the ordinary form. A no-op on
+/// other platforms, and on a path that is not verbatim.
 ///
-/// The storage layer appends subpaths with forward slashes (`.forklift/objects`, via
-/// `file_utils`). On Windows, `std::fs::canonicalize` returns *verbatim* paths
-/// (`\\?\C:\…`), and verbatim paths take their separators **literally** — a forward
-/// slash becomes a filename character, so `\\?\C:\…\.forklift/objects` is rejected as
-/// invalid (os error 123). Stripping the `\\?\` prefix yields an ordinary path, where
-/// Windows accepts both `/` and `\` as separators. We must strip unconditionally (not
-/// e.g. via the `dunce` crate, which keeps the verbatim form for long paths) precisely
-/// because the forward-slash model is incompatible with *any* verbatim root. A no-op on
-/// other platforms.
+/// **The one copy of this rule.** `std::fs::canonicalize` returns *verbatim* paths on
+/// Windows (`\\?\C:\…`, or `\\?\UNC\server\share`), and three unrelated things in this
+/// repo break on them, each for its own reason:
+///
+/// * [`normalize_root`] — verbatim paths take their separators **literally**, so a forward
+///   slash becomes a filename character and the storage layer's `\\?\C:\…\.forklift/objects`
+///   is rejected as invalid (os error 123).
+/// * `commands::alias`'s shim — `cmd.exe` cannot execute a `\\?\`-prefixed path at all
+///   ("The system cannot find the path specified").
+/// * `config_utils`'s not-valid refusal — the one message whose whole job is naming a file
+///   for a human to open in an editor.
+///
+/// Stripping unconditionally is deliberate (not e.g. via the `dunce` crate, which keeps the
+/// verbatim form for long paths): the forward-slash model above is incompatible with *any*
+/// verbatim root, and the other two callers want the human/shell-legible spelling regardless
+/// of length. This was a private copy here plus a second one in `commands::alias`, the two
+/// kept in step by a comment asking the next editor to do so; it is one function now so that
+/// there is nothing to keep in step.
 #[cfg(windows)]
-fn normalize_root(root: &Path) -> PathBuf {
-    let text = root.to_string_lossy();
+pub fn strip_verbatim_prefix(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
 
     if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
         PathBuf::from(format!(r"\\{}", rest))
     } else if let Some(rest) = text.strip_prefix(r"\\?\") {
         PathBuf::from(rest)
     } else {
-        root.to_path_buf()
+        path.to_path_buf()
     }
 }
 
 #[cfg(not(windows))]
+pub fn strip_verbatim_prefix(path: &Path) -> PathBuf {
+    path.to_path_buf()
+}
+
+/// Normalize a storage root to a form the storage layer's path model can build on — see
+/// [`strip_verbatim_prefix`], which owns the rule and the reason.
 fn normalize_root(root: &Path) -> PathBuf {
-    root.to_path_buf()
+    strip_verbatim_prefix(root)
 }
 
 impl Drop for StorageRootScope {
@@ -208,6 +224,39 @@ mod tests {
     #[test]
     fn the_root_is_relative_without_a_scope() {
         assert_eq!(forklift_root(), PathBuf::from(".forklift"));
+    }
+
+    /// The leg of [`strip_verbatim_prefix`] that holds on every platform: a path that is not
+    /// verbatim comes back untouched. Worth pinning on its own now that three unrelated
+    /// callers — the storage root, the Windows shim and `config_utils`'s hand-edit refusal —
+    /// pass ordinary paths through it on the way to something a user or a shell reads.
+    #[test]
+    fn an_ordinary_path_passes_through_unchanged() {
+        for path in ["/warehouses/alpha", "relative/warehouse.toml", "."] {
+            assert_eq!(strip_verbatim_prefix(Path::new(path)), PathBuf::from(path));
+        }
+    }
+
+    /// The stripping itself, which only Windows can exercise — `canonicalize` returns the
+    /// verbatim form there and nowhere else, and the function is deliberately a no-op
+    /// elsewhere, so a cross-platform version of this test would assert the opposite thing on
+    /// each platform. Runs on the Windows CI job; the `\\?\UNC\` case is included because it
+    /// is the one that needs a different rewrite rather than a plain prefix removal.
+    #[cfg(windows)]
+    #[test]
+    fn a_verbatim_path_loses_its_prefix() {
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"\\?\C:\warehouses\alpha")),
+            PathBuf::from(r"C:\warehouses\alpha")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"\\?\UNC\server\share\alpha")),
+            PathBuf::from(r"\\server\share\alpha")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"C:\warehouses\alpha")),
+            PathBuf::from(r"C:\warehouses\alpha")
+        );
     }
 
     #[test]

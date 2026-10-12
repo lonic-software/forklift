@@ -554,8 +554,15 @@ pub const CODE_MAINTENANCE_UNAVAILABLE: &str = "maintenance_unavailable";
 /// What to do about [`CODE_MAINTENANCE_UNAVAILABLE`]. Deliberately does not promise the cause is
 /// permanent: a broken configuration file is, a transient I/O fault is not, and this code covers
 /// both.
+///
+/// It does have to name an **action**, which is the part that was missing: `next_step` is one of
+/// the four fields every stderr warning carries (`docs/MACHINE_INTERFACE.md`), and a consumer
+/// that surfaces it to a human had nothing to surface — only a reassurance about the current
+/// state, while the thing to actually do sat inside `message`. Pointing at `message` is the most
+/// this field can honestly say, because which fault it is only `message` knows.
 pub const MAINTENANCE_UNAVAILABLE_NEXT_STEP: &str =
-    "Packing is skipped while this lasts; the command's own work is unaffected.";
+    "Resolve what the message names; packing resumes on the next mutating command. \
+     The command's own work is unaffected.";
 
 /// Surface background auto-maintenance that could not run at all
 /// (`commands::maintenance::run_if_due`), on the same stderr side-channel — and for the same

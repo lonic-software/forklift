@@ -4,6 +4,7 @@ use crate::enums::config_scope::ConfigScope;
 use crate::globals::forklift_root;
 use crate::model::operator::Operator;
 use crate::util::file_utils;
+use crate::util::remote_utils;
 
 /// The folder inside the forklift root that holds configuration files. The warehouse-level
 /// configuration lives directly in it; per-pallet configuration files are planned to live
@@ -373,6 +374,13 @@ fn parse_profiles(item: &toml_edit::Item, path: &Path) -> Result<Vec<(String, Pr
                 SECTION_PROFILE, name, field, value.type_name()
             )))?;
 
+            // Profile fields do not pass through `validate_value` — the keys here are
+            // user-chosen, so the strictness is applied one level deeper, in this loop. The
+            // emptiness rule has to be applied again with it: this is the branch where an empty
+            // `identifier` is destructive rather than merely wrong.
+            require_non_empty(&format!("{}.{}.{}", SECTION_PROFILE, name, field), value)
+                .map_err(|detail| not_valid(path, detail))?;
+
             match field {
                 PROFILE_FIELD_IDENTIFIER => record.identifier = Some(value.to_string()),
                 _                        => record.name = Some(value.to_string()),
@@ -417,8 +425,14 @@ fn known_sections() -> Vec<&'static str> {
 /// names nothing in particular to anyone who keeps more than one warehouse — and this refusal
 /// can reach a user who is not standing in the one it is about. Canonicalization is best-effort:
 /// a file that has since been removed keeps the relative spelling rather than losing the name.
+///
+/// On Windows `canonicalize` hands back a *verbatim* path (`\\?\C:\…`), which is the last thing
+/// this message wants — its whole job is naming a file for a human to open in an editor — so the
+/// prefix is stripped by the one helper that owns that rule.
 fn not_valid(path: &Path, detail: String) -> String {
-    let named = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let named = path.canonicalize()
+        .map(|resolved| crate::globals::strip_verbatim_prefix(&resolved))
+        .unwrap_or_else(|_| path.to_path_buf());
 
     format!(
         "Configuration file \"{}\" is not valid: {} Fix the file by hand.",
@@ -577,7 +591,7 @@ pub fn set_value(key: &str, value: &str, scope: ConfigScope) -> Result<(), Strin
     let path = get_config_path(scope)?;
 
     let mut document = load_document(&path)?.unwrap_or_default();
-    set_value_in_document(&mut document, section, field, value)
+    set_value_in_document(&mut document, section, field, &storable_value(key, value))
         .map_err(|detail| not_valid(&path, detail))?;
 
     if let Some(parent) = path.parent() {
@@ -716,6 +730,10 @@ pub fn list_profiles() -> Result<Vec<(String, Operator)>, String> {
 /// * `Err(String)` - If the file could not be read, parsed or written, or if `profile` (or the
 ///                   `[profile]` section itself) is present but is not a table.
 pub fn set_profile_field(profile: &str, field: &str, value: &str) -> Result<(), String> {
+    // The write-side half of the parse's emptiness rule — `profile create --identifier ""`
+    // reaches here, and would otherwise lay down exactly the entry the parse now refuses.
+    require_non_empty(&format!("{}.{}.{}", SECTION_PROFILE, profile, field), value)?;
+
     let path = get_config_path(ConfigScope::Global)?;
     let mut document = load_document(&path)?.unwrap_or_default();
 
@@ -836,7 +854,10 @@ fn require_known_key(key: &str) -> Result<(), String> {
 /// read one. Set-time strictness alone only ever covered values this tool wrote; the file is
 /// hand-editable, which is where the typo actually comes from.
 fn validate_value(key: &str, value: &str) -> Result<(), String> {
-    if key == KEY_REMOTE_TOR && !REMOTE_TOR_VALUES.contains(&value.trim().to_ascii_lowercase().as_str()) {
+    require_non_empty(key, value)?;
+
+    if key == KEY_REMOTE_TOR
+        && !REMOTE_TOR_VALUES.contains(&remote_utils::normalize_tor_value(value).as_str()) {
         return Err(format!(
             "\"{}\" is not a valid value for {}. Use one of: {}.",
             value, KEY_REMOTE_TOR, REMOTE_TOR_VALUES.join(", ")
@@ -844,6 +865,58 @@ fn validate_value(key: &str, value: &str) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Refuse an empty — or whitespace-only — value for `label`, which no configuration key accepts.
+///
+/// **Set a key or remove it; there is no third state.** An empty value is the one spelling that
+/// reads differently depending on who is looking, and the identity keys made that expensive:
+///
+/// * `operator.identifier = ""` was taken verbatim by [`get_operator`]'s direct branch, so the
+///   **empty string became the on-chain operator id** written into every parcel authored.
+/// * `[profile.<name>] identifier = ""` went the opposite way — [`ProfileRecord::to_operator`]
+///   maps an absent field and an empty one onto the same `""`, which `get_operator` reads as
+///   "fill this in", so it minted a UUID and **wrote it over the user's own entry**. That is the
+///   mint-and-overwrite hazard this module's strict parse exists to close, reached by a value
+///   that parses perfectly.
+///
+/// One file, one spelling, two opposite readings, one of them destructive. Refusing it at both
+/// ends — [`validate_value`] on every section key, [`parse_profiles`] and [`set_profile_field`]
+/// on the profile fields — removes the state rather than picking a winner, so neither reading
+/// can be reached and `to_operator`'s collapse stays a question about *presence* only.
+///
+/// Whitespace-only counts as empty: `identifier = "   "` is no more an identity than `""` is.
+/// The value is only *tested* trimmed, never stored trimmed — a token or a display name is the
+/// user's string.
+fn require_non_empty(label: &str, value: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err(format!(
+            "\"{}\" cannot be empty. Give it a value, or remove the entry entirely \
+             (\"forklift config --unset {}\" for a key you set with the command).",
+            label, label
+        ));
+    }
+
+    Ok(())
+}
+
+/// The spelling of `value` that [`set_value`] actually writes for `key`.
+///
+/// A fixed-value key is stored normalized, so what lands on disk is literally one of the
+/// spellings [`REMOTE_TOR_VALUES`] and the guide both enumerate. `forklift config remote.tor
+/// "  ON  "` otherwise left `tor = "  ON  "` in the file: admissible, correctly understood, and
+/// not a member of the documented set — a value whose correctness rested on every reader
+/// applying the same normalization forever. Normalizing once, here, means the stored value
+/// needs no normalization to be understood at all.
+///
+/// Free-form keys pass through untouched: a token, a URL or a display name is the user's
+/// string, and folding its case would corrupt it.
+fn storable_value(key: &str, value: &str) -> String {
+    if key == KEY_REMOTE_TOR {
+        return remote_utils::normalize_tor_value(value);
+    }
+
+    value.to_string()
 }
 
 /// Load and parse the configuration file at the given path, if it exists.
@@ -1213,7 +1286,10 @@ mod tests {
     /// silently un-proxies every non-onion remote. The file parse has to know the value set.
     #[test]
     fn an_out_of_range_remote_tor_value_refuses_even_though_it_is_a_string() {
-        for spelling in ["onn", "of", "yes", "true", ""] {
+        // `""` is deliberately not in this list: it is refused by `require_non_empty`, which runs
+        // first and is the more specific answer ("cannot be empty" rather than "not one of auto,
+        // on, off"). `every_refusal_the_guide_tabulates_is_actually_refused` owns that case.
+        for spelling in ["onn", "of", "yes", "true"] {
             let error = parse(&format!("[remote]\ntor = \"{}\"\n", spelling))
                 .expect_err(&format!("\"{spelling}\" must be refused"));
 
@@ -1230,29 +1306,143 @@ mod tests {
         }
     }
 
-    /// `docs/guide/cli.md` §9 tabulates what a configuration file may not contain. A table of
-    /// examples in prose is exactly the shape that rots — so every row of it is a case here, and
-    /// a change that quietly starts accepting one of them fails this test rather than leaving the
-    /// guide lying. Keep the two in step: a row added there gets a case here.
+    /// An empty value is refused at every door, and the write-side doors matter as much as the
+    /// parse: `forklift config operator.identifier ""` and `profile create --identifier ""` both
+    /// reach a writer directly, and either would lay down the entry the parse now refuses.
+    ///
+    /// The whitespace case is the one a length check would miss, so each door is probed with
+    /// both spellings.
+    #[test]
+    fn no_configuration_value_may_be_empty_at_either_end() {
+        for blank in ["", "   ", "\t"] {
+            // The read path, via the one validator every section key goes through.
+            let refused = validate_value(KEY_OPERATOR_IDENTIFIER, blank)
+                .expect_err(&format!("{blank:?} must be refused for a section key"));
+            assert!(refused.contains("cannot be empty"), "unexpected refusal: {refused}");
+            assert!(
+                refused.contains("--unset operator.identifier"),
+                "the refusal must name the way to clear a key instead: {refused}"
+            );
+
+            // The profile-field door, which does not pass through `validate_value` at all.
+            let refused = require_non_empty("profile.work.identifier", blank)
+                .expect_err(&format!("{blank:?} must be refused for a profile field"));
+            assert!(refused.contains("\"profile.work.identifier\" cannot be empty"),
+                "the refusal must name the field: {refused}");
+        }
+
+        // The separation that makes the above mean something: a value that merely *contains*
+        // whitespace is untouched, and a free-form value is never trimmed on its way in.
+        assert!(validate_value(KEY_OPERATOR_NAME, "  Ada  Lovelace  ").is_ok());
+        assert!(require_non_empty("profile.work.name", " A ").is_ok());
+    }
+
+    /// `remote.tor` is stored normalized, so what lands on disk is literally one of the three
+    /// documented spellings rather than a value whose correctness depends on every reader
+    /// applying the same normalization.
+    ///
+    /// The fixture discriminates: `"  ON  "` is accepted by the range check either way, so the
+    /// only thing separating the normalizing implementation from the raw-storing one is the
+    /// spelling that comes back — `"on"` against `"  ON  "`. Reverting `storable_value` makes
+    /// the first assertion fail on exactly that difference, and no rival value in scope
+    /// coincides with either.
+    #[test]
+    fn a_fixed_value_key_is_stored_normalized_and_a_free_form_one_is_not() {
+        assert_eq!(storable_value(KEY_REMOTE_TOR, "  ON  "), "on");
+        assert_eq!(storable_value(KEY_REMOTE_TOR, "Off"), "off");
+        assert_eq!(storable_value(KEY_REMOTE_TOR, "on"), "on");
+
+        // A token, a URL and a display name are the user's strings: case and surrounding
+        // whitespace are content, and folding them would corrupt the value.
+        assert_eq!(storable_value(KEY_REMOTE_TOKEN, "  AbC-123  "), "  AbC-123  ");
+        assert_eq!(storable_value(KEY_OPERATOR_NAME, "Ada L."), "Ada L.");
+        assert_eq!(storable_value(KEY_REMOTE_URL, "HTTP://Example.COM"), "HTTP://Example.COM");
+    }
+
+    /// The normalization is computed in exactly one place, which is the property that keeps the
+    /// admissibility check and the meaning-assigning read from drifting apart. Pinned as an
+    /// equation between the two surfaces rather than as two independent expectations: were
+    /// `validate_value` to grow its own copy again, a spelling it accepted that `TorMode` read as
+    /// something else would fail here.
+    #[test]
+    fn what_the_file_admits_for_remote_tor_is_what_the_reader_understands() {
+        for spelling in ["auto", "on", "off", "  OFF  ", "ON", "\tAuto "] {
+            assert!(
+                validate_value(KEY_REMOTE_TOR, spelling).is_ok(),
+                "{spelling:?} should be admissible"
+            );
+            assert!(
+                REMOTE_TOR_VALUES.contains(&remote_utils::normalize_tor_value(spelling).as_str()),
+                "{spelling:?} normalizes to something outside the documented set"
+            );
+        }
+    }
+
+    /// The number of data rows in `docs/guide/cli.md`'s "Refused, in either file" table, read
+    /// out of the shipped guide — so the figure
+    /// [`every_refusal_the_guide_tabulates_is_actually_refused`] compares itself against is never
+    /// one a hand edit can get wrong.
+    ///
+    /// Anchored on the table's header line, and the test asserts that line occurs exactly once;
+    /// a second table with the same columns would otherwise make this count silently arbitrary.
+    fn guide_refusal_rows() -> usize {
+        const HEADER: &str = "| Written | Why |";
+
+        let guide = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/guide/cli.md");
+        let text = std::fs::read_to_string(&guide)
+            .unwrap_or_else(|e| panic!("the guide must be readable at {}: {e}", guide.display()));
+
+        assert_eq!(
+            text.lines().filter(|line| line.trim() == HEADER).count(), 1,
+            "exactly one table in the guide may carry this test's anchor header ({HEADER})"
+        );
+
+        text.lines()
+            .skip_while(|line| line.trim() != HEADER)
+            .skip(2)                                        // the header itself, then `|---|---|`
+            .take_while(|line| line.starts_with('|'))
+            .count()
+    }
+
+    /// `docs/guide/cli.md` §9 tabulates what a configuration file may not contain, and this is
+    /// the other half of that table: one group of cases per row, every example refused, each for
+    /// the reason the row actually gives.
+    ///
+    /// **The correspondence is checked, not promised.** The first version of this test asked the
+    /// next editor, in a doc comment, to keep the two in step — an obligation in prose, which is
+    /// a guard that is not there: a row added to the guide with no case here failed nothing, and
+    /// a row deleted from it left an orphan case passing forever. It reads the guide now and
+    /// requires exactly one group per row. The *grouping* is what makes that count mean
+    /// something: several rows carry two examples, so a flat list of cases could never be
+    /// compared against a row count at all.
     #[test]
     fn every_refusal_the_guide_tabulates_is_actually_refused() {
-        // Each row carries the phrase the refusal must contain, not merely "it is refused" — a
-        // row that started failing for an *unrelated* reason would otherwise keep this test green
-        // while the guide's explanation of it quietly became wrong.
-        let rows = [
-            ("[opperator]\nidentifier = \"ada\"\n",   "\"opperator\" is not a known configuration section"),
-            ("[operator]\nidentifer = \"ada\"\n",     "\"operator.identifer\" is not a known configuration key"),
-            ("[[operator]]\nname = \"ada\"\n",        "\"operator\" must be a table (written \"[operator]\"), not array of tables"),
-            ("[[profile.work]]\nname = \"ada\"\n",    "\"profile.work\" must be a table (written \"[profile.work]\"), not array of tables"),
-            ("operator = 5\n",                         "\"operator\" must be a table (written \"[operator]\"), not integer"),
-            ("[maintenance]\nloose = 6700\n",          "\"maintenance.loose\" must be a string, not integer"),
-            ("[remote]\ntor = true\n",                 "\"remote.tor\" must be a string, not boolean"),
-            ("[remote]\ntorproxy = \"socks5h://x\"\n", "\"remote.torproxy\" is not a known configuration key"),
-            ("[remote]\ntor = \"onn\"\n",             "\"onn\" is not a valid value for remote.tor"),
-            ("[profile.work]\nnickname = \"w\"\n",    "\"profile.work.nickname\" is not a known profile field"),
+        // One group per guide-table row, in the guide's order. Each case carries the phrase the
+        // refusal must contain, not merely "it is refused" — a case that started failing for an
+        // *unrelated* reason would otherwise keep this test green while the guide's explanation
+        // of it quietly became wrong.
+        let rows: [&[(&str, &str)]; 9] = [
+            &[("[opperator]\nidentifier = \"ada\"\n",   "\"opperator\" is not a known configuration section")],
+            &[("[operator]\nidentifer = \"ada\"\n",     "\"operator.identifer\" is not a known configuration key")],
+            &[("[[operator]]\nname = \"ada\"\n",        "\"operator\" must be a table (written \"[operator]\"), not array of tables"),
+              ("[[profile.work]]\nname = \"ada\"\n",    "\"profile.work\" must be a table (written \"[profile.work]\"), not array of tables")],
+            &[("operator = 5\n",                        "\"operator\" must be a table (written \"[operator]\"), not integer")],
+            &[("[maintenance]\nloose = 6700\n",         "\"maintenance.loose\" must be a string, not integer"),
+              ("[remote]\ntor = true\n",                "\"remote.tor\" must be a string, not boolean")],
+            &[("[remote]\ntorproxy = \"socks5h://x\"\n", "\"remote.torproxy\" is not a known configuration key")],
+            &[("[remote]\ntor = \"onn\"\n",             "\"onn\" is not a valid value for remote.tor")],
+            &[("[profile.work]\nnickname = \"w\"\n",    "\"profile.work.nickname\" is not a known profile field")],
+            &[("[operator]\nidentifier = \"\"\n",       "\"operator.identifier\" cannot be empty"),
+              ("[profile.work]\nidentifier = \"   \"\n", "\"profile.work.identifier\" cannot be empty")],
         ];
 
-        for (content, expected) in rows {
+        assert_eq!(
+            rows.len(), guide_refusal_rows(),
+            "the guide's refusal table and this test's groups must correspond one to one — \
+             a row added there needs a group here, and a row removed there leaves an orphan"
+        );
+
+        for (content, expected) in rows.iter().flat_map(|group| group.iter()) {
             let error = parse(content)
                 .expect_err(&format!("the guide says this is refused: {content:?}"));
 
