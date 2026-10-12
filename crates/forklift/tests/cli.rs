@@ -3261,18 +3261,10 @@ fn a_refused_profile_field_leaves_no_half_created_profile_behind() {
     assert_success(&retry);
 }
 
-/// Round 4 finding F4: the profile *name* was the one door the emptiness rule did not cover.
-///
-/// `profile create ""` wrote a `[profile.""]` section that no command could then reach: selecting
-/// it means `operator.profile = ""`, which the same rule refuses at both the read and the write
-/// door, and there is no `profile delete`. Creating something unusable and unremovable is worse
-/// than refusing to create it.
-///
-/// Run here rather than in `config_utils`'s unit tests because `set_profile_fields` writes to the
-/// real global configuration, and only this harness scopes HOME to the test.
-/// Round 5 findings F1–F4: an empty value is refused from four doors, and each must give advice
-/// that is true *at that door*. The shared validator used to supply one remedy for all four, and
-/// it was wrong at each in a different way. These pin the three doors a command can reach.
+/// Round 5 findings F1–F4: an empty value is refused from several commands, and each must give
+/// advice that is true *for that command*. The shared validator used to supply one remedy for
+/// all of them, and it was wrong at each in a different way. (`franchise` and `profile use`, which
+/// round 6 found also reach the configuration write, are pinned in the next test.)
 ///
 /// **The `set` door: the suggested command is executed, not just read.** Asserting the text
 /// contains `--unset` is what let an `--unset` with no `--global` through — it read correctly
@@ -3288,6 +3280,11 @@ fn the_refusal_for_an_empty_value_suggests_a_command_that_works_at_the_door_it_c
     // without `--global` resolves to the warehouse file and answers "not set".
     assert_success(&warehouse.run(&["config", "--global", "operator.name", "Ada"]));
 
+    // Positive control: without it, the absence asserted below would hold just as well for a
+    // write that never landed, and the executed remedy would establish nothing.
+    let content = std::fs::read_to_string(&global_config).unwrap();
+    assert!(content.contains("name = \"Ada\""), "the setup write must land: {content}");
+
     let refused = warehouse.run(&["config", "--global", "operator.name", ""]);
     assert!(!refused.status.success(), "an empty value must refuse: {}", stdout(&refused));
 
@@ -3300,19 +3297,32 @@ fn the_refusal_for_an_empty_value_suggests_a_command_that_works_at_the_door_it_c
     let ran = warehouse.run(&args[1..]);
     assert_success(&ran);
 
-    let content = std::fs::read_to_string(&global_config).unwrap();
-    assert!(
-        !content.contains("name = \"Ada\""),
-        "running the suggested command must remove the key from the file the refusal was about: \
-         {content}"
-    );
+    // Read back through the CLI at the scope the refusal was about, not by grepping the file.
+    let read = warehouse.run(&["config", "--global", "operator.name"]);
+    assert!(!read.status.success(), "the suggested command must remove the key: {}", stdout(&read));
+    assert!(stderr(&read).contains("is not set"), "unexpected read: {}", stderr(&read));
 
-    // The same door at warehouse scope renders without `--global`.
+    // The same command at warehouse scope renders without `--global` — and that suggestion is
+    // executed too, against a key set at warehouse scope, so a wrong scope cannot pass.
+    assert_success(&warehouse.run(&["config", "operator.name", "Bea"]));
+    let read = warehouse.run(&["config", "operator.name"]);
+    assert_eq!(stdout(&read).trim(), "Bea", "the warehouse-scope setup write must land");
+
     let refused = warehouse.run(&["config", "operator.name", "   "]);
-    assert!(
-        stderr(&refused).contains("\"forklift config --unset operator.name\""),
-        "unexpected refusal: {}", stderr(&refused)
-    );
+    assert!(!refused.status.success(), "an empty value must refuse: {}", stdout(&refused));
+
+    let message = stderr(&refused);
+    let suggested = message.split("run \"").nth(1).and_then(|rest| rest.split('"').next())
+        .unwrap_or_else(|| panic!("the refusal must suggest a command: {message}"));
+    let args: Vec<&str> = suggested.split_whitespace().collect();
+    assert_eq!(args.first(), Some(&"forklift"), "unexpected suggestion: {suggested}");
+    assert!(!args.contains(&"--global"), "warehouse scope must not suggest --global: {suggested}");
+
+    assert_success(&warehouse.run(&args[1..]));
+
+    let read = warehouse.run(&["config", "operator.name"]);
+    assert!(!read.status.success(), "the suggested command must remove the key: {}", stdout(&read));
+    assert!(stderr(&read).contains("is not set"), "unexpected read: {}", stderr(&read));
 
     // The `profile create` door: nothing is on disk yet, so the advice is about the option.
     for (args, option) in [
@@ -3346,6 +3356,51 @@ fn the_refusal_for_an_empty_value_suggests_a_command_that_works_at_the_door_it_c
     assert!(!message.contains("--unset"), "the parse door may not suggest --unset: {message}");
 }
 
+/// Round 6 finding F1: `config` was not the only command that reaches the configuration write.
+/// `franchise --token ""` and `profile use ""` did too, and while the remedy lived in that write
+/// they were told to run `forklift config --unset`, about entries that did not exist. Each now
+/// refuses in its own words, before doing anything.
+#[test]
+fn franchise_and_profile_use_refuse_an_empty_value_in_their_own_words() {
+    let warehouse = TestWarehouse::new("empty-value-franchise-profile-use");
+    assert_success(&warehouse.run(&["prepare"]));
+
+    // Nothing listens here: a refusal that came after the handshake would be a network error,
+    // not the one asserted below.
+    let refused = warehouse.run(&["franchise", "http://127.0.0.1:9/", "clone", "--token", "  "]);
+    assert!(!refused.status.success(), "an empty token must refuse: {}", stdout(&refused));
+
+    let message = stderr(&refused);
+    assert!(message.contains("--token"), "the refusal must name the option: {message}");
+    assert!(message.contains("Omit it"), "the refusal must say what to do: {message}");
+    assert!(!message.contains("--unset"), "there is no entry to remove: {message}");
+    assert!(!warehouse.root.join("clone").exists(), "the refusal must create nothing");
+
+    // A hand-written `[profile.""]` is found by the lookup, so without its own check `profile use`
+    // reached the configuration write and was refused there.
+    let global_config = warehouse.home.join("global-config.toml");
+    std::fs::write(&global_config, "[profile.\"\"]\nidentifier = \"op-1\"\n").unwrap();
+
+    let refused = warehouse.run(&["profile", "use", ""]);
+    assert!(!refused.status.success(), "an empty profile name must refuse: {}", stdout(&refused));
+
+    let message = stderr(&refused);
+    assert!(message.contains("A profile name cannot be empty."), "unexpected: {message}");
+    assert!(!message.contains("--unset"), "there is no entry to remove: {message}");
+
+    let read = warehouse.run(&["config", "operator.profile"]);
+    assert!(!read.status.success(), "nothing may be selected: {}", stdout(&read));
+}
+
+/// Round 4 finding F4: the profile *name* was the one door the emptiness rule did not cover.
+///
+/// `profile create ""` wrote a `[profile.""]` section that no command could then reach: selecting
+/// it means `operator.profile = ""`, which the same rule refuses at both the read and the write
+/// door, and there is no `profile delete`. Creating something unusable and unremovable is worse
+/// than refusing to create it.
+///
+/// Run here rather than in `config_utils`'s unit tests because `set_profile_fields` writes to the
+/// real global configuration, and only this harness scopes HOME to the test.
 #[test]
 fn an_empty_profile_name_is_refused_rather_than_created_unreachable() {
     let warehouse = TestWarehouse::new("profile-create-empty-name");

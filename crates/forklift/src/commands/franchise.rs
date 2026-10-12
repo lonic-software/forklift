@@ -54,6 +54,16 @@ pub async fn handle_command(url: &str,
     let fetch_scope = resolve_fetch_scope(&only)?;
     let sparse = !fetch_scope.is_full();
 
+    // Likewise refused before anything is created: an empty token is never what was meant, and
+    // left to the configuration write it would fail only after the warehouse existed. The advice
+    // is this command's own — there is no entry yet to remove, only an option to leave out.
+    if token.as_deref().is_some_and(config_utils::is_blank) {
+        return Err(
+            "The access token (--token) cannot be empty. Omit it for a remote that needs none."
+                .to_string()
+        );
+    }
+
     let target = Path::new(directory);
 
     if target.exists() {

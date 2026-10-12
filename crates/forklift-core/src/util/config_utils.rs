@@ -100,6 +100,9 @@ const SECTION_PROFILE: &str = "profile";
 const PROFILE_FIELD_IDENTIFIER: &str = "identifier";
 const PROFILE_FIELD_NAME: &str = "name";
 
+/// The refusal for an empty profile name — one spelling, shared by every command that takes one.
+pub const EMPTY_PROFILE_NAME: &str = "A profile name cannot be empty.";
+
 /// One configuration file, fully parsed.
 ///
 /// The type exists to make a partial read unrepresentable. Every field here was accounted
@@ -594,18 +597,9 @@ pub fn get_effective_value(key: &str) -> Result<Option<(String, ConfigScope)>, S
 pub fn set_value(key: &str, value: &str, scope: ConfigScope) -> Result<String, String> {
     let (section, field) = split_key(key)?;
 
-    // The one door that knows both the key and the scope, so the one that can name the command
-    // which actually removes the key. `--global` has to be in it: without it, run from inside a
-    // warehouse, the suggested command targets the warehouse file and answers "not set".
-    if is_blank(value) {
-        let global = if scope == ConfigScope::Global { " --global" } else { "" };
-
-        return Err(format!(
-            "\"{}\" cannot be empty. To remove it instead, run \"forklift config{} --unset {}\".",
-            key, global, key
-        ));
-    }
-
+    // No remedy here: this is reached from `config`, `franchise` and `profile use`, and the
+    // right advice differs at each (see [`require_non_empty`]). Each command refuses a blank
+    // value in its own words before calling; this is the backstop that keeps the file sound.
     validate_value(key, value)?;
     let path = get_config_path(scope)?;
 
@@ -750,18 +744,19 @@ pub fn list_profiles() -> Result<Vec<(String, Operator)>, String> {
 ///
 /// # Returns
 /// * `Ok(())`      - If every field was written.
-/// * `Err(String)` - If a name or value is empty, the file could not be read, parsed or written,
-///                   or `profile` (or the `[profile]` section itself) is present but is not a
-///                   table. Nothing is written in any of these cases.
+/// * `Err(String)` - If a name or value is empty, a field is not `identifier`/`name` or is given
+///                   twice, the file could not be read, parsed or written, or `profile` (or the
+///                   `[profile]` section itself) is present but is not a table. Nothing is
+///                   written in any of these cases.
 pub fn set_profile_fields(profile: &str, fields: &[(&str, &str)]) -> Result<(), String> {
     // The write-side half of the parse's emptiness rule, so this function cannot lay down the
     // entry the parse refuses.
     //
     // The profile *name* is guarded for a different reason. Profile names are the user's to
     // choose and nothing constrains their content — but an empty one is not a name a command can
-    // ever select again: `profile use ""` writes `operator.profile = ""`, which `validate_value`
-    // refuses at both doors, so `[profile.""]` could be created and then neither used nor
-    // removed.
+    // ever select again: selecting it means `operator.profile = ""`, which `validate_value`
+    // refuses on both read and write (and `profile use` refuses up front), so `[profile.""]`
+    // could be created and then neither used nor removed.
     //
     // A hand-written `[profile.""]` still parses, deliberately: it is unreachable but perfectly
     // understood, and refusing it on load would turn someone else's harmless litter into a file
@@ -774,7 +769,25 @@ pub fn set_profile_fields(profile: &str, fields: &[(&str, &str)]) -> Result<(), 
     // reach these through a caller, so the site tests pin `create_profile`'s checks instead.
     // Re-check this list if a third caller appears.
     if is_blank(profile) {
-        return Err("A profile name cannot be empty.".to_string());
+        return Err(EMPTY_PROFILE_NAME.to_string());
+    }
+
+    // A caller error, not a file error, so not `not_valid`: an unknown field would be written
+    // and then refused by the very parse `write_validated` runs, blaming the user's file for a
+    // bug in the caller; a duplicate would be written twice with the last value silently winning.
+    for (index, (field, _)) in fields.iter().enumerate() {
+        if *field != PROFILE_FIELD_IDENTIFIER && *field != PROFILE_FIELD_NAME {
+            return Err(format!(
+                "Internal error: \"{}\" is not a profile field (expected \"{}\" or \"{}\").",
+                field, PROFILE_FIELD_IDENTIFIER, PROFILE_FIELD_NAME
+            ));
+        }
+
+        if fields[..index].iter().any(|(earlier, _)| earlier == field) {
+            return Err(format!(
+                "Internal error: the profile field \"{}\" was given more than once.", field
+            ));
+        }
     }
 
     for (field, value) in fields {
@@ -833,9 +846,11 @@ pub fn create_profile(profile: &str,
     // disk at this point, so the generic "remove the entry" advice would point at an entry that
     // is not there — what the user can actually do is omit the option, and only this door knows
     // which option it was. Checked before the existence test too, so an empty name is reported
-    // as itself and not as whatever the global file's state happens to be.
+    // as itself and not as whatever the global file's state happens to be. The trade: input
+    // errors are reported before any global-file error, so someone with both meets them one at
+    // a time — fix the option, then meet the file.
     if is_blank(profile) {
-        return Err("A profile name cannot be empty.".to_string());
+        return Err(EMPTY_PROFILE_NAME.to_string());
     }
 
     if identifier.is_some_and(is_blank) {
@@ -951,7 +966,7 @@ fn validate_value(key: &str, value: &str) -> Result<(), String> {
 /// Whitespace-only counts as empty: `identifier = "   "` is no more an identity than `""` is.
 /// The value is only *tested* trimmed, never stored trimmed — a token or a display name is the
 /// user's string.
-fn is_blank(value: &str) -> bool {
+pub fn is_blank(value: &str) -> bool {
     value.trim().is_empty()
 }
 
@@ -972,22 +987,25 @@ fn is_blank(value: &str) -> bool {
 /// door removes the state rather than picking a winner, so neither reading can be reached and
 /// `to_operator`'s collapse stays a question about *presence* only.
 ///
-/// **This states the fact and nothing else. The remedy belongs to the door.** The same refusal
-/// is reached from four places, and the right advice differs at each — which is not knowable
-/// here, so any remedy this function offered was wrong somewhere:
+/// **This states the fact and nothing else. The remedy belongs to the command.** No function in
+/// this module knows which command it is serving — [`set_value`] alone is called by `config`,
+/// `franchise` and `profile use` — so any remedy offered here was wrong somewhere. Where the
+/// refusal surfaces, and who words the advice:
 ///
 /// * **Loading a file** ([`parse_config`], [`parse_profiles`]) wraps it in [`not_valid`], which
 ///   names the file and says to fix it. An `--unset` hint here was wrong twice over: it carried
 ///   no `--global`, so for a global file run inside a warehouse it targeted the wrong one, and it
 ///   could not succeed while any *other* entry in the file was also bad.
-/// * **`forklift config <key> ""`** ([`set_value`]) knows its scope, so it renders the exact
-///   `--unset` command — the one door where that advice is both reachable and complete.
-/// * **`forklift profile create`** ([`create_profile`]) refuses before anything is written, so
-///   "remove the entry" points at an entry that does not exist; it names the option to omit.
-/// * **[`set_profile_fields`]** is a precondition on a public function with no caller that can
-///   reach it (see there), so it states the fact.
+/// * **`forklift config <key> ""`** refuses in the command, which knows its scope, and renders
+///   the exact `--unset` command.
+/// * **`forklift franchise --token ""`** refuses in the command, before the network or the
+///   filesystem is touched, and says to omit the option.
+/// * **`forklift profile create`** ([`create_profile`]) and **`forklift profile use`** refuse an
+///   empty name ([`EMPTY_PROFILE_NAME`]); `create` names the option to omit for `--id`/`--name`.
+/// * [`set_value`] and [`set_profile_fields`] reach it only as a backstop behind those checks,
+///   so it states the fact.
 ///
-/// Each door's wording is pinned by a test at that door.
+/// Each command's wording is pinned by a test that runs that command.
 fn require_non_empty(label: &str, value: &str) -> Result<(), String> {
     if is_blank(value) {
         return Err(format!("\"{}\" cannot be empty.", label));
@@ -1410,10 +1428,12 @@ mod tests {
     /// **And the validator offers no remedy — that is pinned here, because it is the contract.**
     /// Rounds 4 and 5 of PR #126 each found a remedy this function printed that was wrong at
     /// some door: an `--unset` with no `--global` at the parse door, an `--unset` the command
-    /// rejects for a profile field, a "remove the entry" where nothing had been written. The
-    /// advice depends on which door was knocked on, which this function cannot see, so it may not
-    /// give any. Each door's own wording is pinned by a test at that door, in `cli.rs` — where
-    /// HOME is scoped, so a write-path probe cannot reach the developer's real configuration.
+    /// rejects for a profile field, a "remove the entry" where nothing had been written — and
+    /// round 6 found that even `set_value` is not one door, being called by `franchise` and
+    /// `profile use` as well as `config`. The advice depends on which command is running, which
+    /// this function cannot see, so it may not give any. Each command's own wording is pinned by
+    /// a test that runs it, in `cli.rs` — where HOME is scoped, so a write-path probe cannot
+    /// reach the developer's real configuration.
     #[test]
     fn no_configuration_value_may_be_empty_and_the_shared_refusal_offers_no_remedy() {
         for blank in ["", "   ", "\t"] {
@@ -1444,6 +1464,27 @@ mod tests {
         // whitespace is untouched, and a free-form value is never trimmed on its way in.
         assert!(validate_value(KEY_OPERATOR_NAME, "  Ada  Lovelace  ").is_ok());
         assert!(require_non_empty("profile.work.name", " A ").is_ok());
+    }
+
+    /// Round 6 finding F6: an unknown or repeated profile field is the caller's bug, refused as
+    /// such — not written (an unknown one would then be blamed on the user's file by the parse,
+    /// and a repeated one would be written twice with the last silently winning).
+    ///
+    /// Every value here is blank **on purpose**: these checks run before the emptiness check, so
+    /// each assertion distinguishes them by message — and if one is removed, the blank value is
+    /// refused next, still before any path is resolved. This test can never reach the real
+    /// global configuration, whichever way it fails.
+    #[test]
+    fn set_profile_fields_refuses_an_unknown_or_repeated_field_as_a_caller_error() {
+        let unknown = set_profile_fields("work", &[("bogus", "")]).unwrap_err();
+        assert!(unknown.contains("\"bogus\" is not a profile field"), "unexpected: {unknown}");
+
+        let repeated = set_profile_fields(
+            "work", &[(PROFILE_FIELD_NAME, "x"), (PROFILE_FIELD_NAME, "")]
+        ).unwrap_err();
+        assert!(repeated.contains("more than once"), "unexpected: {repeated}");
+
+        assert_eq!(set_profile_fields(" ", &[]).unwrap_err(), EMPTY_PROFILE_NAME);
     }
 
     /// `remote.tor` is stored normalized, so what lands on disk is literally one of the three

@@ -49,6 +49,18 @@ pub fn handle_command(global: bool,
 
     match (&key, &value) {
         (Some(key), Some(value)) => {
+            // Only this command knows the scope, so only it can name the command that actually
+            // removes the key. `--global` has to be in it: without it, run from inside a
+            // warehouse, the suggested command targets the warehouse file and answers "not set".
+            if config_utils::is_blank(value) {
+                let global = if global { " --global" } else { "" };
+
+                return Err(format!(
+                    "\"{}\" cannot be empty. To remove it instead, run \"forklift config{} --unset {}\".",
+                    key, global, key
+                ));
+            }
+
             let stored = config_utils::set_value(key, value, scope)?;
 
             // Setting a value has always been silent in human mode; keep it so, but

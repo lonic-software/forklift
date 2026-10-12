@@ -814,13 +814,14 @@ mod tests {
         // them to a `--json` envelope field they have no way to see. An earlier wording said
         // "resolve what the message names"; `message` is a field name, not anything on screen.
         //
-        // Only the two fields that are *not* also ordinary words a human sees are listed, and the
-        // match ignores case. `warning` is on screen ("Warning: …"), so "this warning repeats"
-        // is a fine sentence and must not trip this; "Message" at the start of a sentence is the
-        // same mistake as "message" and must.
+        // The rule is "no field a human cannot see on screen", matched ignoring case: `message`,
+        // `next_step` (also spelled "next step"), and `forklift_json`. `message` is listed although
+        // it is an ordinary word, because the human line never labels its message — "Message" at
+        // the start of a sentence is the same mistake as "message". `warning` alone is excluded:
+        // the human line starts "Warning:", so "this warning repeats" points at something visible.
         let lowered = MAINTENANCE_UNAVAILABLE_NEXT_STEP.to_lowercase();
 
-        for field in ["message", "next_step", "next step"] {
+        for field in ["message", "next_step", "next step", "forklift_json"] {
             assert!(
                 !lowered.contains(field),
                 "the next step is printed to humans too, so it must not name the envelope field \
