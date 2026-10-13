@@ -516,6 +516,10 @@ const TEXT_ONLY_STEP: f64 = 1.0 / 4096.0;
 /// next one, so `progress` keeps meaning 100 × resets + percentage.
 const TEXT_ONLY_LIMIT: u32 = 4095;
 
+/// How many of those text that does not change the phase may use. The rest are kept for phase
+/// changes, so a run whose text has used up its share still reports a new phase.
+const TEXT_ONLY_TEXT_LIMIT: u32 = TEXT_ONLY_LIMIT / 2;
+
 /// Turns one call's events into progress notifications.
 ///
 /// * No `total` is ever sent: an operation cannot promise it will not start a phase over, and a
@@ -525,8 +529,9 @@ const TEXT_ONLY_LIMIT: u32 = 4095;
 ///   value instead of rewinding it.
 /// * `progress` strictly increases. An event that would not raise it is still sent if it brings
 ///   new text, at the last value plus [`TEXT_ONLY_STEP`]; otherwise it is dropped. At most
-///   [`TEXT_ONLY_LIMIT`] of those follow one whole value, so they never reach the next one;
-///   past that, text is dropped until the value rises.
+///   [`TEXT_ONLY_LIMIT`] of those follow one whole value, so they never reach the next one, and
+///   only [`TEXT_ONLY_TEXT_LIMIT`] of them may carry text that names no new phase; past either
+///   limit, such text is dropped until the value rises.
 /// * The phase, the percentage and the text go in `message`, only when the protocol has it.
 ///   Without it, an event that does not raise the value has nothing to say and is dropped.
 /// * At most one notification goes out per [`NOTIFICATION_INTERVAL`], until the run ends.
@@ -551,6 +556,9 @@ struct ProgressMapper {
     /// The newest text received since the last send.
     pending_message: Option<String>,
 
+    /// Whether a `status` arrived since the last send.
+    pending_phase: bool,
+
     /// Text-only notifications sent since the last whole value.
     text_only: u32,
 
@@ -569,6 +577,7 @@ impl ProgressMapper {
             phase: None,
             pending_value: None,
             pending_message: None,
+            pending_phase: false,
             text_only: 0,
             sent_value: None,
             sent_message: None,
@@ -581,6 +590,7 @@ impl ProgressMapper {
         match event {
             Reported::Status(phase) => {
                 self.pending_message = Some(phase.clone());
+                self.pending_phase = true;
                 self.phase = Some(phase);
             }
             Reported::Progress { percent, text } => {
@@ -623,6 +633,7 @@ impl ProgressMapper {
     fn decide(&mut self) -> Option<(f64, Option<String>)> {
         let value = self.pending_value.take();
         let message = self.pending_message.take().filter(|_| self.message);
+        let limit = if std::mem::take(&mut self.pending_phase) { TEXT_ONLY_LIMIT } else { TEXT_ONLY_TEXT_LIMIT };
 
         // Received values are whole, and what was sent is a whole value plus less than one, so
         // a received value raises it exactly when it exceeds the sent value's whole part.
@@ -639,7 +650,7 @@ impl ProgressMapper {
                 }
                 match self.sent_value {
                     None => 0.0,
-                    Some(_) if self.text_only >= TEXT_ONLY_LIMIT => return None,
+                    Some(_) if self.text_only >= limit => return None,
                     Some(sent) => {
                         self.text_only += 1;
                         sent + TEXT_ONLY_STEP
@@ -1326,8 +1337,8 @@ mod tests {
         let mut last = mapper.take(start).unwrap().0;
         assert_eq!(last, 10.0);
 
-        // A long run of text alone: every one is sent until the steps would reach 11, and none
-        // after that.
+        // A long run of text alone: every one is sent until it has used its share of the steps,
+        // and none after that.
         let mut sent = 0;
         for index in 1..=5000u32 {
             mapper.receive(Reported::Progress { percent: None, text: index.to_string() });
@@ -1337,15 +1348,27 @@ mod tests {
                 sent += 1;
             }
         }
-        assert_eq!(sent, super::TEXT_ONLY_LIMIT);
+        assert_eq!(sent, super::TEXT_ONLY_TEXT_LIMIT);
+
+        // A new phase still gets through, until the steps would reach 11, and none after that.
+        let mut phases = 0;
+        for index in 5001..=10000u32 {
+            mapper.receive(status(&format!("phase {}", index)));
+            if let Some((value, _)) = mapper.take(start + super::NOTIFICATION_INTERVAL * index) {
+                assert!(value > last && value < 11.0, "{} after {}", value, last);
+                last = value;
+                phases += 1;
+            }
+        }
+        assert_eq!(sent + phases, super::TEXT_ONLY_LIMIT);
 
         // The next real percentage is sent as itself, not as one more step.
         mapper.receive(progress(12, "x"));
-        assert_eq!(mapper.finish(), Some((12.0, Some("12% x".into()))));
+        assert_eq!(mapper.finish(), Some((12.0, Some("phase 10000: 12% x".into()))));
 
         // And the steps start again from there.
         mapper.receive(Reported::Progress { percent: None, text: "y".into() });
-        assert_eq!(mapper.finish(), Some((12.0 + super::TEXT_ONLY_STEP, Some("y".into()))));
+        assert_eq!(mapper.finish(), Some((12.0 + super::TEXT_ONLY_STEP, Some("phase 10000: y".into()))));
     }
 
     fn progress(percent: u8, text: &str) -> Reported {

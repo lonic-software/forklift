@@ -475,8 +475,10 @@ notifications:
   instead of rewinding it. Read it as a strictly increasing tick, not a fraction.
 * `progress` strictly increases. An event that would not raise it is still sent if it
   brings new text, at the last value plus 1/4096; otherwise it is dropped. Those steps
-  stop short of the next whole value: after 4095 of them, text alone is dropped until the
-  value rises, so the value keeps meaning 100 × resets + percentage.
+  stop short of the next whole value: at most 4095 of them follow one, so the value keeps
+  meaning 100 × resets + percentage. Text that names no new phase may use only 2047 of
+  them, so a new phase is still reported after a long run of text; past either limit, text
+  is dropped until the value rises.
 * `message` carries the phase, the percentage and the event's text
   (`Packing objects: 40% …`), and is sent only when the negotiated protocol is
   `2025-06-18` or later, the first version that has the field. A version that is not a
