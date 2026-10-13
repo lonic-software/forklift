@@ -113,7 +113,8 @@ Once an anchor is held, a remote that later declares a different one is always
 refused (`trust_changed`, exit 22). So is a remote that still holds an office
 but declares no anchor: a server never lifts an office before its anchor and
 never removes one, so the anchor was stripped (`what_changed: "removed"`;
-nothing overrides it). A remote with neither is one trust was never established
+nothing overrides it, and `lift` refuses it too rather than upload an anchor
+over an office it never verified). A remote with neither is one trust was never established
 on, and is not refused, so pin it with `--expect` to require an anchor. Under
 `--json` the refusal carries
 `details` — `subject` (the remote URL), `current` (the remote's genesis now),

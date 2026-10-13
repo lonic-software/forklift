@@ -362,7 +362,7 @@ Every refusal about a remote's trust anchor is one code, `trust_changed` (exit 2
   overrides it — not a transport failure, so not worth retrying), `removed` (the remote holds an
   office but declares no anchor, which an honest server never does: its anchor was stripped.
   `lower` and `franchise` refuse before anything is fetched, whether or not an anchor is held,
-  and nothing overrides it). A remote with neither an anchor nor an office is one trust was never
+  `lift` refuses before anything is uploaded, and nothing overrides it). A remote with neither an anchor nor an office is one trust was never
   established on, and is not refused; pin it with `--expect` to require an anchor.
 
 `office accept-regenesis --confirm <value>` accepts only when `<value>` still equals the

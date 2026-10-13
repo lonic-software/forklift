@@ -249,8 +249,11 @@ the same one-way door it is locally: accepted only when the remote has no anchor
 (`201`), idempotent when the anchor is identical (`200`), and `409` otherwise. The
 server serializes trust establishment with ref updates: two concurrent first contacts
 can never both plant their anchor — exactly one wins, the other gets the `409`. The
-office pallet ref must be lifted (with its objects) before or in the same sync — the
-anchor without the chain verifies nothing.
+anchor comes first and the office pallet ref (with its objects) follows in the same sync:
+no head lifts `@office` while it holds no anchor (`422`), and the anchor without the chain
+verifies nothing. A remote that holds `@office` but no anchor has lost its anchor, and
+`PUT /v1/trust` there is `409` — a client cannot plant an anchor over a chain it never
+verified; the operator must restore the lost one.
 
 **Re-genesis (trust reset).** An existing anchor is replaced only when the incoming one
 names it as `prior_genesis` **and** `adopts` exactly the remote's current office head
@@ -402,7 +405,8 @@ fall back to loose-object `GET`s for anything the bundle lacks.
 
 **lift (push)** — for the office pallet first (when trust is established), then the
 working pallet:
-1. `GET /v1/warehouse`; refuse when the remote head is unknown locally (lower first).
+1. `GET /v1/warehouse`; refuse when the remote head is unknown locally (lower first), and
+   refuse a remote that holds `@office` but no `trust` (its anchor was stripped).
 2. Collect the closure of the parcels between the local head and the remote head;
    `POST /v1/objects/missing` in batches — or, against a storage-backed head,
    `POST /v1/objects/upload-targets`, which answers the same question *and* hands back the
