@@ -447,21 +447,13 @@ fn run_load_kill_spread(
             forklift_core::util::load_guard_utils::marker_path_under(&area.warehouse())
         );
 
-        let stack = area.run(&["stack", &format!("{commit_tag} commit {i}")]);
-        let stderr_lower = String::from_utf8_lossy(&stack.stderr).to_lowercase();
-        let nothing_to_stack = stderr_lower.contains("nothing to stack");
-        assert!(stack.status.success() || nothing_to_stack,
-            "{commit_tag} kill #{i}: stack must either succeed or report nothing staged, stderr: {}",
-            String::from_utf8_lossy(&stack.stderr));
-
-        if stack.status.success() {
+        if stack_or_nothing(area, &format!("{commit_tag} commit {i}")) {
             stacked += 1;
         }
 
-        // 5. Bring the working directory fully up to date before the next iteration's rewrite —
-        //    an uninterrupted `load .`, so leftover partial state from this iteration's kill
-        //    never carries over as ambiguity into the next one — and commit it, so the next
-        //    iteration's `stack` cannot succeed on what this heal staged.
+        // 5. Stage and commit the working directory's current content with an uninterrupted
+        //    `load .` and `stack`, so leftover partial state from this iteration's kill never
+        //    carries over as ambiguity, and nothing is staged when the next iteration starts.
         settle(area, &format!("{commit_tag} heal {i}"));
     }
 
@@ -474,10 +466,18 @@ fn settle(area: &Area, context: &str) {
     let load = area.run(&["load", "."]);
     assert!(load.status.success(), "{context}: load failed: {}",
         String::from_utf8_lossy(&load.stderr));
-    let stack = area.run(&["stack", context]);
-    assert!(stack.status.success()
-            || String::from_utf8_lossy(&stack.stderr).to_lowercase().contains("nothing to stack"),
-        "{context}: stack failed: {}", String::from_utf8_lossy(&stack.stderr));
+    stack_or_nothing(area, context);
+}
+
+/// Run `stack` with `message` and return whether it committed. Anything other than a commit or
+/// "nothing to stack" fails the test.
+fn stack_or_nothing(area: &Area, message: &str) -> bool {
+    let stack = area.run(&["stack", message]);
+    let nothing_to_stack = String::from_utf8_lossy(&stack.stderr).to_lowercase().contains("nothing to stack");
+    assert!(stack.status.success() || nothing_to_stack,
+        "{message}: stack must either succeed or report nothing staged, stderr: {}",
+        String::from_utf8_lossy(&stack.stderr));
+    stack.status.success()
 }
 
 /// Extends the crash-consistency spine to `load`'s parallel per-directory walk (DESIGN.html §5.0
