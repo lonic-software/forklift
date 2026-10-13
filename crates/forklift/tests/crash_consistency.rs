@@ -409,6 +409,11 @@ fn run_load_kill_spread(
 ) -> usize {
     let mut stacked = 0usize;
 
+    // Commit whatever calibration left staged, so the first iteration's `stack`, like every
+    // later one, can only succeed on what its own killed load staged.
+    area.clear_stale_lock();
+    settle(area, &format!("{commit_tag} settle"));
+
     for (i, delay) in delays.iter().enumerate() {
         // 1. Recover from the previous iteration's kill and check it left the store consistent.
         area.clear_stale_lock();
@@ -457,17 +462,22 @@ fn run_load_kill_spread(
         //    an uninterrupted `load .`, so leftover partial state from this iteration's kill
         //    never carries over as ambiguity into the next one — and commit it, so the next
         //    iteration's `stack` cannot succeed on what this heal staged.
-        let heal = area.run(&["load", "."]);
-        assert!(heal.status.success(), "{commit_tag} kill #{i}: healing load failed: {}",
-            String::from_utf8_lossy(&heal.stderr));
-        let heal_stack = area.run(&["stack", &format!("{commit_tag} heal {i}")]);
-        assert!(heal_stack.status.success()
-                || String::from_utf8_lossy(&heal_stack.stderr).to_lowercase().contains("nothing to stack"),
-            "{commit_tag} kill #{i}: healing stack failed: {}",
-            String::from_utf8_lossy(&heal_stack.stderr));
+        settle(area, &format!("{commit_tag} heal {i}"));
     }
 
     stacked
+}
+
+/// An uninterrupted `load .` and a `stack` of whatever it staged, so nothing is left staged for
+/// the next `stack` to pick up. `context` names the step in a failure and is the commit message.
+fn settle(area: &Area, context: &str) {
+    let load = area.run(&["load", "."]);
+    assert!(load.status.success(), "{context}: load failed: {}",
+        String::from_utf8_lossy(&load.stderr));
+    let stack = area.run(&["stack", context]);
+    assert!(stack.status.success()
+            || String::from_utf8_lossy(&stack.stderr).to_lowercase().contains("nothing to stack"),
+        "{context}: stack failed: {}", String::from_utf8_lossy(&stack.stderr));
 }
 
 /// Extends the crash-consistency spine to `load`'s parallel per-directory walk (DESIGN.html §5.0
