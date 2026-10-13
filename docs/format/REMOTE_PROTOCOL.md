@@ -101,7 +101,11 @@ The one-round-trip handshake: protocol version, refs and trust.
 }
 ```
 
-`trust` is `null` when the warehouse has no trust anchor. `default_pallet` is what a
+`trust` is `null` when the warehouse has no trust anchor; a server never holds `@office`
+without one, so a client refuses a handshake that has `@office` and no `trust` (the anchor was
+stripped). Every hash — the `pallets` values and the anchor's — is an object hash in its one
+canonical spelling, 64 lowercase hex characters; a client refuses a handshake with any other
+spelling. `default_pallet` is what a
 franchise (clone) checks out when the user does not choose; it is the remote's current
 pallet. A pallet that exists but has nothing stacked (unborn) is simply absent from
 `pallets`.
@@ -294,7 +298,8 @@ enforces meta-pallet rules by namespace, so the office lifts to `POST /v1/pallet
 
 1. **CAS**: the current head equals `old_head`, else `409` (the client lowers/rebases
    and retries).
-2. **Presence**: the `new_head` parcel and the full closure of every parcel between
+2. **Presence**: `new_head` is an object hash in its canonical spelling (64 lowercase hex
+   characters), and the `new_head` parcel and the full closure of every parcel between
    `new_head` and `old_head` (parents, trees, blobs) are present, else `422` — a ref
    must never point at missing history.
 3. **Ancestry**: `old_head` is an ancestor of `new_head` (fast-forward only; there is

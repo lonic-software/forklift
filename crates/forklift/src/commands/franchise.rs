@@ -92,11 +92,10 @@ pub async fn handle_command(url: &str,
     let client = RemoteClient::new_with_tor(url, token.clone(), TorSettings::from_global_config()?)?;
     let info = client.fetch_info().await?;
 
-    // The handshake already carries the remote's trust anchor, so an out-of-band pin is checked
-    // here — before the bundle download and before the target is touched.
-    if let Some(expected) = &expect {
-        trust_utils::check_expected(client.url(), info.trust.as_ref(), None, expected)?;
-    }
+    // The handshake already carries the remote's trust anchor, so a stripped anchor and an
+    // out-of-band pin are checked here — before the bundle download and before the target is
+    // touched.
+    trust_utils::check_handshake_trust(client.url(), &info, None, expect.as_deref())?;
 
     // Resolve the pallet from the handshake alone — no I/O — so a `--pallet` typo is refused
     // immediately, before anything is fetched or mutated: the same principle once more. (The
@@ -232,7 +231,8 @@ async fn franchise_into_prepared_target(
         }
     }
 
-    let trust = remote_utils::adopt_remote_trust(client, &info).await?;
+    // The pin was checked against this same handshake before the download.
+    let trust = remote_utils::adopt_remote_trust(client, &info, None).await?;
     report.adopted_genesis = trust.adopted_genesis;
 
     // Adopt the meta pallets too (the manifest, …), so a clone carries the post-metadata,

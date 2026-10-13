@@ -1025,7 +1025,8 @@ remote, its trust anchor is adopted (a one-way door, like enrolling) and announc
 warning naming its genesis. `--expect <genesis>` pins the anchor before anything is fetched, as
 for `franchise`. A remote whose anchor changed from the one held is refused with `trust_changed`
 (exit 22) — after a legitimate re-genesis, accept it with
-`office accept-regenesis --confirm <genesis>`. A diverged
+`office accept-regenesis --confirm <genesis>`. A remote that holds an office but declares no
+anchor had it stripped, and is refused the same way, by `franchise` too. A diverged
 pallet is never merged implicitly: `lower` fetches the parcels and reports the
 divergence, and you consolidate deliberately (`palletize` the remote head into
 its own pallet, `consolidate` it, then `lift` the merge). Requires a clean

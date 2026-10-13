@@ -34,4 +34,5 @@ Exit code 17 is reserved for a future feature and is not yet assigned to any cod
 | `incomplete_load` | 20 | "stack" or "park" refused because a "load" that never finished cleanly is still recorded |
 | `durability_taint` | 21 | A durability taint could not be auto-healed (a vanished, unreadable, or corrupt path, or a torn taint record) |
 | `trust_changed` | 22 | A remote's trust anchor is not the one this warehouse holds or the command named; the details carry its current value |
+| `remote_protocol_violation` | 23 | A remote answered with something the protocol never produces; it is misbehaving or corrupt, and retrying gets the same answer |
 

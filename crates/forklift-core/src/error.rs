@@ -177,6 +177,11 @@ refusal_codes! {
     /// the refusal's details carry the remote's value now, so an override can name exactly it
     /// (`trust_utils`).
     TrustChanged => "trust_changed",
+
+    /// A remote answered with something the protocol never produces, such as a pallet head that
+    /// is not the canonical spelling of an object hash. A misbehaving or corrupt remote, not a
+    /// transport failure: retrying gets the same answer.
+    RemoteProtocolViolation => "remote_protocol_violation",
 }
 
 impl RefusalCode {

@@ -36,7 +36,7 @@ pub const TOOL: &str = "forklift";
 ///
 /// Version 3 (this one): `lower` and `franchise` report the adopted trust anchor as
 /// `adopted_genesis` (present only on first contact) in place of the `adopted_anchor` flag, and
-/// the `trust_changed` error code exists, with `details`. Version 2: `history` entries carry
+/// the `trust_changed` error code exists, with `details`, as does `remote_protocol_violation`. Version 2: `history` entries carry
 /// `parents` (always present, `[]` for a root), the `empty_history` error code exists, and
 /// `palletize` list entries carry `head`. A consumer reads this field before relying on a field, to know whether the
 /// command it is about to run supports the capability it needs — the version bump *is*
@@ -396,6 +396,10 @@ error_codes! {
     /// A remote's trust anchor is not the one this warehouse holds or the command named.
     /// `error.details` carries `{subject, current, previous?, what_changed}`.
     TrustChanged,
+
+    /// A remote answered with something the protocol never produces (such as a non-canonical
+    /// pallet head). Not a transport failure: retrying gets the same answer.
+    RemoteProtocolViolation,
 }
 
 impl ErrorCode {
@@ -423,6 +427,7 @@ impl ErrorCode {
             ErrorCode::IncompleteLoad => load_guard_utils::CODE_INCOMPLETE_LOAD,
             ErrorCode::DurabilityTaint => heal_utils::CODE_DURABILITY_TAINT,
             ErrorCode::TrustChanged => RefusalCode::TrustChanged.as_str(),
+            ErrorCode::RemoteProtocolViolation => RefusalCode::RemoteProtocolViolation.as_str(),
         }
     }
 
@@ -453,6 +458,7 @@ impl ErrorCode {
             ErrorCode::IncompleteLoad => 20,
             ErrorCode::DurabilityTaint => 21,
             ErrorCode::TrustChanged => 22,
+            ErrorCode::RemoteProtocolViolation => 23,
         }
     }
 
@@ -503,6 +509,9 @@ impl ErrorCode {
             ErrorCode::TrustChanged =>
                 "A remote's trust anchor is not the one this warehouse holds or the command \
                  named; the details carry its current value",
+            ErrorCode::RemoteProtocolViolation =>
+                "A remote answered with something the protocol never produces; it is \
+                 misbehaving or corrupt, and retrying gets the same answer",
         }
     }
 
@@ -528,6 +537,7 @@ impl ErrorCode {
             RefusalCode::IncompleteLoad => ErrorCode::IncompleteLoad,
             RefusalCode::DurabilityTaint => ErrorCode::DurabilityTaint,
             RefusalCode::TrustChanged => ErrorCode::TrustChanged,
+            RefusalCode::RemoteProtocolViolation => ErrorCode::RemoteProtocolViolation,
         }
     }
 }
@@ -921,6 +931,8 @@ mod tests {
             (RefusalCode::QueryPredicateInvalid, "query_predicate_invalid", 18),
             (RefusalCode::IncompleteLoad, "incomplete_load", 20),
             (RefusalCode::DurabilityTaint, "durability_taint", 21),
+            (RefusalCode::TrustChanged, "trust_changed", 22),
+            (RefusalCode::RemoteProtocolViolation, "remote_protocol_violation", 23),
         ];
 
         for (code, code_str, exit) in table {

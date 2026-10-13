@@ -2821,11 +2821,15 @@ impl RemoteClient {
         // on a case-insensitive filesystem — would skip both and wedge the pallet. Neither the
         // name nor the value is repeated: both came from the remote.
         if info.pallets.values().any(|head| !object_utils::is_object_hash(head)) {
-            return Err(format!(
-                "The remote {} reports a pallet head that is not an object hash (64 lowercase hex \
-                characters). Refusing to sync with it; report it to whoever runs the remote.",
-                self.base
-            ));
+            return Err(CoreError::refusal(
+                RefusalCode::RemoteProtocolViolation,
+                format!(
+                    "The remote {} reports a pallet head that is not an object hash (64 lowercase \
+                    hex characters). Refusing to sync with it.",
+                    self.base
+                ),
+                "Report it to whoever runs the remote; retrying gets the same answer.",
+            ).into());
         }
 
         Ok(info)
@@ -5320,20 +5324,30 @@ pub struct TrustSyncStats {
 /// Adopt the remote's trust state (lower/franchise direction): fetch the office
 /// history, adopt the anchor on first contact, and fast-forward the local office ref.
 /// A remote whose anchor differs from the local one is refused — that is either
-/// tampering or an unrelated warehouse, and no data is worth guessing which.
+/// tampering or an unrelated warehouse, and no data is worth guessing which. So is a remote
+/// whose anchor was stripped, and one that is not the `expect` pin; both are checked before
+/// anything is fetched.
 ///
 /// # Arguments
 /// * `client` - The remote.
 /// * `info`   - The remote's handshake.
+/// * `expect` - The pinned genesis (`--expect`), if any.
 ///
 /// # Returns
 /// * `Ok(TrustSyncStats)` - What happened, including the genesis adopted on first contact —
 ///                          which the caller must surface, since an adoption is never silent.
-/// * `Err(String)`        - A `trust_changed` refusal on an anchor mismatch, or a failed
-///                          transfer.
+/// * `Err(String)`        - A `trust_changed` refusal on an anchor mismatch, a stripped anchor or
+///                          a missed pin, or a failed transfer.
 pub async fn adopt_remote_trust(client: &RemoteClient,
-                                info: &WarehouseInfo) -> Result<TrustSyncStats, String> {
+                                info: &WarehouseInfo,
+                                expect: Option<&str>) -> Result<TrustSyncStats, String> {
     let mut stats = TrustSyncStats::default();
+
+    // Read once: the pin, the stripped-anchor check and the mismatch check below all judge the
+    // same held anchor.
+    let local = office_utils::read_trust_anchor()?;
+    let local_genesis = local.as_ref().map(|anchor| anchor.genesis.as_str());
+    trust_utils::check_handshake_trust(client.url(), info, local_genesis, expect)?;
 
     let Some(remote_trust) = &info.trust else {
         return Ok(stats);
@@ -5342,7 +5356,7 @@ pub async fn adopt_remote_trust(client: &RemoteClient,
     let remote_office_head = info.pallets.get(&office_utils::office_wire_key())
         .ok_or("The remote has a trust anchor but no office pallet; it is corrupt.".to_string())?;
 
-    if let Some(local) = office_utils::read_trust_anchor()? {
+    if let Some(local) = &local {
         if local.genesis != remote_trust.genesis {
             // A re-genesis (§8.7) is a conspicuous trust reset: never adopted silently.
             return Err(trust_utils::anchor_changed(
