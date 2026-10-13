@@ -2680,12 +2680,17 @@ mod tests {
     /// queue push) and this same test run in isolation, the process aborted outright — "thread
     /// '...' has overflowed its stack", `SIGABRT`, `cargo test` reporting "process didn't exit
     /// successfully" — not a normal `Err` a `#[should_panic]` could catch, an abnormal process
-    /// crash, which is the actual falsifier a stack-overflow bug produces (empirically confirmed
-    /// the recursive shape already dies somewhere between 1,000 and 2,000 levels on the machine
-    /// this was verified on). Re-applying the iterative fix makes the same test pass cleanly.
-    /// `DEPTH` here is ~25x that empirically-observed threshold — comfortably past it on any
-    /// plausible stack size — while the iterative version still finishes in low single-digit
-    /// seconds.
+    /// crash, which is the actual falsifier a stack-overflow bug produces. Re-applying the
+    /// iterative fix makes the same test pass cleanly.
+    ///
+    /// **The walk runs on a thread with a deliberately small stack (`STACK`).** The overflow
+    /// depth scales with the stack, so a small one lets a shallow tree prove the same thing a
+    /// deep one would on the default stack. That keeps the fixture cheap: every level is a file
+    /// written and read back, and on Windows CI 50,000 levels against the default 2 MiB stack
+    /// took ~226 s. With `STACK` at 256 KiB the recursive shape dies within the first few
+    /// hundred levels, and `DEPTH` sits well past that. The iterative walk's stack use does not
+    /// grow with depth, so the small stack costs it nothing. Its storage-root scope is entered
+    /// on that thread, because the scope is thread-local.
     ///
     /// Tree objects are written directly to their final on-disk path (`write_tree_object_fast`)
     /// rather than through `LooseObject::store` (which fsyncs, and renames through a barrier,
@@ -2717,7 +2722,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let _scope = StorageRootScope::enter(&dir);
 
-        const DEPTH: usize = 50_000;
+        const DEPTH: usize = 2_000;
+        const STACK: usize = 256 * 1024;
         let target_hash = "9".repeat(64);
 
         // Innermost tree: a single file entry naming the (absent) target hash — never actually
@@ -2750,7 +2756,16 @@ mod tests {
         pallet_utils::set_pallet_head("main", &parcel_object.hash).unwrap();
 
         let targets: BTreeSet<String> = [target_hash.clone()].into_iter().collect();
-        let referenced = closure_references_any(&targets)
+        let walk_dir = dir.clone();
+        let referenced = std::thread::Builder::new()
+            .stack_size(STACK)
+            .spawn(move || {
+                let _scope = StorageRootScope::enter(&walk_dir);
+                closure_references_any(&targets)
+            })
+            .unwrap()
+            .join()
+            .expect("the walk thread must not panic")
             .expect("the closure walk must complete without crashing on a deeply nested tree")
             .hashes;
 
