@@ -367,3 +367,4 @@ forklift profile list                                    # profiles and the loca
 A warehouse selects a profile with `operator.profile`; the profile's id and name
 then take precedence over the plain `operator.*` values. The key directory keeps
 an owner manifest so a machine can tell its identities' keys apart.
+
