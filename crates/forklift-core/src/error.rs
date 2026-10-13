@@ -270,18 +270,19 @@ impl std::error::Error for CoreError {}
 /// loses the machine code — degrading to `Other` rather than leaking the raw `\u{1f}` frame or
 /// inventing a variant. The next step is folded into the message (rather than dropped) because
 /// this is exactly the forward-compat case — a newer peer's refusal — where recovery guidance
-/// matters most and there is no typed field left to carry it in.
+/// matters most and there is no typed field left to carry it in. A frame whose details do not
+/// parse degrades the same way: a refusal is never decoded without the details its code promises.
 impl From<String> for CoreError {
     fn from(message: String) -> CoreError {
         if let Some((code, human, next_step, details)) = deframe_with_details(&message) {
-            return match RefusalCode::from_code(code) {
-                Some(code) => CoreError::Refusal {
+            return match (RefusalCode::from_code(code), details) {
+                (Some(code), Ok(details)) => CoreError::Refusal {
                     code,
                     message: human.to_string(),
                     next_step: next_step.to_string(),
                     details,
                 },
-                None => CoreError::Other(with_next_step(human, next_step)),
+                _ => CoreError::Other(with_next_step(human, next_step)),
             };
         }
 
@@ -382,10 +383,10 @@ pub fn deframe(message: &str) -> Option<(&str, &str, &str)> {
 }
 
 /// Decode a sentinel frame in full: [`deframe`]'s three fields, plus the detail when the frame
-/// carries any. A detail field that does not parse as JSON makes the whole frame undecodable —
-/// never a refusal quietly missing the details its code promises — so the raw text surfaces as
-/// an unclassified error instead.
-fn deframe_with_details(message: &str) -> Option<(&str, &str, &str, Option<serde_json::Value>)> {
+/// carries any — `Err(())` when it does not parse as JSON, for the caller to refuse to decode a
+/// refusal from (never a refusal quietly missing the details its code promises).
+#[allow(clippy::type_complexity)]
+fn deframe_with_details(message: &str) -> Option<(&str, &str, &str, Result<Option<serde_json::Value>, ()>)> {
     let rest = message.strip_prefix(REFUSAL_PREFIX)?;
     let mut parts = rest.splitn(4, REFUSAL_FIELD_SEPARATOR);
 
@@ -393,8 +394,8 @@ fn deframe_with_details(message: &str) -> Option<(&str, &str, &str, Option<serde
     let human = parts.next()?;
     let next_step = parts.next()?;
     let details = match parts.next() {
-        None => None,
-        Some(text) => Some(serde_json::from_str(text).ok()?),
+        None => Ok(None),
+        Some(text) => serde_json::from_str(text).map(Some).map_err(|_| ()),
     };
 
     Some((code, human, next_step, details))
@@ -404,17 +405,19 @@ fn deframe_with_details(message: &str) -> Option<(&str, &str, &str, Option<serde
 mod tests {
     use super::*;
 
-    /// Proves the round trip for every variant the `refusal_codes!` invocation actually declares —
-    /// real exhaustiveness now that `ALL_CODES` is generated from that same invocation (see its doc
-    /// comment): a variant added to the enum necessarily appears in `ALL_CODES` too, so this loop
-    /// cannot silently skip it the way it could when `ALL_CODES` was a separate, hand-written list.
     #[test]
     fn a_frame_whose_details_do_not_parse_is_not_decoded_as_a_refusal() {
         let framed = format!("{}{}{{not json", frame("trust_changed", "changed", "verify", None), REFUSAL_FIELD_SEPARATOR);
 
-        assert_eq!(CoreError::from(framed.clone()), CoreError::Other(framed));
+        // The texts survive and the code is dropped, as for an unknown code; the raw frame never
+        // reaches output.
+        assert_eq!(CoreError::from(framed), CoreError::Other("changed verify".to_string()));
     }
 
+    /// Proves the round trip for every variant the `refusal_codes!` invocation actually declares —
+    /// real exhaustiveness now that `ALL_CODES` is generated from that same invocation (see its doc
+    /// comment): a variant added to the enum necessarily appears in `ALL_CODES` too, so this loop
+    /// cannot silently skip it the way it could when `ALL_CODES` was a separate, hand-written list.
     #[test]
     fn as_str_and_from_code_round_trip_for_every_code() {
         for code in ALL_CODES.iter().copied() {

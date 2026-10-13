@@ -78,6 +78,30 @@ pub struct TrustAnchorDto {
     pub adopts: Option<String>,
 }
 
+impl TrustAnchorDto {
+    /// Refuse an anchor whose hashes are not hashes. Every one of them is shown to a human to
+    /// verify out of band, so a value that could carry terminal escapes or look-alike characters
+    /// is rejected at the handshake rather than sanitized at each place it is printed.
+    pub fn validate(&self) -> Result<(), String> {
+        let hashes = std::iter::once(&self.genesis)
+            .chain(&self.boundary)
+            .chain(&self.prior_genesis)
+            .chain(&self.adopts);
+
+        for hash in hashes {
+            if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(format!(
+                    "The remote's trust anchor is malformed: {:?} is not an object hash. \
+                    Refusing to read it.",
+                    hash.chars().take(80).collect::<String>()
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
+
 impl From<&TrustAnchor> for TrustAnchorDto {
     fn from(anchor: &TrustAnchor) -> Self {
         TrustAnchorDto {
@@ -340,5 +364,27 @@ mod tests {
         let json = r#"{ "control_plane": [], "blobs": [], "more": true, "future": 1 }"#;
         let back: CommitLiftRequest = serde_json::from_str(json).expect("unknown fields ignored");
         assert!(back.more);
+    }
+
+    #[test]
+    fn a_trust_anchor_whose_hashes_are_not_hashes_is_refused() {
+        let hash = "ab".repeat(32);
+        let anchor = |genesis: &str, boundary: Vec<String>, prior: Option<&str>| TrustAnchorDto {
+            genesis: genesis.to_string(),
+            enabled_at: 0,
+            boundary,
+            prior_genesis: prior.map(str::to_string),
+            adopts: None,
+        };
+
+        assert_eq!(anchor(&hash, vec![hash.clone()], Some(&hash)).validate(), Ok(()));
+
+        // Terminal escapes, a bidi override that would make a hash read as another, a short
+        // value, in each field a human is shown.
+        let escape = format!("{}\u{1b}]0;x\u{7}", &hash[..56]);
+        let bidi = format!("{}\u{202e}{}", &hash[..32], &hash[..31]);
+        assert!(anchor(&escape, vec![], None).validate().is_err());
+        assert!(anchor(&hash, vec![bidi], None).validate().is_err());
+        assert!(anchor(&hash, vec![], Some("abc")).validate().is_err());
     }
 }
