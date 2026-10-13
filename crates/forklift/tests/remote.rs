@@ -1506,6 +1506,17 @@ fn a_remote_whose_anchor_was_stripped_is_refused_before_anything_is_fetched() {
     assert_eq!(details["what_changed"], "removed", "{}", details);
     assert!(details.get("previous").is_none(), "a franchise holds no anchor yet: {}", details);
     assert!(!area.path("b").exists(), "a refused franchise must not create the target");
+
+    // Lift refuses the same way rather than re-upload an anchor over the stripped office.
+    let lifted = area.forklift("a", &["--json", "lift"]);
+    assert_eq!(trust_changed_details(&lifted)["what_changed"], "removed");
+
+    // And the server never stores an anchor over an office it holds without one, whoever sends
+    // it: the first client to arrive would otherwise plant its own over a chain it never checked.
+    let foreign = serde_json::json!({ "genesis": "cd".repeat(32), "enabled_at": 0, "boundary": [] });
+    let (status, response) = http_send_json(&server.url, "PUT", "/v1/trust", &foreign.to_string());
+    assert!(status.contains("409"), "{} {}", status, response);
+    assert!(!stripped.exists(), "nothing was stored");
 }
 
 #[test]

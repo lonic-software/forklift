@@ -489,6 +489,54 @@ fn a_user_lift_before_the_office_is_refused() {
     assert_eq!(err.status, Status::Unprocessable);
 }
 
+/// An office is never lifted without an anchor, and an anchor is never planted over an office
+/// that has lost its own: either state reads to a client as a stripped anchor, and the first
+/// client to lift would otherwise plant an anchor over a chain it never verified.
+#[test]
+fn an_office_and_an_anchor_never_exist_apart() {
+    let area = Area::new("office-anchor-pair");
+    prepare(&area, "wh");
+    area.forklift("wh", &["office", "enroll"]);
+    area.write_file("wh/app.txt", "v1\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "signed"]);
+
+    let harvest = harvest(&area.path("wh"));
+    let anchor = harvest.trust.clone().expect("trust");
+    let office_head = harvest.head_of(&format!("@{}", OFFICE_PALLET_NAME)).expect("office head");
+
+    let refs = Arc::new(MemoryRefStore::new());
+    let head = Head::new(MemoryObjectStore::new(), SharedMemoryRefs(refs.clone()));
+    upload_all(&head, &harvest);
+
+    // Lifting the office before the anchor is refused, and leaves the office unborn.
+    let err = head
+        .ref_update(&format!("@{}", OFFICE_PALLET_NAME), &RefUpdateRequest {
+            old_head: None,
+            new_head: office_head.clone(),
+        })
+        .expect_err("office without an anchor");
+    assert_eq!(err.status, Status::Unprocessable);
+    assert_eq!(refs.get_head(pallet_utils::PalletNamespace::Meta, OFFICE_PALLET_NAME), Ok(None));
+
+    // An office whose anchor was lost — planted beneath the head, as a stripped store would
+    // hold it. Planting an anchor over it is refused, and nothing is stored.
+    assert!(matches!(
+        refs.compare_and_set_head(
+            pallet_utils::PalletNamespace::Meta,
+            OFFICE_PALLET_NAME,
+            None,
+            &office_head,
+            OfficePrecondition::NotConsumed,
+            None,
+        ),
+        Ok(CasOutcome::Committed)
+    ));
+    let err = head.put_trust(&anchor).expect_err("anchor over an orphaned office");
+    assert_eq!(err.status, Status::Conflict);
+    assert!(refs.get_trust().expect("read trust").is_none());
+}
+
 /// A signature sidecar is immutable: a conflicting re-upload is a `409`.
 #[test]
 fn a_conflicting_signature_is_refused() {
