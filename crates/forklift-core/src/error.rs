@@ -344,9 +344,10 @@ fn with_next_step(human: &str, next_step: &str) -> String {
     }
 }
 
-/// Strip ASCII control characters (replacing each with a space) so text is frame-safe and
-/// render-safe. See [`CoreError::refusal`].
-fn sanitize(text: &str) -> String {
+/// Strip control characters (replacing each with a space) so text is frame-safe and
+/// render-safe — also for a head printing a remote-supplied value outside a refusal. See
+/// [`CoreError::refusal`].
+pub fn sanitize(text: &str) -> String {
     text.chars().map(|c| if c.is_control() { ' ' } else { c }).collect()
 }
 
@@ -381,8 +382,9 @@ pub fn deframe(message: &str) -> Option<(&str, &str, &str)> {
 }
 
 /// Decode a sentinel frame in full: [`deframe`]'s three fields, plus the detail when the frame
-/// carries any. A detail field that does not parse as JSON is dropped rather than failing the
-/// decode — the refusal's code and texts are still exact.
+/// carries any. A detail field that does not parse as JSON makes the whole frame undecodable —
+/// never a refusal quietly missing the details its code promises — so the raw text surfaces as
+/// an unclassified error instead.
 fn deframe_with_details(message: &str) -> Option<(&str, &str, &str, Option<serde_json::Value>)> {
     let rest = message.strip_prefix(REFUSAL_PREFIX)?;
     let mut parts = rest.splitn(4, REFUSAL_FIELD_SEPARATOR);
@@ -390,7 +392,10 @@ fn deframe_with_details(message: &str) -> Option<(&str, &str, &str, Option<serde
     let code = parts.next()?;
     let human = parts.next()?;
     let next_step = parts.next()?;
-    let details = parts.next().and_then(|text| serde_json::from_str(text).ok());
+    let details = match parts.next() {
+        None => None,
+        Some(text) => Some(serde_json::from_str(text).ok()?),
+    };
 
     Some((code, human, next_step, details))
 }
@@ -403,6 +408,13 @@ mod tests {
     /// real exhaustiveness now that `ALL_CODES` is generated from that same invocation (see its doc
     /// comment): a variant added to the enum necessarily appears in `ALL_CODES` too, so this loop
     /// cannot silently skip it the way it could when `ALL_CODES` was a separate, hand-written list.
+    #[test]
+    fn a_frame_whose_details_do_not_parse_is_not_decoded_as_a_refusal() {
+        let framed = format!("{}{}{{not json", frame("trust_changed", "changed", "verify", None), REFUSAL_FIELD_SEPARATOR);
+
+        assert_eq!(CoreError::from(framed.clone()), CoreError::Other(framed));
+    }
+
     #[test]
     fn as_str_and_from_code_round_trip_for_every_code() {
         for code in ALL_CODES.iter().copied() {

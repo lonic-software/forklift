@@ -102,13 +102,16 @@ forklift franchise <url> my-project --expect <genesis>
 forklift lower --expect <genesis>
 ```
 
-`--expect` is compared, exactly, against the anchor the remote declares in its
+`--expect` is compared, exactly, against the genesis the remote declares in its
 first response. A mismatch — or a remote with no anchor at all — is refused
 before any download and before the target directory is created (`trust_changed`,
-exit 22, `what_changed: "unexpected"`).
+exit 22, `what_changed: "unexpected"`). The pin covers the genesis only: the rest
+of the anchor (the trust boundary of pre-trust history) is adopted as the remote
+declares it.
 
 Once an anchor is held, a remote that later declares a different one is always
-refused (`trust_changed`, exit 22). Under `--json` the refusal carries
+refused (`trust_changed`, exit 22); a remote declaring none is not, so pin it with
+`--expect` to require one. Under `--json` the refusal carries
 `details` — `subject` (the remote URL), `current` (the remote's genesis now),
 `previous` (the one this warehouse holds) and `what_changed`: `regenesis` when
 the new anchor names the held one as its prior (see §9), `unrelated` when it

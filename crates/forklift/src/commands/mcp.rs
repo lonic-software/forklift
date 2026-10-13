@@ -1256,8 +1256,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_tool_error_is_read_from_ok_not_from_the_exit_status() {
-        let success = br#"{"lonic_json":1,"tool":"forklift","schema":2,"command":"x","ok":true,"data":{}}"#;
-        let failure = br#"{"lonic_json":1,"tool":"forklift","schema":2,"command":"x","ok":false,"error":{}}"#;
+        let success = br#"{"lonic_json":1,"tool":"forklift","schema":3,"command":"x","ok":true,"data":{}}"#;
+        let failure = br#"{"lonic_json":1,"tool":"forklift","schema":3,"command":"x","ok":false,"error":{}}"#;
 
         // A negative outcome reported as data: non-zero exit, but `data` is the result.
         assert_eq!(super::tool_result(success, b"", exited(1))["isError"], false);
@@ -1307,7 +1307,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn only_warning_documents_are_forwarded_from_stderr() {
-        let success = br#"{"lonic_json":1,"tool":"forklift","schema":2,"command":"x","ok":true,"data":{}}"#;
+        let success = br#"{"lonic_json":1,"tool":"forklift","schema":3,"command":"x","ok":true,"data":{}}"#;
         let warning = r#"{"lonic_json":1,"tool":"forklift","warning":"maintenance_unavailable","message":"m","next_step":"n"}"#;
         let stderr = format!(
             "Packing objects...\n{}\n{}\n{}\nnot json\n{}\n",
