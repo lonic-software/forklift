@@ -327,6 +327,10 @@ fn an_mcp_call_with_a_progress_token_gets_progress_notifications() {
     let notifications = progress_before_the_response(&messages, &serde_json::json!("p1"));
     assert!(!notifications.is_empty(), "no progress notifications: {:?}", messages);
 
+    // The first goes out at the first event and the last when the run ends, in another phase, so
+    // there are always two to compare.
+    assert!(notifications.len() >= 2, "one notification leaves nothing to compare: {:?}", notifications);
+
     // `progress` strictly increases and there is never a `total`.
     let values: Vec<f64> = notifications.iter().map(|n| n["params"]["progress"].as_f64().unwrap()).collect();
     assert!(values.windows(2).all(|pair| pair[0] < pair[1]), "not strictly increasing: {:?}", values);
@@ -356,6 +360,13 @@ fn an_mcp_call_without_a_progress_token_gets_no_notifications() {
 
     let messages = mcp_compact(&warehouse, "2025-06-18", "");
     assert!(progress_before_the_response(&messages, &serde_json::Value::Null).is_empty(), "{:?}", messages);
+
+    // Nor with a token MCP does not allow: only a string or an integer names a request.
+    for token in ["null", "{}", "[1]", "1.5", "true"] {
+        let messages = mcp_compact(&warehouse, "2025-06-18", &format!(r#","_meta":{{"progressToken":{}}}"#, token));
+        let notifications: Vec<_> = messages.iter().filter(|m| m["method"] == "notifications/progress").collect();
+        assert!(notifications.is_empty(), "token {}: {:?}", token, notifications);
+    }
 }
 
 #[test]

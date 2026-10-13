@@ -2351,6 +2351,38 @@ fn mcp_provenance_takes_tool_and_session_from_the_connection_not_the_agent() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn mcp_is_not_killed_by_a_client_that_stopped_reading() {
+    use std::io::Write;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::Stdio;
+
+    let warehouse = TestWarehouse::new("mcp-gone");
+    assert_success(&warehouse.run(&["prepare"]));
+
+    let mut child = Command::new(FORKLIFT)
+        .arg("mcp")
+        .current_dir(&warehouse.root)
+        .env("FORKLIFT_GLOBAL_CONFIG", warehouse.home.join("global-config.toml"))
+        .env("FORKLIFT_KEYS_DIR", warehouse.home.join("test-keys"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // The client is gone before the server's first reply.
+    drop(child.stdout.take());
+    child.stdin.take().unwrap()
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
+        .unwrap();
+
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.signal(), None, "killed by a signal: {:?}", output.status);
+    assert!(!output.status.success(), "a failed write is still a failure: {:?}", output.status);
+}
+
 #[test]
 fn mcp_forwards_a_warning_document_after_the_envelope() {
     let warehouse = TestWarehouse::new("mcp-warning");
