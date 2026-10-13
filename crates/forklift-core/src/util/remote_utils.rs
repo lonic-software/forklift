@@ -8982,9 +8982,9 @@ mod tests {
 
     /// A completed download lands at the destination through the fsync-on path: the bundle is
     /// synced through the handle that wrote it, then renamed into place. The integration suites
-    /// launch their binaries with durability off, so this in-process test is what still runs
+    /// launch their binaries with durability off, so this in-process test is what still executes
     /// `fetch_bundle_to`'s `sync_all` — the call that fails on Windows if the file is synced
-    /// through a handle without write access.
+    /// through a handle without write access. It catches a sync that errors, not one removed.
     #[test]
     fn fetch_bundle_to_syncs_and_publishes_a_complete_bundle() {
         assert!(

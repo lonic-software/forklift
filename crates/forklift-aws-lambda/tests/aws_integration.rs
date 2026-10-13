@@ -1446,7 +1446,7 @@ fn forklift_binary() -> PathBuf {
 
 /// `forklift` with fsync off. Durability is not what these tests check, and paying an fsync per
 /// write made the suite much slower.
-/// Only the CLI is affected: the server half runs in this test process, which leaves fsync on.
+/// Only the CLI is affected: the server half here writes to S3, where no local fsync applies.
 fn forklift_command() -> Command {
     let mut command = Command::new(forklift_binary());
     command.env("FORKLIFT_FSYNC", "0");

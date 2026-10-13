@@ -2869,14 +2869,6 @@ fn alias_status_reports_installed_state() {
     assert_eq!(json(&after)["data"]["installed"], true);
 }
 
-/// A command that reaches `forklift` through the alias, in the environment [`forklift_command`]
-/// gives the direct one, so a comparison of the two sees only what the alias changes.
-fn forklift_alias_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
-    let mut command = Command::new(program);
-    command.env("FORKLIFT_FSYNC", "0");
-    command
-}
-
 #[test]
 fn the_fl_alias_behaves_identically_to_forklift() {
     let scratch = AliasScratch::new("behaves-identically");
@@ -2885,14 +2877,14 @@ fn the_fl_alias_behaves_identically_to_forklift() {
     // Direct execution of a `.cmd` file via `CreateProcess` is unreliable — Windows needs
     // the command interpreter to run a batch shim. Unix executes the symlink directly.
     #[cfg(windows)]
-    let via_alias = forklift_alias_command("cmd")
+    let via_alias = common::test_command("cmd")
         .arg("/C")
         .arg(scratch.alias_path("fl"))
         .args(["--json", "version"])
         .output()
         .unwrap();
     #[cfg(not(windows))]
-    let via_alias = forklift_alias_command(scratch.alias_path("fl"))
+    let via_alias = common::test_command(scratch.alias_path("fl"))
         .args(["--json", "version"])
         .output()
         .unwrap();
