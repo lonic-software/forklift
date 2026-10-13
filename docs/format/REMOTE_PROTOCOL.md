@@ -256,7 +256,8 @@ replaced, so they cannot sanction its replacement (`403`). The replacement is lo
 loudly. The subsequent office ref update is the one sanctioned non-fast-forward: allowed
 exactly when the head being moved away from is the anchor's `adopts` pin. Clients that
 pinned the old anchor refuse to sync until their holder consciously re-accepts
-(`office accept-regenesis`).
+(`office accept-regenesis --confirm <genesis>`, which accepts only the genesis the remote
+declares at that moment).
 
 Both conditions the replacement is granted under are re-checked **at the write**, not just
 when the request is read, so a re-genesis is refused if either moves underneath it. A second

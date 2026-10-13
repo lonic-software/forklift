@@ -323,6 +323,18 @@ pub enum Command {
                          several subtrees. Widen later with \"expand\"."
         )]
         only: Vec<String>,
+
+        /// Refuse unless the remote's trust anchor is this genesis (an out-of-band pin)
+        #[arg(
+            long = "expect",
+            value_name = "GENESIS",
+            long_help = "Refuse unless the remote's trust anchor is exactly this genesis, a value \
+                         obtained out of band (from an operator you know, or a first-contact \
+                         warning you verified). Checked right after the handshake, before anything \
+                         is downloaded or created. Without it, a first contact adopts whatever \
+                         anchor the remote holds, and says which."
+        )]
+        expect: Option<String>,
     },
 
     /// Reviewable merge proposals (pull requests) on the @haul meta pallet
@@ -441,10 +453,22 @@ pub enum Command {
         long_about = "Download the remote's new parcels for the current pallet from the configured \
                       remote (\"remote.url\") and fast-forward to them — working directory and \
                       inventory included. On first contact with a trusted remote its trust anchor \
-                      is adopted (one-way, like \"office enroll\"). A diverged pallet is reported, \
-                      never merged implicitly."
+                      is adopted (one-way, like \"office enroll\"), and the adopted genesis is \
+                      reported. A diverged pallet is reported, never merged implicitly."
     )]
-    Lower,
+    Lower {
+        /// Refuse unless the remote's trust anchor is this genesis (an out-of-band pin)
+        #[arg(
+            long = "expect",
+            value_name = "GENESIS",
+            long_help = "Refuse unless the remote's trust anchor is exactly this genesis, a value \
+                         obtained out of band (from an operator you know, or a first-contact \
+                         warning you verified). Checked right after the handshake, before anything \
+                         is downloaded or created. Without it, a first contact adopts whatever \
+                         anchor the remote holds, and says which."
+        )]
+        expect: Option<String>,
+    },
 
     /// Attach signed post-metadata to a parcel: approvals, review notes (`mf`)
     #[command(
@@ -1428,12 +1452,14 @@ pub enum OfficeAction {
                       until you deliberately accept the new anchor — the SSH host-key-change \
                       moment. The new anchor must name your pinned genesis as its prior (the \
                       chain of custody); verify out-of-band that the reset is legitimate before \
-                      confirming. Without --confirm, shows what would be accepted."
+                      confirming. Without --confirm, shows what would be accepted and refuses. \
+                      --confirm takes the new genesis being accepted, and accepts only if that is \
+                      still the remote's genesis — so what is accepted is exactly what was shown."
     )]
     AcceptRegenesis {
-        /// Actually accept the new anchor (without it, the reset is only described)
-        #[arg(long)]
-        confirm: bool,
+        /// Accept the new anchor, whose genesis must be this value (without it, the reset is only described)
+        #[arg(long, value_name = "GENESIS")]
+        confirm: Option<String>,
     },
 
     /// List the users and their keys (the default)
@@ -1506,7 +1532,7 @@ impl Command {
                 | Command::ImportGit { .. }
                 | Command::Lift
                 | Command::Load { .. }
-                | Command::Lower
+                | Command::Lower { .. }
                 | Command::Haul { .. }
                 | Command::Manifest { .. }
                 | Command::Narrow { .. }
@@ -1575,7 +1601,7 @@ impl Command {
                 | Command::Heal
                 | Command::ImportGit { .. }
                 | Command::Load { .. }
-                | Command::Lower
+                | Command::Lower { .. }
                 | Command::Haul { .. }
                 | Command::Manifest { .. }
                 | Command::Narrow { .. }

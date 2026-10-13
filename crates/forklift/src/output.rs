@@ -18,7 +18,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use serde::Serialize;
 use forklift_core::error::{CoreError, RefusalCode};
-use forklift_core::util::{heal_utils, load_guard_utils, merge_utils, query_utils, scope_utils};
+use forklift_core::util::{heal_utils, load_guard_utils, merge_utils, query_utils, scope_utils, trust_utils};
 
 /// The version of the envelope every Lonic tool shares, carried as `lonic_json`. A consumer
 /// detects the contract with this one key; it versions the header (`lonic_json`, `tool`,
@@ -34,13 +34,15 @@ pub const TOOL: &str = "forklift";
 /// `data` shape or the error-code registry changes incompatibly, so an agent can pin it and
 /// detect drift.
 ///
-/// Version 2 (this one): `history` entries carry `parents` (always present, `[]` for a
-/// root), the `empty_history` error code exists, and `palletize` list entries carry
-/// `head`. A consumer reads this field before relying on a field, to know whether the
+/// Version 3 (this one): `lower` and `franchise` report the adopted trust anchor as
+/// `adopted_genesis` (present only on first contact) in place of the `adopted_anchor` flag, and
+/// the `trust_changed` error code exists, with `details`. Version 2: `history` entries carry
+/// `parents` (always present, `[]` for a root), the `empty_history` error code exists, and
+/// `palletize` list entries carry `head`. A consumer reads this field before relying on a field, to know whether the
 /// command it is about to run supports the capability it needs — the version bump *is*
 /// the capability-detection mechanism, so it is worth pinning rather than sniffing for a
 /// field's presence.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// How the process renders its output.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -390,6 +392,10 @@ error_codes! {
     /// own (a vanished, unreadable, or corrupt object, or a torn taint record) and refused rather
     /// than silently trust unproven state.
     DurabilityTaint,
+
+    /// A remote's trust anchor is not the one this warehouse holds or the command named.
+    /// `error.details` carries `{subject, current, previous?, what_changed}`.
+    TrustChanged,
 }
 
 impl ErrorCode {
@@ -416,6 +422,7 @@ impl ErrorCode {
             ErrorCode::EmptyHistory => "empty_history",
             ErrorCode::IncompleteLoad => load_guard_utils::CODE_INCOMPLETE_LOAD,
             ErrorCode::DurabilityTaint => heal_utils::CODE_DURABILITY_TAINT,
+            ErrorCode::TrustChanged => RefusalCode::TrustChanged.as_str(),
         }
     }
 
@@ -445,6 +452,7 @@ impl ErrorCode {
             ErrorCode::EmptyHistory => 19,
             ErrorCode::IncompleteLoad => 20,
             ErrorCode::DurabilityTaint => 21,
+            ErrorCode::TrustChanged => 22,
         }
     }
 
@@ -492,6 +500,9 @@ impl ErrorCode {
             ErrorCode::DurabilityTaint =>
                 "A durability taint could not be auto-healed (a vanished, unreadable, or \
                  corrupt path, or a torn taint record)",
+            ErrorCode::TrustChanged =>
+                "A remote's trust anchor is not the one this warehouse holds or the command \
+                 named; the details carry its current value",
         }
     }
 
@@ -516,6 +527,7 @@ impl ErrorCode {
             RefusalCode::QueryPredicateInvalid => ErrorCode::QueryPredicateInvalid,
             RefusalCode::IncompleteLoad => ErrorCode::IncompleteLoad,
             RefusalCode::DurabilityTaint => ErrorCode::DurabilityTaint,
+            RefusalCode::TrustChanged => ErrorCode::TrustChanged,
         }
     }
 }
@@ -551,11 +563,11 @@ impl ForkliftError {
 impl From<CoreError> for ForkliftError {
     fn from(error: CoreError) -> ForkliftError {
         match error {
-            CoreError::Refusal { code, message, next_step } => ForkliftError {
+            CoreError::Refusal { code, message, next_step, details } => ForkliftError {
                 code: ErrorCode::from_refusal(code),
                 message,
                 next_step: Some(next_step),
-                details: None,
+                details,
             },
             CoreError::Other(message) => {
                 ForkliftError { code: ErrorCode::Generic, message, next_step: None, details: None }
@@ -640,6 +652,7 @@ fn standing_taint_warning_text(mode: OutputMode, gate_message: &str) -> String {
             heal_utils::CODE_DURABILITY_TAINT,
             gate_message,
             heal_utils::DURABILITY_TAINT_NEXT_STEP,
+            None,
         ),
     }
 }
@@ -702,14 +715,46 @@ fn maintenance_unavailable_warning_text(mode: OutputMode, error: &str) -> String
             CODE_MAINTENANCE_UNAVAILABLE,
             error,
             MAINTENANCE_UNAVAILABLE_NEXT_STEP,
+            None,
+        ),
+    }
+}
+
+/// Announce a trust anchor adopted on first contact (`lower`, `franchise`). Adoption is never
+/// silent: this names the adopted value, so a reader can check it out of band, and under `--json`
+/// it is a warning document on stderr whose `details` carry the value — the command's own result
+/// stays the one document on stdout.
+pub fn warn_trust_adopted(details: &trust_utils::TrustDetails) {
+    eprintln!("{}", trust_adopted_warning_text(mode(), details));
+}
+
+/// The pure half of [`warn_trust_adopted`], split out like [`standing_taint_warning_text`] so a
+/// test can assert both modes without capturing stderr.
+fn trust_adopted_warning_text(mode: OutputMode, details: &trust_utils::TrustDetails) -> String {
+    let genesis = details.current.as_deref().unwrap_or_default();
+    let message = format!(
+        "FIRST CONTACT with {}: adopted its trust anchor, genesis {}.",
+        details.subject, genesis
+    );
+    let next_step = format!(
+        "Verify that genesis out of band. To check it before anything is fetched, pass \
+         --expect {} to franchise or lower.",
+        genesis
+    );
+
+    match mode {
+        OutputMode::Human => format!("Warning: {} {}", message, next_step),
+        OutputMode::Json => warning_envelope(
+            trust_utils::WARNING_TRUST_ADOPTED, &message, &next_step, Some(&details.to_value()),
         ),
     }
 }
 
 /// The one `--json` warning envelope, shared by every stderr warning so the shape a consumer
-/// parses (`lonic_json`, `tool`, `warning`, `message`, `next_step`) is defined once — including the
-/// hand-built fallback for the serializer failure that cannot actually happen here.
-fn warning_envelope(code: &str, message: &str, next_step: &str) -> String {
+/// parses (`lonic_json`, `tool`, `warning`, `message`, `next_step`, and `details` for the codes
+/// that define one) is defined once — including the hand-built fallback for the serializer
+/// failure that cannot actually happen here.
+fn warning_envelope(code: &str, message: &str, next_step: &str, details: Option<&serde_json::Value>) -> String {
     // A struct, not `json!`: serde_json's `Map` sorts keys, and the header leads.
     #[derive(Serialize)]
     struct Warning<'a> {
@@ -718,9 +763,11 @@ fn warning_envelope(code: &str, message: &str, next_step: &str) -> String {
         warning: &'a str,
         message: &'a str,
         next_step: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        details: Option<&'a serde_json::Value>,
     }
 
-    let envelope = Warning { lonic_json: LONIC_JSON, tool: TOOL, warning: code, message, next_step };
+    let envelope = Warning { lonic_json: LONIC_JSON, tool: TOOL, warning: code, message, next_step, details };
 
     serde_json::to_string(&envelope).unwrap_or_else(|_| format!(
         "{{\"lonic_json\":{},\"tool\":\"{}\",\"warning\":\"{}\"}}",
@@ -989,5 +1036,26 @@ mod tests {
             fields.sort();
             assert_eq!(fields, expected, "documented warning shape changed: {text}");
         }
+    }
+
+    #[test]
+    fn the_trust_adopted_warning_names_the_genesis_in_both_modes() {
+        let details = trust_utils::first_contact("http://remote", "abc123");
+
+        let human = trust_adopted_warning_text(OutputMode::Human, &details);
+        assert!(human.starts_with("Warning: FIRST CONTACT with http://remote"), "{}", human);
+        assert!(human.contains("--expect abc123"), "the pin must be copyable: {}", human);
+
+        // The five fields every warning carries, plus `details` for this code — a literal, so a
+        // renamed key goes red.
+        let json = trust_adopted_warning_text(OutputMode::Json, &details);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let mut fields: Vec<&str> = parsed.as_object().unwrap().keys().map(String::as_str).collect();
+        fields.sort();
+        assert_eq!(fields, ["details", "lonic_json", "message", "next_step", "tool", "warning"], "{json}");
+        assert_eq!(parsed["warning"], "trust_adopted");
+        assert_eq!(parsed["details"], serde_json::json!({
+            "subject": "http://remote", "current": "abc123", "what_changed": "first_contact",
+        }));
     }
 }

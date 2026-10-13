@@ -4,7 +4,7 @@ use forklift_core::model::operator::Operator;
 use forklift_core::util::office_utils::{IdentityClass, OfficeState, RevocationReason, Role, TrustAnchor, UserRecord};
 use forklift_core::util::office_utils::OFFICE_PALLET_NAME;
 use forklift_core::util::remote_utils::{self, RemoteClient};
-use forklift_core::util::{config_utils, office_utils, pallet_utils, sign_utils};
+use forklift_core::util::{config_utils, office_utils, pallet_utils, sign_utils, trust_utils};
 use crate::output::{self, CommandOutput};
 
 // The office command — the warehouse office manages the personnel records: users and
@@ -804,9 +804,9 @@ pub fn regenesis(confirm: bool) -> Result<(), String> {
         Prior genesis:      {} (chain of custody, recorded in the anchor)\n\
         Adopted history:    {} (frozen, attested by the new anchor)\n\n\
         Every clone must consciously re-accept the new anchor with \
-        \"office accept-regenesis\". A remote accepts the reset only from the server \
+        \"office accept-regenesis --confirm {}\". A remote accepts the reset only from the server \
         operator's static token.",
-        genesis, key_id, old_anchor.genesis, old_office_head
+        genesis, key_id, old_anchor.genesis, old_office_head, genesis
     ));
 
     Ok(())
@@ -814,10 +814,17 @@ pub fn regenesis(confirm: bool) -> Result<(), String> {
 
 /// Consciously accept a remote's re-genesis: the deliberate counterpart of the
 /// refusal every sync raises after a trust reset (the SSH host-key-change moment).
-pub async fn accept_regenesis(confirm: bool) -> Result<(), String> {
+///
+/// Without `confirm`, describes the reset and refuses with `trust_changed`, whose details carry
+/// the new genesis. With it, accepts only if `confirm` is still the remote's genesis — the
+/// acceptance is bound to the value that was shown, not to whatever the remote holds now.
+///
+/// # Arguments
+/// * `confirm` - The new genesis being accepted, or `None` to only describe the reset.
+pub async fn accept_regenesis(confirm: Option<String>) -> Result<(), String> {
     let client = RemoteClient::from_config()?;
 
-    if !confirm {
+    let Some(confirmed) = confirm else {
         let Some(local) = office_utils::read_trust_anchor()? else {
             return Err(
                 "This warehouse has no trust anchor; a plain \"lower\" adopts the \
@@ -837,7 +844,7 @@ pub async fn accept_regenesis(confirm: bool) -> Result<(), String> {
             return Ok(());
         }
 
-        crate::human!("The remote's trust anchor was RESET (re-genesis):");
+        crate::human!("The remote's trust anchor CHANGED:");
         crate::human!("  your pinned genesis: {}", local.genesis);
         crate::human!("  remote genesis:      {}", remote_trust.genesis);
         crate::human!("  names as its prior:  {}", remote_trust.prior_genesis.as_deref().unwrap_or("(none)"));
@@ -845,12 +852,15 @@ pub async fn accept_regenesis(confirm: bool) -> Result<(), String> {
         crate::human!();
         crate::human!("Accepting means trusting whoever performed the reset as the new root of");
         crate::human!("this warehouse. Verify that out-of-band (ask the operators you know), then");
-        crate::human!("re-run with --confirm.");
+        crate::human!("re-run with --confirm and the remote genesis above.");
+        crate::human!();
 
-        return Err("Accepting a re-genesis needs --confirm.".to_string());
-    }
+        return Err(trust_utils::anchor_changed(
+            client.url(), &local.genesis, remote_trust, "Accepting it needs --confirm with that genesis."
+        ).into());
+    };
 
-    let (old, new) = remote_utils::accept_regenesis(&client).await?;
+    let (old, new) = remote_utils::accept_regenesis(&client, &confirmed).await?;
 
     output::message(format!(
         "Accepted the re-genesis.\n\

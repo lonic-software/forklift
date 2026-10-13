@@ -798,7 +798,7 @@ mod tests {
 
     fn assert_durability_taint(error: &CoreError, contains: &[&str]) {
         match error {
-            CoreError::Refusal { code, message, next_step } => {
+            CoreError::Refusal { code, message, next_step, .. } => {
                 assert_eq!(*code, RefusalCode::DurabilityTaint, "wrong code, message: {}", message);
                 assert_eq!(next_step.as_str(), DURABILITY_TAINT_NEXT_STEP);
                 for &needle in contains {

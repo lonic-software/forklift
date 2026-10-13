@@ -9,7 +9,7 @@ use forklift_core::util::remote_utils::{RemoteClient, TorSettings};
 use forklift_core::util::scope_utils::MaterializationScope;
 use forklift_core::util::{
     bundle_utils, config_utils, object_utils, pack_utils, pallet_utils, remote_utils,
-    scope_utils, shift_utils, warehouse_utils,
+    scope_utils, shift_utils, trust_utils, warehouse_utils,
 };
 use crate::output::{self, CommandOutput};
 
@@ -40,17 +40,20 @@ use crate::output::{self, CommandOutput};
 ///                 hash. The remote's whole-store bundle is skipped, and the remote is
 ///                 recorded as this sparse warehouse's origin (lift refuses to publish
 ///                 elsewhere).
+/// * `expect`    - The genesis the remote's trust anchor must have (an out-of-band pin),
+///                 checked against the handshake before anything is downloaded or created.
 ///
 /// # Returns
 /// * `Ok(())` - If the franchise is ready to work in.
 /// * `Err(String)` - If `--token` is given but empty, the directory is not empty, the remote is
-///   unreachable, the pallet does not exist, or a transfer failed. The target is left as it was
-///   found (see above) either way.
+///   unreachable, its trust anchor is not the expected one, the pallet does not exist, or a
+///   transfer failed. The target is left as it was found (see above) either way.
 pub async fn handle_command(url: &str,
                             directory: &str,
                             pallet: Option<String>,
                             token: Option<String>,
-                            only: Vec<String>) -> Result<(), String> {
+                            only: Vec<String>,
+                            expect: Option<String>) -> Result<(), String> {
     // Normalize the sparse scope up front (before any warehouse is created), so a malformed
     // --only refuses cleanly. An empty list is a full (ordinary) franchise.
     let fetch_scope = resolve_fetch_scope(&only)?;
@@ -88,6 +91,12 @@ pub async fn handle_command(url: &str,
     // standing in — a cwd-dependent, security-relevant surprise this preserves against.
     let client = RemoteClient::new_with_tor(url, token.clone(), TorSettings::from_global_config()?)?;
     let info = client.fetch_info().await?;
+
+    // The handshake already carries the remote's trust anchor, so an out-of-band pin is checked
+    // here — before the bundle download and before the target is touched.
+    if let Some(expected) = &expect {
+        trust_utils::check_expected(client.url(), info.trust.as_ref(), None, expected)?;
+    }
 
     // Resolve the pallet from the handshake alone — no I/O — so a `--pallet` typo is refused
     // immediately, before anything is fetched or mutated: the same principle once more. (The
@@ -185,7 +194,7 @@ async fn franchise_into_prepared_target(
         directory: directory.to_string(),
         bundle_objects: None,
         bundle_signatures: None,
-        adopted_anchor: false,
+        adopted_genesis: None,
         meta_adopted: Vec::new(),
         pallet: String::new(),
         head: None,
@@ -224,7 +233,7 @@ async fn franchise_into_prepared_target(
     }
 
     let trust = remote_utils::adopt_remote_trust(client, &info).await?;
-    report.adopted_anchor = trust.adopted_anchor;
+    report.adopted_genesis = trust.adopted_genesis;
 
     // Adopt the meta pallets too (the manifest, …), so a clone carries the post-metadata,
     // not just the working history. A fresh clone has none locally, so nothing diverges.
@@ -250,7 +259,7 @@ async fn franchise_into_prepared_target(
 
         report.pallet = pallet_name;
         report.unborn = true;
-        output::emit(&report);
+        emit_report(&report, client);
 
         return Ok(());
     };
@@ -308,7 +317,7 @@ async fn franchise_into_prepared_target(
     report.pallet = pallet_name;
     report.head = Some(remote_head.clone());
     report.fetched_objects = stats.fetched_objects;
-    output::emit(&report);
+    emit_report(&report, client);
 
     Ok(())
 }
@@ -595,6 +604,16 @@ fn is_directory_in_tree(root_tree_hash: &str, key: &str) -> Result<bool, String>
     Ok(true)
 }
 
+/// Emit a successful franchise's report, announcing a first-contact adoption first. Only on
+/// success: a franchise that fails afterwards removes the warehouse, and the adoption with it.
+fn emit_report(report: &FranchiseReport, client: &RemoteClient) {
+    if let Some(genesis) = &report.adopted_genesis {
+        output::warn_trust_adopted(&trust_utils::first_contact(client.url(), genesis));
+    }
+
+    output::emit(report);
+}
+
 /// The result of a franchise: what was imported and which pallet was checked out.
 #[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
@@ -609,8 +628,10 @@ pub(crate) struct FranchiseReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     bundle_signatures: Option<usize>,
 
-    /// Whether the remote's trust anchor was adopted.
-    adopted_anchor: bool,
+    /// The genesis of the remote's trust anchor, adopted on this first contact (absent when the
+    /// remote has none).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adopted_genesis: Option<String>,
 
     /// The meta pallets (e.g. `@manifest`) adopted from the remote.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -648,8 +669,11 @@ impl CommandOutput for FranchiseReport {
             );
         }
 
-        if self.adopted_anchor {
-            println!("Adopted the remote's trust anchor; every parcel is signed from now on.");
+        if let Some(genesis) = &self.adopted_genesis {
+            println!(
+                "Adopted the remote's trust anchor (genesis {}); every parcel is signed from now on.",
+                genesis
+            );
         }
 
         if self.densify_suggested {

@@ -24,7 +24,7 @@ use crate::util::progress_utils::Progress;
 use crate::util::scope_utils::{self, MaterializationScope, ScopeClass};
 use crate::util::{
     bundle_utils, config_utils, file_utils, merge_utils, object_utils, office_utils,
-    pack_utils, pallet_utils, sign_utils,
+    pack_utils, pallet_utils, sign_utils, trust_utils,
 };
 
 /// How many object transfers run concurrently.
@@ -5291,8 +5291,8 @@ fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
 /// What the trust/office synchronization of a lower/franchise did.
 #[derive(Default)]
 pub struct TrustSyncStats {
-    /// Whether the remote's trust anchor was adopted locally (first contact).
-    pub adopted_anchor: bool,
+    /// The genesis of the remote's trust anchor, when it was adopted locally (first contact).
+    pub adopted_genesis: Option<String>,
 
     /// Whether the local office pallet moved to the remote's head.
     pub office_moved: bool,
@@ -5311,8 +5311,10 @@ pub struct TrustSyncStats {
 /// * `info`   - The remote's handshake.
 ///
 /// # Returns
-/// * `Ok(TrustSyncStats)` - What happened.
-/// * `Err(String)`        - On anchor mismatch, or a failed transfer.
+/// * `Ok(TrustSyncStats)` - What happened, including the genesis adopted on first contact —
+///                          which the caller must surface, since an adoption is never silent.
+/// * `Err(String)`        - A `trust_changed` refusal on an anchor mismatch, or a failed
+///                          transfer.
 pub async fn adopt_remote_trust(client: &RemoteClient,
                                 info: &WarehouseInfo) -> Result<TrustSyncStats, String> {
     let mut stats = TrustSyncStats::default();
@@ -5326,25 +5328,10 @@ pub async fn adopt_remote_trust(client: &RemoteClient,
 
     if let Some(local) = office_utils::read_trust_anchor()? {
         if local.genesis != remote_trust.genesis {
-            // A re-genesis (§8.7) is a conspicuous trust reset: never adopted
-            // silently. When the remote's new anchor names our genesis as its prior,
-            // the instruction is the conscious re-accept command; anything else is
-            // another warehouse — or tampering.
-            if remote_trust.prior_genesis.as_deref() == Some(local.genesis.as_str()) {
-                return Err(format!(
-                    "The remote's trust anchor was RESET (re-genesis): new genesis {} \
-                    replaces this warehouse's {}. This changes who controls the \
-                    warehouse — verify out-of-band that the reset is legitimate, then \
-                    accept it consciously with \"office accept-regenesis\".",
-                    remote_trust.genesis, local.genesis
-                ));
-            }
-
-            return Err(format!(
-                "The remote's trust anchor (genesis {}) differs from this warehouse's \
-                (genesis {}). This is another warehouse — or tampering. Refusing to sync.",
-                remote_trust.genesis, local.genesis
-            ));
+            // A re-genesis (§8.7) is a conspicuous trust reset: never adopted silently.
+            return Err(trust_utils::anchor_changed(
+                client.url(), &local.genesis, remote_trust, "Refusing to sync."
+            ).into());
         }
     }
 
@@ -5352,7 +5339,7 @@ pub async fn adopt_remote_trust(client: &RemoteClient,
 
     if office_utils::read_trust_anchor()?.is_none() {
         office_utils::write_trust_anchor(&remote_trust.to_anchor())?;
-        stats.adopted_anchor = true;
+        stats.adopted_genesis = Some(remote_trust.genesis.clone());
     }
 
     match pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME)? {
@@ -5387,14 +5374,22 @@ pub async fn adopt_remote_trust(client: &RemoteClient,
 /// and moves the office ref. The *decision* to trust the reset is the caller's — this
 /// is the mechanical half.
 ///
+/// The acceptance is bound to a value: `confirmed` must be the remote's new genesis as it is
+/// *now*, re-read here, so what is accepted is exactly what was shown — never whatever the remote
+/// returns by the time this runs.
+///
 /// # Arguments
-/// * `client` - The remote.
+/// * `client`    - The remote.
+/// * `confirmed` - The new genesis being accepted.
 ///
 /// # Returns
 /// * `Ok((TrustAnchor, TrustAnchor))` - The replaced and the adopted anchor.
-/// * `Err(String)`                    - If there is nothing to accept, the custody
-///                                      chain does not match, or a transfer failed.
-pub async fn accept_regenesis(client: &RemoteClient) -> Result<(office_utils::TrustAnchor, office_utils::TrustAnchor), String> {
+/// * `Err(String)`                    - If there is nothing to accept, the custody chain does
+///                                      not match or `confirmed` is not the remote's genesis
+///                                      now (both `trust_changed` refusals), or a transfer
+///                                      failed.
+pub async fn accept_regenesis(client: &RemoteClient,
+                              confirmed: &str) -> Result<(office_utils::TrustAnchor, office_utils::TrustAnchor), String> {
     let Some(local) = office_utils::read_trust_anchor()? else {
         return Err(
             "This warehouse has no trust anchor; a plain \"lower\" adopts the remote's \
@@ -5413,12 +5408,13 @@ pub async fn accept_regenesis(client: &RemoteClient) -> Result<(office_utils::Tr
     }
 
     if remote_trust.prior_genesis.as_deref() != Some(local.genesis.as_str()) {
-        return Err(format!(
-            "The remote's anchor (genesis {}) does not name this warehouse's genesis \
-            ({}) as its prior — this is not a re-genesis of the chain you trust, but \
-            another warehouse or a second reset you have not seen. Refusing.",
-            remote_trust.genesis, local.genesis
-        ));
+        return Err(trust_utils::anchor_changed(
+            client.url(), &local.genesis, remote_trust, "Refusing to accept it."
+        ).into());
+    }
+
+    if remote_trust.genesis != confirmed {
+        return Err(trust_utils::confirm_mismatch(client.url(), &local.genesis, remote_trust, confirmed).into());
     }
 
     let remote_office_head = info.pallets.get(&office_utils::office_wire_key())
@@ -5470,20 +5466,10 @@ pub async fn push_local_trust(client: &RemoteClient,
             // that adopts the remote's current office head.
             if local.prior_genesis.as_deref() == Some(remote_trust.genesis.as_str()) {
                 client.put_trust(&TrustAnchorDto::from(&local)).await?;
-            } else if remote_trust.prior_genesis.as_deref() == Some(local.genesis.as_str()) {
-                return Err(format!(
-                    "The remote's trust anchor was RESET (re-genesis): new genesis {} \
-                    replaces this warehouse's {}. This changes who controls the \
-                    warehouse — verify out-of-band that the reset is legitimate, then \
-                    accept it consciously with \"office accept-regenesis\".",
-                    remote_trust.genesis, local.genesis
-                ));
             } else {
-                return Err(format!(
-                    "The remote's trust anchor (genesis {}) differs from this warehouse's \
-                    (genesis {}). This is another warehouse — or tampering. Refusing to lift.",
-                    remote_trust.genesis, local.genesis
-                ));
+                return Err(trust_utils::anchor_changed(
+                    client.url(), &local.genesis, remote_trust, "Refusing to lift."
+                ).into());
             }
         }
     } else {
@@ -5753,7 +5739,7 @@ mod tests {
 
         // The client re-lifts it into a typed refusal with the same code — never a leaked frame.
         match CoreError::from(classified) {
-            CoreError::Refusal { code, message, next_step } => {
+            CoreError::Refusal { code, message, next_step, .. } => {
                 assert_eq!(code, RefusalCode::ChunkedTransportUnsupported);
                 assert!(message.contains("The remote refused the negotiation (422)"),
                     "the client wraps the server message with context: {}", message);
@@ -6044,7 +6030,7 @@ mod tests {
 
         let error = refuse_if_commit_pagination_unsupported(MAX_MISSING_BATCH + 1, false)
             .expect_err("over the cap, against a non-chunking remote, must refuse");
-        let CoreError::Refusal { code, message, next_step } = error else {
+        let CoreError::Refusal { code, message, next_step, .. } = error else {
             panic!("expected a typed refusal, got {:?}", error);
         };
 
