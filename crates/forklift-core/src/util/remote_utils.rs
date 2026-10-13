@@ -9498,16 +9498,19 @@ mod tests {
     }
 
     /// `fetch_object` against a remote whose `Content-Length` outlives the bytes it actually
-    /// sends must fail with a timeout, not hang waiting for a body that is never coming. Ceiling
-    /// sized to `TEST_LOOSE_READ_TIMEOUT`: `fetch_object` rides `bounded_object_reads`, not the
-    /// tight `bounded_reads` the other three calls use.
+    /// sends must fail with a timeout, not hang waiting for a body that is never coming, and the
+    /// message must name this client's own `connect + object_read` silence budget, hedged with
+    /// "at least". Sized to the loose budget: `fetch_object` rides `bounded_object_reads`, not the
+    /// tight `bounded_reads` the other three calls use. The figure is the only pin on
+    /// `describe_transport_error`'s [`Posture::BoundedObjectReads`] arm: [`FAST`]'s figures differ
+    /// from production's, so an arm that printed a production constant fails here.
     #[test]
     fn fetch_object_times_out_against_a_content_length_lie() {
         let remote = LyingContentLengthRemote::start();
         let client = fast_client(&remote.url);
         let hash = "a".repeat(64);
-        let hard_ceiling = FAST.connect + FAST.object_read
-            + std::time::Duration::from_secs(20);
+        let effective_budget = FAST.connect + FAST.object_read;
+        let hard_ceiling = effective_budget + std::time::Duration::from_secs(20);
 
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let outcome = runtime.block_on(async {
@@ -9524,6 +9527,11 @@ mod tests {
         assert!(
             message.to_lowercase().contains("timed out"),
             "must fail specifically with a timeout, not some other transport error: {}", message
+        );
+        assert!(
+            message.contains(&format!("at least {:?}", effective_budget)),
+            "must name this client's effective object-read silence budget {:?}, hedged with \
+            \"at least\": {}", effective_budget, message
         );
     }
 
