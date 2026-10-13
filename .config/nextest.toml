@@ -1,0 +1,18 @@
+# Timeouts for `cargo nextest run`, locally and in CI.
+#
+# A test that runs past its slow-timeout period is reported as SLOW, and one still running after
+# `terminate-after` periods is killed and fails. That turns a hang into a failure with the test's
+# name instead of a CI job that runs until GitHub's six-hour limit, and makes a new slow test
+# visible when it lands. The ceilings sit well above the slowest test on the slowest runner, so
+# a loaded machine does not trip them.
+
+[profile.default]
+# Every test outside the crash suite finishes in seconds; the slowest seen on any runner is
+# about twenty. Fail at two minutes.
+slow-timeout = { period = "30s", terminate-after = 4 }
+
+[[profile.default.overrides]]
+# The crash suite kills and re-runs real processes on purpose, with fsync on; its tests take up
+# to a minute on the macOS runner. Fail at ten.
+filter = 'binary_id(forklift::crash_consistency)'
+slow-timeout = { period = "60s", terminate-after = 10 }
