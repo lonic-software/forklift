@@ -8,10 +8,9 @@
 # a loaded machine does not trip them.
 
 [profile.default]
-# Every test outside the crash suite's kill tests finishes in seconds: across the three runners'
-# CI logs of 2026-10-13, the slowest was about twenty seconds (macOS, in an experimental run at
-# twice the default thread count), once the over-cap subtree fixture stopped writing ten thousand
-# blob files. Fail at two minutes.
+# Every test outside the crash suite's kill tests finishes in seconds: in the CI logs of
+# 2026-10-13, the slowest was about twenty seconds (macOS at one thread per core; Windows at
+# twice that, as CI runs it, peaked at twelve). Fail at two minutes.
 slow-timeout = { period = "30s", terminate-after = 4 }
 
 [[profile.default.overrides]]
@@ -21,3 +20,14 @@ slow-timeout = { period = "30s", terminate-after = 4 }
 # keep the default.
 filter = 'binary_id(forklift::crash_consistency) & test(/^killing_/)'
 slow-timeout = { period = "120s", terminate-after = 5 }
+
+[[profile.default.overrides]]
+# Off macOS, each kill test also takes two of nextest's slots. CI runs twice as many tests as
+# cores on Linux and Windows because most tests wait rather than compute, but the kill tests write
+# with fsync on throughout, and fsync-heavy tests slow each other down past one per core rather than filling idle
+# time; two slots each keeps them at about one per core. macOS CI runs one test per core, where
+# two slots would only make the kill tests wait for each other: on its three cores they ran one
+# after another and the run took 209 s instead of 149 s.
+platform = 'cfg(not(target_os = "macos"))'
+filter = 'binary_id(forklift::crash_consistency) & test(/^killing_/)'
+threads-required = 2
