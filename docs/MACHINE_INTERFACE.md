@@ -456,7 +456,9 @@ for example one killed by a signal, is always an error. Its first item names how
 account of itself is not lost.
 
 The server ignores `SIGPIPE`: a client that stops reading ends the server once the call
-in progress has finished, instead of killing it, and that call's `forklift`, mid-run.
+in progress has finished, instead of killing it, and that call's `forklift`, mid-run. That is
+the end of the connection, as stdin closing is: the server exits with status 0 and writes
+nothing to stderr.
 
 Requests are answered one at a time, in the order they arrive.
 

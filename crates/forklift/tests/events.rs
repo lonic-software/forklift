@@ -423,3 +423,37 @@ fn an_unusable_variable_leaves_the_command_unaffected() {
             .unwrap_or_else(|error| panic!("PULT_EVENTS={:?}: stdout is not one JSON document ({})", value, error));
     }
 }
+
+#[test]
+fn an_mcp_call_reporting_progress_finishes_after_its_client_has_gone() {
+    use std::io::{BufRead, Write};
+
+    let warehouse = TestWarehouse::new("mcp-progress-gone");
+    warehouse.prepare_with_a_parcel();
+    let pack = warehouse.root.join(".forklift/objects/pack");
+    assert!(!pack.exists(), "packed before the call");
+
+    let mut child = warehouse.command(&["mcp"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\"}}\n").unwrap();
+    let mut reply = String::new();
+    std::io::BufReader::new(child.stdout.as_mut().unwrap()).read_line(&mut reply).unwrap();
+    assert!(reply.contains("\"id\":1"), "{}", reply);
+
+    // The client is gone before the call: every progress notification and the response fail.
+    drop(child.stdout.take());
+    stdin.write_all(br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"compact","arguments":{},"_meta":{"progressToken":"p1"}}}"#).unwrap();
+    stdin.write_all(b"\n").unwrap();
+    drop(stdin);
+
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.signal(), None, "killed by a signal: {:?}", output.status);
+    assert!(output.status.success(), "{:?}: {}", output.status, String::from_utf8_lossy(&output.stderr));
+    assert!(pack.is_dir(), "the call did not run to the end");
+}

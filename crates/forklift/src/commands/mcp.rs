@@ -36,7 +36,7 @@ const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 ///            client launches the server inside a warehouse.
 ///
 /// # Returns
-/// * `Ok(())`      - When stdin closes.
+/// * `Ok(())`      - When stdin closes, or the client stops reading stdout.
 /// * `Err(String)` - If the root is unusable, or stdin/stdout fails irrecoverably.
 pub fn handle_command(root: Option<String>) -> Result<(), String> {
     if let Some(root) = root {
@@ -46,7 +46,7 @@ pub fn handle_command(root: Option<String>) -> Result<(), String> {
 
     // A client that goes away must not kill this server mid-call: the call's child would be
     // orphaned, and die on its own next write to the stdout nobody reads any more. With the
-    // signal ignored, the write fails instead, and the loop ends once the call has finished.
+    // signal ignored, the write fails instead, and the server ends once the call has finished.
     // Each child restores the default disposition in its own `main`.
     #[cfg(unix)]
     unsafe {
@@ -77,19 +77,24 @@ pub fn handle_command(root: Option<String>) -> Result<(), String> {
             continue;
         };
 
-        write_message(&mut stdout, &response)?;
+        match write_message(&mut stdout, &response) {
+            Ok(()) => {}
+            // The client has gone: the connection is over, as it is when stdin closes. Nothing
+            // is left to report it to, and stderr may well have gone with it.
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => return Ok(()),
+            Err(e) => return Err(format!("Error while writing stdout: {}", e)),
+        }
     }
 
     Ok(())
 }
 
 /// Write one JSON-RPC message as a line and flush it.
-fn write_message(stdout: &mut std::io::Stdout, message: &Value) -> Result<(), String> {
-    let text = serde_json::to_string(message)
-        .map_err(|e| format!("Error while encoding a response: {}", e))?;
+fn write_message(stdout: &mut std::io::Stdout, message: &Value) -> std::io::Result<()> {
+    let text = serde_json::to_string(message).map_err(std::io::Error::other)?;
 
-    writeln!(stdout, "{}", text).map_err(|e| format!("Error while writing stdout: {}", e))?;
-    stdout.flush().map_err(|e| format!("Error while flushing stdout: {}", e))
+    writeln!(stdout, "{}", text)?;
+    stdout.flush()
 }
 
 /// State the server keeps for the life of one stdio connection. It exists to **harden

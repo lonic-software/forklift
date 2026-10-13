@@ -2380,7 +2380,8 @@ fn mcp_is_not_killed_by_a_client_that_stopped_reading() {
 
     let output = child.wait_with_output().unwrap();
     assert_eq!(output.status.signal(), None, "killed by a signal: {:?}", output.status);
-    assert!(!output.status.success(), "a failed write is still a failure: {:?}", output.status);
+    assert!(output.status.success(), "a client that left is the end of the connection: {:?}", output.status);
+    assert!(output.stderr.is_empty(), "{}", String::from_utf8_lossy(&output.stderr));
 }
 
 #[test]
