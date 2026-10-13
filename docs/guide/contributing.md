@@ -92,8 +92,9 @@ Notes:
   `.config/nextest.toml` reports a test as SLOW at 30 s and fails it at two
   minutes; the crash suite's kill tests get ten. CI runs twice as many tests
   as cores, so a test with a wall-clock bound needs margin
-  for a shared core; `cargo nextest run --test-threads $((2 * $(nproc 2>/dev/null || sysctl -n hw.ncpu)))`
-  reproduces that load locally.
+  for a shared core; `cargo nextest run --profile ci --test-threads $((2 * $(nproc 2>/dev/null || sysctl -n hw.ncpu)))`
+  reproduces that load locally (the `ci` profile gives the crash suite's kill
+  tests two slots each, which only pays at that thread count).
 - To install a working binary (e.g. to dogfood): `cargo install --path
   crates/forklift --force` (lands in `~/.cargo/bin`).
 
