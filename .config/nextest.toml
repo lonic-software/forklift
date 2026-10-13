@@ -9,13 +9,15 @@
 
 [profile.default]
 # Every test outside the crash suite's kill tests finishes in seconds: across the three runners'
-# logs of 2026-10-13, the slowest was about twenty seconds (a macOS run at twice the default
-# thread count). Fail at two minutes.
+# CI logs of 2026-10-13, the slowest was about twenty seconds (macOS, in an experimental run at
+# twice the default thread count), once the over-cap subtree fixture stopped writing ten thousand
+# blob files. Fail at two minutes.
 slow-timeout = { period = "30s", terminate-after = 4 }
 
 [[profile.default.overrides]]
 # The crash suite's kill tests kill and re-run real processes on purpose, with fsync on, and
 # calibrate their kill delays to how long a run takes on the loaded runner; the slowest seen was
-# 99 s on macOS. Fail at ten minutes. The suite's other tests keep the default.
+# 99 s on macOS. Report SLOW past that, at two minutes, and fail at ten. The suite's other tests
+# keep the default.
 filter = 'binary_id(forklift::crash_consistency) & test(/^killing_/)'
-slow-timeout = { period = "60s", terminate-after = 10 }
+slow-timeout = { period = "120s", terminate-after = 5 }
