@@ -441,10 +441,42 @@ the working directory. It implements `initialize`, `tools/list` and `tools/call`
 
 Each tool re-invokes `forklift … --json` and returns its envelope, so the tools speak
 the exact structured output above (and inherit the warehouse lock and exit-code
-taxonomy). A failure document (`ok: false`) comes back as an MCP tool error (`isError:
-true`) carrying the error envelope — the agent sees the stable `code`/`next_step`, not
-a crashed session. `isError` follows `ok`, not the exit status; only a run that wrote no
-document falls back to its exit status.
+taxonomy). The tool result's content is:
+
+* the envelope, as the first text item;
+* then each stderr line that is a [warning document](#--json), one text item each, in
+  order. Other stderr is not forwarded.
+
+A failure document (`ok: false`) comes back as an MCP tool error (`isError: true`)
+carrying the error envelope — the agent sees the stable `code`/`next_step`, not a crashed
+session. `isError` follows `ok`, not the exit status. A run that left no document at all,
+for example one killed by a signal, is always an error: its first item is a sentence
+naming how it ended (`forklift left no result document: it was killed by signal 9.`).
+
+Requests are answered one at a time, in the order they arrive.
+
+**Progress.** A `tools/call` whose request carries `_meta.progressToken` gets
+`notifications/progress` for that token while it runs. The server hands the call a
+[progress-events](#progress-events) channel of its own and turns the events into
+notifications:
+
+* `total` is never sent. An operation can start a phase over, and a fraction sent before
+  that would have reported the whole operation done.
+* `progress` is 100 × the number of resets seen + the event's percentage, where a reset is
+  a percentage lower than the previous one. Each new phase therefore raises the value
+  instead of rewinding it. Read it as a strictly increasing tick, not a fraction.
+* `progress` strictly increases. An event that would not raise it is still sent if it
+  brings new text, at the last value plus 1/128; otherwise it is dropped.
+* `message` carries the phase, the percentage and the event's text
+  (`Packing objects: 40% …`), and is sent only when the negotiated protocol is
+  `2025-06-18` or later, the first version that has the field. Before that version, only
+  events that raise the value are sent.
+* At most one notification goes out every 100 ms. What arrives in between is folded into
+  the next one: the highest value and the newest text.
+* Every notification for a call is written before that call's response, never after.
+
+Only `compact`, `lift` and `lower` report progress. Other tools send no notifications,
+and progress needs macOS or Linux, as the channel does.
 
 The tool surface **mirrors the CLI** — every CLI command is exposed as a tool (a
 multi-subcommand command becomes `<command>_<subcommand>` tools) or is on a small
