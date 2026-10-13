@@ -2687,10 +2687,11 @@ mod tests {
     /// depth scales with the stack, so a small one lets a shallow tree prove the same thing a
     /// deep one would on the default stack. That keeps the fixture cheap: every level is a file
     /// written and read back, and on Windows CI 50,000 levels against the default 2 MiB stack
-    /// took ~226 s. With `STACK` at 256 KiB the recursive shape dies within the first few
-    /// hundred levels, and `DEPTH` sits well past that. The iterative walk's stack use does not
-    /// grow with depth, so the small stack costs it nothing. Its storage-root scope is entered
-    /// on that thread, because the scope is thread-local.
+    /// took ~226 s. Measured on a macOS debug build with `STACK` at 256 KiB: the recursive shape
+    /// survives 100 levels and dies by 150, so `DEPTH` is over 13x past it; the iterative walk,
+    /// whose stack use does not grow with depth, passes on 32 KiB and overflows on 16 KiB, so
+    /// `STACK` leaves it 8x headroom. The walk's storage-root scope is entered on that thread,
+    /// because the scope is thread-local.
     ///
     /// Tree objects are written directly to their final on-disk path (`write_tree_object_fast`)
     /// rather than through `LooseObject::store` (which fsyncs, and renames through a barrier,
