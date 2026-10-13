@@ -21,8 +21,9 @@
 //!   writing thread and has no such fd flag, so the writer thread blocks the signal. Other
 //!   platforms have neither mechanism verified, and never open the channel.
 //! * The channel belongs to this process alone. `PULT_EVENTS` is removed from the environment
-//!   and the fd is made close-on-exec, so a child Forklift spawns (a `forklift` per MCP tool call,
-//!   `git`, a shell) neither writes into the channel nor holds it open.
+//!   and the fd it names is made close-on-exec whether or not it is accepted, so a child Forklift
+//!   spawns (a `forklift` per MCP tool call, `git`, a shell) neither writes into the channel nor
+//!   holds it open.
 
 // Off macOS and Linux nothing opens a channel, so the line and queue machinery is unused there.
 #![cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
@@ -235,6 +236,16 @@ mod channel {
     pub(super) fn open(value: &OsStr) -> Option<Arc<Channel>> {
         let fd = parse_fd(value)?;
 
+        // Close-on-exec before any check can refuse the fd: a refused write end held open by a
+        // child, or by a daemon it leaves behind, would keep the reader from ever seeing EOF.
+        // SAFETY: `fcntl` with an integer argument has no memory effects; on a number that is not
+        // open it fails with `EBADF` and changes nothing. The flag belongs to this process's
+        // descriptor, not the shared open file description, so it changes nothing for anyone else
+        // holding the fd.
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+            return None;
+        }
+
         let stream = writable_stream(fd)?;
 
         #[cfg(target_os = "macos")]
@@ -244,13 +255,6 @@ mod channel {
 
         #[cfg(not(target_os = "macos"))]
         let _ = stream;
-
-        // SAFETY: `fcntl` on a validated open fd with an integer argument has no memory effects.
-        // The close-on-exec flag belongs to this process's descriptor, not the shared open file
-        // description, so it changes nothing for anyone else holding the channel.
-        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
-            return None;
-        }
 
         Some(start(fd))
     }
@@ -631,6 +635,17 @@ mod tests {
             // SAFETY: reads the descriptor flags of an fd we own.
             assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC, 0, "a fresh pipe was already close-on-exec");
             assert!(open(OsStr::new(&fd.to_string())).is_some());
+            // SAFETY: as above.
+            assert_ne!(unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC, 0);
+        }
+
+        #[test]
+        fn a_refused_fd_is_made_close_on_exec_too() {
+            let (reader, _writer) = pipe();
+            let fd = reader.as_raw_fd();
+            // SAFETY: reads the descriptor flags of an fd we own.
+            assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC, 0, "a fresh pipe was already close-on-exec");
+            assert!(open(OsStr::new(&fd.to_string())).is_none(), "a read end was accepted");
             // SAFETY: as above.
             assert_ne!(unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC, 0);
         }

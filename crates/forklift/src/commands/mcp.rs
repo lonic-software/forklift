@@ -426,9 +426,10 @@ fn run_forklift_reporting(
         }
     });
 
-    // The channel ends when the child does: it holds the only write end, and keeps it from
-    // anything it runs. Something that held it anyway would hold the child's stdout too, which
-    // the joins below wait on regardless, so a timeout here would buy nothing.
+    // The channel ends when the child does: it holds the only write end, and makes it
+    // close-on-exec at startup whether or not it accepts it, so nothing it runs inherits it. That
+    // matters, since the loop waits for the end with no timeout: a descendant that detaches from
+    // its stdio (as `git gc --auto` does) would otherwise keep the channel, and this call, open.
     loop {
         match events.recv_timeout(NOTIFICATION_INTERVAL / 2) {
             Ok(event) => progress.receive(event),
