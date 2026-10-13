@@ -8980,6 +8980,61 @@ mod tests {
         let _ = std::fs::remove_file(&dest);
     }
 
+    /// A completed download lands at the destination through the fsync-on path: the bundle is
+    /// synced through the handle that wrote it, then renamed into place. The integration suites
+    /// launch their binaries with durability off, so this in-process test is what still runs
+    /// `fetch_bundle_to`'s `sync_all` — the call that fails on Windows if the file is synced
+    /// through a handle without write access.
+    #[test]
+    fn fetch_bundle_to_syncs_and_publishes_a_complete_bundle() {
+        assert!(
+            file_utils::fsync_enabled(),
+            "this test exists to run the fsync-on path; unset FORKLIFT_FSYNC to run it"
+        );
+        let remote = CannedBodyRemote::start(b"a complete bundle");
+        let client = fast_client(&remote.url);
+        let dest = std::env::temp_dir().join(format!(
+            "forklift-fetch-bundle-to-complete-{}-{}", std::process::id(), line!()
+        ));
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let fetched = runtime.block_on(client.fetch_bundle_to(&dest));
+
+        assert_eq!(fetched, Ok(true));
+        assert_eq!(std::fs::read(&dest).unwrap(), b"a complete bundle");
+        let _ = std::fs::remove_file(&dest);
+    }
+
+    /// A remote that answers one request with `200` and the given body, then closes.
+    struct CannedBodyRemote {
+        url: String,
+    }
+
+    impl CannedBodyRemote {
+        fn start(body: &'static [u8]) -> CannedBodyRemote {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+
+            std::thread::spawn(move || {
+                use std::io::Write;
+
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let _ = read_test_request(&mut stream);
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(body);
+                    let _ = stream.flush();
+                }
+            });
+
+            CannedBodyRemote { url }
+        }
+    }
+
     // -----------------------------------------------------------------------------------
     // The single-write mutation path: `upload_signature`/`put_trust` used to ride
     // `Posture::UnboundedNoRedirect`, genuinely unbounded, on the theory that no client here
