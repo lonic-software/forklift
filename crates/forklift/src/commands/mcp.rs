@@ -1369,6 +1369,14 @@ mod tests {
         // And the steps start again from there.
         mapper.receive(Reported::Progress { percent: None, text: "y".into() });
         assert_eq!(mapper.finish(), Some((12.0 + super::TEXT_ONLY_STEP, Some("phase 10000: y".into()))));
+
+        // A phase seen once does not give later text the phases' share.
+        let mut sent = 1;
+        for index in 0..5000u32 {
+            mapper.receive(Reported::Progress { percent: None, text: index.to_string() });
+            sent += u32::from(mapper.finish().is_some());
+        }
+        assert_eq!(sent, super::TEXT_ONLY_TEXT_LIMIT);
     }
 
     fn progress(percent: u8, text: &str) -> Reported {
