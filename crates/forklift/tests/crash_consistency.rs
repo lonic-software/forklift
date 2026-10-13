@@ -48,12 +48,15 @@ impl Area {
         self.root.join("warehouse")
     }
 
-    /// A command in the warehouse with the isolated global config and key directory.
+    /// A command in the warehouse with the isolated global config and key directory, and fsync
+    /// forced on: durability is what this suite checks, so a `FORKLIFT_FSYNC=0` in the
+    /// environment the tests were started from must not reach the binary.
     fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(FORKLIFT);
         command
             .args(args)
             .current_dir(self.warehouse())
+            .env("FORKLIFT_FSYNC", "1")
             .env("FORKLIFT_GLOBAL_CONFIG", self.root.join("home").join("global-config.toml"))
             .env("FORKLIFT_KEYS_DIR", self.root.join("home").join("keys"));
         command
@@ -106,10 +109,29 @@ impl Drop for Area {
     }
 }
 
-/// Overwrite the corpus file with a fresh, same-order-of-magnitude payload so each `stack` call
-/// (calibration or real) has real hashing/compression/fsync work to do.
-fn rewrite_corpus(file: &Path, base_line: &str, tag: &str) {
-    std::fs::write(file, format!("{}{}\n", base_line.repeat(90_000), tag)).unwrap();
+/// Lines in the `stack` test's single corpus file, about four megabytes.
+const STACK_CORPUS_LINES: usize = 90_000;
+
+/// Lines in each of the 24 files the `load` and `park` tests spread their corpus over, about a
+/// megabyte each.
+///
+/// The corpus is one line repeated, so it compresses to an object of a few kilobytes: the line
+/// count sets how long hashing and compression take, not how many bytes are fsynced. What the
+/// size has to buy is a run long enough that the calibrated kill delays, at least
+/// `MIN_STEP_MS` apart, still fall inside it rather than in process startup or after the end;
+/// shrinking it trades exactly that away.
+const SPREAD_CORPUS_LINES: usize = 22_500;
+
+/// Overwrite a corpus file with a fresh payload of `lines` lines so each call under test
+/// (calibration or real) has real hashing/compression/write work to do. The tag ends with the
+/// file's directory and name, so the files of one round differ: identical files would be stored
+/// as one content-addressed blob, and a kill round would cover one object write rather than one
+/// per file. Only the last two path components go in, so the content does not depend on the
+/// temp directory and is the same on every run and OS.
+fn rewrite_corpus(file: &Path, base_line: &str, lines: usize, tag: &str) {
+    let dir = file.parent().and_then(|p| p.file_name()).unwrap().to_str().unwrap();
+    let name = file.file_name().unwrap().to_str().unwrap();
+    std::fs::write(file, format!("{}{} {}/{}\n", base_line.repeat(lines), tag, dir, name)).unwrap();
 }
 
 /// The current pallet head, if one exists yet.
@@ -136,7 +158,7 @@ fn calibrate_stack_duration(area: &Area, file: &Path, base_line: &str, label: &s
 
     let mut slowest = Duration::ZERO;
     for i in 0..samples {
-        rewrite_corpus(file, base_line, &format!("{label} {i}"));
+        rewrite_corpus(file, base_line, STACK_CORPUS_LINES, &format!("{label} {i}"));
         let load = area.run(&["load", "."]);
         assert!(load.status.success(), "calibration load failed: {}", String::from_utf8_lossy(&load.stderr));
 
@@ -232,7 +254,7 @@ fn run_kill_spread(
         *prior_head = head_now;
 
         // 2. Make a fresh change and stage it.
-        rewrite_corpus(file, base_line, &format!("{commit_tag} {i}"));
+        rewrite_corpus(file, base_line, STACK_CORPUS_LINES, &format!("{commit_tag} {i}"));
         let load = area.run(&["load", "."]);
         assert!(load.status.success(), "load failed: {}", String::from_utf8_lossy(&load.stderr));
 
@@ -258,10 +280,11 @@ fn killing_stack_midway_never_corrupts_the_store() {
     let warehouse = area.warehouse();
     let file = warehouse.join("big.dat");
 
-    // A few megabytes so hashing, compression, the fsync and the rename take long enough that some
-    // of the kills below land inside the write window rather than always before or after it.
+    // A few megabytes so the run is long enough that some of the kills below land inside the
+    // write window rather than always before or after it (see `SPREAD_CORPUS_LINES` for what the
+    // size does and does not scale).
     let base_line = "the quick brown fox jumps over the lazy dog\n";
-    std::fs::write(&file, base_line.repeat(90_000)).unwrap();
+    rewrite_corpus(&file, base_line, STACK_CORPUS_LINES, "seed");
 
     assert!(area.run(&["prepare"]).status.success());
     assert!(area.run(&["config", "operator.name", "crash@forklift"]).status.success());
@@ -340,7 +363,7 @@ fn calibrate_load_duration(area: &Area, files: &[PathBuf], base_line: &str, labe
     let mut slowest = Duration::ZERO;
     for i in 0..samples {
         for file in files {
-            rewrite_corpus(file, base_line, &format!("{label} {i}"));
+            rewrite_corpus(file, base_line, SPREAD_CORPUS_LINES, &format!("{label} {i}"));
         }
 
         let start = Instant::now();
@@ -368,7 +391,9 @@ fn calibrate_load_duration(area: &Area, files: &[PathBuf], base_line: &str, labe
 ///
 /// Returns how many iterations produced a completed `stack` (the signal that this iteration's
 /// kill left something a later step could — and did — build on, not just "killed before
-/// anything").
+/// anything"). Each iteration ends by loading and stacking everything, so the next one starts
+/// with nothing staged: a `stack` that succeeds can only be committing what that iteration's
+/// killed load staged, never the previous iteration's heal.
 ///
 /// The incomplete-load guard (`load_guard_utils`) durably marks a load's root the instant it
 /// starts — before this test's kill ever lands — precisely so a killed `load` is caught even
@@ -387,6 +412,11 @@ fn run_load_kill_spread(
 ) -> usize {
     let mut stacked = 0usize;
 
+    // Commit whatever calibration left staged, so the first iteration's `stack`, like every
+    // later one, can only succeed on what its own killed load staged.
+    area.clear_stale_lock();
+    settle(area, &format!("{commit_tag} settle"));
+
     for (i, delay) in delays.iter().enumerate() {
         // 1. Recover from the previous iteration's kill and check it left the store consistent.
         area.clear_stale_lock();
@@ -395,7 +425,7 @@ fn run_load_kill_spread(
         // 2. A fresh change to every file in the corpus, so the walk below has real work to do
         //    across every directory, not just the ones already touched by an earlier iteration.
         for file in files {
-            rewrite_corpus(file, base_line, &format!("{commit_tag} {i}"));
+            rewrite_corpus(file, base_line, SPREAD_CORPUS_LINES, &format!("{commit_tag} {i}"));
         }
 
         // 3. Spawn the load and SIGKILL it mid-flight.
@@ -420,26 +450,37 @@ fn run_load_kill_spread(
             forklift_core::util::load_guard_utils::marker_path_under(&area.warehouse())
         );
 
-        let stack = area.run(&["stack", &format!("{commit_tag} commit {i}")]);
-        let stderr_lower = String::from_utf8_lossy(&stack.stderr).to_lowercase();
-        let nothing_to_stack = stderr_lower.contains("nothing to stack");
-        assert!(stack.status.success() || nothing_to_stack,
-            "{commit_tag} kill #{i}: stack must either succeed or report nothing staged, stderr: {}",
-            String::from_utf8_lossy(&stack.stderr));
-
-        if stack.status.success() {
+        if stack_or_nothing(area, &format!("{commit_tag} commit {i}")) {
             stacked += 1;
         }
 
-        // 5. Bring the working directory fully up to date before the next iteration's rewrite —
-        //    an uninterrupted `load .`, so leftover partial state from this iteration's kill
-        //    never carries over as ambiguity into the next one.
-        let heal = area.run(&["load", "."]);
-        assert!(heal.status.success(), "{commit_tag} kill #{i}: healing load failed: {}",
-            String::from_utf8_lossy(&heal.stderr));
+        // 5. Stage and commit the working directory's current content with an uninterrupted
+        //    `load .` and `stack`, so leftover partial state from this iteration's kill never
+        //    carries over as ambiguity, and nothing is staged when the next iteration starts.
+        settle(area, &format!("{commit_tag} heal {i}"));
     }
 
     stacked
+}
+
+/// An uninterrupted `load .` and a `stack` of whatever it staged, so nothing is left staged for
+/// the next `stack` to pick up. `context` names the step in a failure and is the commit message.
+fn settle(area: &Area, context: &str) {
+    let load = area.run(&["load", "."]);
+    assert!(load.status.success(), "{context}: load failed: {}",
+        String::from_utf8_lossy(&load.stderr));
+    stack_or_nothing(area, context);
+}
+
+/// Run `stack` with `message` and return whether it committed. Anything other than a commit or
+/// "nothing to stack" fails the test.
+fn stack_or_nothing(area: &Area, message: &str) -> bool {
+    let stack = area.run(&["stack", message]);
+    let nothing_to_stack = String::from_utf8_lossy(&stack.stderr).to_lowercase().contains("nothing to stack");
+    assert!(stack.status.success() || nothing_to_stack,
+        "{message}: stack must either succeed or report nothing staged, stderr: {}",
+        String::from_utf8_lossy(&stack.stderr));
+    stack.status.success()
 }
 
 /// Extends the crash-consistency spine to `load`'s parallel per-directory walk (DESIGN.html §5.0
@@ -471,7 +512,7 @@ fn killing_load_midway_never_leaves_a_shard_referencing_a_missing_or_torn_blob()
 
         for f in 0..4 {
             let file = dir_path.join(format!("file{f}.dat"));
-            std::fs::write(&file, base_line.repeat(20_000)).unwrap();
+            rewrite_corpus(&file, base_line, SPREAD_CORPUS_LINES, "seed");
             files.push(file);
         }
     }
@@ -538,7 +579,7 @@ fn calibrate_park_duration(area: &Area, files: &[PathBuf], base_line: &str, labe
     let mut slowest = Duration::ZERO;
     for i in 0..samples {
         for file in files {
-            rewrite_corpus(file, base_line, &format!("{label} {i}"));
+            rewrite_corpus(file, base_line, SPREAD_CORPUS_LINES, &format!("{label} {i}"));
         }
 
         let start = Instant::now();
@@ -594,7 +635,7 @@ fn run_park_kill_spread(
         area.assert_consistent(&format!("after park {tag} kill #{i}"));
 
         for file in files {
-            rewrite_corpus(file, base_line, &format!("park-{tag} {i}"));
+            rewrite_corpus(file, base_line, SPREAD_CORPUS_LINES, &format!("park-{tag} {i}"));
         }
 
         let before = parked_count(warehouse);
@@ -652,7 +693,7 @@ fn killing_park_midway_never_leaves_a_parked_parcel_referencing_a_missing_or_tor
 
         for f in 0..4 {
             let file = dir_path.join(format!("file{f}.dat"));
-            std::fs::write(&file, base_line.repeat(20_000)).unwrap();
+            rewrite_corpus(&file, base_line, SPREAD_CORPUS_LINES, "seed");
             files.push(file);
         }
     }

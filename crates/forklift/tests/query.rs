@@ -8,9 +8,10 @@
 //! is what's forge-proof); a recorded query must show the divergence the other way. If the
 //! engine ever prunes on the recorded value before verifying, this test fails.
 
-use std::process::{Command, Output};
+use std::process::Output;
 
-const FORKLIFT: &str = env!("CARGO_BIN_EXE_forklift");
+mod common;
+use common::forklift_command;
 
 struct TestWarehouse {
     root: std::path::PathBuf,
@@ -39,7 +40,7 @@ impl TestWarehouse {
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(FORKLIFT)
+        forklift_command()
             .args(args)
             .current_dir(&self.root)
             // Tests must never read or write the developer's real global configuration.
@@ -56,7 +57,7 @@ impl TestWarehouse {
         use std::io::Write;
         use std::process::Stdio;
 
-        let mut child = Command::new(FORKLIFT)
+        let mut child = forklift_command()
             .args(args)
             .current_dir(&self.root)
             .env("FORKLIFT_GLOBAL_CONFIG", self.home.join("global-config.toml"))

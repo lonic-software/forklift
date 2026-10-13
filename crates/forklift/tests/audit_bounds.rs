@@ -14,14 +14,15 @@
 //!   point and re-verified ancestry that was audited when `old_head` was committed.
 
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::Output;
 
 use forklift_core::globals::StorageRootScope;
 use forklift_core::util::{
     audit_utils, file_utils, graph_utils, object_utils, office_utils, pallet_utils,
 };
 
-const FORKLIFT: &str = env!("CARGO_BIN_EXE_forklift");
+mod common;
+use common::forklift_command;
 
 /// The chunk threshold (bytes): content at or above this is stored chunked. Mirrors
 /// `chunk_utils::CHUNK_THRESHOLD_BYTES` (a frozen format constant).
@@ -53,7 +54,7 @@ impl Warehouse {
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(FORKLIFT)
+        forklift_command()
             .args(args)
             .current_dir(&self.root)
             .env("FORKLIFT_GLOBAL_CONFIG", self.home.join("global-config.toml"))

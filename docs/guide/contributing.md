@@ -70,6 +70,13 @@ Notes:
   `FORKLIFT_KEYS_DIR` env vars pointed at a scratch directory, so they never
   touch a developer's real config or keys. Use the same pattern for new tests
   (`TestWarehouse` / `TestArea` helpers already do this).
+- Integration tests launch the binaries with `FORKLIFT_FSYNC=0`, which makes the
+  suite much faster: `forklift_command()` in `crates/forklift/tests/common/mod.rs`
+  (and `server_command()` in `remote.rs`) sets it. Launch through those helpers,
+  not `Command::new(FORKLIFT)`. The exception is `crash_consistency.rs`, the
+  durability suite, which forces fsync on. In-process tests leave fsync on, so
+  they are what still runs the sync calls; a sync call that no in-process test
+  reaches needs one.
 - The hardening test spine is worth knowing when touching the object store,
   the parsers, or the parallel walks: `crates/forklift-core/tests/fuzz_formats.rs`
   fuzzes every parse entry point (must never panic) and checks round-trip
@@ -78,6 +85,12 @@ Notes:
   byte-reproducible repacks, and the warehouse-lock refusal. A parser or
   format change should keep the fuzzer green; if you add a length-prefixed field,
   bound it with a `checked_add` (never `start + length` before the bounds check).
+- Keep tests fast: CI runs the suite on every pull request, on three OSes. A
+  test that has to watch a timeout fire arms a short one instead of waiting out
+  production's (see `FAST` in `remote_utils.rs`), and a fixture writes only the
+  files the code under test reads. Under `cargo nextest run`, which CI uses,
+  `.config/nextest.toml` reports a test as SLOW at 30 s and fails it at two
+  minutes; the crash suite's kill tests get ten.
 - To install a working binary (e.g. to dogfood): `cargo install --path
   crates/forklift --force` (lands in `~/.cargo/bin`).
 

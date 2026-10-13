@@ -9,8 +9,8 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 
-/// Path to the compiled forklift binary (provided by cargo for integration tests).
-const FORKLIFT: &str = env!("CARGO_BIN_EXE_forklift");
+mod common;
+use common::forklift_command;
 
 /// The longest line the emitter may write, newline included.
 const MAX_LINE_BYTES: usize = 512;
@@ -44,7 +44,7 @@ impl TestWarehouse {
     }
 
     fn command(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(FORKLIFT);
+        let mut command = forklift_command();
 
         command.args(args)
             .current_dir(&self.root)
