@@ -10960,6 +10960,39 @@ mod tests {
         runtime.block_on(assert_still_running("fetch_info (Tor-routed)", check_after, client.fetch_info()));
     }
 
+    /// A connect that never completes must fail on this client's own connect bound, and the
+    /// message must name that bound as a connect failure. [`ParkingSocksProxy`] never finishes the
+    /// SOCKS handshake, so the call stalls inside the connector; a Tor-routed [`FAST`] client
+    /// carries [`FAST_TOR_CONNECT`], a figure neither production connect bound shares, so an arm
+    /// that printed a production constant, or a connector armed with one, fails here.
+    #[test]
+    fn a_stalled_connect_names_this_clients_connect_bound() {
+        let proxy = ParkingSocksProxy::start();
+        let tor = TorSettings { mode: TorMode::On, proxy: format!("socks5h://{}", proxy.addr) };
+        let client = RemoteClient::new_test_with_tor_budgets(
+            "http://forklift-connect-message-test.invalid", tor, fast_budgets,
+        ).unwrap();
+        let hard_ceiling = FAST_TOR_CONNECT + std::time::Duration::from_secs(15);
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let outcome = runtime.block_on(async {
+            tokio::time::timeout(hard_ceiling, client.fetch_info()).await
+        });
+        let message = match outcome.unwrap_or_else(|_| panic!(
+            "fetch_info hung past the test's own {:?} ceiling — the connect bound never fired",
+            hard_ceiling
+        )) {
+            Err(message) => message,
+            Ok(_) => panic!("a connect that never completes must not appear to succeed"),
+        };
+
+        assert!(
+            message.contains(&format!("could not connect to the remote within {:?}", FAST_TOR_CONNECT)),
+            "must fail as a connect timeout naming this client's connect bound {:?}: {}",
+            FAST_TOR_CONNECT, message
+        );
+    }
+
     /// A fixture SOCKS5 proxy that **completes the handshake honestly** — greeting, method
     /// selection, and a successful `CONNECT` reply, per RFC 1928 — so the connector's own
     /// `connect_timeout` enforcement is satisfied and the call moves past the connect phase
