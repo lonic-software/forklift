@@ -153,9 +153,9 @@ pub fn get_path_graph_root() -> String {
 /// fan-out folder off of, and every character an ASCII hex digit of either case. A full hash in
 /// its canonical spelling is [`crate::util::object_utils::is_object_hash`]. This is the one rule
 /// [`get_path_for_object`] enforces (and the only one — it does not check length against any
-/// particular digest's width), pulled out so a caller that needs to know *whether* a string is hash-shaped, without wanting the
-/// path or the error string, has something to call instead of re-deriving the condition (or,
-/// worse, inferring it from [`get_path_for_object`]'s `Err` text).
+/// particular digest's width), pulled out so a caller that needs to know *whether* a string is
+/// hash-shaped, without wanting the path or the error string, has something to call instead of
+/// re-deriving the condition (or, worse, inferring it from [`get_path_for_object`]'s `Err` text).
 ///
 /// # Arguments
 /// * `hash` - The candidate string.

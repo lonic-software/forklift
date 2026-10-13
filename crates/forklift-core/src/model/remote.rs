@@ -84,10 +84,10 @@ impl TrustAnchorDto {
     /// look-alike characters is rejected where an anchor is read — the client's handshake, the
     /// server's `PUT /v1/trust` — rather than sanitized at each place it is printed.
     pub fn validate(&self) -> Result<(), String> {
-        let fields = std::iter::once(("genesis", &self.genesis))
-            .chain(self.boundary.iter().map(|hash| ("boundary", hash)))
-            .chain(self.prior_genesis.iter().map(|hash| ("prior_genesis", hash)))
-            .chain(self.adopts.iter().map(|hash| ("adopts", hash)));
+        let fields = std::iter::once(("genesis".to_string(), &self.genesis))
+            .chain(self.boundary.iter().enumerate().map(|(i, hash)| (format!("boundary[{}]", i), hash)))
+            .chain(self.prior_genesis.iter().map(|hash| ("prior_genesis".to_string(), hash)))
+            .chain(self.adopts.iter().map(|hash| ("adopts".to_string(), hash)));
 
         // The problem names the field and what is wrong with it, never the value: the value came
         // from a remote that is misbehaving, and repeating it would hand that remote the message.
@@ -402,7 +402,7 @@ mod tests {
 
         // The problem names the field and the defect, never the remote's value.
         let problem = anchor(&hash, vec![bidi.clone()], None).validate().unwrap_err();
-        assert!(problem.contains("boundary") && problem.contains("byte 32"), "{}", problem);
+        assert!(problem.contains("boundary[0]") && problem.contains("byte 32"), "{}", problem);
         assert!(!problem.contains('\u{202e}') && !problem.contains(&hash[..32]), "{}", problem);
         let problem = anchor(&escape, vec![], None).validate().unwrap_err();
         assert!(!problem.contains('\u{1b}'), "{}", problem);

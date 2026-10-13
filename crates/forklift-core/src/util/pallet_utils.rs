@@ -370,9 +370,19 @@ pub fn set_meta_pallet_head(name: &str, hash: &str) -> Result<(), String> {
 ///
 /// # Returns
 /// * `Ok(())`      - If the head was updated.
-/// * `Err(String)` - If the name is invalid or the ref file could not be written.
+/// * `Err(String)` - If the name is invalid, `hash` is not an object hash, or the ref file could
+///                   not be written.
 pub fn set_pallet_head_in(namespace: PalletNamespace, name: &str, hash: &str) -> Result<(), String> {
     validate_pallet_name(name)?;
+
+    // The writer holds the reader's rule: a ref `get_pallet_head_in` would refuse is never stored.
+    if !object_utils::is_object_hash(hash) {
+        return Err(format!(
+            "Refusing to set the head of pallet \"{}\": the value is not an object hash (64 \
+            lowercase hex characters).",
+            name
+        ));
+    }
 
     let path = get_pallet_ref_path(namespace, name);
 

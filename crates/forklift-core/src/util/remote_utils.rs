@@ -2816,6 +2816,18 @@ impl RemoteClient {
             trust.validate().map_err(|problem| String::from(trust_utils::malformed(self.url(), &problem)))?;
         }
 
+        // A head is written into a local ref as given, and only fetched (and so verified) when
+        // it is missing. A non-canonical spelling of a held head — uppercase finds the same file
+        // on a case-insensitive filesystem — would skip both and wedge the pallet. Neither the
+        // name nor the value is repeated: both came from the remote.
+        if info.pallets.values().any(|head| !object_utils::is_object_hash(head)) {
+            return Err(format!(
+                "The remote {} reports a pallet head that is not an object hash (64 lowercase hex \
+                characters). Refusing to sync with it; report it to whoever runs the remote.",
+                self.base
+            ));
+        }
+
         Ok(info)
     }
 
@@ -7307,6 +7319,50 @@ mod tests {
             error.to_lowercase().contains("location"),
             "the error should name the missing Location header: {}", error
         );
+    }
+
+    /// A handshake whose pallet head is not the canonical spelling of a hash is refused before
+    /// any caller can write it into a local ref. Uppercase is the case that matters: on a
+    /// case-insensitive filesystem it finds a held object's file, skips the fetch that would
+    /// verify it, and the ref it leaves behind is refused on every later read.
+    #[test]
+    fn fetch_info_refuses_a_handshake_with_a_non_canonical_pallet_head() {
+        let serve = |head: String| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let body = serde_json::json!({
+                "protocol": PROTOCOL_VERSION,
+                "default_pallet": "main",
+                "pallets": { "main": head },
+                "trust": null,
+            }).to_string();
+
+            std::thread::spawn(move || {
+                use std::io::Write;
+
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let _ = read_test_request(&mut stream);
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                        Connection: close\r\n\r\n{}",
+                        body.len(), body
+                    );
+                    let _ = stream.flush();
+                }
+            });
+
+            let client = RemoteClient::new(&url, None).unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            runtime.block_on(client.fetch_info())
+        };
+
+        let hash = "ab".repeat(32);
+        assert!(serve(hash.clone()).is_ok(), "a canonical head must pass");
+
+        let error = serve(hash.to_uppercase()).err().expect("an uppercase head must be refused");
+        assert!(error.contains("not an object hash"), "{}", error);
+        assert!(!error.contains(&hash.to_uppercase()), "the remote's value is not repeated: {}", error);
     }
 
     /// A remote that reads one request and answers it with a bare status line and an empty body —
