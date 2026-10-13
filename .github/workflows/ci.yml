@@ -117,7 +117,9 @@ jobs:
         shell: bash
         run: |
           cores=$(nproc 2>/dev/null || sysctl -n hw.ncpu)
-          threads=$(( cores * 2 ))
+          factor=2
+          [ "$RUNNER_OS" = macOS ] && factor=1
+          threads=$(( cores * factor ))
           echo "cores=$cores test-threads=$threads"
           cargo nextest run --workspace --no-fail-fast --test-threads "$threads"
 
