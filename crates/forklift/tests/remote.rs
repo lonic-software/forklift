@@ -4213,52 +4213,45 @@ fn the_path_addressed_subtree_endpoint_round_trips_a_path_with_reserved_characte
         "the endpoint delivered the reserved-character subtree's blob");
 }
 
-/// Build a subtree of `count` uniquely-named, uniquely-hashed blobs directly under one
-/// directory `name`, and set the warehouse's `main` head to a parcel rooted over it. Used to
-/// exceed the subtree endpoint's per-response object cap without paying for thousands of real
-/// `forklift` process calls.
+/// Build a subtree one entry over the subtree endpoint's per-response cap directly under one
+/// directory `name`, and set the warehouse's `main` head to a parcel rooted over it: a directory
+/// of [`MAX_MISSING_BATCH`] blobs, which with the directory's own tree makes a closure of one
+/// more hash than the cap allows.
 ///
-/// Only the trees and the parcel are stored; the blobs are named by their real hashes but never
-/// written. The closure walk reads trees and stops at the cap before it would open any blob,
-/// so the files would never be read, and writing ten thousand of them took most of a minute on
-/// Windows. A walk that started opening blobs would fail here on the missing objects rather
-/// than pass.
-///
-/// Stores objects with a plain, non-atomic write rather than the real (fsync'd) write path:
-/// safe only because this is a disposable fixture built and consumed within one test process,
-/// never exercising crash-recovery. The real path (`LooseObject::store`) fsyncs deliberately —
-/// durable-before-destructive — which is exactly why it is too slow to call ten thousand times
-/// in one test (empirically, over a minute; this fixture needs milliseconds).
-fn build_wide_subtree(warehouse_root: &Path, name: &str, count: usize) -> String {
+/// Only the two trees and the parcel are stored. The blobs are named by their real hashes but
+/// never written: the closure walk reads trees, records blob hashes without opening them, and
+/// stops at the cap, so the files would never be read, and writing ten thousand of them took
+/// most of a minute on Windows. The warehouse this leaves is not a valid one, which is why the
+/// helper builds only an over-cap subtree: an under-cap closure would go on to bundle the
+/// missing blobs and fail.
+fn build_over_cap_subtree_without_blobs(warehouse_root: &Path, name: &str) -> String {
     use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
     use forklift_core::enums::dir_entry_type::DirEntryType;
     use forklift_core::globals::StorageRootScope;
     use forklift_core::model::blob::Blob;
     use forklift_core::model::object::loose_object::LooseObject;
     use forklift_core::model::parcel::Parcel;
+    use forklift_core::model::remote::MAX_MISSING_BATCH;
     use forklift_core::model::tree_item::TreeItem;
-    use forklift_core::util::{file_utils, pallet_utils};
+    use forklift_core::util::pallet_utils;
 
     let _scope = StorageRootScope::enter(warehouse_root);
 
-    fn store_fast(mut object: LooseObject) -> String {
-        let compressed = object.compress().unwrap();
-        let (path, file_name) = file_utils::get_path_for_object(&object.hash).unwrap();
-        std::fs::create_dir_all(&path).unwrap();
-        std::fs::write(std::path::Path::new(&path).join(&file_name), compressed).unwrap();
+    fn store(mut object: LooseObject) -> String {
+        object.store().unwrap();
         object.hash
     }
 
     let mut wide = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
-    for i in 0..count {
+    for i in 0..MAX_MISSING_BATCH {
         let hash = LooseObjectBuilder::build_blob(&Blob { content: i.to_string().into_bytes() }).hash;
         wide.add_child(TreeItem::new(format!("f{}", i), hash, DirEntryType::Normal));
     }
-    let wide_hash = store_fast(LooseObjectBuilder::build_tree(&wide));
+    let wide_hash = store(LooseObjectBuilder::build_tree(&wide));
 
     let mut top = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
     top.add_child(TreeItem::new(name.to_string(), wide_hash, DirEntryType::Tree));
-    let top_hash = store_fast(LooseObjectBuilder::build_tree(&top));
+    let top_hash = store(LooseObjectBuilder::build_tree(&top));
 
     let parcel = Parcel {
         tree_hash: top_hash,
@@ -4266,7 +4259,7 @@ fn build_wide_subtree(warehouse_root: &Path, name: &str, count: usize) -> String
         actions: Vec::new(),
         description: Some("wide subtree fixture".to_string()),
     };
-    let parcel_hash = store_fast(LooseObjectBuilder::build_parcel(&parcel));
+    let parcel_hash = store(LooseObjectBuilder::build_parcel(&parcel));
     pallet_utils::set_pallet_head("main", &parcel_hash).unwrap();
 
     parcel_hash
@@ -4282,9 +4275,9 @@ fn the_subtree_endpoint_refuses_an_oversized_closure_and_the_client_falls_back()
     let area = TestArea::new("subtree-cap");
     let server = Server::start(&area, None);
 
-    // MAX_MISSING_BATCH is 10_000; 10_000 blobs plus their one parent tree is 10_001 objects —
-    // one over the cap.
-    let head = build_wide_subtree(&area.path("server-root"), "big", 10_000);
+    // MAX_MISSING_BATCH is 10_000; 10_000 blob hashes plus their one parent tree is a closure
+    // of 10_001 entries — one over the cap.
+    let head = build_over_cap_subtree_without_blobs(&area.path("server-root"), "big");
 
     // The server refuses with 422, not a streamed bundle — same status and wording whether the
     // walk is bounded internally (the fix) or only checked after it completes (the defect this
