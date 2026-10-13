@@ -394,7 +394,7 @@ mod tests {
         let escape = format!("{}\u{1b}]0;x\u{7}", &hash[..56]);
         let bidi = format!("{}\u{202e}{}", &hash[..32], &hash[..31]);
         assert!(anchor(&escape, vec![], None).validate().is_err());
-        assert!(anchor(&hash, vec![bidi], None).validate().is_err());
+        assert!(anchor(&hash, vec![bidi.clone()], None).validate().is_err());
         assert!(anchor(&hash, vec![], Some("abc")).validate().is_err());
 
         // Uppercase is a hash in another spelling, which every byte-for-byte comparison misses.
