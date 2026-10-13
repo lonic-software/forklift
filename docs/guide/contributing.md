@@ -85,6 +85,12 @@ Notes:
   byte-reproducible repacks, and the warehouse-lock refusal. A parser or
   format change should keep the fuzzer green; if you add a length-prefixed field,
   bound it with a `checked_add` (never `start + length` before the bounds check).
+- Keep tests fast: CI runs the suite on every pull request, on three OSes. A
+  test that has to watch a timeout fire arms a short one instead of waiting out
+  production's (see `FAST` in `remote_utils.rs`), and a fixture writes only the
+  files the code under test reads. Under `cargo nextest run`, which CI uses,
+  `.config/nextest.toml` reports a test as SLOW at 30 s and fails it at two
+  minutes; the crash suite's kill tests get ten.
 - To install a working binary (e.g. to dogfood): `cargo install --path
   crates/forklift --force` (lands in `~/.cargo/bin`).
 

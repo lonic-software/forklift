@@ -1,0 +1,23 @@
+# Timeouts for `cargo nextest run`, which CI runs. Plain `cargo test` (`pult test`, `pult check`)
+# does not read this file.
+#
+# A test that runs past its slow-timeout period is reported as SLOW, and one still running after
+# `terminate-after` periods is killed and fails. That turns a hang into a failure with the test's
+# name instead of a CI job that runs into the job's own timeout, and makes a new slow test
+# visible when it lands. The ceilings sit well above the slowest test on the slowest runner, so
+# a loaded machine does not trip them.
+
+[profile.default]
+# Every test outside the crash suite's kill tests finishes in seconds: across the three runners'
+# CI logs of 2026-10-13, the slowest was about twenty seconds (macOS, in an experimental run at
+# twice the default thread count), once the over-cap subtree fixture stopped writing ten thousand
+# blob files. Fail at two minutes.
+slow-timeout = { period = "30s", terminate-after = 4 }
+
+[[profile.default.overrides]]
+# The crash suite's kill tests kill and re-run real processes on purpose, with fsync on, and
+# calibrate their kill delays to how long a run takes on the loaded runner; the slowest seen was
+# 99 s on macOS. Report SLOW past that, at two minutes, and fail at ten. The suite's other tests
+# keep the default.
+filter = 'binary_id(forklift::crash_consistency) & test(/^killing_/)'
+slow-timeout = { period = "120s", terminate-after = 5 }
