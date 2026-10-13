@@ -18,6 +18,9 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Line tables keep file:line in panics and backtraces; full debug info only slows compiling
+  # and linking the test binaries, which CI never runs under a debugger.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
   # Docs-only pull requests skip the build and tests. This is decided here rather than with
