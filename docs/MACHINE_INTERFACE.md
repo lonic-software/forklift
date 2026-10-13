@@ -350,9 +350,8 @@ Every refusal about a remote's trust anchor is one code, `trust_changed` (exit 2
 ```
 
 - `subject` — the remote, as its URL.
-- `current` — the remote's genesis **now**: the value an override must name. `null` when a
-  pinned remote declares no anchor at all, or declares a malformed one (the value is not
-  repeated).
+- `current` — the remote's genesis **now**: the value an override must name. `null` when the
+  remote declares no anchor at all, or declares a malformed one (the value is not repeated).
 - `previous` — the genesis this warehouse holds; absent when it holds none (a `franchise`).
 - `what_changed` — a closed set, to branch on instead of the message:
   `regenesis` (the new anchor names the held one as its prior; the one override is
@@ -360,7 +359,11 @@ Every refusal about a remote's trust anchor is one code, `trust_changed` (exit 2
   tampering, or a reset never seen; nothing overrides it), `unexpected` (the remote's anchor is
   not the `--expect` pin or the `--confirm` value), `malformed` (the remote declares an anchor
   whose values are not object hashes; every command against that remote refuses, and nothing
-  overrides it — not a transport failure, so not worth retrying).
+  overrides it — not a transport failure, so not worth retrying), `removed` (the remote holds an
+  office but declares no anchor, which an honest server never does: its anchor was stripped.
+  `lower` and `franchise` refuse before anything is fetched, whether or not an anchor is held,
+  `lift` refuses before anything is uploaded, and nothing overrides it). A remote with neither an anchor nor an office is one trust was never
+  established on, and is not refused; pin it with `--expect` to require an anchor.
 
 `office accept-regenesis --confirm <value>` accepts only when `<value>` still equals the
 remote's genesis; any other value refuses with fresh `details`, so an agent re-reads `current`
@@ -368,6 +371,14 @@ rather than retrying a stale one. With nothing pending, it succeeds only when `<
 genesis already held; otherwise it refuses (`unexpected`), so "nothing to accept" never reads as
 the value being trusted. `franchise --expect` and `lower --expect` are checked against the
 first response, before anything is fetched or created.
+
+### A misbehaving remote: `remote_protocol_violation`
+
+A remote that answers with something the protocol never produces — today, a handshake naming a
+pallet head that is not an object hash in its canonical spelling (64 lowercase hex characters) —
+is refused with `remote_protocol_violation` (exit 23). It is not a transport failure: retrying
+gets the same answer, so an agent stops and reports it instead. The message does not repeat the
+remote's value.
 
 A first-contact adoption is not a refusal: the command succeeds, reports the genesis as
 `data.adopted_genesis`, and writes a `trust_adopted` warning (below) with the same `details`

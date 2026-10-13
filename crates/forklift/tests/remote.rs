@@ -1472,6 +1472,53 @@ fn an_expect_pin_is_checked_before_anything_is_fetched_and_first_contact_is_anno
     assert!(!stderr(&lowered).contains("FIRST CONTACT"), "{}", stderr(&lowered));
 }
 
+/// A remote that still holds an office but no longer declares an anchor had it stripped: an
+/// honest server refuses an office lift before an anchor exists and never removes one. Syncing
+/// from it would take its history unverified, so both directions refuse before any download,
+/// whether or not this warehouse holds an anchor.
+#[test]
+fn a_remote_whose_anchor_was_stripped_is_refused_before_anything_is_fetched() {
+    let area = TestArea::new("stripped-anchor");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "a", &server.url);
+    area.write_file("a/code.txt", "v1\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "base"]));
+    assert_success(&area.forklift("a", &["office", "enroll"]));
+    assert_success(&area.forklift("a", &["lift"]));
+    let genesis = std::fs::read_to_string(area.path("a/.forklift/trust")).unwrap();
+    assert!(!genesis.is_empty());
+
+    // Strip the anchor from the remote's storage; the office pallet stays.
+    let stripped = area.path("server-root/.forklift/trust");
+    assert!(stripped.is_file(), "the server keeps its anchor at {}", stripped.display());
+    std::fs::remove_file(&stripped).unwrap();
+
+    let lowered = area.forklift("a", &["--json", "lower"]);
+    let details = trust_changed_details(&lowered);
+    assert_eq!(details["what_changed"], "removed", "{}", details);
+    assert_eq!(details["current"], serde_json::Value::Null);
+    assert!(details["previous"].is_string(), "the held genesis is reported: {}", details);
+
+    let franchised = area.forklift(".", &["--json", "franchise", &server.url, "b"]);
+    let details = trust_changed_details(&franchised);
+    assert_eq!(details["what_changed"], "removed", "{}", details);
+    assert!(details.get("previous").is_none(), "a franchise holds no anchor yet: {}", details);
+    assert!(!area.path("b").exists(), "a refused franchise must not create the target");
+
+    // Lift refuses the same way rather than re-upload an anchor over the stripped office.
+    let lifted = area.forklift("a", &["--json", "lift"]);
+    assert_eq!(trust_changed_details(&lifted)["what_changed"], "removed");
+
+    // And the server never stores an anchor over an office it holds without one, whoever sends
+    // it: the first client to arrive would otherwise plant its own over a chain it never checked.
+    let foreign = serde_json::json!({ "genesis": "cd".repeat(32), "enabled_at": 0, "boundary": [] });
+    let (status, response) = http_send_json(&server.url, "PUT", "/v1/trust", &foreign.to_string());
+    assert!(status.contains("409"), "{} {}", status, response);
+    assert!(!stripped.exists(), "nothing was stored");
+}
+
 #[test]
 fn a_compromised_key_cannot_sign_beyond_its_distrust_boundary() {
     let area = TestArea::new("compromise");

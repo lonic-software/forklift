@@ -489,6 +489,54 @@ fn a_user_lift_before_the_office_is_refused() {
     assert_eq!(err.status, Status::Unprocessable);
 }
 
+/// An office is never lifted without an anchor, and an anchor is never planted over an office
+/// that has lost its own: either state reads to a client as a stripped anchor, and the first
+/// client to lift would otherwise plant an anchor over a chain it never verified.
+#[test]
+fn an_office_and_an_anchor_never_exist_apart() {
+    let area = Area::new("office-anchor-pair");
+    prepare(&area, "wh");
+    area.forklift("wh", &["office", "enroll"]);
+    area.write_file("wh/app.txt", "v1\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "signed"]);
+
+    let harvest = harvest(&area.path("wh"));
+    let anchor = harvest.trust.clone().expect("trust");
+    let office_head = harvest.head_of(&format!("@{}", OFFICE_PALLET_NAME)).expect("office head");
+
+    let refs = Arc::new(MemoryRefStore::new());
+    let head = Head::new(MemoryObjectStore::new(), SharedMemoryRefs(refs.clone()));
+    upload_all(&head, &harvest);
+
+    // Lifting the office before the anchor is refused, and leaves the office unborn.
+    let err = head
+        .ref_update(&format!("@{}", OFFICE_PALLET_NAME), &RefUpdateRequest {
+            old_head: None,
+            new_head: office_head.clone(),
+        })
+        .expect_err("office without an anchor");
+    assert_eq!(err.status, Status::Unprocessable);
+    assert_eq!(refs.get_head(pallet_utils::PalletNamespace::Meta, OFFICE_PALLET_NAME), Ok(None));
+
+    // An office whose anchor was lost — planted beneath the head, as a stripped store would
+    // hold it. Planting an anchor over it is refused, and nothing is stored.
+    assert!(matches!(
+        refs.compare_and_set_head(
+            pallet_utils::PalletNamespace::Meta,
+            OFFICE_PALLET_NAME,
+            None,
+            &office_head,
+            OfficePrecondition::NotConsumed,
+            None,
+        ),
+        Ok(CasOutcome::Committed)
+    ));
+    let err = head.put_trust(&anchor).expect_err("anchor over an orphaned office");
+    assert_eq!(err.status, Status::Conflict);
+    assert!(refs.get_trust().expect("read trust").is_none());
+}
+
 /// A signature sidecar is immutable: a conflicting re-upload is a `409`.
 #[test]
 fn a_conflicting_signature_is_refused() {
@@ -1737,14 +1785,15 @@ fn a_concurrent_office_move_refuses_the_commit_as_office_moved_not_pallet_moved(
     );
 }
 
-/// PR #116 review, finding 2: on an **untrusted** warehouse the audit never reads the office
-/// head at all — both the office-chain mirror and the whole trust block in `ref_update` are
-/// gated on `anchor.is_some()` — so the commit must not condition on it either. Sibling to
+/// On a warehouse with no anchor the audit never reads the office head at all — both the
+/// office-chain mirror and the whole trust block in `ref_update` are gated on
+/// `anchor.is_some()` — so the commit must not condition on it either. No head lifts an office
+/// without an anchor, so the only such warehouse that has an office is a stripped store (which
+/// clients refuse at the handshake); this pins the store-level contract that
+/// `OfficePrecondition::NotConsumed` is never upgraded to a check the audit did not earn. Do not
+/// rebuild the setup as a head lift: that is now a `422`. Sibling to
 /// `a_concurrent_office_move_refuses_the_commit_as_office_moved_not_pallet_moved`, which pins
-/// the opposite: the *trusted* case where the same race must refuse. Neither
-/// `a_concurrently_moved_unrelated_pallet_does_not_refuse_the_commit` nor any other existing
-/// test reaches this — that test only moves an unrelated *user* pallet on a *trusted*
-/// warehouse, never the office pallet itself on an untrusted one.
+/// the opposite, the *trusted* case where the same race must refuse.
 #[test]
 fn an_untrusted_warehouses_concurrent_office_move_does_not_refuse_the_commit() {
     let area = Area::new("untrusted-office-races-the-commit");
@@ -1767,16 +1816,22 @@ fn an_untrusted_warehouses_concurrent_office_move_does_not_refuse_the_commit() {
 
     let store = Arc::new(MemoryRefStore::new());
 
-    // Setup: lift the office pallet and main v1 — no `put_trust` anywhere in this test, so
-    // neither lift is ever audited (an untrusted warehouse verifies nothing, office included).
+    // Setup: an office with no anchor, planted beneath the head — no head lifts one, so the
+    // state is reachable only as a stripped store — then main v1, unaudited (no `put_trust`
+    // anywhere in this test: an untrusted warehouse verifies nothing).
+    assert!(matches!(
+        store.compare_and_set_head(
+            pallet_utils::PalletNamespace::Meta,
+            OFFICE_PALLET_NAME,
+            None,
+            &office_head,
+            OfficePrecondition::NotConsumed,
+            None,
+        ),
+        Ok(CasOutcome::Committed)
+    ));
     let setup = Head::new(MemoryObjectStore::new(), SharedMemoryRefs(store.clone()));
     upload_all(&setup, &latest);
-    setup
-        .ref_update(&format!("@{}", OFFICE_PALLET_NAME), &RefUpdateRequest {
-            old_head: None,
-            new_head: office_head,
-        })
-        .expect("lift office (untrusted, unaudited)");
     setup
         .ref_update("main", &RefUpdateRequest { old_head: None, new_head: main_v1.clone() })
         .expect("lift main v1 (untrusted, unaudited)");

@@ -2,7 +2,7 @@ use serde::Serialize;
 use forklift_core::util::remote_utils::RemoteClient;
 use forklift_core::util::stocktake_utils::ChangeKind;
 use forklift_core::util::{
-    config_utils, haul_utils, office_utils, manifest_utils, merge_utils, object_utils, pallet_utils, remote_utils,
+    config_utils, haul_utils, manifest_utils, merge_utils, object_utils, pallet_utils, remote_utils,
     scope_utils, shift_utils, stocktake_utils, trust_utils,
 };
 use crate::commands::office;
@@ -33,12 +33,8 @@ pub async fn handle_command(expect: Option<String>) -> Result<(), String> {
     let client = RemoteClient::from_config()?;
     let info = client.fetch_info().await?;
 
-    if let Some(expected) = &expect {
-        let held = office_utils::read_trust_anchor()?.map(|anchor| anchor.genesis);
-        trust_utils::check_expected(client.url(), info.trust.as_ref(), held.as_deref(), expected)?;
-    }
-
-    let trust = remote_utils::adopt_remote_trust(&client, &info).await?;
+    // Checks the pin (and a stripped anchor) against the handshake before anything is fetched.
+    let trust = remote_utils::adopt_remote_trust(&client, &info, expect.as_deref()).await?;
 
     // Announced at once, not with the report: the adopted anchor is already on disk, and a
     // later refusal (a dirty warehouse, a missing pallet) would otherwise leave it unsaid.

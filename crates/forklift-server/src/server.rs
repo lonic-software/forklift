@@ -1944,6 +1944,20 @@ async fn put_trust(State(state): State<Arc<AppState>>,
                 Ok(Some(event))
             }
             None => {
+                // No anchor but an office: the anchor was lost, and whichever client lifts first
+                // would otherwise plant its own over a chain it never verified. The office cannot
+                // appear meanwhile: its lift needs an anchor, and this holds the write lock.
+                if pallet_utils::get_meta_pallet_head(office_utils::OFFICE_PALLET_NAME)
+                    .map_err(internal)?
+                    .is_some() {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        "This warehouse holds an office but no trust anchor: its anchor was \
+                        lost. The server operator must restore it; a client cannot \
+                        re-establish it.".to_string()
+                    ));
+                }
+
                 office_utils::write_trust_anchor(&anchor.to_anchor()).map_err(internal)?;
 
                 let mut event = HookEvent::new(EVENT_TRUST_ESTABLISHED);

@@ -706,6 +706,12 @@ fn a_shared_bearer_holder_may_move_any_pallet_including_the_office() {
     // exercises, so this assertion is independent of assertion 1's outcome.
     let main_fixture = seeded_fixture();
     assert_eq!(
+        status(&main_fixture.call(bearer("PUT", "/v1/trust", serde_json::to_vec(&anchor).unwrap()))),
+        201
+    );
+    // Anchor first: no head plants an anchor over an office that has none.
+    let (_, stored_anchor) = main_fixture.refs.get_trust().expect("read trust").expect("anchor");
+    assert_eq!(
         main_fixture
             .refs
             .compare_and_set_head(
@@ -714,15 +720,11 @@ fn a_shared_bearer_holder_may_move_any_pallet_including_the_office() {
                 None,
                 &office_head,
                 OfficePrecondition::NotConsumed,
-                None,
+                Some(stored_anchor.as_str()),
             )
             .expect("seed the office ref directly"),
         CasOutcome::Committed,
         "seeding the office ref outside the HTTP path must not itself be refused"
-    );
-    assert_eq!(
-        status(&main_fixture.call(bearer("PUT", "/v1/trust", serde_json::to_vec(&anchor).unwrap()))),
-        201
     );
 
     let main = RefUpdateRequest { old_head: None, new_head: main_head.clone() };

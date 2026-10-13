@@ -13,7 +13,8 @@
 
 use serde::Serialize;
 use crate::error::{CoreError, RefusalCode};
-use crate::model::remote::TrustAnchorDto;
+use crate::model::remote::{TrustAnchorDto, WarehouseInfo};
+use crate::util::office_utils;
 
 /// The `--json` warning code for a trust anchor adopted on first contact.
 pub const WARNING_TRUST_ADOPTED: &str = "trust_adopted";
@@ -41,6 +42,10 @@ pub enum TrustChange {
     /// The remote declares an anchor that is not well-formed (a value that is not an object
     /// hash). `current` is `null`: the value is not repeated. Nothing overrides it.
     Malformed,
+
+    /// The remote declares no anchor although it holds an office, which an honest server never
+    /// does: the anchor was stripped. `current` is `null`. Nothing overrides it.
+    Removed,
 }
 
 /// The structured detail of a trust refusal or warning, in its documented key order.
@@ -189,6 +194,58 @@ pub fn malformed(subject: &str, problem: &str) -> CoreError {
     )
 }
 
+/// The refusal for a remote that declares no anchor while it holds an office pallet. A server
+/// refuses an office lift until an anchor is established and never removes one, so this is a
+/// remote whose anchor was stripped — and syncing from it would take its history unverified.
+///
+/// # Arguments
+/// * `subject`       - The remote's URL.
+/// * `local_genesis` - The genesis this warehouse holds, if any (reported as `previous`).
+pub fn removed(subject: &str, local_genesis: Option<&str>) -> CoreError {
+    refusal(
+        format!(
+            "{} holds an office but declares no trust anchor: its anchor was removed. Refusing \
+            to sync with it.",
+            subject
+        ),
+        "Report it to whoever runs the remote. Nothing overrides a removed anchor.",
+        TrustDetails {
+            subject: subject.to_string(),
+            current: None,
+            previous: local_genesis.map(str::to_string),
+            what_changed: TrustChange::Removed,
+        },
+    )
+}
+
+/// The trust checks a handshake must pass before anything is fetched from the remote: an anchor
+/// that was stripped (an office without one), then the out-of-band pin, when one was given.
+///
+/// # Arguments
+/// * `subject`       - The remote's URL.
+/// * `info`          - The remote's handshake.
+/// * `local_genesis` - The genesis this warehouse holds, if any.
+/// * `expected`      - The pinned genesis (`--expect`), if any.
+///
+/// # Returns
+/// * `Ok(())`         - Nothing to refuse.
+/// * `Err(CoreError)` - A `trust_changed` refusal: `removed` or `unexpected`.
+pub fn check_handshake_trust(subject: &str,
+                             info: &WarehouseInfo,
+                             local_genesis: Option<&str>,
+                             expected: Option<&str>) -> Result<(), CoreError> {
+    // A remote with neither an anchor nor an office is one trust was never established on (or not
+    // yet lifted to); that stays allowed, and only a pin can require an anchor there.
+    if info.trust.is_none() && info.pallets.contains_key(&office_utils::office_wire_key()) {
+        return Err(removed(subject, local_genesis));
+    }
+
+    match expected {
+        Some(expected) => check_expected(subject, info.trust.as_ref(), local_genesis, expected),
+        None => Ok(()),
+    }
+}
+
 /// Check an out-of-band pin (`--expect`) against the remote's anchor from the handshake, before
 /// anything is fetched. Exact match only: a pin is a security check, and a prefix would weaken it.
 ///
@@ -201,10 +258,10 @@ pub fn malformed(subject: &str, problem: &str) -> CoreError {
 /// # Returns
 /// * `Ok(())`         - The remote's genesis is the pinned one.
 /// * `Err(CoreError)` - A `trust_changed` refusal, `what_changed: "unexpected"`.
-pub fn check_expected(subject: &str,
-                      remote: Option<&TrustAnchorDto>,
-                      local_genesis: Option<&str>,
-                      expected: &str) -> Result<(), CoreError> {
+fn check_expected(subject: &str,
+                  remote: Option<&TrustAnchorDto>,
+                  local_genesis: Option<&str>,
+                  expected: &str) -> Result<(), CoreError> {
     let current = remote.map(|anchor| anchor.genesis.as_str());
 
     if current == Some(expected) {
@@ -353,6 +410,17 @@ mod tests {
             "subject": "u", "current": "held", "previous": "held", "what_changed": "unexpected",
         }));
         assert!(message.contains("stale is not trusted"), "{}", message);
+    }
+
+    #[test]
+    fn a_removed_anchor_reports_the_held_genesis_and_offers_no_override() {
+        let (code, _, next_step, details) = refusal_parts(removed("u", Some("held")));
+
+        assert_eq!(code, RefusalCode::TrustChanged);
+        assert_eq!(details, serde_json::json!({
+            "subject": "u", "current": null, "previous": "held", "what_changed": "removed",
+        }));
+        assert!(!next_step.contains("--confirm"), "{}", next_step);
     }
 
     #[test]

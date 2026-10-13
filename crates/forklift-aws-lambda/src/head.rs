@@ -340,6 +340,17 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         // holding: the incumbent read here is the value the chain-of-custody test below runs
         // against, and `replace_trust` conditions the write on it being unmoved.
         let Some((existing, existing_bytes)) = existing else {
+            // No anchor but an office: the anchor was lost, and whichever client lifts first
+            // would otherwise plant its own over a chain it never verified. No head lifts an
+            // office without an anchor, so the office cannot appear after this read.
+            let office_head = self
+                .refs
+                .get_head(PalletNamespace::Meta, OFFICE_PALLET_NAME)
+                .map_err(HeadError::internal)?;
+            if office_head.is_some() {
+                return Err(Self::anchor_lost());
+            }
+
             return match self
                 .refs
                 .put_trust_if_absent(&anchor.to_anchor())
@@ -549,6 +560,16 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             Some((anchor, bytes)) => (Some(anchor), Some(bytes)),
             None => (None, None),
         };
+
+        // An office is the chain an anchor verifies; one lifted without an anchor is a state
+        // clients read as a stripped anchor, so it is never created. Same as the server, and
+        // decided before any audit work. The commit conditions on the anchor still being absent.
+        if is_office && anchor.is_none() {
+            return Err(HeadError::unprocessable(
+                "Establish the trust anchor (PUT /v1/trust) before lifting the office.".to_string(),
+            ));
+        }
+
         let office_head = self
             .refs
             .get_head(PalletNamespace::Meta, OFFICE_PALLET_NAME)
@@ -956,6 +977,16 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             item on this warehouse, likely its office pallet. No input is known to have \
             moved. Run the push again once the other push has settled — this client does not \
             retry ref updates automatically."
+                .to_string(),
+        )
+    }
+
+    /// The `409` for planting an anchor over an office whose own anchor was lost: the chain was
+    /// never verified against the anchor offered, so no client may supply one.
+    fn anchor_lost() -> HeadError {
+        HeadError::conflict(
+            "This warehouse holds an office but no trust anchor: its anchor was lost. The \
+            server operator must restore it; a client cannot re-establish it."
                 .to_string(),
         )
     }
