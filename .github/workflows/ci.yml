@@ -81,6 +81,9 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     # A docs-only run only has to report its check, so it does not need the OS it is named after.
     runs-on: ${{ (needs.changes.result == 'success' && needs.changes.outputs.code == 'false') && 'ubuntu-latest' || matrix.os }}
+    # A hang anywhere in the job (doc-tests included, which nextest does not run) fails here
+    # rather than at GitHub's six-hour limit. A cold-cache Windows run takes about fifteen.
+    timeout-minutes: 40
     env:
       # Only a classifier that succeeded and said `false` skips; anything else tests. Every
       # step below is gated on this one value, since a job cannot skip its steps but still
