@@ -4257,7 +4257,7 @@ fn build_over_cap_subtree_without_blobs(warehouse_root: &Path, name: &str) -> St
         tree_hash: top_hash,
         parents: Vec::new(),
         actions: Vec::new(),
-        description: Some("wide subtree fixture".to_string()),
+        description: Some("over-cap subtree fixture".to_string()),
     };
     let parcel_hash = store(LooseObjectBuilder::build_parcel(&parcel));
     pallet_utils::set_pallet_head("main", &parcel_hash).unwrap();
@@ -4275,8 +4275,8 @@ fn the_subtree_endpoint_refuses_an_oversized_closure_and_the_client_falls_back()
     let area = TestArea::new("subtree-cap");
     let server = Server::start(&area, None);
 
-    // MAX_MISSING_BATCH is 10_000; 10_000 blob hashes plus their one parent tree is a closure
-    // of 10_001 entries — one over the cap.
+    // MAX_MISSING_BATCH blob hashes plus their one parent tree is a closure one entry over the
+    // cap.
     let head = build_over_cap_subtree_without_blobs(&area.path("server-root"), "big");
 
     // The server refuses with 422, not a streamed bundle — same status and wording whether the
