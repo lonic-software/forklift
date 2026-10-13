@@ -6,6 +6,7 @@ use forklift_core::util::{
     scope_utils, shift_utils, stocktake_utils,
 };
 use crate::commands::office;
+use crate::events;
 use crate::output::{self, CommandOutput};
 
 /// Handle the lower command (git's "pull"): fetch the remote's new parcels for the
@@ -23,6 +24,7 @@ use crate::output::{self, CommandOutput};
 /// * `Err(String)` - If no remote is configured, the warehouse is dirty, the histories
 ///                   diverged, or a transfer failed.
 pub async fn handle_command() -> Result<(), String> {
+    let progress = events::progress();
     let client = RemoteClient::from_config()?;
     let info = client.fetch_info().await?;
 
@@ -75,7 +77,7 @@ pub async fn handle_command() -> Result<(), String> {
     // pallets synced above keep routing through the unscoped fetch, since their audit reads full
     // content.
     let fetch_scope = scope_utils::read_fetch_scope()?;
-    let stats = remote_utils::fetch_history_scoped(&client, remote_head, &fetch_scope).await?;
+    let stats = remote_utils::fetch_history_scoped(&client, remote_head, &fetch_scope, &progress).await?;
     report.fetched_objects = stats.fetched_objects;
     report.fetched_signatures = stats.fetched_signatures;
 
@@ -99,7 +101,7 @@ pub async fn handle_command() -> Result<(), String> {
 
     let remote_tree = object_utils::load_parcel(remote_head)?.tree_hash;
 
-    shift_utils::materialize_tree(local_tree.as_deref(), &remote_tree, "Lowering")?;
+    shift_utils::materialize_tree(local_tree.as_deref(), &remote_tree, "Lowering", &progress)?;
     pallet_utils::set_pallet_head(&pallet, remote_head)?;
 
     report.outcome = LowerOutcome::Lowered;

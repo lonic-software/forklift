@@ -5,6 +5,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use forklift_core::util::progress_utils::Progress;
 
 /// Path to the compiled forklift binary (provided by cargo for integration tests).
 const FORKLIFT: &str = env!("CARGO_BIN_EXE_forklift");
@@ -2081,7 +2082,7 @@ fn a_sync_walks_the_gap_between_the_heads_not_the_history() {
         let client = forklift_core::util::remote_utils::RemoteClient::new(&server.url, None).unwrap();
 
         runtime
-            .block_on(forklift_core::util::remote_utils::fetch_history(&client, head))
+            .block_on(forklift_core::util::remote_utils::fetch_history(&client, head, &Progress::NONE))
             .expect("fetch")
     };
 
@@ -2879,7 +2880,7 @@ fn retiring_a_signer_then_lifting_only_a_replacement_pallet_refuses_instead_of_a
         let _scope = forklift_core::globals::StorageRootScope::enter(&area.path("tmp-clone"));
         let client = forklift_core::util::remote_utils::RemoteClient::new(&server.url, None).unwrap();
         runtime
-            .block_on(forklift_core::util::remote_utils::fetch_history(&client, &a1))
+            .block_on(forklift_core::util::remote_utils::fetch_history(&client, &a1, &Progress::NONE))
             .expect("fetch A1's ancestry");
     }
 
@@ -5123,4 +5124,68 @@ fn franchise_into_an_absolute_target_path_succeeds() {
     ]);
     assert_success(&franchised);
     assert_eq!(std::fs::read_to_string(absolute_target.join("code.txt")).unwrap(), "v1\n");
+}
+
+/// `lift` and `lower` report their phases on a `PULT_EVENTS` channel (the channel itself — fd
+/// validation, a vanished reader — is covered in `tests/events.rs`).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[path = "channel/mod.rs"]
+mod channel;
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod progress_events {
+    use super::*;
+
+    /// Run the CLI in `relative_dir` with a fresh pipe as its channel, returning the output and
+    /// the status lines read from it.
+    fn forklift_with_events(area: &TestArea, relative_dir: &str, args: &[&str]) -> (Output, Vec<String>) {
+        let mut command = Command::new(FORKLIFT);
+        command.args(args)
+            .current_dir(area.path(relative_dir))
+            .env("FORKLIFT_GLOBAL_CONFIG", area.path("area-global.toml"))
+            .env("FORKLIFT_KEYS_DIR", area.path("shared-keys"));
+
+        let (output, text) = channel::run_and_collect(&mut command);
+        let statuses = text.lines()
+            .filter_map(|line| line.strip_prefix("status ").map(str::to_string))
+            .collect();
+
+        (output, statuses)
+    }
+
+    #[test]
+    fn lift_and_lower_report_their_phases() {
+        let area = TestArea::new("events");
+        let server = Server::start(&area, None);
+
+        prepare_warehouse(&area, "a", &server.url);
+        area.write_file("a/readme.txt", "hello\n");
+        assert_success(&area.forklift("a", &["load", "."]));
+        assert_success(&area.forklift("a", &["stack", "first parcel"]));
+
+        // Uploading is followed by per-object progress, and updating the remote ends the run, so
+        // neither can be replaced by the status after it.
+        let (lifted, statuses) = forklift_with_events(&area, "a", &["lift"]);
+        assert_success(&lifted);
+        for phase in ["Uploading objects", "Updating the remote"] {
+            assert!(statuses.iter().any(|status| status == phase), "missing {:?} in {:?}", phase, statuses);
+        }
+
+        assert_success(&area.forklift(".", &["franchise", &server.url, "b"]));
+
+        area.write_file("a/readme.txt", "hello, twice\n");
+        area.write_file("a/new.txt", "new\n");
+        assert_success(&area.forklift("a", &["load", "."]));
+        assert_success(&area.forklift("a", &["stack", "second parcel"]));
+        assert_success(&area.forklift("a", &["lift"]));
+
+        // Writing files is followed by per-file progress and the rebuild ends the run, so
+        // neither can be replaced by the status after it.
+        let (lowered, statuses) = forklift_with_events(&area, "b", &["lower"]);
+        assert_success(&lowered);
+        for phase in ["Writing files", "Rebuilding the inventory"] {
+            assert!(statuses.iter().any(|status| status == phase), "missing {:?} in {:?}", phase, statuses);
+        }
+        assert_eq!(area.read_file("b/new.txt"), "new\n");
+    }
 }

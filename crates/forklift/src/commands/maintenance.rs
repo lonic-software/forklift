@@ -1,6 +1,7 @@
 use std::path::Path;
 use forklift_core::globals::forklift_root;
 use forklift_core::util::pack_utils::{self, AutoCompaction};
+use forklift_core::util::progress_utils::Progress;
 use forklift_core::util::taint_utils;
 
 /// Run background object-store maintenance if it is due — the recurring counterpart of
@@ -63,8 +64,8 @@ pub fn run_if_due() {
     };
 
     let result = match action {
-        AutoCompaction::Incremental => pack_utils::compact(false, false).map(|_| ()),
-        AutoCompaction::Repack => pack_utils::compact(true, false).map(|_| ()),
+        AutoCompaction::Incremental => pack_utils::compact(false, false, &Progress::NONE).map(|_| ()),
+        AutoCompaction::Repack => pack_utils::compact(true, false, &Progress::NONE).map(|_| ()),
         AutoCompaction::None => return,
     };
 

@@ -8,7 +8,8 @@
 //!   [`emit`] — human mode renders prose, JSON mode wraps the data in the envelope.
 //! * A command whose result is just a sentence calls [`message`].
 //! * Progress lines (silent under `--json`, they are not part of the result) use the
-//!   [`human!`](crate::human) macro.
+//!   [`human!`](crate::human) macro. Progress for a program goes to the `PULT_EVENTS`
+//!   channel ([`events`](crate::events)), never to stdout.
 //!
 //! Nothing else prints to stdout. That is what keeps `--json` output a single valid
 //! JSON document.

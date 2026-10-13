@@ -1,9 +1,10 @@
 # The machine-first interface
 
 Forklift's command surface is built to be driven by programs — scripts, CI, and AI
-coding agents — as well as people. Three things make that work:
-a `--json` mode with a versioned envelope, a stable error and exit-code taxonomy, and
-an MCP server that exposes every command as a schema-typed tool.
+coding agents — as well as people. Four things make that work:
+a `--json` mode with a versioned envelope, a stable error and exit-code taxonomy, an
+MCP server that exposes every command as a schema-typed tool, and a progress-events
+channel that keeps a long operation observable without touching its output.
 
 ## `--json`
 
@@ -354,6 +355,84 @@ resolver fetches (`forklift peek <hash>`) and diffs, instead of parsing marker s
 A whole-file or binary conflict has `markers: false` and no sides. An empty list is a
 valid answer — nothing to resolve — not an error.
 
+## Progress events
+
+A program that runs a long Forklift operation can watch it on a channel of its own,
+separate from stdout. Open a pipe (or a FIFO, or a socket), leave its write end open in
+the child at some fd number above 2, and put that number in the environment:
+
+```sh
+PULT_EVENTS=7 forklift compact --json 7>events.fifo
+```
+
+Forklift writes one event per line to that fd. Two verbs appear:
+
+| Line | Meaning |
+|---|---|
+| `status <phase>` | The operation entered a new phase. |
+| `progress <0-100\|?> [text]` | How far the current phase has got, as a percentage, or `?` when the total is unknown. The optional text names the item or the count reached. |
+
+Forklift never writes `step`: it always runs inside someone else's channel and leaves step
+counting to whoever owns it. A reader should ignore any verb it does not know and any line it
+cannot parse.
+
+These commands report today, with these phases:
+
+| Command | Phases |
+|---|---|
+| `compact` | `Collecting objects`, `Packing objects`, `Removing packed originals` |
+| `lift` | `Fetching history` (only when it merges first), `Finding objects to lift`, `Uploading objects`, `Committing staged objects` (only against a staging remote), `Updating the remote` |
+| `lower` | `Fetching history`, `Writing files`, `Rebuilding the inventory` |
+| `import-git` | `Converting commits`, `Publishing objects`, `Building the inventory` |
+
+Phase names are for display. Treat them as text, not as an API to branch on.
+
+**The variable.** `PULT_EVENTS` must be bare decimal digits naming an fd above 2 that is open
+for writing and is a pipe, FIFO or socket. Forklift checks this at startup, before it opens any
+file of its own. Anything else is ignored without a message, and the command runs as if the
+variable were unset: an empty or non-numeric value, a sign or whitespace, 0, 1 or 2, a closed
+fd, a regular file, a terminal, or a read-only end. So an fd inherited by accident is never
+written to, and stdout always stays the one `--json` document.
+
+**Ordering and loss.** Events arrive in the order they happened. Emitting never blocks, slows
+or stops the operation: a small queue sits between the operation and a dedicated writer, and
+when the reader falls behind the queue coalesces instead of waiting.
+
+* A progress replaces the newest queued progress, if that one has not been written yet and
+  its value is no greater than the new one. `?` replaces only `?`.
+* A status replaces a queued status that has not been written yet, so a phase with nothing
+  reported in it can be skipped.
+* When the queue is still full, the oldest entry is dropped.
+
+Within a phase, a percentage never goes down. It starts again from a lower value only after a
+`status` naming the new phase, and even that ordering is best-effort if entries had to be
+dropped. Repeats of the same percentage are thinned to at most ten a second. A report held
+back this way is not lost: it goes out with the next report, before the next `status`, or
+when the operation ends. Until then the text you are showing can lag behind the work, for
+as long as the operation stays quiet.
+
+**Lines.** Each line is at most 512 bytes, newline included: the smallest write POSIX
+guarantees is atomic on a pipe, so a line never interleaves with another writer's. Longer text
+is cut on a character boundary. Control characters, the Unicode line and paragraph separators,
+and bidirectional formatting characters are replaced with spaces. Event text never
+carries credentials. Per-item text such as a file path goes on `progress` lines, never on
+`status`.
+
+**A reader that goes away** costs the operation nothing. Writes that fail stop the channel,
+and the operation finishes and exits normally. It is not killed by `SIGPIPE`, whatever the
+parent's signal disposition. On macOS this takes a setting on the channel itself:
+`F_SETNOSIGPIPE` on a pipe or FIFO, `SO_NOSIGPIPE` on a socket. Both settings belong to the
+shared pipe or socket, not to Forklift's descriptor. Once you hand Forklift the channel, any
+process writing to it, yours included, gets `EPIPE` instead of `SIGPIPE` when the reader is
+gone, even after Forklift exits.
+
+**The channel is Forklift's alone.** Forklift removes `PULT_EVENTS` from its environment and
+marks the descriptor close-on-exec, so nothing it runs (the per-call `forklift` processes of
+`forklift mcp`, `git` during `import-git`) writes to the channel or keeps it open. At exit, Forklift gives the writer up to 200 ms to deliver what
+is still queued, then exits anyway.
+
+The channel exists on macOS and Linux. On other platforms the variable is ignored.
+
 ## `forklift mcp` — the MCP server
 
 `forklift mcp` runs a Model Context Protocol server on stdin/stdout (newline-delimited
@@ -433,6 +512,8 @@ Example session:
 
 * Nothing but the envelope (or the MCP protocol messages) reaches stdout under
   `--json` / `mcp`. Progress chatter is suppressed; the result is a single document.
+  Machine-readable progress goes on the `PULT_EVENTS` channel instead (see
+  [Progress events](#progress-events)).
 * Human output is untouched by all of this — the same commands print prose without
   `--json`, byte-for-byte as before.
 * A mutating command that triggers background auto-maintenance (git's `gc --auto`

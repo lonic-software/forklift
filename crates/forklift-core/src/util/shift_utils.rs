@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use crate::enums::dir_entry_type::DirEntryType;
 use crate::model::inventory::Inventory;
 use crate::model::tree_item::TreeItem;
+use crate::util::progress_utils::Progress;
 use crate::util::scope_utils::{self, MaterializationScope, ScopeClass};
 use crate::util::{file_utils, inventory_utils, object_utils, tree_utils};
 
@@ -554,13 +555,15 @@ fn join_key(key: &str, name: &str) -> String {
 ///                  empty/unborn state).
 /// * `to_tree`    - The tree to materialize.
 /// * `operation`  - What is running (for the collision error message).
+/// * `progress`   - Where to report the file writes and the inventory rebuild.
 ///
 /// # Returns
 /// * `Ok(())`      - If the working directory and the inventory now match `to_tree`.
 /// * `Err(String)` - On untracked collisions, or a failed write.
 pub fn materialize_tree(from_tree: Option<&str>,
                         to_tree: &str,
-                        operation: &str) -> Result<(), String> {
+                        operation: &str,
+                        progress: &Progress) -> Result<(), String> {
     let (ops, removed_dirs) = diff_trees(from_tree, to_tree)?;
 
     let conflicts: Vec<&String> = ops.iter()
@@ -580,11 +583,18 @@ pub fn materialize_tree(from_tree: Option<&str>,
         ));
     }
 
-    for op in &ops {
+    progress.status("Writing files");
+
+    for (done, op) in ops.iter().enumerate() {
         apply_file_op(op)?;
+        progress.fraction(done + 1, ops.len(), || match op {
+            FileOp::Write { path, .. } | FileOp::Remove { path } => path.clone(),
+        });
     }
 
     remove_empty_directories(&removed_dirs);
+
+    progress.status("Rebuilding the inventory");
 
     let shards = build_inventories_for_tree(to_tree)?;
 

@@ -16,6 +16,7 @@ use forklift_core::model::tree_item::TreeItem;
 use forklift_core::util::file_utils::BulkStoreSession;
 use forklift_core::util::pack_utils::{IngestBase, IngestStored, StoreIngest};
 use forklift_core::util::{inventory_utils, object_utils, office_utils, pallet_utils, shift_utils};
+use crate::events;
 use crate::output::{self, CommandOutput};
 
 /// Handle the import-git command (§7.8): one-way migration of a git repository's history
@@ -71,6 +72,7 @@ pub fn handle_command(path: &str, no_compact: bool) -> Result<(), String> {
         return Err(format!("\"{}\" has no local branches to import.", path));
     }
 
+    let progress = events::progress();
     let mut converter = Converter::new(path, !no_compact)?;
 
     // `--no-compact` writes straight to the loose store, one file per object — exactly the
@@ -81,9 +83,15 @@ pub fn handle_command(path: &str, no_compact: bool) -> Result<(), String> {
 
     // Convert every commit oldest-first (so each commit's parents are already mapped),
     // pulling in the trees and blobs each one references on the way.
-    for commit in all_commits(path)? {
-        converter.convert_commit(&commit)?;
+    progress.status("Converting commits");
+
+    let commits = all_commits(path)?;
+    for (done, commit) in commits.iter().enumerate() {
+        converter.convert_commit(commit)?;
+        progress.fraction(done + 1, commits.len(), || format!("{}/{} commits", done + 1, commits.len()));
     }
+
+    progress.status("Publishing objects");
 
     // Publish the final pack before anything points at (or reads) the imported objects:
     // the pallet heads below must never reference an object that is not yet visible. The
@@ -127,6 +135,7 @@ pub fn handle_command(path: &str, no_compact: bool) -> Result<(), String> {
         pallet_utils::set_current_pallet_name(pallet)?;
 
         if let Some(head) = pallet_utils::get_pallet_head(pallet)? {
+            progress.status("Building the inventory");
             let tree = object_utils::load_parcel(&head)?.tree_hash;
             let shards = shift_utils::build_inventories_for_tree(&tree)?;
             inventory_utils::replace_all_inventories(&shards)?;

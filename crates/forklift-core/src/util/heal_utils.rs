@@ -1128,7 +1128,7 @@ mod tests {
         // Repack while nothing is tainted yet (`compact` itself is gated on a clean existence
         // check, so it must run *before* the taint below is planted): deletes the loose copy,
         // lands the object in a pack instead.
-        let stats = pack_utils::compact(false, false).expect("compact must succeed");
+        let stats = pack_utils::compact(false, false, &crate::util::progress_utils::Progress::NONE).expect("compact must succeed");
         assert_eq!(stats.objects_packed, 1, "sanity: exactly the one object got packed");
         assert!(!forklift.join(&relative).exists(), "sanity: the loose copy is gone after compact");
         assert!(pack_utils::is_in_packs(&hash).unwrap(), "sanity: the object now lives in a pack");
@@ -1166,7 +1166,7 @@ mod tests {
         let (hash, relative) = write_loose_object(&forklift, content);
 
         // Same ordering constraint as the entry-heal test above: repack before the taint exists.
-        pack_utils::compact(false, false).expect("compact must succeed");
+        pack_utils::compact(false, false, &crate::util::progress_utils::Progress::NONE).expect("compact must succeed");
         assert!(pack_utils::is_in_packs(&hash).unwrap(), "sanity: the object now lives in a pack");
 
         let relative_str = relative.to_string_lossy().into_owned();

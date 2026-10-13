@@ -1,5 +1,6 @@
 use serde::Serialize;
 use forklift_core::util::pack_utils;
+use crate::events;
 use crate::output::{self, CommandOutput};
 
 /// Handle the compact command: pack the warehouse's objects into a few dense pack files
@@ -25,7 +26,7 @@ pub fn handle_command(all: bool, redelta: bool) -> Result<(), String> {
         );
     }
 
-    let stats = pack_utils::compact(all, redelta)?;
+    let stats = pack_utils::compact(all, redelta, &events::progress())?;
 
     output::emit(&Compacted {
         all,

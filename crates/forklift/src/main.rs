@@ -9,6 +9,7 @@ pub mod cli;
 pub mod commands;
 #[cfg(feature = "docgen")]
 pub mod docgen;
+pub mod events;
 pub mod output;
 pub mod pager;
 pub mod passphrase;
@@ -30,6 +31,10 @@ const WORKER_STACK_SIZE: usize = 8 * 1024 * 1024;
 /// [`WORKER_STACK_SIZE`]) and waits for it. `main` itself does no work that could need a large
 /// stack, so its own (platform-default) stack size is irrelevant.
 fn main() {
+    // Before anything else opens a file descriptor: validating an inherited `PULT_EVENTS`
+    // number is only sound while nothing of ours could have been given that number.
+    events::init();
+
     std::thread::Builder::new()
         .name("forklift-main".to_string())
         .stack_size(WORKER_STACK_SIZE)
@@ -79,6 +84,7 @@ async fn async_main() {
     // deadlock behind it. Torn down after the command so the shell waits for the user to quit.
     let pager = if cli.command.pages_output() { pager::setup(cli.no_pager) } else { None };
     let result = forklift(cli).await;
+    events::finish();
     if let Some(pager) = pager {
         pager.close();
     }
