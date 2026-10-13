@@ -392,7 +392,8 @@ for writing and is a pipe, FIFO or socket. Forklift checks this at startup, befo
 file of its own. Anything else is ignored without a message, and the command runs as if the
 variable were unset: an empty or non-numeric value, a sign or whitespace, 0, 1 or 2, a closed
 fd, a regular file, a terminal, or a read-only end. So an fd inherited by accident is never
-written to, and stdout always stays the one `--json` document.
+written to, and stdout always stays the one `--json` document. Whatever a numeric value above 2
+names, accepted or not, is made close-on-exec, so it is not passed on to anything Forklift runs.
 
 **Ordering and loss.** Events arrive in the order they happened. Emitting never blocks, slows
 or stops the operation: a small queue sits between the operation and a dedicated writer, and

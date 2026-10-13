@@ -9,7 +9,9 @@
 //! Emission must never block, slow or kill the operation it reports on. So:
 //!
 //! * The fd is validated once, at process start, before Forklift opens a file of its own — an
-//!   inherited number that is closed, or now names a file, is never written to.
+//!   inherited number that is closed, or now names a file, is never written to. Whatever fd the
+//!   variable names is not passed on to children even when it is refused, since a refused write
+//!   end that a child kept would hold the reader open.
 //! * Reports go into a small bounded queue and a dedicated thread writes them out. A push never
 //!   waits on the reader: it coalesces into the newest entry where that loses nothing a reader
 //!   needs, and otherwise drops the oldest entry when the queue is full.

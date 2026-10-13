@@ -78,12 +78,19 @@ pub fn handle_command(root: Option<String>) -> Result<(), String> {
             Ok(()) => {}
             // The client has gone: the connection is over, as it is when stdin closes. Nothing
             // is left to report it to, and stderr may well have gone with it.
-            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => return Ok(()),
+            Err(e) if client_gone(&e) => return Ok(()),
             Err(e) => return Err(format!("Error while writing stdout: {}", e)),
         }
     }
 
     Ok(())
+}
+
+/// Whether a failed write means the client has gone: a pipe reports it as a broken pipe, a
+/// socket can report a reset or a lost connection instead.
+fn client_gone(error: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    matches!(error.kind(), ErrorKind::BrokenPipe | ErrorKind::ConnectionReset | ErrorKind::NotConnected)
 }
 
 /// Write one JSON-RPC message as a line and flush it.
@@ -563,7 +570,7 @@ struct ProgressMapper {
     /// The newest text received since the last send.
     pending_message: Option<String>,
 
-    /// Whether a `status` arrived since the last send.
+    /// Whether a `status` naming a new phase arrived since the last send.
     pending_phase: bool,
 
     /// Text-only notifications sent since the last whole value.
@@ -597,8 +604,11 @@ impl ProgressMapper {
     fn receive(&mut self, event: Reported) {
         match event {
             Reported::Status(phase) => {
+                // Only a different phase may use the phases' share: a repeated status is text.
+                if self.phase.as_deref() != Some(phase.as_str()) {
+                    self.pending_phase = true;
+                }
                 self.pending_message = Some(phase.clone());
-                self.pending_phase = true;
                 self.phase = Some(phase);
             }
             Reported::Progress { percent, text } => {
@@ -1387,6 +1397,36 @@ mod tests {
             sent += u32::from(mapper.finish().is_some());
         }
         assert_eq!(sent, super::TEXT_ONLY_TEXT_LIMIT);
+    }
+
+    #[test]
+    fn a_reset_or_lost_connection_is_a_client_that_left_like_a_broken_pipe() {
+        use std::io::{Error, ErrorKind};
+        for kind in [ErrorKind::BrokenPipe, ErrorKind::ConnectionReset, ErrorKind::NotConnected] {
+            assert!(super::client_gone(&Error::from(kind)), "{:?}", kind);
+        }
+        for kind in [ErrorKind::Other, ErrorKind::WriteZero, ErrorKind::Interrupted] {
+            assert!(!super::client_gone(&Error::from(kind)), "{:?}", kind);
+        }
+    }
+
+    #[test]
+    fn a_repeated_status_gets_only_the_text_share_of_the_steps() {
+        // A repeated status names no new phase, so it is text, and the phases' share is still
+        // there for one that does.
+        let mut mapper = ProgressMapper::new(true);
+        mapper.receive(status("Packing objects"));
+        mapper.receive(progress(10, "0"));
+        assert_eq!(mapper.finish().map(|sent| sent.0), Some(10.0));
+        let mut repeated = 0;
+        for index in 0..5000u32 {
+            mapper.receive(status("Packing objects"));
+            mapper.receive(Reported::Progress { percent: None, text: index.to_string() });
+            repeated += u32::from(mapper.finish().is_some());
+        }
+        assert_eq!(repeated, super::TEXT_ONLY_TEXT_LIMIT);
+        mapper.receive(status("Removing packed originals"));
+        assert!(mapper.finish().is_some(), "a new phase was dropped after repeated ones");
     }
 
     fn progress(percent: u8, text: &str) -> Reported {
