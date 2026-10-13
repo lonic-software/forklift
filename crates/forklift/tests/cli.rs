@@ -4,14 +4,8 @@ use std::process::{Command, Output};
 /// Path to the compiled forklift binary (provided by cargo for integration tests).
 const FORKLIFT: &str = env!("CARGO_BIN_EXE_forklift");
 
-/// `forklift` with fsync off. Durability is not what these tests check, and paying an fsync per
-/// write made the suite several times slower (most of all on macOS and Windows).
-/// `crash_consistency.rs` and the in-process fsync tests keep it on.
-fn forklift_command() -> Command {
-    let mut command = Command::new(FORKLIFT);
-    command.env("FORKLIFT_FSYNC", "0");
-    command
-}
+mod common;
+use common::forklift_command;
 
 /// A temporary warehouse directory that is deleted when the test ends.
 struct TestWarehouse {
@@ -2875,6 +2869,14 @@ fn alias_status_reports_installed_state() {
     assert_eq!(json(&after)["data"]["installed"], true);
 }
 
+/// A command that reaches `forklift` through the alias, in the environment [`forklift_command`]
+/// gives the direct one, so a comparison of the two sees only what the alias changes.
+fn forklift_alias_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut command = Command::new(program);
+    command.env("FORKLIFT_FSYNC", "0");
+    command
+}
+
 #[test]
 fn the_fl_alias_behaves_identically_to_forklift() {
     let scratch = AliasScratch::new("behaves-identically");
@@ -2883,14 +2885,14 @@ fn the_fl_alias_behaves_identically_to_forklift() {
     // Direct execution of a `.cmd` file via `CreateProcess` is unreliable — Windows needs
     // the command interpreter to run a batch shim. Unix executes the symlink directly.
     #[cfg(windows)]
-    let via_alias = Command::new("cmd")
+    let via_alias = forklift_alias_command("cmd")
         .arg("/C")
         .arg(scratch.alias_path("fl"))
         .args(["--json", "version"])
         .output()
         .unwrap();
     #[cfg(not(windows))]
-    let via_alias = Command::new(scratch.alias_path("fl"))
+    let via_alias = forklift_alias_command(scratch.alias_path("fl"))
         .args(["--json", "version"])
         .output()
         .unwrap();

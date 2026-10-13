@@ -10,14 +10,8 @@ use forklift_core::util::progress_utils::Progress;
 /// Path to the compiled forklift binary (provided by cargo for integration tests).
 const FORKLIFT: &str = env!("CARGO_BIN_EXE_forklift");
 
-/// `forklift` with fsync off. Durability is not what these tests check, and paying an fsync per
-/// write made the suite several times slower (most of all on macOS and Windows).
-/// `crash_consistency.rs` and the in-process fsync tests keep it on.
-fn forklift_command() -> Command {
-    let mut command = Command::new(FORKLIFT);
-    command.env("FORKLIFT_FSYNC", "0");
-    command
-}
+mod common;
+use common::forklift_command;
 
 /// Path to the compiled forklift-server binary. Cargo exposes `CARGO_BIN_EXE_*` only
 /// for the package's own binaries, so the server is located next to the CLI (both land

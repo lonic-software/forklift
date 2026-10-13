@@ -59,8 +59,8 @@ fn forklift_binary() -> PathBuf {
 }
 
 /// `forklift` with fsync off. Durability is not what these tests check, and paying an fsync per
-/// write made the suite several times slower (most of all on macOS and Windows).
-/// `crash_consistency.rs` and the in-process fsync tests keep it on.
+/// write made the suite much slower.
+/// Only the CLI is affected: the server half runs in this test process, which leaves fsync on.
 fn forklift_command() -> Command {
     let mut command = Command::new(forklift_binary());
     command.env("FORKLIFT_FSYNC", "0");

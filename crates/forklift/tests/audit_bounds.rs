@@ -14,23 +14,15 @@
 //!   point and re-verified ancestry that was audited when `old_head` was committed.
 
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::Output;
 
 use forklift_core::globals::StorageRootScope;
 use forklift_core::util::{
     audit_utils, file_utils, graph_utils, object_utils, office_utils, pallet_utils,
 };
 
-const FORKLIFT: &str = env!("CARGO_BIN_EXE_forklift");
-
-/// `forklift` with fsync off. Durability is not what these tests check, and paying an fsync per
-/// write made the suite several times slower (most of all on macOS and Windows).
-/// `crash_consistency.rs` and the in-process fsync tests keep it on.
-fn forklift_command() -> Command {
-    let mut command = Command::new(FORKLIFT);
-    command.env("FORKLIFT_FSYNC", "0");
-    command
-}
+mod common;
+use common::forklift_command;
 
 /// The chunk threshold (bytes): content at or above this is stored chunked. Mirrors
 /// `chunk_utils::CHUNK_THRESHOLD_BYTES` (a frozen format constant).

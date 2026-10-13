@@ -48,12 +48,15 @@ impl Area {
         self.root.join("warehouse")
     }
 
-    /// A command in the warehouse with the isolated global config and key directory.
+    /// A command in the warehouse with the isolated global config and key directory, and fsync
+    /// forced on: durability is what this suite checks, so a `FORKLIFT_FSYNC=0` in the
+    /// environment the tests were started from must not reach the binary.
     fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(FORKLIFT);
         command
             .args(args)
             .current_dir(self.warehouse())
+            .env("FORKLIFT_FSYNC", "1")
             .env("FORKLIFT_GLOBAL_CONFIG", self.root.join("home").join("global-config.toml"))
             .env("FORKLIFT_KEYS_DIR", self.root.join("home").join("keys"));
         command
