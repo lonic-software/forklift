@@ -2766,7 +2766,7 @@ mod tests {
     fn the_hook_client_is_armed_at_the_production_timeout() {
         assert_eq!(HOOK_CLIENT_TIMEOUT, std::time::Duration::from_secs(10));
         let client = format!("{:?}", build_hook_client().unwrap());
-        assert!(client.contains("timeout: 10s"), "the hook client is not armed at 10s: {}", client);
+        assert!(client.contains("TotalTimeout: 10s"), "the hook client is not armed at 10s: {}", client);
     }
 
     #[tokio::test]
