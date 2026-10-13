@@ -273,8 +273,7 @@ pub struct ServeOptions {
 }
 
 /// The flat request timeout this head arms on the `reqwest::Client` it calls every hook
-/// through ([`build_hook_client`] builds from this constant rather than a second, unlinked
-/// literal). It bounds *every* hook that client carries — authentication, admission, events and
+/// through ([`build_hook_client`] builds from this constant and takes no figure of its own). It bounds *every* hook that client carries — authentication, admission, events and
 /// resolution — individually, not collectively: a request running two of them may wait twice
 /// this long.
 ///
@@ -296,17 +295,19 @@ pub struct ServeOptions {
 /// silent design defect.
 const HOOK_CLIENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Build the outbound HTTP client `AppState.http` holds — timeout-armed at `timeout` so a hook
-/// endpoint that accepts a connection and then never answers cannot wedge the gated request
-/// forever. [`serve`] arms it at [`HOOK_CLIENT_TIMEOUT`]. The one function [`serve`] and the test
-/// harness both construct `AppState.http` through, so the test suite exercises the same armed
-/// client production actually runs rather than an unbounded `reqwest::Client::new()` standing in
-/// for it — see
-/// `tests::an_authentication_hook_that_never_answers_fails_closed_near_the_hook_timeout` (and its
-/// admission-hook sibling) for the tests this closes. Those two arm a short bound so they do not
-/// wait out the production one; `tests::the_hook_client_timeout_is_the_documented_figure` pins
-/// that.
-fn build_hook_client(timeout: std::time::Duration) -> Result<reqwest::Client, String> {
+/// Build the outbound HTTP client `AppState.http` holds, armed at [`HOOK_CLIENT_TIMEOUT`] so a
+/// hook endpoint that accepts a connection and then never answers cannot wedge the gated request
+/// forever. [`serve`] and the test harness both construct `AppState.http` through it, and it takes
+/// no argument, so `serve` has no figure to get wrong.
+/// `tests::the_hook_client_is_armed_at_the_production_timeout` reads the armed figure off the
+/// built client.
+fn build_hook_client() -> Result<reqwest::Client, String> {
+    hook_client_armed_at(HOOK_CLIENT_TIMEOUT)
+}
+
+/// The construction behind [`build_hook_client`]. The tests that watch a hook time out call it
+/// with a short figure, so they build the same client production runs except for the timeout.
+fn hook_client_armed_at(timeout: std::time::Duration) -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .timeout(timeout)
         .build()
@@ -577,7 +578,7 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
         }
     }
 
-    let http = build_hook_client(HOOK_CLIENT_TIMEOUT)?;
+    let http = build_hook_client()?;
 
     let state = Arc::new(AppState {
         mode,
@@ -2428,11 +2429,9 @@ mod tests {
     /// A fresh `AppState` for a given serving mode, with no auth/hooks configured (tests
     /// override individual fields with struct-update syntax). `http` is built through
     /// [`build_hook_client`] — the same function [`serve`] uses — rather than a bare
-    /// `reqwest::Client::new()`: the latter carries no `read_timeout` at all, so a hook test built
-    /// on it would pass against a client that waits out a stalled hook endpoint forever, never
-    /// exercising the bound `serve` actually arms in production. Routing both through one function
-    /// makes that drift structurally impossible rather than a fact the suite has to happen to
-    /// keep testing.
+    /// `reqwest::Client::new()`, which carries no timeout at all, so the handler tests run against
+    /// the client production runs. The two never-answering-hook tests replace it with a client
+    /// armed at [`TEST_HOOK_TIMEOUT`] so they do not wait out the production figure.
     ///
     /// `open: true` here is a test-fixture convenience only, never the production default (see
     /// `ServeOptions::open`'s doc comment and `serve`'s startup refusal): almost none of the
@@ -2451,7 +2450,7 @@ mod tests {
             admission_hook: None,
             events_hook: None,
             resolution_hook: None,
-            http: build_hook_client(HOOK_CLIENT_TIMEOUT).expect(
+            http: build_hook_client().expect(
                 "the hook HTTP client must build with this module's fixed config: only a \
                 malformed TLS/proxy setting could fail this, and none is set here"
             ),
@@ -2755,6 +2754,21 @@ mod tests {
         assert_eq!(error.0, StatusCode::UNAUTHORIZED);
     }
 
+    /// The bound the two never-answering-hook tests arm their client at, in place of
+    /// [`HOOK_CLIENT_TIMEOUT`], so neither waits ten seconds.
+    const TEST_HOOK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1_500);
+
+    /// The client [`serve`] builds is armed at the production figure, read off the client itself
+    /// rather than waited out: the tests that watch a hook time out arm [`TEST_HOOK_TIMEOUT`]
+    /// instead. `reqwest`'s `Debug` output names the armed timeout; if a `reqwest` upgrade changes
+    /// that format, this fails rather than passing vacuously.
+    #[test]
+    fn the_hook_client_is_armed_at_the_production_timeout() {
+        assert_eq!(HOOK_CLIENT_TIMEOUT, std::time::Duration::from_secs(10));
+        let client = format!("{:?}", build_hook_client().unwrap());
+        assert!(client.contains("timeout: 10s"), "the hook client is not armed at 10s: {}", client);
+    }
+
     #[tokio::test]
     async fn an_unreachable_authentication_hook_fails_closed() {
         let state = AppState {
@@ -2772,38 +2786,26 @@ mod tests {
     /// instead: a hook that accepts the connection and then never answers must still fail closed,
     /// within a bound close to the one its client was armed at, rather than hang.
     ///
-    /// The client is armed at [`TEST_HOOK_TIMEOUT`], built through the same
-    /// [`build_hook_client`] [`serve`] uses, so the test waits a second and a half rather than
-    /// production's ten; `the_hook_client_timeout_is_the_documented_figure` pins the production
-    /// figure without waiting it out. `lower_bound`/`upper_bound` are literals, not derived from
-    /// [`TEST_HOOK_TIMEOUT`], so a mutation to the armed figure moves the real elapsed time and
-    /// not the bounds with it. `lower_bound` (1.2s) separates the armed bound from a client
-    /// armed at half of it (0.75s), and `upper_bound` (5s) leaves 3.5s above it for a loaded
-    /// runner's scheduling, while still well under production's 10s, so a client that ignored
-    /// the bound it was given and armed [`HOOK_CLIENT_TIMEOUT`] fails here. `outer_ceiling`
-    /// (15s) is a backstop past both, so a genuinely unbounded regression fails this test's own
-    /// panic (naming the real cause) rather than hanging the suite.
-    /// The bound the two never-answering-hook tests arm their client at, in place of
-    /// [`HOOK_CLIENT_TIMEOUT`], so neither waits ten seconds.
-    const TEST_HOOK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1_500);
-
-    /// The production hook timeout, pinned without waiting it out: the tests that watch a hook
-    /// time out do so against [`TEST_HOOK_TIMEOUT`].
-    #[test]
-    fn the_hook_client_timeout_is_the_documented_figure() {
-        assert_eq!(HOOK_CLIENT_TIMEOUT, std::time::Duration::from_secs(10));
-    }
-
+    /// The client is armed at [`TEST_HOOK_TIMEOUT`] through [`hook_client_armed_at`], the
+    /// construction [`build_hook_client`] uses, so the test waits a second and a half rather than
+    /// production's ten; `the_hook_client_is_armed_at_the_production_timeout` checks the
+    /// production figure without waiting it out. `lower_bound`/`upper_bound` are literals, not
+    /// derived from [`TEST_HOOK_TIMEOUT`], so a mutation to the armed figure moves the real
+    /// elapsed time and not the bounds with it. `lower_bound` (1.2s) rejects a client armed at
+    /// half the figure (0.75s), and `upper_bound` (3s) rejects one armed at twice it, leaving 1.5s
+    /// for a loaded runner's scheduling. `outer_ceiling` (15s) is a backstop past both, so a
+    /// genuinely unbounded regression fails this test's own panic (naming the real cause) rather
+    /// than hanging the suite.
     #[tokio::test]
     async fn an_authentication_hook_that_never_answers_fails_closed_near_the_hook_timeout() {
         let hook = SilentHook::start();
         let state = AppState {
             authentication_hook: Some(HookEndpoint { url: hook.url.clone(), secret: "s".to_string() }),
-            http: build_hook_client(TEST_HOOK_TIMEOUT).unwrap(),
+            http: hook_client_armed_at(TEST_HOOK_TIMEOUT).unwrap(),
             ..single_mode_state(PathBuf::from("/unused"))
         };
         let lower_bound = std::time::Duration::from_millis(1_200);
-        let upper_bound = std::time::Duration::from_secs(5);
+        let upper_bound = std::time::Duration::from_secs(3);
         let outer_ceiling = std::time::Duration::from_secs(15);
 
         let started = std::time::Instant::now();
@@ -2824,7 +2826,7 @@ mod tests {
         assert!(
             elapsed >= lower_bound && elapsed < upper_bound,
             "elapsed {:?} is outside [{:?}, {:?}) — the client that fired was armed with some \
-            other bound than the one `build_hook_client` was given (TEST_HOOK_TIMEOUT, 1.5s)",
+            other bound than the one `hook_client_armed_at` was given (TEST_HOOK_TIMEOUT, 1.5s)",
             elapsed, lower_bound, upper_bound
         );
     }
@@ -2968,17 +2970,17 @@ mod tests {
     /// The admission-hook sibling of
     /// `an_authentication_hook_that_never_answers_fails_closed_near_the_hook_timeout` — same gap,
     /// same fixture, same literal bounds and the same reasoning for why they are literals rather
-    /// than `HOOK_CLIENT_TIMEOUT`-derived; see that test's own doc.
+    /// than derived from [`TEST_HOOK_TIMEOUT`]; see that test's own doc.
     #[tokio::test]
     async fn an_admission_hook_that_never_answers_fails_closed_near_the_hook_timeout() {
         let hook = SilentHook::start();
         let state = AppState {
             admission_hook: Some(HookEndpoint { url: hook.url.clone(), secret: "s".to_string() }),
-            http: build_hook_client(TEST_HOOK_TIMEOUT).unwrap(),
+            http: hook_client_armed_at(TEST_HOOK_TIMEOUT).unwrap(),
             ..single_mode_state(PathBuf::from("/unused"))
         };
         let lower_bound = std::time::Duration::from_millis(1_200);
-        let upper_bound = std::time::Duration::from_secs(5);
+        let upper_bound = std::time::Duration::from_secs(3);
         let outer_ceiling = std::time::Duration::from_secs(15);
 
         let started = std::time::Instant::now();
@@ -3001,7 +3003,7 @@ mod tests {
         assert!(
             elapsed >= lower_bound && elapsed < upper_bound,
             "elapsed {:?} is outside [{:?}, {:?}) — the client that fired was armed with some \
-            other bound than the one `build_hook_client` was given (TEST_HOOK_TIMEOUT, 1.5s)",
+            other bound than the one `hook_client_armed_at` was given (TEST_HOOK_TIMEOUT, 1.5s)",
             elapsed, lower_bound, upper_bound
         );
     }
