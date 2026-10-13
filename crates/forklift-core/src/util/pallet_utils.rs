@@ -573,6 +573,10 @@ pub fn resolve_revision(arg: &str) -> Result<String, String> {
 /// * `Ok(String)`  - The full hash of the single matching object.
 /// * `Err(String)` - If no object matches, or more than one does.
 fn resolve_object_hash_prefix(prefix: &str) -> Result<String, String> {
+    // Hashes are stored and compared in lowercase. On a case-insensitive filesystem an uppercase
+    // prefix still finds the fan-out folder, and the user's casing would end up in the result.
+    let prefix = prefix.to_ascii_lowercase();
+    let prefix = prefix.as_str();
     let mut matches: Vec<String> = Vec::new();
 
     // Loose objects: scan the fan-out folder for matching file names.

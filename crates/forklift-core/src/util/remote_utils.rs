@@ -5374,17 +5374,27 @@ pub async fn adopt_remote_trust(client: &RemoteClient,
     Ok(stats)
 }
 
-/// The re-genesis `office accept-regenesis` would act on: the held anchor and the remote's
-/// handshake, when the remote's anchor differs from the held one. Shared by the describing and
-/// the accepting path, so both refuse the same states the same way.
+/// Where a warehouse stands against its remote's trust anchor, as `office accept-regenesis` sees
+/// it.
+pub enum RegenesisState {
+    /// The remote's anchor differs from the held one: the held anchor, the remote's, and the
+    /// handshake that carried it.
+    Pending {
+        local: office_utils::TrustAnchor,
+        remote: TrustAnchorDto,
+        info: WarehouseInfo,
+    },
+    /// The remote's anchor is the held one.
+    InSync { local: office_utils::TrustAnchor },
+}
+
+/// The re-genesis `office accept-regenesis` would act on. Shared by the describing and the
+/// accepting path, so both refuse the same states the same way.
 ///
 /// # Returns
-/// * `Ok(Some((TrustAnchor, TrustAnchorDto, WarehouseInfo)))` - The held anchor, the remote's
-///                                                              differing one, and the handshake.
-/// * `Ok(None)`    - The remote's anchor is the held one.
-/// * `Err(String)` - This warehouse or the remote holds no anchor, or the handshake failed.
-pub async fn pending_regenesis(client: &RemoteClient)
-    -> Result<Option<(office_utils::TrustAnchor, TrustAnchorDto, WarehouseInfo)>, String> {
+/// * `Ok(RegenesisState)` - Whether a re-genesis is pending, with the anchors on each side.
+/// * `Err(String)`        - This warehouse or the remote holds no anchor, or the handshake failed.
+pub async fn pending_regenesis(client: &RemoteClient) -> Result<RegenesisState, String> {
     let Some(local) = office_utils::read_trust_anchor()? else {
         return Err(
             "This warehouse has no trust anchor; a plain \"lower\" adopts the remote's \
@@ -5394,15 +5404,15 @@ pub async fn pending_regenesis(client: &RemoteClient)
 
     let info = client.fetch_info().await?;
 
-    let Some(remote_trust) = info.trust.clone() else {
+    let Some(remote) = info.trust.clone() else {
         return Err("The remote has no trust anchor; there is no re-genesis to accept.".to_string());
     };
 
-    if remote_trust.genesis == local.genesis {
-        return Ok(None);
+    if remote.genesis == local.genesis {
+        return Ok(RegenesisState::InSync { local });
     }
 
-    Ok(Some((local, remote_trust, info)))
+    Ok(RegenesisState::Pending { local, remote, info })
 }
 
 /// Consciously accept a remote's re-genesis (§8.7): the loud, deliberate counterpart
@@ -5431,16 +5441,15 @@ pub async fn pending_regenesis(client: &RemoteClient)
 pub async fn accept_regenesis(client: &RemoteClient,
                               confirmed: &str)
     -> Result<Option<(office_utils::TrustAnchor, office_utils::TrustAnchor)>, String> {
-    let Some((local, remote_trust, info)) = pending_regenesis(client).await? else {
+    let (local, remote_trust, info) = match pending_regenesis(client).await? {
+        RegenesisState::Pending { local, remote, info } => (local, remote, info),
         // Nothing is pending. That is success only if the confirmed value is the one held;
         // otherwise the remote moved away from what was shown, and saying "nothing to accept"
         // would let a caller believe its value is now trusted.
-        let held = office_utils::read_trust_anchor()?.map(|anchor| anchor.genesis).unwrap_or_default();
-        if held == confirmed {
-            return Ok(None);
+        RegenesisState::InSync { local } if local.genesis == confirmed => return Ok(None),
+        RegenesisState::InSync { local } => {
+            return Err(trust_utils::confirm_not_pending(client.url(), &local.genesis, confirmed).into());
         }
-
-        return Err(trust_utils::confirm_not_pending(client.url(), &held, confirmed).into());
     };
     let remote_trust = &remote_trust;
 

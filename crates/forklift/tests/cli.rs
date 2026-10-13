@@ -2141,6 +2141,13 @@ fn revisions_resolve_pallets_and_parcel_hash_prefixes() {
     assert!(history.contains(&format!("parcel {}", first)));
     assert!(!history.contains("second"));
 
+    // A prefix in another case names the same parcel, and what it resolves to is the stored
+    // lowercase spelling: a ref written from the user's casing would be refused when read back.
+    let upper = first[0..8].to_uppercase();
+    assert_success(&warehouse.run(&["palletize", "upper", &upper]));
+    let history = stdout(&warehouse.run(&["history", "upper"]));
+    assert!(history.contains(&format!("parcel {}", first)), "unexpected history: {}", history);
+
     // Unknown and non-hash arguments are rejected.
     let unknown = warehouse.run(&["history", "zzzz"]);
     assert!(!unknown.status.success());

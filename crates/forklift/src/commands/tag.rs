@@ -162,7 +162,7 @@ enum SubjectProbe {
     /// object hash — never fetched here, or collected after nothing else referenced it.
     Absent,
 
-    /// The subject is not shaped like an object hash at all (`file_utils::is_valid_object_hash`
+    /// The subject is not shaped like an object hash at all (`file_utils::is_object_hash_or_prefix`
     /// says no) — a `@tags` record can carry one because [`Tag::subject`] is an unvalidated
     /// free string a foreign or older client could have authored, synced in wholesale by
     /// `adopt_meta_pallets`. No copy of any warehouse could ever hold an object under a name
@@ -182,7 +182,7 @@ impl SubjectProbe {
 
 /// Probe a tag's subject, classifying it three ways rather than two. A malformed subject is
 /// handled first and entirely locally (a string shape check, never touching the object store):
-/// detected explicitly via [`file_utils::is_valid_object_hash`], never inferred from
+/// detected explicitly via [`file_utils::is_object_hash_or_prefix`], never inferred from
 /// [`file_utils::does_object_exist`]'s `Err` text, which is brittle and not what that text is
 /// for. Only a hash-shaped subject goes on to the real presence probe
 /// (`file_utils::does_object_exist`).
@@ -203,7 +203,7 @@ impl SubjectProbe {
 /// `main.rs`'s entry-heal chokepoint before any command's body — including this probe's — ever
 /// runs.
 fn probe_subject(tag: &Tag) -> Result<SubjectProbe, String> {
-    if !file_utils::is_valid_object_hash(&tag.subject) {
+    if !file_utils::is_object_hash_or_prefix(&tag.subject) {
         return Ok(SubjectProbe::Malformed);
     }
 
@@ -568,7 +568,7 @@ mod tests {
         // check before `probe_subject` would ever need to consult the object store, so this
         // must not need one — if it did, this test would panic on a missing storage root instead
         // of asserting anything about classification. "abc" is deliberately NOT in this list: at
-        // 3 hex characters it clears `is_valid_object_hash`'s permissive floor (it does not
+        // 3 hex characters it clears `is_object_hash_or_prefix`'s permissive floor (it does not
         // enforce any particular digest's width, only "hex and long enough to fan out on") — a
         // short-but-hex-shaped subject is an ordinary Absent question, not a malformed one; see
         // the next test.
@@ -592,12 +592,12 @@ mod tests {
     /// integration fixture instead of a unit test here — see
     /// `a_signed_tag_subject_is_collected_after_undo_moves_the_head_back`.
     #[test]
-    fn is_valid_object_hash_accepts_a_well_formed_hex_string_of_any_length_above_the_floor() {
-        assert!(file_utils::is_valid_object_hash(&"a".repeat(64)));
-        assert!(file_utils::is_valid_object_hash("abc123"));
-        assert!(!file_utils::is_valid_object_hash("ab"));
-        assert!(!file_utils::is_valid_object_hash(""));
-        assert!(!file_utils::is_valid_object_hash("not-hex"));
+    fn is_object_hash_or_prefix_accepts_a_well_formed_hex_string_of_any_length_above_the_floor() {
+        assert!(file_utils::is_object_hash_or_prefix(&"a".repeat(64)));
+        assert!(file_utils::is_object_hash_or_prefix("abc123"));
+        assert!(!file_utils::is_object_hash_or_prefix("ab"));
+        assert!(!file_utils::is_object_hash_or_prefix(""));
+        assert!(!file_utils::is_object_hash_or_prefix("not-hex"));
     }
 
     fn attributed(tag: Tag) -> AttributedTag {

@@ -84,19 +84,28 @@ impl TrustAnchorDto {
     /// look-alike characters is rejected where an anchor is read — the client's handshake, the
     /// server's `PUT /v1/trust` — rather than sanitized at each place it is printed.
     pub fn validate(&self) -> Result<(), String> {
-        let hashes = std::iter::once(&self.genesis)
-            .chain(&self.boundary)
-            .chain(&self.prior_genesis)
-            .chain(&self.adopts);
+        let fields = std::iter::once(("genesis", &self.genesis))
+            .chain(self.boundary.iter().map(|hash| ("boundary", hash)))
+            .chain(self.prior_genesis.iter().map(|hash| ("prior_genesis", hash)))
+            .chain(self.adopts.iter().map(|hash| ("adopts", hash)));
 
-        for hash in hashes {
-            if !crate::util::object_utils::is_object_hash(hash) {
-                return Err(format!(
-                    "The trust anchor is malformed: {:?} is not an object hash (64 lowercase hex \
-                    characters).",
-                    hash.chars().take(80).collect::<String>()
-                ));
+        // The problem names the field and what is wrong with it, never the value: the value came
+        // from a remote that is misbehaving, and repeating it would hand that remote the message.
+        for (field, hash) in fields {
+            if crate::util::object_utils::is_object_hash(hash) {
+                continue;
             }
+
+            let problem = match hash.bytes().position(|b| !matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+                Some(position) if position < 64 => {
+                    format!("byte {} is not a lowercase hex digit", position)
+                }
+                _ => format!("it is {} bytes long, not 64", hash.len()),
+            };
+
+            return Err(format!(
+                "The trust anchor is malformed: its {} is not an object hash ({}).", field, problem
+            ));
         }
 
         Ok(())
@@ -390,5 +399,14 @@ mod tests {
 
         // Uppercase is a hash in another spelling, which every byte-for-byte comparison misses.
         assert!(anchor(&hash.to_uppercase(), vec![], None).validate().is_err());
+
+        // The problem names the field and the defect, never the remote's value.
+        let problem = anchor(&hash, vec![bidi.clone()], None).validate().unwrap_err();
+        assert!(problem.contains("boundary") && problem.contains("byte 32"), "{}", problem);
+        assert!(!problem.contains('\u{202e}') && !problem.contains(&hash[..32]), "{}", problem);
+        let problem = anchor(&escape, vec![], None).validate().unwrap_err();
+        assert!(!problem.contains('\u{1b}'), "{}", problem);
+        let problem = anchor(&hash, vec![], Some("abc")).validate().unwrap_err();
+        assert!(problem.contains("prior_genesis") && problem.contains("3 bytes"), "{}", problem);
     }
 }
