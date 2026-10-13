@@ -125,7 +125,7 @@ jobs:
         run: |
           cores=${NUMBER_OF_PROCESSORS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || true)}
           case "$cores" in
-            ''|*[!0-9]*) echo "could not count cores (got '$cores')"; exit 1 ;;
+            ''|0|*[!0-9]*) echo "could not count cores (got '$cores')"; exit 1 ;;
           esac
           echo "cores=$cores test-threads=$(( cores * 2 ))"
           cargo nextest run --workspace --no-fail-fast --profile ci --test-threads "$(( cores * 2 ))"

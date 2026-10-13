@@ -21,7 +21,8 @@ slow-timeout = { period = "30s", terminate-after = 4 }
 filter = 'binary_id(forklift::crash_consistency) & test(/^killing_/)'
 slow-timeout = { period = "120s", terminate-after = 5 }
 
-# CI runs `--profile ci`, which is the default profile plus what follows.
+# CI runs `--profile ci`, which is the default profile plus what follows. It assumes the
+# `--test-threads` CI passes alongside it, twice the core count; nextest config cannot express that.
 [profile.ci]
 
 [[profile.ci.overrides]]
