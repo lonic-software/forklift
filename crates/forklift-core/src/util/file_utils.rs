@@ -2598,6 +2598,14 @@ mod tests {
         }
     }
 
+    /// The in-process tests are what run the sync calls: the integration suites launch their
+    /// binaries with fsync off. An environment that turns it off for this process too would
+    /// skip every sync call while those tests stay green, so it fails here instead.
+    #[test]
+    fn in_process_tests_run_with_fsync_on() {
+        assert!(fsync_enabled(), "FORKLIFT_FSYNC turns fsync off for the in-process tests; unset it");
+    }
+
     #[test]
     fn sync_dir_succeeds_on_a_real_directory() {
         // The durable-rename helper must accept an existing directory (its no-op-on-Windows path

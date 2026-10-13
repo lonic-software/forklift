@@ -13,7 +13,8 @@
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
-const FORKLIFT: &str = env!("CARGO_BIN_EXE_forklift");
+mod common;
+use common::forklift_command;
 
 struct Warehouse {
     root: PathBuf,
@@ -46,7 +47,7 @@ impl Warehouse {
     }
 
     fn command_at(&self, dir: &PathBuf, args: &[&str]) -> Command {
-        let mut command = Command::new(FORKLIFT);
+        let mut command = forklift_command();
         command
             .args(args)
             .current_dir(dir)

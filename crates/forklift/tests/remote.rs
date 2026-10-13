@@ -10,6 +10,9 @@ use forklift_core::util::progress_utils::Progress;
 /// Path to the compiled forklift binary (provided by cargo for integration tests).
 const FORKLIFT: &str = env!("CARGO_BIN_EXE_forklift");
 
+mod common;
+use common::forklift_command;
+
 /// Path to the compiled forklift-server binary. Cargo exposes `CARGO_BIN_EXE_*` only
 /// for the package's own binaries, so the server is located next to the CLI (both land
 /// in the same target directory when the workspace builds).
@@ -27,6 +30,13 @@ fn server_binary() -> PathBuf {
     );
 
     path
+}
+
+/// `forklift-server` with fsync off, for the same reason as [`forklift_command`].
+fn server_command() -> Command {
+    let mut command = Command::new(server_binary());
+    command.env("FORKLIFT_FSYNC", "0");
+    command
 }
 
 /// A scratch area for one test: warehouses, the server root, the shared key directory
@@ -56,7 +66,7 @@ impl TestArea {
     /// key directory are shared across the whole area — the same operator working from
     /// several copies of the warehouse.
     fn forklift(&self, relative_dir: &str, args: &[&str]) -> Output {
-        Command::new(FORKLIFT)
+        forklift_command()
             .args(args)
             .current_dir(self.path(relative_dir))
             .env("FORKLIFT_GLOBAL_CONFIG", self.path("area-global.toml"))
@@ -119,7 +129,7 @@ impl Server {
         let root = area.path("server-root");
         let root_str = root.to_str().unwrap().to_string();
 
-        let prepared = Command::new(server_binary())
+        let prepared = server_command()
             .args(["prepare", "--root", &root_str])
             .output()
             .unwrap();
@@ -139,7 +149,7 @@ impl Server {
         let root = area.path("server-root");
         let root_str = root.to_str().unwrap().to_string();
 
-        let prepared = Command::new(server_binary())
+        let prepared = server_command()
             .args(["prepare", "--root", &root_str])
             .output()
             .unwrap();
@@ -161,7 +171,7 @@ impl Server {
         let root = area.path(root_relative);
         let root_str = root.to_str().unwrap().to_string();
 
-        let prepared = Command::new(server_binary())
+        let prepared = server_command()
             .args(["prepare", "--root", &root_str])
             .output()
             .unwrap();
@@ -205,7 +215,7 @@ impl Server {
             None => args.push("--open".to_string()),
         }
 
-        let mut child = Command::new(server_binary())
+        let mut child = server_command()
             .args(&args)
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -230,7 +240,7 @@ impl Server {
     }
 
     fn rebuild_bundle(&self, area: &TestArea) -> Output {
-        let output = Command::new(server_binary())
+        let output = server_command()
             .args(["bundle", "--root", area.path("server-root").to_str().unwrap()])
             .output()
             .unwrap();
@@ -1525,7 +1535,7 @@ fn healthz_is_open_and_the_config_file_configures_the_server() {
     let root = area.path("server-root");
     std::fs::create_dir_all(&root).unwrap();
 
-    let prepared = Command::new(server_binary())
+    let prepared = server_command()
         .args(["prepare", "--root", root.to_str().unwrap()])
         .output()
         .unwrap();
@@ -1569,7 +1579,7 @@ fn gc_is_refused_while_serving_then_sweeps_orphans_once_the_server_stops() {
     // gc against the *live* server is refused — it would sweep the server's in-flight objects
     // and make a concurrent lift fail its ref update. It must wait until the server is stopped, and
     // it sweeps nothing when refused.
-    let refused = Command::new(server_binary())
+    let refused = server_command()
         .args(["gc", "--root", &root_str])
         .output()
         .unwrap();
@@ -1586,7 +1596,7 @@ fn gc_is_refused_while_serving_then_sweeps_orphans_once_the_server_stops() {
     let _ = std::fs::remove_file(root.join(".forklift").join("serve.lock"));
 
     // Within the grace period the orphan is protected...
-    let output = Command::new(server_binary())
+    let output = server_command()
         .args(["gc", "--root", &root_str])
         .output()
         .unwrap();
@@ -1596,7 +1606,7 @@ fn gc_is_refused_while_serving_then_sweeps_orphans_once_the_server_stops() {
     assert!(orphan.exists());
 
     // ...with the grace period at zero it is swept, and live history survives.
-    let output = Command::new(server_binary())
+    let output = server_command()
         .args(["gc", "--root", &root_str, "--grace-hours", "0"])
         .output()
         .unwrap();
@@ -1624,7 +1634,7 @@ fn a_second_server_and_gc_are_refused_while_serving_but_bundle_is_allowed() {
     // fails fast rather than blocking. --open: this is a raw `Command`, not `Server::spawn`, so
     // it needs its own explicit opt-out of authentication to reach the serve-lock refusal this
     // test is actually about, rather than the auth-config refusal (checked even earlier).
-    let second = Command::new(server_binary())
+    let second = server_command()
         .args(["serve", "--root", &root_str, "--addr", "127.0.0.1:0", "--open"])
         .output()
         .unwrap();
@@ -1635,7 +1645,7 @@ fn a_second_server_and_gc_are_refused_while_serving_but_bundle_is_allowed() {
             String::from_utf8_lossy(&second.stderr));
 
     // gc is likewise refused while serving.
-    let gc = Command::new(server_binary())
+    let gc = server_command()
         .args(["gc", "--root", &root_str])
         .output()
         .unwrap();
@@ -1643,7 +1653,7 @@ fn a_second_server_and_gc_are_refused_while_serving_but_bundle_is_allowed() {
 
     // bundle, by contrast, is deliberately *allowed* against a live server: it never deletes an
     // object, writes atomically, and a stale bundle is self-healing.
-    let bundle = Command::new(server_binary())
+    let bundle = server_command()
         .args(["bundle", "--root", &root_str])
         .output()
         .unwrap();
@@ -1862,7 +1872,7 @@ fn start_hooked_server(area: &TestArea, hooks: &HookServer, secret: &str) -> Ser
     let root = area.path("server-root");
     let root_str = root.to_str().unwrap().to_string();
 
-    let prepared = Command::new(server_binary())
+    let prepared = server_command()
         .args(["prepare", "--root", &root_str])
         .output()
         .unwrap();
@@ -1960,7 +1970,7 @@ fn an_unreachable_authentication_hook_fails_closed() {
     let area = TestArea::new("hooks-closed");
 
     let root = area.path("server-root");
-    let prepared = Command::new(server_binary())
+    let prepared = server_command()
         .args(["prepare", "--root", root.to_str().unwrap()])
         .output()
         .unwrap();
@@ -2003,7 +2013,7 @@ fn resolution_is_server_mediated_and_degrades_to_pseudonyms() {
     // client never talks to it directly; it asks the server, which asks the directory
     // (§8.12: server-mediated so the resolution policy is enforced, not advisory).
     let root = area.path("server-root");
-    let prepared = Command::new(server_binary())
+    let prepared = server_command()
         .args(["prepare", "--root", root.to_str().unwrap()])
         .output()
         .unwrap();
@@ -5220,7 +5230,7 @@ mod progress_events {
     /// Run the CLI in `relative_dir` with a fresh pipe as its channel, returning the output and
     /// the status lines read from it.
     fn forklift_with_events(area: &TestArea, relative_dir: &str, args: &[&str]) -> (Output, Vec<String>) {
-        let mut command = Command::new(FORKLIFT);
+        let mut command = forklift_command();
         command.args(args)
             .current_dir(area.path(relative_dir))
             .env("FORKLIFT_GLOBAL_CONFIG", area.path("area-global.toml"))

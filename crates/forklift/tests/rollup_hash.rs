@@ -9,7 +9,8 @@
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
-const FORKLIFT: &str = env!("CARGO_BIN_EXE_forklift");
+mod common;
+use common::forklift_command;
 
 /// One isolated warehouse with its own home for global config + keys — mirrors
 /// `determinism.rs`'s harness.
@@ -36,7 +37,7 @@ impl Warehouse {
     }
 
     fn command(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(FORKLIFT);
+        let mut command = forklift_command();
         command
             .args(args)
             .current_dir(&self.root)

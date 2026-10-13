@@ -54,12 +54,13 @@
 //! and stay behind on that branch.
 
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::Output;
 
 use forklift_core::globals::StorageRootScope;
 use forklift_core::util::{file_utils, gc_utils};
 
-const FORKLIFT: &str = env!("CARGO_BIN_EXE_forklift");
+mod common;
+use common::forklift_command;
 
 struct Warehouse {
     root: PathBuf,
@@ -92,7 +93,7 @@ impl Warehouse {
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(FORKLIFT)
+        forklift_command()
             .args(args)
             .current_dir(&self.root)
             .env("FORKLIFT_GLOBAL_CONFIG", self.home.join("global-config.toml"))
