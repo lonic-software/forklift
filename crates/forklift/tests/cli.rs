@@ -4,6 +4,15 @@ use std::process::{Command, Output};
 /// Path to the compiled forklift binary (provided by cargo for integration tests).
 const FORKLIFT: &str = env!("CARGO_BIN_EXE_forklift");
 
+/// `forklift` with fsync off. Durability is not what these tests check, and paying an fsync per
+/// write made the suite several times slower (most of all on macOS and Windows).
+/// `crash_consistency.rs` and the in-process fsync tests keep it on.
+fn forklift_command() -> Command {
+    let mut command = Command::new(FORKLIFT);
+    command.env("FORKLIFT_FSYNC", "0");
+    command
+}
+
 /// A temporary warehouse directory that is deleted when the test ends.
 struct TestWarehouse {
     root: PathBuf,
@@ -44,7 +53,7 @@ impl TestWarehouse {
     /// Run forklift with the working directory at an absolute path (e.g. a bay outside
     /// the warehouse), keeping the test's isolated global config and key directory.
     fn run_at(&self, dir: &std::path::Path, args: &[&str]) -> Output {
-        Command::new(FORKLIFT)
+        forklift_command()
             .args(args)
             .current_dir(dir)
             .env("FORKLIFT_GLOBAL_CONFIG", self.home.join("global-config.toml"))
@@ -54,7 +63,7 @@ impl TestWarehouse {
     }
 
     fn run_in(&self, relative_dir: &str, args: &[&str]) -> Output {
-        Command::new(FORKLIFT)
+        forklift_command()
             .args(args)
             .current_dir(self.root.join(relative_dir))
             // Tests must never read or write the developer's real global configuration.
@@ -67,7 +76,7 @@ impl TestWarehouse {
     /// Run a command with extra environment variables (e.g. supplying a key passphrase
     /// non-interactively via `FORKLIFT_KEY_PASSPHRASE`, standing in for the prompt).
     fn run_with_env(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
-        let mut command = Command::new(FORKLIFT);
+        let mut command = forklift_command();
 
         command.args(args)
             .current_dir(&self.root)
@@ -88,7 +97,7 @@ impl TestWarehouse {
         use std::io::Write;
         use std::process::Stdio;
 
-        let mut child = Command::new(FORKLIFT)
+        let mut child = forklift_command()
             .args(args)
             .current_dir(&self.root)
             .env("FORKLIFT_GLOBAL_CONFIG", self.home.join("global-config.toml"))
@@ -2361,7 +2370,7 @@ fn mcp_is_not_killed_by_a_client_that_stopped_reading() {
     let warehouse = TestWarehouse::new("mcp-gone");
     assert_success(&warehouse.run(&["prepare"]));
 
-    let mut child = Command::new(FORKLIFT)
+    let mut child = forklift_command()
         .arg("mcp")
         .current_dir(&warehouse.root)
         .env("FORKLIFT_GLOBAL_CONFIG", warehouse.home.join("global-config.toml"))
@@ -2695,7 +2704,7 @@ fn self_update_check_reports_without_mutating() {
     // A global command — no warehouse needed. The env override injects "the latest
     // release" so the check never touches the network.
     let run = |latest: &str| -> Output {
-        Command::new(FORKLIFT)
+        forklift_command()
             .args(["--json", "self-update", "--check"])
             .env("FORKLIFT_SELFUPDATE_LATEST", latest)
             .output()
@@ -2733,7 +2742,7 @@ impl AliasScratch {
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(FORKLIFT)
+        forklift_command()
             .args(args)
             .env("FORKLIFT_ALIAS_DIR", &self.dir)
             .output()
@@ -2885,7 +2894,7 @@ fn the_fl_alias_behaves_identically_to_forklift() {
         .args(["--json", "version"])
         .output()
         .unwrap();
-    let via_forklift = Command::new(FORKLIFT).args(["--json", "version"]).output().unwrap();
+    let via_forklift = forklift_command().args(["--json", "version"]).output().unwrap();
 
     assert_success(&via_alias);
     assert_eq!(json(&via_alias), json(&via_forklift), "fl must behave exactly like forklift");

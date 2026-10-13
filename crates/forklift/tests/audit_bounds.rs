@@ -23,6 +23,15 @@ use forklift_core::util::{
 
 const FORKLIFT: &str = env!("CARGO_BIN_EXE_forklift");
 
+/// `forklift` with fsync off. Durability is not what these tests check, and paying an fsync per
+/// write made the suite several times slower (most of all on macOS and Windows).
+/// `crash_consistency.rs` and the in-process fsync tests keep it on.
+fn forklift_command() -> Command {
+    let mut command = Command::new(FORKLIFT);
+    command.env("FORKLIFT_FSYNC", "0");
+    command
+}
+
 /// The chunk threshold (bytes): content at or above this is stored chunked. Mirrors
 /// `chunk_utils::CHUNK_THRESHOLD_BYTES` (a frozen format constant).
 const CHUNK_THRESHOLD: usize = 8 * 1024 * 1024;
@@ -53,7 +62,7 @@ impl Warehouse {
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(FORKLIFT)
+        forklift_command()
             .args(args)
             .current_dir(&self.root)
             .env("FORKLIFT_GLOBAL_CONFIG", self.home.join("global-config.toml"))

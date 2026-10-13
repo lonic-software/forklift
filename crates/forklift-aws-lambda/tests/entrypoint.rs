@@ -935,7 +935,7 @@ impl Area {
         let working = self.path(dir);
         std::fs::create_dir_all(&working).expect("create the working directory");
 
-        let output = Command::new(forklift_binary())
+        let output = forklift_command()
             .args(args)
             .current_dir(&working)
             .env("FORKLIFT_GLOBAL_CONFIG", self.path("global.toml"))
@@ -980,6 +980,15 @@ fn forklift_binary() -> PathBuf {
         binary.display()
     );
     binary
+}
+
+/// `forklift` with fsync off. Durability is not what these tests check, and paying an fsync per
+/// write made the suite several times slower (most of all on macOS and Windows).
+/// `crash_consistency.rs` and the in-process fsync tests keep it on.
+fn forklift_command() -> Command {
+    let mut command = Command::new(forklift_binary());
+    command.env("FORKLIFT_FSYNC", "0");
+    command
 }
 
 struct Harvest {

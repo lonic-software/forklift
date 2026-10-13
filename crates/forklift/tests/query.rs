@@ -12,6 +12,15 @@ use std::process::{Command, Output};
 
 const FORKLIFT: &str = env!("CARGO_BIN_EXE_forklift");
 
+/// `forklift` with fsync off. Durability is not what these tests check, and paying an fsync per
+/// write made the suite several times slower (most of all on macOS and Windows).
+/// `crash_consistency.rs` and the in-process fsync tests keep it on.
+fn forklift_command() -> Command {
+    let mut command = Command::new(FORKLIFT);
+    command.env("FORKLIFT_FSYNC", "0");
+    command
+}
+
 struct TestWarehouse {
     root: std::path::PathBuf,
     home: std::path::PathBuf,
@@ -39,7 +48,7 @@ impl TestWarehouse {
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(FORKLIFT)
+        forklift_command()
             .args(args)
             .current_dir(&self.root)
             // Tests must never read or write the developer's real global configuration.
@@ -56,7 +65,7 @@ impl TestWarehouse {
         use std::io::Write;
         use std::process::Stdio;
 
-        let mut child = Command::new(FORKLIFT)
+        let mut child = forklift_command()
             .args(args)
             .current_dir(&self.root)
             .env("FORKLIFT_GLOBAL_CONFIG", self.home.join("global-config.toml"))

@@ -15,6 +15,15 @@ use std::process::{Command, Output};
 
 const FORKLIFT: &str = env!("CARGO_BIN_EXE_forklift");
 
+/// `forklift` with fsync off. Durability is not what these tests check, and paying an fsync per
+/// write made the suite several times slower (most of all on macOS and Windows).
+/// `crash_consistency.rs` and the in-process fsync tests keep it on.
+fn forklift_command() -> Command {
+    let mut command = Command::new(FORKLIFT);
+    command.env("FORKLIFT_FSYNC", "0");
+    command
+}
+
 struct Warehouse {
     root: PathBuf,
     home: PathBuf,
@@ -46,7 +55,7 @@ impl Warehouse {
     }
 
     fn command_at(&self, dir: &PathBuf, args: &[&str]) -> Command {
-        let mut command = Command::new(FORKLIFT);
+        let mut command = forklift_command();
         command
             .args(args)
             .current_dir(dir)
