@@ -5430,6 +5430,8 @@ pub async fn pending_regenesis(client: &RemoteClient) -> Result<RegenesisState, 
 
     let info = client.fetch_info().await?;
 
+    trust_utils::check_handshake_trust(client.url(), &info, Some(local.genesis.as_str()), None)?;
+
     let Some(remote) = info.trust.clone() else {
         return Err("The remote has no trust anchor; there is no re-genesis to accept.".to_string());
     };
@@ -5519,7 +5521,15 @@ pub async fn accept_regenesis(client: &RemoteClient,
 ///                            transfer.
 pub async fn push_local_trust(client: &RemoteClient,
                               info: &WarehouseInfo) -> Result<Option<LiftResult>, String> {
-    let Some(local) = office_utils::read_trust_anchor()? else {
+    let local = office_utils::read_trust_anchor()?;
+
+    // A stripped remote is refused here as it is on lower: uploading an anchor over an office
+    // it never verified is exactly what the stripped state must not invite.
+    trust_utils::check_handshake_trust(
+        client.url(), info, local.as_ref().map(|anchor| anchor.genesis.as_str()), None
+    )?;
+
+    let Some(local) = local else {
         if info.trust.is_some() {
             return Err(
                 "The remote has trust established but this warehouse does not. \

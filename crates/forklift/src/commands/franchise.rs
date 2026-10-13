@@ -231,7 +231,8 @@ async fn franchise_into_prepared_target(
         }
     }
 
-    // The pin was checked against this same handshake before the download.
+    // `None` because the pin was already checked against this same handshake by
+    // `check_handshake_trust` in `handle_command`, before the download — not because there is none.
     let trust = remote_utils::adopt_remote_trust(client, &info, None).await?;
     report.adopted_genesis = trust.adopted_genesis;
 

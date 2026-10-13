@@ -36,12 +36,12 @@ pub const TOOL: &str = "forklift";
 ///
 /// Version 3 (this one): `lower` and `franchise` report the adopted trust anchor as
 /// `adopted_genesis` (present only on first contact) in place of the `adopted_anchor` flag, and
-/// the `trust_changed` error code exists, with `details`, as does `remote_protocol_violation`. Version 2: `history` entries carry
-/// `parents` (always present, `[]` for a root), the `empty_history` error code exists, and
-/// `palletize` list entries carry `head`. A consumer reads this field before relying on a field, to know whether the
-/// command it is about to run supports the capability it needs — the version bump *is*
-/// the capability-detection mechanism, so it is worth pinning rather than sniffing for a
-/// field's presence.
+/// the `trust_changed` (with `details`) and `remote_protocol_violation` error codes exist.
+/// Version 2: `history` entries carry `parents` (always present, `[]` for a root), the
+/// `empty_history` error code exists, and `palletize` list entries carry `head`. A consumer reads
+/// this field before relying on a field, to know whether the command it is about to run supports
+/// the capability it needs — the version bump *is* the capability-detection mechanism, so it is
+/// worth pinning rather than sniffing for a field's presence.
 pub const SCHEMA_VERSION: u32 = 3;
 
 /// How the process renders its output.

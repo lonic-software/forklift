@@ -340,6 +340,17 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         // holding: the incumbent read here is the value the chain-of-custody test below runs
         // against, and `replace_trust` conditions the write on it being unmoved.
         let Some((existing, existing_bytes)) = existing else {
+            // No anchor but an office: the anchor was lost, and whichever client lifts first
+            // would otherwise plant its own over a chain it never verified. No head lifts an
+            // office without an anchor, so the office cannot appear after this read.
+            let office_head = self
+                .refs
+                .get_head(PalletNamespace::Meta, OFFICE_PALLET_NAME)
+                .map_err(HeadError::internal)?;
+            if office_head.is_some() {
+                return Err(Self::anchor_lost());
+            }
+
             return match self
                 .refs
                 .put_trust_if_absent(&anchor.to_anchor())
@@ -670,6 +681,15 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 }
             }
 
+            // An office is the chain an anchor verifies; one lifted without an anchor is a state
+            // clients read as a stripped anchor, so it is never created. Same as the server.
+            if is_office && anchor.is_none() {
+                return Err(HeadError::unprocessable(
+                    "Establish the trust anchor (PUT /v1/trust) before lifting the office."
+                        .to_string(),
+                ));
+            }
+
             // 3. Trust: a trusted warehouse accepts nothing a local audit would reject.
             if let Some(anchor) = &anchor {
                 if is_office {
@@ -961,6 +981,14 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     }
 
     /// The `409` for trying to replace an established trust anchor.
+    fn anchor_lost() -> HeadError {
+        HeadError::conflict(
+            "This warehouse holds an office but no trust anchor: its anchor was lost. The \
+            server operator must restore it; a client cannot re-establish it."
+                .to_string(),
+        )
+    }
+
     fn trust_one_way_door(&self) -> HeadError {
         HeadError::conflict(
             "This warehouse already has a different trust anchor; trust is a one-way door \
