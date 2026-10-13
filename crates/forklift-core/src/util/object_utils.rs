@@ -631,6 +631,13 @@ pub fn hash_object_bytes(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
 }
 
+/// Whether `text` is an object hash in its one canonical spelling: 64 lowercase hex characters,
+/// as every hash in the store is written. Anything else — uppercase included, which would pass as
+/// "a hash" and then miss every byte-for-byte comparison and path lookup — is not.
+pub fn is_object_hash(text: &str) -> bool {
+    text.len() == 64 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// Verify that raw `bytes` are the object addressed by `hash` — the content-addressing invariant,
 /// enforced on the way *out* of the store as [`store_object_bytes`] enforces it on the way in.
 ///

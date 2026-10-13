@@ -2813,7 +2813,7 @@ impl RemoteClient {
         }
 
         if let Some(trust) = &info.trust {
-            trust.validate()?;
+            trust.validate().map_err(|problem| String::from(trust_utils::malformed(self.url(), &problem)))?;
         }
 
         Ok(info)
@@ -5422,8 +5422,8 @@ pub async fn pending_regenesis(client: &RemoteClient)
 ///
 /// # Returns
 /// * `Ok(Some((TrustAnchor, TrustAnchor)))` - The replaced and the adopted anchor.
-/// * `Ok(None)`                             - The remote's anchor is already the held one:
-///                                            nothing to accept (already accepted, or reverted).
+/// * `Ok(None)`                             - The remote's anchor is already the held one and
+///                                            `confirmed` names it: already accepted.
 /// * `Err(String)`                          - If either side holds no anchor, the custody chain
 ///                                            does not match or `confirmed` is not the remote's
 ///                                            genesis now (both `trust_changed` refusals), or a
@@ -5432,7 +5432,15 @@ pub async fn accept_regenesis(client: &RemoteClient,
                               confirmed: &str)
     -> Result<Option<(office_utils::TrustAnchor, office_utils::TrustAnchor)>, String> {
     let Some((local, remote_trust, info)) = pending_regenesis(client).await? else {
-        return Ok(None);
+        // Nothing is pending. That is success only if the confirmed value is the one held;
+        // otherwise the remote moved away from what was shown, and saying "nothing to accept"
+        // would let a caller believe its value is now trusted.
+        let held = office_utils::read_trust_anchor()?.map(|anchor| anchor.genesis).unwrap_or_default();
+        if held == confirmed {
+            return Ok(None);
+        }
+
+        return Err(trust_utils::confirm_not_pending(client.url(), &held, confirmed).into());
     };
     let remote_trust = &remote_trust;
 

@@ -366,7 +366,13 @@ forklift office accept-regenesis --confirm <genesis> # the SSH host-key-change m
 the moment of accepting. If the anchor changed again after it was shown — or the
 value was mistyped — nothing is accepted, and the refusal names the current
 value (`trust_changed`, `what_changed: "regenesis"`), so what you accept is
-exactly what you verified.
+exactly what you verified. With nothing left to accept, `--confirm` succeeds only
+for the genesis already held — any other value is refused, never reported as
+accepted.
+
+A remote whose anchor is malformed — a value that is not an object hash — is
+refused by every command (`what_changed: "malformed"`); servers refuse to store
+one in the first place.
 
 ---
 
