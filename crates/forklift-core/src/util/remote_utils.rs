@@ -10888,7 +10888,7 @@ mod tests {
     /// `TEST_DIRECT_CONNECT_TIMEOUT + TEST_TIGHT_READ_TIMEOUT` and must sit more than a second past
     /// the *old* flat bound `resolve` used to carry (a plain `RequestBuilder::timeout(5s)`, not
     /// mirrored as a `TEST_*` constant since the production value it mirrored no longer exists to
-    /// drift against). The *behaviour* is checked on a client whose connect bound puts its budget
+    /// drift against). The *behaviour* is checked on a client whose read budget puts its total
     /// past that old bound: a remote that answers after the old bound and well inside the budget
     /// must yield the real mapping. That costs a wait just past 5s, the one figure this test
     /// cannot shrink, because a call site reverted to the old flat bound must fire before the
@@ -10927,9 +10927,12 @@ mod tests {
         );
 
         // The behaviour itself: an answer that arrives past the old bound and well inside this
-        // client's budget is returned, not dropped for pseudonyms. The connect bound is one no
-        // production constructor emits, sized so the budget clears the delay by a second and more.
-        let budgets = Budgets { connect: std::time::Duration::from_millis(6_330), ..FAST };
+        // client's budget is returned, not dropped for pseudonyms. The read budget is one no
+        // production constructor emits, sized so the budget clears the delay by more than a
+        // second; the connect bound stays FAST's, under the old bound, so a call site reverted
+        // to that bound still arms a legal deadline and fails on the behaviour, not on the
+        // payload check.
+        let budgets = Budgets { read: std::time::Duration::from_millis(6_670), ..FAST };
         let new_budget = budgets.connect + budgets.read;
         let delay = old_flat_bound + std::time::Duration::from_millis(500);
         assert!(
