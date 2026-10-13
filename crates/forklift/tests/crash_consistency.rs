@@ -112,6 +112,15 @@ fn rewrite_corpus(file: &Path, base_line: &str, tag: &str) {
     std::fs::write(file, format!("{}{}\n", base_line.repeat(90_000), tag)).unwrap();
 }
 
+/// [`rewrite_corpus`] for one file of the many-file corpus the `load` and `park` tests spread
+/// over 24 files: about a megabyte each rather than the single-file corpus's four, which keeps
+/// tens of megabytes of real work per run without making every kill round rewrite ninety-odd.
+/// The kill delays are calibrated to the measured run either way, so the spread still straddles
+/// the write window; a quarter of the bytes made both tests well over twice as fast.
+fn rewrite_spread_corpus(file: &Path, base_line: &str, tag: &str) {
+    std::fs::write(file, format!("{}{}\n", base_line.repeat(22_500), tag)).unwrap();
+}
+
 /// The current pallet head, if one exists yet.
 fn current_head(warehouse: &Path) -> Option<String> {
     std::fs::read_to_string(warehouse.join(".forklift").join("pallets").join("main"))
@@ -340,7 +349,7 @@ fn calibrate_load_duration(area: &Area, files: &[PathBuf], base_line: &str, labe
     let mut slowest = Duration::ZERO;
     for i in 0..samples {
         for file in files {
-            rewrite_corpus(file, base_line, &format!("{label} {i}"));
+            rewrite_spread_corpus(file, base_line, &format!("{label} {i}"));
         }
 
         let start = Instant::now();
@@ -395,7 +404,7 @@ fn run_load_kill_spread(
         // 2. A fresh change to every file in the corpus, so the walk below has real work to do
         //    across every directory, not just the ones already touched by an earlier iteration.
         for file in files {
-            rewrite_corpus(file, base_line, &format!("{commit_tag} {i}"));
+            rewrite_spread_corpus(file, base_line, &format!("{commit_tag} {i}"));
         }
 
         // 3. Spawn the load and SIGKILL it mid-flight.
@@ -538,7 +547,7 @@ fn calibrate_park_duration(area: &Area, files: &[PathBuf], base_line: &str, labe
     let mut slowest = Duration::ZERO;
     for i in 0..samples {
         for file in files {
-            rewrite_corpus(file, base_line, &format!("{label} {i}"));
+            rewrite_spread_corpus(file, base_line, &format!("{label} {i}"));
         }
 
         let start = Instant::now();
@@ -594,7 +603,7 @@ fn run_park_kill_spread(
         area.assert_consistent(&format!("after park {tag} kill #{i}"));
 
         for file in files {
-            rewrite_corpus(file, base_line, &format!("park-{tag} {i}"));
+            rewrite_spread_corpus(file, base_line, &format!("park-{tag} {i}"));
         }
 
         let before = parked_count(warehouse);
