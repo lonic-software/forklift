@@ -825,7 +825,8 @@ pub async fn accept_regenesis(confirm: Option<String>) -> Result<(), String> {
     let client = RemoteClient::from_config()?;
 
     let Some(confirmed) = confirm else {
-        let Some((local, remote_trust, _)) = remote_utils::pending_regenesis(&client).await? else {
+        let remote_utils::RegenesisState::Pending { local, remote: remote_trust, .. } =
+            remote_utils::pending_regenesis(&client).await? else {
             output::message("The remote's trust anchor matches this warehouse's; nothing to accept.");
 
             return Ok(());

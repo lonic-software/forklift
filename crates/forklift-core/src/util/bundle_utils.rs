@@ -269,7 +269,7 @@ fn write_envelope_and_publish(temporary_path: &Path,
 fn write_signature_record(writer: &mut impl Write,
                           hash: &str,
                           sidecar: &[u8]) -> Result<(), String> {
-    if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if !crate::util::object_utils::is_object_hash(hash) {
         return Err(format!("Cannot bundle signature for \"{}\": not a 64-character hash.", hash));
     }
     writer.write_all(hash.as_bytes())
