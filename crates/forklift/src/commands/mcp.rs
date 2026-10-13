@@ -299,8 +299,8 @@ const EXITED_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// [`run_forklift`], with a progress-events channel the server owns: the child gets the write
 /// end of a fresh pipe through `PULT_EVENTS`, and each event it reports goes into `progress`.
-/// What `progress` decides to send goes to `send`, at most once per [`NOTIFICATION_INTERVAL`],
-/// plus once more after the child has exited, before this returns.
+/// What `progress` decides to send goes to `send`, the last of it after the child has exited and
+/// before this returns.
 ///
 /// The channel exists on macOS and Linux only, as the child's emitter does; elsewhere this is
 /// [`run_forklift`].
@@ -382,7 +382,6 @@ fn run_forklift_reporting(
         }
     });
 
-    let mut last_sent = std::time::Instant::now() - NOTIFICATION_INTERVAL;
     let mut exited_at: Option<std::time::Instant> = None;
 
     loop {
@@ -392,11 +391,8 @@ fn run_forklift_reporting(
             Err(RecvTimeoutError::Disconnected) => break,
         }
 
-        if last_sent.elapsed() >= NOTIFICATION_INTERVAL {
-            if let Some((value, message)) = progress.take() {
-                send(value, message);
-                last_sent = std::time::Instant::now();
-            }
+        if let Some((value, message)) = progress.take(std::time::Instant::now()) {
+            send(value, message);
         }
 
         match exited_at {
@@ -409,7 +405,7 @@ fn run_forklift_reporting(
     }
 
     let status = child.wait().map_err(failed)?;
-    if let Some((value, message)) = progress.take() {
+    if let Some((value, message)) = progress.finish() {
         send(value, message);
     }
 
@@ -479,6 +475,7 @@ const TEXT_ONLY_STEP: f64 = 1.0 / 128.0;
 ///   new text, at the last value plus [`TEXT_ONLY_STEP`]; otherwise it is dropped.
 /// * The phase, the percentage and the text go in `message`, only when the protocol has it.
 ///   Without it, an event that does not raise the value has nothing to say and is dropped.
+/// * At most one notification goes out per [`NOTIFICATION_INTERVAL`], until the run ends.
 ///
 /// Events are folded in as they arrive, and [`ProgressMapper::take`] decides what to send.
 struct ProgressMapper {
@@ -500,9 +497,10 @@ struct ProgressMapper {
     /// The newest text received since the last send.
     pending_message: Option<String>,
 
-    /// The last `progress` and `message` sent.
+    /// The last `progress` and `message` sent, and when.
     sent_value: Option<f64>,
     sent_message: Option<String>,
+    sent_at: Option<std::time::Instant>,
 }
 
 impl ProgressMapper {
@@ -516,6 +514,7 @@ impl ProgressMapper {
             pending_message: None,
             sent_value: None,
             sent_message: None,
+            sent_at: None,
         }
     }
 
@@ -542,8 +541,28 @@ impl ProgressMapper {
         }
     }
 
-    /// What to send now, if anything: `(progress, message)`. Clears what was received.
-    fn take(&mut self) -> Option<(f64, Option<String>)> {
+    /// What to send at `now`, if anything: `(progress, message)`. Nothing until
+    /// [`NOTIFICATION_INTERVAL`] has passed since the last send; what was received meanwhile is
+    /// kept for the next call.
+    fn take(&mut self, now: std::time::Instant) -> Option<(f64, Option<String>)> {
+        if self.sent_at.is_some_and(|at| now.duration_since(at) < NOTIFICATION_INTERVAL) {
+            return None;
+        }
+
+        let sent = self.decide();
+        if sent.is_some() {
+            self.sent_at = Some(now);
+        }
+        sent
+    }
+
+    /// What to send once the run has ended, whatever the interval.
+    fn finish(&mut self) -> Option<(f64, Option<String>)> {
+        self.decide()
+    }
+
+    /// What to send of what was received, if anything. Clears what was received.
+    fn decide(&mut self) -> Option<(f64, Option<String>)> {
         let value = self.pending_value.take();
         let message = self.pending_message.take().filter(|_| self.message);
 
@@ -1218,9 +1237,10 @@ mod tests {
 
     /// Feed each event and take after each one, as if every event arrived a full interval apart.
     fn sent(mapper: &mut ProgressMapper, events: Vec<Reported>) -> Vec<(f64, Option<String>)> {
-        events.into_iter().filter_map(|event| {
+        let start = std::time::Instant::now();
+        events.into_iter().enumerate().filter_map(|(index, event)| {
             mapper.receive(event);
-            mapper.take()
+            mapper.take(start + super::NOTIFICATION_INTERVAL * index as u32)
         }).collect()
     }
 
@@ -1273,10 +1293,32 @@ mod tests {
         mapper.receive(progress(70, "a"));
         mapper.receive(progress(10, "b"));
         mapper.receive(status("Next"));
-        assert_eq!(mapper.take(), Some((110.0, Some("Next".into()))));
+        assert_eq!(mapper.take(std::time::Instant::now()), Some((110.0, Some("Next".into()))));
 
         // Nothing received since: nothing to send.
-        assert_eq!(mapper.take(), None);
+        assert_eq!(mapper.finish(), None);
+    }
+
+    #[test]
+    fn at_most_one_notification_goes_out_per_interval_until_the_run_ends() {
+        let interval = super::NOTIFICATION_INTERVAL;
+        let start = std::time::Instant::now();
+        let mut mapper = ProgressMapper::new(false);
+
+        mapper.receive(progress(10, ""));
+        assert_eq!(mapper.take(start), Some((10.0, None)));
+
+        // Too soon: held, not lost.
+        mapper.receive(progress(20, ""));
+        assert_eq!(mapper.take(start + interval / 2), None);
+        mapper.receive(progress(30, ""));
+        assert_eq!(mapper.take(start + interval - std::time::Duration::from_millis(1)), None);
+        assert_eq!(mapper.take(start + interval), Some((30.0, None)));
+
+        // The end of the run sends what is held, however soon.
+        mapper.receive(progress(40, ""));
+        assert_eq!(mapper.take(start + interval), None);
+        assert_eq!(mapper.finish(), Some((40.0, None)));
     }
 
     #[test]
