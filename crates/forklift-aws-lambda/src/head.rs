@@ -525,6 +525,14 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             return Err(self.moved(&current, &request.old_head));
         }
 
+        // The head is stored as given; refuse a spelling the ref reader would refuse, the same
+        // answer the self-hosted server gives, before presence decides it by S3's key casing.
+        if !object_utils::is_object_hash(&request.new_head) {
+            return Err(HeadError::unprocessable(
+                "The new head is not an object hash (64 lowercase hex characters)."
+            ));
+        }
+
         // The new head must be present — a ref never points at a missing parcel.
         if !self.objects.exists(&request.new_head).map_err(HeadError::internal)? {
             return Err(HeadError::unprocessable(format!(

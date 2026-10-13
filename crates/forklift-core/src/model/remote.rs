@@ -84,14 +84,15 @@ impl TrustAnchorDto {
     /// look-alike characters is rejected where an anchor is read — the client's handshake, the
     /// server's `PUT /v1/trust` — rather than sanitized at each place it is printed.
     pub fn validate(&self) -> Result<(), String> {
-        let fields = std::iter::once(("genesis".to_string(), &self.genesis))
-            .chain(self.boundary.iter().enumerate().map(|(i, hash)| (format!("boundary[{}]", i), hash)))
-            .chain(self.prior_genesis.iter().map(|hash| ("prior_genesis".to_string(), hash)))
-            .chain(self.adopts.iter().map(|hash| ("adopts".to_string(), hash)));
+        // The label is built only for the field that fails: a boundary holds one entry per pallet.
+        let fields = std::iter::once(("genesis", None, &self.genesis))
+            .chain(self.boundary.iter().enumerate().map(|(i, hash)| ("boundary", Some(i), hash)))
+            .chain(self.prior_genesis.iter().map(|hash| ("prior_genesis", None, hash)))
+            .chain(self.adopts.iter().map(|hash| ("adopts", None, hash)));
 
         // The problem names the field and what is wrong with it, never the value: the value came
         // from a remote that is misbehaving, and repeating it would hand that remote the message.
-        for (field, hash) in fields {
+        for (field, index, hash) in fields {
             if crate::util::object_utils::is_object_hash(hash) {
                 continue;
             }
@@ -104,7 +105,8 @@ impl TrustAnchorDto {
             };
 
             return Err(format!(
-                "The trust anchor is malformed: its {} is not an object hash ({}).", field, problem
+                "The trust anchor is malformed: its {} is not an object hash ({}).",
+                index.map_or(field.to_string(), |i| format!("{}[{}]", field, i)), problem
             ));
         }
 

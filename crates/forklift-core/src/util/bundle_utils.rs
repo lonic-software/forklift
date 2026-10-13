@@ -270,8 +270,11 @@ fn write_signature_record(writer: &mut impl Write,
                           hash: &str,
                           sidecar: &[u8]) -> Result<(), String> {
     if !crate::util::object_utils::is_object_hash(hash) {
-        return Err("Cannot bundle a signature whose subject is not an object hash (64 lowercase hex \
-            characters).".to_string());
+        // The hash names a sidecar in this warehouse's own store, so it is shown (escaped) to say
+        // which file to look at.
+        return Err(format!(
+            "Cannot bundle signature for {:?}: not an object hash (64 lowercase hex characters).", hash
+        ));
     }
     writer.write_all(hash.as_bytes())
         .and_then(|_| writer.write_all(&(sidecar.len() as u64).to_be_bytes()))

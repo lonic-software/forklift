@@ -2069,6 +2069,14 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
             ));
         }
 
+        // The head is stored as given; a spelling the ref reader refuses is the request's fault,
+        // and on a case-insensitive filesystem the presence check below would not catch it.
+        if !forklift_core::util::object_utils::is_object_hash(&request.new_head) {
+            return Err(unprocessable(
+                "The new head is not an object hash (64 lowercase hex characters).".to_string()
+            ));
+        }
+
         if !file_utils::does_object_exist(&request.new_head).map_err(internal)? {
             return Err(unprocessable(format!(
                 "The new head {} has not been uploaded.",
