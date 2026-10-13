@@ -11,9 +11,6 @@
 //! (`_meta.progressToken`) gets its `notifications/progress` written by that same thread while
 //! the child runs, and always before the call's response, so none can follow it.
 
-// Off macOS and Linux no call reports progress, so the event and notification machinery is unused there.
-#![cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
-
 use std::io::{BufRead, Write};
 use serde_json::{json, Value};
 
@@ -344,6 +341,7 @@ fn forklift_command(args: &[String]) -> Result<std::process::Command, String> {
 }
 
 /// How often at most a progress notification is sent for one call.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 const NOTIFICATION_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// [`run_forklift`], with a progress-events channel the server owns: the child gets the write
@@ -459,6 +457,8 @@ fn run_forklift_reporting(
     })
 }
 
+// Off macOS and Linux no call reports progress, so the event and notification items that follow
+// are unused there and carry `allow(dead_code)` for it.
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn run_forklift_reporting(
     args: &[String],
@@ -469,6 +469,7 @@ fn run_forklift_reporting(
 }
 
 /// One event read from the channel.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 #[derive(Debug, PartialEq)]
 enum Reported {
     /// `status <phase>`.
@@ -480,6 +481,7 @@ enum Reported {
 
 /// Parse one channel line. Anything that is not a well-formed `status` or `progress` event is
 /// `None`, and is ignored.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 fn parse_event(line: &str) -> Option<Reported> {
     if let Some(phase) = line.strip_prefix("status ") {
         let phase = phase.trim();
@@ -499,6 +501,7 @@ fn parse_event(line: &str) -> Option<Reported> {
 
 /// Whether a protocol version carries `message` on a progress notification: 2025-06-18 and
 /// later. Versions are dates, so they order as strings; anything else carries none.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 fn carries_message(protocol_version: &str) -> bool {
     // Only a well-formed date orders correctly: "draft" sorts after every date, "2025-6-18"
     // before its own month.
@@ -510,14 +513,17 @@ fn carries_message(protocol_version: &str) -> bool {
 
 /// What a notification that only carries new text adds to the last `progress` sent. A power of
 /// two, so the sums stay exact.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 const TEXT_ONLY_STEP: f64 = 1.0 / 4096.0;
 
 /// How many text-only notifications fit between two whole values: the steps never reach the
 /// next one, so `progress` keeps meaning 100 × resets + percentage.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 const TEXT_ONLY_LIMIT: u32 = 4095;
 
 /// How many of those text that does not change the phase may use. The rest are kept for phase
 /// changes, so a run whose text has used up its share still reports a new phase.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 const TEXT_ONLY_TEXT_LIMIT: u32 = TEXT_ONLY_LIMIT / 2;
 
 /// Turns one call's events into progress notifications.
@@ -537,6 +543,7 @@ const TEXT_ONLY_TEXT_LIMIT: u32 = TEXT_ONLY_LIMIT / 2;
 /// * At most one notification goes out per [`NOTIFICATION_INTERVAL`], until the run ends.
 ///
 /// Events are folded in as they arrive, and [`ProgressMapper::take`] decides what to send.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 struct ProgressMapper {
     /// Whether notifications may carry `message`.
     message: bool,
@@ -568,6 +575,7 @@ struct ProgressMapper {
     sent_at: Option<std::time::Instant>,
 }
 
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 impl ProgressMapper {
     fn new(message: bool) -> ProgressMapper {
         ProgressMapper {
@@ -669,6 +677,7 @@ impl ProgressMapper {
 }
 
 /// The `message` for a progress event: "<phase>: <percent>% <text>", leaving out what is absent.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 fn compose_message(phase: Option<&str>, percent: Option<u8>, text: &str) -> String {
     let detail = match (percent, text.is_empty()) {
         (Some(percent), true) => format!("{}%", percent),
@@ -684,6 +693,7 @@ fn compose_message(phase: Option<&str>, percent: Option<u8>, text: &str) -> Stri
 }
 
 /// A `notifications/progress` message.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 fn progress_notification(token: &Value, progress: f64, message: Option<String>) -> Value {
     let mut params = json!({ "progressToken": token, "progress": progress });
     if let Some(message) = message {
