@@ -1815,16 +1815,22 @@ fn an_untrusted_warehouses_concurrent_office_move_does_not_refuse_the_commit() {
 
     let store = Arc::new(MemoryRefStore::new());
 
-    // Setup: lift the office pallet and main v1 — no `put_trust` anywhere in this test, so
-    // neither lift is ever audited (an untrusted warehouse verifies nothing, office included).
+    // Setup: an office with no anchor, planted beneath the head — no head lifts one, so the
+    // state is reachable only as a stripped store — then main v1, unaudited (no `put_trust`
+    // anywhere in this test: an untrusted warehouse verifies nothing).
+    assert!(matches!(
+        store.compare_and_set_head(
+            pallet_utils::PalletNamespace::Meta,
+            OFFICE_PALLET_NAME,
+            None,
+            &office_head,
+            OfficePrecondition::NotConsumed,
+            None,
+        ),
+        Ok(CasOutcome::Committed)
+    ));
     let setup = Head::new(MemoryObjectStore::new(), SharedMemoryRefs(store.clone()));
     upload_all(&setup, &latest);
-    setup
-        .ref_update(&format!("@{}", OFFICE_PALLET_NAME), &RefUpdateRequest {
-            old_head: None,
-            new_head: office_head,
-        })
-        .expect("lift office (untrusted, unaudited)");
     setup
         .ref_update("main", &RefUpdateRequest { old_head: None, new_head: main_v1.clone() })
         .expect("lift main v1 (untrusted, unaudited)");
