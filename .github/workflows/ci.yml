@@ -124,14 +124,10 @@ jobs:
         # kill tests take two slots each there (see .config/nextest.toml).
         shell: bash
         run: |
-          if [ "$RUNNER_OS" = macOS ]; then
-            cargo nextest run --workspace --no-fail-fast
-          else
-            cores=${NUMBER_OF_PROCESSORS:-$(nproc)}
-            [ -n "$cores" ] || { echo "could not count cores"; exit 1; }
-            echo "cores=$cores test-threads=$(( cores * 2 ))"
-            cargo nextest run --workspace --no-fail-fast --test-threads "$(( cores * 2 ))"
-          fi
+          cores=${NUMBER_OF_PROCESSORS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu)}
+          [ -n "$cores" ] || { echo "could not count cores"; exit 1; }
+          echo "cores=$cores test-threads=$(( cores * 2 ))"
+          cargo nextest run --workspace --no-fail-fast --test-threads "$(( cores * 2 ))"
 
       # nextest does not run doc-tests.
       - name: Doc-tests

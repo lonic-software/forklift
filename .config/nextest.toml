@@ -28,6 +28,5 @@ slow-timeout = { period = "120s", terminate-after = 5 }
 # time; two slots each keeps them at about one per core. macOS CI runs one test per core, where
 # two slots would only make the kill tests wait for each other: on its three cores they ran one
 # after another and the run took 209 s instead of 149 s.
-platform = 'cfg(not(target_os = "macos"))'
 filter = 'binary_id(forklift::crash_consistency) & test(/^killing_/)'
 threads-required = 2
