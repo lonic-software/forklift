@@ -89,7 +89,7 @@ so the operational commands are one launcher away; the real logic lives in `bin/
 
 | Command | What it does |
 | --- | --- |
-| `pult check` | `bin/check` — build + test + clippy (what CI runs; green here = green there) |
+| `pult check` | `bin/check` — build + test + clippy, the same checks CI runs (CI runs the tests under cargo-nextest and skips them on docs-only pull requests), plus docs freshness |
 | `pult test` | just the test suite (fast loop) |
 | `pult release` | `bin/release` — preflight, bump the workspace version, tag `v<x.y.z>`, push (the tag triggers `.github/workflows/release.yml`) |
 | `pult install` | build & install the CLI + server from this checkout |

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Exactly what CI runs (.github/workflows/ci.yml): build, test, clippy.
-# Green here means green there. CI's clippy is report-only (style-level lint
+# The build, tests and clippy CI runs (.github/workflows/ci.yml). CI runs the
+# same tests under cargo-nextest, one process per test, plus `cargo test --doc`;
+# `cargo test` here covers both in one go. CI's clippy is report-only (style-level lint
 # debt is tracked separately), so this doesn't fail on lint warnings — the
 # build and the tests are the gate.
 set -euo pipefail

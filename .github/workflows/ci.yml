@@ -26,23 +26,20 @@ jobs:
   # required `test (<os>)` check waiting forever. Instead every matrix job always runs and
   # reports, and only its steps are skipped.
   changes:
+    # Pushes to main always test; a skipped classifier reads as "code changed" below.
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     outputs:
       code: ${{ steps.classify.outputs.code }}
     steps:
       - uses: actions/checkout@v4
-        if: github.event_name == 'pull_request'
         with:
           # The pull request's merge commit and its first parent, the base it merges into, so
-          # the diff between them is exactly what this pull request changes.
+          # the diff between them is the pull request's own change.
           fetch-depth: 2
       - id: classify
         shell: bash
         run: |
-          if [ "${{ github.event_name }}" != "pull_request" ]; then
-            echo "code=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
           # --no-renames lists both sides of a move, so code moved under docs/ still counts.
           changed=$(git diff --name-only --no-renames HEAD^1 HEAD)
           printf 'Changed files:\n%s\n' "$changed"
@@ -50,8 +47,18 @@ jobs:
           code=false
           [ -z "$changed" ] && code=true
           while IFS= read -r path; do
+            [ -z "$path" ] && continue
             case "$path" in
-              docs/*|*.md) ;;
+              # Anything under crates/ is built, include_str!'d or read by a test.
+              crates/*) code=true ;;
+              docs/*|*.md)
+                # Some tests read docs (a guide table, a documented default). A doc whose
+                # repo path appears anywhere in the crates counts as code, so a docs-only
+                # change cannot hide the test it breaks.
+                if git grep -qF -- "$path" -- crates; then
+                  echo "$path is referenced from crates/, so it counts as code."
+                  code=true
+                fi ;;
               *) code=true ;;
             esac
           done <<< "$changed"
@@ -61,48 +68,57 @@ jobs:
   test:
     name: test (${{ matrix.os }})
     needs: changes
+    # Run even when `changes` was skipped (a push) or failed: a classifier that cannot decide
+    # must test, not leave the required checks unreported.
+    if: ${{ !cancelled() }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+    # A docs-only run only has to report its check, so it does not need the OS it is named after.
+    runs-on: ${{ (needs.changes.result == 'success' && needs.changes.outputs.code == 'false') && 'ubuntu-latest' || matrix.os }}
     env:
-      # Anything but an explicit `false` runs the steps, so a classifier that misfires tests
-      # rather than skips.
-      CODE_CHANGED: ${{ needs.changes.outputs.code }}
+      # Only a classifier that succeeded and said `false` skips; anything else tests. Every
+      # step below is gated on this one value, since a job cannot skip its steps but still
+      # report its check any other way.
+      SKIP_TESTS: ${{ needs.changes.result == 'success' && needs.changes.outputs.code == 'false' }}
     steps:
+      - name: Docs-only change
+        if: env.SKIP_TESTS == 'true'
+        run: echo "Docs-only change, build and tests skipped."
+
       - uses: actions/checkout@v4
-        if: env.CODE_CHANGED != 'false'
+        if: env.SKIP_TESTS != 'true'
 
       - name: Install stable Rust
-        if: env.CODE_CHANGED != 'false'
+        if: env.SKIP_TESTS != 'true'
         run: rustup toolchain install stable --profile minimal --component clippy && rustup default stable
 
       - uses: Swatinem/rust-cache@v2
-        if: env.CODE_CHANGED != 'false'
+        if: env.SKIP_TESTS != 'true'
 
       - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
-        if: env.CODE_CHANGED != 'false'
+        if: env.SKIP_TESTS != 'true'
         with:
           tool: cargo-nextest@0.9.146
 
       - name: Build
-        if: env.CODE_CHANGED != 'false'
+        if: env.SKIP_TESTS != 'true'
         run: cargo build --verbose
 
       # nextest runs every test in its own process and the test binaries in parallel, so one
       # slow binary no longer holds up the rest.
       - name: Test
-        if: env.CODE_CHANGED != 'false'
+        if: env.SKIP_TESTS != 'true'
         run: cargo nextest run --workspace --no-fail-fast
 
       # nextest does not run doc-tests.
       - name: Doc-tests
-        if: env.CODE_CHANGED != 'false'
+        if: env.SKIP_TESTS != 'true'
         run: cargo test --workspace --doc --no-fail-fast
 
       - name: Clippy
-        if: env.CODE_CHANGED != 'false'
+        if: env.SKIP_TESTS != 'true'
         # Style-level lint debt is tracked separately; deny only warnings that indicate
         # correctness issues once the doc-comment cleanup lands. For now, report-only.
         run: cargo clippy
