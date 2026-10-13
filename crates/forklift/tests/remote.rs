@@ -4218,6 +4218,12 @@ fn the_path_addressed_subtree_endpoint_round_trips_a_path_with_reserved_characte
 /// exceed the subtree endpoint's per-response object cap without paying for thousands of real
 /// `forklift` process calls.
 ///
+/// Only the trees and the parcel are stored; the blobs are named by their real hashes but never
+/// written. The closure walk reads trees and stops at the cap before it would open any blob,
+/// so the files would never be read, and writing ten thousand of them took most of a minute on
+/// Windows. A walk that started opening blobs would fail here on the missing objects rather
+/// than pass.
+///
 /// Stores objects with a plain, non-atomic write rather than the real (fsync'd) write path:
 /// safe only because this is a disposable fixture built and consumed within one test process,
 /// never exercising crash-recovery. The real path (`LooseObject::store`) fsyncs deliberately —
@@ -4245,7 +4251,7 @@ fn build_wide_subtree(warehouse_root: &Path, name: &str, count: usize) -> String
 
     let mut wide = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
     for i in 0..count {
-        let hash = store_fast(LooseObjectBuilder::build_blob(&Blob { content: i.to_string().into_bytes() }));
+        let hash = LooseObjectBuilder::build_blob(&Blob { content: i.to_string().into_bytes() }).hash;
         wide.add_child(TreeItem::new(format!("f{}", i), hash, DirEntryType::Normal));
     }
     let wide_hash = store_fast(LooseObjectBuilder::build_tree(&wide));
