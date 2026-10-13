@@ -1785,14 +1785,15 @@ fn a_concurrent_office_move_refuses_the_commit_as_office_moved_not_pallet_moved(
     );
 }
 
-/// PR #116 review, finding 2: on an **untrusted** warehouse the audit never reads the office
-/// head at all — both the office-chain mirror and the whole trust block in `ref_update` are
-/// gated on `anchor.is_some()` — so the commit must not condition on it either. Sibling to
+/// On a warehouse with no anchor the audit never reads the office head at all — both the
+/// office-chain mirror and the whole trust block in `ref_update` are gated on
+/// `anchor.is_some()` — so the commit must not condition on it either. No head lifts an office
+/// without an anchor, so the only such warehouse that has an office is a stripped store (which
+/// clients refuse at the handshake); this pins the store-level contract that
+/// `OfficePrecondition::NotConsumed` is never upgraded to a check the audit did not earn. Do not
+/// rebuild the setup as a head lift: that is now a `422`. Sibling to
 /// `a_concurrent_office_move_refuses_the_commit_as_office_moved_not_pallet_moved`, which pins
-/// the opposite: the *trusted* case where the same race must refuse. Neither
-/// `a_concurrently_moved_unrelated_pallet_does_not_refuse_the_commit` nor any other existing
-/// test reaches this — that test only moves an unrelated *user* pallet on a *trusted*
-/// warehouse, never the office pallet itself on an untrusted one.
+/// the opposite, the *trusted* case where the same race must refuse.
 #[test]
 fn an_untrusted_warehouses_concurrent_office_move_does_not_refuse_the_commit() {
     let area = Area::new("untrusted-office-races-the-commit");

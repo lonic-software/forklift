@@ -560,6 +560,16 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             Some((anchor, bytes)) => (Some(anchor), Some(bytes)),
             None => (None, None),
         };
+
+        // An office is the chain an anchor verifies; one lifted without an anchor is a state
+        // clients read as a stripped anchor, so it is never created. Same as the server, and
+        // decided before any audit work. The commit conditions on the anchor still being absent.
+        if is_office && anchor.is_none() {
+            return Err(HeadError::unprocessable(
+                "Establish the trust anchor (PUT /v1/trust) before lifting the office.".to_string(),
+            ));
+        }
+
         let office_head = self
             .refs
             .get_head(PalletNamespace::Meta, OFFICE_PALLET_NAME)
@@ -679,15 +689,6 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                             .to_string(),
                     ));
                 }
-            }
-
-            // An office is the chain an anchor verifies; one lifted without an anchor is a state
-            // clients read as a stripped anchor, so it is never created. Same as the server.
-            if is_office && anchor.is_none() {
-                return Err(HeadError::unprocessable(
-                    "Establish the trust anchor (PUT /v1/trust) before lifting the office."
-                        .to_string(),
-                ));
             }
 
             // 3. Trust: a trusted warehouse accepts nothing a local audit would reject.
@@ -980,7 +981,8 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         )
     }
 
-    /// The `409` for trying to replace an established trust anchor.
+    /// The `409` for planting an anchor over an office whose own anchor was lost: the chain was
+    /// never verified against the anchor offered, so no client may supply one.
     fn anchor_lost() -> HeadError {
         HeadError::conflict(
             "This warehouse holds an office but no trust anchor: its anchor was lost. The \
@@ -989,6 +991,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         )
     }
 
+    /// The `409` for trying to replace an established trust anchor.
     fn trust_one_way_door(&self) -> HeadError {
         HeadError::conflict(
             "This warehouse already has a different trust anchor; trust is a one-way door \
