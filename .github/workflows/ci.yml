@@ -91,6 +91,18 @@ jobs:
         if: env.SKIP_TESTS == 'true'
         run: echo "Docs-only change, build and tests skipped."
 
+      # Windows Defender scans every file the build and the tests create, and the tests create
+      # many (each one builds scratch warehouses under the temp directory). Exclude the
+      # workspace, the temp directory and the toolchain. This runs first, so checkout and the
+      # cache restore are excluded too.
+      - name: Exclude build and test directories from Defender
+        if: env.SKIP_TESTS != 'true' && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Get-MpComputerStatus | Select-Object RealTimeProtectionEnabled, AntivirusEnabled | Format-List
+          Add-MpPreference -ExclusionPath $env:GITHUB_WORKSPACE, $env:RUNNER_TEMP, $env:TEMP, "$env:USERPROFILE\.cargo", "$env:USERPROFILE\.rustup"
+          (Get-MpPreference).ExclusionPath
+
       - uses: actions/checkout@v4
         if: env.SKIP_TESTS != 'true'
 
