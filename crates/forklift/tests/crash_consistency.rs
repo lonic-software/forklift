@@ -106,22 +106,29 @@ impl Drop for Area {
     }
 }
 
-/// Lines in the `stack` test's single corpus file, about four megabytes: the one file has to
-/// carry the whole write window on its own.
+/// Lines in the `stack` test's single corpus file, about four megabytes.
 const STACK_CORPUS_LINES: usize = 90_000;
 
 /// Lines in each of the 24 files the `load` and `park` tests spread their corpus over, about a
-/// megabyte each. The kill delays are calibrated to the measured run, so the spread straddles
-/// the write window whatever the size.
+/// megabyte each.
+///
+/// The corpus is one line repeated, so it compresses to an object of a few kilobytes: the line
+/// count sets how long hashing and compression take, not how many bytes are fsynced. What the
+/// size has to buy is a run long enough that the calibrated kill delays, at least
+/// `MIN_STEP_MS` apart, still fall inside it rather than in process startup or after the end;
+/// shrinking it trades exactly that away.
 const SPREAD_CORPUS_LINES: usize = 22_500;
 
 /// Overwrite a corpus file with a fresh payload of `lines` lines so each call under test
-/// (calibration or real) has real hashing/compression/fsync work to do. The tag ends with the
-/// file's own path, so the files of one round differ: identical files would be stored as one
-/// content-addressed blob, and a kill round would cover a single blob write rather than one per
-/// file.
+/// (calibration or real) has real hashing/compression/write work to do. The tag ends with the
+/// file's directory and name, so the files of one round differ: identical files would be stored
+/// as one content-addressed blob, and a kill round would cover one object write rather than one
+/// per file. Only the last two path components go in, so the content does not depend on the
+/// temp directory and is the same on every run and OS.
 fn rewrite_corpus(file: &Path, base_line: &str, lines: usize, tag: &str) {
-    std::fs::write(file, format!("{}{} {}\n", base_line.repeat(lines), tag, file.display())).unwrap();
+    let dir = file.parent().and_then(|p| p.file_name()).unwrap().to_str().unwrap();
+    let name = file.file_name().unwrap().to_str().unwrap();
+    std::fs::write(file, format!("{}{} {}/{}\n", base_line.repeat(lines), tag, dir, name)).unwrap();
 }
 
 /// The current pallet head, if one exists yet.
@@ -270,8 +277,9 @@ fn killing_stack_midway_never_corrupts_the_store() {
     let warehouse = area.warehouse();
     let file = warehouse.join("big.dat");
 
-    // A few megabytes so hashing, compression, the fsync and the rename take long enough that some
-    // of the kills below land inside the write window rather than always before or after it.
+    // A few megabytes so the run is long enough that some of the kills below land inside the
+    // write window rather than always before or after it (see `SPREAD_CORPUS_LINES` for what the
+    // size does and does not scale).
     let base_line = "the quick brown fox jumps over the lazy dog\n";
     rewrite_corpus(&file, base_line, STACK_CORPUS_LINES, "seed");
 
@@ -380,7 +388,9 @@ fn calibrate_load_duration(area: &Area, files: &[PathBuf], base_line: &str, labe
 ///
 /// Returns how many iterations produced a completed `stack` (the signal that this iteration's
 /// kill left something a later step could — and did — build on, not just "killed before
-/// anything").
+/// anything"). Each iteration ends by loading and stacking everything, so the next one starts
+/// with nothing staged: a `stack` that succeeds can only be committing what that iteration's
+/// killed load staged, never the previous iteration's heal.
 ///
 /// The incomplete-load guard (`load_guard_utils`) durably marks a load's root the instant it
 /// starts — before this test's kill ever lands — precisely so a killed `load` is caught even
@@ -445,10 +455,16 @@ fn run_load_kill_spread(
 
         // 5. Bring the working directory fully up to date before the next iteration's rewrite —
         //    an uninterrupted `load .`, so leftover partial state from this iteration's kill
-        //    never carries over as ambiguity into the next one.
+        //    never carries over as ambiguity into the next one — and commit it, so the next
+        //    iteration's `stack` cannot succeed on what this heal staged.
         let heal = area.run(&["load", "."]);
         assert!(heal.status.success(), "{commit_tag} kill #{i}: healing load failed: {}",
             String::from_utf8_lossy(&heal.stderr));
+        let heal_stack = area.run(&["stack", &format!("{commit_tag} heal {i}")]);
+        assert!(heal_stack.status.success()
+                || String::from_utf8_lossy(&heal_stack.stderr).to_lowercase().contains("nothing to stack"),
+            "{commit_tag} kill #{i}: healing stack failed: {}",
+            String::from_utf8_lossy(&heal_stack.stderr));
     }
 
     stacked
