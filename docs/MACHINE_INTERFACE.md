@@ -450,13 +450,19 @@ taxonomy). The tool result's content is:
 A failure document (`ok: false`) comes back as an MCP tool error (`isError: true`)
 carrying the error envelope — the agent sees the stable `code`/`next_step`, not a crashed
 session. `isError` follows `ok`, not the exit status. A run that left no document at all,
-for example one killed by a signal, is always an error: its first item is a sentence
-naming how it ended (`forklift left no result document: it was killed by signal 9.`).
+for example one killed by a signal, is always an error. Its first item names how it ended
+(`forklift left no result document: it was killed by signal 9.`), then quotes the last
+4 KiB of whatever it wrote to stdout and, warnings aside, to stderr, so a crash's own
+account of itself is not lost.
+
+The server ignores `SIGPIPE`: a client that stops reading ends the server once the call
+in progress has finished, instead of killing it, and that call's `forklift`, mid-run.
 
 Requests are answered one at a time, in the order they arrive.
 
-**Progress.** A `tools/call` whose request carries `_meta.progressToken` gets
-`notifications/progress` for that token while it runs. The server hands the call a
+**Progress.** A `tools/call` whose request carries `_meta.progressToken`, a string or an
+integer, gets `notifications/progress` for that token while it runs. Any other token is
+treated as none. The server hands the call a
 [progress-events](#progress-events) channel of its own and turns the events into
 notifications:
 
@@ -466,12 +472,16 @@ notifications:
   a percentage lower than the previous one. Each new phase therefore raises the value
   instead of rewinding it. Read it as a strictly increasing tick, not a fraction.
 * `progress` strictly increases. An event that would not raise it is still sent if it
-  brings new text, at the last value plus 1/128; otherwise it is dropped.
+  brings new text, at the last value plus 1/4096; otherwise it is dropped. Those steps
+  stop short of the next whole value: after 4095 of them, text alone is dropped until the
+  value rises, so the value keeps meaning 100 × resets + percentage.
 * `message` carries the phase, the percentage and the event's text
   (`Packing objects: 40% …`), and is sent only when the negotiated protocol is
-  `2025-06-18` or later, the first version that has the field. Before that version, only
-  events that raise the value are sent.
-* At most one notification goes out every 100 ms. What arrives in between is folded into
+  `2025-06-18` or later, the first version that has the field. A version that is not a
+  `YYYY-MM-DD` date counts as earlier. Before that version, only events that raise the
+  value are sent.
+* At most one notification goes out every 100 ms while the call runs, plus one when it
+  ends, which can follow the previous one sooner. What arrives in between is folded into
   the next one: the highest value and the newest text.
 * Every notification for a call is written before that call's response, never after.
 

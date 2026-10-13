@@ -636,7 +636,7 @@ impl ProgressMapper {
                     Some(_) if self.text_only >= TEXT_ONLY_LIMIT => return None,
                     Some(sent) => {
                         self.text_only += 1;
-                        sent.floor() + f64::from(self.text_only) * TEXT_ONLY_STEP
+                        sent + TEXT_ONLY_STEP
                     }
                 }
             }
