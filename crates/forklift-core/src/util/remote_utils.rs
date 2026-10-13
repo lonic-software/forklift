@@ -8280,18 +8280,28 @@ mod tests {
     }
 
     /// `fetch_info` against a remote that connects and then never writes anything must fail with
-    /// a timeout — not hang forever, and not fail for some unrelated reason.
+    /// a timeout — not hang forever, and not fail for some unrelated reason — and must fail on
+    /// this client's own read budget. The message names that budget, but the figure comes from
+    /// `describe_transport_error`, not from the client that timed out, so it cannot tell a
+    /// `Clients::build` that armed the production [`REMOTE_READ_TIMEOUT`] apart from one that
+    /// armed this client's. The elapsed-time bound can: it sits at the midpoint between this
+    /// client's budget and that rival's.
     #[test]
     fn fetch_info_times_out_against_a_silent_remote() {
         let remote = SilentRemote::start();
         let client = fast_client(&remote.url);
         let effective_budget = FAST.connect + FAST.read;
+        let rival_production_read_budget = FAST.connect + TEST_TIGHT_READ_TIMEOUT;
+        let upper_bound =
+            effective_budget + (rival_production_read_budget - effective_budget) / 2;
         let hard_ceiling = effective_budget + std::time::Duration::from_secs(15);
 
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let started = std::time::Instant::now();
         let outcome = runtime.block_on(async {
             tokio::time::timeout(hard_ceiling, client.fetch_info()).await
         });
+        let elapsed = started.elapsed();
 
         let inner = outcome.unwrap_or_else(|_| panic!(
             "fetch_info hung past the test's own {:?} ceiling — no timeout fired at all",
@@ -8311,6 +8321,13 @@ mod tests {
         assert!(
             message.contains(&format!("{:?}", effective_budget)),
             "must name the effective bound {:?}, not some other figure: {}", effective_budget, message
+        );
+        assert!(
+            elapsed < upper_bound,
+            "elapsed {:?} is past {:?} (the midpoint between this client's read budget {:?} and \
+            the {:?} the production read timeout would arm) — the tight client is not armed with \
+            this client's budgets",
+            elapsed, upper_bound, effective_budget, rival_production_read_budget
         );
     }
 
