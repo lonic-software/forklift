@@ -54,9 +54,13 @@ jobs:
               docs/*|*.md)
                 # Some tests read docs (a guide table, a documented default). A doc whose
                 # repo path appears anywhere in the crates counts as code, so a docs-only
-                # change cannot hide the test it breaks.
-                if git grep -qF -- "$path" -- crates; then
-                  echo "$path is referenced from crates/, so it counts as code."
+                # change cannot hide the test it breaks. This needs a test to name the doc
+                # by its literal repo path. Only "no match" (exit 1) leaves a doc docs-only;
+                # a grep that errors counts as code.
+                rc=0
+                git grep -qF -- "$path" -- crates || rc=$?
+                if [ "$rc" -ne 1 ]; then
+                  echo "$path is referenced from crates/ (or grep failed), so it counts as code."
                   code=true
                 fi ;;
               *) code=true ;;
