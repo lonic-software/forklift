@@ -1834,7 +1834,9 @@ fn drain_parcel_queue(
 /// pathologically deep tree; see [`tests::walk_tree_survives_a_pathologically_deep_tree`]. Mirrors
 /// `gc_utils::collect_live_set`'s own `tree_queue: VecDeque` loop — same shape, same semantics,
 /// just applied here instead of there. `check_leaf`'s own descent (recipe → chunks) is one level
-/// deep, never further, so it stays recursion-free without needing this treatment.
+/// deep, never further, so it stays recursion-free without needing this treatment. That test
+/// runs the walk on a small-stack thread, so it relies on the walk staying on the calling
+/// thread; a walk fanned out to worker threads needs its falsifier rebuilt.
 fn walk_tree(
     tree_hash: &str,
     targets: &BTreeSet<String>,
@@ -2674,8 +2676,7 @@ mod tests {
     /// A pathologically deep parcel spine tree (a chain of `DEPTH` nested subtrees, one child
     /// each) must not crash the closure walk. Before `walk_tree` was made iterative (an explicit
     /// `VecDeque` work queue, mirroring `gc_utils::collect_live_set`'s own `tree_queue`), it
-    /// recursed once per subtree level — confirmed to overflow the default test-thread stack at
-    /// this depth: with `walk_tree`'s body temporarily reverted to its old recursive shape (one
+    /// recursed once per subtree level, and overflowed: with `walk_tree`'s body temporarily reverted to its old recursive shape (one
     /// `walk_tree` call inside the `for (_, subtree) in tree.get_subtrees()` loop instead of a
     /// queue push) and this same test run in isolation, the process aborted outright — "thread
     /// '...' has overflowed its stack", `SIGABRT`, `cargo test` reporting "process didn't exit
@@ -2690,8 +2691,15 @@ mod tests {
     /// took ~226 s. Measured on a macOS debug build with `STACK` at 256 KiB: the recursive shape
     /// survives 100 levels and dies by 150, so `DEPTH` is over 13x past it; the iterative walk,
     /// whose stack use does not grow with depth, passes on 32 KiB and overflows on 16 KiB, so
-    /// `STACK` leaves it 8x headroom. The walk's storage-root scope is entered on that thread,
-    /// because the scope is thread-local.
+    /// `STACK` leaves it 8x headroom. The same figures passed on Linux and Windows CI.
+    ///
+    /// Both figures are for debug builds. An optimised test build shrinks the recursive frames,
+    /// and with them the margin, so `DEPTH` at the default stack, or under `--release`, is not
+    /// a proven falsifier; keep the two constants together. The test also relies on
+    /// `closure_references_any` walking on the calling thread: a walk moved onto worker threads
+    /// would run on their default stacks, and this test would stop catching a recursive descent.
+    /// The walk's storage-root scope is entered on the small-stack thread, because the scope is
+    /// thread-local.
     ///
     /// Tree objects are written directly to their final on-disk path (`write_tree_object_fast`)
     /// rather than through `LooseObject::store` (which fsyncs, and renames through a barrier,
@@ -2766,6 +2774,8 @@ mod tests {
             })
             .unwrap()
             .join()
+            // A stack overflow aborts the process rather than panicking, so this only reports
+            // an unrelated panic; the falsifier shows up as "has overflowed its stack".
             .expect("the walk thread must not panic")
             .expect("the closure walk must complete without crashing on a deeply nested tree")
             .hashes;
