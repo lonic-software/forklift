@@ -9,8 +9,8 @@
 
 [profile.default]
 # Every test outside the crash suite's kill tests finishes in seconds: in the CI logs of
-# 2026-10-13, the slowest was about twenty seconds (macOS at one thread per core; Windows at
-# twice that, as CI runs it, peaked at twelve). Fail at two minutes.
+# 2026-10-13, at twice as many threads as cores as CI runs them, the slowest was about
+# twenty-five seconds (Windows; macOS peaked at fifteen). Fail at two minutes.
 slow-timeout = { period = "30s", terminate-after = 4 }
 
 [[profile.default.overrides]]
@@ -21,13 +21,16 @@ slow-timeout = { period = "30s", terminate-after = 4 }
 filter = 'binary_id(forklift::crash_consistency) & test(/^killing_/)'
 slow-timeout = { period = "120s", terminate-after = 5 }
 
-[[profile.default.overrides]]
-# Off macOS, each kill test also takes two of nextest's slots. CI runs twice as many tests as
-# cores on Linux and Windows because most tests wait rather than compute, but the kill tests write
-# with fsync on throughout, and fsync-heavy tests slow each other down past one per core rather than filling idle
-# time; two slots each keeps them at about one per core. macOS CI runs one test per core, where
-# two slots would only make the kill tests wait for each other: on its three cores they ran one
-# after another and the run took 209 s instead of 149 s.
-platform = 'cfg(not(target_os = "macos"))'
+# CI runs `--profile ci`, which is the default profile plus what follows. It assumes the
+# `--test-threads` CI passes alongside it, twice the core count; nextest config cannot express that.
+[profile.ci]
+
+[[profile.ci.overrides]]
+# CI also runs twice as many tests as cores, because most tests wait rather than compute; there,
+# each kill test takes two of nextest's slots. The kill tests write with fsync on throughout, and
+# fsync-heavy tests slow each other down past one per core rather than filling idle time; two
+# slots each keeps them at about one per core. Not in the default profile: at nextest's default
+# of one thread per core, two slots would only make them wait for each other — on a three-core
+# runner they ran one after another.
 filter = 'binary_id(forklift::crash_consistency) & test(/^killing_/)'
 threads-required = 2

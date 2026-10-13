@@ -117,21 +117,18 @@ jobs:
       # slow binary no longer holds up the rest.
       - name: Test
         if: env.SKIP_TESTS != 'true'
-        # Twice as many test threads as cores on Linux and Windows: many tests spend their time
-        # waiting (on a timeout, a server, a child process), not computing, so the default of one
-        # per core leaves cores idle. The macOS runner's disk is the bottleneck instead — doubling
-        # there more than doubled the run — so it keeps nextest's default. The crash suite's
-        # kill tests take two slots each there (see .config/nextest.toml).
+        # Twice as many test threads as cores: many tests spend their time waiting (on a timeout,
+        # a server, a child process), not computing, so the default of one per core leaves cores
+        # idle. The ci profile gives the crash suite's kill tests two slots each
+        # (see .config/nextest.toml).
         shell: bash
         run: |
-          if [ "$RUNNER_OS" = macOS ]; then
-            cargo nextest run --workspace --no-fail-fast
-          else
-            cores=${NUMBER_OF_PROCESSORS:-$(nproc)}
-            [ -n "$cores" ] || { echo "could not count cores"; exit 1; }
-            echo "cores=$cores test-threads=$(( cores * 2 ))"
-            cargo nextest run --workspace --no-fail-fast --test-threads "$(( cores * 2 ))"
-          fi
+          cores=${NUMBER_OF_PROCESSORS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || true)}
+          case "$cores" in
+            ''|0|*[!0-9]*) echo "could not count cores (got '$cores')"; exit 1 ;;
+          esac
+          echo "cores=$cores test-threads=$(( cores * 2 ))"
+          cargo nextest run --workspace --no-fail-fast --profile ci --test-threads "$(( cores * 2 ))"
 
       # nextest does not run doc-tests.
       - name: Doc-tests
