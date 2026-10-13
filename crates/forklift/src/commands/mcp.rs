@@ -879,7 +879,13 @@ fn build_args(name: &str, arguments: &Value) -> Result<Vec<String>, String> {
         "undo" => args.push("undo".to_string()),
         "heal" => args.push("heal".to_string()),
         "lift" => args.push("lift".to_string()),
-        "lower" => args.push("lower".to_string()),
+        "lower" => {
+            args.push("lower".to_string());
+            if let Some(genesis) = string_arg("expect") {
+                args.push("--expect".to_string());
+                args.push(genesis);
+            }
+        }
         "office_list" => args.push("office".to_string()),
         "bay_add" => {
             args.push("bay".to_string());
@@ -1146,8 +1152,8 @@ fn tool_definitions() -> Value {
             object(json!({}), json!([]))),
         tool("lift", "Push the current pallet's new parcels to the configured remote.",
             object(json!({}), json!([]))),
-        tool("lower", "Pull and fast-forward the current pallet from the configured remote.",
-            object(json!({}), json!([]))),
+        tool("lower", "Pull and fast-forward the current pallet from the configured remote. expect pins the genesis the remote's trust anchor must have, checked before anything is fetched; a mismatch refuses with trust_changed.",
+            object(json!({ "expect": string }), json!([]))),
         tool("office_list", "List the enrolled operators and their keys.",
             object(json!({}), json!([]))),
         tool("bay_add", "Open a bay: a new working directory bound to this warehouse, checked out to a new pallet named after it (branched from the current head). Pass scope to open a scoped (sparse) bay materializing only those subtree(s) — the tool for an orchestrator to hand a sub-agent a task-scoped sandbox. path defaults to a sibling of the warehouse.",

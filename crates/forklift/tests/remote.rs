@@ -331,6 +331,15 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).to_string()
 }
 
+/// The `details` of a `trust_changed` refusal under `--json`: exit 22, the error document on
+/// stdout.
+fn trust_changed_details(output: &Output) -> serde_json::Value {
+    assert_eq!(output.status.code(), Some(22), "{}{}", stdout(output), stderr(output));
+    let value: serde_json::Value = serde_json::from_str(&stdout(output)).unwrap();
+    assert_eq!(value["error"]["code"], "trust_changed", "{}", value);
+    value["error"]["details"].clone()
+}
+
 /// Walk a parcel's tree to the object at a warehouse path via `peek --json`, run in a directory
 /// of the area — so a test can find (then delete) an object and prove a later walk skips it.
 fn path_object_hash(area: &TestArea, dir: &str, parcel: &str, path: &str) -> String {
@@ -1328,24 +1337,87 @@ fn regenesis_is_gated_by_the_static_token_and_accepted_consciously() {
     let lifted = area.forklift("a", &["lift"]);
     assert_success(&lifted);
 
-    // B's next sync is refused loudly, pointing at the conscious re-accept.
+    // B's next sync is refused loudly, pointing at the conscious re-accept, and the refusal
+    // names both values: the remote's genesis now and the one B holds.
     let refused = area.forklift("b", &["lower"]);
     assert!(!refused.status.success());
-    assert!(stderr(&refused).contains("RESET"), "{}", stderr(&refused));
-    assert!(stderr(&refused).contains("accept-regenesis"), "{}", stderr(&refused));
+    assert!(stderr(&refused).contains("CHANGED"), "{}", stderr(&refused));
+    assert!(stderr(&refused).contains("accept-regenesis --confirm"), "{}", stderr(&refused));
 
-    // The acceptance itself is two-step: a dry-run description, then --confirm.
+    let refused = area.forklift("b", &["--json", "lower"]);
+    let details = trust_changed_details(&refused);
+    assert_eq!(details["what_changed"], "regenesis");
+    assert_eq!(details["subject"], server.url.as_str());
+    let current = details["current"].as_str().unwrap().to_string();
+    let previous = details["previous"].as_str().unwrap().to_string();
+    assert_ne!(current, previous);
+
+    // The description alone accepts nothing; it refuses with the same details.
     let dry = area.forklift("b", &["office", "accept-regenesis"]);
     assert!(!dry.status.success());
-    assert!(stdout(&dry).contains("RESET"), "{}", stdout(&dry));
+    assert!(stdout(&dry).contains("CHANGED"), "{}", stdout(&dry));
+    let dry = area.forklift("b", &["--json", "office", "accept-regenesis"]);
+    assert_eq!(trust_changed_details(&dry)["current"], current.as_str());
 
-    assert_success(&area.forklift("b", &["office", "accept-regenesis", "--confirm"]));
+    // --confirm binds the acceptance to the value shown: any other value is refused, with
+    // fresh details naming the current one, and nothing is accepted.
+    let wrong = area.forklift("b", &["--json", "office", "accept-regenesis", "--confirm", &previous]);
+    let details = trust_changed_details(&wrong);
+    assert_eq!(details["current"], current.as_str());
+    assert_eq!(details["previous"], previous.as_str());
+    assert!(!area.forklift("b", &["lower"]).status.success(), "a refused confirm accepted nothing");
+
+    assert_success(&area.forklift("b", &["office", "accept-regenesis", "--confirm", &current]));
     assert_success(&area.forklift("b", &["lower"]));
 
     // B's offline audit passes with the prior history attested (legacy).
     let audit = area.forklift("b", &["audit"]);
     assert!(audit.status.success(), "{}", stderr(&audit));
     assert!(stdout(&audit).contains("legacy parcel(s)"), "{}", stdout(&audit));
+}
+
+#[test]
+fn an_expect_pin_is_checked_before_anything_is_fetched_and_first_contact_is_announced() {
+    let area = TestArea::new("expect-pin");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "a", &server.url);
+    area.write_file("a/code.txt", "v1\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "base"]));
+    assert_success(&area.forklift("a", &["office", "enroll"]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    // A wrong pin refuses before the target exists: nothing downloaded, nothing created.
+    let wrong = area.forklift(".", &["--json", "franchise", &server.url, "b", "--expect", "not-it"]);
+    let details = trust_changed_details(&wrong);
+    assert_eq!(details["what_changed"], "unexpected");
+    assert_eq!(details["subject"], server.url.as_str());
+    assert!(details.get("previous").is_none(), "a franchise holds no anchor yet: {}", details);
+    assert!(!area.path("b").exists(), "a refused pin must not create the target");
+    let genesis = details["current"].as_str().unwrap().to_string();
+
+    // The right pin franchises, and the first contact is still announced — on stderr, as a
+    // warning document — and recorded in the report.
+    let pinned = area.forklift(".", &["--json", "franchise", &server.url, "b", "--expect", &genesis]);
+    assert_success(&pinned);
+    let report: serde_json::Value = serde_json::from_str(&stdout(&pinned)).unwrap();
+    assert_eq!(report["data"]["adopted_genesis"], genesis.as_str(), "{}", report);
+    let warning: serde_json::Value = serde_json::from_str(stderr(&pinned).lines()
+        .find(|line| line.contains("trust_adopted")).expect("a trust_adopted warning")).unwrap();
+    assert_eq!(warning["details"], serde_json::json!({
+        "subject": server.url, "current": genesis, "what_changed": "first_contact",
+    }));
+
+    // Lower checks the pin against the held anchor too, and a held anchor is not re-announced.
+    let wrong = area.forklift("b", &["--json", "lower", "--expect", "not-it"]);
+    let details = trust_changed_details(&wrong);
+    assert_eq!(details["current"], genesis.as_str());
+    assert_eq!(details["previous"], genesis.as_str());
+
+    let lowered = area.forklift("b", &["lower", "--expect", &genesis]);
+    assert_success(&lowered);
+    assert!(!stderr(&lowered).contains("FIRST CONTACT"), "{}", stderr(&lowered));
 }
 
 #[test]

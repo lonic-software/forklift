@@ -171,6 +171,12 @@ refusal_codes! {
     /// vanished, failed to read back, no longer matched their own content hash, or the taint's own
     /// record was itself incomplete (torn). The taint is left standing in every case.
     DurabilityTaint => "durability_taint",
+
+    /// A remote's trust anchor is not the one this warehouse holds, or not the one the command
+    /// named (an `--expect` pin, an `accept-regenesis --confirm` value). Never adopted silently:
+    /// the refusal's details carry the remote's value now, so an override can name exactly it
+    /// (`trust_utils`).
+    TrustChanged => "trust_changed",
 }
 
 impl RefusalCode {
@@ -198,6 +204,9 @@ pub enum CoreError {
         message: String,
         /// The machine-actionable recovery step.
         next_step: String,
+        /// Code-specific structured detail, for the codes whose contract defines one (a head emits
+        /// it as `error.details` under `--json`).
+        details: Option<serde_json::Value>,
     },
 
     /// An error without a more specific classification yet — a plain message, no code.
@@ -219,6 +228,24 @@ impl CoreError {
             code,
             message: sanitize(&message.into()),
             next_step: sanitize(&next_step.into()),
+            details: None,
+        }
+    }
+
+    /// Build a classified refusal that carries structured detail as well — see
+    /// [`CoreError::refusal`] for the sanitizing of the two texts. The detail needs none: the frame
+    /// carries it as compact JSON, which escapes every control character.
+    pub fn refusal_with_details(
+        code: RefusalCode,
+        message: impl Into<String>,
+        next_step: impl Into<String>,
+        details: serde_json::Value,
+    ) -> CoreError {
+        CoreError::Refusal {
+            code,
+            message: sanitize(&message.into()),
+            next_step: sanitize(&next_step.into()),
+            details: Some(details),
         }
     }
 }
@@ -246,12 +273,13 @@ impl std::error::Error for CoreError {}
 /// matters most and there is no typed field left to carry it in.
 impl From<String> for CoreError {
     fn from(message: String) -> CoreError {
-        if let Some((code, human, next_step)) = deframe(&message) {
+        if let Some((code, human, next_step, details)) = deframe_with_details(&message) {
             return match RefusalCode::from_code(code) {
                 Some(code) => CoreError::Refusal {
                     code,
                     message: human.to_string(),
                     next_step: next_step.to_string(),
+                    details,
                 },
                 None => CoreError::Other(with_next_step(human, next_step)),
             };
@@ -274,8 +302,8 @@ impl From<&str> for CoreError {
 impl From<CoreError> for String {
     fn from(error: CoreError) -> String {
         match error {
-            CoreError::Refusal { code, message, next_step } => {
-                frame(code.as_str(), &message, &next_step)
+            CoreError::Refusal { code, message, next_step, details } => {
+                frame(code.as_str(), &message, &next_step, details.as_ref())
             }
             CoreError::Other(message) => message,
         }
@@ -294,8 +322,12 @@ impl From<CoreError> for String {
 /// `Result<_, String>` error.
 pub fn append_to_message(error: String, extra: &str) -> String {
     match CoreError::from(error) {
-        CoreError::Refusal { code, message, next_step } =>
-            CoreError::refusal(code, format!("{} {}", message, extra), next_step).into(),
+        CoreError::Refusal { code, message, next_step, details } => CoreError::Refusal {
+            code,
+            message: sanitize(&format!("{} {}", message, extra)),
+            next_step,
+            details,
+        }.into(),
         CoreError::Other(message) => format!("{} {}", message, extra),
     }
 }
@@ -319,9 +351,11 @@ fn sanitize(text: &str) -> String {
 }
 
 /// Build the sentinel frame for a refusal. Re-sanitizes defensively so a `Refusal` assembled
-/// through the struct literal (bypassing [`CoreError::refusal`]) still frames decodably.
-fn frame(code: &str, message: &str, next_step: &str) -> String {
-    format!(
+/// through the struct literal (bypassing [`CoreError::refusal`]) still frames decodably. Detail,
+/// when there is any, is a fourth field of compact JSON — which escapes every control character,
+/// the separator included, so the field needs no sanitizing of its own.
+fn frame(code: &str, message: &str, next_step: &str, details: Option<&serde_json::Value>) -> String {
+    let mut framed = format!(
         "{}{}{}{}{}{}",
         REFUSAL_PREFIX,
         code,
@@ -329,21 +363,36 @@ fn frame(code: &str, message: &str, next_step: &str) -> String {
         sanitize(message),
         REFUSAL_FIELD_SEPARATOR,
         sanitize(next_step),
-    )
+    );
+
+    if let Some(details) = details {
+        framed.push(REFUSAL_FIELD_SEPARATOR);
+        framed.push_str(&details.to_string());
+    }
+
+    framed
 }
 
 /// Decode a sentinel frame into `(code, message, next_step)`; `None` for any string that is not a
-/// frame. The inverse of [`frame`], and the low-level primitive both the wire (`error_of`) and the
-/// String→`CoreError` bridge parse.
+/// frame. The inverse of [`frame`] without its detail, and the low-level primitive the servers'
+/// wire mapping parses — the wire carries no detail, so a detail field never reaches `next_step`.
 pub fn deframe(message: &str) -> Option<(&str, &str, &str)> {
+    deframe_with_details(message).map(|(code, human, next_step, _)| (code, human, next_step))
+}
+
+/// Decode a sentinel frame in full: [`deframe`]'s three fields, plus the detail when the frame
+/// carries any. A detail field that does not parse as JSON is dropped rather than failing the
+/// decode — the refusal's code and texts are still exact.
+fn deframe_with_details(message: &str) -> Option<(&str, &str, &str, Option<serde_json::Value>)> {
     let rest = message.strip_prefix(REFUSAL_PREFIX)?;
-    let mut parts = rest.splitn(3, REFUSAL_FIELD_SEPARATOR);
+    let mut parts = rest.splitn(4, REFUSAL_FIELD_SEPARATOR);
 
     let code = parts.next()?;
     let human = parts.next()?;
     let next_step = parts.next()?;
+    let details = parts.next().and_then(|text| serde_json::from_str(text).ok());
 
-    Some((code, human, next_step))
+    Some((code, human, next_step, details))
 }
 
 #[cfg(test)]
@@ -394,7 +443,7 @@ mod tests {
         // A frame whose code this build does not know (a newer peer). It must not leak the raw
         // frame; it degrades to Other, but the recovery guidance (next_step) survives folded into
         // the message rather than being silently dropped (no invented variant, no code).
-        let framed = frame("some_future_code", "a human explanation", "do this");
+        let framed = frame("some_future_code", "a human explanation", "do this", None);
         let error: CoreError = framed.into();
 
         assert_eq!(error, CoreError::Other("a human explanation do this".to_string()));
@@ -447,7 +496,7 @@ mod tests {
         let relifted: CoreError = extended.into();
 
         match relifted {
-            CoreError::Refusal { code, message, next_step } => {
+            CoreError::Refusal { code, message, next_step, .. } => {
                 assert_eq!(code, RefusalCode::OversizedTransportUnsupported);
                 assert_eq!(message, "too big (additionally, cleanup failed)");
                 assert_eq!(next_step, "shrink it", "next_step must be untouched");

@@ -453,16 +453,22 @@ fn with_pack_warnings(error: CoreError, pack_warnings: &[String]) -> CoreError {
     }
 
     match error {
-        CoreError::Refusal { code, message, next_step } => {
+        CoreError::Refusal { code, message, next_step, details } => {
             let block = pack_warnings.iter().map(String::as_str).collect::<Vec<_>>().join(" ");
-            CoreError::refusal(
+            let refusal = CoreError::refusal(
                 code,
                 format!(
                     "{} Pack index problems (unrelated to this refusal — clear them separately): {}",
                     message, block
                 ),
                 next_step,
-            )
+            );
+
+            match (refusal, details) {
+                (CoreError::Refusal { code, message, next_step, .. }, Some(details)) =>
+                    CoreError::Refusal { code, message, next_step, details: Some(details) },
+                (refusal, _) => refusal,
+            }
         }
         other => other,
     }

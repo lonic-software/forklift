@@ -2,8 +2,8 @@ use serde::Serialize;
 use forklift_core::util::remote_utils::RemoteClient;
 use forklift_core::util::stocktake_utils::ChangeKind;
 use forklift_core::util::{
-    config_utils, haul_utils, manifest_utils, merge_utils, object_utils, pallet_utils, remote_utils,
-    scope_utils, shift_utils, stocktake_utils,
+    config_utils, haul_utils, office_utils, manifest_utils, merge_utils, object_utils, pallet_utils, remote_utils,
+    scope_utils, shift_utils, stocktake_utils, trust_utils,
 };
 use crate::commands::office;
 use crate::events;
@@ -19,16 +19,32 @@ use crate::output::{self, CommandOutput};
 /// A diverged pallet is never merged implicitly: lower reports it and the operator
 /// consolidates deliberately.
 ///
+/// # Arguments
+/// * `expect` - The genesis the remote's trust anchor must have (an out-of-band pin), checked
+///              against the handshake before anything is fetched.
+///
 /// # Returns
 /// * `Ok(())`      - If the pallet is now at the remote head (or was already).
-/// * `Err(String)` - If no remote is configured, the warehouse is dirty, the histories
-///                   diverged, or a transfer failed.
-pub async fn handle_command() -> Result<(), String> {
+/// * `Err(String)` - If no remote is configured, its trust anchor is not the expected one or
+///                   not the one held, the warehouse is dirty, the histories diverged, or a
+///                   transfer failed.
+pub async fn handle_command(expect: Option<String>) -> Result<(), String> {
     let progress = events::progress();
     let client = RemoteClient::from_config()?;
     let info = client.fetch_info().await?;
 
+    if let Some(expected) = &expect {
+        let held = office_utils::read_trust_anchor()?.map(|anchor| anchor.genesis);
+        trust_utils::check_expected(client.url(), info.trust.as_ref(), held.as_deref(), expected)?;
+    }
+
     let trust = remote_utils::adopt_remote_trust(&client, &info).await?;
+
+    // Announced at once, not with the report: the adopted anchor is already on disk, and a
+    // later refusal (a dirty warehouse, a missing pallet) would otherwise leave it unsaid.
+    if let Some(genesis) = &trust.adopted_genesis {
+        output::warn_trust_adopted(&trust_utils::first_contact(client.url(), genesis));
+    }
 
     // Meta pallets (the manifest, …) sync alongside trust — fast-forwarded, never
     // materialized. A diverged manifest merges cleanly (its records are independent).
@@ -47,7 +63,7 @@ pub async fn handle_command() -> Result<(), String> {
     let local_head = pallet_utils::get_pallet_head(&pallet)?;
 
     let mut report = LowerReport {
-        adopted_anchor: trust.adopted_anchor,
+        adopted_genesis: trust.adopted_genesis,
         office_moved: trust.office_moved,
         meta_adopted,
         meta_merged,
@@ -129,8 +145,9 @@ pub(crate) enum LowerOutcome {
 #[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
 pub(crate) struct LowerReport {
-    /// Whether the remote's trust anchor was adopted on first contact.
-    adopted_anchor: bool,
+    /// The genesis of the remote's trust anchor, when it was adopted on this first contact.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adopted_genesis: Option<String>,
 
     /// Whether the office pallet moved with the remote.
     office_moved: bool,
@@ -152,8 +169,11 @@ pub(crate) struct LowerReport {
 
 impl CommandOutput for LowerReport {
     fn render_human(&self) {
-        if self.adopted_anchor {
-            println!("Adopted the remote's trust anchor; every parcel is signed from now on.");
+        if let Some(genesis) = &self.adopted_genesis {
+            println!(
+                "Adopted the remote's trust anchor (genesis {}); every parcel is signed from now on.",
+                genesis
+            );
         }
 
         if self.office_moved {

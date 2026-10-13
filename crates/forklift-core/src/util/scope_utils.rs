@@ -730,7 +730,7 @@ mod tests {
     /// instead of decoding a string.
     fn parts(error: &CoreError) -> (RefusalCode, &str, &str) {
         match error {
-            CoreError::Refusal { code, message, next_step } => (*code, message, next_step),
+            CoreError::Refusal { code, message, next_step, .. } => (*code, message, next_step),
             CoreError::Other(other) => panic!("expected a refusal, got Other({:?})", other),
         }
     }

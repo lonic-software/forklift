@@ -38,6 +38,7 @@ pub mod marker_utils;
 pub mod taint_utils;
 pub mod heal_utils;
 pub mod recovery_utils;
+pub mod trust_utils;
 pub mod path_utils;
 pub mod remote_utils;
 pub mod progress_utils;
