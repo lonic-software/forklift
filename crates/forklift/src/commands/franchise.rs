@@ -672,7 +672,7 @@ impl CommandOutput for FranchiseReport {
         if let Some(genesis) = &self.adopted_genesis {
             println!(
                 "Adopted the remote's trust anchor (genesis {}); every parcel is signed from now on.",
-                genesis
+                forklift_core::error::sanitize(genesis)
             );
         }
 

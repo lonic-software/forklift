@@ -5337,11 +5337,6 @@ pub async fn adopt_remote_trust(client: &RemoteClient,
 
     stats.fetch = fetch_history(client, remote_office_head, &Progress::NONE).await?;
 
-    if office_utils::read_trust_anchor()?.is_none() {
-        office_utils::write_trust_anchor(&remote_trust.to_anchor())?;
-        stats.adopted_genesis = Some(remote_trust.genesis.clone());
-    }
-
     match pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME)? {
         None => {
             pallet_utils::set_meta_pallet_head(OFFICE_PALLET_NAME, remote_office_head)?;
@@ -5364,7 +5359,45 @@ pub async fn adopt_remote_trust(client: &RemoteClient,
         }
     }
 
+    // Adopted last, once nothing after it can fail: an anchor written before a refusal would
+    // stand unannounced, and the next sync — finding it held — would never announce it either.
+    if office_utils::read_trust_anchor()?.is_none() {
+        office_utils::write_trust_anchor(&remote_trust.to_anchor())?;
+        stats.adopted_genesis = Some(remote_trust.genesis.clone());
+    }
+
     Ok(stats)
+}
+
+/// The re-genesis `office accept-regenesis` would act on: the held anchor and the remote's
+/// handshake, when the remote's anchor differs from the held one. Shared by the describing and
+/// the accepting path, so both refuse the same states the same way.
+///
+/// # Returns
+/// * `Ok(Some((TrustAnchor, TrustAnchorDto, WarehouseInfo)))` - The held anchor, the remote's
+///                                                              differing one, and the handshake.
+/// * `Ok(None)`    - The remote's anchor is the held one.
+/// * `Err(String)` - This warehouse or the remote holds no anchor, or the handshake failed.
+pub async fn pending_regenesis(client: &RemoteClient)
+    -> Result<Option<(office_utils::TrustAnchor, TrustAnchorDto, WarehouseInfo)>, String> {
+    let Some(local) = office_utils::read_trust_anchor()? else {
+        return Err(
+            "This warehouse has no trust anchor; a plain \"lower\" adopts the remote's \
+            trust on first contact.".to_string()
+        );
+    };
+
+    let info = client.fetch_info().await?;
+
+    let Some(remote_trust) = info.trust.clone() else {
+        return Err("The remote has no trust anchor; there is no re-genesis to accept.".to_string());
+    };
+
+    if remote_trust.genesis == local.genesis {
+        return Ok(None);
+    }
+
+    Ok(Some((local, remote_trust, info)))
 }
 
 /// Consciously accept a remote's re-genesis (§8.7): the loud, deliberate counterpart
@@ -5390,22 +5423,10 @@ pub async fn adopt_remote_trust(client: &RemoteClient,
 ///                                      failed.
 pub async fn accept_regenesis(client: &RemoteClient,
                               confirmed: &str) -> Result<(office_utils::TrustAnchor, office_utils::TrustAnchor), String> {
-    let Some(local) = office_utils::read_trust_anchor()? else {
-        return Err(
-            "This warehouse has no trust anchor; a plain \"lower\" adopts the remote's \
-            trust on first contact.".to_string()
-        );
-    };
-
-    let info = client.fetch_info().await?;
-
-    let Some(remote_trust) = &info.trust else {
-        return Err("The remote has no trust anchor; there is no re-genesis to accept.".to_string());
-    };
-
-    if remote_trust.genesis == local.genesis {
+    let Some((local, remote_trust, info)) = pending_regenesis(client).await? else {
         return Err("The remote's trust anchor matches this warehouse's; there is nothing to accept.".to_string());
-    }
+    };
+    let remote_trust = &remote_trust;
 
     if remote_trust.prior_genesis.as_deref() != Some(local.genesis.as_str()) {
         return Err(trust_utils::anchor_changed(

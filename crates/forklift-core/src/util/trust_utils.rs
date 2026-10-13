@@ -3,9 +3,11 @@
 //! `--json`; `docs/MACHINE_INTERFACE.md`).
 //!
 //! A trust anchor is never adopted or changed silently. First contact adopts it loudly (the
-//! caller warns with [`first_contact`]'s details); a change to an anchor already held is refused
-//! with [`RefusalCode::TrustChanged`], whose details always name the remote's value *now*
-//! (`current`) and the one this warehouse holds (`previous`). The one override,
+//! caller warns with [`first_contact`]'s details); a remote declaring a *different* anchor from the
+//! one held is refused with [`RefusalCode::TrustChanged`], whose details name the remote's value
+//! *now* (`current`) and the one this warehouse holds (`previous`). A remote declaring *no* anchor
+//! is not refused by a sync — it is also a warehouse whose holder enrolled but has not lifted yet —
+//! only by an `--expect` pin. The one override,
 //! `office accept-regenesis --confirm <value>`, succeeds only when its value still equals
 //! `current` — so what is accepted is exactly what a human or agent was shown.
 

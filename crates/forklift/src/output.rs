@@ -731,10 +731,13 @@ pub fn warn_trust_adopted(details: &trust_utils::TrustDetails) {
 /// The pure half of [`warn_trust_adopted`], split out like [`standing_taint_warning_text`] so a
 /// test can assert both modes without capturing stderr.
 fn trust_adopted_warning_text(mode: OutputMode, details: &trust_utils::TrustDetails) -> String {
-    let genesis = details.current.as_deref().unwrap_or_default();
+    // Both values come from the remote (or its URL): stripped of control characters, so a
+    // hostile genesis cannot rewrite the terminal line a human is asked to verify.
+    let genesis = forklift_core::error::sanitize(details.current.as_deref().unwrap_or_default());
+    let subject = forklift_core::error::sanitize(&details.subject);
     let message = format!(
         "FIRST CONTACT with {}: adopted its trust anchor, genesis {}.",
-        details.subject, genesis
+        subject, genesis
     );
     let next_step = format!(
         "Verify that genesis out of band. To check it before anything is fetched, pass \
@@ -1045,6 +1048,10 @@ mod tests {
         let human = trust_adopted_warning_text(OutputMode::Human, &details);
         assert!(human.starts_with("Warning: FIRST CONTACT with http://remote"), "{}", human);
         assert!(human.contains("--expect abc123"), "the pin must be copyable: {}", human);
+
+        let hostile = trust_utils::first_contact("http://remote", "abc\u{1b}]0;spoof\u{7}\ndef");
+        let human = trust_adopted_warning_text(OutputMode::Human, &hostile);
+        assert!(!human.chars().any(char::is_control), "a remote value reached the terminal raw: {:?}", human);
 
         // The five fields every warning carries, plus `details` for this code — a literal, so a
         // renamed key goes red.
