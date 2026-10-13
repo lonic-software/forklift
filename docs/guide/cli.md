@@ -923,12 +923,19 @@ forklift franchise http://forklift.example.com:9418 my-project
 forklift franchise <url> <dir> --pallet main --token <secret>
 forklift franchise <url> <dir> --only src/api            # sparse: fetch one subtree
 forklift franchise <url> <dir> --only src/api --only docs # several subtrees
+forklift franchise <url> <dir> --expect <genesis>          # pin the remote's trust anchor
 ```
 
 Prepares a fresh warehouse in the target directory, remembers the remote, adopts
 its trust anchor, downloads the history (using the remote's bundle when it has
 one, then loose objects for the rest), and materializes the chosen pallet
 (default: the remote's default pallet). The directory must be new or empty.
+
+Adopting a trust anchor is announced, never silent: a warning names the remote and the adopted
+genesis, and the report records it (`adopted_genesis`). Verify it out of band — or pin it in advance
+with `--expect <genesis>`, which is checked against the remote's first response before anything is
+downloaded or created; a mismatch refuses with `trust_changed` (exit 22). See
+[trust-and-identity.md](trust-and-identity.md).
 
 The remote is contacted before anything is written, and a `--pallet` typo is checked against the
 handshake's own answer before anything is fetched, so a bad URL, a bad token, an unreachable
@@ -1009,11 +1016,16 @@ remote that doesn't, `lift` refuses up front, before uploading anything
 
 ```sh
 forklift lower
+forklift lower --expect <genesis>   # refuse unless the remote's trust anchor is this one
 ```
 
 Fetches the remote's new parcels for the current pallet and fast-forwards to them
 — working directory and inventory included. On first contact with a trusted
-remote, its trust anchor is adopted (a one-way door, like enrolling). A diverged
+remote, its trust anchor is adopted (a one-way door, like enrolling) and announced with a
+warning naming its genesis. `--expect <genesis>` pins the anchor before anything is fetched, as
+for `franchise`. A remote whose anchor changed from the one held is refused with `trust_changed`
+(exit 22) — after a legitimate re-genesis, accept it with
+`office accept-regenesis --confirm <genesis>`. A diverged
 pallet is never merged implicitly: `lower` fetches the parcels and reports the
 divergence, and you consolidate deliberately (`palletize` the remote head into
 its own pallet, `consolidate` it, then `lift` the merge). Requires a clean

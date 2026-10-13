@@ -18,7 +18,7 @@ The envelope is the one every Lonic tool shares. Success:
 {
   "lonic_json": 1,
   "tool": "forklift",
-  "schema": 2,
+  "schema": 3,
   "command": "stocktake",
   "ok": true,
   "data": { "…command-specific…" }
@@ -32,7 +32,7 @@ Failure keeps the same header, with `"ok": false` and an `error` in place of `da
 {
   "lonic_json": 1,
   "tool": "forklift",
-  "schema": 2,
+  "schema": 3,
   "command": "stocktake",
   "ok": false,
   "error": {
@@ -335,6 +335,39 @@ stable `code` (see `format/REMOTE_PROTOCOL.md`), and the client classifies it wi
 and exit code as a local one — so a script branches identically whether the refusal was local or
 server-side.
 
+### Trust refusals: `trust_changed`
+
+Every refusal about a remote's trust anchor is one code, `trust_changed` (exit 22), with
+`error.details` saying what changed:
+
+```json
+"details": {
+  "subject": "https://forklift.example.com",
+  "current": "1ee9…",
+  "previous": "712d…",
+  "what_changed": "regenesis"
+}
+```
+
+- `subject` — the remote, as its URL.
+- `current` — the remote's genesis **now**: the value an override must name. `null` only when a
+  pinned remote declares no anchor at all.
+- `previous` — the genesis this warehouse holds; absent when it holds none (a `franchise`).
+- `what_changed` — a closed set, to branch on instead of the message:
+  `regenesis` (the new anchor names the held one as its prior; the one override is
+  `office accept-regenesis --confirm <current>`), `unrelated` (it does not: another warehouse,
+  tampering, or a reset never seen; nothing overrides it), `unexpected` (the remote's anchor is
+  not the `--expect` pin).
+
+`office accept-regenesis --confirm <value>` accepts only when `<value>` still equals the
+remote's genesis; any other value refuses with fresh `details`, so an agent re-reads `current`
+rather than retrying a stale one. `franchise --expect` and `lower --expect` are checked against the
+first response, before anything is fetched or created.
+
+A first-contact adoption is not a refusal: the command succeeds, reports the genesis as
+`data.adopted_genesis`, and writes a `trust_adopted` warning (below) with the same `details`
+shape, `what_changed: "first_contact"` and no `previous`.
+
 ## Structured conflicts
 
 `forklift conflicts` lists the files an unresolved consolidation or cherry-pick left in conflict.
@@ -573,6 +606,12 @@ Example session:
   stderr, not just check the exit code; the taint is enforced regardless on the very next
   command's entry-heal chokepoint (`durability_taint`, exit 21) until `forklift heal`
   resolves it.
+* A `franchise` or `lower` that adopts a remote's trust anchor on first contact writes a
+  `trust_adopted` warning to the same channel, with `details`
+  `{ "subject": "<url>", "current": "<genesis>", "what_changed": "first_contact" }` — see
+  [Trust refusals](#trust-refusals-trust_changed). `lower` writes it as soon as the anchor is
+  adopted, since the adoption stands even if the pull then fails; `franchise` only on success,
+  since a failed franchise removes the warehouse it adopted into.
 * The same stderr channel carries one other warning, in the same shape:
   `{ "lonic_json": 1, "tool": "forklift", "warning": "maintenance_unavailable", "message": "…", "next_step":
   "Resolve the reported cause; …" }`. It means background auto-maintenance could not even decide

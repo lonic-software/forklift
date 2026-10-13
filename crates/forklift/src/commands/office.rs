@@ -804,9 +804,9 @@ pub fn regenesis(confirm: bool) -> Result<(), String> {
         Prior genesis:      {} (chain of custody, recorded in the anchor)\n\
         Adopted history:    {} (frozen, attested by the new anchor)\n\n\
         Every clone must consciously re-accept the new anchor with \
-        \"office accept-regenesis\". A remote accepts the reset only from the server \
+        \"office accept-regenesis --confirm {}\". A remote accepts the reset only from the server \
         operator's static token.",
-        genesis, key_id, old_anchor.genesis, old_office_head
+        genesis, key_id, old_anchor.genesis, old_office_head, genesis
     ));
 
     Ok(())

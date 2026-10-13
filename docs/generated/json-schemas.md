@@ -980,9 +980,12 @@ A command not listed here either reports only the generic human-message shape `{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "The result of a franchise: what was imported and which pallet was checked out.",
   "properties": {
-    "adopted_anchor": {
-      "description": "Whether the remote's trust anchor was adopted.",
-      "type": "boolean"
+    "adopted_genesis": {
+      "description": "The genesis of the remote's trust anchor, adopted on this first contact (absent when the\nremote has none).",
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "bundle_objects": {
       "description": "Objects imported from the remote's bundle, when it had one.",
@@ -1046,7 +1049,6 @@ A command not listed here either reports only the generic human-message shape `{
   "required": [
     "remote",
     "directory",
-    "adopted_anchor",
     "meta_adopted",
     "pallet",
     "unborn",
@@ -1727,9 +1729,12 @@ A command not listed here either reports only the generic human-message shape `{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "The result of a lower: the trust sync that ran first, then the pallet's outcome.",
   "properties": {
-    "adopted_anchor": {
-      "description": "Whether the remote's trust anchor was adopted on first contact.",
-      "type": "boolean"
+    "adopted_genesis": {
+      "description": "The genesis of the remote's trust anchor, when it was adopted on this first contact.",
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "fetched_objects": {
       "format": "uint",
@@ -1770,7 +1775,6 @@ A command not listed here either reports only the generic human-message shape `{
     }
   },
   "required": [
-    "adopted_anchor",
     "office_moved",
     "meta_adopted",
     "meta_merged",

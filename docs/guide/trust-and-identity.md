@@ -86,6 +86,35 @@ this warehouse must be signed** — this cannot be undone.
   `compact` — even one no pallet points at any more — so the pre-trust history
   it attests can't be swept out from under a future audit.
 
+### Joining a trusted warehouse: first contact
+
+The first `franchise` or `lower` against a trusted remote **adopts its trust
+anchor** — trust-on-first-use, like an SSH host key. It is never silent: the
+command warns, naming the remote and the adopted genesis, and its report records
+that genesis (`adopted_genesis` under `--json`, where the warning is a
+`trust_adopted` document on stderr). Verify that genesis out of band — with
+whoever runs the warehouse — because every later sync is checked against it.
+
+To check it *before* anything is fetched, pin it:
+
+```sh
+forklift franchise <url> my-project --expect <genesis>
+forklift lower --expect <genesis>
+```
+
+`--expect` is compared, exactly, against the anchor the remote declares in its
+first response. A mismatch — or a remote with no anchor at all — is refused
+before any download and before the target directory is created (`trust_changed`,
+exit 22, `what_changed: "unexpected"`).
+
+Once an anchor is held, a remote that later declares a different one is always
+refused (`trust_changed`, exit 22). Under `--json` the refusal carries
+`details` — `subject` (the remote URL), `current` (the remote's genesis now),
+`previous` (the one this warehouse holds) and `what_changed`: `regenesis` when
+the new anchor names the held one as its prior (see §9), `unrelated` when it
+does not (another warehouse, tampering, or a reset you never saw — nothing
+overrides it).
+
 ---
 
 ## 3. Adding people
@@ -321,11 +350,20 @@ deliberately **loud**: every clone refuses to sync until its holder consciously
 re-accepts, and a remote accepts the reset only from the server operator's static
 token.
 
-On another clone, after verifying out-of-band that the reset is legitimate:
+Every other clone's next sync is refused, naming the new genesis. On each, after
+verifying out-of-band that the reset is legitimate **and** that the genesis is
+the one the refusal named:
 
 ```sh
-forklift office accept-regenesis --confirm   # the SSH host-key-change moment
+forklift office accept-regenesis                    # describes the change, accepts nothing
+forklift office accept-regenesis --confirm <genesis> # the SSH host-key-change moment
 ```
+
+`--confirm` takes the genesis itself, and it must equal the remote's genesis at
+the moment of accepting. If the anchor changed again after it was shown — or the
+value was mistyped — nothing is accepted, and the refusal names the current
+value (`trust_changed`, `what_changed: "regenesis"`), so what you accept is
+exactly what you verified.
 
 ---
 
