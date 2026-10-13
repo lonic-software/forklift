@@ -8069,7 +8069,8 @@ mod tests {
     /// constant in place of the instance, names a figure the assertion does not expect. The
     /// ratios follow production's where a test depends on them: `batch_head_patience` stays under
     /// `object_read`, `read` under `object_read`, and the Tor connect bound far above the direct
-    /// one.
+    /// one. A test that widens `read` past `object_read` for its own margin (`WIDE_READ`, the
+    /// resolve survive test) gives that up, so it must not touch the object-read path.
     ///
     /// A test that separates an armed budget from a rival by elapsed time needs the two at least a
     /// second apart, so the midpoint leaves half a second or more for a loaded runner's
@@ -8615,8 +8616,8 @@ mod tests {
     ///
     /// **Drives the seam, not `fetch_batch`.** That is what makes it fast — the connect bound is
     /// injected at 300ms and the head budget is 600ms, so the fixture's ~2s body genuinely
-    /// outlasts the bound without paying the production 50s — and it is also its limit: it says nothing about
-    /// which posture `fetch_batch`'s own call site names.
+    /// outlasts the bound without paying the production 50s — and it is also its limit: it says
+    /// nothing about which posture `fetch_batch`'s own call site names.
     /// `fetch_batch_times_out_against_a_silent_remote` is what pins that.
     ///
     /// The head budget deliberately exceeds `connect_timeout`, the invariant
@@ -10893,9 +10894,9 @@ mod tests {
     /// must yield the real mapping. That costs a wait just past 5s, the one figure this test
     /// cannot shrink, because a call site reverted to the old flat bound must fire before the
     /// answer arrives. Before the fix, a healthy remote answering past 5s made `send` return
-    /// `Err` and `resolve` fall back to an empty map — pseudonyms. Asserts the returned mapping itself, not merely that the call
-    /// returned promptly — a timing-only assertion is green in both worlds, so it would pin
-    /// nothing.
+    /// `Err` and `resolve` fall back to an empty map — pseudonyms. Asserts the returned mapping
+    /// itself, not merely that the call returned promptly — a timing-only assertion is green in
+    /// both worlds, so it would pin nothing.
     ///
     /// **Not a termination pin.** This fixture always answers eventually, so it is green whether
     /// `resolve` is bounded at ~15s *or not bounded at all* — exactly the gap that let `resolve`
