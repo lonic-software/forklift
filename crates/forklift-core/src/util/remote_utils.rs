@@ -727,16 +727,16 @@ pub(crate) const PRESENCE_ALLOWANCE_MS_PER_OP: f64 = 5.0;
 /// derived, unknowable-in-advance one `update_ref`'s audit walk runs.
 ///
 /// **Client patience, not a server-priced ceiling.** This is how long this caller is willing to
-/// wait for one of these two small, idempotent writes to finish before it gives up loudly and in
-/// a retry-safe way — a policy choice this client makes about itself, the same category as
+/// wait for one of these two small, idempotent writes to finish before it gives up loudly and in a
+/// retry-safe way — a policy choice this client makes about itself, the same category as
 /// [`REMOTE_CONNECT_TIMEOUT`]. It is not, and must never become again, an arithmetic expression
-/// over some specific head's implementation: an earlier version of this constant computed itself
-/// as `2 * HOOK_CLIENT_TIMEOUT + 5s`, importing a constant whose entire meaning was
+/// over some specific head's implementation: an earlier version of this constant computed itself as
+/// `2 * HOOK_CLIENT_TIMEOUT + 5s`, importing a constant whose entire meaning was
 /// `forklift-server`'s own per-hook allowance — wrong even against that one head, since
 /// `forklift-server`'s hooks are deployment-optional, and structurally wrong against
-/// `forklift-aws-lambda`, which serves both these routes and runs no hooks at all. `HOOK_CLIENT_TIMEOUT`
-/// now lives in `forklift-server` alone, precisely so a `forklift-core` budget cannot reach it
-/// without adding a dependency this workspace does not have.
+/// `forklift-aws-lambda`, which serves both these routes and runs no hooks at all.
+/// `HOOK_CLIENT_TIMEOUT` now lives in `forklift-server` alone, precisely so a `forklift-core`
+/// budget cannot reach it without adding a dependency this workspace does not have.
 ///
 /// **What the committed evidence actually bounds — and why it does not size this constant.** The
 /// 25s value is unchanged from before this doc was rewritten (verified bit-identical at
@@ -1452,8 +1452,8 @@ mod clients {
     }
 
     impl Clients {
-        /// Build every client from one shared connect-timeout/proxy configuration. See
-        /// [`super::RemoteClient::build`]'s own doc for why one `connect_timeout` must reach every
+        /// Build every client from one shared budgets/proxy configuration. See
+        /// [`super::RemoteClient::build`]'s own doc for why one set of budgets must reach every
         /// client rather than being decided by one path and overwritten on a field by another.
         pub(super) fn build(budgets: &super::Budgets,
                             proxy: Option<&reqwest::Proxy>) -> Result<Clients, String> {
@@ -2075,11 +2075,11 @@ pub struct RemoteClient {
     /// The `reqwest::Client`s this remote may send a request on, gated behind
     /// [`clients::Posture`] — see the [`clients`] module's own doc.
     clients: Clients,
-    /// The connect-phase bound this instance's clients were actually built with —
-    /// [`REMOTE_CONNECT_TIMEOUT`] or [`REMOTE_CONNECT_TIMEOUT_TOR`], whichever
-    /// `should_route_through_tor` selected at construction. Kept so a connect-phase transport
-    /// failure can be reported against the bound that actually applied, rather than a
-    /// hardcoded guess (see `describe_transport_error`).
+    /// The budgets this instance's clients were actually built with — [`Budgets::production`]
+    /// for whichever routing `should_route_through_tor` selected at construction, outside tests.
+    /// Every arm site and every message reads them from here, so a transport failure is reported
+    /// against the bound that actually applied rather than a hardcoded guess (see
+    /// `describe_transport_error`).
     budgets: Budgets,
     base: String,
     token: Option<String>,
@@ -2205,24 +2205,33 @@ impl RemoteClient {
     pub fn new_with_tor(url: &str,
                         token: Option<String>,
                         tor: TorSettings) -> Result<RemoteClient, String> {
-        let routes_through_tor = should_route_through_tor(&tor.mode, url);
-
         // A Tor dial's connect phase covers the whole SOCKS handshake and onion circuit build,
         // which can legitimately take tens of seconds — far past what a direct dial should ever
         // need (see `REMOTE_CONNECT_TIMEOUT_TOR`'s doc).
-        Self::build(url, token, &tor, routes_through_tor, Budgets::production(routes_through_tor))
+        Self::with_budgets_for(url, token, &tor, Budgets::production)
     }
 
-    /// Build the underlying clients and assemble a [`RemoteClient`], given a
-    /// `connect_timeout` already decided by the caller — [`Self::new_with_tor`] is the only
-    /// production caller, and decides it from [`should_route_through_tor`] as its doc describes.
-    /// Split out from `new_with_tor` so the test constructors can supply arbitrary [`Budgets`]
-    /// that actually get built into every client, rather than one construction path deciding the
-    /// budgets and a second one overwriting only the `budgets` field afterward — the latter would leave the inner clients armed
-    /// with a *different* bound than the field reports, which is not a client any production
-    /// constructor could ever produce and would silently invalidate any test built on top of it
-    /// that touches `describe_transport_error` or `send_with_watchdog`, both of which trust this
-    /// field to describe what the clients actually carry.
+    /// Decide the routing and build the client with the budgets `budgets_for` gives for it. The
+    /// one path [`Self::new_with_tor`] and the test fixtures share, so a test that injects its
+    /// own budgets still goes through the production routing decision.
+    fn with_budgets_for(url: &str,
+                        token: Option<String>,
+                        tor: &TorSettings,
+                        budgets_for: fn(bool) -> Budgets) -> Result<RemoteClient, String> {
+        let routes_through_tor = should_route_through_tor(&tor.mode, url);
+        Self::build(url, token, tor, routes_through_tor, budgets_for(routes_through_tor))
+    }
+
+    /// Build the underlying clients and assemble a [`RemoteClient`], given budgets already decided
+    /// by the caller — [`Self::with_budgets_for`] is the only production caller, and decides them
+    /// from [`should_route_through_tor`]. Split out so the test constructors can supply arbitrary
+    /// [`Budgets`] that actually get built into every client, rather than one construction path
+    /// deciding the budgets and a second one overwriting only the `budgets` field afterward — the
+    /// latter would leave the inner clients armed with a *different* bound than the field reports,
+    /// which is not a client any production constructor could ever produce and would silently
+    /// invalidate any test built on top of it that touches `describe_transport_error` or
+    /// `send_with_watchdog`, both of which trust this field to describe what the clients actually
+    /// carry.
     fn build(url: &str,
              token: Option<String>,
              tor: &TorSettings,
@@ -2246,46 +2255,14 @@ impl RemoteClient {
         })
     }
 
-    /// Test-only: build a client with an arbitrary injected `connect_timeout`, threaded into the
-    /// inner clients via [`Self::build`] rather than overwritten on the field afterward (see
-    /// that method's doc for why the two are not equivalent). Never routes through Tor — `tor` is
-    /// irrelevant to a plain/`.invalid` test URL, and passing `routes_through_tor: false`
-    /// explicitly here means that is a direct fact about this constructor, not a side effect of
-    /// `TorMode::Auto`'s onion-sniffing that a future `.onion` call site could quietly flip.
-    /// Needed because the two production constructors can only ever produce one of two
-    /// `connect_timeout` values — [`REMOTE_CONNECT_TIMEOUT`] (5s) or
-    /// [`REMOTE_CONNECT_TIMEOUT_TOR`] (60s) — so a fixture built through either one can never
-    /// separate "reads this instance's own `connect_timeout`" from "hardcodes whichever of those
-    /// two constants that fixture happens to carry": a Tor-mode fixture asserting the Tor-folded
-    /// budget stayed green under review round 7's mutation that hardcoded
-    /// `REMOTE_CONNECT_TIMEOUT_TOR` directly in [`Self::error_body_budget`], because the field and
-    /// the hardcoded constant were the same value at that one fixture point. A value no production
-    /// constructor can ever emit closes that gap — see `error_body_budget_reads_this_field_not_a_rival_constant`.
-    #[cfg(test)]
-    fn new_test_with_connect_timeout(url: &str, connect_timeout: std::time::Duration) -> RemoteClient {
-        let budgets = Budgets { connect: connect_timeout, ..Budgets::production(false) };
-        RemoteClient::build(url, None, &TorSettings::default(), false, budgets)
-            .expect("test fixture URL must build a client")
-    }
-
     /// Test-only: build a client for a direct dial whose every budget is the caller's — the seam
     /// that lets a test watch a budget fire in milliseconds instead of waiting out the production
-    /// figure.
+    /// figure, and inject a budget no production constructor can emit, so an accessor that reads
+    /// a production constant in place of the instance's field cannot match it by coincidence.
     #[cfg(test)]
     fn new_test_with_budgets(url: &str, budgets: Budgets) -> RemoteClient {
         RemoteClient::build(url, None, &TorSettings::default(), false, budgets.checked())
             .expect("test fixture URL must build a client")
-    }
-
-    /// Test-only: [`Self::new_with_tor`] with the budgets chosen by `budgets_for` instead of
-    /// [`Budgets::production`] — called with the same routing decision `new_with_tor` makes, so a
-    /// test still exercises that decision while waiting out milliseconds rather than a minute.
-    #[cfg(test)]
-    fn new_test_with_tor_budgets(url: &str,
-                                 tor: TorSettings,
-                                 budgets_for: fn(bool) -> Budgets) -> Result<RemoteClient, String> {
-        let routes_through_tor = should_route_through_tor(&tor.mode, url);
-        Self::build(url, None, &tor, routes_through_tor, budgets_for(routes_through_tor).checked())
     }
 
     /// Create the client for the configured remote of the current warehouse
@@ -2911,18 +2888,18 @@ impl RemoteClient {
 
     /// The total-deadline budget to arm for *this* client instance's call to [`Self::resolve`] —
     /// folds this instance's own `connect_timeout` into [`bounded_read_timeout`]'s arithmetic.
-    /// Split out as its own `&self` method, rather than inlining the call to
-    /// `bounded_read_timeout` at `resolve`'s one call site, so a test can pin that the right
-    /// instance field is actually read: not just read from *some* client. [`Self::error_body_budget`]
-    /// carries the identical shape (`self.budgets.connect` plus a fixed post-connect addend) for a
-    /// sibling budget, and its own doc explains why that distinction needs a `connect_timeout` no
-    /// production constructor can produce — the direct and Tor-mode constructors only ever emit
+    /// Split out as its own `&self` method, rather than inlining the call to `bounded_read_timeout`
+    /// at `resolve`'s one call site, so a test can pin that the right instance field is actually
+    /// read: not just read from *some* client. [`Self::error_body_budget`] carries the identical
+    /// shape (`self.budgets.connect` plus a fixed post-connect addend) for a sibling budget, and
+    /// its own doc explains why that distinction needs a `connect_timeout` no production
+    /// constructor can produce — the direct and Tor-mode constructors only ever emit
     /// [`REMOTE_CONNECT_TIMEOUT`] or [`REMOTE_CONNECT_TIMEOUT_TOR`], so a test built through either
     /// one can never separate "reads this field" from "hardcodes whichever of those two constants
     /// that fixture happens to carry." See `resolve_budget_reads_this_field_not_a_rival_constant`
-    /// and `resolve_budget_is_70s_for_a_real_tor_mode_client` in the test module: the same
-    /// two-test pair `error_body_budget` carries, and for the same reason — neither subsumes the
-    /// other, see `error_body_budget_reads_this_field_not_a_rival_constant`'s own doc for why.
+    /// and `resolve_budget_is_70s_for_a_real_tor_mode_client` in the test module: the same two-test
+    /// pair `error_body_budget` carries, and for the same reason — neither subsumes the other, see
+    /// `error_body_budget_reads_this_field_not_a_rival_constant`'s own doc for why.
     fn resolve_budget(&self) -> std::time::Duration {
         bounded_read_timeout(self.budgets.connect, self.budgets.read)
     }
@@ -8064,6 +8041,10 @@ mod tests {
 
     const TEST_DIRECT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
     const TEST_TOR_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+    /// Mirrors production `REMOTE_READ_TIMEOUT` as a literal rather than referring to it, as every
+    /// `TEST_*` constant here does for its own production constant: an assertion built on a
+    /// mirror keeps meaning what it meant when it was written, so a change to the production
+    /// figure has to be re-affirmed here instead of moving both sides of an assertion together.
     const TEST_TIGHT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
     const TEST_LOOSE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
     /// Mirrors production `UPLOAD_SILENCE_BUDGET` — see `TEST_TIGHT_READ_TIMEOUT`'s doc for why
@@ -8089,13 +8070,18 @@ mod tests {
     /// ratios follow production's where a test depends on them: `batch_head_patience` stays under
     /// `object_read`, `read` under `object_read`, and the Tor connect bound far above the direct
     /// one.
+    ///
+    /// A test that separates an armed budget from a rival by elapsed time needs the two at least a
+    /// second apart, so the midpoint leaves half a second or more for a loaded runner's
+    /// scheduling. Where [`FAST`]'s own spacing is closer than that for the pair a test separates,
+    /// the test widens the one budget it needs rather than every fixture paying for it.
     const FAST: Budgets = Budgets {
         connect: std::time::Duration::from_millis(330),
         read: std::time::Duration::from_millis(670),
         object_read: std::time::Duration::from_millis(4_100),
         batch_head_patience: std::time::Duration::from_millis(3_050),
         error_body_read: std::time::Duration::from_millis(730),
-        upload_silence: std::time::Duration::from_millis(610),
+        upload_silence: std::time::Duration::from_millis(2_110),
         post_send_verify_base: std::time::Duration::from_millis(170),
         single_write_allowance: std::time::Duration::from_millis(1_690),
     };
@@ -8105,9 +8091,22 @@ mod tests {
     const FAST_TOR_CONNECT: std::time::Duration = std::time::Duration::from_millis(3_900);
 
     /// [`FAST`] for a direct dial, or with [`FAST_TOR_CONNECT`] for one through Tor — the
-    /// `budgets_for` that [`RemoteClient::new_test_with_tor_budgets`] takes.
+    /// `budgets_for` that [`RemoteClient::with_budgets_for`] takes.
     fn fast_budgets(routes_through_tor: bool) -> Budgets {
         if routes_through_tor { Budgets { connect: FAST_TOR_CONNECT, ..FAST } } else { FAST }
+            .checked()
+    }
+
+    /// A read budget for the tests that separate the tight silence budget from a nearby figure by
+    /// elapsed time, where [`FAST`]'s own `read` leaves too little room. Distinct from every
+    /// [`FAST`] figure and every production one.
+    const WIDE_READ: std::time::Duration = std::time::Duration::from_millis(3_670);
+
+    /// [`fast_budgets`] with [`WIDE_READ`], for a fixture that must tell a connect-phase stall
+    /// from a read-phase one: `read_timeout` is armed before the connector is polled and spans
+    /// connect plus read, so the read budget is the room between the two firings.
+    fn fast_budgets_wide_read(routes_through_tor: bool) -> Budgets {
+        Budgets { read: WIDE_READ, ..fast_budgets(routes_through_tor) }.checked()
     }
 
     /// A direct-dial client carrying [`FAST`].
@@ -8149,6 +8148,28 @@ mod tests {
         let inverted = Budgets { batch_head_patience: FAST.object_read, ..FAST };
         let refused = std::panic::catch_unwind(|| inverted.checked());
         assert!(refused.is_err(), "a head patience equal to the object silence budget must be refused");
+    }
+
+    /// Each budget accessor sums the connect bound with *its own* allowance. [`FAST`]'s figures
+    /// are pairwise distinct, so an accessor that read a sibling field — the read budget in place
+    /// of the error-body one, say, which production cannot tell apart because both are 10s —
+    /// returns a figure this test does not expect. No waiting: the arithmetic is the property.
+    #[test]
+    fn each_budget_accessor_reads_its_own_field() {
+        let client = fast_client("http://forklift-budget-accessor-test.invalid");
+        assert_eq!(client.resolve_budget(), FAST.connect + FAST.read, "resolve_budget");
+        assert_eq!(client.error_body_budget(), FAST.connect + FAST.error_body_read, "error_body_budget");
+        assert_eq!(
+            client.batch_head_budget(), FAST.connect + FAST.batch_head_patience, "batch_head_budget"
+        );
+        assert_eq!(
+            client.single_write_budget(), FAST.connect + FAST.single_write_allowance,
+            "single_write_budget"
+        );
+        assert_eq!(
+            client.presence_negotiation_budget(0), FAST.connect + FAST.post_send_verify_base,
+            "presence_negotiation_budget"
+        );
     }
 
     /// `classify` is pure and total over the two booleans `reqwest::Error` exposes — this pins
@@ -8410,17 +8431,16 @@ mod tests {
     /// no total deadline needed. `fetch_info_times_out_against_a_silent_remote` above establishes
     /// exactly this: `fetch_info` rides `Posture::BoundedReads` (no `TotalDeadline` payload
     /// anywhere in the picture) against this same [`SilentRemote`] fixture and asserts both a
-    /// genuine timeout and the effective connect + read budget that produced it. So this test would stay
-    /// green even if `resolve`'s call site rode `Posture::BoundedReads` with no total bound at
+    /// genuine timeout and the effective connect + read budget that produced it. So this test would
+    /// stay green even if `resolve`'s call site rode `Posture::BoundedReads` with no total bound at
     /// all — it is real coverage (a fully-unbounded posture, or a dropped bound entirely, still
     /// fails it), just not the falsifying test for that specific call-site choice.
     /// `resolve_gives_up_on_a_remote_that_never_stops_trickling` below is: it calls `resolve`
     /// itself against a remote that never goes silent at all, the one shape a silence budget
     /// structurally cannot catch and a total deadline must.
-    /// (`send_on_applies_a_total_deadline_that_ignores_progress`, also below, uses that same
-    /// shape of remote but drives the seam directly rather than calling `resolve` — real
-    /// coverage of the seam's own wiring, not of which posture `resolve`'s call site
-    /// actually names.)
+    /// (`send_on_applies_a_total_deadline_that_ignores_progress`, also below, uses that same shape
+    /// of remote but drives the seam directly rather than calling `resolve` — real coverage of the
+    /// seam's own wiring, not of which posture `resolve`'s call site actually names.)
     #[test]
     fn resolve_times_out_against_a_silent_remote() {
         let remote = SilentRemote::start();
@@ -8503,15 +8523,15 @@ mod tests {
     /// `resolve` itself and pins that.
     ///
     /// A short [`Posture::TotalDeadline`] (`FAST.connect + 1s` — deliberately above the client's
-    /// own connect bound, the invariant [`clients::check_total_deadline_payload`] enforces on
-    /// every `TotalDeadline` payload) against a remote writing one byte every 100ms — never
-    /// silent for longer than 100ms, well under every silence budget [`FAST`] carries — must still
-    /// be cut off at that deadline, because a `RequestBuilder::timeout` does not reset on
-    /// anything. `total_bytes` (100) at that gap makes the full trickle 10s: longer than
-    /// `hard_ceiling`, so the fixture is still writing when the ceiling would fire — not
-    /// literally unbounded, just sized past this test's own horizon. If the deadline were silently dropped, the
-    /// outer `tokio::time::timeout` — not the assertion below it — is what would catch it, loudly,
-    /// rather than the test quietly passing on a technicality.
+    /// own connect bound, the invariant [`clients::check_total_deadline_payload`] enforces on every
+    /// `TotalDeadline` payload) against a remote writing one byte every 100ms — never silent for
+    /// longer than 100ms, well under every silence budget [`FAST`] carries — must still be cut off
+    /// at that deadline, because a `RequestBuilder::timeout` does not reset on anything.
+    /// `total_bytes` (100) at that gap makes the full trickle 10s: longer than `hard_ceiling`, so
+    /// the fixture is still writing when the ceiling would fire — not literally unbounded, just
+    /// sized past this test's own horizon. If the deadline were silently dropped, the outer
+    /// `tokio::time::timeout` — not the assertion below it — is what would catch it, loudly, rather
+    /// than the test quietly passing on a technicality.
     #[test]
     fn send_on_applies_a_total_deadline_that_ignores_progress() {
         let url = start_continuously_trickling_remote(100, std::time::Duration::from_millis(100));
@@ -8593,16 +8613,16 @@ mod tests {
     /// above is its mirror image: the same trickling fixture, the rival mechanism, the opposite
     /// required outcome.
     ///
-    /// **Drives the seam, not `fetch_batch`.** That is what makes it fast — `connect_timeout` is
-    /// injected at 1s and the head budget is 2s, so the fixture's ~5s body genuinely outlasts the
-    /// bound without paying the production 50s — and it is also its limit: it says nothing about
+    /// **Drives the seam, not `fetch_batch`.** That is what makes it fast — the connect bound is
+    /// injected at 300ms and the head budget is 600ms, so the fixture's ~2s body genuinely
+    /// outlasts the bound without paying the production 50s — and it is also its limit: it says nothing about
     /// which posture `fetch_batch`'s own call site names.
     /// `fetch_batch_times_out_against_a_silent_remote` is what pins that.
     ///
     /// The head budget deliberately exceeds `connect_timeout`, the invariant
     /// [`clients::clamp_head_deadline_payload`] enforces on every payload — so the clamp is a
     /// no-op here and the figure under test is the one written below. It also sits far under this
-    /// posture's own client-level `read_timeout` (1s connect + 60s), the other fence
+    /// posture's own client-level `read_timeout` (300ms connect + the production 60s), the other fence
     /// [`clients::check_head_deadline_payload`] holds, so neither guard interferes with what this
     /// test measures.
     #[test]
@@ -8619,7 +8639,9 @@ mod tests {
         );
 
         let url = start_continuously_trickling_remote(body_bytes, gap);
-        let client = RemoteClient::new_test_with_connect_timeout(&url, connect_timeout);
+        let client = RemoteClient::new_test_with_budgets(
+            &url, Budgets { connect: connect_timeout, ..Budgets::production(false) },
+        );
         let hard_ceiling = body_duration + std::time::Duration::from_secs(15);
 
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -9112,9 +9134,10 @@ mod tests {
     /// external timer is a true upper bound, unlike the silence budgets whose arms in
     /// `describe_transport_error` deliberately hedge.
     ///
-    /// The seam-level companion is `send_on_head_deadline_does_not_bound_a_body_that_arrives_after_it`
-    /// — this test would stay green under an implementation that armed a *total* deadline of the
-    /// same size, and that one is what rules it out.
+    /// The seam-level companion is
+    /// `send_on_head_deadline_does_not_bound_a_body_that_arrives_after_it` — this test would stay
+    /// green under an implementation that armed a *total* deadline of the same size, and that one
+    /// is what rules it out.
     #[test]
     fn fetch_batch_times_out_against_a_silent_remote() {
         let remote = SilentRemote::start();
@@ -9360,12 +9383,12 @@ mod tests {
     /// the direct arm, which the mutant does not touch. Nothing else in the file compares the two
     /// arms against each other, so without this test that mutant ships.
     ///
-    /// The mirror mutant — giving *this* posture's arm the `BoundedObjectReads` wording — is **not**
-    /// the one that justifies this test's wait, and an earlier version of this doc said it was. It
-    /// fails two tests, not one: [`fetch_batch_times_out_on_a_stalled_direct_body`] trips first, on
-    /// its `contains("headers")` assertion. Recorded because a coverage claim is exactly what a
-    /// later reader consults when deciding a slow test is redundant, and this one was wrong in the
-    /// direction that would have got the test deleted.
+    /// The mirror mutant — giving *this* posture's arm the `BoundedObjectReads` wording — is
+    /// **not** the one that justifies this test's wait, and an earlier version of this doc said it
+    /// was. It fails two tests, not one: [`fetch_batch_times_out_on_a_stalled_direct_body`] trips
+    /// first, on its `contains("headers")` assertion. Recorded because a coverage claim is exactly
+    /// what a later reader consults when deciding a slow test is redundant, and this one was wrong
+    /// in the direction that would have got the test deleted.
     #[test]
     fn the_two_batch_stations_do_not_share_one_stall_message() {
         let direct = StalledDirectBodyRemote::start();
@@ -9423,8 +9446,9 @@ mod tests {
     /// deadline over the response (`RequestBuilder::timeout`, one line away in the seam's own
     /// match) cuts the transfer off at its own figure however healthy it is. A head-wait timer
     /// widened to cover the body kills it at `connect + batch_head_patience`. The tight
-    /// [`Posture::BoundedReads`] silence budget (`connect + read`) kills it at the first gap. Only a *loose, resetting* silence
-    /// budget survives, which is precisely the mechanism this station is supposed to carry.
+    /// [`Posture::BoundedReads`] silence budget (`connect + read`) kills it at the first gap. Only
+    /// a *loose, resetting* silence budget survives, which is precisely the mechanism this station
+    /// is supposed to carry.
     ///
     /// Reuses `start_steady_drip_remote` — `fetch_object`'s own drip fixture, on the direct path
     /// with no redirect hop, which is exactly the shape the batch `POST` sees from a non-offloading
@@ -9605,18 +9629,19 @@ mod tests {
     }
 
     /// `missing_objects` now rides [`Posture::TotalDeadline`] (FORK-92 budget 1), sized per batch
-    /// by [`RemoteClient::presence_negotiation_budget`] — but that outer, per-request deadline is
-    /// a *different* bound from `error_of`'s own inner [`RemoteClient::error_body_budget`], and
-    /// this test's whole point survives that move only because the batch size below (2,000) is
+    /// by [`RemoteClient::presence_negotiation_budget`] — but that outer, per-request deadline is a
+    /// *different* bound from `error_of`'s own inner [`RemoteClient::error_body_budget`], and this
+    /// test's whole point survives that move only because the batch size below (2,000) is
     /// deliberately picked so the outer bound (`connect + post_send_verify_base + 2,000 *
     /// PRESENCE_ALLOWANCE_MS_PER_OP`) stays looser than the inner one (`connect +
-    /// error_body_read`): the inner budget is still what actually fires here, and the test
-    /// asserts that bracket rather than assuming it. At a small batch (see
-    /// `missing_objects_times_out_against_a_silent_remote`'s own budget) the outer deadline is the *tighter* of the two and would fire first instead —
-    /// a real, deliberate interaction between the two bounds, not a gap: whichever fires first
-    /// still surfaces as a plain `Err` through the same `error_of` fallback path either way (a
-    /// timed-out `response.json()` and an elapsed inner `tokio::time::timeout` both take the same
-    /// "no usable error body arrived" arm), so no call ever hangs regardless of which bound wins.
+    /// error_body_read`): the inner budget is still what actually fires here, and the test asserts
+    /// that bracket rather than assuming it. At a small batch (see
+    /// `missing_objects_times_out_against_a_silent_remote`'s own budget) the outer deadline is the
+    /// *tighter* of the two and would fire first instead — a real, deliberate interaction between
+    /// the two bounds, not a gap: whichever fires first still surfaces as a plain `Err` through the
+    /// same `error_of` fallback path either way (a timed-out `response.json()` and an elapsed inner
+    /// `tokio::time::timeout` both take the same "no usable error body arrived" arm), so no call
+    /// ever hangs regardless of which bound wins.
     ///
     /// Before this call had its own outer deadline at all, it rode the auto-following client with
     /// no bound of any kind — a `500` whose body then wedges hung it forever, with the status line
@@ -9638,15 +9663,15 @@ mod tests {
     /// cannot tell "reads `self.budgets.connect`" apart from "hardcodes the larger
     /// [`REMOTE_CONNECT_TIMEOUT`]", which only waits longer. That is the gap
     /// `error_body_budget_reads_this_field_not_a_rival_constant` closes, with a connect bound no
-    /// production constructor can produce, so a hardcoded rival can never coincidentally match it. Four tests together pin the property: this one pins
-    /// call-site-uses-the-budget, `error_body_read_budget_folds_in_the_connect_timeout` pins the
-    /// arithmetic the budget computes, `error_body_budget_reads_this_field_not_a_rival_constant`
-    /// pins that the accessor reads *this instance's* connect timeout field rather than hardcoding
-    /// any constant a real constructor could produce, and
-    /// `error_body_budget_is_70s_for_a_real_tor_mode_client` pins that the value at the one client
-    /// mode that actually ships a non-default budget is the correct, uncapped 70s (the field-read
-    /// property alone does not imply this one: a future cap on the result would leave it
-    /// unaffected while breaking this).
+    /// production constructor can produce, so a hardcoded rival can never coincidentally match it.
+    /// Four tests together pin the property: this one pins call-site-uses-the-budget,
+    /// `error_body_read_budget_folds_in_the_connect_timeout` pins the arithmetic the budget
+    /// computes, `error_body_budget_reads_this_field_not_a_rival_constant` pins that the accessor
+    /// reads *this instance's* connect timeout field rather than hardcoding any constant a real
+    /// constructor could produce, and `error_body_budget_is_70s_for_a_real_tor_mode_client` pins
+    /// that the value at the one client mode that actually ships a non-default budget is the
+    /// correct, uncapped 70s (the field-read property alone does not imply this one: a future cap
+    /// on the result would leave it unaffected while breaking this).
     #[test]
     fn missing_objects_bounds_the_error_body_read_after_a_wedged_500() {
         let remote = SilentErrorBodyRemote::start();
@@ -9706,6 +9731,18 @@ mod tests {
             the bare error-body-read timeout (or less)",
             elapsed, lower_bound
         );
+        // The other side: the production error-body read budget in place of this instance's
+        // would still clear the lower bound and fit under the outer deadline, so only an upper
+        // bound tells it apart.
+        let rival_production_budget = FAST.connect + TEST_ERROR_BODY_READ_TIMEOUT;
+        let upper_bound = lower_bound + (rival_production_budget - lower_bound) / 2;
+        assert!(
+            elapsed < upper_bound,
+            "elapsed {:?} is past {:?} (the midpoint between this client's error-body budget {:?} \
+            and the {:?} the production error-body read timeout would give) — the error-body read \
+            is not armed with this instance's budgets",
+            elapsed, upper_bound, lower_bound, rival_production_budget
+        );
 
         assert!(
             error.contains("(500)"),
@@ -9718,18 +9755,19 @@ mod tests {
         );
     }
 
-    /// Review round 7, finding: a Tor-mode fixture (this test's predecessor,
+    /// A Tor-mode fixture (this test's predecessor,
     /// `error_body_budget_reads_this_instances_connect_timeout`) cannot tell
     /// "[`RemoteClient::error_body_budget`] reads `self.budgets.connect`" apart from "hardcodes
     /// [`REMOTE_CONNECT_TIMEOUT_TOR`] directly" — a mutation to the latter still passed, because a
     /// `TorMode::On` client's field genuinely *is* 60s, the same value the hardcoded rival would
     /// return. The direct-client version has the identical problem one level down (5s either way).
-    /// No fixture built through a production constructor can separate the two: [`RemoteClient::new`]
-    /// only ever yields [`REMOTE_CONNECT_TIMEOUT`] (5s) and [`RemoteClient::new_with_tor`] under
-    /// `TorMode::On` only ever yields [`REMOTE_CONNECT_TIMEOUT_TOR`] (60s) — both are rivals a
-    /// hardcoded mutant can impersonate. [`RemoteClient::new_test_with_connect_timeout`] injects a
-    /// third value, `SENTINEL_CONNECT_TIMEOUT` (7s), that no production constructor can ever
-    /// produce, so a mutant hardcoding *either* rival constant is caught here.
+    /// No fixture built through a production constructor can separate the two:
+    /// [`RemoteClient::new`] only ever yields [`REMOTE_CONNECT_TIMEOUT`] (5s) and
+    /// [`RemoteClient::new_with_tor`] under `TorMode::On` only ever yields
+    /// [`REMOTE_CONNECT_TIMEOUT_TOR`] (60s) — both are rivals a hardcoded mutant can impersonate.
+    /// [`RemoteClient::new_test_with_budgets`] injects a third value, `SENTINEL_CONNECT_TIMEOUT`
+    /// (7s), that no production constructor can ever produce, so a mutant hardcoding *either* rival
+    /// constant is caught here.
     ///
     /// 7 was checked against every named `Duration` constant this module defines before being
     /// picked, and collides with none of them. The procedure, so a reader can re-derive that
@@ -9741,9 +9779,9 @@ mod tests {
     /// this paragraph. A transcribed census is a hand-maintained enumeration, and this module's
     /// history is that contracts survive in prose while enumerations rot: the commit that added
     /// this file's most recent `Duration` constant left **every** such list in this test module
-    /// stale at once, including the one it wrote itself. What each of these tests actually rests on is
-    /// the separation claim — this sentinel collides with nothing — and that claim is re-checkable
-    /// in a second by the grep above. The census only ever decays between edits.
+    /// stale at once, including the one it wrote itself. What each of these tests actually rests on
+    /// is the separation claim — this sentinel collides with nothing — and that claim is
+    /// re-checkable in a second by the grep above. The census only ever decays between edits.
     ///
     /// A coincidental *sum* of two unrelated constants would not be a rival even where one exists:
     /// the mutation this test defends against is a hardcoded *connect_timeout* substitution — one
@@ -9774,9 +9812,9 @@ mod tests {
     fn error_body_budget_reads_this_field_not_a_rival_constant() {
         const SENTINEL_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(7);
 
-        let client = RemoteClient::new_test_with_connect_timeout(
+        let client = RemoteClient::new_test_with_budgets(
             "http://forklift-fork-49-error-body-budget-sentinel-test.invalid",
-            SENTINEL_CONNECT_TIMEOUT,
+            Budgets { connect: SENTINEL_CONNECT_TIMEOUT, ..Budgets::production(false) },
         );
 
         assert_eq!(
@@ -9833,17 +9871,17 @@ mod tests {
     /// *output*, 21s (`11 + TEST_TIGHT_READ_TIMEOUT`): the two values a hardcoded production
     /// `connect_timeout` would actually produce here are `15s` (`REMOTE_CONNECT_TIMEOUT` +
     /// `TEST_TIGHT_READ_TIMEOUT`) and `70s` (`REMOTE_CONNECT_TIMEOUT_TOR` +
-    /// `TEST_TIGHT_READ_TIMEOUT`), and 21s separates from both. This is a separation report against those two rivals, not a
-    /// claim that no other combination of this module's constants could ever sum to 21 —
-    /// characterising a separation table as complete has cost a fresh defect on every attempt this
-    /// module's history has tried it, so that claim is deliberately not made.
+    /// `TEST_TIGHT_READ_TIMEOUT`), and 21s separates from both. This is a separation report against
+    /// those two rivals, not a claim that no other combination of this module's constants could
+    /// ever sum to 21 — characterising a separation table as complete has cost a fresh defect on
+    /// every attempt this module's history has tried it, so that claim is deliberately not made.
     #[test]
     fn resolve_budget_reads_this_field_not_a_rival_constant() {
         const SENTINEL_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(11);
 
-        let client = RemoteClient::new_test_with_connect_timeout(
+        let client = RemoteClient::new_test_with_budgets(
             "http://forklift-fork-96-resolve-budget-sentinel-test.invalid",
-            SENTINEL_CONNECT_TIMEOUT,
+            Budgets { connect: SENTINEL_CONNECT_TIMEOUT, ..Budgets::production(false) },
         );
 
         assert_eq!(
@@ -9907,9 +9945,9 @@ mod tests {
     fn batch_head_budget_reads_this_field_not_a_rival_constant() {
         const SENTINEL_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(17);
 
-        let client = RemoteClient::new_test_with_connect_timeout(
+        let client = RemoteClient::new_test_with_budgets(
             "http://forklift-fork-104-batch-head-budget-sentinel-test.invalid",
-            SENTINEL_CONNECT_TIMEOUT,
+            Budgets { connect: SENTINEL_CONNECT_TIMEOUT, ..Budgets::production(false) },
         );
 
         assert_eq!(
@@ -9971,9 +10009,9 @@ mod tests {
     /// "must differ" check but not an exact one).
     #[test]
     fn presence_negotiation_budget_reads_n() {
-        let client = RemoteClient::new_test_with_connect_timeout(
+        let client = RemoteClient::new_test_with_budgets(
             "http://forklift-fork-92-presence-budget-n-test.invalid",
-            TEST_DIRECT_CONNECT_TIMEOUT,
+            Budgets { connect: TEST_DIRECT_CONNECT_TIMEOUT, ..Budgets::production(false) },
         );
 
         let small = client.presence_negotiation_budget(1);
@@ -10029,9 +10067,9 @@ mod tests {
     fn presence_negotiation_budget_reads_this_field_not_a_rival_constant() {
         const SENTINEL_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(13);
 
-        let client = RemoteClient::new_test_with_connect_timeout(
+        let client = RemoteClient::new_test_with_budgets(
             "http://forklift-fork-92-presence-budget-sentinel-test.invalid",
-            SENTINEL_CONNECT_TIMEOUT,
+            Budgets { connect: SENTINEL_CONNECT_TIMEOUT, ..Budgets::production(false) },
         );
 
         assert_eq!(
@@ -10123,9 +10161,9 @@ mod tests {
     fn single_write_budget_reads_this_field_not_a_rival_constant() {
         const SENTINEL_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(9);
 
-        let client = RemoteClient::new_test_with_connect_timeout(
+        let client = RemoteClient::new_test_with_budgets(
             "http://forklift-fork-49-single-write-budget-sentinel-test.invalid",
-            SENTINEL_CONNECT_TIMEOUT,
+            Budgets { connect: SENTINEL_CONNECT_TIMEOUT, ..Budgets::production(false) },
         );
 
         assert_eq!(
@@ -10154,20 +10192,24 @@ mod tests {
     /// plausible wrong one: `hard_ceiling` here is `effective_budget` plus generous slack, and
     /// `Posture::BoundedReads`'s own effective silence budget against a fully silent remote
     /// (`connect + read`) sits well inside it — so a mutant that rewired this call site onto
-    /// `BoundedReads` instead of `TotalDeadline` would still return an `Err` inside that ceiling, and the test would still pass, certifying nothing about which posture
-    /// actually fired. `upper_bound` below is the assertion that actually distinguishes them, set
-    /// at the *midpoint* between this call's own budget and that rival's effective silence budget
-    /// (not an arbitrary margin over the true value): that split spends exactly as much slack on
-    /// absorbing scheduling/dispatch noise as it keeps in reserve to still catch the rewiring, and
-    /// makes the trade a reader who widens this margin later is making explicit — how much closer
-    /// to the rival's own budget they are choosing to get.
+    /// `BoundedReads` instead of `TotalDeadline` would still return an `Err` inside that ceiling,
+    /// and the test would still pass, certifying nothing about which posture actually fired.
+    /// `upper_bound` below is the assertion that actually distinguishes them, set at the *midpoint*
+    /// between this call's own budget and that rival's effective silence budget (not an arbitrary
+    /// margin over the true value): that split spends exactly as much slack on absorbing
+    /// scheduling/dispatch noise as it keeps in reserve to still catch the rewiring, and makes the
+    /// trade a reader who widens this margin later is making explicit — how much closer to the
+    /// rival's own budget they are choosing to get.
     #[test]
     fn missing_objects_times_out_against_a_silent_remote() {
         let remote = SilentRemote::start();
-        let client = fast_client(&remote.url);
+        // A read budget seconds past this call's own deadline, so the midpoint between the two
+        // leaves room for a loaded runner rather than the quarter-second FAST's spacing gives.
+        let budgets = Budgets { read: WIDE_READ, ..FAST };
+        let client = RemoteClient::new_test_with_budgets(&remote.url, budgets);
         let hashes = vec!["a".repeat(64)];
         let effective_budget = client.presence_negotiation_budget(hashes.len());
-        let rival_bounded_reads_budget = FAST.connect + FAST.read;
+        let rival_bounded_reads_budget = budgets.connect + budgets.read;
         let upper_bound = effective_budget + (rival_bounded_reads_budget - effective_budget) / 2;
         let hard_ceiling = effective_budget + std::time::Duration::from_secs(15);
 
@@ -10204,10 +10246,13 @@ mod tests {
     #[test]
     fn upload_targets_times_out_against_a_silent_remote() {
         let remote = SilentRemote::start();
-        let client = fast_client(&remote.url);
+        // A read budget seconds past this call's own deadline, so the midpoint between the two
+        // leaves room for a loaded runner rather than the quarter-second FAST's spacing gives.
+        let budgets = Budgets { read: WIDE_READ, ..FAST };
+        let client = RemoteClient::new_test_with_budgets(&remote.url, budgets);
         let hashes = vec!["a".repeat(64)];
         let effective_budget = client.presence_negotiation_budget(hashes.len());
-        let rival_bounded_reads_budget = FAST.connect + FAST.read;
+        let rival_bounded_reads_budget = budgets.connect + budgets.read;
         let upper_bound = effective_budget + (rival_bounded_reads_budget - effective_budget) / 2;
         let hard_ceiling = effective_budget + std::time::Duration::from_secs(15);
 
@@ -10521,7 +10566,9 @@ mod tests {
         const SENTINEL_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
 
         let remote = MalformedJsonRemote::start();
-        let client = RemoteClient::new_test_with_connect_timeout(&remote.url, SENTINEL_CONNECT_TIMEOUT);
+        let client = RemoteClient::new_test_with_budgets(
+            &remote.url, Budgets { connect: SENTINEL_CONNECT_TIMEOUT, ..Budgets::production(false) },
+        );
         let hashes = vec!["a".repeat(64)];
         let armed_budget = client.presence_negotiation_budget(hashes.len());
 
@@ -10552,7 +10599,9 @@ mod tests {
         const SENTINEL_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
 
         let remote = MalformedJsonRemote::start();
-        let client = RemoteClient::new_test_with_connect_timeout(&remote.url, SENTINEL_CONNECT_TIMEOUT);
+        let client = RemoteClient::new_test_with_budgets(
+            &remote.url, Budgets { connect: SENTINEL_CONNECT_TIMEOUT, ..Budgets::production(false) },
+        );
         let hashes = vec!["a".repeat(64)];
         let armed_budget = client.presence_negotiation_budget(hashes.len());
 
@@ -10690,8 +10739,8 @@ mod tests {
     }
 
     /// `fetch_object` against a body that dribbles in slowly but steadily — every inter-chunk gap
-    /// comfortably under
-    /// `TEST_LOOSE_READ_TIMEOUT`, the total transfer comfortably past it — must **succeed**,
+    /// comfortably under the client's object-read silence budget, the total transfer comfortably
+    /// past it — must **succeed**,
     /// never be treated as a stall. A total-deadline bound (rejected in favor of
     /// `read_timeout`-on-its-own-client, see `REMOTE_READ_TIMEOUT`'s doc) fails this test: it
     /// would kill the transfer partway through even though every single gap was healthy.
@@ -10839,10 +10888,12 @@ mod tests {
     /// `TEST_DIRECT_CONNECT_TIMEOUT + TEST_TIGHT_READ_TIMEOUT` and must sit more than a second past
     /// the *old* flat bound `resolve` used to carry (a plain `RequestBuilder::timeout(5s)`, not
     /// mirrored as a `TEST_*` constant since the production value it mirrored no longer exists to
-    /// drift against). The *behaviour* is checked on a [`FAST`] client: a remote that answers
-    /// halfway through that client's budget must yield the real mapping. Before the fix, a
-    /// healthy remote answering past 5s made `send` return `Err` and `resolve` fall back to an
-    /// empty map — pseudonyms. Asserts the returned mapping itself, not merely that the call
+    /// drift against). The *behaviour* is checked on a client whose connect bound puts its budget
+    /// past that old bound: a remote that answers after the old bound and well inside the budget
+    /// must yield the real mapping. That costs a wait just past 5s, the one figure this test
+    /// cannot shrink, because a call site reverted to the old flat bound must fire before the
+    /// answer arrives. Before the fix, a healthy remote answering past 5s made `send` return
+    /// `Err` and `resolve` fall back to an empty map — pseudonyms. Asserts the returned mapping itself, not merely that the call
     /// returned promptly — a timing-only assertion is green in both worlds, so it would pin
     /// nothing.
     ///
@@ -10875,10 +10926,18 @@ mod tests {
             production_budget, old_flat_bound
         );
 
-        // The behaviour itself, without waiting out the production figures: an answer that
-        // arrives well inside this client's budget is returned, not dropped for pseudonyms.
-        let new_budget = FAST.connect + FAST.read;
-        let delay = new_budget / 2;
+        // The behaviour itself: an answer that arrives past the old bound and well inside this
+        // client's budget is returned, not dropped for pseudonyms. The connect bound is one no
+        // production constructor emits, sized so the budget clears the delay by a second and more.
+        let budgets = Budgets { connect: std::time::Duration::from_millis(6_330), ..FAST };
+        let new_budget = budgets.connect + budgets.read;
+        let delay = old_flat_bound + std::time::Duration::from_millis(500);
+        assert!(
+            delay > old_flat_bound,
+            "the fixture's delay {:?} must exceed the old flat bound {:?}, or this test no \
+            longer discriminates the old behavior from the new — it would pass even against the \
+            reverted fix", delay, old_flat_bound
+        );
         assert!(
             delay < new_budget,
             "the fixture's delay {:?} must stay under the new budget {:?}, or this test would \
@@ -10887,7 +10946,7 @@ mod tests {
         );
 
         let url = start_slow_answering_remote(delay, r#"{"names":{"agent-1":"Real Display Name"}}"#);
-        let client = fast_client(&url);
+        let client = RemoteClient::new_test_with_budgets(&url, budgets);
         let outer_ceiling = new_budget + std::time::Duration::from_secs(15);
 
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -10900,8 +10959,9 @@ mod tests {
 
         assert_eq!(
             names.get("agent-1").map(String::as_str), Some("Real Display Name"),
-            "a remote that answers correctly after {:?}, well inside the connect+read budget, \
-            must return the real mapping, not fall back to pseudonyms: got {:?}", delay, names
+            "a remote that answers correctly after {:?} — past the old flat 5s bound, well \
+            inside the connect+read budget — must return the real mapping, not fall back to \
+            pseudonyms: got {:?}", delay, names
         );
     }
 
@@ -10934,7 +10994,7 @@ mod tests {
     }
 
     /// A Tor-routed client's read/silence budget must not preempt its own, much larger, connect
-    /// budget. Built through `new_test_with_tor_budgets`/`TorSettings` (`TorMode::On`, pointed at
+    /// budget. Built through `with_budgets_for`/`TorSettings` (`TorMode::On`, pointed at
     /// a fixture-controlled fake SOCKS proxy, with [`FAST`]'s budgets) — no live Tor daemon, no
     /// config file needed. With a flat read budget as the `read_timeout`, fired regardless of the
     /// connect bound (`read_timeout` is armed and checked before the connector is even polled),
@@ -10946,8 +11006,8 @@ mod tests {
     fn tor_routed_read_budget_does_not_preempt_the_tor_connect_budget() {
         let proxy = ParkingSocksProxy::start();
         let tor = TorSettings { mode: TorMode::On, proxy: format!("socks5h://{}", proxy.addr) };
-        let client = RemoteClient::new_test_with_tor_budgets(
-            "http://forklift-fork-49-tor-test.invalid", tor, fast_budgets,
+        let client = RemoteClient::with_budgets_for(
+            "http://forklift-fork-49-tor-test.invalid", None, &tor, fast_budgets,
         ).unwrap();
 
         // Comfortably past both the old flat tight-budget bug and the direct connect budget — if
@@ -10964,13 +11024,15 @@ mod tests {
     /// message must name that bound as a connect failure. [`ParkingSocksProxy`] never finishes the
     /// SOCKS handshake, so the call stalls inside the connector; a Tor-routed [`FAST`] client
     /// carries [`FAST_TOR_CONNECT`], a figure neither production connect bound shares, so an arm
-    /// that printed a production constant, or a connector armed with one, fails here.
+    /// that printed a production constant, or a connector armed with one, fails here. The client
+    /// carries [`WIDE_READ`], so the connect bound fires seconds before the read timeout that also
+    /// spans the connect phase.
     #[test]
     fn a_stalled_connect_names_this_clients_connect_bound() {
         let proxy = ParkingSocksProxy::start();
         let tor = TorSettings { mode: TorMode::On, proxy: format!("socks5h://{}", proxy.addr) };
-        let client = RemoteClient::new_test_with_tor_budgets(
-            "http://forklift-connect-message-test.invalid", tor, fast_budgets,
+        let client = RemoteClient::with_budgets_for(
+            "http://forklift-connect-message-test.invalid", None, &tor, fast_budgets_wide_read,
         ).unwrap();
         let hard_ceiling = FAST_TOR_CONNECT + std::time::Duration::from_secs(15);
 
@@ -11056,20 +11118,20 @@ mod tests {
     }
 
     /// The timed-out message must name the *effective* bound (connect + silence) that actually
-    /// governs the client — `bounded_read_timeout` computes what the client is actually
-    /// configured with, and `describe_transport_error` must report that same figure, not the raw
-    /// silence constant alone. The gap is widest, and nothing before this test checked it, on a
-    /// Tor-routed remote: the effective bound is the Tor connect bound plus the read silence
-    /// budget (70s in production), not the bare silence budget an earlier version of the message
-    /// printed regardless of transport. Uses [`HandshakeCompletingSocksProxy`], not [`ParkingSocksProxy`]: this test
-    /// needs the failure to land specifically in the read-silence branch, which requires connect
-    /// to have genuinely succeeded first.
+    /// governs the client — `bounded_read_timeout` computes what the client is actually configured
+    /// with, and `describe_transport_error` must report that same figure, not the raw silence
+    /// constant alone. The gap is widest, and nothing before this test checked it, on a Tor-routed
+    /// remote: the effective bound is the Tor connect bound plus the read silence budget (70s in
+    /// production), not the bare silence budget an earlier version of the message printed
+    /// regardless of transport. Uses [`HandshakeCompletingSocksProxy`], not [`ParkingSocksProxy`]:
+    /// this test needs the failure to land specifically in the read-silence branch, which requires
+    /// connect to have genuinely succeeded first.
     #[test]
     fn fetch_info_message_names_the_effective_tor_bound() {
         let proxy = HandshakeCompletingSocksProxy::start();
         let tor = TorSettings { mode: TorMode::On, proxy: format!("socks5h://{}", proxy.addr) };
-        let client = RemoteClient::new_test_with_tor_budgets(
-            "http://forklift-fork-49-tor-message-test.invalid", tor, fast_budgets,
+        let client = RemoteClient::with_budgets_for(
+            "http://forklift-fork-49-tor-message-test.invalid", None, &tor, fast_budgets,
         ).unwrap();
 
         let effective_budget = FAST_TOR_CONNECT + FAST.read;
@@ -11482,7 +11544,7 @@ mod tests {
     #[test]
     fn upload_object_survives_a_slow_but_steadily_draining_remote() {
         let read_size = 4 * 1024 * 1024;
-        let gap = std::time::Duration::from_millis(300);
+        let gap = std::time::Duration::from_millis(400);
         let iterations = 10u32;
         let body_len = read_size * iterations as usize;
         let effective_budget = FAST.connect + FAST.upload_silence;
