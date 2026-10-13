@@ -1352,6 +1352,10 @@ fn regenesis_is_gated_by_the_static_token_and_accepted_consciously() {
     let previous = details["previous"].as_str().unwrap().to_string();
     assert_ne!(current, previous);
 
+    // A pin is checked before the held anchor is compared, so a wrong one names itself.
+    let pinned = area.forklift("b", &["--json", "lower", "--expect", &previous]);
+    assert_eq!(trust_changed_details(&pinned)["what_changed"], "unexpected");
+
     // The description alone accepts nothing; it refuses with the same details.
     let dry = area.forklift("b", &["office", "accept-regenesis"]);
     assert!(!dry.status.success());
@@ -1396,6 +1400,11 @@ fn an_expect_pin_is_checked_before_anything_is_fetched_and_first_contact_is_anno
     assert!(details.get("previous").is_none(), "a franchise holds no anchor yet: {}", details);
     assert!(!area.path("b").exists(), "a refused pin must not create the target");
     let genesis = details["current"].as_str().unwrap().to_string();
+
+    // The pin is checked first: even a pallet that does not exist refuses as an unexpected
+    // anchor, not as a missing pallet — so nothing resolved from it was ever fetched.
+    let first = area.forklift(".", &["--json", "franchise", &server.url, "b", "--pallet", "nope", "--expect", "not-it"]);
+    assert_eq!(trust_changed_details(&first)["what_changed"], "unexpected");
 
     // The right pin franchises, and the first contact is still announced — on stderr, as a
     // warning document — and recorded in the report.
