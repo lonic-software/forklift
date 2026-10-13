@@ -114,7 +114,11 @@ jobs:
       # slow binary no longer holds up the rest.
       - name: Test
         if: env.SKIP_TESTS != 'true'
-        run: cargo nextest run --workspace --no-fail-fast
+        shell: bash
+        run: |
+          threads=$(( $(nproc) * 2 ))
+          echo "cores=$(nproc) test-threads=$threads"
+          cargo nextest run --workspace --no-fail-fast --test-threads "$threads"
 
       # nextest does not run doc-tests.
       - name: Doc-tests
