@@ -116,8 +116,9 @@ jobs:
         if: env.SKIP_TESTS != 'true'
         shell: bash
         run: |
-          threads=$(( $(nproc) * 2 ))
-          echo "cores=$(nproc) test-threads=$threads"
+          cores=$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+          threads=$(( cores * 2 ))
+          echo "cores=$cores test-threads=$threads"
           cargo nextest run --workspace --no-fail-fast --test-threads "$threads"
 
       # nextest does not run doc-tests.
