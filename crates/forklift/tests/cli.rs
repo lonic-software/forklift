@@ -2352,6 +2352,42 @@ fn mcp_provenance_takes_tool_and_session_from_the_connection_not_the_agent() {
 }
 
 #[test]
+fn mcp_forwards_a_warning_document_after_the_envelope() {
+    let warehouse = TestWarehouse::new("mcp-warning");
+    assert_success(&warehouse.run(&["prepare"]));
+    warehouse.write_file("a.txt", "one\n");
+
+    // The same unparseable maintenance setting that makes `load` warn on the CLI.
+    std::fs::write(
+        warehouse.root.join(".forklift/config/warehouse.toml"),
+        "[maintenance]\nloose = 12345\n",
+    ).unwrap();
+
+    let input = format!(
+        "{}\n{}\n",
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"load","arguments":{"path":"."}}}"#,
+    );
+    let output = warehouse.run_with_stdin(&["mcp"], &input);
+    assert_success(&output);
+
+    let call = stdout(&output).lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|message| message["id"] == 2)
+        .expect("a reply to the load call");
+    assert_eq!(call["result"]["isError"], false, "load failed: {}", call);
+
+    let content = call["result"]["content"].as_array().unwrap();
+    assert_eq!(content.len(), 2, "expected the envelope and one warning: {}", call);
+
+    let envelope: serde_json::Value = serde_json::from_str(content[0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(envelope["command"], "load", "the envelope comes first: {}", call);
+
+    let warning: serde_json::Value = serde_json::from_str(content[1]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(warning["warning"], "maintenance_unavailable", "unexpected warning: {}", warning);
+}
+
+#[test]
 fn import_git_migrates_a_repo_into_the_warehouse() {
     let warehouse = TestWarehouse::new("import-git");
     let root = warehouse.root.clone();
