@@ -281,6 +281,94 @@ fn children_never_write_into_the_channel() {
     assert_eq!(text, "", "a child wrote into the channel");
 }
 
+/// Run `forklift mcp` over one `compact` call, with the protocol version and the call's
+/// `_meta` given, and return every message the server wrote, in order.
+fn mcp_compact(warehouse: &TestWarehouse, protocol: &str, meta: &str) -> Vec<serde_json::Value> {
+    let input_path = warehouse.home.join("mcp-input");
+    std::fs::write(&input_path, format!(
+        "{}\n{}\n{}\n",
+        format_args!(r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"{}"}}}}"#, protocol),
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        format_args!(r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"compact","arguments":{{}}{}}}}}"#, meta),
+    )).unwrap();
+
+    let mut command = warehouse.command(&["mcp"]);
+    command.stdin(std::fs::File::open(&input_path).unwrap());
+    let output = command.output().unwrap();
+    assert_success(&output);
+
+    String::from_utf8_lossy(&output.stdout).lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+/// The `notifications/progress` messages, after checking that they all come before the call's
+/// response and carry `token`.
+fn progress_before_the_response(messages: &[serde_json::Value], token: &serde_json::Value) -> Vec<serde_json::Value> {
+    let response = messages.iter().position(|message| message["id"] == 2).expect("a reply to the compact call");
+    assert_eq!(messages[response]["result"]["isError"], false, "compact failed: {}", messages[response]);
+
+    let is_progress = |message: &&serde_json::Value| message["method"] == "notifications/progress";
+    assert!(!messages[response..].iter().any(|message| is_progress(&message)), "progress after the response: {:?}", messages);
+
+    let notifications: Vec<serde_json::Value> = messages[..response].iter().filter(is_progress).cloned().collect();
+    for notification in &notifications {
+        assert_eq!(&notification["params"]["progressToken"], token, "{}", notification);
+    }
+    notifications
+}
+
+#[test]
+fn an_mcp_call_with_a_progress_token_gets_progress_notifications() {
+    let warehouse = TestWarehouse::new("mcp-progress");
+    warehouse.prepare_with_a_parcel();
+
+    let messages = mcp_compact(&warehouse, "2025-06-18", r#","_meta":{"progressToken":"p1"}"#);
+    let notifications = progress_before_the_response(&messages, &serde_json::json!("p1"));
+    assert!(!notifications.is_empty(), "no progress notifications: {:?}", messages);
+
+    // The first goes out at the first event and the last when the run ends, in another phase, so
+    // there are always two to compare.
+    assert!(notifications.len() >= 2, "one notification leaves nothing to compare: {:?}", notifications);
+
+    // `progress` strictly increases and there is never a `total`.
+    let values: Vec<f64> = notifications.iter().map(|n| n["params"]["progress"].as_f64().unwrap()).collect();
+    assert!(values.windows(2).all(|pair| pair[0] < pair[1]), "not strictly increasing: {:?}", values);
+    assert!(notifications.iter().all(|n| n["params"].get("total").is_none()), "a total was sent: {:?}", notifications);
+
+    // Under 2025-06-18 every notification has a `message`, and the last names the last phase.
+    assert!(notifications.iter().all(|n| n["params"]["message"].is_string()), "{:?}", notifications);
+    let last = notifications.last().unwrap()["params"]["message"].as_str().unwrap().to_string();
+    assert!(last.starts_with("Removing packed originals"), "last message: {:?}", last);
+}
+
+#[test]
+fn an_mcp_progress_notification_has_no_message_before_protocol_2025_06_18() {
+    let warehouse = TestWarehouse::new("mcp-progress-old");
+    warehouse.prepare_with_a_parcel();
+
+    let messages = mcp_compact(&warehouse, "2024-11-05", r#","_meta":{"progressToken":7}"#);
+    let notifications = progress_before_the_response(&messages, &serde_json::json!(7));
+    assert!(!notifications.is_empty(), "no progress notifications: {:?}", messages);
+    assert!(notifications.iter().all(|n| n["params"].get("message").is_none()), "{:?}", notifications);
+}
+
+#[test]
+fn an_mcp_call_without_a_progress_token_gets_no_notifications() {
+    let warehouse = TestWarehouse::new("mcp-no-progress");
+    warehouse.prepare_with_a_parcel();
+
+    let messages = mcp_compact(&warehouse, "2025-06-18", "");
+    assert!(progress_before_the_response(&messages, &serde_json::Value::Null).is_empty(), "{:?}", messages);
+
+    // Nor with a token MCP does not allow: only a string or an integer names a request.
+    for token in ["null", "{}", "[1]", "1.5", "true"] {
+        let messages = mcp_compact(&warehouse, "2025-06-18", &format!(r#","_meta":{{"progressToken":{}}}"#, token));
+        let notifications: Vec<_> = messages.iter().filter(|m| m["method"] == "notifications/progress").collect();
+        assert!(notifications.is_empty(), "token {}: {:?}", token, notifications);
+    }
+}
+
 #[test]
 fn a_regular_file_is_never_written_as_a_channel() {
     let warehouse = TestWarehouse::new("regular-file");
@@ -334,4 +422,38 @@ fn an_unusable_variable_leaves_the_command_unaffected() {
         serde_json::from_slice::<serde_json::Value>(&output.stdout)
             .unwrap_or_else(|error| panic!("PULT_EVENTS={:?}: stdout is not one JSON document ({})", value, error));
     }
+}
+
+#[test]
+fn an_mcp_call_reporting_progress_finishes_after_its_client_has_gone() {
+    use std::io::{BufRead, Write};
+
+    let warehouse = TestWarehouse::new("mcp-progress-gone");
+    warehouse.prepare_with_a_parcel();
+    let pack = warehouse.root.join(".forklift/objects/pack");
+    assert!(!pack.exists(), "packed before the call");
+
+    let mut child = warehouse.command(&["mcp"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\"}}\n").unwrap();
+    let mut reply = String::new();
+    std::io::BufReader::new(child.stdout.as_mut().unwrap()).read_line(&mut reply).unwrap();
+    assert!(reply.contains("\"id\":1"), "{}", reply);
+
+    // The client is gone before the call: every progress notification and the response fail.
+    drop(child.stdout.take());
+    stdin.write_all(br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"compact","arguments":{},"_meta":{"progressToken":"p1"}}}"#).unwrap();
+    stdin.write_all(b"\n").unwrap();
+    drop(stdin);
+
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.signal(), None, "killed by a signal: {:?}", output.status);
+    assert!(output.status.success(), "{:?}: {}", output.status, String::from_utf8_lossy(&output.stderr));
+    assert!(pack.is_dir(), "the call did not run to the end");
 }

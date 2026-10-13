@@ -2351,6 +2351,75 @@ fn mcp_provenance_takes_tool_and_session_from_the_connection_not_the_agent() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn mcp_is_not_killed_by_a_client_that_stopped_reading() {
+    use std::io::Write;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::Stdio;
+
+    let warehouse = TestWarehouse::new("mcp-gone");
+    assert_success(&warehouse.run(&["prepare"]));
+
+    let mut child = Command::new(FORKLIFT)
+        .arg("mcp")
+        .current_dir(&warehouse.root)
+        .env("FORKLIFT_GLOBAL_CONFIG", warehouse.home.join("global-config.toml"))
+        .env("FORKLIFT_KEYS_DIR", warehouse.home.join("test-keys"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // The client is gone before the server's first reply.
+    drop(child.stdout.take());
+    child.stdin.take().unwrap()
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
+        .unwrap();
+
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.signal(), None, "killed by a signal: {:?}", output.status);
+    assert!(output.status.success(), "a client that left is the end of the connection: {:?}", output.status);
+    assert!(output.stderr.is_empty(), "{}", String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
+fn mcp_forwards_a_warning_document_after_the_envelope() {
+    let warehouse = TestWarehouse::new("mcp-warning");
+    assert_success(&warehouse.run(&["prepare"]));
+    warehouse.write_file("a.txt", "one\n");
+
+    // The same unparseable maintenance setting that makes `load` warn on the CLI.
+    std::fs::write(
+        warehouse.root.join(".forklift/config/warehouse.toml"),
+        "[maintenance]\nloose = 12345\n",
+    ).unwrap();
+
+    let input = format!(
+        "{}\n{}\n",
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"load","arguments":{"path":"."}}}"#,
+    );
+    let output = warehouse.run_with_stdin(&["mcp"], &input);
+    assert_success(&output);
+
+    let call = stdout(&output).lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|message| message["id"] == 2)
+        .expect("a reply to the load call");
+    assert_eq!(call["result"]["isError"], false, "load failed: {}", call);
+
+    let content = call["result"]["content"].as_array().unwrap();
+    assert_eq!(content.len(), 2, "expected the envelope and one warning: {}", call);
+
+    let envelope: serde_json::Value = serde_json::from_str(content[0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(envelope["command"], "load", "the envelope comes first: {}", call);
+
+    let warning: serde_json::Value = serde_json::from_str(content[1]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(warning["warning"], "maintenance_unavailable", "unexpected warning: {}", warning);
+}
+
 #[test]
 fn import_git_migrates_a_repo_into_the_warehouse() {
     let warehouse = TestWarehouse::new("import-git");

@@ -392,7 +392,8 @@ for writing and is a pipe, FIFO or socket. Forklift checks this at startup, befo
 file of its own. Anything else is ignored without a message, and the command runs as if the
 variable were unset: an empty or non-numeric value, a sign or whitespace, 0, 1 or 2, a closed
 fd, a regular file, a terminal, or a read-only end. So an fd inherited by accident is never
-written to, and stdout always stays the one `--json` document.
+written to, and stdout always stays the one `--json` document. Whatever a numeric value above 2
+names, accepted or not, is made close-on-exec, so it is not passed on to anything Forklift runs.
 
 **Ordering and loss.** Events arrive in the order they happened. Emitting never blocks, slows
 or stops the operation: a small queue sits between the operation and a dedicated writer, and
@@ -441,10 +442,56 @@ the working directory. It implements `initialize`, `tools/list` and `tools/call`
 
 Each tool re-invokes `forklift … --json` and returns its envelope, so the tools speak
 the exact structured output above (and inherit the warehouse lock and exit-code
-taxonomy). A failure document (`ok: false`) comes back as an MCP tool error (`isError:
-true`) carrying the error envelope — the agent sees the stable `code`/`next_step`, not
-a crashed session. `isError` follows `ok`, not the exit status; only a run that wrote no
-document falls back to its exit status.
+taxonomy). The tool result's content is:
+
+* the envelope, as the first text item;
+* then each stderr line that is a [warning document](#--json), one text item each, in
+  order. Other stderr is not forwarded.
+
+A failure document (`ok: false`) comes back as an MCP tool error (`isError: true`)
+carrying the error envelope — the agent sees the stable `code`/`next_step`, not a crashed
+session. `isError` follows `ok`, not the exit status. A run that left no document at all,
+for example one killed by a signal, is always an error. Its first item names how it ended
+(`forklift left no result document: it was killed by signal 9.`), then quotes the last
+4 KiB of whatever it wrote to stdout and, warnings aside, to stderr, so a crash's own
+account of itself is not lost.
+
+The server ignores `SIGPIPE`: a client that stops reading ends the server once the call
+in progress has finished, instead of killing it, and that call's `forklift`, mid-run. That is
+the end of the connection, as stdin closing is: the server exits with status 0 and writes
+nothing to stderr.
+
+Requests are answered one at a time, in the order they arrive.
+
+**Progress.** A `tools/call` whose request carries `_meta.progressToken`, a string or an
+integer, gets `notifications/progress` for that token while it runs. Any other token is
+treated as none. The server hands the call a
+[progress-events](#progress-events) channel of its own and turns the events into
+notifications:
+
+* `total` is never sent. An operation can start a phase over, and a fraction sent before
+  that would have reported the whole operation done.
+* `progress` is 100 × the number of resets seen + the event's percentage, where a reset is
+  a percentage lower than the previous one. Each new phase therefore raises the value
+  instead of rewinding it. Read it as a strictly increasing tick, not a fraction.
+* `progress` strictly increases. An event that would not raise it is still sent if it
+  brings new text, at the last value plus 1/4096; otherwise it is dropped. Those steps
+  stop short of the next whole value: at most 4095 of them follow one, so the value keeps
+  meaning 100 × resets + percentage. Text that names no new phase may use only 2047 of
+  them, so a new phase is still reported after a long run of text; past either limit, text
+  is dropped until the value rises.
+* `message` carries the phase, the percentage and the event's text
+  (`Packing objects: 40% …`), and is sent only when the negotiated protocol is
+  `2025-06-18` or later, the first version that has the field. A version that is not a
+  `YYYY-MM-DD` date counts as earlier. Before that version, only events that raise the
+  value are sent.
+* At most one notification goes out every 100 ms while the call runs, plus one when it
+  ends, which can follow the previous one sooner. What arrives in between is folded into
+  the next one: the highest value and the newest text.
+* Every notification for a call is written before that call's response, never after.
+
+Only `compact`, `lift` and `lower` report progress. Other tools send no notifications,
+and progress needs macOS or Linux, as the channel does.
 
 The tool surface **mirrors the CLI** — every CLI command is exposed as a tool (a
 multi-subcommand command becomes `<command>_<subcommand>` tools) or is on a small

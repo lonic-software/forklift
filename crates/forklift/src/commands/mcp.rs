@@ -6,6 +6,10 @@
 //! stdin/stdout. A `tools/call` re-invokes this same binary with `--json` and captures
 //! its envelope, so every tool reuses the exact structured output (and the warehouse
 //! lock, and the exit-code taxonomy) the CLI already produces — one source of truth.
+//!
+//! Requests are answered one at a time, on this one thread. A call that asked for progress
+//! (`_meta.progressToken`) gets its `notifications/progress` written by that same thread while
+//! the child runs, and always before the call's response, so none can follow it.
 
 use std::io::{BufRead, Write};
 use serde_json::{json, Value};
@@ -29,12 +33,21 @@ const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 ///            client launches the server inside a warehouse.
 ///
 /// # Returns
-/// * `Ok(())`      - When stdin closes.
+/// * `Ok(())`      - When stdin closes, or the client stops reading stdout.
 /// * `Err(String)` - If the root is unusable, or stdin/stdout fails irrecoverably.
 pub fn handle_command(root: Option<String>) -> Result<(), String> {
     if let Some(root) = root {
         std::env::set_current_dir(&root)
             .map_err(|e| format!("Error while changing into the warehouse \"{}\": {}", root, e))?;
+    }
+
+    // A client that goes away must not kill this server mid-call: the call's child would be
+    // orphaned, and die on its own next write to the stdout nobody reads any more. With the
+    // signal ignored, the write fails instead, and the server ends once the call has finished.
+    // Each child restores the default disposition in its own `main`.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
 
     let stdin = std::io::stdin();
@@ -50,19 +63,42 @@ pub fn handle_command(root: Option<String>) -> Result<(), String> {
             continue;
         }
 
-        let Some(response) = handle_message(&line, &mut state) else {
+        // A notification sent mid-call that cannot be written is not fatal on its own: the
+        // response that follows hits the same stdout and reports the failure.
+        let mut notify = |notification: &Value| {
+            let _ = write_message(&mut stdout, notification);
+        };
+
+        let Some(response) = handle_message(&line, &mut state, &mut notify) else {
             // A notification (no id) gets no response.
             continue;
         };
 
-        let text = serde_json::to_string(&response)
-            .map_err(|e| format!("Error while encoding a response: {}", e))?;
-
-        writeln!(stdout, "{}", text).map_err(|e| format!("Error while writing stdout: {}", e))?;
-        stdout.flush().map_err(|e| format!("Error while flushing stdout: {}", e))?;
+        match write_message(&mut stdout, &response) {
+            Ok(()) => {}
+            // The client has gone: the connection is over, as it is when stdin closes. Nothing
+            // is left to report it to, and stderr may well have gone with it.
+            Err(e) if client_gone(&e) => return Ok(()),
+            Err(e) => return Err(format!("Error while writing stdout: {}", e)),
+        }
     }
 
     Ok(())
+}
+
+/// Whether a failed write means the client has gone: a pipe reports it as a broken pipe, a
+/// socket can report a reset or a lost connection instead.
+fn client_gone(error: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    matches!(error.kind(), ErrorKind::BrokenPipe | ErrorKind::ConnectionReset | ErrorKind::NotConnected)
+}
+
+/// Write one JSON-RPC message as a line and flush it.
+fn write_message(stdout: &mut std::io::Stdout, message: &Value) -> std::io::Result<()> {
+    let text = serde_json::to_string(message).map_err(std::io::Error::other)?;
+
+    writeln!(stdout, "{}", text)?;
+    stdout.flush()
 }
 
 /// State the server keeps for the life of one stdio connection. It exists to **harden
@@ -78,6 +114,10 @@ struct ServerState {
     /// The client application from `initialize` (`name` or `name/version`), once it has
     /// identified itself. Used as the provenance `tool`.
     client: Option<String>,
+
+    /// The protocol version `initialize` settled on. It decides whether a progress notification
+    /// may carry a `message`.
+    protocol_version: String,
 }
 
 impl ServerState {
@@ -92,13 +132,16 @@ impl ServerState {
         ServerState {
             session: format!("mcp-{:x}-{:x}", std::process::id(), millis),
             client: None,
+            protocol_version: DEFAULT_PROTOCOL_VERSION.to_string(),
         }
     }
 }
 
 /// Handle one JSON-RPC message; `None` for a notification (which gets no reply) or an
 /// unparseable line we choose to ignore rather than crash the session.
-fn handle_message(line: &str, state: &mut ServerState) -> Option<Value> {
+///
+/// `notify` writes a notification to the client; a `tools/call` uses it for progress.
+fn handle_message(line: &str, state: &mut ServerState, notify: &mut dyn FnMut(&Value)) -> Option<Value> {
     let message: Value = serde_json::from_str(line).ok()?;
 
     let id = message.get("id").cloned();
@@ -112,7 +155,7 @@ fn handle_message(line: &str, state: &mut ServerState) -> Option<Value> {
     let result = match method {
         "initialize" => Ok(initialize(&params, state)),
         "tools/list" => Ok(json!({ "tools": tool_definitions() })),
-        "tools/call" => call_tool(&params, state),
+        "tools/call" => call_tool(&params, state, notify),
         other => Err(JsonRpcError::method_not_found(other)),
     };
 
@@ -139,6 +182,8 @@ fn initialize(params: &Value, state: &mut ServerState) -> Value {
         .and_then(Value::as_str)
         .unwrap_or(DEFAULT_PROTOCOL_VERSION);
 
+    state.protocol_version = protocol_version.to_string();
+
     json!({
         "protocolVersion": protocol_version,
         "capabilities": { "tools": {} },
@@ -147,10 +192,10 @@ fn initialize(params: &Value, state: &mut ServerState) -> Value {
 }
 
 /// Dispatch a `tools/call`: map the tool and its arguments to a `forklift … --json`
-/// invocation, run it, and return the envelope as the tool result. A failure document is
-/// reported as an MCP tool error (`isError: true`) carrying the error envelope — the agent
-/// sees the stable `code`/`next_step`, not a crash. See [`tool_failed`] for the rule.
-fn call_tool(params: &Value, state: &ServerState) -> Result<Value, JsonRpcError> {
+/// invocation, run it, and return the envelope as the tool result (see [`tool_result`]). When the
+/// request carries `_meta.progressToken`, the run's progress events are sent to the client as
+/// `notifications/progress` through `notify` while it runs.
+fn call_tool(params: &Value, state: &ServerState, notify: &mut dyn FnMut(&Value)) -> Result<Value, JsonRpcError> {
     let name = params.get("name").and_then(Value::as_str)
         .ok_or_else(|| JsonRpcError::invalid_params("the tool name is required"))?;
 
@@ -173,42 +218,499 @@ fn call_tool(params: &Value, state: &ServerState) -> Result<Value, JsonRpcError>
     let args = build_args(name, &arguments)
         .map_err(|reason| JsonRpcError::invalid_params(&reason))?;
 
-    let output = run_forklift(&args)
-        .map_err(|reason| JsonRpcError::internal(&reason))?;
+    // MCP allows a string or an integer; anything else names no request a client could match.
+    let token = params.get("_meta").and_then(|meta| meta.get("progressToken"))
+        .filter(|token| token.is_string() || token.is_i64() || token.is_u64());
 
-    let text = String::from_utf8_lossy(&output.stdout).to_string();
+    let output = match token {
+        Some(token) => {
+            let mut progress = ProgressMapper::new(carries_message(&state.protocol_version));
+            run_forklift_reporting(&args, &mut progress, &mut |value, message| {
+                notify(&progress_notification(token, value, message));
+            })
+        }
+        None => run_forklift(&args),
+    }.map_err(|reason| JsonRpcError::internal(&reason))?;
 
-    Ok(json!({
-        "content": [ { "type": "text", "text": text } ],
-        "isError": tool_failed(&output.stdout, output.status.success()),
-    }))
+    Ok(tool_result(&output.stdout, &output.stderr, output.status))
 }
 
-/// Whether a `--json` run failed, by the envelope's own rule: `ok` says whether `data` is the
-/// result, and the exit status does not — a command may exit non-zero with `ok: true` to report a
-/// negative outcome as data. Only a run that wrote no document falls back to its exit status.
+/// Build a tool result from a finished run.
+///
+/// * The first text item is the run's `--json` document. `isError` follows its `ok`, not the
+///   exit status: a command may exit non-zero with `ok: true` to report a negative outcome as
+///   data.
+/// * A run that left no document — killed by a signal, say — has nothing to forward. Its first
+///   item says so and names the exit status, and it is always an error.
+/// * Every stderr line that is a warning document follows, one item each. Other stderr is not
+///   forwarded.
 ///
 /// # Arguments
-/// * `stdout`    - The run's standard output.
-/// * `exited_ok` - Whether the process exited 0.
+/// * `stdout` - The run's standard output.
+/// * `stderr` - The run's standard error.
+/// * `status` - How the run ended.
 ///
 /// # Returns
-/// * `bool` - `true` if the agent should see the result as a tool error.
-fn tool_failed(stdout: &[u8], exited_ok: bool) -> bool {
-    serde_json::from_slice::<Value>(stdout).ok()
-        .and_then(|document| document.get("ok").and_then(Value::as_bool))
-        .map_or(!exited_ok, |ok| !ok)
+/// * `Value` - The `tools/call` result.
+fn tool_result(stdout: &[u8], stderr: &[u8], status: std::process::ExitStatus) -> Value {
+    // A document is an object with a boolean `ok`; anything else on stdout is not one.
+    let ok = serde_json::from_slice::<Value>(stdout).ok()
+        .and_then(|document| document.get("ok").and_then(Value::as_bool));
+
+    let mut content = vec![match ok {
+        Some(_) => json!({ "type": "text", "text": String::from_utf8_lossy(stdout) }),
+        None => json!({ "type": "text", "text": no_document_text(stdout, stderr, status) }),
+    }];
+
+    for line in String::from_utf8_lossy(stderr).lines() {
+        if is_warning_document(line) {
+            content.push(json!({ "type": "text", "text": line }));
+        }
+    }
+
+    json!({ "content": content, "isError": ok != Some(true) })
+}
+
+/// The first item of a result with no document: how the run ended, then the end of whatever it
+/// did write, which for a panic is the only account of what happened.
+fn no_document_text(stdout: &[u8], stderr: &[u8], status: std::process::ExitStatus) -> String {
+    let mut text = format!("forklift left no result document: it {}.", describe_exit(status));
+
+    let stdout = String::from_utf8_lossy(stdout);
+    if !stdout.trim().is_empty() {
+        text.push_str("\n\nstdout:\n");
+        text.push_str(tail(stdout.trim_end()));
+    }
+
+    let stderr = String::from_utf8_lossy(stderr);
+    let stderr: Vec<&str> = stderr.lines().filter(|line| !is_warning_document(line)).collect();
+    let stderr = stderr.join("\n");
+    if !stderr.trim().is_empty() {
+        text.push_str("\n\nstderr:\n");
+        text.push_str(tail(stderr.trim_end()));
+    }
+
+    text
+}
+
+/// The last [`TAIL_BYTES`] of `text`, cut on a character boundary.
+fn tail(text: &str) -> &str {
+    let mut start = text.len().saturating_sub(TAIL_BYTES);
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..]
+}
+
+/// How much of a stream a result with no document quotes, from its end.
+const TAIL_BYTES: usize = 4096;
+
+/// Whether a stderr line is a warning document: a JSON object carrying `lonic_json` and a string
+/// `warning`.
+fn is_warning_document(line: &str) -> bool {
+    serde_json::from_str::<Value>(line).ok()
+        .is_some_and(|value| value.get("lonic_json").is_some() && value.get("warning").is_some_and(Value::is_string))
+}
+
+/// How a run ended, as the tail of a sentence: "exited with status 3", "was killed by signal 9".
+fn describe_exit(status: std::process::ExitStatus) -> String {
+    if let Some(code) = status.code() {
+        return format!("exited with status {}", code);
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+
+        if let Some(signal) = status.signal() {
+            return format!("was killed by signal {}", signal);
+        }
+    }
+
+    "ended without an exit status".to_string()
 }
 
 /// Run this same binary with the given arguments plus `--json`, capturing its output.
 fn run_forklift(args: &[String]) -> Result<std::process::Output, String> {
+    forklift_command(args)?.output()
+        .map_err(|e| format!("Error while running \"forklift {}\": {}", args.join(" "), e))
+}
+
+/// The command for one tool call: this same binary, the given arguments, and `--json`.
+fn forklift_command(args: &[String]) -> Result<std::process::Command, String> {
     let exe = std::env::current_exe()
         .map_err(|e| format!("Cannot locate the forklift binary: {}", e))?;
 
     let mut command = std::process::Command::new(exe);
     command.args(args).arg("--json");
 
-    command.output().map_err(|e| format!("Error while running \"forklift {}\": {}", args.join(" "), e))
+    Ok(command)
+}
+
+/// How often at most a progress notification is sent for one call.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+const NOTIFICATION_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// [`run_forklift`], with a progress-events channel the server owns: the child gets the write
+/// end of a fresh pipe through `PULT_EVENTS`, and each event it reports goes into `progress`.
+/// What `progress` decides to send goes to `send`, the last of it after the child has exited and
+/// before this returns.
+///
+/// The channel exists on macOS and Linux only, as the child's emitter does; elsewhere this is
+/// [`run_forklift`].
+///
+/// # Arguments
+/// * `args`    - The forklift arguments.
+/// * `progress` - Takes each event the child reports.
+/// * `send`     - Sends one notification: `progress` and `message`.
+///
+/// # Returns
+/// * `Ok(Output)`  - The finished run.
+/// * `Err(String)` - If the channel could not be set up, or the child could not be run.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn run_forklift_reporting(
+    args: &[String],
+    progress: &mut ProgressMapper,
+    send: &mut dyn FnMut(f64, Option<String>),
+) -> Result<std::process::Output, String> {
+    use std::io::{BufRead, Read};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+    use std::sync::mpsc::RecvTimeoutError;
+
+    let failed = |e: std::io::Error| format!("Error while running \"forklift {}\": {}", args.join(" "), e);
+
+    let (reader, writer) = std::io::pipe().map_err(failed)?;
+
+    // The child must find the write end above the standard streams, and still open after exec.
+    // So it is duplicated to a number of at least 3, close-on-exec here, and only the child
+    // clears that flag, after the fork, so no other process this server runs inherits it.
+    let duplicate = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+    if duplicate == -1 {
+        return Err(failed(std::io::Error::last_os_error()));
+    }
+    let child_end = unsafe { OwnedFd::from_raw_fd(duplicate) };
+    drop(writer);
+
+    let mut command = forklift_command(args)?;
+    command.env("PULT_EVENTS", duplicate.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    // SAFETY: the closure only calls `fcntl`, which is async-signal-safe.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(duplicate, libc::F_SETFD, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let mut child = command.spawn().map_err(failed)?;
+
+    // Only the child may hold the write end now, so the reader sees end-of-file when it exits.
+    drop(child_end);
+
+    let drain = |stream: Option<Box<dyn Read + Send>>| std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut stream) = stream {
+            let _ = stream.read_to_end(&mut bytes);
+        }
+        bytes
+    });
+    let stdout = drain(child.stdout.take().map(|s| Box::new(s) as Box<dyn Read + Send>));
+    let stderr = drain(child.stderr.take().map(|s| Box::new(s) as Box<dyn Read + Send>));
+
+    let (sender, events) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(reader).lines() {
+            let Ok(line) = line else { break };
+            if let Some(event) = parse_event(&line) {
+                if sender.send(event).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    // The channel ends when the child does: it holds the only write end, and makes it
+    // close-on-exec at startup whether or not it accepts it, so nothing it runs inherits it. That
+    // matters, since the loop waits for the end with no timeout: a descendant that detaches from
+    // its stdio (as `git gc --auto` does) would otherwise keep the channel, and this call, open.
+    loop {
+        match events.recv_timeout(NOTIFICATION_INTERVAL / 2) {
+            Ok(event) => progress.receive(event),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+
+        if let Some((value, message)) = progress.take(std::time::Instant::now()) {
+            send(value, message);
+        }
+    }
+
+    let status = child.wait().map_err(failed)?;
+    if let Some((value, message)) = progress.finish() {
+        send(value, message);
+    }
+
+    Ok(std::process::Output {
+        status,
+        stdout: stdout.join().unwrap_or_default(),
+        stderr: stderr.join().unwrap_or_default(),
+    })
+}
+
+// Off macOS and Linux no call reports progress, so the event and notification items that follow
+// are unused there and carry `allow(dead_code)` for it.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn run_forklift_reporting(
+    args: &[String],
+    _progress: &mut ProgressMapper,
+    _send: &mut dyn FnMut(f64, Option<String>),
+) -> Result<std::process::Output, String> {
+    run_forklift(args)
+}
+
+/// One event read from the channel.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+#[derive(Debug, PartialEq)]
+enum Reported {
+    /// `status <phase>`.
+    Status(String),
+
+    /// `progress <0-100|?> [text]`.
+    Progress { percent: Option<u8>, text: String },
+}
+
+/// Parse one channel line. Anything that is not a well-formed `status` or `progress` event is
+/// `None`, and is ignored.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+fn parse_event(line: &str) -> Option<Reported> {
+    if let Some(phase) = line.strip_prefix("status ") {
+        let phase = phase.trim();
+        return (!phase.is_empty()).then(|| Reported::Status(phase.to_string()));
+    }
+
+    let rest = line.strip_prefix("progress ")?;
+    let (value, text) = rest.split_once(' ').unwrap_or((rest, ""));
+
+    let percent = match value {
+        "?" => None,
+        value => Some(value.parse::<u8>().ok().filter(|percent| *percent <= 100)?),
+    };
+
+    Some(Reported::Progress { percent, text: text.trim().to_string() })
+}
+
+/// Whether a protocol version carries `message` on a progress notification: 2025-06-18 and
+/// later. Versions are dates, so they order as strings; anything else carries none.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+fn carries_message(protocol_version: &str) -> bool {
+    // Only a well-formed date orders correctly: "draft" sorts after every date, "2025-6-18"
+    // before its own month.
+    let is_date = protocol_version.len() == 10 && protocol_version.bytes().enumerate()
+        .all(|(index, byte)| if index == 4 || index == 7 { byte == b'-' } else { byte.is_ascii_digit() });
+
+    is_date && protocol_version >= "2025-06-18"
+}
+
+/// What a notification that only carries new text adds to the last `progress` sent. A power of
+/// two, so the sums stay exact.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+const TEXT_ONLY_STEP: f64 = 1.0 / 4096.0;
+
+/// How many text-only notifications fit between two whole values: the steps never reach the
+/// next one, so `progress` keeps meaning 100 × resets + percentage.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+const TEXT_ONLY_LIMIT: u32 = 4095;
+
+/// How many of those text that does not change the phase may use. The rest are kept for phase
+/// changes, so a run whose text has used up its share still reports a new phase.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+const TEXT_ONLY_TEXT_LIMIT: u32 = TEXT_ONLY_LIMIT / 2;
+
+/// Turns one call's events into progress notifications.
+///
+/// * No `total` is ever sent: an operation cannot promise it will not start a phase over, and a
+///   fraction sent before that would report the whole operation done.
+/// * `progress` is 100 × the resets seen + the event's percentage, where a reset is a percentage
+///   lower than the previous one received. Each phase starts low again, so a phase advances the
+///   value instead of rewinding it.
+/// * `progress` strictly increases. An event that would not raise it is still sent if it brings
+///   new text, at the last value plus [`TEXT_ONLY_STEP`]; otherwise it is dropped. At most
+///   [`TEXT_ONLY_LIMIT`] of those follow one whole value, so they never reach the next one, and
+///   only [`TEXT_ONLY_TEXT_LIMIT`] of them may carry text that names no new phase; past either
+///   limit, such text is dropped until the value rises.
+/// * The phase, the percentage and the text go in `message`, only when the protocol has it.
+///   Without it, an event that does not raise the value has nothing to say and is dropped.
+/// * At most one notification goes out per [`NOTIFICATION_INTERVAL`], until the run ends.
+///
+/// Events are folded in as they arrive, and [`ProgressMapper::take`] decides what to send.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+struct ProgressMapper {
+    /// Whether notifications may carry `message`.
+    message: bool,
+
+    /// Percentages that went down, counted so far.
+    resets: u32,
+
+    /// The last percentage received.
+    last_percent: Option<u8>,
+
+    /// The phase the last `status` named.
+    phase: Option<String>,
+
+    /// The highest value received since the last send.
+    pending_value: Option<f64>,
+
+    /// The newest text received since the last send.
+    pending_message: Option<String>,
+
+    /// Whether a `status` naming a new phase arrived since the last send.
+    pending_phase: bool,
+
+    /// Text-only notifications sent since the last whole value.
+    text_only: u32,
+
+    /// The last `progress` and `message` sent, and when.
+    sent_value: Option<f64>,
+    sent_message: Option<String>,
+    sent_at: Option<std::time::Instant>,
+}
+
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+impl ProgressMapper {
+    fn new(message: bool) -> ProgressMapper {
+        ProgressMapper {
+            message,
+            resets: 0,
+            last_percent: None,
+            phase: None,
+            pending_value: None,
+            pending_message: None,
+            pending_phase: false,
+            text_only: 0,
+            sent_value: None,
+            sent_message: None,
+            sent_at: None,
+        }
+    }
+
+    /// Fold in one event.
+    fn receive(&mut self, event: Reported) {
+        match event {
+            Reported::Status(phase) => {
+                // Only a different phase may use the phases' share: a repeated status is text.
+                if self.phase.as_deref() != Some(phase.as_str()) {
+                    self.pending_phase = true;
+                }
+                self.pending_message = Some(phase.clone());
+                self.phase = Some(phase);
+            }
+            Reported::Progress { percent, text } => {
+                if let Some(percent) = percent {
+                    if self.last_percent.is_some_and(|last| percent < last) {
+                        self.resets += 1;
+                    }
+                    self.last_percent = Some(percent);
+
+                    let value = 100.0 * f64::from(self.resets) + f64::from(percent);
+                    self.pending_value = Some(self.pending_value.map_or(value, |pending| pending.max(value)));
+                }
+
+                self.pending_message = Some(compose_message(self.phase.as_deref(), percent, &text));
+            }
+        }
+    }
+
+    /// What to send at `now`, if anything: `(progress, message)`. Nothing until
+    /// [`NOTIFICATION_INTERVAL`] has passed since the last send; what was received meanwhile is
+    /// kept for the next call.
+    fn take(&mut self, now: std::time::Instant) -> Option<(f64, Option<String>)> {
+        if self.sent_at.is_some_and(|at| now.duration_since(at) < NOTIFICATION_INTERVAL) {
+            return None;
+        }
+
+        let sent = self.decide();
+        if sent.is_some() {
+            self.sent_at = Some(now);
+        }
+        sent
+    }
+
+    /// What to send once the run has ended, whatever the interval.
+    fn finish(&mut self) -> Option<(f64, Option<String>)> {
+        self.decide()
+    }
+
+    /// What to send of what was received, if anything. Clears what was received.
+    fn decide(&mut self) -> Option<(f64, Option<String>)> {
+        let value = self.pending_value.take();
+        let message = self.pending_message.take().filter(|_| self.message);
+        let limit = if std::mem::take(&mut self.pending_phase) { TEXT_ONLY_LIMIT } else { TEXT_ONLY_TEXT_LIMIT };
+
+        // Received values are whole, and what was sent is a whole value plus less than one, so
+        // a received value raises it exactly when it exceeds the sent value's whole part.
+        let value = match (value, self.sent_value) {
+            (Some(value), Some(sent)) if value > sent => {
+                self.text_only = 0;
+                value
+            }
+            (Some(value), None) => value,
+            _ => {
+                // Nothing raises the value: only new text is worth a notification.
+                if message.is_none() || message == self.sent_message {
+                    return None;
+                }
+                match self.sent_value {
+                    None => 0.0,
+                    Some(_) if self.text_only >= limit => return None,
+                    Some(sent) => {
+                        self.text_only += 1;
+                        sent + TEXT_ONLY_STEP
+                    }
+                }
+            }
+        };
+
+        self.sent_value = Some(value);
+        if message.is_some() {
+            self.sent_message = message.clone();
+        }
+
+        Some((value, message))
+    }
+}
+
+/// The `message` for a progress event: "<phase>: <percent>% <text>", leaving out what is absent.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+fn compose_message(phase: Option<&str>, percent: Option<u8>, text: &str) -> String {
+    let detail = match (percent, text.is_empty()) {
+        (Some(percent), true) => format!("{}%", percent),
+        (Some(percent), false) => format!("{}% {}", percent, text),
+        (None, _) => text.to_string(),
+    };
+
+    match (phase, detail.is_empty()) {
+        (Some(phase), true) => phase.to_string(),
+        (Some(phase), false) => format!("{}: {}", phase, detail),
+        (None, _) => detail,
+    }
+}
+
+/// A `notifications/progress` message.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+fn progress_notification(token: &Value, progress: f64, message: Option<String>) -> Value {
+    let mut params = json!({ "progressToken": token, "progress": progress });
+    if let Some(message) = message {
+        params["message"] = json!(message);
+    }
+
+    json!({ "jsonrpc": "2.0", "method": "notifications/progress", "params": params })
 }
 
 /// Map an MCP tool name and its arguments to the forklift CLI arguments. Keeping the
@@ -736,20 +1238,301 @@ impl JsonRpcError {
 mod tests {
     use clap::CommandFactory;
 
+    use super::{ProgressMapper, Reported};
+    use serde_json::json;
+
+    /// A finished run's status, as `wait` would report it.
+    #[cfg(unix)]
+    fn exited(code: i32) -> std::process::ExitStatus {
+        std::os::unix::process::ExitStatusExt::from_raw(code << 8)
+    }
+
+    #[cfg(unix)]
     #[test]
     fn a_tool_error_is_read_from_ok_not_from_the_exit_status() {
         let success = br#"{"lonic_json":1,"tool":"forklift","schema":2,"command":"x","ok":true,"data":{}}"#;
         let failure = br#"{"lonic_json":1,"tool":"forklift","schema":2,"command":"x","ok":false,"error":{}}"#;
 
         // A negative outcome reported as data: non-zero exit, but `data` is the result.
-        assert!(!super::tool_failed(success, false));
-        assert!(super::tool_failed(failure, true));
-        assert!(!super::tool_failed(success, true));
-        assert!(super::tool_failed(failure, false));
+        assert_eq!(super::tool_result(success, b"", exited(1))["isError"], false);
+        assert_eq!(super::tool_result(failure, b"", exited(0))["isError"], true);
+        assert_eq!(super::tool_result(success, b"", exited(0))["isError"], false);
+        assert_eq!(super::tool_result(failure, b"", exited(1))["isError"], true);
 
-        // No document at all: the exit status is all there is.
-        assert!(super::tool_failed(b"", false));
-        assert!(!super::tool_failed(b"", true));
+        // The document itself is the first item, unchanged.
+        let result = super::tool_result(success, b"", exited(0));
+        assert_eq!(result["content"][0]["text"], std::str::from_utf8(success).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_run_with_no_document_is_an_error_naming_how_it_ended() {
+        let killed: std::process::ExitStatus = std::os::unix::process::ExitStatusExt::from_raw(9);
+        let result = super::tool_result(b"", b"", killed);
+        assert_eq!(result["isError"], true);
+        assert_eq!(result["content"][0]["text"], "forklift left no result document: it was killed by signal 9.");
+
+        // Even a zero exit: the contract promises a document, and there is none to show.
+        let result = super::tool_result(b"", b"", exited(0));
+        assert_eq!(result["isError"], true);
+        assert_eq!(result["content"][0]["text"], "forklift left no result document: it exited with status 0.");
+
+        // What the run did write is quoted, warnings aside, so a panic is not lost.
+        let warning = r#"{"lonic_json":1,"tool":"forklift","warning":"w","message":"m","next_step":"n"}"#;
+        let stderr = format!("thread 'main' panicked at src/x.rs:1:1:\nboom\n{}\n", warning);
+        let result = super::tool_result(b"partial", stderr.as_bytes(), exited(101));
+        assert_eq!(
+            result["content"][0]["text"],
+            "forklift left no result document: it exited with status 101.\n\nstdout:\npartial\n\nstderr:\nthread 'main' panicked at src/x.rs:1:1:\nboom",
+        );
+        assert_eq!(result["content"][1]["text"], warning);
+
+        // Only the end of a long stream, cut on a character boundary.
+        let long = format!("{}é{}", "a".repeat(10_000), "b".repeat(super::TAIL_BYTES - 1));
+        let quoted = super::tail(&long);
+        assert_eq!(quoted, &long[long.len() - super::TAIL_BYTES + 1..]);
+
+        // JSON that is not a document — no boolean `ok` — is not one either.
+        let result = super::tool_result(br#"{"ok":"yes"}"#, b"", exited(3));
+        assert_eq!(result["isError"], true);
+        assert_eq!(result["content"][0]["text"], "forklift left no result document: it exited with status 3.\n\nstdout:\n{\"ok\":\"yes\"}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_warning_documents_are_forwarded_from_stderr() {
+        let success = br#"{"lonic_json":1,"tool":"forklift","schema":2,"command":"x","ok":true,"data":{}}"#;
+        let warning = r#"{"lonic_json":1,"tool":"forklift","warning":"maintenance_unavailable","message":"m","next_step":"n"}"#;
+        let stderr = format!(
+            "Packing objects...\n{}\n{}\n{}\nnot json\n{}\n",
+            warning,
+            r#"{"lonic_json":1,"tool":"forklift","message":"no warning code"}"#,
+            r#"{"warning":"x","message":"no lonic_json"}"#,
+            warning,
+        );
+
+        let result = super::tool_result(success, stderr.as_bytes(), exited(0));
+        let texts: Vec<&str> = result["content"].as_array().unwrap().iter()
+            .map(|item| item["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(texts, vec![std::str::from_utf8(success).unwrap(), warning, warning]);
+
+        // Warnings ride along with a run that left no document, too.
+        let result = super::tool_result(b"", warning.as_bytes(), exited(1));
+        assert_eq!(result["content"].as_array().unwrap().len(), 2);
+        assert_eq!(result["content"][1]["text"], warning);
+    }
+
+    #[test]
+    fn channel_lines_parse_to_events_and_malformed_ones_do_not() {
+        assert_eq!(super::parse_event("status Packing objects"), Some(Reported::Status("Packing objects".into())));
+        assert_eq!(super::parse_event("progress 40"), Some(Reported::Progress { percent: Some(40), text: "".into() }));
+        assert_eq!(super::parse_event("progress 100 a b"), Some(Reported::Progress { percent: Some(100), text: "a b".into() }));
+        assert_eq!(super::parse_event("progress ? item"), Some(Reported::Progress { percent: None, text: "item".into() }));
+
+        for line in ["status ", "status", "progress 101", "progress -1", "progress x y", "progress", "step 1 2 x", ""] {
+            assert_eq!(super::parse_event(line), None, "{:?} parsed", line);
+        }
+    }
+
+    #[test]
+    fn the_message_field_starts_at_protocol_2025_06_18() {
+        assert!(!super::carries_message("2024-11-05"));
+        assert!(!super::carries_message("2025-03-26"));
+        assert!(super::carries_message("2025-06-18"));
+        assert!(super::carries_message("2025-11-25"));
+
+        // Not a date, so not ordered: no `message`, whichever way the string happens to sort.
+        for version in ["draft", "DRAFT-2026", "2025-6-18x", "9999-99-9x", "2025/06/18", ""] {
+            assert!(!super::carries_message(version), "{:?}", version);
+        }
+    }
+
+    #[test]
+    fn text_only_steps_stop_short_of_the_next_whole_value() {
+        let start = std::time::Instant::now();
+        let mut mapper = ProgressMapper::new(true);
+
+        mapper.receive(progress(10, "0"));
+        let mut last = mapper.take(start).unwrap().0;
+        assert_eq!(last, 10.0);
+
+        // A long run of text alone: every one is sent until it has used its share of the steps,
+        // and none after that.
+        let mut sent = 0;
+        for index in 1..=5000u32 {
+            mapper.receive(Reported::Progress { percent: None, text: index.to_string() });
+            if let Some((value, _)) = mapper.take(start + super::NOTIFICATION_INTERVAL * index) {
+                assert!(value > last && value < 11.0, "{} after {}", value, last);
+                last = value;
+                sent += 1;
+            }
+        }
+        assert_eq!(sent, super::TEXT_ONLY_TEXT_LIMIT);
+
+        // A new phase still gets through, until the steps would reach 11, and none after that.
+        let mut phases = 0;
+        for index in 5001..=10000u32 {
+            mapper.receive(status(&format!("phase {}", index)));
+            if let Some((value, _)) = mapper.take(start + super::NOTIFICATION_INTERVAL * index) {
+                assert!(value > last && value < 11.0, "{} after {}", value, last);
+                last = value;
+                phases += 1;
+            }
+        }
+        assert_eq!(sent + phases, super::TEXT_ONLY_LIMIT);
+
+        // The next real percentage is sent as itself, not as one more step.
+        mapper.receive(progress(12, "x"));
+        assert_eq!(mapper.finish(), Some((12.0, Some("phase 10000: 12% x".into()))));
+
+        // And the steps start again from there.
+        mapper.receive(Reported::Progress { percent: None, text: "y".into() });
+        assert_eq!(mapper.finish(), Some((12.0 + super::TEXT_ONLY_STEP, Some("phase 10000: y".into()))));
+
+        // A phase seen once does not give later text the phases' share.
+        let mut sent = 1;
+        for index in 0..5000u32 {
+            mapper.receive(Reported::Progress { percent: None, text: index.to_string() });
+            sent += u32::from(mapper.finish().is_some());
+        }
+        assert_eq!(sent, super::TEXT_ONLY_TEXT_LIMIT);
+    }
+
+    #[test]
+    fn a_reset_or_lost_connection_is_a_client_that_left_like_a_broken_pipe() {
+        use std::io::{Error, ErrorKind};
+        for kind in [ErrorKind::BrokenPipe, ErrorKind::ConnectionReset, ErrorKind::NotConnected] {
+            assert!(super::client_gone(&Error::from(kind)), "{:?}", kind);
+        }
+        for kind in [ErrorKind::Other, ErrorKind::WriteZero, ErrorKind::Interrupted] {
+            assert!(!super::client_gone(&Error::from(kind)), "{:?}", kind);
+        }
+    }
+
+    #[test]
+    fn a_repeated_status_gets_only_the_text_share_of_the_steps() {
+        // A repeated status names no new phase, so it is text, and the phases' share is still
+        // there for one that does.
+        let mut mapper = ProgressMapper::new(true);
+        mapper.receive(status("Packing objects"));
+        mapper.receive(progress(10, "0"));
+        assert_eq!(mapper.finish().map(|sent| sent.0), Some(10.0));
+        let mut repeated = 0;
+        for index in 0..5000u32 {
+            mapper.receive(status("Packing objects"));
+            mapper.receive(Reported::Progress { percent: None, text: index.to_string() });
+            repeated += u32::from(mapper.finish().is_some());
+        }
+        assert_eq!(repeated, super::TEXT_ONLY_TEXT_LIMIT);
+        mapper.receive(status("Removing packed originals"));
+        assert!(mapper.finish().is_some(), "a new phase was dropped after repeated ones");
+    }
+
+    fn progress(percent: u8, text: &str) -> Reported {
+        Reported::Progress { percent: Some(percent), text: text.to_string() }
+    }
+
+    fn status(phase: &str) -> Reported {
+        Reported::Status(phase.to_string())
+    }
+
+    /// Feed each event and take after each one, as if every event arrived a full interval apart.
+    fn sent(mapper: &mut ProgressMapper, events: Vec<Reported>) -> Vec<(f64, Option<String>)> {
+        let start = std::time::Instant::now();
+        events.into_iter().enumerate().filter_map(|(index, event)| {
+            mapper.receive(event);
+            mapper.take(start + super::NOTIFICATION_INTERVAL * index as u32)
+        }).collect()
+    }
+
+    #[test]
+    fn a_lower_percentage_counts_as_a_reset_and_advances_the_value() {
+        let mut mapper = ProgressMapper::new(false);
+        let values: Vec<f64> = sent(&mut mapper, vec![
+            progress(10, ""), progress(90, ""), progress(5, ""), progress(60, ""), progress(0, ""),
+        ]).into_iter().map(|(value, _)| value).collect();
+
+        assert_eq!(values, vec![10.0, 90.0, 105.0, 160.0, 200.0]);
+    }
+
+    #[test]
+    fn the_value_strictly_increases_and_a_repeat_with_nothing_new_is_dropped() {
+        let mut mapper = ProgressMapper::new(true);
+        let notifications = sent(&mut mapper, vec![
+            progress(40, "a"), progress(40, "a"), progress(40, "b"), progress(41, "b"),
+        ]);
+
+        assert_eq!(notifications, vec![
+            (40.0, Some("40% a".into())),
+            (40.0 + super::TEXT_ONLY_STEP, Some("40% b".into())),
+            (41.0, Some("41% b".into())),
+        ]);
+    }
+
+    #[test]
+    fn status_and_indeterminate_events_go_in_the_message_only_when_the_protocol_has_one() {
+        let events = || vec![status("Collecting objects"), progress(0, ""), Reported::Progress { percent: None, text: "x".into() }, status("Packing objects"), progress(30, "y")];
+
+        let mut with = ProgressMapper::new(true);
+        let step = super::TEXT_ONLY_STEP;
+        assert_eq!(sent(&mut with, events()), vec![
+            (0.0, Some("Collecting objects".into())),
+            (step, Some("Collecting objects: 0%".into())),
+            (2.0 * step, Some("Collecting objects: x".into())),
+            (3.0 * step, Some("Packing objects".into())),
+            (30.0, Some("Packing objects: 30% y".into())),
+        ]);
+
+        // Without `message`, only a raised value is worth sending.
+        let mut without = ProgressMapper::new(false);
+        assert_eq!(sent(&mut without, events()), vec![(0.0, None), (30.0, None)]);
+    }
+
+    #[test]
+    fn events_folded_between_sends_keep_the_highest_value_and_the_newest_text() {
+        let mut mapper = ProgressMapper::new(true);
+        mapper.receive(progress(70, "a"));
+        mapper.receive(progress(10, "b"));
+        mapper.receive(status("Next"));
+        assert_eq!(mapper.take(std::time::Instant::now()), Some((110.0, Some("Next".into()))));
+
+        // Nothing received since: nothing to send.
+        assert_eq!(mapper.finish(), None);
+    }
+
+    #[test]
+    fn at_most_one_notification_goes_out_per_interval_until_the_run_ends() {
+        let interval = super::NOTIFICATION_INTERVAL;
+        let start = std::time::Instant::now();
+        let mut mapper = ProgressMapper::new(false);
+
+        mapper.receive(progress(10, ""));
+        assert_eq!(mapper.take(start), Some((10.0, None)));
+
+        // Too soon: held, not lost.
+        mapper.receive(progress(20, ""));
+        assert_eq!(mapper.take(start + interval / 2), None);
+        mapper.receive(progress(30, ""));
+        assert_eq!(mapper.take(start + interval - std::time::Duration::from_millis(1)), None);
+        assert_eq!(mapper.take(start + interval), Some((30.0, None)));
+
+        // The end of the run sends what is held, however soon.
+        mapper.receive(progress(40, ""));
+        assert_eq!(mapper.take(start + interval), None);
+        assert_eq!(mapper.finish(), Some((40.0, None)));
+    }
+
+    #[test]
+    fn a_notification_carries_the_token_and_never_a_total() {
+        let notification = super::progress_notification(&json!(7), 12.5, Some("m".into()));
+        assert_eq!(notification, json!({
+            "jsonrpc": "2.0", "method": "notifications/progress",
+            "params": { "progressToken": 7, "progress": 12.5, "message": "m" },
+        }));
+
+        let notification = super::progress_notification(&json!("t"), 1.0, None);
+        assert_eq!(notification["params"], json!({ "progressToken": "t", "progress": 1.0 }));
     }
 
     /// CLI commands intentionally **not** exposed as MCP tools: warehouse/identity setup,
