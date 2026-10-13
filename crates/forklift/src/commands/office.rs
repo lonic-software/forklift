@@ -853,7 +853,11 @@ pub async fn accept_regenesis(confirm: Option<String>) -> Result<(), String> {
         ).into());
     };
 
-    let (old, new) = remote_utils::accept_regenesis(&client, &confirmed).await?;
+    let Some((old, new)) = remote_utils::accept_regenesis(&client, &confirmed).await? else {
+        output::message("The remote's trust anchor matches this warehouse's; nothing to accept.");
+
+        return Ok(());
+    };
 
     output::message(format!(
         "Accepted the re-genesis.\n\

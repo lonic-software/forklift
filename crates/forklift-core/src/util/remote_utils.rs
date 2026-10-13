@@ -2812,6 +2812,10 @@ impl RemoteClient {
             ));
         }
 
+        if let Some(trust) = &info.trust {
+            trust.validate()?;
+        }
+
         Ok(info)
     }
 
@@ -5359,8 +5363,9 @@ pub async fn adopt_remote_trust(client: &RemoteClient,
         }
     }
 
-    // Adopted last, once nothing after it can fail: an anchor written before a refusal would
-    // stand unannounced, and the next sync — finding it held — would never announce it either.
+    // Adopted last, after every refusal above: an anchor written before one would stand
+    // unannounced, and the next sync — finding it held — would never announce it either. If the
+    // write itself fails, nothing is held, and the next sync adopts and announces it.
     if office_utils::read_trust_anchor()?.is_none() {
         office_utils::write_trust_anchor(&remote_trust.to_anchor())?;
         stats.adopted_genesis = Some(remote_trust.genesis.clone());
@@ -5416,15 +5421,18 @@ pub async fn pending_regenesis(client: &RemoteClient)
 /// * `confirmed` - The new genesis being accepted.
 ///
 /// # Returns
-/// * `Ok((TrustAnchor, TrustAnchor))` - The replaced and the adopted anchor.
-/// * `Err(String)`                    - If there is nothing to accept, the custody chain does
-///                                      not match or `confirmed` is not the remote's genesis
-///                                      now (both `trust_changed` refusals), or a transfer
-///                                      failed.
+/// * `Ok(Some((TrustAnchor, TrustAnchor)))` - The replaced and the adopted anchor.
+/// * `Ok(None)`                             - The remote's anchor is already the held one:
+///                                            nothing to accept (already accepted, or reverted).
+/// * `Err(String)`                          - If either side holds no anchor, the custody chain
+///                                            does not match or `confirmed` is not the remote's
+///                                            genesis now (both `trust_changed` refusals), or a
+///                                            transfer failed.
 pub async fn accept_regenesis(client: &RemoteClient,
-                              confirmed: &str) -> Result<(office_utils::TrustAnchor, office_utils::TrustAnchor), String> {
+                              confirmed: &str)
+    -> Result<Option<(office_utils::TrustAnchor, office_utils::TrustAnchor)>, String> {
     let Some((local, remote_trust, info)) = pending_regenesis(client).await? else {
-        return Err("The remote's trust anchor matches this warehouse's; there is nothing to accept.".to_string());
+        return Ok(None);
     };
     let remote_trust = &remote_trust;
 
@@ -5450,7 +5458,7 @@ pub async fn accept_regenesis(client: &RemoteClient,
     office_utils::replace_trust_anchor(&new_anchor)?;
     pallet_utils::set_meta_pallet_head(OFFICE_PALLET_NAME, remote_office_head)?;
 
-    Ok((local, new_anchor))
+    Ok(Some((local, new_anchor)))
 }
 
 /// Push the local trust state (lift direction): establish the anchor on the remote when
