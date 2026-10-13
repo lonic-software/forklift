@@ -79,9 +79,10 @@ pub struct TrustAnchorDto {
 }
 
 impl TrustAnchorDto {
-    /// Refuse an anchor whose hashes are not hashes. Every one of them is shown to a human to
-    /// verify out of band, so a value that could carry terminal escapes or look-alike characters
-    /// is rejected at the handshake rather than sanitized at each place it is printed.
+    /// Refuse an anchor whose hashes are not canonical object hashes. Every one of them is shown
+    /// to a human to verify out of band, so a value that could carry terminal escapes or
+    /// look-alike characters is rejected where an anchor is read — the client's handshake, the
+    /// server's `PUT /v1/trust` — rather than sanitized at each place it is printed.
     pub fn validate(&self) -> Result<(), String> {
         let hashes = std::iter::once(&self.genesis)
             .chain(&self.boundary)
@@ -89,10 +90,10 @@ impl TrustAnchorDto {
             .chain(&self.adopts);
 
         for hash in hashes {
-            if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            if !crate::util::object_utils::is_object_hash(hash) {
                 return Err(format!(
-                    "The remote's trust anchor is malformed: {:?} is not an object hash. \
-                    Refusing to read it.",
+                    "The trust anchor is malformed: {:?} is not an object hash (64 lowercase hex \
+                    characters).",
                     hash.chars().take(80).collect::<String>()
                 ));
             }
@@ -386,5 +387,8 @@ mod tests {
         assert!(anchor(&escape, vec![], None).validate().is_err());
         assert!(anchor(&hash, vec![bidi], None).validate().is_err());
         assert!(anchor(&hash, vec![], Some("abc")).validate().is_err());
+
+        // Uppercase is a hash in another spelling, which every byte-for-byte comparison misses.
+        assert!(anchor(&hash.to_uppercase(), vec![], None).validate().is_err());
     }
 }

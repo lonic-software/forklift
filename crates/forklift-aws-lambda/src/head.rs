@@ -329,6 +329,10 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// authority a re-genesis requires is enforced by the runtime adapter, exactly as the
     /// server head restricts it to its static token.
     pub fn put_trust(&self, anchor: &TrustAnchorDto) -> HeadResult<TrustResult> {
+        // Clients refuse a malformed anchor at the handshake, and trust here is a one-way door:
+        // one stored would lock every client out of this warehouse for good.
+        anchor.validate().map_err(HeadError::unprocessable)?;
+
         let existing = self.refs.get_trust().map_err(HeadError::internal)?;
 
         // The stored bytes travel with `get_trust` so a write can condition on exactly what was

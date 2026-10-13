@@ -64,7 +64,7 @@ pub fn read_state() -> Result<Option<CherryPickState>, String> {
         path.to_string_lossy()
     ))?;
 
-    let is_valid_hash = state.source.len() == 64 && state.source.bytes().all(|b| b.is_ascii_hexdigit());
+    let is_valid_hash = object_utils::is_object_hash(&state.source);
 
     if !is_valid_hash {
         return Err(format!(

@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use crate::globals::{bay_root, forklift_root};
-use crate::util::file_utils;
+use crate::util::{file_utils, object_utils};
 
 /// The folder inside the forklift root that holds the *user* pallet ref files (branches).
 /// Each pallet is a file named after the pallet, containing the hash of its head parcel
@@ -319,7 +319,7 @@ pub fn get_pallet_head_in(namespace: PalletNamespace, name: &str) -> Result<Opti
         .map_err(|e| format!("Error while reading the ref of pallet \"{}\": {}", name, e))?;
     let hash = content.trim_end_matches('\n').to_string();
 
-    let is_valid_hash = hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit());
+    let is_valid_hash = object_utils::is_object_hash(&hash);
 
     if !is_valid_hash {
         return Err(format!(

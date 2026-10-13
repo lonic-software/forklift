@@ -1865,6 +1865,12 @@ async fn put_trust(State(state): State<Arc<AppState>>,
         Err(error) => return error_response(error),
     };
 
+    // Clients refuse a malformed anchor at the handshake, and trust here is a one-way door: one
+    // stored would lock every client out of this warehouse for good.
+    if let Err(problem) = anchor.validate() {
+        return error_response(unprocessable(problem));
+    }
+
     let warehouse = match resolve_warehouse(&state, &params) {
         Ok(warehouse) => warehouse,
         Err(error) => return error_response(error),
