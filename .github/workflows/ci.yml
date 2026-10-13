@@ -120,8 +120,8 @@ jobs:
         # Twice as many test threads as cores on Linux and Windows: many tests spend their time
         # waiting (on a timeout, a server, a child process), not computing, so the default of one
         # per core leaves cores idle. The macOS runner's disk is the bottleneck instead — doubling
-        # there more than doubled the run — so it keeps nextest's default. Tests that write with
-        # fsync on take two slots each (see .config/nextest.toml).
+        # there more than doubled the run — so it keeps nextest's default. The crash suite's
+        # kill tests take two slots each there (see .config/nextest.toml).
         shell: bash
         run: |
           if [ "$RUNNER_OS" = macOS ]; then

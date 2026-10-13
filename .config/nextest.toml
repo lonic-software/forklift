@@ -23,8 +23,8 @@ slow-timeout = { period = "120s", terminate-after = 5 }
 
 [[profile.default.overrides]]
 # Off macOS, each kill test also takes two of nextest's slots. CI runs twice as many tests as
-# cores on Linux and Windows because most tests wait rather than compute, but these write with
-# fsync on, and fsync-heavy tests slow each other down past one per core rather than filling idle
+# cores on Linux and Windows because most tests wait rather than compute, but the kill tests write
+# with fsync on throughout, and fsync-heavy tests slow each other down past one per core rather than filling idle
 # time; two slots each keeps them at about one per core. macOS CI runs one test per core, where
 # two slots would only make the kill tests wait for each other: on its three cores they ran one
 # after another and the run took 209 s instead of 149 s.
