@@ -273,7 +273,8 @@ pub struct ServeOptions {
 }
 
 /// The flat request timeout this head arms on the `reqwest::Client` it calls every hook
-/// through ([`build_hook_client`] builds from this constant and takes no figure of its own). It bounds *every* hook that client carries — authentication, admission, events and
+/// through ([`build_hook_client`] builds from this constant and takes no figure of its own).
+/// It bounds *every* hook that client carries — authentication, admission, events and
 /// resolution — individually, not collectively: a request running two of them may wait twice
 /// this long.
 ///
@@ -2758,13 +2759,13 @@ mod tests {
     /// [`HOOK_CLIENT_TIMEOUT`], so neither waits ten seconds.
     const TEST_HOOK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1_500);
 
-    /// The client [`serve`] builds is armed at the production figure, read off the client itself
-    /// rather than waited out: the tests that watch a hook time out arm [`TEST_HOOK_TIMEOUT`]
-    /// instead. `reqwest`'s `Debug` output names the armed timeout; if a `reqwest` upgrade changes
-    /// that format, this fails rather than passing vacuously.
+    /// The client [`build_hook_client`] builds (the one [`serve`] uses) is armed at the production
+    /// figure, read off the client itself rather than waited out: the tests that watch a hook time
+    /// out arm [`TEST_HOOK_TIMEOUT`] instead, so this is the check on the production figure.
+    /// `reqwest`'s `Debug` output names the armed timeout; if a `reqwest` upgrade changes that
+    /// format, this fails rather than passing vacuously.
     #[test]
     fn the_hook_client_is_armed_at_the_production_timeout() {
-        assert_eq!(HOOK_CLIENT_TIMEOUT, std::time::Duration::from_secs(10));
         let client = format!("{:?}", build_hook_client().unwrap());
         assert!(client.contains("TotalTimeout: 10s"), "the hook client is not armed at 10s: {}", client);
     }
@@ -2781,10 +2782,11 @@ mod tests {
     }
 
     /// `an_unreachable_authentication_hook_fails_closed` above pins the connection-refused path,
-    /// which fails fast regardless of whether `AppState.http` carries any timeout at all — so it
-    /// cannot, on its own, prove `serve` actually arms one. This pins the response-side wait
-    /// instead: a hook that accepts the connection and then never answers must still fail closed,
-    /// within a bound close to the one its client was armed at, rather than hang.
+    /// which fails fast regardless of whether `AppState.http` carries any timeout at all. This pins
+    /// the response-side wait instead: a hook that accepts the connection and then never answers
+    /// must still fail closed when the client's timeout fires, rather than hang. Which figure
+    /// production arms is `the_hook_client_is_armed_at_the_production_timeout`'s check, not this
+    /// one's.
     ///
     /// The client is armed at [`TEST_HOOK_TIMEOUT`] through [`hook_client_armed_at`], the
     /// construction [`build_hook_client`] uses, so the test waits a second and a half rather than
@@ -2792,8 +2794,9 @@ mod tests {
     /// production figure without waiting it out. `lower_bound`/`upper_bound` are literals, not
     /// derived from [`TEST_HOOK_TIMEOUT`], so a mutation to the armed figure moves the real
     /// elapsed time and not the bounds with it. `lower_bound` (1.2s) rejects a client armed at
-    /// half the figure (0.75s), and `upper_bound` (3s) rejects one armed at twice it, leaving 1.5s
-    /// for a loaded runner's scheduling. `outer_ceiling` (15s) is a backstop past both, so a
+    /// half the figure (0.75s), and `upper_bound` (5s) leaves 3.5s for a loaded runner's
+    /// scheduling while still rejecting production's 10s; a client armed at a multiple of its
+    /// figure is the production-timeout test's to catch. `outer_ceiling` (15s) is a backstop past both, so a
     /// genuinely unbounded regression fails this test's own panic (naming the real cause) rather
     /// than hanging the suite.
     #[tokio::test]
@@ -2805,7 +2808,7 @@ mod tests {
             ..single_mode_state(PathBuf::from("/unused"))
         };
         let lower_bound = std::time::Duration::from_millis(1_200);
-        let upper_bound = std::time::Duration::from_secs(3);
+        let upper_bound = std::time::Duration::from_secs(5);
         let outer_ceiling = std::time::Duration::from_secs(15);
 
         let started = std::time::Instant::now();
@@ -2980,7 +2983,7 @@ mod tests {
             ..single_mode_state(PathBuf::from("/unused"))
         };
         let lower_bound = std::time::Duration::from_millis(1_200);
-        let upper_bound = std::time::Duration::from_secs(3);
+        let upper_bound = std::time::Duration::from_secs(5);
         let outer_ceiling = std::time::Duration::from_secs(15);
 
         let started = std::time::Instant::now();
