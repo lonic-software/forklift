@@ -106,19 +106,22 @@ impl Drop for Area {
     }
 }
 
-/// Overwrite the corpus file with a fresh, same-order-of-magnitude payload so each `stack` call
-/// (calibration or real) has real hashing/compression/fsync work to do.
-fn rewrite_corpus(file: &Path, base_line: &str, tag: &str) {
-    std::fs::write(file, format!("{}{}\n", base_line.repeat(90_000), tag)).unwrap();
-}
+/// Lines in the `stack` test's single corpus file, about four megabytes: the one file has to
+/// carry the whole write window on its own.
+const STACK_CORPUS_LINES: usize = 90_000;
 
-/// [`rewrite_corpus`] for one file of the many-file corpus the `load` and `park` tests spread
-/// over 24 files: about a megabyte each rather than the single-file corpus's four, which keeps
-/// tens of megabytes of real work per run without making every kill round rewrite ninety-odd.
-/// The kill delays are calibrated to the measured run either way, so the spread still straddles
-/// the write window; a quarter of the bytes made both tests well over twice as fast.
-fn rewrite_spread_corpus(file: &Path, base_line: &str, tag: &str) {
-    std::fs::write(file, format!("{}{}\n", base_line.repeat(22_500), tag)).unwrap();
+/// Lines in each of the 24 files the `load` and `park` tests spread their corpus over, about a
+/// megabyte each. The kill delays are calibrated to the measured run, so the spread straddles
+/// the write window whatever the size.
+const SPREAD_CORPUS_LINES: usize = 22_500;
+
+/// Overwrite a corpus file with a fresh payload of `lines` lines so each call under test
+/// (calibration or real) has real hashing/compression/fsync work to do. The tag ends with the
+/// file's own path, so the files of one round differ: identical files would be stored as one
+/// content-addressed blob, and a kill round would cover a single blob write rather than one per
+/// file.
+fn rewrite_corpus(file: &Path, base_line: &str, lines: usize, tag: &str) {
+    std::fs::write(file, format!("{}{} {}\n", base_line.repeat(lines), tag, file.display())).unwrap();
 }
 
 /// The current pallet head, if one exists yet.
@@ -145,7 +148,7 @@ fn calibrate_stack_duration(area: &Area, file: &Path, base_line: &str, label: &s
 
     let mut slowest = Duration::ZERO;
     for i in 0..samples {
-        rewrite_corpus(file, base_line, &format!("{label} {i}"));
+        rewrite_corpus(file, base_line, STACK_CORPUS_LINES, &format!("{label} {i}"));
         let load = area.run(&["load", "."]);
         assert!(load.status.success(), "calibration load failed: {}", String::from_utf8_lossy(&load.stderr));
 
@@ -241,7 +244,7 @@ fn run_kill_spread(
         *prior_head = head_now;
 
         // 2. Make a fresh change and stage it.
-        rewrite_corpus(file, base_line, &format!("{commit_tag} {i}"));
+        rewrite_corpus(file, base_line, STACK_CORPUS_LINES, &format!("{commit_tag} {i}"));
         let load = area.run(&["load", "."]);
         assert!(load.status.success(), "load failed: {}", String::from_utf8_lossy(&load.stderr));
 
@@ -270,7 +273,7 @@ fn killing_stack_midway_never_corrupts_the_store() {
     // A few megabytes so hashing, compression, the fsync and the rename take long enough that some
     // of the kills below land inside the write window rather than always before or after it.
     let base_line = "the quick brown fox jumps over the lazy dog\n";
-    std::fs::write(&file, base_line.repeat(90_000)).unwrap();
+    rewrite_corpus(&file, base_line, STACK_CORPUS_LINES, "seed");
 
     assert!(area.run(&["prepare"]).status.success());
     assert!(area.run(&["config", "operator.name", "crash@forklift"]).status.success());
@@ -349,7 +352,7 @@ fn calibrate_load_duration(area: &Area, files: &[PathBuf], base_line: &str, labe
     let mut slowest = Duration::ZERO;
     for i in 0..samples {
         for file in files {
-            rewrite_spread_corpus(file, base_line, &format!("{label} {i}"));
+            rewrite_corpus(file, base_line, SPREAD_CORPUS_LINES, &format!("{label} {i}"));
         }
 
         let start = Instant::now();
@@ -404,7 +407,7 @@ fn run_load_kill_spread(
         // 2. A fresh change to every file in the corpus, so the walk below has real work to do
         //    across every directory, not just the ones already touched by an earlier iteration.
         for file in files {
-            rewrite_spread_corpus(file, base_line, &format!("{commit_tag} {i}"));
+            rewrite_corpus(file, base_line, SPREAD_CORPUS_LINES, &format!("{commit_tag} {i}"));
         }
 
         // 3. Spawn the load and SIGKILL it mid-flight.
@@ -480,7 +483,7 @@ fn killing_load_midway_never_leaves_a_shard_referencing_a_missing_or_torn_blob()
 
         for f in 0..4 {
             let file = dir_path.join(format!("file{f}.dat"));
-            std::fs::write(&file, base_line.repeat(20_000)).unwrap();
+            rewrite_corpus(&file, base_line, SPREAD_CORPUS_LINES, "seed");
             files.push(file);
         }
     }
@@ -547,7 +550,7 @@ fn calibrate_park_duration(area: &Area, files: &[PathBuf], base_line: &str, labe
     let mut slowest = Duration::ZERO;
     for i in 0..samples {
         for file in files {
-            rewrite_spread_corpus(file, base_line, &format!("{label} {i}"));
+            rewrite_corpus(file, base_line, SPREAD_CORPUS_LINES, &format!("{label} {i}"));
         }
 
         let start = Instant::now();
@@ -603,7 +606,7 @@ fn run_park_kill_spread(
         area.assert_consistent(&format!("after park {tag} kill #{i}"));
 
         for file in files {
-            rewrite_spread_corpus(file, base_line, &format!("park-{tag} {i}"));
+            rewrite_corpus(file, base_line, SPREAD_CORPUS_LINES, &format!("park-{tag} {i}"));
         }
 
         let before = parked_count(warehouse);
@@ -661,7 +664,7 @@ fn killing_park_midway_never_leaves_a_parked_parcel_referencing_a_missing_or_tor
 
         for f in 0..4 {
             let file = dir_path.join(format!("file{f}.dat"));
-            std::fs::write(&file, base_line.repeat(20_000)).unwrap();
+            rewrite_corpus(&file, base_line, SPREAD_CORPUS_LINES, "seed");
             files.push(file);
         }
     }
