@@ -1869,6 +1869,12 @@ async fn put_trust(State(state): State<Arc<AppState>>,
         Err(error) => return error_response(error),
     };
 
+    // Clients refuse a malformed anchor at the handshake, and trust here is a one-way door: one
+    // stored would lock every client out of this warehouse for good.
+    if let Err(problem) = anchor.validate() {
+        return error_response(unprocessable(problem));
+    }
+
     let warehouse = match resolve_warehouse(&state, &params) {
         Ok(warehouse) => warehouse,
         Err(error) => return error_response(error),
@@ -2064,6 +2070,14 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
                     current.as_deref().unwrap_or("unborn"),
                     request.old_head.as_deref().unwrap_or("unborn")
                 )
+            ));
+        }
+
+        // The head is stored as given; a spelling the ref reader refuses is the request's fault,
+        // and on a case-insensitive filesystem the presence check below would not catch it.
+        if !forklift_core::util::object_utils::is_object_hash(&request.new_head) {
+            return Err(unprocessable(
+                "The new head is not an object hash (64 lowercase hex characters).".to_string()
             ));
         }
 

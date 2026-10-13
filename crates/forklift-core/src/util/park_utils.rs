@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use crate::globals::bay_root;
-use crate::util::file_utils;
+use crate::util::{file_utils, object_utils};
 
 /// The name of the parked-parcels file (inside the forklift root folder): one parcel hash
 /// per line, the last line being the most recently parked one. Parked parcels are regular
@@ -38,7 +38,7 @@ pub fn read_parked_in(dir: &Path) -> Result<Vec<String>, String> {
     let mut hashes: Vec<String> = Vec::new();
 
     for line in content.lines() {
-        let is_valid = line.len() == 64 && line.bytes().all(|b| b.is_ascii_hexdigit());
+        let is_valid = object_utils::is_object_hash(line);
 
         if !is_valid {
             return Err(format!(

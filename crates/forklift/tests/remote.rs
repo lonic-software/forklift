@@ -305,14 +305,19 @@ fn http_status(server_url: &str, method: &str, path: &str, token: Option<&str>) 
 /// upload-targets contract test honest — it asserts the exact wire shape the one client flow
 /// depends on, without going through the client that consumes it.
 fn http_post_json(server_url: &str, path: &str, body: &str) -> (String, String) {
+    http_send_json(server_url, "POST", path, body)
+}
+
+/// Send a JSON body with `method` over raw HTTP and return `(status line, response body)`.
+fn http_send_json(server_url: &str, method: &str, path: &str, body: &str) -> (String, String) {
     let address = server_url.strip_prefix("http://").unwrap();
     let mut stream = std::net::TcpStream::connect(address).unwrap();
 
     write!(
         stream,
-        "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\n\
+        "{} {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\n\
         Content-Length: {}\r\nConnection: close\r\n\r\n{}",
-        path, address, body.len(), body
+        method, path, address, body.len(), body
     ).unwrap();
 
     let mut response = String::new();
@@ -1382,12 +1387,40 @@ fn regenesis_is_gated_by_the_static_token_and_accepted_consciously() {
     assert!(!area.forklift("b", &["lower"]).status.success(), "a refused confirm accepted nothing");
 
     assert_success(&area.forklift("b", &["office", "accept-regenesis", "--confirm", &current]));
+
+    // Nothing is pending now. Re-confirming the held value is success; confirming any other is
+    // refused, so a caller never reads "nothing to accept" as its value being trusted.
+    assert_success(&area.forklift("b", &["office", "accept-regenesis", "--confirm", &current]));
+    let stale = area.forklift("b", &["--json", "office", "accept-regenesis", "--confirm", &previous]);
+    let details = trust_changed_details(&stale);
+    assert_eq!(details["what_changed"], "unexpected");
+    assert_eq!(details["current"], current.as_str());
     assert_success(&area.forklift("b", &["lower"]));
 
     // B's offline audit passes with the prior history attested (legacy).
     let audit = area.forklift("b", &["audit"]);
     assert!(audit.status.success(), "{}", stderr(&audit));
     assert!(stdout(&audit).contains("legacy parcel(s)"), "{}", stdout(&audit));
+}
+
+/// Clients refuse a malformed anchor at the handshake, so the server must never store one: trust
+/// is a one-way door, and a stored malformed anchor would lock every client out for good.
+#[test]
+fn the_server_refuses_to_store_a_malformed_trust_anchor() {
+    let area = TestArea::new("malformed-anchor");
+    let server = Server::start(&area, None);
+
+    let hash = "ab".repeat(32);
+    for genesis in ["x".to_string(), hash.to_uppercase(), format!("{}\u{1b}", &hash[..63])] {
+        let body = serde_json::json!({ "genesis": genesis, "enabled_at": 0, "boundary": [] }).to_string();
+        let (status, response) = http_send_json(&server.url, "PUT", "/v1/trust", &body);
+        assert!(status.contains("422"), "{:?}: {} {}", genesis, status, response);
+    }
+
+    // Nothing was stored: the handshake still declares no anchor, so a franchise works.
+    let (_, info) = http_get(&server.url, "/v1/warehouse");
+    let info: serde_json::Value = serde_json::from_str(&info).unwrap();
+    assert!(info["trust"].is_null(), "{}", info);
 }
 
 #[test]

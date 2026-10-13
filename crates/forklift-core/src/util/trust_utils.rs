@@ -3,9 +3,11 @@
 //! `--json`; `docs/MACHINE_INTERFACE.md`).
 //!
 //! A trust anchor is never adopted or changed silently. First contact adopts it loudly (the
-//! caller warns with [`first_contact`]'s details); a change to an anchor already held is refused
-//! with [`RefusalCode::TrustChanged`], whose details always name the remote's value *now*
-//! (`current`) and the one this warehouse holds (`previous`). The one override,
+//! caller warns with [`first_contact`]'s details); a remote declaring a *different* anchor from the
+//! one held is refused with [`RefusalCode::TrustChanged`], whose details name the remote's value
+//! *now* (`current`) and the one this warehouse holds (`previous`). A remote declaring *no* anchor
+//! is not refused by a sync — it is also a warehouse whose holder enrolled but has not lifted yet —
+//! only by an `--expect` pin. The one override,
 //! `office accept-regenesis --confirm <value>`, succeeds only when its value still equals
 //! `current` — so what is accepted is exactly what a human or agent was shown.
 
@@ -32,9 +34,13 @@ pub enum TrustChange {
     /// second reset this warehouse never saw. Nothing overrides it.
     Unrelated,
 
-    /// The remote's anchor is not the value pinned with `--expect` (`current` is `null` when the
-    /// remote has no anchor at all).
+    /// The remote's anchor is not the value pinned with `--expect`, or confirmed with
+    /// `accept-regenesis --confirm` (`current` is `null` when the remote has no anchor at all).
     Unexpected,
+
+    /// The remote declares an anchor that is not well-formed (a value that is not an object
+    /// hash). `current` is `null`: the value is not repeated. Nothing overrides it.
+    Malformed,
 }
 
 /// The structured detail of a trust refusal or warning, in its documented key order.
@@ -135,6 +141,50 @@ pub fn confirm_mismatch(subject: &str, local_genesis: &str, remote: &TrustAnchor
             current: Some(remote.genesis.clone()),
             previous: Some(local_genesis.to_string()),
             what_changed: TrustChange::Regenesis,
+        },
+    )
+}
+
+/// The refusal for an `accept-regenesis --confirm` naming a value the remote no longer declares,
+/// when the remote's anchor is the one this warehouse already holds (the reset was reverted, or
+/// accepted elsewhere with another value): nothing is pending, and the named value is not trusted.
+///
+/// # Arguments
+/// * `subject`   - The remote's URL.
+/// * `held`      - The genesis this warehouse holds — and the remote declares.
+/// * `confirmed` - The value the caller confirmed.
+pub fn confirm_not_pending(subject: &str, held: &str, confirmed: &str) -> CoreError {
+    refusal(
+        format!(
+            "The confirmed genesis {} is not the remote's: it declares {}, the anchor this \
+            warehouse already holds. Nothing was accepted, and {} is not trusted.",
+            confirmed, held, confirmed
+        ),
+        "Verify out of band which genesis this remote should have.",
+        TrustDetails {
+            subject: subject.to_string(),
+            current: Some(held.to_string()),
+            previous: Some(held.to_string()),
+            what_changed: TrustChange::Unexpected,
+        },
+    )
+}
+
+/// The refusal for a remote whose declared anchor is malformed (see `TrustAnchorDto::validate`).
+/// Classified, so a consumer can tell it from a transport failure worth retrying.
+///
+/// # Arguments
+/// * `subject` - The remote's URL.
+/// * `problem` - What is malformed.
+pub fn malformed(subject: &str, problem: &str) -> CoreError {
+    refusal(
+        format!("{} declares an unusable trust anchor. {} Refusing to talk to it.", subject, problem),
+        "Report it to whoever runs the remote. No override accepts a malformed anchor.",
+        TrustDetails {
+            subject: subject.to_string(),
+            current: None,
+            previous: None,
+            what_changed: TrustChange::Malformed,
         },
     )
 }
@@ -293,5 +343,26 @@ mod tests {
         let original = anchor_changed("http://remote", "held", &anchor("fresh", Some("held")), "Refusing.");
         let framed: String = original.clone().into();
         assert_eq!(CoreError::from(framed), original);
+    }
+
+    #[test]
+    fn a_confirm_the_remote_no_longer_declares_names_the_held_value() {
+        let (_, message, _, details) = refusal_parts(confirm_not_pending("u", "held", "stale"));
+
+        assert_eq!(details, serde_json::json!({
+            "subject": "u", "current": "held", "previous": "held", "what_changed": "unexpected",
+        }));
+        assert!(message.contains("stale is not trusted"), "{}", message);
+    }
+
+    #[test]
+    fn a_malformed_anchor_is_classified_and_does_not_repeat_the_value() {
+        let (code, _, next_step, details) = refusal_parts(malformed("u", "bad hash"));
+
+        assert_eq!(code, RefusalCode::TrustChanged);
+        assert_eq!(details, serde_json::json!({
+            "subject": "u", "current": null, "what_changed": "malformed",
+        }));
+        assert!(!next_step.contains("--confirm"), "{}", next_step);
     }
 }

@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use crate::globals::{bay_root, forklift_root};
-use crate::util::file_utils;
+use crate::util::{file_utils, object_utils};
 
 /// The folder inside the forklift root that holds the *user* pallet ref files (branches).
 /// Each pallet is a file named after the pallet, containing the hash of its head parcel
@@ -319,7 +319,7 @@ pub fn get_pallet_head_in(namespace: PalletNamespace, name: &str) -> Result<Opti
         .map_err(|e| format!("Error while reading the ref of pallet \"{}\": {}", name, e))?;
     let hash = content.trim_end_matches('\n').to_string();
 
-    let is_valid_hash = hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit());
+    let is_valid_hash = object_utils::is_object_hash(&hash);
 
     if !is_valid_hash {
         return Err(format!(
@@ -370,9 +370,19 @@ pub fn set_meta_pallet_head(name: &str, hash: &str) -> Result<(), String> {
 ///
 /// # Returns
 /// * `Ok(())`      - If the head was updated.
-/// * `Err(String)` - If the name is invalid or the ref file could not be written.
+/// * `Err(String)` - If the name is invalid, `hash` is not an object hash, or the ref file could
+///                   not be written.
 pub fn set_pallet_head_in(namespace: PalletNamespace, name: &str, hash: &str) -> Result<(), String> {
     validate_pallet_name(name)?;
+
+    // The writer holds the reader's rule: a ref `get_pallet_head_in` would refuse is never stored.
+    if !object_utils::is_object_hash(hash) {
+        return Err(format!(
+            "Refusing to set the head of pallet \"{}\": the value is not an object hash (64 \
+            lowercase hex characters).",
+            name
+        ));
+    }
 
     let path = get_pallet_ref_path(namespace, name);
 
@@ -573,6 +583,10 @@ pub fn resolve_revision(arg: &str) -> Result<String, String> {
 /// * `Ok(String)`  - The full hash of the single matching object.
 /// * `Err(String)` - If no object matches, or more than one does.
 fn resolve_object_hash_prefix(prefix: &str) -> Result<String, String> {
+    // Hashes are stored and compared in lowercase. On a case-insensitive filesystem an uppercase
+    // prefix still finds the fan-out folder, and the user's casing would end up in the result.
+    let prefix = prefix.to_ascii_lowercase();
+    let prefix = prefix.as_str();
     let mut matches: Vec<String> = Vec::new();
 
     // Loose objects: scan the fan-out folder for matching file names.

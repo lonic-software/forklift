@@ -350,18 +350,23 @@ Every refusal about a remote's trust anchor is one code, `trust_changed` (exit 2
 ```
 
 - `subject` — the remote, as its URL.
-- `current` — the remote's genesis **now**: the value an override must name. `null` only when a
-  pinned remote declares no anchor at all.
+- `current` — the remote's genesis **now**: the value an override must name. `null` when a
+  pinned remote declares no anchor at all, or declares a malformed one (the value is not
+  repeated).
 - `previous` — the genesis this warehouse holds; absent when it holds none (a `franchise`).
 - `what_changed` — a closed set, to branch on instead of the message:
   `regenesis` (the new anchor names the held one as its prior; the one override is
   `office accept-regenesis --confirm <current>`), `unrelated` (it does not: another warehouse,
   tampering, or a reset never seen; nothing overrides it), `unexpected` (the remote's anchor is
-  not the `--expect` pin).
+  not the `--expect` pin or the `--confirm` value), `malformed` (the remote declares an anchor
+  whose values are not object hashes; every command against that remote refuses, and nothing
+  overrides it — not a transport failure, so not worth retrying).
 
 `office accept-regenesis --confirm <value>` accepts only when `<value>` still equals the
 remote's genesis; any other value refuses with fresh `details`, so an agent re-reads `current`
-rather than retrying a stale one. `franchise --expect` and `lower --expect` are checked against the
+rather than retrying a stale one. With nothing pending, it succeeds only when `<value>` is the
+genesis already held; otherwise it refuses (`unexpected`), so "nothing to accept" never reads as
+the value being trusted. `franchise --expect` and `lower --expect` are checked against the
 first response, before anything is fetched or created.
 
 A first-contact adoption is not a refusal: the command succeeds, reports the genesis as

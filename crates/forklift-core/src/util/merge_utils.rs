@@ -66,7 +66,7 @@ pub fn read_consolidation_state_in(dir: &Path) -> Result<Option<ConsolidationSta
     let their_head = lines.next().unwrap_or("").to_string();
     let their_pallet = lines.next().unwrap_or("").to_string();
 
-    let is_valid_hash = their_head.len() == 64 && their_head.bytes().all(|b| b.is_ascii_hexdigit());
+    let is_valid_hash = object_utils::is_object_hash(&their_head);
 
     if !is_valid_hash || their_pallet.is_empty() {
         return Err(format!(

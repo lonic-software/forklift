@@ -825,24 +825,14 @@ pub async fn accept_regenesis(confirm: Option<String>) -> Result<(), String> {
     let client = RemoteClient::from_config()?;
 
     let Some(confirmed) = confirm else {
-        let Some(local) = office_utils::read_trust_anchor()? else {
-            return Err(
-                "This warehouse has no trust anchor; a plain \"lower\" adopts the \
-                remote's trust on first contact.".to_string()
-            );
-        };
-
-        let info = client.fetch_info().await?;
-
-        let Some(remote_trust) = &info.trust else {
-            return Err("The remote has no trust anchor; there is no re-genesis to accept.".to_string());
-        };
-
-        if remote_trust.genesis == local.genesis {
+        let remote_utils::RegenesisState::Pending { local, remote: remote_trust, .. } =
+            remote_utils::pending_regenesis(&client).await? else {
             output::message("The remote's trust anchor matches this warehouse's; nothing to accept.");
 
             return Ok(());
-        }
+        };
+        let remote_trust = &remote_trust;
+        let names_prior = remote_trust.prior_genesis.as_deref() == Some(local.genesis.as_str());
 
         crate::human!("The remote's trust anchor CHANGED:");
         crate::human!("  your pinned genesis: {}", local.genesis);
@@ -850,17 +840,25 @@ pub async fn accept_regenesis(confirm: Option<String>) -> Result<(), String> {
         crate::human!("  names as its prior:  {}", remote_trust.prior_genesis.as_deref().unwrap_or("(none)"));
         crate::human!("  adopts office head:  {}", remote_trust.adopts.as_deref().unwrap_or("(none)"));
         crate::human!();
-        crate::human!("Accepting means trusting whoever performed the reset as the new root of");
-        crate::human!("this warehouse. Verify that out-of-band (ask the operators you know), then");
-        crate::human!("re-run with --confirm and the remote genesis above.");
-        crate::human!();
+        if names_prior {
+            crate::human!("Accepting means trusting whoever performed the reset as the new root of");
+            crate::human!("this warehouse. Verify that out-of-band (ask the operators you know), then");
+            crate::human!("re-run with --confirm and the remote genesis above.");
+            crate::human!();
+        }
 
+        // The refusal's own next step says whether there is anything to confirm: a re-genesis
+        // names the value, an unrelated anchor has no override.
         return Err(trust_utils::anchor_changed(
-            client.url(), &local.genesis, remote_trust, "Accepting it needs --confirm with that genesis."
+            client.url(), &local.genesis, remote_trust, "Nothing was accepted."
         ).into());
     };
 
-    let (old, new) = remote_utils::accept_regenesis(&client, &confirmed).await?;
+    let Some((old, new)) = remote_utils::accept_regenesis(&client, &confirmed).await? else {
+        output::message("The remote's trust anchor matches this warehouse's; nothing to accept.");
+
+        return Ok(());
+    };
 
     output::message(format!(
         "Accepted the re-genesis.\n\

@@ -78,6 +78,42 @@ pub struct TrustAnchorDto {
     pub adopts: Option<String>,
 }
 
+impl TrustAnchorDto {
+    /// Refuse an anchor whose hashes are not canonical object hashes. Every one of them is shown
+    /// to a human to verify out of band, so a value that could carry terminal escapes or
+    /// look-alike characters is rejected where an anchor is read — the client's handshake, the
+    /// server's `PUT /v1/trust` — rather than sanitized at each place it is printed.
+    pub fn validate(&self) -> Result<(), String> {
+        // The label is built only for the field that fails: a boundary holds one entry per pallet.
+        let fields = std::iter::once(("genesis", None, &self.genesis))
+            .chain(self.boundary.iter().enumerate().map(|(i, hash)| ("boundary", Some(i), hash)))
+            .chain(self.prior_genesis.iter().map(|hash| ("prior_genesis", None, hash)))
+            .chain(self.adopts.iter().map(|hash| ("adopts", None, hash)));
+
+        // The problem names the field and what is wrong with it, never the value: the value came
+        // from a remote that is misbehaving, and repeating it would hand that remote the message.
+        for (field, index, hash) in fields {
+            if crate::util::object_utils::is_object_hash(hash) {
+                continue;
+            }
+
+            let problem = match hash.bytes().position(|b| !matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+                Some(position) if position < 64 => {
+                    format!("byte {} is not a lowercase hex digit", position)
+                }
+                _ => format!("it is {} bytes long, not 64", hash.len()),
+            };
+
+            return Err(format!(
+                "The trust anchor is malformed: its {} is not an object hash ({}).",
+                index.map_or(field.to_string(), |i| format!("{}[{}]", field, i)), problem
+            ));
+        }
+
+        Ok(())
+    }
+}
+
 impl From<&TrustAnchor> for TrustAnchorDto {
     fn from(anchor: &TrustAnchor) -> Self {
         TrustAnchorDto {
@@ -340,5 +376,39 @@ mod tests {
         let json = r#"{ "control_plane": [], "blobs": [], "more": true, "future": 1 }"#;
         let back: CommitLiftRequest = serde_json::from_str(json).expect("unknown fields ignored");
         assert!(back.more);
+    }
+
+    #[test]
+    fn a_trust_anchor_whose_hashes_are_not_hashes_is_refused() {
+        let hash = "ab".repeat(32);
+        let anchor = |genesis: &str, boundary: Vec<String>, prior: Option<&str>| TrustAnchorDto {
+            genesis: genesis.to_string(),
+            enabled_at: 0,
+            boundary,
+            prior_genesis: prior.map(str::to_string),
+            adopts: None,
+        };
+
+        assert_eq!(anchor(&hash, vec![hash.clone()], Some(&hash)).validate(), Ok(()));
+
+        // Terminal escapes, a bidi override that would make a hash read as another, a short
+        // value, in each field a human is shown.
+        let escape = format!("{}\u{1b}]0;x\u{7}", &hash[..56]);
+        let bidi = format!("{}\u{202e}{}", &hash[..32], &hash[..31]);
+        assert!(anchor(&escape, vec![], None).validate().is_err());
+        assert!(anchor(&hash, vec![bidi.clone()], None).validate().is_err());
+        assert!(anchor(&hash, vec![], Some("abc")).validate().is_err());
+
+        // Uppercase is a hash in another spelling, which every byte-for-byte comparison misses.
+        assert!(anchor(&hash.to_uppercase(), vec![], None).validate().is_err());
+
+        // The problem names the field and the defect, never the remote's value.
+        let problem = anchor(&hash, vec![bidi.clone()], None).validate().unwrap_err();
+        assert!(problem.contains("boundary[0]") && problem.contains("byte 32"), "{}", problem);
+        assert!(!problem.contains('\u{202e}') && !problem.contains(&hash[..32]), "{}", problem);
+        let problem = anchor(&escape, vec![], None).validate().unwrap_err();
+        assert!(!problem.contains('\u{1b}'), "{}", problem);
+        let problem = anchor(&hash, vec![], Some("abc")).validate().unwrap_err();
+        assert!(problem.contains("prior_genesis") && problem.contains("3 bytes"), "{}", problem);
     }
 }

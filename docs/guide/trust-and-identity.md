@@ -102,13 +102,16 @@ forklift franchise <url> my-project --expect <genesis>
 forklift lower --expect <genesis>
 ```
 
-`--expect` is compared, exactly, against the anchor the remote declares in its
+`--expect` is compared, exactly, against the genesis the remote declares in its
 first response. A mismatch — or a remote with no anchor at all — is refused
 before any download and before the target directory is created (`trust_changed`,
-exit 22, `what_changed: "unexpected"`).
+exit 22, `what_changed: "unexpected"`). The pin covers the genesis only: the rest
+of the anchor (the trust boundary of pre-trust history) is adopted as the remote
+declares it.
 
 Once an anchor is held, a remote that later declares a different one is always
-refused (`trust_changed`, exit 22). Under `--json` the refusal carries
+refused (`trust_changed`, exit 22); a remote declaring none is not, so pin it with
+`--expect` to require one. Under `--json` the refusal carries
 `details` — `subject` (the remote URL), `current` (the remote's genesis now),
 `previous` (the one this warehouse holds) and `what_changed`: `regenesis` when
 the new anchor names the held one as its prior (see §9), `unrelated` when it
@@ -363,7 +366,13 @@ forklift office accept-regenesis --confirm <genesis> # the SSH host-key-change m
 the moment of accepting. If the anchor changed again after it was shown — or the
 value was mistyped — nothing is accepted, and the refusal names the current
 value (`trust_changed`, `what_changed: "regenesis"`), so what you accept is
-exactly what you verified.
+exactly what you verified. With nothing left to accept, `--confirm` succeeds only
+for the genesis already held — any other value is refused, never reported as
+accepted.
+
+A remote whose anchor is malformed — a value that is not an object hash — is
+refused by every command (`what_changed: "malformed"`); servers refuse to store
+one in the first place.
 
 ---
 

@@ -437,6 +437,12 @@ fn trusted_lift_audits_the_office_and_the_pallet() {
     let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
     upload_all(&head, &harvest);
 
+    // A malformed anchor is refused before anything is stored: clients would refuse it at the
+    // handshake, and a stored one could never be replaced.
+    let mut malformed = anchor.clone();
+    malformed.genesis = anchor.genesis.to_uppercase();
+    assert_eq!(head.put_trust(&malformed).expect_err("malformed anchor").status, Status::Unprocessable);
+
     // Trust first, then the office pallet, then the working pallet — the client's order.
     assert_eq!(head.put_trust(&anchor).expect("put trust"), TrustResult::Established);
     // Idempotent.

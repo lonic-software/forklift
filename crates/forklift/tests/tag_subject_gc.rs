@@ -21,7 +21,7 @@
 //! Before that fix, `probe_subject`'s presence check (`file_utils::does_object_exist`) reached
 //! `get_path_for_object`, which refuses a non-hash string outright — turning one bad record into
 //! an anonymous, whole-command failure for `tag list`/`tag show` alike. A malformed subject is
-//! now classified explicitly (`file_utils::is_valid_object_hash`) and marks, exactly like an
+//! now classified explicitly (`file_utils::is_object_hash_or_prefix`) and marks, exactly like an
 //! ordinary absence, with its own accurate wording. **This case is not covered end-to-end here**:
 //! no shipped `forklift` command can construct a malformed-subject `@tags` record locally (`tag
 //! create`'s only two subject sources already verify hash shape and object presence before

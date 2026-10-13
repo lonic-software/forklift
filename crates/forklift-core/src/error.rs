@@ -270,18 +270,19 @@ impl std::error::Error for CoreError {}
 /// loses the machine code — degrading to `Other` rather than leaking the raw `\u{1f}` frame or
 /// inventing a variant. The next step is folded into the message (rather than dropped) because
 /// this is exactly the forward-compat case — a newer peer's refusal — where recovery guidance
-/// matters most and there is no typed field left to carry it in.
+/// matters most and there is no typed field left to carry it in. A frame whose details do not
+/// parse degrades the same way: a refusal is never decoded without the details its code promises.
 impl From<String> for CoreError {
     fn from(message: String) -> CoreError {
         if let Some((code, human, next_step, details)) = deframe_with_details(&message) {
-            return match RefusalCode::from_code(code) {
-                Some(code) => CoreError::Refusal {
+            return match (RefusalCode::from_code(code), details) {
+                (Some(code), Ok(details)) => CoreError::Refusal {
                     code,
                     message: human.to_string(),
                     next_step: next_step.to_string(),
                     details,
                 },
-                None => CoreError::Other(with_next_step(human, next_step)),
+                _ => CoreError::Other(with_next_step(human, next_step)),
             };
         }
 
@@ -344,9 +345,10 @@ fn with_next_step(human: &str, next_step: &str) -> String {
     }
 }
 
-/// Strip ASCII control characters (replacing each with a space) so text is frame-safe and
-/// render-safe. See [`CoreError::refusal`].
-fn sanitize(text: &str) -> String {
+/// Strip control characters (replacing each with a space) so text is frame-safe and
+/// render-safe — also for a head printing a remote-supplied value outside a refusal. See
+/// [`CoreError::refusal`].
+pub fn sanitize(text: &str) -> String {
     text.chars().map(|c| if c.is_control() { ' ' } else { c }).collect()
 }
 
@@ -381,16 +383,20 @@ pub fn deframe(message: &str) -> Option<(&str, &str, &str)> {
 }
 
 /// Decode a sentinel frame in full: [`deframe`]'s three fields, plus the detail when the frame
-/// carries any. A detail field that does not parse as JSON is dropped rather than failing the
-/// decode — the refusal's code and texts are still exact.
-fn deframe_with_details(message: &str) -> Option<(&str, &str, &str, Option<serde_json::Value>)> {
+/// carries any — `Err(())` when it does not parse as JSON, for the caller to refuse to decode a
+/// refusal from (never a refusal quietly missing the details its code promises).
+#[allow(clippy::type_complexity)]
+fn deframe_with_details(message: &str) -> Option<(&str, &str, &str, Result<Option<serde_json::Value>, ()>)> {
     let rest = message.strip_prefix(REFUSAL_PREFIX)?;
     let mut parts = rest.splitn(4, REFUSAL_FIELD_SEPARATOR);
 
     let code = parts.next()?;
     let human = parts.next()?;
     let next_step = parts.next()?;
-    let details = parts.next().and_then(|text| serde_json::from_str(text).ok());
+    let details = match parts.next() {
+        None => Ok(None),
+        Some(text) => serde_json::from_str(text).map(Some).map_err(|_| ()),
+    };
 
     Some((code, human, next_step, details))
 }
@@ -398,6 +404,15 @@ fn deframe_with_details(message: &str) -> Option<(&str, &str, &str, Option<serde
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_frame_whose_details_do_not_parse_is_not_decoded_as_a_refusal() {
+        let framed = format!("{}{}{{not json", frame("trust_changed", "changed", "verify", None), REFUSAL_FIELD_SEPARATOR);
+
+        // The texts survive and the code is dropped, as for an unknown code; the raw frame never
+        // reaches output.
+        assert_eq!(CoreError::from(framed), CoreError::Other("changed verify".to_string()));
+    }
 
     /// Proves the round trip for every variant the `refusal_codes!` invocation actually declares —
     /// real exhaustiveness now that `ALL_CODES` is generated from that same invocation (see its doc

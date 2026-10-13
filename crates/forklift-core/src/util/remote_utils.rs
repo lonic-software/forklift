@@ -2812,6 +2812,22 @@ impl RemoteClient {
             ));
         }
 
+        if let Some(trust) = &info.trust {
+            trust.validate().map_err(|problem| String::from(trust_utils::malformed(self.url(), &problem)))?;
+        }
+
+        // A head is written into a local ref as given, and only fetched (and so verified) when
+        // it is missing. A non-canonical spelling of a held head — uppercase finds the same file
+        // on a case-insensitive filesystem — would skip both and wedge the pallet. Neither the
+        // name nor the value is repeated: both came from the remote.
+        if info.pallets.values().any(|head| !object_utils::is_object_hash(head)) {
+            return Err(format!(
+                "The remote {} reports a pallet head that is not an object hash (64 lowercase hex \
+                characters). Refusing to sync with it; report it to whoever runs the remote.",
+                self.base
+            ));
+        }
+
         Ok(info)
     }
 
@@ -5337,11 +5353,6 @@ pub async fn adopt_remote_trust(client: &RemoteClient,
 
     stats.fetch = fetch_history(client, remote_office_head, &Progress::NONE).await?;
 
-    if office_utils::read_trust_anchor()?.is_none() {
-        office_utils::write_trust_anchor(&remote_trust.to_anchor())?;
-        stats.adopted_genesis = Some(remote_trust.genesis.clone());
-    }
-
     match pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME)? {
         None => {
             pallet_utils::set_meta_pallet_head(OFFICE_PALLET_NAME, remote_office_head)?;
@@ -5364,7 +5375,56 @@ pub async fn adopt_remote_trust(client: &RemoteClient,
         }
     }
 
+    // Adopted last, after every refusal above: an anchor written before one would stand
+    // unannounced, and the next sync — finding it held — would never announce it either. If the
+    // write itself fails, nothing is held, and the next sync adopts and announces it.
+    if office_utils::read_trust_anchor()?.is_none() {
+        office_utils::write_trust_anchor(&remote_trust.to_anchor())?;
+        stats.adopted_genesis = Some(remote_trust.genesis.clone());
+    }
+
     Ok(stats)
+}
+
+/// Where a warehouse stands against its remote's trust anchor, as `office accept-regenesis` sees
+/// it.
+pub enum RegenesisState {
+    /// The remote's anchor differs from the held one: the held anchor, the remote's, and the
+    /// handshake that carried it.
+    Pending {
+        local: office_utils::TrustAnchor,
+        remote: TrustAnchorDto,
+        info: WarehouseInfo,
+    },
+    /// The remote's anchor is the held one.
+    InSync { local: office_utils::TrustAnchor },
+}
+
+/// The re-genesis `office accept-regenesis` would act on. Shared by the describing and the
+/// accepting path, so both refuse the same states the same way.
+///
+/// # Returns
+/// * `Ok(RegenesisState)` - Whether a re-genesis is pending, with the anchors on each side.
+/// * `Err(String)`        - This warehouse or the remote holds no anchor, or the handshake failed.
+pub async fn pending_regenesis(client: &RemoteClient) -> Result<RegenesisState, String> {
+    let Some(local) = office_utils::read_trust_anchor()? else {
+        return Err(
+            "This warehouse has no trust anchor; a plain \"lower\" adopts the remote's \
+            trust on first contact.".to_string()
+        );
+    };
+
+    let info = client.fetch_info().await?;
+
+    let Some(remote) = info.trust.clone() else {
+        return Err("The remote has no trust anchor; there is no re-genesis to accept.".to_string());
+    };
+
+    if remote.genesis == local.genesis {
+        return Ok(RegenesisState::InSync { local });
+    }
+
+    Ok(RegenesisState::Pending { local, remote, info })
 }
 
 /// Consciously accept a remote's re-genesis (§8.7): the loud, deliberate counterpart
@@ -5383,29 +5443,27 @@ pub async fn adopt_remote_trust(client: &RemoteClient,
 /// * `confirmed` - The new genesis being accepted.
 ///
 /// # Returns
-/// * `Ok((TrustAnchor, TrustAnchor))` - The replaced and the adopted anchor.
-/// * `Err(String)`                    - If there is nothing to accept, the custody chain does
-///                                      not match or `confirmed` is not the remote's genesis
-///                                      now (both `trust_changed` refusals), or a transfer
-///                                      failed.
+/// * `Ok(Some((TrustAnchor, TrustAnchor)))` - The replaced and the adopted anchor.
+/// * `Ok(None)`                             - The remote's anchor is already the held one and
+///                                            `confirmed` names it: already accepted.
+/// * `Err(String)`                          - If either side holds no anchor, the custody chain
+///                                            does not match or `confirmed` is not the remote's
+///                                            genesis now (both `trust_changed` refusals), or a
+///                                            transfer failed.
 pub async fn accept_regenesis(client: &RemoteClient,
-                              confirmed: &str) -> Result<(office_utils::TrustAnchor, office_utils::TrustAnchor), String> {
-    let Some(local) = office_utils::read_trust_anchor()? else {
-        return Err(
-            "This warehouse has no trust anchor; a plain \"lower\" adopts the remote's \
-            trust on first contact.".to_string()
-        );
+                              confirmed: &str)
+    -> Result<Option<(office_utils::TrustAnchor, office_utils::TrustAnchor)>, String> {
+    let (local, remote_trust, info) = match pending_regenesis(client).await? {
+        RegenesisState::Pending { local, remote, info } => (local, remote, info),
+        // Nothing is pending. That is success only if the confirmed value is the one held;
+        // otherwise the remote moved away from what was shown, and saying "nothing to accept"
+        // would let a caller believe its value is now trusted.
+        RegenesisState::InSync { local } if local.genesis == confirmed => return Ok(None),
+        RegenesisState::InSync { local } => {
+            return Err(trust_utils::confirm_not_pending(client.url(), &local.genesis, confirmed).into());
+        }
     };
-
-    let info = client.fetch_info().await?;
-
-    let Some(remote_trust) = &info.trust else {
-        return Err("The remote has no trust anchor; there is no re-genesis to accept.".to_string());
-    };
-
-    if remote_trust.genesis == local.genesis {
-        return Err("The remote's trust anchor matches this warehouse's; there is nothing to accept.".to_string());
-    }
+    let remote_trust = &remote_trust;
 
     if remote_trust.prior_genesis.as_deref() != Some(local.genesis.as_str()) {
         return Err(trust_utils::anchor_changed(
@@ -5429,7 +5487,7 @@ pub async fn accept_regenesis(client: &RemoteClient,
     office_utils::replace_trust_anchor(&new_anchor)?;
     pallet_utils::set_meta_pallet_head(OFFICE_PALLET_NAME, remote_office_head)?;
 
-    Ok((local, new_anchor))
+    Ok(Some((local, new_anchor)))
 }
 
 /// Push the local trust state (lift direction): establish the anchor on the remote when
@@ -7261,6 +7319,50 @@ mod tests {
             error.to_lowercase().contains("location"),
             "the error should name the missing Location header: {}", error
         );
+    }
+
+    /// A handshake whose pallet head is not the canonical spelling of a hash is refused before
+    /// any caller can write it into a local ref. Uppercase is the case that matters: on a
+    /// case-insensitive filesystem it finds a held object's file, skips the fetch that would
+    /// verify it, and the ref it leaves behind is refused on every later read.
+    #[test]
+    fn fetch_info_refuses_a_handshake_with_a_non_canonical_pallet_head() {
+        let serve = |head: String| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let body = serde_json::json!({
+                "protocol": PROTOCOL_VERSION,
+                "default_pallet": "main",
+                "pallets": { "main": head },
+                "trust": null,
+            }).to_string();
+
+            std::thread::spawn(move || {
+                use std::io::Write;
+
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let _ = read_test_request(&mut stream);
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                        Connection: close\r\n\r\n{}",
+                        body.len(), body
+                    );
+                    let _ = stream.flush();
+                }
+            });
+
+            let client = RemoteClient::new(&url, None).unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            runtime.block_on(client.fetch_info())
+        };
+
+        let hash = "ab".repeat(32);
+        assert!(serve(hash.clone()).is_ok(), "a canonical head must pass");
+
+        let error = serve(hash.to_uppercase()).err().expect("an uppercase head must be refused");
+        assert!(error.contains("not an object hash"), "{}", error);
+        assert!(!error.contains(&hash.to_uppercase()), "the remote's value is not repeated: {}", error);
     }
 
     /// A remote that reads one request and answers it with a bare status line and an empty body —
