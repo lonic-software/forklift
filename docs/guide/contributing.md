@@ -70,6 +70,11 @@ Notes:
   `FORKLIFT_KEYS_DIR` env vars pointed at a scratch directory, so they never
   touch a developer's real config or keys. Use the same pattern for new tests
   (`TestWarehouse` / `TestArea` helpers already do this).
+- Integration tests launch the binaries with `FORKLIFT_FSYNC=0`: each test file's
+  `forklift_command()` (and `server_command()` in `remote.rs`) sets it, which makes
+  the suite several times faster. Launch through those helpers, not
+  `Command::new(FORKLIFT)`. The exception is `crash_consistency.rs`, the durability
+  suite, which keeps fsync on.
 - The hardening test spine is worth knowing when touching the object store,
   the parsers, or the parallel walks: `crates/forklift-core/tests/fuzz_formats.rs`
   fuzzes every parse entry point (must never panic) and checks round-trip
