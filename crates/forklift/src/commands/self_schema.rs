@@ -169,7 +169,7 @@ enum Param {
 #[derive(Serialize)]
 struct Input {
     /// The value is a credential.
-    #[serde(skip_serializing_if = "is_false")]
+    #[serde(skip_serializing_if = "crate::output::is_false")]
     secret: bool,
 }
 
@@ -196,12 +196,8 @@ struct Repeat {
     max: Option<u32>,
 
     /// Every value is a credential.
-    #[serde(skip_serializing_if = "is_false")]
+    #[serde(skip_serializing_if = "crate::output::is_false")]
     secret: bool,
-}
-
-fn is_false(value: &bool) -> bool {
-    !*value
 }
 
 fn is_zero(value: &u32) -> bool {

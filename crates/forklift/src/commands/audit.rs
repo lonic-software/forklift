@@ -48,7 +48,7 @@ pub fn handle_command(pallet: Option<String>, full: bool) -> Result<(), String> 
     let mut report = AuditReport {
         genesis: anchor.genesis.clone(),
         pallet: pallet_ref.to_wire(),
-        pallet_verified: None,
+        pallet_verified: false,
         verified_parcels: 0,
         legacy_parcels: 0,
         full,
@@ -67,7 +67,7 @@ pub fn handle_command(pallet: Option<String>, full: bool) -> Result<(), String> 
 
         let (verified, legacy) = audit_utils::verify_pallet_history(&head, &anchor, &office_state, None)?;
 
-        report.pallet_verified = Some(true);
+        report.pallet_verified = true;
         report.verified_parcels = verified;
         report.legacy_parcels = legacy;
 
@@ -108,8 +108,8 @@ pub(crate) struct AuditReport {
 
     /// Whether a working pallet's history was audited (absent when only the office
     /// chain was — i.e. the audited pallet *is* the office).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pallet_verified: Option<bool>,
+    #[serde(skip_serializing_if = "crate::output::is_false")]
+    pallet_verified: bool,
 
     /// How many signed parcels verified on the pallet.
     verified_parcels: usize,
@@ -192,7 +192,7 @@ impl CommandOutput for AuditReport {
     fn render_human(&self) {
         println!("Office chain verified back to genesis {}.", self.genesis);
 
-        if self.pallet_verified != Some(true) {
+        if !self.pallet_verified {
             return;
         }
 

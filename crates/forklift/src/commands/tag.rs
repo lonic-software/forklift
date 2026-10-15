@@ -308,7 +308,7 @@ pub(crate) struct TagView {
     /// (`franchise`/`lower`), and nothing validates a record's `name` on the way in — only
     /// `tag create` does, for a name of its own choosing — so a foreign or older client's record
     /// can carry one this build would never have created itself.
-    #[serde(skip_serializing_if = "is_false")]
+    #[serde(skip_serializing_if = "crate::output::is_false")]
     name_invalid: bool,
 
     /// The parcel the tag points at.
@@ -338,7 +338,7 @@ pub(crate) struct TagView {
 
     /// Present and `true` when the subject parcel is not in this store (never fetched, collected,
     /// or recorded with an invalid hash); omitted when the subject is present.
-    #[serde(skip_serializing_if = "is_false")]
+    #[serde(skip_serializing_if = "crate::output::is_false")]
     subject_absent: bool,
 
     // Render-only: which wording `render_human`'s warning line uses when `subject_absent` is
@@ -466,10 +466,6 @@ impl CommandOutput for TagView {
 ///
 /// # Returns
 /// * `s`, truncated to at most `chars` characters (unchanged if already shorter).
-fn is_false(value: &bool) -> bool {
-    !*value
-}
-
 fn truncate_chars(s: &str, chars: usize) -> String {
     s.chars().take(chars).collect()
 }

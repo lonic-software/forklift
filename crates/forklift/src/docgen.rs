@@ -200,11 +200,18 @@ fn check_output_contract() -> Result<(), String> {
     }
 
     let schema = OutputSchema::of::<Probe>().schema;
-    let required = schema.get("required").cloned().unwrap_or_default();
-    if required != serde_json::json!(["always_written", "written_with_a_default"]) {
+    let required: std::collections::BTreeSet<&str> = schema
+        .get("required")
+        .and_then(|value| value.as_array())
+        .map(|names| names.iter().filter_map(|name| name.as_str()).collect())
+        .unwrap_or_default();
+    let expected = std::collections::BTreeSet::from(["always_written", "written_with_a_default"]);
+    if required != expected {
         return Err(format!(
-            "docgen: output schemas must mark `required` as serialized (a skipped field optional, \
-             an Option without a skip required); the probe got `required: {required}`."
+            "docgen: output schemas must mark `required` as serialized: a field with \
+             `skip_serializing_if` is optional, with or without `#[serde(default)]`, and every \
+             other field (an `Option`, or one with only `#[serde(default)]`) is required. The \
+             probe expected {expected:?} and got {required:?}."
         ));
     }
     Ok(())

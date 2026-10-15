@@ -184,10 +184,7 @@ A command not listed here either reports only the generic human-message shape `{
     },
     "pallet_verified": {
       "description": "Whether a working pallet's history was audited (absent when only the office\nchain was — i.e. the audited pallet *is* the office).",
-      "type": [
-        "boolean",
-        "null"
-      ]
+      "type": "boolean"
     },
     "scope": {
       "anyOf": [
