@@ -150,11 +150,23 @@ impl Serialize for Params {
     }
 }
 
-/// One param, in Pult's param kinds.
+/// One param: its kind, and what its value is for.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[derive(Serialize)]
+struct Param {
+    #[serde(flatten)]
+    kind: Kind,
+
+    /// What the value is for, from the argument's help; absent when it has none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+}
+
+/// A param's kind, in Pult's vocabulary.
 #[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
 #[serde(rename_all = "lowercase")]
-enum Param {
+enum Kind {
     /// A required single positional; Pult prompts for it when it is absent.
     Input(Input),
 
@@ -289,6 +301,7 @@ struct Positional {
     required: bool,
     variadic: bool,
     secret: bool,
+    help: Option<String>,
 }
 
 impl Walk<'_> {
@@ -324,19 +337,19 @@ impl Walk<'_> {
 
             let long = arg.get_long()
                 .ok_or_else(|| refusal(&path, arg, "it has no long name for Pult to pass"))?;
-            let param = match arg.get_action() {
+            let kind = match arg.get_action() {
                 ArgAction::SetTrue => {
                     switch_refusals(&path, arg)?;
                     if arg.get_num_args().is_some() {
                         return Err(refusal(&path, arg, "it is a switch with a value count"));
                     }
-                    Param::Flag(Flag { arg: format!("--{long}") })
+                    Kind::Flag(Flag { arg: format!("--{long}") })
                 }
                 ArgAction::Set | ArgAction::Append => {
                     single_valued(&path, arg)?;
                     let required = arg.is_required_set();
                     let append = matches!(arg.get_action(), ArgAction::Append);
-                    Param::Repeat(Repeat {
+                    Kind::Repeat(Repeat {
                         arg: Some(format!("--{long}")),
                         min: if required { 1 } else { 0 },
                         max: if append { None } else { Some(1) },
@@ -345,7 +358,7 @@ impl Walk<'_> {
                 }
                 other => return Err(refusal(&path, arg, &format!("its action {other:?} has no Pult param"))),
             };
-            named.0.push((long.to_string(), param));
+            named.0.push((long.to_string(), Param { kind, description: help(arg) }));
         }
 
         let mut params = named;
@@ -512,7 +525,16 @@ fn positional(path: &[&str], arg: &Arg, secret: bool) -> Result<Positional, Stri
         required: arg.is_required_set(),
         variadic,
         secret,
+        help: help(arg),
     })
+}
+
+/// An argument's help, as its param's description: the short help, else the long one; none
+/// when it has neither, since Pult treats an empty description as absent anyway.
+fn help(arg: &Arg) -> Option<String> {
+    arg.get_help().or_else(|| arg.get_long_help())
+        .map(|text| text.to_string())
+        .filter(|text| !text.trim().is_empty())
 }
 
 /// Refuse an option whose value count is anything but one value per occurrence. On the
@@ -587,12 +609,12 @@ fn layout(path: &[&str], positionals: Vec<Positional>) -> Result<Vec<(String, Pa
                 earlier.key, positional.key
             ));
         }
-        let param = if positional.variadic {
-            Param::Repeat(Repeat { arg: None, min: 1, max: None, secret: positional.secret })
+        let kind = if positional.variadic {
+            Kind::Repeat(Repeat { arg: None, min: 1, max: None, secret: positional.secret })
         } else {
-            Param::Input(Input { secret: positional.secret })
+            Kind::Input(Input { secret: positional.secret })
         };
-        params.push((positional.key, param));
+        params.push((positional.key, Param { kind, description: positional.help }));
     }
 
     if !optional.is_empty() {
@@ -603,7 +625,19 @@ fn layout(path: &[&str], positionals: Vec<Positional>) -> Result<Vec<(String, Pa
         };
         let key = optional.iter().map(|positional| positional.key.as_str()).collect::<Vec<_>>().join("-");
         let secret = optional.iter().any(|positional| positional.secret);
-        params.push((key, Param::Repeat(Repeat { arg: None, min: 0, max, secret })));
+        // One param stands for the whole run, so each member's help is labelled with its own
+        // key, in the order the values fill them.
+        let description = match optional.as_slice() {
+            [only] => only.help.clone(),
+            run => {
+                let parts: Vec<String> = run.iter()
+                    .filter_map(|positional| positional.help.as_ref().map(|help| format!("{}: {help}", positional.key)))
+                    .collect();
+                (!parts.is_empty()).then(|| parts.join("; "))
+            }
+        };
+        let kind = Kind::Repeat(Repeat { arg: None, min: 0, max, secret });
+        params.push((key, Param { kind, description }));
     }
 
     Ok(params)
@@ -691,13 +725,21 @@ mod tests {
 
         let diff = json("diff");
         assert!(diff.contains(r#""run":"diff {staged} -- {targets}""#), "{diff}");
-        assert!(diff.contains(r#""params":{"staged":{"flag":{"arg":"--staged"}},"targets":{"repeat":{}}}"#), "{diff}");
+        assert!(diff.contains(concat!(
+            r#""staged":{"flag":{"arg":"--staged"},"#,
+            r#""description":"Compare the inventory against the pallet head (what \"stack\" would record)"}"#,
+        )), "{diff}");
+        assert!(diff.contains(r#""targets":{"repeat":{},"description":"#), "{diff}");
 
         let config = json("config");
-        assert!(config.contains(r#""key-value":{"repeat":{"max":2,"secret":true}}"#), "{config}");
+        assert!(config.contains(concat!(
+            r#""key-value":{"repeat":{"max":2,"secret":true},"description":"#,
+            r#""key: The configuration key (e.g. \"operator.name\"); omit it to list every key; "#,
+            r#"value: The value to set the key to; omit it to print the current value"}"#,
+        )), "{config}");
 
         let franchise = json("franchise");
-        assert!(franchise.contains(r#""token":{"repeat":{"arg":"--token","max":1,"secret":true}}"#), "{franchise}");
+        assert!(franchise.contains(r#""token":{"repeat":{"arg":"--token","max":1,"secret":true},"#), "{franchise}");
         assert!(franchise.contains(r#""run":"franchise {pallet} {token} {only} {expect} -- {url} {directory}""#), "{franchise}");
 
         let office = json("office");
@@ -754,6 +796,21 @@ mod tests {
         /// A trailing positional that swallows options
         #[command(trailing_var_arg = true)]
         Swallow { rest: Vec<String> },
+        /// Described
+        Described {
+            /// Short help
+            ///
+            /// Only in the long help
+            #[arg(long)]
+            both: Option<String>,
+            #[arg(long, long_help = "Long help only")]
+            long_only: bool,
+            #[arg(long)]
+            bare: bool,
+            /// The first
+            first: Option<String>,
+            second: Option<String>,
+        },
     }
 
     /// The probe tree with only `name` under its root, so each probe is judged alone.
@@ -794,6 +851,22 @@ mod tests {
         );
     }
 
+    /// A param's description is its argument's short help, else its long help, else absent;
+    /// a collapsed run of positionals labels each member's help with that member's key.
+    #[test]
+    fn a_param_is_described_by_its_help() {
+        let doc = describe(&probe("described"), &NO_TABLES).unwrap();
+        assert_eq!(
+            serde_json::to_string(&doc.commands[0].params).unwrap(),
+            concat!(
+                r#"{"both":{"repeat":{"arg":"--both","max":1},"description":"Short help"},"#,
+                r#""long-only":{"flag":{"arg":"--long-only"},"description":"Long help only"},"#,
+                r#""bare":{"flag":{"arg":"--bare"}},"#,
+                r#""first-second":{"repeat":{"max":2},"description":"first: The first"}}"#,
+            )
+        );
+    }
+
     // (c) Every command's run, rendered the way Pult renders it, makes clap bind each value to
     // exactly the argument it was meant for.
 
@@ -814,15 +887,15 @@ mod tests {
                 continue;
             };
             let param = &command.params.0.iter().find(|(name, _)| name == key).expect(key).1;
-            match (param, values.get(key)) {
+            match (&param.kind, values.get(key)) {
                 (_, None) => {}
-                (Param::Input(_), Some(Value::Text(text))) => argv.push(text.clone()),
-                (Param::Flag(flag), Some(Value::Switch(on))) => {
+                (Kind::Input(_), Some(Value::Text(text))) => argv.push(text.clone()),
+                (Kind::Flag(flag), Some(Value::Switch(on))) => {
                     if *on {
                         argv.push(flag.arg.clone());
                     }
                 }
-                (Param::Repeat(repeat), Some(Value::List(items))) => {
+                (Kind::Repeat(repeat), Some(Value::List(items))) => {
                     for item in items {
                         argv.extend(repeat.arg.clone());
                         argv.push(item.clone());
@@ -892,9 +965,9 @@ mod tests {
     fn positional_words(command: &SchemaCommand, values: &BTreeMap<String, Value>) -> Vec<String> {
         let mut words = Vec::new();
         for (key, param) in &command.params.0 {
-            match (param, values.get(key)) {
-                (Param::Input(_), Some(Value::Text(text))) => words.push(text.clone()),
-                (Param::Repeat(Repeat { arg: None, .. }), Some(Value::List(items))) => words.extend(items.iter().cloned()),
+            match (&param.kind, values.get(key)) {
+                (Kind::Input(_), Some(Value::Text(text))) => words.push(text.clone()),
+                (Kind::Repeat(Repeat { arg: None, .. }), Some(Value::List(items))) => words.extend(items.iter().cloned()),
                 _ => {}
             }
         }
@@ -917,9 +990,9 @@ mod tests {
         assert!(words.next().is_none(), "{}: more positional words than positionals", command.id);
 
         for (key, param) in &command.params.0 {
-            let long = match param {
-                Param::Flag(flag) => &flag.arg,
-                Param::Repeat(Repeat { arg: Some(arg), .. }) => arg,
+            let long = match &param.kind {
+                Kind::Flag(flag) => &flag.arg,
+                Kind::Repeat(Repeat { arg: Some(arg), .. }) => arg,
                 _ => continue,
             };
             let arg = own_args(leaf).find(|arg| arg.get_long() == long.strip_prefix("--")).expect(long);
@@ -979,12 +1052,12 @@ mod tests {
         let mut slot = 0;
         let mut values = BTreeMap::new();
         for (key, param) in &command.params.0 {
-            match param {
-                Param::Input(_) => {
+            match &param.kind {
+                Kind::Input(_) => {
                     values.insert(key.clone(), Value::Text(valid_value(command, slots[slot], slot)));
                     slot += 1;
                 }
-                Param::Repeat(Repeat { arg: None, max, .. }) => {
+                Kind::Repeat(Repeat { arg: None, max, .. }) => {
                     let count = max.unwrap_or(2) as usize;
                     let items = (0..count).map(|offset| {
                         let arg = slots[(slot + offset).min(slots.len() - 1)];
@@ -993,7 +1066,7 @@ mod tests {
                     values.insert(key.clone(), Value::List(items));
                     slot += count;
                 }
-                Param::Repeat(Repeat { arg: Some(long), min, .. }) if *min > 0 => {
+                Kind::Repeat(Repeat { arg: Some(long), min, .. }) if *min > 0 => {
                     let arg = own_args(leaf).find(|arg| arg.get_long() == long.strip_prefix("--")).expect(long);
                     values.insert(key.clone(), Value::List(vec![valid_value(command, arg, 0)]));
                 }
@@ -1016,8 +1089,8 @@ mod tests {
                 Ok(()) => return base,
                 Err(error) => error,
             };
-            let optional = command.params.0.iter().rev().find_map(|(name, param)| match param {
-                Param::Repeat(Repeat { arg: None, min: 0, .. }) => Some(name),
+            let optional = command.params.0.iter().rev().find_map(|(name, param)| match &param.kind {
+                Kind::Repeat(Repeat { arg: None, min: 0, .. }) => Some(name),
                 _ => None,
             });
             let dropped = match optional.and_then(|name| base.get_mut(name)) {
@@ -1037,14 +1110,14 @@ mod tests {
         let positionals = positionals(leaf);
         let mut slot = 0;
         for (key, param) in &command.params.0 {
-            let covered = match param {
-                Param::Flag(Flag { arg }) | Param::Repeat(Repeat { arg: Some(arg), .. }) => {
+            let covered = match &param.kind {
+                Kind::Flag(Flag { arg }) | Kind::Repeat(Repeat { arg: Some(arg), .. }) => {
                     assert_eq!(arg.strip_prefix("--"), Some(key.as_str()), "{}", command.id);
                     continue;
                 }
-                Param::Input(_) => 1,
-                Param::Repeat(Repeat { arg: None, max: Some(max), .. }) => *max as usize,
-                Param::Repeat(Repeat { arg: None, max: None, .. }) => positionals.len() - slot,
+                Kind::Input(_) => 1,
+                Kind::Repeat(Repeat { arg: None, max: Some(max), .. }) => *max as usize,
+                Kind::Repeat(Repeat { arg: None, max: None, .. }) => positionals.len() - slot,
             };
             let ids: Vec<String> = positionals[slot..slot + covered].iter()
                 .map(|arg| arg.get_id().as_str().replace('_', "-"))
@@ -1066,14 +1139,14 @@ mod tests {
         let mut values = values.clone();
         let mut at = 0;
         for (key, param) in &command.params.0 {
-            match (param, values.get_mut(key)) {
-                (Param::Input(_), Some(Value::Text(text))) => {
+            match (&param.kind, values.get_mut(key)) {
+                (Kind::Input(_), Some(Value::Text(text))) => {
                     if at == index {
                         *text = word.to_string();
                     }
                     at += 1;
                 }
-                (Param::Repeat(Repeat { arg: None, .. }), Some(Value::List(items))) => {
+                (Kind::Repeat(Repeat { arg: None, .. }), Some(Value::List(items))) => {
                     for item in items {
                         if at == index {
                             *item = word.to_string();
@@ -1118,11 +1191,11 @@ mod tests {
             }
 
             for (key, param) in &command.params.0 {
-                match param {
-                    Param::Flag(_) => {
+                match &param.kind {
+                    Kind::Flag(_) => {
                         fit(&built, command, &base, key, Value::Switch(true));
                     }
-                    Param::Repeat(Repeat { arg: Some(long), max, .. }) => {
+                    Kind::Repeat(Repeat { arg: Some(long), max, .. }) => {
                         let arg = own_args(leaf).find(|arg| arg.get_long() == long.strip_prefix("--")).expect(long);
                         let valid = valid_value(command, arg, 0);
 
