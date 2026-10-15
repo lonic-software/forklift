@@ -452,13 +452,13 @@ fn capitalize(word: &str) -> String {
 
 /// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
 #[cfg(feature = "docgen")]
-pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
     vec![
-        ("Opened", schemars::schema_for!(Opened)),
-        ("HaulList", schemars::schema_for!(HaulList)),
-        ("HaulDetail", schemars::schema_for!(HaulDetail)),
-        ("Acted", schemars::schema_for!(Acted)),
-        ("Merged", schemars::schema_for!(Merged)),
-        ("MergeConflicts", schemars::schema_for!(MergeConflicts)),
+        crate::docgen::OutputSchema::of::<Opened>(),
+        crate::docgen::OutputSchema::of::<HaulList>(),
+        crate::docgen::OutputSchema::of::<HaulDetail>(),
+        crate::docgen::OutputSchema::of::<Acted>(),
+        crate::docgen::OutputSchema::of::<Merged>(),
+        crate::docgen::OutputSchema::of::<MergeConflicts>(),
     ]
 }

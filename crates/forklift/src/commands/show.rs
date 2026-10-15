@@ -144,6 +144,6 @@ impl CommandOutput for Shown {
 
 /// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
 #[cfg(feature = "docgen")]
-pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
-    vec![("Shown", schemars::schema_for!(Shown))]
+pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
+    vec![crate::docgen::OutputSchema::of::<Shown>()]
 }

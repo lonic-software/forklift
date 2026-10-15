@@ -158,8 +158,8 @@ pub fn use_profile(profile: &str) -> Result<(), String> {
 
 /// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
 #[cfg(feature = "docgen")]
-pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
     vec![
-        ("ProfileList", schemars::schema_for!(ProfileList)),
+        crate::docgen::OutputSchema::of::<ProfileList>(),
     ]
 }

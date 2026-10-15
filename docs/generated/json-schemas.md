@@ -252,8 +252,7 @@ A command not listed here either reports only the generic human-message shape `{
     "name",
     "path",
     "pallet",
-    "head",
-    "scope"
+    "head"
   ],
   "title": "BayCreated",
   "type": "object"
@@ -481,8 +480,7 @@ A command not listed here either reports only the generic human-message shape `{
   "required": [
     "outcome",
     "source",
-    "pallet",
-    "conflicts"
+    "pallet"
   ],
   "title": "CherryPicked",
   "type": "object"
@@ -771,8 +769,7 @@ A command not listed here either reports only the generic human-message shape `{
   "required": [
     "outcome",
     "pallet",
-    "target",
-    "conflicts"
+    "target"
   ],
   "title": "ConsolidateReport",
   "type": "object"
@@ -1049,10 +1046,8 @@ A command not listed here either reports only the generic human-message shape `{
   "required": [
     "remote",
     "directory",
-    "meta_adopted",
     "pallet",
     "unborn",
-    "scope",
     "fetched_objects"
   ],
   "title": "FranchiseReport",
@@ -1368,9 +1363,7 @@ A command not listed here either reports only the generic human-message shape `{
   },
   "required": [
     "was_tainted",
-    "restaged",
-    "resolved",
-    "notes"
+    "restaged"
   ],
   "title": "HealReport",
   "type": "object"
@@ -1468,7 +1461,6 @@ A command not listed here either reports only the generic human-message shape `{
       },
       "required": [
         "parcel",
-        "consolidates",
         "parents",
         "actions"
       ],
@@ -1597,8 +1589,7 @@ A command not listed here either reports only the generic human-message shape `{
     "trees",
     "blobs",
     "pallets",
-    "ignored_git",
-    "warnings"
+    "ignored_git"
   ],
   "title": "ImportReport",
   "type": "object"
@@ -1663,8 +1654,6 @@ A command not listed here either reports only the generic human-message shape `{
     }
   },
   "required": [
-    "meta_pallets",
-    "auto_merged",
     "pallet",
     "up_to_date",
     "head",
@@ -1776,8 +1765,6 @@ A command not listed here either reports only the generic human-message shape `{
   },
   "required": [
     "office_moved",
-    "meta_adopted",
-    "meta_merged",
     "pallet",
     "outcome",
     "head",
@@ -2015,7 +2002,6 @@ A command not listed here either reports only the generic human-message shape `{
         "identifier",
         "role",
         "class",
-        "pallets",
         "keys"
       ],
       "type": "object"
@@ -2036,8 +2022,7 @@ A command not listed here either reports only the generic human-message shape `{
     }
   },
   "required": [
-    "enrolled",
-    "users"
+    "enrolled"
   ],
   "title": "OfficeListing",
   "type": "object"
@@ -2072,7 +2057,8 @@ A command not listed here either reports only the generic human-message shape `{
     }
   },
   "required": [
-    "pallet"
+    "pallet",
+    "head"
   ],
   "title": "Palletized",
   "type": "object"
@@ -2103,7 +2089,8 @@ A command not listed here either reports only the generic human-message shape `{
       },
       "required": [
         "name",
-        "current"
+        "current",
+        "head"
       ],
       "type": "object"
     }
@@ -2137,8 +2124,7 @@ A command not listed here either reports only the generic human-message shape `{
   "required": [
     "current",
     "current_unborn",
-    "pallets",
-    "meta"
+    "pallets"
   ],
   "title": "PalletList",
   "type": "object"
@@ -2383,11 +2369,7 @@ A command not listed here either reports only the generic human-message shape `{
     }
   },
   "required": [
-    "object_type",
-    "entries",
-    "parents",
-    "actions",
-    "chunks"
+    "object_type"
   ],
   "title": "PeekObject",
   "type": "object"
@@ -2585,8 +2567,7 @@ A command not listed here either reports only the generic human-message shape `{
         "parcel",
         "author",
         "is_merge",
-        "actions",
-        "tags"
+        "actions"
       ],
       "type": "object"
     },
@@ -3270,10 +3251,9 @@ A command not listed here either reports only the generic human-message shape `{
   },
   "required": [
     "pallet",
+    "head",
     "staged_count",
     "unstaged_count",
-    "staged",
-    "unstaged",
     "summary"
   ],
   "title": "StocktakeReport",
@@ -3312,7 +3292,6 @@ A command not listed here either reports only the generic human-message shape `{
     }
   },
   "required": [
-    "added",
     "scope",
     "fetched_objects"
   ],
@@ -3754,7 +3733,6 @@ A command not listed here either reports only the generic human-message shape `{
       "required": [
         "name",
         "subject",
-        "message",
         "tagger",
         "tagged_at",
         "parcel"
@@ -3842,7 +3820,6 @@ A command not listed here either reports only the generic human-message shape `{
   "required": [
     "name",
     "subject",
-    "message",
     "tagger",
     "tagged_at",
     "parcel"
@@ -3889,10 +3866,7 @@ A command not listed here either reports only the generic human-message shape `{
   "required": [
     "op",
     "pallet",
-    "left",
-    "undone",
-    "head",
-    "description"
+    "head"
   ],
   "title": "Undone",
   "type": "object"

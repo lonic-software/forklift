@@ -122,8 +122,8 @@ impl CommandOutput for StocktakeReport {
 
 /// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
 #[cfg(feature = "docgen")]
-pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
-    vec![("StocktakeReport", schemars::schema_for!(StocktakeReport))]
+pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
+    vec![crate::docgen::OutputSchema::of::<StocktakeReport>()]
 }
 
 /// Print a list of changes, one per line, with aligned change kinds.

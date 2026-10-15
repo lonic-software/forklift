@@ -438,9 +438,9 @@ fn print_parcel_action(action: &ParcelAction) {
 
 /// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
 #[cfg(feature = "docgen")]
-pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
     vec![
-        ("PeekInventory", schemars::schema_for!(PeekInventory)),
-        ("PeekObject", schemars::schema_for!(PeekObject)),
+        crate::docgen::OutputSchema::of::<PeekInventory>(),
+        crate::docgen::OutputSchema::of::<PeekObject>(),
     ]
 }

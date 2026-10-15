@@ -264,7 +264,10 @@ table) and `docs/generated/json-schemas.md` (every command's `--json` `data` sch
 produced by `bin/gen-docs` from the code itself — the `ErrorCode` enum and the
 `#[derive(schemars::JsonSchema)]` output structs in `crates/forklift/src/commands/`
 (behind the dev-only `docgen` cargo feature, never enabled in a release build; see
-`crates/forklift/src/docgen.rs`). `bin/check` regenerates them into a scratch directory
+`crates/forklift/src/docgen.rs`). Each command registers its structs from a
+`__docgen_schemas` fn through `docgen::OutputSchema::of`, which describes the serialized
+shape: a field with `skip_serializing_if` comes out optional without needing
+`#[serde(default)]`. `bin/check` regenerates them into a scratch directory
 and diffs against the committed copy, so **stale generated docs fail CI** — if you add an
 error code or change a command's `--json` output, run `pult gen-docs` (or `./bin/gen-docs`)
 and commit the result along with your change; you don't hand-edit those two files.

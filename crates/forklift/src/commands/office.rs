@@ -947,8 +947,8 @@ fn require_admin(state: &OfficeState, actor_id: &str) -> Result<(), String> {
 
 /// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
 #[cfg(feature = "docgen")]
-pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
     vec![
-        ("OfficeListing", schemars::schema_for!(OfficeListing)),
+        crate::docgen::OutputSchema::of::<OfficeListing>(),
     ]
 }

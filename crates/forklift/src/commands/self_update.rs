@@ -276,8 +276,8 @@ mod tests {
 
 /// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
 #[cfg(feature = "docgen")]
-pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
     vec![
-        ("SelfUpdate", schemars::schema_for!(SelfUpdate)),
+        crate::docgen::OutputSchema::of::<SelfUpdate>(),
     ]
 }

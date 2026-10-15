@@ -529,11 +529,11 @@ fn render_display_date(rfc3339: &str) -> String {
 
 /// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
 #[cfg(feature = "docgen")]
-pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
     vec![
-        ("Created", schemars::schema_for!(Created)),
-        ("TagList", schemars::schema_for!(TagList)),
-        ("TagView", schemars::schema_for!(TagView)),
+        crate::docgen::OutputSchema::of::<Created>(),
+        crate::docgen::OutputSchema::of::<TagList>(),
+        crate::docgen::OutputSchema::of::<TagView>(),
     ]
 }
 
