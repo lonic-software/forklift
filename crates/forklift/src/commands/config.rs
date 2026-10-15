@@ -193,10 +193,10 @@ impl CommandOutput for ConfigList {
 
 /// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
 #[cfg(feature = "docgen")]
-pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
     vec![
-        ("ConfigSet", schemars::schema_for!(ConfigSet)),
-        ("ConfigValue", schemars::schema_for!(ConfigValue)),
-        ("ConfigList", schemars::schema_for!(ConfigList)),
+        crate::docgen::OutputSchema::of::<ConfigSet>(),
+        crate::docgen::OutputSchema::of::<ConfigValue>(),
+        crate::docgen::OutputSchema::of::<ConfigList>(),
     ]
 }

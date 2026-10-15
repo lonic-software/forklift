@@ -443,10 +443,10 @@ impl CommandOutput for StatusReport {
 
 /// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
 #[cfg(feature = "docgen")]
-pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
     vec![
-        ("Installed", schemars::schema_for!(Installed)),
-        ("Uninstalled", schemars::schema_for!(Uninstalled)),
-        ("StatusReport", schemars::schema_for!(StatusReport)),
+        crate::docgen::OutputSchema::of::<Installed>(),
+        crate::docgen::OutputSchema::of::<Uninstalled>(),
+        crate::docgen::OutputSchema::of::<StatusReport>(),
     ]
 }

@@ -270,7 +270,7 @@ impl CommandOutput for TagList {
             // trailing the line: a message ending in text that imitates this marker (or, worse,
             // an ANSI escape) cannot forge or blank it if it never gets to render after it.
             let absent_marker =
-                if tag.subject_absent == Some(true) { "(subject not in this store)  " } else { "" };
+                if tag.subject_absent { "(subject not in this store)  " } else { "" };
 
             // `name` itself is remote-authored and precedes everything else in the row,
             // including the marker above — sanitizing its control characters (done above) stops
@@ -281,7 +281,7 @@ impl CommandOutput for TagList {
             // literal — printed by code, before anything `name` supplies — so nothing inside
             // `name` can ever precede it, unlike a position defined only in terms of `name`'s own
             // content.
-            let name_prefix = if tag.name_invalid == Some(true) { "[invalid name] " } else { "" };
+            let name_prefix = if tag.name_invalid { "[invalid name] " } else { "" };
 
             println!(
                 "{}{:<width$}  {}  {}by {}{}",
@@ -308,8 +308,8 @@ pub(crate) struct TagView {
     /// (`franchise`/`lower`), and nothing validates a record's `name` on the way in — only
     /// `tag create` does, for a name of its own choosing — so a foreign or older client's record
     /// can carry one this build would never have created itself.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    name_invalid: Option<bool>,
+    #[serde(skip_serializing_if = "crate::output::is_false")]
+    name_invalid: bool,
 
     /// The parcel the tag points at.
     subject: String,
@@ -336,20 +336,15 @@ pub(crate) struct TagView {
     /// The @tags parcel that introduced the tag.
     parcel: String,
 
-    // `Option`, not a bare `bool`: `skip_serializing_if = "Option::is_none"` actually drops it
-    // from the schema's `required` list, which a bare `bool` field cannot do regardless of
-    // `skip_serializing_if` — the same pattern `tagger_role` above already uses. `Some(true)`
-    // when absent, `None` when present — `Some(false)` is never constructed.
     /// Present and `true` when the subject parcel is not in this store (never fetched, collected,
     /// or recorded with an invalid hash); omitted when the subject is present.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    subject_absent: Option<bool>,
+    #[serde(skip_serializing_if = "crate::output::is_false")]
+    subject_absent: bool,
 
     // Render-only: which wording `render_human`'s warning line uses when `subject_absent` is
     // `true`. Not part of the wire contract (`subject_absent` alone answers "is it here" for a
     // `--json` consumer) and never rendered by `TagList` — `#[serde(skip)]`, not
-    // `skip_serializing_if`, so it never reaches the schema at all, unlike `subject_absent`
-    // above before this fix.
+    // `skip_serializing_if`, so it never reaches the schema at all.
     #[serde(skip)]
     subject_malformed: bool,
 }
@@ -370,7 +365,7 @@ impl TagView {
 
         TagView {
             name: attributed.tag.name.clone(),
-            name_invalid: name_invalid.then_some(true),
+            name_invalid,
             subject: attributed.tag.subject.clone(),
             message: attributed.tag.message.clone(),
             tagger,
@@ -378,7 +373,7 @@ impl TagView {
             tagger_role,
             tagged_at: render_timestamp(attributed.tag.tagged_at),
             parcel: attributed.parcel.clone(),
-            subject_absent: probe.is_absent().then_some(true),
+            subject_absent: probe.is_absent(),
             subject_malformed,
         }
     }
@@ -413,7 +408,7 @@ impl CommandOutput for TagView {
         // means `find_tag` already matched it against a name argument, so it is never rejected
         // here, only flagged — see `TagView::name_invalid`'s doc comment for why one can exist
         // at all despite `tag create` validating its own.
-        if self.name_invalid == Some(true) {
+        if self.name_invalid {
             println!(
                 "warning: this tag's recorded name does not meet the naming rules \"tag create\" \
                 enforces (letters, digits, \".\", \"_\", \"-\" only) — shown exactly as recorded."
@@ -435,7 +430,7 @@ impl CommandOutput for TagView {
                 copy of any warehouse could ever hold an object under that name.",
                 subject
             );
-        } else if self.subject_absent == Some(true) {
+        } else if self.subject_absent {
             println!(
                 "warning: parcel {} is not in this store — never fetched here, or collected \
                 after nothing else referenced it. Another copy of this warehouse may still \
@@ -529,11 +524,11 @@ fn render_display_date(rfc3339: &str) -> String {
 
 /// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
 #[cfg(feature = "docgen")]
-pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
     vec![
-        ("Created", schemars::schema_for!(Created)),
-        ("TagList", schemars::schema_for!(TagList)),
-        ("TagView", schemars::schema_for!(TagView)),
+        crate::docgen::OutputSchema::of::<Created>(),
+        crate::docgen::OutputSchema::of::<TagList>(),
+        crate::docgen::OutputSchema::of::<TagView>(),
     ]
 }
 
@@ -616,19 +611,19 @@ mod tests {
         let malformed = TagView::of(
             &attributed(malformed_tag("not-a-valid-hash")), &names, &office, SubjectProbe::Malformed,
         );
-        assert_eq!(malformed.subject_absent, Some(true), "malformed must still mark subject_absent");
+        assert!(malformed.subject_absent, "malformed must still mark subject_absent");
         assert!(malformed.subject_malformed, "malformed must set the render-only reason flag");
 
         let absent = TagView::of(
             &attributed(malformed_tag(&"a".repeat(64))), &names, &office, SubjectProbe::Absent,
         );
-        assert_eq!(absent.subject_absent, Some(true), "a definite absence must mark subject_absent");
+        assert!(absent.subject_absent, "a definite absence must mark subject_absent");
         assert!(!absent.subject_malformed, "an ordinary absence must not claim to be malformed");
 
         let present = TagView::of(
             &attributed(malformed_tag(&"a".repeat(64))), &names, &office, SubjectProbe::Present,
         );
-        assert_eq!(present.subject_absent, None, "a present subject must omit subject_absent");
+        assert!(!present.subject_absent, "a present subject must omit subject_absent");
         assert!(!present.subject_malformed, "a present subject is never malformed");
     }
 
@@ -716,7 +711,7 @@ mod tests {
 
         let view = TagView {
             name: "v1.0".to_string(),
-            name_invalid: None,
+            name_invalid: false,
             subject: subject.clone(),
             message: "release".to_string(),
             tagger: "spike@forklift".to_string(),
@@ -724,7 +719,7 @@ mod tests {
             tagger_role: None,
             tagged_at: render_timestamp(1_700_000_000),
             parcel: "b".repeat(64),
-            subject_absent: Some(true),
+            subject_absent: true,
             subject_malformed: true,
         };
 
@@ -754,10 +749,10 @@ mod tests {
         );
 
         let view = TagView::of(&attributed(forged), &names, &office, SubjectProbe::Present);
-        assert_eq!(view.name_invalid, Some(true), "a name outside tag create's own charset must be flagged");
+        assert!(view.name_invalid, "a name outside tag create's own charset must be flagged");
 
         let ordinary = malformed_tag(&"a".repeat(64)); // name: "v1.0", from `malformed_tag`
         let view = TagView::of(&attributed(ordinary), &names, &office, SubjectProbe::Present);
-        assert_eq!(view.name_invalid, None, "an ordinary name must never be flagged");
+        assert!(!view.name_invalid, "an ordinary name must never be flagged");
     }
 }

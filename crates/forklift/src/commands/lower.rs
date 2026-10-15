@@ -273,8 +273,8 @@ async fn adopt_and_merge_meta(client: &RemoteClient,
 
 /// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
 #[cfg(feature = "docgen")]
-pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
     vec![
-        ("LowerReport", schemars::schema_for!(LowerReport)),
+        crate::docgen::OutputSchema::of::<LowerReport>(),
     ]
 }

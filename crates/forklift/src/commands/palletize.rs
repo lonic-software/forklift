@@ -234,9 +234,9 @@ impl CommandOutput for PalletList {
 
 /// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
 #[cfg(feature = "docgen")]
-pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
     vec![
-        ("Palletized", schemars::schema_for!(Palletized)),
-        ("PalletList", schemars::schema_for!(PalletList)),
+        crate::docgen::OutputSchema::of::<Palletized>(),
+        crate::docgen::OutputSchema::of::<PalletList>(),
     ]
 }

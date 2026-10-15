@@ -627,8 +627,8 @@ impl CommandOutput for QueryReport {
 
 /// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
 #[cfg(feature = "docgen")]
-pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
-    vec![("QueryReport", schemars::schema_for!(QueryReport))]
+pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
+    vec![crate::docgen::OutputSchema::of::<QueryReport>()]
 }
 
 #[cfg(test)]

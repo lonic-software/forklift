@@ -63,9 +63,12 @@ const GENERIC_OR_NO_DATA: &[(&str, &str)] = &[
 /// # Returns
 /// * `Ok(String)`  - The rendered markdown.
 /// * `Err(String)` - A CLI command is neither in the schema registry nor on
-///                   [`GENERIC_OR_NO_DATA`] (or a stale allow-list entry names no real command) —
+///                   [`GENERIC_OR_NO_DATA`] (or a stale allow-list entry names no real command),
+///                   or [`OutputSchema`] no longer describes the serialized shape —
 ///                   `bin/gen-docs` propagates this as a failing exit code.
 pub fn render_json_schemas() -> Result<String, String> {
+    check_output_contract()?;
+
     let mut out = String::new();
     out.push_str(GENERATED_BANNER);
     out.push_str("# `--json` output schemas\n\n");
@@ -76,7 +79,9 @@ pub fn render_json_schemas() -> Result<String, String> {
          [JSON Schema](https://json-schema.org/) per shape a command can emit; a command with \
          more than one (e.g. one per subcommand) lists all of them. Descriptions come straight \
          from the Rust doc comments on the underlying struct, so they stay in sync with the \
-         field they describe.\n\n\
+         field they describe. Each schema describes what Forklift writes: a field under \
+         `required` is always present (possibly as `null`), and any other field is left out \
+         when it has nothing to say.\n\n\
          A command not listed here either reports only the generic human-message shape \
          `{ \"message\": string }`, or produces no `--json` data at all — see the command's \
          entry in `docs/guide/cli.md`.\n\n",
@@ -122,7 +127,7 @@ pub fn render_json_schemas() -> Result<String, String> {
                 }
 
                 out.push_str(&format!("## `{}`\n\n", name));
-                for (struct_name, schema) in schemas {
+                for OutputSchema { name: struct_name, schema } in schemas {
                     out.push_str(&format!("### `{}`\n\n", struct_name));
                     let pretty = serde_json::to_string_pretty(schema.as_value()).map_err(|e| {
                         format!(
@@ -157,10 +162,65 @@ const GENERATED_BANNER: &str = "<!--\n\
     that affects it (a new error code, or a `--json` output struct).\n\
 -->\n\n";
 
+/// One `--json` `data` shape for json-schemas.md, generated under schemars' *serialize*
+/// contract: the schema describes what Forklift writes, not what a deserializer would accept.
+/// The two disagree on exactly the fields a reader of our output cares about: a field with
+/// `skip_serializing_if` is absent whenever its predicate holds, so it must not be `required`,
+/// and an `Option` field without one is always written (as `null`), so it must be. The default
+/// (deserialize) contract gets both backwards.
+///
+/// The fields are private, so [`OutputSchema::of`] is the only way a command module can build
+/// one, and a registration cannot fall back to `schemars::schema_for!`.
+pub(crate) struct OutputSchema {
+    name: String,
+    schema: schemars::Schema,
+}
+
+impl OutputSchema {
+    /// The schema of `T` as serialized, headed by `T`'s schema name.
+    pub(crate) fn of<T: schemars::JsonSchema>() -> Self {
+        let generator = schemars::generate::SchemaSettings::default().for_serialize().into_generator();
+        Self { name: T::schema_name().into_owned(), schema: generator.into_root_schema_for::<T>() }
+    }
+}
+
+/// Fails the generator unless [`OutputSchema::of`] marks `required` the serialized way. It runs
+/// inside the generator for the reason [`GENERIC_OR_NO_DATA`] gives.
+fn check_output_contract() -> Result<(), String> {
+    #[derive(schemars::JsonSchema, serde::Serialize)]
+    #[allow(dead_code)]
+    struct Probe {
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        skipped_when_empty: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        skipped_with_a_default: Vec<String>,
+        always_written: Option<String>,
+        #[serde(default)]
+        written_with_a_default: Vec<String>,
+    }
+
+    let schema = OutputSchema::of::<Probe>().schema;
+    let required: std::collections::BTreeSet<&str> = schema
+        .get("required")
+        .and_then(|value| value.as_array())
+        .map(|names| names.iter().filter_map(|name| name.as_str()).collect())
+        .unwrap_or_default();
+    let expected = std::collections::BTreeSet::from(["always_written", "written_with_a_default"]);
+    if required != expected {
+        return Err(format!(
+            "docgen: output schemas must mark `required` as serialized: a field with \
+             `skip_serializing_if` is optional, with or without `#[serde(default)]`, and every \
+             other field (an `Option`, or one with only `#[serde(default)]`) is required. The \
+             probe expected {expected:?} and got {required:?}."
+        ));
+    }
+    Ok(())
+}
+
 /// Look up the schema-registry function for a CLI command name. `None` means the command has
 /// no entry here — [`render_json_schemas`] only accepts that when the name is also on
 /// [`GENERIC_OR_NO_DATA`]; otherwise it is undocumented drift and the generator fails.
-fn command_schemas(name: &str) -> Option<Vec<(&'static str, schemars::Schema)>> {
+fn command_schemas(name: &str) -> Option<Vec<OutputSchema>> {
     use crate::commands;
 
     Some(match name {

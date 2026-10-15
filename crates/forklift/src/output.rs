@@ -187,6 +187,11 @@ pub fn message(text: impl Into<String>) {
 pub const DENSIFY_TIP: &str = "Tip: \"forklift compact --all --redelta\" can significantly \
     shrink this store (one-shot, takes a few minutes on large histories).";
 
+/// `skip_serializing_if` predicate for a flag that is written only when set.
+pub fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// Render a byte count in a human-friendly binary unit (B/KiB/MiB/GiB/TiB). The object store's
 /// scale makes raw byte counts noise, so the size-reporting commands (`compact`, `store`) show
 /// this instead. JSON output always carries the exact byte count, never this string.

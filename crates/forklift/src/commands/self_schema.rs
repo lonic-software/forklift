@@ -169,7 +169,7 @@ enum Param {
 #[derive(Serialize)]
 struct Input {
     /// The value is a credential.
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(skip_serializing_if = "crate::output::is_false")]
     secret: bool,
 }
 
@@ -188,7 +188,7 @@ struct Repeat {
     arg: Option<String>,
 
     /// The fewest values accepted.
-    #[serde(default, skip_serializing_if = "is_zero")]
+    #[serde(skip_serializing_if = "is_zero")]
     min: u32,
 
     /// The most values accepted; unbounded when absent.
@@ -196,12 +196,8 @@ struct Repeat {
     max: Option<u32>,
 
     /// Every value is a credential.
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(skip_serializing_if = "crate::output::is_false")]
     secret: bool,
-}
-
-fn is_false(value: &bool) -> bool {
-    !*value
 }
 
 fn is_zero(value: &u32) -> bool {
@@ -615,9 +611,9 @@ fn layout(path: &[&str], positionals: Vec<Positional>) -> Result<Vec<(String, Pa
 
 /// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
 #[cfg(feature = "docgen")]
-pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
     vec![
-        ("SelfSchema", schemars::schema_for!(SelfSchema)),
+        crate::docgen::OutputSchema::of::<SelfSchema>(),
     ]
 }
 

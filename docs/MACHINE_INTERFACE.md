@@ -63,7 +63,9 @@ Failure keeps the same header, with `"ok": false` and an `error` in place of `da
 
 A command's `data` shape is documented by the struct it emits (in
 `crates/forklift/src/commands/`) — the generated, exhaustive reference for every one of
-them is [`generated/json-schemas.md`](generated/json-schemas.md).
+them is [`generated/json-schemas.md`](generated/json-schemas.md). Those schemas describe
+what Forklift writes: a field under `required` is always present (possibly as `null`), and
+any other field is left out when it has nothing to say.
 
 **Usage errors** (an unknown command, a missing or invalid argument) are `usage`
 failures with exit 2. `message` is the parser's one-line complaint, and

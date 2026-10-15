@@ -7,7 +7,7 @@ that affects it (a new error code, or a `--json` output struct).
 
 # `--json` output schemas
 
-Every command's `--json` result is `{ "lonic_json", "tool", "schema", "command", "ok": true, "data": … }` on success (see `docs/MACHINE_INTERFACE.md` for the envelope and the failure shape). This page is the exhaustive reference for each command's `data` — one [JSON Schema](https://json-schema.org/) per shape a command can emit; a command with more than one (e.g. one per subcommand) lists all of them. Descriptions come straight from the Rust doc comments on the underlying struct, so they stay in sync with the field they describe.
+Every command's `--json` result is `{ "lonic_json", "tool", "schema", "command", "ok": true, "data": … }` on success (see `docs/MACHINE_INTERFACE.md` for the envelope and the failure shape). This page is the exhaustive reference for each command's `data` — one [JSON Schema](https://json-schema.org/) per shape a command can emit; a command with more than one (e.g. one per subcommand) lists all of them. Descriptions come straight from the Rust doc comments on the underlying struct, so they stay in sync with the field they describe. Each schema describes what Forklift writes: a field under `required` is always present (possibly as `null`), and any other field is left out when it has nothing to say.
 
 A command not listed here either reports only the generic human-message shape `{ "message": string }`, or produces no `--json` data at all — see the command's entry in `docs/guide/cli.md`.
 
@@ -184,10 +184,7 @@ A command not listed here either reports only the generic human-message shape `{
     },
     "pallet_verified": {
       "description": "Whether a working pallet's history was audited (absent when only the office\nchain was — i.e. the audited pallet *is* the office).",
-      "type": [
-        "boolean",
-        "null"
-      ]
+      "type": "boolean"
     },
     "scope": {
       "anyOf": [
@@ -252,8 +249,7 @@ A command not listed here either reports only the generic human-message shape `{
     "name",
     "path",
     "pallet",
-    "head",
-    "scope"
+    "head"
   ],
   "title": "BayCreated",
   "type": "object"
@@ -481,8 +477,7 @@ A command not listed here either reports only the generic human-message shape `{
   "required": [
     "outcome",
     "source",
-    "pallet",
-    "conflicts"
+    "pallet"
   ],
   "title": "CherryPicked",
   "type": "object"
@@ -771,8 +766,7 @@ A command not listed here either reports only the generic human-message shape `{
   "required": [
     "outcome",
     "pallet",
-    "target",
-    "conflicts"
+    "target"
   ],
   "title": "ConsolidateReport",
   "type": "object"
@@ -1049,10 +1043,8 @@ A command not listed here either reports only the generic human-message shape `{
   "required": [
     "remote",
     "directory",
-    "meta_adopted",
     "pallet",
     "unborn",
-    "scope",
     "fetched_objects"
   ],
   "title": "FranchiseReport",
@@ -1368,9 +1360,7 @@ A command not listed here either reports only the generic human-message shape `{
   },
   "required": [
     "was_tainted",
-    "restaged",
-    "resolved",
-    "notes"
+    "restaged"
   ],
   "title": "HealReport",
   "type": "object"
@@ -1468,7 +1458,6 @@ A command not listed here either reports only the generic human-message shape `{
       },
       "required": [
         "parcel",
-        "consolidates",
         "parents",
         "actions"
       ],
@@ -1597,8 +1586,7 @@ A command not listed here either reports only the generic human-message shape `{
     "trees",
     "blobs",
     "pallets",
-    "ignored_git",
-    "warnings"
+    "ignored_git"
   ],
   "title": "ImportReport",
   "type": "object"
@@ -1663,8 +1651,6 @@ A command not listed here either reports only the generic human-message shape `{
     }
   },
   "required": [
-    "meta_pallets",
-    "auto_merged",
     "pallet",
     "up_to_date",
     "head",
@@ -1776,8 +1762,6 @@ A command not listed here either reports only the generic human-message shape `{
   },
   "required": [
     "office_moved",
-    "meta_adopted",
-    "meta_merged",
     "pallet",
     "outcome",
     "head",
@@ -2015,7 +1999,6 @@ A command not listed here either reports only the generic human-message shape `{
         "identifier",
         "role",
         "class",
-        "pallets",
         "keys"
       ],
       "type": "object"
@@ -2036,8 +2019,7 @@ A command not listed here either reports only the generic human-message shape `{
     }
   },
   "required": [
-    "enrolled",
-    "users"
+    "enrolled"
   ],
   "title": "OfficeListing",
   "type": "object"
@@ -2072,7 +2054,8 @@ A command not listed here either reports only the generic human-message shape `{
     }
   },
   "required": [
-    "pallet"
+    "pallet",
+    "head"
   ],
   "title": "Palletized",
   "type": "object"
@@ -2103,7 +2086,8 @@ A command not listed here either reports only the generic human-message shape `{
       },
       "required": [
         "name",
-        "current"
+        "current",
+        "head"
       ],
       "type": "object"
     }
@@ -2137,8 +2121,7 @@ A command not listed here either reports only the generic human-message shape `{
   "required": [
     "current",
     "current_unborn",
-    "pallets",
-    "meta"
+    "pallets"
   ],
   "title": "PalletList",
   "type": "object"
@@ -2383,11 +2366,7 @@ A command not listed here either reports only the generic human-message shape `{
     }
   },
   "required": [
-    "object_type",
-    "entries",
-    "parents",
-    "actions",
-    "chunks"
+    "object_type"
   ],
   "title": "PeekObject",
   "type": "object"
@@ -2585,8 +2564,7 @@ A command not listed here either reports only the generic human-message shape `{
         "parcel",
         "author",
         "is_merge",
-        "actions",
-        "tags"
+        "actions"
       ],
       "type": "object"
     },
@@ -3270,10 +3248,9 @@ A command not listed here either reports only the generic human-message shape `{
   },
   "required": [
     "pallet",
+    "head",
     "staged_count",
     "unstaged_count",
-    "staged",
-    "unstaged",
     "summary"
   ],
   "title": "StocktakeReport",
@@ -3312,7 +3289,6 @@ A command not listed here either reports only the generic human-message shape `{
     }
   },
   "required": [
-    "added",
     "scope",
     "fetched_objects"
   ],
@@ -3708,10 +3684,7 @@ A command not listed here either reports only the generic human-message shape `{
         },
         "name_invalid": {
           "description": "Present and `true` when `name` does not meet the naming rules `tag create` enforces\n(letters, digits, `.`, `_`, `-` only); omitted otherwise. `@tags` syncs in wholesale\n(`franchise`/`lower`), and nothing validates a record's `name` on the way in — only\n`tag create` does, for a name of its own choosing — so a foreign or older client's record\ncan carry one this build would never have created itself.",
-          "type": [
-            "boolean",
-            "null"
-          ]
+          "type": "boolean"
         },
         "parcel": {
           "description": "The @tags parcel that introduced the tag.",
@@ -3723,10 +3696,7 @@ A command not listed here either reports only the generic human-message shape `{
         },
         "subject_absent": {
           "description": "Present and `true` when the subject parcel is not in this store (never fetched, collected,\nor recorded with an invalid hash); omitted when the subject is present.",
-          "type": [
-            "boolean",
-            "null"
-          ]
+          "type": "boolean"
         },
         "tagged_at": {
           "description": "The tag creation time as RFC 3339 (UTC).",
@@ -3754,7 +3724,6 @@ A command not listed here either reports only the generic human-message shape `{
       "required": [
         "name",
         "subject",
-        "message",
         "tagger",
         "tagged_at",
         "parcel"
@@ -3796,10 +3765,7 @@ A command not listed here either reports only the generic human-message shape `{
     },
     "name_invalid": {
       "description": "Present and `true` when `name` does not meet the naming rules `tag create` enforces\n(letters, digits, `.`, `_`, `-` only); omitted otherwise. `@tags` syncs in wholesale\n(`franchise`/`lower`), and nothing validates a record's `name` on the way in — only\n`tag create` does, for a name of its own choosing — so a foreign or older client's record\ncan carry one this build would never have created itself.",
-      "type": [
-        "boolean",
-        "null"
-      ]
+      "type": "boolean"
     },
     "parcel": {
       "description": "The @tags parcel that introduced the tag.",
@@ -3811,10 +3777,7 @@ A command not listed here either reports only the generic human-message shape `{
     },
     "subject_absent": {
       "description": "Present and `true` when the subject parcel is not in this store (never fetched, collected,\nor recorded with an invalid hash); omitted when the subject is present.",
-      "type": [
-        "boolean",
-        "null"
-      ]
+      "type": "boolean"
     },
     "tagged_at": {
       "description": "The tag creation time as RFC 3339 (UTC).",
@@ -3842,7 +3805,6 @@ A command not listed here either reports only the generic human-message shape `{
   "required": [
     "name",
     "subject",
-    "message",
     "tagger",
     "tagged_at",
     "parcel"
@@ -3889,10 +3851,7 @@ A command not listed here either reports only the generic human-message shape `{
   "required": [
     "op",
     "pallet",
-    "left",
-    "undone",
-    "head",
-    "description"
+    "head"
   ],
   "title": "Undone",
   "type": "object"

@@ -599,8 +599,8 @@ fn split_path(path: &str) -> (&str, &str) {
 
 /// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
 #[cfg(feature = "docgen")]
-pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
     vec![
-        ("ConsolidateReport", schemars::schema_for!(ConsolidateReport)),
+        crate::docgen::OutputSchema::of::<ConsolidateReport>(),
     ]
 }

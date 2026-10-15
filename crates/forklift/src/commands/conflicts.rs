@@ -191,8 +191,8 @@ fn short(hash: &Option<String>) -> &str {
 
 /// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
 #[cfg(feature = "docgen")]
-pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
     vec![
-        ("ConflictReport", schemars::schema_for!(ConflictReport)),
+        crate::docgen::OutputSchema::of::<ConflictReport>(),
     ]
 }

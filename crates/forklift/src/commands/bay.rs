@@ -333,10 +333,10 @@ impl CommandOutput for BayRemoved {
 
 /// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
 #[cfg(feature = "docgen")]
-pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
     vec![
-        ("BayCreated", schemars::schema_for!(BayCreated)),
-        ("BayList", schemars::schema_for!(BayList)),
-        ("BayRemoved", schemars::schema_for!(BayRemoved)),
+        crate::docgen::OutputSchema::of::<BayCreated>(),
+        crate::docgen::OutputSchema::of::<BayList>(),
+        crate::docgen::OutputSchema::of::<BayRemoved>(),
     ]
 }
