@@ -952,8 +952,10 @@ mod tests {
         List(Vec<String>),
     }
 
-    /// The argv Pult composes for `command` with `values`: its render rules for each kind,
-    /// substituted into the run, after the program name.
+    /// The argv `pult tool` composes for `command` with `values`: its render rules for each
+    /// kind, substituted into the run, after the program name. An item starting with `-` under
+    /// a `--` option rides inside it as one word, `--grep=-x`, as Pult's `exec::argv` does;
+    /// split in two, clap would read `-x` as a flag of its own.
     fn render(command: &SchemaCommand, values: &BTreeMap<String, Value>) -> Vec<String> {
         let mut argv = vec!["forklift".to_string()];
         for word in command.run.split_whitespace() {
@@ -972,8 +974,11 @@ mod tests {
                 }
                 (Kind::Repeat(repeat), Some(Value::List(items))) => {
                     for item in items {
-                        argv.extend(repeat.arg.clone());
-                        argv.push(item.clone());
+                        match &repeat.arg {
+                            Some(arg) if arg.starts_with("--") && item.starts_with('-') => argv.push(format!("{arg}={item}")),
+                            Some(arg) => argv.extend([arg.clone(), item.clone()]),
+                            None => argv.push(item.clone()),
+                        }
                     }
                 }
                 _ => panic!("{}: value of the wrong kind for {key}", command.id),
@@ -1240,6 +1245,9 @@ mod tests {
         let mut built = Cli::command();
         built.build();
         let doc = forklift();
+        // Dash-led option values checked, as (bound as text, refused by type): neither half
+        // may pass by having nothing to check.
+        let mut dash_led = (0, 0);
 
         for command in &doc.commands {
             let leaf = leaf(&built, command);
@@ -1292,20 +1300,34 @@ mod tests {
                                 .unwrap_or_else(|error| panic!("{}: --{key} {items:?}: {error}", command.id));
                         }
 
-                        // A value that spells an option is refused loudly, never bound elsewhere.
+                        // A value that spells an option rides inside its own option, so it binds
+                        // there verbatim, alone or beside a plain value; where the type cannot
+                        // hold it, clap refuses it as a value, never reads it as a flag.
                         for word in &hostile {
-                            let mut values = base.clone();
-                            values.insert(key.clone(), Value::List(vec![word.clone()]));
-                            assert!(
-                                parse(&built, command, &values).is_err(),
-                                "{}: --{key} {word:?} was accepted", command.id
-                            );
+                            let mut lists = vec![vec![word.clone()]];
+                            if max.is_none() {
+                                lists.push(vec![valid.clone(), word.clone()]);
+                            }
+                            for items in lists {
+                                let mut values = base.clone();
+                                values.insert(key.clone(), Value::List(items.clone()));
+                                let result = parse(&built, command, &values);
+                                if is_string(arg) {
+                                    result.unwrap_or_else(|error| panic!("{}: --{key} {items:?}: {error}", command.id));
+                                    dash_led.0 += 1;
+                                } else {
+                                    let error = result.err().unwrap_or_else(|| panic!("{}: --{key} {items:?} was accepted", command.id));
+                                    assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation, "{}: --{key} {items:?}: {error}", command.id);
+                                    dash_led.1 += 1;
+                                }
+                            }
                         }
                     }
                     _ => {}
                 }
             }
         }
+        assert!(dash_led.0 > 0 && dash_led.1 > 0, "dash-led values checked: {dash_led:?}");
     }
 
     // (d) Credentials: classified by the tables, and the tables are checked against the tree.
