@@ -35,7 +35,8 @@ const RESERVED_PARAMS: &[&str] = &["trust", "print", "params-json", "run-id", "h
 
 /// What separates the members of a collapsed run of positionals in its param's description.
 const RUN_SEPARATOR: &str = " | ";
-/// The character that marks [`RUN_SEPARATOR`]; no key may hold it, nor any run member's help.
+/// The character that marks [`RUN_SEPARATOR`]; no key may hold it, nor the help of any member
+/// of a run of two or more.
 const RUN_MARK: char = '|';
 
 /// Substrings that make an argument's name look like a credential. Every value-taking
@@ -927,6 +928,8 @@ mod tests {
     /// a collapsed run of positionals labels each member's help with that member's key.
     #[test]
     fn a_param_is_described_by_its_help() {
+        // The refusal guards the mark, so the separator must be built around it.
+        assert_eq!(RUN_SEPARATOR, format!(" {RUN_MARK} "));
         let doc = describe(&probe("described"), &NO_TABLES).unwrap();
         assert_eq!(
             serde_json::to_string(&doc.commands[0].params).unwrap(),
