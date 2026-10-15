@@ -33,6 +33,12 @@ const RESERVED_IDS: &[&str] = &[
 /// Param names Pult reserves (its resolver's `RESERVED_PARAMS`, pult 0.5.1).
 const RESERVED_PARAMS: &[&str] = &["trust", "print", "params-json", "run-id", "help", "json", "var"];
 
+/// What separates the members of a collapsed run of positionals in its param's description.
+const RUN_SEPARATOR: &str = " | ";
+/// The character that marks [`RUN_SEPARATOR`]; no key may hold it, nor the help of any member
+/// of a run of two or more.
+const RUN_MARK: char = '|';
+
 /// Substrings that make an argument's name look like a credential. Every value-taking
 /// argument whose id or long name contains one must be classified in [`Tables::secret`] or
 /// [`Tables::not_secret`]. This catches a new credential by its name; one hiding behind an
@@ -150,11 +156,24 @@ impl Serialize for Params {
     }
 }
 
-/// One param, in Pult's param kinds.
+/// One param: its kind, and what its value is for.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "docgen", schemars(deny_unknown_fields))]
+#[derive(Serialize)]
+struct Param {
+    #[serde(flatten)]
+    kind: Kind,
+
+    /// What the value is for, from the argument's help; absent when it has none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+}
+
+/// A param's kind, in Pult's vocabulary.
 #[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
 #[serde(rename_all = "lowercase")]
-enum Param {
+enum Kind {
     /// A required single positional; Pult prompts for it when it is absent.
     Input(Input),
 
@@ -285,10 +304,12 @@ struct Walk<'a> {
 
 /// How a positional argument is shaped.
 struct Positional {
+    id: String,
     key: String,
     required: bool,
     variadic: bool,
     secret: bool,
+    help: Option<String>,
 }
 
 impl Walk<'_> {
@@ -324,19 +345,19 @@ impl Walk<'_> {
 
             let long = arg.get_long()
                 .ok_or_else(|| refusal(&path, arg, "it has no long name for Pult to pass"))?;
-            let param = match arg.get_action() {
+            let kind = match arg.get_action() {
                 ArgAction::SetTrue => {
                     switch_refusals(&path, arg)?;
                     if arg.get_num_args().is_some() {
                         return Err(refusal(&path, arg, "it is a switch with a value count"));
                     }
-                    Param::Flag(Flag { arg: format!("--{long}") })
+                    Kind::Flag(Flag { arg: format!("--{long}") })
                 }
                 ArgAction::Set | ArgAction::Append => {
                     single_valued(&path, arg)?;
                     let required = arg.is_required_set();
                     let append = matches!(arg.get_action(), ArgAction::Append);
-                    Param::Repeat(Repeat {
+                    Kind::Repeat(Repeat {
                         arg: Some(format!("--{long}")),
                         min: if required { 1 } else { 0 },
                         max: if append { None } else { Some(1) },
@@ -345,7 +366,7 @@ impl Walk<'_> {
                 }
                 other => return Err(refusal(&path, arg, &format!("its action {other:?} has no Pult param"))),
             };
-            named.0.push((long.to_string(), param));
+            named.0.push((long.to_string(), Param { kind, description: help(&path, arg)? }));
         }
 
         let mut params = named;
@@ -397,13 +418,24 @@ impl Walk<'_> {
             }
         }
 
+        let title = about(command, path)?;
         let long_about = command.get_long_about()
             .map(|text| text.to_string())
             .filter(|text| !text.trim().is_empty());
+        // Pult substitutes `${...}` in a command's title and description as it does in a
+        // param's, so a literal one would be silently rewritten.
+        for (what, text) in [("title", Some(&title)), ("description", long_about.as_ref())] {
+            if text.is_some_and(|text| text.contains("${")) {
+                return Err(format!(
+                    "self-schema: `forklift {shown}` has a {what} containing `${{`, which Pult would \
+                     read as a variable"
+                ));
+            }
+        }
 
         self.commands.push(SchemaCommand {
             id,
-            title: about(command, path)?,
+            title,
             category: (path.len() > 1 || command.has_subcommands()).then(|| path[0].to_string()),
             description: long_about,
             params,
@@ -489,8 +521,13 @@ fn about(command: &Command, path: &[&str]) -> Result<String, String> {
 
 /// The refusal for an argument outside the whitelist.
 fn refusal(path: &[&str], arg: &Arg, why: &str) -> String {
+    refusal_of(path, arg.get_id().as_str(), why)
+}
+
+/// [`refusal`], for an argument known by its clap id.
+fn refusal_of(path: &[&str], id: &str, why: &str) -> String {
     let shown = if path.is_empty() { String::new() } else { format!(" {}", path.join(" ")) };
-    format!("self-schema cannot describe argument `{}` of `forklift{shown}`: {why}", arg.get_id())
+    format!("self-schema cannot describe argument `{id}` of `forklift{shown}`: {why}")
 }
 
 /// Refuse the argument settings no Pult param can carry, then classify a positional.
@@ -508,11 +545,26 @@ fn positional(path: &[&str], arg: &Arg, secret: bool) -> Result<Positional, Stri
     };
 
     Ok(Positional {
+        id: arg.get_id().to_string(),
         key: arg.get_id().as_str().replace('_', "-"),
         required: arg.is_required_set(),
         variadic,
         secret,
+        help: help(path, arg)?,
     })
+}
+
+/// An argument's help, as its param's description: the short help, else the long one; none
+/// when it has neither, since Pult treats an empty description as absent anyway. Refuses a
+/// help with `${`, which Pult reads as a variable reference in a description.
+fn help(path: &[&str], arg: &Arg) -> Result<Option<String>, String> {
+    let help = arg.get_help().or_else(|| arg.get_long_help())
+        .map(|text| text.to_string())
+        .filter(|text| !text.trim().is_empty());
+    if help.as_deref().is_some_and(|text| text.contains("${")) {
+        return Err(refusal(path, arg, "its help contains `${`, which Pult would read as a variable"));
+    }
+    Ok(help)
 }
 
 /// Refuse an option whose value count is anything but one value per occurrence. On the
@@ -587,12 +639,12 @@ fn layout(path: &[&str], positionals: Vec<Positional>) -> Result<Vec<(String, Pa
                 earlier.key, positional.key
             ));
         }
-        let param = if positional.variadic {
-            Param::Repeat(Repeat { arg: None, min: 1, max: None, secret: positional.secret })
+        let kind = if positional.variadic {
+            Kind::Repeat(Repeat { arg: None, min: 1, max: None, secret: positional.secret })
         } else {
-            Param::Input(Input { secret: positional.secret })
+            Kind::Input(Input { secret: positional.secret })
         };
-        params.push((positional.key, param));
+        params.push((positional.key, Param { kind, description: positional.help }));
     }
 
     if !optional.is_empty() {
@@ -603,7 +655,30 @@ fn layout(path: &[&str], positionals: Vec<Positional>) -> Result<Vec<(String, Pa
         };
         let key = optional.iter().map(|positional| positional.key.as_str()).collect::<Vec<_>>().join("-");
         let secret = optional.iter().any(|positional| positional.secret);
-        params.push((key, Param::Repeat(Repeat { arg: None, min: 0, max, secret })));
+        // One param stands for the whole run, so every member is named by its key, in the
+        // order the values fill them, with its help when it has one. Neither a key nor a
+        // member's help may hold the separator's mark, so every mark in the description is a
+        // separator and the reader can always tell where a member starts.
+        let description = match optional.as_slice() {
+            [only] => only.help.clone(),
+            run if run.iter().all(|positional| positional.help.is_none()) => None,
+            run => {
+                let mut parts = Vec::new();
+                for positional in run {
+                    match &positional.help {
+                        Some(help) if help.contains(RUN_MARK) => return Err(refusal_of(
+                            path, &positional.id,
+                            &format!("its help contains `{RUN_MARK}`, which separates the members of its run"),
+                        )),
+                        Some(help) => parts.push(format!("{}: {help}", positional.key)),
+                        None => parts.push(positional.key.clone()),
+                    }
+                }
+                Some(parts.join(RUN_SEPARATOR))
+            }
+        };
+        let kind = Kind::Repeat(Repeat { arg: None, min: 0, max, secret });
+        params.push((key, Param { kind, description }));
     }
 
     Ok(params)
@@ -664,7 +739,10 @@ mod tests {
             assert!(!command.title.trim().is_empty());
 
             let mut keys = std::collections::HashSet::new();
-            for (key, _) in &command.params.0 {
+            for (key, param) in &command.params.0 {
+                // Absence is legal (an argument with no help), but none is absent today; a new
+                // undocumented argument would ship an unexplained prompt in Pult.
+                assert!(param.description.is_some(), "{}: param {key} has no description", command.id);
                 assert!(key.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')));
                 assert!(!RESERVED_PARAMS.contains(&key.as_str()), "{}: reserved param {key}", command.id);
                 assert!(keys.insert(key.as_str()), "{}: duplicate param {key}", command.id);
@@ -691,13 +769,27 @@ mod tests {
 
         let diff = json("diff");
         assert!(diff.contains(r#""run":"diff {staged} -- {targets}""#), "{diff}");
-        assert!(diff.contains(r#""params":{"staged":{"flag":{"arg":"--staged"}},"targets":{"repeat":{}}}"#), "{diff}");
+        assert!(diff.contains(concat!(
+            r#""staged":{"flag":{"arg":"--staged"},"#,
+            r#""description":"Compare the inventory against the pallet head (what \"stack\" would record)"}"#,
+        )), "{diff}");
+        // A run of one optional positional is described by that positional's help, unlabelled.
+        assert!(diff.contains(
+            r#""targets":{"repeat":{},"description":"[path], or <revision-a> <revision-b> [path] — \":empty\" is the empty tree"}"#
+        ), "{diff}");
 
         let config = json("config");
-        assert!(config.contains(r#""key-value":{"repeat":{"max":2,"secret":true}}"#), "{config}");
+        assert!(config.contains(concat!(
+            r#""key-value":{"repeat":{"max":2,"secret":true},"description":"#,
+            r#""key: The configuration key (e.g. \"operator.name\"); omit it to list every key | "#,
+            r#"value: The value to set the key to; omit it to print the current value"}"#,
+        )), "{config}");
 
         let franchise = json("franchise");
-        assert!(franchise.contains(r#""token":{"repeat":{"arg":"--token","max":1,"secret":true}}"#), "{franchise}");
+        assert!(franchise.contains(concat!(
+            r#""token":{"repeat":{"arg":"--token","max":1,"secret":true},"#,
+            r#""description":"The bearer token, when the remote requires one (remembered as \"remote.token\")"}"#,
+        )), "{franchise}");
         assert!(franchise.contains(r#""run":"franchise {pallet} {token} {only} {expect} -- {url} {directory}""#), "{franchise}");
 
         let office = json("office");
@@ -754,6 +846,40 @@ mod tests {
         /// A trailing positional that swallows options
         #[command(trailing_var_arg = true)]
         Swallow { rest: Vec<String> },
+        /// Described
+        Described {
+            /// Short help
+            ///
+            /// Only in the long help
+            #[arg(long)]
+            both: Option<String>,
+            #[arg(long, long_help = "Long help only")]
+            long_only: bool,
+            #[arg(long)]
+            bare: bool,
+            /// The first
+            first: Option<String>,
+            second: Option<String>,
+        },
+        /// Variable-like help
+        Dollar {
+            /// Defaults to ${HOME}
+            #[arg(long)]
+            home: Option<String>,
+        },
+        /// Uses ${HOME}
+        DollarTitle,
+        /// Plain title
+        ///
+        /// Writes to ${module.dir}
+        DollarLong,
+        /// Help holding the run separator's mark
+        Piped {
+            /// One |the other
+            either: Option<String>,
+            /// The next
+            next: Option<String>,
+        },
     }
 
     /// The probe tree with only `name` under its root, so each probe is judged alone.
@@ -778,6 +904,10 @@ mod tests {
             ("hidden-switch", "`dump`"),
             ("global-switch", "`loudly`"),
             ("swallow", "swallows options"),
+            ("dollar", "`home` of `forklift dollar`: its help contains `${`"),
+            ("dollar-title", "has a title containing `${`"),
+            ("dollar-long", "has a description containing `${`"),
+            ("piped", "`either` of `forklift piped`: its help contains `|`"),
         ] {
             let error = describe(&probe(name), &NO_TABLES).err()
                 .unwrap_or_else(|| panic!("probe {name} was accepted"));
@@ -791,6 +921,24 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&doc.commands).unwrap(),
             r#"[{"id":"plain","title":"Plain","params":{"label":{"repeat":{"arg":"--label","max":1}}},"run":"plain {label}","interactive":false}]"#
+        );
+    }
+
+    /// A param's description is its argument's short help, else its long help, else absent;
+    /// a collapsed run of positionals labels each member's help with that member's key.
+    #[test]
+    fn a_param_is_described_by_its_help() {
+        // The refusal guards the mark, so the separator must be built around it.
+        assert_eq!(RUN_SEPARATOR, format!(" {RUN_MARK} "));
+        let doc = describe(&probe("described"), &NO_TABLES).unwrap();
+        assert_eq!(
+            serde_json::to_string(&doc.commands[0].params).unwrap(),
+            concat!(
+                r#"{"both":{"repeat":{"arg":"--both","max":1},"description":"Short help"},"#,
+                r#""long-only":{"flag":{"arg":"--long-only"},"description":"Long help only"},"#,
+                r#""bare":{"flag":{"arg":"--bare"}},"#,
+                r#""first-second":{"repeat":{"max":2},"description":"first: The first | second"}}"#,
+            )
         );
     }
 
@@ -814,15 +962,15 @@ mod tests {
                 continue;
             };
             let param = &command.params.0.iter().find(|(name, _)| name == key).expect(key).1;
-            match (param, values.get(key)) {
+            match (&param.kind, values.get(key)) {
                 (_, None) => {}
-                (Param::Input(_), Some(Value::Text(text))) => argv.push(text.clone()),
-                (Param::Flag(flag), Some(Value::Switch(on))) => {
+                (Kind::Input(_), Some(Value::Text(text))) => argv.push(text.clone()),
+                (Kind::Flag(flag), Some(Value::Switch(on))) => {
                     if *on {
                         argv.push(flag.arg.clone());
                     }
                 }
-                (Param::Repeat(repeat), Some(Value::List(items))) => {
+                (Kind::Repeat(repeat), Some(Value::List(items))) => {
                     for item in items {
                         argv.extend(repeat.arg.clone());
                         argv.push(item.clone());
@@ -892,9 +1040,9 @@ mod tests {
     fn positional_words(command: &SchemaCommand, values: &BTreeMap<String, Value>) -> Vec<String> {
         let mut words = Vec::new();
         for (key, param) in &command.params.0 {
-            match (param, values.get(key)) {
-                (Param::Input(_), Some(Value::Text(text))) => words.push(text.clone()),
-                (Param::Repeat(Repeat { arg: None, .. }), Some(Value::List(items))) => words.extend(items.iter().cloned()),
+            match (&param.kind, values.get(key)) {
+                (Kind::Input(_), Some(Value::Text(text))) => words.push(text.clone()),
+                (Kind::Repeat(Repeat { arg: None, .. }), Some(Value::List(items))) => words.extend(items.iter().cloned()),
                 _ => {}
             }
         }
@@ -917,9 +1065,9 @@ mod tests {
         assert!(words.next().is_none(), "{}: more positional words than positionals", command.id);
 
         for (key, param) in &command.params.0 {
-            let long = match param {
-                Param::Flag(flag) => &flag.arg,
-                Param::Repeat(Repeat { arg: Some(arg), .. }) => arg,
+            let long = match &param.kind {
+                Kind::Flag(flag) => &flag.arg,
+                Kind::Repeat(Repeat { arg: Some(arg), .. }) => arg,
                 _ => continue,
             };
             let arg = own_args(leaf).find(|arg| arg.get_long() == long.strip_prefix("--")).expect(long);
@@ -979,12 +1127,12 @@ mod tests {
         let mut slot = 0;
         let mut values = BTreeMap::new();
         for (key, param) in &command.params.0 {
-            match param {
-                Param::Input(_) => {
+            match &param.kind {
+                Kind::Input(_) => {
                     values.insert(key.clone(), Value::Text(valid_value(command, slots[slot], slot)));
                     slot += 1;
                 }
-                Param::Repeat(Repeat { arg: None, max, .. }) => {
+                Kind::Repeat(Repeat { arg: None, max, .. }) => {
                     let count = max.unwrap_or(2) as usize;
                     let items = (0..count).map(|offset| {
                         let arg = slots[(slot + offset).min(slots.len() - 1)];
@@ -993,7 +1141,7 @@ mod tests {
                     values.insert(key.clone(), Value::List(items));
                     slot += count;
                 }
-                Param::Repeat(Repeat { arg: Some(long), min, .. }) if *min > 0 => {
+                Kind::Repeat(Repeat { arg: Some(long), min, .. }) if *min > 0 => {
                     let arg = own_args(leaf).find(|arg| arg.get_long() == long.strip_prefix("--")).expect(long);
                     values.insert(key.clone(), Value::List(vec![valid_value(command, arg, 0)]));
                 }
@@ -1016,8 +1164,8 @@ mod tests {
                 Ok(()) => return base,
                 Err(error) => error,
             };
-            let optional = command.params.0.iter().rev().find_map(|(name, param)| match param {
-                Param::Repeat(Repeat { arg: None, min: 0, .. }) => Some(name),
+            let optional = command.params.0.iter().rev().find_map(|(name, param)| match &param.kind {
+                Kind::Repeat(Repeat { arg: None, min: 0, .. }) => Some(name),
                 _ => None,
             });
             let dropped = match optional.and_then(|name| base.get_mut(name)) {
@@ -1037,14 +1185,14 @@ mod tests {
         let positionals = positionals(leaf);
         let mut slot = 0;
         for (key, param) in &command.params.0 {
-            let covered = match param {
-                Param::Flag(Flag { arg }) | Param::Repeat(Repeat { arg: Some(arg), .. }) => {
+            let covered = match &param.kind {
+                Kind::Flag(Flag { arg }) | Kind::Repeat(Repeat { arg: Some(arg), .. }) => {
                     assert_eq!(arg.strip_prefix("--"), Some(key.as_str()), "{}", command.id);
                     continue;
                 }
-                Param::Input(_) => 1,
-                Param::Repeat(Repeat { arg: None, max: Some(max), .. }) => *max as usize,
-                Param::Repeat(Repeat { arg: None, max: None, .. }) => positionals.len() - slot,
+                Kind::Input(_) => 1,
+                Kind::Repeat(Repeat { arg: None, max: Some(max), .. }) => *max as usize,
+                Kind::Repeat(Repeat { arg: None, max: None, .. }) => positionals.len() - slot,
             };
             let ids: Vec<String> = positionals[slot..slot + covered].iter()
                 .map(|arg| arg.get_id().as_str().replace('_', "-"))
@@ -1066,14 +1214,14 @@ mod tests {
         let mut values = values.clone();
         let mut at = 0;
         for (key, param) in &command.params.0 {
-            match (param, values.get_mut(key)) {
-                (Param::Input(_), Some(Value::Text(text))) => {
+            match (&param.kind, values.get_mut(key)) {
+                (Kind::Input(_), Some(Value::Text(text))) => {
                     if at == index {
                         *text = word.to_string();
                     }
                     at += 1;
                 }
-                (Param::Repeat(Repeat { arg: None, .. }), Some(Value::List(items))) => {
+                (Kind::Repeat(Repeat { arg: None, .. }), Some(Value::List(items))) => {
                     for item in items {
                         if at == index {
                             *item = word.to_string();
@@ -1118,11 +1266,11 @@ mod tests {
             }
 
             for (key, param) in &command.params.0 {
-                match param {
-                    Param::Flag(_) => {
+                match &param.kind {
+                    Kind::Flag(_) => {
                         fit(&built, command, &base, key, Value::Switch(true));
                     }
-                    Param::Repeat(Repeat { arg: Some(long), max, .. }) => {
+                    Kind::Repeat(Repeat { arg: Some(long), max, .. }) => {
                         let arg = own_args(leaf).find(|arg| arg.get_long() == long.strip_prefix("--")).expect(long);
                         let valid = valid_value(command, arg, 0);
 

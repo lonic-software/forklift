@@ -2802,10 +2802,9 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "object"
     },
     "Param": {
-      "description": "One param, in Pult's param kinds.",
+      "description": "One param: its kind, and what its value is for.",
       "oneOf": [
         {
-          "additionalProperties": false,
           "description": "A required single positional; Pult prompts for it when it is absent.",
           "properties": {
             "input": {
@@ -2818,7 +2817,6 @@ A command not listed here either reports only the generic human-message shape `{
           "type": "object"
         },
         {
-          "additionalProperties": false,
           "description": "A switch.",
           "properties": {
             "flag": {
@@ -2831,7 +2829,6 @@ A command not listed here either reports only the generic human-message shape `{
           "type": "object"
         },
         {
-          "additionalProperties": false,
           "description": "An option (with `arg`) or the trailing positionals (without).",
           "properties": {
             "repeat": {
@@ -2843,7 +2840,18 @@ A command not listed here either reports only the generic human-message shape `{
           ],
           "type": "object"
         }
-      ]
+      ],
+      "properties": {
+        "description": {
+          "description": "What the value is for, from the argument's help; absent when it has none.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object",
+      "unevaluatedProperties": false
     },
     "Repeat": {
       "properties": {

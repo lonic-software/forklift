@@ -1168,8 +1168,11 @@ matches the binary that prints it. Each runnable command path (`office admit`, a
 such as `office` that runs on its own) becomes one command with an id (`office-admit`), a
 title, its params and a `run`: the argument tail after the program name, with options and
 switches before a literal `--` and positionals after it, so a value is never mistaken for a
-flag. `pult tool` reads it and prefixes the path of the binary it found; the document is not
-a runnable `pult.yaml` on its own.
+flag. Each param carries its argument's help text as its `description`, which Pult shows
+beside the prompt and in its own `--help`; when several optional positionals share one param
+(`config`'s key and value), each part is labelled with its name. `pult tool` reads it and
+prefixes the path of the binary it found; the document is not a runnable `pult.yaml` on its
+own.
 
 The global `--json`, `--verbose` and `--no-pager` are not params: they are the caller's
 choice of rendering. `help`, `mcp` and `self-schema` itself are left out. The bearer token
