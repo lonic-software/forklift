@@ -113,9 +113,10 @@ struct ErrorBody<'a> {
 }
 
 /// Print one document to stdout. Pretty-printed: the consumer is a program, but a human
-/// debugging the pipe reads it too, and JSON parsers do not care about whitespace. The
-/// fallback for the serializer failure that cannot happen here (`data` is already a `Value`) is
-/// a failure, never an `ok: true` without `data`.
+/// debugging the pipe reads it too, and JSON parsers do not care about whitespace. If the
+/// document does not serialize (only a typed `data` from [`emit_ordered`] can fail; a `Value`
+/// cannot), the fallback is a failure document and a failing exit, never an `ok: true` without
+/// `data`.
 fn print_document<T: Serialize>(data: Option<&T>, error: Option<ErrorBody>) {
     let ok = error.is_none();
     let command = COMMAND.get().and_then(|command| command.as_deref());
@@ -131,10 +132,13 @@ fn print_document<T: Serialize>(data: Option<&T>, error: Option<ErrorBody>) {
 
     match serde_json::to_string_pretty(&document) {
         Ok(text) => println!("{}", text),
-        Err(_) => println!(
-            "{{\"lonic_json\":{},\"tool\":\"{}\",\"schema\":{},\"command\":{},\"ok\":false,\"error\":{{\"code\":\"{}\",\"message\":\"The result could not be serialized.\"}}}}",
-            LONIC_JSON, TOOL, SCHEMA_VERSION, serde_json::json!(command), ErrorCode::Generic.as_str()
-        ),
+        Err(_) => {
+            RESULT_UNSERIALIZABLE.store(true, Ordering::Relaxed);
+            println!(
+                "{{\"lonic_json\":{},\"tool\":\"{}\",\"schema\":{},\"command\":{},\"ok\":false,\"error\":{{\"code\":\"{}\",\"message\":\"The result could not be serialized.\"}}}}",
+                LONIC_JSON, TOOL, SCHEMA_VERSION, serde_json::json!(command), ErrorCode::Generic.as_str()
+            );
+        }
     }
 }
 
@@ -151,6 +155,16 @@ pub fn emit<T: CommandOutput>(value: &T) {
     match mode() {
         OutputMode::Human => value.render_human(),
         OutputMode::Json => print_envelope(value),
+    }
+}
+
+/// Emit a structured result whose map key order is part of its meaning, keeping that order in
+/// `--json` instead of sorting it (see [`data_value`]). Only for a result with no `HashMap`
+/// inside, since nothing here makes a hash order deterministic.
+pub fn emit_ordered<T: CommandOutput>(value: &T) {
+    match mode() {
+        OutputMode::Human => value.render_human(),
+        OutputMode::Json => print_document(Some(value), None),
     }
 }
 

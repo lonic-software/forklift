@@ -410,7 +410,7 @@ provider maps ids to display names behind its own policy; locally, your
 a personal identity and one per organization:
 
 ```sh
-forklift profile create work --name "Work Me"           # mints an id
+forklift profile create work --display-name "Work Me"   # mints an id
 forklift profile create acme --id acme-issued-id        # or use a provider-issued id
 forklift profile use work                                # this warehouse now acts as "work"
 forklift profile list                                    # profiles and the local keys each holds
