@@ -79,7 +79,9 @@ pub fn render_json_schemas() -> Result<String, String> {
          [JSON Schema](https://json-schema.org/) per shape a command can emit; a command with \
          more than one (e.g. one per subcommand) lists all of them. Descriptions come straight \
          from the Rust doc comments on the underlying struct, so they stay in sync with the \
-         field they describe.\n\n\
+         field they describe. Each schema describes what Forklift writes: a field under \
+         `required` is always present (possibly as `null`), and any other field is left out \
+         when it has nothing to say.\n\n\
          A command not listed here either reports only the generic human-message shape \
          `{ \"message\": string }`, or produces no `--json` data at all — see the command's \
          entry in `docs/guide/cli.md`.\n\n",
@@ -190,12 +192,16 @@ fn check_output_contract() -> Result<(), String> {
     struct Probe {
         #[serde(skip_serializing_if = "Vec::is_empty")]
         skipped_when_empty: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        skipped_with_a_default: Vec<String>,
         always_written: Option<String>,
+        #[serde(default)]
+        written_with_a_default: Vec<String>,
     }
 
     let schema = OutputSchema::of::<Probe>().schema;
     let required = schema.get("required").cloned().unwrap_or_default();
-    if required != serde_json::json!(["always_written"]) {
+    if required != serde_json::json!(["always_written", "written_with_a_default"]) {
         return Err(format!(
             "docgen: output schemas must mark `required` as serialized (a skipped field optional, \
              an Option without a skip required); the probe got `required: {required}`."

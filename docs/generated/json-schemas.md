@@ -7,7 +7,7 @@ that affects it (a new error code, or a `--json` output struct).
 
 # `--json` output schemas
 
-Every command's `--json` result is `{ "lonic_json", "tool", "schema", "command", "ok": true, "data": … }` on success (see `docs/MACHINE_INTERFACE.md` for the envelope and the failure shape). This page is the exhaustive reference for each command's `data` — one [JSON Schema](https://json-schema.org/) per shape a command can emit; a command with more than one (e.g. one per subcommand) lists all of them. Descriptions come straight from the Rust doc comments on the underlying struct, so they stay in sync with the field they describe.
+Every command's `--json` result is `{ "lonic_json", "tool", "schema", "command", "ok": true, "data": … }` on success (see `docs/MACHINE_INTERFACE.md` for the envelope and the failure shape). This page is the exhaustive reference for each command's `data` — one [JSON Schema](https://json-schema.org/) per shape a command can emit; a command with more than one (e.g. one per subcommand) lists all of them. Descriptions come straight from the Rust doc comments on the underlying struct, so they stay in sync with the field they describe. Each schema describes what Forklift writes: a field under `required` is always present (possibly as `null`), and any other field is left out when it has nothing to say.
 
 A command not listed here either reports only the generic human-message shape `{ "message": string }`, or produces no `--json` data at all — see the command's entry in `docs/guide/cli.md`.
 
@@ -3687,10 +3687,7 @@ A command not listed here either reports only the generic human-message shape `{
         },
         "name_invalid": {
           "description": "Present and `true` when `name` does not meet the naming rules `tag create` enforces\n(letters, digits, `.`, `_`, `-` only); omitted otherwise. `@tags` syncs in wholesale\n(`franchise`/`lower`), and nothing validates a record's `name` on the way in — only\n`tag create` does, for a name of its own choosing — so a foreign or older client's record\ncan carry one this build would never have created itself.",
-          "type": [
-            "boolean",
-            "null"
-          ]
+          "type": "boolean"
         },
         "parcel": {
           "description": "The @tags parcel that introduced the tag.",
@@ -3702,10 +3699,7 @@ A command not listed here either reports only the generic human-message shape `{
         },
         "subject_absent": {
           "description": "Present and `true` when the subject parcel is not in this store (never fetched, collected,\nor recorded with an invalid hash); omitted when the subject is present.",
-          "type": [
-            "boolean",
-            "null"
-          ]
+          "type": "boolean"
         },
         "tagged_at": {
           "description": "The tag creation time as RFC 3339 (UTC).",
@@ -3774,10 +3768,7 @@ A command not listed here either reports only the generic human-message shape `{
     },
     "name_invalid": {
       "description": "Present and `true` when `name` does not meet the naming rules `tag create` enforces\n(letters, digits, `.`, `_`, `-` only); omitted otherwise. `@tags` syncs in wholesale\n(`franchise`/`lower`), and nothing validates a record's `name` on the way in — only\n`tag create` does, for a name of its own choosing — so a foreign or older client's record\ncan carry one this build would never have created itself.",
-      "type": [
-        "boolean",
-        "null"
-      ]
+      "type": "boolean"
     },
     "parcel": {
       "description": "The @tags parcel that introduced the tag.",
@@ -3789,10 +3780,7 @@ A command not listed here either reports only the generic human-message shape `{
     },
     "subject_absent": {
       "description": "Present and `true` when the subject parcel is not in this store (never fetched, collected,\nor recorded with an invalid hash); omitted when the subject is present.",
-      "type": [
-        "boolean",
-        "null"
-      ]
+      "type": "boolean"
     },
     "tagged_at": {
       "description": "The tag creation time as RFC 3339 (UTC).",
