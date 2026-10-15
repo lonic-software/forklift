@@ -35,6 +35,8 @@ const RESERVED_PARAMS: &[&str] = &["trust", "print", "params-json", "run-id", "h
 
 /// What separates the members of a collapsed run of positionals in its param's description.
 const RUN_SEPARATOR: &str = " | ";
+/// The character that marks [`RUN_SEPARATOR`]; no key may hold it, nor any run member's help.
+const RUN_MARK: char = '|';
 
 /// Substrings that make an argument's name look like a credential. Every value-taking
 /// argument whose id or long name contains one must be classified in [`Tables::secret`] or
@@ -301,6 +303,7 @@ struct Walk<'a> {
 
 /// How a positional argument is shaped.
 struct Positional {
+    id: String,
     key: String,
     required: bool,
     variadic: bool,
@@ -414,13 +417,24 @@ impl Walk<'_> {
             }
         }
 
+        let title = about(command, path)?;
         let long_about = command.get_long_about()
             .map(|text| text.to_string())
             .filter(|text| !text.trim().is_empty());
+        // Pult substitutes `${...}` in a command's title and description as it does in a
+        // param's, so a literal one would be silently rewritten.
+        for (what, text) in [("title", Some(&title)), ("description", long_about.as_ref())] {
+            if text.is_some_and(|text| text.contains("${")) {
+                return Err(format!(
+                    "self-schema: `forklift {shown}` has a {what} containing `${{`, which Pult would \
+                     read as a variable"
+                ));
+            }
+        }
 
         self.commands.push(SchemaCommand {
             id,
-            title: about(command, path)?,
+            title,
             category: (path.len() > 1 || command.has_subcommands()).then(|| path[0].to_string()),
             description: long_about,
             params,
@@ -506,8 +520,13 @@ fn about(command: &Command, path: &[&str]) -> Result<String, String> {
 
 /// The refusal for an argument outside the whitelist.
 fn refusal(path: &[&str], arg: &Arg, why: &str) -> String {
+    refusal_of(path, arg.get_id().as_str(), why)
+}
+
+/// [`refusal`], for an argument known by its clap id.
+fn refusal_of(path: &[&str], id: &str, why: &str) -> String {
     let shown = if path.is_empty() { String::new() } else { format!(" {}", path.join(" ")) };
-    format!("self-schema cannot describe argument `{}` of `forklift{shown}`: {why}", arg.get_id())
+    format!("self-schema cannot describe argument `{id}` of `forklift{shown}`: {why}")
 }
 
 /// Refuse the argument settings no Pult param can carry, then classify a positional.
@@ -525,6 +544,7 @@ fn positional(path: &[&str], arg: &Arg, secret: bool) -> Result<Positional, Stri
     };
 
     Ok(Positional {
+        id: arg.get_id().to_string(),
         key: arg.get_id().as_str().replace('_', "-"),
         required: arg.is_required_set(),
         variadic,
@@ -635,8 +655,9 @@ fn layout(path: &[&str], positionals: Vec<Positional>) -> Result<Vec<(String, Pa
         let key = optional.iter().map(|positional| positional.key.as_str()).collect::<Vec<_>>().join("-");
         let secret = optional.iter().any(|positional| positional.secret);
         // One param stands for the whole run, so every member is named by its key, in the
-        // order the values fill them, with its help when it has one. The separator is one no
-        // member's help may contain, so the reader can always tell where a member starts.
+        // order the values fill them, with its help when it has one. Neither a key nor a
+        // member's help may hold the separator's mark, so every mark in the description is a
+        // separator and the reader can always tell where a member starts.
         let description = match optional.as_slice() {
             [only] => only.help.clone(),
             run if run.iter().all(|positional| positional.help.is_none()) => None,
@@ -644,10 +665,9 @@ fn layout(path: &[&str], positionals: Vec<Positional>) -> Result<Vec<(String, Pa
                 let mut parts = Vec::new();
                 for positional in run {
                     match &positional.help {
-                        Some(help) if help.contains(RUN_SEPARATOR) => return Err(format!(
-                            "self-schema: `forklift {shown}` has a positional `{}` whose help \
-                             contains `{RUN_SEPARATOR}`, which separates the members of its run",
-                            positional.key
+                        Some(help) if help.contains(RUN_MARK) => return Err(refusal_of(
+                            path, &positional.id,
+                            &format!("its help contains `{RUN_MARK}`, which separates the members of its run"),
                         )),
                         Some(help) => parts.push(format!("{}: {help}", positional.key)),
                         None => parts.push(positional.key.clone()),
@@ -846,9 +866,15 @@ mod tests {
             #[arg(long)]
             home: Option<String>,
         },
-        /// Help holding the run separator
+        /// Uses ${HOME}
+        DollarTitle,
+        /// Plain title
+        ///
+        /// Writes to ${module.dir}
+        DollarLong,
+        /// Help holding the run separator's mark
         Piped {
-            /// One | the other
+            /// One |the other
             either: Option<String>,
             /// The next
             next: Option<String>,
@@ -877,8 +903,10 @@ mod tests {
             ("hidden-switch", "`dump`"),
             ("global-switch", "`loudly`"),
             ("swallow", "swallows options"),
-            ("dollar", "`home`"),
-            ("piped", "`either` whose help contains ` | `"),
+            ("dollar", "`home` of `forklift dollar`: its help contains `${`"),
+            ("dollar-title", "has a title containing `${`"),
+            ("dollar-long", "has a description containing `${`"),
+            ("piped", "`either` of `forklift piped`: its help contains `|`"),
         ] {
             let error = describe(&probe(name), &NO_TABLES).err()
                 .unwrap_or_else(|| panic!("probe {name} was accepted"));
