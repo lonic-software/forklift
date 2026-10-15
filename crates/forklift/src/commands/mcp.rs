@@ -498,9 +498,17 @@ fn parse_event(line: &str) -> Option<Reported> {
     let rest = line.strip_prefix("progress ")?;
     let (value, text) = rest.split_once(' ').unwrap_or((rest, ""));
 
+    // The v1 rule Pult's reference states: ASCII digits after at most one `+`, and a value over 100
+    // saturates at any magnitude. With the digits checked, a failed parse can only be overflow.
     let percent = match value {
         "?" => None,
-        value => Some(value.parse::<u8>().ok().filter(|percent| *percent <= 100)?),
+        value => {
+            let digits = value.strip_prefix('+').unwrap_or(value);
+            if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            Some(digits.parse::<u8>().map_or(100, |percent| percent.min(100)))
+        }
     };
 
     Some(Reported::Progress { percent, text: text.trim().to_string() })
@@ -1336,7 +1344,30 @@ mod tests {
         assert_eq!(super::parse_event("progress 100 a b"), Some(Reported::Progress { percent: Some(100), text: "a b".into() }));
         assert_eq!(super::parse_event("progress ? item"), Some(Reported::Progress { percent: None, text: "item".into() }));
 
-        for line in ["status ", "status", "progress 101", "progress -1", "progress x y", "progress", "step 1 2 x", ""] {
+        for line in ["status ", "status", "progress -1", "progress x y", "progress", "step 1 2 x", ""] {
+            assert_eq!(super::parse_event(line), None, "{:?} parsed", line);
+        }
+    }
+
+    #[test]
+    fn a_percent_saturates_at_any_magnitude_and_a_non_digit_is_malformed() {
+        let percent = |line: &str| match super::parse_event(line) {
+            Some(Reported::Progress { percent, .. }) => percent,
+            other => panic!("{:?} parsed as {:?}", line, other),
+        };
+        // Above u8, above u32::MAX, then above u64::MAX: no integer width saves a parse-then-clamp
+        // reader from dropping these. Padding is not magnitude.
+        for (line, want) in [
+            ("progress 101", 100), ("progress 300", 100), ("progress +101", 100),
+            ("progress 99999999999", 100), ("progress 99999999999999999999999999", 100),
+            ("progress +50", 50), ("progress 0000000000050", 50), ("progress 0000000000101", 100),
+        ] {
+            assert_eq!(percent(line), Some(want), "{}", line);
+        }
+        // A sign, a decimal point, a letter or a non-ASCII digit is malformed. Once a parse fails it
+        // reads as overflow, so a looser digit check would turn the last two into a full bar.
+        for line in ["progress -1", "progress -0", "progress 1.5", "progress x", "progress +", "progress ++5",
+                     "progress +-5", "progress \u{663}", "progress \u{ff15}"] {
             assert_eq!(super::parse_event(line), None, "{:?} parsed", line);
         }
     }
