@@ -965,8 +965,8 @@ mod tests {
         Split,
     }
 
-    /// The argv Pult composes for `command` with `values`: its render rules for each kind,
-    /// substituted into the run, after the program name.
+    /// The argv for `command` with `values`, option items written in `form`: Pult's render
+    /// rules for each kind, substituted into the run, after the program name.
     fn render(command: &SchemaCommand, values: &BTreeMap<String, Value>, form: Form) -> Vec<String> {
         let mut argv = vec!["forklift".to_string()];
         for word in command.run.split_whitespace() {
@@ -1142,6 +1142,11 @@ mod tests {
         // No run carries a global, so a value that spells one (`--json`) must not set it.
         for global in built.get_arguments().filter(|arg| arg.is_global_set()) {
             let id = global.get_id().as_str();
+            let long = global.get_long().map(|long| format!("--{long}"));
+            assert!(
+                !command.run.split_whitespace().any(|word| Some(word) == long.as_deref()),
+                "{}: the run carries the global {id}", command.id
+            );
             assert_ne!(at.value_source(id), Some(ValueSource::CommandLine), "{argv:?}: set the global {id}");
         }
         assert_eq!(bound, expectation(leaf, command, values), "{argv:?}");
@@ -1336,6 +1341,9 @@ mod tests {
 
                                 // Written as two words, a value that spells an option is refused
                                 // loudly, never bound elsewhere.
+                                // The refusal is the word's: `good` parsed this same base, split,
+                                // with a plain value where the word stands. Which argument clap
+                                // blames varies (`--` ends the options, so a neighbour is).
                                 assert!(
                                     parse_as(&built, command, &values, Form::Split).is_err(),
                                     "{}: --{key} {items:?} split in two was accepted", command.id

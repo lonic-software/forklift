@@ -1168,10 +1168,11 @@ matches the binary that prints it. Each runnable command path (`office admit`, a
 such as `office` that runs on its own) becomes one command with an id (`office-admit`), a
 title, its params and a `run`: the argument tail after the program name, with options and
 switches before a literal `--` and positionals after it, so a value is never mistaken for a
-flag. An option value that looks like a flag (`-x`, `--json`) has to ride inside its option
-as one word, `--grep=-x`, which is how `pult tool` passes it; written as two words, it is
-refused rather than read as a value. Each param carries its argument's help text as its `description`, which Pult shows
-beside the prompt and in its own `--help`; when several optional positionals share one param
+flag. A text option's value that looks like a flag (`-x`, `--json`) has to ride inside its
+option as one word, `--grep=-x`, which is how `pult tool` passes it; written as two words, it
+is refused rather than read as a value. Each param carries its argument's help text as its
+`description`, which Pult shows beside the prompt and in its own `--help`; when several
+optional positionals share one param
 (`config`'s key and value), each part is labelled with its name. `pult tool` reads it and
 prefixes the path of the binary it found; the document is not a runnable `pult.yaml` on its
 own.
