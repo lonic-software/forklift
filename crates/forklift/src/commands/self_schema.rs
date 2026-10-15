@@ -33,6 +33,9 @@ const RESERVED_IDS: &[&str] = &[
 /// Param names Pult reserves (its resolver's `RESERVED_PARAMS`, pult 0.5.1).
 const RESERVED_PARAMS: &[&str] = &["trust", "print", "params-json", "run-id", "help", "json", "var"];
 
+/// What separates the members of a collapsed run of positionals in its param's description.
+const RUN_SEPARATOR: &str = " | ";
+
 /// Substrings that make an argument's name look like a credential. Every value-taking
 /// argument whose id or long name contains one must be classified in [`Tables::secret`] or
 /// [`Tables::not_secret`]. This catches a new credential by its name; one hiding behind an
@@ -152,6 +155,7 @@ impl Serialize for Params {
 
 /// One param: its kind, and what its value is for.
 #[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "docgen", schemars(deny_unknown_fields))]
 #[derive(Serialize)]
 struct Param {
     #[serde(flatten)]
@@ -358,7 +362,7 @@ impl Walk<'_> {
                 }
                 other => return Err(refusal(&path, arg, &format!("its action {other:?} has no Pult param"))),
             };
-            named.0.push((long.to_string(), Param { kind, description: help(arg) }));
+            named.0.push((long.to_string(), Param { kind, description: help(&path, arg)? }));
         }
 
         let mut params = named;
@@ -525,16 +529,21 @@ fn positional(path: &[&str], arg: &Arg, secret: bool) -> Result<Positional, Stri
         required: arg.is_required_set(),
         variadic,
         secret,
-        help: help(arg),
+        help: help(path, arg)?,
     })
 }
 
 /// An argument's help, as its param's description: the short help, else the long one; none
-/// when it has neither, since Pult treats an empty description as absent anyway.
-fn help(arg: &Arg) -> Option<String> {
-    arg.get_help().or_else(|| arg.get_long_help())
+/// when it has neither, since Pult treats an empty description as absent anyway. Refuses a
+/// help with `${`, which Pult reads as a variable reference in a description.
+fn help(path: &[&str], arg: &Arg) -> Result<Option<String>, String> {
+    let help = arg.get_help().or_else(|| arg.get_long_help())
         .map(|text| text.to_string())
-        .filter(|text| !text.trim().is_empty())
+        .filter(|text| !text.trim().is_empty());
+    if help.as_deref().is_some_and(|text| text.contains("${")) {
+        return Err(refusal(path, arg, "its help contains `${`, which Pult would read as a variable"));
+    }
+    Ok(help)
 }
 
 /// Refuse an option whose value count is anything but one value per occurrence. On the
@@ -625,15 +634,26 @@ fn layout(path: &[&str], positionals: Vec<Positional>) -> Result<Vec<(String, Pa
         };
         let key = optional.iter().map(|positional| positional.key.as_str()).collect::<Vec<_>>().join("-");
         let secret = optional.iter().any(|positional| positional.secret);
-        // One param stands for the whole run, so each member's help is labelled with its own
-        // key, in the order the values fill them.
+        // One param stands for the whole run, so every member is named by its key, in the
+        // order the values fill them, with its help when it has one. The separator is one no
+        // member's help may contain, so the reader can always tell where a member starts.
         let description = match optional.as_slice() {
             [only] => only.help.clone(),
+            run if run.iter().all(|positional| positional.help.is_none()) => None,
             run => {
-                let parts: Vec<String> = run.iter()
-                    .filter_map(|positional| positional.help.as_ref().map(|help| format!("{}: {help}", positional.key)))
-                    .collect();
-                (!parts.is_empty()).then(|| parts.join("; "))
+                let mut parts = Vec::new();
+                for positional in run {
+                    match &positional.help {
+                        Some(help) if help.contains(RUN_SEPARATOR) => return Err(format!(
+                            "self-schema: `forklift {shown}` has a positional `{}` whose help \
+                             contains `{RUN_SEPARATOR}`, which separates the members of its run",
+                            positional.key
+                        )),
+                        Some(help) => parts.push(format!("{}: {help}", positional.key)),
+                        None => parts.push(positional.key.clone()),
+                    }
+                }
+                Some(parts.join(RUN_SEPARATOR))
             }
         };
         let kind = Kind::Repeat(Repeat { arg: None, min: 0, max, secret });
@@ -698,7 +718,10 @@ mod tests {
             assert!(!command.title.trim().is_empty());
 
             let mut keys = std::collections::HashSet::new();
-            for (key, _) in &command.params.0 {
+            for (key, param) in &command.params.0 {
+                // Absence is legal (an argument with no help), but none is absent today; a new
+                // undocumented argument would ship an unexplained prompt in Pult.
+                assert!(param.description.is_some(), "{}: param {key} has no description", command.id);
                 assert!(key.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')));
                 assert!(!RESERVED_PARAMS.contains(&key.as_str()), "{}: reserved param {key}", command.id);
                 assert!(keys.insert(key.as_str()), "{}: duplicate param {key}", command.id);
@@ -729,17 +752,23 @@ mod tests {
             r#""staged":{"flag":{"arg":"--staged"},"#,
             r#""description":"Compare the inventory against the pallet head (what \"stack\" would record)"}"#,
         )), "{diff}");
-        assert!(diff.contains(r#""targets":{"repeat":{},"description":"#), "{diff}");
+        // A run of one optional positional is described by that positional's help, unlabelled.
+        assert!(diff.contains(
+            r#""targets":{"repeat":{},"description":"[path], or <revision-a> <revision-b> [path] — \":empty\" is the empty tree"}"#
+        ), "{diff}");
 
         let config = json("config");
         assert!(config.contains(concat!(
             r#""key-value":{"repeat":{"max":2,"secret":true},"description":"#,
-            r#""key: The configuration key (e.g. \"operator.name\"); omit it to list every key; "#,
+            r#""key: The configuration key (e.g. \"operator.name\"); omit it to list every key | "#,
             r#"value: The value to set the key to; omit it to print the current value"}"#,
         )), "{config}");
 
         let franchise = json("franchise");
-        assert!(franchise.contains(r#""token":{"repeat":{"arg":"--token","max":1,"secret":true},"#), "{franchise}");
+        assert!(franchise.contains(concat!(
+            r#""token":{"repeat":{"arg":"--token","max":1,"secret":true},"#,
+            r#""description":"The bearer token, when the remote requires one (remembered as \"remote.token\")"}"#,
+        )), "{franchise}");
         assert!(franchise.contains(r#""run":"franchise {pallet} {token} {only} {expect} -- {url} {directory}""#), "{franchise}");
 
         let office = json("office");
@@ -811,6 +840,19 @@ mod tests {
             first: Option<String>,
             second: Option<String>,
         },
+        /// Variable-like help
+        Dollar {
+            /// Defaults to ${HOME}
+            #[arg(long)]
+            home: Option<String>,
+        },
+        /// Help holding the run separator
+        Piped {
+            /// One | the other
+            either: Option<String>,
+            /// The next
+            next: Option<String>,
+        },
     }
 
     /// The probe tree with only `name` under its root, so each probe is judged alone.
@@ -835,6 +877,8 @@ mod tests {
             ("hidden-switch", "`dump`"),
             ("global-switch", "`loudly`"),
             ("swallow", "swallows options"),
+            ("dollar", "`home`"),
+            ("piped", "`either` whose help contains ` | `"),
         ] {
             let error = describe(&probe(name), &NO_TABLES).err()
                 .unwrap_or_else(|| panic!("probe {name} was accepted"));
@@ -862,7 +906,7 @@ mod tests {
                 r#"{"both":{"repeat":{"arg":"--both","max":1},"description":"Short help"},"#,
                 r#""long-only":{"flag":{"arg":"--long-only"},"description":"Long help only"},"#,
                 r#""bare":{"flag":{"arg":"--bare"}},"#,
-                r#""first-second":{"repeat":{"max":2},"description":"first: The first"}}"#,
+                r#""first-second":{"repeat":{"max":2},"description":"first: The first | second"}}"#,
             )
         );
     }

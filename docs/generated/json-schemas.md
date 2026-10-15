@@ -2850,7 +2850,8 @@ A command not listed here either reports only the generic human-message shape `{
           ]
         }
       },
-      "type": "object"
+      "type": "object",
+      "unevaluatedProperties": false
     },
     "Repeat": {
       "properties": {
