@@ -197,6 +197,7 @@ fn command_schemas(name: &str) -> Option<Vec<(&'static str, schemars::Schema)>> 
         "remove" => commands::remove::__docgen_schemas(),
         "scope" => commands::scope::__docgen_schemas(),
         "scope-prune" => commands::scope_prune::__docgen_schemas(),
+        "self-schema" => commands::self_schema::__docgen_schemas(),
         "self-update" => commands::self_update::__docgen_schemas(),
         "shift" => commands::shift::__docgen_schemas(),
         "show" => commands::show::__docgen_schemas(),

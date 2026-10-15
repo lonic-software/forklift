@@ -727,6 +727,17 @@ pub enum Command {
         path: String,
     },
 
+    /// Describe this binary's command surface as a Pult manifest
+    #[command(
+        long_about = "Print Forklift's command surface in Pult's manifest vocabulary, generated \
+                      from this binary's own argument definitions: one command per runnable \
+                      command path, each with its params and the argument tail to run. Under \
+                      --json the document is the envelope's data. It is input for `pult tool`, \
+                      which prefixes the binary's path; it is not a runnable pult.yaml on its \
+                      own, because its runs omit the program name."
+    )]
+    SelfSchema,
+
     /// Check for a newer release and update this binary (client only)
     #[command(
         long_about = "Check the latest published release against this binary and, for a \
@@ -1477,7 +1488,7 @@ pub enum ProfileAction {
         name: String,
 
         /// The display name (local only; falls back to the operator id)
-        #[arg(long = "name", value_name = "DISPLAY_NAME")]
+        #[arg(long = "display-name", value_name = "DISPLAY_NAME")]
         display_name: Option<String>,
 
         /// The operator id (e.g. one issued by a hosting provider); minted when omitted

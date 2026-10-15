@@ -2795,6 +2795,196 @@ A command not listed here either reports only the generic human-message shape `{
 }
 ```
 
+## `self-schema`
+
+### `SelfSchema`
+
+```json
+{
+  "$defs": {
+    "Flag": {
+      "properties": {
+        "arg": {
+          "description": "The word passed when the switch is on.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "arg"
+      ],
+      "type": "object"
+    },
+    "Input": {
+      "properties": {
+        "secret": {
+          "description": "The value is a credential.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "Param": {
+      "description": "One param, in Pult's param kinds.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "A required single positional; Pult prompts for it when it is absent.",
+          "properties": {
+            "input": {
+              "$ref": "#/$defs/Input"
+            }
+          },
+          "required": [
+            "input"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A switch.",
+          "properties": {
+            "flag": {
+              "$ref": "#/$defs/Flag"
+            }
+          },
+          "required": [
+            "flag"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "An option (with `arg`) or the trailing positionals (without).",
+          "properties": {
+            "repeat": {
+              "$ref": "#/$defs/Repeat"
+            }
+          },
+          "required": [
+            "repeat"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Repeat": {
+      "properties": {
+        "arg": {
+          "description": "The option each value follows; absent for positionals.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max": {
+          "description": "The most values accepted; unbounded when absent.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "min": {
+          "description": "The fewest values accepted.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "secret": {
+          "description": "Every value is a credential.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "SchemaCommand": {
+      "description": "One runnable command path.",
+      "properties": {
+        "category": {
+          "description": "The top-level group the command belongs to; absent for a top-level command.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "description": {
+          "description": "The command's long description, when it has one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "description": "The command path joined with `-` (`office-admit`).",
+          "type": "string"
+        },
+        "interactive": {
+          "description": "Always false: no Forklift command requires a terminal by itself.",
+          "type": "boolean"
+        },
+        "params": {
+          "additionalProperties": {
+            "$ref": "#/$defs/Param"
+          },
+          "description": "The command's params by key, in order: options and switches first, then positionals.",
+          "type": "object"
+        },
+        "run": {
+          "description": "The argument tail after the program name, with a `{key}` placeholder per param.\nOptions and switches come before a literal `--`, positionals after it.",
+          "type": "string"
+        },
+        "title": {
+          "description": "The command's one-line description.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "title",
+        "params",
+        "run",
+        "interactive"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The command surface as a Pult manifest: exactly the top-level keys a root manifest may\ncarry, since Pult refuses unknown ones.",
+  "properties": {
+    "commands": {
+      "description": "One command per runnable command path, in clap's declaration order.",
+      "items": {
+        "$ref": "#/$defs/SchemaCommand"
+      },
+      "type": "array"
+    },
+    "description": {
+      "description": "The tool's one-line description.",
+      "type": "string"
+    },
+    "name": {
+      "description": "The tool's name (`forklift`).",
+      "type": "string"
+    },
+    "version": {
+      "description": "Pult's manifest version (1).",
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "version",
+    "name",
+    "description",
+    "commands"
+  ],
+  "title": "SelfSchema",
+  "type": "object"
+}
+```
+
 ## `self-update`
 
 ### `SelfUpdate`

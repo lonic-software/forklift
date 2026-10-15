@@ -1110,7 +1110,7 @@ forklift office retire <key>      # revoke a key
 
 ```sh
 forklift profile list
-forklift profile create work --name "Work Me"
+forklift profile create work --display-name "Work Me"
 forklift profile use work
 ```
 
@@ -1154,6 +1154,28 @@ design: a server is redeployed (new container / Lambda version / package), never
 self-mutated. If the [`fl` alias](#alias--the-fl-short-name) was already installed, self-update
 keeps it working — the binary is replaced at the same path, and self-update also restores the
 alias if it ever goes missing.
+
+### `self-schema` — describe the command surface for Pult
+
+```sh
+forklift self-schema           # the document, pretty-printed
+forklift self-schema --json    # the same document as the envelope's data
+```
+
+Prints Forklift's command surface in [Pult](https://github.com/lonic-software/pult)'s
+manifest vocabulary, generated from this binary's own argument definitions, so it always
+matches the binary that prints it. Each runnable command path (`office admit`, and a group
+such as `office` that runs on its own) becomes one command with an id (`office-admit`), a
+title, its params and a `run`: the argument tail after the program name, with options and
+switches before a literal `--` and positionals after it, so a value is never mistaken for a
+flag. `pult tool` reads it and prefixes the path of the binary it found; the document is not
+a runnable `pult.yaml` on its own.
+
+The global `--json`, `--verbose` and `--no-pager` are not params: they are the caller's
+choice of rendering. `help`, `mcp` and `self-schema` itself are left out. The bearer token
+of `franchise --token` and a `config` value are marked secret. An argument shape the
+document cannot express exactly is refused with an error naming the command and argument,
+never dropped: you get the whole surface or none of it.
 
 ### `compact` — pack the object store
 
@@ -1530,6 +1552,7 @@ what you've `load`ed — it doesn't stage for you). `diff`, `restore`, `tag`, `s
 | `manifest` | `mf` | Record/read signed post-metadata on parcels |
 | `tag` | | Signed tags / releases (admin-signed, offline-verifiable) |
 | `mcp` | | Serve the command surface as MCP tools |
+| `self-schema` | | Describe the command surface as a Pult manifest |
 | `help` | `h` | Show help |
 | `version` | `v` | Print the version |
 

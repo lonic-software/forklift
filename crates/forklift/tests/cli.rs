@@ -2724,6 +2724,35 @@ fn self_update_check_reports_without_mutating() {
     assert_eq!(json(&none)["data"]["update_available"], false);
 }
 
+/// `self-schema --json` keeps the document's key order, unlike other envelopes' `data`: Pult
+/// binds positional params in the order they are listed, so a sorted `franchise` would take
+/// the directory for the url. Human mode prints the same document, so the keys of both, in
+/// order, must agree past the envelope's header.
+#[test]
+fn self_schema_json_keeps_the_document_order() {
+    let keys = |output: &Output| -> Vec<String> {
+        stdout(output).lines()
+            .filter_map(|line| line.trim_start().strip_prefix('"'))
+            .filter_map(|line| line.split_once("\": ").map(|(key, _)| key.to_string()))
+            .collect()
+    };
+
+    let enveloped = forklift_command().args(["--json", "self-schema"]).output().expect("forklift binary runs");
+    let human = forklift_command().args(["self-schema"]).output().expect("forklift binary runs");
+    assert_success(&enveloped);
+    assert_success(&human);
+
+    // Not sorted: in franchise, `url` (the first positional) comes before `directory`.
+    let text = stdout(&enveloped);
+    let at = text.find("\"id\": \"franchise\"").expect("franchise is described");
+    assert!(text[at..].find("\"url\":").unwrap() < text[at..].find("\"directory\":").unwrap());
+
+    let header = ["lonic_json", "tool", "schema", "command", "ok", "data"];
+    let enveloped = keys(&enveloped);
+    assert_eq!(enveloped[..header.len()], header);
+    assert_eq!(enveloped[header.len()..], keys(&human)[..]);
+}
+
 /// A scratch directory standing in for "next to the binary" via `FORKLIFT_ALIAS_DIR` (the
 /// same override the `alias` command reads), so these tests never touch the real target/
 /// build output. Cleaned up on drop, like `TestWarehouse`.
@@ -3235,7 +3264,7 @@ fn profiles_select_the_identity_a_warehouse_acts_under() {
     configure_operator(&warehouse);
 
     // Create a named profile; its id is minted (none given).
-    let created = warehouse.run(&["profile", "create", "work", "--name", "Work Me"]);
+    let created = warehouse.run(&["profile", "create", "work", "--display-name", "Work Me"]);
     assert_success(&created);
 
     // Creating it again is refused.
@@ -3422,7 +3451,7 @@ fn the_json_set_envelope_reports_the_value_that_reached_the_file() {
 /// A refused profile creation leaves nothing behind. Creation used to be two writes, and a value
 /// refused by the second left the first on disk.
 ///
-/// `profile create --name "" work` minted an identifier, wrote `[profile.work]`, then refused the
+/// `profile create --display-name "" work` minted an identifier, wrote `[profile.work]`, then refused the
 /// empty display name — reporting failure while leaving a profile behind that made the obvious
 /// retry fail too ("the profile \"work\" already exists"), with no command able to remove it.
 /// The fixture is the *second* field for that reason: refusing on the first would prove nothing
@@ -3437,7 +3466,7 @@ fn a_refused_profile_field_leaves_no_half_created_profile_behind() {
     let warehouse = TestWarehouse::new("profile-create-is-all-or-nothing");
     assert_success(&warehouse.run(&["prepare"]));
 
-    let created = warehouse.run(&["profile", "create", "work", "--name", ""]);
+    let created = warehouse.run(&["profile", "create", "work", "--display-name", ""]);
     assert!(!created.status.success(), "an empty display name must refuse: {}", stdout(&created));
     assert!(
         stderr(&created).contains("cannot be empty"),
@@ -3453,7 +3482,7 @@ fn a_refused_profile_field_leaves_no_half_created_profile_behind() {
     );
 
     // And the retry that used to be locked out succeeds.
-    let retry = warehouse.run(&["profile", "create", "work", "--name", "Work Me"]);
+    let retry = warehouse.run(&["profile", "create", "work", "--display-name", "Work Me"]);
     assert_success(&retry);
 }
 
@@ -3496,7 +3525,7 @@ fn an_empty_value_is_refused_with_advice_only_where_the_advice_is_always_true() 
 
     // The `profile create` door: nothing is on disk yet, so the advice is about the option.
     for (args, option) in [
-        (["profile", "create", "work", "--name", ""], "--name"),
+        (["profile", "create", "work", "--display-name", ""], "--display-name"),
         (["profile", "create", "work", "--id", "  "], "--id"),
     ] {
         let refused = warehouse.run(&args);

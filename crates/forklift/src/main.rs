@@ -401,6 +401,7 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
         Command::Undo => commands::undo::handle_command().await,
         Command::Unload { path } => commands::unload::handle_command(&path),
         Command::Version => commands::version::handle_command(),
+        Command::SelfSchema => commands::self_schema::handle_command(),
         Command::SelfUpdate { check } => commands::self_update::handle_command(check).await,
         #[cfg(feature = "docgen")]
         Command::Docgen { target } => {

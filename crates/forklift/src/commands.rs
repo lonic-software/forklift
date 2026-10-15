@@ -33,6 +33,7 @@ pub mod heal;
 pub mod history;
 pub mod import_git;
 pub mod prepare;
+pub mod self_schema;
 pub mod self_update;
 pub mod peek;
 pub mod show;

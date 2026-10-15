@@ -915,7 +915,7 @@ pub fn create_profile(profile: &str,
 
     if name.is_some_and(is_blank) {
         return Err(
-            "The display name (--name) cannot be empty. Omit it to show the operator id instead."
+            "The display name (--display-name) cannot be empty. Omit it to show the operator id instead."
                 .to_string()
         );
     }
@@ -1051,7 +1051,7 @@ pub fn is_blank(value: &str) -> bool {
 /// **This states the fact and nothing else.** It is reached from several commands, and no advice
 /// is true at all of them (an `--unset` needs the scope, fails for a key that is not set, and
 /// cannot be run for a profile field), so the refusal names the key and stops. The commands that
-/// take a value as an *option* — `profile create --id`/`--name`, `franchise --token` — refuse it
+/// take a value as an *option* — `profile create --id`/`--display-name`, `franchise --token` — refuse it
 /// themselves first and say to omit the option, which is true wherever they print it.
 fn require_non_empty(label: &str, value: &str) -> Result<(), String> {
     if is_blank(value) {
