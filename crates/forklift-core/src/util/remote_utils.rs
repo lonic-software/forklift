@@ -8552,9 +8552,8 @@ mod tests {
     /// The budgets the stalled-error-body tests arm with. [`FAST`] has no error-body budget a
     /// second clear of every rival on both sides (see [`error_body_bracket`]), and a
     /// connect bound as small as [`FAST`]'s leaves the connect-forgotten rival under a second
-    /// below whatever allowance is picked, so these widen both. Each figure is distinct from every
-    /// [`FAST`] and production one; [`error_body_bracket`] checks the separation
-    /// rather than this doc stating it.
+    /// below whatever allowance is picked, so these widen both. [`error_body_bracket`] checks their
+    /// separation from every rival it lists rather than this doc stating it.
     fn stalled_error_body_budgets() -> Budgets {
         Budgets {
             connect: std::time::Duration::from_millis(2_900),
@@ -8605,6 +8604,12 @@ mod tests {
         let too_close = rivals.iter()
             .find(|&&rival| rival + second > armed && rival < armed + second);
         if let Some(rival) = too_close {
+            assert!(
+                *rival != armed,
+                "the armed error-body budget {:?} is listed twice: this instance's connect bound \
+                {:?} equals a production one, so a misarm reading that bound cannot be told apart",
+                armed, budgets.connect
+            );
             panic!(
                 "the armed error-body budget {:?} is within a second of the rival {:?}, too close \
                 to separate by elapsed time", armed, rival
@@ -10426,10 +10431,10 @@ mod tests {
         let hashes: Vec<String> = (0..2000).map(|_| "a".repeat(64)).collect();
         // The bracket this fixture's batch size depends on, made an assertion rather than left as
         // a comment: the call's own outer TotalDeadline must stay looser than error_of's inner
-        // error_body_budget (the bracket's lower bound), or the outer bound fires first and every
-        // assertion below would end up blaming error_of/error_body_read_budget for a regression
-        // that actually lives in presence_negotiation_budget or its constants — a misleading red,
-        // not a wrong one. Computed as a constant sum, not via a helper, for the same reason the
+        // error_body_budget (connect plus the error-body allowance), or the outer bound fires
+        // first and every assertion below would end up blaming error_of/error_body_read_budget for
+        // a regression that actually lives in presence_negotiation_budget or its constants — a
+        // misleading red, not a wrong one. Computed as a constant sum, not via a helper, for the same reason the
         // bracket's lower bound is: calling `presence_negotiation_budget` here would let a bug in
         // that method move this guard and the real behavior it is meant to guard against in
         // lockstep, silently validating a broken implementation instead of catching it.
@@ -10437,18 +10442,18 @@ mod tests {
             + std::time::Duration::from_secs_f64(
                 hashes.len() as f64 * PRESENCE_ALLOWANCE_MS_PER_OP / 1000.0
             );
-        // The outer deadline is a rival too: were the inner bound lost, it would be what fires.
-        let Bracket { lower_bound, upper_bound, nearest_rival, outer_ceiling } =
-            error_body_bracket(budgets, &[outer_budget]);
         assert!(
-            outer_budget > lower_bound,
+            outer_budget > budgets.connect + budgets.error_body_read,
             "this fixture's batch size ({} hashes, outer TotalDeadline {:?}) no longer stays \
             looser than error_of's own inner error_body_budget ({:?}) — resize `hashes` above \
             until it does; every assertion below assumes the inner budget is what fires, and a \
             red result here means they are about to fail for the wrong reason (the outer bound \
             firing first) rather than the one they exist to catch",
-            hashes.len(), outer_budget, lower_bound
+            hashes.len(), outer_budget, budgets.connect + budgets.error_body_read
         );
+        // The outer deadline is a rival too: were the inner bound lost, it would be what fires.
+        let Bracket { lower_bound, upper_bound, nearest_rival, outer_ceiling } =
+            error_body_bracket(budgets, &[outer_budget]);
 
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let started = std::time::Instant::now();
