@@ -110,12 +110,16 @@ with about half the tree, and the options that would close the gap (comment
 wrapping, import grouping and granularity) are nightly-only. So the root
 `rustfmt.toml` sets `disable_all_formatting = true`, which makes an accidental
 `cargo fmt`, or an editor's format-on-save through rustfmt, a no-op rather than a
-reflow of files the change never touched.
+reflow of files the change never touched. An editor that formats Rust with its own
+formatter rather than rustfmt (RustRover's default) does not read `rustfmt.toml`,
+so turn its reformat-on-save off for this project.
 
-`bin/check` and CI enforce the guard with `cargo fmt --all --check`. It passes
-only while the guard is in force: if `rustfmt.toml` is deleted, or a nested
-`rustfmt.toml` overrides it, rustfmt would rewrite the tree and the check fails.
-It never formats anything itself.
+`bin/check` and CI enforce the guard with `bin/fmt-guard`. It fails if the root
+`rustfmt.toml` loses its `disable_all_formatting = true` line, or if a second
+`rustfmt.toml` or `.rustfmt.toml` exists anywhere in the tree (rustfmt uses the
+nearest config above each file, so a second one switches formatting back on
+beneath it). It also runs `cargo fmt --all --check`, which needs the rustfmt
+component installed. It never formats anything itself.
 
 ### Maintainer commands (pult)
 

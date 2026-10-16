@@ -7,16 +7,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-echo "── formatting guard (cargo fmt --check)"
-# The tree is formatted by hand and rustfmt.toml switches rustfmt off, so this passes only while
-# that guard is in force. Removed or overridden (a nested rustfmt.toml), `cargo fmt` would rewrite
-# about half the tree, and this reports it instead. It never formats anything itself.
-if ! cargo fmt --all --check >/dev/null; then
-    echo
-    echo "cargo fmt would reformat the tree: rustfmt.toml's disable_all_formatting guard is missing" >&2
-    echo "or overridden. Restore it; do not run cargo fmt (see docs/guide/contributing.md)." >&2
-    exit 1
-fi
+echo "── formatting guard (bin/fmt-guard)"
+./bin/fmt-guard
 
 echo "── cargo build --workspace"
 cargo build --workspace
