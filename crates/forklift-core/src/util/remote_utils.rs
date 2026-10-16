@@ -8478,6 +8478,7 @@ mod tests {
     /// mirror keeps meaning what it meant when it was written, so a change to the production
     /// figure has to be re-affirmed here instead of moving both sides of an assertion together.
     const TEST_TIGHT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    /// Mirrors production `FETCH_OBJECT_READ_TIMEOUT`, likewise.
     const TEST_LOOSE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
     /// Mirrors production `UPLOAD_SILENCE_BUDGET` — see `TEST_TIGHT_READ_TIMEOUT`'s doc for why
     /// this is its own constant rather than a reference to the production one.
@@ -8563,9 +8564,10 @@ mod tests {
         .checked()
     }
 
-    /// A timed error-body test's upper bound: the midpoint from `budgets`' armed error-body budget
-    /// (its connect bound plus its error-body allowance) toward the nearest figure above it that a
-    /// single misarm could fire at instead, returned with that figure. The rivals are every
+    /// A timed error-body test's upper bound: the midpoint from `lower_bound`, the test's armed
+    /// error-body budget (`budgets`' connect bound plus its error-body allowance, summed by the
+    /// test itself), toward the nearest figure above it that a single misarm could fire at
+    /// instead. The rivals are every
     /// allowance of this instance or of [`PRODUCTION_MIRROR`], on its own or folded with any
     /// connect bound (this instance's or a production one); each connect bound alone; and `extra`,
     /// the test's own outer deadlines. Every rival is asserted to be at least a second from the
@@ -8574,9 +8576,16 @@ mod tests {
     /// test tolerates. The midpoint is asserted to sit under `outer_ceiling`, or a misarm between
     /// the two would read as a hang; a test calls this before it starts waiting.
     fn error_body_upper_bound(
-        budgets: Budgets, extra: &[std::time::Duration], outer_ceiling: std::time::Duration,
-    ) -> (std::time::Duration, std::time::Duration) {
-        let armed = budgets.connect + budgets.error_body_read;
+        budgets: Budgets, lower_bound: std::time::Duration, extra: &[std::time::Duration],
+        outer_ceiling: std::time::Duration,
+    ) -> UpperBound {
+        let armed = lower_bound;
+        assert!(
+            budgets.connect != PRODUCTION_MIRROR.connect
+                && budgets.connect != PRODUCTION_MIRROR_TOR.connect,
+            "the connect bound {:?} is a production one, so a misarm reading the production bound \
+            could not be told apart from this instance's", budgets.connect
+        );
         // Destructured without `..`, so a field added to `Budgets` has to be placed here.
         let allowances = |b: Budgets| {
             let Budgets {
@@ -8616,7 +8625,16 @@ mod tests {
             "the midpoint {:?} must sit under the {:?} ceiling, or a misarm between them reads as \
             a hang", upper_bound, outer_ceiling
         );
-        (nearest, upper_bound)
+        UpperBound { midpoint: upper_bound, nearest_rival: nearest }
+    }
+
+    /// What [`error_body_upper_bound`] returns: named, since both are durations and a test that
+    /// asserted against the rival in place of the midpoint would still compile.
+    struct UpperBound {
+        /// The bound a test asserts the elapsed time is under.
+        midpoint: std::time::Duration,
+        /// The figure the midpoint was taken toward, for the failure message.
+        nearest_rival: std::time::Duration,
     }
 
     /// A direct-dial client carrying [`FAST`].
@@ -10436,8 +10454,8 @@ mod tests {
         );
         let outer_ceiling = lower_bound + std::time::Duration::from_secs(10);
         // The outer deadline is a rival too: were the inner bound lost, it would be what fires.
-        let (nearest_rival, upper_bound) =
-            error_body_upper_bound(budgets, &[outer_budget], outer_ceiling);
+        let UpperBound { midpoint: upper_bound, nearest_rival } =
+            error_body_upper_bound(budgets, lower_bound, &[outer_budget], outer_ceiling);
 
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let started = std::time::Instant::now();
@@ -10496,7 +10514,8 @@ mod tests {
         let client = RemoteClient::new_test_with_budgets(&remote.url, budgets);
         let lower_bound = budgets.connect + budgets.error_body_read;
         let outer_ceiling = lower_bound + std::time::Duration::from_secs(10);
-        let (nearest_rival, upper_bound) = error_body_upper_bound(budgets, &[], outer_ceiling);
+        let UpperBound { midpoint: upper_bound, nearest_rival } =
+            error_body_upper_bound(budgets, lower_bound, &[], outer_ceiling);
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let started = std::time::Instant::now();
 
@@ -10816,8 +10835,8 @@ mod tests {
     /// with none of them. Procedure: `grep -n "Duration::from_secs\|Duration::from_millis"` over
     /// this file; the values are not transcribed here, for the reason
     /// [`error_body_budget_reads_this_field_not_a_rival_constant`]'s own doc gives at length.
-    /// `n` is fixed at 1 here (a 5ms scaled term) precisely so
-    /// this test's asserted *output* — 15.005s (`13 + POST_SEND_VERIFY_BASE + 0.005`) — is what
+    /// `n` is fixed at 1 here (a 5ms scaled term) precisely so this test's asserted *output* —
+    /// 15.005s (`13 + TEST_POST_SEND_VERIFY_BASE + 0.005`) — is what
     /// actually needs checking for collisions, and unlike `error_body_budget`/`resolve_budget`'s
     /// own two-addend sums, `presence_negotiation_budget` sums *three* terms (`connect_timeout`,
     /// `POST_SEND_VERIFY_BASE`, the `n`-scaled term); unlike those tests, the odd `.005s` fraction
