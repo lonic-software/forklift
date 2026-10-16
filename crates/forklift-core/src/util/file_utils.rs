@@ -1648,7 +1648,8 @@ pub fn retrieve_object_by_hash_uncached(hash: &str) -> Result<Vec<u8>, String> {
 pub(crate) enum StoreReadOutcome {
     /// The ordinary read succeeds; the bytes hash to the address.
     Verified(Vec<u8>),
-    /// Neither packs nor loose hold it, even after the read path's own reload-on-miss retry.
+    /// Neither packs nor loose hold it, even after the read path's own second look at the packs
+    /// (revalidated against the pack folder) on a loose miss.
     Absent,
     /// Something is at the address, but the ordinary read fails on it — this carries the exact
     /// error the read path would surface for it. Decisive, not an unknown: a subsequent ordinary
@@ -1664,8 +1665,8 @@ pub(crate) enum StoreReadOutcome {
 /// being it) was found, more than once, to disagree with it on an edge case — this function is
 /// the structural fix: there is only one read implementation now.
 ///
-/// Mirrors [`read_object_uncached`]'s own shape branch for branch (packs first, then loose, with
-/// the same reload-on-miss retry) — see that function's doc comment for why packs are consulted
+/// Mirrors [`read_object_uncached`]'s own shape branch for branch (packs first, then loose, then
+/// the packs again on a loose miss) — see that function's doc comment for why packs are consulted
 /// first.
 ///
 /// **There is no *unverified* pack→loose fall-through.** Once a pack record for a hash fails to
@@ -1712,11 +1713,12 @@ pub(crate) fn read_object_classified(hash: &str) -> Result<StoreReadOutcome, Str
             match read_loose_if_verified(hash) {
                 Ok(Some(bytes)) => return Ok(StoreReadOutcome::Verified(bytes)),
                 Ok(None) => {
-                    // Neither the failed pack record nor the loose store served it. One reloading
-                    // pack retry (the same one-reload-max discipline the loose-miss branch below
-                    // already applies) closes the window against a stale cached registry, so a
-                    // good copy an external `compact` wrote into a new pack after this process
-                    // cached its pack set is not shadowed by this broken record forever. The
+                    // Neither the failed pack record nor the loose store served it. One forced
+                    // reload closes the window against a stale mapping, so a good copy an external
+                    // `compact` wrote after this process cached its pack set is not shadowed by
+                    // this broken record forever. Forced, unlike the loose-miss branch's
+                    // revalidation below: the pack folder's names cannot vouch for a record that
+                    // is located but broken. The
                     // original pack error stays the primary, decisive reason either way — a
                     // reload that cannot even load the registry does not get to replace a
                     // decisive pack failure with a lesser environment unknown.
@@ -1724,8 +1726,8 @@ pub(crate) fn read_object_classified(hash: &str) -> Result<StoreReadOutcome, Str
                     // registry, not just this one entry — a persistently-broken record read
                     // repeatedly pays a full reload per read, not a one-time cost.
                     // Cold/corruption-path only (a located record already failed to resolve
-                    // first), the same known reload-thrash class the loose-miss reload below
-                    // already carries (FORK-50).
+                    // first) — the known reload-thrash class (FORK-50); the loose-miss branch
+                    // below no longer shares it, since it revalidates rather than reloading.
                     return Ok(match crate::util::pack_utils::retrieve_from_packs_reloading(hash) {
                         Ok(PackRetrieval::Verified(bytes)) => StoreReadOutcome::Verified(bytes),
                         _ => StoreReadOutcome::Unverifiable(pack_error),
@@ -2066,9 +2068,9 @@ pub fn get_inventory_data_path_for_key(key: &str) -> PathBuf {
 ///                   only, and only once activated) a durability taint is standing for this
 ///                   root — never a false "does not exist" in that case.
 pub fn does_object_exist(hash: &str) -> Result<bool, String> {
-    // Packs first: a resident-index lookup is syscall-free, so a packed object needs no stat —
-    // and, as this function's own doc comment explains, no taint-gate check either.
-    if crate::util::pack_utils::is_in_packs(hash)? {
+    // Cached packs first: a resident-index lookup is syscall-free, so a packed object needs no
+    // stat — and, as this function's own doc comment explains, no taint-gate check either.
+    if crate::util::pack_utils::is_in_cached_packs(hash)? {
         return Ok(true);
     }
 
@@ -2077,6 +2079,18 @@ pub fn does_object_exist(hash: &str) -> Result<bool, String> {
     taint_utils::gate_check(&forklift_root())?;
 
     // Otherwise it may be loose (written but not yet packed).
+    if loose_dentry_exists(hash)? {
+        return Ok(true);
+    }
+
+    // Last, the packs revalidated against the pack folder: a pack another process published since
+    // this one cached its set — including one a compact wrote just before sweeping the loose file
+    // the look above missed.
+    crate::util::pack_utils::is_in_packs(hash)
+}
+
+/// Whether the loose fan-out path for `hash` has a dentry (no content check).
+fn loose_dentry_exists(hash: &str) -> Result<bool, String> {
     let (path, file_name) = get_path_for_object(hash)?;
     let file_path = path.add(PATH_SEPARATOR).add(&file_name);
 
@@ -2105,14 +2119,12 @@ pub fn does_object_exist(hash: &str) -> Result<bool, String> {
 /// * `Ok(false)`   - Neither a pack nor the loose fan-out path holds it.
 /// * `Err(String)` - The pack registry or the loose path could not be checked.
 pub fn raw_object_present(hash: &str) -> Result<bool, String> {
-    if crate::util::pack_utils::is_in_packs(hash)? {
+    // The same three looks as `does_object_exist`, without its taint gate.
+    if crate::util::pack_utils::is_in_cached_packs(hash)? || loose_dentry_exists(hash)? {
         return Ok(true);
     }
 
-    let (path, file_name) = get_path_for_object(hash)?;
-    let file_path = path.add(PATH_SEPARATOR).add(&file_name);
-
-    std::fs::exists(&file_path).map_err(|e| format!("Error while checking if object exists: {}", e))
+    crate::util::pack_utils::is_in_packs(hash)
 }
 
 /// Get the UTF-8 encoded name of a file or directory.
