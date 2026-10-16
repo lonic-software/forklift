@@ -94,9 +94,11 @@ impl Drop for StoreLock {
 ///
 /// The server head acquires it once at startup — for the single served root, or per warehouse in
 /// multi-warehouse mode — and holds it for the whole process lifetime; `gc` acquires it for its
-/// duration. That makes the two mutually exclusive on a given root: `gc` can never sweep a live
-/// server's in-flight objects (a lift slower than the grace period would otherwise lose its
-/// staged objects and then fail its ref update), and a second server accidentally started on the
+/// duration, and so does a full repack (`compact --all`, FORK-149), which drops every packed object
+/// outside the live set with no grace period at all. That makes them mutually exclusive on a given
+/// root: neither can sweep a live server's in-flight objects (a lift slower than the grace period —
+/// or any lift, for a repack — would otherwise lose its staged objects and then fail its ref
+/// update), and a second server accidentally started on the
 /// same root is refused up front instead of silently breaking the first server's in-process
 /// ref-update CAS. `bundle` deliberately does *not* take it — it never deletes an object,
 /// writes atomically, and a stale bundle is self-healing, so it is safe against a live server.
@@ -105,7 +107,7 @@ impl Drop for StoreLock {
 /// (compaction vs compaction) — a server never compacts, so it never takes that lock; this one is
 /// the serve-vs-maintenance gate. Like the other locks it is a lock *file* created with
 /// `create_new` (atomic on every platform) and removed on drop; a hard-killed holder leaves it
-/// behind for the next command to report by PID (a crashed server thus blocks `gc`/`bundle` until
+/// behind for the next command to report by PID (a crashed server thus blocks `gc` and a repack until
 /// the operator removes it, which is the safe default — better than sweeping a root that might
 /// still be served).
 pub struct ServeLock {
@@ -114,11 +116,11 @@ pub struct ServeLock {
 
 impl ServeLock {
     /// Acquire the serve lock at the current storage root. Errors immediately (does not block) if
-    /// another process already holds it — a live server on this root, or a `gc`/`bundle` already
-    /// running against it.
+    /// another process already holds it — a live server on this root, or a `gc` or full repack
+    /// already running against it.
     pub fn acquire() -> Result<ServeLock, String> {
-        // Lives at `forklift_root` (the shared store root), like the store lock: the server and
-        // `gc`/`bundle` all enter the same storage-root scope, so they agree on the path. Absolute
+        // Lives at `forklift_root` (the shared store root), like the store lock: the server, `gc`
+        // and a repack all enter the same storage-root scope, so they agree on the path. Absolute
         // for the same reason as the other locks — the working directory can change before drop.
         let path = absolute(forklift_root().join(FILE_NAME_SERVE_LOCK));
         acquire_lock_file(&path, "warehouse root")?;

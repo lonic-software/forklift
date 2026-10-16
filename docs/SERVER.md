@@ -214,6 +214,10 @@ revocation by more than about a day.
   `serve.lock` behind (a graceful SIGINT/SIGTERM removes it automatically); if `gc` reports
   the root locked by a process that is no longer running, remove
   `<root>/.forklift/serve.lock` and retry.
+- **Repack:** `forklift compact --all` against a served root is refused for the same reason
+  as `gc` — it drops unreachable packed objects with no grace period at all — so it also
+  belongs in the maintenance window. Plain `forklift compact` (incremental) never drops an
+  object and is safe beside a live server.
 - **Shutdown:** SIGINT/SIGTERM drain in-flight requests before exiting.
 
 ## Updating

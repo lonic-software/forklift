@@ -1648,7 +1648,8 @@ pub fn retrieve_object_by_hash_uncached(hash: &str) -> Result<Vec<u8>, String> {
 pub(crate) enum StoreReadOutcome {
     /// The ordinary read succeeds; the bytes hash to the address.
     Verified(Vec<u8>),
-    /// Neither packs nor loose hold it, even after the read path's own reload-on-miss retry.
+    /// Neither packs nor loose hold it, even after the read path's own second look at the packs
+    /// (revalidated against the pack folder) on a loose miss.
     Absent,
     /// Something is at the address, but the ordinary read fails on it — this carries the exact
     /// error the read path would surface for it. Decisive, not an unknown: a subsequent ordinary
@@ -1664,8 +1665,8 @@ pub(crate) enum StoreReadOutcome {
 /// being it) was found, more than once, to disagree with it on an edge case — this function is
 /// the structural fix: there is only one read implementation now.
 ///
-/// Mirrors [`read_object_uncached`]'s own shape branch for branch (packs first, then loose, with
-/// the same reload-on-miss retry) — see that function's doc comment for why packs are consulted
+/// Mirrors [`read_object_uncached`]'s own shape branch for branch (packs first, then loose, then
+/// the packs again on a loose miss) — see that function's doc comment for why packs are consulted
 /// first.
 ///
 /// **There is no *unverified* pack→loose fall-through.** Once a pack record for a hash fails to
@@ -1712,11 +1713,12 @@ pub(crate) fn read_object_classified(hash: &str) -> Result<StoreReadOutcome, Str
             match read_loose_if_verified(hash) {
                 Ok(Some(bytes)) => return Ok(StoreReadOutcome::Verified(bytes)),
                 Ok(None) => {
-                    // Neither the failed pack record nor the loose store served it. One reloading
-                    // pack retry (the same one-reload-max discipline the loose-miss branch below
-                    // already applies) closes the window against a stale cached registry, so a
-                    // good copy an external `compact` wrote into a new pack after this process
-                    // cached its pack set is not shadowed by this broken record forever. The
+                    // Neither the failed pack record nor the loose store served it. One forced
+                    // reload closes the window against a stale mapping, so a good copy an external
+                    // `compact` wrote after this process cached its pack set is not shadowed by
+                    // this broken record forever. Forced, unlike the loose-miss branch's
+                    // revalidation below: the pack folder's names cannot vouch for a record that
+                    // is located but broken. The
                     // original pack error stays the primary, decisive reason either way — a
                     // reload that cannot even load the registry does not get to replace a
                     // decisive pack failure with a lesser environment unknown.
@@ -1724,8 +1726,8 @@ pub(crate) fn read_object_classified(hash: &str) -> Result<StoreReadOutcome, Str
                     // registry, not just this one entry — a persistently-broken record read
                     // repeatedly pays a full reload per read, not a one-time cost.
                     // Cold/corruption-path only (a located record already failed to resolve
-                    // first), the same known reload-thrash class the loose-miss reload below
-                    // already carries (FORK-50).
+                    // first) — the known reload-thrash class (FORK-50); the loose-miss branch
+                    // below no longer shares it, since it revalidates rather than reloading.
                     return Ok(match crate::util::pack_utils::retrieve_from_packs_reloading(hash) {
                         Ok(PackRetrieval::Verified(bytes)) => StoreReadOutcome::Verified(bytes),
                         _ => StoreReadOutcome::Unverifiable(pack_error),
@@ -1766,16 +1768,16 @@ pub(crate) fn read_object_classified(hash: &str) -> Result<StoreReadOutcome, Str
     let compressed = match std::fs::read(&file_path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            // Neither the cached packs nor a loose file holds it. In a long-running process (a
-            // live server) the pack registry can predate an external `compact` that moved this
-            // object into a new pack and swept its loose source — so reload the registry once and
-            // retry the packs before concluding the object is gone (reload-on-miss).
-            return match crate::util::pack_utils::retrieve_from_packs_reloading(hash) {
+            // Neither the packs nor a loose file holds it. Ask the packs once more: a `compact` in
+            // another process can have packed this object and swept its loose source between the
+            // pack lookup above and the loose read, and `retrieve_from_packs` revalidates its
+            // cached set against the pack folder on a miss, so a pack published since is seen.
+            return match crate::util::pack_utils::retrieve_from_packs(hash) {
                 Ok(PackRetrieval::Verified(bytes)) => Ok(StoreReadOutcome::Verified(bytes)),
                 // The single `Absent`-production site (FORK-47, DESIGN.html §3.1.1): gated
                 // against the *enumerable* quarantine set only (`quarantine_reason`, a binary
-                // search over each quarantined index's resident bytes — no per-hash parse, no
-                // extra reload since the registry was just warmed above). A hash a quarantined
+                // search over each quarantined index's resident bytes — no per-hash parse, and the
+                // set it reads was just revalidated by the miss above). A hash a quarantined
                 // (data-missing) index names is not "no surviving index names this hash," so it
                 // must read `Unverifiable` naming that index rather than a bare `Absent`
                 // indistinguishable from never-existed. An *unenumerable* (unparseable) index is
@@ -2040,8 +2042,8 @@ pub fn get_inventory_data_path_for_key(key: &str) -> PathBuf {
 /// Check if an object with the given hash exists.
 ///
 /// A pack-registry hit answers `true` with **no** taint-gate check at all, deliberately: the
-/// registry is process-local memory, reloaded from disk only at process startup (and on a
-/// reload-on-miss — see [`read_object_uncached`]), so a crash that could have lost a pack's
+/// registry is process-local memory, loaded from disk by this process (and revalidated against the
+/// pack folder on a miss — see `pack_utils::is_in_packs`), so a crash that could have lost a pack's
 /// dentry also clears whatever this process's registry remembers about it. There is no stale
 /// in-memory "yes" here that could outlive the crash it would need to survive, so the taint gate
 /// (which exists precisely to catch such a stale "yes") has nothing to add on that path.
@@ -2066,17 +2068,32 @@ pub fn get_inventory_data_path_for_key(key: &str) -> PathBuf {
 ///                   only, and only once activated) a durability taint is standing for this
 ///                   root — never a false "does not exist" in that case.
 pub fn does_object_exist(hash: &str) -> Result<bool, String> {
-    // Packs first: a resident-index lookup is syscall-free, so a packed object needs no stat —
-    // and, as this function's own doc comment explains, no taint-gate check either.
-    if crate::util::pack_utils::is_in_packs(hash)? {
+    // Cached packs first: a resident-index lookup is syscall-free, so a packed object needs no
+    // stat — and, as this function's own doc comment explains, no taint-gate check either.
+    if crate::util::pack_utils::is_in_cached_packs(hash)? {
         return Ok(true);
     }
 
     // A standing taint means a loose-path "yes" cannot be trusted until it is healed — refuse
-    // rather than silently answering as if nothing had happened.
-    taint_utils::gate_check(&forklift_root())?;
+    // rather than silently answering as if nothing had happened. A pack hit still needs no gate,
+    // so ask the revalidated packs before refusing.
+    if let Err(taint) = taint_utils::gate_check(&forklift_root()) {
+        return if crate::util::pack_utils::is_in_packs(hash)? { Ok(true) } else { Err(taint) };
+    }
 
     // Otherwise it may be loose (written but not yet packed).
+    if loose_dentry_exists(hash)? {
+        return Ok(true);
+    }
+
+    // Last, the packs revalidated against the pack folder: a pack another process published since
+    // this one cached its set — including one a compact wrote just before sweeping the loose file
+    // the look above missed.
+    crate::util::pack_utils::is_in_packs(hash)
+}
+
+/// Whether the loose fan-out path for `hash` has a dentry (no content check).
+fn loose_dentry_exists(hash: &str) -> Result<bool, String> {
     let (path, file_name) = get_path_for_object(hash)?;
     let file_path = path.add(PATH_SEPARATOR).add(&file_name);
 
@@ -2105,14 +2122,12 @@ pub fn does_object_exist(hash: &str) -> Result<bool, String> {
 /// * `Ok(false)`   - Neither a pack nor the loose fan-out path holds it.
 /// * `Err(String)` - The pack registry or the loose path could not be checked.
 pub fn raw_object_present(hash: &str) -> Result<bool, String> {
-    if crate::util::pack_utils::is_in_packs(hash)? {
+    // The same three looks as `does_object_exist`, without its taint gate.
+    if crate::util::pack_utils::is_in_cached_packs(hash)? || loose_dentry_exists(hash)? {
         return Ok(true);
     }
 
-    let (path, file_name) = get_path_for_object(hash)?;
-    let file_path = path.add(PATH_SEPARATOR).add(&file_name);
-
-    std::fs::exists(&file_path).map_err(|e| format!("Error while checking if object exists: {}", e))
+    crate::util::pack_utils::is_in_packs(hash)
 }
 
 /// Get the UTF-8 encoded name of a file or directory.
@@ -3964,6 +3979,45 @@ mod tests {
                 "expected Verified via the Failed-path reload, got Absent"
             ),
         }
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// FORK-106: a presence check must see a pack published after this process cached its pack
+    /// set. Fixture: cache the registry while X is absent, then publish a pack holding X into the
+    /// pack folder with no `invalidate_cache()` — the shape an external `compact` leaves behind a
+    /// live server. `does_object_exist` and `raw_object_present` must both answer yes.
+    #[test]
+    fn a_pack_published_after_caching_is_seen_by_the_presence_check() {
+        use crate::util::pack_utils::TransportPackBuilder;
+
+        let temp = std::env::temp_dir()
+            .join(format!("forklift-presence-after-caching-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+        let folder = crate::util::pack_utils::pack_folder();
+
+        let content = b"an object compacted by another process after this registry was cached".to_vec();
+        let hash = blake3::hash(&content).to_hex().to_string();
+        let other_content = b"a second object, published after the first one was seen".to_vec();
+        let other_hash = blake3::hash(&other_content).to_hex().to_string();
+
+        assert!(!does_object_exist(&hash).unwrap(), "sanity: X is absent, and the registry is now cached");
+
+        let mut builder = TransportPackBuilder::new(&folder).unwrap();
+        builder.append_full(&hash, content.as_slice()).unwrap();
+        builder.finish().unwrap();
+
+        assert!(does_object_exist(&hash).unwrap(), "a pack published after caching must be seen");
+
+        // A second publish against the set the check above refreshed, so the gate-free check
+        // faces a stale cache of its own.
+        let mut builder = TransportPackBuilder::new(&folder).unwrap();
+        builder.append_full(&other_hash, other_content.as_slice()).unwrap();
+        builder.finish().unwrap();
+
+        assert!(raw_object_present(&other_hash).unwrap(), "the gate-free presence check must see it too");
 
         std::fs::remove_dir_all(&temp).ok();
     }

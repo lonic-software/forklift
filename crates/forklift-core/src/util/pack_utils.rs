@@ -30,9 +30,11 @@
 //! base can only fail a read, never return wrong bytes silently.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::ffi::OsString;
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::model::object::loose_object::LooseObject;
 
@@ -282,7 +284,7 @@ pub fn store_status() -> Result<StoreStatus, String> {
     // on-disk size (data file + index file, both already sized once loaded). `PackSet`'s
     // registry-independent load means a single orphaned or unparseable pack pair never fails this
     // census (FORK-47, DESIGN.html §3.1.1) — both problem lists are surfaced below instead.
-    let PackSet { packs: loaded, quarantined, unenumerable } = load_packs_from_disk(&pack_folder())?;
+    let PackSet { packs: loaded, quarantined, unenumerable, .. } = load_packs_from_disk(&pack_folder())?;
 
     let mut packs = Vec::new();
     for pack in loaded {
@@ -328,9 +330,9 @@ pub fn store_status() -> Result<StoreStatus, String> {
         index_path: q.index_path.to_string_lossy().into_owned(),
         error: q.error,
     }).collect();
-    let unenumerable_indexes = unenumerable.into_iter().map(|(index_path, error)| PackIndexProblem {
-        index_path: index_path.to_string_lossy().into_owned(),
-        error,
+    let unenumerable_indexes = unenumerable.into_iter().map(|u| PackIndexProblem {
+        index_path: u.index_path.to_string_lossy().into_owned(),
+        error: u.error,
     }).collect();
 
     Ok(StoreStatus {
@@ -514,7 +516,154 @@ struct QuarantinedPack {
     index: Vec<u8>,
     count: usize,
     error: String,
+    /// Revalidation state (see [`reloaded_if_stale`]): the pair's files as they stood just before
+    /// this load, what kind of failure it was, and when it was attempted.
+    stamp: PairStamp,
+    failure: FailureKind,
+    attempted_at: Instant,
 }
+
+/// A pack index that could not even be read or parsed, so its hash set is unknown. `error` is the
+/// read or parse failure; `stamp`, `failure` and `attempted_at` mean what they do on
+/// [`QuarantinedPack`].
+struct UnenumerablePack {
+    index_path: PathBuf,
+    error: String,
+    stamp: PairStamp,
+    failure: FailureKind,
+    attempted_at: Instant,
+}
+
+/// What kind of failure left a pair broken, which decides when [`reloaded_if_stale`] retries it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureKind {
+    /// An `open` failed with something other than not-found (permissions, descriptor exhaustion).
+    /// The file is there and may open next time; retrying is two `open`s, so it is retried on every
+    /// miss.
+    Open,
+    /// A read or map failed after a successful `open` (EIO, ENOMEM, too many mappings). It may
+    /// clear without the file changing, but retrying means re-reading the index, so it is retried
+    /// at most once per [`IO_FAILURE_RETRY_INTERVAL`].
+    Io,
+    /// A file was not found, or its content was rejected. It stays as it is until a file changes,
+    /// which the pair's [`PairStamp`] notices.
+    Fixed,
+}
+
+/// How often a pair broken by a post-`open` I/O failure ([`FailureKind::Io`]) is retried while
+/// its files stay unchanged: often enough that a passing fault clears within seconds, rarely
+/// enough that a persistent one does not re-read an index on every miss.
+const IO_FAILURE_RETRY_INTERVAL: Duration = Duration::from_secs(10);
+
+/// One file as `stat` saw it — enough to tell that it was created, removed, rewritten, or renamed
+/// over since. The inode is what catches a same-length, same-second rename-over on unix; elsewhere
+/// it reads 0 and the other fields carry the comparison.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FileStamp {
+    Absent,
+    /// `stat` itself failed with something other than not-found. Equal to itself, so a file that
+    /// stays unstatable is not re-read on every miss.
+    Unstatable,
+    Present { len: u64, modified: Option<SystemTime>, inode: u64 },
+}
+
+fn file_stamp(path: &Path) -> FileStamp {
+    match std::fs::metadata(path) {
+        Ok(metadata) => FileStamp::Present {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            inode: inode_of(&metadata),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => FileStamp::Absent,
+        Err(_) => FileStamp::Unstatable,
+    }
+}
+
+#[cfg(unix)]
+fn inode_of(metadata: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    metadata.ino()
+}
+
+#[cfg(not(unix))]
+fn inode_of(_metadata: &std::fs::Metadata) -> u64 {
+    0
+}
+
+/// A pack pair's two files, stamped together.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PairStamp {
+    index: FileStamp,
+    data: FileStamp,
+    /// When a file was modified within [`MTIME_GRANULARITY`] of this stamp being taken, it may
+    /// change again in the same mtime tick without its stamp moving (an in-place, same-length
+    /// rewrite on a coarse-mtime filesystem). This is the moment that window closes: once it has
+    /// passed, [`broken_pair_changed`] re-classifies the pair once, and the stamp the reload takes
+    /// then no longer falls inside the window. `None` when no file was that fresh.
+    settles_at: Option<SystemTime>,
+}
+
+impl PairStamp {
+    /// Whether both files still stat as they did when `self` was taken.
+    fn files_match(&self, other: &PairStamp) -> bool {
+        self.index == other.index && self.data == other.data
+    }
+}
+
+fn pair_stamp(index_path: &Path) -> PairStamp {
+    let read_at = SystemTime::now();
+    let index = file_stamp(index_path);
+    let data = file_stamp(&index_path.with_extension(PACK_DATA_EXTENSION));
+
+    let settles_at = [&index, &data].into_iter()
+        .filter_map(|stamp| match stamp {
+            FileStamp::Present { modified: Some(modified), .. } => Some(*modified + MTIME_GRANULARITY),
+            _ => None,
+        })
+        .filter(|settles| *settles >= read_at)
+        .max();
+
+    PairStamp { index, data, settles_at }
+}
+
+/// What the pack folder looked like when a [`PackSet`] was loaded from it, taken *before* the
+/// listing so a pack published during the load moves the folder past the stamp rather than
+/// slipping in under it.
+struct FolderStamp {
+    /// The sorted names of every pack index and pack data file in the folder. Temp files end in
+    /// `.tmp`, so they are not among them.
+    names: Vec<OsString>,
+    /// The folder's mtime and when it was read. Both were taken before `names` was listed, and a
+    /// racy check that lists the folder again and finds the same names replaces both with the
+    /// values it read before *its* listing — so a stamp stops being racy once the granularity
+    /// margin has passed, and is never newer than the names it vouches for.
+    times: Mutex<StampTimes>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StampTimes {
+    /// `None` when the folder did not exist. `Some(None)` when it existed but the platform reported
+    /// no modification time — such a stamp is always racy, so every miss compares names.
+    modified: Option<Option<SystemTime>>,
+    read_at: SystemTime,
+}
+
+impl StampTimes {
+    /// Whether the folder may have changed again within the same mtime tick it was stamped at, so
+    /// an equal mtime does not prove the listing is current.
+    fn is_racy(&self) -> bool {
+        match self.modified {
+            None => false,
+            Some(None) => true,
+            Some(Some(modified)) => modified + MTIME_GRANULARITY >= self.read_at,
+        }
+    }
+}
+
+/// How coarse a filesystem's modification times may be. A folder modified within this margin of
+/// when it was stamped may have changed again in the same tick, so its mtime alone cannot prove
+/// that nothing was published since.
+const MTIME_GRANULARITY: Duration = Duration::from_secs(2);
 
 impl QuarantinedPack {
     /// Whether this quarantined index names `hash_bytes` — the same sorted binary search
@@ -553,22 +702,33 @@ struct PackSet {
     /// Index parses; data missing/unmappable/bad. Sorted by index file name for the same
     /// deterministic-error-message reason `packs` is.
     quarantined: Vec<QuarantinedPack>,
-    /// Index itself unreadable or corrupt: `(index_path, parse error)`. Its hash set is unknown,
-    /// so it can never gate a verdict — surfacing it is a future leg's job.
-    unenumerable: Vec<(PathBuf, String)>,
+    /// Index itself unreadable or corrupt. Its hash set is unknown, so it can never gate a
+    /// verdict.
+    unenumerable: Vec<UnenumerablePack>,
+    /// The folder as it stood when this set was loaded (see [`reloaded_if_stale`]).
+    stamp: FolderStamp,
 }
 
 impl PackSet {
     fn empty() -> PackSet {
-        PackSet { packs: Vec::new(), quarantined: Vec::new(), unenumerable: Vec::new() }
+        PackSet {
+            packs: Vec::new(),
+            quarantined: Vec::new(),
+            unenumerable: Vec::new(),
+            stamp: FolderStamp {
+                names: Vec::new(),
+                times: Mutex::new(StampTimes { modified: None, read_at: SystemTime::UNIX_EPOCH }),
+            },
+        }
     }
 }
 
 /// The read cache: each warehouse's object store maps to the packs loaded for it. Keyed by
 /// the objects-root path so one process serving several warehouse roots (the server, via a
-/// storage-root scope) never mixes their packs. Loaded once per root on first miss of the
-/// loose store; `compact` invalidates its own root's entry so a same-process read sees new
-/// packs.
+/// storage-root scope) never mixes their packs. Loaded on first use, and revalidated against the
+/// pack folder on every lookup that misses (see [`reloaded_if_stale`]), so a pack another process
+/// publishes — an external `compact` beside a live server — is seen by the next miss. `compact`
+/// still invalidates its own root's entry so a same-process read sees its packs at once.
 static PACK_REGISTRY: OnceLock<Mutex<HashMap<String, Arc<PackSet>>>> = OnceLock::new();
 
 fn registry() -> &'static Mutex<HashMap<String, Arc<PackSet>>> {
@@ -591,6 +751,14 @@ fn loaded_packs() -> Result<Arc<PackSet>, String> {
         return Ok(Arc::clone(packs));
     }
 
+    reload_packs()
+}
+
+/// Load the active warehouse's packs from disk and cache them, replacing whatever was cached.
+/// Two threads reloading at once may overwrite each other; an older set that wins carries an
+/// older stamp, so the next miss sees the folder past it and reloads again.
+fn reload_packs() -> Result<Arc<PackSet>, String> {
+    let key = file_utils::get_path_objects_root();
     let packs = Arc::new(load_packs_from_disk(&pack_folder())?);
 
     registry().lock().expect("the pack registry lock is poisoned")
@@ -599,15 +767,158 @@ fn loaded_packs() -> Result<Arc<PackSet>, String> {
     Ok(packs)
 }
 
+/// Revalidate `cached` against the pack folder after a lookup in it missed, reloading when the
+/// folder has moved on: `Ok(Some(fresh))` when it reloaded (retry the lookup there), `Ok(None)`
+/// when `cached` is still current.
+///
+/// This is what lets a long-lived process (a live server) see packs another process published
+/// after it cached its set — an external `compact`, a bundle install, a bulk ingest — without
+/// paying a full reload on every miss. A hit never comes here, so it stays syscall-free.
+///
+/// Two checks, in order:
+///
+/// 1. **Broken entries.** A quarantined or unenumerable pair is not a function of the folder's
+///    names, so each one is checked on its own: a full reload if either of its files changed
+///    since it was stamped, or when its [`FailureKind`] says to retry: an `open` failure once both
+///    files open, a post-`open` I/O failure once [`IO_FAILURE_RETRY_INTERVAL`] has passed. A
+///    fixed-state failure whose files are unchanged costs two `stat`s and is never re-read.
+/// 2. **The folder.** A reload if its mtime differs from the stamp. An equal mtime is proof only
+///    when the stamp is not racy ([`StampTimes::is_racy`]); a racy one lists the folder and
+///    reloads if the pack names differ, otherwise refreshes the stamp's times from values read
+///    before that listing.
+///
+/// Precondition: a local filesystem whose directory mtime moves when an entry is created,
+/// renamed or removed, and whose clock does not step backwards past [`MTIME_GRANULARITY`].
+fn reloaded_if_stale(cached: &PackSet) -> Result<Option<Arc<PackSet>>, String> {
+    let folder = pack_folder();
+    if pack_set_is_current(cached, &folder)? {
+        return Ok(None);
+    }
+
+    // One reload at a time: after an external compact, every concurrent miss on a live server
+    // finds the same set stale, and each would otherwise read every index into its own copy. A
+    // thread that waited here takes the set the thread before it loaded, if that one is current.
+    let key = file_utils::get_path_objects_root();
+    let reload_lock = Arc::clone(RELOAD_LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+        .lock().expect("the pack reload locks are poisoned")
+        .entry(key.clone()).or_default());
+    let _reloading = reload_lock.lock().expect("the pack reload lock is poisoned");
+
+    let newer = registry().lock().expect("the pack registry lock is poisoned")
+        .get(&key)
+        .filter(|entry| !std::ptr::eq(Arc::as_ptr(entry), cached))
+        .map(Arc::clone);
+
+    if let Some(newer) = newer {
+        if pack_set_is_current(&newer, &folder)? {
+            return Ok(Some(newer));
+        }
+    }
+
+    reload_packs().map(Some)
+}
+
+/// Serializes [`reloaded_if_stale`]'s reloads per warehouse object store (keyed like
+/// [`PACK_REGISTRY`]), so one warehouse's reload never holds up another's.
+static RELOAD_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+
+/// The check behind [`reloaded_if_stale`]. A `stat` or listing failure on the folder reads as
+/// "not current", so the reload that follows reports it as the environment failure it is.
+fn pack_set_is_current(set: &PackSet, folder: &Path) -> Result<bool, String> {
+    let broken = set.quarantined.iter()
+        .map(|q| (&q.index_path, &q.stamp, q.failure, q.attempted_at, q.index_path.with_extension(PACK_DATA_EXTENSION)))
+        .chain(set.unenumerable.iter()
+            .map(|u| (&u.index_path, &u.stamp, u.failure, u.attempted_at, u.index_path.clone())));
+
+    for (index_path, stamp, failure, attempted_at, open_probe) in broken {
+        if broken_pair_changed(index_path, stamp, failure, attempted_at, &open_probe) {
+            return Ok(false);
+        }
+    }
+
+    let stored = *set.stamp.times.lock().expect("the pack stamp lock is poisoned");
+
+    // Read before the stat, and the stat before the listing (see `FolderStamp`).
+    let read_at = SystemTime::now();
+    let modified = match std::fs::metadata(folder) {
+        Ok(metadata) => Some(metadata.modified().ok()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return Ok(false),
+    };
+
+    if modified != stored.modified {
+        return Ok(false);
+    }
+
+    if !stored.is_racy() {
+        return Ok(true);
+    }
+
+    let Ok(entries) = std::fs::read_dir(folder) else {
+        return Ok(false);
+    };
+
+    let mut names = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return Ok(false);
+        };
+        if is_pack_file_name(&entry.path()) {
+            names.push(entry.file_name());
+        }
+    }
+    names.sort();
+
+    if names != set.stamp.names {
+        return Ok(false);
+    }
+
+    *set.stamp.times.lock().expect("the pack stamp lock is poisoned") = StampTimes { modified, read_at };
+    Ok(true)
+}
+
+/// Whether a broken pair may now classify differently, so the set must be reloaded (which
+/// re-classifies it with the loader's own classifier): either file changed since it was stamped,
+/// its stamp was taken inside a file's mtime tick and that tick has since passed
+/// ([`PairStamp::settles_at`]), or its failure kind ([`FailureKind`]) says to retry now — an
+/// `open` failure once `open_probe` opens (one `open` per miss, no read), a post-`open` I/O
+/// failure once [`IO_FAILURE_RETRY_INTERVAL`] has passed since it was attempted.
+///
+/// `open_probe` is the file whose `open` decides the pair's classification: the index for an
+/// unenumerable pair (its index is what could not be read), the data file for a quarantined one
+/// (its index was read; a data file that opens is what would load it).
+fn broken_pair_changed(index_path: &Path,
+                       stamp: &PairStamp,
+                       failure: FailureKind,
+                       attempted_at: Instant,
+                       open_probe: &Path) -> bool {
+    if !pair_stamp(index_path).files_match(stamp) {
+        return true;
+    }
+
+    if stamp.settles_at.is_some_and(|settles_at| SystemTime::now() > settles_at) {
+        return true;
+    }
+
+    match failure {
+        FailureKind::Fixed => false,
+        FailureKind::Io => attempted_at.elapsed() >= IO_FAILURE_RETRY_INTERVAL,
+        FailureKind::Open => !matches!(
+            std::fs::File::open(open_probe), Err(error) if error.kind() != std::io::ErrorKind::NotFound
+        ),
+    }
+}
+
 /// Whether `hash` is named only by a quarantined (data-missing) pack index — the honest-wording
 /// half of FORK-47's `Absent` gate (DESIGN.html §3.1.1): a hash a quarantined index names is not
 /// "no surviving index names this hash," so its ordinary read must say so rather than reading a
 /// bare, indistinguishable-from-never-existed `Absent`. Membership is a binary search over each
 /// quarantined index's resident sorted bytes ([`QuarantinedPack::contains`]) — no per-hash parse.
 ///
-/// Consults [`loaded_packs`] (cache-warm in every caller today: this is only ever reached after a
-/// `retrieve_from_packs_reloading` call already populated it), never `unenumerable` — an
-/// unparseable index's hash set is unknown, so it must never gate a verdict (I4).
+/// Consults [`loaded_packs`] (current in every caller today: this is only ever reached right
+/// after a `retrieve_from_packs` miss, which revalidated the set against the pack folder), never
+/// `unenumerable` — an unparseable index's hash set is unknown, so it must never gate a verdict
+/// (I4).
 ///
 /// # Returns
 /// * `Ok(Some(message))` - `hash` is named by a quarantined index; `message` is ready to use as
@@ -664,7 +975,7 @@ pub(crate) fn pack_health_snapshot() -> Result<PackHealthSnapshot, String> {
 
     Ok(PackHealthSnapshot {
         quarantined: quarantined.into_iter().map(|q| (q.index_path, q.error)).collect(),
-        unenumerable,
+        unenumerable: unenumerable.into_iter().map(|u| (u.index_path, u.error)).collect(),
     })
 }
 
@@ -744,15 +1055,24 @@ pub fn densify_pending() -> Result<bool, String> {
 /// unknown, so (I4) it must never gate a verdict; it is inert until a future leg surfaces it.
 /// Only a `read_dir` failure on the pack folder itself (not `NotFound`) is still a whole-load
 /// `Err` — an environment failure, not a per-pack one.
+///
+/// The returned set carries a [`FolderStamp`] taken before the listing, and each broken entry a
+/// [`PairStamp`] taken before its load, which is what [`reloaded_if_stale`] compares against.
 fn load_packs_from_disk(pack_folder: &Path) -> Result<PackSet, String> {
     let mut packs = Vec::new();
     let mut quarantined = Vec::new();
     let mut unenumerable = Vec::new();
+    let mut names = Vec::new();
+
+    // Stamp first, list second (see `FolderStamp`).
+    let read_at = SystemTime::now();
+    let modified = folder_modified(pack_folder)?;
 
     let entries = match std::fs::read_dir(pack_folder) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(PackSet { packs, quarantined, unenumerable });
+            let stamp = FolderStamp { names, times: Mutex::new(StampTimes { modified: None, read_at }) };
+            return Ok(PackSet { packs, quarantined, unenumerable, stamp });
         }
         Err(error) => return Err(format!(
             "Error while reading the pack folder \"{}\": {}", pack_folder.to_string_lossy(), error
@@ -763,25 +1083,18 @@ fn load_packs_from_disk(pack_folder: &Path) -> Result<PackSet, String> {
         let entry = entry.map_err(|e| format!("Error while listing the pack folder: {}", e))?;
         let path = entry.path();
 
+        if is_pack_file_name(&path) {
+            names.push(entry.file_name());
+        }
+
         if path.extension().and_then(|e| e.to_str()) != Some(PACK_INDEX_EXTENSION) {
             continue;
         }
 
-        let data_path = path.with_extension(PACK_DATA_EXTENSION);
-
-        match load_pack_pair(&data_path, &path) {
-            Ok(pack) => packs.push(pack),
-            Err(pair_error) => match std::fs::read(&path) {
-                Ok(index) => match parse_index_header(&index, &path) {
-                    Ok((count, _version)) => {
-                        quarantined.push(QuarantinedPack { index_path: path, index, count, error: pair_error });
-                    }
-                    Err(parse_error) => unenumerable.push((path, parse_error)),
-                },
-                Err(read_error) => unenumerable.push((path.clone(), format!(
-                    "Error while reading pack index \"{}\": {}", path.to_string_lossy(), read_error
-                ))),
-            },
+        match classify_pack_pair(&path) {
+            PairOutcome::Loaded(pack) => packs.push(pack),
+            PairOutcome::Quarantined(pack) => quarantined.push(pack),
+            PairOutcome::Unenumerable(pack) => unenumerable.push(pack),
         }
     }
 
@@ -790,40 +1103,164 @@ fn load_packs_from_disk(pack_folder: &Path) -> Result<PackSet, String> {
     // lets a test pin the "broken copy enumerated first" case deterministically on every platform.
     packs.sort_by(|a, b| a.data_path.file_name().cmp(&b.data_path.file_name()));
     quarantined.sort_by(|a, b| a.index_path.file_name().cmp(&b.index_path.file_name()));
+    names.sort();
 
-    Ok(PackSet { packs, quarantined, unenumerable })
+    let stamp = FolderStamp { names, times: Mutex::new(StampTimes { modified: Some(modified), read_at }) };
+    Ok(PackSet { packs, quarantined, unenumerable, stamp })
+}
+
+/// Whether `path` names a pack index or pack data file — the names a [`FolderStamp`] records.
+fn is_pack_file_name(path: &Path) -> bool {
+    matches!(path.extension().and_then(|e| e.to_str()), Some(PACK_INDEX_EXTENSION) | Some(PACK_DATA_EXTENSION))
+}
+
+/// The pack folder's modification time: `Ok(None)` when it exists but the platform reports none,
+/// `Ok(Some(..))` otherwise. A missing folder reads as `Ok(None)` too — its `read_dir` will say
+/// `NotFound` next, and the caller records the absence from that. Any other `stat` failure is the
+/// same environment failure a `read_dir` on the folder would be.
+fn folder_modified(pack_folder: &Path) -> Result<Option<SystemTime>, String> {
+    match std::fs::metadata(pack_folder) {
+        Ok(metadata) => Ok(metadata.modified().ok()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "Error while reading the pack folder \"{}\": {}", pack_folder.to_string_lossy(), error
+        )),
+    }
+}
+
+/// What the loader makes of one index entry.
+enum PairOutcome {
+    Loaded(LoadedPack),
+    Quarantined(QuarantinedPack),
+    Unenumerable(UnenumerablePack),
+}
+
+/// Classify one index entry exactly as the loader does — the single classifier both
+/// [`load_packs_from_disk`] and [`reloaded_if_stale`]'s retries rest on, so the two cannot
+/// disagree about what a pair is. A `load_pack_pair` failure re-attempts the registry-independent
+/// index parse alone (the same read-and-`parse_index_header` shape [`hashes_in_index_file`] uses,
+/// without touching the data file that just failed): an index that parses is quarantined, one
+/// that does not is unenumerable.
+///
+/// The pair is stamped before it is opened, so a change that lands during the load moves its
+/// files past the stamp.
+fn classify_pack_pair(index_path: &Path) -> PairOutcome {
+    let stamp = pair_stamp(index_path);
+    let attempted_at = Instant::now();
+    let data_path = index_path.with_extension(PACK_DATA_EXTENSION);
+
+    let pair_failure = match load_pack_pair_classified(&data_path, index_path) {
+        Ok(pack) => return PairOutcome::Loaded(pack),
+        Err(failure) => failure,
+    };
+
+    match read_pack_file(index_path) {
+        Ok(index) => match parse_index_header(&index, index_path) {
+            Ok((count, _version)) => PairOutcome::Quarantined(QuarantinedPack {
+                index_path: index_path.to_path_buf(),
+                index,
+                count,
+                error: pair_failure.message,
+                stamp,
+                failure: pair_failure.kind,
+                attempted_at,
+            }),
+            Err(parse_error) => PairOutcome::Unenumerable(UnenumerablePack {
+                index_path: index_path.to_path_buf(),
+                error: parse_error,
+                stamp,
+                failure: FailureKind::Fixed,
+                attempted_at,
+            }),
+        },
+        Err(read_failure) => PairOutcome::Unenumerable(UnenumerablePack {
+            index_path: index_path.to_path_buf(),
+            error: format!("Error while reading pack index \"{}\": {}", index_path.to_string_lossy(), read_failure.error),
+            stamp,
+            failure: read_failure.kind,
+            attempted_at,
+        }),
+    }
+}
+
+/// Why a pack file could not be read, and its [`FailureKind`].
+struct PackReadFailure {
+    error: std::io::Error,
+    kind: FailureKind,
+}
+
+/// Open a pack file, classifying a failure: not-found is [`FailureKind::Fixed`], anything else
+/// [`FailureKind::Open`].
+fn open_pack_file(path: &Path) -> Result<std::fs::File, PackReadFailure> {
+    std::fs::File::open(path).map_err(|error| {
+        let kind = if error.kind() == std::io::ErrorKind::NotFound { FailureKind::Fixed } else { FailureKind::Open };
+        PackReadFailure { error, kind }
+    })
+}
+
+/// Read a whole pack file, as `std::fs::read` does, but with its failure classified: a read error
+/// after the `open` succeeded is [`FailureKind::Io`].
+fn read_pack_file(path: &Path) -> Result<Vec<u8>, PackReadFailure> {
+    let mut file = open_pack_file(path)?;
+    let mut bytes = Vec::with_capacity(file.metadata().map(|m| m.len() as usize).unwrap_or(0));
+    file.read_to_end(&mut bytes).map_err(|error| PackReadFailure { error, kind: FailureKind::Io })?;
+    Ok(bytes)
 }
 
 /// Load one native pack/index pair and validate the structural contract shared by ordinary local
 /// packs and transport-installed packs. Content hashes are checked separately: ordinary reads do
 /// it on demand, while a transport import checks the whole quarantined set before publication.
 fn load_pack_pair(data_path: &Path, index_path: &Path) -> Result<LoadedPack, String> {
-    let index = std::fs::read(index_path)
-        .map_err(|e| format!("Error while reading pack index \"{}\": {}", index_path.to_string_lossy(), e))?;
-    let (count, version) = parse_index_header(&index, index_path)?;
+    load_pack_pair_classified(data_path, index_path).map_err(|failure| failure.message)
+}
 
-    let file = std::fs::File::open(data_path)
-        .map_err(|e| format!("Error while opening pack data \"{}\": {}", data_path.to_string_lossy(), e))?;
+/// A [`load_pack_pair`] failure: its message and [`FailureKind`].
+struct PairFailure {
+    message: String,
+    kind: FailureKind,
+}
+
+impl PairFailure {
+    fn fixed(message: String) -> PairFailure {
+        PairFailure { message, kind: FailureKind::Fixed }
+    }
+}
+
+/// [`load_pack_pair`], keeping its failure's [`FailureKind`].
+fn load_pack_pair_classified(data_path: &Path, index_path: &Path) -> Result<LoadedPack, PairFailure> {
+    let index = read_pack_file(index_path).map_err(|failure| PairFailure {
+        message: format!("Error while reading pack index \"{}\": {}", index_path.to_string_lossy(), failure.error),
+        kind: failure.kind,
+    })?;
+    let (count, version) = parse_index_header(&index, index_path).map_err(PairFailure::fixed)?;
+
+    let file = open_pack_file(data_path).map_err(|failure| PairFailure {
+        message: format!("Error while opening pack data \"{}\": {}", data_path.to_string_lossy(), failure.error),
+        kind: failure.kind,
+    })?;
     // SAFETY: callers only pass immutable pack data: a published pack is write-once, and a
     // transport staging file is closed and never modified again before this mapping is dropped.
     let data = unsafe { memmap2::Mmap::map(&file) }
-        .map_err(|e| format!("Error while mapping pack data \"{}\": {}", data_path.to_string_lossy(), e))?;
+        .map_err(|e| PairFailure {
+            message: format!("Error while mapping pack data \"{}\": {}", data_path.to_string_lossy(), e),
+            kind: FailureKind::Io,
+        })?;
 
     if data.len() < PACK_DATA_HEADER_LEN as usize || &data[0..8] != PACK_DATA_MAGIC {
-        return Err(format!(
+        return Err(PairFailure::fixed(format!(
             "Pack data \"{}\" is corrupt or has an unknown format.", data_path.to_string_lossy()
-        ));
+        )));
     }
 
     let data_version = read_u32_le(&data, 8);
     if data_version != version {
-        return Err(format!(
+        return Err(PairFailure::fixed(format!(
             "Pack data \"{}\" has format version {}, but its index has version {}.",
             data_path.to_string_lossy(), data_version, version
-        ));
+        )));
     }
 
-    validate_index_records(&index, count, data.len(), index_path)?;
+    validate_index_records(&index, count, data.len(), index_path).map_err(PairFailure::fixed)?;
 
     Ok(LoadedPack { data_path: data_path.to_path_buf(), data, index, count, version })
 }
@@ -1384,10 +1821,21 @@ pub(crate) fn retrieve_from_packs(hash: &str) -> Result<PackRetrieval, String> {
 
     let packs = loaded_packs()?;
 
+    match retrieve_from(&packs, &hash_bytes, hash)? {
+        PackRetrieval::NotLocated => match reloaded_if_stale(&packs)? {
+            Some(fresh) => retrieve_from(&fresh, &hash_bytes, hash),
+            None => Ok(PackRetrieval::NotLocated),
+        },
+        located => Ok(located),
+    }
+}
+
+/// [`retrieve_from_packs`] against one already-loaded set, with no revalidation.
+fn retrieve_from(packs: &PackSet, hash_bytes: &[u8; HASH_LEN], hash: &str) -> Result<PackRetrieval, String> {
     let mut first_error: Option<String> = None;
 
     for pack in packs.packs.iter() {
-        let Some((offset, length)) = pack.locate(&hash_bytes) else {
+        let Some((offset, length)) = pack.locate(hash_bytes) else {
             continue;
         };
 
@@ -1417,17 +1865,15 @@ pub(crate) fn retrieve_from_packs(hash: &str) -> Result<PackRetrieval, String> {
 }
 
 /// Retrieve an object from packs after forcibly reloading this warehouse's pack registry from
-/// disk — the reload-on-miss retry a long-running process needs.
+/// disk.
 ///
-/// The mmap pack registry is otherwise only refreshed by a `compact` in *this* process. A live
-/// server whose registry predates an *external* `compact` would miss an object that was moved
-/// into a new pack — and whose loose source that same compact already swept — so both the cached
-/// pack lookup and the loose fallback come up empty even though the object is present on disk. One
-/// forced reload closes that window before the read is declared a miss. Called from the read
-/// path's last-resort branches (a loose miss, and now — since a good copy an external `compact`
-/// wrote into a new pack must not stay shadowed by a stale cached registry — a failed pack
-/// resolve that the loose store also could not serve), so a genuinely absent or genuinely broken
-/// object reloads at most once per read.
+/// A miss no longer needs this: [`retrieve_from_packs`] revalidates the cached set against the
+/// pack folder on every miss ([`reloaded_if_stale`]). What the folder's names cannot vouch for is
+/// a pack's *data* bytes — a same-name rewrite can replace a record — so the one caller left is
+/// the read path's `Failed` branch: a located record that failed to resolve, which the loose
+/// store also could not serve, gets one forced reload so a good copy written since is not
+/// shadowed by the stale mapping. A persistently broken record therefore reloads at most once per
+/// read.
 pub(crate) fn retrieve_from_packs_reloading(hash: &str) -> Result<PackRetrieval, String> {
     invalidate_cache();
     retrieve_from_packs(hash)
@@ -1536,6 +1982,11 @@ fn reconstruct_record(record: &[u8], version: u32, hash: &str) -> Result<Vec<u8>
 /// resolving once its object is packed. A linear scan of the resident indexes; resolution is
 /// interactive and rare, so the simple form is fine.
 ///
+/// The cached set is revalidated ([`reloaded_if_stale`]) before every scan, not only when the
+/// scan comes back empty: a prefix that matches one packed hash can still match another in a pack
+/// published since, and answering "unique" from a stale set would resolve it wrongly. Against a
+/// linear scan of every index, the extra `stat` is noise.
+///
 /// # Arguments
 /// * `prefix` - A hex hash or hash prefix.
 ///
@@ -1543,7 +1994,8 @@ fn reconstruct_record(record: &[u8], version: u32, hash: &str) -> Result<Vec<u8>
 /// * `Ok(Vec<String>)` - The full hex hashes of packed objects matching the prefix.
 /// * `Err(String)`     - If the packs could not be loaded.
 pub fn find_hashes_with_prefix(prefix: &str) -> Result<Vec<String>, String> {
-    let packs = loaded_packs()?;
+    let cached = loaded_packs()?;
+    let packs = reloaded_if_stale(&cached)?.unwrap_or(cached);
     let mut matches = Vec::new();
 
     for pack in packs.packs.iter() {
@@ -1603,6 +2055,14 @@ pub(crate) fn hashes_in_index_file(index_path: &Path) -> Result<Vec<String>, Str
 /// rather than silently skip it — flipping the polarity would make a quarantine-named hash
 /// permanently unhealable.
 ///
+/// A hit answers from the cached set with no syscall. A miss revalidates the set against the pack
+/// folder first ([`reloaded_if_stale`]) — so a pack another process published since this one
+/// cached its set is seen, and `false` means no pack on disk held the hash when this call looked,
+/// not merely none this process happened to load (FORK-106: a live server used to 404 everything
+/// an external `compact` had packed). A caller that also checks the loose store must ask the packs
+/// again after a loose miss, since a compact can pack and sweep in between (see
+/// [`is_in_cached_packs`]).
+///
 /// # Arguments
 /// * `hash` - The hex hash of the object.
 ///
@@ -1616,8 +2076,31 @@ pub fn is_in_packs(hash: &str) -> Result<bool, String> {
     };
 
     let packs = loaded_packs()?;
+    if located_in(&packs, &hash_bytes) {
+        return Ok(true);
+    }
 
-    Ok(packs.packs.iter().any(|pack| pack.locate(&hash_bytes).is_some()))
+    Ok(match reloaded_if_stale(&packs)? {
+        Some(fresh) => located_in(&fresh, &hash_bytes),
+        None => false,
+    })
+}
+
+/// [`is_in_packs`] against the cached set only, with no revalidation: the first step of a
+/// presence check that tries packs, then loose, then revalidated packs (`does_object_exist`).
+/// Asking the cached set first keeps a loose object's check free of the revalidation; asking the
+/// revalidated set last catches a compact that packed the object and swept its loose file between
+/// the two looks.
+pub(crate) fn is_in_cached_packs(hash: &str) -> Result<bool, String> {
+    let Some(hash_bytes) = hash_to_bytes(hash) else {
+        return Ok(false);
+    };
+
+    Ok(located_in(&*loaded_packs()?, &hash_bytes))
+}
+
+fn located_in(packs: &PackSet, hash_bytes: &[u8; HASH_LEN]) -> bool {
+    packs.packs.iter().any(|pack| pack.locate(hash_bytes).is_some())
 }
 
 /// Where an object to pack comes from, and how to pack it.
@@ -1740,6 +2223,23 @@ pub fn compact(all: bool, redelta: bool, progress: &Progress) -> Result<CompactS
     // auto-maintenance (which ignores compaction errors) simply skips the now-redundant work.
     // Taken after the folder exists so its parent (`forklift_root`) is present for `create_new`.
     let _store_lock = lock_utils::StoreLock::acquire()?;
+
+    // A repack is serve-exclusive, like gc (FORK-149). It keeps only the live set, with no grace
+    // period, so beside a live server it can drop a lift's objects after an incremental compact
+    // packed them and before the lift's ref update lands — and a server whose presence check is
+    // current (FORK-106) answers "present" for exactly those objects, so the client never
+    // re-sends a loose copy that would survive. Incremental compaction drops nothing and stays
+    // allowed. Auto-maintenance ignores a compaction error, so it simply skips the repack while
+    // the root is served.
+    let _serve_lock = if all {
+        Some(lock_utils::ServeLock::acquire().map_err(|e| format!(
+            "A full repack cannot run while this warehouse root is being served, or while a gc runs \
+             against it; stop the server first. If neither is running, the lock below was left by \
+             one that was killed and can be removed. {}", e
+        ))?)
+    } else {
+        None
+    };
 
     remove_stale_temp_files(&pack_folder);
 
@@ -6009,6 +6509,345 @@ mod tests {
         assert_eq!(loaded.packs.len(), 1, "only A's pair loaded cleanly");
         assert!(loaded.quarantined.is_empty(), "B's index does not parse; it cannot be quarantined");
         assert_eq!(loaded.unenumerable.len(), 1, "B's unparseable index must be recorded as unenumerable");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// The pack set this process has cached for the active warehouse (panics if none is cached).
+    fn cached_pack_set() -> Arc<PackSet> {
+        Arc::clone(registry().lock().expect("registry lock").get(&file_utils::get_path_objects_root())
+            .expect("a pack set is cached for this warehouse"))
+    }
+
+    /// Set a file's mtime. Through a write handle: Windows needs one to set file times.
+    fn set_mtime(path: &Path, modified: SystemTime) {
+        std::fs::OpenOptions::new().write(true).open(path).unwrap().set_modified(modified).unwrap();
+    }
+
+    /// A fresh, empty warehouse root for one test.
+    fn fresh_root(name: &str) -> PathBuf {
+        let temp = std::env::temp_dir().join(format!("forklift-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        temp
+    }
+
+    /// Publish one pack holding `content` into the active warehouse's pack folder, as another
+    /// process would — no `invalidate_cache()`. Returns the object's hash and the pair's paths.
+    fn publish_external_pack(content: &[u8]) -> (String, TransportPackArtifact) {
+        let hash = blake3::hash(content).to_hex().to_string();
+        let mut builder = TransportPackBuilder::new(&pack_folder()).unwrap();
+        builder.append_full(&hash, content).unwrap();
+        let mut artifacts = builder.finish().unwrap();
+        assert_eq!(artifacts.len(), 1, "test fixture expects exactly one pack pair");
+        (hash, artifacts.remove(0))
+    }
+
+    /// FORK-106: prefix resolution sees a pack published after this process cached its set — the
+    /// same staleness the presence check had, on the `find_hashes_with_prefix` path (which never
+    /// misses in the lookup sense, so it revalidates before every scan).
+    ///
+    /// Revert: drop the `reloaded_if_stale` call from `find_hashes_with_prefix` → the second
+    /// lookup scans the stale (empty) set and returns nothing → red.
+    #[test]
+    fn prefix_resolution_sees_a_pack_published_after_caching() {
+        let temp = fresh_root("prefix-after-caching");
+        let _scope = StorageRootScope::enter(&temp);
+
+        let content = b"an object whose short hash is resolved after an external compact".to_vec();
+        let hash = blake3::hash(&content).to_hex().to_string();
+        let prefix = &hash[..12];
+
+        assert!(find_hashes_with_prefix(prefix).unwrap().is_empty(), "sanity: nothing matches yet, and the set is cached");
+        publish_external_pack(&content);
+
+        assert_eq!(find_hashes_with_prefix(prefix).unwrap(), vec![hash.clone()],
+            "a pack published after caching must be seen by prefix resolution");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// FORK-106, the racy half of the folder check: a publish that leaves the folder's mtime equal
+    /// to the stamped one (a coarse-mtime filesystem, two changes in one tick) is still caught,
+    /// because a stamp taken within the granularity margin compares the folder's names.
+    ///
+    /// Fixture: cache the set, publish a pack, then set the folder's mtime back to exactly the
+    /// stamped value — so only the name compare can notice.
+    ///
+    /// Revert: make `StampTimes::is_racy` return `false` → an equal mtime is trusted, the miss
+    /// reports absent → red.
+    #[cfg(unix)]
+    #[test]
+    fn a_publish_hidden_under_an_equal_folder_mtime_is_caught_by_the_name_compare() {
+        let temp = fresh_root("racy-name-compare");
+        let _scope = StorageRootScope::enter(&temp);
+        std::fs::create_dir_all(pack_folder()).unwrap();
+
+        let content = b"published within the same mtime tick as the stamp".to_vec();
+        let hash = blake3::hash(&content).to_hex().to_string();
+
+        assert!(!is_in_packs(&hash).unwrap(), "sanity: absent, and the set is cached");
+        let stamped = cached_pack_set().stamp.times.lock().unwrap().modified
+            .expect("the pack folder existed when the set was stamped")
+            .expect("this platform reports directory mtimes");
+        assert!(cached_pack_set().stamp.times.lock().unwrap().is_racy(), "sanity: a just-taken stamp is racy");
+
+        publish_external_pack(&content);
+        std::fs::File::open(pack_folder()).unwrap().set_modified(stamped).unwrap();
+        assert_eq!(std::fs::metadata(pack_folder()).unwrap().modified().unwrap(), stamped,
+            "sanity: the folder's mtime is back at the stamped value");
+
+        assert!(is_in_packs(&hash).unwrap(), "the name compare must catch a publish the mtime hides");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// FORK-106, the `open`-failure kind: a pack whose data file could not be opened (here,
+    /// permissions) is retried on the next miss once it opens, even though neither file's stamp
+    /// changed — a `chmod` moves neither length, mtime nor inode.
+    ///
+    /// Revert: classify every `open` failure as `FailureKind::Fixed` (or make
+    /// `broken_pair_changed` return `false` for `Open`) → the pair stays quarantined until the
+    /// process restarts, the second presence check says absent → red.
+    #[cfg(unix)]
+    #[test]
+    fn a_pack_whose_data_could_not_be_opened_is_retried_once_it_opens() {
+        use std::os::unix::fs::PermissionsExt;
+        use crate::util::file_utils::StoreReadOutcome;
+
+        let temp = fresh_root("open-failure-retry");
+        let _scope = StorageRootScope::enter(&temp);
+
+        let (hash, artifact) = publish_external_pack(b"a pack whose data file is briefly unreadable");
+        let readable = std::fs::metadata(&artifact.data_path).unwrap().permissions();
+        std::fs::set_permissions(&artifact.data_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&artifact.data_path).is_ok() {
+            // Running as root: permissions cannot make the open fail, so there is nothing to test.
+            std::fs::set_permissions(&artifact.data_path, readable).unwrap();
+            std::fs::remove_dir_all(&temp).ok();
+            return;
+        }
+
+        invalidate_cache();
+        match file_utils::read_object_classified(&hash).unwrap() {
+            StoreReadOutcome::Unverifiable(_) => {}
+            StoreReadOutcome::Verified(_) => panic!("an unopenable pack must not read Verified"),
+            StoreReadOutcome::Absent => panic!("a quarantine-named hash must read Unverifiable, not Absent"),
+        }
+        let cached = cached_pack_set();
+        assert_eq!(cached.quarantined.len(), 1, "sanity: the pair is quarantined");
+        assert_eq!(cached.quarantined[0].failure, FailureKind::Open, "sanity: as an open failure");
+
+        std::fs::set_permissions(&artifact.data_path, readable).unwrap();
+        assert!(is_in_packs(&hash).unwrap(), "once the data file opens, the next miss must find the object");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// FORK-106, the retry rule per failure kind, on unchanged files: a post-`open` I/O failure is
+    /// retried only once `IO_FAILURE_RETRY_INTERVAL` has passed since it was attempted; a fixed
+    /// failure never; an `open` failure as soon as both files open.
+    ///
+    /// Revert: retry `Io` on every miss (drop the interval) → the fresh-attempt assertion goes red;
+    /// never retry it → the aged-attempt assertion goes red.
+    #[test]
+    fn each_failure_kind_is_retried_on_its_own_schedule() {
+        let temp = fresh_root("failure-kind-schedule");
+        let _scope = StorageRootScope::enter(&temp);
+
+        let (_, artifact) = publish_external_pack(b"a healthy pair standing in for a broken one");
+        let index = &artifact.index_path;
+        let stamp = PairStamp { settles_at: None, ..pair_stamp(index) };
+        let now = Instant::now();
+        let aged = now.checked_sub(IO_FAILURE_RETRY_INTERVAL + Duration::from_secs(1))
+            .expect("the monotonic clock is past the retry interval");
+
+        assert!(!broken_pair_changed(index, &stamp, FailureKind::Io, now, index),
+            "an I/O failure just attempted must not be retried yet");
+        assert!(broken_pair_changed(index, &stamp, FailureKind::Io, aged, index),
+            "an I/O failure attempted longer ago than the interval must be retried");
+        assert!(!broken_pair_changed(index, &stamp, FailureKind::Fixed, aged, index),
+            "a fixed failure on unchanged files is never retried");
+        assert!(broken_pair_changed(index, &stamp, FailureKind::Open, now, index),
+            "an open failure is retried as soon as its probe opens");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// FORK-106: a change to a broken pair's own files is seen even when the folder's names and
+    /// mtime do not move. Fixture: pack B's data is gone and its index corrupt (unenumerable, so a
+    /// read of Y is `Absent`); the index is then repaired *in place* — same name, same inode, no
+    /// folder entry created — while the data stays missing. Y is now named by a quarantined index,
+    /// so its read must turn `Unverifiable`, not stay `Absent`.
+    ///
+    /// Revert: drop the broken-entries loop from `pack_set_is_current` → the folder check alone
+    /// finds the set current, Y stays `Absent` → red.
+    #[test]
+    fn an_index_repaired_in_place_turns_an_absent_read_unverifiable() {
+        use crate::util::file_utils::StoreReadOutcome;
+
+        let temp = fresh_root("repaired-in-place");
+        let _scope = StorageRootScope::enter(&temp);
+
+        let (y_hash, artifact) = publish_external_pack(b"named by an index that is corrupt, then repaired");
+        std::fs::remove_file(&artifact.data_path).unwrap();
+        let good_index = std::fs::read(&artifact.index_path).unwrap();
+        let mut corrupt = good_index.clone();
+        corrupt[0..8].copy_from_slice(b"NOTAPACK");
+        std::fs::write(&artifact.index_path, &corrupt).unwrap();
+
+        invalidate_cache();
+        assert!(matches!(file_utils::read_object_classified(&y_hash).unwrap(), StoreReadOutcome::Absent),
+            "sanity: an unenumerable index is inert, so Y reads Absent");
+        assert_eq!(cached_pack_set().unenumerable.len(), 1, "sanity: B is unenumerable");
+
+        // Rewrite in place, and move the mtime past the stamp explicitly, so the change is
+        // visible to the pair stamp on any mtime granularity (the same-tick case is
+        // `a_pair_stamped_inside_an_mtime_tick_is_rechecked_once_the_tick_passes`).
+        let stamped_mtime = std::fs::metadata(&artifact.index_path).unwrap().modified().unwrap();
+        std::fs::write(&artifact.index_path, &good_index).unwrap();
+        set_mtime(&artifact.index_path, stamped_mtime + Duration::from_secs(5));
+
+        match file_utils::read_object_classified(&y_hash).unwrap() {
+            StoreReadOutcome::Unverifiable(_) => {}
+            StoreReadOutcome::Absent => panic!("a repaired index naming Y must turn its read Unverifiable, not leave it Absent"),
+            StoreReadOutcome::Verified(_) => panic!("Y's data is missing; it must not read Verified"),
+        }
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// FORK-106, the cost half: a fixed-state broken pair (an orphaned index) whose files do not
+    /// change does not make every miss reload the pack set — the cached set survives repeated
+    /// misses.
+    ///
+    /// Revert: make `broken_pair_changed` return `true` for `FailureKind::Fixed` → every miss
+    /// reloads and replaces the cached set → red.
+    #[test]
+    fn an_unchanged_orphaned_index_does_not_reload_on_every_miss() {
+        let temp = fresh_root("orphan-no-reload");
+        let _scope = StorageRootScope::enter(&temp);
+
+        let (_, artifact) = publish_external_pack(b"an orphaned index that stays orphaned");
+        std::fs::remove_file(&artifact.data_path).unwrap();
+        // Backdate the index so its stamp is settled: a stamp inside the file's mtime tick is
+        // re-checked once when the tick passes, which a slow runner could hit inside the loop.
+        set_mtime(&artifact.index_path, SystemTime::now() - Duration::from_secs(60));
+
+        invalidate_cache();
+        let never_stored = "7".repeat(64);
+        assert!(!is_in_packs(&never_stored).unwrap(), "sanity: absent");
+        let first = cached_pack_set();
+        assert_eq!(first.quarantined.len(), 1, "sanity: the orphan is quarantined");
+        assert_eq!(first.quarantined[0].failure, FailureKind::Fixed, "sanity: as a fixed failure");
+
+        for _ in 0..3 {
+            assert!(!is_in_packs(&never_stored).unwrap());
+        }
+        assert!(Arc::ptr_eq(&first, &cached_pack_set()), "an unchanged orphan must not reload the set on a miss");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// FORK-149: a full repack is serve-exclusive — refused while the serve lock is held (a live
+    /// server on this root, or a gc), with an error that says why; incremental compaction drops
+    /// nothing and still runs.
+    ///
+    /// Revert: drop the serve-lock acquire from `compact` → the repack runs beside the "server"
+    /// → red.
+    #[test]
+    fn a_repack_refuses_while_the_root_is_served_but_incremental_compaction_runs() {
+        let temp = fresh_root("repack-serve-lock");
+        let _scope = StorageRootScope::enter(&temp);
+
+        let content = b"content packed beside a live server".to_vec();
+        store_loose(&blake3::hash(&content).to_hex().to_string(), &content);
+
+        let served = lock_utils::ServeLock::acquire().expect("hold the serve lock, as a live server does");
+        let error = compact(true, false, &Progress::NONE).expect_err("a repack must refuse while the root is served");
+        assert!(error.contains("being served"), "the refusal should say the root is served: {}", error);
+        assert!(compact(false, false, &Progress::NONE).is_ok(), "incremental compaction runs beside a server");
+        drop(served);
+        assert!(compact(true, false, &Progress::NONE).is_ok(), "a repack runs once the root is no longer served");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// FORK-106, the open probe: an unenumerable pair whose index could not be opened is retried
+    /// once the *index* opens, even while its data file still cannot be — re-classifying it
+    /// quarantined, so a hash its index names reads `Unverifiable`, never `Absent`.
+    ///
+    /// Revert: probe the data file for an unenumerable pair (or require both files to open) → the
+    /// pair stays unenumerable, Y keeps reading `Absent` → red.
+    #[cfg(unix)]
+    #[test]
+    fn an_unenumerable_pair_is_retried_when_its_index_opens_though_its_data_does_not() {
+        use std::os::unix::fs::PermissionsExt;
+        use crate::util::file_utils::StoreReadOutcome;
+
+        let temp = fresh_root("open-probe-index");
+        let _scope = StorageRootScope::enter(&temp);
+
+        let (y_hash, artifact) = publish_external_pack(b"named by an index that briefly cannot be opened");
+        let readable = std::fs::metadata(&artifact.index_path).unwrap().permissions();
+        let locked = std::fs::Permissions::from_mode(0o000);
+        std::fs::set_permissions(&artifact.index_path, locked.clone()).unwrap();
+        std::fs::set_permissions(&artifact.data_path, locked).unwrap();
+        if std::fs::File::open(&artifact.index_path).is_ok() {
+            // Running as root: permissions cannot make the open fail, so there is nothing to test.
+            std::fs::set_permissions(&artifact.index_path, readable.clone()).unwrap();
+            std::fs::set_permissions(&artifact.data_path, readable).unwrap();
+            std::fs::remove_dir_all(&temp).ok();
+            return;
+        }
+
+        invalidate_cache();
+        assert!(matches!(file_utils::read_object_classified(&y_hash).unwrap(), StoreReadOutcome::Absent),
+            "sanity: an unenumerable index is inert, so Y reads Absent");
+        let cached = cached_pack_set();
+        assert_eq!(cached.unenumerable.len(), 1, "sanity: the pair is unenumerable");
+        assert_eq!(cached.unenumerable[0].failure, FailureKind::Open, "sanity: as an open failure");
+
+        std::fs::set_permissions(&artifact.index_path, readable.clone()).unwrap();
+        let outcome = file_utils::read_object_classified(&y_hash).unwrap();
+        std::fs::set_permissions(&artifact.data_path, readable).unwrap();
+        match outcome {
+            StoreReadOutcome::Unverifiable(_) => {}
+            StoreReadOutcome::Absent => panic!("once the index opens, Y is quarantine-named and must read Unverifiable, not Absent"),
+            StoreReadOutcome::Verified(_) => panic!("Y's data cannot be opened; it must not read Verified"),
+        }
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// FORK-106, the coarse-mtime half of a pair stamp: a stamp taken within `MTIME_GRANULARITY`
+    /// of a file's mtime may miss a same-length, in-place rewrite in that tick, so once the tick
+    /// has passed the pair is re-classified once; a stamp taken after it is trusted.
+    ///
+    /// Revert: drop the `settles_at` check from `broken_pair_changed` → the unsettled stamp is
+    /// trusted forever → red.
+    #[test]
+    fn a_pair_stamped_inside_an_mtime_tick_is_rechecked_once_the_tick_passes() {
+        let temp = fresh_root("pair-stamp-settles");
+        let _scope = StorageRootScope::enter(&temp);
+
+        let (_, artifact) = publish_external_pack(b"a pair whose stamp may sit inside an mtime tick");
+        let index = &artifact.index_path;
+        assert!(pair_stamp(index).settles_at.is_some(), "sanity: a file written just now stamps unsettled");
+
+        let past = SystemTime::now() - Duration::from_secs(60);
+        for path in [index, &artifact.data_path] {
+            set_mtime(path, past);
+        }
+        let settled = pair_stamp(index);
+        assert!(settled.settles_at.is_none(), "sanity: files last modified a minute ago stamp settled");
+
+        let unsettled = PairStamp { settles_at: Some(past + MTIME_GRANULARITY), ..settled.clone() };
+        let now = Instant::now();
+        assert!(broken_pair_changed(index, &unsettled, FailureKind::Fixed, now, index),
+            "a stamp whose tick has passed must be re-checked once");
+        assert!(!broken_pair_changed(index, &settled, FailureKind::Fixed, now, index),
+            "a settled stamp on unchanged files is trusted");
 
         std::fs::remove_dir_all(&temp).ok();
     }
