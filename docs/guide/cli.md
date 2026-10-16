@@ -1075,9 +1075,9 @@ correctly keeps it). It is **multi-bay-aware** — it refuses (`scope_prune_bloc
 free a path any checkout (the main tree or a bay) still materializes, so narrow that path away
 everywhere first. Nothing is lost: the pruned history is sealed by hash, re-fetchable from the
 origin with `expand`. Work that exists only here is never freed, whatever its path: content
-loaded but not yet stacked, parked parcels, and an unfinished consolidation, in any bay, as well
-as anything a trust pin needs. If any of that cannot be read, the prune refuses before changing
-anything. A full (non-sparse) warehouse has nothing to prune. Use `--dry-run` before
+loaded but not yet stacked, parked parcels, and an unfinished consolidation, in any bay. So you
+can park edits under the path, narrow and prune; the parked edits survive. If any of that state
+cannot be read, the prune refuses before changing anything. A full (non-sparse) warehouse has nothing to prune. Use `--dry-run` before
 you leap. (Objects already inside a pack are reported but not reclaimed yet — a scope-aware
 repack is future work.)
 

@@ -91,7 +91,7 @@ pub fn plan_prune(
     let local = local_roots(&user_parcels, &meta_parcels)?;
 
     let mut retained = collect_retained(&user_parcels, &meta_parcels, post_prune)?;
-    retain_local_closure(&local, &mut retained)?;
+    retain_local_closure(&local, post_prune, &mut retained)?;
 
     // Ordered children-before-parents (see the module doc): filtering this sequence (never
     // reordering it) preserves that property in `to_free`, which is what makes a partial
@@ -176,7 +176,7 @@ fn reachable_parcels() -> Result<(Vec<String>, Vec<String>), String> {
 /// targets through them.
 struct LocalRoots {
     /// Every parcel reachable from a parked parcel, an in-progress consolidation or a trust pin,
-    /// in any bay, that the pallet heads do not already reach. Retained in full, never scoped.
+    /// in any bay, that the pallet heads do not already reach. Walked scoped, like history.
     parcels: Vec<String>,
     /// Every staged inventory shard leaf, in any bay. Retained whatever its path.
     staged: Vec<(String, DirEntryType)>,
@@ -188,11 +188,8 @@ struct LocalRoots {
 /// These used to be omitted on the argument that whatever a transient state references under
 /// the pruned path is out of scope after the prune. That holds per path but not per object:
 /// content addressing lets a staged `b/y`, or a parked parcel's `b/y`, hold the very blob the
-/// pruned `a/x` holds, and freeing it would lose the only copy (FORK-156). Nor is a parked
-/// parcel's content under the pruned path sealed the way history is: it never left this
-/// warehouse, so no origin can serve it back, and `narrow` itself suggests parking uncommitted
-/// work under the path first. So everything these roots reach is retained in full, see
-/// [`retain_local_closure`].
+/// pruned `a/x` holds, and freeing it would lose the only copy (FORK-156). See
+/// [`retain_local_closure`] for what each kind of root keeps.
 ///
 /// # Arguments
 /// * `user_parcels` - The parcels the user pallet heads reach, already retained.
@@ -317,49 +314,81 @@ fn collect_retained(
     Ok(retained)
 }
 
-/// Retain everything [`LocalRoots`] reach, in full and whatever its path: every staged leaf
-/// (descending a chunked entry's recipe), and the whole closure of every local parcel.
+/// Retain what [`LocalRoots`] reach: every staged leaf whatever its path (descending a chunked
+/// entry's recipe), and every local parcel scoped exactly like pallet history in
+/// [`collect_retained`].
 ///
-/// Presence-tolerant, unlike [`collect_retained`]: a local parcel made in a sparse checkout, or a
-/// pinned historical parcel, seals out-of-scope subtrees this warehouse never fetched, and a
-/// staged recipe may already be gone (FORK-157). An absent object has nothing left to keep and
-/// is not a prune target either, so skipping it is the same rule gc's live set applies.
+/// Scoped is enough for the parcels, because a prune only ever frees its targets, and every
+/// target is pallet history under the pruned path. A local parcel's own work (an edit parked
+/// under that path) is a new object, never a target, so it survives whatever this walk does.
+/// What a local parcel shares with a target is history, sealed by hash and re-fetchable like
+/// the rest of it. The one thing at risk is a target a local parcel holds *in scope*, where
+/// absence would read as missing, and the scoped walk keeps exactly that. Walking the parcels in
+/// full instead would keep the whole pruned path whenever any bay has parked work, since a park
+/// snapshots the whole tree.
+///
+/// Presence-tolerant, unlike [`collect_retained`]: a local parcel made in a narrower checkout,
+/// or a pinned historical parcel, may seal subtrees this warehouse never fetched, and a staged
+/// recipe may already be gone (FORK-157). An absent object has nothing left to keep and is not
+/// a prune target either, so skipping it is the same rule gc's live set applies.
 ///
 /// # Arguments
-/// * `local`    - The non-head roots from [`local_roots`].
-/// * `retained` - The retained set to add to.
-fn retain_local_closure(local: &LocalRoots, retained: &mut HashSet<String>) -> Result<(), String> {
-    let mut frontier: VecDeque<String> = VecDeque::new();
-
+/// * `local`      - The non-head roots from [`local_roots`].
+/// * `post_prune` - The warehouse fetch scope that will remain after the prune.
+/// * `retained`   - The retained set to add to.
+fn retain_local_closure(
+    local: &LocalRoots,
+    post_prune: &MaterializationScope,
+    retained: &mut HashSet<String>,
+) -> Result<(), String> {
     for (hash, item_type) in &local.staged {
         if retained.insert(hash.clone()) && item_type.is_chunked() {
             retain_present_recipe_chunks(hash, retained)?;
         }
     }
 
+    // `Some(path)` walks a spine tree at that path, classifying its children; `None` walks an
+    // in-scope tree in full. Deduped on both, as in `collect_retained`: one tree can be spine at
+    // one path and in scope at another.
+    let mut frontier: VecDeque<(String, Option<String>)> = VecDeque::new();
+    let mut seen: HashSet<(String, Option<String>)> = HashSet::new();
+
     for parcel in &local.parcels {
         retained.insert(parcel.clone());
-        frontier.push_back(object_utils::load_parcel(parcel)?.tree_hash);
+        frontier.push_back((object_utils::load_parcel(parcel)?.tree_hash, Some(String::new())));
     }
 
-    let mut seen: HashSet<String> = HashSet::new();
-
-    while let Some(tree_hash) = frontier.pop_front() {
-        if !seen.insert(tree_hash.clone()) || !file_utils::does_object_exist(&tree_hash)? {
+    while let Some((tree_hash, path)) = frontier.pop_front() {
+        if !seen.insert((tree_hash.clone(), path.clone())) || !file_utils::does_object_exist(&tree_hash)? {
             continue;
         }
 
         retained.insert(tree_hash.clone());
         let tree = object_utils::load_tree(&tree_hash)?;
 
-        for (_, file) in tree.get_files() {
-            if retained.insert(file.hash.clone()) && file.item_type.is_chunked() {
+        for (name, file) in tree.get_files() {
+            let kept = match &path {
+                None => true,
+                Some(path) => post_prune.classify(&join_key(path, name)) != ScopeClass::OutOfScope,
+            };
+
+            if kept && retained.insert(file.hash.clone()) && file.item_type.is_chunked() {
                 retain_present_recipe_chunks(&file.hash, retained)?;
             }
         }
 
-        for (_, subtree) in tree.get_subtrees() {
-            frontier.push_back(subtree.hash.clone());
+        for (name, subtree) in tree.get_subtrees() {
+            let Some(path) = &path else {
+                frontier.push_back((subtree.hash.clone(), None));
+                continue;
+            };
+
+            let child = join_key(path, name);
+            match post_prune.classify(&child) {
+                ScopeClass::InScope => frontier.push_back((subtree.hash.clone(), None)),
+                ScopeClass::Spine => frontier.push_back((subtree.hash.clone(), Some(child))),
+                ScopeClass::OutOfScope => {}
+            }
         }
     }
 
@@ -742,30 +771,54 @@ mod tests {
     }
 
     #[test]
-    fn plan_prune_keeps_everything_a_parked_parcel_holds_in_scope_or_not() {
-        // A parked parcel never left this warehouse, so nothing can serve its content back:
-        // whether it holds the pruned blob's bytes in scope or under the pruned path itself (the
-        // user parked uncommitted edits there, as `narrow` suggests, before pruning), it stays.
-        for (dir, file) in [("api", "y.txt"), ("web", "edited.txt")] {
-            let _scratch = Scratch::new(&format!("keeps-parked-{}", dir));
-            let f = build_fixture();
-            plant_parked("b", &src_tree_with(dir, file, &f.web_blob));
+    fn plan_prune_keeps_a_blob_a_parked_parcel_holds_in_scope() {
+        // A parked `src/api/y.txt` holding the pruned blob's bytes: after the prune it is in
+        // scope, where absence would read as missing.
+        let _scratch = Scratch::new("parked-in-scope");
+        let f = build_fixture();
+        plant_parked("b", &src_tree_with("api", "y.txt", &f.web_blob));
 
-            let post_prune = MaterializationScope::from_prefixes(["src/api"]);
-            let plan = plan_prune(&["src/web".to_string()], &post_prune).unwrap();
-            assert!(!plan.to_free.contains(&f.web_blob), "a blob parked under src/{} must not be freed", dir);
-            assert!(plan.to_free.contains(&f.web_tree), "the head's own unique tree is still freed");
+        let post_prune = MaterializationScope::from_prefixes(["src/api"]);
+        let plan = plan_prune(&["src/web".to_string()], &post_prune).unwrap();
+        assert!(!plan.to_free.contains(&f.web_blob), "a blob parked in scope must not be freed");
+        assert!(plan.to_free.contains(&f.web_tree), "the head's own unique tree is still freed");
+    }
+
+    #[test]
+    fn plan_prune_never_frees_parked_edits_under_the_pruned_path_yet_still_reclaims_it() {
+        // The flow `narrow` suggests: park uncommitted edits under the path, narrow, prune. The
+        // park snapshots the whole tree, so it names the head's own `src/web` subtree too.
+        let _scratch = Scratch::new("parked-under-pruned");
+        let f = build_fixture();
+        let edit = store_blob("an edit nobody stacked\n");
+        let web = store_tree(&[("w.txt", &f.web_blob, DirEntryType::Normal), ("new.txt", &edit, DirEntryType::Normal)]);
+        let src = store_tree(&[("api", &f.api_tree, DirEntryType::Tree), ("web", &web, DirEntryType::Tree)]);
+        let snapshot = store_tree(&[("src", &src, DirEntryType::Tree), ("README.md", &f.readme_blob, DirEntryType::Normal)]);
+        plant_parked("b", &snapshot);
+
+        let post_prune = MaterializationScope::from_prefixes(["src/api"]);
+        let plan = plan_prune(&["src/web".to_string()], &post_prune).unwrap();
+
+        // The parked work is no history, so never a target: it survives.
+        for hash in [&edit, &web] {
+            assert!(!plan.to_free.contains(hash), "parked work must never be freed: {}", hash);
         }
+        // What it shares with the pruned history is sealed like the rest of that history, so the
+        // snapshot does not stop the prune from reclaiming it.
+        assert!(plan.to_free.contains(&f.web_blob), "a parked snapshot must not pin pruned history");
+        assert!(plan.to_free.contains(&f.web_tree));
     }
 
     #[test]
     fn plan_prune_tolerates_a_parked_parcel_sealing_a_subtree_never_fetched() {
-        // A parcel parked in a sparse checkout seals out-of-scope subtrees by hash only. The
-        // retained walk skips the absent object (nothing to keep) instead of refusing the prune.
+        // A parcel parked in a narrower checkout, or a pinned historical one, may seal a subtree
+        // this warehouse never fetched, even under a path the prune keeps. The retained walk
+        // skips the absent object (nothing to keep) instead of refusing the prune.
         let _scratch = Scratch::new("parked-sealed");
         let f = build_fixture();
         let never_fetched = "e".repeat(64);
-        let src = store_tree(&[("docs", &never_fetched, DirEntryType::Tree)]);
+        let api = store_tree(&[("old", &never_fetched, DirEntryType::Tree)]);
+        let src = store_tree(&[("api", &api, DirEntryType::Tree)]);
         plant_parked("b", &store_tree(&[("src", &src, DirEntryType::Tree)]));
 
         let post_prune = MaterializationScope::from_prefixes(["src/api"]);
@@ -774,31 +827,26 @@ mod tests {
     }
 
     #[test]
-    fn plan_prune_keeps_what_an_in_progress_consolidation_brings_in() {
+    fn plan_prune_keeps_what_an_in_progress_consolidation_brings_in_scope() {
         // The other side of an unfinished consolidation is reachable only through the bay's
-        // consolidation state until it is stacked.
+        // consolidation state until it is stacked. Here it brings the pruned blob's bytes in at
+        // `src/api/t.txt`, which stays in scope, while its own `src/web` is sealed history.
         let _scratch = Scratch::new("keeps-consolidation");
         let f = build_fixture();
-        let their_blob = store_blob("their edit\n");
-        let theirs = store_parcel(&src_tree_with("web", "w.txt", &their_blob), Vec::new());
+        let api = store_tree(&[("t.txt", &f.web_blob, DirEntryType::Normal)]);
+        let their_old = store_blob("their web\n");
+        let web = store_tree(&[("w.txt", &their_old, DirEntryType::Normal)]);
+        let src = store_tree(&[("api", &api, DirEntryType::Tree), ("web", &web, DirEntryType::Tree)]);
+        let theirs = store_parcel(&store_tree(&[("src", &src, DirEntryType::Tree)]), Vec::new());
+
         let dir = crate::util::bay_utils::bay_state_dir("b");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("consolidation"), format!("{}\nfeature\n", theirs)).unwrap();
 
-        // The head's history holds the same bytes under the pruned path, which makes the blob a
-        // prune target; only the consolidation root keeps it.
-        let shared = store_tree(&[
-            ("w.txt", &their_blob, DirEntryType::Normal),
-            ("x.txt", &f.web_blob, DirEntryType::Normal),
-        ]);
-        let src = store_tree(&[("api", &f.api_tree, DirEntryType::Tree), ("web", &shared, DirEntryType::Tree)]);
-        let head = store_parcel(&store_tree(&[("src", &src, DirEntryType::Tree)]), vec![f.parcel.clone()]);
-        pallet_utils::set_pallet_head("main", &head).unwrap();
-
         let post_prune = MaterializationScope::from_prefixes(["src/api"]);
         let plan = plan_prune(&["src/web".to_string()], &post_prune).unwrap();
-        assert!(!plan.to_free.contains(&their_blob), "a blob the consolidation brings in must not be freed");
-        assert!(plan.to_free.contains(&f.web_blob), "the head history's own unique blob is still freed");
+        assert!(!plan.to_free.contains(&f.web_blob), "a blob the consolidation holds in scope must not be freed");
+        assert!(plan.to_free.contains(&f.web_tree), "the head's own unique tree is still freed");
     }
 
     #[test]
