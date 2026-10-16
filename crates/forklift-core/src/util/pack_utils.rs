@@ -984,9 +984,9 @@ pub(crate) fn pack_health_snapshot() -> Result<PackHealthSnapshot, String> {
 /// Called after `compact`/a bundle install write new packs in this process, so a later read in
 /// the same process sees them — and, the same idiom in reverse, called defensively *before*
 /// deleting or renaming pack files this process may have already mmap'd. The cached [`PackSet`]
-/// holds a `memmap2::Mmap` per pack; the original worry (PR #84 review finding 1) was that an
-/// open mmap blocks its own pack file's deletion on Windows. **That specific claim was tested
-/// directly on `windows-latest` and did not hold**: `load_pack_pair` opens the pack file with a
+/// holds a `memmap2::Mmap` per pack; the original worry was that an open mmap blocks its own
+/// pack file's deletion on Windows. **That specific claim was tested directly on
+/// `windows-latest` and did not hold**: `load_pack_pair` opens the pack file with a
 /// plain `std::fs::File::open`, and Rust's `std::fs::File` defaults its Windows share mode to
 /// include `FILE_SHARE_DELETE`, so a file mapped from that handle stays deletable the whole time
 /// it's open — see `an_mmapd_pack_does_not_block_its_own_directory_removal` in this file's own
@@ -4215,8 +4215,8 @@ mod tests {
     /// target and the test is gated accordingly rather than asserting something platform-
     /// specific as if it were universal.
     ///
-    /// This was written after the franchise-level regression test for the same finding turned
-    /// out not to discriminate: it passed identically with and without `invalidate_cache()` in
+    /// This was written after the franchise-level regression test for the same worry turned out
+    /// not to discriminate: it passed identically with and without `invalidate_cache()` in
     /// `franchise.rs`'s cleanup path, on Windows CI. Run directly on `windows-latest`, this probe
     /// answered the question the other test couldn't: **the mechanism is not real** in this
     /// configuration. `remove_dir_all` succeeds on a directory containing a still-mapped pack.
@@ -4264,8 +4264,8 @@ mod tests {
             removal_while_mapped.is_ok(),
             "expected remove_dir_all to succeed even while a pack from this directory is still \
             mmap'd (the confirmed Windows behavior) — got {:?}; if this now fails, the platform \
-            or toolchain behavior this test documents has changed and finding 1 needs \
-            re-examining, not this assertion silently flipped back",
+            or toolchain behavior this test documents has changed and `invalidate_cache`'s \
+            pre-deletion role needs re-examining, not this assertion silently flipped back",
             removal_while_mapped
         );
     }
@@ -6217,7 +6217,7 @@ mod tests {
 
     #[test]
     fn compact_reconstructs_a_delta_whose_path_base_is_a_skipped_over_ceiling_giant() {
-        // Review finding on PR #75: `compute_path_bases` never checks object size, so a
+        // `compute_path_bases` never checks object size, so a
         // grandfathered over-ceiling giant is just as eligible a path-delta *base* as any other
         // object at the same path — being skipped as a *target* (`PrepSlot::OverCeiling`, never
         // packed) does not make it ineligible as someone else's base. Verified this is already
@@ -6390,7 +6390,7 @@ mod tests {
     /// Y classifies `Absent`, whose ordinary-read message is the generic NotFound wording — the
     /// name assertions go red (an `Absent`-derived message never names an index file).
     ///
-    /// Also pins the negative half (code review finding 1): a hash the quarantined index does
+    /// Also pins the negative half: a hash the quarantined index does
     /// *not* name must still classify `Absent`, not `Unverifiable` — `QuarantinedPack::contains`'s
     /// binary search must never over-match. Mutation: hardwire `QuarantinedPack::contains` to
     /// return `true` unconditionally → this half goes red (the never-stored hash below wrongly
@@ -6432,7 +6432,7 @@ mod tests {
             "expected the ordinary read's error to name \"{}\", got: {}", index_name, error
         );
 
-        // Negative membership (code review finding 1): a hash the quarantined index does NOT
+        // Negative membership: a hash the quarantined index does NOT
         // name must still classify `Absent` — a `QuarantinedPack::contains` over-match would
         // wrongly turn every never-stored hash `Unverifiable` too.
         let never_stored_hash = "9".repeat(64);

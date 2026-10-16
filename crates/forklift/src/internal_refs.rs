@@ -4,9 +4,9 @@
 
 /// Fails when `text`, rendered for `page`, cites something only the project's own trackers can
 /// resolve: a `FORK-<n>` ticket, a `§<n>` section of the design document, or a review-round
-/// label (`S<n>-F<n>`, "review round <n>"). Every description on a generated page comes from a
-/// doc comment written for maintainers, and the page ships to readers who can open none of
-/// those, so the reasoning must be stated in the sentence instead.
+/// label (`S<n>-F<n>`, "review round …", "round <n> finding"). Every description on a
+/// generated page comes from a doc comment written for maintainers, and the page ships to
+/// readers who can open none of those, so the reasoning must be stated in the sentence instead.
 ///
 /// # Returns
 /// * `Ok(())`      - No line holds such a reference.
@@ -24,11 +24,13 @@ pub(crate) fn check_no_internal_refs(page: &str, text: &str) -> Result<(), Strin
     ))
 }
 
-/// Whether `line` holds a `FORK-<n>`, `§<n>`, `S<n>-F<n>` or "review round <n>" reference,
-/// ignoring ASCII case and allowing spaces between `§` and its number.
+/// Whether `line` holds a `FORK-<n>`, `§<n>`, `S<n>-F<n>`, "review round" or
+/// "round <n> finding" reference, ignoring ASCII case. A rendered JSON description keeps a doc
+/// comment's line breaks as `\n` escapes inside one physical line, so those escapes and every
+/// whitespace run count as a single space: a label the source wrapped is still caught.
 pub(crate) fn has_internal_ref(line: &str) -> bool {
-    // ASCII upper-casing changes no byte offsets, so offsets found in `upper` index `bytes`.
-    let upper = line.to_ascii_uppercase();
+    let upper = line.replace("\\n", " ").split_whitespace().collect::<Vec<_>>().join(" ")
+        .to_ascii_uppercase();
     let bytes = upper.as_bytes();
     let digit_at = |i: usize| bytes.get(i).is_some_and(u8::is_ascii_digit);
     let skip = |mut i: usize, byte: u8| {
@@ -40,14 +42,21 @@ pub(crate) fn has_internal_ref(line: &str) -> bool {
 
     let ticket = upper.match_indices("FORK-").any(|(i, _)| digit_at(i + 5));
     let section = upper.match_indices('§').any(|(i, s)| digit_at(skip(i + s.len(), b' ')));
-    let round = upper.match_indices("REVIEW ROUND").any(|(i, s)| digit_at(skip(i + s.len(), b' ')));
+    let starts_word = |i: usize| i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+    let digits_end = |i: usize| bytes[i..].iter().take_while(|b| b.is_ascii_digit()).count() + i;
+
+    let review_round = upper.contains("REVIEW ROUND");
+    let round_finding = upper.match_indices("ROUND ").any(|(i, s)| {
+        let end = digits_end(i + s.len());
+        starts_word(i) && end > i + s.len()
+            && upper[skip(end, b',')..].starts_with(" FINDING")
+    });
     let label = upper.match_indices('S').any(|(i, _)| {
-        let starts_word = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
-        let after_digits = bytes[i + 1..].iter().take_while(|b| b.is_ascii_digit()).count() + i + 1;
-        starts_word && after_digits > i + 1
+        let after_digits = digits_end(i + 1);
+        starts_word(i) && after_digits > i + 1
             && upper[after_digits..].starts_with("-F") && digit_at(after_digits + 2)
     });
-    ticket || section || round || label
+    ticket || section || review_round || round_finding || label
 }
 
 #[cfg(test)]
@@ -66,6 +75,10 @@ mod tests {
             "(S2-F10)",
             "review round 5, finding 2",
             "Review Round 8",
+            "(review round S2 fix hole)",
+            "wrapped (review\\nround 5 finding 2)",
+            "fix was unpinned (round 6 finding 1)",
+            "round 6, finding 1",
         ] {
             assert!(has_internal_ref(line), "missed: {line:?}");
         }
@@ -82,7 +95,9 @@ mod tests {
             "S2-X3",
             "S-F1",
             "S2-F",
-            "a review round in general",
+            "a round of review",
+            "around 5 findings",
+            "round 3 of 5",
             "",
         ] {
             assert!(!has_internal_ref(line), "false positive: {line:?}");

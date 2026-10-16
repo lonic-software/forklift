@@ -668,11 +668,12 @@ const UPLOAD_WATCHDOG_POLL_INTERVAL: std::time::Duration = std::time::Duration::
 
 /// Fixed part of [`post_send_verify_budget`]'s bound on the *post-send* phase — the wait for a
 /// response once the whole body has already been handed off (see [`UploadProgress`]'s doc on why
-/// that phase used to be left unbounded, and why leaving it unbounded reopened the silent-remote
-/// hang [`REMOTE_READ_TIMEOUT`] exists to close: a remote that reads the entire body and then wedges
-/// during verification is a completely ordinary failure — a crash or a stuck disk mid-write — and
-/// without this bound the upload would wait on it forever). This covers dispatch/scheduling overhead
-/// so a tiny object's total budget isn't unrealistically close to zero.
+/// that phase used to be left unbounded, and why leaving it unbounded reopened the
+/// silent-remote hang [`REMOTE_READ_TIMEOUT`] exists to close: a remote that reads the entire
+/// body and then wedges during verification is a completely ordinary failure — a crash or a
+/// stuck disk mid-write — and without this bound the upload would wait on it forever). This
+/// covers dispatch/scheduling overhead so a tiny object's total budget isn't unrealistically
+/// close to zero.
 const POST_SEND_VERIFY_BASE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The conservative inline-verification throughput [`post_send_verify_budget`] assumes for the
@@ -2761,15 +2762,14 @@ impl RemoteClient {
     }
 
     /// The actual error-body-read bound to arm for *this* client instance — folds this
-    /// instance's own `connect_timeout` into [`error_body_read_budget`]'s arithmetic (review
-    /// round 5 finding 2). Split out as its own `&self` method, rather than inlining the call to
-    /// the free function at the one call site, so a test can pin that the right instance field is
-    /// actually read: not just read from *some* client (round 6 finding 1's fix was itself
-    /// unpinned in that dimension — every behavioral test of [`Self::error_of`] necessarily used a
-    /// direct client, so nothing distinguished "reads `self.budgets.connect`" from "hardcodes the
-    /// direct 5s constant"), but read from an instance whose `connect_timeout` a production
-    /// constructor could never have produced (round 7 found the *next* fixture — a `TorMode::On`
-    /// one — had the identical problem one level up, at 60s instead of 5s) — see
+    /// instance's own `connect_timeout` into [`error_body_read_budget`]'s arithmetic. Split out as
+    /// its own `&self` method, rather than inlining the call to the free function at the one call
+    /// site, so a test can pin that the right instance field is actually read: not just read from
+    /// *some* client (every behavioral test of [`Self::error_of`] necessarily uses a direct
+    /// client, so none of them distinguishes "reads `self.budgets.connect`" from "hardcodes the
+    /// direct 5s constant", and a `TorMode::On` fixture has the identical problem one level up, at
+    /// 60s instead of 5s), but read from an instance whose `connect_timeout` a production
+    /// constructor could never have produced — see
     /// `error_body_budget_reads_this_field_not_a_rival_constant` in the test module.
     fn error_body_budget(&self) -> std::time::Duration {
         error_body_read_budget(&self.budgets)
@@ -2777,10 +2777,10 @@ impl RemoteClient {
 
     /// Turn a non-success response into the client-facing error, threading the server's refusal
     /// code (§7.4) through the taxonomy when the body carries one. The body read is bounded by
-    /// [`Self::error_body_budget`] (so this instance's own `connect_timeout` is folded in) — see that method's and [`error_body_read_budget`]'s docs
-    /// for why this call in particular needs its own bound rather than inheriting one from
-    /// whichever client sent the request, and why the flat [`ERROR_BODY_READ_TIMEOUT`] alone is
-    /// not it.
+    /// [`Self::error_body_budget`] (so this instance's own `connect_timeout` is folded in) — see
+    /// that method's and [`error_body_read_budget`]'s docs for why this call in particular needs
+    /// its own bound rather than inheriting one from whichever client sent the request, and why
+    /// the flat [`ERROR_BODY_READ_TIMEOUT`] alone is not it.
     async fn error_of(&self, response: reqwest::Response, action: &str) -> String {
         let status = response.status();
         let budget = self.error_body_budget();
@@ -2983,12 +2983,12 @@ impl RemoteClient {
     /// calls `check_auth`, which on a bearer-token auth-cache miss makes its own hook round trip
     /// via `authenticate_via_hook` — up to 10s — before `post_resolve` makes its *own*
     /// resolution-hook call through `post_hook` — up to another 10s. A 15s total deadline can
-    /// therefore abandon a request a slow-hook deployment is still legitimately serving. Accepted deliberately:
-    /// `resolve` is cosmetic display sugar and its fallback to pseudonyms is free (never a
-    /// command failure), so giving up early is the right failure for this one call — unlike
-    /// `fetch_info`/`fetch_signature`/`fetch_bundle_to`, whose `BoundedReads` silence budget never
-    /// has to make this trade because a *silence* bound cannot mistake a slow-but-real transfer
-    /// for a hang in the first place.
+    /// therefore abandon a request a slow-hook deployment is still legitimately serving. Accepted
+    /// deliberately: `resolve` is cosmetic display sugar and its fallback to pseudonyms is free
+    /// (never a command failure), so giving up early is the right failure for this one call —
+    /// unlike `fetch_info`/`fetch_signature`/`fetch_bundle_to`, whose `BoundedReads` silence
+    /// budget never has to make this trade because a *silence* bound cannot mistake a
+    /// slow-but-real transfer for a hang in the first place.
     pub async fn resolve(&self, identifiers: Vec<String>) -> BTreeMap<String, String> {
         if identifiers.is_empty() {
             return BTreeMap::new();
@@ -11429,7 +11429,7 @@ mod tests {
     // -----------------------------------------------------------------------------------
     // FORK-49 slice 2: the upload path. `upload_object` and `put_presigned` used to hang forever
     // against a remote that accepted the connection and then simply stopped reading — no error,
-    // no exit. `read_timeout` (the read-path fix, slice 1) cannot be reused here: it is a flat,
+    // no exit. `read_timeout` (the read-path fix) cannot be reused here: it is a flat,
     // non-resetting deadline covering connect *and* the whole request-body send, so arming it on
     // an upload would cap total upload time and kill a healthy large transfer on a slow link —
     // worse than the bug. `UPLOAD_SILENCE_BUDGET`/`send_with_watchdog` are a different mechanism:
@@ -11468,7 +11468,7 @@ mod tests {
     /// client's own kernel outward the peer looks alive but is not consuming anything, which is
     /// exactly the FORK-49 slice-2 bug: a body-send stream that stalls because the peer stopped
     /// reading, not because it went away. Parks on the same channel-recv pattern as `SilentRemote`
-    /// (slice 1, above) — dropped, never signaled mid-test, only once `_park` goes out of scope
+    /// (above) — dropped, never signaled mid-test, only once `_park` goes out of scope
     /// at the end of the test.
     struct WedgedUploadRemote {
         url: String,
@@ -11969,9 +11969,9 @@ mod tests {
     // and so reported "exhausted" by the client's own stream — almost instantly, regardless of
     // whether the peer's *application* has read a single byte. The fixture's deliberate pause
     // before it ever calls `read()` stands in for exactly the invisible, still-genuinely-
-    // happening work (an in-flight tail draining slowly) phase 2 must wait out — the client cannot tell
-    // it apart from having actually reached the remote already, and must not be too impatient
-    // about it.
+    // happening work (an in-flight tail draining slowly) phase 2 must wait out — the client
+    // cannot tell it apart from having actually reached the remote already, and must not be too
+    // impatient about it.
     // -----------------------------------------------------------------------------------
 
     /// Starts a remote that reads only the request headers immediately, then pauses for `delay`
@@ -12030,8 +12030,8 @@ mod tests {
     /// `upload_object` must survive a remote that pauses before reading a small body — the
     /// deterministic stand-in for a slow-draining in-flight tail (see this section's own
     /// comment). A verify-only phase-2 budget (`post_send_verify_budget` alone — the first, too
-    /// tight, fix) is far shorter than `delay` here and would fail this test; the real `phase2_budget`
-    /// (which folds the full send-phase allowance back in as flush margin, see
+    /// tight, fix) is far shorter than `delay` here and would fail this test; the real
+    /// `phase2_budget` (which folds the full send-phase allowance back in as flush margin, see
     /// `send_with_watchdog`'s doc) comfortably covers it. This is exactly the test a fix that
     /// only re-tightened `post_send_verify_budget`'s own constants — without folding the
     /// send-phase allowance back in — would still fail.
