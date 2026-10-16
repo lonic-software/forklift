@@ -1441,7 +1441,10 @@ both need an `operator.identifier` agree on one instead of each minting its own.
 empty and is left in place; deleting it while no command is running is harmless. Reads take no
 lock. A configuration file that is a symbolic link is written *through* the link: the link stays,
 its target is replaced, and the lock is taken beside the target. A link whose target does not
-exist is refused, rather than replaced with a plain file.
+exist — to the file, or to a folder above it — is refused, rather than replaced with a plain file.
+On Unix the replacement keeps the old file's permission bits, so a `chmod 600` on a file holding
+`remote.token` survives every edit; its owner, extended attributes and any hard links do not,
+since the file is replaced rather than rewritten.
 
 Refused, in either file:
 

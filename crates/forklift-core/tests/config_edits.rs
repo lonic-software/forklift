@@ -35,6 +35,8 @@ fn configuration_edits_are_atomic_and_serialized() {
     a_symlinked_config_is_written_through_and_shares_its_targets_lock(&root);
     a_dangling_symlinked_config_is_refused_not_replaced(&root);
     a_missing_config_folder_is_created_before_locking(&root);
+    a_dangling_symlinked_config_folder_is_refused_before_anything_is_created(&root);
+    a_replaced_config_keeps_its_permissions(&root);
 
     std::fs::remove_dir_all(&root).ok();
 }
@@ -198,7 +200,8 @@ fn a_dangling_symlinked_config_is_refused_not_replaced(root: &Path) {
 
     let refusal = config_utils::set_value("operator.name", "Ada", ConfigScope::Global)
         .expect_err("a write through a dangling link must refuse");
-    assert!(refusal.contains("symbolic link"), "unexpected refusal: {refusal}");
+    // "cannot be written" is the write path's own refusal; the read path's says "cannot be read".
+    assert!(refusal.contains("cannot be written"), "unexpected refusal: {refusal}");
     assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "the dangling link was replaced");
     assert!(!folder.join("gone.toml").exists(), "a refused write must not create the link's target");
 }
@@ -219,3 +222,40 @@ fn a_missing_config_folder_is_created_before_locking(root: &Path) {
         Some(operator.identifier),
     );
 }
+
+/// The folder is created before the lock is taken, so a dangling link to the folder must be
+/// refused before that — not reported as the folder creation's bare "File exists".
+#[cfg(unix)]
+fn a_dangling_symlinked_config_folder_is_refused_before_anything_is_created(root: &Path) {
+    let folder = root.join("t9");
+    std::fs::create_dir_all(&folder).unwrap();
+    let linked_folder = folder.join("config");
+    std::os::unix::fs::symlink(folder.join("gone"), &linked_folder).unwrap();
+    std::env::set_var("FORKLIFT_GLOBAL_CONFIG", linked_folder.join("global.toml"));
+
+    let refusal = config_utils::set_value("operator.name", "Ada", ConfigScope::Global)
+        .expect_err("a write through a dangling folder link must refuse");
+    assert!(refusal.contains("cannot be written"), "unexpected refusal: {refusal}");
+    assert!(refusal.contains("symbolic link"), "the refusal must name the link: {refusal}");
+    assert!(!folder.join("gone").exists(), "a refused write must not create the link's target");
+}
+
+#[cfg(not(unix))]
+fn a_dangling_symlinked_config_folder_is_refused_before_anything_is_created(_root: &Path) {}
+
+/// The replacement is a new file; it must not come back more readable than the file it replaced.
+#[cfg(unix)]
+fn a_replaced_config_keeps_its_permissions(root: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let config = fresh_global(root, "t10", Some("[remote]\ntoken = \"secret\"\n"));
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    config_utils::set_value("operator.name", "Ada", ConfigScope::Global).unwrap();
+
+    let mode = std::fs::metadata(&config).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "an edit must keep the file's permissions, got {mode:o}");
+}
+
+#[cfg(not(unix))]
+fn a_replaced_config_keeps_its_permissions(_root: &Path) {}

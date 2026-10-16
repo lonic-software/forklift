@@ -950,7 +950,8 @@ fn set_profile_fields_in_document(document: &mut DocumentMut,
 /// # Returns
 /// * `Ok(Operator)` - The created identity.
 /// * `Err(String)`  - If an input is empty, the profile already exists, or the write failed.
-///                    Nothing is written in any of these cases.
+///                    The configuration file is not changed in any of these cases (see
+///                    [`edit_locked`] for what may be created beside it).
 pub fn create_profile(profile: &str,
                       name: Option<&str>,
                       identifier: Option<&str>) -> Result<Operator, String> {
@@ -1255,6 +1256,10 @@ fn write_validated(path: &Path, document: &DocumentMut) -> Result<(), String> {
 /// 4. run `edit` on the resolved path; it loads, decides and writes;
 /// 5. release the lock.
 ///
+/// Steps 2 and 3 happen before `edit` has decided anything, so an edit that then refuses — an
+/// `--unset` of a key that is not set, a profile that already exists — still leaves the folder
+/// and the empty `<file>.lock` sidecar behind. The configuration file itself is untouched.
+///
 /// `edit` must not call back into another configuration operation: one lock at a time is what
 /// keeps two configuration locks from ever deadlocking.
 fn edit_locked<T>(path: &Path, edit: impl FnOnce(&Path) -> Result<T, String>) -> Result<T, String> {
@@ -1281,9 +1286,22 @@ fn edit_locked<T>(path: &Path, edit: impl FnOnce(&Path) -> Result<T, String>) ->
 /// # Returns
 /// * `Ok(PathBuf)` - The real file behind a link, or `path` itself when it is not a link (or
 ///                   does not exist yet).
-/// * `Err(String)` - `path` is a link whose target does not exist: a write never creates a file in
-///                   the link's place, exactly as a read never treats it as absent.
+/// * `Err(String)` - `path`, or a folder above it, is a link whose target does not exist: a write
+///                   never creates a file or a folder in the link's place, exactly as a read never
+///                   treats it as absent.
 fn resolve_write_target(path: &Path) -> Result<PathBuf, String> {
+    // Checked before anything is created: a dangling link to the configuration *folder* would
+    // otherwise surface as the folder creation's bare "File exists", naming neither the link nor
+    // the fix.
+    if let Some(link) = dangling_link_in(path) {
+        return Err(format!(
+            "Configuration file \"{}\" cannot be written: \"{}\" is a symbolic link to a path \
+             that does not exist. Create the target, or remove the link.",
+            std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()).to_string_lossy(),
+            std::path::absolute(&link).unwrap_or(link).to_string_lossy()
+        ));
+    }
+
     let is_link = std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink());
 
     if !is_link {

@@ -674,6 +674,11 @@ pub fn write_file_atomically(file_path: &Path, content: &[u8]) -> Result<(), Str
 /// Callers serialize their own writers: this function makes one write untearable, not two
 /// concurrent edits of the same file safe (see `config_utils`'s edit lock).
 ///
+/// The replacement is a new file, so on Unix it is given the old file's permission bits before
+/// any content is written: a configuration holding `remote.token` that its owner made `0600`
+/// must not come back world-readable after the next edit. Ownership, extended attributes and
+/// hard links are not carried over — the file is replaced, not rewritten.
+///
 /// # Arguments
 /// * `file_path` - The file to replace (or create).
 /// * `content`   - Its complete new content.
@@ -686,7 +691,7 @@ pub fn write_file_atomically(file_path: &Path, content: &[u8]) -> Result<(), Str
 pub(crate) fn replace_file_atomically(file_path: &Path, content: &[u8]) -> Result<(), String> {
     let temporary_file_path = temp_path_for(file_path)?;
 
-    let written = write_and_sync_file(&temporary_file_path, content).and_then(|()|
+    let written = write_replacement(&temporary_file_path, file_path, content).and_then(|()|
         std::fs::rename(&temporary_file_path, file_path).map_err(|e| format!(
             "Error while moving file into place at \"{}\": {}", file_path.to_string_lossy(), e
         ))
@@ -702,6 +707,35 @@ pub(crate) fn replace_file_atomically(file_path: &Path, content: &[u8]) -> Resul
         Some(parent) if !parent.as_os_str().is_empty() => sync_dir(parent),
         _ => Ok(()),
     }
+}
+
+/// Write [`replace_file_atomically`]'s temporary file: created fresh, given `replaced`'s
+/// permission bits on Unix (when `replaced` exists) while still empty, then filled and fsynced
+/// through its own write handle.
+///
+/// The permissions are set on the open handle rather than requested at creation, because a
+/// creation mode is filtered through the umask and would turn a `0664` file into `0644`.
+fn write_replacement(path: &Path, replaced: &Path, content: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+
+    let error = |e: std::io::Error| format!("Error while writing file \"{}\": {}", path.to_string_lossy(), e);
+
+    let mut file = std::fs::File::create_new(path).map_err(error)?;
+
+    #[cfg(unix)]
+    if let Ok(existing) = std::fs::metadata(replaced) {
+        file.set_permissions(existing.permissions()).map_err(error)?;
+    }
+    #[cfg(not(unix))]
+    let _ = replaced;
+
+    file.write_all(content).map_err(error)?;
+
+    if fsync_enabled() {
+        file.sync_all()
+            .map_err(|e| format!("Error while syncing file \"{}\": {}", path.to_string_lossy(), e))?;
+    }
+    Ok(())
 }
 
 /// The process-global bulk-store session registry: `Some(pending)` while a session is active,
