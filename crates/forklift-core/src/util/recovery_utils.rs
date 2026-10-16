@@ -65,6 +65,13 @@
 //! holding the anchor holds that object by construction (see
 //! [`crate::util::office_utils::PinAbsencePolicy::Loss`]).
 //!
+//! A **tag subject** root gets the same gap treatment (FORK-83). A tag is never a gc root, so
+//! its subject can be collected once `undo` orphans it, and a sparse `franchise --only` adopts
+//! every tag record without the history behind it. Locally the two cannot be told apart, and
+//! neither can ever be resolved, so reporting either as dangling wedged the whole warehouse
+//! with no in-tool exit. An absent subject is named in a note instead
+//! ([`WalkClosureOutcome::never_held_tags`]).
+//!
 //! This is sound to *clear* on, not merely tolerate: `collect_walk_roots`'s own doc comment
 //! establishes that this walk's root set is a superset of
 //! [`crate::util::gc_utils::collect_live_set`]'s, and the absence policy above changes only
@@ -820,6 +827,9 @@ async fn resolve_the_rest(
     for hash in &walk.never_held_pins {
         notes.push(never_held_pin_note(hash));
     }
+    for (name, subject) in &walk.never_held_tags {
+        notes.push(never_held_tag_note(name, subject));
+    }
     // Any source `collect_walk_roots` had to skip can *never* reach here with `remainder`
     // empty — `roots_incomplete` above forces every hash the walk could not positively clear into
     // `remainder`, so a non-empty `walk.degraded_sources` always implies a non-empty `remainder`,
@@ -861,6 +871,19 @@ fn never_held_pin_note(hash: &str) -> String {
         boundary snapshot that was only ever declared, never fetched — if it should be held, \
         fetch its history explicitly (a franchise, or an ordinary fetch of that head).",
         hash
+    )
+}
+
+/// Plain-language note for a tag whose subject [`walk_closure_for`] confirmed is not held
+/// locally (FORK-83) — see [`WalkRoots::tag_subjects`] for why that is never a dangling
+/// reference. Non-blocking, like [`never_held_pin_note`].
+fn never_held_tag_note(name: &str, subject: &str) -> String {
+    format!(
+        "tag \"{}\" names \"{}\", which is not held locally; this is expected when a sparse \
+        franchise never fetched it or when collection removed it after its history was undone. \
+        It does not block this heal; if the subject should be held, fetch its history \
+        explicitly.",
+        name, subject
     )
 }
 
@@ -1056,6 +1079,9 @@ fn rescan_torn_taint(
         for hash in &walk.never_held_pins {
             notes.push(never_held_pin_note(hash));
         }
+        for (name, subject) in &walk.never_held_tags {
+            notes.push(never_held_tag_note(name, subject));
+        }
 
         Ok(HealOutcome {
             was_tainted: true,
@@ -1242,12 +1268,19 @@ fn classify_vanished(relative: &Path) -> VanishedClass {
 /// the registration ledger) — see the module doc comment.
 struct WalkRoots {
     /// Parcel hashes to walk ancestry-and-tree-closure from: every pallet head (both namespaces),
-    /// every bay's parked parcels, every tag's subject parcel, and every bay's in-progress
-    /// consolidation `their_head`. A hash here that is itself absent is treated as an ordinary
-    /// dangling reference — see [`walk_closure_for`]. Every one of these is a ref THIS warehouse's
-    /// own commands set, so its absence is genuine local loss, never "maybe never fetched" —
-    /// unlike [`Self::pin_parcels`] below.
+    /// every bay's parked parcels, and every bay's in-progress consolidation `their_head`. A hash
+    /// here that is itself absent is treated as an ordinary dangling reference — see
+    /// [`walk_closure_for`]. Every one of these is a ref THIS warehouse's own commands set, so its
+    /// absence is genuine local loss, never "maybe never fetched" — unlike [`Self::pin_parcels`]
+    /// and [`Self::tag_subjects`] below.
     parcels: Vec<String>,
+    /// Every tag as `(name, subject)`, walked with [`AbsencePolicy::Gap`] (FORK-83). A tag is not
+    /// a gc root, so an absent subject is either collected garbage or one a sparse franchise
+    /// never fetched — indistinguishable here, and unresolvable either way, so it is noted
+    /// ([`WalkClosureOutcome::never_held_tags`]) and never reported dangling. A **present**
+    /// subject's ancestry and tree are walked with the ordinary tolerance, so the gc⊆heal
+    /// superset invariant is untouched.
+    tag_subjects: Vec<(String, String)>,
     /// Every trust-pin root — the trust anchor's adopted head, its enrollment boundary, and every
     /// key's revocation distrust boundary — paired with its own
     /// [`office_utils::PinAbsencePolicy`] (see [`office_utils::collect_trust_pin_roots`]), walked
@@ -1392,7 +1425,8 @@ pub(crate) fn gc_root_sources(
 /// bay's parked parcels, every bay's in-progress consolidation `their_head`, and every trust-pin
 /// root — the shared trust-anchor `adopts`, its `boundary` snapshot, and every key's revocation
 /// `distrust_boundary`, FORK-81 — and every bay's staged inventory shard leaves, FORK-156) — plus
-/// every tag's subject, the one source gc deliberately does not root. If gc ever treats an
+/// every tag's subject, the one source gc deliberately does not root (walked at gap policy, so an
+/// absent subject is noted rather than reported — see [`WalkRoots::tag_subjects`]). If gc ever treats an
 /// object as live, this walk must never call the same object safe to drop — otherwise
 /// `forklift heal` could clear a taint over an object `forklift gc` would refuse to delete.
 /// Everything but the tags is not duplicated here — both this function and `collect_live_set`
@@ -1440,16 +1474,17 @@ fn collect_walk_roots() -> Result<WalkRoots, String> {
         &bay_dirs, bay_utils::BayReadPolicy::Tolerate, office_utils::TrustPinReadPolicy::Tolerate,
     )?;
 
-    let mut parcels = sources.parcels;
-
     // Tags are recovery-only (gc deliberately does not root them) and stay a heal-specific
-    // addition on top of the shared sources above.
-    for tag in tag_utils::read_tags()? {
-        parcels.push(tag.tag.subject);
-    }
+    // addition on top of the shared sources above, walked at gap policy — see
+    // `WalkRoots::tag_subjects`.
+    let tag_subjects = tag_utils::read_tags()?
+        .into_iter()
+        .map(|tag| (tag.tag.name, tag.tag.subject))
+        .collect();
 
     Ok(WalkRoots {
-        parcels,
+        parcels: sources.parcels,
+        tag_subjects,
         pin_parcels: sources.pin_parcels,
         shard_referenced: sources.shard_leaves,
         degraded_sources: sources.degraded,
@@ -1533,6 +1568,10 @@ pub(crate) struct ClosureWalkResult {
     /// pipeline that actually knows about it. Callers fold this into [`HealOutcome::notes`] on
     /// their `Ok` path only — see [`never_held_pin_note`].
     pub never_held_pins: BTreeSet<String>,
+    /// Every tag `(name, subject)` whose subject this run confirmed absent and unreached by any
+    /// genuine ancestry edge (FORK-83). Never blocking, folded into notes on the `Ok` path only —
+    /// see [`never_held_tag_note`].
+    pub never_held_tags: Vec<(String, String)>,
 }
 
 /// Walk every durable ref source's closure looking for `targets`, returning the subset actually
@@ -1547,6 +1586,7 @@ pub(crate) fn closure_references_any(targets: &BTreeSet<String>) -> Result<Closu
     if targets.is_empty() {
         return Ok(ClosureWalkResult {
             hashes: BTreeSet::new(), degraded_sources: Vec::new(), never_held_pins: BTreeSet::new(),
+            never_held_tags: Vec::new(),
         });
     }
 
@@ -1562,6 +1602,7 @@ pub(crate) fn closure_references_any(targets: &BTreeSet<String>) -> Result<Closu
         hashes: outcome.referenced,
         degraded_sources: roots.degraded_sources,
         never_held_pins: outcome.never_held_pins,
+        never_held_tags: outcome.never_held_tags,
     })
 }
 
@@ -1605,6 +1646,7 @@ pub(crate) fn enumerate_absent_reachable(corrupt: &BTreeSet<String>) -> Result<C
         hashes: absent,
         degraded_sources: roots.degraded_sources,
         never_held_pins: outcome.never_held_pins,
+        never_held_tags: outcome.never_held_tags,
     })
 }
 
@@ -1638,7 +1680,7 @@ fn reborrow_sink<'a>(sink: &'a mut Option<&mut dyn FnMut(&str)>) -> Option<&'a m
 /// vacuous, so the walk falls through to (and records at) every presence guard it meets.
 ///
 /// **Trust-pin roots (`roots.pin_parcels`) get one extra rule the ordinary `roots.parcels` roots
-/// don't.** An ordinary root — a pallet head, a parked parcel, a tag subject, an in-progress
+/// don't.** An ordinary root — a pallet head, a parked parcel, an in-progress
 /// consolidation's `their_head` — is a ref *this warehouse's own commands* set, so its being
 /// raw-absent is genuine local loss and is reported via `sink` exactly like any other descent-
 /// guard absence: it always carries [`AbsencePolicy::Report`]. A `Gap`-policy trust-pin root
@@ -1649,7 +1691,9 @@ fn reborrow_sink<'a>(sink: &'a mut Option<&mut dyn FnMut(&str)>) -> Option<&'a m
 /// absence found *for that specific queue entry* is never fed to `sink` and never enters
 /// `referenced` (unless it is itself a hunted `targets` member — see below). A `Loss`-policy pin
 /// (`adopts`) is queued as `Report`, exactly like an ordinary root, and its own doc comment
-/// explains why.
+/// explains why. Every tag subject is queued `Gap` too (FORK-83 — see
+/// [`WalkRoots::tag_subjects`]), and one never resolved lands in
+/// [`WalkClosureOutcome::never_held_tags`] exactly as a pin lands in `never_held_pins`.
 ///
 /// **A present pin root's own ancestry and tree are walked with the walk's ordinary tolerance,
 /// exactly like any other reachable parcel — every parent [`drain_parcel_queue`] discovers this
@@ -1713,6 +1757,7 @@ fn walk_closure_for(
         .cloned()
         .map(|hash| (hash, AbsencePolicy::Report))
         .chain(roots.pin_parcels.iter().map(|(hash, policy)| (hash.clone(), AbsencePolicy::from(*policy))))
+        .chain(roots.tag_subjects.iter().map(|(_, subject)| (subject.clone(), AbsencePolicy::Gap)))
         .collect();
 
     drain_parcel_queue(
@@ -1731,14 +1776,22 @@ fn walk_closure_for(
         .map(|(hash, _)| hash.clone())
         .filter(|hash| !visited_parcels.contains(hash) && !referenced.contains(hash))
         .collect();
+    // The same condition for tag subjects (FORK-83), kept apart so the note can name the tag.
+    let never_held_tags: Vec<(String, String)> = roots.tag_subjects.iter()
+        .filter(|(_, subject)| !visited_parcels.contains(subject) && !referenced.contains(subject))
+        .cloned()
+        .collect();
 
-    Ok(WalkClosureOutcome { referenced, never_held_pins })
+    Ok(WalkClosureOutcome { referenced, never_held_pins, never_held_tags })
 }
 
 /// [`walk_closure_for`]'s full result — see that function's own doc comment.
 struct WalkClosureOutcome {
     referenced: BTreeSet<String>,
     never_held_pins: BTreeSet<String>,
+    /// Every tag `(name, subject)` whose subject is absent and that no `Report` edge reached —
+    /// the tag counterpart of `never_held_pins` (FORK-83).
+    never_held_tags: Vec<(String, String)>,
 }
 
 /// Whether a queued parcel hash's own absence, if found, is reported to `sink` (`Report`) or
@@ -1758,7 +1811,8 @@ enum AbsencePolicy {
     /// comment). An absent hash under this policy is fed to `sink` and marked visited immediately.
     Report,
     /// This queue entry is a declared `Gap`-policy trust-pin root itself (`boundary`, a key's
-    /// `distrust_boundary`), which can legitimately name a head never actually fetched. An absent
+    /// `distrust_boundary`) or a tag subject (FORK-83), which can legitimately name a head never
+    /// actually fetched, or one gc was entitled to collect. An absent
     /// hash under this policy is deliberately **not** marked visited: leaving it out of
     /// `visited_parcels` lets a *different* queue entry for the very same hash — a genuine
     /// ancestry edge, always queued `Report` — still resolve and report it normally, whenever such
