@@ -884,7 +884,7 @@ fn tags_unread_note(error: &str) -> String {
     format!(
         "the tags could not be read this run ({}), so none of them was checked. It does not \
         block this heal: tags never keep an object alive.",
-        crate::error::sanitize(error)
+        crate::error::sanitize(&error.chars().take(200).collect::<String>())
     )
 }
 

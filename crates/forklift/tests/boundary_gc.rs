@@ -1109,7 +1109,7 @@ fn a_recorded_taint_over_a_collected_tag_subject_clears() {
 ///
 /// Mutation: propagate the `read_tags` error in `collect_walk_roots` → the rescan aborts →
 /// `heal` exits 21 → red at the exit-code assertion. Dropping the `tags_unread` note on the
-/// torn path → red at the `Note:` assertion.
+/// torn path, or on the targeted path (`resolve_the_rest`) → red at that path's `Note:` assertion.
 #[test]
 fn a_torn_taint_heals_over_a_malformed_tag_record_and_notes_it() {
     use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
@@ -1164,6 +1164,21 @@ fn a_torn_taint_heals_over_a_malformed_tag_record_and_notes_it() {
     assert!(
         heal_out.lines().any(|line| line.starts_with("Note: the tags could not be read")),
         "heal must say the tags went unchecked; stdout: {}", heal_out
+    );
+
+    // The targeted path too: a complete record naming an object nothing references.
+    let record = format!("objects/{}/{}\nEND\n", "a".repeat(2), "a".repeat(62));
+    std::fs::write(taint_dir.join("taint-99999-1"), record).unwrap();
+    let healed = warehouse.run(&["heal"]);
+    let heal_out = String::from_utf8_lossy(&healed.stdout).to_string();
+    assert!(
+        healed.status.success(),
+        "the targeted path must not abort on an unreadable tag history either; stderr: {}",
+        String::from_utf8_lossy(&healed.stderr)
+    );
+    assert!(
+        heal_out.lines().any(|line| line.starts_with("Note: the tags could not be read")),
+        "the targeted path must say the tags went unchecked too; stdout: {}", heal_out
     );
 }
 
