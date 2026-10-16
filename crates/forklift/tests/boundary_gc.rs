@@ -15,36 +15,40 @@
 //! | revocation `distrust_boundary` | verifying | **FIXED (FORK-81)** — rooted; the two `a_boundary_pin_*`/`a_distrust_boundary_pin_*` legs (FORK-63/64 spike) |
 //! | `audit`'s boundary head | verifying | **FIXED (FORK-81)** — rooted; `an_undone_boundary_head_*`, `a_boundary_head_and_the_legacy_parcel_*`. The residual gap a *rooted* pin can still reach — never fetched, or genuinely lost, since gc can no longer produce it — is a separate finding with its own legs (not gc-driven, no canary): `an_absent_interior_ancestor_behind_a_present_boundary_head_is_named_not_accused_of_tampering`, `a_genuinely_pre_trust_side_pallet_parcel_behind_an_absent_boundary_head_refuses_instead_of_accusing`, `the_accusation_still_fires_with_no_gap_at_all`. **PR #121 round 1 narrowed the tolerance to interior-only gaps; round 2 reverted that narrowing** — an absent boundary HEAD, exactly like an absent interior ancestor, un-resolves the boundary walk's negative for anything the present portion cannot itself settle, because there is no such thing as an "unrelated" absent reference: relatedness to the parcel under test is precisely the question the walk exists to answer (see `audit_utils::verify_pallet_history`'s `boundary_gap` doc). Reproduced end to end against a real origin server, from ordinary commands, in `tests/remote.rs`'s two Construction T/D legs. |
 //! | `CherryPickState.source` | **acting** | `a_collected_cherry_pick_source_*` (FORK-82) |
-//! | `Tag.subject` under a torn taint | **healing** | `a_torn_taint_over_an_absent_tag_subject_*` (FORK-83) |
+//! | `Tag.subject` under a taint | **healing** | **FIXED (FORK-83)** — a tag's own reference never counts, an absent subject is noted; `a_torn_taint_over_an_absent_tag_subject_heals_*`, `a_recorded_taint_over_a_collected_tag_subject_clears`, and `a_lost_tagged_parcel_that_is_also_an_ancestor_*` for the other direction |
 //! | staged inventory shard | **healing**, then acting | **FIXED (FORK-156)** — rooted; `staged_content_survives_collection_*`, `a_full_repack_keeps_staged_content_*`. Found as FORK-83's widened half: unrooted, collection deleted staged work, a torn taint then wedged the store, and a full repack lost it silently |
 //!
 //! `Tag.subject`'s *rendering* reader is pinned separately in `tag_subject_gc.rs` (FORK-79).
 //!
 //! **Four legs carry a canary** — a parcel pinned by nothing — and assert it was collected, so
 //! "the pin survived" can never be satisfied by a collector that swept nothing. The canary check
-//! holds both before and after any fix; it is the legs' own assertions that invert. (**Eight** of
-//! the nine legs drive collection — six call `collect_garbage`, and
+//! holds both before and after any fix; it is the legs' own assertions that invert. (**Nine** of
+//! the ten legs drive collection — seven call `collect_garbage`, and
 //! `an_undone_boundary_head_survives_the_sweep_and_audit_passes` and
 //! `a_full_repack_keeps_staged_content_and_the_next_stack_restores_it` drive the same live set
 //! through `compact --all` — so "gc-driven" is not the dividing line. Only the torn-taint control
 //! collects nothing.)
 //!
-//! The other five discriminate differently: the two anchor legs now assert `b_present &&
+//! The other six discriminate differently: the two anchor legs now assert `b_present &&
 //! legacy_present && audit succeeds` (FORK-81 rooted the boundary pin, so both survive together;
 //! before the fix this was `!b_present && legacy_present`, already two-sided in the other
-//! direction); `a_torn_taint_alone_...` is a matched companion to the wedge leg rather than a
+//! direction); `a_torn_taint_alone_...` is a matched companion to the FORK-83 legs rather than a
 //! canary user; `staged_content_survives_...` names the exact blob it staged and asserts that
-//! specific object survived collection; and `a_full_repack_keeps_...` asserts the staged content
-//! itself comes back through `restore`.
+//! specific object survived collection; `a_full_repack_keeps_...` asserts the staged content
+//! itself comes back through `restore`; and `a_recorded_taint_over_a_collected_tag_subject_clears`
+//! asserts directly that the tag subject it heals over was collected.
 //!
-//! **Three further legs, added for FORK-81's second finding, sit outside this counting
-//! entirely.** They delete an object directly rather than driving `collect_garbage` — the state
-//! they construct (a rooted pin's referent simply never held locally, or genuinely lost) is not
+//! **Four further legs sit outside this counting entirely** — three added for FORK-81's second
+//! finding, and FORK-83's `a_lost_tagged_parcel_that_is_also_an_ancestor_still_refuses`. They
+//! delete an object directly rather than driving `collect_garbage` — the state they construct (a rooted pin's referent simply never held locally, or genuinely lost) is not
 //! something gc can produce any more, so there is no sweep for a canary to witness and none is
 //! used. See
 //! `an_absent_interior_ancestor_behind_a_present_boundary_head_is_named_not_accused_of_tampering`,
-//! `a_genuinely_pre_trust_side_pallet_parcel_behind_an_absent_boundary_head_refuses_instead_of_accusing`
-//! and `the_accusation_still_fires_with_no_gap_at_all`.
+//! `a_genuinely_pre_trust_side_pallet_parcel_behind_an_absent_boundary_head_refuses_instead_of_accusing`,
+//! `the_accusation_still_fires_with_no_gap_at_all` and
+//! `a_lost_tagged_parcel_that_is_also_an_ancestor_still_refuses`. FORK-83's
+//! `a_torn_taint_heals_over_a_malformed_tag_record_and_notes_it` sits outside it too: it writes a
+//! malformed tag record directly and collects nothing.
 
 use std::path::PathBuf;
 use std::process::Output;
@@ -938,27 +942,27 @@ fn a_collected_cherry_pick_source_makes_the_completing_stack_fail_unattributed()
     );
 }
 
-/// FORK-83 — THE HEALING READER, and the only member of this class that takes the whole
-/// warehouse down.
+/// FORK-83 — THE HEALING READER, fixed: an absent tag subject no longer wedges the warehouse.
 ///
-/// `recovery_utils::collect_walk_roots` roots every tag's subject (`recovery_utils.rs:1277-1279`)
-/// — deliberately, because heal's walk must be a superset of gc's live set. The torn-taint rescan
-/// builds its roots from that walk (`:1418-1419`) and folds every referenced-but-absent hash into
-/// the remainder (`:953`, `:981-985`); a non-empty remainder returns
-/// `Err(torn_rescan_dangling_refusal(...))` (`:1024`), which is a store-wide refusal rather than
-/// one command's exit code.
-///
-/// So an absent tag subject plus a torn taint bricks the store. And it cannot be cleared:
-/// `TagAction` is `Create`/`Show`/`List` only (`cli.rs:1011-1038`) — no delete, names immutable —
-/// and `heal` cannot restore an object nobody holds.
+/// A tag is not a gc root, so `undo` plus a collection can sweep a tagged parcel; a sparse
+/// `franchise --only` also adopts every tag record without the history behind it. Locally the two
+/// cannot be told apart, and neither can ever be resolved. Before the fix, heal's walk rooted tag
+/// subjects at the ordinary reporting policy, so a torn taint's store-wide rescan named the
+/// absent subject as dangling and refused, with exit 21, on every command. There was no exit
+/// either: `tag` has no retire verb, and the refusal pointed back at `forklift heal`. Heal no
+/// longer roots tags at all, exactly like gc (`recovery_utils::WalkRoots::tag_subjects`): it
+/// clears, and names the tag in a note.
 ///
 /// The taint is written directly rather than driven through a command because a torn taint is by
-/// definition crash debris: `parse_taint_content` (`taint_utils.rs:623`) calls a file torn when it
-/// lacks the `END\n` suffix, which is exactly what a crash mid-write leaves. Everything else here
-/// is a shipped command. Note `crates/forklift/src/main.rs:60` calls `taint_utils::activate()`, so
-/// the CLI really does read these files.
+/// definition crash debris: `parse_taint_content` calls a file torn when it lacks the `END\n`
+/// suffix, which is exactly what a crash mid-write leaves. Everything else here is a shipped
+/// command.
+///
+/// Mutation: queue tag subjects at `AbsencePolicy::Report` in `walk_closure_for` → the rescan
+/// names the subject dangling → `heal` exits 21 → red at the first assertion. Dropping the
+/// tag-note loop in `heal_torn_taint` instead → red at the `Note:` assertion.
 #[test]
-fn a_torn_taint_over_an_absent_tag_subject_wedges_the_whole_warehouse() {
+fn a_torn_taint_over_an_absent_tag_subject_heals_and_names_the_tag() {
     let warehouse = Warehouse::new("torn");
 
     warehouse.stack("app.txt", "v1\n", "first");
@@ -975,10 +979,8 @@ fn a_torn_taint_over_an_absent_tag_subject_wedges_the_whole_warehouse() {
     // Orphan and collect the subject: `undo` moves the head back past the tagged parcel.
     warehouse.run_ok(&["undo"]);
 
-    // ISOLATE THE TAG. A soft `undo` leaves the undone content STAGED. Before FORK-156 gc
-    // collected it while heal's walk still rooted it, so the leg wedged for two independent
-    // reasons; staged inventory is a gc root now and cannot dangle, but unstaging still keeps
-    // the tag subject the only thing this leg is about.
+    // A soft `undo` leaves the undone content staged. Unstaging keeps the tag subject the only
+    // absent root this leg is about.
     warehouse.run_ok(&["restore", "--staged", "."]);
 
     let stats = warehouse.scoped(|| gc_utils::collect_garbage(0).expect("gc runs"));
@@ -988,167 +990,252 @@ fn a_torn_taint_over_an_absent_tag_subject_wedges_the_whole_warehouse() {
         "TORN: gc deleted {} object(s); tag subject {} present = {}\n      canary was {}",
         stats.deleted, tagged, present, canary
     );
+    // FIXTURE PRECONDITIONS, not claims: the store really reached the state under test. Rooting
+    // tag subjects in gc would redden here instead — a remedy FORK-83 rules out.
     assert_the_sweep_ran(&warehouse, &canary, stats.deleted);
     assert!(!present, "the fixture needs the tag subject collected");
 
-    // The torn taint: a parseable prefix with no `END\n` suffix, which is what a crash
-    // mid-write-of-a-line leaves behind.
     let taint_dir = warehouse.root.join(".forklift").join("taint");
     std::fs::create_dir_all(&taint_dir).unwrap();
     std::fs::write(taint_dir.join("taint-99999-0"), b"objects/ab/cdef\n").unwrap();
 
     let healed = warehouse.run(&["heal"]);
+    let heal_out = String::from_utf8_lossy(&healed.stdout).to_string();
+    let heal_err = String::from_utf8_lossy(&healed.stderr).to_string();
     println!(
         "TORN: `heal` exit = {:?}\n  stdout: {}\n  stderr: {}",
-        healed.status.code(),
-        String::from_utf8_lossy(&healed.stdout).trim(),
-        String::from_utf8_lossy(&healed.stderr).trim()
+        healed.status.code(), heal_out.trim(), heal_err.trim()
     );
 
-    // An ordinary command, to show the refusal is store-wide rather than heal's own.
-    let ordinary = warehouse.run(&["stocktake"]);
-    println!(
-        "TORN: `stocktake` exit = {:?}\n  stdout: {}\n  stderr: {}",
-        ordinary.status.code(),
-        String::from_utf8_lossy(&ordinary.stdout).trim(),
-        String::from_utf8_lossy(&ordinary.stderr).trim()
-    );
-
-    // And there is no in-tool exit: no way to retire the tag whose subject is the blocker.
-    let tag_help = warehouse.run(&["tag", "--help"]);
-    let help = String::from_utf8_lossy(&tag_help.stdout).to_string();
-
-    // THE WEDGE, asserted. The four claims are: heal exits 21, the refusal names `tagged`,
-    // an ordinary command is refused too, and the remedy is circular. (The `tag` subcommand
-    // assertion further down is NOT one of them — it pins the missing in-tool exit, and being an
-    // exact-set equality it reddens on ANY change to the subcommand list: a retire verb, but also
-    // an unrelated addition, a rename, or a reordering of `TagAction`'s variants, since clap
-    // prints declaration order. Never on a rescan change. The isolation assertion BELOW is
-    // likewise a property of the fixture, not a claim about the defect.)
-    //
-    // It is worth being exact about how they invert, because an earlier version of this comment
-    // was not.
-    //
-    // Two of the assertions above (`assert_the_sweep_ran`, `!present`) are FIXTURE PRECONDITIONS,
-    // not claims: they say the store really reached the state under test. A mutation that stops
-    // the subject being collected reddens THERE, which is correct and is what happens if the fix
-    // chosen is to root tag subjects — a remedy FORK-83 explicitly rules out.
-    //
-    // The four claims below invert on the fixes actually on the table, all of which change what
-    // the RESCAN does with a referenced-absent subject while leaving it collected.
-    //
-    // Two companion legs, and they support DIFFERENT things. This sentence has now been wrong
-    // twice, in opposite directions, so it is worth spelling out which is which:
-    //
-    //   * `a_torn_taint_alone_...` (the control) is the only leg that varies DANGLING-NESS: torn
-    //     taint, nothing dangling, exit 0. Paired with this leg's exit 21 it is what separates the
-    //     dangling reference from torn-ness — the contingency asserted here. It is a weak pair
-    //     (it differs in several variables at once, which is why it cannot show anything about the
-    //     TAG specifically), but on this one axis it is the only evidence there is.
-    //   * `staged_content_survives_...` once held dangling-ness constant and varied the tag and the
-    //     `undo`, showing the wedge was not tag-specific: a collected staged blob wedged the store
-    //     the same way. Since FORK-156 rooted staged inventory, nothing staged can dangle there,
-    //     so it now pins that fix and says nothing about tags or torn-ness.
-    //
-    // The control's doc once claimed the tag was load-bearing, and a later revision demoted it
-    // too far; what it does and does not support is stated above.
-    let heal_err = String::from_utf8_lossy(&healed.stderr).to_string();
-    let ordinary_err = String::from_utf8_lossy(&ordinary.stderr).to_string();
-
-    assert_eq!(
-        healed.status.code(), Some(21),
-        "`heal` must refuse with the durability-taint exit; got {:?}, stderr: {}",
+    assert!(
+        healed.status.success(),
+        "a torn taint whose only absent root is a tag subject must heal; got {:?}, stderr: {}",
         healed.status.code(), heal_err
     );
+    let note = heal_out.lines().find(|line| line.starts_with("Note: tag \"v1.0\""));
     assert!(
-        heal_err.contains(&tagged),
-        "the refusal must name the collected tag subject {} as dangling — that is the whole \
-         finding. stderr: {}",
-        tagged, heal_err
-    );
-    // THE ISOLATION ITSELF, pinned. The unstage above exists so the tag subject is the SOLE
-    // dangling reference — that is what restores invertibility to the claims below. Asserting
-    // only that `tagged` appears would stay green if a future change re-introduced a second
-    // dangling root, silently losing the property round 1 was fixed to gain.
-    // "and 1 reference(s)", not "1 reference(s)": the latter is a substring of "11 reference(s)"
-    // and "101 reference(s)", so it would go green in exactly the case it exists to catch — a
-    // change that re-roots a whole class and pushes the remainder into double digits.
-    assert!(
-        heal_err.contains("and 1 reference(s)"),
-        "the tag subject must be the ONLY dangling reference; more than one means the unstage no \
-         longer isolates it and three of the four claims below stop inverting. stderr: {}",
-        heal_err
-    );
-    assert_eq!(
-        ordinary.status.code(), Some(21),
-        "the refusal must be STORE-WIDE, not heal's own exit code: an ordinary `stocktake` has \
-         to be refused too. got {:?}, stderr: {}",
-        ordinary.status.code(), ordinary_err
+        note.is_some_and(|line| line.contains(&tagged)),
+        "heal must name the tag and its absent subject {} in a note. stdout: {}",
+        tagged, heal_out
     );
 
-    // No in-tool exit. If a retire/delete verb ever lands, this is the assertion to invert —
-    // and the wedge stops being a wedge.
-    // Matched against the SUBCOMMAND LIST only, not the whole help text: a bare substring sweep
-    // over `help` also fires on a reworded description or an unrelated `--remove-*` option on a
-    // sibling, producing a red with nothing to do with FORK-83.
+    let ordinary = warehouse.run(&["stocktake"]);
+    assert!(
+        ordinary.status.success(),
+        "with the taint cleared, ordinary commands must work again; stderr: {}",
+        String::from_utf8_lossy(&ordinary.stderr)
+    );
+    // The tag record itself is untouched: still listed, its subject still absent.
+    let listed = warehouse.run_ok(&["tag", "list"]);
+    assert!(
+        String::from_utf8_lossy(&listed.stdout).contains("v1.0"),
+        "heal must not touch the tag record. stdout: {}",
+        String::from_utf8_lossy(&listed.stdout)
+    );
+
+    // `tag` still has no retire verb. That is no longer a wedge — the store heals around the
+    // absent subject — but it is what made the old wedge permanent, so the set stays pinned.
+    // Matched against the SUBCOMMAND LIST only, not the whole help text.
+    let tag_help = warehouse.run(&["tag", "--help"]);
+    let help = String::from_utf8_lossy(&tag_help.stdout).to_string();
     let subcommands: Vec<String> = help
         .lines()
         .skip_while(|line| !line.starts_with("Commands:"))
         .skip(1)
-        // Exactly two leading spaces then a non-space. Clap wraps a long description onto a
-        // continuation line indented far deeper (`forklift --help` renders one as
-        // `               bl]`), which also starts with two spaces — so the looser test emits
-        // "bl]" as a subcommand and reddens the equality below with the wrong explanation.
+        // Exactly two leading spaces then a non-space: clap indents a wrapped description's
+        // continuation line far deeper, and the looser test would read it as a subcommand.
         .take_while(|line| line.starts_with("  ") && !line.starts_with("   "))
         .map(|line| line.trim().split_whitespace().next().unwrap_or("").to_string())
         .collect();
-
-    println!("STAGED/TORN: `tag` subcommands = {:?}", subcommands);
-    assert!(
-        !subcommands.is_empty(),
-        "failed to parse the subcommand list out of `tag --help`; the parse, not the claim, is \
-         what broke. help was:\n{}",
-        help
-    );
-    // EXACT SET, not a blocklist. Round 1 narrowed an over-broad substring sweep to equality
-    // against delete/retire/remove — which is under-broad in the other direction: `rm`, `drop`,
-    // `forget` or `revoke` would give the wedge an in-tool exit while this stayed green. The
-    // exact set is narrow AND total: any change to the list reddens here and gets read. It needs
-    // a manual edit when the list legitimately changes, which is the intended cost.
+    println!("TORN: `tag` subcommands = {:?}", subcommands);
     assert_eq!(
         subcommands, vec!["create", "show", "list"],
-        "`tag`'s subcommand list changed. If a retire/delete verb landed, the wedge now has an \
-         in-tool exit — invert this leg and revisit FORK-83's premise. If the change is unrelated, \
-         update the expected set."
+        "`tag`'s subcommand list changed. Update the expected set, and if a retire verb landed, \
+         say in FORK-83's ledger row that a tag can now be retired."
+    );
+}
+
+/// The targeted path: a complete (not torn) taint whose recorded path IS the collected tag
+/// subject. Heal checks that one hash against every root; only the tag names it, and a tag is not
+/// a gc root, so holding the taint open over it would wedge for nothing.
+///
+/// Mutation: queue tag subjects as roots in `walk_closure_for` → the subject counts as
+/// referenced → `heal` exits 21 → red. Dropping the tag-note loop on this targeted path
+/// (`resolve_the_rest`) instead → red at the `Note:` assertion.
+#[test]
+fn a_recorded_taint_over_a_collected_tag_subject_clears() {
+    let warehouse = Warehouse::new("tag-target");
+
+    warehouse.stack("app.txt", "v1\n", "first");
+    let tagged = warehouse.stack("app.txt", "v2\n", "second");
+    warehouse.run_ok(&["tag", "create", "v1.0", &tagged, "-m", "release"]);
+    warehouse.run_ok(&["undo"]);
+    warehouse.run_ok(&["restore", "--staged", "."]);
+    warehouse.scoped(|| gc_utils::collect_garbage(0).expect("gc runs"));
+    assert!(
+        !warehouse.scoped(|| file_utils::does_object_exist(&tagged).unwrap()),
+        "the fixture needs the tag subject collected"
     );
 
-    // AND THE REMEDY IS CIRCULAR — the part the ticket does not state. The refusal that blocks
-    // every command tells the operator to run the one command that just refused.
+    let taint_dir = warehouse.root.join(".forklift").join("taint");
+    std::fs::create_dir_all(&taint_dir).unwrap();
+    let record = format!("objects/{}/{}\nEND\n", &tagged[..2], &tagged[2..]);
+    std::fs::write(taint_dir.join("taint-99999-0"), record).unwrap();
+
+    let healed = warehouse.run(&["heal"]);
+    println!(
+        "TAG-TARGET: `heal` exit = {:?}\n  stdout: {}\n  stderr: {}",
+        healed.status.code(),
+        String::from_utf8_lossy(&healed.stdout).trim(),
+        String::from_utf8_lossy(&healed.stderr).trim()
+    );
     assert!(
-        ordinary_err.contains("forklift heal"),
-        "expected the store-wide refusal to direct the operator to `forklift heal`; stderr: {}",
-        ordinary_err
+        healed.status.success(),
+        "a recorded taint over a hash only a tag names must clear; stderr: {}",
+        String::from_utf8_lossy(&healed.stderr)
+    );
+    let heal_out = String::from_utf8_lossy(&healed.stdout).to_string();
+    assert!(
+        heal_out.lines().any(|line| line.starts_with("Note: tag \"v1.0\"")),
+        "the targeted path must name the absent tag subject too; stdout: {}", heal_out
+    );
+    warehouse.run_ok(&["stocktake"]);
+}
+
+/// A tag history that cannot be read at all never wedges either. A `@tags` record syncs in
+/// unvalidated, so a foreign client can publish one `parse_tag` rejects; tags feed heal's notes
+/// only, so heal notes the failed read and clears rather than aborting its walk. The malformed
+/// record is built directly because no shipped command writes one.
+///
+/// Mutation: propagate the `read_tags` error in `collect_walk_roots` → the rescan aborts →
+/// `heal` exits 21 → red at the exit-code assertion. Dropping the `tags_unread` note on the
+/// torn path, or on the targeted path (`resolve_the_rest`) → red at that path's `Note:` assertion.
+#[test]
+fn a_torn_taint_heals_over_a_malformed_tag_record_and_notes_it() {
+    use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
+    use forklift_core::enums::dir_entry_type::DirEntryType;
+    use forklift_core::model::blob::Blob;
+    use forklift_core::model::parcel::Parcel;
+    use forklift_core::model::tree_item::TreeItem;
+    use forklift_core::util::{pallet_utils, tag_utils};
+
+    let warehouse = Warehouse::new("tag-malformed");
+
+    let head = warehouse.stack("app.txt", "v1\n", "first");
+    warehouse.run_ok(&["tag", "create", "v1.0", &head, "-m", "release"]);
+
+    warehouse.scoped(|| {
+        let mut blob = LooseObjectBuilder::build_blob(&Blob { content: b"name = \"bad\"\n".to_vec() });
+        blob.store().unwrap();
+        let mut node = TreeItem::new("bad.toml".to_string(), blob.hash.clone(), DirEntryType::Normal);
+        for name in ["tags", "tracked", ".forklift", ""] {
+            let mut tree = TreeItem::new(name.to_string(), String::new(), DirEntryType::Tree);
+            tree.add_child(node);
+            let mut object = LooseObjectBuilder::build_tree(&tree);
+            object.store().unwrap();
+            tree.hash = object.hash.clone();
+            node = tree;
+        }
+        let parent = pallet_utils::get_meta_pallet_head(tag_utils::TAGS_PALLET_NAME).unwrap().unwrap();
+        let mut parcel = LooseObjectBuilder::build_parcel(&Parcel {
+            tree_hash: node.hash.clone(), parents: vec![parent], actions: Vec::new(), description: None,
+        });
+        parcel.store().unwrap();
+        pallet_utils::set_meta_pallet_head(tag_utils::TAGS_PALLET_NAME, &parcel.hash).unwrap();
+        assert!(tag_utils::read_tags().is_err(), "the fixture needs an unreadable tag history");
+    });
+
+    let taint_dir = warehouse.root.join(".forklift").join("taint");
+    std::fs::create_dir_all(&taint_dir).unwrap();
+    std::fs::write(taint_dir.join("taint-99999-0"), b"objects/ab/cdef\n").unwrap();
+
+    let healed = warehouse.run(&["heal"]);
+    let heal_out = String::from_utf8_lossy(&healed.stdout).to_string();
+    let heal_err = String::from_utf8_lossy(&healed.stderr).to_string();
+    println!(
+        "TAG-MALFORMED: `heal` exit = {:?}\n  stdout: {}\n  stderr: {}",
+        healed.status.code(), heal_out.trim(), heal_err.trim()
+    );
+    assert!(
+        healed.status.success(),
+        "an unreadable tag history must not abort heal; got {:?}, stderr: {}",
+        healed.status.code(), heal_err
+    );
+    assert!(
+        heal_out.lines().any(|line| line.starts_with("Note: the tags could not be read")),
+        "heal must say the tags went unchecked; stdout: {}", heal_out
+    );
+
+    // The targeted path too: a complete record naming an object nothing references.
+    let record = format!("objects/{}/{}\nEND\n", "a".repeat(2), "a".repeat(62));
+    std::fs::write(taint_dir.join("taint-99999-1"), record).unwrap();
+    let healed = warehouse.run(&["heal"]);
+    let heal_out = String::from_utf8_lossy(&healed.stdout).to_string();
+    assert!(
+        healed.status.success(),
+        "the targeted path must not abort on an unreadable tag history either; stderr: {}",
+        String::from_utf8_lossy(&healed.stderr)
+    );
+    assert!(
+        heal_out.lines().any(|line| line.starts_with("Note: the tags could not be read")),
+        "the targeted path must say the tags went unchecked too; stdout: {}", heal_out
+    );
+}
+
+/// The other direction: the tag's policy must not swallow a genuine loss.
+///
+/// The tagged parcel is the parent of `main`'s head, so it is reached by an ancestry edge as
+/// well as by the tag, and its absence is real local loss (gc cannot produce it; it is deleted
+/// directly, as in the FORK-81 legs, so no canary is used). The rescan must still report it and
+/// refuse.
+///
+/// Mutation: the over-broad fix — have `enumerate_absent_reachable`'s sink drop any hash a tag
+/// names → nothing is reported → `heal` clears → red at the exit-code assertion.
+#[test]
+fn a_lost_tagged_parcel_that_is_also_an_ancestor_still_refuses() {
+    let warehouse = Warehouse::new("torn-tag-ancestor");
+
+    let tagged = warehouse.stack("app.txt", "v1\n", "first");
+    warehouse.run_ok(&["tag", "create", "v1.0", &tagged, "-m", "release"]);
+    warehouse.stack("app.txt", "v2\n", "second");
+
+    warehouse.delete_object(&tagged);
+
+    let taint_dir = warehouse.root.join(".forklift").join("taint");
+    std::fs::create_dir_all(&taint_dir).unwrap();
+    std::fs::write(taint_dir.join("taint-99999-0"), b"objects/ab/cdef\n").unwrap();
+
+    let healed = warehouse.run(&["heal"]);
+    let heal_err = String::from_utf8_lossy(&healed.stderr).to_string();
+    println!(
+        "TORN-ANCESTOR: `heal` exit = {:?}\n  stdout: {}\n  stderr: {}",
+        healed.status.code(),
+        String::from_utf8_lossy(&healed.stdout).trim(),
+        heal_err.trim()
+    );
+
+    assert_eq!(
+        healed.status.code(), Some(21),
+        "a lost parcel that `main`'s history still reaches must refuse, tag or no tag; got {:?}, \
+         stderr: {}",
+        healed.status.code(), heal_err
+    );
+    assert!(
+        heal_err.contains(&tagged),
+        "the refusal must name the lost parcel {}. stderr: {}",
+        tagged, heal_err
     );
 }
 
 /// CONTROL: a torn taint with nothing dangling heals cleanly.
 ///
-/// **This is a narrow control and it is worth being exact about what it establishes**, because an
-/// earlier version of this comment claimed much more. It removes the tag, the `undo` AND the
-/// collection, so its green shows only that torn-ness *alone* does not refuse — which is what
-/// stops the wedge leg above from being satisfied by "a torn taint bricks any warehouse".
+/// A narrow control: no tag, no `undo`, no collection. Its green shows only that torn-ness
+/// *alone* does not refuse, so `a_lost_tagged_parcel_that_is_also_an_ancestor_still_refuses`
+/// cannot be satisfied by "a torn taint refuses any warehouse". It says nothing about tags.
 ///
-/// It does **not** show the tag is load-bearing, and an earlier draft that said so was wrong:
-/// before FORK-156, a collected staged blob wedged the store with no tag at all (the defect
-/// `staged_content_survives_collection_and_a_torn_taint_heals_over_it` below now pins fixed).
-/// That draft also reasoned that the wedge leg's second dangling hash "is
-/// byte-identical across runs, so it is a fixed-content object rather than anything this fixture
-/// created" — a non-sequitur, since a fixture with hardcoded file bodies produces fixed content
-/// by construction. It was this fixture's own staged blob, and chasing it is what turned up the
-/// wider defect.
-///
-/// The tag-only control is now inside the wedge leg itself: it unstages after the `undo`, so the
-/// tag subject is the only dangling root there.
+/// Before FORK-156 a collected staged blob wedged the store with no tag at all; chasing an
+/// unexplained second dangling hash in the old FORK-83 leg is what found that defect, now pinned
+/// fixed by `staged_content_survives_collection_and_a_torn_taint_heals_over_it`.
 #[test]
 fn a_torn_taint_alone_on_an_untouched_warehouse_is_the_control() {
     let warehouse = Warehouse::new("torn-control");
@@ -1174,13 +1261,11 @@ fn a_torn_taint_alone_on_an_untouched_warehouse_is_the_control() {
         String::from_utf8_lossy(&ordinary.stderr).trim()
     );
 
-    // The distinguishing half. Same torn taint, same shipped commands, no absent tag subject:
-    // the store heals and stays usable. Without this leg the wedge leg above is satisfied just
-    // as well by "a torn taint bricks any warehouse", which is false.
+    // Same torn taint, same shipped commands, nothing absent: the store heals and stays usable.
     assert!(
         healed.status.success(),
-        "a torn taint alone must heal cleanly — if this refuses, the wedge is not about tag \
-         subjects at all and FORK-83 is filed too narrowly. stdout: {} / stderr: {}",
+        "a torn taint alone must heal cleanly — if this refuses, every refusal in the FORK-83 legs \
+         is explained by torn-ness, not by what is absent. stdout: {} / stderr: {}",
         String::from_utf8_lossy(&healed.stdout), String::from_utf8_lossy(&healed.stderr)
     );
     assert!(
