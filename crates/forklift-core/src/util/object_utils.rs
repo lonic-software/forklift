@@ -1864,4 +1864,77 @@ mod tests {
         assert!(matches!(result, Err(BoundedDecodeError::OverCeiling)),
             "a frame one byte over the ceiling must be refused, not truncated to Ok");
     }
+
+    /// A zstd frame of `content` whose header declares a `window_log` window (a stream encoder
+    /// with no pledged size writes the window it was configured with, whatever the content).
+    fn frame_with_window(content: &[u8], window_log: u32, dictionary: Option<&[u8]>) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut encoder = match dictionary {
+            Some(dictionary) => zstd::stream::Encoder::with_dictionary(&mut out, 3, dictionary).unwrap(),
+            None => zstd::stream::Encoder::new(&mut out, 3).unwrap(),
+        };
+        encoder.window_log(window_log).unwrap();
+        std::io::Write::write_all(&mut encoder, content).unwrap();
+        encoder.finish().unwrap();
+        out
+    }
+
+    #[test]
+    fn an_object_frame_declaring_a_window_past_the_bound_is_refused_and_one_at_it_decodes() {
+        let content = b"a small object whose frame claims a large window".repeat(10);
+
+        let over = frame_with_window(&content, MAX_DECODE_WINDOW_LOG + 1, None);
+        assert!(matches!(decode_object_bounded(&over[..]), Err(BoundedDecodeError::Malformed(_))));
+
+        let at = frame_with_window(&content, MAX_DECODE_WINDOW_LOG, None);
+        assert_eq!(decode_object_bounded(&at[..]).unwrap(), content);
+    }
+
+    #[test]
+    fn a_delta_frame_declaring_a_window_past_the_bound_is_refused_and_one_at_it_decodes() {
+        let base = b"the base object a delta is made against ".repeat(50);
+        let mut target = base.clone();
+        target.extend(b" and an edit");
+
+        let over = frame_with_window(&target, MAX_DECODE_WINDOW_LOG + 1, Some(&base));
+        assert!(crate::util::delta_utils::decompress_delta(&base, &over, target.len()).is_err());
+
+        let at = frame_with_window(&target, MAX_DECODE_WINDOW_LOG, Some(&base));
+        assert_eq!(crate::util::delta_utils::decompress_delta(&base, &at, target.len()).unwrap(), target);
+    }
+
+    /// Mixed content — runs of repeats far apart, interleaved with incompressible noise — large
+    /// enough that a writer choosing its window from the content would choose one past the
+    /// bound. Every writer this build has must still produce frames the bounded decoders read.
+    fn large_mixed_content(len: usize, seed: u64) -> Vec<u8> {
+        let mut state = seed;
+        let mut noise = || { state ^= state << 13; state ^= state >> 7; state ^= state << 17; state as u8 };
+        let motif: Vec<u8> = (0..4096).map(|_| noise()).collect();
+        let mut content = Vec::with_capacity(len);
+
+        while content.len() < len {
+            content.extend(&motif);
+            content.extend((0..8192).map(|_| noise()));
+        }
+
+        content.truncate(len);
+        content
+    }
+
+    #[test]
+    fn every_writer_produces_frames_the_bounded_decoders_read() {
+        // The loose-object and bundle writers share one encoder configuration (level 0, no
+        // pledged size); the delta writer is the bulk compressor against a dictionary.
+        let object = large_mixed_content(MAX_OBJECT_BYTES, 1);
+        let compressed = zstd::encode_all(&object[..], 0).unwrap();
+        assert_eq!(decode_object_bounded(&compressed[..]).unwrap(), object);
+
+        let base = large_mixed_content(crate::util::delta_utils::MAX_DELTA_TARGET_BYTES, 2);
+        let mut target = base.clone();
+        target[1000..2000].copy_from_slice(&[9u8; 1000]);
+        target.extend(b"appended");
+        target.truncate(crate::util::delta_utils::MAX_DELTA_TARGET_BYTES);
+        let delta = crate::util::delta_utils::compress_delta(&base, &target).unwrap();
+        assert_eq!(crate::util::delta_utils::decompress_delta(&base, &delta, target.len()).unwrap(), target);
+    }
 }

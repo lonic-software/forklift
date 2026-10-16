@@ -1608,4 +1608,89 @@ mod tests {
         let error = import_bundle_bytes(&bytes).err().unwrap();
         assert!(error.contains("object ceiling"), "a v3 bundle refuses the giant: {}", error);
     }
+
+    /// [`raw_bundle`], but with the record stream's frame declaring a `window_log` window — a
+    /// stream encoder with no pledged size writes the window into the frame header whatever the
+    /// content, so a small bundle can declare a window as large as any bomb.
+    fn bundle_with_window(header: &str, records: &[u8], window_log: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend(header.as_bytes());
+        bytes.push(b'\n');
+
+        let mut encoder = zstd::stream::Encoder::new(&mut bytes, 3).unwrap();
+        encoder.window_log(window_log).unwrap();
+        std::io::Write::write_all(&mut encoder, records).unwrap();
+        encoder.finish().unwrap();
+        bytes
+    }
+
+    /// Three object records and their hashes.
+    fn three_objects() -> (Vec<u8>, Vec<String>) {
+        let mut records = Vec::new();
+        let mut hashes = Vec::new();
+
+        for i in 0..3 {
+            let content = format!("streamed object {} {}", i, "x".repeat(200 * i));
+            let hash = object_utils::hash_object_bytes(content.as_bytes());
+            records.extend(record(b'O', &hash, content.as_bytes()));
+            hashes.push(hash);
+        }
+
+        (records, hashes)
+    }
+
+    #[test]
+    fn a_streamed_bundle_cut_short_anywhere_fails_instead_of_importing_as_a_smaller_one() {
+        // A transfer that ends early without an error of its own (a close-delimited body cut by
+        // the peer) hands the importer a clean end of input mid-stream. Wherever that lands —
+        // inside a record, or exactly between two — the import must fail: a bundle that loses
+        // its tail is corrupt, never a smaller valid one.
+        let (records, hashes) = three_objects();
+        let bytes = raw_bundle(BUNDLE_HEADER_V3, &records);
+        let header_len = BUNDLE_HEADER_V3.len() + 1;
+
+        for cut in header_len..bytes.len() {
+            let _scratch = Scratch::new("streamed-cut");
+            let outcome = import_streamed_bundle(std::io::Cursor::new(&bytes[..cut]));
+            assert!(outcome.is_err(), "a bundle cut at byte {} of {} must not import", cut, bytes.len());
+        }
+
+        let _scratch = Scratch::new("streamed-whole");
+        let stats = import_streamed_bundle(std::io::Cursor::new(&bytes)).unwrap();
+        assert_eq!(stats.stored_objects, 3);
+        assert!(hashes.iter().all(|hash| file_utils::does_object_exist(hash).unwrap()));
+    }
+
+    #[test]
+    fn a_streamed_bundle_is_accepted_only_at_version_3() {
+        let _scratch = Scratch::new("streamed-versions");
+        let (records, _) = three_objects();
+
+        for header in [BUNDLE_HEADER, BUNDLE_HEADER_V2, BUNDLE_HEADER_V1] {
+            let error = import_streamed_bundle(std::io::Cursor::new(raw_bundle(header, &records)))
+                .err().unwrap_or_else(|| panic!("a \"{}\" bundle must be refused on the streamed path", header));
+            assert!(error.contains("refusing to import it"), "{}", error);
+        }
+
+        assert!(import_streamed_bundle(std::io::Cursor::new(raw_bundle(BUNDLE_HEADER_V3, &records))).is_ok());
+    }
+
+    #[test]
+    fn a_bundle_stream_declaring_a_window_past_the_bound_is_refused_and_one_at_it_imports() {
+        let (records, hashes) = three_objects();
+
+        let over = bundle_with_window(BUNDLE_HEADER_V3, &records, object_utils::MAX_DECODE_WINDOW_LOG + 1);
+        {
+            let _scratch = Scratch::new("window-over");
+            assert!(import_bundle_bytes(&over).is_err(), "a file bundle over the window bound is refused");
+            assert!(import_streamed_bundle(std::io::Cursor::new(&over)).is_err(),
+                "a streamed bundle over the window bound is refused");
+            assert!(!hashes.iter().any(|hash| file_utils::does_object_exist(hash).unwrap()),
+                "the refusal comes before the first record");
+        }
+
+        let at = bundle_with_window(BUNDLE_HEADER_V3, &records, object_utils::MAX_DECODE_WINDOW_LOG);
+        let _scratch = Scratch::new("window-at");
+        assert_eq!(import_streamed_bundle(std::io::Cursor::new(&at)).unwrap().stored_objects, 3);
+    }
 }
