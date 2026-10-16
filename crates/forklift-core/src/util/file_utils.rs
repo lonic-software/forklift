@@ -32,14 +32,17 @@ const IGNORE_FILE_CONTENT: &str = r#"# Forklift ignore file.
 # This file is used to specify files and directories that should be ignored by Forklift.
 # Every entry must be a valid regex pattern.
 #
-# Example - ignore a folder called "test":
-# ^test\/?.*$
+# Example - ignore a folder called "test" (and nothing else whose name starts with "test"):
+# ^test(/.*)?$
 #
 # Example - ignore all files with the extension ".log":
 # \.log$
 "#;
 
-const DEFAULT_IGNORED_PATHS: [&str; 1] = ["^\\.forklift/?.*$"];
+/// Always ignored: the warehouse's own folder, and the ignore file. Each is anchored at both
+/// ends, so a tracked sibling that merely starts with the same name (`.forklift-notes`) is
+/// not swallowed.
+const DEFAULT_IGNORED_PATHS: [&str; 2] = [r"^\.forklift(/.*)?$", r"^\.forkliftignore$"];
 
 /// The path separator used in warehouse-internal paths (inventory keys, metadata entries,
 /// object store paths). This is always `/`, on every platform: keys written on one platform
@@ -2591,6 +2594,37 @@ fn get_regex_for_pattern(pattern: &str) -> Result<Regex, String> {
 mod tests {
     use super::*;
     use crate::globals::StorageRootScope;
+
+    #[test]
+    fn default_ignore_rules_cover_the_warehouse_folder_and_ignore_file_but_no_sibling() {
+        let defaults = get_default_ignored_paths().unwrap();
+
+        for ignored in [".forklift", ".forklift/config/warehouse.toml", ".forkliftignore"] {
+            assert!(is_path_ignored(ignored, &defaults), "{} must be ignored", ignored);
+        }
+        for tracked in [".forklift-notes", ".forkliftrc", ".forkliftignore.bak", "a/.forklift", "x.forklift"] {
+            assert!(!is_path_ignored(tracked, &defaults), "{} must not be ignored", tracked);
+        }
+    }
+
+    #[test]
+    fn the_ignore_file_template_teaches_an_anchored_folder_rule() {
+        // The folder example a new warehouse's ignore file shows is the pattern users copy;
+        // read it from the template so the test follows the text that ships.
+        let example = IGNORE_FILE_CONTENT.lines()
+            .skip_while(|line| !line.contains("ignore a folder called \"test\""))
+            .nth(1)
+            .and_then(|line| line.strip_prefix("# "))
+            .expect("the template's folder example");
+        let rule = vec![get_regex_for_pattern(example).unwrap()];
+
+        for ignored in ["test", "test/a.rs", "test/deep/b.rs"] {
+            assert!(is_path_ignored(ignored, &rule), "{} must be ignored by {}", ignored, example);
+        }
+        for tracked in ["testing.rs", "tests/a.rs", "test.txt", "src/test"] {
+            assert!(!is_path_ignored(tracked, &rule), "{} must not be ignored by {}", tracked, example);
+        }
+    }
 
     #[test]
     fn a_corrupt_loose_object_fails_the_read_instead_of_returning_wrong_bytes() {

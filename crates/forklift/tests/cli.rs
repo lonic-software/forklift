@@ -2506,6 +2506,7 @@ fn import_git_ignores_only_the_git_directory_not_its_dotfile_siblings() {
     warehouse.write_file(".github/x.md", "a\n");
     warehouse.write_file(".gitignore", "b\n");
     warehouse.write_file(".gitattributes", "c\n");
+    warehouse.write_file(".git-blame-ignore-revs", "e\n");
     warehouse.write_file("readme", "d\n");
     git(&["add", "-A"]);
     git(&["commit", "-qm", "init"]);
@@ -2523,7 +2524,7 @@ fn import_git_ignores_only_the_git_directory_not_its_dotfile_siblings() {
     // "The working directory matches the inventory" holds either way; the staged half is
     // what the wrong rule changes.
     assert!(status.contains("nothing is staged"), "load staged a change after import: {}", status);
-    for sibling in [".github/x.md", ".gitignore", ".gitattributes"] {
+    for sibling in [".github/x.md", ".gitignore", ".gitattributes", ".git-blame-ignore-revs"] {
         assert!(!status.contains(sibling), "{} was staged for removal: {}", sibling, status);
     }
 
