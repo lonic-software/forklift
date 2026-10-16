@@ -31,8 +31,8 @@ use forklift_core::model::hooks::{
 use forklift_core::model::remote::{
     ErrorResponse, MissingObjectsRequest, MissingObjectsResponse, RefUpdateRequest,
     ResolveRequest, ResolveResponse, TrustAnchorDto, UploadTargetsRequest, UploadTargetsResponse,
-    WarehouseInfo, MAX_MISSING_BATCH, MAX_RESOLVE_IDENTIFIERS, MAX_UPLOAD_TARGETS_BATCH, PROTOCOL_VERSION,
-    resolve_answer_cap,
+    WarehouseInfo, MAX_MISSING_BATCH, MAX_UPLOAD_TARGETS_BATCH, PROTOCOL_VERSION,
+    distinct_resolve_identifiers, resolve_answer_cap,
 };
 use forklift_core::util::office_utils::OFFICE_PALLET_NAME;
 use forklift_core::util::lock_utils::ServeLock;
@@ -2303,16 +2303,13 @@ async fn post_resolve(State(state): State<Arc<AppState>>,
     // server, hook or not, so the limit is part of the request's contract rather than of how a
     // server is configured. The hook answer's cap scales with these identifiers, so they are
     // what bounds it.
-    let identifiers: Vec<String> = request.identifiers.into_iter()
-        .collect::<std::collections::BTreeSet<_>>().into_iter().collect();
-
-    if identifiers.len() > MAX_RESOLVE_IDENTIFIERS {
-        tracing::warn!(count = identifiers.len(), "refused a resolve request naming too many identifiers");
-        return error_response(unprocessable(format!(
-            "At most {} distinct identifiers per resolve request; batch larger sets.",
-            MAX_RESOLVE_IDENTIFIERS
-        )));
-    }
+    let identifiers = match distinct_resolve_identifiers(request.identifiers) {
+        Ok(identifiers) => identifiers,
+        Err(refusal) => {
+            tracing::warn!("refused a resolve request naming too many identifiers");
+            return error_response(unprocessable(refusal));
+        }
+    };
 
     let Some(hook) = &state.resolution_hook else {
         // No directory is configured: the server knows no names. The client degrades
@@ -2331,12 +2328,15 @@ async fn post_resolve(State(state): State<Arc<AppState>>,
 
     // What a directory can legitimately answer for these identifiers.
     let answer_cap = resolve_answer_cap(&identifiers);
+    // Only what was asked is answered: a directory naming identifiers outside the request does not
+    // reach the client.
+    let asked: std::collections::BTreeSet<String> = identifiers.iter().cloned().collect();
     let hook_request = ResolutionHookRequest { caller, identifiers };
 
     let names = match post_hook(&state, hook, "resolution", &hook_request).await {
         Ok(response) if response.status().is_success() => {
             match body_utils::read_json_capped::<ResolutionHookResponse>(response, answer_cap).await {
-                Ok(answer) => answer.names,
+                Ok(answer) => answer.names.into_iter().filter(|(id, _)| asked.contains(id)).collect(),
                 Err(e) => {
                     tracing::warn!(error = ?e,
                         "the resolution hook's answer is unreadable, oversized or malformed; showing pseudonyms");

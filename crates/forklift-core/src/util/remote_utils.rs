@@ -95,9 +95,14 @@ const ERROR_BODY_CAP: u64 = 1024 * 1024;
 /// practice) keyed by its hash.
 const UPLOAD_TARGETS_BODY_BYTES_PER_HASH: u64 = 8 * 1024;
 
-/// The most identifier bytes one resolve request carries, so a roster of long identifiers is split
-/// well inside any server's request-body limit rather than refused whole.
+/// The most identifier bytes, as serialised, one resolve request carries, so a roster of long
+/// identifiers is split well inside any server's request-body limit rather than refused whole.
+/// An identifier longer than this on its own still goes, alone in its request.
 const RESOLVE_REQUEST_IDENTIFIER_BYTES: usize = 256 * 1024;
+
+/// The most resolve requests in flight at once: enough that a large roster costs a few deadlines
+/// rather than one per request, few enough not to swamp a server's directory hook.
+const RESOLVE_REQUESTS_IN_FLIGHT: usize = 4;
 
 /// The characters a warehouse path SEGMENT must be percent-encoded against before it is spliced
 /// into a URL. Everything but RFC 3986 unreserved characters (ASCII alphanumerics, `-`, `_`,
@@ -3094,17 +3099,19 @@ impl RemoteClient {
     /// Each distinct identifier is asked about once, in requests of at most
     /// [`MAX_RESOLVE_IDENTIFIERS`](crate::model::remote::MAX_RESOLVE_IDENTIFIERS) — the most a
     /// server accepts — and [`RESOLVE_REQUEST_IDENTIFIER_BYTES`], so a large roster resolves in
-    /// several requests rather than none. The requests run concurrently, so the call as a whole
-    /// is bounded by one request's deadline however many there are.
+    /// several requests rather than none. Up to [`RESOLVE_REQUESTS_IN_FLIGHT`] run at once, and
+    /// each request's answer counts only for the identifiers it asked about, so the names shown
+    /// never depend on which request finished first.
     pub async fn resolve(&self, identifiers: Vec<String>) -> BTreeMap<String, String> {
         let distinct: std::collections::BTreeSet<String> = identifiers.into_iter().collect();
         let mut batches: Vec<Vec<String>> = Vec::new();
         let mut batch_bytes = 0usize;
 
         for identifier in distinct {
+            let bytes = serde_json::to_string(&identifier).map_or(identifier.len(), |json| json.len() + 1);
             let full = batches.last().is_none_or(|batch| {
                 batch.len() >= crate::model::remote::MAX_RESOLVE_IDENTIFIERS
-                    || batch_bytes + identifier.len() > RESOLVE_REQUEST_IDENTIFIER_BYTES
+                    || batch_bytes + bytes > RESOLVE_REQUEST_IDENTIFIER_BYTES
             });
 
             if full {
@@ -3112,15 +3119,23 @@ impl RemoteClient {
                 batch_bytes = 0;
             }
 
-            batch_bytes += identifier.len();
+            batch_bytes += bytes;
             batches.last_mut().expect("a batch was just ensured").push(identifier);
         }
 
         let mut requests = JoinSet::new();
+        let in_flight = Arc::new(tokio::sync::Semaphore::new(RESOLVE_REQUESTS_IN_FLIGHT));
 
         for batch in batches {
             let client = self.clone();
-            requests.spawn(async move { client.resolve_batch(batch).await });
+            let in_flight = Arc::clone(&in_flight);
+
+            requests.spawn(async move {
+                let Ok(_permit) = in_flight.acquire().await else { return BTreeMap::new() };
+                let asked: std::collections::BTreeSet<String> = batch.iter().cloned().collect();
+
+                client.resolve_batch(batch).await.into_iter().filter(|(id, _)| asked.contains(id)).collect()
+            });
         }
 
         let mut names = BTreeMap::new();
@@ -9992,6 +10007,56 @@ mod tests {
         assert_eq!(batches.iter().sum::<usize>(), distinct, "each identifier is asked about once: {:?}", batches);
         assert!(batches.iter().all(|&n| n <= crate::model::remote::MAX_RESOLVE_IDENTIFIERS),
             "no request exceeds the server's limit: {:?}", batches);
+    }
+
+    /// Long identifiers split a roster by bytes, not just by count; the requests run at once (three
+    /// one-second answers in well under three seconds); and a name an answer gives for an
+    /// identifier its request did not ask about is dropped.
+    #[test]
+    fn resolve_splits_by_bytes_runs_requests_at_once_and_keeps_only_asked_names() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let batches = std::sync::Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+        let seen = std::sync::Arc::clone(&batches);
+
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let seen = std::sync::Arc::clone(&seen);
+
+                std::thread::spawn(move || {
+                    use std::io::Write;
+
+                    let Some((_, _, _, body)) = read_test_request(&mut stream) else { return };
+                    seen.lock().unwrap().push(body.len());
+                    let request: ResolveRequest = serde_json::from_slice(&body).unwrap();
+                    let mut names: BTreeMap<String, String> = request.identifiers.iter()
+                        .map(|id| (id.clone(), "Named".to_string())).collect();
+                    names.insert("never-asked".to_string(), "Intruder".to_string());
+                    let answer = serde_json::json!({ "names": names }).to_string();
+
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        answer.len(), answer);
+                });
+            }
+        });
+
+        // About 600 KB of identifiers: three requests by bytes, far under the count limit.
+        let identifiers: Vec<String> = (0..600).map(|i| format!("{:04}{}", i, "x".repeat(996))).collect();
+        let client = RemoteClient::new(&url, None).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let started = std::time::Instant::now();
+        let names = runtime.block_on(client.resolve(identifiers));
+        let elapsed = started.elapsed();
+
+        assert_eq!(names.len(), 600, "every asked identifier resolves, and nothing else");
+        assert!(!names.contains_key("never-asked"), "a name for an identifier no request asked about is dropped");
+        let batches = batches.lock().unwrap().clone();
+        assert_eq!(batches.len(), 3, "split by bytes: {:?}", batches);
+        assert!(batches.iter().all(|&bytes| bytes <= RESOLVE_REQUEST_IDENTIFIER_BYTES + 64), "{:?}", batches);
+        assert!(elapsed < std::time::Duration::from_millis(2_500),
+            "three one-second requests run at once, not one after another: {:?}", elapsed);
     }
 
     /// An importer that refuses the bundle stops the transfer at once: a remote that sends a

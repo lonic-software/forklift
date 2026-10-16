@@ -236,7 +236,7 @@ it simply shows pseudonyms.
 * Duplicate `event` deliveries are normal; idempotence is the consumer's job.
 * Keep answers small. The server reads at most 64 KiB of an `authentication` or
   `admission` answer, and refuses a larger one exactly as it does an unreachable hook
-  (fail closed). A `resolution` answer may take each identifier's own length plus
-  1 KiB per identifier asked for, plus 64 KiB; a larger one shows pseudonyms. The
+  (fail closed). A `resolution` answer may take six times each identifier's length (room
+  for JSON escaping) plus 1 KiB per identifier asked for, plus 64 KiB; a larger one shows pseudonyms. The
   server asks about each identifier once, and a resolve request may name at most
   10,000 distinct identifiers (the client splits a larger roster across requests).

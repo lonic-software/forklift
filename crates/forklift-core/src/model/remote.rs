@@ -236,6 +236,22 @@ pub struct ResolveRequest {
 /// with more splits them across requests.
 pub const MAX_RESOLVE_IDENTIFIERS: usize = 10_000;
 
+/// A resolve request's identifiers, each once, or the refusal every head gives a request naming
+/// more than [`MAX_RESOLVE_IDENTIFIERS`] distinct ones.
+pub fn distinct_resolve_identifiers(identifiers: Vec<String>) -> Result<Vec<String>, String> {
+    let distinct: Vec<String> = identifiers.into_iter()
+        .collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+
+    if distinct.len() > MAX_RESOLVE_IDENTIFIERS {
+        return Err(format!(
+            "At most {} distinct identifiers per resolve request; batch larger sets.",
+            MAX_RESOLVE_IDENTIFIERS
+        ));
+    }
+
+    Ok(distinct)
+}
+
 /// Per-identifier allowance in a resolve answer, beyond the identifier itself: the name it
 /// resolves to and the JSON around the pair.
 pub const RESOLVE_ANSWER_BYTES_PER_IDENTIFIER: u64 = 1024;
