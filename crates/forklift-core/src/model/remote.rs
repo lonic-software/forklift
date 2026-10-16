@@ -239,31 +239,22 @@ pub struct ResolveRequest<'a> {
 /// with more splits them across requests.
 pub const MAX_RESOLVE_IDENTIFIERS: usize = 10_000;
 
-/// A resolve request's identifiers, each once, or the refusal every head gives a request naming
-/// more than [`MAX_RESOLVE_IDENTIFIERS`] distinct ones.
-pub fn distinct_resolve_identifiers(identifiers: Vec<String>) -> Result<Vec<String>, String> {
-    let distinct: std::collections::BTreeSet<String> = identifiers.into_iter().collect();
-    refuse_past_resolve_limit(distinct.len())?;
+/// A resolve request's identifiers, each once and sorted, or the refusal every head gives a
+/// request naming more than [`MAX_RESOLVE_IDENTIFIERS`] distinct ones (which says how many it
+/// named). Borrowed, so a head that only checks the limit copies nothing.
+pub fn distinct_resolve_identifiers(identifiers: &[String])
+                                    -> Result<std::collections::BTreeSet<&String>, String> {
+    let distinct: std::collections::BTreeSet<&String> = identifiers.iter().collect();
 
-    Ok(distinct.into_iter().collect())
-}
-
-/// Refuse a resolve request naming more than [`MAX_RESOLVE_IDENTIFIERS`] distinct identifiers,
-/// without copying them; the refusal says how many it named.
-pub fn check_resolve_identifiers(identifiers: &[String]) -> Result<(), String> {
-    refuse_past_resolve_limit(identifiers.iter().collect::<std::collections::BTreeSet<_>>().len())
-}
-
-fn refuse_past_resolve_limit(distinct: usize) -> Result<(), String> {
-    if distinct > MAX_RESOLVE_IDENTIFIERS {
+    if distinct.len() > MAX_RESOLVE_IDENTIFIERS {
         return Err(format!(
             "This resolve request names {} distinct identifiers; at most {} are allowed per \
             request, so batch larger sets.",
-            distinct, MAX_RESOLVE_IDENTIFIERS
+            distinct.len(), MAX_RESOLVE_IDENTIFIERS
         ));
     }
 
-    Ok(())
+    Ok(distinct)
 }
 
 /// Per-identifier allowance in a resolve answer, beyond the identifier itself: the name it

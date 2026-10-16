@@ -2299,8 +2299,8 @@ async fn post_resolve(State(state): State<Arc<AppState>>,
     // server, hook or not, so the limit is part of the request's contract rather than of how a
     // server is configured. The hook answer's cap scales with these identifiers, so they are
     // what bounds it.
-    let identifiers = match distinct_resolve_identifiers(request.identifiers.into_owned()) {
-        Ok(identifiers) => identifiers,
+    let identifiers: Vec<String> = match distinct_resolve_identifiers(&request.identifiers) {
+        Ok(identifiers) => identifiers.into_iter().cloned().collect(),
         Err(refusal) => {
             tracing::warn!(refusal = %refusal, "refused a resolve request naming too many identifiers");
             return error_response(unprocessable(refusal));

@@ -629,11 +629,6 @@ pub fn import_bundle(path: &Path) -> Result<ImportStats, String> {
     import_bundle_reader(std::io::BufReader::new(file))
 }
 
-/// Import an in-memory bundle into the object store — the same verification as `import_bundle`.
-pub fn import_bundle_bytes(bytes: &[u8]) -> Result<ImportStats, String> {
-    import_bundle_reader(std::io::Cursor::new(bytes))
-}
-
 /// Import a bundle streamed from a remote (a batch or subtree response) as it arrives — the same
 /// verification as `import_bundle`, holding at most one record in memory.
 ///
@@ -1011,6 +1006,11 @@ mod tests {
     use crate::model::recipe::{Recipe, RecipeChunk};
     use crate::model::tree_item::TreeItem;
     use crate::util::byte_utils::number_to_vlq_bytes;
+
+    /// Import an in-memory bundle, as `import_bundle` imports a file.
+    fn import_bundle_bytes(bytes: &[u8]) -> Result<ImportStats, String> {
+        import_bundle_reader(std::io::Cursor::new(bytes))
+    }
 
     /// A fresh warehouse root for one test, entered as the active storage-root scope for
     /// its lifetime. Each test gets its own directory (and its own thread, `cargo test`'s

@@ -2861,21 +2861,26 @@ impl RemoteClient {
     /// the flat [`ERROR_BODY_READ_TIMEOUT`] alone is not it.
     async fn error_of(&self, response: reqwest::Response, action: &str) -> String {
         let status = response.status();
-        let budget = self.error_body_budget();
+        let body = self.read_error_body(response).await;
 
-        let reason = status.canonical_reason().unwrap_or("unknown error").to_string();
-        let (message, code, next_step) = match tokio::time::timeout(
-            budget, body_utils::read_json_capped::<ErrorResponse>(response, ERROR_BODY_CAP)
+        classify_remote_error(status.as_u16(), action, body.error, body.code, body.next_step)
+    }
+
+    /// Read a refusal's error body within [`ERROR_BODY_CAP`] and the error-body budget. A body that
+    /// cannot be read stands in as the status's reason, and one over the cap says it was not read.
+    async fn read_error_body(&self, response: reqwest::Response) -> ErrorResponse {
+        let reason = response.status().canonical_reason().unwrap_or("unknown error").to_string();
+        let unread = |error: String| ErrorResponse { error, code: None, next_step: None };
+
+        match tokio::time::timeout(
+            self.error_body_budget(), body_utils::read_json_capped::<ErrorResponse>(response, ERROR_BODY_CAP)
         ).await {
-            Ok(Ok(body)) => (body.error, body.code, body.next_step),
-            Ok(Err(JsonReadError::Body(BodyReadError::OverCap { cap }))) => (
-                format!("{} (the remote's description of the error is larger than {} bytes and was not read)", reason, cap),
-                None, None,
-            ),
-            Ok(Err(_)) | Err(_) => (reason, None, None),
-        };
-
-        classify_remote_error(status.as_u16(), action, message, code, next_step)
+            Ok(Ok(body)) => body,
+            Ok(Err(JsonReadError::Body(BodyReadError::OverCap { cap }))) => unread(format!(
+                "{} (the remote's description of the error is larger than {} bytes and was not read)", reason, cap
+            )),
+            Ok(Err(_)) | Err(_) => unread(reason),
+        }
     }
 
     /// Read a whole response body within `cap`, composing each failure the way this client
@@ -3441,11 +3446,11 @@ impl RemoteClient {
 
         drop(sender);
 
-        let imported = importer.await
-            .map_err(|e| format!("The bundle-import task panicked: {}", e))?;
+        let imported = importer.await;
 
+        // When both sides fail, the transfer's error is the cause, even if the importer panicked.
         transferred?;
-        imported
+        imported.map_err(|e| format!("The bundle-import task panicked: {}", e))?
     }
 
     /// Fetch one object's raw bytes. On [`Posture::BoundedObjectReads`], not [`Posture::BoundedReads`]
@@ -3669,10 +3674,7 @@ impl RemoteClient {
         }
 
         let status = response.status();
-        let message = match body_utils::read_json_capped::<ErrorResponse>(response, body_utils::SMALL_BODY_CAP).await {
-            Ok(body) => body.error,
-            Err(_) => status.canonical_reason().unwrap_or("unknown error").to_string(),
-        };
+        let message = self.read_error_body(response).await.error;
 
         if is_transient_commit_failure(status, &message) {
             return Ok(CommitOutcome::BlobNotReady);
@@ -3702,7 +3704,7 @@ impl RemoteClient {
 
         self.read_body(
             response, body_utils::SMALL_BODY_CAP, &format!("reading the signature of {}", parcel_hash),
-            posture, &format!("the signature of {}", parcel_hash),
+            posture, &format!("signature of {}", parcel_hash),
         ).await.map(Some)
     }
 
@@ -10204,8 +10206,8 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------------------
-    // The unbounded error-body read: `error_of` calls `response.json()` with no bound of its own
-    // once a non-success status line has arrived. The auto-following client (`Posture::
+    // The error-body read: once a non-success status line has arrived, `error_of` reads the body
+    // through `read_error_body`, whose byte cap bounds its size but not how long it takes. The auto-following client (`Posture::
     // UnboundedFollowsRedirects`, which `missing_objects` rides) carries only a `connect_timeout`,
     // no `read_timeout` at all — so a remote that delivers a
     // full status line and headers and then wedges before writing the body hangs the caller
@@ -10266,8 +10268,8 @@ mod tests {
     /// `missing_objects_times_out_against_a_silent_remote`'s own budget) the outer deadline is the
     /// *tighter* of the two and would fire first instead — a real, deliberate interaction between
     /// the two bounds, not a gap: whichever fires first still surfaces as a plain `Err` through the
-    /// same `error_of` fallback path either way (a timed-out `response.json()` and an elapsed inner
-    /// `tokio::time::timeout` both take the same "no usable error body arrived" arm), so no call
+    /// same `error_of` fallback path either way (a body read cut off by the deadline and an elapsed
+    /// inner `tokio::time::timeout` both take the same "no usable error body arrived" arm), so no call
     /// ever hangs regardless of which bound wins.
     ///
     /// Before this call had its own outer deadline at all, it rode the auto-following client with
@@ -11047,9 +11049,9 @@ mod tests {
     /// parked-connection shape as [`LyingContentLengthRemote`], but for a JSON body instead of raw
     /// bytes, and generic to any request path (via [`read_test_request`]) rather than one
     /// endpoint. Exists for the tests below: a fully [`SilentRemote`] never gets past headers, so
-    /// it cannot distinguish `missing_objects`/`upload_targets`'s `response.json()` timeout branch
-    /// (route through the composer) from their JSON-parse-failure branch (the unconditional "not
-    /// valid JSON" message) — both look identical against total silence, because neither branch is
+    /// it cannot distinguish `read_json`'s transport-failure branch for `missing_objects`/
+    /// `upload_targets` (routed through the composer) from its parse-failure branch (the "not valid
+    /// JSON" message) — both look identical against total silence, because neither branch is
     /// ever reached without headers. This fixture reaches the body-read arm specifically: headers
     /// and a fragment arrive, then the connection stalls forever mid-body.
     struct PartialJsonThenSilentRemote {
@@ -11069,7 +11071,7 @@ mod tests {
                 if let Ok((mut stream, _)) = listener.accept() {
                     let _ = read_test_request(&mut stream);
                     // Claims 4096 bytes of JSON, writes one opening brace, then parks — the rest
-                    // never arrives and the connection is never closed, so response.json() is
+                    // never arrives and the connection is never closed, so the body read is
                     // left waiting on bytes that are never coming rather than failing to parse
                     // what little it already has.
                     let _ = write!(
@@ -11087,11 +11089,10 @@ mod tests {
         }
     }
 
-    /// Distinguishes the body-phase fix from a cosmetic one: reverting `missing_objects`'s
-    /// `response.json()` map_err back to the unconditional "not valid JSON" message (dropping the
-    /// `is_timeout()` branch) would still pass every silent-remote test above — a fully silent
-    /// remote never sends headers at all, so it never reaches `response.json()`'s error arm in the
-    /// first place. Against [`PartialJsonThenSilentRemote`] it does: the deadline still fires (the
+    /// Distinguishes the body-phase fix from a cosmetic one: reporting every failed read in
+    /// `read_json` as "not valid JSON" (dropping its transport-failure branch) would still pass
+    /// every silent-remote test above — a fully silent remote never sends headers at all, so it
+    /// never reaches the body read's error arm in the first place. Against [`PartialJsonThenSilentRemote`] it does: the deadline still fires (the
     /// `TotalDeadline` posture bounds the whole response, body included — a total timeout carries
     /// into the body read, not just `.send()`), and the message must be the deadline message, not
     /// the JSON-parse-failure one, since the remote never sent garbage — it sent a valid-so-far
@@ -11167,10 +11168,10 @@ mod tests {
         }
     }
 
-    /// Pins the `else` half of `missing_objects`'s `if e.is_timeout()` guard, which the two
-    /// partial-body tests above cannot reach: their fixture only ever produces the timeout case,
-    /// so widening the condition to `true` — routing *every* `response.json()` failure through the
-    /// composer — leaves both of them green.
+    /// Pins `read_json`'s parse-failure branch for `missing_objects`, which the two partial-body
+    /// tests above cannot reach: their fixture only ever produces a transport failure, so routing
+    /// *every* failed read through the composer — parse failures included — leaves both of them
+    /// green.
     ///
     /// Measured under that mutant, against a proxy or captive portal answering `200` with an HTML
     /// interstitial: the message becomes `"Error while negotiating with the remote: expected value
@@ -11321,11 +11322,55 @@ mod tests {
             "the refusal names what was refused and the cap: {}", message);
     }
 
-    /// The third `is_timeout()` json guard, on `fetch_info`, gets the same treatment as the two
-    /// above. It predates this reshape and was the *least* covered of the three: mutating it to
-    /// `if true` left the entire crate suite green, because every existing `fetch_info` test
-    /// drives either a refused connect or header-phase silence, neither of which ever reaches
-    /// `response.json()`'s error arm at all.
+    /// A signature sidecar over its cap is refused in words that read: the remote's signature of
+    /// the parcel, named once.
+    #[test]
+    fn an_over_cap_signature_is_refused_naming_it_once() {
+        let url = serve_one_handshake(
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {}", body_utils::SMALL_BODY_CAP + 1),
+            String::new(),
+        );
+        let client = RemoteClient::new(&url, None).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+
+        let message = runtime.block_on(client.fetch_signature("abc")).expect_err("an over-cap sidecar is refused");
+        assert!(message.contains("The answer to the remote's signature of abc is larger than"), "{}", message);
+    }
+
+    /// A lift-commit refusal whose description runs past the small-answer cap is still read (it
+    /// may list many blobs), and one past the error-body cap says its description went unread
+    /// instead of passing for the bare status.
+    #[test]
+    fn a_long_lift_commit_refusal_is_read_and_an_over_cap_one_says_so() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let refusal = |length: u64| {
+            let url = serve_one_handshake(
+                format!("HTTP/1.1 422 Unprocessable Entity\r\nContent-Type: application/json\r\nContent-Length: {}", length),
+                if length <= ERROR_BODY_CAP {
+                    let error = "b".repeat(length as usize - r#"{"error":""}"#.len());
+                    serde_json::json!({ "error": error }).to_string()
+                } else {
+                    String::new()
+                },
+            );
+            let client = RemoteClient::new(&url, None).unwrap();
+            match runtime.block_on(client.commit_lift("session", &[], &[], false)) {
+                Err(message) => message,
+                Ok(_) => panic!("a 422 is refused"),
+            }
+        };
+
+        let long = refusal(body_utils::SMALL_BODY_CAP * 2);
+        assert!(long.contains(&"b".repeat(1000)), "the long description is read: {:.200}", long);
+
+        let unread = refusal(ERROR_BODY_CAP + 1);
+        assert!(unread.contains("was not read"), "{}", unread);
+    }
+
+    /// The handshake's read in `fetch_info` gets the same treatment as the two above. It was the
+    /// *least* covered of the three: routing its parse failures through the composer left the
+    /// entire crate suite green, because every other `fetch_info` test drives either a refused
+    /// connect or header-phase silence, neither of which ever reaches the body read's error arm.
     ///
     /// The handshake is the first call any remote operation makes, so this is the guard a captive
     /// portal meets first: a `200` carrying an HTML sign-in page on `/v1/warehouse` must be

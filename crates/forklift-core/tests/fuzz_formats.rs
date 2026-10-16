@@ -472,7 +472,8 @@ mod regressions {
     /// `vec![0u8; length]` before reading — a one-record denial of service (capacity-overflow
     /// panic / allocator abort). Import now reads the record as a bounded stream and reports the
     /// short stream as truncation. This is the most exposed of the length bugs, so it is pinned
-    /// end-to-end through `import_bundle_bytes`.
+    /// end-to-end through `import_bundle`, the path a downloaded bundle file takes. (A batch or
+    /// subtree streamed from a remote takes `import_streamed_bundle`, pinned in its own module.)
     #[test]
     fn bundle_import_rejects_a_huge_record_length_without_allocating_it() {
         // A private storage scope: `import` resolves the object root from the thread-local scope,
@@ -492,7 +493,9 @@ mod regressions {
         record.extend(b"only a few real bytes");
         raw.extend(zstd::encode_all(&record[..], 3).unwrap());
 
-        let result = forklift_core::util::bundle_utils::import_bundle_bytes(&raw);
+        let bundle = temp.join("hostile.bundle");
+        std::fs::write(&bundle, &raw).unwrap();
+        let result = forklift_core::util::bundle_utils::import_bundle(&bundle);
         assert!(result.is_err(), "a huge record length must be an error, not a panic/abort");
 
         std::fs::remove_dir_all(&temp).ok();
