@@ -1344,7 +1344,8 @@ refusal before ever reaching its own fetch):
   doing. A tag whose parcel is not in this store never holds a heal up: the parcel may never
   have been fetched (a clone with `--only` still copies every tag) or may have been collected
   after an `undo` moved the history off it, and nothing could bring it back. `heal` names such a
-  tag in a `Note:` line and clears. The same goes for a trust boundary naming a head this store
+  tag in a `Note:` line and clears; so it does for a tag record synced in from elsewhere whose
+  subject is not a parcel at all. The same goes for a trust boundary naming a head this store
   never fetched. A lost parcel that a pallet's history still needs is reported as below, even if
   a tag also names it.
 - **Something is genuinely gone, and something still needs it** — `heal` reports exactly what,
