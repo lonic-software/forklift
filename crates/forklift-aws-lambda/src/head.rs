@@ -350,6 +350,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             if office_head.is_some() {
                 return Err(Self::anchor_lost());
             }
+            self.require_adopted_history(&anchor)?;
 
             return match self
                 .refs
@@ -983,6 +984,24 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
 
     /// The `409` for planting an anchor over an office whose own anchor was lost: the chain was
     /// never verified against the anchor offered, so no client may supply one.
+    /// Refuse a first anchor whose `adopts` names history this warehouse does not hold. The
+    /// replacement path needs no such check — it requires `adopts` to be the office head — but a
+    /// first anchor arrives over an unborn office, and every warehouse that adopts it later
+    /// fetches that history from here. The client uploads it before the anchor.
+    fn require_adopted_history(&self, anchor: &TrustAnchorDto) -> Result<(), HeadError> {
+        if let Some(adopts) = &anchor.adopts {
+            if !self.objects.exists(adopts).map_err(HeadError::internal)? {
+                return Err(HeadError::unprocessable(format!(
+                    "The trust anchor adopts office head {}, which this warehouse does not \
+                    hold. Lift that history before the anchor.",
+                    adopts
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
     fn anchor_lost() -> HeadError {
         HeadError::conflict(
             "This warehouse holds an office but no trust anchor: its anchor was lost. The \

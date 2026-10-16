@@ -61,8 +61,9 @@
 //! name a head this store was never going to hold — is, when absent, neither reported through the
 //! sink nor marked visited (FORK-81). Not marking it is deliberate: the same hash reached later as
 //! a genuine parent edge carries the reporting policy and must still resolve. `adopts` is the
-//! exception among the pins and keeps the ordinary reporting behaviour, because a warehouse that
-//! performed its own re-genesis held that object by construction.
+//! exception among the pins and keeps the ordinary reporting behaviour, because every warehouse
+//! holding the anchor holds that object by construction (see
+//! [`crate::util::office_utils::PinAbsencePolicy::Loss`]).
 //!
 //! This is sound to *clear* on, not merely tolerate: `collect_walk_roots`'s own doc comment
 //! establishes that this walk's root set is a superset of

@@ -1958,6 +1958,22 @@ async fn put_trust(State(state): State<Arc<AppState>>,
                     ));
                 }
 
+                // A first anchor arrives over an unborn office, so nothing above ties its
+                // `adopts` to held history — but every warehouse that adopts this anchor later
+                // fetches that history from here. The client uploads it before the anchor.
+                if let Some(adopts) = &anchor.adopts {
+                    if !file_utils::does_object_exist(adopts).map_err(internal)? {
+                        return Err((
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            format!(
+                                "The trust anchor adopts office head {}, which this warehouse \
+                                does not hold. Lift that history before the anchor.",
+                                adopts
+                            )
+                        ));
+                    }
+                }
+
                 office_utils::write_trust_anchor(&anchor.to_anchor()).map_err(internal)?;
 
                 let mut event = HookEvent::new(EVENT_TRUST_ESTABLISHED);

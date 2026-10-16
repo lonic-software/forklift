@@ -552,19 +552,13 @@ pub enum TrustPinReadPolicy {
 /// there, and still is under this policy).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PinAbsencePolicy {
-    /// This warehouse's own commands set this pin to a head it held at the moment of writing: the
-    /// re-genesis `adopts` pin (`office regenesis`, office.rs) names *this warehouse's own* prior
-    /// office head — present by construction on the warehouse that performed the re-genesis. Its
-    /// absence is genuine local loss and is reported exactly like any ordinary ref.
-    ///
-    /// The one documented exception is a franchise's verbatim copy of a remote's already-
-    /// re-genesis'd anchor (`remote_utils::adopt_remote_trust`'s `write_trust_anchor(&remote_trust
-    /// .to_anchor())`): that franchise's own `fetch_history` call only follows the *new* chain's
-    /// ancestry, never the adopted, pre-re-genesis one, so it can legitimately never hold that
-    /// object. This policy still reports it there — matching `adopts`'s pre-FORK-81 (main-branch)
-    /// behavior exactly, not a new regression; recovering that specific case is a distinct piece
-    /// of work, not this one — tracked as FORK-114 (PR #120 round 3, F3): on such a franchise,
-    /// every `forklift heal` reports the adopted head dangling and refuses to clear, forever.
+    /// The pin names history every warehouse holding the anchor holds, by construction: the
+    /// re-genesis `adopts` pin. `office regenesis` (office.rs) sets it to this warehouse's own
+    /// prior office head; every other way an anchor with `adopts` arrives fetches that history
+    /// before writing the anchor (`remote_utils::fetch_adopted_history`, on franchise and on
+    /// `office accept-regenesis`), and a remote refuses a first anchor whose adopted history it
+    /// does not hold. Its absence is therefore genuine local loss, reported exactly like any
+    /// ordinary ref.
     Loss,
     /// This pin names a head *declared* by a remote or a revoker at the moment of enrollment or
     /// revocation, never pulled first (`office enroll`/`office revoke`, DESIGN.html §8.7/§8.11):

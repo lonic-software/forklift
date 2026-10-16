@@ -1479,6 +1479,51 @@ fn accepting_a_regenesis_from_behind_holds_the_adopted_history_and_heals() {
         healed.status.code(), stderr(&healed));
 }
 
+/// FORK-114, the lifting side: a warehouse that re-genesised before it ever lifted establishes
+/// its anchor on a fresh remote. The office lift carries only the new chain, so the adopted
+/// history must be uploaded with the anchor — or the remote holds a pin it cannot serve, and
+/// every franchise of it fails.
+#[test]
+fn a_regenesis_lifted_to_a_fresh_remote_carries_its_adopted_history() {
+    let area = TestArea::new("regenesis-first-lift");
+    let server = Server::start(&area, Some("root"));
+
+    prepare_warehouse(&area, "a", &server.url);
+    assert_success(&area.forklift("a", &["config", "remote.token", "root"]));
+    area.write_file("a/code.txt", "v1\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "base"]));
+    assert_success(&area.forklift("a", &["office", "enroll"]));
+    std::fs::remove_dir_all(area.path("shared-keys")).unwrap();
+    assert_success(&area.forklift("a", &["office", "regenesis", "--confirm"]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    assert_success(&area.forklift(".", &["franchise", &server.url, "c", "--token", "root"]));
+    plant_torn_taint(&area, "c");
+    let healed = area.forklift("c", &["heal"]);
+    assert!(healed.status.success(),
+        "heal must clear on a franchise of a remote first lifted after a re-genesis: {:?}\n{}",
+        healed.status.code(), stderr(&healed));
+}
+
+/// FORK-114: the server refuses a first anchor whose `adopts` names history it does not hold —
+/// it would be a pin it can never serve — and stores nothing.
+#[test]
+fn the_server_refuses_a_first_anchor_adopting_history_it_does_not_hold() {
+    let area = TestArea::new("first-anchor-adopts");
+    let server = Server::start(&area, None);
+
+    let missing = "ab".repeat(32);
+    let body = serde_json::json!({
+        "genesis": "cd".repeat(32), "enabled_at": 0, "boundary": [], "adopts": missing,
+    }).to_string();
+    let (status, response) = http_send_json(&server.url, "PUT", "/v1/trust", &body);
+    assert!(status.contains("422"), "{} {}", status, response);
+    assert!(response.contains(&missing), "the refusal must name the pin: {}", response);
+
+    assert_success(&area.forklift(".", &["franchise", &server.url, "d"]));
+}
+
 /// Clients refuse a malformed anchor at the handshake, so the server must never store one: trust
 /// is a one-way door, and a stored malformed anchor would lock every client out for good.
 #[test]
