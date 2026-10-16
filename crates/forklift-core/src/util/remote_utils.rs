@@ -2862,11 +2862,11 @@ impl RemoteClient {
     /// instance's own `connect_timeout` into [`error_body_read_budget`]'s arithmetic. Split out as
     /// its own `&self` method, rather than inlining the call to the free function at its call
     /// sites (`error_of` and `commit_lift`), so a test can pin that the right instance field is
-    /// actually read: not just read from *some* client (every behavioral test of [`Self::error_of`] necessarily uses a direct
-    /// client, so none of them distinguishes "reads `self.budgets.connect`" from "hardcodes the
-    /// direct 5s constant", and a `TorMode::On` fixture has the identical problem one level up, at
-    /// 60s instead of 5s), but read from an instance whose `connect_timeout` a production
-    /// constructor could never have produced — see
+    /// actually read: not just read from *some* client (every behavioral test of [`Self::error_of`]
+    /// necessarily uses a direct client, so none of them distinguishes "reads
+    /// `self.budgets.connect`" from "hardcodes the direct 5s constant", and a `TorMode::On` fixture
+    /// has the identical problem one level up, at 60s instead of 5s), but read from an instance
+    /// whose `connect_timeout` a production constructor could never have produced — see
     /// `error_body_budget_reads_this_field_not_a_rival_constant` in the test module.
     fn error_body_budget(&self) -> std::time::Duration {
         error_body_read_budget(&self.budgets)
@@ -10224,8 +10224,8 @@ mod tests {
     // forever. The caller's `error_body_budget` bounds the read itself, in `read_error_body`,
     // rather than trying to fix it with yet another client — no client can help here, since the
     // body-read bound is inherited from whichever client sent the request, and `error_of` serves
-    // responses from all of them. `commit_lift` reads its refusals under the same budget; only its wait for
-    // the response itself stays unbounded, under FORK-91.
+    // responses from all of them. `commit_lift` reads its refusals under the same budget; only its
+    // wait for the response itself stays unbounded, under FORK-91.
     // -----------------------------------------------------------------------------------
 
     /// A remote that delivers a non-success status line and full headers (claiming a body),
@@ -10285,9 +10285,9 @@ mod tests {
     /// no bound of any kind — a `500` whose body then wedges hung it forever, with the status line
     /// and headers already fully delivered. The outer test-ceiling below is a safety net, not the
     /// property under test: if the bound in `read_error_body` were missing, that ceiling is what
-    /// would trip (the test failing instead of hanging the suite) — unambiguous evidence the internal
-    /// bound is gone, since status line and headers were fully delivered before the park, so the
-    /// only thing left to hang on is the error-body read itself.
+    /// would trip (the test failing instead of hanging the suite) — unambiguous evidence the
+    /// internal bound is gone, since status line and headers were fully delivered before the park,
+    /// so the only thing left to hang on is the error-body read itself.
     ///
     /// Also asserts a **lower** bound on elapsed time: a red-then-green
     /// suite run alone does not prove `error_of` calls [`error_body_read_budget`] at all — nothing
