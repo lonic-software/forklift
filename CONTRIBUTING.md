@@ -101,7 +101,9 @@ as-is.
 - Read the [contributor guide](docs/guide/contributing.md) for architecture,
   build/test instructions, and the conventions the codebase holds to (they are
   load-bearing and enforced by tests).
-- Run `pult check` (build + test + clippy — what CI runs) before opening a PR.
+- Run `pult check` (formatting guard + build + test + clippy — what CI runs) before opening a PR.
+- The code is formatted by hand: do not run `cargo fmt`; match the surrounding code
+  (see [formatting](docs/guide/contributing.md#formatting)).
 - Commit subjects follow `Area - Topic: short description`.
 - Documentation is part of the change, not a follow-up — see
   [keeping docs in sync](docs/guide/contributing.md#8-keeping-docs-in-sync).

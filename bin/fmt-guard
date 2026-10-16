@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Fails unless rustfmt is switched off for the whole tree. Forklift is formatted by hand, and the
+# root rustfmt.toml sets disable_all_formatting so that `cargo fmt` is a no-op (see
+# docs/guide/contributing.md, "Formatting"). bin/check and CI run this. It never formats anything.
+#
+# The config is checked directly, not inferred from the code. A second rustfmt.toml or
+# .rustfmt.toml would switch rustfmt back on for some files beneath it, and `cargo fmt --check`
+# cannot be relied on to notice: it reads configs only at each crate target's root, and stays green
+# wherever the files already happen to be rustfmt-clean. Nor is the search left to git, which skips
+# ignored files and can fail without telling this script.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+fail() {
+    echo "fmt-guard: $1" >&2
+    echo "Do not run cargo fmt; see docs/guide/contributing.md, \"Formatting\"." >&2
+    exit 1
+}
+
+# The root config must hold that one setting and nothing else but comments, so no table, second
+# key or parse error can hide behind a line that looks right. CR is stripped for CRLF checkouts.
+[ -f rustfmt.toml ] || fail "rustfmt.toml is missing from the repository root."
+settings="$(tr -d '\r' < rustfmt.toml | grep -v -e '^[[:space:]]*#' -e '^[[:space:]]*$' || true)"
+if [ "$settings" != "disable_all_formatting = true" ]; then
+    fail "rustfmt.toml must contain only comments and the line 'disable_all_formatting = true'."
+fi
+
+# Every other rustfmt config in the tree, ignored files included. The target dirs hold build
+# output, .git is git's, and .claude holds other worktrees, each with its own guard.
+found="$(find . \( -path ./target -o -path ./target-lambda-docker -o -path ./.git -o -path ./.claude \) \
+    -prune -o \( -name rustfmt.toml -o -name .rustfmt.toml \) -print)" \
+    || fail "could not search the tree for rustfmt configs."
+others="$(printf '%s\n' "$found" | grep -vx './rustfmt.toml' | tr '\n' ' ' || true)"
+if [ -n "$others" ]; then
+    fail "a second rustfmt config would switch rustfmt back on beneath it: $others"
+fi
+
+# The effect, as well as the config: nothing cargo fmt reaches may come out reformatted.
+if ! cargo fmt --version >/dev/null 2>&1; then
+    fail "cargo fmt is not installed, so the guard cannot be checked (rustup component add rustfmt)."
+fi
+if ! cargo fmt --all --check >/dev/null; then
+    fail "cargo fmt --all --check failed: it would reformat files, or could not run (its errors are above)."
+fi
+
+echo "fmt-guard: rustfmt is switched off for the whole tree"
