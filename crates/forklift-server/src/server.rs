@@ -275,7 +275,12 @@ pub struct ServeOptions {
 /// Per-identifier allowance in a resolution hook's answer: the identifier and the name it resolves
 /// to. The authentication and admission hooks answer a fixed-size verdict and are capped at
 /// [`body_utils::SMALL_BODY_CAP`].
-const RESOLUTION_ANSWER_BYTES_PER_IDENTIFIER: u64 = 4 * 1024;
+const RESOLUTION_ANSWER_BYTES_PER_IDENTIFIER: u64 = 1024;
+
+/// The most distinct identifiers one resolve request may name. The hook answer's cap scales with
+/// the count, so this is what keeps a broken directory from making one request hold more than
+/// about 10 MiB; it is far above the operators any one history display names.
+const MAX_RESOLVE_IDENTIFIERS: usize = 10_000;
 
 /// The flat request timeout this head arms on the `reqwest::Client` it calls every hook
 /// through ([`build_hook_client`] builds from this constant and takes no figure of its own).
@@ -2316,8 +2321,20 @@ async fn post_resolve(State(state): State<Arc<AppState>>,
 
     // Each identifier's resolved name plus its key, with the envelope on top: what a directory
     // can legitimately answer for this many identifiers.
-    let answer_cap = body_utils::per_item_body_cap(request.identifiers.len(), RESOLUTION_ANSWER_BYTES_PER_IDENTIFIER);
-    let hook_request = ResolutionHookRequest { caller, identifiers: request.identifiers };
+    // Asked once per distinct identifier, and never for more than a directory can be expected to
+    // answer at once: the answer's cap scales with the count, so the count is what bounds it.
+    let identifiers: Vec<String> = request.identifiers.into_iter()
+        .collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+
+    if identifiers.len() > MAX_RESOLVE_IDENTIFIERS {
+        return error_response((StatusCode::BAD_REQUEST, format!(
+            "A resolve request may name at most {} distinct identifiers; this one names {}.",
+            MAX_RESOLVE_IDENTIFIERS, identifiers.len()
+        )));
+    }
+
+    let answer_cap = body_utils::per_item_body_cap(identifiers.len(), RESOLUTION_ANSWER_BYTES_PER_IDENTIFIER);
+    let hook_request = ResolutionHookRequest { caller, identifiers };
 
     let names = match post_hook(&state, hook, "resolution", &hook_request).await {
         Ok(response) if response.status().is_success() => {
@@ -2333,7 +2350,10 @@ async fn post_resolve(State(state): State<Arc<AppState>>,
         // The resolution failure policy is "show pseudonyms": a hook that is down or
         // answers badly resolves to nothing, never a failed request (unlike the hot
         // authentication/admission hooks, which fail closed).
-        Ok(_) => BTreeMap::new(),
+        Ok(response) => {
+            tracing::warn!(status = %response.status(), "the resolution hook refused; showing pseudonyms");
+            BTreeMap::new()
+        }
         Err(reason) => {
             tracing::warn!(reason, "the resolution hook is unreachable; showing pseudonyms");
             BTreeMap::new()

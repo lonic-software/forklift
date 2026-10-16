@@ -1688,7 +1688,10 @@ mod tests {
             hostile.extend(b"only a few real bytes");
 
             let outcome = import_streamed_bundle(std::io::Cursor::new(raw_bundle(BUNDLE_HEADER_V3, &hostile)));
-            assert!(outcome.is_err(), "a '{}' record of declared length u64::MAX must be refused", kind as char);
+            let error = outcome.err()
+                .unwrap_or_else(|| panic!("a '{}' record of declared length u64::MAX must be refused", kind as char));
+            assert!(error.contains("declares 18446744073709551615 bytes"),
+                "the '{}' record is refused on its declared length, not on some later error: {}", kind as char, error);
         }
     }
 

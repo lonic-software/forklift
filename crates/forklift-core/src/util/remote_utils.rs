@@ -87,6 +87,10 @@ const HANDSHAKE_BODY_CAP: u64 = 64 * 1024 * 1024;
 /// room to spare.
 const MISSING_BODY_BYTES_PER_HASH: u64 = 128;
 
+/// The cap for a structured error body. A refusal may list paths or hashes, so it is not held to
+/// [`body_utils::SMALL_BODY_CAP`]; one larger than this is reported as unread rather than parsed.
+const ERROR_BODY_CAP: u64 = 1024 * 1024;
+
 /// Per-hash allowance in an `upload-targets` answer: a presigned upload URL (about 500 bytes in
 /// practice) keyed by its hash.
 const UPLOAD_TARGETS_BODY_BYTES_PER_HASH: u64 = 8 * 1024;
@@ -2849,11 +2853,16 @@ impl RemoteClient {
         let status = response.status();
         let budget = self.error_body_budget();
 
+        let reason = status.canonical_reason().unwrap_or("unknown error").to_string();
         let (message, code, next_step) = match tokio::time::timeout(
-            budget, body_utils::read_json_capped::<ErrorResponse>(response, body_utils::SMALL_BODY_CAP)
+            budget, body_utils::read_json_capped::<ErrorResponse>(response, ERROR_BODY_CAP)
         ).await {
             Ok(Ok(body)) => (body.error, body.code, body.next_step),
-            Ok(Err(_)) | Err(_) => (status.canonical_reason().unwrap_or("unknown error").to_string(), None, None),
+            Ok(Err(JsonReadError::Body(BodyReadError::OverCap { cap }))) => (
+                format!("{} (the remote's description of the error is larger than {} bytes and was not read)", reason, cap),
+                None, None,
+            ),
+            Ok(Err(_)) | Err(_) => (reason, None, None),
         };
 
         classify_remote_error(status.as_u16(), action, message, code, next_step)
@@ -3338,8 +3347,14 @@ impl RemoteClient {
         });
 
         let transferred: Result<(), String> = loop {
+            // An importer that stops (a refused header, a bad record) closes the channel; waiting
+            // on the next chunk instead would leave a stalled remote's silence budget to report a
+            // timeout in place of the refusal.
             #[allow(clippy::disallowed_methods)] // streamed to the importer, never accumulated
-            let next = response.chunk().await;
+            let next = tokio::select! {
+                next = response.chunk() => next,
+                _ = sender.closed() => break Ok(()),
+            };
 
             match next {
                 Ok(Some(chunk)) => {
@@ -3380,10 +3395,16 @@ impl RemoteClient {
             return Err(self.error_of(response, &format!("object {}", hash)).await);
         }
 
-        self.read_body(
-            response, MAX_OBJECT_BYTES as u64, &format!("reading object {}", hash), posture,
-            &format!("object {}", hash),
-        ).await
+        // An object over the ceiling cannot be stored however it arrives, so it is refused in
+        // the ceiling's own terms rather than as a misbehaving remote: a store may still hold one
+        // authored before the ceiling existed.
+        body_utils::read_body_capped(response, MAX_OBJECT_BYTES as u64).await.map_err(|e| match e {
+            BodyReadError::Transport(e) => self.describe_transport_error(&format!("reading object {}", hash), posture, e),
+            BodyReadError::OverCap { cap } => format!(
+                "Object {} on the remote is larger than the {}-byte whole-object ceiling; refusing to fetch it.",
+                hash, cap
+            ),
+        })
     }
 
     /// Upload one object's raw bytes to the control plane (`PUT /v1/objects/{hash}`), where the
@@ -9885,6 +9906,45 @@ mod tests {
         // the import outright, so arriving intact is the object landing.
         assert_eq!(stats.stored_objects, 1, "the full body must arrive intact, not a prefix of it");
         assert!(file_utils::does_object_exist(&hash).unwrap(), "the dripped object landed in this store");
+    }
+
+    /// An importer that refuses the bundle stops the transfer at once: a remote that sends a
+    /// refused header and then goes silent must get the refusal back, not a timeout once the
+    /// silence budget runs out.
+    #[test]
+    fn a_refused_batch_bundle_reports_the_refusal_without_waiting_out_a_stalled_remote() {
+        let _store = Scratch::new("batch-refused-then-stalled");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+
+        std::thread::spawn(move || {
+            use std::io::Write;
+
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = read_test_request(&mut stream);
+                let chunk = "forklift-bundle 2026-07-06\n";
+                let _ = write!(stream, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{}\r\n",
+                    chunk.len(), chunk);
+                let _ = stream.flush();
+                std::thread::sleep(std::time::Duration::from_secs(30));
+            }
+        });
+
+        let client = fast_client(&url);
+        let silence_budget = FAST.connect + FAST.object_read;
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let started = std::time::Instant::now();
+        let outcome = runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(20), client.fetch_batch(&["a".repeat(64)])).await
+        }).expect("fetch_batch hung past its outer ceiling");
+
+        let message = match outcome {
+            Err(message) => message,
+            Ok(_) => panic!("a refused bundle must not import"),
+        };
+        assert!(message.contains("refusing to import it"), "the importer's refusal is reported: {}", message);
+        assert!(started.elapsed() < silence_budget,
+            "the refusal must not wait out the silence budget {:?}: took {:?}", silence_budget, started.elapsed());
     }
 
     /// A remote that accepts the connection, reads the request, sends response headers claiming
