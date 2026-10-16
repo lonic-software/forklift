@@ -171,7 +171,16 @@ fn ignore_git_directory() -> Result<bool, String> {
     let path = forklift_core::globals::warehouse_root().join(".forkliftignore");
     let pattern = GIT_DIRECTORY_PATTERN;
 
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    // Only a missing file starts empty: on any other read error, writing would replace the
+    // user's rules with this one.
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!(
+            "The history was imported, but \".forkliftignore\" could not be read, so the \".git\" rule \
+             was not added: {}", e
+        )),
+    };
 
     if existing.lines().any(|line| line.trim() == pattern) {
         return Ok(false);
@@ -943,7 +952,7 @@ impl CommandOutput for ImportReport {
         }
 
         if self.ignored_git {
-            println!("Added \".git/\" to \".forkliftignore\".");
+            println!("Added \".git/\" to \".forkliftignore\". Load and stack it to keep the rule in the history.");
         }
 
         if let Some(packed) = &self.compacted {
