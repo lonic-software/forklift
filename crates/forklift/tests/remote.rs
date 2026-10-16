@@ -2341,6 +2341,22 @@ fn resolution_is_server_mediated_and_degrades_to_pseudonyms() {
     assert_eq!(resolve.hook, "resolution");
     assert_signed(&resolve, secret);
 
+    // The hook's answer cap scales with the identifiers asked for, so the server bounds that
+    // count — distinct identifiers, since a repeated one is asked about once.
+    let many: Vec<String> = (0..10_001).map(|i| format!("op-{}", i)).collect();
+    let (status, body) = http_post_json(
+        &server.url, "/v1/resolve", &serde_json::json!({ "identifiers": many }).to_string()
+    );
+    assert!(status.contains("400"), "{} {}", status, body);
+    assert!(body.contains("at most 10000 distinct identifiers"), "{}", body);
+
+    let repeated = vec!["tester@forklift"; 20_000];
+    let (status, body) = http_post_json(
+        &server.url, "/v1/resolve", &serde_json::json!({ "identifiers": repeated }).to_string()
+    );
+    assert!(status.contains("200"), "a repeated identifier counts once: {} {}", status, body);
+    assert!(body.contains("Remote Tester"), "{}", body);
+
     // Resolution never fails a command: point the remote at a dead port and history
     // degrades to the pseudonymous id instead of erroring.
     assert_success(&area.forklift("a", &["config", "remote.url", "http://127.0.0.1:9"]));
