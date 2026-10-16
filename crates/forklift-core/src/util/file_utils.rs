@@ -3997,6 +3997,8 @@ mod tests {
 
         let content = b"an object compacted by another process after this registry was cached".to_vec();
         let hash = blake3::hash(&content).to_hex().to_string();
+        let other_content = b"a second object, published after the first one was seen".to_vec();
+        let other_hash = blake3::hash(&other_content).to_hex().to_string();
 
         assert!(!does_object_exist(&hash).unwrap(), "sanity: X is absent, and the registry is now cached");
 
@@ -4005,7 +4007,14 @@ mod tests {
         builder.finish().unwrap();
 
         assert!(does_object_exist(&hash).unwrap(), "a pack published after caching must be seen");
-        assert!(raw_object_present(&hash).unwrap(), "the gate-free presence check must see it too");
+
+        // A second publish against the set the check above refreshed, so the gate-free check
+        // faces a stale cache of its own.
+        let mut builder = TransportPackBuilder::new(&folder).unwrap();
+        builder.append_full(&other_hash, other_content.as_slice()).unwrap();
+        builder.finish().unwrap();
+
+        assert!(raw_object_present(&other_hash).unwrap(), "the gate-free presence check must see it too");
 
         std::fs::remove_dir_all(&temp).ok();
     }
