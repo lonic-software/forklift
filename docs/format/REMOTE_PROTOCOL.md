@@ -383,7 +383,9 @@ verification input.
 ```
 
 Response — the names the caller is permitted to see; anything withheld or unknown is
-simply absent:
+simply absent. Every key is an identifier the request named, spelled as it named it: a
+server drops any other key its directory gives, and a client ignores any other key it
+receives:
 
 ```json
 { "names": { "<operator id>": "<display name>", "…": "…" } }

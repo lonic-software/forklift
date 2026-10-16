@@ -2359,11 +2359,12 @@ fn resolution_is_server_mediated_and_degrades_to_pseudonyms() {
     assert!(body.contains("Remote Tester"), "{}", body);
 
     // This directory names tester@forklift whatever it is asked; a request that did not ask about
-    // that identifier must not get its name.
+    // that identifier must not get its name, though the directory was asked and answered.
     let (status, body) = http_post_json(
         &server.url, "/v1/resolve", &serde_json::json!({ "identifiers": ["someone-else"] }).to_string()
     );
     assert!(status.contains("200"), "{} {}", status, body);
+    hooks.wait_for("/resolve", "someone-else");
     assert!(!body.contains("Remote Tester"), "a name nobody asked about reaches the client: {}", body);
 
     // Resolution never fails a command: point the remote at a dead port and history

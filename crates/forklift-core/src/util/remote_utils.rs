@@ -3099,15 +3099,15 @@ impl RemoteClient {
     ///
     /// Each distinct identifier is asked about once, in requests of at most
     /// [`MAX_RESOLVE_IDENTIFIERS`](crate::model::remote::MAX_RESOLVE_IDENTIFIERS) — the most a
-    /// server accepts — and [`RESOLVE_REQUEST_IDENTIFIER_BYTES`], so a large roster resolves in
-    /// several requests rather than none. Up to [`RESOLVE_REQUESTS_IN_FLIGHT`] run at once, and
+    /// server accepts — and `RESOLVE_REQUEST_IDENTIFIER_BYTES`, so a large roster resolves in
+    /// several requests rather than none. Up to `RESOLVE_REQUESTS_IN_FLIGHT` run at once, and
     /// each request's answer counts only for the identifiers it asked about, so the names shown
     /// never depend on which request finished first.
     ///
     /// The deadline above is per request, so the whole call can take one deadline per
-    /// `RESOLVE_REQUESTS_IN_FLIGHT` requests against a remote that never answers. A roster needs
-    /// more than one round only past 40,000 identifiers or 1 MiB of them, so in practice the call
-    /// is bounded by one deadline.
+    /// `RESOLVE_REQUESTS_IN_FLIGHT` requests against a remote that never answers. A roster that
+    /// fits in that many requests — up to 40,000 short identifiers, though fewer long ones, since
+    /// a request closes when the next identifier would not fit — is bounded by one deadline.
     pub async fn resolve(&self, identifiers: Vec<String>) -> BTreeMap<String, String> {
         let distinct: std::collections::BTreeSet<String> = identifiers.into_iter().collect();
         let mut batches: Vec<Vec<String>> = Vec::new();
@@ -10027,8 +10027,8 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let batches = Arc::new(Mutex::new(Vec::<usize>::new()));
-        // Requests open now and the most ever open at once.
-        let open = Arc::new((Mutex::new((0usize, 0usize)), Condvar::new()));
+        // Requests open now, the most ever open at once, and how many have arrived.
+        let open = Arc::new((Mutex::new((0usize, 0usize, 0usize)), Condvar::new()));
         let (seen, gauge) = (Arc::clone(&batches), Arc::clone(&open));
 
         std::thread::spawn(move || {
@@ -10047,15 +10047,18 @@ mod tests {
                     names.insert("never-asked".to_string(), "Intruder".to_string());
                     let answer = serde_json::json!({ "names": names }).to_string();
 
-                    // Hold every request until the limit's worth are open (or a while passes), then
-                    // a little longer, so a client exceeding the limit is seen exceeding it.
+                    // Hold every request until its whole round of the limit's worth has arrived (or a
+                    // while passes), then a little longer, so a client exceeding the limit is seen
+                    // exceeding it and one under it never fills a round.
                     let (lock, changed) = &*gauge;
                     let mut counts = lock.lock().unwrap();
+                    let round_full = (counts.2 / RESOLVE_REQUESTS_IN_FLIGHT + 1) * RESOLVE_REQUESTS_IN_FLIGHT;
                     counts.0 += 1;
                     counts.1 = counts.1.max(counts.0);
+                    counts.2 += 1;
                     changed.notify_all();
                     let (mut counts, _) = changed.wait_timeout_while(counts, std::time::Duration::from_secs(10),
-                        |counts| counts.0 < RESOLVE_REQUESTS_IN_FLIGHT).unwrap();
+                        |counts| counts.2 < round_full).unwrap();
                     drop(counts);
                     std::thread::sleep(std::time::Duration::from_millis(300));
                     counts = lock.lock().unwrap();
