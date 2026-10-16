@@ -1766,16 +1766,16 @@ pub(crate) fn read_object_classified(hash: &str) -> Result<StoreReadOutcome, Str
     let compressed = match std::fs::read(&file_path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            // Neither the cached packs nor a loose file holds it. In a long-running process (a
-            // live server) the pack registry can predate an external `compact` that moved this
-            // object into a new pack and swept its loose source — so reload the registry once and
-            // retry the packs before concluding the object is gone (reload-on-miss).
-            return match crate::util::pack_utils::retrieve_from_packs_reloading(hash) {
+            // Neither the packs nor a loose file holds it. Ask the packs once more: a `compact` in
+            // another process can have packed this object and swept its loose source between the
+            // pack lookup above and the loose read, and `retrieve_from_packs` revalidates its
+            // cached set against the pack folder on a miss, so a pack published since is seen.
+            return match crate::util::pack_utils::retrieve_from_packs(hash) {
                 Ok(PackRetrieval::Verified(bytes)) => Ok(StoreReadOutcome::Verified(bytes)),
                 // The single `Absent`-production site (FORK-47, DESIGN.html §3.1.1): gated
                 // against the *enumerable* quarantine set only (`quarantine_reason`, a binary
-                // search over each quarantined index's resident bytes — no per-hash parse, no
-                // extra reload since the registry was just warmed above). A hash a quarantined
+                // search over each quarantined index's resident bytes — no per-hash parse, and the
+                // set it reads was just revalidated by the miss above). A hash a quarantined
                 // (data-missing) index names is not "no surviving index names this hash," so it
                 // must read `Unverifiable` naming that index rather than a bare `Absent`
                 // indistinguishable from never-existed. An *unenumerable* (unparseable) index is
@@ -2040,8 +2040,8 @@ pub fn get_inventory_data_path_for_key(key: &str) -> PathBuf {
 /// Check if an object with the given hash exists.
 ///
 /// A pack-registry hit answers `true` with **no** taint-gate check at all, deliberately: the
-/// registry is process-local memory, reloaded from disk only at process startup (and on a
-/// reload-on-miss — see [`read_object_uncached`]), so a crash that could have lost a pack's
+/// registry is process-local memory, loaded from disk by this process (and revalidated against the
+/// pack folder on a miss — see `pack_utils::is_in_packs`), so a crash that could have lost a pack's
 /// dentry also clears whatever this process's registry remembers about it. There is no stale
 /// in-memory "yes" here that could outlive the crash it would need to survive, so the taint gate
 /// (which exists precisely to catch such a stale "yes") has nothing to add on that path.
