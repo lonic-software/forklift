@@ -49,7 +49,8 @@ pub(crate) fn has_internal_ref(line: &str) -> bool {
     let round_finding = upper.match_indices("ROUND ").any(|(i, s)| {
         let end = digits_end(i + s.len());
         starts_word(i) && end > i + s.len()
-            && upper[skip(end, b',')..].starts_with(" FINDING")
+            && upper[skip(end, b',')..].strip_prefix(" FINDING")
+                .is_some_and(|rest| !rest.starts_with(|c: char| c.is_ascii_alphanumeric()))
     });
     let label = upper.match_indices('S').any(|(i, _)| {
         let after_digits = digits_end(i + 1);
@@ -79,6 +80,7 @@ mod tests {
             "wrapped (review\\nround 5 finding 2)",
             "fix was unpinned (round 6 finding 1)",
             "round 6, finding 1",
+            "stable across every review round",
         ] {
             assert!(has_internal_ref(line), "missed: {line:?}");
         }
@@ -98,6 +100,7 @@ mod tests {
             "a round of review",
             "around 5 findings",
             "round 3 of 5",
+            "in round 2 findings were batched",
             "",
         ] {
             assert!(!has_internal_ref(line), "false positive: {line:?}");
