@@ -2862,12 +2862,10 @@ impl RemoteClient {
     /// instance's own `connect_timeout` into [`error_body_read_budget`]'s arithmetic. Split out as
     /// its own `&self` method, rather than inlining the call to the free function at its call
     /// sites (`error_of` and `commit_lift`), so a test can pin that the right instance field is
-    /// actually read: not just read from *some* client (every behavioral test of [`Self::error_of`]
-    /// necessarily uses a direct client, so none of them distinguishes "reads
-    /// `self.budgets.connect`" from "hardcodes the direct 5s constant", and a `TorMode::On` fixture
-    /// has the identical problem one level up, at 60s instead of 5s), but read from an instance
-    /// whose `connect_timeout` a production constructor could never have produced — see
-    /// `error_body_budget_reads_this_field_not_a_rival_constant` in the test module.
+    /// read without waiting a budget out: `error_body_budget_reads_this_field_not_a_rival_constant`
+    /// reads it from an instance whose `connect_timeout` no production constructor could have
+    /// produced, so a hardcoded direct (5s) or Tor (60s) connect bound cannot coincide with it. The
+    /// timed tests of both call sites catch the direct hardcode as well, by elapsed time.
     fn error_body_budget(&self) -> std::time::Duration {
         error_body_read_budget(&self.budgets)
     }
@@ -8541,6 +8539,41 @@ mod tests {
         Budgets { read: WIDE_READ, ..fast_budgets(routes_through_tor) }.checked()
     }
 
+    /// An error-body allowance for the tests that watch a stalled error body time out, where
+    /// [`FAST`]'s own arms at 1.06s, 60ms above the resolve budget and under a second below the
+    /// single-write one. Folded with [`FAST`]'s connect bound this arms at 5.5s, more than a second
+    /// above every other [`FAST`] budget and four and a half seconds under the nearest rival above
+    /// it, the bare production allowance; [`nearest_rival_above`] checks that side.
+    const WIDE_ERROR_BODY_READ: std::time::Duration = std::time::Duration::from_millis(5_170);
+
+    /// The smallest figure above `armed`, an error-body budget on a client carrying `budgets`,
+    /// that a single misarm could fire at instead: another allowance of this instance, on its own
+    /// or folded with its connect bound; this allowance folded with the production direct connect
+    /// bound; or the production error-body allowance, bare or folded with either connect bound. A
+    /// timed test's upper bound is the midpoint toward it, so every such misarm above lands past
+    /// the bound; the gap is asserted to be at least a second, so the midpoint leaves half a second
+    /// for a loaded runner. The rivals under `armed` are the lower bound's to catch.
+    fn nearest_rival_above(budgets: Budgets, armed: std::time::Duration) -> std::time::Duration {
+        let other_allowances = [
+            budgets.read, budgets.object_read, budgets.batch_head_patience, budgets.upload_silence,
+            budgets.post_send_verify_base, budgets.single_write_allowance,
+        ];
+        let production = TEST_ERROR_BODY_READ_TIMEOUT;
+        let nearest = other_allowances.iter()
+            .flat_map(|&allowance| [allowance, budgets.connect + allowance])
+            .chain([budgets.error_body_read, TEST_DIRECT_CONNECT_TIMEOUT + budgets.error_body_read])
+            .chain([production, budgets.connect + production, TEST_DIRECT_CONNECT_TIMEOUT + production])
+            .filter(|&rival| rival > armed)
+            .min()
+            .expect("the production error-body allowance folded with a connect bound exceeds any test budget");
+        assert!(
+            nearest >= armed + std::time::Duration::from_secs(1),
+            "the nearest rival budget {:?} is under a second above the armed {:?}, too close to \
+            separate by elapsed time", nearest, armed
+        );
+        nearest
+    }
+
     /// A direct-dial client carrying [`FAST`].
     fn fast_client(url: &str) -> RemoteClient {
         RemoteClient::new_test_with_budgets(url, FAST)
@@ -10314,7 +10347,8 @@ mod tests {
     #[test]
     fn missing_objects_bounds_the_error_body_read_after_a_wedged_500() {
         let remote = SilentErrorBodyRemote::start();
-        let client = fast_client(&remote.url);
+        let budgets = Budgets { error_body_read: WIDE_ERROR_BODY_READ, ..FAST };
+        let client = RemoteClient::new_test_with_budgets(&remote.url, budgets);
         // A batch of 2,000 hashes — large enough that the call's own outer TotalDeadline
         // (`connect + post_send_verify_base + 2,000 * PRESENCE_ALLOWANCE_MS_PER_OP`) stays looser
         // than error_of's inner error_body_budget, so the inner budget is still what fires and
@@ -10324,7 +10358,7 @@ mod tests {
         // Written as the sum of the injected budgets, not via `error_body_read_budget`, so this
         // assertion doesn't co-move with a corrupted helper — a helper bug would then move the
         // elapsed time it produces and this fixed lower bound in lockstep, pinning nothing.
-        let lower_bound = FAST.connect + FAST.error_body_read;
+        let lower_bound = budgets.connect + budgets.error_body_read;
         // The bracket this fixture's batch size depends on, made an assertion rather than left as
         // a comment: the call's own outer TotalDeadline must stay looser than error_of's inner
         // error_body_budget (`lower_bound` above), or the outer bound fires first and every
@@ -10334,7 +10368,7 @@ mod tests {
         // for the identical reason: calling `presence_negotiation_budget` here would let a bug in
         // that method move this guard and the real behavior it is meant to guard against in
         // lockstep, silently validating a broken implementation instead of catching it.
-        let outer_budget = FAST.connect + FAST.post_send_verify_base
+        let outer_budget = budgets.connect + budgets.post_send_verify_base
             + std::time::Duration::from_secs_f64(
                 hashes.len() as f64 * PRESENCE_ALLOWANCE_MS_PER_OP / 1000.0
             );
@@ -10370,17 +10404,17 @@ mod tests {
             the bare error-body-read timeout (or less)",
             elapsed, lower_bound
         );
-        // The other side: the production error-body read budget in place of this instance's
-        // would still clear the lower bound and fit under the outer deadline, so only an upper
-        // bound tells it apart.
-        let rival_production_budget = FAST.connect + TEST_ERROR_BODY_READ_TIMEOUT;
-        let upper_bound = lower_bound + (rival_production_budget - lower_bound) / 2;
+        // The other side: a misarm that waits longer (the production error-body allowance, or
+        // this one folded with the production connect bound) would still clear the lower bound
+        // and fit under the outer ceiling, so only an upper bound tells it apart.
+        let nearest_rival = nearest_rival_above(budgets, lower_bound);
+        let upper_bound = lower_bound + (nearest_rival - lower_bound) / 2;
         assert!(
             elapsed < upper_bound,
             "elapsed {:?} is past {:?} (the midpoint between this client's error-body budget {:?} \
-            and the {:?} the production error-body read timeout would give) — the error-body read \
-            is not armed with this instance's budgets",
-            elapsed, upper_bound, lower_bound, rival_production_budget
+            and {:?}, the nearest longer budget a misarm could fire at) — the error-body read is \
+            not armed with this instance's budget",
+            elapsed, upper_bound, lower_bound, nearest_rival
         );
 
         assert!(
@@ -10397,15 +10431,16 @@ mod tests {
     /// A lift commit's refusal whose body stalls fails as a terminal error under the same
     /// error-body budget instead of hanging the lift: the auto-following client it rides has no
     /// read timeout, so nothing else would end the wait. Bracketed like the `missing_objects` test
-    /// above: at least the injected budget (no shorter bound fired), under the midpoint to the
-    /// production budget (no longer one did either, so it is this instance's budget), and under an
-    /// outer ceiling (a lost bound fails rather than hangs). The message is the status reason that
+    /// above: at least the injected budget (no shorter bound fired), under the midpoint toward the
+    /// nearest longer budget a misarm could fire at (no longer one did either, so it is this
+    /// instance's budget), and under an outer ceiling (a lost bound fails rather than hangs). The message is the status reason that
     /// stands in for an unread body.
     #[test]
     fn commit_lift_bounds_the_error_body_read_after_a_wedged_500() {
         let remote = SilentErrorBodyRemote::start();
-        let client = fast_client(&remote.url);
-        let lower_bound = FAST.connect + FAST.error_body_read;
+        let budgets = Budgets { error_body_read: WIDE_ERROR_BODY_READ, ..FAST };
+        let client = RemoteClient::new_test_with_budgets(&remote.url, budgets);
+        let lower_bound = budgets.connect + budgets.error_body_read;
         let outer_ceiling = lower_bound + std::time::Duration::from_secs(10);
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let started = std::time::Instant::now();
@@ -10422,13 +10457,13 @@ mod tests {
         };
         assert!(message.contains("(500): Internal Server Error"), "the status stands in for the body: {}", message);
         assert!(elapsed >= lower_bound, "the error-body budget fired early ({:?} < {:?})", elapsed, lower_bound);
-        // The production error-body budget in place of this instance's would also clear the lower
-        // bound and the ceiling; only the midpoint between them tells the two apart.
-        let rival_production_budget = FAST.connect + TEST_ERROR_BODY_READ_TIMEOUT;
-        let upper_bound = lower_bound + (rival_production_budget - lower_bound) / 2;
+        // A misarm that waits longer would also clear the lower bound and the ceiling; only the
+        // midpoint toward the nearest one tells it apart.
+        let nearest_rival = nearest_rival_above(budgets, lower_bound);
+        let upper_bound = lower_bound + (nearest_rival - lower_bound) / 2;
         assert!(elapsed < upper_bound,
-            "elapsed {:?} is past {:?}: the lift commit's error-body read is not armed with this \
-            instance's budget", elapsed, upper_bound);
+            "elapsed {:?} is past {:?}, the midpoint toward {:?}: the lift commit's error-body read \
+            is not armed with this instance's budget", elapsed, upper_bound, nearest_rival);
     }
 
     /// A Tor-mode fixture (this test's predecessor,
