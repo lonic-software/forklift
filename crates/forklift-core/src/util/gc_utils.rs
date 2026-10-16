@@ -1,10 +1,10 @@
 //! Garbage collection of unreferenced objects (DESIGN.html §4.5).
 //!
 //! A failed or abandoned lift leaves verified objects with no ref pointing at them.
-//! The collector marks everything reachable from the GC roots — every pallet head,
-//! plus every bay's parked parcels and in-progress consolidation, when those local
-//! states exist — and sweeps the rest, with an mtime grace period protecting the
-//! objects of in-flight lifts.
+//! The collector marks everything reachable from the GC roots — every pallet head and
+//! trust pin, plus every bay's parked parcels, in-progress consolidation and staged
+//! inventory, when those local states exist — and sweeps the rest, with an mtime grace
+//! period protecting the objects of in-flight lifts.
 //!
 //! The mark walk is presence-tolerant: a store can legitimately hold only some of a
 //! parcel's paths — an out-of-scope subtree is sealed by a hash the signed parcel commits
@@ -20,7 +20,7 @@ use std::collections::{HashSet, VecDeque};
 use std::time::SystemTime;
 use crate::util::{audit_utils, bay_utils, file_utils, object_utils};
 // Test-only: `collect_live_set`'s own pallet-head root gathering moved into the shared
-// `recovery_utils::gc_root_sources` (F8, PR #120 round 2), so this module's non-test code no
+// `recovery_utils::gc_root_sources`, so this module's non-test code no
 // longer calls `pallet_utils` directly — only its own test fixtures still build pallet refs by
 // hand.
 #[cfg(test)]
@@ -155,11 +155,11 @@ pub fn collect_garbage(grace_seconds: u64) -> Result<GcStats, String> {
 /// function's own doc comment for why a sweep and a non-deleting recovery walk are allowed to
 /// differ here the way they already differ on an unreadable bay (`bay_utils::BayReadPolicy`).
 pub(crate) fn collect_live_set() -> Result<HashSet<String>, String> {
-    // Pallet heads (both namespaces), bay-scoped parcel roots, and trust-pin roots — the three
-    // sources this function shares, hash for hash, with `recovery_utils::collect_walk_roots`
-    // (F8, PR #120 round 2: before this, both callers open-coded the same three-source assembly
-    // by hand — see `recovery_utils::gc_root_sources`'s own doc comment for why that duplication
-    // was worth closing, and for the superset invariant this list must stay a subset of). GC does
+    // Pallet heads (both namespaces), bay-scoped parcel roots, trust-pin roots and staged shard
+    // leaves: the sources this function shares, hash for hash, with
+    // `recovery_utils::collect_walk_roots` through `recovery_utils::gc_root_sources`, so the two
+    // cannot drift apart (see that function's doc comment, and `collect_walk_roots`' for the
+    // superset invariant this list must stay a subset of). GC does
     // not need the pin/ordinary distinction `collect_walk_roots` cares about (an absent root, pin
     // or ordinary, is just a gap to `audit_utils::collect_reachable_present` below — see this
     // function's own doc comment), so both lists are flattened into one plain `roots` bag.
@@ -182,6 +182,19 @@ pub(crate) fn collect_live_set() -> Result<HashSet<String>, String> {
 
     let mut live: HashSet<String> = HashSet::new();
     let mut tree_queue: VecDeque<String> = VecDeque::new();
+
+    // Staged inventory leaves (FORK-156): loaded-but-unstacked content is referenced by its
+    // bay's inventory shard and by nothing else, so without this a repack drops it at once (no
+    // grace on packed objects) and a loose sweep drops it once the grace period passes, while
+    // `stocktake` still shows the file staged and `stack` signs a parcel over the missing hash.
+    // Same leaf treatment as a tree's file entry below: the hash is marked live unread, and a
+    // chunked entry's recipe is descended for its chunks.
+    // Only a newly inserted recipe is descended, so one recipe staged in many bays is read once.
+    for (hash, item_type) in &sources.shard_leaves {
+        if live.insert(hash.clone()) && item_type.is_chunked() {
+            mark_recipe_chunks_live(hash, &mut live)?;
+        }
+    }
 
     for parcel_hash in &parcels {
         live.insert(parcel_hash.clone());
@@ -283,7 +296,7 @@ fn mark_recipe_chunks_live(recipe_hash: &str, live: &mut HashSet<String>) -> Res
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::builder::object::loose_object_builder::LooseObjectBuilder;
     use crate::enums::dir_entry_type::DirEntryType;
@@ -636,6 +649,87 @@ mod tests {
         assert!(gc_result.is_err(), "gc must refuse rather than reclaim when a bay's ref source is unreadable");
         assert!(loose_path(&garbage).exists(),
             "gc must delete nothing when the live set could not be computed, even unrelated garbage");
+    }
+
+    /// Plant a staged inventory shard holding `items` (`(name, hash, type)`) in bay `bay`'s state
+    /// dir, by path, the way `load` lays it out on disk. Shared with `prune_utils`' tests.
+    pub(crate) fn plant_staged_shard(bay: &str, items: &[(&str, &str, DirEntryType)]) -> PathBuf {
+        use crate::builder::inventory::InventoryBuilder;
+        use crate::enums::inventory_item_state::InventoryItemState;
+        use crate::model::inventory::{Inventory, InventoryItem};
+
+        let mut inventory = Inventory::new();
+        for (name, hash, item_type) in items {
+            inventory.add_item(InventoryItem {
+                metadata_change_timestamp: 0,
+                content_change_timestamp: 0,
+                device: 0,
+                inode: 0,
+                item_type: *item_type,
+                user_id: 0,
+                group_id: 0,
+                file_size: 0,
+                hash: hash.to_string(),
+                file_name_length: name.len() as u64,
+                state: InventoryItemState::Normal,
+                name: name.to_string(),
+            });
+        }
+
+        let shard_path = bay_utils::bay_state_dir(bay)
+            .join(crate::globals::FOLDER_NAME_INVENTORY_ROOT)
+            .join(file_utils::PREFIX_INVENTORY_FOLDER)
+            .join(file_utils::FILE_NAME_INVENTORY_DATA);
+        std::fs::create_dir_all(shard_path.parent().unwrap()).unwrap();
+        std::fs::write(&shard_path, InventoryBuilder::build(&inventory)).unwrap();
+
+        shard_path
+    }
+
+    /// FORK-156: loaded-but-unstacked content is referenced by its bay's staged inventory shard
+    /// and by nothing else, so a live set without the shard leaves deleted it — a blob outright,
+    /// and for a chunked file both the recipe and every chunk behind it. Planted in a non-active
+    /// bay so the walk has to cover every bay, not just the one gc runs from. Red if the
+    /// `shard_leaves` loop in `collect_live_set` is removed (all four staged objects deleted), or
+    /// if its `mark_recipe_chunks_live` call is (the two chunks deleted).
+    #[test]
+    fn gc_keeps_every_bays_staged_blob_recipe_and_chunks() {
+        let _scratch = Scratch::new("gc-staged-shard");
+
+        let staged_blob = store_blob("work in progress\n");
+        let chunk_a = store_chunk(b"staged chunk a");
+        let chunk_b = store_chunk(b"staged chunk b");
+        let recipe = store_recipe(&[(chunk_a.clone(), 14), (chunk_b.clone(), 14)]);
+        let garbage = store_blob("nothing stages or stacks me\n");
+
+        plant_staged_shard("b", &[
+            ("wip.txt", &staged_blob, DirEntryType::Normal),
+            ("big.bin", &recipe, DirEntryType::NormalChunked),
+        ]);
+
+        let stats = collect_garbage(0).expect("gc runs");
+
+        assert_eq!(stats.deleted, 1, "exactly the unreferenced blob is collected");
+        assert!(!loose_path(&garbage).exists(), "the garbage blob must be gone");
+        for hash in [&staged_blob, &recipe, &chunk_a, &chunk_b] {
+            assert!(loose_path(hash).exists(), "a staged object must survive gc: {}", hash);
+        }
+    }
+
+    /// The staged-shard source is read fail-closed, like every other gc root source: a shard gc
+    /// cannot parse may name the only copy of someone's staged work, so the sweep must refuse and
+    /// delete nothing rather than skip it.
+    #[test]
+    fn gc_fails_closed_and_deletes_nothing_on_an_unparseable_staged_shard() {
+        let _scratch = Scratch::new("gc-staged-shard-unparseable");
+
+        let garbage = store_blob("would be wrongly collected if the bad shard were skipped\n");
+        let shard = plant_staged_shard("b", &[]);
+        std::fs::write(&shard, b"not an inventory shard").unwrap();
+
+        assert!(collect_live_set().is_err(), "an unparseable staged shard must fail the live set");
+        assert!(collect_garbage(0).is_err(), "gc must refuse when a staged shard cannot be read");
+        assert!(loose_path(&garbage).exists(), "gc must delete nothing when the live set failed");
     }
 
     /// Finding 6 (round 1, PR #120): `collect_live_set` must ERROR, not silently narrow the

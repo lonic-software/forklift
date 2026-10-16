@@ -84,9 +84,10 @@ enum Command {
         root: String,
     },
 
-    /// Delete unreferenced objects (mark-and-sweep from the pallet heads)
+    /// Delete unreferenced objects (mark-and-sweep from every live root)
     #[command(
-        long_about = "Delete objects no pallet head reaches (a failed or abandoned lift \
+        long_about = "Delete objects no pallet head, trust pin, or parked, consolidating or \
+                      staged work reaches (a failed or abandoned lift \
                       leaves verified objects behind). Unreferenced objects younger than \
                       the grace period are kept: an in-flight lift may still be uploading \
                       the parcels that will reference them."
