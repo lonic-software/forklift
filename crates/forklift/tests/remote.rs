@@ -463,6 +463,70 @@ fn a_lift_uploads_a_subtree_introduced_by_a_parent_of_both_merge_sides() {
     assert_eq!(area.read_file("verify/b.txt"), "b\n");
 }
 
+/// The ignore file is tracked content, like `.gitignore`: a warehouse that receives a pallet
+/// tracking it gets the remote's rules, by either route a fresh warehouse takes onto a remote
+/// pallet. Both routes prepare the target first, so a `prepare` that wrote a template ignore file
+/// would collide with the tracked one.
+#[test]
+fn the_ignore_file_travels_with_the_pallet() {
+    let area = TestArea::new("ignore-file-travels");
+    let server = Server::start(&area, None);
+
+    let rules = "# build output\n^build(/.*)?$\n";
+    prepare_warehouse(&area, "a", &server.url);
+    area.write_file("a/.forkliftignore", rules);
+    area.write_file("a/src.txt", "src\n");
+    area.write_file("a/build/out.txt", "generated\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "track the ignore rules"]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    // Route 1: franchise into a new directory.
+    assert_success(&area.forklift(".", &["franchise", &server.url, "b"]));
+    assert_eq!(area.read_file("b/.forkliftignore"), rules);
+    assert!(!area.path("b/build").exists(), "an ignored path is never part of the pallet");
+
+    // The received rules are in force: an ignored build folder reads clean.
+    area.write_file("b/build/out.txt", "generated in b\n");
+    let status = area.forklift("b", &["stocktake"]);
+    assert_success(&status);
+    assert!(stdout(&status).contains("matches the inventory"), "{}", stdout(&status));
+
+    // An edit to the rules is a change like any other, and reaches the other side.
+    let widened = "# build output\n^build(/.*)?$\n\\.log$\n";
+    area.write_file("a/.forkliftignore", widened);
+    assert_success(&area.forklift("a", &["load", ".forkliftignore"]));
+    assert_success(&area.forklift("a", &["stack", "ignore logs"]));
+    assert_success(&area.forklift("a", &["lift"]));
+    assert_success(&area.forklift("b", &["lower"]));
+    assert_eq!(area.read_file("b/.forkliftignore"), widened);
+}
+
+/// The other route onto a remote pallet: prepare a fresh warehouse, point it at the remote and
+/// lower. A template ignore file from `prepare` would make lower refuse to write the tracked one.
+#[test]
+fn a_prepared_warehouse_lowers_the_tracked_ignore_file() {
+    let area = TestArea::new("ignore-file-lowered");
+    let server = Server::start(&area, None);
+
+    let rules = "^build(/.*)?$\n";
+    prepare_warehouse(&area, "a", &server.url);
+    area.write_file("a/.forkliftignore", rules);
+    area.write_file("a/src.txt", "src\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "track the ignore rules"]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    prepare_warehouse(&area, "c", &server.url);
+    assert_success(&area.forklift("c", &["lower"]));
+    assert_eq!(area.read_file("c/.forkliftignore"), rules);
+
+    area.write_file("c/build/out.txt", "generated in c\n");
+    let status = area.forklift("c", &["stocktake"]);
+    assert_success(&status);
+    assert!(stdout(&status).contains("matches the inventory"), "{}", stdout(&status));
+}
+
 #[test]
 fn lift_franchise_lower_round_trip() {
     let area = TestArea::new("round-trip");

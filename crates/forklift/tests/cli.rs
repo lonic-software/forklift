@@ -138,6 +138,16 @@ fn json(output: &Output) -> serde_json::Value {
         .unwrap_or_else(|e| panic!("stdout is not one JSON document ({}): {}", e, stdout(output)))
 }
 
+/// Assert the state `import-git` leaves a colocated repo in: the imported tree is checked out,
+/// nothing is staged, and the only working-tree change is the ignore file the import wrote its
+/// `.git` rule into. That file is tracked content, so the import leaves it for the user to stack.
+fn assert_only_the_ignore_file_is_untracked(warehouse: &TestWarehouse) {
+    let status = json(&warehouse.run(&["--json", "stocktake"]));
+    assert_eq!(status["data"]["staged_count"], 0, "{}", status);
+    assert_eq!(status["data"]["unstaged"], serde_json::json!([{"kind": "untracked", "path": ".forkliftignore"}]),
+        "{}", status);
+}
+
 /// Configure the operator identity (in the test-scoped global configuration), which
 /// stacking parcels requires.
 fn configure_operator(warehouse: &TestWarehouse) {
@@ -2469,11 +2479,11 @@ fn import_git_migrates_a_repo_into_the_warehouse() {
     let pallets = stdout(&warehouse.run(&["palletize"]));
     assert!(pallets.contains("* main") && pallets.contains("feature"), "unexpected: {}", pallets);
 
-    // History and authorship survived; the colocated working tree reads clean (`.git`
-    // was auto-ignored).
+    // History and authorship survived; the colocated working tree reads clean apart from the
+    // ignore file (`.git` was auto-ignored).
     assert!(stdout(&warehouse.run(&["history", "feature"])).contains("feature work"));
     assert!(stdout(&warehouse.run(&["history"])).contains("ada@example.com"), "git author must survive");
-    assert!(stdout(&warehouse.run(&["stocktake"])).contains("matches the inventory"));
+    assert_only_the_ignore_file_is_untracked(&warehouse);
 
     // Enrolling after import anchors the imported history as the legacy boundary, so a
     // later audit tolerates it as unsigned rather than rejecting it.
@@ -2515,15 +2525,19 @@ fn import_git_ignores_only_the_git_directory_not_its_dotfile_siblings() {
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["import-git", "."]));
 
-    // Before the load, stocktake already reads clean: the import builds the tree from git
-    // objects, not the worktree. The over-broad rule only bites on the load.
-    assert!(stdout(&warehouse.run(&["stocktake"])).contains("nothing is staged"));
+    // Before the load, nothing is staged and only the import's ignore file is untracked: the
+    // import builds the tree from git objects, not the worktree. The over-broad rule only bites
+    // on the load.
+    assert_only_the_ignore_file_is_untracked(&warehouse);
 
     assert_success(&warehouse.run(&["load", "."]));
     let status = stdout(&warehouse.run(&["stocktake"]));
     // "The working directory matches the inventory" holds either way; the staged half is
-    // what the wrong rule changes.
-    assert!(status.contains("nothing is staged"), "load staged a change after import: {}", status);
+    // what the wrong rule changes. The one staged change is the ignore file the import wrote,
+    // which is tracked content.
+    let staged = json(&warehouse.run(&["--json", "stocktake"]));
+    assert_eq!(staged["data"]["staged"], serde_json::json!([{"kind": "added", "path": ".forkliftignore"}]),
+        "load staged a change after import: {}", staged);
     for sibling in [".github/x.md", ".gitignore", ".gitattributes", ".git-blame-ignore-revs"] {
         assert!(!status.contains(sibling), "{} was staged for removal: {}", sibling, status);
     }
@@ -2574,7 +2588,7 @@ fn import_git_auto_compacts_unless_no_compact() {
     assert!(packed.root.join(".forklift/objects/pack").is_dir(), "a pack folder should exist after import");
     // Reads work against the packed store immediately.
     assert!(stdout(&packed.run(&["history"])).contains("first commit"));
-    assert!(stdout(&packed.run(&["stocktake"])).contains("matches the inventory"));
+    assert_only_the_ignore_file_is_untracked(&packed);
 
     // --no-compact opts out: the imported objects are left loose.
     let loose = TestWarehouse::new("import-no-compact");
@@ -2655,7 +2669,159 @@ fn import_git_rederives_tree_bases_when_the_cache_is_starved() {
 
     // The starved import still reads back correctly.
     assert!(stdout(&starved.run(&["history"])).contains("third commit"));
-    assert!(stdout(&starved.run(&["stocktake"])).contains("matches the inventory"));
+    assert_only_the_ignore_file_is_untracked(&starved);
+}
+
+#[cfg(unix)]
+#[test]
+fn import_git_never_replaces_an_ignore_file_it_cannot_read() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // The ignore file is tracked content. If it exists but cannot be read, appending the `.git`
+    // rule to an empty buffer would replace the user's rules with that one line. The history is
+    // imported by then, so the import still succeeds, and warns with the rule to add by hand.
+    let warehouse = TestWarehouse::new("import-git-unreadable-ignore");
+    let root = warehouse.root.clone();
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&root)
+            .env("GIT_AUTHOR_NAME", "Ada").env("GIT_AUTHOR_EMAIL", "ada@example.com")
+            .env("GIT_COMMITTER_NAME", "Ada").env("GIT_COMMITTER_EMAIL", "ada@example.com")
+            .output()
+            .expect("git must be installed to run this test");
+        assert!(output.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&output.stderr));
+    };
+    git(&["init", "-q", "-b", "main"]);
+    warehouse.write_file("a.txt", "hello\n");
+    git(&["add", "a.txt"]);
+    git(&["commit", "-qm", "first commit"]);
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    let rules = "^keep(/.*)?$\n";
+    warehouse.write_file(".forkliftignore", rules);
+    let ignore_file = root.join(".forkliftignore");
+    std::fs::set_permissions(&ignore_file, std::fs::Permissions::from_mode(0o200)).unwrap();
+    if std::fs::read_to_string(&ignore_file).is_ok() {
+        // Running as root: permissions do not refuse the read, so there is nothing to test.
+        return;
+    }
+
+    let imported = warehouse.run(&["import-git", "."]);
+    std::fs::set_permissions(&ignore_file, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    assert_success(&imported);
+    assert!(stdout(&imported).contains(r"add the rule ^\.git(/.*)?$ to"), "{}", stdout(&imported));
+    assert!(!stdout(&imported).contains("Added \".git/\""), "{}", stdout(&imported));
+    assert_eq!(std::fs::read_to_string(&ignore_file).unwrap(), rules, "the user's rules must survive");
+}
+
+#[test]
+fn import_git_from_elsewhere_writes_no_ignore_file() {
+    // The `.git` rule goes into the tracked ignore file, so it is added only when the warehouse
+    // holds a `.git` folder to ignore.
+    let source = TestWarehouse::new("import-git-elsewhere-source");
+    let warehouse = TestWarehouse::new("import-git-elsewhere");
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&source.root)
+            .env("GIT_AUTHOR_NAME", "Ada").env("GIT_AUTHOR_EMAIL", "ada@example.com")
+            .env("GIT_COMMITTER_NAME", "Ada").env("GIT_COMMITTER_EMAIL", "ada@example.com")
+            .output()
+            .expect("git must be installed to run this test");
+        assert!(output.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&output.stderr));
+    };
+    git(&["init", "-q", "-b", "main"]);
+    source.write_file("a.txt", "hello\n");
+    git(&["add", "a.txt"]);
+    git(&["commit", "-qm", "first commit"]);
+
+    // The checkout's files are here (the inventory is built against them), but no `.git` is.
+    warehouse.write_file("a.txt", "hello\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    let imported = warehouse.run(&["import-git", source.root.to_str().unwrap()]);
+    assert_success(&imported);
+    assert!(!stdout(&imported).contains(".forkliftignore"), "{}", stdout(&imported));
+    assert!(!warehouse.root.join(".forkliftignore").exists(), "no `.git` here, so no rule to add");
+
+    // The positive half: the same import into a warehouse holding a `.git` folder adds the rule.
+    let colocated = TestWarehouse::new("import-git-elsewhere-colocated");
+    assert_success(&colocated.run(&["prepare"]));
+    configure_operator(&colocated);
+    std::fs::create_dir(colocated.root.join(".git")).unwrap();
+    colocated.write_file("a.txt", "hello\n");
+    // An indented copy of the rule is a different pattern (rules compile untrimmed) that never
+    // matches `.git`, so it must not count as the rule being present.
+    colocated.write_file(".forkliftignore", "  ^\\.git(/.*)?$\n");
+    assert_success(&colocated.run(&["import-git", source.root.to_str().unwrap()]));
+    let rules = std::fs::read_to_string(colocated.root.join(".forkliftignore")).unwrap();
+    assert!(rules.lines().any(|line| line == r"^\.git(/.*)?$"), "{:?}", rules);
+}
+
+#[test]
+fn a_conflicted_ignore_file_is_refused_not_read_as_rules() {
+    // The ignore file is tracked, so consolidating two edits of it can write conflict markers
+    // into it. Read as rules, `||||||| base` matches every path: stocktake would show nothing and
+    // `load .` would stage the removal of the whole tree.
+    let warehouse = TestWarehouse::new("conflicted-ignore-file");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    warehouse.write_file(".forkliftignore", "^build(/.*)?$\n");
+    warehouse.write_file("a.txt", "a\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base"]));
+
+    assert_success(&warehouse.run(&["palletize", "feature"]));
+    warehouse.write_file(".forkliftignore", "^out(/.*)?$\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "feature rules"]));
+    assert_success(&warehouse.run(&["shift", "main"]));
+    warehouse.write_file(".forkliftignore", "^tmp(/.*)?$\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "main rules"]));
+
+    warehouse.run(&["consolidate", "feature"]);
+    let conflicted = std::fs::read_to_string(warehouse.root.join(".forkliftignore")).unwrap();
+    assert!(conflicted.contains("||||||| base"), "{}", conflicted);
+
+    for args in [&["stocktake"][..], &["load", "."][..]] {
+        let refused = warehouse.run(args);
+        assert!(!refused.status.success(), "{:?} must refuse the conflicted rules: {}", args, stdout(&refused));
+        assert!(stderr(&refused).contains("unresolved conflict marker on line 1"), "{}", stderr(&refused));
+    }
+
+    // Resolved, the rules read again and nothing tracked was dropped.
+    warehouse.write_file(".forkliftignore", "^out(/.*)?$\n^tmp(/.*)?$\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    let status = json(&warehouse.run(&["--json", "stocktake"]));
+    assert!(status["data"]["staged"].as_array().unwrap().iter().all(|entry| entry["kind"] != "removed"),
+        "{}", status);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_ignore_file_is_refused() {
+    // The ignore file is tracked content and can arrive as a symbolic link. A dangling one must
+    // not read as "no rules", and a live one must not read rules from outside the warehouse.
+    let warehouse = TestWarehouse::new("symlinked-ignore-file");
+    assert_success(&warehouse.run(&["prepare"]));
+    warehouse.write_file("rules", "^x$\n");
+
+    for target in ["rules", "missing"] {
+        let _ = std::fs::remove_file(warehouse.root.join(".forkliftignore"));
+        std::os::unix::fs::symlink(target, warehouse.root.join(".forkliftignore")).unwrap();
+        let refused = warehouse.run(&["stocktake"]);
+        assert!(!refused.status.success(), "a link to {} must be refused: {}", target, stdout(&refused));
+        assert!(stderr(&refused).contains("must be a regular file"), "{}", stderr(&refused));
+    }
+
+    // The positive half: the same rules in a regular file are read.
+    std::fs::remove_file(warehouse.root.join(".forkliftignore")).unwrap();
+    warehouse.write_file(".forkliftignore", "^x$\n");
+    assert_success(&warehouse.run(&["stocktake"]));
 }
 
 #[cfg(unix)]

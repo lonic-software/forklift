@@ -28,21 +28,12 @@ pub const OBJECT_HASH_FOLDER_PATH_CHARACTERS: usize = 2;
 const FILENAME_IGNORE: &str = ".forkliftignore";
 
 const IGNORE_FILE_COMMENT_PREFIX: &str = "#";
-const IGNORE_FILE_CONTENT: &str = r#"# Forklift ignore file.
-# This file is used to specify files and directories that should be ignored by Forklift.
-# Every entry must be a valid regex pattern.
-#
-# Example - ignore a folder called "test" (and nothing else whose name starts with "test"):
-# ^test(/.*)?$
-#
-# Example - ignore all files with the extension ".log":
-# \.log$
-"#;
 
-/// Always ignored: the warehouse's own folder, and the ignore file. Each is anchored at both
-/// ends, so a tracked sibling that merely starts with the same name (`.forklift-notes`) is
-/// not swallowed.
-const DEFAULT_IGNORED_PATHS: [&str; 2] = [r"^\.forklift(/.*)?$", r"^\.forkliftignore$"];
+/// Always ignored: the warehouse's own folder. Anchored at both ends, so a tracked sibling that
+/// merely starts with the same name (`.forklift-notes`, the ignore file itself) is not
+/// swallowed. The ignore file is tracked content, like `.gitignore`: its rules travel with the
+/// history.
+const DEFAULT_IGNORED_PATHS: [&str; 1] = [r"^\.forklift(/.*)?$"];
 
 /// The path separator used in warehouse-internal paths (inventory keys, metadata entries,
 /// object store paths). This is always `/`, on every platform: keys written on one platform
@@ -2447,54 +2438,96 @@ pub fn get_owners_for_file(_metadata: &Metadata) -> (u64, u64) {
     (0, 0)
 }
 
-/// Create the `.forkliftignore` file (with default content) if it does not exist yet.
-///
-/// # Returns
-/// * `Ok(true)`    - If the ignore file was created.
-/// * `Ok(false)`   - If the ignore file already existed.
-/// * `Err(String)` - If an error occurred while creating the ignore file.
-pub fn create_ignore_file_if_not_exists() -> Result<bool, String> {
-    let ignore_file_path = crate::globals::warehouse_root().join(FILENAME_IGNORE);
-    let mut created_ignore_file = false;
-
-    if !ignore_file_path.exists() {
-        std::fs::write(&ignore_file_path, IGNORE_FILE_CONTENT)
-            .map_err(|e| format!("Error while creating ignore file: {}", e))?;
-
-        created_ignore_file = true;
-    }
-
-    Ok(created_ignore_file)
-}
-
 /// Get regex patterns for paths that should be ignored by Forklift.
 ///
 /// # Returns
 /// * Ok(Vec<Regex>) - The regex patterns for ignored paths.
-/// * Err(String)    - If an error occurred while reading the ignore file.
+/// * Err(String)    - If the ignore file could not be read, or was refused: a symbolic link or
+///                    folder, a conflict marker, or a pattern matching the empty string.
 pub fn get_ignored_paths() -> Result<Vec<Regex>, String> {
     let mut ignored_paths = get_default_ignored_paths()?;
-    let ignore_file_path = crate::globals::warehouse_root().join(FILENAME_IGNORE);
 
-    if !ignore_file_path.exists() {
-        return Ok(ignored_paths);
+    if let Some(content) = read_ignore_file()? {
+        ignored_paths.extend(parse_ignore_rules(&content)?);
     }
 
-    let ignore_file = std::fs::read_to_string(ignore_file_path)
-        .map_err(|e| format!("Error while reading ignore file: {}", e))?;
+    Ok(ignored_paths)
+}
 
-    for line in ignore_file.lines() {
-        // Skip empty lines and comments
+/// The path of the warehouse's ignore file, at the root of the working tree.
+pub fn ignore_file_path() -> PathBuf {
+    crate::globals::warehouse_root().join(FILENAME_IGNORE)
+}
+
+/// Read the ignore file, if there is one.
+///
+/// The file is tracked content, so it can arrive as a symbolic link. Like git with a symlinked
+/// `.gitignore`, that is refused rather than followed: a dangling link would silently yield no
+/// rules, and a live one would read rules from outside the warehouse.
+///
+/// # Returns
+/// * `Ok(Some(String))` - The file's content.
+/// * `Ok(None)`         - There is no ignore file.
+/// * `Err(String)`      - The file is a symbolic link or not a regular file, or could not be read.
+pub fn read_ignore_file() -> Result<Option<String>, String> {
+    let path = ignore_file_path();
+
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("Error while reading \"{}\": {}", FILENAME_IGNORE, e)),
+    };
+
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "\"{}\" must be a regular file; a symbolic link or a folder is not read as ignore rules.",
+            FILENAME_IGNORE
+        ));
+    }
+
+    std::fs::read_to_string(&path)
+        .map(Some)
+        .map_err(|e| format!("Error while reading \"{}\": {}", FILENAME_IGNORE, e))
+}
+
+/// Parse the ignore file's content into rules: one regex per line, skipping empty lines and lines
+/// that start with `#`.
+///
+/// Two kinds of line are refused rather than compiled:
+/// * a merge conflict marker, which consolidating two edits of the file writes into it. One of
+///   them, `||||||| base`, compiles to a pattern that matches every path, so the next `load .`
+///   would stage the removal of the whole tree;
+/// * a pattern that matches the empty string. Matching is a search anywhere in the path, so
+///   such a pattern (`.*`, `x*`, `a|`) matches every path.
+fn parse_ignore_rules(content: &str) -> Result<Vec<Regex>, String> {
+    let mut rules = Vec::new();
+
+    for (index, line) in content.lines().enumerate() {
         if line.is_empty() || line.starts_with(IGNORE_FILE_COMMENT_PREFIX) {
             continue;
         }
 
-        let regex = get_regex_for_pattern(line)?;
+        if ["<<<<<<<", "|||||||", "=======", ">>>>>>>"].iter().any(|marker| line.starts_with(marker)) {
+            return Err(format!(
+                "\"{}\" has an unresolved conflict marker on line {}. Resolve the file first.",
+                FILENAME_IGNORE, index + 1
+            ));
+        }
 
-        ignored_paths.push(regex);
+        let regex = get_regex_for_pattern(line)
+            .map_err(|e| format!("\"{}\", line {}: {}", FILENAME_IGNORE, index + 1, e))?;
+
+        if regex.is_match("") {
+            return Err(format!(
+                "\"{}\", line {}: the pattern \"{}\" matches the empty string, so it would match every path.",
+                FILENAME_IGNORE, index + 1, line
+            ));
+        }
+
+        rules.push(regex);
     }
 
-    Ok(ignored_paths)
+    Ok(rules)
 }
 
 /// Check if a path should be ignored by Forklift.
@@ -2596,33 +2629,30 @@ mod tests {
     use crate::globals::StorageRootScope;
 
     #[test]
-    fn default_ignore_rules_cover_the_warehouse_folder_and_ignore_file_but_no_sibling() {
+    fn default_ignore_rules_cover_the_warehouse_folder_but_no_sibling() {
         let defaults = get_default_ignored_paths().unwrap();
 
-        for ignored in [".forklift", ".forklift/config/warehouse.toml", ".forkliftignore"] {
+        for ignored in [".forklift", ".forklift/config/warehouse.toml"] {
             assert!(is_path_ignored(ignored, &defaults), "{} must be ignored", ignored);
         }
-        for tracked in [".forklift-notes", ".forkliftrc", ".forkliftignore.bak", "a/.forklift", "x.forklift"] {
+        // The ignore file is a sibling too: it is tracked content, like `.gitignore`.
+        for tracked in [".forkliftignore", ".forkliftignore.bak", ".forklift-notes", ".forkliftrc", "a/.forklift", "x.forklift"] {
             assert!(!is_path_ignored(tracked, &defaults), "{} must not be ignored", tracked);
         }
     }
 
     #[test]
-    fn the_ignore_file_template_teaches_an_anchored_folder_rule() {
-        // The folder example a new warehouse's ignore file shows is the pattern users copy;
-        // read it from the template so the test follows the text that ships.
-        let example = IGNORE_FILE_CONTENT.lines()
-            .skip_while(|line| !line.contains("ignore a folder called \"test\""))
-            .nth(1)
-            .and_then(|line| line.strip_prefix("# "))
-            .expect("the template's folder example");
-        let rule = vec![get_regex_for_pattern(example).unwrap()];
+    fn ignore_rules_refuse_conflict_markers_and_match_everything_patterns() {
+        let rules = parse_ignore_rules("# comment\n\n^build(/.*)?$\n\\.log$\n").unwrap();
+        assert_eq!(rules.len(), 2);
 
-        for ignored in ["test", "test/a.rs", "test/deep/b.rs"] {
-            assert!(is_path_ignored(ignored, &rule), "{} must be ignored by {}", ignored, example);
+        for marker in ["<<<<<<< ours", "||||||| base", "=======", ">>>>>>> theirs"] {
+            let error = parse_ignore_rules(&format!("^a$\n{}\n", marker)).unwrap_err();
+            assert!(error.contains("unresolved conflict marker on line 2"), "{}: {}", marker, error);
         }
-        for tracked in ["testing.rs", "tests/a.rs", "test.txt", "src/test"] {
-            assert!(!is_path_ignored(tracked, &rule), "{} must not be ignored by {}", tracked, example);
+        for pattern in [".*", "x*", "a|", "|"] {
+            let error = parse_ignore_rules(&format!("{}\n", pattern)).unwrap_err();
+            assert!(error.contains("matches the empty string"), "{}: {}", pattern, error);
         }
     }
 
