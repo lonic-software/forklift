@@ -10,6 +10,8 @@ pub mod commands;
 #[cfg(feature = "docgen")]
 pub mod docgen;
 pub mod events;
+#[cfg(any(test, feature = "docgen"))]
+mod internal_refs;
 pub mod output;
 pub mod pager;
 pub mod passphrase;

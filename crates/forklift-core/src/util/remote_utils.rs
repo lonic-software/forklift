@@ -564,7 +564,7 @@ const _: () = assert!(
 /// body are indistinguishable to the caller, which is right: both mean "no usable error body
 /// arrived."
 ///
-/// Not the actual timeout duration on its own (review round 5, finding 2) — see
+/// Not the actual timeout duration on its own — see
 /// [`error_body_read_budget`] for why `self.budgets.connect` is folded in on top of this base,
 /// the same way [`bounded_read_timeout`] and [`clients::Clients::send_with_watchdog`]'s own phase
 /// budgets already do.
@@ -668,10 +668,10 @@ const UPLOAD_WATCHDOG_POLL_INTERVAL: std::time::Duration = std::time::Duration::
 
 /// Fixed part of [`post_send_verify_budget`]'s bound on the *post-send* phase — the wait for a
 /// response once the whole body has already been handed off (see [`UploadProgress`]'s doc on why
-/// that phase used to be left unbounded, and why leaving it unbounded was actually the FORK-49
-/// defect surviving inside its own fix: a remote that reads the entire body and then wedges during
-/// verification is a completely ordinary failure — a crash or a stuck disk mid-write — and it hangs
-/// exactly like the original bug on this exact path). This covers dispatch/scheduling overhead
+/// that phase used to be left unbounded, and why leaving it unbounded reopened the silent-remote
+/// hang [`REMOTE_READ_TIMEOUT`] exists to close: a remote that reads the entire body and then wedges
+/// during verification is a completely ordinary failure — a crash or a stuck disk mid-write — and
+/// without this bound the upload would wait on it forever). This covers dispatch/scheduling overhead
 /// so a tiny object's total budget isn't unrealistically close to zero.
 const POST_SEND_VERIFY_BASE: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -2777,8 +2777,7 @@ impl RemoteClient {
 
     /// Turn a non-success response into the client-facing error, threading the server's refusal
     /// code (§7.4) through the taxonomy when the body carries one. The body read is bounded by
-    /// [`Self::error_body_budget`] (review round 5 finding 2, so this instance's own
-    /// `connect_timeout` is folded in) — see that method's and [`error_body_read_budget`]'s docs
+    /// [`Self::error_body_budget`] (so this instance's own `connect_timeout` is folded in) — see that method's and [`error_body_read_budget`]'s docs
     /// for why this call in particular needs its own bound rather than inheriting one from
     /// whichever client sent the request, and why the flat [`ERROR_BODY_READ_TIMEOUT`] alone is
     /// not it.
@@ -2983,8 +2982,8 @@ impl RemoteClient {
     /// `HOOK_CLIENT_TIMEOUT` of 10s, and a single call can pay that twice: `post_resolve` first
     /// calls `check_auth`, which on a bearer-token auth-cache miss makes its own hook round trip
     /// via `authenticate_via_hook` — up to 10s — before `post_resolve` makes its *own*
-    /// resolution-hook call through `post_hook` — up to another 10s. A 15s total deadline can therefore abandon a
-    /// request a slow-hook deployment is still legitimately serving. Accepted deliberately:
+    /// resolution-hook call through `post_hook` — up to another 10s. A 15s total deadline can
+    /// therefore abandon a request a slow-hook deployment is still legitimately serving. Accepted deliberately:
     /// `resolve` is cosmetic display sugar and its fallback to pseudonyms is free (never a
     /// command failure), so giving up early is the right failure for this one call — unlike
     /// `fetch_info`/`fetch_signature`/`fetch_bundle_to`, whose `BoundedReads` silence budget never
@@ -4845,8 +4844,8 @@ fn refuse_if_over_ceiling_for_upload(hash: &str, bytes: &[u8]) -> Result<(), Cor
     scope_utils::refuse_if_over_object_ceiling(&format!("object {}", hash), bytes.len())
 }
 
-/// Load one object's bytes and apply the transport-ceiling refusal, off the async runtime
-/// (review round S2 fix hole): `retrieve_object_by_hash` is synchronous pack/loose-object I/O
+/// Load one object's bytes and apply the transport-ceiling refusal, off the async runtime:
+/// `retrieve_object_by_hash` is synchronous pack/loose-object I/O
 /// (decompression, hash verification), not a `.await` point, so running it directly inside a
 /// spawned task blocks whichever runtime worker polls that task for however long the read takes.
 /// On the production multi-thread runtime with [`CONCURRENT_TRANSFERS`] (24) workers all
@@ -4896,7 +4895,7 @@ async fn retrieve_object_for_upload(hash: String,
 
 #[cfg(test)]
 thread_local! {
-    /// Test-only seam (review round S2 fix hole, falsifier for the `spawn_blocking` fix above):
+    /// Test-only seam (the falsifier for the `spawn_blocking` move above):
     /// lets a test make the blocking retrieval artificially slow, long enough that a runtime
     /// whose only worker is stuck *synchronously* inside the read would visibly miss timer ticks
     /// a sibling task is trying to fire. Thread-local, not a process-global `static`: `cargo test`
@@ -6239,25 +6238,25 @@ mod tests {
         ));
     }
 
-    /// Review round 5, finding 2: `error_body_read_budget` must fold the caller's own
+    /// `error_body_read_budget` must fold the caller's own
     /// `connect_timeout` into the flat `ERROR_BODY_READ_TIMEOUT` base — a Tor-routed client's
     /// (60s) connect budget must survive into the composed bound, not just the direct client's
     /// (5s) one. Asserts the arithmetic directly rather than constructing a live Tor client and
     /// waiting out the real budget (the exact ~72s shape deleted from this suite in 8b93d00).
     ///
     /// This pins one of four links; on its own it pins only the helper's arithmetic, not that
-    /// `error_of` actually calls it (review round 6, finding 1 — nothing enforced that link
-    /// before `missing_objects_bounds_the_error_body_read_after_a_wedged_500` below started
-    /// asserting a lower bound on elapsed time), not that the accessor computing the budget reads
+    /// `error_of` actually calls it (that link is pinned by
+    /// `missing_objects_bounds_the_error_body_read_after_a_wedged_500` below, which asserts a
+    /// lower bound on elapsed time), not that the accessor computing the budget reads
     /// *this instance's* `budgets.connect` field at all, rather than hardcoding whichever constant
-    /// a given fixture's client happens to carry (review round 7 — a fixture built through a
+    /// a given fixture's client happens to carry (a fixture built through a
     /// production constructor can only ever carry `REMOTE_CONNECT_TIMEOUT` or
     /// `REMOTE_CONNECT_TIMEOUT_TOR`, so it cannot separate "reads the field" from "hardcodes that
     /// one value"; see `error_body_budget_reads_this_field_not_a_rival_constant`, which injects a
     /// value neither constructor can produce), and not that the value at the one client mode that
     /// actually ships with a non-default budget (`TorMode::On`) is the correct 70s rather than some
-    /// other value a future change (e.g. a cap) could silently substitute (review round 8, finding
-    /// 1; see `error_body_budget_is_70s_for_a_real_tor_mode_client`). All four together pin
+    /// other value a future change (e.g. a cap) could silently substitute (see
+    /// `error_body_budget_is_70s_for_a_real_tor_mode_client`). All four together pin
     /// `error_of`'s real behavior, on any client, without a live remote.
     #[test]
     fn error_body_read_budget_folds_in_the_connect_timeout() {
@@ -6878,7 +6877,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------------------
-    // Review round S2 fix hole: `upload_objects`/`upload_to_targets` called the synchronous
+    // `upload_objects`/`upload_to_targets` used to call the synchronous
     // `retrieve_object_by_hash` directly inside a spawned async task, no `spawn_blocking`. On
     // the production multi-thread runtime, with `CONCURRENT_TRANSFERS` (24) workers all
     // eventually blocked in pack retrieval at once, in-flight upload watchdogs go unpolled and
@@ -6898,7 +6897,7 @@ mod tests {
     /// that spent most of the window synchronously blocked (which deterministically misses on
     /// the order of 50 ticks — see the reverted-fix run this test's doc references).
     ///
-    /// Review round 5, finding 3: the ticker count alone does not exercise *where*
+    /// The ticker count alone does not exercise *where*
     /// `current_scope_root()`/the delay seam are captured — moving that capture from
     /// `upload_objects`'s own loop into `retrieve_object_for_upload` itself (see that function's
     /// doc for why the two placements differ on a genuine multi-thread runtime) would leave the
@@ -10058,10 +10057,9 @@ mod tests {
         );
     }
 
-    /// Review round 8, finding 1: the sentinel test above pins *reads-the-field-not-a-rival* but
+    /// The sentinel test above pins *reads-the-field-not-a-rival* but
     /// not what `error_body_budget` actually returns for a real Tor-mode client — the two are
-    /// different claims, and a round 7 argument that the sentinel subsumed this test's predecessor
-    /// was accepted on prose alone and never tested. It doesn't hold: see that test's own doc for
+    /// different claims, and the sentinel does not subsume this one: see that test's own doc for
     /// the falsifying mutation (a 30s cap) that leaves the sentinel green while this one reddens.
     /// Built the same no-I/O way as `new_with_tor_selects_the_60s_connect_budget` (`new_with_tor`
     /// never touches the network).
@@ -11610,7 +11608,7 @@ mod tests {
     // (`connect + UPLOAD_SILENCE_BUDGET + post_send_verify_budget(body_len)`), not
     // `post_send_verify_budget(body_len)` alone.
     //
-    // `SilentRemote` (above, from slice 1) is exactly the fixture this needs: it already reads a
+    // `SilentRemote` (above) is exactly the fixture this needs: it already reads a
     // request in full via `read_test_request` (headers *and* body, draining to `Content-Length`)
     // and then parks without ever writing a response — a wedge that happens *after* a complete
     // receive, never during one. That's what makes it different from `WedgedUploadRemote`, which

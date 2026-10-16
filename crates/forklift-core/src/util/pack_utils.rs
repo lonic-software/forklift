@@ -4206,11 +4206,12 @@ mod tests {
         std::fs::remove_dir_all(&temp).ok();
     }
 
-    /// Mechanism-level probe for PR #84 review finding 1, isolated from `franchise` entirely:
+    /// Mechanism-level probe for a held pack mapping blocking a franchise's cleanup, isolated
+    /// from `franchise` entirely:
     /// does an `Mmap`'d pack file actually block `remove_dir_all` on its own containing
     /// directory? Windows-only by construction — POSIX permits unlinking (and therefore
     /// recursively removing a directory over) a file that is still mapped, verified empirically
-    /// on macOS during that review round, so this question has no meaning on a non-Windows
+    /// on macOS, so this question has no meaning on a non-Windows
     /// target and the test is gated accordingly rather than asserting something platform-
     /// specific as if it were universal.
     ///

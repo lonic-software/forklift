@@ -20,7 +20,13 @@ cargo build --quiet -p forklift --features docgen
 
 bin="./target/debug/forklift"
 
-"$bin" __docgen errors > "$out/errors.md"
-"$bin" __docgen json-schemas > "$out/json-schemas.md"
+# Render each page into a temp file and move it into place only on success: a renderer that
+# refuses its page must leave the committed copy untouched, not truncated (and no temp file
+# behind for `bin/check`'s diff to trip over).
+trap 'rm -f "$out/errors.md.tmp" "$out/json-schemas.md.tmp"' EXIT
+"$bin" __docgen errors > "$out/errors.md.tmp"
+"$bin" __docgen json-schemas > "$out/json-schemas.md.tmp"
+mv "$out/errors.md.tmp" "$out/errors.md"
+mv "$out/json-schemas.md.tmp" "$out/json-schemas.md"
 
 echo "gen-docs: wrote $out/errors.md and $out/json-schemas.md"
