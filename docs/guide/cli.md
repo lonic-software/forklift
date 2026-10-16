@@ -136,7 +136,19 @@ own lines:
 
 The file is **tracked content**, like `.gitignore`: `load` and `stack` it, and its
 rules travel with the history — a `franchise` or `lower` brings the remote's rules
-along. Only `.forklift/` is always ignored. `import-git` adds a rule for `.git/`.
+along. Only `.forklift/` is always ignored. `import-git` adds a rule for `.git/` when
+the warehouse holds a `.git` folder. The rules are read only from the file on disk at
+the warehouse root. A sparse franchise (`--only`) materializes only its in-scope
+paths, so when the root file is out of scope, its rules do not apply there.
+
+Forklift refuses to read the file, and stops, when it is a symbolic link, when a line
+is a leftover conflict marker (consolidating two edits of the file writes them), or
+when a pattern matches the empty string (`.*`, `x*`, `a|`): such a pattern matches
+every path.
+
+Unlike git, a rule also applies to paths that are already tracked: the next `load .`
+stages their removal. Because the rules travel, a rule someone else stacks does the
+same in your warehouse once you `lower` it.
 
 Anchor a folder rule at both ends. `^target\/?.*$` also matches `targets.txt` and
 `target-notes/`, and ignoring a tracked file makes the next `load .` stage its
