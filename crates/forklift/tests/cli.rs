@@ -761,8 +761,9 @@ fn a_dangling_warehouse_config_link_is_an_error_not_a_fallback_to_global() {
     // The same, one level up: the configuration *folder* is the dangling link, so the file's own
     // path ends in nothing at all and only the walk up the path can tell it from absence.
     let folder = warehouse.root.join(".forklift/config");
+    // Recursive: beside the file the folder also holds its edit-lock sidecar.
     std::fs::remove_file(&config).unwrap();
-    std::fs::remove_dir(&folder).unwrap();
+    std::fs::remove_dir_all(&folder).unwrap();
     std::os::unix::fs::symlink(warehouse.root.join("unmounted"), &folder).unwrap();
 
     let read = warehouse.run(&["config", "remote.url"]);
@@ -3598,7 +3599,7 @@ fn franchise_and_profile_use_refuse_an_empty_value_in_their_own_words() {
 /// door, and there is no `profile delete`. Creating something unusable and unremovable is worse
 /// than refusing to create it.
 ///
-/// Run here rather than in `config_utils`'s unit tests because `set_profile_fields` writes to the
+/// Run here rather than in `config_utils`'s unit tests because `create_profile` writes to the
 /// real global configuration, and only this harness scopes HOME to the test.
 #[test]
 fn an_empty_profile_name_is_refused_rather_than_created_unreachable() {

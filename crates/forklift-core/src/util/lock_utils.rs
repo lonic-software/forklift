@@ -134,6 +134,60 @@ impl Drop for ServeLock {
     }
 }
 
+/// An exclusive lock serializing every edit of one **configuration file**, held for one
+/// load → edit → write and no longer.
+///
+/// Unlike the lock files above, this is a *kernel* lock (`File::lock`: `flock` on Unix,
+/// `LockFileEx` on Windows) on a sidecar `<config file>.lock` that is never deleted. A second
+/// writer **waits** instead of failing: config edits are short, and the cost of refusing is high
+/// (operator identity is minted on first use by any command). And a hard-killed holder leaves
+/// nothing stale, because the kernel drops the lock with the process. A `create_new` lock file
+/// in the home directory, left behind by a crash, would refuse identity minting for every
+/// warehouse on the machine until someone deleted it by hand.
+///
+/// The lock is on a sidecar, never the config file itself: a write replaces the config by rename,
+/// so a lock on the old file would exclude nothing, and on Windows the lock may be mandatory and
+/// would then block the readers, which deliberately take no lock.
+///
+/// A thread holds at most one config lock at a time and runs no other config operation while
+/// holding it, so two config locks can never deadlock.
+pub struct ConfigFileLock {
+    // Held only to keep the lock: closing the handle releases it.
+    _file: std::fs::File,
+}
+
+impl ConfigFileLock {
+    /// Acquire the edit lock for the configuration file at `config_path`, waiting while another
+    /// thread or process holds it. The folder of `config_path` must exist.
+    ///
+    /// # Returns
+    /// * `Ok(ConfigFileLock)` - The acquired lock (released when dropped).
+    /// * `Err(String)`        - The sidecar could not be opened or locked.
+    pub fn acquire(config_path: &Path) -> Result<ConfigFileLock, String> {
+        let path = config_lock_path(config_path)?;
+
+        let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
+            .open(&path)
+            .map_err(|e| format!("Error while opening the lock file \"{}\": {}", path.to_string_lossy(), e))?;
+
+        file.lock()
+            .map_err(|e| format!("Error while locking \"{}\": {}", path.to_string_lossy(), e))?;
+
+        Ok(ConfigFileLock { _file: file })
+    }
+}
+
+/// The sidecar lock file of a configuration file: `<config file>.lock`, beside it.
+fn config_lock_path(config_path: &Path) -> Result<PathBuf, String> {
+    let file_name = config_path.file_name()
+        .ok_or_else(|| format!("Cannot lock \"{}\": it has no file name.", config_path.to_string_lossy()))?;
+
+    let mut lock_name = file_name.to_os_string();
+    lock_name.push(".lock");
+
+    Ok(config_path.with_file_name(lock_name))
+}
+
 /// How many times `acquire_lock_file` retries a transient permission-denied create, and the
 /// delay between attempts (see the function doc for what this absorbs).
 const LOCK_CREATE_MAX_ATTEMPTS: u32 = 6;

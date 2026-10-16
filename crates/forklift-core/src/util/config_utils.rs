@@ -4,6 +4,7 @@ use crate::enums::config_scope::ConfigScope;
 use crate::globals::forklift_root;
 use crate::model::operator::Operator;
 use crate::util::file_utils;
+use crate::util::lock_utils::ConfigFileLock;
 use crate::util::remote_utils;
 
 /// The folder inside the forklift root that holds configuration files. The warehouse-level
@@ -549,23 +550,25 @@ pub fn get_config_path(scope: ConfigScope) -> Result<PathBuf, String> {
 }
 
 /// Create the warehouse configuration file (with a commented template) if it does not
-/// exist yet. The configuration folder must already exist.
+/// exist yet, creating the configuration folder first if it is missing.
 ///
 /// # Returns
 /// * `Ok(true)`    - If the configuration file was created.
 /// * `Ok(false)`   - If the configuration file already existed.
 /// * `Err(String)` - If an error occurred while creating the file.
 pub fn create_warehouse_config_if_not_exists() -> Result<bool, String> {
-    let path = get_config_path(ConfigScope::Warehouse)?;
+    edit_locked(&get_config_path(ConfigScope::Warehouse)?, |path| {
+        // Decided under the lock, so two initializations cannot both find the file absent and
+        // the second overwrite whatever the first (or a `config` command in between) wrote.
+        if std::fs::symlink_metadata(path).is_ok() {
+            return Ok(false);
+        }
 
-    if path.exists() {
-        return Ok(false);
-    }
+        file_utils::replace_file_atomically(path, WAREHOUSE_CONFIG_TEMPLATE.as_bytes())
+            .map_err(|e| format!("Error while creating configuration file \"{}\": {}", path.to_string_lossy(), e))?;
 
-    std::fs::write(&path, WAREHOUSE_CONFIG_TEMPLATE)
-        .map_err(|e| format!("Error while creating configuration file \"{}\": {}", path.to_string_lossy(), e))?;
-
-    Ok(true)
+        Ok(true)
+    })
 }
 
 /// Get the value of a configuration key from the configuration file of the given scope.
@@ -657,19 +660,13 @@ pub fn set_value(key: &str, value: &str, scope: ConfigScope) -> Result<String, S
 
     let stored = storable_value(key, value);
 
-    let mut document = load_document(&path)?.unwrap_or_default();
-    set_value_in_document(&mut document, section, field, &stored)
-        .map_err(|detail| not_valid(&path, detail))?;
+    edit_locked(&path, |path| {
+        let mut document = load_document(path)?.unwrap_or_default();
+        set_value_in_document(&mut document, section, field, &stored)
+            .map_err(|detail| not_valid(path, detail))?;
 
-    if let Some(parent) = path.parent() {
-        // The configuration folder may not exist yet in warehouses prepared before this
-        // feature was added.
-        if !parent.as_os_str().is_empty() {
-            file_utils::create_folder_if_not_exists(parent)?;
-        }
-    }
-
-    write_validated(&path, &document)?;
+        write_validated(path, &document)
+    })?;
 
     Ok(stored)
 }
@@ -690,18 +687,20 @@ pub fn unset_value(key: &str, scope: ConfigScope) -> Result<(), String> {
     let (section, field) = split_key(key)?;
     let path = get_config_path(scope)?;
 
-    let Some(mut document) = load_document(&path)? else {
-        return Err(format!("\"{}\" is not set.", key));
-    };
+    edit_locked(&path, |path| {
+        let Some(mut document) = load_document(path)? else {
+            return Err(format!("\"{}\" is not set.", key));
+        };
 
-    let removed = remove_value_from_document(&mut document, section, field)
-        .map_err(|detail| not_valid(&path, detail))?;
+        let removed = remove_value_from_document(&mut document, section, field)
+            .map_err(|detail| not_valid(path, detail))?;
 
-    if !removed {
-        return Err(format!("\"{}\" is not set.", key));
-    }
+        if !removed {
+            return Err(format!("\"{}\" is not set.", key));
+        }
 
-    write_validated(&path, &document)
+        write_validated(path, &document)
+    })
 }
 
 /// Get the operator identity for parcel authorship. Identity is zero-configuration:
@@ -730,8 +729,7 @@ pub fn get_operator() -> Result<Operator, String> {
         };
 
         if identity.identifier.is_empty() {
-            identity.identifier = mint_uuid_v4();
-            set_profile_fields(&profile, &[(PROFILE_FIELD_IDENTIFIER, &identity.identifier)])?;
+            identity.identifier = mint_profile_identifier(&profile)?;
         }
 
         if identity.name.is_empty() {
@@ -743,11 +741,7 @@ pub fn get_operator() -> Result<Operator, String> {
 
     let identifier = match get_effective_value(KEY_OPERATOR_IDENTIFIER)? {
         Some((identifier, _)) => identifier,
-        None => {
-            let minted = mint_uuid_v4();
-            set_value(KEY_OPERATOR_IDENTIFIER, &minted, ConfigScope::Global)?;
-            minted
-        }
+        None => mint_global_identifier()?,
     };
 
     let name = get_effective_value(KEY_OPERATOR_NAME)?
@@ -755,6 +749,69 @@ pub fn get_operator() -> Result<Operator, String> {
         .unwrap_or_else(|| identifier.clone());
 
     Ok(Operator { name, identifier })
+}
+
+/// The global `operator.identifier`, minted and written if the global file still has none.
+///
+/// **The identifier returned is the one the file holds.** Deciding "none is set" from an earlier
+/// read and then writing a fresh UUID lost identities: when several commands ran their first use
+/// at once, each minted its own, each wrote it and went on signing with it, and only the last
+/// write survived. Every other caller had already used an identity the machine then forgot. The
+/// decision is therefore re-made under the edit lock, and a caller that finds an identifier there
+/// takes it instead of its own.
+///
+/// Only the global file is consulted under the lock: the warehouse scope was already found
+/// without an identifier by the caller, and reading it here would mean a second file inside this
+/// one's lock.
+fn mint_global_identifier() -> Result<String, String> {
+    edit_locked(&get_config_path(ConfigScope::Global)?, |path| {
+        let mut document = load_document(path)?.unwrap_or_default();
+
+        if let Some(identifier) = parse_config(&document, path)?.get(KEY_OPERATOR_IDENTIFIER) {
+            return Ok(identifier.to_string());
+        }
+
+        let (section, field) = split_key(KEY_OPERATOR_IDENTIFIER)?;
+        let minted = mint_uuid_v4();
+        set_value_in_document(&mut document, section, field, &minted)
+            .map_err(|detail| not_valid(path, detail))?;
+
+        write_validated(path, &document)?;
+
+        Ok(minted)
+    })
+}
+
+/// A profile's identifier, minted and written if the profile still has none — the profile
+/// counterpart of [`mint_global_identifier`], decided under the edit lock for the same reason.
+///
+/// # Returns
+/// * `Ok(String)`  - The identifier the profile holds.
+/// * `Err(String)` - The global file could not be read or written, or the profile no longer
+///                   exists (it was removed since the caller read it).
+fn mint_profile_identifier(profile: &str) -> Result<String, String> {
+    edit_locked(&get_config_path(ConfigScope::Global)?, |path| {
+        let mut document = load_document(path)?.unwrap_or_default();
+
+        let Some(record) = parse_config(&document, path)?.profile(profile).cloned() else {
+            return Err(format!(
+                "The selected profile \"{}\" does not exist in the global configuration. \
+                Create it with \"forklift profile create {}\".",
+                profile, profile
+            ));
+        };
+
+        if let Some(identifier) = record.identifier {
+            return Ok(identifier);
+        }
+
+        let minted = mint_uuid_v4();
+        set_profile_fields_in_document(&mut document, path, profile, &[(PROFILE_FIELD_IDENTIFIER, &minted)])?;
+
+        write_validated(path, &document)?;
+
+        Ok(minted)
+    })
 }
 
 /// Read a named profile from the global configuration.
@@ -786,21 +843,26 @@ pub fn list_profiles() -> Result<Vec<(String, Operator)>, String> {
         .collect())
 }
 
-/// Set fields of a named profile in the global configuration, creating the profile section
-/// when it does not exist yet — **all of them in one document edit and one write**, so a profile
-/// is never left holding some of the fields it was given.
+/// Set fields of a named profile in a parsed global configuration document, creating the profile
+/// section when it does not exist yet — **all of them in one edit**, so a profile is never left
+/// holding some of the fields it was given. Writing the document is the caller's, inside the
+/// edit lock it read the document under (see [`edit_locked`]).
 ///
 /// # Arguments
-/// * `profile` - The profile name.
-/// * `fields`  - The `(field, value)` pairs to set (`identifier` and/or `name`).
+/// * `document` - The global configuration document.
+/// * `path`     - The file it came from, named in a refusal.
+/// * `profile`  - The profile name.
+/// * `fields`   - The `(field, value)` pairs to set (`identifier` and/or `name`).
 ///
 /// # Returns
-/// * `Ok(())`      - If every field was written.
-/// * `Err(String)` - If a name or value is empty, a field is not `identifier`/`name` or is given
-///                   twice, the file could not be read, parsed or written, or `profile` (or the
-///                   `[profile]` section itself) is present but is not a table. Nothing is
-///                   written in any of these cases.
-pub fn set_profile_fields(profile: &str, fields: &[(&str, &str)]) -> Result<(), String> {
+/// * `Ok(())`      - Every field was set in `document`.
+/// * `Err(String)` - A name or value is empty, a field is not `identifier`/`name` or is given
+///                   twice, or `profile` (or the `[profile]` section itself) is present but is not
+///                   a table. The input checks run before `document` is touched.
+fn set_profile_fields_in_document(document: &mut DocumentMut,
+                                  path: &Path,
+                                  profile: &str,
+                                  fields: &[(&str, &str)]) -> Result<(), String> {
     // The write-side half of the parse's emptiness rule, so this function cannot lay down the
     // entry the parse refuses.
     //
@@ -815,13 +877,12 @@ pub fn set_profile_fields(profile: &str, fields: &[(&str, &str)]) -> Result<(), 
     // that no command can read. The strict parse is for values that would be *misread*.
     //
     // Every check in this function — the name, the values, and the field checks below — is a
-    // precondition on a public function, not a live defence: swept 2026-10-12, both callers
-    // already exclude every case — `create_profile` validates its inputs with its own wording
-    // before calling and passes only the two known fields once each, and `get_operator` passes an
+    // precondition, not a live defence: both callers already exclude every case —
+    // `create_profile` validates its inputs with its own wording before calling and passes only
+    // the two known fields once each, and `mint_profile_identifier` is reached with an
     // `operator.profile` that `validate_value` refuses when empty, with a freshly minted
-    // identifier. No caller can reach them, so a unit test calls this function directly — with a
-    // blank value in every call, so that no mutation can make it write the real global file.
-    // Re-check this list if a third caller appears.
+    // identifier. No caller can reach them, so a unit test calls this function directly on an
+    // in-memory document. Re-check this list if a third caller appears.
     if is_blank(profile) {
         return Err(EMPTY_PROFILE_NAME.to_string());
     }
@@ -848,14 +909,11 @@ pub fn set_profile_fields(profile: &str, fields: &[(&str, &str)]) -> Result<(), 
         require_non_empty(&format!("{}.{}.{}", SECTION_PROFILE, profile, field), value)?;
     }
 
-    let path = get_config_path(ConfigScope::Global)?;
-    let mut document = load_document(&path)?.unwrap_or_default();
-
     let section_item = document.entry(SECTION_PROFILE).or_insert(toml_edit::table());
     let actual = section_item.type_name();
 
     let profiles = section_item.as_table_like_mut()
-        .ok_or_else(|| not_valid(&path, format!(
+        .ok_or_else(|| not_valid(path, format!(
             "\"{}\" must be a table (written \"[{}.<name>]\"), not {}.",
             SECTION_PROFILE, SECTION_PROFILE, actual
         )))?;
@@ -864,12 +922,12 @@ pub fn set_profile_fields(profile: &str, fields: &[(&str, &str)]) -> Result<(), 
         profiles.insert(profile, toml_edit::table());
     }
 
-    let profile_item = profiles.get_mut(profile).ok_or_else(|| not_valid(&path, format!(
+    let profile_item = profiles.get_mut(profile).ok_or_else(|| not_valid(path, format!(
         "\"{}.{}\" vanished between being created and being written.", SECTION_PROFILE, profile
     )))?;
     let actual = profile_item.type_name();
 
-    let table = profile_item.as_table_like_mut().ok_or_else(|| not_valid(&path, format!(
+    let table = profile_item.as_table_like_mut().ok_or_else(|| not_valid(path, format!(
         "\"{}.{}\" must be a table (written \"[{}.{}]\"), not {}.",
         SECTION_PROFILE, profile, SECTION_PROFILE, profile, actual
     )))?;
@@ -878,7 +936,7 @@ pub fn set_profile_fields(profile: &str, fields: &[(&str, &str)]) -> Result<(), 
         table.insert(field, toml_edit::value(*value));
     }
 
-    write_validated(&path, &document)
+    Ok(())
 }
 
 /// Create a named profile: record its display name and identifier, minting an
@@ -892,7 +950,8 @@ pub fn set_profile_fields(profile: &str, fields: &[(&str, &str)]) -> Result<(), 
 /// # Returns
 /// * `Ok(Operator)` - The created identity.
 /// * `Err(String)`  - If an input is empty, the profile already exists, or the write failed.
-///                    Nothing is written in any of these cases.
+///                    The configuration file is not changed in any of these cases (see
+///                    [`edit_locked`] for what may be created beside it).
 pub fn create_profile(profile: &str,
                       name: Option<&str>,
                       identifier: Option<&str>) -> Result<Operator, String> {
@@ -920,10 +979,6 @@ pub fn create_profile(profile: &str,
         );
     }
 
-    if get_profile(profile)?.is_some() {
-        return Err(format!("The profile \"{}\" already exists.", profile));
-    }
-
     let identifier = identifier.map(|id| id.to_string()).unwrap_or_else(mint_uuid_v4);
 
     // One write for every field. Creation used to be one write per field, so a failure on the
@@ -936,7 +991,20 @@ pub fn create_profile(profile: &str,
         fields.push((PROFILE_FIELD_NAME, name));
     }
 
-    set_profile_fields(profile, &fields)?;
+    edit_locked(&get_config_path(ConfigScope::Global)?, |path| {
+        let mut document = load_document(path)?.unwrap_or_default();
+
+        // Under the lock, in the document about to be written: checked against an earlier read,
+        // two creations of one name could both find it free, and the second would silently
+        // replace the identity the first had already reported.
+        if parse_config(&document, path)?.profile(profile).is_some() {
+            return Err(format!("The profile \"{}\" already exists.", profile));
+        }
+
+        set_profile_fields_in_document(&mut document, path, profile, &fields)?;
+
+        write_validated(path, &document)
+    })?;
 
     Ok(Operator {
         name: name.unwrap_or(&identifier).to_string(),
@@ -1166,8 +1234,88 @@ fn dangling_link_in(path: &Path) -> Option<PathBuf> {
 fn write_validated(path: &Path, document: &DocumentMut) -> Result<(), String> {
     parse_config(document, path)?;
 
-    std::fs::write(path, document.to_string())
+    file_utils::replace_file_atomically(path, document.to_string().as_bytes())
         .map_err(|e| format!("Error while writing configuration file \"{}\": {}", path.to_string_lossy(), e))
+}
+
+/// Run one edit of the configuration file at `path` — its load, its decision and its write —
+/// under that file's edit lock. **Every write of a configuration file goes through here.**
+///
+/// The edit used to be an unlocked load, edit and truncating write, which lost data two ways:
+/// a reader racing the write saw an empty or half-written file, and two edits racing each other
+/// kept only the later one's view — two `config` commands lost one value, and concurrent first
+/// uses minted several operator identities and kept one. Now the write replaces the file
+/// atomically ([`file_utils::replace_file_atomically`]), so readers need no lock, and this lock
+/// makes the load → write of one edit indivisible against every other edit of the same file.
+///
+/// The steps, in order:
+/// 1. resolve `path` through a symbolic link (see [`resolve_write_target`]);
+/// 2. create its folder if missing — a warehouse's configuration folder, or the directory
+///    `FORKLIFT_GLOBAL_CONFIG` names, may not exist yet, and the lock lives in it;
+/// 3. take the lock ([`ConfigFileLock`]), waiting for any other holder;
+/// 4. run `edit` on the resolved path; it loads, decides and writes;
+/// 5. release the lock.
+///
+/// Steps 2 and 3 happen before `edit` has decided anything, so an edit that then refuses — an
+/// `--unset` of a key that is not set, a profile that already exists — still leaves the folder
+/// and the empty `<file>.lock` sidecar behind. The configuration file itself is untouched.
+///
+/// `edit` must not call back into another configuration operation: one lock at a time is what
+/// keeps two configuration locks from ever deadlocking.
+fn edit_locked<T>(path: &Path, edit: impl FnOnce(&Path) -> Result<T, String>) -> Result<T, String> {
+    let target = resolve_write_target(path)?;
+
+    if let Some(parent) = target.parent() {
+        if !parent.as_os_str().is_empty() {
+            file_utils::create_folder_if_not_exists(parent)?;
+        }
+    }
+
+    let _lock = ConfigFileLock::acquire(&target)?;
+
+    edit(&target)
+}
+
+/// The file a write of the configuration at `path` must replace.
+///
+/// A rename replaces the directory entry it lands on, so writing to a symbolic link — a dotfiles
+/// manager's `~/.forkliftconfig`, say — would silently swap the link for a plain file and leave
+/// the real file stale. An in-place write follows the link; so must this. Resolving also makes a
+/// link and its target, however each is named, one file under one lock.
+///
+/// # Returns
+/// * `Ok(PathBuf)` - The real file behind a link, or `path` itself when it is not a link (or
+///                   does not exist yet).
+/// * `Err(String)` - `path`, or a folder above it, is a link whose target does not exist: a write
+///                   never creates a file or a folder in the link's place, exactly as a read never
+///                   treats it as absent.
+fn resolve_write_target(path: &Path) -> Result<PathBuf, String> {
+    // Checked before anything is created: a dangling link to the configuration *folder* would
+    // otherwise surface as the folder creation's bare "File exists", naming neither the link nor
+    // the fix.
+    if let Some(link) = dangling_link_in(path) {
+        return Err(format!(
+            "Configuration file \"{}\" cannot be written: \"{}\" is a symbolic link to a path \
+             that does not exist. Create the target, or remove the link.",
+            std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()).to_string_lossy(),
+            std::path::absolute(&link).unwrap_or(link).to_string_lossy()
+        ));
+    }
+
+    let is_link = std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink());
+
+    if !is_link {
+        return Ok(path.to_path_buf());
+    }
+
+    std::fs::canonicalize(path)
+        .map(|target| crate::globals::strip_verbatim_prefix(&target))
+        .map_err(|e| format!(
+            "Configuration file \"{}\" cannot be written: it is a symbolic link whose target \
+             cannot be resolved ({}).",
+            std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()).to_string_lossy(),
+            e
+        ))
 }
 
 /// Set a string value in a parsed configuration document, creating the section if needed.
@@ -1559,21 +1707,27 @@ mod tests {
     ///
     /// Every value here is blank **on purpose**: these checks run before the emptiness check, so
     /// each assertion distinguishes them by message — and if one is removed, the blank value is
-    /// refused next, still before any path is resolved. This test can never reach the real
-    /// global configuration, whichever way it fails.
+    /// refused next. The document is in memory, so no file is ever touched, and it must come
+    /// out of every refusal unchanged.
     #[test]
     fn set_profile_fields_refuses_an_unknown_or_repeated_field_as_a_caller_error() {
-        let unknown = set_profile_fields("work", &[("bogus", "")]).unwrap_err();
+        let path = Path::new("config.toml");
+        let mut document = DocumentMut::default();
+
+        let unknown = set_profile_fields_in_document(&mut document, path, "work", &[("bogus", "")]).unwrap_err();
         assert!(unknown.contains("\"bogus\" is not a profile field"), "unexpected: {unknown}");
 
-        let repeated = set_profile_fields(
-            "work", &[(PROFILE_FIELD_NAME, "x"), (PROFILE_FIELD_NAME, "")]
+        let repeated = set_profile_fields_in_document(
+            &mut document, path, "work", &[(PROFILE_FIELD_NAME, "x"), (PROFILE_FIELD_NAME, "")]
         ).unwrap_err();
         assert!(repeated.contains("more than once"), "unexpected: {repeated}");
 
-        // A field rides along so that, without the name check, the blank value is still refused
-        // before any path is resolved — an empty list would go on to write the real file.
-        assert_eq!(set_profile_fields(" ", &[(PROFILE_FIELD_NAME, "")]).unwrap_err(), EMPTY_PROFILE_NAME);
+        assert_eq!(
+            set_profile_fields_in_document(&mut document, path, " ", &[(PROFILE_FIELD_NAME, "")]).unwrap_err(),
+            EMPTY_PROFILE_NAME
+        );
+
+        assert_eq!(document.to_string(), "", "a refused edit must not touch the document");
     }
 
     /// `remote.tor` is stored normalized, so what lands on disk is literally one of the three

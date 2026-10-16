@@ -1431,6 +1431,21 @@ A configuration file that is there but cannot be read is not "absent". That incl
 link to a path that does not exist — a dotfiles link whose target you have not created yet — so
 create the target, or remove the link, before the first command that needs it.
 
+**Every write replaces the file whole, and edits to one file take turns.** A command writes the new
+configuration to a temporary file beside the old one and renames it into place, so a reader sees
+either the old file or the new one — never a half-written file — and a crash mid-write leaves the
+old file intact. Commands that edit the same file at once wait for each other on a lock held on a
+`<file>.lock` sidecar beside it (`warehouse.toml.lock`, `.forkliftconfig.lock`); each re-reads the
+file once its turn comes, so concurrent edits do not lose one another, and two first commands that
+both need an `operator.identifier` agree on one instead of each minting its own. The sidecar is
+empty and is left in place; deleting it while no command is running is harmless. Reads take no
+lock. A configuration file that is a symbolic link is written *through* the link: the link stays,
+its target is replaced, and the lock is taken beside the target. A link whose target does not
+exist — to the file, or to a folder above it — is refused, rather than replaced with a plain file.
+On Unix the replacement keeps the old file's permission bits, so a `chmod 600` on a file holding
+`remote.token` survives every edit; its owner, extended attributes and any hard links do not,
+since the file is replaced rather than rewritten.
+
 Refused, in either file:
 
 | Written | Why |
