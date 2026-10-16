@@ -10,9 +10,10 @@
 //!
 //! The reclamation is computed as the closure of the pruned subtree(s) across history, minus
 //! everything the post-prune scope still keeps. The subtraction makes it content-addressing-
-//! safe: an object the pruned path shares with a still-fetched path (or with any meta pallet)
-//! is retained, never freed. Meta pallets (office and the rest) are walked in full and never
-//! scoped — the carve-out this feature depends on.
+//! safe: an object the pruned path shares with a still-fetched path, with any meta pallet, or
+//! with any bay's staged, parked or consolidating work is retained, never freed. Meta pallets
+//! (office and the rest) are walked in full and never scoped — the carve-out this feature
+//! depends on.
 //!
 //! A chunked large file (§9.4b) reaches one level deeper: its tree entry names a *recipe*, whose
 //! chunks are content-addressed objects reachable only through it. Freeing such a file frees its
@@ -42,9 +43,13 @@
 //! freed — never a corrupt gap a resumed walk could misinterpret as newly-discovered garbage.
 
 use std::collections::{HashSet, VecDeque};
+use crate::enums::dir_entry_type::DirEntryType;
 use crate::util::pallet_utils::PalletNamespace;
 use crate::util::scope_utils::{MaterializationScope, ScopeClass};
-use crate::util::{audit_utils, file_utils, object_utils, pack_utils, pallet_utils, tree_utils};
+use crate::util::{
+    audit_utils, bay_utils, file_utils, object_utils, office_utils, pack_utils, pallet_utils, recovery_utils,
+    tree_utils,
+};
 
 /// The reclamation a prune would carry out, computed without mutating anything (safe for a
 /// dry run).
@@ -83,7 +88,17 @@ pub fn plan_prune(
     post_prune: &MaterializationScope,
 ) -> Result<PrunePlan, String> {
     let (user_parcels, meta_parcels) = reachable_parcels()?;
-    let retained = collect_retained(&user_parcels, &meta_parcels, post_prune)?;
+    let local = local_roots(&user_parcels, &meta_parcels)?;
+
+    let mut scoped_parcels = user_parcels.clone();
+    scoped_parcels.extend(local.parcels);
+    let mut retained = collect_retained(&scoped_parcels, &meta_parcels, post_prune)?;
+
+    for (hash, item_type) in &local.staged {
+        if retained.insert(hash.clone()) && item_type.is_chunked() {
+            retain_recipe_chunks(hash, &mut retained)?;
+        }
+    }
 
     // Ordered children-before-parents (see the module doc): filtering this sequence (never
     // reordering it) preserves that property in `to_free`, which is what makes a partial
@@ -145,13 +160,8 @@ pub fn free_objects(to_free: &[String]) -> Result<PruneStats, String> {
 /// The reachable user- and meta-pallet parcels, kept apart because the carve-out scopes only
 /// user-pallet content: meta pallets (office and the rest) are retained in full, always.
 ///
-/// Only the persistent pallet heads are roots. Transient local states (parked parcels, an
-/// in-progress consolidation) are deliberately omitted: a prune only ever frees objects under
-/// a pruned path, and any such object a transient state references is out of scope after the
-/// prune — sealed by hash, its object not needed — so omitting those roots can never free
-/// something a transient state still needs. New in-scope work under the pruned path could only
-/// live in a checkout that scopes the path, which the caller's materialization-scope guard
-/// refuses before reaching here.
+/// Only the persistent pallet heads are roots here: they alone decide what a prune *targets*.
+/// What it must *retain* also counts every other gc root, see [`local_roots`].
 fn reachable_parcels() -> Result<(Vec<String>, Vec<String>), String> {
     let mut user_roots: Vec<String> = Vec::new();
     let mut meta_roots: Vec<String> = Vec::new();
@@ -167,6 +177,47 @@ fn reachable_parcels() -> Result<(Vec<String>, Vec<String>), String> {
     let meta: Vec<String> = audit_utils::collect_reachable_present(&meta_roots)?.into_iter().collect();
 
     Ok((user, meta))
+}
+
+/// The gc roots that are not pallet heads, which a prune must retain from even though it never
+/// targets through them.
+struct LocalRoots {
+    /// Every parcel reachable from a parked parcel, an in-progress consolidation or a trust pin,
+    /// in any bay, that the pallet heads do not already reach. Walked scoped, like user history.
+    parcels: Vec<String>,
+    /// Every staged inventory shard leaf, in any bay. Retained whatever its path.
+    staged: Vec<(String, DirEntryType)>,
+}
+
+/// Collect [`LocalRoots`] from [`recovery_utils::gc_root_sources`], fail-closed: a bay, shard or
+/// office record that cannot be read aborts the prune before anything is narrowed or freed.
+///
+/// These used to be omitted on the argument that whatever a transient state references under
+/// the pruned path is out of scope after the prune. That holds per path but not per object:
+/// content addressing lets a staged `b/y`, or a parked parcel's `b/y`, hold the very blob the
+/// pruned `a/x` holds, and freeing it would lose the only copy (FORK-156). Walking the parcels
+/// through the same scoped retention as user history keeps that sharing safe and still frees
+/// their out-of-scope content, which is sealed by hash as before.
+///
+/// # Arguments
+/// * `user_parcels` - The parcels the user pallet heads reach, already retained.
+/// * `meta_parcels` - The parcels the meta pallet heads reach, already retained.
+fn local_roots(user_parcels: &[String], meta_parcels: &[String]) -> Result<LocalRoots, String> {
+    let bay_dirs = bay_utils::all_bay_state_dirs()?;
+    let sources = recovery_utils::gc_root_sources(
+        &bay_dirs, bay_utils::BayReadPolicy::FailClosed, office_utils::TrustPinReadPolicy::FailClosed,
+    )?;
+
+    let known: HashSet<&String> = user_parcels.iter().chain(meta_parcels).collect();
+    let mut roots: Vec<String> = sources.parcels.into_iter().filter(|p| !known.contains(p)).collect();
+    roots.extend(sources.pin_parcels.into_iter().map(|(p, _)| p).filter(|p| !known.contains(p)));
+
+    let parcels: Vec<String> = audit_utils::collect_reachable_present(&roots)?
+        .into_iter()
+        .filter(|p| !known.contains(p))
+        .collect();
+
+    Ok(LocalRoots { parcels, staged: sources.shard_leaves })
 }
 
 /// Every object that must survive the prune: exactly what a fresh franchise scoped to the
@@ -601,6 +652,64 @@ mod tests {
         assert!(!plan.to_free.contains(&shared_blob), "a blob shared with a retained path must not be freed");
         assert!(plan.to_free.contains(&web_tree), "the pruned subtree's unique object is freed");
         assert_eq!(plan.retained_shared, 1, "the shared blob is counted as retained-shared, not silently dropped");
+    }
+
+    #[test]
+    fn plan_prune_keeps_a_blob_another_bays_staged_entry_shares() {
+        // A staged entry is referenced by its bay's inventory shard and nothing else. When it
+        // holds the same bytes as a pruned path, the shared blob is its only copy (FORK-156).
+        let _scratch = Scratch::new("keeps-staged");
+        let f = build_fixture();
+
+        crate::util::gc_utils::tests::plant_staged_shard("b", &[
+            ("src/api/y.txt", &f.web_blob, DirEntryType::Normal),
+        ]);
+
+        let post_prune = MaterializationScope::from_prefixes(["src/api"]);
+        let plan = plan_prune(&["src/web".to_string()], &post_prune).unwrap();
+
+        assert!(!plan.to_free.contains(&f.web_blob), "a blob a staged entry shares must not be freed");
+        assert!(plan.to_free.contains(&f.web_tree), "the pruned subtree's unique object is still freed");
+        assert_eq!(plan.retained_shared, 1);
+    }
+
+    /// Park `tree_hash` as bay `bay`'s only parked parcel, by path.
+    fn plant_parked(bay: &str, tree_hash: &str) {
+        let parcel = store_parcel(tree_hash, Vec::new());
+        let dir = crate::util::bay_utils::bay_state_dir(bay);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("parked"), format!("{}\n", parcel)).unwrap();
+    }
+
+    #[test]
+    fn plan_prune_keeps_a_blob_a_parked_parcel_shares_in_scope_but_not_under_the_pruned_path() {
+        // In scope: a parked `src/api/y.txt` holding the pruned blob's bytes keeps it.
+        {
+            let _scratch = Scratch::new("keeps-parked-in-scope");
+            let f = build_fixture();
+            let api = store_tree(&[("y.txt", &f.web_blob, DirEntryType::Normal)]);
+            let src = store_tree(&[("api", &api, DirEntryType::Tree)]);
+            plant_parked("b", &store_tree(&[("src", &src, DirEntryType::Tree)]));
+
+            let post_prune = MaterializationScope::from_prefixes(["src/api"]);
+            let plan = plan_prune(&["src/web".to_string()], &post_prune).unwrap();
+            assert!(!plan.to_free.contains(&f.web_blob), "a blob parked in scope must not be freed");
+            assert!(plan.to_free.contains(&f.web_tree));
+        }
+
+        // Under the pruned path only: the parked reference is out of scope after the prune and
+        // sealed by hash, so the blob is still freed.
+        {
+            let _scratch = Scratch::new("frees-parked-out-of-scope");
+            let f = build_fixture();
+            let web = store_tree(&[("w.txt", &f.web_blob, DirEntryType::Normal)]);
+            let src = store_tree(&[("web", &web, DirEntryType::Tree)]);
+            plant_parked("b", &store_tree(&[("src", &src, DirEntryType::Tree)]));
+
+            let post_prune = MaterializationScope::from_prefixes(["src/api"]);
+            let plan = plan_prune(&["src/web".to_string()], &post_prune).unwrap();
+            assert!(plan.to_free.contains(&f.web_blob), "parked content under the pruned path stays freeable");
+        }
     }
 
     #[test]

@@ -20,7 +20,7 @@ use std::collections::{HashSet, VecDeque};
 use std::time::SystemTime;
 use crate::util::{audit_utils, bay_utils, file_utils, object_utils};
 // Test-only: `collect_live_set`'s own pallet-head root gathering moved into the shared
-// `recovery_utils::gc_root_sources` (F8, PR #120 round 2), so this module's non-test code no
+// `recovery_utils::gc_root_sources`, so this module's non-test code no
 // longer calls `pallet_utils` directly — only its own test fixtures still build pallet refs by
 // hand.
 #[cfg(test)]
@@ -156,10 +156,10 @@ pub fn collect_garbage(grace_seconds: u64) -> Result<GcStats, String> {
 /// differ here the way they already differ on an unreadable bay (`bay_utils::BayReadPolicy`).
 pub(crate) fn collect_live_set() -> Result<HashSet<String>, String> {
     // Pallet heads (both namespaces), bay-scoped parcel roots, trust-pin roots and staged shard
-    // leaves — the sources this function shares, hash for hash, with `recovery_utils::collect_walk_roots`
-    // (F8, PR #120 round 2: before this, both callers open-coded the same three-source assembly
-    // by hand — see `recovery_utils::gc_root_sources`'s own doc comment for why that duplication
-    // was worth closing, and for the superset invariant this list must stay a subset of). GC does
+    // leaves: the sources this function shares, hash for hash, with
+    // `recovery_utils::collect_walk_roots` through `recovery_utils::gc_root_sources`, so the two
+    // cannot drift apart (see that function's doc comment, and `collect_walk_roots`' for the
+    // superset invariant this list must stay a subset of). GC does
     // not need the pin/ordinary distinction `collect_walk_roots` cares about (an absent root, pin
     // or ordinary, is just a gap to `audit_utils::collect_reachable_present` below — see this
     // function's own doc comment), so both lists are flattened into one plain `roots` bag.
@@ -189,10 +189,9 @@ pub(crate) fn collect_live_set() -> Result<HashSet<String>, String> {
     // `stocktake` still shows the file staged and `stack` signs a parcel over the missing hash.
     // Same leaf treatment as a tree's file entry below: the hash is marked live unread, and a
     // chunked entry's recipe is descended for its chunks.
+    // Only a newly inserted recipe is descended, so one recipe staged in many bays is read once.
     for (hash, item_type) in &sources.shard_leaves {
-        live.insert(hash.clone());
-
-        if item_type.is_chunked() {
+        if live.insert(hash.clone()) && item_type.is_chunked() {
             mark_recipe_chunks_live(hash, &mut live)?;
         }
     }
@@ -297,7 +296,7 @@ fn mark_recipe_chunks_live(recipe_hash: &str, live: &mut HashSet<String>) -> Res
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::builder::object::loose_object_builder::LooseObjectBuilder;
     use crate::enums::dir_entry_type::DirEntryType;
@@ -653,8 +652,8 @@ mod tests {
     }
 
     /// Plant a staged inventory shard holding `items` (`(name, hash, type)`) in bay `bay`'s state
-    /// dir, by path, the way `load` lays it out on disk.
-    fn plant_staged_shard(bay: &str, items: &[(&str, &str, DirEntryType)]) -> PathBuf {
+    /// dir, by path, the way `load` lays it out on disk. Shared with `prune_utils`' tests.
+    pub(crate) fn plant_staged_shard(bay: &str, items: &[(&str, &str, DirEntryType)]) -> PathBuf {
         use crate::builder::inventory::InventoryBuilder;
         use crate::enums::inventory_item_state::InventoryItemState;
         use crate::model::inventory::{Inventory, InventoryItem};

@@ -1140,7 +1140,8 @@ fn a_torn_taint_over_an_absent_tag_subject_wedges_the_whole_warehouse() {
 ///
 /// It does **not** show the tag is load-bearing, and an earlier draft that said so was wrong:
 /// before FORK-156, a collected staged blob wedged the store with no tag at all (the defect
-/// `staged_content_survives_collection_and_a_torn_taint_heals_over_it` below now pins fixed). That draft also reasoned that the wedge leg's second dangling hash "is
+/// `staged_content_survives_collection_and_a_torn_taint_heals_over_it` below now pins fixed).
+/// That draft also reasoned that the wedge leg's second dangling hash "is
 /// byte-identical across runs, so it is a fixed-content object rather than anything this fixture
 /// created" — a non-sequitur, since a fixture with hardcoded file bodies produces fixed content
 /// by construction. It was this fixture's own staged blob, and chasing it is what turned up the
