@@ -95,8 +95,6 @@ const ERROR_BODY_CAP: u64 = 1024 * 1024;
 /// practice) keyed by its hash.
 const UPLOAD_TARGETS_BODY_BYTES_PER_HASH: u64 = 8 * 1024;
 
-/// Per-identifier allowance in a `resolve` answer: the identifier and the name it resolves to.
-const RESOLVE_BODY_BYTES_PER_IDENTIFIER: u64 = 4 * 1024;
 
 /// The characters a warehouse path SEGMENT must be percent-encoded against before it is spliced
 /// into a URL. Everything but RFC 3986 unreserved characters (ASCII alphanumerics, `-`, `_`,
@@ -625,9 +623,11 @@ const _: () = assert!(
 ///
 /// Flat, not scaled like [`FETCH_OBJECT_READ_TIMEOUT`] or the negotiation calls' own read costs:
 /// after a non-success status line, the error body this module parses (an [`ErrorResponse`]) is
-/// small and O(constant) regardless of which call produced it or why *that* call's own success
-/// path is unbounded — the scaling reason a success body might be large or slow never applies to
-/// the error one. On elapse, falls back to `status.canonical_reason()` — the exact fallback this
+/// small in practice regardless of which call produced it or why *that* call's own success path
+/// is unbounded — the scaling reason a success body might be large or slow never applies to the
+/// error one. A refusal that lists paths or hashes can run longer, up to [`ERROR_BODY_CAP`]; one
+/// that does not arrive within this budget over a slow link loses its code and next step the same
+/// way an unparseable one does. On elapse, falls back to `status.canonical_reason()` — the exact fallback this
 /// code already uses when the body fails to parse as JSON at all, so a timeout and a malformed
 /// body are indistinguishable to the caller, which is right: both mean "no usable error body
 /// arrived."
@@ -3086,16 +3086,29 @@ impl RemoteClient {
     /// unlike `fetch_info`/`fetch_signature`/`fetch_bundle_to`, whose `BoundedReads` silence
     /// budget never has to make this trade because a *silence* bound cannot mistake a
     /// slow-but-real transfer for a hang in the first place.
+    ///
+    /// Each distinct identifier is asked about once, in requests of at most
+    /// [`MAX_RESOLVE_IDENTIFIERS`](crate::model::remote::MAX_RESOLVE_IDENTIFIERS) — the most a
+    /// server accepts — so a roster past that resolves in several requests rather than none.
     pub async fn resolve(&self, identifiers: Vec<String>) -> BTreeMap<String, String> {
-        if identifiers.is_empty() {
-            return BTreeMap::new();
+        let distinct: Vec<String> = identifiers.into_iter()
+            .collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+        let mut names = BTreeMap::new();
+
+        for batch in distinct.chunks(crate::model::remote::MAX_RESOLVE_IDENTIFIERS) {
+            names.extend(self.resolve_batch(batch.to_vec()).await);
         }
 
+        names
+    }
+
+    /// One `POST /v1/resolve` of at most the server's identifier limit; see [`Self::resolve`].
+    async fn resolve_batch(&self, identifiers: Vec<String>) -> BTreeMap<String, String> {
         let total_deadline = self.resolve_budget();
         // Every failure degrades to the designed fallback, including a serialization failure the
-        // seam now surfaces up front rather than deferring into a `reqwest::Error` — see this
-        // function's own doc for why an empty map is the right answer to all of them here.
-        let cap = body_utils::per_item_body_cap(identifiers.len(), RESOLVE_BODY_BYTES_PER_IDENTIFIER);
+        // seam now surfaces up front rather than deferring into a `reqwest::Error` — see
+        // `resolve`'s own doc for why an empty map is the right answer to all of them here.
+        let cap = crate::model::remote::resolve_answer_cap(&identifiers);
         let Ok(body) = SendBody::json(&ResolveRequest { identifiers }) else {
             return BTreeMap::new();
         };
@@ -9906,6 +9919,48 @@ mod tests {
         // the import outright, so arriving intact is the object landing.
         assert_eq!(stats.stored_objects, 1, "the full body must arrive intact, not a prefix of it");
         assert!(file_utils::does_object_exist(&hash).unwrap(), "the dripped object landed in this store");
+    }
+
+    /// A roster past the server's per-request limit resolves in several requests, each within the
+    /// limit and asking about each identifier once — not in one request the server refuses, which
+    /// would show every operator pseudonymously.
+    #[test]
+    fn resolve_splits_a_roster_past_the_server_limit_and_asks_each_identifier_once() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let batches = std::sync::Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+        let seen = std::sync::Arc::clone(&batches);
+
+        std::thread::spawn(move || {
+            use std::io::Write;
+
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let Some((_, _, _, body)) = read_test_request(&mut stream) else { continue };
+                let request: ResolveRequest = serde_json::from_slice(&body).unwrap();
+                seen.lock().unwrap().push(request.identifiers.len());
+
+                let names: BTreeMap<String, String> = request.identifiers.iter()
+                    .map(|id| (id.clone(), format!("Name of {}", id))).collect();
+                let answer = serde_json::json!({ "names": names }).to_string();
+                let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    answer.len(), answer);
+            }
+        });
+
+        let distinct = crate::model::remote::MAX_RESOLVE_IDENTIFIERS + 1;
+        let mut identifiers: Vec<String> = (0..distinct).map(|i| format!("op-{}", i)).collect();
+        identifiers.extend((0..5000).map(|_| "op-0".to_string()));
+
+        let client = RemoteClient::new(&url, None).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let names = runtime.block_on(client.resolve(identifiers));
+
+        assert_eq!(names.len(), distinct, "every distinct identifier resolves");
+        let batches = batches.lock().unwrap().clone();
+        assert_eq!(batches.iter().sum::<usize>(), distinct, "each identifier is asked about once: {:?}", batches);
+        assert!(batches.iter().all(|&n| n <= crate::model::remote::MAX_RESOLVE_IDENTIFIERS),
+            "no request exceeds the server's limit: {:?}", batches);
     }
 
     /// An importer that refuses the bundle stops the transfer at once: a remote that sends a

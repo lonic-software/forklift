@@ -232,6 +232,25 @@ pub struct ResolveRequest {
     pub identifiers: Vec<String>,
 }
 
+/// The most distinct identifiers one resolve request may name. A server refuses more; a client
+/// with more splits them across requests.
+pub const MAX_RESOLVE_IDENTIFIERS: usize = 10_000;
+
+/// Per-identifier allowance in a resolve answer, beyond the identifier itself: the name it
+/// resolves to and the JSON around the pair.
+pub const RESOLVE_ANSWER_BYTES_PER_IDENTIFIER: u64 = 1024;
+
+/// The cap for an answer resolving `identifiers`, at the directory and again at the client: each
+/// identifier's own bytes (an answer keys on them) plus [`RESOLVE_ANSWER_BYTES_PER_IDENTIFIER`],
+/// plus the envelope. Sized from the identifiers' bytes, not their count alone, so a long one
+/// cannot overflow the answer for the whole request.
+pub fn resolve_answer_cap(identifiers: &[String]) -> u64 {
+    let identifier_bytes = identifiers.iter().fold(0u64, |sum, id| sum.saturating_add(id.len() as u64));
+
+    crate::util::body_utils::per_item_body_cap(identifiers.len(), RESOLVE_ANSWER_BYTES_PER_IDENTIFIER)
+        .saturating_add(identifier_bytes)
+}
+
 /// The response of `POST /v1/resolve`: the names the caller is allowed to see (the
 /// policy withholds the rest, and a server with no resolution hook returns none —
 /// the client shows pseudonyms either way).

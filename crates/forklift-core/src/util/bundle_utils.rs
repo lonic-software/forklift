@@ -1691,7 +1691,7 @@ mod tests {
             let error = outcome.err()
                 .unwrap_or_else(|| panic!("a '{}' record of declared length u64::MAX must be refused", kind as char));
             assert!(error.contains("declares 18446744073709551615 bytes"),
-                "the '{}' record is refused on its declared length, not on some later error: {}", kind as char, error);
+                "the '{}' record is refused on its declared length before any of it is read: {}", kind as char, error);
         }
     }
 

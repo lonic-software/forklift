@@ -2366,6 +2366,25 @@ fn resolution_is_server_mediated_and_degrades_to_pseudonyms() {
     assert!(stdout(&history).contains("tester@forklift"), "{}", stdout(&history));
 }
 
+/// The resolve request limit is part of the request's contract, so a server with no directory
+/// configured enforces it too: a client cannot pass against one server and fail against another.
+#[test]
+fn a_server_without_a_resolution_hook_still_bounds_resolve_identifiers() {
+    let area = TestArea::new("resolve-limit-no-hook");
+    let server = Server::start(&area, None);
+
+    let many: Vec<String> = (0..10_001).map(|i| format!("op-{}", i)).collect();
+    let (status, body) = http_post_json(
+        &server.url, "/v1/resolve", &serde_json::json!({ "identifiers": many }).to_string()
+    );
+    assert!(status.contains("400"), "{} {}", status, body);
+
+    let (status, body) = http_post_json(
+        &server.url, "/v1/resolve", &serde_json::json!({ "identifiers": ["op-1"] }).to_string()
+    );
+    assert!(status.contains("200") && body.contains("\"names\":{}"), "{} {}", status, body);
+}
+
 #[test]
 fn delta_bundle_reconstructs_a_files_many_versions() {
     let area = TestArea::new("delta-bundle");

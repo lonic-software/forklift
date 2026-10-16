@@ -31,7 +31,8 @@ use forklift_core::model::hooks::{
 use forklift_core::model::remote::{
     ErrorResponse, MissingObjectsRequest, MissingObjectsResponse, RefUpdateRequest,
     ResolveRequest, ResolveResponse, TrustAnchorDto, UploadTargetsRequest, UploadTargetsResponse,
-    WarehouseInfo, MAX_MISSING_BATCH, MAX_UPLOAD_TARGETS_BATCH, PROTOCOL_VERSION,
+    WarehouseInfo, MAX_MISSING_BATCH, MAX_RESOLVE_IDENTIFIERS, MAX_UPLOAD_TARGETS_BATCH, PROTOCOL_VERSION,
+    resolve_answer_cap,
 };
 use forklift_core::util::office_utils::OFFICE_PALLET_NAME;
 use forklift_core::util::lock_utils::ServeLock;
@@ -272,15 +273,9 @@ pub struct ServeOptions {
     pub open: bool,
 }
 
-/// Per-identifier allowance in a resolution hook's answer: the identifier and the name it resolves
-/// to. The authentication and admission hooks answer a fixed-size verdict and are capped at
-/// [`body_utils::SMALL_BODY_CAP`].
-const RESOLUTION_ANSWER_BYTES_PER_IDENTIFIER: u64 = 1024;
-
-/// The most distinct identifiers one resolve request may name. The hook answer's cap scales with
-/// the count, so this is what keeps a broken directory from making one request hold more than
-/// about 10 MiB; it is far above the operators any one history display names.
-const MAX_RESOLVE_IDENTIFIERS: usize = 10_000;
+/// The authentication and admission hooks answer a fixed-size verdict and are capped at
+/// [`body_utils::SMALL_BODY_CAP`]; the resolution hook's answer is capped by
+/// [`resolve_answer_cap`], which scales with the identifiers asked about.
 
 /// The flat request timeout this head arms on the `reqwest::Client` it calls every hook
 /// through ([`build_hook_client`] builds from this constant and takes no figure of its own).
@@ -2304,6 +2299,21 @@ async fn post_resolve(State(state): State<Arc<AppState>>,
         return error_response(error);
     }
 
+    // Asked once per distinct identifier, and never for more than one request may name — on every
+    // server, hook or not, so the limit is part of the request's contract rather than of how a
+    // server is configured. The hook answer's cap scales with these identifiers, so they are
+    // what bounds it.
+    let identifiers: Vec<String> = request.identifiers.into_iter()
+        .collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+
+    if identifiers.len() > MAX_RESOLVE_IDENTIFIERS {
+        tracing::warn!(count = identifiers.len(), "refused a resolve request naming too many identifiers");
+        return error_response((StatusCode::BAD_REQUEST, format!(
+            "A resolve request may name at most {} distinct identifiers; this one names {}.",
+            MAX_RESOLVE_IDENTIFIERS, identifiers.len()
+        )));
+    }
+
     let Some(hook) = &state.resolution_hook else {
         // No directory is configured: the server knows no names. The client degrades
         // to the pseudonymous identifiers — never an error.
@@ -2319,21 +2329,8 @@ async fn post_resolve(State(state): State<Arc<AppState>>,
         _ => None,
     };
 
-    // Each identifier's resolved name plus its key, with the envelope on top: what a directory
-    // can legitimately answer for this many identifiers.
-    // Asked once per distinct identifier, and never for more than a directory can be expected to
-    // answer at once: the answer's cap scales with the count, so the count is what bounds it.
-    let identifiers: Vec<String> = request.identifiers.into_iter()
-        .collect::<std::collections::BTreeSet<_>>().into_iter().collect();
-
-    if identifiers.len() > MAX_RESOLVE_IDENTIFIERS {
-        return error_response((StatusCode::BAD_REQUEST, format!(
-            "A resolve request may name at most {} distinct identifiers; this one names {}.",
-            MAX_RESOLVE_IDENTIFIERS, identifiers.len()
-        )));
-    }
-
-    let answer_cap = body_utils::per_item_body_cap(identifiers.len(), RESOLUTION_ANSWER_BYTES_PER_IDENTIFIER);
+    // What a directory can legitimately answer for these identifiers.
+    let answer_cap = resolve_answer_cap(&identifiers);
     let hook_request = ResolutionHookRequest { caller, identifiers };
 
     let names = match post_hook(&state, hook, "resolution", &hook_request).await {
