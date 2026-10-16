@@ -42,11 +42,11 @@ pub(crate) struct StoreReport {
     /// install) and would still benefit from a one-shot `compact --all --redelta` pass.
     /// Additive field; never acted on automatically.
     densify_suggested: bool,
-    /// Pack indexes that parsed but whose data file could not be loaded (FORK-47) — their
+    /// Pack indexes that parsed but whose data file could not be loaded — their
     /// objects are quarantined, not lost: `forklift heal` can still refetch them. Empty on a
     /// healthy store.
     quarantined_packs: Vec<PackIndexIssue>,
-    /// Pack index files that could not even be parsed (FORK-47) — move the file aside and
+    /// Pack index files that could not even be parsed — move the file aside and
     /// re-run. Empty on a healthy store.
     unenumerable_indexes: Vec<PackIndexIssue>,
 }

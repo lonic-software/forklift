@@ -188,7 +188,7 @@ pub(crate) struct LiftReport {
     meta_pallets: Vec<String>,
 
     /// How many times the lift auto-merged a diverged remote before it went through
-    /// (optimistic lift, §7.7).
+    /// (optimistic lift).
     #[serde(skip_serializing_if = "is_zero")]
     auto_merged: usize,
 

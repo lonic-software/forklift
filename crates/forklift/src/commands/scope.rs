@@ -63,7 +63,7 @@ fn status() -> Result<(), String> {
     Ok(())
 }
 
-/// The sparse-workspace scope of the current bay (§7.6). An empty prefix list means the full
+/// The sparse-workspace scope of the current bay. An empty prefix list means the full
 /// tree (an unscoped bay or the main tree).
 #[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]

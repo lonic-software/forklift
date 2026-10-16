@@ -1603,7 +1603,7 @@ A command not listed here either reports only the generic human-message shape `{
   "description": "The result of a lift: the pallet's outcome, plus the office lift when trust\nrequired its keys to reach the remote first.",
   "properties": {
     "auto_merged": {
-      "description": "How many times the lift auto-merged a diverged remote before it went through\n(optimistic lift, §7.7).",
+      "description": "How many times the lift auto-merged a diverged remote before it went through\n(optimistic lift).",
       "format": "uint",
       "minimum": 0,
       "type": "integer"
@@ -3345,7 +3345,7 @@ A command not listed here either reports only the generic human-message shape `{
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "The sparse-workspace scope of the current bay (§7.6). An empty prefix list means the full\ntree (an unscoped bay or the main tree).",
+  "description": "The sparse-workspace scope of the current bay. An empty prefix list means the full\ntree (an unscoped bay or the main tree).",
   "properties": {
     "bay": {
       "description": "The active bay's name (`null` in the main tree).",
@@ -3606,7 +3606,7 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "array"
     },
     "quarantined_packs": {
-      "description": "Pack indexes that parsed but whose data file could not be loaded (FORK-47) — their\nobjects are quarantined, not lost: `forklift heal` can still refetch them. Empty on a\nhealthy store.",
+      "description": "Pack indexes that parsed but whose data file could not be loaded — their\nobjects are quarantined, not lost: `forklift heal` can still refetch them. Empty on a\nhealthy store.",
       "items": {
         "$ref": "#/$defs/PackIndexIssue"
       },
@@ -3619,7 +3619,7 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "integer"
     },
     "unenumerable_indexes": {
-      "description": "Pack index files that could not even be parsed (FORK-47) — move the file aside and\nre-run. Empty on a healthy store.",
+      "description": "Pack index files that could not even be parsed — move the file aside and\nre-run. Empty on a healthy store.",
       "items": {
         "$ref": "#/$defs/PackIndexIssue"
       },

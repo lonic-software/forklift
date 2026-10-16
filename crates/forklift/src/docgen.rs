@@ -7,11 +7,18 @@
 //! produces byte-identical output and `bin/check` can verify freshness with a plain diff.
 
 use crate::cli::Cli;
+use crate::internal_refs::check_no_internal_refs;
 use crate::output::ErrorCode;
 use clap::CommandFactory;
 
 /// Render `docs/generated/errors.md`: the exhaustive error-code / exit-code reference.
-pub fn render_errors() -> String {
+///
+/// # Returns
+/// * `Ok(String)`  - The rendered markdown.
+/// * `Err(String)` - A code's description cites a reference only the project's own trackers
+///                   can resolve (see [`check_no_internal_refs`], which runs here rather than
+///                   in a test for the reason [`GENERIC_OR_NO_DATA`] gives).
+pub fn render_errors() -> Result<String, String> {
     let mut out = String::new();
     out.push_str(GENERATED_BANNER);
     out.push_str("# Error codes and exit codes\n\n");
@@ -36,7 +43,8 @@ pub fn render_errors() -> String {
         ));
     }
     out.push('\n');
-    out
+    check_no_internal_refs("errors.md", &out)?;
+    Ok(out)
 }
 
 /// Commands whose `--json` data is either the generic message shape (`{ "message": string }`)
@@ -152,6 +160,7 @@ pub fn render_json_schemas() -> Result<String, String> {
         }
     }
 
+    check_no_internal_refs("json-schemas.md", &out)?;
     Ok(out)
 }
 

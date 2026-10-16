@@ -10,6 +10,8 @@ pub mod commands;
 #[cfg(feature = "docgen")]
 pub mod docgen;
 pub mod events;
+#[cfg(any(test, feature = "docgen"))]
+mod internal_refs;
 pub mod output;
 pub mod pager;
 pub mod passphrase;
@@ -407,10 +409,7 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
         Command::Docgen { target } => {
             use crate::cli::DocgenTarget;
             match target {
-                DocgenTarget::Errors => {
-                    print!("{}", docgen::render_errors());
-                    Ok(())
-                }
+                DocgenTarget::Errors => docgen::render_errors().map(|out| print!("{}", out)),
                 DocgenTarget::JsonSchemas => docgen::render_json_schemas().map(|out| print!("{}", out)),
             }
         }

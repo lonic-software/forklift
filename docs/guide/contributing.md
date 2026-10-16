@@ -271,3 +271,10 @@ shape: a field with `skip_serializing_if` comes out optional without needing
 and diffs against the committed copy, so **stale generated docs fail CI** — if you add an
 error code or change a command's `--json` output, run `pult gen-docs` (or `./bin/gen-docs`)
 and commit the result along with your change; you don't hand-edit those two files.
+
+The doc comments those pages are rendered from are read by people outside the project, so the
+generator refuses a page that cites a `FORK-<n>` ticket, a `§<n>` section of the design
+document, or a review-round label (`S<n>-F<n>`, "review round …", "round <n> finding"): a
+reader cannot open any of them. State the reasoning
+in the comment itself. Elsewhere in the source, a ticket reference is fine as provenance beside
+reasoning that is already written out, but never as the only place the reasoning lives.
