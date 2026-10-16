@@ -234,3 +234,8 @@ it simply shows pseudonyms.
   *policy* at the hook (or a dedicated policy layer), so the hook can front an
   existing corporate directory (§8.13).
 * Duplicate `event` deliveries are normal; idempotence is the consumer's job.
+* Keep answers small. The server reads at most 64 KiB of an `authentication` or
+  `admission` answer, and refuses a larger one exactly as it does an unreachable hook
+  (fail closed). A `resolution` answer may take 1 KiB per identifier asked for, plus
+  64 KiB; a larger one shows pseudonyms. The server asks about each identifier once,
+  and at most 10,000 distinct identifiers per request.
