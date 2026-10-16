@@ -38,7 +38,9 @@ forklift prepare
 
 Creates `.forklift/` in the current directory: the object store, the inventory,
 the config folder, the pallets folder, the default pallet `main` (unborn until
-your first `stack`), a warehouse config file, and an ignore file. Idempotent —
+your first `stack`) and a warehouse config file. It writes no `.forkliftignore`,
+as `git init` writes no `.gitignore` — see [`.forkliftignore`](#forkliftignore--files-forklift-shouldnt-track).
+Idempotent —
 running it in an existing warehouse only creates what's missing. `-v` lists each
 piece created.
 
@@ -53,8 +55,9 @@ forklift import-git .
 One-way migration of a git repo's history into the warehouse: git commits become
 parcels, trees become trees, blobs become blobs, and each **local branch becomes a
 pallet** (git's author/committer split maps onto forklift's author/stack). Git's HEAD
-branch is checked out, and `.git/` is added to `.forkliftignore` so a colocated repo
-reads clean. Requires `git` on your PATH. The imported history is **unsigned** (it
+branch is checked out, and `.git/` is added to `.forkliftignore` (creating the file if
+there is none) so a colocated repo reads clean. That edit is left in the working tree,
+not stacked: `load .forkliftignore` and stack it with your next parcel. Requires `git` on your PATH. The imported history is **unsigned** (it
 predates trust) — import into a fresh warehouse, then `office enroll` to anchor it as the
 legacy boundary (a later `audit` then tolerates the imported parcels as legacy). Submodules
 (gitlinks) are skipped with a warning. For agents, this means a project can be moved onto
@@ -118,15 +121,22 @@ forklift config --unset <key>         # remove a value
 
 ### `.forkliftignore` — files forklift shouldn't track
 
-`prepare` writes a `.forkliftignore` at the warehouse root. Each line is a
-**regex** (not a glob) matched against warehouse-relative, `/`-separated paths.
-The file starts with comments only; `.forklift/` and `.forkliftignore` itself are
-always ignored, and `import-git` adds a rule for `.git/`. Example entries:
+Create a `.forkliftignore` at the warehouse root when you need one; `prepare`
+does not write it. Each line is a **regex** (not a glob) matched against
+warehouse-relative, `/`-separated paths. Empty lines and lines starting with `#`
+are skipped; a `#` anywhere else is part of the pattern, so put comments on their
+own lines:
 
 ```
-^target(/.*)?$     # a folder called target (not targets.txt)
-\.log$             # any .log file
+# a folder called target (not targets.txt)
+^target(/.*)?$
+# any .log file
+\.log$
 ```
+
+The file is **tracked content**, like `.gitignore`: `load` and `stack` it, and its
+rules travel with the history — a `franchise` or `lower` brings the remote's rules
+along. Only `.forklift/` is always ignored. `import-git` adds a rule for `.git/`.
 
 Anchor a folder rule at both ends. `^target\/?.*$` also matches `targets.txt` and
 `target-notes/`, and ignoring a tracked file makes the next `load .` stage its
