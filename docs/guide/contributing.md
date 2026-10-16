@@ -117,9 +117,10 @@ so turn its reformat-on-save off for this project.
 `bin/check` and CI enforce the guard with `bin/fmt-guard`. It fails if the root
 `rustfmt.toml` holds anything but comments and `disable_all_formatting = true`,
 or if a second `rustfmt.toml` or `.rustfmt.toml` exists anywhere in the tree
-outside `target/` and `.claude/`, ignored files included, since a second config would switch
-rustfmt back on for some files beneath it. It also runs `cargo fmt --all --check`,
-which needs the rustfmt component installed. It never formats anything itself.
+outside build output, `.git` and `.claude/` (ignored files included), since a
+second config would switch rustfmt back on for some files beneath it. It also
+runs `cargo fmt --all --check`, which needs the rustfmt component installed. It
+never formats anything itself.
 
 ### Maintainer commands (pult)
 

@@ -8,7 +8,8 @@
 # reports. This line makes `cargo fmt` a no-op instead.
 #
 # `bin/check` and CI run `bin/fmt-guard`, which fails if this file holds anything but comments
-# and the line below, or if a second rustfmt.toml or .rustfmt.toml exists anywhere in the tree.
+# and the line below, or if a second rustfmt.toml or .rustfmt.toml exists anywhere in the tree
+# outside build output, .git and .claude/.
 # Match the formatting of the surrounding code by hand.
 # See docs/guide/contributing.md, "Formatting".
 disable_all_formatting = true

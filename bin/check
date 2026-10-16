@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# The formatting guard (bin/fmt-guard; CI runs it on its Linux leg), build, tests and clippy CI
-# runs (.github/workflows/ci.yml). CI runs the
-# same tests under cargo-nextest, one process per test, plus `cargo test --doc`;
+# The formatting guard (bin/fmt-guard; CI runs it on its Linux leg), build, tests and
+# clippy CI runs (.github/workflows/ci.yml). CI runs the same tests under cargo-nextest,
+# one process per test, plus `cargo test --doc`;
 # `cargo test` here covers both in one go. CI's clippy is report-only (style-level lint
 # debt is tracked separately), so this doesn't fail on lint warnings — the
 # formatting guard, the build and the tests are the gate.
