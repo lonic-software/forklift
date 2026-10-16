@@ -878,6 +878,13 @@ fn never_held_pin_note(hash: &str) -> String {
 /// locally (FORK-83) — see [`WalkRoots::tag_subjects`] for why that is never a dangling
 /// reference. Non-blocking, like [`never_held_pin_note`].
 fn never_held_tag_note(name: &str, subject: &str) -> String {
+    if !file_utils::is_object_hash_or_prefix(subject) {
+        return format!(
+            "tag \"{}\" names \"{}\", which is not an object hash, so no store can hold it; \
+            the record came from elsewhere. It does not block this heal.",
+            name, subject
+        );
+    }
     format!(
         "tag \"{}\" names \"{}\", which is not held locally; this is expected when a sparse \
         franchise never fetched it or when collection removed it after its history was undone. \
@@ -1757,7 +1764,12 @@ fn walk_closure_for(
         .cloned()
         .map(|hash| (hash, AbsencePolicy::Report))
         .chain(roots.pin_parcels.iter().map(|(hash, policy)| (hash.clone(), AbsencePolicy::from(*policy))))
-        .chain(roots.tag_subjects.iter().map(|(_, subject)| (subject.clone(), AbsencePolicy::Gap)))
+        // A subject that is not even hash-shaped (a synced-in `@tags` record is an unvalidated
+        // string) names nothing any store could hold, and its presence probe would error and
+        // abort the walk. It is never queued, so it lands in `never_held_tags` below.
+        .chain(roots.tag_subjects.iter()
+            .filter(|(_, subject)| file_utils::is_object_hash_or_prefix(subject))
+            .map(|(_, subject)| (subject.clone(), AbsencePolicy::Gap)))
         .collect();
 
     drain_parcel_queue(
@@ -3827,6 +3839,53 @@ mod tests {
             "the run must NAME the never-held pin it tolerated, or clearing silently hides the \
              very state the next `audit` will refuse over: {:?}", outcome.notes
         );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// FORK-83: a tag subject is walked at gap policy. An absent, well-formed subject and one
+    /// that is not even hash-shaped are both never reported to the sink and both come back as
+    /// never-held tags. Mutations: queue tag subjects at `AbsencePolicy::Report` → the absent
+    /// hash reaches the sink → red; drop the hash-shape filter → the malformed subject's presence
+    /// probe errors → `walk_closure_for` returns `Err` → red at the `.expect`.
+    #[test]
+    fn an_absent_or_malformed_tag_subject_is_a_noted_gap_never_a_dangling_reference() {
+        use crate::globals::StorageRootScope;
+
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        let root = std::env::temp_dir()
+            .join(format!("forklift-recovery-utils-tag-subject-gap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        let _scope = StorageRootScope::enter(&root);
+
+        let absent = "a".repeat(64);
+        let roots = WalkRoots {
+            parcels: Vec::new(),
+            tag_subjects: vec![
+                ("v1.0".to_string(), absent.clone()),
+                ("bad".to_string(), "not-hex".to_string()),
+            ],
+            pin_parcels: Vec::new(),
+            shard_referenced: Vec::new(),
+            degraded_sources: Vec::new(),
+        };
+        let mut reported: Vec<String> = Vec::new();
+        let outcome = {
+            let mut sink = |hash: &str| reported.push(hash.to_string());
+            walk_closure_for(&BTreeSet::new(), &roots, &BTreeSet::new(), Some(&mut sink))
+                .expect("a malformed tag subject must not abort the walk")
+        };
+
+        assert!(reported.is_empty(), "no tag subject may be reported dangling; got {:?}", reported);
+        assert_eq!(
+            outcome.never_held_tags,
+            vec![("v1.0".to_string(), absent.clone()), ("bad".to_string(), "not-hex".to_string())],
+        );
+        assert!(never_held_tag_note("bad", "not-hex").contains("not an object hash"));
+        assert!(never_held_tag_note("v1.0", &absent).contains("not held locally"));
 
         std::fs::remove_dir_all(&root).ok();
     }
