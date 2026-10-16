@@ -640,9 +640,10 @@ const _: () = assert!(
     head-wait wording and the post-header wording both start lying"
 );
 
-/// The base allowance for [`RemoteClient::error_of`]'s own inline error-body read, once a
-/// non-success status line and headers have already arrived. Needed because `error_of`'s own
-/// bound (if any) doesn't cover this: it serves responses from every client this type builds,
+/// The base allowance for an error-body read (`read_error_body`, called by
+/// [`RemoteClient::error_of`] and `commit_lift` under [`RemoteClient::error_body_budget`]), once a
+/// non-success status line and headers have already arrived. Needed because no client's own bound
+/// covers this: `error_of` serves responses from every client this type builds,
 /// including the three deliberately-unbounded ones
 /// (`http`/`no_redirect`/`upload_targets`'s negotiation calls — see those calls' own docs), so a
 /// remote that answers a `5xx` with full headers and then wedges before writing the JSON body can
@@ -2859,9 +2860,9 @@ impl RemoteClient {
 
     /// The actual error-body-read bound to arm for *this* client instance — folds this
     /// instance's own `connect_timeout` into [`error_body_read_budget`]'s arithmetic. Split out as
-    /// its own `&self` method, rather than inlining the call to the free function at its call sites
-    /// (`error_of` and `commit_lift`), so a test can pin that the right instance field is actually read: not just read from
-    /// *some* client (every behavioral test of [`Self::error_of`] necessarily uses a direct
+    /// its own `&self` method, rather than inlining the call to the free function at its call
+    /// sites (`error_of` and `commit_lift`), so a test can pin that the right instance field is
+    /// actually read: not just read from *some* client (every behavioral test of [`Self::error_of`] necessarily uses a direct
     /// client, so none of them distinguishes "reads `self.budgets.connect`" from "hardcodes the
     /// direct 5s constant", and a `TorMode::On` fixture has the identical problem one level up, at
     /// 60s instead of 5s), but read from an instance whose `connect_timeout` a production
@@ -6511,7 +6512,9 @@ mod tests {
     /// actually ships with a non-default budget (`TorMode::On`) is the correct 70s rather than some
     /// other value a future change (e.g. a cap) could silently substitute (see
     /// `error_body_budget_is_70s_for_a_real_tor_mode_client`). All four together pin
-    /// `error_of`'s real behavior, on any client, without a live remote.
+    /// `error_of`'s real behavior, on any client, without a live remote;
+    /// `commit_lift_bounds_the_error_body_read_after_a_wedged_500` pins the budget's other call
+    /// site the same way.
     #[test]
     fn error_body_read_budget_folds_in_the_connect_timeout() {
         assert_eq!(
@@ -10219,9 +10222,9 @@ mod tests {
     // carries only a `connect_timeout`, no `read_timeout` at all — so a remote that delivers a
     // full status line and headers and then wedges before writing the body hangs the caller
     // forever. The caller's `error_body_budget` bounds the read itself, in `read_error_body`,
-    // rather than trying to fix it with yet another client — no client can help here, since the body-read
-    // bound is inherited from whichever client sent the request, and `error_of` serves responses
-    // from all of them. `commit_lift` reads its refusals under the same budget; only its wait for
+    // rather than trying to fix it with yet another client — no client can help here, since the
+    // body-read bound is inherited from whichever client sent the request, and `error_of` serves
+    // responses from all of them. `commit_lift` reads its refusals under the same budget; only its wait for
     // the response itself stays unbounded, under FORK-91.
     // -----------------------------------------------------------------------------------
 
@@ -10274,15 +10277,15 @@ mod tests {
     /// `missing_objects_times_out_against_a_silent_remote`'s own budget) the outer deadline is the
     /// *tighter* of the two and would fire first instead — a real, deliberate interaction between
     /// the two bounds, not a gap: whichever fires first still surfaces as a plain `Err` through the
-    /// same `error_of` fallback path either way (a body read cut off by the deadline and an elapsed
-    /// inner `tokio::time::timeout` both take the same "no usable error body arrived" arm), so no call
-    /// ever hangs regardless of which bound wins.
+    /// same `error_of` fallback path either way (a body read cut off by the deadline and an
+    /// elapsed inner `tokio::time::timeout` both take the same "no usable error body arrived"
+    /// arm), so no call ever hangs regardless of which bound wins.
     ///
     /// Before this call had its own outer deadline at all, it rode the auto-following client with
     /// no bound of any kind — a `500` whose body then wedges hung it forever, with the status line
     /// and headers already fully delivered. The outer test-ceiling below is a safety net, not the
-    /// property under test: if the bound in `read_error_body` were missing, that ceiling is what would
-    /// trip (the test failing instead of hanging the suite) — unambiguous evidence the internal
+    /// property under test: if the bound in `read_error_body` were missing, that ceiling is what
+    /// would trip (the test failing instead of hanging the suite) — unambiguous evidence the internal
     /// bound is gone, since status line and headers were fully delivered before the park, so the
     /// only thing left to hang on is the error-body read itself.
     ///
@@ -10299,7 +10302,8 @@ mod tests {
     /// [`REMOTE_CONNECT_TIMEOUT`]", which only waits longer. That is the gap
     /// `error_body_budget_reads_this_field_not_a_rival_constant` closes, with a connect bound no
     /// production constructor can produce, so a hardcoded rival can never coincidentally match it.
-    /// Four tests together pin the property: this one pins call-site-uses-the-budget,
+    /// Four tests together pin the property (`commit_lift`'s call site has its own test, after this
+    /// one): this one pins call-site-uses-the-budget,
     /// `error_body_read_budget_folds_in_the_connect_timeout` pins the arithmetic the budget
     /// computes, `error_body_budget_reads_this_field_not_a_rival_constant` pins that the accessor
     /// reads *this instance's* connect timeout field rather than hardcoding any constant a real
@@ -10393,9 +10397,10 @@ mod tests {
     /// A lift commit's refusal whose body stalls fails as a terminal error under the same
     /// error-body budget instead of hanging the lift: the auto-following client it rides has no
     /// read timeout, so nothing else would end the wait. Bracketed like the `missing_objects` test
-    /// above — at least the injected budget (so it is this instance's budget that fired, not some
-    /// shorter constant), under an outer ceiling (so a lost bound fails rather than hangs) — and
-    /// the message is the status reason that stands in for an unread body.
+    /// above: at least the injected budget (no shorter bound fired), under the midpoint to the
+    /// production budget (no longer one did either, so it is this instance's budget), and under an
+    /// outer ceiling (a lost bound fails rather than hangs). The message is the status reason that
+    /// stands in for an unread body.
     #[test]
     fn commit_lift_bounds_the_error_body_read_after_a_wedged_500() {
         let remote = SilentErrorBodyRemote::start();
@@ -10417,6 +10422,13 @@ mod tests {
         };
         assert!(message.contains("(500): Internal Server Error"), "the status stands in for the body: {}", message);
         assert!(elapsed >= lower_bound, "the error-body budget fired early ({:?} < {:?})", elapsed, lower_bound);
+        // The production error-body budget in place of this instance's would also clear the lower
+        // bound and the ceiling; only the midpoint between them tells the two apart.
+        let rival_production_budget = FAST.connect + TEST_ERROR_BODY_READ_TIMEOUT;
+        let upper_bound = lower_bound + (rival_production_budget - lower_bound) / 2;
+        assert!(elapsed < upper_bound,
+            "elapsed {:?} is past {:?}: the lift commit's error-body read is not armed with this \
+            instance's budget", elapsed, upper_bound);
     }
 
     /// A Tor-mode fixture (this test's predecessor,
