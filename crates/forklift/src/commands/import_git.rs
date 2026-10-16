@@ -160,11 +160,16 @@ pub fn handle_command(path: &str, no_compact: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// The ignore rule for a colocated git repository's metadata folder. It matches `.git`
+/// and what lies under it, never a sibling such as `.github/` or `.gitignore`: those are
+/// tracked content, and ignoring them makes the next `load .` stage their removal.
+const GIT_DIRECTORY_PATTERN: &str = r"^\.git(/.*)?$";
+
 /// Add a `.git` ignore pattern to `.forkliftignore` if it is not already there, so a
 /// colocated git repository's metadata folder is not treated as untracked content.
 fn ignore_git_directory() -> Result<bool, String> {
     let path = forklift_core::globals::warehouse_root().join(".forkliftignore");
-    let pattern = r"^\.git\/?.*$";
+    let pattern = GIT_DIRECTORY_PATTERN;
 
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
 

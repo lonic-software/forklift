@@ -120,13 +120,17 @@ forklift config --unset <key>         # remove a value
 
 `prepare` writes a `.forkliftignore` at the warehouse root. Each line is a
 **regex** (not a glob) matched against warehouse-relative, `/`-separated paths.
-The defaults ignore `target/`, `.idea/` and `.git/`; `.forklift/` itself is
-always ignored. Example entries:
+The file starts with comments only; `.forklift/` and `.forkliftignore` itself are
+always ignored, and `import-git` adds a rule for `.git/`. Example entries:
 
 ```
-^target\/?.*$      # a folder called target
+^target(/.*)?$     # a folder called target (not targets.txt)
 \.log$             # any .log file
 ```
+
+Anchor a folder rule at both ends. `^target\/?.*$` also matches `targets.txt` and
+`target-notes/`, and ignoring a tracked file makes the next `load .` stage its
+removal.
 
 ### `alias` — the `fl` short name
 

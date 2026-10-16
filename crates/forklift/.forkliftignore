@@ -2,8 +2,8 @@
 # This file is used to specify files and directories that should be ignored by Forklift.
 # Every entry must be a valid regex pattern.
 #
-# Example - ignore a folder called "test":
-# ^test\/?.*$
+# Example - ignore a folder called "test" (and nothing else whose name starts with "test"):
+# ^test(/.*)?$
 #
 # Example - ignore all files with the extension ".log":
 # \.log$

@@ -2485,6 +2485,55 @@ fn import_git_migrates_a_repo_into_the_warehouse() {
 }
 
 #[test]
+fn import_git_ignores_only_the_git_directory_not_its_dotfile_siblings() {
+    // The `.git` rule import-git writes must not swallow tracked files that merely start
+    // with `.git`: if it does, the first ordinary `load .` stages their removal.
+    let warehouse = TestWarehouse::new("import-git-siblings");
+    let root = warehouse.root.clone();
+
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&root)
+            .env("GIT_AUTHOR_NAME", "Ada").env("GIT_AUTHOR_EMAIL", "ada@example.com")
+            .env("GIT_COMMITTER_NAME", "Ada").env("GIT_COMMITTER_EMAIL", "ada@example.com")
+            .output()
+            .expect("git must be installed to run this test");
+        assert!(output.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&output.stderr));
+    };
+
+    git(&["init", "-q", "-b", "main"]);
+    warehouse.write_file(".github/x.md", "a\n");
+    warehouse.write_file(".gitignore", "b\n");
+    warehouse.write_file(".gitattributes", "c\n");
+    warehouse.write_file(".git-blame-ignore-revs", "e\n");
+    warehouse.write_file("readme", "d\n");
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "init"]);
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["import-git", "."]));
+
+    // Before the load, stocktake already reads clean: the import builds the tree from git
+    // objects, not the worktree. The over-broad rule only bites on the load.
+    assert!(stdout(&warehouse.run(&["stocktake"])).contains("nothing is staged"));
+
+    assert_success(&warehouse.run(&["load", "."]));
+    let status = stdout(&warehouse.run(&["stocktake"]));
+    // "The working directory matches the inventory" holds either way; the staged half is
+    // what the wrong rule changes.
+    assert!(status.contains("nothing is staged"), "load staged a change after import: {}", status);
+    for sibling in [".github/x.md", ".gitignore", ".gitattributes", ".git-blame-ignore-revs"] {
+        assert!(!status.contains(sibling), "{} was staged for removal: {}", sibling, status);
+    }
+
+    // The git directory itself is still ignored (it is on disk, holding objects and refs).
+    assert!(root.join(".git").is_dir());
+    assert!(!status.contains(".git/"), "the git directory leaked into the stocktake: {}", status);
+}
+
+#[test]
 fn import_git_auto_compacts_unless_no_compact() {
     // Seed a small colocated git repo in the warehouse root (import runs on ".").
     fn seed_git_repo(root: &Path) {
