@@ -7,8 +7,8 @@
 # files the change never touched, silently, because a formatter rewrites rather than
 # reports. This line makes `cargo fmt` a no-op instead.
 #
-# `bin/check` and CI run `bin/fmt-guard`, which fails if this line is removed or if a second
-# rustfmt.toml or .rustfmt.toml anywhere in the tree would override it. Match the formatting
-# of the surrounding code by hand.
+# `bin/check` and CI run `bin/fmt-guard`, which fails if this file holds anything but comments
+# and the line below, or if a second rustfmt.toml or .rustfmt.toml exists anywhere in the tree.
+# Match the formatting of the surrounding code by hand.
 # See docs/guide/contributing.md, "Formatting".
 disable_all_formatting = true

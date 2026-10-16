@@ -3,10 +3,11 @@
 # root rustfmt.toml sets disable_all_formatting so that `cargo fmt` is a no-op (see
 # docs/guide/contributing.md, "Formatting"). bin/check and CI run this. It never formats anything.
 #
-# The config is checked directly, not inferred from the code: rustfmt uses the nearest
-# rustfmt.toml or .rustfmt.toml above each file, so any second config file switches formatting
-# back on beneath it. That is invisible to `cargo fmt --check` when the files there already happen
-# to be rustfmt-clean, as about a quarter of them are.
+# The config is checked directly, not inferred from the code. A second rustfmt.toml or
+# .rustfmt.toml would switch rustfmt back on for some files beneath it, and `cargo fmt --check`
+# cannot be relied on to notice: it reads configs only at each crate target's root, and stays green
+# wherever the files already happen to be rustfmt-clean. Nor is the search left to git, which skips
+# ignored files and can fail without telling this script.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -16,28 +17,30 @@ fail() {
     exit 1
 }
 
-if ! grep -qx 'disable_all_formatting = true' rustfmt.toml 2>/dev/null; then
-    fail "rustfmt.toml must exist at the repository root and contain the line 'disable_all_formatting = true'."
+# The root config must hold that one setting and nothing else but comments, so no table, second
+# key or parse error can hide behind a line that looks right. CR is stripped for CRLF checkouts.
+[ -f rustfmt.toml ] || fail "rustfmt.toml is missing from the repository root."
+settings="$(tr -d '\r' < rustfmt.toml | grep -v -e '^[[:space:]]*#' -e '^[[:space:]]*$' || true)"
+if [ "$settings" != "disable_all_formatting = true" ]; then
+    fail "rustfmt.toml must contain only comments and the line 'disable_all_formatting = true'."
 fi
 
-# Tracked files plus untracked ones that are not ignored, so a local override is caught before it
-# is committed.
-others=()
-while IFS= read -r path; do
-    [ "$path" = rustfmt.toml ] && continue
-    [ -e "$path" ] && others+=("$path")
-done < <(git ls-files --cached --others --exclude-standard -- \
-    ':(glob)**/rustfmt.toml' ':(glob)**/.rustfmt.toml')
-if [ "${#others[@]}" -gt 0 ]; then
-    fail "a second rustfmt config would override the root guard beneath it: ${others[*]}"
+# Every other rustfmt config in the tree, ignored files included. The target dirs hold build
+# output, .git is git's, and .claude holds other worktrees, each with its own guard.
+found="$(find . \( -path ./target -o -path ./target-lambda-docker -o -path ./.git -o -path ./.claude \) \
+    -prune -o \( -name rustfmt.toml -o -name .rustfmt.toml \) -print)" \
+    || fail "could not search the tree for rustfmt configs."
+others="$(printf '%s\n' "$found" | grep -vx './rustfmt.toml' | tr '\n' ' ' || true)"
+if [ -n "$others" ]; then
+    fail "a second rustfmt config would switch rustfmt back on beneath it: $others"
 fi
 
-# The effect, as well as the config: no file cargo fmt would reach may come out reformatted.
+# The effect, as well as the config: nothing cargo fmt reaches may come out reformatted.
 if ! cargo fmt --version >/dev/null 2>&1; then
     fail "cargo fmt is not installed, so the guard cannot be checked (rustup component add rustfmt)."
 fi
 if ! cargo fmt --all --check >/dev/null; then
-    fail "cargo fmt --all --check reports files rustfmt would reformat, so the guard is not in force."
+    fail "cargo fmt --all --check failed: it would reformat files, or could not run (its errors are above)."
 fi
 
 echo "fmt-guard: rustfmt is switched off for the whole tree"

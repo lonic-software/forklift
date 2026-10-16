@@ -1,4 +1,4 @@
-# Forklift CI: formatting guard + build + test on Linux, macOS and Windows.
+# Forklift CI: build + test on Linux, macOS and Windows, plus the formatting guard on Linux.
 #
 # All dependencies come from crates.io (the private CodeArtifact registry became
 # unnecessary when the CLI moved from `rust-cli-core` to clap), so no credentials or
@@ -99,7 +99,7 @@ jobs:
 
       - name: Install stable Rust
         if: env.SKIP_TESTS != 'true'
-        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt && rustup default stable
+        run: rustup toolchain install stable --profile minimal --component clippy${{ matrix.os == 'ubuntu-latest' && ',rustfmt' || '' }} && rustup default stable
 
       # The tree is formatted by hand and rustfmt.toml switches rustfmt off; bin/fmt-guard fails if
       # that guard is missing, or if a second rustfmt config would override it. Its answer does not
