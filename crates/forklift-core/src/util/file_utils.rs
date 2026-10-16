@@ -2075,8 +2075,11 @@ pub fn does_object_exist(hash: &str) -> Result<bool, String> {
     }
 
     // A standing taint means a loose-path "yes" cannot be trusted until it is healed — refuse
-    // rather than silently answering as if nothing had happened.
-    taint_utils::gate_check(&forklift_root())?;
+    // rather than silently answering as if nothing had happened. A pack hit still needs no gate,
+    // so ask the revalidated packs before refusing.
+    if let Err(taint) = taint_utils::gate_check(&forklift_root()) {
+        return if crate::util::pack_utils::is_in_packs(hash)? { Ok(true) } else { Err(taint) };
+    }
 
     // Otherwise it may be loose (written but not yet packed).
     if loose_dentry_exists(hash)? {

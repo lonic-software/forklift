@@ -798,10 +798,14 @@ fn reloaded_if_stale(cached: &PackSet) -> Result<Option<Arc<PackSet>>, String> {
     // One reload at a time: after an external compact, every concurrent miss on a live server
     // finds the same set stale, and each would otherwise read every index into its own copy. A
     // thread that waited here takes the set the thread before it loaded, if that one is current.
-    let _reloading = RELOAD_LOCK.lock().expect("the pack reload lock is poisoned");
+    let key = file_utils::get_path_objects_root();
+    let reload_lock = Arc::clone(RELOAD_LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+        .lock().expect("the pack reload locks are poisoned")
+        .entry(key.clone()).or_default());
+    let _reloading = reload_lock.lock().expect("the pack reload lock is poisoned");
 
     let newer = registry().lock().expect("the pack registry lock is poisoned")
-        .get(&file_utils::get_path_objects_root())
+        .get(&key)
         .filter(|entry| !std::ptr::eq(Arc::as_ptr(entry), cached))
         .map(Arc::clone);
 
@@ -814,8 +818,9 @@ fn reloaded_if_stale(cached: &PackSet) -> Result<Option<Arc<PackSet>>, String> {
     reload_packs().map(Some)
 }
 
-/// Serializes [`reloaded_if_stale`]'s reloads (see there).
-static RELOAD_LOCK: Mutex<()> = Mutex::new(());
+/// Serializes [`reloaded_if_stale`]'s reloads per warehouse object store (keyed like
+/// [`PACK_REGISTRY`]), so one warehouse's reload never holds up another's.
+static RELOAD_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
 
 /// The check behind [`reloaded_if_stale`]. A `stat` or listing failure on the folder reads as
 /// "not current", so the reload that follows reports it as the environment failure it is.
@@ -6514,6 +6519,11 @@ mod tests {
             .expect("a pack set is cached for this warehouse"))
     }
 
+    /// Set a file's mtime. Through a write handle: Windows needs one to set file times.
+    fn set_mtime(path: &Path, modified: SystemTime) {
+        std::fs::OpenOptions::new().write(true).open(path).unwrap().set_modified(modified).unwrap();
+    }
+
     /// A fresh, empty warehouse root for one test.
     fn fresh_root(name: &str) -> PathBuf {
         let temp = std::env::temp_dir().join(format!("forklift-{}-{}", name, std::process::id()));
@@ -6696,8 +6706,7 @@ mod tests {
         // `a_pair_stamped_inside_an_mtime_tick_is_rechecked_once_the_tick_passes`).
         let stamped_mtime = std::fs::metadata(&artifact.index_path).unwrap().modified().unwrap();
         std::fs::write(&artifact.index_path, &good_index).unwrap();
-        std::fs::File::open(&artifact.index_path).unwrap()
-            .set_modified(stamped_mtime + Duration::from_secs(5)).unwrap();
+        set_mtime(&artifact.index_path, stamped_mtime + Duration::from_secs(5));
 
         match file_utils::read_object_classified(&y_hash).unwrap() {
             StoreReadOutcome::Unverifiable(_) => {}
@@ -6721,6 +6730,9 @@ mod tests {
 
         let (_, artifact) = publish_external_pack(b"an orphaned index that stays orphaned");
         std::fs::remove_file(&artifact.data_path).unwrap();
+        // Backdate the index so its stamp is settled: a stamp inside the file's mtime tick is
+        // re-checked once when the tick passes, which a slow runner could hit inside the loop.
+        set_mtime(&artifact.index_path, SystemTime::now() - Duration::from_secs(60));
 
         invalidate_cache();
         let never_stored = "7".repeat(64);
@@ -6825,7 +6837,7 @@ mod tests {
 
         let past = SystemTime::now() - Duration::from_secs(60);
         for path in [index, &artifact.data_path] {
-            std::fs::File::open(path).unwrap().set_modified(past).unwrap();
+            set_mtime(path, past);
         }
         let settled = pair_stamp(index);
         assert!(settled.settles_at.is_none(), "sanity: files last modified a minute ago stamp settled");
