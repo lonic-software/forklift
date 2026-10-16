@@ -227,9 +227,12 @@ pub struct CommitLiftRequest {
 /// never talks to the resolution service directly, so the policy that decides *which*
 /// names a caller may see is enforced, not advisory. The server answers from its
 /// resolution hook (`docs/format/HOOK_PROTOCOL.md`), knowing who is asking.
+///
+/// The identifiers are borrowed when sending, so a client need not copy a batch to ask about it,
+/// and owned when received.
 #[derive(Serialize, Deserialize)]
-pub struct ResolveRequest {
-    pub identifiers: Vec<String>,
+pub struct ResolveRequest<'a> {
+    pub identifiers: std::borrow::Cow<'a, [String]>,
 }
 
 /// The most distinct identifiers one resolve request may name. A server refuses more; a client
@@ -239,17 +242,25 @@ pub const MAX_RESOLVE_IDENTIFIERS: usize = 10_000;
 /// A resolve request's identifiers, each once, or the refusal every head gives a request naming
 /// more than [`MAX_RESOLVE_IDENTIFIERS`] distinct ones.
 pub fn distinct_resolve_identifiers(identifiers: Vec<String>) -> Result<Vec<String>, String> {
-    let distinct: Vec<String> = identifiers.into_iter()
-        .collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+    check_resolve_identifiers(&identifiers)?;
 
-    if distinct.len() > MAX_RESOLVE_IDENTIFIERS {
+    Ok(identifiers.into_iter().collect::<std::collections::BTreeSet<_>>().into_iter().collect())
+}
+
+/// Refuse a resolve request naming more than [`MAX_RESOLVE_IDENTIFIERS`] distinct identifiers,
+/// without copying them; the refusal says how many it named.
+pub fn check_resolve_identifiers(identifiers: &[String]) -> Result<(), String> {
+    let distinct = identifiers.iter().collect::<std::collections::BTreeSet<_>>().len();
+
+    if distinct > MAX_RESOLVE_IDENTIFIERS {
         return Err(format!(
-            "At most {} distinct identifiers per resolve request; batch larger sets.",
-            MAX_RESOLVE_IDENTIFIERS
+            "This resolve request names {} distinct identifiers; at most {} are allowed per \
+            request, so batch larger sets.",
+            distinct, MAX_RESOLVE_IDENTIFIERS
         ));
     }
 
-    Ok(distinct)
+    Ok(())
 }
 
 /// Per-identifier allowance in a resolve answer, beyond the identifier itself: the name it

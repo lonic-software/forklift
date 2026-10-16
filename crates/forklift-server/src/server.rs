@@ -2287,7 +2287,7 @@ fn maybe_rebuild_bundle(state: &AppState, warehouse: Arc<WarehouseHandle>) {
 async fn post_resolve(State(state): State<Arc<AppState>>,
                       headers: HeaderMap,
                       Path(params): Path<PathParams>,
-                      Json(request): Json<ResolveRequest>) -> Response {
+                      Json(request): Json<ResolveRequest<'static>>) -> Response {
     let principal = match check_auth(&state, &headers).await {
         Ok(principal) => principal,
         Err(error) => return error_response(error),
@@ -2303,10 +2303,10 @@ async fn post_resolve(State(state): State<Arc<AppState>>,
     // server, hook or not, so the limit is part of the request's contract rather than of how a
     // server is configured. The hook answer's cap scales with these identifiers, so they are
     // what bounds it.
-    let identifiers = match distinct_resolve_identifiers(request.identifiers) {
+    let identifiers = match distinct_resolve_identifiers(request.identifiers.into_owned()) {
         Ok(identifiers) => identifiers,
         Err(refusal) => {
-            tracing::warn!("refused a resolve request naming too many identifiers");
+            tracing::warn!(refusal = %refusal, "refused a resolve request naming too many identifiers");
             return error_response(unprocessable(refusal));
         }
     };
@@ -2328,15 +2328,15 @@ async fn post_resolve(State(state): State<Arc<AppState>>,
 
     // What a directory can legitimately answer for these identifiers.
     let answer_cap = resolve_answer_cap(&identifiers);
-    // Only what was asked is answered: a directory naming identifiers outside the request does not
-    // reach the client.
-    let asked: std::collections::BTreeSet<String> = identifiers.iter().cloned().collect();
     let hook_request = ResolutionHookRequest { caller, identifiers };
 
     let names = match post_hook(&state, hook, "resolution", &hook_request).await {
         Ok(response) if response.status().is_success() => {
             match body_utils::read_json_capped::<ResolutionHookResponse>(response, answer_cap).await {
-                Ok(answer) => answer.names.into_iter().filter(|(id, _)| asked.contains(id)).collect(),
+                // Only what was asked is answered: a directory naming identifiers outside the
+                // request does not reach the client. The identifiers are sorted and distinct.
+                Ok(answer) => answer.names.into_iter()
+                    .filter(|(id, _)| hook_request.identifiers.binary_search(id).is_ok()).collect(),
                 Err(e) => {
                     tracing::warn!(error = ?e,
                         "the resolution hook's answer is unreadable, oversized or malformed; showing pseudonyms");

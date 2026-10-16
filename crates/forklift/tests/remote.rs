@@ -2349,7 +2349,7 @@ fn resolution_is_server_mediated_and_degrades_to_pseudonyms() {
         &server.url, "/v1/resolve", &serde_json::json!({ "identifiers": many }).to_string()
     );
     assert!(status.contains("422"), "{} {}", status, body);
-    assert!(body.contains("distinct identifiers per resolve request"), "{}", body);
+    assert!(body.contains("names 10001 distinct identifiers"), "{}", body);
 
     let repeated = vec!["tester@forklift"; 20_000];
     let (status, body) = http_post_json(
@@ -2357,6 +2357,14 @@ fn resolution_is_server_mediated_and_degrades_to_pseudonyms() {
     );
     assert!(status.contains("200"), "a repeated identifier counts once: {} {}", status, body);
     assert!(body.contains("Remote Tester"), "{}", body);
+
+    // This directory names tester@forklift whatever it is asked; a request that did not ask about
+    // that identifier must not get its name.
+    let (status, body) = http_post_json(
+        &server.url, "/v1/resolve", &serde_json::json!({ "identifiers": ["someone-else"] }).to_string()
+    );
+    assert!(status.contains("200"), "{} {}", status, body);
+    assert!(!body.contains("Remote Tester"), "a name nobody asked about reaches the client: {}", body);
 
     // Resolution never fails a command: point the remote at a dead port and history
     // degrades to the pseudonymous id instead of erroring.

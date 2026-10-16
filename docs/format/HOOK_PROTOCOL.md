@@ -190,7 +190,10 @@ Response:
 resolve nothing, members only the peers of warehouses they share, admins everyone);
 a dumb directory may ignore it and let the server pre-filter. Identifiers the caller
 may not resolve, or that the directory does not know, are simply **absent** —
-withholding is indistinguishable from not knowing, by design. Every failure
+withholding is indistinguishable from not knowing, by design. Key each name by the
+identifier exactly as the request spelled it: the server drops any entry for an
+identifier the request did not name, so a canonicalised or aliased key is discarded
+and that operator shows as a pseudonym. Every failure
 (unreachable, non-`200`, malformed) degrades to the pseudonymous identifiers on
 screen; resolution can never fail a command, and its answers are never a
 verification input.
