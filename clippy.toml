@@ -1,3 +1,38 @@
+# Two bans live here, each enforced by `cargo clippy` in CI.
+#
+# zstd decoders: every decoder of untrusted bytes is built by object_utils' bounded constructors,
+# which cap the frame window. The list names every safe-API constructor and the raw streaming entry
+# points. It is complete only while zstd-sys's `experimental` feature stays off: that feature
+# exposes further decompression entry points (`ZSTD_decompressStream_simpleArgs` and kin) which
+# would need adding here. Nothing enables it today.
+#
+# reqwest body reads: whole-body and chunk readers go through util::body_utils, which caps what a
+# peer can make the client hold. The streaming loops that write to disk or to the bundle importer
+# allow `chunk` per site with a justification.
 disallowed-methods = [
     { path = "zstd::stream::decode_all", reason = "unbounded decode of untrusted bytes; use object_utils::decode_object_bounded unless reading back bytes this store itself wrote — allow per-site with a justification" },
+    { path = "zstd::stream::read::Decoder::new", reason = "every zstd decoder of untrusted bytes is built by object_utils::bounded_zstd_decoder / bounded_zstd_dictionary_decoder, which bound the frame window (a frame can otherwise make its decoder hold up to 128 MiB)" },
+    { path = "zstd::stream::read::Decoder::with_buffer", reason = "every zstd decoder of untrusted bytes is built by object_utils::bounded_zstd_decoder / bounded_zstd_dictionary_decoder, which bound the frame window (a frame can otherwise make its decoder hold up to 128 MiB)" },
+    { path = "zstd::stream::read::Decoder::with_dictionary", reason = "every zstd decoder of untrusted bytes is built by object_utils::bounded_zstd_decoder / bounded_zstd_dictionary_decoder, which bound the frame window (a frame can otherwise make its decoder hold up to 128 MiB)" },
+    { path = "zstd::stream::read::Decoder::with_context", reason = "every zstd decoder of untrusted bytes is built by object_utils::bounded_zstd_decoder / bounded_zstd_dictionary_decoder, which bound the frame window (a frame can otherwise make its decoder hold up to 128 MiB)" },
+    { path = "zstd::stream::read::Decoder::with_prepared_dictionary", reason = "every zstd decoder of untrusted bytes is built by object_utils::bounded_zstd_decoder / bounded_zstd_dictionary_decoder, which bound the frame window (a frame can otherwise make its decoder hold up to 128 MiB)" },
+    { path = "zstd::stream::read::Decoder::with_ref_prefix", reason = "every zstd decoder of untrusted bytes is built by object_utils::bounded_zstd_decoder / bounded_zstd_dictionary_decoder, which bound the frame window (a frame can otherwise make its decoder hold up to 128 MiB)" },
+    { path = "zstd::stream::write::Decoder::new", reason = "every zstd decoder of untrusted bytes is built by object_utils::bounded_zstd_decoder / bounded_zstd_dictionary_decoder, which bound the frame window (a frame can otherwise make its decoder hold up to 128 MiB)" },
+    { path = "zstd::stream::write::Decoder::with_dictionary", reason = "every zstd decoder of untrusted bytes is built by object_utils::bounded_zstd_decoder / bounded_zstd_dictionary_decoder, which bound the frame window (a frame can otherwise make its decoder hold up to 128 MiB)" },
+    { path = "zstd::stream::write::Decoder::with_prepared_dictionary", reason = "every zstd decoder of untrusted bytes is built by object_utils::bounded_zstd_decoder / bounded_zstd_dictionary_decoder, which bound the frame window (a frame can otherwise make its decoder hold up to 128 MiB)" },
+    { path = "zstd::stream::raw::Decoder::new", reason = "every zstd decoder of untrusted bytes is built by object_utils::bounded_zstd_decoder / bounded_zstd_dictionary_decoder, which bound the frame window (a frame can otherwise make its decoder hold up to 128 MiB)" },
+    { path = "zstd::stream::raw::Decoder::with_dictionary", reason = "every zstd decoder of untrusted bytes is built by object_utils::bounded_zstd_decoder / bounded_zstd_dictionary_decoder, which bound the frame window (a frame can otherwise make its decoder hold up to 128 MiB)" },
+    { path = "zstd::stream::raw::Decoder::with_context", reason = "every zstd decoder of untrusted bytes is built by object_utils::bounded_zstd_decoder / bounded_zstd_dictionary_decoder, which bound the frame window (a frame can otherwise make its decoder hold up to 128 MiB)" },
+    { path = "zstd::stream::raw::Decoder::with_prepared_dictionary", reason = "every zstd decoder of untrusted bytes is built by object_utils::bounded_zstd_decoder / bounded_zstd_dictionary_decoder, which bound the frame window (a frame can otherwise make its decoder hold up to 128 MiB)" },
+    { path = "zstd::stream::raw::Decoder::with_ref_prefix", reason = "every zstd decoder of untrusted bytes is built by object_utils::bounded_zstd_decoder / bounded_zstd_dictionary_decoder, which bound the frame window (a frame can otherwise make its decoder hold up to 128 MiB)" },
+    { path = "zstd::stream::copy_decode", reason = "every zstd decoder of untrusted bytes is built by object_utils::bounded_zstd_decoder / bounded_zstd_dictionary_decoder, which bound the frame window (a frame can otherwise make its decoder hold up to 128 MiB)" },
+    { path = "zstd::zstd_safe::DCtx::create", reason = "every zstd decoder of untrusted bytes is built by object_utils::bounded_zstd_decoder / bounded_zstd_dictionary_decoder, which bound the frame window (a frame can otherwise make its decoder hold up to 128 MiB)" },
+    { path = "zstd::zstd_safe::DCtx::try_create", reason = "every zstd decoder of untrusted bytes is built by object_utils::bounded_zstd_decoder / bounded_zstd_dictionary_decoder, which bound the frame window (a frame can otherwise make its decoder hold up to 128 MiB)" },
+    { path = "zstd::zstd_safe::DCtx::decompress_stream", reason = "every zstd decoder of untrusted bytes is built by object_utils::bounded_zstd_decoder / bounded_zstd_dictionary_decoder, which bound the frame window (a frame can otherwise make its decoder hold up to 128 MiB)" },
+    { path = "zstd::zstd_safe::zstd_sys::ZSTD_decompressStream", reason = "every zstd decoder of untrusted bytes is built by object_utils::bounded_zstd_decoder / bounded_zstd_dictionary_decoder, which bound the frame window (a frame can otherwise make its decoder hold up to 128 MiB)" },
+    { path = "reqwest::Response::bytes", reason = "whole-body response reads go through util::body_utils (read_body_capped / read_json_capped), which cap what a peer can make the client hold" },
+    { path = "reqwest::Response::json", reason = "whole-body response reads go through util::body_utils (read_body_capped / read_json_capped), which cap what a peer can make the client hold" },
+    { path = "reqwest::Response::text", reason = "whole-body response reads go through util::body_utils (read_body_capped / read_json_capped), which cap what a peer can make the client hold" },
+    { path = "reqwest::Response::chunk", reason = "a whole-body read goes through util::body_utils (read_body_capped / read_json_capped); a streaming read must hand each chunk to disk or the bundle importer and allow this call at that site with a justification" },
+    { path = "reqwest::Response::bytes_stream", reason = "a whole-body read goes through util::body_utils (read_body_capped / read_json_capped); a streaming read must hand each chunk to disk or the bundle importer and allow this call at that site with a justification" },
 ]

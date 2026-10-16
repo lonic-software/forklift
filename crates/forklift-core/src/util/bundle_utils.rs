@@ -19,9 +19,9 @@ use crate::util::{
 /// into one durably-synced loose file per object.
 pub const BUNDLE_HEADER: &str = "forklift-bundle 2026-07-13";
 
-/// Version 3: the former current format — one outer zstd stream of `O`/`D`/`S` records. Still used
-/// by small in-memory partial bundles (`objects/batch`, subtree fetches), and still accepted for
-/// backward-compatible whole-bundle imports.
+/// Version 3: the former current format — one outer zstd stream of `O`/`D`/`S` records. Still the
+/// format of partial bundles (`objects/batch`, subtree fetches), which are imported as they stream
+/// in and accept no other version, and still accepted for whole-bundle imports.
 const BUNDLE_HEADER_V3: &str = "forklift-bundle 2026-07-11";
 
 /// The version-2 header (2026-07-06, §9.1 #1), which added delta records (`KIND_DELTA`). Still
@@ -86,7 +86,7 @@ pub struct BuildStats {
 }
 
 /// What a bundle import actually stored (records already present are skipped).
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct ImportStats {
     pub stored_objects: usize,
     pub stored_signatures: usize,
@@ -629,19 +629,41 @@ pub fn import_bundle(path: &Path) -> Result<ImportStats, String> {
     import_bundle_reader(std::io::BufReader::new(file))
 }
 
-/// Import an in-memory bundle (a `POST /v1/objects/batch` response) into the object
-/// store — the same verification as `import_bundle`.
-pub fn import_bundle_bytes(bytes: &[u8]) -> Result<ImportStats, String> {
-    import_bundle_reader(std::io::Cursor::new(bytes))
+/// Import a bundle streamed from a remote (a batch or subtree response) as it arrives — the same
+/// verification as `import_bundle`, holding at most one record in memory.
+///
+/// Only a version-3 bundle is accepted: that is what every batch and subtree producer writes, and
+/// it is the version whose records stream. A whole-warehouse version-4 bundle imports through
+/// temporary pack files and has no business arriving here, so it is refused rather than imported
+/// by a path this one was never meant to take.
+///
+/// # Arguments
+/// * `reader` - The response body, as it arrives.
+///
+/// # Returns
+/// * `Ok(ImportStats)` - What was stored.
+/// * `Err(String)`     - On any header but version 3, a corrupt or truncated record, or an I/O
+///   error (including the transfer ending before the bundle did).
+pub fn import_streamed_bundle<R: std::io::BufRead>(mut reader: R) -> Result<ImportStats, String> {
+    let header = read_bundle_header(&mut reader)?;
+
+    if header != BUNDLE_HEADER_V3.as_bytes() {
+        return Err(format!(
+            "The remote sent a \"{}\" bundle where only a \"{}\" one belongs; refusing to import it.",
+            String::from_utf8_lossy(&header), BUNDLE_HEADER_V3
+        ));
+    }
+
+    import_record_stream(reader, true)
 }
 
-/// Import a bundle from a reader (see `import_bundle`).
-fn import_bundle_reader<R: std::io::BufRead>(mut reader: R) -> Result<ImportStats, String> {
+/// Read a bundle's uncompressed header line, without its newline.
+fn read_bundle_header<R: std::io::BufRead>(reader: &mut R) -> Result<Vec<u8>, String> {
     // The header line is uncompressed; everything after it is one zstd stream. `length` is not
     // the only attacker-controlled number here: a hostile bundle need not carry a newline at all
     // (or may run arbitrarily many non-newline bytes before one), and an unbounded
     // `read_until(b'\n', ...)` would grow `header` without limit chasing it — the same
-    // unbounded-growth shape the record-length fix elsewhere in this function exists to close.
+    // unbounded-growth shape the record-length checks in `import_record_stream` exist to close.
     // Every header this build recognizes is under 30 bytes, so bound the search to a small,
     // fixed cap: past it, this cannot be a bundle this build understands, however long the
     // stream actually runs.
@@ -659,6 +681,13 @@ fn import_bundle_reader<R: std::io::BufRead>(mut reader: R) -> Result<ImportStat
     }
 
     header.pop();
+
+    Ok(header)
+}
+
+/// Import a bundle from a reader (see `import_bundle`).
+fn import_bundle_reader<R: std::io::BufRead>(mut reader: R) -> Result<ImportStats, String> {
+    let header = read_bundle_header(&mut reader)?;
 
     if header == BUNDLE_HEADER.as_bytes() {
         return import_native_bundle_reader(&mut reader);
@@ -682,7 +711,13 @@ fn import_bundle_reader<R: std::io::BufRead>(mut reader: R) -> Result<ImportStat
     // unconditional memory defense regardless of version.
     let is_new_version = header == BUNDLE_HEADER_V3.as_bytes();
 
-    let mut decoder = zstd::stream::Decoder::new(reader)
+    import_record_stream(reader, is_new_version)
+}
+
+/// Import the zstd record stream that follows a version 1–3 header. `is_new_version` is whether
+/// the header was version 3, whose records are refused on declared size past the object ceiling.
+fn import_record_stream<R: std::io::BufRead>(reader: R, is_new_version: bool) -> Result<ImportStats, String> {
+    let mut decoder = object_utils::bounded_zstd_decoder(reader)
         .map_err(|e| format!("Error while opening the bundle stream: {}", e))?;
 
     let mut stats = ImportStats::default();
@@ -690,9 +725,20 @@ fn import_bundle_reader<R: std::io::BufRead>(mut reader: R) -> Result<ImportStat
     loop {
         let mut kind = [0u8; 1];
 
-        match decoder.read_exact(&mut kind) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+        // Only a read that produces nothing ends the bundle: the stream finished on a frame
+        // boundary between records. A truncated frame is an error from the decoder, never a clean
+        // end — so a bundle cut short in transit, even exactly between two records, fails the
+        // import instead of passing for a smaller one.
+        let read = loop {
+            match decoder.read(&mut kind) {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                other => break other,
+            }
+        };
+
+        match read {
+            Ok(0) => break,
+            Ok(_) => {}
             Err(e) => return Err(format!("Error while reading the bundle: {}", e)),
         }
 
@@ -960,6 +1006,11 @@ mod tests {
     use crate::model::recipe::{Recipe, RecipeChunk};
     use crate::model::tree_item::TreeItem;
     use crate::util::byte_utils::number_to_vlq_bytes;
+
+    /// Import an in-memory bundle, as `import_bundle` imports a file.
+    fn import_bundle_bytes(bytes: &[u8]) -> Result<ImportStats, String> {
+        import_bundle_reader(std::io::Cursor::new(bytes))
+    }
 
     /// A fresh warehouse root for one test, entered as the active storage-root scope for
     /// its lifetime. Each test gets its own directory (and its own thread, `cargo test`'s
@@ -1556,5 +1607,110 @@ mod tests {
         let bytes = raw_bundle(BUNDLE_HEADER_V3, &record(b'O', &object.hash, &raw));
         let error = import_bundle_bytes(&bytes).err().unwrap();
         assert!(error.contains("object ceiling"), "a v3 bundle refuses the giant: {}", error);
+    }
+
+    /// [`raw_bundle`], but with the record stream's frame declaring a `window_log` window — a
+    /// stream encoder with no pledged size writes the window into the frame header whatever the
+    /// content, so a small bundle can declare a window as large as any bomb.
+    fn bundle_with_window(header: &str, records: &[u8], window_log: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend(header.as_bytes());
+        bytes.push(b'\n');
+
+        let mut encoder = zstd::stream::Encoder::new(&mut bytes, 3).unwrap();
+        encoder.window_log(window_log).unwrap();
+        std::io::Write::write_all(&mut encoder, records).unwrap();
+        encoder.finish().unwrap();
+        bytes
+    }
+
+    /// Three object records and their hashes.
+    fn three_objects() -> (Vec<u8>, Vec<String>) {
+        let mut records = Vec::new();
+        let mut hashes = Vec::new();
+
+        for i in 0..3 {
+            let content = format!("streamed object {} {}", i, "x".repeat(200 * i));
+            let hash = object_utils::hash_object_bytes(content.as_bytes());
+            records.extend(record(b'O', &hash, content.as_bytes()));
+            hashes.push(hash);
+        }
+
+        (records, hashes)
+    }
+
+    #[test]
+    fn a_streamed_bundle_cut_short_anywhere_fails_instead_of_importing_as_a_smaller_one() {
+        // A transfer that ends early without an error of its own (a close-delimited body cut by
+        // the peer) hands the importer a clean end of input mid-stream. Wherever that lands —
+        // inside a record, or exactly between two — the import must fail: a bundle that loses
+        // its tail is corrupt, never a smaller valid one.
+        let (records, hashes) = three_objects();
+        let bytes = raw_bundle(BUNDLE_HEADER_V3, &records);
+        let header_len = BUNDLE_HEADER_V3.len() + 1;
+
+        for cut in header_len..bytes.len() {
+            let _scratch = Scratch::new("streamed-cut");
+            let outcome = import_streamed_bundle(std::io::Cursor::new(&bytes[..cut]));
+            assert!(outcome.is_err(), "a bundle cut at byte {} of {} must not import", cut, bytes.len());
+        }
+
+        let _scratch = Scratch::new("streamed-whole");
+        let stats = import_streamed_bundle(std::io::Cursor::new(&bytes)).unwrap();
+        assert_eq!(stats.stored_objects, 3);
+        assert!(hashes.iter().all(|hash| file_utils::does_object_exist(hash).unwrap()));
+    }
+
+    #[test]
+    fn a_streamed_bundle_is_accepted_only_at_version_3() {
+        let _scratch = Scratch::new("streamed-versions");
+        let (records, _) = three_objects();
+
+        for header in [BUNDLE_HEADER, BUNDLE_HEADER_V2, BUNDLE_HEADER_V1] {
+            let error = import_streamed_bundle(std::io::Cursor::new(raw_bundle(header, &records)))
+                .err().unwrap_or_else(|| panic!("a \"{}\" bundle must be refused on the streamed path", header));
+            assert!(error.contains("refusing to import it"), "{}", error);
+        }
+
+        assert!(import_streamed_bundle(std::io::Cursor::new(raw_bundle(BUNDLE_HEADER_V3, &records))).is_ok());
+    }
+
+    /// The streamed path is the one a remote's batch and subtree answers reach, so the hostile
+    /// declared length the fuzz suite pins through `import_bundle` is pinned here too: a
+    /// record declaring `u64::MAX` bytes is an error, never an allocation of them.
+    #[test]
+    fn a_streamed_record_declaring_a_huge_length_is_refused_without_allocating_it() {
+        for kind in [b'O', b'D', b'S'] {
+            let _scratch = Scratch::new("streamed-huge-length");
+            let mut hostile = vec![kind];
+            hostile.extend([b'a'; 64]);
+            hostile.extend(u64::MAX.to_be_bytes());
+            hostile.extend(b"only a few real bytes");
+
+            let outcome = import_streamed_bundle(std::io::Cursor::new(raw_bundle(BUNDLE_HEADER_V3, &hostile)));
+            let error = outcome.err()
+                .unwrap_or_else(|| panic!("a '{}' record of declared length u64::MAX must be refused", kind as char));
+            assert!(error.contains("declares 18446744073709551615 bytes"),
+                "the '{}' record is refused on its declared length before any of it is read: {}", kind as char, error);
+        }
+    }
+
+    #[test]
+    fn a_bundle_stream_declaring_a_window_past_the_bound_is_refused_and_one_at_it_imports() {
+        let (records, hashes) = three_objects();
+
+        let over = bundle_with_window(BUNDLE_HEADER_V3, &records, object_utils::MAX_DECODE_WINDOW_LOG + 1);
+        {
+            let _scratch = Scratch::new("window-over");
+            assert!(import_bundle_bytes(&over).is_err(), "a file bundle over the window bound is refused");
+            assert!(import_streamed_bundle(std::io::Cursor::new(&over)).is_err(),
+                "a streamed bundle over the window bound is refused");
+            assert!(!hashes.iter().any(|hash| file_utils::does_object_exist(hash).unwrap()),
+                "the refusal comes before the first record");
+        }
+
+        let at = bundle_with_window(BUNDLE_HEADER_V3, &records, object_utils::MAX_DECODE_WINDOW_LOG);
+        let _scratch = Scratch::new("window-at");
+        assert_eq!(import_streamed_bundle(std::io::Cursor::new(&at)).unwrap().stored_objects, 3);
     }
 }

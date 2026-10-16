@@ -1247,6 +1247,7 @@ dependencies = [
  "chrono",
  "ed25519-dalek",
  "file-id",
+ "flate2",
  "flume",
  "libc",
  "memmap2",

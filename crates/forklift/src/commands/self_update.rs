@@ -1,10 +1,16 @@
 use std::process::Command;
 use serde::Serialize;
+use forklift_core::util::body_utils::{self, BodyReadError, JsonReadError};
 use crate::commands::alias;
 use crate::output::{self, CommandOutput};
 
 /// The version this binary was built as.
 const CURRENT: &str = env!("CARGO_PKG_VERSION");
+
+/// The largest latest-release answer read from GitHub. A release's JSON lists its assets and
+/// notes; a few hundred kilobytes is typical, so this bounds a hostile or broken answer without
+/// coming near a real one.
+const RELEASE_ANSWER_CAP: u64 = 8 * 1024 * 1024;
 
 /// The GitHub repository releases are published to.
 const REPO: &str = "lonic-software/forklift";
@@ -103,8 +109,14 @@ async fn fetch_latest() -> Result<Option<String>, String> {
         return Ok(None);
     }
 
-    let body: serde_json::Value = response.json().await
-        .map_err(|e| format!("Could not read GitHub's response: {}", e))?;
+    let body: serde_json::Value = body_utils::read_json_capped(response, RELEASE_ANSWER_CAP).await
+        .map_err(|e| match e {
+            JsonReadError::Body(BodyReadError::OverCap { cap }) => {
+                body_utils::over_cap_message("GitHub's release information", cap)
+            }
+            JsonReadError::Body(BodyReadError::Transport(e)) => format!("Could not read GitHub's response: {}", e),
+            JsonReadError::Parse(e) => format!("Could not read GitHub's response: {}", e),
+        })?;
 
     Ok(body["tag_name"].as_str().map(|tag| tag.trim_start_matches('v').to_string()))
 }

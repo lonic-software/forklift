@@ -32,11 +32,12 @@ use forklift_core::model::remote::{
     ErrorResponse, MissingObjectsRequest, MissingObjectsResponse, RefUpdateRequest,
     ResolveRequest, ResolveResponse, TrustAnchorDto, UploadTargetsRequest, UploadTargetsResponse,
     WarehouseInfo, MAX_MISSING_BATCH, MAX_UPLOAD_TARGETS_BATCH, PROTOCOL_VERSION,
+    distinct_resolve_identifiers, resolve_answer_cap,
 };
 use forklift_core::util::office_utils::OFFICE_PALLET_NAME;
 use forklift_core::util::lock_utils::ServeLock;
 use forklift_core::util::{
-    audit_utils, bundle_utils, file_utils, hook_utils, merge_utils, object_utils,
+    audit_utils, body_utils, bundle_utils, file_utils, hook_utils, merge_utils, object_utils,
     office_utils, pallet_utils, sign_utils, tree_utils, warehouse_utils,
 };
 use subtle::ConstantTimeEq;
@@ -951,8 +952,10 @@ async fn authenticate_via_hook(state: &AppState,
         ));
     }
 
-    let answer: AuthenticationHookResponse = response.json().await.map_err(|e| {
-        tracing::warn!(error = %e, "the authentication hook answered malformed JSON");
+    let answer: AuthenticationHookResponse = body_utils::read_json_capped(
+        response, body_utils::SMALL_BODY_CAP
+    ).await.map_err(|e| {
+        tracing::warn!(error = ?e, "the authentication hook's answer is unreadable, oversized or malformed");
 
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1052,8 +1055,10 @@ async fn check_admission(state: &AppState,
         ));
     }
 
-    let verdict: AdmissionHookResponse = response.json().await.map_err(|e| {
-        tracing::warn!(error = %e, "the admission hook answered malformed JSON");
+    let verdict: AdmissionHookResponse = body_utils::read_json_capped(
+        response, body_utils::SMALL_BODY_CAP
+    ).await.map_err(|e| {
+        tracing::warn!(error = ?e, "the admission hook's answer is unreadable, oversized or malformed");
 
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2278,7 +2283,7 @@ fn maybe_rebuild_bundle(state: &AppState, warehouse: Arc<WarehouseHandle>) {
 async fn post_resolve(State(state): State<Arc<AppState>>,
                       headers: HeaderMap,
                       Path(params): Path<PathParams>,
-                      Json(request): Json<ResolveRequest>) -> Response {
+                      Json(request): Json<ResolveRequest<'static>>) -> Response {
     let principal = match check_auth(&state, &headers).await {
         Ok(principal) => principal,
         Err(error) => return error_response(error),
@@ -2289,6 +2294,18 @@ async fn post_resolve(State(state): State<Arc<AppState>>,
     if let Err(error) = resolve_warehouse(&state, &params) {
         return error_response(error);
     }
+
+    // Asked once per distinct identifier, and never for more than one request may name — on every
+    // server, hook or not, so the limit is part of the request's contract rather than of how a
+    // server is configured. The hook answer's cap scales with these identifiers, so they are
+    // what bounds it.
+    let identifiers: Vec<String> = match distinct_resolve_identifiers(&request.identifiers) {
+        Ok(identifiers) => identifiers.into_iter().cloned().collect(),
+        Err(refusal) => {
+            tracing::warn!(refusal = %refusal, "refused a resolve request naming too many identifiers");
+            return error_response(unprocessable(refusal));
+        }
+    };
 
     let Some(hook) = &state.resolution_hook else {
         // No directory is configured: the server knows no names. The client degrades
@@ -2305,18 +2322,31 @@ async fn post_resolve(State(state): State<Arc<AppState>>,
         _ => None,
     };
 
-    let hook_request = ResolutionHookRequest { caller, identifiers: request.identifiers };
+    // What a directory can legitimately answer for these identifiers.
+    let answer_cap = resolve_answer_cap(&identifiers);
+    let hook_request = ResolutionHookRequest { caller, identifiers };
 
     let names = match post_hook(&state, hook, "resolution", &hook_request).await {
         Ok(response) if response.status().is_success() => {
-            response.json::<ResolutionHookResponse>().await
-                .map(|answer| answer.names)
-                .unwrap_or_default()
+            match body_utils::read_json_capped::<ResolutionHookResponse>(response, answer_cap).await {
+                // Only what was asked is answered: a directory naming identifiers outside the
+                // request does not reach the client. The identifiers are sorted and distinct.
+                Ok(answer) => answer.names.into_iter()
+                    .filter(|(id, _)| hook_request.identifiers.binary_search(id).is_ok()).collect(),
+                Err(e) => {
+                    tracing::warn!(error = ?e,
+                        "the resolution hook's answer is unreadable, oversized or malformed; showing pseudonyms");
+                    BTreeMap::new()
+                }
+            }
         }
         // The resolution failure policy is "show pseudonyms": a hook that is down or
         // answers badly resolves to nothing, never a failed request (unlike the hot
         // authentication/admission hooks, which fail closed).
-        Ok(_) => BTreeMap::new(),
+        Ok(response) => {
+            tracing::warn!(status = %response.status(), "the resolution hook refused; showing pseudonyms");
+            BTreeMap::new()
+        }
         Err(reason) => {
             tracing::warn!(reason, "the resolution hook is unreachable; showing pseudonyms");
             BTreeMap::new()

@@ -753,6 +753,18 @@ fn bundle_latest_is_404_and_resolve_is_an_empty_map() {
     assert_eq!(status(&response), 200);
     let resolved: ResolveResponse = body_json(&response);
     assert!(resolved.names.is_empty());
+
+    // The identifier limit holds on this hookless head as on any other; a repeat counts once.
+    let many: Vec<String> = (0..=forklift_core::model::remote::MAX_RESOLVE_IDENTIFIERS)
+        .map(|i| format!("op-{}", i)).collect();
+    let refused = fixture.call(post_json("/v1/resolve", &serde_json::json!({ "identifiers": many })));
+    assert_eq!(status(&refused), 422);
+    let refusal = String::from_utf8_lossy(refused.body()).to_string();
+    assert!(refusal.contains(&format!("names {} distinct identifiers", forklift_core::model::remote::MAX_RESOLVE_IDENTIFIERS + 1)), "the refusal names its count: {}", refusal);
+
+    let repeated = vec!["op-0"; forklift_core::model::remote::MAX_RESOLVE_IDENTIFIERS * 2];
+    let accepted = fixture.call(post_json("/v1/resolve", &serde_json::json!({ "identifiers": repeated })));
+    assert_eq!(status(&accepted), 200);
 }
 
 /// Multi-warehouse routing: the id in the path reaches the head builder, a bad id is a 422, and

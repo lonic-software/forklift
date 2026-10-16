@@ -2032,7 +2032,7 @@ impl HookServer {
                             ("200 OK", r#"{"allow":false,"reason":"the quota is exhausted"}"#)
                         }
                     }
-                    "/resolve" => ("200 OK", r#"{"names":{"tester@forklift":"Remote Tester"}}"#),
+                    "/resolve" => ("200 OK", r#"{"names":{"tester@forklift":"Remote Tester","someone-else":"Someone Else"}}"#),
                     _ => ("200 OK", r#"{}"#),
                 };
 
@@ -2341,6 +2341,32 @@ fn resolution_is_server_mediated_and_degrades_to_pseudonyms() {
     assert_eq!(resolve.hook, "resolution");
     assert_signed(&resolve, secret);
 
+    // The hook's answer cap scales with the identifiers asked for, so the server bounds that
+    // count — distinct identifiers, since a repeated one is asked about once.
+    let many: Vec<String> = (0..=forklift_core::model::remote::MAX_RESOLVE_IDENTIFIERS)
+        .map(|i| format!("op-{}", i)).collect();
+    let (status, body) = http_post_json(
+        &server.url, "/v1/resolve", &serde_json::json!({ "identifiers": many }).to_string()
+    );
+    assert!(status.contains("422"), "{} {}", status, body);
+    assert!(body.contains(&format!("names {} distinct identifiers", forklift_core::model::remote::MAX_RESOLVE_IDENTIFIERS + 1)), "{}", body);
+
+    let repeated = vec!["tester@forklift"; 20_000];
+    let (status, body) = http_post_json(
+        &server.url, "/v1/resolve", &serde_json::json!({ "identifiers": repeated }).to_string()
+    );
+    assert!(status.contains("200"), "a repeated identifier counts once: {} {}", status, body);
+    assert!(body.contains("Remote Tester"), "{}", body);
+
+    // This directory names tester@forklift whatever it is asked; a request that did not ask about
+    // that identifier gets the name it did ask about (so the answer was read) and not that one.
+    let (status, body) = http_post_json(
+        &server.url, "/v1/resolve", &serde_json::json!({ "identifiers": ["someone-else"] }).to_string()
+    );
+    assert!(status.contains("200"), "{} {}", status, body);
+    assert!(body.contains("Someone Else"), "the directory's answer was read: {}", body);
+    assert!(!body.contains("Remote Tester"), "a name nobody asked about reaches the client: {}", body);
+
     // Resolution never fails a command: point the remote at a dead port and history
     // degrades to the pseudonymous id instead of erroring.
     assert_success(&area.forklift("a", &["config", "remote.url", "http://127.0.0.1:9"]));
@@ -2348,6 +2374,26 @@ fn resolution_is_server_mediated_and_degrades_to_pseudonyms() {
     assert_success(&history);
     assert!(!stdout(&history).contains("Remote Tester"), "{}", stdout(&history));
     assert!(stdout(&history).contains("tester@forklift"), "{}", stdout(&history));
+}
+
+/// The resolve request limit is part of the request's contract, so a server with no directory
+/// configured enforces it too: a client cannot pass against one server and fail against another.
+#[test]
+fn a_server_without_a_resolution_hook_still_bounds_resolve_identifiers() {
+    let area = TestArea::new("resolve-limit-no-hook");
+    let server = Server::start(&area, None);
+
+    let many: Vec<String> = (0..=forklift_core::model::remote::MAX_RESOLVE_IDENTIFIERS)
+        .map(|i| format!("op-{}", i)).collect();
+    let (status, body) = http_post_json(
+        &server.url, "/v1/resolve", &serde_json::json!({ "identifiers": many }).to_string()
+    );
+    assert!(status.contains("422"), "{} {}", status, body);
+
+    let (status, body) = http_post_json(
+        &server.url, "/v1/resolve", &serde_json::json!({ "identifiers": ["op-1"] }).to_string()
+    );
+    assert!(status.contains("200") && body.contains("\"names\":{}"), "{} {}", status, body);
 }
 
 #[test]
@@ -4437,19 +4483,20 @@ fn the_path_addressed_subtree_endpoint_serves_a_subtree_and_signals_fallback_on_
     assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src/api"]));
     assert!(!object_present(&area, "sparse", &web_tree), "src/web starts sealed, not fetched");
 
-    // Drive the client straight against the endpoint (a current-thread runtime: the storage scope
-    // is thread-local, so the import must stay on this thread).
+    // Drive the client straight against the endpoint. The storage scope is thread-local and the
+    // client imports on a blocking pool thread, so the objects landing in `sparse` (not in
+    // whatever the pool thread's working directory resolves to) is what proves the import
+    // re-entered this thread's scope.
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     let _scope = forklift_core::globals::StorageRootScope::enter(&area.path("sparse"));
     let client = forklift_core::util::remote_utils::RemoteClient::new(&server.url, None).unwrap();
 
-    // The endpoint resolves src/web to its subtree and serves the closure; importing it lands the
-    // sealed objects, hash-verified like any bundle.
-    let bundle = runtime
+    // The endpoint resolves src/web to its subtree and streams the closure, which the client
+    // imports as it arrives — the sealed objects land hash-verified like any bundle.
+    runtime
         .block_on(client.fetch_subtree(&head, "src/web"))
-        .expect("the subtree fetch must not error")
+        .expect("the subtree fetch and its import must not error")
         .expect("a present remote serves the subtree, not a 404");
-    forklift_core::util::bundle_utils::import_bundle_bytes(&bundle).expect("the served subtree imports");
 
     assert!(object_present(&area, "sparse", &web_tree), "the endpoint delivered the subtree object");
     assert!(object_present(&area, "sparse", &web_blob), "the endpoint delivered the subtree's blob");
@@ -4493,11 +4540,10 @@ fn the_path_addressed_subtree_endpoint_round_trips_a_path_with_reserved_characte
     let _scope = forklift_core::globals::StorageRootScope::enter(&area.path("sparse"));
     let client = forklift_core::util::remote_utils::RemoteClient::new(&server.url, None).unwrap();
 
-    let bundle = runtime
+    runtime
         .block_on(client.fetch_subtree(&head, "src/a dir#1/100%"))
-        .expect("the subtree fetch must not error")
+        .expect("the subtree fetch and its import must not error")
         .expect("the server must resolve the reserved-character path, not 404 on a mangled URL");
-    forklift_core::util::bundle_utils::import_bundle_bytes(&bundle).expect("the served subtree imports");
 
     assert!(object_present(&area, "sparse", &weird_tree),
         "the endpoint delivered the reserved-character subtree object");
@@ -4762,7 +4808,7 @@ fn heal_driven_refetch_clears_only_the_hash_the_remote_actually_has() {
 // `attempt_heal_driven_refetch`.
 #[test]
 fn heal_driven_refetch_recovers_every_object_when_more_than_one_is_missing() {
-    // The batch path's `import_bundle_bytes` stores its records one at a time, each with its own
+    // The batch path's bundle import stores its records one at a time, each with its own
     // `?` — the first object's store self-trips `taint_recheck` against the still-standing taint
     // and the `Err` aborts the whole call before the second object is even attempted.
     // `resolve_the_rest`'s recovery verdict is decided by a post-fetch `raw_object_present`
@@ -4842,7 +4888,7 @@ fn heal_pass_one_restoring_a_missing_ancestor_keeps_the_closure_walk_from_falsel
     // parent, so the walk never reaches H1 to notice it is missing. Deleting H2 too makes the
     // walk's very first frontier node fail its presence check, forcing it to actually fetch H2,
     // load its parcel, and cascade into checking (and, once the fix's guard is armed, restoring)
-    // H1 — the same call shape `fetch_missing_objects` and `import_bundle_bytes` use elsewhere,
+    // H1 — the same call shape `fetch_missing_objects` and the batch import use elsewhere,
     // just reached through history discovery instead of a direct hash target. Neither H1 nor H2
     // was ever locally re-fetched before this `heal` run — this is genuinely pass 1's own
     // restoration, not something already sitting on disk.

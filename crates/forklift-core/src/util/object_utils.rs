@@ -27,7 +27,7 @@ use crate::util::{byte_utils, chunk_utils, fanout_utils, file_utils};
 /// [`store_object_stream`], which deliberately does not enforce this ceiling.
 pub const MAX_OBJECT_BYTES: usize = 64 * 1024 * 1024;
 
-/// The largest object [`import_bundle_reader`](crate::util::bundle_utils) buffers whole before it
+/// The largest object the bundle importer ([`crate::util::bundle_utils`]) buffers whole before it
 /// switches to the streaming store path. At or below it a bundle record is read into memory and
 /// stored via [`store_object_bytes`] (memory bounded by this size); above it,
 /// [`store_object_stream`] hashes and compresses it to a temp file without ever holding it whole.
@@ -40,6 +40,51 @@ pub const STREAM_STORE_THRESHOLD_BYTES: usize = chunk_utils::MAX_CHUNK_BYTES;
 // chunk (<= max chunk), and the chunk threshold itself — so the ordering is a compile-time freeze.
 const _: () = assert!(MAX_OBJECT_BYTES > chunk_utils::CHUNK_THRESHOLD_BYTES);
 const _: () = assert!(MAX_OBJECT_BYTES > chunk_utils::MAX_CHUNK_BYTES);
+
+/// The largest window, as a power of two, that a zstd decoder of untrusted bytes accepts: 8 MiB.
+///
+/// A zstd frame names its own window, and the decoder allocates and fills a buffer that size
+/// before it produces a byte past it, so a frame can make its decoder hold up to 128 MiB (the
+/// library's default ceiling) while every output-length bound downstream still looks satisfied.
+/// Every frame this build writes, at the compression levels it uses, declares a window of at most
+/// 2 MiB, so 8 MiB refuses nothing a forklift writer produced and bounds what a hostile one can.
+pub(crate) const MAX_DECODE_WINDOW_LOG: u32 = 23;
+
+/// A zstd stream decoder over untrusted bytes, refusing any frame whose window is larger than
+/// [`MAX_DECODE_WINDOW_LOG`] allows. The only way production code opens a zstd decoder:
+/// `clippy.toml` disallows the library's own constructors.
+///
+/// # Arguments
+/// * `reader` - The compressed bytes.
+///
+/// # Returns
+/// * `Ok(Decoder)`       - The window-bounded decoder.
+/// * `Err(io::Error)`    - The decoder could not be created.
+#[allow(clippy::disallowed_methods)] // the bounded constructor every other decoder goes through
+pub(crate) fn bounded_zstd_decoder<'a, R: std::io::BufRead>(reader: R)
+    -> std::io::Result<zstd::stream::read::Decoder<'a, R>> {
+    let mut decoder = zstd::stream::read::Decoder::with_buffer(reader)?;
+    decoder.window_log_max(MAX_DECODE_WINDOW_LOG)?;
+    Ok(decoder)
+}
+
+/// [`bounded_zstd_decoder`] for a frame compressed against a raw-content dictionary (a delta
+/// against its base).
+///
+/// # Arguments
+/// * `payload`    - The compressed frame.
+/// * `dictionary` - The content the frame was compressed against.
+///
+/// # Returns
+/// * `Ok(Decoder)`       - The window-bounded decoder.
+/// * `Err(io::Error)`    - The decoder could not be created.
+#[allow(clippy::disallowed_methods)] // the bounded constructor every other decoder goes through
+pub(crate) fn bounded_zstd_dictionary_decoder<'a>(payload: &'a [u8], dictionary: &[u8])
+    -> std::io::Result<zstd::stream::read::Decoder<'static, &'a [u8]>> {
+    let mut decoder = zstd::stream::read::Decoder::with_dictionary(payload, dictionary)?;
+    decoder.window_log_max(MAX_DECODE_WINDOW_LOG)?;
+    Ok(decoder)
+}
 
 /// Why a bounded zstd decode of untrusted bytes failed.
 #[derive(Debug)]
@@ -66,7 +111,8 @@ pub(crate) enum BoundedDecodeError {
 /// bare `take(MAX_OBJECT_BYTES)` cannot tell "decoded to exactly the ceiling" (legal) apart from
 /// "silently truncated at the ceiling" (an over-ceiling frame returned as plausible bytes).
 pub(crate) fn decode_object_bounded(compressed: impl Read) -> Result<Vec<u8>, BoundedDecodeError> {
-    let mut decoder = zstd::stream::read::Decoder::new(compressed)
+    let buffered = std::io::BufReader::with_capacity(zstd::zstd_safe::DCtx::in_size(), compressed);
+    let mut decoder = bounded_zstd_decoder(buffered)
         .map_err(|e| BoundedDecodeError::Malformed(e.to_string()))?;
     let mut bytes = Vec::new();
     decoder.by_ref()
@@ -1817,5 +1863,78 @@ mod tests {
 
         assert!(matches!(result, Err(BoundedDecodeError::OverCeiling)),
             "a frame one byte over the ceiling must be refused, not truncated to Ok");
+    }
+
+    /// A zstd frame of `content` whose header declares a `window_log` window (a stream encoder
+    /// with no pledged size writes the window it was configured with, whatever the content).
+    fn frame_with_window(content: &[u8], window_log: u32, dictionary: Option<&[u8]>) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut encoder = match dictionary {
+            Some(dictionary) => zstd::stream::Encoder::with_dictionary(&mut out, 3, dictionary).unwrap(),
+            None => zstd::stream::Encoder::new(&mut out, 3).unwrap(),
+        };
+        encoder.window_log(window_log).unwrap();
+        std::io::Write::write_all(&mut encoder, content).unwrap();
+        encoder.finish().unwrap();
+        out
+    }
+
+    #[test]
+    fn an_object_frame_declaring_a_window_past_the_bound_is_refused_and_one_at_it_decodes() {
+        let content = b"a small object whose frame claims a large window".repeat(10);
+
+        let over = frame_with_window(&content, MAX_DECODE_WINDOW_LOG + 1, None);
+        assert!(matches!(decode_object_bounded(&over[..]), Err(BoundedDecodeError::Malformed(_))));
+
+        let at = frame_with_window(&content, MAX_DECODE_WINDOW_LOG, None);
+        assert_eq!(decode_object_bounded(&at[..]).unwrap(), content);
+    }
+
+    #[test]
+    fn a_delta_frame_declaring_a_window_past_the_bound_is_refused_and_one_at_it_decodes() {
+        let base = b"the base object a delta is made against ".repeat(50);
+        let mut target = base.clone();
+        target.extend(b" and an edit");
+
+        let over = frame_with_window(&target, MAX_DECODE_WINDOW_LOG + 1, Some(&base));
+        assert!(crate::util::delta_utils::decompress_delta(&base, &over, target.len()).is_err());
+
+        let at = frame_with_window(&target, MAX_DECODE_WINDOW_LOG, Some(&base));
+        assert_eq!(crate::util::delta_utils::decompress_delta(&base, &at, target.len()).unwrap(), target);
+    }
+
+    /// Mixed content — runs of repeats far apart, interleaved with incompressible noise — large
+    /// enough that a writer choosing its window from the content would choose one past the
+    /// bound. Every writer this build has must still produce frames the bounded decoders read.
+    fn large_mixed_content(len: usize, seed: u64) -> Vec<u8> {
+        let mut state = seed;
+        let mut noise = || { state ^= state << 13; state ^= state >> 7; state ^= state << 17; state as u8 };
+        let motif: Vec<u8> = (0..4096).map(|_| noise()).collect();
+        let mut content = Vec::with_capacity(len);
+
+        while content.len() < len {
+            content.extend(&motif);
+            content.extend((0..8192).map(|_| noise()));
+        }
+
+        content.truncate(len);
+        content
+    }
+
+    #[test]
+    fn every_writer_produces_frames_the_bounded_decoders_read() {
+        // The loose-object and bundle writers share one encoder configuration (level 0, no
+        // pledged size); the delta writer is the bulk compressor against a dictionary.
+        let object = large_mixed_content(MAX_OBJECT_BYTES, 1);
+        let compressed = zstd::encode_all(&object[..], 0).unwrap();
+        assert_eq!(decode_object_bounded(&compressed[..]).unwrap(), object);
+
+        let base = large_mixed_content(crate::util::delta_utils::MAX_DELTA_TARGET_BYTES, 2);
+        let mut target = base.clone();
+        target[1000..2000].copy_from_slice(&[9u8; 1000]);
+        target.extend(b"appended");
+        target.truncate(crate::util::delta_utils::MAX_DELTA_TARGET_BYTES);
+        let delta = crate::util::delta_utils::compress_delta(&base, &target).unwrap();
+        assert_eq!(crate::util::delta_utils::decompress_delta(&base, &delta, target.len()).unwrap(), target);
     }
 }

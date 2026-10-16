@@ -433,7 +433,7 @@ static SELF_TRIP_EXEMPTION_COUNT: std::sync::atomic::AtomicUsize = std::sync::at
 ///
 /// **Must be process-global, not thread-local.** A refetch's stores do not all run on the thread
 /// that armed this guard: `fetch_loose_objects`'s `JoinSet` tasks run on tokio worker threads, and
-/// `import_bundle_bytes` runs on whatever thread the async runtime happens to poll it on. A
+/// a fetched bundle is imported on a blocking-pool thread (`RemoteClient::import_response`). A
 /// thread-local guard would not be visible to those threads, reproducing exactly the scheduling-
 /// dependent bug this exemption exists to remove. This assumes the CLI's tokio runtime is
 /// multithreaded, which is the default — a load-bearing assumption for anyone who later touches
@@ -1084,7 +1084,9 @@ thread_local! {
     /// substring instead of touching the filesystem. Thread-local because unit tests run
     /// concurrently on separate threads while a given `WriteBatch::finish`/`run_write_barrier`
     /// call always runs entirely on its caller's thread — one test's arming can never be observed
-    /// by a concurrently running test on another thread. `DirSyncFaultGuard`'s construct-and-Drop
+    /// by a concurrently running test on another thread. The exception is a fetched bundle's
+    /// import, which runs on a blocking-pool thread: a rig armed around a batch or subtree fetch
+    /// does not see that import's writes. `DirSyncFaultGuard`'s construct-and-Drop
     /// reset (see its own doc comment) is what additionally isolates tests from each other when
     /// they instead run sequentially (`--test-threads=1`) and reuse the same thread.
     static DIR_SYNC_FAULT: std::cell::RefCell<DirSyncFaultState> =

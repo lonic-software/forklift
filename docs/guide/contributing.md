@@ -174,6 +174,13 @@ forklift behaves predictably. From `DESIGN.html` §2:
 - **The remote is untrusted storage + thin verifiers.** Anything a client uploads
   is unverified until the server checks it (hash, signature, privileges). Anything
   a client downloads is verifiable offline (content addressing + signatures).
+  Nor may a peer decide how much memory we spend: read a response through
+  `util::body_utils` with a cap derived from what the request can produce, stream
+  anything without a fixed bound (bundles) to disk or to the importer, and build
+  every zstd decoder with `object_utils::bounded_zstd_decoder` /
+  `bounded_zstd_dictionary_decoder`. `clippy.toml` bans the uncapped alternatives,
+  so `cargo clippy` fails on a new one; a deliberate exception carries an
+  `#[allow]` with its justification.
 - **Timestamps never decide security.** Validity questions (trust boundaries,
   revocation) are decided by exact ancestry in the parcel graph, never by time — a
   forged or shifted clock must change nothing.

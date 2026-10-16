@@ -941,6 +941,14 @@ Forklift's remote is untrusted storage plus thin verifiers: bytes move in
 parallel, and anything you download is verified locally by hash. Set a remote
 once, then push and pull.
 
+A remote also cannot make the client hold more memory than an answer can legitimately need. Every
+answer has a size limit: small for an error or a signature, 64 MiB for one object or for the
+handshake, and one that scales with the request for negotiation answers. An answer over its limit
+is refused with a message naming what was refused and the limit. Bundles (clone, pull, sparse
+fetches) are written to disk or imported as they arrive rather than held whole, so they have no
+memory limit. The client accepts gzip-compressed answers only, and a zstd frame received from a
+remote may use at most an 8 MiB window; a frame asking for more is refused.
+
 ### `franchise` — clone (`fr`)
 
 ```sh

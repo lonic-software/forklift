@@ -22,6 +22,8 @@ use crate::globals::{self, StorageRootScope};
 use crate::util::office_utils::OFFICE_PALLET_NAME;
 use crate::util::progress_utils::Progress;
 use crate::util::scope_utils::{self, MaterializationScope, ScopeClass};
+use crate::util::body_utils::{self, BodyReadError, JsonReadError};
+use crate::util::object_utils::MAX_OBJECT_BYTES;
 use crate::util::{
     bundle_utils, config_utils, file_utils, merge_utils, object_utils, office_utils,
     pack_utils, pallet_utils, sign_utils, trust_utils,
@@ -29,6 +31,97 @@ use crate::util::{
 
 /// How many object transfers run concurrently.
 pub const CONCURRENT_TRANSFERS: usize = 24;
+
+/// How many response chunks may wait between a batch or subtree transfer and its importer.
+const IMPORT_CHANNEL_DEPTH: usize = 16;
+
+/// One piece of a response body on its way to the importer. `End` is sent only when the transfer
+/// read the body to its end, so a channel that closes without it was cut short.
+enum BodyPiece {
+    Bytes(bytes::Bytes),
+    End,
+}
+
+/// A blocking reader over the pieces a transfer forwards — the importer's side of the channel.
+struct ChannelBody {
+    receiver: tokio::sync::mpsc::Receiver<BodyPiece>,
+    current: bytes::Bytes,
+    ended: bool,
+}
+
+impl ChannelBody {
+    fn new(receiver: tokio::sync::mpsc::Receiver<BodyPiece>) -> ChannelBody {
+        ChannelBody { receiver, current: bytes::Bytes::new(), ended: false }
+    }
+}
+
+impl std::io::Read for ChannelBody {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        while self.current.is_empty() {
+            if self.ended || buf.is_empty() {
+                return Ok(0);
+            }
+
+            match self.receiver.blocking_recv() {
+                Some(BodyPiece::Bytes(chunk)) => self.current = chunk,
+                Some(BodyPiece::End) => self.ended = true,
+                None => return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "the transfer stopped before the response was complete",
+                )),
+            }
+        }
+
+        let n = buf.len().min(self.current.len());
+        buf[..n].copy_from_slice(&self.current.split_to(n));
+        Ok(n)
+    }
+}
+
+/// The largest handshake body read. Its size grows with the warehouse's pallet list, which has
+/// no limit of its own, so the cap is set far past any real warehouse — a few hundred thousand
+/// pallets — while still bounding what a hostile remote can make a client hold.
+const HANDSHAKE_BODY_CAP: u64 = 64 * 1024 * 1024;
+
+/// Per-hash allowance in a `missing` answer: a 64-character hash, its quotes and separator, with
+/// room to spare.
+const MISSING_BODY_BYTES_PER_HASH: u64 = 128;
+
+/// The cap for a structured error body. A refusal may list paths or hashes, so it is not held to
+/// [`body_utils::SMALL_BODY_CAP`]; one larger than this is reported as unread rather than parsed.
+const ERROR_BODY_CAP: u64 = 1024 * 1024;
+
+/// Read a refusal's error body within [`ERROR_BODY_CAP`] and `budget`. A body that cannot be read
+/// in time, or at all, stands in as the status's reason; one over the cap says it was not read.
+async fn read_error_body(response: reqwest::Response, budget: std::time::Duration) -> ErrorResponse {
+    let status = response.status();
+    let reason = || status.canonical_reason().unwrap_or("unknown error").to_string();
+    let unread = |error: String| ErrorResponse { error, code: None, next_step: None };
+
+    let read = body_utils::read_json_capped::<ErrorResponse>(response, ERROR_BODY_CAP);
+
+    match tokio::time::timeout(budget, read).await {
+        Ok(Ok(body)) => body,
+        Ok(Err(JsonReadError::Body(BodyReadError::OverCap { cap }))) => unread(format!(
+            "{} (the remote's description of the error is larger than {} bytes and was not read)", reason(), cap
+        )),
+        Ok(Err(_)) | Err(_) => unread(reason()),
+    }
+}
+
+/// Per-hash allowance in an `upload-targets` answer: a presigned upload URL (about 500 bytes in
+/// practice) keyed by its hash.
+const UPLOAD_TARGETS_BODY_BYTES_PER_HASH: u64 = 8 * 1024;
+
+/// The most identifier bytes, as serialised, one resolve request carries, so a roster of long
+/// identifiers is split rather than refused whole. A quarter of the smallest body limit a server
+/// can set above zero (1 MiB), which leaves the request's fixed envelope ample room. An
+/// identifier longer than this on its own still goes, alone in its request.
+const RESOLVE_REQUEST_IDENTIFIER_BYTES: usize = 256 * 1024;
+
+/// The most resolve requests in flight at once: enough that a large roster costs a few deadlines
+/// rather than one per request, few enough not to swamp a server's directory hook.
+const RESOLVE_REQUESTS_IN_FLIGHT: usize = 4;
 
 /// The characters a warehouse path SEGMENT must be percent-encoded against before it is spliced
 /// into a URL. Everything but RFC 3986 unreserved characters (ASCII alphanumerics, `-`, `_`,
@@ -547,9 +640,10 @@ const _: () = assert!(
     head-wait wording and the post-header wording both start lying"
 );
 
-/// The base allowance for [`RemoteClient::error_of`]'s own inline error-body read, once a
-/// non-success status line and headers have already arrived. Needed because `error_of`'s own
-/// bound (if any) doesn't cover this: it serves responses from every client this type builds,
+/// The base allowance for an error-body read (`read_error_body`, called by
+/// [`RemoteClient::error_of`] and `commit_lift` under [`RemoteClient::error_body_budget`]), once a
+/// non-success status line and headers have already arrived. Needed because no client's own bound
+/// covers this: `error_of` serves responses from every client this type builds,
 /// including the three deliberately-unbounded ones
 /// (`http`/`no_redirect`/`upload_targets`'s negotiation calls — see those calls' own docs), so a
 /// remote that answers a `5xx` with full headers and then wedges before writing the JSON body can
@@ -557,9 +651,12 @@ const _: () = assert!(
 ///
 /// Flat, not scaled like [`FETCH_OBJECT_READ_TIMEOUT`] or the negotiation calls' own read costs:
 /// after a non-success status line, the error body this module parses (an [`ErrorResponse`]) is
-/// small and O(constant) regardless of which call produced it or why *that* call's own success
-/// path is unbounded — the scaling reason a success body might be large or slow never applies to
-/// the error one. On elapse, falls back to `status.canonical_reason()` — the exact fallback this
+/// small in practice regardless of which call produced it or why *that* call's own success path
+/// is unbounded — the scaling reason a success body might be large or slow never applies to the
+/// error one. A refusal that lists paths or hashes can run longer, up to [`ERROR_BODY_CAP`]; one
+/// that does not arrive within this budget over a slow link loses its code and next step the same
+/// way an unparseable one does.
+/// On elapse, falls back to `status.canonical_reason()` — the exact fallback this
 /// code already uses when the body fails to parse as JSON at all, so a timeout and a malformed
 /// body are indistinguishable to the caller, which is right: both mean "no usable error body
 /// arrived."
@@ -2763,14 +2860,12 @@ impl RemoteClient {
 
     /// The actual error-body-read bound to arm for *this* client instance — folds this
     /// instance's own `connect_timeout` into [`error_body_read_budget`]'s arithmetic. Split out as
-    /// its own `&self` method, rather than inlining the call to the free function at the one call
-    /// site, so a test can pin that the right instance field is actually read: not just read from
-    /// *some* client (every behavioral test of [`Self::error_of`] necessarily uses a direct
-    /// client, so none of them distinguishes "reads `self.budgets.connect`" from "hardcodes the
-    /// direct 5s constant", and a `TorMode::On` fixture has the identical problem one level up, at
-    /// 60s instead of 5s), but read from an instance whose `connect_timeout` a production
-    /// constructor could never have produced — see
-    /// `error_body_budget_reads_this_field_not_a_rival_constant` in the test module.
+    /// its own `&self` method, rather than inlining the call to the free function at its call
+    /// sites (`error_of` and `commit_lift`), so a test can pin that the right instance field is
+    /// read without waiting a budget out: `error_body_budget_reads_this_field_not_a_rival_constant`
+    /// reads it from an instance whose `connect_timeout` no production constructor could have
+    /// produced, so a hardcoded direct (5s) or Tor (60s) connect bound cannot coincide with it. The
+    /// timed tests of both call sites catch the direct hardcode as well, by elapsed time.
     fn error_body_budget(&self) -> std::time::Duration {
         error_body_read_budget(&self.budgets)
     }
@@ -2778,21 +2873,46 @@ impl RemoteClient {
     /// Turn a non-success response into the client-facing error, threading the server's refusal
     /// code (§7.4) through the taxonomy when the body carries one. The body read is bounded by
     /// [`Self::error_body_budget`] (so this instance's own `connect_timeout` is folded in) — see
-    /// that method's and [`error_body_read_budget`]'s docs for why this call in particular needs
-    /// its own bound rather than inheriting one from whichever client sent the request, and why
-    /// the flat [`ERROR_BODY_READ_TIMEOUT`] alone is not it.
+    /// that method's and [`error_body_read_budget`]'s docs for why an error-body read needs its
+    /// own bound rather than inheriting one from whichever client sent the request, and why the
+    /// flat [`ERROR_BODY_READ_TIMEOUT`] alone is not it.
     async fn error_of(&self, response: reqwest::Response, action: &str) -> String {
         let status = response.status();
-        let budget = self.error_body_budget();
+        let body = read_error_body(response, self.error_body_budget()).await;
 
-        let (message, code, next_step) = match tokio::time::timeout(
-            budget, response.json::<ErrorResponse>()
-        ).await {
-            Ok(Ok(body)) => (body.error, body.code, body.next_step),
-            Ok(Err(_)) | Err(_) => (status.canonical_reason().unwrap_or("unknown error").to_string(), None, None),
-        };
+        classify_remote_error(status.as_u16(), action, body.error, body.code, body.next_step)
+    }
 
-        classify_remote_error(status.as_u16(), action, message, code, next_step)
+    /// Read a whole response body within `cap`, composing each failure the way this client
+    /// reports it: a transport failure through [`Self::describe_transport_error`] under `action`
+    /// and `posture`, an over-cap body as a refusal naming `what`.
+    async fn read_body(&self,
+                       response: reqwest::Response,
+                       cap: u64,
+                       action: &str,
+                       posture: Posture,
+                       what: &str) -> Result<Vec<u8>, String> {
+        body_utils::read_body_capped(response, cap).await.map_err(|e| match e {
+            BodyReadError::Transport(e) => self.describe_transport_error(action, posture, e),
+            BodyReadError::OverCap { cap } => body_utils::over_cap_message(&format!("the remote's {}", what), cap),
+        })
+    }
+
+    /// [`Self::read_body`] for a JSON body: a body that arrives whole but does not parse is
+    /// reported as the remote's `what` not being valid JSON.
+    async fn read_json<T: serde::de::DeserializeOwned>(&self,
+                                                       response: reqwest::Response,
+                                                       cap: u64,
+                                                       action: &str,
+                                                       posture: Posture,
+                                                       what: &str) -> Result<T, String> {
+        body_utils::read_json_capped(response, cap).await.map_err(|e| match e {
+            JsonReadError::Body(BodyReadError::Transport(e)) => self.describe_transport_error(action, posture, e),
+            JsonReadError::Body(BodyReadError::OverCap { cap }) => {
+                body_utils::over_cap_message(&format!("the remote's {}", what), cap)
+            }
+            JsonReadError::Parse(e) => format!("The remote's {} is not valid JSON: {}", what, e),
+        })
     }
 
     /// Fetch the warehouse handshake and check the protocol version.
@@ -2809,15 +2929,10 @@ impl RemoteClient {
             return Err(self.error_of(response, "the handshake").await);
         }
 
-        let info: WarehouseInfo = response.json()
-            .await
-            .map_err(|e| if e.is_timeout() {
-                self.describe_transport_error(
-                    &format!("reaching the remote {}", self.base), posture, e
-                )
-            } else {
-                format!("The remote's handshake is not valid JSON: {}", e)
-            })?;
+        let info: WarehouseInfo = self.read_json(
+            response, HANDSHAKE_BODY_CAP, &format!("reaching the remote {}", self.base), posture,
+            "handshake",
+        ).await?;
 
         if info.protocol != PROTOCOL_VERSION {
             return Err(format!(
@@ -2907,13 +3022,10 @@ impl RemoteClient {
                 return Err(self.error_of(response, "the negotiation").await);
             }
 
-            let body: MissingObjectsResponse = response.json()
-                .await
-                .map_err(|e| if e.is_timeout() {
-                    self.describe_transport_error("negotiating with the remote", posture, e)
-                } else {
-                    format!("The remote's negotiation response is not valid JSON: {}", e)
-                })?;
+            let body: MissingObjectsResponse = self.read_json(
+                response, body_utils::per_item_body_cap(batch.len(), MISSING_BODY_BYTES_PER_HASH),
+                "negotiating with the remote", posture, "negotiation response",
+            ).await?;
 
             missing.extend(body.missing);
         }
@@ -2989,16 +3101,75 @@ impl RemoteClient {
     /// unlike `fetch_info`/`fetch_signature`/`fetch_bundle_to`, whose `BoundedReads` silence
     /// budget never has to make this trade because a *silence* bound cannot mistake a
     /// slow-but-real transfer for a hang in the first place.
+    ///
+    /// Each distinct identifier is asked about once, in requests of at most
+    /// [`MAX_RESOLVE_IDENTIFIERS`](crate::model::remote::MAX_RESOLVE_IDENTIFIERS) — the most a
+    /// server accepts — and `RESOLVE_REQUEST_IDENTIFIER_BYTES`, so a large roster resolves in
+    /// several requests rather than none. Up to `RESOLVE_REQUESTS_IN_FLIGHT` run at once, and
+    /// each request's answer counts only for the identifiers it asked about, so the names shown
+    /// never depend on which request finished first.
+    ///
+    /// The deadline above is per request, so the whole call can take one deadline per
+    /// `RESOLVE_REQUESTS_IN_FLIGHT` requests against a remote that never answers. A roster that
+    /// fits in that many requests — up to that many times `MAX_RESOLVE_IDENTIFIERS` short
+    /// identifiers, though fewer long ones, since a request closes when the next identifier would
+    /// not fit — is bounded by one deadline.
     pub async fn resolve(&self, identifiers: Vec<String>) -> BTreeMap<String, String> {
-        if identifiers.is_empty() {
-            return BTreeMap::new();
+        let distinct: std::collections::BTreeSet<String> = identifiers.into_iter().collect();
+        let mut batches: Vec<Vec<String>> = Vec::new();
+        let mut batch_bytes = 0usize;
+
+        for identifier in distinct {
+            // As serialised, quotes and escapes included, plus the comma that separates it.
+            let bytes = serde_json::to_string(&identifier).expect("a string serialises").len() + 1;
+            let full = batches.last().is_none_or(|batch| {
+                batch.len() >= crate::model::remote::MAX_RESOLVE_IDENTIFIERS
+                    || batch_bytes + bytes > RESOLVE_REQUEST_IDENTIFIER_BYTES
+            });
+
+            if full {
+                batches.push(Vec::new());
+                batch_bytes = 0;
+            }
+
+            batch_bytes += bytes;
+            batches.last_mut().expect("a batch was just ensured").push(identifier);
         }
 
+        let mut requests = JoinSet::new();
+        let in_flight = Arc::new(tokio::sync::Semaphore::new(RESOLVE_REQUESTS_IN_FLIGHT));
+
+        for batch in batches {
+            let client = self.clone();
+            let in_flight = Arc::clone(&in_flight);
+
+            requests.spawn(async move {
+                let Ok(_permit) = in_flight.acquire().await else { return BTreeMap::new() };
+
+                // The batch is sorted and distinct (it comes off a set), so it can be searched.
+                client.resolve_batch(&batch).await.into_iter()
+                    .filter(|(id, _)| batch.binary_search(id).is_ok()).collect()
+            });
+        }
+
+        let mut names = BTreeMap::new();
+
+        // A request that panicked resolves nothing, like any other failure here.
+        while let Some(answer) = requests.join_next().await {
+            names.extend(answer.unwrap_or_default());
+        }
+
+        names
+    }
+
+    /// One `POST /v1/resolve` of at most the server's identifier limit; see [`Self::resolve`].
+    async fn resolve_batch(&self, identifiers: &[String]) -> BTreeMap<String, String> {
         let total_deadline = self.resolve_budget();
         // Every failure degrades to the designed fallback, including a serialization failure the
-        // seam now surfaces up front rather than deferring into a `reqwest::Error` — see this
-        // function's own doc for why an empty map is the right answer to all of them here.
-        let Ok(body) = SendBody::json(&ResolveRequest { identifiers }) else {
+        // seam now surfaces up front rather than deferring into a `reqwest::Error` — see
+        // `resolve`'s own doc for why an empty map is the right answer to all of them here.
+        let cap = crate::model::remote::resolve_answer_cap(identifiers);
+        let Ok(body) = SendBody::json(&ResolveRequest { identifiers: identifiers.into() }) else {
             return BTreeMap::new();
         };
 
@@ -3012,7 +3183,7 @@ impl RemoteClient {
             return BTreeMap::new();
         }
 
-        match response.json::<ResolveResponse>().await {
+        match body_utils::read_json_capped::<ResolveResponse>(response, cap).await {
             Ok(body) => body.names,
             Err(_) => BTreeMap::new(),
         }
@@ -3043,7 +3214,8 @@ impl RemoteClient {
     }
 
     /// Fetch many objects in one round trip as a bundle-format stream
-    /// (`POST /v1/objects/batch`). `None` when the remote predates the endpoint
+    /// (`POST /v1/objects/batch`) and import them as the stream arrives (see
+    /// [`Self::import_response`]). `None` when the remote predates the endpoint
     /// (a `404`) — the caller falls back to loose fetches.
     ///
     /// An offloading (storage-backed) head cannot stream a large bundle back through its own
@@ -3103,7 +3275,7 @@ impl RemoteClient {
     /// figure by different arguments, and share one composer call under one action string**, which
     /// is why their [`Self::describe_transport_error`] arms have to be told apart by wording — see
     /// that function's doc.
-    pub async fn fetch_batch(&self, hashes: &[String]) -> Result<Option<Vec<u8>>, String> {
+    pub async fn fetch_batch(&self, hashes: &[String]) -> Result<Option<bundle_utils::ImportStats>, String> {
         let post_posture = Posture::HeadDeadlineNoRedirect { head: self.batch_head_budget() };
         let outcome = self.send_on(
             post_posture,
@@ -3158,14 +3330,12 @@ impl RemoteClient {
             return Err(self.error_of(response, "the batch fetch").await);
         }
 
-        response.bytes()
-            .await
-            .map(|bytes| Some(bytes.to_vec()))
-            .map_err(|e| self.describe_transport_error("reading the batch response", body_posture, e))
+        self.import_response(response, "reading the batch response", body_posture).await.map(Some)
     }
 
     /// Fetch the object closure of a subtree at a path of a parcel, as a bundle-format stream
-    /// (`GET /v1/parcels/{parcel}/subtree/{path}`). This is the **path-addressed** fetch: the
+    /// (`GET /v1/parcels/{parcel}/subtree/{path}`), and import it as it arrives (see
+    /// [`Self::import_response`]). This is the **path-addressed** fetch: the
     /// remote resolves the path to a subtree itself, so it can authorize the request by path —
     /// the wire surface file-level path enforcement (FORK-10) is designed to gate, which a
     /// hash-addressed `GET /v1/objects/{hash}` cannot, being path-blind. `Ok(None)` when the
@@ -3189,7 +3359,7 @@ impl RemoteClient {
     /// all, so a budget here would price nothing reachable. This stays unbounded until it has its
     /// own scaled budget or an abandon-and-fall-back lane — or until a production caller appears,
     /// which is the trigger to reconsider rather than a reason to guess now.
-    pub async fn fetch_subtree(&self, parcel: &str, path: &str) -> Result<Option<Vec<u8>>, String> {
+    pub async fn fetch_subtree(&self, parcel: &str, path: &str) -> Result<Option<bundle_utils::ImportStats>, String> {
         let posture = Posture::UnboundedFollowsRedirects(UnboundedTicket::Fork92);
         let outcome = self.send_on(
             posture,
@@ -3210,10 +3380,77 @@ impl RemoteClient {
             return Err(self.error_of(response, &format!("the subtree fetch for \"{}\"", path)).await);
         }
 
-        response.bytes()
-            .await
-            .map(|bytes| Some(bytes.to_vec()))
-            .map_err(|e| self.describe_transport_error("reading the subtree response", posture, e))
+        self.import_response(response, "reading the subtree response", posture).await.map(Some)
+    }
+
+    /// Import a batch or subtree response into the object store as it arrives, never holding the
+    /// whole body: the legitimate size of one runs to tens of GiB, so no memory cap fits it.
+    ///
+    /// The response's chunks are forwarded over a bounded channel to a blocking task running
+    /// [`bundle_utils::import_streamed_bundle`], which re-enters the caller's storage-root scope
+    /// (thread-local, so a pool thread would otherwise resolve the store by working directory —
+    /// the same idiom as `retrieve_object_for_upload`). Memory is one record, the channel, and the
+    /// decoder's bounded window.
+    ///
+    /// The importer sees the end of the bundle only when the transfer reached the end of the body.
+    /// A transfer that fails, or is dropped, closes the channel without that mark, which the
+    /// importer reads as an error — so a body cut short never imports as a smaller bundle. When
+    /// both sides fail, the transfer's error is the one reported: it is the cause.
+    ///
+    /// Three consequences of importing while the body arrives, all accepted:
+    /// * A transfer that fails partway leaves the records before the break stored. Each is
+    ///   verified against its hash, so they are ordinary present objects, and every caller decides
+    ///   what to fetch next by presence rather than by this call's result.
+    /// * Dropping this future (an outer timeout) drops the sender, and the importer stops at its
+    ///   next read — after the record it is storing, never mid-record. Stores are content-addressed
+    ///   and atomic, so a fallback storing the same hash meanwhile is harmless.
+    /// * A slow importer stops the transfer being read once the channel fills. The silence budget
+    ///   is armed only while the body is polled, so this never trips the client's own timeout; a
+    ///   remote's idle timeout could, which is the price of not holding the bundle in memory.
+    async fn import_response(&self,
+                             mut response: reqwest::Response,
+                             action: &str,
+                             posture: Posture) -> Result<bundle_utils::ImportStats, String> {
+        let (sender, receiver) = tokio::sync::mpsc::channel::<BodyPiece>(IMPORT_CHANNEL_DEPTH);
+        let scope_root = globals::current_scope_root();
+
+        let importer = tokio::task::spawn_blocking(move || {
+            let _scope = scope_root.as_deref().map(StorageRootScope::enter);
+            bundle_utils::import_streamed_bundle(std::io::BufReader::new(ChannelBody::new(receiver)))
+        });
+
+        let transferred: Result<(), String> = loop {
+            // An importer that stops (a refused header, a bad record) closes the channel; waiting
+            // on the next chunk instead would leave a stalled remote's silence budget to report a
+            // timeout in place of the refusal.
+            #[allow(clippy::disallowed_methods)] // streamed to the importer, never accumulated
+            let next = tokio::select! {
+                next = response.chunk() => next,
+                _ = sender.closed() => break Ok(()),
+            };
+
+            match next {
+                Ok(Some(chunk)) => {
+                    // A closed channel means the importer already stopped; its result says why.
+                    if sender.send(BodyPiece::Bytes(chunk)).await.is_err() {
+                        break Ok(());
+                    }
+                }
+                Ok(None) => {
+                    let _ = sender.send(BodyPiece::End).await;
+                    break Ok(());
+                }
+                Err(e) => break Err(self.describe_transport_error(action, posture, e)),
+            }
+        };
+
+        drop(sender);
+
+        let imported = importer.await;
+
+        // When both sides fail, the transfer's error is the cause, even if the importer panicked.
+        transferred?;
+        imported.map_err(|e| format!("The bundle-import task panicked: {}", e))?
     }
 
     /// Fetch one object's raw bytes. On [`Posture::BoundedObjectReads`], not [`Posture::BoundedReads`]
@@ -3231,12 +3468,16 @@ impl RemoteClient {
             return Err(self.error_of(response, &format!("object {}", hash)).await);
         }
 
-        response.bytes()
-            .await
-            .map(|bytes| bytes.to_vec())
-            .map_err(|e| self.describe_transport_error(
-                &format!("reading object {}", hash), posture, e
-            ))
+        // An object over the ceiling cannot be stored however it arrives, so it is refused in
+        // the ceiling's own terms rather than as a misbehaving remote: a store may still hold one
+        // authored before the ceiling existed.
+        body_utils::read_body_capped(response, MAX_OBJECT_BYTES as u64).await.map_err(|e| match e {
+            BodyReadError::Transport(e) => self.describe_transport_error(&format!("reading object {}", hash), posture, e),
+            BodyReadError::OverCap { cap } => format!(
+                "Object {} on the remote is larger than the {}-byte whole-object ceiling; refusing to fetch it.",
+                hash, cap
+            ),
+        })
     }
 
     /// Upload one object's raw bytes to the control plane (`PUT /v1/objects/{hash}`), where the
@@ -3323,13 +3564,10 @@ impl RemoteClient {
                 return Err(self.error_of(response, "the upload negotiation").await);
             }
 
-            let body: UploadTargetsResponse = response.json()
-                .await
-                .map_err(|e| if e.is_timeout() {
-                    self.describe_transport_error("negotiating upload targets", posture, e)
-                } else {
-                    format!("The remote's upload-targets response is not valid JSON: {}", e)
-                })?;
+            let body: UploadTargetsResponse = self.read_json(
+                response, body_utils::per_item_body_cap(batch.len(), UPLOAD_TARGETS_BODY_BYTES_PER_HASH),
+                "negotiating upload targets", posture, "upload-targets response",
+            ).await?;
 
             merged.present.extend(body.present);
             merged.targets.extend(body.targets);
@@ -3392,9 +3630,10 @@ impl RemoteClient {
     /// other:**
     ///
     /// 1. **Response wait is unbounded** (rides [`Posture::UnboundedFollowsRedirects`],
-    ///    [`UnboundedTicket::Fork91`]): this call's error-body read decides retry-vs-terminal
-    ///    control flow, so bounding it is a retry-contract design question — FORK-91's own scope,
-    ///    still open.
+    ///    [`UnboundedTicket::Fork91`]): how long to wait for the remote's answer decides
+    ///    retry-vs-terminal control flow, so bounding it is a retry-contract design question —
+    ///    FORK-91's own scope, still open. A refusal's *body*, once its status has arrived, is read
+    ///    under the error-body budget like any other; one that stalls reads as terminal.
     /// 2. **No redirect guard** (a *separate* axis from 1, not covered by fixing it): this is
     ///    this module's one remaining mutation that still rides the auto-following client with no
     ///    `is_redirection()` check. FORK-89 moved every other mutation (`update_ref`,
@@ -3436,10 +3675,12 @@ impl RemoteClient {
         }
 
         let status = response.status();
-        let message = match response.json::<ErrorResponse>().await {
-            Ok(body) => body.error,
-            Err(_) => status.canonical_reason().unwrap_or("unknown error").to_string(),
-        };
+        // Bounded like every error body. A body that does not arrive in time reads as the bare
+        // status, which is terminal, exactly as an unparseable one is: the wait for the response
+        // itself (gap 1) stays open, but a refusal whose description stalls fails loudly rather
+        // than hanging the lift. The cost is a slow description of a transient refusal failing
+        // instead of being retried, which a budget sized for a small body makes rare.
+        let message = read_error_body(response, self.error_body_budget()).await.error;
 
         if is_transient_commit_failure(status, &message) {
             return Ok(CommitOutcome::BlobNotReady);
@@ -3467,12 +3708,10 @@ impl RemoteClient {
             return Err(self.error_of(response, &format!("the signature of {}", parcel_hash)).await);
         }
 
-        response.bytes()
-            .await
-            .map(|bytes| Some(bytes.to_vec()))
-            .map_err(|e| self.describe_transport_error(
-                &format!("reading the signature of {}", parcel_hash), posture, e
-            ))
+        self.read_body(
+            response, body_utils::SMALL_BODY_CAP, &format!("reading the signature of {}", parcel_hash),
+            posture, &format!("signature of {}", parcel_hash),
+        ).await.map(Some)
     }
 
     /// The total-deadline budget to arm for *this* client instance's call to
@@ -3672,6 +3911,7 @@ impl RemoteClient {
             .map_err(|e| format!("Error while creating the bundle file: {}", e))?;
         let mut cleanup = RemoveTempOnDrop::armed(&temp_path);
 
+        #[allow(clippy::disallowed_methods)] // streamed to the bundle file, never accumulated
         while let Some(chunk) = response.chunk()
             .await
             .map_err(|e| self.describe_transport_error("downloading the bundle", posture, e))?
@@ -4155,9 +4395,8 @@ pub(crate) async fn fetch_missing_objects(client: &RemoteClient, hashes: &[Strin
     // remote may lack objects) is fetched loose below too.
     if missing.len() > 1 {
         for chunk in missing.chunks(BATCH_FETCH_CHUNK) {
-            match client.fetch_batch(chunk).await? {
-                Some(bytes) => { bundle_utils::import_bundle_bytes(&bytes)?; }
-                None => break,
+            if client.fetch_batch(chunk).await?.is_none() {
+                break;
             }
         }
 
@@ -5954,6 +6193,20 @@ mod tests {
         }
     }
 
+    /// A real version-3 batch bundle carrying one freshly built object, split into exactly
+    /// `pieces` chunks for a drip fixture, and that object's hash. Built in a store of its own, so
+    /// the caller's store starts without the object.
+    fn drip_bundle(pieces: usize) -> (Vec<Vec<u8>>, String) {
+        let (bytes, hash) = {
+            let _source = Scratch::new("drip-bundle-source");
+            let hash = stack(Vec::new(), "drip");
+            (bundle_utils::build_partial_bundle(std::slice::from_ref(&hash)).unwrap(), hash)
+        };
+        let chunks: Vec<Vec<u8>> = bytes.chunks(bytes.len().div_ceil(pieces)).map(<[u8]>::to_vec).collect();
+        assert_eq!(chunks.len(), pieces, "the bundle splits into exactly the pieces asked for");
+        (chunks, hash)
+    }
+
     /// [`stack`], but with a real tree, for the walks that actually descend one.
     fn stack_with_tree(parents: Vec<String>, tree_hash: &str, tag: &str) -> String {
         let parcel = crate::model::parcel::Parcel {
@@ -6257,7 +6510,9 @@ mod tests {
     /// actually ships with a non-default budget (`TorMode::On`) is the correct 70s rather than some
     /// other value a future change (e.g. a cap) could silently substitute (see
     /// `error_body_budget_is_70s_for_a_real_tor_mode_client`). All four together pin
-    /// `error_of`'s real behavior, on any client, without a live remote.
+    /// `error_of`'s real behavior, on any client, without a live remote;
+    /// `commit_lift_bounds_the_error_body_read_after_a_wedged_500` pins the budget's other call
+    /// site the same way.
     #[test]
     fn error_body_read_budget_folds_in_the_connect_timeout() {
         assert_eq!(
@@ -7654,8 +7909,8 @@ mod tests {
     #[test]
     fn fetch_batch_redirect_follow_survives_a_slow_but_steadily_progressing_bundle() {
         let gap = std::time::Duration::from_millis(1_500);
-        let chunks: Vec<Vec<u8>> = (0..4).map(|i| format!("bundle-chunk-{}-drip", i).into_bytes()).collect();
-        let expected: Vec<u8> = chunks.concat();
+        let _store = Scratch::new("batch-redirect-drip");
+        let (chunks, hash) = drip_bundle(4);
         // Four gaps run past the effective loose budget (connect + object read) in total, while
         // no single gap comes near it — the sole property this fixture pins. Each gap does exceed
         // the *tight* [`Posture::BoundedReads`] effective budget (connect + read) — deliberately:
@@ -7681,19 +7936,18 @@ mod tests {
             tokio::time::timeout(outer_ceiling, client.fetch_batch(&["a".repeat(64)])).await
         });
 
-        let bytes = outcome
+        let stats = outcome
             .unwrap_or_else(|_| panic!(
                 "fetch_batch hung past its own generous outer ceiling {:?}", outer_ceiling
             ))
             .unwrap_or_else(|e| panic!(
                 "a slow-but-steady bundle must succeed — it was never silent, so it must never be \
                 treated as a stall: {}", e
-            ));
+            ))
+            .expect("a served bundle is not the absence signal");
 
-        assert_eq!(
-            bytes, Some(expected),
-            "the full bundle must arrive intact despite the drip"
-        );
+        assert_eq!(stats.stored_objects, 1, "the full bundle must arrive intact despite the drip");
+        assert!(file_utils::does_object_exist(&hash).unwrap(), "the dripped object landed in this store");
     }
 
     /// The designed transport for chunks (DESIGN.html §9.4b: "franchise, lower and expand fetch
@@ -8209,18 +8463,22 @@ mod tests {
     //
     // The fixtures that wait a budget out build their client with [`FAST`], whose budgets are
     // milliseconds, so each one fires in about a second rather than a minute. The `TEST_*`
-    // constants mirror the production values as literals, and
-    // `production_budgets_are_the_documented_figures` pins `Budgets::production` to them; tests
+    // constants mirror the production values as literals, [`PRODUCTION_MIRROR`] assembles them,
+    // and `production_budgets_are_the_documented_figures` pins `Budgets::production` to it; tests
     // that only compute a production budget, never wait one out, still read them.
     // -----------------------------------------------------------------------------------
 
+    /// Mirrors production `REMOTE_CONNECT_TIMEOUT`, for the reason `TEST_TIGHT_READ_TIMEOUT`'s doc
+    /// gives.
     const TEST_DIRECT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    /// Mirrors production `REMOTE_CONNECT_TIMEOUT_TOR`, likewise.
     const TEST_TOR_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
     /// Mirrors production `REMOTE_READ_TIMEOUT` as a literal rather than referring to it, as every
     /// `TEST_*` constant here does for its own production constant: an assertion built on a
     /// mirror keeps meaning what it meant when it was written, so a change to the production
     /// figure has to be re-affirmed here instead of moving both sides of an assertion together.
     const TEST_TIGHT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    /// Mirrors production `FETCH_OBJECT_READ_TIMEOUT`, likewise.
     const TEST_LOOSE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
     /// Mirrors production `UPLOAD_SILENCE_BUDGET` — see `TEST_TIGHT_READ_TIMEOUT`'s doc for why
     /// this is its own constant rather than a reference to the production one.
@@ -8232,6 +8490,12 @@ mod tests {
     /// assertion built on it must not silently track a change to a *different* production
     /// constant that happens to coincide in value today.
     const TEST_ERROR_BODY_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    /// Mirrors production `POST_SEND_VERIFY_BASE`, for the reason `TEST_TIGHT_READ_TIMEOUT`'s doc
+    /// gives.
+    const TEST_POST_SEND_VERIFY_BASE: std::time::Duration = std::time::Duration::from_secs(2);
+    /// Mirrors production `SINGLE_WRITE_ALLOWANCE`, for the reason `TEST_TIGHT_READ_TIMEOUT`'s doc
+    /// gives.
+    const TEST_SINGLE_WRITE_ALLOWANCE: std::time::Duration = std::time::Duration::from_secs(25);
     /// Mirrors production `BATCH_HEAD_PATIENCE` — its own constant, not a reference to the
     /// production one, for the reason `TEST_TIGHT_READ_TIMEOUT`'s doc gives: an assertion built on
     /// a mirror keeps meaning what it meant when it was written, and a change to the production
@@ -8250,7 +8514,7 @@ mod tests {
     /// A test that separates an armed budget from a rival by elapsed time needs the two at least a
     /// second apart, so the midpoint leaves half a second or more for a loaded runner's
     /// scheduling. Where [`FAST`]'s own spacing is closer than that for the pair a test separates,
-    /// the test widens the one budget it needs rather than every fixture paying for it.
+    /// the test widens the budgets it needs rather than every fixture paying for it.
     const FAST: Budgets = Budgets {
         connect: std::time::Duration::from_millis(330),
         read: std::time::Duration::from_millis(670),
@@ -8285,28 +8549,128 @@ mod tests {
         Budgets { read: WIDE_READ, ..fast_budgets(routes_through_tor) }.checked()
     }
 
+    /// The budgets the stalled-error-body tests arm with. [`FAST`] has no error-body budget a
+    /// second clear of every rival on both sides (see [`error_body_bracket`]), and a
+    /// connect bound as small as [`FAST`]'s leaves the connect-forgotten rival under a second
+    /// below whatever allowance is picked, so these widen both. [`error_body_bracket`] checks their
+    /// separation from every rival it lists rather than this doc stating it.
+    fn stalled_error_body_budgets() -> Budgets {
+        Budgets {
+            connect: std::time::Duration::from_millis(2_900),
+            error_body_read: std::time::Duration::from_millis(8_550),
+            ..FAST
+        }
+        .checked()
+    }
+
+    /// The elapsed-time bracket of a timed error-body test on a client carrying `budgets`, computed
+    /// before it starts waiting. The lower bound is the armed error-body budget, summed from the
+    /// injected budgets rather than through `error_body_read_budget`, so a bug in that helper
+    /// cannot move the elapsed time and the bound in lockstep. The upper bound is the midpoint
+    /// toward the nearest figure above it that a single misarm could fire at instead: any
+    /// allowance of this instance or of [`PRODUCTION_MIRROR`], on its own or folded with any
+    /// connect bound (this instance's or a production one); each connect bound alone; and `extra`,
+    /// the test's own outer deadlines. Every rival is asserted to be at least a second from the
+    /// armed budget on either side (a connect bound equal to a production one lists the armed sum
+    /// twice and fails here), so the midpoint leaves half a second for a loaded runner and a misarm
+    /// below fires a second before the lower bound. The outer ceiling, which turns a lost bound
+    /// into a failure rather than a hang, is asserted to sit above the midpoint, or a misarm
+    /// between the two would read as a hang.
+    fn error_body_bracket(budgets: Budgets, extra: &[std::time::Duration]) -> Bracket {
+        let armed = budgets.connect + budgets.error_body_read;
+        // Destructured without `..`, so a field added to `Budgets` has to be placed here.
+        let allowances = |b: Budgets| {
+            let Budgets {
+                connect: _, read, object_read, batch_head_patience, error_body_read, upload_silence,
+                post_send_verify_base, single_write_allowance,
+            } = b;
+            [read, object_read, batch_head_patience, error_body_read, upload_silence,
+                post_send_verify_base, single_write_allowance]
+        };
+        let connects = [budgets.connect, PRODUCTION_MIRROR.connect, PRODUCTION_MIRROR_TOR.connect];
+        let mut rivals: Vec<std::time::Duration> = allowances(budgets).into_iter()
+            .chain(allowances(PRODUCTION_MIRROR))
+            .flat_map(|allowance| {
+                std::iter::once(allowance).chain(connects.map(|connect| connect + allowance))
+            })
+            .chain(connects)
+            .chain(extra.iter().copied())
+            .collect();
+        // The armed budget itself is the one entry that is not a rival; any other at the same
+        // figure is, and must fail the separation below.
+        let own = rivals.iter().position(|&rival| rival == armed).expect("the armed sum is listed");
+        rivals.swap_remove(own);
+        let second = std::time::Duration::from_secs(1);
+        // An exact coincidence first: a connect bound or allowance equal to a production one, or
+        // an outer deadline at the armed figure, is the likeliest cause and the least obvious.
+        assert!(
+            !rivals.contains(&armed),
+            "a rival coincides exactly with the armed error-body budget {:?}, so a misarm firing \
+            at it cannot be told apart", armed
+        );
+        let too_close = rivals.iter()
+            .find(|&&rival| rival + second > armed && rival < armed + second);
+        if let Some(rival) = too_close {
+            panic!(
+                "the armed error-body budget {:?} is within a second of the rival {:?}, too close \
+                to separate by elapsed time", armed, rival
+            );
+        }
+        let nearest = rivals.into_iter().filter(|&rival| rival > armed).min()
+            .expect("the production allowances folded with a connect bound exceed any test budget");
+        let upper_bound = armed + (nearest - armed) / 2;
+        let outer_ceiling = armed + std::time::Duration::from_secs(10);
+        assert!(
+            upper_bound < outer_ceiling,
+            "the midpoint {:?} must sit under the {:?} ceiling, or a misarm between them reads as \
+            a hang", upper_bound, outer_ceiling
+        );
+        Bracket { lower_bound: armed, upper_bound, nearest_rival: nearest, outer_ceiling }
+    }
+
+    /// What [`error_body_bracket`] returns, its fields named for the reader: every one is a
+    /// duration, so nothing but review stops a test asserting against the wrong one.
+    struct Bracket {
+        /// The elapsed time must be at least this, the armed error-body budget.
+        lower_bound: std::time::Duration,
+        /// The elapsed time must be under this.
+        upper_bound: std::time::Duration,
+        /// The figure `upper_bound` is the midpoint toward, for the failure message.
+        nearest_rival: std::time::Duration,
+        /// The test's own timeout around the call.
+        outer_ceiling: std::time::Duration,
+    }
+
     /// A direct-dial client carrying [`FAST`].
     fn fast_client(url: &str) -> RemoteClient {
         RemoteClient::new_test_with_budgets(url, FAST)
     }
 
+    /// The direct-dial production budgets, built from the mirrors rather than the production
+    /// constants, for the reason `TEST_TIGHT_READ_TIMEOUT`'s doc gives.
+    const PRODUCTION_MIRROR: Budgets = Budgets {
+        connect: TEST_DIRECT_CONNECT_TIMEOUT,
+        read: TEST_TIGHT_READ_TIMEOUT,
+        object_read: TEST_LOOSE_READ_TIMEOUT,
+        batch_head_patience: TEST_BATCH_HEAD_PATIENCE,
+        error_body_read: TEST_ERROR_BODY_READ_TIMEOUT,
+        upload_silence: TEST_UPLOAD_SILENCE_BUDGET,
+        post_send_verify_base: TEST_POST_SEND_VERIFY_BASE,
+        single_write_allowance: TEST_SINGLE_WRITE_ALLOWANCE,
+    };
+
+    /// [`PRODUCTION_MIRROR`] for a dial through Tor, which differs in the connect bound alone.
+    const PRODUCTION_MIRROR_TOR: Budgets =
+        Budgets { connect: TEST_TOR_CONNECT_TIMEOUT, ..PRODUCTION_MIRROR };
+
     /// The production figures, pinned without waiting any of them out: every fixture that watches
     /// a budget fire does so against [`FAST`], so this is what holds the shipped values.
     #[test]
     fn production_budgets_are_the_documented_figures() {
-        assert_eq!(Budgets::production(false), Budgets {
-            connect: TEST_DIRECT_CONNECT_TIMEOUT,
-            read: TEST_TIGHT_READ_TIMEOUT,
-            object_read: TEST_LOOSE_READ_TIMEOUT,
-            batch_head_patience: TEST_BATCH_HEAD_PATIENCE,
-            error_body_read: TEST_ERROR_BODY_READ_TIMEOUT,
-            upload_silence: TEST_UPLOAD_SILENCE_BUDGET,
-            post_send_verify_base: std::time::Duration::from_secs(2),
-            single_write_allowance: std::time::Duration::from_secs(25),
-        });
+        assert_eq!(Budgets::production(false), PRODUCTION_MIRROR);
         assert_eq!(
             Budgets::production(true),
-            Budgets { connect: TEST_TOR_CONNECT_TIMEOUT, ..Budgets::production(false) },
+            PRODUCTION_MIRROR_TOR,
             "a Tor dial differs from a direct one in the connect bound and nothing else"
         );
         let direct = RemoteClient::new_with_tor("http://127.0.0.1:1", None, TorSettings::default())
@@ -8744,6 +9108,7 @@ mod tests {
                     ),
                 };
 
+                #[allow(clippy::disallowed_methods)] // probes the transport bound itself, not a production read
                 response.bytes().await
             }).await
         });
@@ -8838,6 +9203,7 @@ mod tests {
                     ),
                 };
 
+                #[allow(clippy::disallowed_methods)] // probes the transport bound itself, not a production read
                 response.bytes().await
             }).await
         })
@@ -9687,9 +10053,8 @@ mod tests {
     #[test]
     fn fetch_batch_survives_a_slow_but_steadily_progressing_direct_body() {
         let gap = std::time::Duration::from_millis(1_500);
-        let chunks: Vec<Vec<u8>> =
-            (0..4).map(|i| format!("direct-chunk-{}-drip", i).into_bytes()).collect();
-        let expected: Vec<u8> = chunks.concat();
+        let _store = Scratch::new("batch-direct-drip");
+        let (chunks, hash) = drip_bundle(4);
         let total_duration = gap * (chunks.len() as u32);
         let effective_silence_budget = FAST.connect + FAST.object_read;
         let effective_head_budget = FAST.connect + FAST.batch_head_patience;
@@ -9715,20 +10080,171 @@ mod tests {
             tokio::time::timeout(outer_ceiling, client.fetch_batch(&["a".repeat(64)])).await
         });
 
-        let bytes = outcome
+        let stats = outcome
             .unwrap_or_else(|_| panic!(
                 "fetch_batch hung past its own generous outer ceiling {:?}", outer_ceiling
             ))
             .unwrap_or_else(|e| panic!(
                 "a body that was never silent for more than {:?} must never be treated as a \
                 stall, however long the whole transfer took: {}", gap, e
-            ));
+            ))
+            .expect("a served bundle is not the absence signal");
 
-        assert_eq!(
-            bytes, Some(expected),
-            "the full body must arrive intact, not a prefix of it — a truncated read is the other \
-            shape a wrongly-scoped bound produces"
-        );
+        // A prefix of the bundle — the other shape a wrongly-scoped bound produces — now fails
+        // the import outright, so arriving intact is the object landing.
+        assert_eq!(stats.stored_objects, 1, "the full body must arrive intact, not a prefix of it");
+        assert!(file_utils::does_object_exist(&hash).unwrap(), "the dripped object landed in this store");
+    }
+
+    /// A roster past the server's per-request limit resolves in several requests, each within the
+    /// limit and asking about each identifier once — not in one request the server refuses, which
+    /// would show every operator pseudonymously.
+    #[test]
+    fn resolve_splits_a_roster_past_the_server_limit_and_asks_each_identifier_once() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let batches = std::sync::Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+        let seen = std::sync::Arc::clone(&batches);
+
+        std::thread::spawn(move || {
+            use std::io::Write;
+
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let Some((_, _, _, body)) = read_test_request(&mut stream) else { continue };
+                let request: ResolveRequest = serde_json::from_slice(&body).unwrap();
+                seen.lock().unwrap().push(request.identifiers.len());
+
+                let names: BTreeMap<String, String> = request.identifiers.iter()
+                    .map(|id| (id.clone(), format!("Name of {}", id))).collect();
+                let answer = serde_json::json!({ "names": names }).to_string();
+                let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    answer.len(), answer);
+            }
+        });
+
+        let distinct = crate::model::remote::MAX_RESOLVE_IDENTIFIERS + 1;
+        let mut identifiers: Vec<String> = (0..distinct).map(|i| format!("op-{}", i)).collect();
+        identifiers.extend((0..5000).map(|_| "op-0".to_string()));
+
+        let client = RemoteClient::new(&url, None).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let names = runtime.block_on(client.resolve(identifiers));
+
+        assert_eq!(names.len(), distinct, "every distinct identifier resolves");
+        let batches = batches.lock().unwrap().clone();
+        assert_eq!(batches.iter().sum::<usize>(), distinct, "each identifier is asked about once: {:?}", batches);
+        assert!(batches.iter().all(|&n| n <= crate::model::remote::MAX_RESOLVE_IDENTIFIERS),
+            "no request exceeds the server's limit: {:?}", batches);
+    }
+
+    /// Long identifiers split a roster by bytes, not just by count; exactly
+    /// `RESOLVE_REQUESTS_IN_FLIGHT` requests are open at once; and a name an answer gives for an
+    /// identifier its request did not ask about is dropped.
+    #[test]
+    fn resolve_splits_by_bytes_runs_four_requests_at_once_and_keeps_only_asked_names() {
+        use std::sync::{Arc, Condvar, Mutex};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let batches = Arc::new(Mutex::new(Vec::<usize>::new()));
+        // Requests open now, the most ever open at once, and how many have arrived.
+        let open = Arc::new((Mutex::new((0usize, 0usize, 0usize)), Condvar::new()));
+        let (seen, gauge) = (Arc::clone(&batches), Arc::clone(&open));
+
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let (seen, gauge) = (Arc::clone(&seen), Arc::clone(&gauge));
+
+                std::thread::spawn(move || {
+                    use std::io::Write;
+
+                    let Some((_, _, _, body)) = read_test_request(&mut stream) else { return };
+                    seen.lock().unwrap().push(body.len());
+                    let request: ResolveRequest = serde_json::from_slice(&body).unwrap();
+                    let mut names: BTreeMap<String, String> = request.identifiers.iter()
+                        .map(|id| (id.clone(), "Named".to_string())).collect();
+                    names.insert("never-asked".to_string(), "Intruder".to_string());
+                    let answer = serde_json::json!({ "names": names }).to_string();
+
+                    // Hold every request until its whole round of the limit's worth has arrived (or a
+                    // while passes), then a little longer, so a client exceeding the limit is seen
+                    // exceeding it and one under it never fills a round.
+                    let (lock, changed) = &*gauge;
+                    let mut counts = lock.lock().unwrap();
+                    let round_full = (counts.2 / RESOLVE_REQUESTS_IN_FLIGHT + 1) * RESOLVE_REQUESTS_IN_FLIGHT;
+                    counts.0 += 1;
+                    counts.1 = counts.1.max(counts.0);
+                    counts.2 += 1;
+                    changed.notify_all();
+                    let (mut counts, _) = changed.wait_timeout_while(counts, std::time::Duration::from_secs(10),
+                        |counts| counts.2 < round_full).unwrap();
+                    drop(counts);
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    counts = lock.lock().unwrap();
+                    counts.0 -= 1;
+                    drop(counts);
+
+                    let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        answer.len(), answer);
+                });
+            }
+        });
+
+        // 261 thousand-byte identifiers fill a request by bytes (each serialises to 1,003), so 2,088
+        // of them are exactly two rounds of four requests, far under the count limit.
+        let identifiers: Vec<String> = (0..2088).map(|i| format!("{:04}{}", i, "x".repeat(996))).collect();
+        let client = RemoteClient::new(&url, None).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let names = runtime.block_on(client.resolve(identifiers));
+
+        assert_eq!(names.len(), 2088, "every asked identifier resolves, and nothing else");
+        assert!(!names.contains_key("never-asked"), "a name for an identifier no request asked about is dropped");
+        let batches = batches.lock().unwrap().clone();
+        assert_eq!(batches.len(), 2 * RESOLVE_REQUESTS_IN_FLIGHT, "split by bytes: {:?}", batches);
+        assert!(batches.iter().all(|&bytes| bytes <= RESOLVE_REQUEST_IDENTIFIER_BYTES + 64), "{:?}", batches);
+        assert_eq!(open.0.lock().unwrap().1, RESOLVE_REQUESTS_IN_FLIGHT,
+            "the requests run at once, never more of them than the limit");
+    }
+
+    /// An importer that refuses the bundle stops the transfer at once: a remote that sends a
+    /// refused header and then goes silent must get the refusal back, not a timeout once the
+    /// silence budget runs out.
+    #[test]
+    fn a_refused_batch_bundle_reports_the_refusal_without_waiting_out_a_stalled_remote() {
+        let _store = Scratch::new("batch-refused-then-stalled");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+
+        std::thread::spawn(move || {
+            use std::io::Write;
+
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = read_test_request(&mut stream);
+                let chunk = "forklift-bundle 2026-07-06\n";
+                let _ = write!(stream, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{}\r\n",
+                    chunk.len(), chunk);
+                let _ = stream.flush();
+                std::thread::sleep(std::time::Duration::from_secs(30));
+            }
+        });
+
+        let client = fast_client(&url);
+        let silence_budget = FAST.connect + FAST.object_read;
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let started = std::time::Instant::now();
+        let outcome = runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(20), client.fetch_batch(&["a".repeat(64)])).await
+        }).expect("fetch_batch hung past its outer ceiling");
+
+        let message = match outcome {
+            Err(message) => message,
+            Ok(_) => panic!("a refused bundle must not import"),
+        };
+        assert!(message.contains("refusing to import it"), "the importer's refusal is reported: {}", message);
+        assert!(started.elapsed() < silence_budget,
+            "the refusal must not wait out the silence budget {:?}: took {:?}", silence_budget, started.elapsed());
     }
 
     /// A remote that accepts the connection, reads the request, sends response headers claiming
@@ -9808,17 +10324,16 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------------------
-    // The unbounded error-body read: `error_of` calls `response.json()` with no bound of its own
-    // once a non-success status line has arrived. The auto-following client (`Posture::
-    // UnboundedFollowsRedirects`, which `missing_objects` rides) carries only a `connect_timeout`,
-    // no `read_timeout` at all — so a remote that delivers a
+    // The error-body read: once a non-success status line has arrived, `error_of` reads the body
+    // through `read_error_body`, under a byte cap and a time budget. The
+    // auto-following client (`Posture::UnboundedFollowsRedirects`, which `missing_objects` rides)
+    // carries only a `connect_timeout`, no `read_timeout` at all — so a remote that delivers a
     // full status line and headers and then wedges before writing the body hangs the caller
-    // forever. `ERROR_BODY_READ_TIMEOUT` bounds the read itself, in `error_of`, rather than
-    // trying to fix it with yet another client — no client can help here, since the body-read
-    // bound is inherited from whichever client sent the request, and `error_of` serves responses
-    // from all of them. `commit_lift`'s own error-body read is deliberately left unbounded (a
-    // pre-existing, ticketed defect — FORK-49 is scoped to reads whose result only shapes a
-    // message, not this call's retry-vs-terminal control flow).
+    // forever. The caller's `error_body_budget` bounds the read itself, in `read_error_body`,
+    // rather than trying to fix it with yet another client — no client can help here, since the
+    // body-read bound is inherited from whichever client sent the request, and `error_of` serves
+    // responses from all of them. `commit_lift` reads its refusals under the same budget; only its
+    // wait for the response itself stays unbounded, under FORK-91.
     // -----------------------------------------------------------------------------------
 
     /// A remote that delivers a non-success status line and full headers (claiming a body),
@@ -9826,8 +10341,8 @@ mod tests {
     /// stays open (no FIN), so anything reading the body is left waiting on bytes that never
     /// arrive. Distinct from [`SilentRemote`] (silent *before* the status line even arrives) and
     /// [`LyingContentLengthRemote`] (a `2xx` success path): this is specifically the shape
-    /// [`ERROR_BODY_READ_TIMEOUT`] exists for — status and headers fully delivered, only the
-    /// error body itself left hanging.
+    /// [`RemoteClient::error_body_budget`] exists for — status and headers fully delivered, only
+    /// the error body itself left hanging.
     struct SilentErrorBodyRemote {
         url: String,
         _park: std::sync::mpsc::Sender<()>,
@@ -9870,17 +10385,17 @@ mod tests {
     /// `missing_objects_times_out_against_a_silent_remote`'s own budget) the outer deadline is the
     /// *tighter* of the two and would fire first instead — a real, deliberate interaction between
     /// the two bounds, not a gap: whichever fires first still surfaces as a plain `Err` through the
-    /// same `error_of` fallback path either way (a timed-out `response.json()` and an elapsed inner
-    /// `tokio::time::timeout` both take the same "no usable error body arrived" arm), so no call
-    /// ever hangs regardless of which bound wins.
+    /// same `error_of` fallback path either way (a body read cut off by the deadline and an
+    /// elapsed inner `tokio::time::timeout` both take the same "no usable error body arrived"
+    /// arm), so no call ever hangs regardless of which bound wins.
     ///
     /// Before this call had its own outer deadline at all, it rode the auto-following client with
     /// no bound of any kind — a `500` whose body then wedges hung it forever, with the status line
     /// and headers already fully delivered. The outer test-ceiling below is a safety net, not the
-    /// property under test: if the wrapper in `error_of` were missing, that ceiling is what would
-    /// trip (the test failing instead of hanging the suite) — unambiguous evidence the internal
-    /// bound is gone, since status line and headers were fully delivered before the park, so the
-    /// only thing left to hang on is the error-body read itself.
+    /// property under test: if the bound in `read_error_body` were missing, that ceiling is what
+    /// would trip (the test failing instead of hanging the suite) — unambiguous evidence the
+    /// internal bound is gone, since status line and headers were fully delivered before the park,
+    /// so the only thing left to hang on is the error-body read itself.
     ///
     /// Also asserts a **lower** bound on elapsed time: a red-then-green
     /// suite run alone does not prove `error_of` calls [`error_body_read_budget`] at all — nothing
@@ -9895,7 +10410,8 @@ mod tests {
     /// [`REMOTE_CONNECT_TIMEOUT`]", which only waits longer. That is the gap
     /// `error_body_budget_reads_this_field_not_a_rival_constant` closes, with a connect bound no
     /// production constructor can produce, so a hardcoded rival can never coincidentally match it.
-    /// Four tests together pin the property: this one pins call-site-uses-the-budget,
+    /// Four tests together pin the property (`commit_lift`'s call site has its own test, after this
+    /// one): this one pins call-site-uses-the-budget,
     /// `error_body_read_budget_folds_in_the_connect_timeout` pins the arithmetic the budget
     /// computes, `error_body_budget_reads_this_field_not_a_rival_constant` pins that the accessor
     /// reads *this instance's* connect timeout field rather than hardcoding any constant a real
@@ -9906,40 +10422,41 @@ mod tests {
     #[test]
     fn missing_objects_bounds_the_error_body_read_after_a_wedged_500() {
         let remote = SilentErrorBodyRemote::start();
-        let client = fast_client(&remote.url);
+        let budgets = stalled_error_body_budgets();
+        let client = RemoteClient::new_test_with_budgets(&remote.url, budgets);
         // A batch of 2,000 hashes — large enough that the call's own outer TotalDeadline
         // (`connect + post_send_verify_base + 2,000 * PRESENCE_ALLOWANCE_MS_PER_OP`) stays looser
         // than error_of's inner error_body_budget, so the inner budget is still what fires and
         // this test still pins what it always pinned. Any real hash
         // string works — the fixture never inspects the body.
         let hashes: Vec<String> = (0..2000).map(|_| "a".repeat(64)).collect();
-        // Written as the sum of the injected budgets, not via `error_body_read_budget`, so this
-        // assertion doesn't co-move with a corrupted helper — a helper bug would then move the
-        // elapsed time it produces and this fixed lower bound in lockstep, pinning nothing.
-        let lower_bound = FAST.connect + FAST.error_body_read;
-        // The bracket this fixture's batch size depends on, made an assertion rather than left as
-        // a comment: the call's own outer TotalDeadline must stay looser than error_of's inner
-        // error_body_budget (`lower_bound` above), or the outer bound fires first and every
-        // assertion below would end up blaming error_of/error_body_read_budget for a regression
-        // that actually lives in presence_negotiation_budget or its constants — a misleading red,
-        // not a wrong one. Computed the same constant-sum-not-via-helper way as `lower_bound`,
-        // for the identical reason: calling `presence_negotiation_budget` here would let a bug in
-        // that method move this guard and the real behavior it is meant to guard against in
-        // lockstep, silently validating a broken implementation instead of catching it.
-        let outer_budget = FAST.connect + FAST.post_send_verify_base
+        // The bracket this fixture's batch size depends on, made an assertion rather than left as a
+        // comment: the call's own outer TotalDeadline must stay a second looser than error_of's
+        // inner error_body_budget (connect plus the error-body allowance), or the outer bound fires
+        // first and every assertion below would end up blaming error_of/error_body_read_budget for
+        // a regression that actually lives in presence_negotiation_budget or its constants — a
+        // misleading red, not a wrong one. Computed as a constant sum, not via a helper, for the
+        // same reason the bracket's lower bound is: calling `presence_negotiation_budget` here
+        // would let a bug in that method move this guard and the real behavior it is meant to guard
+        // against in lockstep, silently validating a broken implementation instead of catching it.
+        let outer_budget = budgets.connect + budgets.post_send_verify_base
             + std::time::Duration::from_secs_f64(
                 hashes.len() as f64 * PRESENCE_ALLOWANCE_MS_PER_OP / 1000.0
             );
+        let inner_budget = budgets.connect + budgets.error_body_read;
         assert!(
-            outer_budget > lower_bound,
+            outer_budget >= inner_budget + std::time::Duration::from_secs(1),
             "this fixture's batch size ({} hashes, outer TotalDeadline {:?}) no longer stays \
-            looser than error_of's own inner error_body_budget ({:?}) — resize `hashes` above \
-            until it does; every assertion below assumes the inner budget is what fires, and a \
+            a second looser than error_of's own inner error_body_budget ({:?}) — resize `hashes` \
+            above until it does; every assertion below assumes the inner budget is what fires and \
+            can be told from the outer one by elapsed time, and a \
             red result here means they are about to fail for the wrong reason (the outer bound \
             firing first) rather than the one they exist to catch",
-            hashes.len(), outer_budget, lower_bound
+            hashes.len(), outer_budget, inner_budget
         );
-        let outer_ceiling = lower_bound + std::time::Duration::from_secs(10);
+        // The outer deadline is a rival too: were the inner bound lost, it would be what fires.
+        let Bracket { lower_bound, upper_bound, nearest_rival, outer_ceiling } =
+            error_body_bracket(budgets, &[outer_budget]);
 
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let started = std::time::Instant::now();
@@ -9962,17 +10479,15 @@ mod tests {
             the bare error-body-read timeout (or less)",
             elapsed, lower_bound
         );
-        // The other side: the production error-body read budget in place of this instance's
-        // would still clear the lower bound and fit under the outer deadline, so only an upper
-        // bound tells it apart.
-        let rival_production_budget = FAST.connect + TEST_ERROR_BODY_READ_TIMEOUT;
-        let upper_bound = lower_bound + (rival_production_budget - lower_bound) / 2;
+        // The other side: a misarm that waits longer (the production error-body allowance folded
+        // with this connect bound, say, or the call's own outer deadline) would still clear the
+        // lower bound and fit under the outer ceiling, so only an upper bound tells it apart.
         assert!(
             elapsed < upper_bound,
             "elapsed {:?} is past {:?} (the midpoint between this client's error-body budget {:?} \
-            and the {:?} the production error-body read timeout would give) — the error-body read \
-            is not armed with this instance's budgets",
-            elapsed, upper_bound, lower_bound, rival_production_budget
+            and {:?}, the nearest longer budget a misarm could fire at) — the error-body read is \
+            not armed with this instance's budget",
+            elapsed, upper_bound, lower_bound, nearest_rival
         );
 
         assert!(
@@ -9984,6 +10499,42 @@ mod tests {
             "on a timed-out/unparseable body, must fall back to the canonical reason — the same \
             fallback already used for a parse failure: {}", error
         );
+    }
+
+    /// A lift commit's refusal whose body stalls fails as a terminal error under the same
+    /// error-body budget instead of hanging the lift: the auto-following client it rides has no
+    /// read timeout, so nothing else would end the wait. Bracketed like the `missing_objects` test
+    /// above: at least the injected budget (no shorter bound fired), under the midpoint toward the
+    /// nearest longer budget a misarm could fire at (no longer one did either, so it is this
+    /// instance's budget), and under an outer ceiling (a lost bound fails rather than hangs). The
+    /// message is the status reason that stands in for an unread body.
+    #[test]
+    fn commit_lift_bounds_the_error_body_read_after_a_wedged_500() {
+        let remote = SilentErrorBodyRemote::start();
+        let budgets = stalled_error_body_budgets();
+        let client = RemoteClient::new_test_with_budgets(&remote.url, budgets);
+        let Bracket { lower_bound, upper_bound, nearest_rival, outer_ceiling } =
+            error_body_bracket(budgets, &[]);
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let started = std::time::Instant::now();
+
+        let outcome = runtime.block_on(async {
+            tokio::time::timeout(outer_ceiling, client.commit_lift("session", &[], &[], false)).await
+        });
+        let elapsed = started.elapsed();
+
+        let message = match outcome {
+            Ok(Err(message)) => message,
+            Ok(Ok(_)) => panic!("a 500 is refused"),
+            Err(_) => panic!("the stalled body held the lift past {:?}: its read is unbounded", outer_ceiling),
+        };
+        assert!(message.contains("(500): Internal Server Error"), "the status stands in for the body: {}", message);
+        assert!(elapsed >= lower_bound, "the error-body budget fired early ({:?} < {:?})", elapsed, lower_bound);
+        // A misarm that waits longer would also clear the lower bound and the ceiling; only the
+        // midpoint toward the nearest one tells it apart.
+        assert!(elapsed < upper_bound,
+            "elapsed {:?} is past {:?}, the midpoint toward {:?}: the lift commit's error-body read \
+            is not armed with this instance's budget", elapsed, upper_bound, nearest_rival);
     }
 
     /// A Tor-mode fixture (this test's predecessor,
@@ -10283,13 +10834,13 @@ mod tests {
     /// with none of them. Procedure: `grep -n "Duration::from_secs\|Duration::from_millis"` over
     /// this file; the values are not transcribed here, for the reason
     /// [`error_body_budget_reads_this_field_not_a_rival_constant`]'s own doc gives at length.
-    /// `n` is fixed at 1 here (a 5ms scaled term) precisely so
-    /// this test's asserted *output* — 15.005s (`13 + POST_SEND_VERIFY_BASE + 0.005`) — is what
-    /// actually needs checking for collisions, and unlike `error_body_budget`/`resolve_budget`'s
-    /// own two-addend sums, `presence_negotiation_budget` sums *three* terms (`connect_timeout`,
+    /// `n` is fixed at 1 here (a 5ms scaled term) precisely so this test's asserted *output* —
+    /// 15.005s (`13 + TEST_POST_SEND_VERIFY_BASE + 0.005`) — is what actually needs checking for
+    /// collisions, and unlike `error_body_budget`/`resolve_budget`'s own two-addend sums,
+    /// `presence_negotiation_budget` sums *three* terms (`connect_timeout`,
     /// `POST_SEND_VERIFY_BASE`, the `n`-scaled term); unlike those tests, the odd `.005s` fraction
-    /// this asserts is not producible at all by summing any subset of this module's named
-    /// (whole- or tenth-second) `Duration` constants — a fractional-second remainder no
+    /// this asserts is not producible at all by summing any subset of this module's named (whole-
+    /// or tenth-second) `Duration` constants — a fractional-second remainder no
     /// whole/tenth-second constant in this module can produce, so no enumeration is needed to make
     /// the point, and none is attempted: characterising a separation table as complete has cost a
     /// fresh defect on every attempt this module's history has tried it.
@@ -10304,7 +10855,7 @@ mod tests {
 
         assert_eq!(
             client.presence_negotiation_budget(1),
-            SENTINEL_CONNECT_TIMEOUT + POST_SEND_VERIFY_BASE
+            SENTINEL_CONNECT_TIMEOUT + TEST_POST_SEND_VERIFY_BASE
                 + std::time::Duration::from_secs_f64(1.0 * PRESENCE_ALLOWANCE_MS_PER_OP / 1000.0),
             "presence_negotiation_budget must fold in *this instance's* connect_timeout — a value \
             neither RemoteClient::new (5s) nor RemoteClient::new_with_tor under TorMode::On (60s) \
@@ -10330,7 +10881,7 @@ mod tests {
             "http://forklift-fork-92-presence-budget-tor-endpoint-test.invalid", None, tor,
         ).unwrap();
 
-        let expected = TEST_TOR_CONNECT_TIMEOUT + POST_SEND_VERIFY_BASE
+        let expected = TEST_TOR_CONNECT_TIMEOUT + TEST_POST_SEND_VERIFY_BASE
             + std::time::Duration::from_secs_f64(
                 MAX_MISSING_BATCH as f64 * PRESENCE_ALLOWANCE_MS_PER_OP / 1000.0
             );
@@ -10651,9 +11202,9 @@ mod tests {
     /// parked-connection shape as [`LyingContentLengthRemote`], but for a JSON body instead of raw
     /// bytes, and generic to any request path (via [`read_test_request`]) rather than one
     /// endpoint. Exists for the tests below: a fully [`SilentRemote`] never gets past headers, so
-    /// it cannot distinguish `missing_objects`/`upload_targets`'s `response.json()` timeout branch
-    /// (route through the composer) from their JSON-parse-failure branch (the unconditional "not
-    /// valid JSON" message) — both look identical against total silence, because neither branch is
+    /// it cannot distinguish `read_json`'s transport-failure branch for `missing_objects`/
+    /// `upload_targets` (routed through the composer) from its parse-failure branch (the "not valid
+    /// JSON" message) — both look identical against total silence, because neither branch is
     /// ever reached without headers. This fixture reaches the body-read arm specifically: headers
     /// and a fragment arrive, then the connection stalls forever mid-body.
     struct PartialJsonThenSilentRemote {
@@ -10673,7 +11224,7 @@ mod tests {
                 if let Ok((mut stream, _)) = listener.accept() {
                     let _ = read_test_request(&mut stream);
                     // Claims 4096 bytes of JSON, writes one opening brace, then parks — the rest
-                    // never arrives and the connection is never closed, so response.json() is
+                    // never arrives and the connection is never closed, so the body read is
                     // left waiting on bytes that are never coming rather than failing to parse
                     // what little it already has.
                     let _ = write!(
@@ -10691,13 +11242,13 @@ mod tests {
         }
     }
 
-    /// Distinguishes the body-phase fix from a cosmetic one: reverting `missing_objects`'s
-    /// `response.json()` map_err back to the unconditional "not valid JSON" message (dropping the
-    /// `is_timeout()` branch) would still pass every silent-remote test above — a fully silent
-    /// remote never sends headers at all, so it never reaches `response.json()`'s error arm in the
-    /// first place. Against [`PartialJsonThenSilentRemote`] it does: the deadline still fires (the
-    /// `TotalDeadline` posture bounds the whole response, body included — a total timeout carries
-    /// into the body read, not just `.send()`), and the message must be the deadline message, not
+    /// Distinguishes the body-phase fix from a cosmetic one: reporting every failed read in
+    /// `read_json` as "not valid JSON" (dropping its transport-failure branch) would still pass
+    /// every silent-remote test above — a fully silent remote never sends headers at all, so it
+    /// never reaches the body read's error arm in the first place. Against
+    /// [`PartialJsonThenSilentRemote`] it does: the deadline still fires (the `TotalDeadline`
+    /// posture bounds the whole response, body included — a total timeout carries into the body
+    /// read, not just `.send()`), and the message must be the deadline message, not
     /// the JSON-parse-failure one, since the remote never sent garbage — it sent a valid-so-far
     /// prefix and then nothing further.
     #[test]
@@ -10771,10 +11322,10 @@ mod tests {
         }
     }
 
-    /// Pins the `else` half of `missing_objects`'s `if e.is_timeout()` guard, which the two
-    /// partial-body tests above cannot reach: their fixture only ever produces the timeout case,
-    /// so widening the condition to `true` — routing *every* `response.json()` failure through the
-    /// composer — leaves both of them green.
+    /// Pins `read_json`'s parse-failure branch for `missing_objects`, which the two partial-body
+    /// tests above cannot reach: their fixture only ever produces a transport failure, so routing
+    /// *every* failed read through the composer — parse failures included — leaves both of them
+    /// green.
     ///
     /// Measured under that mutant, against a proxy or captive portal answering `200` with an HTML
     /// interstitial: the message becomes `"Error while negotiating with the remote: expected value
@@ -10859,11 +11410,122 @@ mod tests {
         );
     }
 
-    /// The third `is_timeout()` json guard, on `fetch_info`, gets the same treatment as the two
-    /// above. It predates this reshape and was the *least* covered of the three: mutating it to
-    /// `if true` left the entire crate suite green, because every existing `fetch_info` test
-    /// drives either a refused connect or header-phase silence, neither of which ever reaches
-    /// `response.json()`'s error arm at all.
+    /// Serve one canned answer to whatever request arrives first, on any path: `head` (status line
+    /// and headers, without the blank line) then `body`.
+    fn serve_one_answer(head: String, body: String) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+
+        std::thread::spawn(move || {
+            use std::io::Write;
+
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = read_test_request(&mut stream);
+                let _ = write!(stream, "{}\r\nConnection: close\r\n\r\n{}", head, body);
+                let _ = stream.flush();
+            }
+        });
+
+        url
+    }
+
+    /// The handshake lists every pallet, and a warehouse may have any number of them: a cap sized
+    /// for a "small" answer would refuse a real warehouse outright (750 pallets already pass
+    /// 64 KiB). Five thousand pallets, about 450 KB, must handshake.
+    #[test]
+    fn a_handshake_listing_thousands_of_pallets_is_read() {
+        let pallets: BTreeMap<String, String> = (0..5000)
+            .map(|i| (format!("feature/branch-number-{}", i), "a".repeat(64)))
+            .collect();
+        let body = serde_json::json!({
+            "protocol": PROTOCOL_VERSION, "default_pallet": "main", "pallets": pallets,
+            "trust": null, "chunking": false,
+        }).to_string();
+        assert!(body.len() > 400_000, "the fixture must be far past a small-body cap");
+
+        let url = serve_one_answer(
+            format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}", body.len()),
+            body,
+        );
+        let client = RemoteClient::new(&url, None).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+
+        let info = runtime.block_on(client.fetch_info()).unwrap_or_else(|e| panic!("{}", e));
+        assert_eq!(info.pallets.len(), 5000);
+    }
+
+    /// The other side of the handshake cap: an answer declaring more than it is refused before a
+    /// byte of it is read, with a message naming what was refused and the cap.
+    #[test]
+    fn a_handshake_over_its_cap_is_refused_naming_the_cap() {
+        let url = serve_one_answer(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}",
+                HANDSHAKE_BODY_CAP + 1
+            ),
+            String::new(),
+        );
+        let client = RemoteClient::new(&url, None).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+
+        let message = match runtime.block_on(client.fetch_info()) {
+            Err(message) => message,
+            Ok(_) => panic!("an over-cap handshake must not appear to succeed"),
+        };
+        assert!(message.contains("handshake") && message.contains(&HANDSHAKE_BODY_CAP.to_string()),
+            "the refusal names what was refused and the cap: {}", message);
+    }
+
+    /// A signature sidecar over its cap is refused in words that read: the remote's signature of
+    /// the parcel, named once.
+    #[test]
+    fn an_over_cap_signature_is_refused_naming_it_once() {
+        let url = serve_one_answer(
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {}", body_utils::SMALL_BODY_CAP + 1),
+            String::new(),
+        );
+        let client = RemoteClient::new(&url, None).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+
+        let message = runtime.block_on(client.fetch_signature("abc")).expect_err("an over-cap sidecar is refused");
+        assert!(message.contains("The answer to the remote's signature of abc is larger than"), "{}", message);
+    }
+
+    /// A lift-commit refusal whose description runs past the small-answer cap is still read (it
+    /// may list many blobs), and one past the error-body cap says its description went unread
+    /// instead of passing for the bare status.
+    #[test]
+    fn a_long_lift_commit_refusal_is_read_and_an_over_cap_one_says_so() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let refusal = |length: u64| {
+            let url = serve_one_answer(
+                format!("HTTP/1.1 422 Unprocessable Entity\r\nContent-Type: application/json\r\nContent-Length: {}", length),
+                if length <= ERROR_BODY_CAP {
+                    let error = "b".repeat(length as usize - r#"{"error":""}"#.len());
+                    serde_json::json!({ "error": error }).to_string()
+                } else {
+                    String::new()
+                },
+            );
+            let client = RemoteClient::new(&url, None).unwrap();
+            match runtime.block_on(client.commit_lift("session", &[], &[], false)) {
+                Err(message) => message,
+                Ok(_) => panic!("a 422 is refused"),
+            }
+        };
+
+        let long = refusal(body_utils::SMALL_BODY_CAP * 2);
+        assert!(long.contains(&"b".repeat(1000)), "the long description is read: {:.200}", long);
+
+        let unread = refusal(ERROR_BODY_CAP + 1);
+        assert!(unread.contains("was not read"), "{}", unread);
+    }
+
+    /// The handshake's read in `fetch_info` gets the same treatment as the `missing_objects` and
+    /// `upload_targets` parse-failure tests. It was the *least* covered of those three reads:
+    /// routing its parse failures through the composer left the entire crate suite green, because
+    /// every other `fetch_info` test drives either a refused connect or header-phase silence,
+    /// neither of which ever reaches the body read's error arm.
     ///
     /// The handshake is the first call any remote operation makes, so this is the guard a captive
     /// portal meets first: a `200` carrying an HTML sign-in page on `/v1/warehouse` must be

@@ -1340,6 +1340,7 @@ async fn the_http_edge_drives_a_staged_lift_over_s3_and_dynamodb_following_307s(
     assert!(canonical_url.contains(&format!("objects/{}", staged_hash)), "{}", canonical_url);
     let fetched = client.get(&canonical_url).send().await.expect("presigned GET");
     assert!(fetched.status().is_success(), "the presigned GET failed: {}", fetched.status());
+    #[allow(clippy::disallowed_methods)] // a test reading its own fixture object back
     let fetched = fetched.bytes().await.expect("read the object").to_vec();
     assert_eq!(fetched, staged_bytes, "the object fetched through the redirect is byte-identical");
 

@@ -346,7 +346,8 @@ thread_local! {
     /// `DirSyncFaultGuard`: records every taint file path it is asked to sync, in call order,
     /// and can be armed to fail for paths containing a given substring instead of touching the
     /// filesystem. Thread-local for the same reason as its `file_utils` counterpart — a taint
-    /// write always runs entirely on its caller's thread.
+    /// write always runs entirely on its caller's thread, with the same exception: a fetched
+    /// bundle's import runs on a blocking-pool thread, out of reach of a rig armed by the caller.
     static TAINT_WRITE_FAULT: std::cell::RefCell<TaintFaultState> =
         const { std::cell::RefCell::new(TaintFaultState { attempted: Vec::new(), fail_needle: None }) };
 }
