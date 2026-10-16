@@ -1332,7 +1332,7 @@ still good.
 
 Run `forklift heal` when a command keeps refusing with `durability_taint`. It repeats that
 same restage pass and, for whatever it still cannot resolve on its own, walks every pallet
-head, parked change, tag, staged file, and trust pin (the anchor's boundary, and every
+head, parked change, staged file, and trust pin (the anchor's boundary, and every
 revoked key's own distrust boundary) to work out whether the affected object is still
 needed by anything. If a remote is configured, `heal` also tries fetching from it itself, right
 here, before giving up on anything — you never need to run `lower` by hand for this (and it
@@ -1341,11 +1341,11 @@ refusal before ever reaching its own fetch):
 
 - **Nothing was actually lost, or what vanished is not needed by anything anymore** — `heal`
   clears the taint and reports what it restaged or dropped. Exit 0; go on with what you were
-  doing. A tag whose parcel is not in this store never holds a heal up: the parcel may never
+  doing. Tags are not part of that walk, so a tag never holds a heal up: its parcel may never
   have been fetched (a clone with `--only` still copies every tag) or may have been collected
   after an `undo` moved the history off it, and nothing could bring it back. `heal` names such a
-  tag in a `Note:` line and clears; so it does for a tag record synced in from elsewhere whose
-  subject is not a parcel at all. The same goes for a trust boundary naming a head this store
+  tag in a `Note:` line and clears, and likewise names a tag record synced in from elsewhere
+  whose subject is not a well-formed object hash. The same goes for a trust boundary naming a head this store
   never fetched. A lost parcel that a pallet's history still needs is reported as below, even if
   a tag also names it.
 - **Something is genuinely gone, and something still needs it** — `heal` reports exactly what,
@@ -1358,7 +1358,7 @@ refusal before ever reaching its own fetch):
   it named everything) — this is rare; it needs a second, unrelated crash on top of the original
   failure. `heal` no longer treats this as a dead end: it re-derives the full scope itself by
   checking every object actually present in the warehouse and re-walking every pallet head,
-  parked change, tag, staged file, and trust pin to see what is still needed, then records
+  parked change, staged file, and trust pin to see what is still needed, then records
   exactly what came out dangling. This can take noticeably longer than the ordinary case (it is
   checking the whole object store, not just the affected paths), and it prints progress as it
   goes. If nothing turns out to be missing, the taint clears — exit 0, same as any other clean

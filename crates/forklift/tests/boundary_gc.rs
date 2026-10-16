@@ -947,8 +947,8 @@ fn a_collected_cherry_pick_source_makes_the_completing_stack_fail_unattributed()
 /// cannot be told apart, and neither can ever be resolved. Before the fix, heal's walk rooted tag
 /// subjects at the ordinary reporting policy, so a torn taint's store-wide rescan named the
 /// absent subject as dangling and refused, with exit 21, on every command. There was no exit
-/// either: `tag` has no retire verb, and the refusal pointed back at `forklift heal`. Heal now
-/// walks tag subjects at `AbsencePolicy::Unrooted` (`recovery_utils::WalkRoots::tag_subjects`),
+/// either: `tag` has no retire verb, and the refusal pointed back at `forklift heal`. Heal no
+/// longer roots tags at all, exactly like gc (`recovery_utils::WalkRoots::tag_subjects`): it
 /// clears, and names the tag in a note.
 ///
 /// The taint is written directly rather than driven through a command because a torn taint is by
@@ -957,7 +957,8 @@ fn a_collected_cherry_pick_source_makes_the_completing_stack_fail_unattributed()
 /// command.
 ///
 /// Mutation: queue tag subjects at `AbsencePolicy::Report` in `walk_closure_for` → the rescan
-/// names the subject dangling → `heal` exits 21 → red at the first assertion.
+/// names the subject dangling → `heal` exits 21 → red at the first assertion. Dropping the
+/// tag-note loop in `heal_torn_taint` instead → red at the `Note:` assertion.
 #[test]
 fn a_torn_taint_over_an_absent_tag_subject_heals_and_names_the_tag() {
     let warehouse = Warehouse::new("torn");
@@ -1056,8 +1057,9 @@ fn a_torn_taint_over_an_absent_tag_subject_heals_and_names_the_tag() {
 /// subject. Heal checks that one hash against every root; only the tag names it, and a tag is not
 /// a gc root, so holding the taint open over it would wedge for nothing.
 ///
-/// Mutation: drop the `AbsencePolicy::Unrooted` exception to the targets-check in
-/// `drain_parcel_queue` → the subject counts as referenced → `heal` exits 21 → red.
+/// Mutation: queue tag subjects as roots in `walk_closure_for` → the subject counts as
+/// referenced → `heal` exits 21 → red. Dropping the tag-note loop on this targeted path
+/// (`resolve_the_rest`) instead → red at the `Note:` assertion.
 #[test]
 fn a_recorded_taint_over_a_collected_tag_subject_clears() {
     let warehouse = Warehouse::new("tag-target");
@@ -1090,6 +1092,11 @@ fn a_recorded_taint_over_a_collected_tag_subject_clears() {
         "a recorded taint over a hash only a tag names must clear; stderr: {}",
         String::from_utf8_lossy(&healed.stderr)
     );
+    let heal_out = String::from_utf8_lossy(&healed.stdout).to_string();
+    assert!(
+        heal_out.lines().any(|line| line.starts_with("Note: tag \"v1.0\"")),
+        "the targeted path must name the absent tag subject too; stdout: {}", heal_out
+    );
     warehouse.run_ok(&["stocktake"]);
 }
 
@@ -1100,9 +1107,8 @@ fn a_recorded_taint_over_a_collected_tag_subject_clears() {
 /// directly, as in the FORK-81 legs, so no canary is used). The rescan must still report it and
 /// refuse.
 ///
-/// Mutation: mark a gap-policy absence visited immediately in `drain_parcel_queue` → the tag's
-/// entry, dequeued before the head's parent edge, consumes the hash → nothing is reported →
-/// `heal` clears → red at the exit-code assertion.
+/// Mutation: the over-broad fix — have `enumerate_absent_reachable`'s sink drop any hash a tag
+/// names → nothing is reported → `heal` clears → red at the exit-code assertion.
 #[test]
 fn a_lost_tagged_parcel_that_is_also_an_ancestor_still_refuses() {
     let warehouse = Warehouse::new("torn-tag-ancestor");

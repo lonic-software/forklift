@@ -223,17 +223,6 @@ pub fn load_parcel(hash: &str) -> Result<Parcel, String> {
     }
 }
 
-/// [`load_parcel`] for a hash that may legitimately name some other kind of object: `Ok(None)`
-/// when the object parses but is not a parcel. A read or parse failure is still an `Err`.
-pub fn load_parcel_if_parcel(hash: &str) -> Result<Option<Parcel>, String> {
-    let bytes = read_parcel_bytes(hash)?;
-
-    match parser::object::loose_object_parser::parse(&bytes)? {
-        ParsedObject::Parcel(parcel) => Ok(Some(parcel)),
-        _ => Ok(None),
-    }
-}
-
 /// A bounded content-addressed cache of *parsed* trees, one layer above `file_utils`'s raw-bytes
 /// read cache. A tree's hash is its content and `parser::object::loose_object_parser::parse` is a
 /// pure function of the bytes (no environment, no randomness), so a hash-keyed parse is valid
