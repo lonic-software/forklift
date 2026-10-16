@@ -6436,4 +6436,252 @@ mod tests {
 
         std::fs::remove_dir_all(&temp).ok();
     }
+
+    /// The pack set this process has cached for the active warehouse (panics if none is cached).
+    fn cached_pack_set() -> Arc<PackSet> {
+        Arc::clone(registry().lock().expect("registry lock").get(&file_utils::get_path_objects_root())
+            .expect("a pack set is cached for this warehouse"))
+    }
+
+    /// A fresh, empty warehouse root for one test.
+    fn fresh_root(name: &str) -> PathBuf {
+        let temp = std::env::temp_dir().join(format!("forklift-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        temp
+    }
+
+    /// Publish one pack holding `content` into the active warehouse's pack folder, as another
+    /// process would — no `invalidate_cache()`. Returns the object's hash and the pair's paths.
+    fn publish_external_pack(content: &[u8]) -> (String, TransportPackArtifact) {
+        let hash = blake3::hash(content).to_hex().to_string();
+        let mut builder = TransportPackBuilder::new(&pack_folder()).unwrap();
+        builder.append_full(&hash, content).unwrap();
+        let mut artifacts = builder.finish().unwrap();
+        assert_eq!(artifacts.len(), 1, "test fixture expects exactly one pack pair");
+        (hash, artifacts.remove(0))
+    }
+
+    /// FORK-106: prefix resolution sees a pack published after this process cached its set — the
+    /// same staleness the presence check had, on the `find_hashes_with_prefix` path (which never
+    /// misses in the lookup sense, so it revalidates before every scan).
+    ///
+    /// Revert: drop the `reloaded_if_stale` call from `find_hashes_with_prefix` → the second
+    /// lookup scans the stale (empty) set and returns nothing → red.
+    #[test]
+    fn prefix_resolution_sees_a_pack_published_after_caching() {
+        let temp = fresh_root("prefix-after-caching");
+        let _scope = StorageRootScope::enter(&temp);
+
+        let content = b"an object whose short hash is resolved after an external compact".to_vec();
+        let hash = blake3::hash(&content).to_hex().to_string();
+        let prefix = &hash[..12];
+
+        assert!(find_hashes_with_prefix(prefix).unwrap().is_empty(), "sanity: nothing matches yet, and the set is cached");
+        publish_external_pack(&content);
+
+        assert_eq!(find_hashes_with_prefix(prefix).unwrap(), vec![hash.clone()],
+            "a pack published after caching must be seen by prefix resolution");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// FORK-106, the racy half of the folder check: a publish that leaves the folder's mtime equal
+    /// to the stamped one (a coarse-mtime filesystem, two changes in one tick) is still caught,
+    /// because a stamp taken within the granularity margin compares the folder's names.
+    ///
+    /// Fixture: cache the set, publish a pack, then set the folder's mtime back to exactly the
+    /// stamped value — so only the name compare can notice.
+    ///
+    /// Revert: make `StampTimes::is_racy` return `false` → an equal mtime is trusted, the miss
+    /// reports absent → red.
+    #[cfg(unix)]
+    #[test]
+    fn a_publish_hidden_under_an_equal_folder_mtime_is_caught_by_the_name_compare() {
+        let temp = fresh_root("racy-name-compare");
+        let _scope = StorageRootScope::enter(&temp);
+        std::fs::create_dir_all(pack_folder()).unwrap();
+
+        let content = b"published within the same mtime tick as the stamp".to_vec();
+        let hash = blake3::hash(&content).to_hex().to_string();
+
+        assert!(!is_in_packs(&hash).unwrap(), "sanity: absent, and the set is cached");
+        let stamped = cached_pack_set().stamp.times.lock().unwrap().modified
+            .expect("the pack folder existed when the set was stamped")
+            .expect("this platform reports directory mtimes");
+        assert!(cached_pack_set().stamp.times.lock().unwrap().is_racy(), "sanity: a just-taken stamp is racy");
+
+        publish_external_pack(&content);
+        std::fs::File::open(pack_folder()).unwrap().set_modified(stamped).unwrap();
+        assert_eq!(std::fs::metadata(pack_folder()).unwrap().modified().unwrap(), stamped,
+            "sanity: the folder's mtime is back at the stamped value");
+
+        assert!(is_in_packs(&hash).unwrap(), "the name compare must catch a publish the mtime hides");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// FORK-106, the `open`-failure kind: a pack whose data file could not be opened (here,
+    /// permissions) is retried on the next miss once it opens, even though neither file's stamp
+    /// changed — a `chmod` moves neither length, mtime nor inode.
+    ///
+    /// Revert: classify every `open` failure as `FailureKind::Fixed` (or make
+    /// `broken_pair_changed` return `false` for `Open`) → the pair stays quarantined until the
+    /// process restarts, the second presence check says absent → red.
+    #[cfg(unix)]
+    #[test]
+    fn a_pack_whose_data_could_not_be_opened_is_retried_once_it_opens() {
+        use std::os::unix::fs::PermissionsExt;
+        use crate::util::file_utils::StoreReadOutcome;
+
+        let temp = fresh_root("open-failure-retry");
+        let _scope = StorageRootScope::enter(&temp);
+
+        let (hash, artifact) = publish_external_pack(b"a pack whose data file is briefly unreadable");
+        let readable = std::fs::metadata(&artifact.data_path).unwrap().permissions();
+        std::fs::set_permissions(&artifact.data_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&artifact.data_path).is_ok() {
+            // Running as root: permissions cannot make the open fail, so there is nothing to test.
+            std::fs::set_permissions(&artifact.data_path, readable).unwrap();
+            std::fs::remove_dir_all(&temp).ok();
+            return;
+        }
+
+        invalidate_cache();
+        match file_utils::read_object_classified(&hash).unwrap() {
+            StoreReadOutcome::Unverifiable(_) => {}
+            StoreReadOutcome::Verified(_) => panic!("an unopenable pack must not read Verified"),
+            StoreReadOutcome::Absent => panic!("a quarantine-named hash must read Unverifiable, not Absent"),
+        }
+        let cached = cached_pack_set();
+        assert_eq!(cached.quarantined.len(), 1, "sanity: the pair is quarantined");
+        assert_eq!(cached.quarantined[0].failure, FailureKind::Open, "sanity: as an open failure");
+
+        std::fs::set_permissions(&artifact.data_path, readable).unwrap();
+        assert!(is_in_packs(&hash).unwrap(), "once the data file opens, the next miss must find the object");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// FORK-106, the retry rule per failure kind, on unchanged files: a post-`open` I/O failure is
+    /// retried only once `IO_FAILURE_RETRY_INTERVAL` has passed since it was attempted; a fixed
+    /// failure never; an `open` failure as soon as both files open.
+    ///
+    /// Revert: retry `Io` on every miss (drop the interval) → the fresh-attempt assertion goes red;
+    /// never retry it → the aged-attempt assertion goes red.
+    #[test]
+    fn each_failure_kind_is_retried_on_its_own_schedule() {
+        let temp = fresh_root("failure-kind-schedule");
+        let _scope = StorageRootScope::enter(&temp);
+
+        let (_, artifact) = publish_external_pack(b"a healthy pair standing in for a broken one");
+        let stamp = pair_stamp(&artifact.index_path);
+        let now = Instant::now();
+        let aged = now.checked_sub(IO_FAILURE_RETRY_INTERVAL + Duration::from_secs(1))
+            .expect("the monotonic clock is past the retry interval");
+
+        assert!(!broken_pair_changed(&artifact.index_path, &stamp, FailureKind::Io, now),
+            "an I/O failure just attempted must not be retried yet");
+        assert!(broken_pair_changed(&artifact.index_path, &stamp, FailureKind::Io, aged),
+            "an I/O failure attempted longer ago than the interval must be retried");
+        assert!(!broken_pair_changed(&artifact.index_path, &stamp, FailureKind::Fixed, aged),
+            "a fixed failure on unchanged files is never retried");
+        assert!(broken_pair_changed(&artifact.index_path, &stamp, FailureKind::Open, now),
+            "an open failure is retried as soon as both files open");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// FORK-106: a change to a broken pair's own files is seen even when the folder's names and
+    /// mtime do not move. Fixture: pack B's data is gone and its index corrupt (unenumerable, so a
+    /// read of Y is `Absent`); the index is then repaired *in place* — same name, same inode, no
+    /// folder entry created — while the data stays missing. Y is now named by a quarantined index,
+    /// so its read must turn `Unverifiable`, not stay `Absent`.
+    ///
+    /// Revert: drop the broken-entries loop from `pack_set_is_current` → the folder check alone
+    /// finds the set current, Y stays `Absent` → red.
+    #[test]
+    fn an_index_repaired_in_place_turns_an_absent_read_unverifiable() {
+        use crate::util::file_utils::StoreReadOutcome;
+
+        let temp = fresh_root("repaired-in-place");
+        let _scope = StorageRootScope::enter(&temp);
+
+        let (y_hash, artifact) = publish_external_pack(b"named by an index that is corrupt, then repaired");
+        std::fs::remove_file(&artifact.data_path).unwrap();
+        let good_index = std::fs::read(&artifact.index_path).unwrap();
+        let mut corrupt = good_index.clone();
+        corrupt[0..8].copy_from_slice(b"NOTAPACK");
+        std::fs::write(&artifact.index_path, &corrupt).unwrap();
+
+        invalidate_cache();
+        assert!(matches!(file_utils::read_object_classified(&y_hash).unwrap(), StoreReadOutcome::Absent),
+            "sanity: an unenumerable index is inert, so Y reads Absent");
+        assert_eq!(cached_pack_set().unenumerable.len(), 1, "sanity: B is unenumerable");
+
+        // Let the rewrite land on a later mtime than the stamp recorded.
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&artifact.index_path, &good_index).unwrap();
+
+        match file_utils::read_object_classified(&y_hash).unwrap() {
+            StoreReadOutcome::Unverifiable(_) => {}
+            StoreReadOutcome::Absent => panic!("a repaired index naming Y must turn its read Unverifiable, not leave it Absent"),
+            StoreReadOutcome::Verified(_) => panic!("Y's data is missing; it must not read Verified"),
+        }
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// FORK-106, the cost half: a fixed-state broken pair (an orphaned index) whose files do not
+    /// change does not make every miss reload the pack set — the cached set survives repeated
+    /// misses.
+    ///
+    /// Revert: make `broken_pair_changed` return `true` for `FailureKind::Fixed` → every miss
+    /// reloads and replaces the cached set → red.
+    #[test]
+    fn an_unchanged_orphaned_index_does_not_reload_on_every_miss() {
+        let temp = fresh_root("orphan-no-reload");
+        let _scope = StorageRootScope::enter(&temp);
+
+        let (_, artifact) = publish_external_pack(b"an orphaned index that stays orphaned");
+        std::fs::remove_file(&artifact.data_path).unwrap();
+
+        invalidate_cache();
+        let never_stored = "7".repeat(64);
+        assert!(!is_in_packs(&never_stored).unwrap(), "sanity: absent");
+        let first = cached_pack_set();
+        assert_eq!(first.quarantined.len(), 1, "sanity: the orphan is quarantined");
+        assert_eq!(first.quarantined[0].failure, FailureKind::Fixed, "sanity: as a fixed failure");
+
+        for _ in 0..3 {
+            assert!(!is_in_packs(&never_stored).unwrap());
+        }
+        assert!(Arc::ptr_eq(&first, &cached_pack_set()), "an unchanged orphan must not reload the set on a miss");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// FORK-149: a full repack is serve-exclusive — refused while the serve lock is held (a live
+    /// server on this root, or a gc), with an error that says why; incremental compaction drops
+    /// nothing and still runs.
+    ///
+    /// Revert: drop the serve-lock acquire from `compact` → the repack runs beside the "server"
+    /// → red.
+    #[test]
+    fn a_repack_refuses_while_the_root_is_served_but_incremental_compaction_runs() {
+        let temp = fresh_root("repack-serve-lock");
+        let _scope = StorageRootScope::enter(&temp);
+
+        let content = b"content packed beside a live server".to_vec();
+        store_loose(&blake3::hash(&content).to_hex().to_string(), &content);
+
+        let served = lock_utils::ServeLock::acquire().expect("hold the serve lock, as a live server does");
+        let error = compact(true, false, &Progress::NONE).expect_err("a repack must refuse while the root is served");
+        assert!(error.contains("being served"), "the refusal should say the root is served: {}", error);
+        assert!(compact(false, false, &Progress::NONE).is_ok(), "incremental compaction runs beside a server");
+        drop(served);
+        assert!(compact(true, false, &Progress::NONE).is_ok(), "a repack runs once the root is no longer served");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
 }
