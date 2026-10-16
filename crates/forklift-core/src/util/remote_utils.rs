@@ -2859,8 +2859,8 @@ impl RemoteClient {
 
     /// The actual error-body-read bound to arm for *this* client instance — folds this
     /// instance's own `connect_timeout` into [`error_body_read_budget`]'s arithmetic. Split out as
-    /// its own `&self` method, rather than inlining the call to the free function at the one call
-    /// site, so a test can pin that the right instance field is actually read: not just read from
+    /// its own `&self` method, rather than inlining the call to the free function at its call sites
+    /// (`error_of` and `commit_lift`), so a test can pin that the right instance field is actually read: not just read from
     /// *some* client (every behavioral test of [`Self::error_of`] necessarily uses a direct
     /// client, so none of them distinguishes "reads `self.budgets.connect`" from "hardcodes the
     /// direct 5s constant", and a `TorMode::On` fixture has the identical problem one level up, at
@@ -2874,9 +2874,9 @@ impl RemoteClient {
     /// Turn a non-success response into the client-facing error, threading the server's refusal
     /// code (§7.4) through the taxonomy when the body carries one. The body read is bounded by
     /// [`Self::error_body_budget`] (so this instance's own `connect_timeout` is folded in) — see
-    /// that method's and [`error_body_read_budget`]'s docs for why this call in particular needs
-    /// its own bound rather than inheriting one from whichever client sent the request, and why
-    /// the flat [`ERROR_BODY_READ_TIMEOUT`] alone is not it.
+    /// that method's and [`error_body_read_budget`]'s docs for why an error-body read needs its
+    /// own bound rather than inheriting one from whichever client sent the request, and why the
+    /// flat [`ERROR_BODY_READ_TIMEOUT`] alone is not it.
     async fn error_of(&self, response: reqwest::Response, action: &str) -> String {
         let status = response.status();
         let body = read_error_body(response, self.error_body_budget()).await;
@@ -10218,8 +10218,8 @@ mod tests {
     // auto-following client (`Posture::UnboundedFollowsRedirects`, which `missing_objects` rides)
     // carries only a `connect_timeout`, no `read_timeout` at all — so a remote that delivers a
     // full status line and headers and then wedges before writing the body hangs the caller
-    // forever. `ERROR_BODY_READ_TIMEOUT` bounds the read itself, in `read_error_body`, rather than
-    // trying to fix it with yet another client — no client can help here, since the body-read
+    // forever. The caller's `error_body_budget` bounds the read itself, in `read_error_body`,
+    // rather than trying to fix it with yet another client — no client can help here, since the body-read
     // bound is inherited from whichever client sent the request, and `error_of` serves responses
     // from all of them. `commit_lift` reads its refusals under the same budget; only its wait for
     // the response itself stays unbounded, under FORK-91.
@@ -10230,8 +10230,8 @@ mod tests {
     /// stays open (no FIN), so anything reading the body is left waiting on bytes that never
     /// arrive. Distinct from [`SilentRemote`] (silent *before* the status line even arrives) and
     /// [`LyingContentLengthRemote`] (a `2xx` success path): this is specifically the shape
-    /// [`ERROR_BODY_READ_TIMEOUT`] exists for — status and headers fully delivered, only the
-    /// error body itself left hanging.
+    /// [`RemoteClient::error_body_budget`] exists for — status and headers fully delivered, only
+    /// the error body itself left hanging.
     struct SilentErrorBodyRemote {
         url: String,
         _park: std::sync::mpsc::Sender<()>,
@@ -10281,7 +10281,7 @@ mod tests {
     /// Before this call had its own outer deadline at all, it rode the auto-following client with
     /// no bound of any kind — a `500` whose body then wedges hung it forever, with the status line
     /// and headers already fully delivered. The outer test-ceiling below is a safety net, not the
-    /// property under test: if the wrapper in `error_of` were missing, that ceiling is what would
+    /// property under test: if the bound in `read_error_body` were missing, that ceiling is what would
     /// trip (the test failing instead of hanging the suite) — unambiguous evidence the internal
     /// bound is gone, since status line and headers were fully delivered before the park, so the
     /// only thing left to hang on is the error-body read itself.
@@ -10307,25 +10307,6 @@ mod tests {
     /// that the value at the one client mode that actually ships a non-default budget is the
     /// correct, uncapped 70s (the field-read property alone does not imply this one: a future cap
     /// on the result would leave it unaffected while breaking this).
-    /// A lift commit's refusal whose body stalls fails as a terminal error within the error-body
-    /// budget instead of hanging the lift: the auto-following client it rides has no read
-    /// timeout, so nothing else would end the wait.
-    #[test]
-    fn commit_lift_bounds_the_error_body_read_after_a_wedged_500() {
-        let remote = SilentErrorBodyRemote::start();
-        let client = fast_client(&remote.url);
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        let started = std::time::Instant::now();
-
-        let message = match runtime.block_on(client.commit_lift("session", &[], &[], false)) {
-            Err(message) => message,
-            Ok(_) => panic!("a 500 is refused"),
-        };
-        assert!(message.contains("(500)"), "{}", message);
-        assert!(started.elapsed() < std::time::Duration::from_secs(30),
-            "the stalled body must not hold the lift: {:?}", started.elapsed());
-    }
-
     #[test]
     fn missing_objects_bounds_the_error_body_read_after_a_wedged_500() {
         let remote = SilentErrorBodyRemote::start();
@@ -10407,6 +10388,35 @@ mod tests {
             "on a timed-out/unparseable body, must fall back to the canonical reason — the same \
             fallback already used for a parse failure: {}", error
         );
+    }
+
+    /// A lift commit's refusal whose body stalls fails as a terminal error under the same
+    /// error-body budget instead of hanging the lift: the auto-following client it rides has no
+    /// read timeout, so nothing else would end the wait. Bracketed like the `missing_objects` test
+    /// above — at least the injected budget (so it is this instance's budget that fired, not some
+    /// shorter constant), under an outer ceiling (so a lost bound fails rather than hangs) — and
+    /// the message is the status reason that stands in for an unread body.
+    #[test]
+    fn commit_lift_bounds_the_error_body_read_after_a_wedged_500() {
+        let remote = SilentErrorBodyRemote::start();
+        let client = fast_client(&remote.url);
+        let lower_bound = FAST.connect + FAST.error_body_read;
+        let outer_ceiling = lower_bound + std::time::Duration::from_secs(10);
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let started = std::time::Instant::now();
+
+        let outcome = runtime.block_on(async {
+            tokio::time::timeout(outer_ceiling, client.commit_lift("session", &[], &[], false)).await
+        });
+        let elapsed = started.elapsed();
+
+        let message = match outcome {
+            Ok(Err(message)) => message,
+            Ok(Ok(_)) => panic!("a 500 is refused"),
+            Err(_) => panic!("the stalled body held the lift past {:?}: its read is unbounded", outer_ceiling),
+        };
+        assert!(message.contains("(500): Internal Server Error"), "the status stands in for the body: {}", message);
+        assert!(elapsed >= lower_bound, "the error-body budget fired early ({:?} < {:?})", elapsed, lower_bound);
     }
 
     /// A Tor-mode fixture (this test's predecessor,
