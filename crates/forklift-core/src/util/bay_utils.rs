@@ -234,8 +234,7 @@ pub struct BayScopeOutcome {
 /// new bay-local ref source to only one copy of a duplicated loop would silently break that
 /// superset relationship — a live object in one recovery/gc pair but not the other, and quiet
 /// data loss (`heal` clearing a taint over an object `gc` still refuses to delete, or `gc`
-/// deleting an object `heal` would have called live). Recovery additionally adds every tag's
-/// subject (a source gc deliberately does not root); both additionally add every bay's staged
+/// deleting an object `heal` would have called live). Both additionally add every bay's staged
 /// inventory shard leaves (FORK-156) and the shared trust-pin roots (`adopts`, the enrollment
 /// `boundary` snapshot, and every key's revocation `distrust_boundary` — FORK-81), via
 /// `recovery_utils::gc_root_sources`. Neither of those is part of this helper — only the portion

@@ -46,7 +46,9 @@
 //! `an_absent_interior_ancestor_behind_a_present_boundary_head_is_named_not_accused_of_tampering`,
 //! `a_genuinely_pre_trust_side_pallet_parcel_behind_an_absent_boundary_head_refuses_instead_of_accusing`,
 //! `the_accusation_still_fires_with_no_gap_at_all` and
-//! `a_lost_tagged_parcel_that_is_also_an_ancestor_still_refuses`.
+//! `a_lost_tagged_parcel_that_is_also_an_ancestor_still_refuses`. FORK-83's
+//! `a_torn_taint_heals_over_a_malformed_tag_record_and_notes_it` sits outside it too: it writes a
+//! malformed tag record directly and collects nothing.
 
 use std::path::PathBuf;
 use std::process::Output;
@@ -1098,6 +1100,71 @@ fn a_recorded_taint_over_a_collected_tag_subject_clears() {
         "the targeted path must name the absent tag subject too; stdout: {}", heal_out
     );
     warehouse.run_ok(&["stocktake"]);
+}
+
+/// A tag history that cannot be read at all never wedges either. A `@tags` record syncs in
+/// unvalidated, so a foreign client can publish one `parse_tag` rejects; tags feed heal's notes
+/// only, so heal notes the failed read and clears rather than aborting its walk. The malformed
+/// record is built directly because no shipped command writes one.
+///
+/// Mutation: propagate the `read_tags` error in `collect_walk_roots` → the rescan aborts →
+/// `heal` exits 21 → red at the exit-code assertion. Dropping the `tags_unread` note on the
+/// torn path → red at the `Note:` assertion.
+#[test]
+fn a_torn_taint_heals_over_a_malformed_tag_record_and_notes_it() {
+    use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
+    use forklift_core::enums::dir_entry_type::DirEntryType;
+    use forklift_core::model::blob::Blob;
+    use forklift_core::model::parcel::Parcel;
+    use forklift_core::model::tree_item::TreeItem;
+    use forklift_core::util::{pallet_utils, tag_utils};
+
+    let warehouse = Warehouse::new("tag-malformed");
+
+    let head = warehouse.stack("app.txt", "v1\n", "first");
+    warehouse.run_ok(&["tag", "create", "v1.0", &head, "-m", "release"]);
+
+    warehouse.scoped(|| {
+        let mut blob = LooseObjectBuilder::build_blob(&Blob { content: b"name = \"bad\"\n".to_vec() });
+        blob.store().unwrap();
+        let mut node = TreeItem::new("bad.toml".to_string(), blob.hash.clone(), DirEntryType::Normal);
+        for name in ["tags", "tracked", ".forklift", ""] {
+            let mut tree = TreeItem::new(name.to_string(), String::new(), DirEntryType::Tree);
+            tree.add_child(node);
+            let mut object = LooseObjectBuilder::build_tree(&tree);
+            object.store().unwrap();
+            tree.hash = object.hash.clone();
+            node = tree;
+        }
+        let parent = pallet_utils::get_meta_pallet_head(tag_utils::TAGS_PALLET_NAME).unwrap().unwrap();
+        let mut parcel = LooseObjectBuilder::build_parcel(&Parcel {
+            tree_hash: node.hash.clone(), parents: vec![parent], actions: Vec::new(), description: None,
+        });
+        parcel.store().unwrap();
+        pallet_utils::set_meta_pallet_head(tag_utils::TAGS_PALLET_NAME, &parcel.hash).unwrap();
+        assert!(tag_utils::read_tags().is_err(), "the fixture needs an unreadable tag history");
+    });
+
+    let taint_dir = warehouse.root.join(".forklift").join("taint");
+    std::fs::create_dir_all(&taint_dir).unwrap();
+    std::fs::write(taint_dir.join("taint-99999-0"), b"objects/ab/cdef\n").unwrap();
+
+    let healed = warehouse.run(&["heal"]);
+    let heal_out = String::from_utf8_lossy(&healed.stdout).to_string();
+    let heal_err = String::from_utf8_lossy(&healed.stderr).to_string();
+    println!(
+        "TAG-MALFORMED: `heal` exit = {:?}\n  stdout: {}\n  stderr: {}",
+        healed.status.code(), heal_out.trim(), heal_err.trim()
+    );
+    assert!(
+        healed.status.success(),
+        "an unreadable tag history must not abort heal; got {:?}, stderr: {}",
+        healed.status.code(), heal_err
+    );
+    assert!(
+        heal_out.lines().any(|line| line.starts_with("Note: the tags could not be read")),
+        "heal must say the tags went unchecked; stdout: {}", heal_out
+    );
 }
 
 /// The other direction: the tag's policy must not swallow a genuine loss.

@@ -831,6 +831,9 @@ async fn resolve_the_rest(
     for (name, subject, gap) in &walk.never_held_tags {
         notes.push(never_held_tag_note(name, subject, gap));
     }
+    if let Some(error) = &walk.tags_unread {
+        notes.push(tags_unread_note(error));
+    }
     // Any source `collect_walk_roots` had to skip can *never* reach here with `remainder`
     // empty — `roots_incomplete` above forces every hash the walk could not positively clear into
     // `remainder`, so a non-empty `walk.degraded_sources` always implies a non-empty `remainder`,
@@ -875,8 +878,19 @@ fn never_held_pin_note(hash: &str) -> String {
     )
 }
 
-/// Plain-language note for a tag whose subject [`walk_closure_for`] found is not held here
-/// (FORK-83) — see [`WalkRoots::tag_subjects`] for why that never blocks clearing.
+/// Plain-language note for a tag read that failed (FORK-83) — see [`WalkRoots::tags_unread`].
+/// The error can quote a synced `@tags` record, so it is sanitized.
+fn tags_unread_note(error: &str) -> String {
+    format!(
+        "the tags could not be read this run ({}), so none of them was checked. It does not \
+        block this heal: tags never keep an object alive.",
+        crate::error::sanitize(error)
+    )
+}
+
+/// Plain-language note for a tag whose subject [`walk_closure_for`] found absent, could not
+/// probe, or never looked up because it is not canonical (FORK-83) — see
+/// [`WalkRoots::tag_subjects`] for why that never blocks clearing.
 /// Both strings come from a `@tags` record, which syncs in unvalidated, so they are sanitized.
 fn never_held_tag_note(name: &str, subject: &str, gap: &TagGap) -> String {
     let (name, subject) = (crate::error::sanitize(name), crate::error::sanitize(subject));
@@ -1087,6 +1101,9 @@ fn rescan_torn_taint(
         for (name, subject, gap) in &walk.never_held_tags {
             notes.push(never_held_tag_note(name, subject, gap));
         }
+        if let Some(error) = &walk.tags_unread {
+            notes.push(tags_unread_note(error));
+        }
 
         Ok(HealOutcome {
             was_tainted: true,
@@ -1285,6 +1302,11 @@ struct WalkRoots {
     /// [`walk_closure_for`] can name an absent or non-canonical subject in a note
     /// ([`WalkClosureOutcome::never_held_tags`]).
     tag_subjects: Vec<(String, String)>,
+    /// Why the tags could not be read, if they could not (FORK-83). Tags feed notes only, so a
+    /// malformed synced `@tags` record must never abort heal: it leaves `tag_subjects` empty and
+    /// becomes a note. A lost object in the `@tags` history is still reported, because the
+    /// `@tags` pallet head is an ordinary root the walk itself descends.
+    tags_unread: Option<String>,
     /// Every trust-pin root — the trust anchor's adopted head, its enrollment boundary, and every
     /// key's revocation distrust boundary — paired with its own
     /// [`office_utils::PinAbsencePolicy`] (see [`office_utils::collect_trust_pin_roots`]), walked
@@ -1476,14 +1498,15 @@ fn collect_walk_roots() -> Result<WalkRoots, String> {
     )?;
 
     // Tags are read for notes only, never walked — see `WalkRoots::tag_subjects`.
-    let tag_subjects = tag_utils::read_tags()?
-        .into_iter()
-        .map(|tag| (tag.tag.name, tag.tag.subject))
-        .collect();
+    let (tag_subjects, tags_unread) = match tag_utils::read_tags() {
+        Ok(tags) => (tags.into_iter().map(|tag| (tag.tag.name, tag.tag.subject)).collect(), None),
+        Err(error) => (Vec::new(), Some(error)),
+    };
 
     Ok(WalkRoots {
         parcels: sources.parcels,
         tag_subjects,
+        tags_unread,
         pin_parcels: sources.pin_parcels,
         shard_referenced: sources.shard_leaves,
         degraded_sources: sources.degraded,
@@ -1567,10 +1590,13 @@ pub(crate) struct ClosureWalkResult {
     /// pipeline that actually knows about it. Callers fold this into [`HealOutcome::notes`] on
     /// their `Ok` path only — see [`never_held_pin_note`].
     pub never_held_pins: BTreeSet<String>,
-    /// Every tag `(name, subject, why)` whose subject this run confirmed is not a parcel held
-    /// here, and that no genuine ancestry edge resolved (FORK-83). Never blocking, folded into
-    /// notes on the `Ok` path only — see [`never_held_tag_note`].
+    /// Every tag `(name, subject, why)` that no genuine root reached and whose subject this run
+    /// found absent, could not probe, or did not look up because it is not canonical — see
+    /// [`TagGap`]; a present subject is never listed (FORK-83). Never blocking, folded into notes
+    /// on the `Ok` path only — see [`never_held_tag_note`].
     pub never_held_tags: Vec<(String, String, TagGap)>,
+    /// [`WalkRoots::tags_unread`], carried through to a note — see [`tags_unread_note`].
+    pub tags_unread: Option<String>,
 }
 
 /// Walk every durable ref source's closure looking for `targets`, returning the subset actually
@@ -1585,7 +1611,7 @@ pub(crate) fn closure_references_any(targets: &BTreeSet<String>) -> Result<Closu
     if targets.is_empty() {
         return Ok(ClosureWalkResult {
             hashes: BTreeSet::new(), degraded_sources: Vec::new(), never_held_pins: BTreeSet::new(),
-            never_held_tags: Vec::new(),
+            never_held_tags: Vec::new(), tags_unread: None,
         });
     }
 
@@ -1602,6 +1628,7 @@ pub(crate) fn closure_references_any(targets: &BTreeSet<String>) -> Result<Closu
         degraded_sources: roots.degraded_sources,
         never_held_pins: outcome.never_held_pins,
         never_held_tags: outcome.never_held_tags,
+        tags_unread: roots.tags_unread,
     })
 }
 
@@ -1646,6 +1673,7 @@ pub(crate) fn enumerate_absent_reachable(corrupt: &BTreeSet<String>) -> Result<C
         degraded_sources: roots.degraded_sources,
         never_held_pins: outcome.never_held_pins,
         never_held_tags: outcome.never_held_tags,
+        tags_unread: roots.tags_unread,
     })
 }
 
@@ -2383,7 +2411,7 @@ fn walk_failure_refusal(root: &Path, error: &str) -> CoreError {
             not be determined.",
             taint_utils::GATE_TAINT_MARKER, root.to_string_lossy(), error
         ),
-        "Check that every pallet head, parked parcel, tag and staged inventory shard is itself \
+        "Check that every pallet head, parked parcel and staged inventory shard is itself \
         readable, then run \"forklift heal\" again.",
     )
 }
@@ -2564,8 +2592,8 @@ mod tests {
         let live = crate::util::gc_utils::collect_live_set().unwrap();
         assert!(!live.contains(&target_hash),
             "gc's own live set must also exclude a target only reachable through an absent \
-            subtree boundary — heal's root set is a superset of gc's, so anything heal's \
-            tolerant walk calls unreferenced must be unreferenced under gc's smaller root set too");
+            subtree boundary — heal's root set is gc's own, so anything heal's tolerant walk \
+            calls unreferenced must be unreferenced under gc's live set too");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3901,6 +3929,7 @@ mod tests {
                 ("bad".to_string(), "not-hex".to_string()),
                 ("upper".to_string(), upper.clone()),
             ],
+            tags_unread: None,
             pin_parcels: Vec::new(),
             shard_referenced: Vec::new(),
             degraded_sources: Vec::new(),
@@ -3933,6 +3962,8 @@ mod tests {
         let note = never_held_tag_note("bad\nname", "\x1b[2Kx", &TagGap::NotCanonical);
         assert!(note.contains("canonical form"));
         assert!(!note.chars().any(|c| c.is_control()), "synced strings must be sanitized: {:?}", note);
+        let note = tags_unread_note("bad \x1b[2K record");
+        assert!(!note.chars().any(|c| c.is_control()), "a quoted record must be sanitized: {:?}", note);
 
         std::fs::remove_dir_all(&root).ok();
     }

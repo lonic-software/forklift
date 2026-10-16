@@ -1341,11 +1341,13 @@ refusal before ever reaching its own fetch):
 
 - **Nothing was actually lost, or what vanished is not needed by anything anymore** — `heal`
   clears the taint and reports what it restaged or dropped. Exit 0; go on with what you were
-  doing. Tags are not part of that walk, so a tag never holds a heal up: its parcel may never
+  doing. Tags are not part of that walk, so a tag never holds a heal up, and neither does
+  anything only a tag reaches. A tagged parcel may never
   have been fetched (a clone with `--only` still copies every tag) or may have been collected
   after an `undo` moved the history off it, and nothing could bring it back. `heal` names such a
   tag in a `Note:` line and clears, and likewise names a tag record synced in from elsewhere
-  whose subject is not a well-formed object hash. The same goes for a trust boundary naming a head this store
+  whose subject is not a well-formed object hash, or notes that the tags could not be read at
+  all. The same goes for a trust boundary naming a head this store
   never fetched. A lost parcel that a pallet's history still needs is reported as below, even if
   a tag also names it.
 - **Something is genuinely gone, and something still needs it** — `heal` reports exactly what,
