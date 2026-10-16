@@ -36,7 +36,7 @@ use forklift_core::model::remote::{
 use forklift_core::util::office_utils::OFFICE_PALLET_NAME;
 use forklift_core::util::lock_utils::ServeLock;
 use forklift_core::util::{
-    audit_utils, bundle_utils, file_utils, hook_utils, merge_utils, object_utils,
+    audit_utils, body_utils, bundle_utils, file_utils, hook_utils, merge_utils, object_utils,
     office_utils, pallet_utils, sign_utils, tree_utils, warehouse_utils,
 };
 use subtle::ConstantTimeEq;
@@ -271,6 +271,11 @@ pub struct ServeOptions {
     /// an absent or malformed setting.
     pub open: bool,
 }
+
+/// Per-identifier allowance in a resolution hook's answer: the identifier and the name it resolves
+/// to. The authentication and admission hooks answer a fixed-size verdict and are capped at
+/// [`body_utils::SMALL_BODY_CAP`].
+const RESOLUTION_ANSWER_BYTES_PER_IDENTIFIER: u64 = 4 * 1024;
 
 /// The flat request timeout this head arms on the `reqwest::Client` it calls every hook
 /// through ([`build_hook_client`] builds from this constant and takes no figure of its own).
@@ -951,8 +956,10 @@ async fn authenticate_via_hook(state: &AppState,
         ));
     }
 
-    let answer: AuthenticationHookResponse = response.json().await.map_err(|e| {
-        tracing::warn!(error = %e, "the authentication hook answered malformed JSON");
+    let answer: AuthenticationHookResponse = body_utils::read_json_capped(
+        response, body_utils::SMALL_BODY_CAP
+    ).await.map_err(|e| {
+        tracing::warn!(error = ?e, "the authentication hook's answer is unreadable, oversized or malformed");
 
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1052,8 +1059,10 @@ async fn check_admission(state: &AppState,
         ));
     }
 
-    let verdict: AdmissionHookResponse = response.json().await.map_err(|e| {
-        tracing::warn!(error = %e, "the admission hook answered malformed JSON");
+    let verdict: AdmissionHookResponse = body_utils::read_json_capped(
+        response, body_utils::SMALL_BODY_CAP
+    ).await.map_err(|e| {
+        tracing::warn!(error = ?e, "the admission hook's answer is unreadable, oversized or malformed");
 
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2305,11 +2314,16 @@ async fn post_resolve(State(state): State<Arc<AppState>>,
         _ => None,
     };
 
+    // Each identifier's resolved name plus its key, with the envelope on top: what a directory
+    // can legitimately answer for this many identifiers.
+    let answer_cap = (request.identifiers.len() as u64)
+        .saturating_mul(RESOLUTION_ANSWER_BYTES_PER_IDENTIFIER)
+        .saturating_add(body_utils::SMALL_BODY_CAP);
     let hook_request = ResolutionHookRequest { caller, identifiers: request.identifiers };
 
     let names = match post_hook(&state, hook, "resolution", &hook_request).await {
         Ok(response) if response.status().is_success() => {
-            response.json::<ResolutionHookResponse>().await
+            body_utils::read_json_capped::<ResolutionHookResponse>(response, answer_cap).await
                 .map(|answer| answer.names)
                 .unwrap_or_default()
         }

@@ -86,7 +86,7 @@ pub struct BuildStats {
 }
 
 /// What a bundle import actually stored (records already present are skipped).
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct ImportStats {
     pub stored_objects: usize,
     pub stored_signatures: usize,
@@ -629,19 +629,46 @@ pub fn import_bundle(path: &Path) -> Result<ImportStats, String> {
     import_bundle_reader(std::io::BufReader::new(file))
 }
 
-/// Import an in-memory bundle (a `POST /v1/objects/batch` response) into the object
-/// store — the same verification as `import_bundle`.
+/// Import an in-memory bundle into the object store — the same verification as `import_bundle`.
 pub fn import_bundle_bytes(bytes: &[u8]) -> Result<ImportStats, String> {
     import_bundle_reader(std::io::Cursor::new(bytes))
 }
 
-/// Import a bundle from a reader (see `import_bundle`).
-fn import_bundle_reader<R: std::io::BufRead>(mut reader: R) -> Result<ImportStats, String> {
+/// Import a bundle streamed from a remote (a batch or subtree response) as it arrives — the same
+/// verification as `import_bundle`, holding at most one record in memory.
+///
+/// Only a version-3 bundle is accepted: that is what every batch and subtree producer writes, and
+/// it is the version whose records stream. A whole-warehouse version-4 bundle imports through
+/// temporary pack files and has no business arriving here, so it is refused rather than imported
+/// by a path this one was never meant to take.
+///
+/// # Arguments
+/// * `reader` - The response body, as it arrives.
+///
+/// # Returns
+/// * `Ok(ImportStats)` - What was stored.
+/// * `Err(String)`     - On any header but version 3, a corrupt or truncated record, or an I/O
+///   error (including the transfer ending before the bundle did).
+pub fn import_streamed_bundle<R: std::io::BufRead>(mut reader: R) -> Result<ImportStats, String> {
+    let header = read_bundle_header(&mut reader)?;
+
+    if header != BUNDLE_HEADER_V3.as_bytes() {
+        return Err(format!(
+            "The remote sent a \"{}\" bundle where only a \"{}\" one belongs; refusing to import it.",
+            String::from_utf8_lossy(&header), BUNDLE_HEADER_V3
+        ));
+    }
+
+    import_record_stream(reader, true)
+}
+
+/// Read a bundle's uncompressed header line, without its newline.
+fn read_bundle_header<R: std::io::BufRead>(reader: &mut R) -> Result<Vec<u8>, String> {
     // The header line is uncompressed; everything after it is one zstd stream. `length` is not
     // the only attacker-controlled number here: a hostile bundle need not carry a newline at all
     // (or may run arbitrarily many non-newline bytes before one), and an unbounded
     // `read_until(b'\n', ...)` would grow `header` without limit chasing it — the same
-    // unbounded-growth shape the record-length fix elsewhere in this function exists to close.
+    // unbounded-growth shape the record-length checks in `import_record_stream` exist to close.
     // Every header this build recognizes is under 30 bytes, so bound the search to a small,
     // fixed cap: past it, this cannot be a bundle this build understands, however long the
     // stream actually runs.
@@ -659,6 +686,13 @@ fn import_bundle_reader<R: std::io::BufRead>(mut reader: R) -> Result<ImportStat
     }
 
     header.pop();
+
+    Ok(header)
+}
+
+/// Import a bundle from a reader (see `import_bundle`).
+fn import_bundle_reader<R: std::io::BufRead>(mut reader: R) -> Result<ImportStats, String> {
+    let header = read_bundle_header(&mut reader)?;
 
     if header == BUNDLE_HEADER.as_bytes() {
         return import_native_bundle_reader(&mut reader);
@@ -682,7 +716,13 @@ fn import_bundle_reader<R: std::io::BufRead>(mut reader: R) -> Result<ImportStat
     // unconditional memory defense regardless of version.
     let is_new_version = header == BUNDLE_HEADER_V3.as_bytes();
 
-    let mut decoder = zstd::stream::Decoder::new(reader)
+    import_record_stream(reader, is_new_version)
+}
+
+/// Import the zstd record stream that follows a version 1–3 header. `is_new_version` is whether
+/// the header was version 3, whose records are refused on declared size past the object ceiling.
+fn import_record_stream<R: std::io::BufRead>(reader: R, is_new_version: bool) -> Result<ImportStats, String> {
+    let mut decoder = object_utils::bounded_zstd_decoder(reader)
         .map_err(|e| format!("Error while opening the bundle stream: {}", e))?;
 
     let mut stats = ImportStats::default();
@@ -690,9 +730,20 @@ fn import_bundle_reader<R: std::io::BufRead>(mut reader: R) -> Result<ImportStat
     loop {
         let mut kind = [0u8; 1];
 
-        match decoder.read_exact(&mut kind) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+        // Only a read that produces nothing ends the bundle: the stream finished on a frame
+        // boundary between records. A truncated frame is an error from the decoder, never a clean
+        // end — so a bundle cut short in transit, even exactly between two records, fails the
+        // import instead of passing for a smaller one.
+        let read = loop {
+            match decoder.read(&mut kind) {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                other => break other,
+            }
+        };
+
+        match read {
+            Ok(0) => break,
+            Ok(_) => {}
             Err(e) => return Err(format!("Error while reading the bundle: {}", e)),
         }
 

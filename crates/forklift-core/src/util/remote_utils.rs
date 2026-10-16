@@ -22,6 +22,8 @@ use crate::globals::{self, StorageRootScope};
 use crate::util::office_utils::OFFICE_PALLET_NAME;
 use crate::util::progress_utils::Progress;
 use crate::util::scope_utils::{self, MaterializationScope, ScopeClass};
+use crate::util::body_utils::{self, BodyReadError, JsonReadError};
+use crate::util::object_utils::MAX_OBJECT_BYTES;
 use crate::util::{
     bundle_utils, config_utils, file_utils, merge_utils, object_utils, office_utils,
     pack_utils, pallet_utils, sign_utils, trust_utils,
@@ -29,6 +31,74 @@ use crate::util::{
 
 /// How many object transfers run concurrently.
 pub const CONCURRENT_TRANSFERS: usize = 24;
+
+/// How many response chunks may wait between a batch or subtree transfer and its importer.
+const IMPORT_CHANNEL_DEPTH: usize = 16;
+
+/// One piece of a response body on its way to the importer. `End` is sent only when the transfer
+/// read the body to its end, so a channel that closes without it was cut short.
+enum BodyPiece {
+    Bytes(bytes::Bytes),
+    End,
+}
+
+/// A blocking reader over the pieces a transfer forwards — the importer's side of the channel.
+struct ChannelBody {
+    receiver: tokio::sync::mpsc::Receiver<BodyPiece>,
+    current: bytes::Bytes,
+    ended: bool,
+}
+
+impl ChannelBody {
+    fn new(receiver: tokio::sync::mpsc::Receiver<BodyPiece>) -> ChannelBody {
+        ChannelBody { receiver, current: bytes::Bytes::new(), ended: false }
+    }
+}
+
+impl std::io::Read for ChannelBody {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        while self.current.is_empty() {
+            if self.ended || buf.is_empty() {
+                return Ok(0);
+            }
+
+            match self.receiver.blocking_recv() {
+                Some(BodyPiece::Bytes(chunk)) => self.current = chunk,
+                Some(BodyPiece::End) => self.ended = true,
+                None => return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "the transfer stopped before the response was complete",
+                )),
+            }
+        }
+
+        let n = buf.len().min(self.current.len());
+        buf[..n].copy_from_slice(&self.current.split_to(n));
+        Ok(n)
+    }
+}
+
+/// The largest handshake body read. Its size grows with the warehouse's pallet list, which has
+/// no limit of its own, so the cap is set far past any real warehouse — a few hundred thousand
+/// pallets — while still bounding what a hostile remote can make a client hold.
+const HANDSHAKE_BODY_CAP: u64 = 64 * 1024 * 1024;
+
+/// Per-hash allowance in a `missing` answer: a 64-character hash, its quotes and separator, with
+/// room to spare.
+const MISSING_BODY_BYTES_PER_HASH: u64 = 128;
+
+/// Per-hash allowance in an `upload-targets` answer: a presigned upload URL (about 500 bytes in
+/// practice) keyed by its hash.
+const UPLOAD_TARGETS_BODY_BYTES_PER_HASH: u64 = 8 * 1024;
+
+/// Per-identifier allowance in a `resolve` answer: the identifier and the name it resolves to.
+const RESOLVE_BODY_BYTES_PER_IDENTIFIER: u64 = 4 * 1024;
+
+/// The cap for an answer that lists up to `items` entries of at most `per_item` bytes each, plus
+/// [`body_utils::SMALL_BODY_CAP`] for its envelope.
+fn per_item_body_cap(items: usize, per_item: u64) -> u64 {
+    (items as u64).saturating_mul(per_item).saturating_add(body_utils::SMALL_BODY_CAP)
+}
 
 /// The characters a warehouse path SEGMENT must be percent-encoded against before it is spliced
 /// into a URL. Everything but RFC 3986 unreserved characters (ASCII alphanumerics, `-`, `_`,
@@ -2786,13 +2856,45 @@ impl RemoteClient {
         let budget = self.error_body_budget();
 
         let (message, code, next_step) = match tokio::time::timeout(
-            budget, response.json::<ErrorResponse>()
+            budget, body_utils::read_json_capped::<ErrorResponse>(response, body_utils::SMALL_BODY_CAP)
         ).await {
             Ok(Ok(body)) => (body.error, body.code, body.next_step),
             Ok(Err(_)) | Err(_) => (status.canonical_reason().unwrap_or("unknown error").to_string(), None, None),
         };
 
         classify_remote_error(status.as_u16(), action, message, code, next_step)
+    }
+
+    /// Read a whole response body within `cap`, composing each failure the way this client
+    /// reports it: a transport failure through [`Self::describe_transport_error`] under `action`
+    /// and `posture`, an over-cap body as a refusal naming `what`.
+    async fn read_body(&self,
+                       response: reqwest::Response,
+                       cap: u64,
+                       action: &str,
+                       posture: Posture,
+                       what: &str) -> Result<Vec<u8>, String> {
+        body_utils::read_body_capped(response, cap).await.map_err(|e| match e {
+            BodyReadError::Transport(e) => self.describe_transport_error(action, posture, e),
+            BodyReadError::OverCap { cap } => body_utils::over_cap_message(&format!("the remote's {}", what), cap),
+        })
+    }
+
+    /// [`Self::read_body`] for a JSON body: a body that arrives whole but does not parse is
+    /// reported as the remote's `what` not being valid JSON.
+    async fn read_json<T: serde::de::DeserializeOwned>(&self,
+                                                       response: reqwest::Response,
+                                                       cap: u64,
+                                                       action: &str,
+                                                       posture: Posture,
+                                                       what: &str) -> Result<T, String> {
+        body_utils::read_json_capped(response, cap).await.map_err(|e| match e {
+            JsonReadError::Body(BodyReadError::Transport(e)) => self.describe_transport_error(action, posture, e),
+            JsonReadError::Body(BodyReadError::OverCap { cap }) => {
+                body_utils::over_cap_message(&format!("the remote's {}", what), cap)
+            }
+            JsonReadError::Parse(e) => format!("The remote's {} is not valid JSON: {}", what, e),
+        })
     }
 
     /// Fetch the warehouse handshake and check the protocol version.
@@ -2809,15 +2911,10 @@ impl RemoteClient {
             return Err(self.error_of(response, "the handshake").await);
         }
 
-        let info: WarehouseInfo = response.json()
-            .await
-            .map_err(|e| if e.is_timeout() {
-                self.describe_transport_error(
-                    &format!("reaching the remote {}", self.base), posture, e
-                )
-            } else {
-                format!("The remote's handshake is not valid JSON: {}", e)
-            })?;
+        let info: WarehouseInfo = self.read_json(
+            response, HANDSHAKE_BODY_CAP, &format!("reaching the remote {}", self.base), posture,
+            "handshake",
+        ).await?;
 
         if info.protocol != PROTOCOL_VERSION {
             return Err(format!(
@@ -2907,13 +3004,10 @@ impl RemoteClient {
                 return Err(self.error_of(response, "the negotiation").await);
             }
 
-            let body: MissingObjectsResponse = response.json()
-                .await
-                .map_err(|e| if e.is_timeout() {
-                    self.describe_transport_error("negotiating with the remote", posture, e)
-                } else {
-                    format!("The remote's negotiation response is not valid JSON: {}", e)
-                })?;
+            let body: MissingObjectsResponse = self.read_json(
+                response, per_item_body_cap(batch.len(), MISSING_BODY_BYTES_PER_HASH),
+                "negotiating with the remote", posture, "negotiation response",
+            ).await?;
 
             missing.extend(body.missing);
         }
@@ -2998,6 +3092,7 @@ impl RemoteClient {
         // Every failure degrades to the designed fallback, including a serialization failure the
         // seam now surfaces up front rather than deferring into a `reqwest::Error` — see this
         // function's own doc for why an empty map is the right answer to all of them here.
+        let cap = per_item_body_cap(identifiers.len(), RESOLVE_BODY_BYTES_PER_IDENTIFIER);
         let Ok(body) = SendBody::json(&ResolveRequest { identifiers }) else {
             return BTreeMap::new();
         };
@@ -3012,7 +3107,7 @@ impl RemoteClient {
             return BTreeMap::new();
         }
 
-        match response.json::<ResolveResponse>().await {
+        match body_utils::read_json_capped::<ResolveResponse>(response, cap).await {
             Ok(body) => body.names,
             Err(_) => BTreeMap::new(),
         }
@@ -3103,7 +3198,7 @@ impl RemoteClient {
     /// figure by different arguments, and share one composer call under one action string**, which
     /// is why their [`Self::describe_transport_error`] arms have to be told apart by wording — see
     /// that function's doc.
-    pub async fn fetch_batch(&self, hashes: &[String]) -> Result<Option<Vec<u8>>, String> {
+    pub async fn fetch_batch(&self, hashes: &[String]) -> Result<Option<bundle_utils::ImportStats>, String> {
         let post_posture = Posture::HeadDeadlineNoRedirect { head: self.batch_head_budget() };
         let outcome = self.send_on(
             post_posture,
@@ -3158,10 +3253,7 @@ impl RemoteClient {
             return Err(self.error_of(response, "the batch fetch").await);
         }
 
-        response.bytes()
-            .await
-            .map(|bytes| Some(bytes.to_vec()))
-            .map_err(|e| self.describe_transport_error("reading the batch response", body_posture, e))
+        self.import_response(response, "reading the batch response", body_posture).await.map(Some)
     }
 
     /// Fetch the object closure of a subtree at a path of a parcel, as a bundle-format stream
@@ -3189,7 +3281,7 @@ impl RemoteClient {
     /// all, so a budget here would price nothing reachable. This stays unbounded until it has its
     /// own scaled budget or an abandon-and-fall-back lane — or until a production caller appears,
     /// which is the trigger to reconsider rather than a reason to guess now.
-    pub async fn fetch_subtree(&self, parcel: &str, path: &str) -> Result<Option<Vec<u8>>, String> {
+    pub async fn fetch_subtree(&self, parcel: &str, path: &str) -> Result<Option<bundle_utils::ImportStats>, String> {
         let posture = Posture::UnboundedFollowsRedirects(UnboundedTicket::Fork92);
         let outcome = self.send_on(
             posture,
@@ -3210,10 +3302,60 @@ impl RemoteClient {
             return Err(self.error_of(response, &format!("the subtree fetch for \"{}\"", path)).await);
         }
 
-        response.bytes()
-            .await
-            .map(|bytes| Some(bytes.to_vec()))
-            .map_err(|e| self.describe_transport_error("reading the subtree response", posture, e))
+        self.import_response(response, "reading the subtree response", posture).await.map(Some)
+    }
+
+    /// Import a batch or subtree response into the object store as it arrives, never holding the
+    /// whole body: the legitimate size of one runs to tens of GiB, so no memory cap fits it.
+    ///
+    /// The response's chunks are forwarded over a bounded channel to a blocking task running
+    /// [`bundle_utils::import_streamed_bundle`], which re-enters the caller's storage-root scope
+    /// (thread-local, so a pool thread would otherwise resolve the store by working directory —
+    /// the same idiom as `retrieve_object_for_upload`). Memory is one record, the channel, and the
+    /// decoder's bounded window.
+    ///
+    /// The importer sees the end of the bundle only when the transfer reached the end of the body.
+    /// A transfer that fails, or is dropped, closes the channel without that mark, which the
+    /// importer reads as an error — so a body cut short never imports as a smaller bundle. When
+    /// both sides fail, the transfer's error is the one reported: it is the cause.
+    async fn import_response(&self,
+                             mut response: reqwest::Response,
+                             action: &str,
+                             posture: Posture) -> Result<bundle_utils::ImportStats, String> {
+        let (sender, receiver) = tokio::sync::mpsc::channel::<BodyPiece>(IMPORT_CHANNEL_DEPTH);
+        let scope_root = globals::current_scope_root();
+
+        let importer = tokio::task::spawn_blocking(move || {
+            let _scope = scope_root.as_deref().map(StorageRootScope::enter);
+            bundle_utils::import_streamed_bundle(std::io::BufReader::new(ChannelBody::new(receiver)))
+        });
+
+        let transferred: Result<(), String> = loop {
+            #[allow(clippy::disallowed_methods)] // streamed to the importer, never accumulated
+            let next = response.chunk().await;
+
+            match next {
+                Ok(Some(chunk)) => {
+                    // A closed channel means the importer already stopped; its result says why.
+                    if sender.send(BodyPiece::Bytes(chunk)).await.is_err() {
+                        break Ok(());
+                    }
+                }
+                Ok(None) => {
+                    let _ = sender.send(BodyPiece::End).await;
+                    break Ok(());
+                }
+                Err(e) => break Err(self.describe_transport_error(action, posture, e)),
+            }
+        };
+
+        drop(sender);
+
+        let imported = importer.await
+            .map_err(|e| format!("The bundle-import task panicked: {}", e))?;
+
+        transferred?;
+        imported
     }
 
     /// Fetch one object's raw bytes. On [`Posture::BoundedObjectReads`], not [`Posture::BoundedReads`]
@@ -3231,12 +3373,10 @@ impl RemoteClient {
             return Err(self.error_of(response, &format!("object {}", hash)).await);
         }
 
-        response.bytes()
-            .await
-            .map(|bytes| bytes.to_vec())
-            .map_err(|e| self.describe_transport_error(
-                &format!("reading object {}", hash), posture, e
-            ))
+        self.read_body(
+            response, MAX_OBJECT_BYTES as u64, &format!("reading object {}", hash), posture,
+            &format!("object {}", hash),
+        ).await
     }
 
     /// Upload one object's raw bytes to the control plane (`PUT /v1/objects/{hash}`), where the
@@ -3323,13 +3463,10 @@ impl RemoteClient {
                 return Err(self.error_of(response, "the upload negotiation").await);
             }
 
-            let body: UploadTargetsResponse = response.json()
-                .await
-                .map_err(|e| if e.is_timeout() {
-                    self.describe_transport_error("negotiating upload targets", posture, e)
-                } else {
-                    format!("The remote's upload-targets response is not valid JSON: {}", e)
-                })?;
+            let body: UploadTargetsResponse = self.read_json(
+                response, per_item_body_cap(batch.len(), UPLOAD_TARGETS_BODY_BYTES_PER_HASH),
+                "negotiating upload targets", posture, "upload-targets response",
+            ).await?;
 
             merged.present.extend(body.present);
             merged.targets.extend(body.targets);
@@ -3436,7 +3573,7 @@ impl RemoteClient {
         }
 
         let status = response.status();
-        let message = match response.json::<ErrorResponse>().await {
+        let message = match body_utils::read_json_capped::<ErrorResponse>(response, body_utils::SMALL_BODY_CAP).await {
             Ok(body) => body.error,
             Err(_) => status.canonical_reason().unwrap_or("unknown error").to_string(),
         };
@@ -3467,12 +3604,10 @@ impl RemoteClient {
             return Err(self.error_of(response, &format!("the signature of {}", parcel_hash)).await);
         }
 
-        response.bytes()
-            .await
-            .map(|bytes| Some(bytes.to_vec()))
-            .map_err(|e| self.describe_transport_error(
-                &format!("reading the signature of {}", parcel_hash), posture, e
-            ))
+        self.read_body(
+            response, body_utils::SMALL_BODY_CAP, &format!("reading the signature of {}", parcel_hash),
+            posture, &format!("the signature of {}", parcel_hash),
+        ).await.map(Some)
     }
 
     /// The total-deadline budget to arm for *this* client instance's call to
@@ -3672,6 +3807,7 @@ impl RemoteClient {
             .map_err(|e| format!("Error while creating the bundle file: {}", e))?;
         let mut cleanup = RemoveTempOnDrop::armed(&temp_path);
 
+        #[allow(clippy::disallowed_methods)] // streamed to the bundle file, never accumulated
         while let Some(chunk) = response.chunk()
             .await
             .map_err(|e| self.describe_transport_error("downloading the bundle", posture, e))?
@@ -4155,9 +4291,8 @@ pub(crate) async fn fetch_missing_objects(client: &RemoteClient, hashes: &[Strin
     // remote may lack objects) is fetched loose below too.
     if missing.len() > 1 {
         for chunk in missing.chunks(BATCH_FETCH_CHUNK) {
-            match client.fetch_batch(chunk).await? {
-                Some(bytes) => { bundle_utils::import_bundle_bytes(&bytes)?; }
-                None => break,
+            if client.fetch_batch(chunk).await?.is_none() {
+                break;
             }
         }
 
@@ -5954,6 +6089,20 @@ mod tests {
         }
     }
 
+    /// A real version-3 batch bundle carrying one freshly built object, split into exactly
+    /// `pieces` chunks for a drip fixture, and that object's hash. Built in a store of its own, so
+    /// the caller's store starts without the object.
+    fn drip_bundle(pieces: usize) -> (Vec<Vec<u8>>, String) {
+        let (bytes, hash) = {
+            let _source = Scratch::new("drip-bundle-source");
+            let hash = stack(Vec::new(), "drip");
+            (bundle_utils::build_partial_bundle(std::slice::from_ref(&hash)).unwrap(), hash)
+        };
+        let chunks: Vec<Vec<u8>> = bytes.chunks(bytes.len().div_ceil(pieces)).map(<[u8]>::to_vec).collect();
+        assert_eq!(chunks.len(), pieces, "the bundle splits into exactly the pieces asked for");
+        (chunks, hash)
+    }
+
     /// [`stack`], but with a real tree, for the walks that actually descend one.
     fn stack_with_tree(parents: Vec<String>, tree_hash: &str, tag: &str) -> String {
         let parcel = crate::model::parcel::Parcel {
@@ -7654,8 +7803,8 @@ mod tests {
     #[test]
     fn fetch_batch_redirect_follow_survives_a_slow_but_steadily_progressing_bundle() {
         let gap = std::time::Duration::from_millis(1_500);
-        let chunks: Vec<Vec<u8>> = (0..4).map(|i| format!("bundle-chunk-{}-drip", i).into_bytes()).collect();
-        let expected: Vec<u8> = chunks.concat();
+        let _store = Scratch::new("batch-redirect-drip");
+        let (chunks, hash) = drip_bundle(4);
         // Four gaps run past the effective loose budget (connect + object read) in total, while
         // no single gap comes near it — the sole property this fixture pins. Each gap does exceed
         // the *tight* [`Posture::BoundedReads`] effective budget (connect + read) — deliberately:
@@ -7681,19 +7830,18 @@ mod tests {
             tokio::time::timeout(outer_ceiling, client.fetch_batch(&["a".repeat(64)])).await
         });
 
-        let bytes = outcome
+        let stats = outcome
             .unwrap_or_else(|_| panic!(
                 "fetch_batch hung past its own generous outer ceiling {:?}", outer_ceiling
             ))
             .unwrap_or_else(|e| panic!(
                 "a slow-but-steady bundle must succeed — it was never silent, so it must never be \
                 treated as a stall: {}", e
-            ));
+            ))
+            .expect("a served bundle is not the absence signal");
 
-        assert_eq!(
-            bytes, Some(expected),
-            "the full bundle must arrive intact despite the drip"
-        );
+        assert_eq!(stats.stored_objects, 1, "the full bundle must arrive intact despite the drip");
+        assert!(file_utils::does_object_exist(&hash).unwrap(), "the dripped object landed in this store");
     }
 
     /// The designed transport for chunks (DESIGN.html §9.4b: "franchise, lower and expand fetch
@@ -8744,6 +8892,7 @@ mod tests {
                     ),
                 };
 
+                #[allow(clippy::disallowed_methods)] // probes the transport bound itself, not a production read
                 response.bytes().await
             }).await
         });
@@ -8838,6 +8987,7 @@ mod tests {
                     ),
                 };
 
+                #[allow(clippy::disallowed_methods)] // probes the transport bound itself, not a production read
                 response.bytes().await
             }).await
         })
@@ -9687,9 +9837,8 @@ mod tests {
     #[test]
     fn fetch_batch_survives_a_slow_but_steadily_progressing_direct_body() {
         let gap = std::time::Duration::from_millis(1_500);
-        let chunks: Vec<Vec<u8>> =
-            (0..4).map(|i| format!("direct-chunk-{}-drip", i).into_bytes()).collect();
-        let expected: Vec<u8> = chunks.concat();
+        let _store = Scratch::new("batch-direct-drip");
+        let (chunks, hash) = drip_bundle(4);
         let total_duration = gap * (chunks.len() as u32);
         let effective_silence_budget = FAST.connect + FAST.object_read;
         let effective_head_budget = FAST.connect + FAST.batch_head_patience;
@@ -9715,20 +9864,20 @@ mod tests {
             tokio::time::timeout(outer_ceiling, client.fetch_batch(&["a".repeat(64)])).await
         });
 
-        let bytes = outcome
+        let stats = outcome
             .unwrap_or_else(|_| panic!(
                 "fetch_batch hung past its own generous outer ceiling {:?}", outer_ceiling
             ))
             .unwrap_or_else(|e| panic!(
                 "a body that was never silent for more than {:?} must never be treated as a \
                 stall, however long the whole transfer took: {}", gap, e
-            ));
+            ))
+            .expect("a served bundle is not the absence signal");
 
-        assert_eq!(
-            bytes, Some(expected),
-            "the full body must arrive intact, not a prefix of it — a truncated read is the other \
-            shape a wrongly-scoped bound produces"
-        );
+        // A prefix of the bundle — the other shape a wrongly-scoped bound produces — now fails
+        // the import outright, so arriving intact is the object landing.
+        assert_eq!(stats.stored_objects, 1, "the full body must arrive intact, not a prefix of it");
+        assert!(file_utils::does_object_exist(&hash).unwrap(), "the dripped object landed in this store");
     }
 
     /// A remote that accepts the connection, reads the request, sends response headers claiming

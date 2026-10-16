@@ -4437,19 +4437,20 @@ fn the_path_addressed_subtree_endpoint_serves_a_subtree_and_signals_fallback_on_
     assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src/api"]));
     assert!(!object_present(&area, "sparse", &web_tree), "src/web starts sealed, not fetched");
 
-    // Drive the client straight against the endpoint (a current-thread runtime: the storage scope
-    // is thread-local, so the import must stay on this thread).
+    // Drive the client straight against the endpoint. The storage scope is thread-local and the
+    // client imports on a blocking pool thread, so the objects landing in `sparse` (not in
+    // whatever the pool thread's working directory resolves to) is what proves the import
+    // re-entered this thread's scope.
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     let _scope = forklift_core::globals::StorageRootScope::enter(&area.path("sparse"));
     let client = forklift_core::util::remote_utils::RemoteClient::new(&server.url, None).unwrap();
 
-    // The endpoint resolves src/web to its subtree and serves the closure; importing it lands the
-    // sealed objects, hash-verified like any bundle.
-    let bundle = runtime
+    // The endpoint resolves src/web to its subtree and streams the closure, which the client
+    // imports as it arrives — the sealed objects land hash-verified like any bundle.
+    runtime
         .block_on(client.fetch_subtree(&head, "src/web"))
-        .expect("the subtree fetch must not error")
+        .expect("the subtree fetch and its import must not error")
         .expect("a present remote serves the subtree, not a 404");
-    forklift_core::util::bundle_utils::import_bundle_bytes(&bundle).expect("the served subtree imports");
 
     assert!(object_present(&area, "sparse", &web_tree), "the endpoint delivered the subtree object");
     assert!(object_present(&area, "sparse", &web_blob), "the endpoint delivered the subtree's blob");
@@ -4493,11 +4494,10 @@ fn the_path_addressed_subtree_endpoint_round_trips_a_path_with_reserved_characte
     let _scope = forklift_core::globals::StorageRootScope::enter(&area.path("sparse"));
     let client = forklift_core::util::remote_utils::RemoteClient::new(&server.url, None).unwrap();
 
-    let bundle = runtime
+    runtime
         .block_on(client.fetch_subtree(&head, "src/a dir#1/100%"))
-        .expect("the subtree fetch must not error")
+        .expect("the subtree fetch and its import must not error")
         .expect("the server must resolve the reserved-character path, not 404 on a mangled URL");
-    forklift_core::util::bundle_utils::import_bundle_bytes(&bundle).expect("the served subtree imports");
 
     assert!(object_present(&area, "sparse", &weird_tree),
         "the endpoint delivered the reserved-character subtree object");

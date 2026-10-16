@@ -41,6 +41,51 @@ pub const STREAM_STORE_THRESHOLD_BYTES: usize = chunk_utils::MAX_CHUNK_BYTES;
 const _: () = assert!(MAX_OBJECT_BYTES > chunk_utils::CHUNK_THRESHOLD_BYTES);
 const _: () = assert!(MAX_OBJECT_BYTES > chunk_utils::MAX_CHUNK_BYTES);
 
+/// The largest window, as a power of two, that a zstd decoder of untrusted bytes accepts: 8 MiB.
+///
+/// A zstd frame names its own window, and the decoder allocates and fills a buffer that size
+/// before it produces a byte past it, so a frame can make its decoder hold up to 128 MiB (the
+/// library's default ceiling) while every output-length bound downstream still looks satisfied.
+/// Every frame this build writes, at the compression levels it uses, declares a window of at most
+/// 2 MiB, so 8 MiB refuses nothing a forklift writer produced and bounds what a hostile one can.
+pub(crate) const MAX_DECODE_WINDOW_LOG: u32 = 23;
+
+/// A zstd stream decoder over untrusted bytes, refusing any frame whose window is larger than
+/// [`MAX_DECODE_WINDOW_LOG`] allows. The only way production code opens a zstd decoder:
+/// `clippy.toml` disallows the library's own constructors.
+///
+/// # Arguments
+/// * `reader` - The compressed bytes.
+///
+/// # Returns
+/// * `Ok(Decoder)`       - The window-bounded decoder.
+/// * `Err(io::Error)`    - The decoder could not be created.
+#[allow(clippy::disallowed_methods)] // the bounded constructor every other decoder goes through
+pub(crate) fn bounded_zstd_decoder<'a, R: std::io::BufRead>(reader: R)
+    -> std::io::Result<zstd::stream::read::Decoder<'a, R>> {
+    let mut decoder = zstd::stream::read::Decoder::with_buffer(reader)?;
+    decoder.window_log_max(MAX_DECODE_WINDOW_LOG)?;
+    Ok(decoder)
+}
+
+/// [`bounded_zstd_decoder`] for a frame compressed against a raw-content dictionary (a delta
+/// against its base).
+///
+/// # Arguments
+/// * `payload`    - The compressed frame.
+/// * `dictionary` - The content the frame was compressed against.
+///
+/// # Returns
+/// * `Ok(Decoder)`       - The window-bounded decoder.
+/// * `Err(io::Error)`    - The decoder could not be created.
+#[allow(clippy::disallowed_methods)] // the bounded constructor every other decoder goes through
+pub(crate) fn bounded_zstd_dictionary_decoder<'a>(payload: &'a [u8], dictionary: &[u8])
+    -> std::io::Result<zstd::stream::read::Decoder<'static, &'a [u8]>> {
+    let mut decoder = zstd::stream::read::Decoder::with_dictionary(payload, dictionary)?;
+    decoder.window_log_max(MAX_DECODE_WINDOW_LOG)?;
+    Ok(decoder)
+}
+
 /// Why a bounded zstd decode of untrusted bytes failed.
 #[derive(Debug)]
 pub(crate) enum BoundedDecodeError {
@@ -66,7 +111,8 @@ pub(crate) enum BoundedDecodeError {
 /// bare `take(MAX_OBJECT_BYTES)` cannot tell "decoded to exactly the ceiling" (legal) apart from
 /// "silently truncated at the ceiling" (an over-ceiling frame returned as plausible bytes).
 pub(crate) fn decode_object_bounded(compressed: impl Read) -> Result<Vec<u8>, BoundedDecodeError> {
-    let mut decoder = zstd::stream::read::Decoder::new(compressed)
+    let buffered = std::io::BufReader::with_capacity(zstd::zstd_safe::DCtx::in_size(), compressed);
+    let mut decoder = bounded_zstd_decoder(buffered)
         .map_err(|e| BoundedDecodeError::Malformed(e.to_string()))?;
     let mut bytes = Vec::new();
     decoder.by_ref()
