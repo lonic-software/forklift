@@ -1235,7 +1235,8 @@ Plain `compact` is **incremental**: it packs the loose objects into a *new* pack
 existing packs alone (cheap, but packs accumulate over time). `compact --all` is a **full
 repack**: it rewrites every pack too, **dropping unreachable objects** that were stuck in
 packs (garbage from undone stacks, abandoned pushes) and **consolidating many packs into
-few**. It **reuses** each object's existing delta (a byte-copy, not a re-compress), so it is
+few**. Content you have loaded but not yet stacked is never garbage: every bay's staged files
+are kept, alongside everything reachable from a pallet. It **reuses** each object's existing delta (a byte-copy, not a re-compress), so it is
 fast and never balloons the store — but heavier than incremental; run it occasionally (auto
 does when packs pile up). Because it drops unreachable packed objects with no grace period,
 `compact --all` is **refused while a `forklift-server` is serving that root** (or a

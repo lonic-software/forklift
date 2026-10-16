@@ -1,9 +1,10 @@
 //! Executed evidence for the **collected-referent class**: a durable hash pin whose referent has
 //! been garbage-collected.
 //!
-//! `gc_utils::collect_live_set` roots pallet refs, bay-scoped parcels and every trust-pin root
-//! (`office_utils::collect_trust_pin_roots`: the anchor's `adopts` pin, its `boundary` snapshot,
-//! and every key's revocation `distrust_boundary`). Several other places
+//! `gc_utils::collect_live_set` roots pallet refs, bay-scoped parcels, every bay's staged
+//! inventory (FORK-156) and every trust-pin root (`office_utils::collect_trust_pin_roots`: the
+//! anchor's `adopts` pin, its `boundary` snapshot, and every key's revocation
+//! `distrust_boundary`). Several other places
 //! still write a parcel or object hash durably with no such root, and read it back regardless.
 //! When gc collects an unrooted referent, each reader fails differently — and the members
 //! disagree about what correct behaviour even is, which is why the pallet-lifecycle design
@@ -15,24 +16,26 @@
 //! | `audit`'s boundary head | verifying | **FIXED (FORK-81)** — rooted; `an_undone_boundary_head_*`, `a_boundary_head_and_the_legacy_parcel_*`. The residual gap a *rooted* pin can still reach — never fetched, or genuinely lost, since gc can no longer produce it — is a separate finding with its own legs (not gc-driven, no canary): `an_absent_interior_ancestor_behind_a_present_boundary_head_is_named_not_accused_of_tampering`, `a_genuinely_pre_trust_side_pallet_parcel_behind_an_absent_boundary_head_refuses_instead_of_accusing`, `the_accusation_still_fires_with_no_gap_at_all`. **PR #121 round 1 narrowed the tolerance to interior-only gaps; round 2 reverted that narrowing** — an absent boundary HEAD, exactly like an absent interior ancestor, un-resolves the boundary walk's negative for anything the present portion cannot itself settle, because there is no such thing as an "unrelated" absent reference: relatedness to the parcel under test is precisely the question the walk exists to answer (see `audit_utils::verify_pallet_history`'s `boundary_gap` doc). Reproduced end to end against a real origin server, from ordinary commands, in `tests/remote.rs`'s two Construction T/D legs. |
 //! | `CherryPickState.source` | **acting** | `a_collected_cherry_pick_source_*` (FORK-82) |
 //! | `Tag.subject` under a torn taint | **healing** | `a_torn_taint_over_an_absent_tag_subject_*` (FORK-83) |
-//! | staged inventory shard under a torn taint | **healing** | `staging_a_file_and_then_collecting_*` (FORK-83, widened) |
+//! | staged inventory shard | **healing**, then acting | **FIXED (FORK-156)** — rooted; `staged_content_survives_collection_*`, `a_full_repack_keeps_staged_content_*`. Found as FORK-83's widened half: unrooted, collection deleted staged work, a torn taint then wedged the store, and a full repack lost it silently |
 //!
 //! `Tag.subject`'s *rendering* reader is pinned separately in `tag_subject_gc.rs` (FORK-79).
 //!
 //! **Four legs carry a canary** — a parcel pinned by nothing — and assert it was collected, so
 //! "the pin survived" can never be satisfied by a collector that swept nothing. The canary check
-//! holds both before and after any fix; it is the legs' own assertions that invert. (**Seven** of
-//! the eight legs drive collection — six call `collect_garbage`, and
-//! `an_undone_boundary_head_survives_the_sweep_and_audit_passes` drives the same sweep through
-//! `compact --all` — so "gc-driven" is not the dividing line. Only the torn-taint control collects
-//! nothing.)
+//! holds both before and after any fix; it is the legs' own assertions that invert. (**Eight** of
+//! the nine legs drive collection — six call `collect_garbage`, and
+//! `an_undone_boundary_head_survives_the_sweep_and_audit_passes` and
+//! `a_full_repack_keeps_staged_content_and_the_next_stack_restores_it` drive the same live set
+//! through `compact --all` — so "gc-driven" is not the dividing line. Only the torn-taint control
+//! collects nothing.)
 //!
-//! The other four discriminate differently: the two anchor legs now assert `b_present &&
+//! The other five discriminate differently: the two anchor legs now assert `b_present &&
 //! legacy_present && audit succeeds` (FORK-81 rooted the boundary pin, so both survive together;
 //! before the fix this was `!b_present && legacy_present`, already two-sided in the other
 //! direction); `a_torn_taint_alone_...` is a matched companion to the wedge leg rather than a
-//! canary user; and `staging_a_file_...` names the exact blob it staged and asserts that specific
-//! object was collected, which is a canary's job done directly.
+//! canary user; `staged_content_survives_...` names the exact blob it staged and asserts that
+//! specific object survived collection; and `a_full_repack_keeps_...` asserts the staged content
+//! itself comes back through `restore`.
 //!
 //! **Three further legs, added for FORK-81's second finding, sit outside this counting
 //! entirely.** They delete an object directly rather than driving `collect_garbage` — the state
@@ -972,12 +975,10 @@ fn a_torn_taint_over_an_absent_tag_subject_wedges_the_whole_warehouse() {
     // Orphan and collect the subject: `undo` moves the head back past the tagged parcel.
     warehouse.run_ok(&["undo"]);
 
-    // ISOLATE THE TAG. A soft `undo` leaves the undone content STAGED, and heal's walk roots
-    // staged inventory shards (`recovery_utils.rs:1224-1233`) — so without this the leg wedges
-    // for two independent reasons and three of its four claims below could not invert on a
-    // tag-subject fix. Unstaging drops the shard's reference, leaving the tag subject as the
-    // only dangling root. The staged-shard half gets its own leg further down; it is a wider
-    // defect, not this one.
+    // ISOLATE THE TAG. A soft `undo` leaves the undone content STAGED. Before FORK-156 gc
+    // collected it while heal's walk still rooted it, so the leg wedged for two independent
+    // reasons; staged inventory is a gc root now and cannot dangle, but unstaging still keeps
+    // the tag subject the only thing this leg is about.
     warehouse.run_ok(&["restore", "--staged", "."]);
 
     let stats = warehouse.scoped(|| gc_utils::collect_garbage(0).expect("gc runs"));
@@ -1044,12 +1045,13 @@ fn a_torn_taint_over_an_absent_tag_subject_wedges_the_whole_warehouse() {
     //     dangling reference from torn-ness — the contingency asserted here. It is a weak pair
     //     (it differs in several variables at once, which is why it cannot show anything about the
     //     TAG specifically), but on this one axis it is the only evidence there is.
-    //   * `staging_a_file_and_then_collecting_...` holds dangling-ness CONSTANT and varies the tag
-    //     and the `undo`. It therefore shows the wedge is not tag-specific, and it cannot speak to
-    //     torn-ness at all.
+    //   * `staged_content_survives_...` once held dangling-ness constant and varied the tag and the
+    //     `undo`, showing the wedge was not tag-specific: a collected staged blob wedged the store
+    //     the same way. Since FORK-156 rooted staged inventory, nothing staged can dangle there,
+    //     so it now pins that fix and says nothing about tags or torn-ness.
     //
-    // Round 1 corrected the control's doc for claiming the second of these; round 2 then demoted
-    // the control out of the first, which it does support. Both halves are stated above.
+    // The control's doc once claimed the tag was load-bearing, and a later revision demoted it
+    // too far; what it does and does not support is stated above.
     let heal_err = String::from_utf8_lossy(&healed.stderr).to_string();
     let ordinary_err = String::from_utf8_lossy(&ordinary.stderr).to_string();
 
@@ -1137,8 +1139,8 @@ fn a_torn_taint_over_an_absent_tag_subject_wedges_the_whole_warehouse() {
 /// stops the wedge leg above from being satisfied by "a torn taint bricks any warehouse".
 ///
 /// It does **not** show the tag is load-bearing, and an earlier draft that said so was wrong:
-/// `staging_a_file_and_then_collecting_wedges_the_warehouse_with_no_tag_involved` below refutes
-/// it outright. That draft also reasoned that the wedge leg's second dangling hash "is
+/// before FORK-156, a collected staged blob wedged the store with no tag at all (the defect
+/// `staged_content_survives_collection_and_a_torn_taint_heals_over_it` below now pins fixed). That draft also reasoned that the wedge leg's second dangling hash "is
 /// byte-identical across runs, so it is a fixed-content object rather than anything this fixture
 /// created" — a non-sequitur, since a fixture with hardcoded file bodies produces fixed content
 /// by construction. It was this fixture's own staged blob, and chasing it is what turned up the
@@ -1187,40 +1189,24 @@ fn a_torn_taint_alone_on_an_untouched_warehouse_is_the_control() {
     );
 }
 
-/// FORK-83 IS FILED TOO NARROWLY — the wedge needs no tag, and this is the minimal case.
+/// FORK-156 (found as FORK-83's widened half) — STAGED CONTENT IS A GC ROOT.
 ///
-/// `collect_walk_roots` roots **every bay's staged inventory shards** and records, in terms, that
-/// gc "deliberately does not root" them — "an unstacked staged shard is a pre-existing, accepted
-/// gc design choice, not a bug this walk needs to match" (`recovery_utils.rs:1224-1233`).
+/// `load` a file and do not stack it yet: the blob is referenced by the bay's staged inventory
+/// shard and by nothing else. gc's live set used to leave staged shards unrooted while heal's walk
+/// rooted them, and the asymmetry was recorded as accepted. It was not harmless: collection
+/// deleted the staged blob, and a later torn taint then wedged the whole warehouse, because the
+/// rescan folds every referenced-but-absent hash into its remainder and entry-heal blocks
+/// `restore --staged`, the one command that would have dropped the reference.
 ///
-/// That asymmetry was accepted for the *walk*, where its only effect is a conservative extra
-/// root. Nobody re-checked it against the **torn rescan**, which folds every referenced-but-absent
-/// hash into a remainder and turns a non-empty remainder into a store-wide refusal
-/// (`recovery_utils.rs:953`, `:981-985`, `:1024`). Under the rescan, the same asymmetry bricks
-/// the warehouse.
-///
-/// So the reachable sequence is not "tag, undo, collect" — it is:
-///
-/// 1. `load` a file and do not stack it yet (ordinary work in progress).
-/// 2. Collection runs (`maintenance: auto on`, or any `forklift compact`).
-/// 3. A crash tears the taint record.
-///
-/// The tag-subject leg above is one instance of this class. The `undo` path reaches it too, for
-/// the same reason: a soft `undo` leaves the undone content staged.
-///
-/// **And the remedy is inside the wedge.** Unlike a tag, a staged shard *can* be dropped —
-/// `restore --staged` is exactly the command that would clear the dangling reference — but
-/// entry-heal refuses every command but `heal`/`audit`, so it cannot be run. `heal` refuses, and
-/// `audit` reports the warehouse clean.
+/// With staged shards rooted, the blob survives collection, so a torn taint over this store heals
+/// like the untouched control and the staged work is still restorable. Names the blob `load`
+/// created rather than counting deletions, so the leg is about that object and nothing else.
 #[test]
-fn staging_a_file_and_then_collecting_wedges_the_warehouse_with_no_tag_involved() {
+fn staged_content_survives_collection_and_a_torn_taint_heals_over_it() {
     let warehouse = Warehouse::new("staged");
 
     warehouse.stack("app.txt", "v1\n", "first");
 
-    // Stage a new file and never stack it — the ordinary work-in-progress state. Snapshot the
-    // store around the `load` so the staged blob can be named: without that, the assertions below
-    // would accept a refusal about ANY object and the leg would stop being about staged shards.
     let before = warehouse.loose_objects();
     std::fs::write(warehouse.root.join("wip.txt"), "work in progress\n").unwrap();
     warehouse.run_ok(&["load", "."]);
@@ -1238,74 +1224,76 @@ fn staging_a_file_and_then_collecting_wedges_the_warehouse_with_no_tag_involved(
 
     let stats = warehouse.scoped(|| gc_utils::collect_garbage(0).expect("gc runs"));
     println!("STAGED: gc deleted {} object(s)", stats.deleted);
-    // Precondition, not a claim — see the wedge leg's note. Names the blob rather than counting
-    // deletions: `stats.deleted > 0` passes on ANY garbage, so in a world where gc started
-    // rooting staged shards this leg would sail past here and die at the `exit 21` assertion
-    // below, whose message blames the rescan — the wrong cause. It works today only because this
-    // fixture happens to have exactly one piece of garbage.
     assert!(
-        !warehouse.scoped(|| file_utils::does_object_exist(&wip_blob).unwrap()),
-        "gc must collect the staged-but-unstacked blob {} for this fixture to mean anything — if \
-         it stopped doing so, the gc/walk asymmetry is gone and this whole leg inverts \
+        warehouse.scoped(|| file_utils::does_object_exist(&wip_blob).unwrap()),
+        "gc must keep the staged-but-unstacked blob {}: a bay's staged inventory is a gc root \
          (gc deleted {} object(s))",
         wip_blob, stats.deleted
     );
 
-    // The torn taint: crash debris, per `parse_taint_content` (taint_utils.rs:623).
+    // The torn taint: crash debris, per `parse_taint_content`.
     let taint_dir = warehouse.root.join(".forklift").join("taint");
     std::fs::create_dir_all(&taint_dir).unwrap();
     std::fs::write(taint_dir.join("taint-99999-0"), b"objects/ab/cdef\n").unwrap();
 
     let healed = warehouse.run(&["heal"]);
-    let heal_err = String::from_utf8_lossy(&healed.stderr).to_string();
-    println!("STAGED: heal exit = {:?}\n  stderr: {}", healed.status.code(), heal_err.trim());
+    println!("STAGED: heal exit = {:?}\n  stderr: {}",
+        healed.status.code(), String::from_utf8_lossy(&healed.stderr).trim());
+    assert!(
+        healed.status.success(),
+        "with the staged blob kept, a torn taint must heal exactly like the untouched control. \
+         stdout: {} / stderr: {}",
+        String::from_utf8_lossy(&healed.stdout), String::from_utf8_lossy(&healed.stderr)
+    );
 
+    let stocktake = warehouse.run_ok(&["stocktake"]);
+    assert!(
+        String::from_utf8_lossy(&stocktake.stdout).contains("wip.txt"),
+        "wip.txt must still be staged after the heal; stdout: {}",
+        String::from_utf8_lossy(&stocktake.stdout)
+    );
+
+    std::fs::remove_file(warehouse.root.join("wip.txt")).unwrap();
+    warehouse.run_ok(&["restore", "wip.txt"]);
     assert_eq!(
-        healed.status.code(), Some(21),
-        "`heal` must refuse over the stranded staged blob, with NO tag anywhere in this fixture. \
-         If this passes, the rescan stopped folding staged-shard references into the remainder. \
-         stderr: {}",
-        heal_err
+        std::fs::read_to_string(warehouse.root.join("wip.txt")).unwrap(),
+        "work in progress\n",
+        "the staged work must be restorable from the store after collection and heal"
     );
-    assert!(
-        heal_err.contains("genuinely dangling"),
-        "expected the torn-rescan dangling refusal; stderr: {}", heal_err
-    );
-    assert!(
-        heal_err.contains(&wip_blob),
-        "the refusal must name the STAGED BLOB {} specifically — that a refusal happened at all \
-         is not this leg's claim, and would still pass if some unrelated object dangled while \
-         staged shards stopped being rooted. stderr: {}",
-        wip_blob, heal_err
-    );
+}
 
-    // The refusal is store-wide, and — the part that makes it a wedge rather than an error — it
-    // also blocks `restore --staged`, the one command that would clear the dangling reference.
-    for attempt in [
-        vec!["stocktake"],
-        vec!["restore", "--staged", "."],
-        vec!["restore", "."],
-    ] {
-        let out = warehouse.run(&attempt);
-        println!("STAGED: `{}` exit = {:?}", attempt.join(" "), out.status.code());
-        assert_eq!(
-            out.status.code(), Some(21),
-            "`{}` must be refused by entry-heal — it is `restore --staged` being unreachable that \
-             makes this unescapable. If this one succeeds, the wedge has an in-tool exit and this \
-             leg inverts. stderr: {}",
-            attempt.join(" "), String::from_utf8_lossy(&out.stderr)
-        );
-    }
+/// FORK-156 — the silent-loss path, through shipped commands only. A full repack drops non-live
+/// packed objects with no grace period, and automatic maintenance runs one when packs pile up.
+/// Before staged shards were rooted, this sequence deleted the staged blob while `stocktake` still
+/// listed the file as staged; `stack` then signed a parcel over the missing hash, `audit` passed
+/// it, and only a later `restore` failed. Asserts on the content coming back rather than on the
+/// test process's own view of the packs, which a repack in a CLI subprocess does not refresh.
+#[test]
+fn a_full_repack_keeps_staged_content_and_the_next_stack_restores_it() {
+    let warehouse = Warehouse::new("staged-repack");
 
-    // The contradiction worth keeping: the one non-heal command that IS allowed reports the
-    // warehouse healthy, while every other command refuses it as tainted.
-    let audit = warehouse.run(&["audit"]);
-    println!("STAGED: `audit` exit = {:?}", audit.status.code());
+    warehouse.stack("app.txt", "v1\n", "first");
+
+    std::fs::write(warehouse.root.join("wip.txt"), "work in progress\n").unwrap();
+    warehouse.run_ok(&["load", "."]);
+
+    // Pack the staged blob first, so the full repack below has to decide whether to carry it.
+    warehouse.run_ok(&["compact"]);
+    warehouse.run_ok(&["compact", "--all"]);
+
+    warehouse.run_ok(&["stack", "second"]);
+    warehouse.run_ok(&["audit"]);
+
+    std::fs::remove_file(warehouse.root.join("wip.txt")).unwrap();
+    let restored = warehouse.run(&["restore", "wip.txt"]);
     assert!(
-        audit.status.success(),
-        "`audit` is expected to report this warehouse CLEAN while every other command refuses it \
-         as tainted — two shipped commands giving opposite verdicts on one store. If audit starts \
-         refusing too, invert this leg. stderr: {}",
-        String::from_utf8_lossy(&audit.stderr)
+        restored.status.success(),
+        "a file staged before a full repack must still be restorable after it is stacked — if \
+         this fails the repack dropped the staged blob. stderr: {}",
+        String::from_utf8_lossy(&restored.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(warehouse.root.join("wip.txt")).unwrap(),
+        "work in progress\n"
     );
 }

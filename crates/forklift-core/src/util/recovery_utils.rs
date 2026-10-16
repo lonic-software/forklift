@@ -1290,6 +1290,12 @@ pub(crate) struct GcRootSources {
     /// [`office_utils::PinAbsencePolicy`] — see [`gc_root_sources`]'s own doc comment for why the
     /// policy tag rides along instead of being stripped here.
     pub pin_parcels: Vec<(String, office_utils::PinAbsencePolicy)>,
+    /// Every object hash a staged inventory shard of any bay references directly (never through
+    /// a parcel), with the entry's type so a chunked file's recipe can be descended for its
+    /// chunks. Staged content is reachable from nothing else until it is stacked, so a live set
+    /// without these leaves would let gc or a repack delete a user's loaded-but-unstacked work
+    /// (FORK-156).
+    pub shard_leaves: Vec<(String, DirEntryType)>,
     /// One plain-language note per bay or office-record read this call had to skip rather than
     /// abort on — only ever populated when both `bay_policy` and `pin_policy` were passed as
     /// their respective `Tolerate` variant.
@@ -1358,7 +1364,15 @@ pub(crate) fn gc_root_sources(
         degraded.push(note);
     }
 
-    Ok(GcRootSources { parcels, pin_parcels: trust_pins.roots, degraded })
+    // Staged shards are read fail-closed under either `bay_policy`: an unreadable or unparseable
+    // shard aborts the call. For gc that is the only safe answer (a shard it cannot read may
+    // reference the only copy of staged work); for heal it is unchanged behaviour.
+    let mut shard_leaves: Vec<(String, DirEntryType)> = Vec::new();
+    for dir in bay_dirs {
+        walk_shard_files(&dir.join(FOLDER_NAME_INVENTORY_ROOT), &mut shard_leaves)?;
+    }
+
+    Ok(GcRootSources { parcels, pin_parcels: trust_pins.roots, shard_leaves, degraded })
 }
 
 /// Collect every durable ref source's roots — see [`WalkRoots`].
@@ -1377,18 +1391,16 @@ pub(crate) fn gc_root_sources(
 /// this walk's roots must stay a *superset* of gc's live-set roots (every pallet head, every
 /// bay's parked parcels, every bay's in-progress consolidation `their_head`, and every trust-pin
 /// root — the shared trust-anchor `adopts`, its `boundary` snapshot, and every key's revocation
-/// `distrust_boundary`, FORK-81) — plus every tag's subject and every bay's staged inventory
-/// shards, sources gc deliberately does not root (tags are not a gc root today; an unstacked
-/// staged shard is a pre-existing, accepted gc design choice, not a bug this walk needs to
-/// match). If gc ever treats an object as live, this walk must never call the same object safe
-/// to drop — otherwise `forklift heal` could clear a taint over an object `forklift gc` would
-/// refuse to delete. The pallet-head/parked-parcels/consolidation/trust-pin portion of that
-/// shared root list is not duplicated here — both this function and `collect_live_set` call the
-/// shared [`gc_root_sources`] for it (F8, PR #120 round 2 — see that function's own doc comment),
-/// so the two can never drift apart on that portion by construction.
+/// `distrust_boundary`, FORK-81 — and every bay's staged inventory shard leaves, FORK-156) — plus
+/// every tag's subject, the one source gc deliberately does not root. If gc ever treats an
+/// object as live, this walk must never call the same object safe to drop — otherwise
+/// `forklift heal` could clear a taint over an object `forklift gc` would refuse to delete.
+/// Everything but the tags is not duplicated here — both this function and `collect_live_set`
+/// call the shared [`gc_root_sources`] for it (F8, PR #120 round 2 — see that function's own doc
+/// comment), so the two can never drift apart on that portion by construction.
 /// **A future edit adding a new bay-local or trust-pin ref source should still re-check both
 /// callers of [`gc_root_sources`], and re-check the other function's root list for anything not
-/// routed through it (tags, shards).**
+/// routed through it (tags).**
 ///
 /// **Tolerant, unlike `collect_live_set`.** This call passes [`bay_utils::BayReadPolicy::
 /// Tolerate`] for the bay-scoped sources, and [`office_utils::TrustPinReadPolicy::Tolerate`] for
@@ -1421,12 +1433,8 @@ pub(crate) fn gc_root_sources(
 /// wart §3.2 calls out by name; a walk that trusted the ledger could silently miss a real
 /// dangling reference).
 fn collect_walk_roots() -> Result<WalkRoots, String> {
-    let mut shard_referenced: Vec<(String, DirEntryType)> = Vec::new();
-
-    // One `all_bay_state_dirs` enumeration, fed to both `gc_root_sources` (the parked/
-    // consolidation portion) and this function's own staged-shard loop below, so `list_bays` runs
-    // exactly once per heal. `Tolerate`/`Tolerate` — see this function's own doc comment for why
-    // heal, unlike gc, must not brick on a single unreadable bay or office record.
+    // `Tolerate`/`Tolerate` — see this function's own doc comment for why heal, unlike gc, must
+    // not brick on a single unreadable bay or office record.
     let bay_dirs = bay_utils::all_bay_state_dirs()?;
     let sources = gc_root_sources(
         &bay_dirs, bay_utils::BayReadPolicy::Tolerate, office_utils::TrustPinReadPolicy::Tolerate,
@@ -1440,12 +1448,12 @@ fn collect_walk_roots() -> Result<WalkRoots, String> {
         parcels.push(tag.tag.subject);
     }
 
-    // Staged inventory shards are likewise recovery-only.
-    for dir in &bay_dirs {
-        walk_shard_files(&dir.join(FOLDER_NAME_INVENTORY_ROOT), &mut shard_referenced)?;
-    }
-
-    Ok(WalkRoots { parcels, pin_parcels: sources.pin_parcels, shard_referenced, degraded_sources: sources.degraded })
+    Ok(WalkRoots {
+        parcels,
+        pin_parcels: sources.pin_parcels,
+        shard_referenced: sources.shard_leaves,
+        degraded_sources: sources.degraded,
+    })
 }
 
 fn walk_shard_files(folder: &Path, hashes: &mut Vec<(String, DirEntryType)>) -> Result<(), String> {
