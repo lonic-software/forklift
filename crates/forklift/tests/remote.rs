@@ -492,12 +492,6 @@ fn the_ignore_file_travels_with_the_pallet() {
     assert_success(&status);
     assert!(stdout(&status).contains("matches the inventory"), "{}", stdout(&status));
 
-    // Route 2: prepare a fresh warehouse, point it at the remote, lower.
-    prepare_warehouse(&area, "c", &server.url);
-    let lowered = area.forklift("c", &["lower"]);
-    assert_success(&lowered);
-    assert_eq!(area.read_file("c/.forkliftignore"), rules);
-
     // An edit to the rules is a change like any other, and reaches the other side.
     let widened = "# build output\n^build(/.*)?$\n\\.log$\n";
     area.write_file("a/.forkliftignore", widened);
@@ -506,6 +500,31 @@ fn the_ignore_file_travels_with_the_pallet() {
     assert_success(&area.forklift("a", &["lift"]));
     assert_success(&area.forklift("b", &["lower"]));
     assert_eq!(area.read_file("b/.forkliftignore"), widened);
+}
+
+/// The other route onto a remote pallet: prepare a fresh warehouse, point it at the remote and
+/// lower. A template ignore file from `prepare` would make lower refuse to write the tracked one.
+#[test]
+fn a_prepared_warehouse_lowers_the_tracked_ignore_file() {
+    let area = TestArea::new("ignore-file-lowered");
+    let server = Server::start(&area, None);
+
+    let rules = "^build(/.*)?$\n";
+    prepare_warehouse(&area, "a", &server.url);
+    area.write_file("a/.forkliftignore", rules);
+    area.write_file("a/src.txt", "src\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "track the ignore rules"]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    prepare_warehouse(&area, "c", &server.url);
+    assert_success(&area.forklift("c", &["lower"]));
+    assert_eq!(area.read_file("c/.forkliftignore"), rules);
+
+    area.write_file("c/build/out.txt", "generated in c\n");
+    let status = area.forklift("c", &["stocktake"]);
+    assert_success(&status);
+    assert!(stdout(&status).contains("matches the inventory"), "{}", stdout(&status));
 }
 
 #[test]
