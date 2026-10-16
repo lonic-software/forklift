@@ -1073,12 +1073,14 @@ warehouse fetch scope and deletes the objects under it from the object store, re
 reachability-`gc` never could (narrowed-away content is still reachable history, so `gc`
 correctly keeps it). It is **multi-bay-aware** — it refuses (`scope_prune_blocked`, exit 13) to
 free a path any checkout (the main tree or a bay) still materializes, so narrow that path away
-everywhere first. Nothing is lost: the pruned history is sealed by hash, re-fetchable from the
-origin with `expand`. Work that exists only here is never freed, whatever its path: content
-loaded but not yet stacked, parked parcels, and an unfinished consolidation, in any bay. So you
-can park edits under the path, narrow and prune; the parked edits survive. If any of that state
-cannot be read, the prune refuses before changing anything. A full (non-sparse) warehouse has nothing to prune. Use `--dry-run` before
-you leap. (Objects already inside a pack are reported but not reclaimed yet — a scope-aware
+everywhere first. The pruned history is sealed by hash and re-fetchable from the origin with
+`expand`, so only history the origin holds comes back: lift any stacks under the path before
+pruning it. Work that exists only here is never freed, whatever its path: content loaded but not
+yet stacked, parked parcels, and an unfinished consolidation, in any bay. So you can park edits
+under the path, narrow and prune; the parked edits survive, and `park pop` re-applies them once
+`expand` has brought the path back. If any of that state cannot be read, the prune refuses
+before changing anything. A full (non-sparse) warehouse has nothing to prune. Use `--dry-run`
+before you leap. (Objects already inside a pack are reported but not reclaimed yet — a scope-aware
 repack is future work.)
 
 Pruning a **large (chunked) file** frees its recipe **and every chunk** it names, not just the

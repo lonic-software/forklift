@@ -787,7 +787,7 @@ mod tests {
     #[test]
     fn plan_prune_never_frees_parked_edits_under_the_pruned_path_yet_still_reclaims_it() {
         // The flow `narrow` suggests: park uncommitted edits under the path, narrow, prune. The
-        // park snapshots the whole tree, so it names the head's own `src/web` subtree too.
+        // park snapshots the whole tree, so it shares the head's own `src/web` content too.
         let _scratch = Scratch::new("parked-under-pruned");
         let f = build_fixture();
         let edit = store_blob("an edit nobody stacked\n");
