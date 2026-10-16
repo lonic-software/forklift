@@ -8550,10 +8550,10 @@ mod tests {
     }
 
     /// The budgets the stalled-error-body tests arm with. [`FAST`] has no error-body budget a
-    /// second clear of every rival on both sides (see [`error_body_upper_bound`]), and a
+    /// second clear of every rival on both sides (see [`error_body_bracket`]), and a
     /// connect bound as small as [`FAST`]'s leaves the connect-forgotten rival under a second
     /// below whatever allowance is picked, so these widen both. Each figure is distinct from every
-    /// [`FAST`] and production one; [`error_body_upper_bound`] checks the separation
+    /// [`FAST`] and production one; [`error_body_bracket`] checks the separation
     /// rather than this doc stating it.
     fn stalled_error_body_budgets() -> Budgets {
         Budgets {
@@ -8564,28 +8564,21 @@ mod tests {
         .checked()
     }
 
-    /// A timed error-body test's upper bound: the midpoint from `lower_bound`, the test's armed
-    /// error-body budget (`budgets`' connect bound plus its error-body allowance, summed by the
-    /// test itself), toward the nearest figure above it that a single misarm could fire at
-    /// instead. The rivals are every
+    /// The elapsed-time bracket of a timed error-body test on a client carrying `budgets`, computed
+    /// before it starts waiting. The lower bound is the armed error-body budget, summed from the
+    /// injected budgets rather than through `error_body_read_budget`, so a bug in that helper
+    /// cannot move the elapsed time and the bound in lockstep. The upper bound is the midpoint
+    /// toward the nearest figure above it that a single misarm could fire at instead: any
     /// allowance of this instance or of [`PRODUCTION_MIRROR`], on its own or folded with any
     /// connect bound (this instance's or a production one); each connect bound alone; and `extra`,
     /// the test's own outer deadlines. Every rival is asserted to be at least a second from the
-    /// armed budget on either side, so the midpoint leaves half a second for a loaded runner and a
-    /// misarm below fires a second before the lower bound, further than any scheduling delay a
-    /// test tolerates. The midpoint is asserted to sit under `outer_ceiling`, or a misarm between
-    /// the two would read as a hang; a test calls this before it starts waiting.
-    fn error_body_upper_bound(
-        budgets: Budgets, lower_bound: std::time::Duration, extra: &[std::time::Duration],
-        outer_ceiling: std::time::Duration,
-    ) -> UpperBound {
-        let armed = lower_bound;
-        assert!(
-            budgets.connect != PRODUCTION_MIRROR.connect
-                && budgets.connect != PRODUCTION_MIRROR_TOR.connect,
-            "the connect bound {:?} is a production one, so a misarm reading the production bound \
-            could not be told apart from this instance's", budgets.connect
-        );
+    /// armed budget on either side (a connect bound equal to a production one lists the armed sum
+    /// twice and fails here), so the midpoint leaves half a second for a loaded runner and a misarm
+    /// below fires a second before the lower bound. The outer ceiling, which turns a lost bound
+    /// into a failure rather than a hang, is asserted to sit above the midpoint, or a misarm
+    /// between the two would read as a hang.
+    fn error_body_bracket(budgets: Budgets, extra: &[std::time::Duration]) -> Bracket {
+        let armed = budgets.connect + budgets.error_body_read;
         // Destructured without `..`, so a field added to `Budgets` has to be placed here.
         let allowances = |b: Budgets| {
             let Budgets {
@@ -8620,21 +8613,26 @@ mod tests {
         let nearest = rivals.into_iter().filter(|&rival| rival > armed).min()
             .expect("the production allowances folded with a connect bound exceed any test budget");
         let upper_bound = armed + (nearest - armed) / 2;
+        let outer_ceiling = armed + std::time::Duration::from_secs(10);
         assert!(
             upper_bound < outer_ceiling,
             "the midpoint {:?} must sit under the {:?} ceiling, or a misarm between them reads as \
             a hang", upper_bound, outer_ceiling
         );
-        UpperBound { midpoint: upper_bound, nearest_rival: nearest }
+        Bracket { lower_bound: armed, upper_bound, nearest_rival: nearest, outer_ceiling }
     }
 
-    /// What [`error_body_upper_bound`] returns: named, since both are durations and a test that
-    /// asserted against the rival in place of the midpoint would still compile.
-    struct UpperBound {
-        /// The bound a test asserts the elapsed time is under.
-        midpoint: std::time::Duration,
-        /// The figure the midpoint was taken toward, for the failure message.
+    /// What [`error_body_bracket`] returns, its fields named for the reader: every one is a
+    /// duration, so nothing but review stops a test asserting against the wrong one.
+    struct Bracket {
+        /// The elapsed time must be at least this, the armed error-body budget.
+        lower_bound: std::time::Duration,
+        /// The elapsed time must be under this.
+        upper_bound: std::time::Duration,
+        /// The figure `upper_bound` is the midpoint toward, for the failure message.
         nearest_rival: std::time::Duration,
+        /// The test's own timeout around the call.
+        outer_ceiling: std::time::Duration,
     }
 
     /// A direct-dial client carrying [`FAST`].
@@ -10426,23 +10424,22 @@ mod tests {
         // this test still pins what it always pinned. Any real hash
         // string works — the fixture never inspects the body.
         let hashes: Vec<String> = (0..2000).map(|_| "a".repeat(64)).collect();
-        // Written as the sum of the injected budgets, not via `error_body_read_budget`, so this
-        // assertion doesn't co-move with a corrupted helper — a helper bug would then move the
-        // elapsed time it produces and this fixed lower bound in lockstep, pinning nothing.
-        let lower_bound = budgets.connect + budgets.error_body_read;
         // The bracket this fixture's batch size depends on, made an assertion rather than left as
         // a comment: the call's own outer TotalDeadline must stay looser than error_of's inner
-        // error_body_budget (`lower_bound` above), or the outer bound fires first and every
+        // error_body_budget (the bracket's lower bound), or the outer bound fires first and every
         // assertion below would end up blaming error_of/error_body_read_budget for a regression
         // that actually lives in presence_negotiation_budget or its constants — a misleading red,
-        // not a wrong one. Computed the same constant-sum-not-via-helper way as `lower_bound`,
-        // for the identical reason: calling `presence_negotiation_budget` here would let a bug in
+        // not a wrong one. Computed as a constant sum, not via a helper, for the same reason the
+        // bracket's lower bound is: calling `presence_negotiation_budget` here would let a bug in
         // that method move this guard and the real behavior it is meant to guard against in
         // lockstep, silently validating a broken implementation instead of catching it.
         let outer_budget = budgets.connect + budgets.post_send_verify_base
             + std::time::Duration::from_secs_f64(
                 hashes.len() as f64 * PRESENCE_ALLOWANCE_MS_PER_OP / 1000.0
             );
+        // The outer deadline is a rival too: were the inner bound lost, it would be what fires.
+        let Bracket { lower_bound, upper_bound, nearest_rival, outer_ceiling } =
+            error_body_bracket(budgets, &[outer_budget]);
         assert!(
             outer_budget > lower_bound,
             "this fixture's batch size ({} hashes, outer TotalDeadline {:?}) no longer stays \
@@ -10452,10 +10449,6 @@ mod tests {
             firing first) rather than the one they exist to catch",
             hashes.len(), outer_budget, lower_bound
         );
-        let outer_ceiling = lower_bound + std::time::Duration::from_secs(10);
-        // The outer deadline is a rival too: were the inner bound lost, it would be what fires.
-        let UpperBound { midpoint: upper_bound, nearest_rival } =
-            error_body_upper_bound(budgets, lower_bound, &[outer_budget], outer_ceiling);
 
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let started = std::time::Instant::now();
@@ -10512,10 +10505,8 @@ mod tests {
         let remote = SilentErrorBodyRemote::start();
         let budgets = stalled_error_body_budgets();
         let client = RemoteClient::new_test_with_budgets(&remote.url, budgets);
-        let lower_bound = budgets.connect + budgets.error_body_read;
-        let outer_ceiling = lower_bound + std::time::Duration::from_secs(10);
-        let UpperBound { midpoint: upper_bound, nearest_rival } =
-            error_body_upper_bound(budgets, lower_bound, &[], outer_ceiling);
+        let Bracket { lower_bound, upper_bound, nearest_rival, outer_ceiling } =
+            error_body_bracket(budgets, &[]);
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let started = std::time::Instant::now();
 
@@ -10836,12 +10827,12 @@ mod tests {
     /// this file; the values are not transcribed here, for the reason
     /// [`error_body_budget_reads_this_field_not_a_rival_constant`]'s own doc gives at length.
     /// `n` is fixed at 1 here (a 5ms scaled term) precisely so this test's asserted *output* —
-    /// 15.005s (`13 + TEST_POST_SEND_VERIFY_BASE + 0.005`) — is what
-    /// actually needs checking for collisions, and unlike `error_body_budget`/`resolve_budget`'s
-    /// own two-addend sums, `presence_negotiation_budget` sums *three* terms (`connect_timeout`,
+    /// 15.005s (`13 + TEST_POST_SEND_VERIFY_BASE + 0.005`) — is what actually needs checking for
+    /// collisions, and unlike `error_body_budget`/`resolve_budget`'s own two-addend sums,
+    /// `presence_negotiation_budget` sums *three* terms (`connect_timeout`,
     /// `POST_SEND_VERIFY_BASE`, the `n`-scaled term); unlike those tests, the odd `.005s` fraction
-    /// this asserts is not producible at all by summing any subset of this module's named
-    /// (whole- or tenth-second) `Duration` constants — a fractional-second remainder no
+    /// this asserts is not producible at all by summing any subset of this module's named (whole-
+    /// or tenth-second) `Duration` constants — a fractional-second remainder no
     /// whole/tenth-second constant in this module can produce, so no enumeration is needed to make
     /// the point, and none is attempted: characterising a separation table as complete has cost a
     /// fresh defect on every attempt this module's history has tried it.
