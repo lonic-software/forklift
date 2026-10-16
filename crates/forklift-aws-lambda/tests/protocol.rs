@@ -2482,3 +2482,39 @@ fn a_transient_refusal_of_the_anchor_write_is_a_503() {
 
     assert_eq!(err.status, Status::ServiceUnavailable);
 }
+
+/// FORK-114: a first anchor arrives over an unborn office, so its `adopts` is tied to nothing
+/// else — and every warehouse that adopts the anchor later fetches that history from here. One
+/// naming history the head does not hold is refused; the same anchor once the history is
+/// uploaded is established.
+#[test]
+fn a_first_anchor_adopting_history_the_head_does_not_hold_is_refused() {
+    let area = Area::new("first-anchor-adopts");
+    prepare(&area, "wh");
+    area.forklift("wh", &["office", "enroll"]);
+    area.write_file("wh/app.txt", "v1\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "signed"]);
+
+    let harvest = harvest(&area.path("wh"));
+    let office_head = harvest.head_of(&format!("@{}", OFFICE_PALLET_NAME)).expect("office head");
+    let anchor = TrustAnchorDto {
+        genesis: "e".repeat(64),
+        adopts: Some(office_head.clone()),
+        ..harvest.trust.clone().expect("trust")
+    };
+
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    let err = head.put_trust(&anchor).expect_err("adopted history not held");
+    assert_eq!(err.status, Status::Unprocessable);
+    assert!(err.message.contains(&office_head), "the refusal must name the pin: {}", err.message);
+
+    // The head parcel alone is not the history: its tree and records are still missing.
+    head.object_put(None, &office_head, &harvest.objects[&office_head]).expect("upload head");
+    let err = head.put_trust(&anchor).expect_err("adopted history incomplete");
+    assert_eq!(err.status, Status::Unprocessable, "{}", err.message);
+    assert!(err.message.contains(&office_head), "the refusal must name the pin: {}", err.message);
+
+    upload_all(&head, &harvest);
+    head.put_trust(&anchor).expect("adopted history held");
+}

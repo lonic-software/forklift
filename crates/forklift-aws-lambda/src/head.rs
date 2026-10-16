@@ -350,6 +350,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             if office_head.is_some() {
                 return Err(Self::anchor_lost());
             }
+            self.require_adopted_history(&anchor)?;
 
             return match self
                 .refs
@@ -979,6 +980,53 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             retry ref updates automatically."
                 .to_string(),
         )
+    }
+
+    /// Refuse a first anchor whose `adopts` names history this warehouse does not completely
+    /// hold. The replacement path needs no such check — it requires `adopts` to be the office
+    /// head — but a first anchor arrives over an unborn office, and every warehouse that adopts it
+    /// later fetches that history from here. The client uploads it before the anchor.
+    ///
+    /// The whole closure is walked, as the lift audit walks it: the adopted chain is an office
+    /// chain, so its parcels, trees and record blobs are mirrored into the scratch and checked
+    /// there, with the chunk and recipe seams answered by the object store.
+    fn require_adopted_history(&self, anchor: &TrustAnchorDto) -> Result<(), HeadError> {
+        let Some(adopts) = anchor.adopts.as_deref() else {
+            return Ok(());
+        };
+
+        let scratch = self.scratch().map_err(HeadError::internal)?;
+
+        scratch.scoped(|| -> HeadResult<()> {
+            let mut mirror = Mirror::default();
+            materialize(&self.objects, adopts, true, None, &mut mirror).map_err(HeadError::internal)?;
+
+            let verify_closure = |head: &str| {
+                audit_utils::verify_parcel_closure_with(
+                    head,
+                    None,
+                    &|hash| self.objects.exists(hash),
+                    &|chunks| self.objects.objects_missing(chunks),
+                    &|hash| {
+                        let bytes = self
+                            .objects
+                            .get(hash)?
+                            .ok_or_else(|| format!("Recipe {} is missing.", hash))?;
+
+                        Ok(object_utils::parse_recipe_bytes(hash, &bytes)?
+                            .chunks
+                            .into_iter()
+                            .map(|chunk| chunk.hash)
+                            .collect())
+                    },
+                    // A creation (`known_complete: None`) takes no prune candidates.
+                    &|hash| Err(format!("Tree {} was read as a prune base, but nothing bounds this walk.", hash)),
+                )
+            };
+
+            audit_utils::require_adopted_history(Some(adopts), &verify_closure)
+                .map_err(HeadError::unprocessable)
+        })
     }
 
     /// The `409` for planting an anchor over an office whose own anchor was lost: the chain was

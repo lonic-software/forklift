@@ -358,6 +358,11 @@ deliberately **loud**: every clone refuses to sync until its holder consciously
 re-accepts, and a remote accepts the reset only from the server operator's static
 token.
 
+The attested history travels with the anchor. Accepting the reset, or franchising
+from the remote after it, fetches the old office chain. Lifting a re-genesis to a
+remote that has no anchor yet uploads that chain first. A server refuses an anchor
+whose attested history it does not hold.
+
 Every other clone's next sync is refused, naming the new genesis. On each, after
 verifying out-of-band that the reset is legitimate **and** that the genesis is
 the one the refusal named:

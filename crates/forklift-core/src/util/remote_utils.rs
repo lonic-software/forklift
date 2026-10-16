@@ -4461,6 +4461,32 @@ async fn lift_pallet_inner(client: &RemoteClient,
         }
     }
 
+    let (new_parcels, uploaded_objects, uploaded_signatures) =
+        upload_history(client, local_head, remote_head, chunking_supported, progress).await?;
+
+    client.update_ref(pallet, remote_head, local_head).await?;
+
+    Ok(LiftResult::Lifted(LiftStats {
+        new_parcels,
+        uploaded_objects,
+        uploaded_signatures,
+        old_head: remote_head.map(|hash| hash.to_string()),
+    }))
+}
+
+/// Upload the history `local_head` reaches and the remote does not — every parcel past
+/// `remote_head` (all of them when `None`), its objects and its signatures — without moving any
+/// ref. [`lift_pallet_inner`] follows it with the ref update; [`push_local_trust`] uses it alone
+/// for a re-genesis anchor's adopted office history, which no ref on the remote names.
+///
+/// # Returns
+/// * `Ok((usize, usize, usize))` - The new parcels, uploaded objects and uploaded signatures.
+/// * `Err(String)`               - If the history could not be read or a transfer failed.
+async fn upload_history(client: &RemoteClient,
+                        local_head: &str,
+                        remote_head: Option<&str>,
+                        chunking_supported: bool,
+                        progress: &Progress) -> Result<(usize, usize, usize), String> {
     // The new parcels the remote does not have, ordered parents-first — see
     // `new_parcels_parents_first`, which owns both the walk and the order the candidate
     // loop below depends on.
@@ -4533,14 +4559,7 @@ async fn lift_pallet_inner(client: &RemoteClient,
         }
     }
 
-    client.update_ref(pallet, remote_head, local_head).await?;
-
-    Ok(LiftResult::Lifted(LiftStats {
-        new_parcels: new_parcels.len(),
-        uploaded_objects,
-        uploaded_signatures,
-        old_head: remote_head.map(|hash| hash.to_string()),
-    }))
+    Ok((new_parcels.len(), uploaded_objects, uploaded_signatures))
 }
 
 /// The new parcels of a lift — everything reachable from the local head that the remote does
@@ -5366,6 +5385,11 @@ pub async fn adopt_remote_trust(client: &RemoteClient,
     }
 
     stats.fetch = fetch_history(client, remote_office_head, &Progress::NONE).await?;
+    // Before the office head moves: an anchor is only ever held with its adopted history. A held
+    // anchor was adopted with it already, so only an anchor about to be written needs the walk.
+    if local.is_none() {
+        fetch_adopted_history(client, remote_trust).await?;
+    }
 
     match pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME)? {
         None => {
@@ -5398,6 +5422,23 @@ pub async fn adopt_remote_trust(client: &RemoteClient,
     }
 
     Ok(stats)
+}
+
+/// Fetch the office history a remote's re-genesis anchor adopts, if it adopts any. The new office
+/// chain starts fresh at the re-genesis, so following the office head never reaches it; without
+/// this, a warehouse would hold an anchor pinning history it never had, and every `heal` would
+/// report that pin dangling. Called before the anchor is written, so a failure leaves none held.
+///
+/// The adopted chain is frozen and attested by the anchor, so it is fetched, not re-verified.
+async fn fetch_adopted_history(client: &RemoteClient, remote_trust: &TrustAnchorDto) -> Result<(), String> {
+    if let Some(adopts) = &remote_trust.adopts {
+        fetch_history(client, adopts, &Progress::NONE).await.map_err(|error| format!(
+            "Could not fetch the office history {} adopted by the trust anchor of {}: {}",
+            adopts, client.url(), error
+        ))?;
+    }
+
+    Ok(())
 }
 
 /// Where a warehouse stands against its remote's trust anchor, as `office accept-regenesis` sees
@@ -5495,6 +5536,7 @@ pub async fn accept_regenesis(client: &RemoteClient,
         .ok_or("The remote has a trust anchor but no office pallet; it is corrupt.".to_string())?;
 
     fetch_history(client, remote_office_head, &Progress::NONE).await?;
+    fetch_adopted_history(client, remote_trust).await?;
 
     // Never adopt an anchor whose chain does not even verify against itself.
     let new_anchor = remote_trust.to_anchor();
@@ -5555,6 +5597,13 @@ pub async fn push_local_trust(client: &RemoteClient,
             }
         }
     } else {
+        // A re-genesis anchor's `adopts` names history no ref reaches — the new office chain
+        // starts fresh — so the office lift below never carries it. Upload it first: the remote
+        // refuses an anchor whose adopted history it does not hold, and every warehouse that
+        // later adopts this anchor fetches that history from it.
+        if let Some(adopts) = &local.adopts {
+            upload_history(client, adopts, None, info.chunking, &Progress::NONE).await?;
+        }
         client.put_trust(&TrustAnchorDto::from(&local)).await?;
     }
 

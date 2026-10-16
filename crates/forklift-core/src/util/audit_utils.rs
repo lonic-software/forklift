@@ -1410,6 +1410,36 @@ pub fn verify_one_signature(parcel_hash: &str,
     Ok(())
 }
 
+/// Refuse a first trust anchor whose `adopts` names history the warehouse does not completely
+/// hold. Every head that establishes an anchor runs this: a first anchor arrives over an unborn
+/// office, so nothing else ties its `adopts` to held history — yet every warehouse that adopts
+/// the anchor later fetches that history from here, and roots it with
+/// `PinAbsencePolicy::Loss`. The head's object being present is not enough: a parcel or record
+/// lost behind it is just as unservable.
+///
+/// # Arguments
+/// * `adopts`         - The anchor's `adopts` pin (`None` passes: nothing is adopted).
+/// * `verify_closure` - The head's whole-history check ([`verify_parcel_closure`] with no
+///                      bound, or the same walk over the head's own object store).
+///
+/// # Returns
+/// * `Ok(())`      - If nothing is adopted, or the adopted history is completely present.
+/// * `Err(String)` - The refusal, naming the pin and what is missing.
+pub fn require_adopted_history(
+    adopts: Option<&str>,
+    verify_closure: &dyn Fn(&str) -> Result<(), String>,
+) -> Result<(), String> {
+    let Some(adopts) = adopts else {
+        return Ok(());
+    };
+
+    verify_closure(adopts).map_err(|missing| format!(
+        "The trust anchor adopts office head {}, but this warehouse does not hold that history \
+        completely ({}). Lift that history before the anchor.",
+        adopts, missing
+    ))
+}
+
 /// Verify that the history behind a head is completely present: every parcel from
 /// `head` back to `known_complete` (exclusive), and the full tree/blob closure of each
 /// of those parcels. A ref must never point at missing history — a remote runs this
