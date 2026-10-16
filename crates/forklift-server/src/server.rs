@@ -2316,16 +2316,19 @@ async fn post_resolve(State(state): State<Arc<AppState>>,
 
     // Each identifier's resolved name plus its key, with the envelope on top: what a directory
     // can legitimately answer for this many identifiers.
-    let answer_cap = (request.identifiers.len() as u64)
-        .saturating_mul(RESOLUTION_ANSWER_BYTES_PER_IDENTIFIER)
-        .saturating_add(body_utils::SMALL_BODY_CAP);
+    let answer_cap = body_utils::per_item_body_cap(request.identifiers.len(), RESOLUTION_ANSWER_BYTES_PER_IDENTIFIER);
     let hook_request = ResolutionHookRequest { caller, identifiers: request.identifiers };
 
     let names = match post_hook(&state, hook, "resolution", &hook_request).await {
         Ok(response) if response.status().is_success() => {
-            body_utils::read_json_capped::<ResolutionHookResponse>(response, answer_cap).await
-                .map(|answer| answer.names)
-                .unwrap_or_default()
+            match body_utils::read_json_capped::<ResolutionHookResponse>(response, answer_cap).await {
+                Ok(answer) => answer.names,
+                Err(e) => {
+                    tracing::warn!(error = ?e,
+                        "the resolution hook's answer is unreadable, oversized or malformed; showing pseudonyms");
+                    BTreeMap::new()
+                }
+            }
         }
         // The resolution failure policy is "show pseudonyms": a hook that is down or
         // answers badly resolves to nothing, never a failed request (unlike the hot

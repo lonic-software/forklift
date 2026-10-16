@@ -22,6 +22,12 @@ use serde::de::DeserializeOwned;
 /// sidecar, or a hook's small answer.
 pub const SMALL_BODY_CAP: u64 = 64 * 1024;
 
+/// The cap for an answer that lists up to `items` entries of at most `per_item` bytes each, plus
+/// [`SMALL_BODY_CAP`] for its envelope. Saturates rather than overflowing.
+pub fn per_item_body_cap(items: usize, per_item: u64) -> u64 {
+    (items as u64).saturating_mul(per_item).saturating_add(SMALL_BODY_CAP)
+}
+
 /// Why a capped read did not return a body.
 #[derive(Debug)]
 pub enum BodyReadError {

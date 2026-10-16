@@ -1675,6 +1675,23 @@ mod tests {
         assert!(import_streamed_bundle(std::io::Cursor::new(raw_bundle(BUNDLE_HEADER_V3, &records))).is_ok());
     }
 
+    /// The streamed path is the one a remote's batch and subtree answers reach, so the hostile
+    /// declared length the fuzz suite pins through `import_bundle_bytes` is pinned here too: a
+    /// record declaring `u64::MAX` bytes is an error, never an allocation of them.
+    #[test]
+    fn a_streamed_record_declaring_a_huge_length_is_refused_without_allocating_it() {
+        for kind in [b'O', b'D', b'S'] {
+            let _scratch = Scratch::new("streamed-huge-length");
+            let mut hostile = vec![kind];
+            hostile.extend([b'a'; 64]);
+            hostile.extend(u64::MAX.to_be_bytes());
+            hostile.extend(b"only a few real bytes");
+
+            let outcome = import_streamed_bundle(std::io::Cursor::new(raw_bundle(BUNDLE_HEADER_V3, &hostile)));
+            assert!(outcome.is_err(), "a '{}' record of declared length u64::MAX must be refused", kind as char);
+        }
+    }
+
     #[test]
     fn a_bundle_stream_declaring_a_window_past_the_bound_is_refused_and_one_at_it_imports() {
         let (records, hashes) = three_objects();

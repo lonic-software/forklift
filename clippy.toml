@@ -33,6 +33,6 @@ disallowed-methods = [
     { path = "reqwest::Response::bytes", reason = "whole-body response reads go through util::body_utils (read_body_capped / read_json_capped), which cap what a peer can make the client hold" },
     { path = "reqwest::Response::json", reason = "whole-body response reads go through util::body_utils (read_body_capped / read_json_capped), which cap what a peer can make the client hold" },
     { path = "reqwest::Response::text", reason = "whole-body response reads go through util::body_utils (read_body_capped / read_json_capped), which cap what a peer can make the client hold" },
-    { path = "reqwest::Response::chunk", reason = "whole-body response reads go through util::body_utils (read_body_capped / read_json_capped), which cap what a peer can make the client hold" },
-    { path = "reqwest::Response::bytes_stream", reason = "whole-body response reads go through util::body_utils (read_body_capped / read_json_capped), which cap what a peer can make the client hold" },
+    { path = "reqwest::Response::chunk", reason = "a whole-body read goes through util::body_utils (read_body_capped / read_json_capped); a streaming read must hand each chunk to disk or the bundle importer and allow this call at that site with a justification" },
+    { path = "reqwest::Response::bytes_stream", reason = "a whole-body read goes through util::body_utils (read_body_capped / read_json_capped); a streaming read must hand each chunk to disk or the bundle importer and allow this call at that site with a justification" },
 ]

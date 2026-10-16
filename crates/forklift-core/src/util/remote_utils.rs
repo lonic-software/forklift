@@ -94,12 +94,6 @@ const UPLOAD_TARGETS_BODY_BYTES_PER_HASH: u64 = 8 * 1024;
 /// Per-identifier allowance in a `resolve` answer: the identifier and the name it resolves to.
 const RESOLVE_BODY_BYTES_PER_IDENTIFIER: u64 = 4 * 1024;
 
-/// The cap for an answer that lists up to `items` entries of at most `per_item` bytes each, plus
-/// [`body_utils::SMALL_BODY_CAP`] for its envelope.
-fn per_item_body_cap(items: usize, per_item: u64) -> u64 {
-    (items as u64).saturating_mul(per_item).saturating_add(body_utils::SMALL_BODY_CAP)
-}
-
 /// The characters a warehouse path SEGMENT must be percent-encoded against before it is spliced
 /// into a URL. Everything but RFC 3986 unreserved characters (ASCII alphanumerics, `-`, `_`,
 /// `.`, `~`) is encoded — so a segment holding a space, `#`, `?`, `%`, or any other character
@@ -3005,7 +2999,7 @@ impl RemoteClient {
             }
 
             let body: MissingObjectsResponse = self.read_json(
-                response, per_item_body_cap(batch.len(), MISSING_BODY_BYTES_PER_HASH),
+                response, body_utils::per_item_body_cap(batch.len(), MISSING_BODY_BYTES_PER_HASH),
                 "negotiating with the remote", posture, "negotiation response",
             ).await?;
 
@@ -3092,7 +3086,7 @@ impl RemoteClient {
         // Every failure degrades to the designed fallback, including a serialization failure the
         // seam now surfaces up front rather than deferring into a `reqwest::Error` — see this
         // function's own doc for why an empty map is the right answer to all of them here.
-        let cap = per_item_body_cap(identifiers.len(), RESOLVE_BODY_BYTES_PER_IDENTIFIER);
+        let cap = body_utils::per_item_body_cap(identifiers.len(), RESOLVE_BODY_BYTES_PER_IDENTIFIER);
         let Ok(body) = SendBody::json(&ResolveRequest { identifiers }) else {
             return BTreeMap::new();
         };
@@ -3320,6 +3314,17 @@ impl RemoteClient {
     /// A transfer that fails, or is dropped, closes the channel without that mark, which the
     /// importer reads as an error — so a body cut short never imports as a smaller bundle. When
     /// both sides fail, the transfer's error is the one reported: it is the cause.
+    ///
+    /// Three consequences of importing while the body arrives, all accepted:
+    /// * A transfer that fails partway leaves the records before the break stored. Each is
+    ///   verified against its hash, so they are ordinary present objects, and every caller decides
+    ///   what to fetch next by presence rather than by this call's result.
+    /// * Dropping this future (an outer timeout) drops the sender, and the importer stops at its
+    ///   next read — after the record it is storing, never mid-record. Stores are content-addressed
+    ///   and atomic, so a fallback storing the same hash meanwhile is harmless.
+    /// * A slow importer stops the transfer being read once the channel fills. The silence budget
+    ///   is armed only while the body is polled, so this never trips the client's own timeout; a
+    ///   remote's idle timeout could, which is the price of not holding the bundle in memory.
     async fn import_response(&self,
                              mut response: reqwest::Response,
                              action: &str,
@@ -3466,7 +3471,7 @@ impl RemoteClient {
             }
 
             let body: UploadTargetsResponse = self.read_json(
-                response, per_item_body_cap(batch.len(), UPLOAD_TARGETS_BODY_BYTES_PER_HASH),
+                response, body_utils::per_item_body_cap(batch.len(), UPLOAD_TARGETS_BODY_BYTES_PER_HASH),
                 "negotiating upload targets", posture, "upload-targets response",
             ).await?;
 
