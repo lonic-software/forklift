@@ -4762,7 +4762,7 @@ fn heal_driven_refetch_clears_only_the_hash_the_remote_actually_has() {
 // `attempt_heal_driven_refetch`.
 #[test]
 fn heal_driven_refetch_recovers_every_object_when_more_than_one_is_missing() {
-    // The batch path's `import_bundle_bytes` stores its records one at a time, each with its own
+    // The batch path's bundle import stores its records one at a time, each with its own
     // `?` — the first object's store self-trips `taint_recheck` against the still-standing taint
     // and the `Err` aborts the whole call before the second object is even attempted.
     // `resolve_the_rest`'s recovery verdict is decided by a post-fetch `raw_object_present`
@@ -4842,7 +4842,7 @@ fn heal_pass_one_restoring_a_missing_ancestor_keeps_the_closure_walk_from_falsel
     // parent, so the walk never reaches H1 to notice it is missing. Deleting H2 too makes the
     // walk's very first frontier node fail its presence check, forcing it to actually fetch H2,
     // load its parcel, and cascade into checking (and, once the fix's guard is armed, restoring)
-    // H1 — the same call shape `fetch_missing_objects` and `import_bundle_bytes` use elsewhere,
+    // H1 — the same call shape `fetch_missing_objects` and the batch import use elsewhere,
     // just reached through history discovery instead of a direct hash target. Neither H1 nor H2
     // was ever locally re-fetched before this `heal` run — this is genuinely pass 1's own
     // restoration, not something already sitting on disk.

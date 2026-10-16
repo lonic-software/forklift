@@ -19,9 +19,9 @@ use crate::util::{
 /// into one durably-synced loose file per object.
 pub const BUNDLE_HEADER: &str = "forklift-bundle 2026-07-13";
 
-/// Version 3: the former current format — one outer zstd stream of `O`/`D`/`S` records. Still used
-/// by small in-memory partial bundles (`objects/batch`, subtree fetches), and still accepted for
-/// backward-compatible whole-bundle imports.
+/// Version 3: the former current format — one outer zstd stream of `O`/`D`/`S` records. Still the
+/// format of partial bundles (`objects/batch`, subtree fetches), which are imported as they stream
+/// in and accept no other version, and still accepted for whole-bundle imports.
 const BUNDLE_HEADER_V3: &str = "forklift-bundle 2026-07-11";
 
 /// The version-2 header (2026-07-06, §9.1 #1), which added delta records (`KIND_DELTA`). Still

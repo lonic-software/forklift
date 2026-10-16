@@ -1,3 +1,14 @@
+# Two bans live here, each enforced by `cargo clippy` in CI.
+#
+# zstd decoders: every decoder of untrusted bytes is built by object_utils' bounded constructors,
+# which cap the frame window. The list names every safe-API constructor and the raw streaming entry
+# points. It is complete only while zstd-sys's `experimental` feature stays off: that feature
+# exposes further decompression entry points (`ZSTD_decompressStream_simpleArgs` and kin) which
+# would need adding here. Nothing enables it today.
+#
+# reqwest body reads: whole-body and chunk readers go through util::body_utils, which caps what a
+# peer can make the client hold. The streaming loops that write to disk or to the bundle importer
+# allow `chunk` per site with a justification.
 disallowed-methods = [
     { path = "zstd::stream::decode_all", reason = "unbounded decode of untrusted bytes; use object_utils::decode_object_bounded unless reading back bytes this store itself wrote — allow per-site with a justification" },
     { path = "zstd::stream::read::Decoder::new", reason = "every zstd decoder of untrusted bytes is built by object_utils::bounded_zstd_decoder / bounded_zstd_dictionary_decoder, which bound the frame window (a frame can otherwise make its decoder hold up to 128 MiB)" },

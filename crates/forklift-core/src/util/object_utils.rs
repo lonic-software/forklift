@@ -27,7 +27,7 @@ use crate::util::{byte_utils, chunk_utils, fanout_utils, file_utils};
 /// [`store_object_stream`], which deliberately does not enforce this ceiling.
 pub const MAX_OBJECT_BYTES: usize = 64 * 1024 * 1024;
 
-/// The largest object [`import_bundle_reader`](crate::util::bundle_utils) buffers whole before it
+/// The largest object the bundle importer ([`crate::util::bundle_utils`]) buffers whole before it
 /// switches to the streaming store path. At or below it a bundle record is read into memory and
 /// stored via [`store_object_bytes`] (memory bounded by this size); above it,
 /// [`store_object_stream`] hashes and compresses it to a temp file without ever holding it whole.

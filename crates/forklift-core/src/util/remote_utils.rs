@@ -3138,7 +3138,8 @@ impl RemoteClient {
     }
 
     /// Fetch many objects in one round trip as a bundle-format stream
-    /// (`POST /v1/objects/batch`). `None` when the remote predates the endpoint
+    /// (`POST /v1/objects/batch`) and import them as the stream arrives (see
+    /// [`Self::import_response`]). `None` when the remote predates the endpoint
     /// (a `404`) — the caller falls back to loose fetches.
     ///
     /// An offloading (storage-backed) head cannot stream a large bundle back through its own
@@ -3257,7 +3258,8 @@ impl RemoteClient {
     }
 
     /// Fetch the object closure of a subtree at a path of a parcel, as a bundle-format stream
-    /// (`GET /v1/parcels/{parcel}/subtree/{path}`). This is the **path-addressed** fetch: the
+    /// (`GET /v1/parcels/{parcel}/subtree/{path}`), and import it as it arrives (see
+    /// [`Self::import_response`]). This is the **path-addressed** fetch: the
     /// remote resolves the path to a subtree itself, so it can authorize the request by path —
     /// the wire surface file-level path enforcement (FORK-10) is designed to gate, which a
     /// hash-addressed `GET /v1/objects/{hash}` cannot, being path-blind. `Ok(None)` when the

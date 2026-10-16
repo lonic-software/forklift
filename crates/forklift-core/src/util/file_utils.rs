@@ -433,7 +433,7 @@ static SELF_TRIP_EXEMPTION_COUNT: std::sync::atomic::AtomicUsize = std::sync::at
 ///
 /// **Must be process-global, not thread-local.** A refetch's stores do not all run on the thread
 /// that armed this guard: `fetch_loose_objects`'s `JoinSet` tasks run on tokio worker threads, and
-/// `import_bundle_bytes` runs on whatever thread the async runtime happens to poll it on. A
+/// a fetched bundle is imported on a blocking-pool thread (`RemoteClient::import_response`). A
 /// thread-local guard would not be visible to those threads, reproducing exactly the scheduling-
 /// dependent bug this exemption exists to remove. This assumes the CLI's tokio runtime is
 /// multithreaded, which is the default — a load-bearing assumption for anyone who later touches
