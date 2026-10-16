@@ -151,8 +151,7 @@ stages their removal. Because the rules travel, a rule someone else stacks does 
 same in your warehouse once you `lower` it.
 
 Anchor a folder rule at both ends. `^target\/?.*$` also matches `targets.txt` and
-`target-notes/`, and ignoring a tracked file makes the next `load .` stage its
-removal.
+`target-notes/`, so an unanchored rule can swallow tracked files you meant to keep.
 
 ### `alias` — the `fl` short name
 

@@ -2442,7 +2442,8 @@ pub fn get_owners_for_file(_metadata: &Metadata) -> (u64, u64) {
 ///
 /// # Returns
 /// * Ok(Vec<Regex>) - The regex patterns for ignored paths.
-/// * Err(String)    - If an error occurred while reading the ignore file.
+/// * Err(String)    - If the ignore file could not be read, or was refused: a symbolic link or
+///                    folder, a conflict marker, or a pattern matching the empty string.
 pub fn get_ignored_paths() -> Result<Vec<Regex>, String> {
     let mut ignored_paths = get_default_ignored_paths()?;
 
