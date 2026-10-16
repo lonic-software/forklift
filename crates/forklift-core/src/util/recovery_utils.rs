@@ -3858,11 +3858,11 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// Finding 2 (round 2, PR #120): `adopts` must keep its pre-FORK-81 (main-branch) strict
-    /// semantics — reported when absent, exactly like an ordinary ref — never the `Gap` tolerance
-    /// `boundary`/`distrust_boundary` get. `office regenesis` sets `adopts` to THIS warehouse's
-    /// own prior office head (present by construction on the warehouse performing the re-genesis),
-    /// so its absence is genuine local loss, not a "maybe never fetched" declared snapshot.
+    /// `adopts` is reported when absent, exactly like an ordinary ref — never the `Gap` tolerance
+    /// `boundary`/`distrust_boundary` get. Every warehouse holding a re-genesis anchor holds its
+    /// adopted history: the one that ran `office regenesis` by construction, every other one
+    /// because franchise and `office accept-regenesis` fetch it before writing the anchor. Its
+    /// absence is genuine local loss, not a "maybe never fetched" declared snapshot.
     /// Contrast with `torn_taint_clears_when_the_only_reference_is_a_never_held_trust_pin` above
     /// (a `boundary` hash, correctly a gap) — this fixture is the same shape but for `adopts`, and
     /// must refuse instead of clearing.

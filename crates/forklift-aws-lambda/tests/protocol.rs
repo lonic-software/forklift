@@ -2509,6 +2509,12 @@ fn a_first_anchor_adopting_history_the_head_does_not_hold_is_refused() {
     assert_eq!(err.status, Status::Unprocessable);
     assert!(err.message.contains(&office_head), "the refusal must name the pin: {}", err.message);
 
+    // The head parcel alone is not the history: its tree and records are still missing.
+    head.object_put(None, &office_head, &harvest.objects[&office_head]).expect("upload head");
+    let err = head.put_trust(&anchor).expect_err("adopted history incomplete");
+    assert_eq!(err.status, Status::Unprocessable, "{}", err.message);
+    assert!(err.message.contains(&office_head), "the refusal must name the pin: {}", err.message);
+
     upload_all(&head, &harvest);
     head.put_trust(&anchor).expect("adopted history held");
 }

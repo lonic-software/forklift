@@ -1521,6 +1521,23 @@ fn the_server_refuses_a_first_anchor_adopting_history_it_does_not_hold() {
     assert!(status.contains("422"), "{} {}", status, response);
     assert!(response.contains(&missing), "the refusal must name the pin: {}", response);
 
+    // A held head parcel is not held history: plant only the office head of a real chain, and
+    // the parcel's tree and records are still missing.
+    prepare_warehouse(&area, "w", &server.url);
+    assert_success(&area.forklift("w", &["office", "enroll"]));
+    let office_head = std::fs::read_to_string(area.path("w/.forklift/meta/office")).unwrap();
+    let office_head = office_head.trim();
+    let relative = std::path::Path::new(".forklift/objects").join(&office_head[..2]).join(&office_head[2..]);
+    let planted = area.path("server-root").join(&relative);
+    std::fs::create_dir_all(planted.parent().unwrap()).unwrap();
+    std::fs::copy(area.path("w").join(&relative), &planted).unwrap();
+    let body = serde_json::json!({
+        "genesis": "cd".repeat(32), "enabled_at": 0, "boundary": [], "adopts": office_head,
+    }).to_string();
+    let (status, response) = http_send_json(&server.url, "PUT", "/v1/trust", &body);
+    assert!(status.contains("422"), "{} {}", status, response);
+    assert!(response.contains(office_head), "the refusal must name the pin: {}", response);
+
     assert_success(&area.forklift(".", &["franchise", &server.url, "d"]));
 }
 

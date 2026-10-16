@@ -546,10 +546,9 @@ pub enum TrustPinReadPolicy {
 /// remote's or a revoker's *declared* heads, never pulled first — see each variant's own doc
 /// comment for which pin gets which and why). Carried per pin entry in
 /// [`TrustPinRootsOutcome::roots`] rather than one policy for the whole call, because the three
-/// pin sources do not share this property (F2, PR #120 round 2: folding `adopts` into the same
-/// gap treatment as `boundary`/`distrust_boundary` silently weakened its pre-existing, main-branch
-/// semantics — this warehouse's own commands set `adopts`, so its absence was always reported
-/// there, and still is under this policy).
+/// pin sources do not share this property: `adopts` names history every warehouse holding the
+/// anchor holds (see [`PinAbsencePolicy::Loss`]), so folding it into the gap treatment
+/// `boundary`/`distrust_boundary` get would silently tolerate real loss.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PinAbsencePolicy {
     /// The pin names history every warehouse holding the anchor holds, by construction: the

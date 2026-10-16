@@ -5385,8 +5385,11 @@ pub async fn adopt_remote_trust(client: &RemoteClient,
     }
 
     stats.fetch = fetch_history(client, remote_office_head, &Progress::NONE).await?;
-    // Before the office head moves: an anchor is only ever held with its adopted history.
-    fetch_adopted_history(client, remote_trust).await?;
+    // Before the office head moves: an anchor is only ever held with its adopted history. A held
+    // anchor was adopted with it already, so only an anchor about to be written needs the walk.
+    if local.is_none() {
+        fetch_adopted_history(client, remote_trust).await?;
+    }
 
     match pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME)? {
         None => {
@@ -5429,7 +5432,10 @@ pub async fn adopt_remote_trust(client: &RemoteClient,
 /// The adopted chain is frozen and attested by the anchor, so it is fetched, not re-verified.
 async fn fetch_adopted_history(client: &RemoteClient, remote_trust: &TrustAnchorDto) -> Result<(), String> {
     if let Some(adopts) = &remote_trust.adopts {
-        fetch_history(client, adopts, &Progress::NONE).await?;
+        fetch_history(client, adopts, &Progress::NONE).await.map_err(|error| format!(
+            "Could not fetch the office history {} adopted by the trust anchor of {}: {}",
+            adopts, client.url(), error
+        ))?;
     }
 
     Ok(())
