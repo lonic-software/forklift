@@ -11008,6 +11008,72 @@ mod tests {
         );
     }
 
+    /// Serve one `/v1/warehouse` answer: `head` (status line and headers, without the blank line)
+    /// then `body`.
+    fn serve_one_handshake(head: String, body: String) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+
+        std::thread::spawn(move || {
+            use std::io::Write;
+
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = read_test_request(&mut stream);
+                let _ = write!(stream, "{}\r\nConnection: close\r\n\r\n{}", head, body);
+                let _ = stream.flush();
+            }
+        });
+
+        url
+    }
+
+    /// The handshake lists every pallet, and a warehouse may have any number of them: a cap sized
+    /// for a "small" answer would refuse a real warehouse outright (750 pallets already pass
+    /// 64 KiB). Five thousand pallets, about 450 KB, must handshake.
+    #[test]
+    fn a_handshake_listing_thousands_of_pallets_is_read() {
+        let pallets: BTreeMap<String, String> = (0..5000)
+            .map(|i| (format!("feature/branch-number-{}", i), "a".repeat(64)))
+            .collect();
+        let body = serde_json::json!({
+            "protocol": PROTOCOL_VERSION, "default_pallet": "main", "pallets": pallets,
+            "trust": null, "chunking": false,
+        }).to_string();
+        assert!(body.len() > 400_000, "the fixture must be far past a small-body cap");
+
+        let url = serve_one_handshake(
+            format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}", body.len()),
+            body,
+        );
+        let client = RemoteClient::new(&url, None).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+
+        let info = runtime.block_on(client.fetch_info()).unwrap_or_else(|e| panic!("{}", e));
+        assert_eq!(info.pallets.len(), 5000);
+    }
+
+    /// The other side of the handshake cap: an answer declaring more than it is refused before a
+    /// byte of it is read, with a message naming what was refused and the cap.
+    #[test]
+    fn a_handshake_over_its_cap_is_refused_naming_the_cap() {
+        let url = serve_one_handshake(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}",
+                HANDSHAKE_BODY_CAP + 1
+            ),
+            String::new(),
+        );
+        let client = RemoteClient::new(&url, None).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+
+        let message = match runtime.block_on(client.fetch_info()) {
+            Err(message) => message,
+            Ok(_) => panic!("an over-cap handshake must not appear to succeed"),
+        };
+        assert!(message.contains("handshake") && message.contains(&HANDSHAKE_BODY_CAP.to_string()),
+            "the refusal names what was refused and the cap: {}", message);
+    }
+
     /// The third `is_timeout()` json guard, on `fetch_info`, gets the same treatment as the two
     /// above. It predates this reshape and was the *least* covered of the three: mutating it to
     /// `if true` left the entire crate suite green, because every existing `fetch_info` test
