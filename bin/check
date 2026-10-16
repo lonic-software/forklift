@@ -1,11 +1,22 @@
 #!/usr/bin/env bash
-# The build, tests and clippy CI runs (.github/workflows/ci.yml). CI runs the
+# The formatting guard, build, tests and clippy CI runs (.github/workflows/ci.yml). CI runs the
 # same tests under cargo-nextest, one process per test, plus `cargo test --doc`;
 # `cargo test` here covers both in one go. CI's clippy is report-only (style-level lint
 # debt is tracked separately), so this doesn't fail on lint warnings — the
-# build and the tests are the gate.
+# formatting guard, the build and the tests are the gate.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+
+echo "── formatting guard (cargo fmt --check)"
+# The tree is formatted by hand and rustfmt.toml switches rustfmt off, so this passes only while
+# that guard is in force. Removed or overridden (a nested rustfmt.toml), `cargo fmt` would rewrite
+# about half the tree, and this reports it instead. It never formats anything itself.
+if ! cargo fmt --all --check >/dev/null; then
+    echo
+    echo "cargo fmt would reformat the tree: rustfmt.toml's disable_all_formatting guard is missing" >&2
+    echo "or overridden. Restore it; do not run cargo fmt (see docs/guide/contributing.md)." >&2
+    exit 1
+fi
 
 echo "── cargo build --workspace"
 cargo build --workspace
@@ -28,4 +39,4 @@ if ! diff -ru docs/generated "$docs_scratch"; then
     exit 1
 fi
 
-echo "check: build + tests + docs green"
+echo "check: formatting guard + build + tests + docs green"

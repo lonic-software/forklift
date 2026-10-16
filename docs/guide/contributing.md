@@ -98,6 +98,25 @@ Notes:
 - To install a working binary (e.g. to dogfood): `cargo install --path
   crates/forklift --force` (lands in `~/.cargo/bin`).
 
+### Formatting
+
+Forklift is formatted by hand. **Do not run `cargo fmt` or `rustfmt`**; match the
+formatting of the code around your change instead. A construct stays on one line
+whenever it fits the width, and doc comments are wrapped by hand.
+
+No stable rustfmt configuration matches this style. The closest one tried
+(`use_small_heuristics = "Max"`, no import or module reordering) still disagreed
+with about half the tree, and the options that would close the gap (comment
+wrapping, import grouping and granularity) are nightly-only. So the root
+`rustfmt.toml` sets `disable_all_formatting = true`, which makes an accidental
+`cargo fmt`, or an editor's format-on-save through rustfmt, a no-op rather than a
+reflow of files the change never touched.
+
+`bin/check` and CI enforce the guard with `cargo fmt --all --check`. It passes
+only while the guard is in force: if `rustfmt.toml` is deleted, or a nested
+`rustfmt.toml` overrides it, rustfmt would rewrite the tree and the check fails.
+It never formats anything itself.
+
 ### Maintainer commands (pult)
 
 The repo ships a [pult](https://github.com/lonic-software/pult) manifest (`pult.yaml`)
@@ -106,7 +125,7 @@ so the operational commands are one launcher away; the real logic lives in `bin/
 
 | Command | What it does |
 | --- | --- |
-| `pult check` | `bin/check` — build + test + clippy, the same checks CI runs (CI runs the tests under cargo-nextest and skips them on docs-only pull requests), plus docs freshness. A test that reads a file under `docs/` must name it by its literal repo path (e.g. `"../../docs/guide/cli.md"`), because that is how CI tells a docs-only change from one a test depends on |
+| `pult check` | `bin/check` — the [formatting guard](#formatting) + build + test + clippy, the same checks CI runs (CI runs the tests under cargo-nextest and skips them on docs-only pull requests), plus docs freshness. A test that reads a file under `docs/` must name it by its literal repo path (e.g. `"../../docs/guide/cli.md"`), because that is how CI tells a docs-only change from one a test depends on |
 | `pult test` | just the test suite (fast loop) |
 | `pult release` | `bin/release` — preflight, bump the workspace version, tag `v<x.y.z>`, push (the tag triggers `.github/workflows/release.yml`) |
 | `pult install` | build & install the CLI + server from this checkout |

@@ -1,0 +1,13 @@
+# Forklift is formatted by hand, and rustfmt is switched off here on purpose.
+#
+# No stable rustfmt configuration matches the house style: the closest one tried
+# (use_small_heuristics = "Max", no import or module reordering) still rewrote about half
+# the tree, and the options that would close the gap (comment wrapping, import grouping
+# and granularity) are nightly-only. Without this file, a routine `cargo fmt` reflows
+# files the change never touched, silently, because a formatter rewrites rather than
+# reports. This line makes `cargo fmt` a no-op instead.
+#
+# `bin/check` and CI run `cargo fmt --check`, which fails if this guard is removed or
+# overridden by a nested rustfmt.toml. Match the formatting of the surrounding code by hand.
+# See docs/guide/contributing.md, "Formatting".
+disable_all_formatting = true

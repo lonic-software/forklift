@@ -8,7 +8,7 @@ name: lonic-forklift
 
 commands:
   - id: check
-    title: Run what CI runs — build, test, clippy
+    title: Run what CI runs — formatting guard, build, test, clippy
     run: "./bin/check"
 
   - id: test
