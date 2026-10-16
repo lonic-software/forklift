@@ -3968,6 +3968,36 @@ mod tests {
         std::fs::remove_dir_all(&temp).ok();
     }
 
+    /// FORK-106: a presence check must see a pack published after this process cached its pack
+    /// set. Fixture: cache the registry while X is absent, then publish a pack holding X into the
+    /// pack folder with no `invalidate_cache()` — the shape an external `compact` leaves behind a
+    /// live server. `does_object_exist` and `raw_object_present` must both answer yes.
+    #[test]
+    fn a_pack_published_after_caching_is_seen_by_the_presence_check() {
+        use crate::util::pack_utils::TransportPackBuilder;
+
+        let temp = std::env::temp_dir()
+            .join(format!("forklift-presence-after-caching-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+        let folder = crate::util::pack_utils::pack_folder();
+
+        let content = b"an object compacted by another process after this registry was cached".to_vec();
+        let hash = blake3::hash(&content).to_hex().to_string();
+
+        assert!(!does_object_exist(&hash).unwrap(), "sanity: X is absent, and the registry is now cached");
+
+        let mut builder = TransportPackBuilder::new(&folder).unwrap();
+        builder.append_full(&hash, content.as_slice()).unwrap();
+        builder.finish().unwrap();
+
+        assert!(does_object_exist(&hash).unwrap(), "a pack published after caching must be seen");
+        assert!(raw_object_present(&hash).unwrap(), "the gate-free presence check must see it too");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
     /// (I6) The `Failed`-path fall-through to the loose store is verification-gated, never a
     /// blind "anything at this path will do": a loose file at a broken hash's own fan-out path
     /// only turns the terminal verdict `Verified` when its bytes actually hash to that address; a
