@@ -91,25 +91,22 @@ const MISSING_BODY_BYTES_PER_HASH: u64 = 128;
 /// [`body_utils::SMALL_BODY_CAP`]; one larger than this is reported as unread rather than parsed.
 const ERROR_BODY_CAP: u64 = 1024 * 1024;
 
-/// Read a refusal's error body within [`ERROR_BODY_CAP`]. A body that cannot be read stands in as
-/// the status's reason, and one over the cap says it was not read. Bounds the size only: how long
-/// the read may take is the caller's to decide (see `error_of` and `commit_lift`).
-async fn read_error_body(response: reqwest::Response) -> ErrorResponse {
+/// Read a refusal's error body within [`ERROR_BODY_CAP`] and `budget`. A body that cannot be read
+/// in time, or at all, stands in as the status's reason; one over the cap says it was not read.
+async fn read_error_body(response: reqwest::Response, budget: std::time::Duration) -> ErrorResponse {
     let status = response.status();
-    let reason = status.canonical_reason().unwrap_or("unknown error").to_string();
+    let reason = || status.canonical_reason().unwrap_or("unknown error").to_string();
+    let unread = |error: String| ErrorResponse { error, code: None, next_step: None };
 
-    match body_utils::read_json_capped::<ErrorResponse>(response, ERROR_BODY_CAP).await {
-        Ok(body) => body,
-        Err(JsonReadError::Body(BodyReadError::OverCap { cap })) => unread_error(format!(
-            "{} (the remote's description of the error is larger than {} bytes and was not read)", reason, cap
+    let read = body_utils::read_json_capped::<ErrorResponse>(response, ERROR_BODY_CAP);
+
+    match tokio::time::timeout(budget, read).await {
+        Ok(Ok(body)) => body,
+        Ok(Err(JsonReadError::Body(BodyReadError::OverCap { cap }))) => unread(format!(
+            "{} (the remote's description of the error is larger than {} bytes and was not read)", reason(), cap
         )),
-        Err(_) => unread_error(reason),
+        Ok(Err(_)) | Err(_) => unread(reason()),
     }
-}
-
-/// An error body standing in for one that could not be read.
-fn unread_error(error: String) -> ErrorResponse {
-    ErrorResponse { error, code: None, next_step: None }
 }
 
 /// Per-hash allowance in an `upload-targets` answer: a presigned upload URL (about 500 bytes in
@@ -2882,10 +2879,7 @@ impl RemoteClient {
     /// the flat [`ERROR_BODY_READ_TIMEOUT`] alone is not it.
     async fn error_of(&self, response: reqwest::Response, action: &str) -> String {
         let status = response.status();
-        let body = match tokio::time::timeout(self.error_body_budget(), read_error_body(response)).await {
-            Ok(body) => body,
-            Err(_) => unread_error(status.canonical_reason().unwrap_or("unknown error").to_string()),
-        };
+        let body = read_error_body(response, self.error_body_budget()).await;
 
         classify_remote_error(status.as_u16(), action, body.error, body.code, body.next_step)
     }
@@ -3637,9 +3631,10 @@ impl RemoteClient {
     /// other:**
     ///
     /// 1. **Response wait is unbounded** (rides [`Posture::UnboundedFollowsRedirects`],
-    ///    [`UnboundedTicket::Fork91`]): this call's error-body read decides retry-vs-terminal
-    ///    control flow, so bounding it is a retry-contract design question — FORK-91's own scope,
-    ///    still open.
+    ///    [`UnboundedTicket::Fork91`]): how long to wait for the remote's answer decides
+    ///    retry-vs-terminal control flow, so bounding it is a retry-contract design question —
+    ///    FORK-91's own scope, still open. A refusal's *body*, once its status has arrived, is read
+    ///    under the error-body budget like any other; one that stalls reads as terminal.
     /// 2. **No redirect guard** (a *separate* axis from 1, not covered by fixing it): this is
     ///    this module's one remaining mutation that still rides the auto-following client with no
     ///    `is_redirection()` check. FORK-89 moved every other mutation (`update_ref`,
@@ -3681,9 +3676,12 @@ impl RemoteClient {
         }
 
         let status = response.status();
-        // Bounded in size only: how long it may take decides retry against terminal, which is
-        // the open question gap 1 above records.
-        let message = read_error_body(response).await.error;
+        // Bounded like every error body. A body that does not arrive in time reads as the bare
+        // status, which is terminal, exactly as an unparseable one is: the wait for the response
+        // itself (gap 1) stays open, but a refusal whose description stalls fails loudly rather
+        // than hanging the lift. The cost is a slow description of a transient refusal failing
+        // instead of being retried, which a budget sized for a small body makes rare.
+        let message = read_error_body(response, self.error_body_budget()).await.error;
 
         if is_transient_commit_failure(status, &message) {
             return Ok(CommitOutcome::BlobNotReady);
@@ -10216,16 +10214,15 @@ mod tests {
 
     // -----------------------------------------------------------------------------------
     // The error-body read: once a non-success status line has arrived, `error_of` reads the body
-    // through `read_error_body`, whose byte cap bounds its size but not how long it takes. The
+    // through `read_error_body`, under a byte cap and a time budget. The
     // auto-following client (`Posture::UnboundedFollowsRedirects`, which `missing_objects` rides)
     // carries only a `connect_timeout`, no `read_timeout` at all — so a remote that delivers a
     // full status line and headers and then wedges before writing the body hangs the caller
-    // forever. `ERROR_BODY_READ_TIMEOUT` bounds the read itself, in `error_of`, rather than
+    // forever. `ERROR_BODY_READ_TIMEOUT` bounds the read itself, in `read_error_body`, rather than
     // trying to fix it with yet another client — no client can help here, since the body-read
     // bound is inherited from whichever client sent the request, and `error_of` serves responses
-    // from all of them. `commit_lift`'s own error-body read is deliberately left unbounded (a
-    // pre-existing, ticketed defect — FORK-49 is scoped to reads whose result only shapes a
-    // message, not this call's retry-vs-terminal control flow).
+    // from all of them. `commit_lift` reads its refusals under the same budget; only its wait for
+    // the response itself stays unbounded, under FORK-91.
     // -----------------------------------------------------------------------------------
 
     /// A remote that delivers a non-success status line and full headers (claiming a body),
@@ -10310,6 +10307,25 @@ mod tests {
     /// that the value at the one client mode that actually ships a non-default budget is the
     /// correct, uncapped 70s (the field-read property alone does not imply this one: a future cap
     /// on the result would leave it unaffected while breaking this).
+    /// A lift commit's refusal whose body stalls fails as a terminal error within the error-body
+    /// budget instead of hanging the lift: the auto-following client it rides has no read
+    /// timeout, so nothing else would end the wait.
+    #[test]
+    fn commit_lift_bounds_the_error_body_read_after_a_wedged_500() {
+        let remote = SilentErrorBodyRemote::start();
+        let client = fast_client(&remote.url);
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let started = std::time::Instant::now();
+
+        let message = match runtime.block_on(client.commit_lift("session", &[], &[], false)) {
+            Err(message) => message,
+            Ok(_) => panic!("a 500 is refused"),
+        };
+        assert!(message.contains("(500)"), "{}", message);
+        assert!(started.elapsed() < std::time::Duration::from_secs(30),
+            "the stalled body must not hold the lift: {:?}", started.elapsed());
+    }
+
     #[test]
     fn missing_objects_bounds_the_error_body_read_after_a_wedged_500() {
         let remote = SilentErrorBodyRemote::start();
@@ -11101,9 +11117,10 @@ mod tests {
     /// Distinguishes the body-phase fix from a cosmetic one: reporting every failed read in
     /// `read_json` as "not valid JSON" (dropping its transport-failure branch) would still pass
     /// every silent-remote test above — a fully silent remote never sends headers at all, so it
-    /// never reaches the body read's error arm in the first place. Against [`PartialJsonThenSilentRemote`] it does: the deadline still fires (the
-    /// `TotalDeadline` posture bounds the whole response, body included — a total timeout carries
-    /// into the body read, not just `.send()`), and the message must be the deadline message, not
+    /// never reaches the body read's error arm in the first place. Against
+    /// [`PartialJsonThenSilentRemote`] it does: the deadline still fires (the `TotalDeadline`
+    /// posture bounds the whole response, body included — a total timeout carries into the body
+    /// read, not just `.send()`), and the message must be the deadline message, not
     /// the JSON-parse-failure one, since the remote never sent garbage — it sent a valid-so-far
     /// prefix and then nothing further.
     #[test]
@@ -11377,9 +11394,10 @@ mod tests {
     }
 
     /// The handshake's read in `fetch_info` gets the same treatment as the `missing_objects` and
-    /// `upload_targets` parse-failure tests. It was the *least* covered of those three reads: routing its parse failures through the composer left the
-    /// entire crate suite green, because every other `fetch_info` test drives either a refused
-    /// connect or header-phase silence, neither of which ever reaches the body read's error arm.
+    /// `upload_targets` parse-failure tests. It was the *least* covered of those three reads:
+    /// routing its parse failures through the composer left the entire crate suite green, because
+    /// every other `fetch_info` test drives either a refused connect or header-phase silence,
+    /// neither of which ever reaches the body read's error arm.
     ///
     /// The handshake is the first call any remote operation makes, so this is the guard a captive
     /// portal meets first: a `200` carrying an HTML sign-in page on `/v1/warehouse` must be
