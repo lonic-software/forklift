@@ -2149,6 +2149,22 @@ pub fn compact(all: bool, redelta: bool, progress: &Progress) -> Result<CompactS
     // Taken after the folder exists so its parent (`forklift_root`) is present for `create_new`.
     let _store_lock = lock_utils::StoreLock::acquire()?;
 
+    // A repack is serve-exclusive, like gc (FORK-149). It keeps only the live set, with no grace
+    // period, so beside a live server it can drop a lift's objects after an incremental compact
+    // packed them and before the lift's ref update lands — and a server whose presence check is
+    // current (FORK-106) answers "present" for exactly those objects, so the client never
+    // re-sends a loose copy that would survive. Incremental compaction drops nothing and stays
+    // allowed. Auto-maintenance ignores a compaction error, so it simply skips the repack while
+    // the root is served.
+    let _serve_lock = if all {
+        Some(lock_utils::ServeLock::acquire().map_err(|e| format!(
+            "A full repack cannot run while this warehouse root is being served, or while a gc runs \
+             against it; stop the server first. {}", e
+        ))?)
+    } else {
+        None
+    };
+
     remove_stale_temp_files(&pack_folder);
 
     progress.status("Collecting objects");

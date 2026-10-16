@@ -1237,7 +1237,11 @@ repack**: it rewrites every pack too, **dropping unreachable objects** that were
 packs (garbage from undone stacks, abandoned pushes) and **consolidating many packs into
 few**. It **reuses** each object's existing delta (a byte-copy, not a re-compress), so it is
 fast and never balloons the store — but heavier than incremental; run it occasionally (auto
-does when packs pile up, or a server off-peak).
+does when packs pile up). Because it drops unreachable packed objects with no grace period,
+`compact --all` is **refused while a `forklift-server` is serving that root** (or a
+`forklift-server gc` is running against it): a lift in flight would lose objects it had already
+uploaded. Stop the server, repack, then restart. Plain `compact` drops nothing and stays
+allowed; the automatic repack simply waits until the root is no longer served.
 
 ```sh
 forklift compact          # incremental: pack the loose objects
