@@ -760,7 +760,7 @@ fn bundle_latest_is_404_and_resolve_is_an_empty_map() {
     let refused = fixture.call(post_json("/v1/resolve", &serde_json::json!({ "identifiers": many })));
     assert_eq!(status(&refused), 422);
     let refusal = String::from_utf8_lossy(refused.body()).to_string();
-    assert!(refusal.contains("names 10001 distinct identifiers"), "the refusal names its count: {}", refusal);
+    assert!(refusal.contains(&format!("names {} distinct identifiers", forklift_core::model::remote::MAX_RESOLVE_IDENTIFIERS + 1)), "the refusal names its count: {}", refusal);
 
     let repeated = vec!["op-0"; forklift_core::model::remote::MAX_RESOLVE_IDENTIFIERS * 2];
     let accepted = fixture.call(post_json("/v1/resolve", &serde_json::json!({ "identifiers": repeated })));

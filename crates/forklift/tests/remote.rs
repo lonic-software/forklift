@@ -2032,7 +2032,7 @@ impl HookServer {
                             ("200 OK", r#"{"allow":false,"reason":"the quota is exhausted"}"#)
                         }
                     }
-                    "/resolve" => ("200 OK", r#"{"names":{"tester@forklift":"Remote Tester"}}"#),
+                    "/resolve" => ("200 OK", r#"{"names":{"tester@forklift":"Remote Tester","someone-else":"Someone Else"}}"#),
                     _ => ("200 OK", r#"{}"#),
                 };
 
@@ -2349,7 +2349,7 @@ fn resolution_is_server_mediated_and_degrades_to_pseudonyms() {
         &server.url, "/v1/resolve", &serde_json::json!({ "identifiers": many }).to_string()
     );
     assert!(status.contains("422"), "{} {}", status, body);
-    assert!(body.contains("names 10001 distinct identifiers"), "{}", body);
+    assert!(body.contains(&format!("names {} distinct identifiers", forklift_core::model::remote::MAX_RESOLVE_IDENTIFIERS + 1)), "{}", body);
 
     let repeated = vec!["tester@forklift"; 20_000];
     let (status, body) = http_post_json(
@@ -2359,12 +2359,12 @@ fn resolution_is_server_mediated_and_degrades_to_pseudonyms() {
     assert!(body.contains("Remote Tester"), "{}", body);
 
     // This directory names tester@forklift whatever it is asked; a request that did not ask about
-    // that identifier must not get its name, though the directory was asked and answered.
+    // that identifier gets the name it did ask about (so the answer was read) and not that one.
     let (status, body) = http_post_json(
         &server.url, "/v1/resolve", &serde_json::json!({ "identifiers": ["someone-else"] }).to_string()
     );
     assert!(status.contains("200"), "{} {}", status, body);
-    hooks.wait_for("/resolve", "someone-else");
+    assert!(body.contains("Someone Else"), "the directory's answer was read: {}", body);
     assert!(!body.contains("Remote Tester"), "a name nobody asked about reaches the client: {}", body);
 
     // Resolution never fails a command: point the remote at a dead port and history

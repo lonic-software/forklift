@@ -3106,8 +3106,9 @@ impl RemoteClient {
     ///
     /// The deadline above is per request, so the whole call can take one deadline per
     /// `RESOLVE_REQUESTS_IN_FLIGHT` requests against a remote that never answers. A roster that
-    /// fits in that many requests — up to 40,000 short identifiers, though fewer long ones, since
-    /// a request closes when the next identifier would not fit — is bounded by one deadline.
+    /// fits in that many requests — up to that many times `MAX_RESOLVE_IDENTIFIERS` short
+    /// identifiers, though fewer long ones, since a request closes when the next identifier would
+    /// not fit — is bounded by one deadline.
     pub async fn resolve(&self, identifiers: Vec<String>) -> BTreeMap<String, String> {
         let distinct: std::collections::BTreeSet<String> = identifiers.into_iter().collect();
         let mut batches: Vec<Vec<String>> = Vec::new();
