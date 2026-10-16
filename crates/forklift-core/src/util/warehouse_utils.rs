@@ -75,6 +75,10 @@ pub fn cwd_relative_to_root() -> PathBuf {
 /// Prepare a warehouse in the current folder. Every step is idempotent: only the pieces
 /// that are missing get created.
 ///
+/// No `.forkliftignore` is written, as `git init` writes no `.gitignore`. The ignore file is
+/// tracked content, and a template written here would be an untracked file that franchise and
+/// lower then refuse to overwrite with a pallet's own copy.
+///
 /// # Returns
 /// * `Ok(Vec<String>)` - One note per created piece; empty if the warehouse was already
 ///                       fully prepared.
@@ -116,10 +120,6 @@ pub fn prepare_warehouse() -> Result<Vec<String>, String> {
 
     if config_utils::create_warehouse_config_if_not_exists()? {
         created.push("Created warehouse configuration file.".to_string());
-    }
-
-    if file_utils::create_ignore_file_if_not_exists()? {
-        created.push("Created ignore file.".to_string());
     }
 
     Ok(created)

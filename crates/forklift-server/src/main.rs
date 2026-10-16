@@ -555,7 +555,7 @@ fn resolve_root(root: &str, create: bool) -> Result<std::path::PathBuf, String> 
 }
 
 /// Prepare a bare warehouse: the same layout `forklift prepare` creates — the server
-/// simply never uses the working-directory parts (inventory, ignore file).
+/// simply never uses the working-directory parts (the inventory).
 fn prepare(root: &str) -> Result<(), String> {
     let resolved = resolve_root(root, true)?;
     let _scope = forklift_core::globals::StorageRootScope::enter(&resolved);

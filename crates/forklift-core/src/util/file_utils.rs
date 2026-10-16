@@ -28,21 +28,12 @@ pub const OBJECT_HASH_FOLDER_PATH_CHARACTERS: usize = 2;
 const FILENAME_IGNORE: &str = ".forkliftignore";
 
 const IGNORE_FILE_COMMENT_PREFIX: &str = "#";
-const IGNORE_FILE_CONTENT: &str = r#"# Forklift ignore file.
-# This file is used to specify files and directories that should be ignored by Forklift.
-# Every entry must be a valid regex pattern.
-#
-# Example - ignore a folder called "test" (and nothing else whose name starts with "test"):
-# ^test(/.*)?$
-#
-# Example - ignore all files with the extension ".log":
-# \.log$
-"#;
 
-/// Always ignored: the warehouse's own folder, and the ignore file. Each is anchored at both
-/// ends, so a tracked sibling that merely starts with the same name (`.forklift-notes`) is
-/// not swallowed.
-const DEFAULT_IGNORED_PATHS: [&str; 2] = [r"^\.forklift(/.*)?$", r"^\.forkliftignore$"];
+/// Always ignored: the warehouse's own folder. Anchored at both ends, so a tracked sibling that
+/// merely starts with the same name (`.forklift-notes`, the ignore file itself) is not
+/// swallowed. The ignore file is tracked content, like `.gitignore`: its rules travel with the
+/// history.
+const DEFAULT_IGNORED_PATHS: [&str; 1] = [r"^\.forklift(/.*)?$"];
 
 /// The path separator used in warehouse-internal paths (inventory keys, metadata entries,
 /// object store paths). This is always `/`, on every platform: keys written on one platform
@@ -2447,26 +2438,6 @@ pub fn get_owners_for_file(_metadata: &Metadata) -> (u64, u64) {
     (0, 0)
 }
 
-/// Create the `.forkliftignore` file (with default content) if it does not exist yet.
-///
-/// # Returns
-/// * `Ok(true)`    - If the ignore file was created.
-/// * `Ok(false)`   - If the ignore file already existed.
-/// * `Err(String)` - If an error occurred while creating the ignore file.
-pub fn create_ignore_file_if_not_exists() -> Result<bool, String> {
-    let ignore_file_path = crate::globals::warehouse_root().join(FILENAME_IGNORE);
-    let mut created_ignore_file = false;
-
-    if !ignore_file_path.exists() {
-        std::fs::write(&ignore_file_path, IGNORE_FILE_CONTENT)
-            .map_err(|e| format!("Error while creating ignore file: {}", e))?;
-
-        created_ignore_file = true;
-    }
-
-    Ok(created_ignore_file)
-}
-
 /// Get regex patterns for paths that should be ignored by Forklift.
 ///
 /// # Returns
@@ -2596,33 +2567,15 @@ mod tests {
     use crate::globals::StorageRootScope;
 
     #[test]
-    fn default_ignore_rules_cover_the_warehouse_folder_and_ignore_file_but_no_sibling() {
+    fn default_ignore_rules_cover_the_warehouse_folder_but_no_sibling() {
         let defaults = get_default_ignored_paths().unwrap();
 
-        for ignored in [".forklift", ".forklift/config/warehouse.toml", ".forkliftignore"] {
+        for ignored in [".forklift", ".forklift/config/warehouse.toml"] {
             assert!(is_path_ignored(ignored, &defaults), "{} must be ignored", ignored);
         }
-        for tracked in [".forklift-notes", ".forkliftrc", ".forkliftignore.bak", "a/.forklift", "x.forklift"] {
+        // The ignore file is a sibling too: it is tracked content, like `.gitignore`.
+        for tracked in [".forkliftignore", ".forkliftignore.bak", ".forklift-notes", ".forkliftrc", "a/.forklift", "x.forklift"] {
             assert!(!is_path_ignored(tracked, &defaults), "{} must not be ignored", tracked);
-        }
-    }
-
-    #[test]
-    fn the_ignore_file_template_teaches_an_anchored_folder_rule() {
-        // The folder example a new warehouse's ignore file shows is the pattern users copy;
-        // read it from the template so the test follows the text that ships.
-        let example = IGNORE_FILE_CONTENT.lines()
-            .skip_while(|line| !line.contains("ignore a folder called \"test\""))
-            .nth(1)
-            .and_then(|line| line.strip_prefix("# "))
-            .expect("the template's folder example");
-        let rule = vec![get_regex_for_pattern(example).unwrap()];
-
-        for ignored in ["test", "test/a.rs", "test/deep/b.rs"] {
-            assert!(is_path_ignored(ignored, &rule), "{} must be ignored by {}", ignored, example);
-        }
-        for tracked in ["testing.rs", "tests/a.rs", "test.txt", "src/test"] {
-            assert!(!is_path_ignored(tracked, &rule), "{} must not be ignored by {}", tracked, example);
         }
     }
 

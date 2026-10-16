@@ -570,8 +570,9 @@ pub enum Command {
         visible_alias = "p",
         alias = "init",
         long_about = "Prepare a new warehouse in the current directory: the \".forklift\" folder \
-                      with the object store, the staging area, the configuration template and the \
-                      ignore file. Preparing is idempotent — only the missing pieces are created."
+                      with the object store, the staging area and the configuration template. No \
+                      ignore file is written: \".forkliftignore\" is tracked content, created when \
+                      you need one. Preparing is idempotent — only the missing pieces are created."
     )]
     Prepare,
 

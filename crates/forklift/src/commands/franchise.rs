@@ -509,8 +509,8 @@ fn refuse_if_not_an_empty_directory(target: &Path) -> Result<(), String> {
 
 /// Undo whatever franchise created in `target` before it failed, so the directory is retryable
 /// rather than permanently wedged — the defect this closes: a franchise that failed partway
-/// through used to leave `.forklift`/`.forkliftignore` behind, and a subsequent, correct attempt
-/// then refused to enter a directory that was no longer empty.
+/// through used to leave its `.forklift` folder behind, and a subsequent, correct attempt then
+/// refused to enter a directory that was no longer empty.
 ///
 /// `created_directory` is `claim_target`'s own record of whether it created `target` itself —
 /// never re-inferred here:
