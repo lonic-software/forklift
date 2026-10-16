@@ -1403,6 +1403,82 @@ fn regenesis_is_gated_by_the_static_token_and_accepted_consciously() {
     assert!(stdout(&audit).contains("legacy parcel(s)"), "{}", stdout(&audit));
 }
 
+/// Plant crash debris in a warehouse — a torn taint, a parseable prefix with no `END` line — so
+/// the next `heal` walks every root, the anchor's `adopts` pin included, and refuses (exit 21) if
+/// any root that must be held is absent.
+fn plant_torn_taint(area: &TestArea, warehouse: &str) {
+    let taint_dir = area.path(warehouse).join(".forklift").join("taint");
+    std::fs::create_dir_all(&taint_dir).unwrap();
+    std::fs::write(taint_dir.join("taint-99999-0"), b"objects/ab/cdef\n").unwrap();
+}
+
+/// Set up warehouse A on a server with static token "root", enrolled and lifted, then re-genesis
+/// it and lift the reset. Returns the server; `before_reset` runs after A's first lift.
+fn regenesis_on_remote(area: &TestArea, before_reset: impl FnOnce(&Server)) -> Server {
+    area.write_file("tokens.toml", concat!(
+        "[operators]\n",
+        "\"w-token\" = \"worker@forklift\"\n",
+    ));
+    let server = Server::start_with_tokens(area, Some("root"), "tokens.toml");
+
+    prepare_warehouse(area, "a", &server.url);
+    assert_success(&area.forklift("a", &["config", "remote.token", "root"]));
+    area.write_file("a/code.txt", "v1\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "base"]));
+    assert_success(&area.forklift("a", &["office", "enroll"]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    before_reset(&server);
+
+    std::fs::remove_dir_all(area.path("shared-keys")).unwrap();
+    assert_success(&area.forklift("a", &["office", "regenesis", "--confirm"]));
+    assert_success(&area.forklift("a", &["lift"]));
+    server
+}
+
+/// FORK-114: a franchise made after a re-genesis copies the remote's anchor, whose `adopts` names
+/// the remote's pre-reset office head — history the new office chain never reaches. The
+/// franchise must fetch it, or every `heal` on it reports that pin dangling and refuses forever.
+#[test]
+fn a_franchise_after_a_regenesis_holds_the_adopted_history_and_heals() {
+    let area = TestArea::new("regenesis-franchise-heal");
+    let server = regenesis_on_remote(&area, |_| {});
+
+    assert_success(&area.forklift(".", &["franchise", &server.url, "c", "--token", "root"]));
+    plant_torn_taint(&area, "c");
+    let healed = area.forklift("c", &["heal"]);
+    assert!(healed.status.success(),
+        "heal must clear on a franchise of a re-genesis'd remote: {:?}\n{}",
+        healed.status.code(), stderr(&healed));
+}
+
+/// FORK-114, the accepting side: a clone whose office fell behind before the reset accepts the
+/// re-genesis. Its anchor's `adopts` names the remote's pre-reset office head, which the clone
+/// never lowered; accepting must fetch it, exactly as a fresh franchise does.
+#[test]
+fn accepting_a_regenesis_from_behind_holds_the_adopted_history_and_heals() {
+    let area = TestArea::new("regenesis-accept-heal");
+    let server = regenesis_on_remote(&area, |server| {
+        assert_success(&area.forklift(".", &["franchise", &server.url, "b", "--token", "w-token"]));
+        // The office moves on after B's franchise, so B never holds the head the reset adopts.
+        let worker = keygen_admit_args(&area, "worker@forklift");
+        assert_success(&area.forklift("a", &["office", "admit", &worker[0], &worker[1], &worker[2]]));
+        assert_success(&area.forklift("a", &["lift"]));
+    });
+    let _ = &server;
+
+    let refused = area.forklift("b", &["--json", "lower"]);
+    let current = trust_changed_details(&refused)["current"].as_str().unwrap().to_string();
+    assert_success(&area.forklift("b", &["office", "accept-regenesis", "--confirm", &current]));
+
+    plant_torn_taint(&area, "b");
+    let healed = area.forklift("b", &["heal"]);
+    assert!(healed.status.success(),
+        "heal must clear after accepting a re-genesis from behind: {:?}\n{}",
+        healed.status.code(), stderr(&healed));
+}
+
 /// Clients refuse a malformed anchor at the handshake, so the server must never store one: trust
 /// is a one-way door, and a stored malformed anchor would lock every client out for good.
 #[test]
