@@ -241,11 +241,12 @@ pub const MAX_RESOLVE_IDENTIFIERS: usize = 10_000;
 pub const RESOLVE_ANSWER_BYTES_PER_IDENTIFIER: u64 = 1024;
 
 /// The cap for an answer resolving `identifiers`, at the directory and again at the client: each
-/// identifier's own bytes (an answer keys on them) plus [`RESOLVE_ANSWER_BYTES_PER_IDENTIFIER`],
-/// plus the envelope. Sized from the identifiers' bytes, not their count alone, so a long one
-/// cannot overflow the answer for the whole request.
+/// identifier as the answer spells it (a JSON-escaped key, up to six times its raw length) plus
+/// [`RESOLVE_ANSWER_BYTES_PER_IDENTIFIER`], plus the envelope. Sized from the identifiers' bytes,
+/// not their count alone, so a long one cannot overflow the answer for the whole request.
 pub fn resolve_answer_cap(identifiers: &[String]) -> u64 {
-    let identifier_bytes = identifiers.iter().fold(0u64, |sum, id| sum.saturating_add(id.len() as u64));
+    let identifier_bytes = identifiers.iter()
+        .fold(0u64, |sum, id| sum.saturating_add((id.len() as u64).saturating_mul(6)));
 
     crate::util::body_utils::per_item_body_cap(identifiers.len(), RESOLVE_ANSWER_BYTES_PER_IDENTIFIER)
         .saturating_add(identifier_bytes)

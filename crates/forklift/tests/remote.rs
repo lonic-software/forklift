@@ -2343,12 +2343,13 @@ fn resolution_is_server_mediated_and_degrades_to_pseudonyms() {
 
     // The hook's answer cap scales with the identifiers asked for, so the server bounds that
     // count — distinct identifiers, since a repeated one is asked about once.
-    let many: Vec<String> = (0..10_001).map(|i| format!("op-{}", i)).collect();
+    let many: Vec<String> = (0..=forklift_core::model::remote::MAX_RESOLVE_IDENTIFIERS)
+        .map(|i| format!("op-{}", i)).collect();
     let (status, body) = http_post_json(
         &server.url, "/v1/resolve", &serde_json::json!({ "identifiers": many }).to_string()
     );
-    assert!(status.contains("400"), "{} {}", status, body);
-    assert!(body.contains("at most 10000 distinct identifiers"), "{}", body);
+    assert!(status.contains("422"), "{} {}", status, body);
+    assert!(body.contains("distinct identifiers per resolve request"), "{}", body);
 
     let repeated = vec!["tester@forklift"; 20_000];
     let (status, body) = http_post_json(
@@ -2373,11 +2374,12 @@ fn a_server_without_a_resolution_hook_still_bounds_resolve_identifiers() {
     let area = TestArea::new("resolve-limit-no-hook");
     let server = Server::start(&area, None);
 
-    let many: Vec<String> = (0..10_001).map(|i| format!("op-{}", i)).collect();
+    let many: Vec<String> = (0..=forklift_core::model::remote::MAX_RESOLVE_IDENTIFIERS)
+        .map(|i| format!("op-{}", i)).collect();
     let (status, body) = http_post_json(
         &server.url, "/v1/resolve", &serde_json::json!({ "identifiers": many }).to_string()
     );
-    assert!(status.contains("400"), "{} {}", status, body);
+    assert!(status.contains("422"), "{} {}", status, body);
 
     let (status, body) = http_post_json(
         &server.url, "/v1/resolve", &serde_json::json!({ "identifiers": ["op-1"] }).to_string()

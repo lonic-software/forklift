@@ -95,6 +95,9 @@ const ERROR_BODY_CAP: u64 = 1024 * 1024;
 /// practice) keyed by its hash.
 const UPLOAD_TARGETS_BODY_BYTES_PER_HASH: u64 = 8 * 1024;
 
+/// The most identifier bytes one resolve request carries, so a roster of long identifiers is split
+/// well inside any server's request-body limit rather than refused whole.
+const RESOLVE_REQUEST_IDENTIFIER_BYTES: usize = 256 * 1024;
 
 /// The characters a warehouse path SEGMENT must be percent-encoded against before it is spliced
 /// into a URL. Everything but RFC 3986 unreserved characters (ASCII alphanumerics, `-`, `_`,
@@ -627,7 +630,8 @@ const _: () = assert!(
 /// is unbounded — the scaling reason a success body might be large or slow never applies to the
 /// error one. A refusal that lists paths or hashes can run longer, up to [`ERROR_BODY_CAP`]; one
 /// that does not arrive within this budget over a slow link loses its code and next step the same
-/// way an unparseable one does. On elapse, falls back to `status.canonical_reason()` — the exact fallback this
+/// way an unparseable one does.
+/// On elapse, falls back to `status.canonical_reason()` — the exact fallback this
 /// code already uses when the body fails to parse as JSON at all, so a timeout and a malformed
 /// body are indistinguishable to the caller, which is right: both mean "no usable error body
 /// arrived."
@@ -3089,14 +3093,41 @@ impl RemoteClient {
     ///
     /// Each distinct identifier is asked about once, in requests of at most
     /// [`MAX_RESOLVE_IDENTIFIERS`](crate::model::remote::MAX_RESOLVE_IDENTIFIERS) — the most a
-    /// server accepts — so a roster past that resolves in several requests rather than none.
+    /// server accepts — and [`RESOLVE_REQUEST_IDENTIFIER_BYTES`], so a large roster resolves in
+    /// several requests rather than none. The requests run concurrently, so the call as a whole
+    /// is bounded by one request's deadline however many there are.
     pub async fn resolve(&self, identifiers: Vec<String>) -> BTreeMap<String, String> {
-        let distinct: Vec<String> = identifiers.into_iter()
-            .collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+        let distinct: std::collections::BTreeSet<String> = identifiers.into_iter().collect();
+        let mut batches: Vec<Vec<String>> = Vec::new();
+        let mut batch_bytes = 0usize;
+
+        for identifier in distinct {
+            let full = batches.last().is_none_or(|batch| {
+                batch.len() >= crate::model::remote::MAX_RESOLVE_IDENTIFIERS
+                    || batch_bytes + identifier.len() > RESOLVE_REQUEST_IDENTIFIER_BYTES
+            });
+
+            if full {
+                batches.push(Vec::new());
+                batch_bytes = 0;
+            }
+
+            batch_bytes += identifier.len();
+            batches.last_mut().expect("a batch was just ensured").push(identifier);
+        }
+
+        let mut requests = JoinSet::new();
+
+        for batch in batches {
+            let client = self.clone();
+            requests.spawn(async move { client.resolve_batch(batch).await });
+        }
+
         let mut names = BTreeMap::new();
 
-        for batch in distinct.chunks(crate::model::remote::MAX_RESOLVE_IDENTIFIERS) {
-            names.extend(self.resolve_batch(batch.to_vec()).await);
+        // A request that panicked resolves nothing, like any other failure here.
+        while let Some(answer) = requests.join_next().await {
+            names.extend(answer.unwrap_or_default());
         }
 
         names

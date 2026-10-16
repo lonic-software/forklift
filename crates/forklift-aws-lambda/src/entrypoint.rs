@@ -46,8 +46,8 @@ use subtle::ConstantTimeEq;
 
 use forklift_core::model::remote::{
     CommitLiftRequest, ErrorResponse, MissingObjectsRequest, MissingObjectsResponse,
-    RefUpdateRequest, ResolveResponse, TrustAnchorDto, UploadTargetsRequest, MAX_MISSING_BATCH,
-    MAX_UPLOAD_TARGETS_BATCH,
+    RefUpdateRequest, ResolveRequest, ResolveResponse, TrustAnchorDto, UploadTargetsRequest, MAX_MISSING_BATCH,
+    MAX_RESOLVE_IDENTIFIERS, MAX_UPLOAD_TARGETS_BATCH,
 };
 use forklift_core::util::pallet_utils::DEFAULT_PALLET_NAME;
 
@@ -583,11 +583,21 @@ where
         // Resolution is a display-only, server-mediated directory lookup (DESIGN.html §8.12).
         // The hosted service tiers names behind its own (privately tracked) policy; this head runs no
         // resolution hook, so — exactly as the protocol prescribes for a head without one — it
-        // answers an empty map, and the client shows pseudonyms.
-        Route::Resolve => Ok(json_response(
-            StatusCode::OK,
-            &ResolveResponse { names: std::collections::BTreeMap::new() },
-        )),
+        // answers an empty map, and the client shows pseudonyms. The identifier limit is part of
+        // the request's contract, so it holds here exactly as on a head with a hook.
+        Route::Resolve => {
+            let request: ResolveRequest = parse_json(&body)?;
+            let distinct: std::collections::BTreeSet<&String> = request.identifiers.iter().collect();
+
+            if distinct.len() > MAX_RESOLVE_IDENTIFIERS {
+                return Err(HeadError::unprocessable(format!(
+                    "At most {} distinct identifiers per resolve request; batch larger sets.",
+                    MAX_RESOLVE_IDENTIFIERS
+                )));
+            }
+
+            Ok(json_response(StatusCode::OK, &ResolveResponse { names: std::collections::BTreeMap::new() }))
+        }
 
         // A bundle builder is periodic ECS work (DESIGN.html §4.3/§4.6); until one runs
         // `bundle_latest` is a spec-compliant `404` (the `?` returns it) and clients fall back

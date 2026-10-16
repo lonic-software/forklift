@@ -391,7 +391,9 @@ simply absent:
 
 The server answers from its `resolution` hook (`docs/format/HOOK_PROTOCOL.md`),
 forwarding the authenticated caller so the directory can tier its answer. A server
-with no resolution hook returns an empty map. The endpoint is **additive**: servers
+with no resolution hook returns an empty map. A request names at most 10 000 distinct
+identifiers (a repeated one counts once); a server refuses more with `422` — batch
+larger sets. The endpoint is **additive**: servers
 that predate it answer `404`, and clients treat any failure — `404`, unreachable,
 malformed — as "show pseudonyms", so no version bump is required.
 

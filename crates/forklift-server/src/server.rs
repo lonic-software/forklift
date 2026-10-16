@@ -273,9 +273,9 @@ pub struct ServeOptions {
     pub open: bool,
 }
 
-/// The authentication and admission hooks answer a fixed-size verdict and are capped at
-/// [`body_utils::SMALL_BODY_CAP`]; the resolution hook's answer is capped by
-/// [`resolve_answer_cap`], which scales with the identifiers asked about.
+// The authentication and admission hooks answer a fixed-size verdict and are capped at
+// `body_utils::SMALL_BODY_CAP`; the resolution hook's answer is capped by `resolve_answer_cap`,
+// which scales with the identifiers asked about.
 
 /// The flat request timeout this head arms on the `reqwest::Client` it calls every hook
 /// through ([`build_hook_client`] builds from this constant and takes no figure of its own).
@@ -2308,9 +2308,9 @@ async fn post_resolve(State(state): State<Arc<AppState>>,
 
     if identifiers.len() > MAX_RESOLVE_IDENTIFIERS {
         tracing::warn!(count = identifiers.len(), "refused a resolve request naming too many identifiers");
-        return error_response((StatusCode::BAD_REQUEST, format!(
-            "A resolve request may name at most {} distinct identifiers; this one names {}.",
-            MAX_RESOLVE_IDENTIFIERS, identifiers.len()
+        return error_response(unprocessable(format!(
+            "At most {} distinct identifiers per resolve request; batch larger sets.",
+            MAX_RESOLVE_IDENTIFIERS
         )));
     }
 
