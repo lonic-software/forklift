@@ -10429,15 +10429,15 @@ mod tests {
         // this test still pins what it always pinned. Any real hash
         // string works — the fixture never inspects the body.
         let hashes: Vec<String> = (0..2000).map(|_| "a".repeat(64)).collect();
-        // The bracket this fixture's batch size depends on, made an assertion rather than left as
-        // a comment: the call's own outer TotalDeadline must stay looser than error_of's inner
-        // error_body_budget (connect plus the error-body allowance), or the outer bound fires
-        // first and every assertion below would end up blaming error_of/error_body_read_budget for
-        // a regression that actually lives in presence_negotiation_budget or its constants — a
-        // misleading red, not a wrong one. Computed as a constant sum, not via a helper, for the same reason the
-        // bracket's lower bound is: calling `presence_negotiation_budget` here would let a bug in
-        // that method move this guard and the real behavior it is meant to guard against in
-        // lockstep, silently validating a broken implementation instead of catching it.
+        // The bracket this fixture's batch size depends on, made an assertion rather than left as a
+        // comment: the call's own outer TotalDeadline must stay looser than error_of's inner
+        // error_body_budget (connect plus the error-body allowance), or the outer bound fires first
+        // and every assertion below would end up blaming error_of/error_body_read_budget for a
+        // regression that actually lives in presence_negotiation_budget or its constants — a
+        // misleading red, not a wrong one. Computed as a constant sum, not via a helper, for the
+        // same reason the bracket's lower bound is: calling `presence_negotiation_budget` here
+        // would let a bug in that method move this guard and the real behavior it is meant to guard
+        // against in lockstep, silently validating a broken implementation instead of catching it.
         let outer_budget = budgets.connect + budgets.post_send_verify_base
             + std::time::Duration::from_secs_f64(
                 hashes.len() as f64 * PRESENCE_ALLOWANCE_MS_PER_OP / 1000.0
