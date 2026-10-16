@@ -249,12 +249,14 @@ fn a_replaced_config_keeps_its_permissions(root: &Path) {
     use std::os::unix::fs::PermissionsExt;
 
     let config = fresh_global(root, "t10", Some("[remote]\ntoken = \"secret\"\n"));
-    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+    // 0o604 is a mode no umask produces from a fresh file's 0o666, so a replacement that kept
+    // nothing cannot match it by accident, whatever umask the test runs under.
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o604)).unwrap();
 
     config_utils::set_value("operator.name", "Ada", ConfigScope::Global).unwrap();
 
     let mode = std::fs::metadata(&config).unwrap().permissions().mode() & 0o777;
-    assert_eq!(mode, 0o600, "an edit must keep the file's permissions, got {mode:o}");
+    assert_eq!(mode, 0o604, "an edit must keep the file's permissions, got {mode:o}");
 }
 
 #[cfg(not(unix))]

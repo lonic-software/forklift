@@ -1311,8 +1311,8 @@ fn resolve_write_target(path: &Path) -> Result<PathBuf, String> {
     std::fs::canonicalize(path)
         .map(|target| crate::globals::strip_verbatim_prefix(&target))
         .map_err(|e| format!(
-            "Configuration file \"{}\" cannot be written: it is a symbolic link that does not resolve \
-             ({}). Create the target, or remove the link.",
+            "Configuration file \"{}\" cannot be written: it is a symbolic link whose target \
+             cannot be resolved ({}).",
             std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()).to_string_lossy(),
             e
         ))

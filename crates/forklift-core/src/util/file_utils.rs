@@ -722,9 +722,15 @@ fn write_replacement(path: &Path, replaced: &Path, content: &[u8]) -> Result<(),
 
     let mut file = std::fs::File::create_new(path).map_err(error)?;
 
+    // Only a file that is truly absent has no mode to keep; any other failure to read it would
+    // quietly widen the replacement to the umask's default, so it refuses instead.
     #[cfg(unix)]
-    if let Ok(existing) = std::fs::metadata(replaced) {
-        file.set_permissions(existing.permissions()).map_err(error)?;
+    match std::fs::metadata(replaced) {
+        Ok(existing) => file.set_permissions(existing.permissions()).map_err(error)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+        Err(e) => return Err(format!(
+            "Error while reading the permissions of \"{}\": {}", replaced.to_string_lossy(), e
+        )),
     }
     #[cfg(not(unix))]
     let _ = replaced;
