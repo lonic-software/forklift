@@ -15,7 +15,7 @@ use forklift_core::model::parcel_action::ParcelAction;
 use forklift_core::model::tree_item::TreeItem;
 use forklift_core::util::file_utils::BulkStoreSession;
 use forklift_core::util::pack_utils::{IngestBase, IngestStored, StoreIngest};
-use forklift_core::util::{inventory_utils, object_utils, office_utils, pallet_utils, shift_utils};
+use forklift_core::util::{file_utils, inventory_utils, object_utils, office_utils, pallet_utils, shift_utils};
 use crate::events;
 use crate::output::{self, CommandOutput};
 
@@ -142,9 +142,22 @@ pub fn handle_command(path: &str, no_compact: bool) -> Result<(), String> {
         }
     }
 
-    // A colocated git repo keeps its `.git` folder in the working tree; forklift should
-    // never track it. Adding the pattern is harmless when the repo lives elsewhere.
-    let ignored_git = ignore_git_directory()?;
+    // A colocated git repo keeps its `.git` folder in the working tree; forklift should never
+    // track it. The rule goes into the tracked ignore file, so it is added only when there is a
+    // `.git` folder here to ignore. The history is already imported by now, so a failure to add
+    // it is reported as a warning naming the rule, not as a failed import.
+    let mut warnings = converter.warnings;
+    let ignored_git = if forklift_core::globals::warehouse_root().join(".git").exists() {
+        ignore_git_directory().unwrap_or_else(|e| {
+            warnings.push(format!(
+                "the \".git\" folder is not ignored ({}); add the rule {} to \".forkliftignore\" by hand",
+                e, GIT_DIRECTORY_PATTERN
+            ));
+            false
+        })
+    } else {
+        false
+    };
 
     output::emit(&ImportReport {
         commits: converter.commits.len(),
@@ -154,7 +167,7 @@ pub fn handle_command(path: &str, no_compact: bool) -> Result<(), String> {
         current,
         ignored_git,
         compacted: packed,
-        warnings: converter.warnings,
+        warnings,
     });
 
     Ok(())
@@ -168,21 +181,15 @@ const GIT_DIRECTORY_PATTERN: &str = r"^\.git(/.*)?$";
 /// Add a `.git` ignore pattern to `.forkliftignore` if it is not already there, so a
 /// colocated git repository's metadata folder is not treated as untracked content.
 fn ignore_git_directory() -> Result<bool, String> {
-    let path = forklift_core::globals::warehouse_root().join(".forkliftignore");
     let pattern = GIT_DIRECTORY_PATTERN;
 
     // Only a missing file starts empty: on any other read error, writing would replace the
     // user's rules with this one.
-    let existing = match std::fs::read_to_string(&path) {
-        Ok(content) => content,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(format!(
-            "The history was imported, but \".forkliftignore\" could not be read, so the \".git\" rule \
-             was not added: {}", e
-        )),
-    };
+    let existing = file_utils::read_ignore_file()?.unwrap_or_default();
 
-    if existing.lines().any(|line| line.trim() == pattern) {
+    // Compared exactly, as the rules are compiled: a copy with stray whitespace is a different
+    // pattern, and would not ignore `.git`.
+    if existing.lines().any(|line| line == pattern) {
         return Ok(false);
     }
 
@@ -194,7 +201,7 @@ fn ignore_git_directory() -> Result<bool, String> {
     content.push_str(pattern);
     content.push('\n');
 
-    std::fs::write(&path, content)
+    std::fs::write(file_utils::ignore_file_path(), content)
         .map_err(|e| format!("Error while updating the ignore file: {}", e))?;
 
     Ok(true)
