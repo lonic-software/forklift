@@ -658,6 +658,52 @@ pub fn write_file_atomically(file_path: &Path, content: &[u8]) -> Result<(), Str
     Ok(())
 }
 
+/// Replace a file that is **not store content** — a configuration file — atomically: a fresh
+/// temporary file in the same folder, fsynced through its own write handle, renamed over
+/// `file_path`, then the folder fsynced. A reader opening `file_path` at any moment sees the old
+/// file or the new one, complete, never an empty or partial one; that holds even with
+/// [`fsync_enabled`] off, which only gives up durability across power loss.
+///
+/// Deliberately not [`write_file_atomically`], which carries two object-store behaviours that are
+/// wrong here. Inside an active [`BulkStoreSession`] it only *stages* the write, so a config
+/// change would stay invisible until the session finishes and vanish if it aborts. And its
+/// directory sync goes through the taint record, which is keyed by storage root: a warehouse
+/// config would be taint-tracked like an object, and a standing store taint would refuse every
+/// config write. Nor does this count towards [`BARRIER_COUNT`], which measures store barriers.
+///
+/// Callers serialize their own writers: this function makes one write untearable, not two
+/// concurrent edits of the same file safe (see `config_utils`'s edit lock).
+///
+/// # Arguments
+/// * `file_path` - The file to replace (or create).
+/// * `content`   - Its complete new content.
+///
+/// # Returns
+/// * `Ok(())`      - `file_path` now holds `content`.
+/// * `Err(String)` - The write or the rename failed, and `file_path` still holds whatever it held
+///                   before; or the folder sync after the rename failed, and `file_path` holds
+///                   `content` with the durability of its new name unproven.
+pub(crate) fn replace_file_atomically(file_path: &Path, content: &[u8]) -> Result<(), String> {
+    let temporary_file_path = temp_path_for(file_path)?;
+
+    let written = write_and_sync_file(&temporary_file_path, content).and_then(|()|
+        std::fs::rename(&temporary_file_path, file_path).map_err(|e| format!(
+            "Error while moving file into place at \"{}\": {}", file_path.to_string_lossy(), e
+        ))
+    );
+
+    if let Err(error) = written {
+        // Nothing was published; the temporary file is litter, and nobody else knows its name.
+        let _ = std::fs::remove_file(&temporary_file_path);
+        return Err(error);
+    }
+
+    match file_path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => sync_dir(parent),
+        _ => Ok(()),
+    }
+}
+
 /// The process-global bulk-store session registry: `Some(pending)` while a session is active,
 /// where `pending` is the recorded `(temp_path, final_path)` writes staged so far. Behind a
 /// `Mutex` so [`write_file_atomically`] and [`BulkStoreSession`] can share it without either
