@@ -695,6 +695,7 @@ pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::error::{ContextKind, ContextValue, ErrorKind};
     use clap::parser::ValueSource;
     use clap::{FromArgMatches, Parser, Subcommand};
     use std::any::TypeId;
@@ -952,9 +953,21 @@ mod tests {
         List(Vec<String>),
     }
 
-    /// The argv Pult composes for `command` with `values`: its render rules for each kind,
-    /// substituted into the run, after the program name.
-    fn render(command: &SchemaCommand, values: &BTreeMap<String, Value>) -> Vec<String> {
+    /// How an option's items are written.
+    #[derive(Clone, Copy)]
+    enum Form {
+        /// As `pult tool` writes them (Pult's `exec::argv`): an item starting with `-` under a
+        /// `--` option rides inside it as one word, `--grep=-x`; any other item follows it.
+        /// Every `arg` here starts with `--` (`assert_keys`), so only the item decides.
+        Tool,
+        /// Always as two words, `--grep -x`: how Pult renders a hand-written manifest, and how
+        /// a person types it.
+        Split,
+    }
+
+    /// The argv for `command` with `values`, option items written in `form`: Pult's render
+    /// rules for each kind, substituted into the run, after the program name.
+    fn render(command: &SchemaCommand, values: &BTreeMap<String, Value>, form: Form) -> Vec<String> {
         let mut argv = vec!["forklift".to_string()];
         for word in command.run.split_whitespace() {
             let Some(key) = word.strip_prefix('{').and_then(|word| word.strip_suffix('}')) else {
@@ -972,8 +985,13 @@ mod tests {
                 }
                 (Kind::Repeat(repeat), Some(Value::List(items))) => {
                     for item in items {
-                        argv.extend(repeat.arg.clone());
-                        argv.push(item.clone());
+                        match (&repeat.arg, form) {
+                            (Some(arg), Form::Tool) if arg.starts_with("--") && item.starts_with('-') => {
+                                argv.push(format!("{arg}={item}"))
+                            }
+                            (Some(arg), _) => argv.extend([arg.clone(), item.clone()]),
+                            (None, _) => argv.push(item.clone()),
+                        }
                     }
                 }
                 _ => panic!("{}: value of the wrong kind for {key}", command.id),
@@ -1088,7 +1106,12 @@ mod tests {
     /// line and every value landed exactly where expected (anything else panics); `Err` is
     /// clap's refusal.
     fn parse(built: &Command, command: &SchemaCommand, values: &BTreeMap<String, Value>) -> Result<(), clap::Error> {
-        let argv = render(command, values);
+        parse_as(built, command, values, Form::Tool)
+    }
+
+    /// `parse`, with the option items written in `form`.
+    fn parse_as(built: &Command, command: &SchemaCommand, values: &BTreeMap<String, Value>, form: Form) -> Result<(), clap::Error> {
+        let argv = render(command, values, form);
         let mut matches = built.clone().try_get_matches_from(&argv)?;
         Cli::from_arg_matches_mut(&mut matches.clone())?;
 
@@ -1116,6 +1139,16 @@ mod tests {
             bound.insert(id.to_string(), value);
         }
 
+        // No run carries a global, so a value that spells one (`--json`) must not set it.
+        for global in built.get_arguments().filter(|arg| arg.is_global_set()) {
+            let id = global.get_id().as_str();
+            let long = global.get_long().map(|long| format!("--{long}"));
+            assert!(
+                !command.run.split_whitespace().any(|word| Some(word) == long.as_deref()),
+                "{}: the run carries the global {id}", command.id
+            );
+            assert_ne!(at.value_source(id), Some(ValueSource::CommandLine), "{argv:?}: set the global {id}");
+        }
         assert_eq!(bound, expectation(leaf, command, values), "{argv:?}");
         Ok(())
     }
@@ -1240,6 +1273,8 @@ mod tests {
         let mut built = Cli::command();
         built.build();
         let doc = forklift();
+        // Dash-led option values checked, so no claim below passes by having nothing to check.
+        let (mut bound_alone, mut bound_beside_plain, mut refused_by_type) = (0, 0, 0);
 
         for command in &doc.commands {
             let leaf = leaf(&built, command);
@@ -1285,27 +1320,68 @@ mod tests {
                         if max.is_none() {
                             good.push(vec![valid.clone(), valid_value(command, arg, 1)]);
                         }
+                        // In either form: `--scope -` and `--scope=-` both bind the bare `-`.
                         for items in good {
                             let mut values = base.clone();
                             values.insert(key.clone(), Value::List(items.clone()));
-                            parse(&built, command, &values)
-                                .unwrap_or_else(|error| panic!("{}: --{key} {items:?}: {error}", command.id));
+                            for form in [Form::Tool, Form::Split] {
+                                parse_as(&built, command, &values, form)
+                                    .unwrap_or_else(|error| panic!("{}: --{key} {items:?}: {error}", command.id));
+                            }
                         }
 
-                        // A value that spells an option is refused loudly, never bound elsewhere.
                         for word in &hostile {
-                            let mut values = base.clone();
-                            values.insert(key.clone(), Value::List(vec![word.clone()]));
-                            assert!(
-                                parse(&built, command, &values).is_err(),
-                                "{}: --{key} {word:?} was accepted", command.id
-                            );
+                            let mut lists = vec![vec![word.clone()]];
+                            if max.is_none() {
+                                lists.push(vec![valid.clone(), word.clone()]);
+                            }
+                            for items in lists {
+                                let mut values = base.clone();
+                                values.insert(key.clone(), Value::List(items.clone()));
+
+                                // Written as two words, a value that spells an option is refused
+                                // loudly, never bound elsewhere.
+                                // The refusal is the word's: `good` parsed this same base, split,
+                                // with a plain value where the word stands. Which argument clap
+                                // blames varies (`--` ends the options, so a neighbour is).
+                                assert!(
+                                    parse_as(&built, command, &values, Form::Split).is_err(),
+                                    "{}: --{key} {items:?} split in two was accepted", command.id
+                                );
+
+                                // Riding inside its option, it binds there verbatim; where the
+                                // type cannot hold it, clap refuses it as this option's value,
+                                // never reads it as a flag.
+                                let result = parse(&built, command, &values);
+                                if !is_string(arg) {
+                                    let error = result.err()
+                                        .unwrap_or_else(|| panic!("{}: --{key} {items:?} was accepted", command.id));
+                                    let context = |kind| match error.get(kind) {
+                                        Some(ContextValue::String(text)) => text.clone(),
+                                        _ => String::new(),
+                                    };
+                                    assert_eq!(error.kind(), ErrorKind::ValueValidation, "{}: --{key} {items:?}: {error}", command.id);
+                                    assert!(context(ContextKind::InvalidArg).starts_with(&format!("--{key} ")), "{}: {error}", command.id);
+                                    assert_eq!(context(ContextKind::InvalidValue), *word, "{}: {error}", command.id);
+                                    refused_by_type += 1;
+                                    continue;
+                                }
+                                result.unwrap_or_else(|error| panic!("{}: --{key} {items:?}: {error}", command.id));
+                                if items.len() == 1 {
+                                    bound_alone += 1;
+                                } else {
+                                    bound_beside_plain += 1;
+                                }
+                            }
                         }
                     }
                     _ => {}
                 }
             }
         }
+        assert!(bound_alone > 0, "no dash-led value was bound alone");
+        assert!(bound_beside_plain > 0, "no dash-led value was bound beside a plain one");
+        assert!(refused_by_type > 0, "no dash-led value was refused by its option's type");
     }
 
     // (d) Credentials: classified by the tables, and the tables are checked against the tree.
