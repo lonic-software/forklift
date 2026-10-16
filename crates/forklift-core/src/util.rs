@@ -1,5 +1,6 @@
 pub mod audit_utils;
 pub mod blame_utils;
+pub mod body_utils;
 pub mod bundle_utils;
 pub mod delta_utils;
 pub mod gc_utils;

@@ -46,7 +46,10 @@ memmap2 = "0.9"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 file-id = "0.2.3"
 rand = "0.8"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "zstd", "gzip", "socks", "stream"] }
+# No `zstd` feature: reqwest decodes (and so advertises) every codec it is built with, and the
+# zstd decoder's window (up to 128 MiB under a hostile frame) would sit beneath every response
+# cap in util/body_utils.rs. gzip's window is a fixed 32 KiB (FORK-80).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip", "socks", "stream"] }
 percent-encoding = "2"
 regex = "1.10.6"
 toml_edit = "0.23"
@@ -61,3 +64,5 @@ schemars = { version = "1.2", features = ["chrono04"] }
 # ed25519-dalek, promoted to a direct dependency for the two server heads' auth checks so a
 # byte-wise `==` never regresses back in. Zero dependencies of its own — pins no new crate.
 subtle = "2.6"
+# Test-only (a forklift-core dev-dependency): already in the tree through reqwest's gzip decoder.
+flate2 = "1"
