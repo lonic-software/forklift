@@ -3196,7 +3196,7 @@ mod tests {
         });
     }
 
-    /// Falsifier 3: the class stays closed for a field beyond the two named in FORK-76.
+    /// Falsifier 3: the class stays closed for a field beyond `class` and `supervisor`.
     /// `pallets` stands in here as a third, unrelated field; the mechanism that catches
     /// it is structural, not a per-field list — `UserRecord` derives `PartialEq`, so a
     /// field added to the struct in the future is compared automatically, the same way

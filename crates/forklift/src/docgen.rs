@@ -11,7 +11,12 @@ use crate::output::ErrorCode;
 use clap::CommandFactory;
 
 /// Render `docs/generated/errors.md`: the exhaustive error-code / exit-code reference.
-pub fn render_errors() -> String {
+///
+/// # Returns
+/// * `Ok(String)`  - The rendered markdown.
+/// * `Err(String)` - A code's description cites a reference only the project's own trackers
+///                   can resolve (see [`check_no_internal_refs`]).
+pub fn render_errors() -> Result<String, String> {
     let mut out = String::new();
     out.push_str(GENERATED_BANNER);
     out.push_str("# Error codes and exit codes\n\n");
@@ -36,7 +41,41 @@ pub fn render_errors() -> String {
         ));
     }
     out.push('\n');
-    out
+    check_no_internal_refs("errors.md", &out)?;
+    Ok(out)
+}
+
+/// Fails the generator when a rendered page cites something only the project's own trackers can
+/// resolve: a `FORK-<n>` ticket, a `§<n>` section of the design document, or an `S<n>-F<n>`
+/// review-round label. Every description on these pages comes from a doc comment written for
+/// maintainers, and the pages ship to readers who can open none of those, so the reasoning must
+/// be stated in the sentence instead. It runs inside the generator for the reason
+/// [`GENERIC_OR_NO_DATA`] gives.
+fn check_no_internal_refs(page: &str, text: &str) -> Result<(), String> {
+    let hits: Vec<&str> = text.lines().filter(|line| has_internal_ref(line)).collect();
+    if hits.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "docgen: {page} would cite references a reader cannot resolve (a FORK-<n> ticket, a \
+         §<n> design section, or an S<n>-F<n> review label). State the reasoning in the doc \
+         comment the text comes from instead:\n{}",
+        hits.join("\n")
+    ))
+}
+
+/// Whether `line` holds a `FORK-<digit>`, `§<digit>`, or `S<digit>-F<digit>` reference.
+fn has_internal_ref(line: &str) -> bool {
+    let chars: Vec<char> = line.chars().collect();
+    let digit_at = |i: usize| chars.get(i).is_some_and(|c| c.is_ascii_digit());
+    (0..chars.len()).any(|i| {
+        let rest: String = chars[i..].iter().take(5).collect();
+        let starts_word = i == 0 || !chars[i - 1].is_ascii_alphanumeric();
+        (rest.starts_with("FORK-") && digit_at(i + 5))
+            || (chars[i] == '§' && digit_at(i + 1))
+            || (starts_word && chars[i] == 'S' && digit_at(i + 1)
+                && chars.get(i + 2) == Some(&'-') && chars.get(i + 3) == Some(&'F') && digit_at(i + 4))
+    })
 }
 
 /// Commands whose `--json` data is either the generic message shape (`{ "message": string }`)
@@ -152,6 +191,7 @@ pub fn render_json_schemas() -> Result<String, String> {
         }
     }
 
+    check_no_internal_refs("json-schemas.md", &out)?;
     Ok(out)
 }
 
