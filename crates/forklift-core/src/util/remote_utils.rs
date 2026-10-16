@@ -8504,7 +8504,8 @@ mod tests {
     /// A test that separates an armed budget from a rival by elapsed time needs the two at least a
     /// second apart, so the midpoint leaves half a second or more for a loaded runner's
     /// scheduling. Where [`FAST`]'s own spacing is closer than that for the pair a test separates,
-    /// the test widens the one budget it needs rather than every fixture paying for it.
+    /// the test widens the budgets it needs (`WIDE_READ`, [`stalled_error_body_budgets`]) rather
+    /// than every fixture paying for it.
     const FAST: Budgets = Budgets {
         connect: std::time::Duration::from_millis(330),
         read: std::time::Duration::from_millis(670),
@@ -8540,10 +8541,11 @@ mod tests {
     }
 
     /// The budgets the stalled-error-body tests arm with. [`FAST`] has no error-body budget a
-    /// second clear of every rival on both sides (see [`error_body_rivals`]), and a connect bound
-    /// as small as [`FAST`]'s leaves the connect-forgotten rival under a second below whatever
-    /// allowance is picked, so these widen both. Each figure is distinct from every [`FAST`] and
-    /// production one; [`error_body_rivals`] checks the separation rather than this doc stating it.
+    /// second clear of every rival on both sides (see [`nearest_error_body_rival_above`]), and a
+    /// connect bound as small as [`FAST`]'s leaves the connect-forgotten rival under a second
+    /// below whatever allowance is picked, so these widen both. Each figure is distinct from every
+    /// [`FAST`] and production one; [`nearest_error_body_rival_above`] checks the separation
+    /// rather than this doc stating it.
     fn stalled_error_body_budgets() -> Budgets {
         Budgets {
             connect: std::time::Duration::from_millis(2_900),
@@ -8553,40 +8555,50 @@ mod tests {
         .checked()
     }
 
-    /// The nearest figures below and above `budgets`' armed error-body budget (its connect bound
-    /// plus its error-body allowance) that a single misarm could fire at instead: any allowance of
-    /// this instance or of production, on its own, folded with this instance's connect bound, or
-    /// folded with the production direct one, and either connect bound alone. Both are asserted
-    /// to be at least a second away, so a midpoint toward either leaves half a second for a
-    /// loaded runner: a misarm above lands past the upper bound's midpoint, and one below fires
-    /// at least a second before the lower bound, which no scheduling delay a test tolerates
-    /// carries past it.
-    fn error_body_rivals(budgets: Budgets) -> (std::time::Duration, std::time::Duration) {
+    /// The nearest figure above `budgets`' armed error-body budget (its connect bound plus its
+    /// error-body allowance) that a single misarm could fire at instead, for a timed test's upper
+    /// bound to take the midpoint toward. The rivals are every allowance of this instance or of
+    /// [`PRODUCTION_MIRROR`], on its own, folded with this instance's connect bound, or folded with
+    /// the production direct one; either connect bound alone; and `extra`, the test's own outer
+    /// deadlines. Every rival is asserted to be at least a second from the armed budget on either
+    /// side, so the midpoint above leaves half a second for a loaded runner, and a misarm below
+    /// fires a second before the lower bound, further than any scheduling delay a test tolerates.
+    fn nearest_error_body_rival_above(
+        budgets: Budgets, extra: &[std::time::Duration],
+    ) -> std::time::Duration {
         let armed = budgets.connect + budgets.error_body_read;
-        let production = Budgets::production(false);
-        let allowances = |b: Budgets| [
-            b.read, b.object_read, b.batch_head_patience, b.error_body_read, b.upload_silence,
-            b.post_send_verify_base, b.single_write_allowance,
-        ];
-        let rivals: Vec<std::time::Duration> = allowances(budgets).into_iter()
-            .chain(allowances(production))
+        // Destructured without `..`, so a field added to `Budgets` has to be placed here.
+        let allowances = |b: Budgets| {
+            let Budgets {
+                connect: _, read, object_read, batch_head_patience, error_body_read, upload_silence,
+                post_send_verify_base, single_write_allowance,
+            } = b;
+            [read, object_read, batch_head_patience, error_body_read, upload_silence,
+                post_send_verify_base, single_write_allowance]
+        };
+        let mut rivals: Vec<std::time::Duration> = allowances(budgets).into_iter()
+            .chain(allowances(PRODUCTION_MIRROR))
             .flat_map(|allowance| [
                 allowance, budgets.connect + allowance, TEST_DIRECT_CONNECT_TIMEOUT + allowance,
             ])
             .chain([budgets.connect, TEST_DIRECT_CONNECT_TIMEOUT])
-            .filter(|&rival| rival != armed)
+            .chain(extra.iter().copied())
             .collect();
-        let below = rivals.iter().copied().filter(|&rival| rival < armed).max()
-            .expect("the bare connect bound is under any armed budget");
-        let above = rivals.iter().copied().filter(|&rival| rival > armed).min()
-            .expect("the production allowances folded with a connect bound exceed any test budget");
+        // The armed budget itself is the one entry that is not a rival; any other at the same
+        // figure is, and must fail the separation below.
+        let own = rivals.iter().position(|&rival| rival == armed).expect("the armed sum is listed");
+        rivals.swap_remove(own);
         let second = std::time::Duration::from_secs(1);
-        assert!(
-            below + second <= armed && armed + second <= above,
-            "the armed error-body budget {:?} is within a second of a rival ({:?} below, {:?} \
-            above), too close to separate by elapsed time", armed, below, above
-        );
-        (below, above)
+        let too_close = rivals.iter()
+            .find(|&&rival| rival + second > armed && rival < armed + second);
+        if let Some(rival) = too_close {
+            panic!(
+                "the armed error-body budget {:?} is within a second of the rival {:?}, too close \
+                to separate by elapsed time", armed, rival
+            );
+        }
+        rivals.into_iter().filter(|&rival| rival > armed).min()
+            .expect("the production allowances folded with a connect bound exceed any test budget")
     }
 
     /// A direct-dial client carrying [`FAST`].
@@ -8594,20 +8606,24 @@ mod tests {
         RemoteClient::new_test_with_budgets(url, FAST)
     }
 
+    /// The direct-dial production budgets, built from the mirrors rather than the production
+    /// constants, for the reason `TEST_TIGHT_READ_TIMEOUT`'s doc gives.
+    const PRODUCTION_MIRROR: Budgets = Budgets {
+        connect: TEST_DIRECT_CONNECT_TIMEOUT,
+        read: TEST_TIGHT_READ_TIMEOUT,
+        object_read: TEST_LOOSE_READ_TIMEOUT,
+        batch_head_patience: TEST_BATCH_HEAD_PATIENCE,
+        error_body_read: TEST_ERROR_BODY_READ_TIMEOUT,
+        upload_silence: TEST_UPLOAD_SILENCE_BUDGET,
+        post_send_verify_base: std::time::Duration::from_secs(2),
+        single_write_allowance: std::time::Duration::from_secs(25),
+    };
+
     /// The production figures, pinned without waiting any of them out: every fixture that watches
     /// a budget fire does so against [`FAST`], so this is what holds the shipped values.
     #[test]
     fn production_budgets_are_the_documented_figures() {
-        assert_eq!(Budgets::production(false), Budgets {
-            connect: TEST_DIRECT_CONNECT_TIMEOUT,
-            read: TEST_TIGHT_READ_TIMEOUT,
-            object_read: TEST_LOOSE_READ_TIMEOUT,
-            batch_head_patience: TEST_BATCH_HEAD_PATIENCE,
-            error_body_read: TEST_ERROR_BODY_READ_TIMEOUT,
-            upload_silence: TEST_UPLOAD_SILENCE_BUDGET,
-            post_send_verify_base: std::time::Duration::from_secs(2),
-            single_write_allowance: std::time::Duration::from_secs(25),
-        });
+        assert_eq!(Budgets::production(false), PRODUCTION_MIRROR);
         assert_eq!(
             Budgets::production(true),
             Budgets { connect: TEST_TOR_CONNECT_TIMEOUT, ..Budgets::production(false) },
@@ -10363,7 +10379,6 @@ mod tests {
     fn missing_objects_bounds_the_error_body_read_after_a_wedged_500() {
         let remote = SilentErrorBodyRemote::start();
         let budgets = stalled_error_body_budgets();
-        let (_, nearest_rival) = error_body_rivals(budgets);
         let client = RemoteClient::new_test_with_budgets(&remote.url, budgets);
         // A batch of 2,000 hashes — large enough that the call's own outer TotalDeadline
         // (`connect + post_send_verify_base + 2,000 * PRESENCE_ALLOWANCE_MS_PER_OP`) stays looser
@@ -10397,6 +10412,8 @@ mod tests {
             firing first) rather than the one they exist to catch",
             hashes.len(), outer_budget, lower_bound
         );
+        // The outer deadline is a rival too: were the inner bound lost, it would be what fires.
+        let nearest_rival = nearest_error_body_rival_above(budgets, &[outer_budget]);
         let outer_ceiling = lower_bound + std::time::Duration::from_secs(10);
 
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -10420,9 +10437,9 @@ mod tests {
             the bare error-body-read timeout (or less)",
             elapsed, lower_bound
         );
-        // The other side: a misarm that waits longer (the production error-body allowance, or
-        // this one folded with the production connect bound) would still clear the lower bound
-        // and fit under the outer ceiling, so only an upper bound tells it apart.
+        // The other side: a misarm that waits longer (the production error-body allowance folded
+        // with this connect bound, say, or the call's own outer deadline) would still clear the
+        // lower bound and fit under the outer ceiling, so only an upper bound tells it apart.
         let upper_bound = lower_bound + (nearest_rival - lower_bound) / 2;
         assert!(
             elapsed < upper_bound,
@@ -10454,7 +10471,7 @@ mod tests {
     fn commit_lift_bounds_the_error_body_read_after_a_wedged_500() {
         let remote = SilentErrorBodyRemote::start();
         let budgets = stalled_error_body_budgets();
-        let (_, nearest_rival) = error_body_rivals(budgets);
+        let nearest_rival = nearest_error_body_rival_above(budgets, &[]);
         let client = RemoteClient::new_test_with_budgets(&remote.url, budgets);
         let lower_bound = budgets.connect + budgets.error_body_read;
         let outer_ceiling = lower_bound + std::time::Duration::from_secs(10);
