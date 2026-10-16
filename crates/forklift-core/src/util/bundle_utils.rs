@@ -1676,7 +1676,7 @@ mod tests {
     }
 
     /// The streamed path is the one a remote's batch and subtree answers reach, so the hostile
-    /// declared length the fuzz suite pins through `import_bundle_bytes` is pinned here too: a
+    /// declared length the fuzz suite pins through `import_bundle` is pinned here too: a
     /// record declaring `u64::MAX` bytes is an error, never an allocation of them.
     #[test]
     fn a_streamed_record_declaring_a_huge_length_is_refused_without_allocating_it() {

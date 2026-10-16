@@ -91,6 +91,27 @@ const MISSING_BODY_BYTES_PER_HASH: u64 = 128;
 /// [`body_utils::SMALL_BODY_CAP`]; one larger than this is reported as unread rather than parsed.
 const ERROR_BODY_CAP: u64 = 1024 * 1024;
 
+/// Read a refusal's error body within [`ERROR_BODY_CAP`]. A body that cannot be read stands in as
+/// the status's reason, and one over the cap says it was not read. Bounds the size only: how long
+/// the read may take is the caller's to decide (see `error_of` and `commit_lift`).
+async fn read_error_body(response: reqwest::Response) -> ErrorResponse {
+    let status = response.status();
+    let reason = status.canonical_reason().unwrap_or("unknown error").to_string();
+
+    match body_utils::read_json_capped::<ErrorResponse>(response, ERROR_BODY_CAP).await {
+        Ok(body) => body,
+        Err(JsonReadError::Body(BodyReadError::OverCap { cap })) => unread_error(format!(
+            "{} (the remote's description of the error is larger than {} bytes and was not read)", reason, cap
+        )),
+        Err(_) => unread_error(reason),
+    }
+}
+
+/// An error body standing in for one that could not be read.
+fn unread_error(error: String) -> ErrorResponse {
+    ErrorResponse { error, code: None, next_step: None }
+}
+
 /// Per-hash allowance in an `upload-targets` answer: a presigned upload URL (about 500 bytes in
 /// practice) keyed by its hash.
 const UPLOAD_TARGETS_BODY_BYTES_PER_HASH: u64 = 8 * 1024;
@@ -2861,26 +2882,12 @@ impl RemoteClient {
     /// the flat [`ERROR_BODY_READ_TIMEOUT`] alone is not it.
     async fn error_of(&self, response: reqwest::Response, action: &str) -> String {
         let status = response.status();
-        let body = self.read_error_body(response).await;
+        let body = match tokio::time::timeout(self.error_body_budget(), read_error_body(response)).await {
+            Ok(body) => body,
+            Err(_) => unread_error(status.canonical_reason().unwrap_or("unknown error").to_string()),
+        };
 
         classify_remote_error(status.as_u16(), action, body.error, body.code, body.next_step)
-    }
-
-    /// Read a refusal's error body within [`ERROR_BODY_CAP`] and the error-body budget. A body that
-    /// cannot be read stands in as the status's reason, and one over the cap says it was not read.
-    async fn read_error_body(&self, response: reqwest::Response) -> ErrorResponse {
-        let reason = response.status().canonical_reason().unwrap_or("unknown error").to_string();
-        let unread = |error: String| ErrorResponse { error, code: None, next_step: None };
-
-        match tokio::time::timeout(
-            self.error_body_budget(), body_utils::read_json_capped::<ErrorResponse>(response, ERROR_BODY_CAP)
-        ).await {
-            Ok(Ok(body)) => body,
-            Ok(Err(JsonReadError::Body(BodyReadError::OverCap { cap }))) => unread(format!(
-                "{} (the remote's description of the error is larger than {} bytes and was not read)", reason, cap
-            )),
-            Ok(Err(_)) | Err(_) => unread(reason),
-        }
     }
 
     /// Read a whole response body within `cap`, composing each failure the way this client
@@ -3674,7 +3681,9 @@ impl RemoteClient {
         }
 
         let status = response.status();
-        let message = self.read_error_body(response).await.error;
+        // Bounded in size only: how long it may take decides retry against terminal, which is
+        // the open question gap 1 above records.
+        let message = read_error_body(response).await.error;
 
         if is_transient_commit_failure(status, &message) {
             return Ok(CommitOutcome::BlobNotReady);
@@ -10207,9 +10216,9 @@ mod tests {
 
     // -----------------------------------------------------------------------------------
     // The error-body read: once a non-success status line has arrived, `error_of` reads the body
-    // through `read_error_body`, whose byte cap bounds its size but not how long it takes. The auto-following client (`Posture::
-    // UnboundedFollowsRedirects`, which `missing_objects` rides) carries only a `connect_timeout`,
-    // no `read_timeout` at all — so a remote that delivers a
+    // through `read_error_body`, whose byte cap bounds its size but not how long it takes. The
+    // auto-following client (`Posture::UnboundedFollowsRedirects`, which `missing_objects` rides)
+    // carries only a `connect_timeout`, no `read_timeout` at all — so a remote that delivers a
     // full status line and headers and then wedges before writing the body hangs the caller
     // forever. `ERROR_BODY_READ_TIMEOUT` bounds the read itself, in `error_of`, rather than
     // trying to fix it with yet another client — no client can help here, since the body-read
@@ -11256,9 +11265,9 @@ mod tests {
         );
     }
 
-    /// Serve one `/v1/warehouse` answer: `head` (status line and headers, without the blank line)
-    /// then `body`.
-    fn serve_one_handshake(head: String, body: String) -> String {
+    /// Serve one canned answer to whatever request arrives first, on any path: `head` (status line
+    /// and headers, without the blank line) then `body`.
+    fn serve_one_answer(head: String, body: String) -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
 
@@ -11289,7 +11298,7 @@ mod tests {
         }).to_string();
         assert!(body.len() > 400_000, "the fixture must be far past a small-body cap");
 
-        let url = serve_one_handshake(
+        let url = serve_one_answer(
             format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}", body.len()),
             body,
         );
@@ -11304,7 +11313,7 @@ mod tests {
     /// byte of it is read, with a message naming what was refused and the cap.
     #[test]
     fn a_handshake_over_its_cap_is_refused_naming_the_cap() {
-        let url = serve_one_handshake(
+        let url = serve_one_answer(
             format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}",
                 HANDSHAKE_BODY_CAP + 1
@@ -11326,7 +11335,7 @@ mod tests {
     /// the parcel, named once.
     #[test]
     fn an_over_cap_signature_is_refused_naming_it_once() {
-        let url = serve_one_handshake(
+        let url = serve_one_answer(
             format!("HTTP/1.1 200 OK\r\nContent-Length: {}", body_utils::SMALL_BODY_CAP + 1),
             String::new(),
         );
@@ -11344,7 +11353,7 @@ mod tests {
     fn a_long_lift_commit_refusal_is_read_and_an_over_cap_one_says_so() {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let refusal = |length: u64| {
-            let url = serve_one_handshake(
+            let url = serve_one_answer(
                 format!("HTTP/1.1 422 Unprocessable Entity\r\nContent-Type: application/json\r\nContent-Length: {}", length),
                 if length <= ERROR_BODY_CAP {
                     let error = "b".repeat(length as usize - r#"{"error":""}"#.len());
@@ -11367,8 +11376,8 @@ mod tests {
         assert!(unread.contains("was not read"), "{}", unread);
     }
 
-    /// The handshake's read in `fetch_info` gets the same treatment as the two above. It was the
-    /// *least* covered of the three: routing its parse failures through the composer left the
+    /// The handshake's read in `fetch_info` gets the same treatment as the `missing_objects` and
+    /// `upload_targets` parse-failure tests. It was the *least* covered of those three reads: routing its parse failures through the composer left the
     /// entire crate suite green, because every other `fetch_info` test drives either a refused
     /// connect or header-phase silence, neither of which ever reaches the body read's error arm.
     ///
