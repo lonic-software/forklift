@@ -313,10 +313,6 @@ while IFS= read -r f; do DIRTY+=("$f"); done \
 if [ "${#DIRTY[@]}" -eq 0 ]; then
     while IFS= read -r f; do DIRTY+=("$f"); done < <(git -C "$A" ls-files | head -20)
 fi
-for f in "${DIRTY[@]}"; do
-    printf '\n// benchmark edit\n' >> "$A/$f"
-    printf '\n// benchmark edit\n' >> "$B/$f"
-done
 
 # fl_count <staged_count|unstaged_count>  → that count from forklift's stocktake
 fl_count() {
@@ -324,18 +320,31 @@ fl_count() {
         | sed -n "s/.*\"$1\": *\([0-9][0-9]*\).*/\1/p"
 }
 # expect_counts <what> <git_count> <forklift_count>  — both tools must see the same
-# change set, or the row compares different work.
+# change set, or the row compares different work. On a mismatch, show what each saw.
 expect_counts() {
     if [ "$2" != "${#DIRTY[@]}" ] || [ "$3" != "${#DIRTY[@]}" ]; then
         echo "error: $1: expected ${#DIRTY[@]} changed file(s) on both sides, git saw '$2'" \
              "and forklift saw '$3' — the two copies no longer hold the same change." >&2
+        echo "── git status ──" >&2; git -C "$A" status --short >&2 || true
+        echo "── forklift stocktake ──" >&2; ( cd "$B" && forklift stocktake ) >&2 || true
         echo "  Re-run with --keep and compare $A and $B by hand." >&2
         exit 1
     fi
 }
 
+# Forklift's unstaged count includes untracked entries, which `git diff` never shows
+# (git.git's sha1collisiondetection/ submodule checks out as an empty, untracked
+# directory). Take the clean tree's count as the baseline and expect the edits to add
+# exactly one entry per edited file on top of it.
+FL_UNSTAGED_BASE=$(fl_count unstaged_count)
+
+for f in "${DIRTY[@]}"; do
+    printf '\n// benchmark edit\n' >> "$A/$f"
+    printf '\n// benchmark edit\n' >> "$B/$f"
+done
+
 expect_counts "unstaged diff" "$(git -C "$A" diff --name-only | wc -l | tr -d ' ')" \
-    "$(fl_count unstaged_count)"
+    "$(( $(fl_count unstaged_count) - FL_UNSTAGED_BASE ))"
 GM=$(time_cmd "$RUNS" "$A" "" 'git diff')
 FM=$(time_cmd "$RUNS" "$B" "" 'forklift diff')
 add_row "diff, unstaged (${#DIRTY[@]} files)" "$GM" "$FM" "git diff vs forklift diff"
@@ -353,7 +362,8 @@ add_row "diff, staged (${#DIRTY[@]} files)" "$GM" "$FM" "git diff --staged vs fo
 run_in "$A" 'git reset -q --hard'
 run_in "$B" 'forklift restore --staged . && forklift restore .'
 if [ -n "$(git -C "$A" status --porcelain)" ] \
-    || [ "$(fl_count staged_count)" != 0 ] || [ "$(fl_count unstaged_count)" != 0 ]; then
+    || [ "$(fl_count staged_count)" != 0 ] \
+    || [ "$(fl_count unstaged_count)" != "$FL_UNSTAGED_BASE" ]; then
     echo "error: a working copy is not clean after the diff step, so the commit benchmark" >&2
     echo "  would record more than one file. Re-run with --keep and inspect $A and $B." >&2
     exit 1
