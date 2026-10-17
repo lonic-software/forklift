@@ -443,7 +443,22 @@ impl Converter {
         let mut tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
 
         let (_, bytes) = self.batch.read(git_hash)?;
-        for entry in parse_raw_tree(&bytes, self.oid_len)? {
+        // A refused name stops the whole import, so say where it is: the directory, from the root.
+        let entries = parse_raw_tree(&bytes, self.oid_len).map_err(|e| format!(
+            "{} It is in the directory {:?} of the git history.",
+            e, if path_prefix.is_empty() { "/" } else { path_prefix }
+        ))?;
+        for entry in entries {
+            // As `stack` refuses it: a top-level name some file system opens as `.forklift`
+            // could never be checked out there.
+            if path_prefix.is_empty() && office_utils::is_metadata_folder_name(&entry.name) {
+                return Err(format!(
+                    "The git tree {} has the top-level entry {:?}, which some file systems open as \
+                    the warehouse's metadata folder, so it cannot be imported.",
+                    git_hash, entry.name
+                ));
+            }
+
             let path = join_path(path_prefix, &entry.name);
             let child = match entry.mode.as_str() {
                 "40000" | "040000" => {
