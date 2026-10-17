@@ -6,9 +6,10 @@
 //! are free to hold such pairs and nothing here consults a fixed folding table for a verdict.
 //! The volume is the oracle: a path is judged by what the file system resolves it to (by
 //! `lstat` identity), and a pair of names nothing on disk can judge yet is settled by a probe on
-//! the same volume. A case-fold key only proposes candidates; it never decides. It does no
-//! normalization, so two new names that alias only under normalization are not paired up front:
-//! the exclusive create of the second write is what refuses them.
+//! the same volume. A key (a full case fold of the canonical decomposition) only proposes
+//! candidates; it never decides. Two new names a volume merges under a rule the key does not
+//! cover are not paired up front: for files the exclusive create of the second write refuses
+//! them, but a second directory is entered silently, so its entries merge into the first.
 //!
 //! Every working-directory materializer runs its up-front collision check through
 //! [`AliasCheck`], so a case-only rename is a rename (not an "untracked" collision), and two
@@ -17,6 +18,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use unicode_normalization::UnicodeNormalization;
 use crate::enums::inventory_item_state::InventoryItemState;
 use crate::parser::inventory::inventory_parser;
 use crate::util::{file_utils, inventory_utils};
@@ -43,10 +45,10 @@ fn identity(path: &Path) -> Option<Identity> {
 }
 
 /// The candidate key two names must share before a probe is spent on them: a full case fold
-/// (`ß` and `ss`, the Kelvin sign and `k`, `ﬁ` and `fi` all meet), with no normalization. It
-/// proposes pairs; the volume decides them.
+/// (`ß` and `ss`, the Kelvin sign and `k`, `ﬁ` and `fi` all meet) in canonical decomposition (an
+/// NFC and an NFD spelling meet). It proposes pairs; the volume decides them.
 pub fn fold_key(name: &str) -> String {
-    name.to_lowercase().to_uppercase().to_lowercase()
+    name.to_lowercase().to_uppercase().to_lowercase().nfd().collect()
 }
 
 /// What sits at a path a materialization is about to create.
@@ -68,6 +70,8 @@ pub enum Occupancy {
     },
     /// A component short of the last resolves, under its own name, to something that is not a
     /// directory (a file, or a symlink, which is never followed): that entry occupies the path.
+    /// A symlink is judged as the entry it is, never as the directory it may point at, so a
+    /// refusal names the link itself.
     NonDirectory {
         /// The key of the entry on disk.
         occupant: String,
@@ -264,15 +268,7 @@ impl AliasCheck {
                 }
             }
             Occupancy::Alias { occupant, occupant_is_dir: true, .. } => {
-                let (tracked, vacated) = match self.directories.get(&occupant) {
-                    Some(&known) => known,
-                    None => {
-                        let tracked = inventory_utils::is_tracked_directory(&occupant)?;
-                        let known = (tracked, tracked && vacated(&occupant, removals)?);
-                        self.directories.insert(occupant.clone(), known);
-                        known
-                    }
-                };
+                let (tracked, vacated) = self.directory(&occupant, removals)?;
 
                 if vacated {
                     Verdict::Proceed
@@ -285,20 +281,57 @@ impl AliasCheck {
         })
     }
 
+    /// Whether a directory is tracked, and whether `removals` vacate it, read once per check.
+    fn directory(&mut self, key: &str, removals: &dyn Removals) -> Result<(bool, bool), String> {
+        if let Some(&known) = self.directories.get(key) {
+            return Ok(known);
+        }
+
+        let tracked = inventory_utils::is_tracked_directory(key)?;
+        let known = (tracked, tracked && vacated(key, removals)?);
+        self.directories.insert(key.to_string(), known);
+        Ok(known)
+    }
+
+    /// Whether what `key` resolves to on disk is still there once the operation has run: the
+    /// entry [`judge`] refuses a path for, or one listed under exactly `key` that the operation
+    /// does not remove (or, for a directory, vacate). Nothing on disk, or an occupant the
+    /// operation clears, stays not.
+    ///
+    /// [`judge`]: AliasCheck::judge
+    fn stays(&mut self, key: &str, removals: &dyn Removals) -> Result<bool, String> {
+        if std::fs::symlink_metadata(key).is_err() {
+            return Ok(false);
+        }
+
+        Ok(match self.judge(key, removals)? {
+            Verdict::Proceed => false,
+            Verdict::Refuse(_) => true,
+            Verdict::Exists if Path::new(key).is_dir() => !self.directory(key, removals)?.1,
+            Verdict::Exists => !removals.removes_file(key),
+        })
+    }
+
     /// Find the pairs among `created` (paths one operation creates) that would land on one file:
     /// distinct names under one parent that share a [`fold_key`] and that a probe on the target
-    /// volume confirms. Pairs where either name already resolves are left to [`judge`], which
-    /// sees them on disk.
+    /// volume confirms. A pair one of whose names resolves to something that [`stays`] is left
+    /// to [`judge`], which refuses the path for that occupant; a pair whose names resolve only to
+    /// what the operation clears is probed like any other, since both names are then written.
     ///
     /// # Arguments
-    /// * `created` - The paths the operation creates.
+    /// * `created`  - The paths the operation creates.
+    /// * `removals` - What the same operation removes before it writes.
     ///
     /// # Returns
     /// * `Ok(Vec<Collision>)` - One `Alias` per confirmed pair (empty when there are none).
-    /// * `Err(String)`        - Never today; reserved for a probe that cannot be cleaned up.
+    /// * `Err(String)`        - If a probe could not be made, or the disk or the inventory could
+    ///                          not be read.
     ///
     /// [`judge`]: AliasCheck::judge
-    pub fn created_pairs<'a>(&mut self, created: impl IntoIterator<Item = &'a str>) -> Result<Vec<Collision>, String> {
+    /// [`stays`]: AliasCheck::stays
+    pub fn created_pairs<'a>(&mut self,
+                             created: impl IntoIterator<Item = &'a str>,
+                             removals: &dyn Removals) -> Result<Vec<Collision>, String> {
         let mut by_parent: BTreeMap<&str, BTreeMap<String, BTreeSet<&str>>> = BTreeMap::new();
 
         for path in created {
@@ -321,13 +354,14 @@ impl AliasCheck {
 
                 for (index, first) in names.iter().enumerate() {
                     for second in &names[index + 1..] {
-                        let on_disk = |name: &str| std::fs::symlink_metadata(join(parent, name)).is_ok();
+                        let (first_key, second_key) = (join(parent, first), join(parent, second));
 
-                        if !on_disk(first) && !on_disk(second) && probe_aliases(parent, first, second) {
-                            collisions.push(Collision::Alias {
-                                path: join(parent, second),
-                                occupant: join(parent, first),
-                            });
+                        if self.stays(&first_key, removals)? || self.stays(&second_key, removals)? {
+                            continue;
+                        }
+
+                        if probe_aliases(parent, first, second)? {
+                            collisions.push(Collision::Alias { path: second_key, occupant: first_key });
                         }
                     }
                 }
@@ -345,9 +379,9 @@ fn join(parent: &str, name: &str) -> String {
 /// Whether the volume `parent` lands on resolves `first` and `second` to one file. Probed in a
 /// fresh directory inside the nearest existing ancestor of `parent` in the working directory —
 /// the volume (and, where sensitivity is per directory, the directory) the write lands on, which
-/// the metadata folder need not share. A probe that cannot be made answers `false`: the names
-/// then go on to the write, whose exclusive create is the backstop.
-fn probe_aliases(parent: &str, first: &str, second: &str) -> bool {
+/// the metadata folder need not share. A probe that cannot be made is an error, never a "no":
+/// two directories that alias would otherwise merge silently.
+fn probe_aliases(parent: &str, first: &str, second: &str) -> Result<bool, String> {
     let mut base = PathBuf::from(if parent.is_empty() { "." } else { parent });
 
     while !base.is_dir() {
@@ -357,11 +391,16 @@ fn probe_aliases(parent: &str, first: &str, second: &str) -> bool {
         }
     }
 
+    let mut last_error = None;
     let Some(probe_dir) = (0..16).find_map(|attempt| {
         let candidate = base.join(format!(".forklift-alias-probe-{}-{}", std::process::id(), attempt));
-        std::fs::create_dir(&candidate).ok().map(|()| candidate)
+        std::fs::create_dir(&candidate).inspect_err(|e| last_error = Some(e.to_string())).ok().map(|()| candidate)
     }) else {
-        return false;
+        return Err(format!(
+            "Could not tell whether \"{}\" and \"{}\" name one file here: no probe directory could be \
+            made in \"{}\" ({}).",
+            join(parent, first), join(parent, second), base.display(), last_error.unwrap_or_default()
+        ));
     };
 
     let aliases = std::fs::OpenOptions::new()
@@ -373,7 +412,7 @@ fn probe_aliases(parent: &str, first: &str, second: &str) -> bool {
 
     let _ = std::fs::remove_dir_all(&probe_dir);
 
-    aliases
+    Ok(aliases)
 }
 
 /// Whether the inventory holds a live file entry at `key`.

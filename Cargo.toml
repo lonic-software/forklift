@@ -52,6 +52,8 @@ rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip", "socks", "stream"] }
 percent-encoding = "2"
 regex = "1.10.6"
+# Canonical decomposition for the case-alias candidate key (alias_utils::fold_key).
+unicode-normalization = "0.1.25"
 toml_edit = "0.23"
 argon2 = "0.5"
 chacha20poly1305 = "0.10"

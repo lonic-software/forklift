@@ -427,7 +427,7 @@ pub(crate) fn ensure_no_untracked_collisions(actions: &[MergeAction], target: &s
         }
     }
 
-    collisions.extend(check.created_pairs(created)?);
+    collisions.extend(check.created_pairs(created, &removals)?);
 
     alias_utils::refuse_collisions(&format!("Consolidating \"{}\"", target), &collisions)
 }

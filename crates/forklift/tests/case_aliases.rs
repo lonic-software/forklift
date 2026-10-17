@@ -162,6 +162,16 @@ fn folds_case(dir: &Path) -> bool {
     folds
 }
 
+/// Whether the volume holding `dir` resolves an NFD spelling to the NFC one's file.
+fn folds_normalization(dir: &Path) -> bool {
+    let probe = dir.join("normalization-probe");
+    std::fs::create_dir_all(&probe).unwrap();
+    std::fs::write(probe.join("caf\u{e9}"), "").unwrap();
+    let folds = probe.join("cafe\u{301}").exists();
+    std::fs::remove_dir_all(&probe).unwrap();
+    folds
+}
+
 /// The names `dir` lists, exactly as spelled on disk.
 fn listed(dir: &Path) -> BTreeSet<String> {
     std::fs::read_dir(dir).unwrap()
@@ -461,4 +471,71 @@ fn a_new_pair_whose_one_name_is_on_disk_is_reported_once() {
     assert_refused_with(&shifted, UNTRACKED_REFUSAL, &["a"]);
     assert!(!stderr(&shifted).contains(ALIAS_REFUSAL), "{}", stderr(&shifted));
     assert_eq!(warehouse.read("a"), "untracked\n");
+}
+
+/// A pair whose names resolve only to what the shift removes is still a pair: both are written,
+/// so it is probed like any other rather than left to the per-path check.
+#[test]
+fn a_new_pair_replacing_a_removed_entry_is_refused_or_materialized_whole() {
+    let warehouse = Warehouse::new("pair-replacing", &[("app.txt", "app\n"), ("README", "old\n"), ("Docs/a", "old\n")]);
+    warehouse.craft("files", "main", &[("app.txt", "app\n"), ("Docs/a", "old\n"), ("readme", "lower\n"), ("ReadMe", "mixed\n")]);
+    warehouse.craft("dirs", "main", &[("app.txt", "app\n"), ("README", "old\n"), ("docs/x", "x\n"), ("DOCS/y", "y\n")]);
+
+    let files = warehouse.run(&["shift", "files"]);
+    if warehouse.folds_case() {
+        assert_refused_with(&files, ALIAS_REFUSAL, &["ReadMe and readme"]);
+        assert_eq!(warehouse.read("README"), "old\n", "a refused shift removes nothing");
+    } else {
+        assert!(files.status.success(), "{}", stderr(&files));
+        assert_eq!(warehouse.read("readme"), "lower\n");
+        assert_eq!(warehouse.read("ReadMe"), "mixed\n");
+        warehouse.run_ok(&["shift", "main"]);
+    }
+
+    let dirs = warehouse.run(&["shift", "dirs"]);
+    if warehouse.folds_case() {
+        assert_refused_with(&dirs, ALIAS_REFUSAL, &["DOCS and docs"]);
+        assert_eq!(warehouse.read("Docs/a"), "old\n", "a refused shift removes nothing");
+    } else {
+        assert!(dirs.status.success(), "{}", stderr(&dirs));
+        assert_eq!(warehouse.read("docs/x"), "x\n");
+        assert_eq!(warehouse.read("DOCS/y"), "y\n");
+    }
+}
+
+/// Two new directories spelled in NFC and NFD land on one directory where the volume normalizes,
+/// and the second would be entered silently, merging their entries: the pair is refused up front.
+#[test]
+fn a_new_directory_pair_differing_only_in_normalization_is_refused_or_materialized_whole() {
+    let (nfc, nfd) = ("caf\u{e9}", "cafe\u{301}");
+    let warehouse = Warehouse::new("normalization", &[("app.txt", "app\n")]);
+    warehouse.craft("pair", "main", &[("app.txt", "app\n"), (&format!("{}/a", nfc), "a\n"), (&format!("{}/b", nfd), "b\n")]);
+
+    let shifted = warehouse.run(&["shift", "pair"]);
+
+    if folds_normalization(&warehouse.base) {
+        assert_refused_with(&shifted, ALIAS_REFUSAL, &[nfc, nfd]);
+        assert_eq!(listed(&warehouse.root), BTreeSet::from([".forklift".to_string(), "app.txt".to_string()]),
+                   "a refused shift writes nothing");
+    } else {
+        assert!(shifted.status.success(), "{}", stderr(&shifted));
+        assert_eq!(warehouse.read(&format!("{}/a", nfc)), "a\n");
+        assert_eq!(warehouse.read(&format!("{}/b", nfd)), "b\n");
+    }
+}
+
+/// A file where the restored path needs a directory is refused by name, not left to fail inside
+/// the write.
+#[test]
+fn restore_refuses_a_path_beneath_a_file() {
+    let warehouse = Warehouse::new("restore-non-directory", &[("app.txt", "app\n"), ("foo/a.txt", "a\n")]);
+    std::fs::remove_dir_all(warehouse.root.join("foo")).unwrap();
+    warehouse.write("foo", "mine\n");
+
+    for target in ["foo/a.txt", "foo"] {
+        let restored = warehouse.run(&["restore", target]);
+        assert!(!restored.status.success(), "restore {}", target);
+        assert!(stderr(&restored).contains("\"foo\" is not a directory"), "restore {}: {}", target, stderr(&restored));
+        assert_eq!(warehouse.read("foo"), "mine\n");
+    }
 }

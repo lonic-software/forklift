@@ -207,15 +207,24 @@ fn restore_file_and_refresh_entry(parent_key: &str,
 
     // The inventory can hold two spellings of one file on a case-insensitive volume (a
     // case-only directory rename staged under the new name while the old one stays): writing
-    // the one that is not on disk would overwrite the other through the alias.
-    if let alias_utils::Occupancy::Alias { occupant, .. } | alias_utils::Occupancy::Unidentified { component: occupant }
-        = alias_utils::AliasCheck::new().occupancy(&file_path)? {
-        return Err(format!(
-            "Cannot restore \"{}\": on this file system it names the same file as \"{}\", which \
-            restoring would overwrite. Stage the one you mean to keep (load or unload the other) \
-            first.",
-            file_path, occupant
-        ));
+    // the one that is not on disk would overwrite the other through the alias. A file where the
+    // path needs a directory is refused too, rather than failing inside the write.
+    match alias_utils::AliasCheck::new().occupancy(&file_path)? {
+        alias_utils::Occupancy::Alias { occupant, .. } | alias_utils::Occupancy::Unidentified { component: occupant } => {
+            return Err(format!(
+                "Cannot restore \"{}\": on this file system it names the same file as \"{}\", which \
+                restoring would overwrite. Stage the one you mean to keep (load or unload the other) \
+                first.",
+                file_path, occupant
+            ));
+        }
+        alias_utils::Occupancy::NonDirectory { occupant } => {
+            return Err(format!(
+                "Cannot restore \"{}\": \"{}\" is not a directory. Move it aside first.",
+                file_path, occupant
+            ));
+        }
+        alias_utils::Occupancy::Vacant | alias_utils::Occupancy::Listed => {}
     }
 
     shift_utils::write_tracked_file(&file_path, hash, item_type, false)?;

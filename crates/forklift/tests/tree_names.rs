@@ -220,7 +220,8 @@ fn a_subtree_cased_like_a_symlink_does_not_write_through_it() {
 
     warehouse.craft_pallet(|blob| vec![symlink("lib", &target), subtree("LIB", blob)]);
 
-    assert_refused(&warehouse, &outside.join("escaped.txt"), "\"LIB");
+    // The two spellings land on one entry, so the up-front alias check refuses the pair by name.
+    assert_refused(&warehouse, &outside.join("escaped.txt"), "LIB and lib");
 }
 
 #[cfg(unix)]

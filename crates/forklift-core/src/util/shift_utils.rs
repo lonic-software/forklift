@@ -285,7 +285,7 @@ pub fn collect_collisions(ops: &[FileOp], removed_dirs: &[String]) -> Result<Vec
         }
     }
 
-    collisions.extend(check.created_pairs(created)?);
+    collisions.extend(check.created_pairs(created, &removals)?);
 
     Ok(collisions)
 }
