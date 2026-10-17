@@ -2482,6 +2482,19 @@ impl IgnoreRules {
         Coverage(false)
     }
 
+    /// The coverage a directory passes to its entries, given its parent's: what
+    /// [`IgnoreRules::coverage_of`] returns, without climbing the ancestors again.
+    ///
+    /// # Arguments
+    /// * `parent`  - The coverage of the directory's parent.
+    /// * `dir_key` - The warehouse path key of the directory (`""` for the root).
+    ///
+    /// # Returns
+    /// * `Coverage` - Whether a user rule matches the key or an ancestor's key.
+    pub fn coverage_below(&self, parent: Coverage, dir_key: &str) -> Coverage {
+        Coverage(parent.0 || (!dir_key.is_empty() && self.user.iter().any(|r| r.is_match(dir_key))))
+    }
+
     /// Whether the walks should skip the path with the given key.
     ///
     /// An untracked path is covered by a user rule that matches its own key or the key of any

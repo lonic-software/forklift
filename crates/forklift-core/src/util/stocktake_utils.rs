@@ -401,6 +401,7 @@ async fn collect_unstaged_changes_impl(collect_shards: bool)
         String::new(),
         Arc::clone(&keys),
         Arc::clone(&ignore_rules),
+        ignore_rules.coverage_of(""),
     ));
 
     executor.execute(root_task).await.map_err(|e|
@@ -427,6 +428,8 @@ async fn collect_unstaged_changes_impl(collect_shards: bool)
 /// * `key`           - The warehouse path key of the directory.
 /// * `keys`          - All inventoried directory keys.
 /// * `ignore_rules`  - The ignore rules.
+/// * `parent_coverage` - The coverage of the directory's parent (see
+///                   `file_utils::IgnoreRules::coverage_of`).
 ///
 /// # Returns
 /// * `Ok(())`      - If the directory was compared.
@@ -434,7 +437,8 @@ async fn collect_unstaged_changes_impl(collect_shards: bool)
 fn walk_directory_unstaged(context: Arc<ChangeWalkContext>,
                            key: String,
                            keys: Arc<BTreeSet<String>>,
-                           ignore_rules: Arc<file_utils::IgnoreRules>)
+                           ignore_rules: Arc<file_utils::IgnoreRules>,
+                           parent_coverage: file_utils::Coverage)
                            -> impl Future<Output = Result<(), String>> + Send {
     async move {
         let fs_path = if key.is_empty() {
@@ -468,18 +472,22 @@ fn walk_directory_unstaged(context: Arc<ChangeWalkContext>,
         // matches is walked by its own task, never reported "removed" (which fans out into a
         // single-threaded walk of its whole subtree).
         let mut ignored_names: BTreeSet<String> = BTreeSet::new();
-        let coverage = ignore_rules.coverage_of(&key);
+        let coverage = ignore_rules.coverage_below(parent_coverage, &key);
 
         for entry_result in file_utils::read_directory(&fs_path)? {
             let entry = entry_result.map_err(|e| format!("Error while reading directory entry: {}", e))?;
             let name = file_utils::get_name_for_file_or_directory(&entry)?;
             let entry_key = join_key(&key, &name);
 
-            let tracked = inventory_utils::entry_is_tracked(Some(&inventory), &name, &entry_key, &keys);
-
-            if ignore_rules.excludes(&entry_key, tracked, coverage) {
-                ignored_names.insert(name);
-                continue;
+            match inventory_utils::rule_verdict(&ignore_rules, coverage, Some(&inventory), &entry, &name, &entry_key, &keys)? {
+                inventory_utils::RuleVerdict::Walk => {}
+                inventory_utils::RuleVerdict::Ignored => {
+                    ignored_names.insert(name);
+                    continue;
+                }
+                // Not in `ignored_names`: the tracked entry under this name is gone and must be
+                // reported, while the untracked one on disk stays hidden.
+                inventory_utils::RuleVerdict::CoveredOtherType => continue,
             }
 
             let metadata = file_utils::get_symlink_metadata_for_path(&entry.path())?;
@@ -519,6 +527,7 @@ fn walk_directory_unstaged(context: Arc<ChangeWalkContext>,
                         entry_key,
                         Arc::clone(&keys),
                         Arc::clone(&ignore_rules),
+                        coverage,
                     )))?;
                 } else {
                     found.push(Change::new(ChangeKind::Untracked, format!("{}/", entry_key)));

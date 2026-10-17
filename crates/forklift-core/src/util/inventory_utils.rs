@@ -421,18 +421,66 @@ fn has_live_entry(inventory: &Inventory, name: &str) -> bool {
     matches!(inventory.get_item_by_name(name), Some(item) if item.state != InventoryItemState::Deleted)
 }
 
-/// Whether the entry `name` of a directory is tracked, for the ignore rules: its name has a live
-/// entry in the directory's shard, or its key is registered. Deliberately blind to the entry's
-/// type on disk now, so that after a file/directory flip the tracked half is still reported
-/// rather than hidden by a rule.
+/// What the ignore rules make of one entry of a directory a walk reads. See [`rule_verdict`].
+pub enum RuleVerdict {
+    /// No rule hides the entry: classify it like any other.
+    Walk,
+    /// The rules hide the entry, and nothing under its name is tracked.
+    Ignored,
+    /// The rules hide what is on disk, but its name is tracked as the other type (a tracked
+    /// file replaced by a folder, or a tracked folder by a file). The entry on disk is skipped
+    /// like ignored content, and the tracked one is reported as gone, never hidden.
+    CoveredOtherType,
+}
+
+/// The ignore rules' verdict on an entry of a directory. A rule covers only untracked paths,
+/// and an entry is tracked as what it is on disk now: a file by a live entry in the
+/// directory's shard, a directory by its registered key. So a rule hides the entry on disk
+/// whenever that one is untracked, but a tracked entry of the other type under the same name
+/// must still be reported as gone, which [`RuleVerdict::CoveredOtherType`] tells apart.
+///
+/// The inventory is consulted first, and the entry's type (`DirEntry::file_type`, no extra
+/// stat on the common platforms) only when a rule covers a name that is tracked.
 ///
 /// # Arguments
+/// * `rules`      - The ignore rules.
+/// * `parent`     - The directory's coverage (see [`file_utils::IgnoreRules::coverage_of`]).
 /// * `shard`      - The directory's shard (`None` when it has none, or it could not be read).
+/// * `entry`      - The entry.
 /// * `name`       - The entry's name.
 /// * `key`        - The entry's warehouse path key.
 /// * `registered` - The registered directory keys.
-pub fn entry_is_tracked(shard: Option<&Inventory>, name: &str, key: &str, registered: &BTreeSet<String>) -> bool {
-    shard.is_some_and(|inventory| has_live_entry(inventory, name)) || registered.contains(key)
+///
+/// # Returns
+/// * `Ok(RuleVerdict)` - The verdict.
+/// * `Err(String)`     - If the entry's type could not be read.
+pub fn rule_verdict(rules: &file_utils::IgnoreRules,
+                    parent: file_utils::Coverage,
+                    shard: Option<&Inventory>,
+                    entry: &std::fs::DirEntry,
+                    name: &str,
+                    key: &str,
+                    registered: &BTreeSet<String>) -> Result<RuleVerdict, String> {
+    if !rules.excludes(key, false, parent) {
+        return Ok(RuleVerdict::Walk);
+    }
+
+    let has_file_entry = shard.is_some_and(|inventory| has_live_entry(inventory, name));
+    let is_registered = registered.contains(key);
+
+    if rules.excludes(key, true, parent) || (!has_file_entry && !is_registered) {
+        return Ok(RuleVerdict::Ignored);
+    }
+
+    let is_directory = entry.file_type()
+        .map_err(|e| format!("Error while getting the type of \"{}\": {}", key, e))?
+        .is_dir();
+
+    if (is_directory && is_registered) || (!is_directory && has_file_entry) {
+        Ok(RuleVerdict::Walk)
+    } else {
+        Ok(RuleVerdict::CoveredOtherType)
+    }
 }
 
 /// Whether the directory with the given key is tracked: registered in the inventory metadata.
@@ -512,11 +560,17 @@ pub async fn create_inventory_for_directory(path: &WarehousePath) -> Result<(), 
     // taken before the walk changes it, is what the walk asks whether a directory is tracked.
     let registered = populate_dirty_inventory_paths(&context, path).await?;
 
+    let parent_coverage = match path.split_parent() {
+        Ok((parent, _)) if !path.is_root() => ignore_rules.coverage_of(parent.as_key()),
+        _ => ignore_rules.coverage_of(""),
+    };
+
     let root_task: InventoryBuilderTask = Box::pin(build_inventory(
         Arc::clone(&context),
         Arc::new(path.clone()),
         Arc::new(ignore_rules),
         Arc::new(registered),
+        parent_coverage,
     ));
 
     // `result` accumulates the *first* failure from anywhere in this function — the walk itself,
@@ -963,7 +1017,8 @@ fn publish_shard_outcomes(clear_keys: &BTreeSet<String>,
 fn build_inventory(context: Arc<InventoryBuilderContext>,
                    path: Arc<WarehousePath>,
                    ignore_rules: Arc<file_utils::IgnoreRules>,
-                   registered: Arc<BTreeSet<String>>) -> impl Future<Output = Result<(), String>> + Send {
+                   registered: Arc<BTreeSet<String>>,
+                   parent_coverage: file_utils::Coverage) -> impl Future<Output = Result<(), String>> + Send {
     async move {
         // Captured before this task reads, stats or hashes anything below — the timestamp this
         // directory's published shard will carry as its mtime (see the join point's publish
@@ -982,15 +1037,11 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
         // The root is asked as the directory it is, by registration: a stale file entry under its
         // name (a file replaced by this folder) is the parent's business, and the parent's walk
         // stages its removal. Walking the folder for it would only register an empty directory.
-        if !path.is_root() {
-            let (parent, _) = path.split_parent()?;
-
-            if ignore_rules.excludes(path.as_key(), registered.contains(path.as_key()), ignore_rules.coverage_of(parent.as_key())) {
-                return Ok(());
-            }
+        if !path.is_root() && ignore_rules.excludes(path.as_key(), registered.contains(path.as_key()), parent_coverage) {
+            return Ok(());
         }
 
-        let coverage = ignore_rules.coverage_of(path.as_key());
+        let coverage = ignore_rules.coverage_below(parent_coverage, path.as_key());
 
         // The existing inventory of this directory (if any) is the stat cache: entries whose
         // file metadata is unchanged are reused without reading or hashing the file.
@@ -1023,11 +1074,14 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
             let name = file_utils::get_name_for_file_or_directory(&entry)?;
             let entry_path = path.child(&name);
 
-            let tracked = entry_is_tracked(
-                existing_inventory.as_ref().map(|(inv, _)| inv), &name, entry_path.as_key(), &registered,
-            );
+            // An entry the rules hide is left out of the rebuilt shard either way: a tracked
+            // entry of the other type under its name is then staged as removed.
+            let verdict = rule_verdict(
+                &ignore_rules, coverage, existing_inventory.as_ref().map(|(inv, _)| inv),
+                &entry, &name, entry_path.as_key(), &registered,
+            )?;
 
-            if ignore_rules.excludes(entry_path.as_key(), tracked, coverage) {
+            if !matches!(verdict, RuleVerdict::Walk) {
                 continue;
             }
 
@@ -1091,6 +1145,7 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
                     Arc::new(entry_path),
                     Arc::clone(&ignore_rules),
                     Arc::clone(&registered),
+                    coverage,
                 ));
 
                 context.send_task(new_task)?;
@@ -1281,7 +1336,9 @@ fn directory_has_no_untracked_content(key: &str,
         let name = file_utils::get_name_for_file_or_directory(&entry)?;
         let entry_key = if key.is_empty() { name.clone() } else { format!("{}/{}", key, name) };
 
-        if ignore_rules.excludes(&entry_key, entry_is_tracked(Some(&inventory), &name, &entry_key, registered), coverage) {
+        // Content the rules hide never blocks a replace, including an entry that took over a
+        // tracked name as the other type.
+        if !matches!(rule_verdict(ignore_rules, coverage, Some(&inventory), &entry, &name, &entry_key, registered)?, RuleVerdict::Walk) {
             continue;
         }
 

@@ -92,6 +92,15 @@ fn restore_worktree(path: &WarehousePath) -> Result<(), String> {
         TrackedKind::File => {}
     }
 
+    // A tracked file replaced by a folder: writing the file back would have to delete the
+    // folder and whatever untracked content it holds, so refuse instead.
+    if std::fs::symlink_metadata(path.to_fs_path()).is_ok_and(|metadata| metadata.is_dir()) {
+        return Err(format!(
+            "Cannot restore \"{}\": the tracked file was replaced by a folder. Move or delete the folder first.",
+            path.as_key()
+        ));
+    }
+
     let (parent, file_name) = path.split_parent()?;
 
     let (_, shard_bytes) = file_utils::retrieve_inventory_or_none_by_key(parent.as_key())?;

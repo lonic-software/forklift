@@ -982,6 +982,8 @@ fn stocktake_leaves_an_ignored_tracked_directory_alone_instead_of_reporting_it_r
 
 /// The staged and unstaged changes `stocktake --json` reports, as (kind, path) pairs.
 fn changes(warehouse: &TestWarehouse, section: &str) -> Vec<(String, String)> {
+    // An empty section is left out of the JSON, so a misspelled one would read as empty.
+    assert!(matches!(section, "staged" | "unstaged"), "stocktake has no section {:?}", section);
     let out = warehouse.run(&["--json", "stocktake"]);
     assert_success(&out);
     json(&out)["data"][section].as_array().cloned().unwrap_or_default()
@@ -1252,9 +1254,8 @@ fn a_tracked_file_a_rule_covers_replaced_by_a_folder_still_shows_its_removal() {
     let unstaged = changes(&warehouse, "unstaged");
     assert!(unstaged.iter().any(|(_, path)| path == "notes.txt"),
         "the tracked file's removal must stay visible under the rule: {:?}", unstaged);
-    let untracked = changes(&warehouse, "untracked");
-    assert!(!untracked.iter().any(|(_, path)| path.starts_with("notes.txt/")),
-        "the rule still covers the folder's untracked content: {:?}", untracked);
+    assert!(!unstaged.iter().any(|(_, path)| path.starts_with("notes.txt/")),
+        "the rule still covers the folder that replaced it: {:?}", unstaged);
 
     // Loading the parent stages the tracked file's removal, and nothing the rule covers; the
     // folder is not registered, so after the stack the rule covers it whole.
@@ -1265,6 +1266,36 @@ fn a_tracked_file_a_rule_covers_replaced_by_a_folder_still_shows_its_removal() {
     assert_success(&warehouse.run(&["stack", "notes.txt is gone"]));
     let remove = warehouse.run(&["remove", "notes.txt"]);
     assert!(!remove.status.success(), "notes.txt must be untracked: {}", stdout(&remove));
+}
+
+#[test]
+fn a_tracked_folder_a_rule_covers_replaced_by_a_file_is_removed_and_the_file_stays_ignored() {
+    let warehouse = warehouse_with_a_diverged_pallet("flip-dir-to-file-ignored");
+    warehouse.write_file(".forkliftignore", "^build$\n");
+    std::fs::remove_dir_all(warehouse.root.join("build")).unwrap();
+    warehouse.write_file("build", "now a file\n");
+
+    let unstaged = changes(&warehouse, "unstaged");
+    assert!(unstaged.iter().any(|(_, path)| path.starts_with("build/")),
+        "the tracked folder's removal must stay visible under the rule: {:?}", unstaged);
+    assert!(!unstaged.iter().any(|(_, path)| path == "build"), "the rule covers the untracked file: {:?}", unstaged);
+
+    assert_success(&warehouse.run(&["load", "."]));
+    let staged = changes(&warehouse, "staged");
+    assert!(staged.contains(&("removed".to_string(), "build/out.txt".to_string())), "{:?}", staged);
+    assert!(!staged.iter().any(|(_, path)| path == "build"), "a folder load must not add the covered file: {:?}", staged);
+}
+
+#[test]
+fn restore_refuses_a_file_replaced_by_a_folder_and_keeps_the_folder() {
+    let warehouse = warehouse_with_a_diverged_pallet("restore-flip-file-to-dir");
+    std::fs::remove_file(warehouse.root.join("notes.txt")).unwrap();
+    warehouse.write_file("notes.txt/new.txt", "new\n");
+
+    let restore = warehouse.run(&["restore", "notes.txt"]);
+    assert!(!restore.status.success(), "{}", stdout(&restore));
+    assert!(stderr(&restore).contains("replaced by a folder"), "{}", stderr(&restore));
+    assert_eq!(read(&warehouse, "notes.txt/new.txt"), "new\n");
 }
 
 #[test]
