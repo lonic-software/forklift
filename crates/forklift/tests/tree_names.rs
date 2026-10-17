@@ -296,3 +296,32 @@ fn stacking_a_top_level_alias_of_the_metadata_folder_is_refused() {
     assert!(!output.status.success(), "stack accepted the alias; stderr: {}", stderr);
     assert!(stderr.contains("\".forklift.\""), "the refusal must name the entry; stderr: {}", stderr);
 }
+
+#[test]
+fn a_leftover_assembly_temp_file_does_not_wedge_checkout() {
+    // An interrupted assembly can leave `.<name>.forklift-assemble.tmp` behind. The temp file is
+    // created new (so a symlink there is never followed), which must not turn that leftover into
+    // a permanent refusal: it is cleared first.
+    let warehouse = Warehouse::new("assemble-leftover");
+    let first = {
+        let _scope = StorageRootScope::enter(&warehouse.root);
+        pallet_utils::get_pallet_head("main").unwrap().unwrap()
+    };
+
+    let big: Vec<u8> = (0..9 * 1024 * 1024u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
+    std::fs::write(warehouse.root.join("big.bin"), &big).unwrap();
+    warehouse.run_ok(&["load", "big.bin"]);
+    warehouse.run_ok(&["stack", "big"]);
+
+    {
+        let _scope = StorageRootScope::enter(&warehouse.root);
+        pallet_utils::set_pallet_head("before", &first).unwrap();
+    }
+    warehouse.run_ok(&["shift", "before"]);
+    std::fs::write(warehouse.root.join(".big.bin.forklift-assemble.tmp"), "half an assembly").unwrap();
+
+    warehouse.run_ok(&["shift", "main"]);
+
+    assert!(std::fs::read(warehouse.root.join("big.bin")).unwrap() == big);
+    assert!(!warehouse.root.join(".big.bin.forklift-assemble.tmp").exists());
+}
