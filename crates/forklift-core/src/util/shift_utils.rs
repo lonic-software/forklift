@@ -5,7 +5,7 @@ use crate::model::inventory::Inventory;
 use crate::model::tree_item::TreeItem;
 use crate::util::progress_utils::Progress;
 use crate::util::scope_utils::{self, MaterializationScope, ScopeClass};
-use crate::util::{file_utils, inventory_utils, object_utils, tree_utils};
+use crate::util::{file_utils, inventory_utils, object_utils, office_utils, tree_utils};
 
 /// A single file operation needed to turn one tree into another in the working directory.
 pub enum FileOp {
@@ -49,6 +49,10 @@ pub fn diff_trees(from: Option<&str>, to: &str) -> Result<(Vec<FileOp>, Vec<Stri
         None => None,
     };
     let to_tree = object_utils::load_tree(to)?;
+
+    // Every materializer comes through here, so the metadata-folder refusal is enforced once for
+    // all of them rather than by each caller remembering it.
+    office_utils::ensure_not_metadata_root(&to_tree)?;
 
     let mut ops: Vec<FileOp> = Vec::new();
     let mut removed_dirs: Vec<String> = Vec::new();

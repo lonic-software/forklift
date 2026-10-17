@@ -9,6 +9,7 @@ use std::process::Output;
 use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
 use forklift_core::enums::dir_entry_type::DirEntryType;
 use forklift_core::globals::StorageRootScope;
+use forklift_core::model::blob::Blob;
 use forklift_core::model::object::loose_object::LooseObject;
 use forklift_core::model::parcel::Parcel;
 use forklift_core::model::tree_item::TreeItem;
@@ -67,11 +68,16 @@ impl Warehouse {
     }
 
     /// Point a new pallet `evil` at a parcel on top of `main` whose root tree is `main`'s root
-    /// tree plus `extra`, which is built from the blob hash of `app.txt`.
-    fn craft_pallet(&self, extra: impl FnOnce(&str) -> TreeItem) {
+    /// tree plus the entries `extra` returns, built from the blob hash of `app.txt`.
+    fn craft_pallet(&self, extra: impl FnOnce(&str) -> Vec<TreeItem>) {
+        self.craft_pallet_named("evil", "main", extra);
+    }
+
+    /// [`Self::craft_pallet`], naming the new pallet and the pallet it builds on.
+    fn craft_pallet_named(&self, name: &str, base: &str, extra: impl FnOnce(&str) -> Vec<TreeItem>) {
         let _scope = StorageRootScope::enter(&self.root);
 
-        let head = pallet_utils::get_pallet_head("main").unwrap().unwrap();
+        let head = pallet_utils::get_pallet_head(base).unwrap().unwrap();
         let parcel = object_utils::load_parcel(&head).unwrap();
         let mut tree = object_utils::load_tree(&parcel.tree_hash).unwrap();
         let blob = tree.get_files()
@@ -79,7 +85,9 @@ impl Warehouse {
             .map(|(_, item)| item.hash.clone())
             .unwrap();
 
-        tree.add_child(extra(&blob));
+        for item in extra(&blob) {
+            tree.add_child(item);
+        }
         let tree_hash = store(LooseObjectBuilder::build_tree(&tree));
 
         let crafted = Parcel {
@@ -90,7 +98,7 @@ impl Warehouse {
         };
         let parcel_hash = store(LooseObjectBuilder::build_parcel(&crafted));
 
-        pallet_utils::set_pallet_head("evil", &parcel_hash).unwrap();
+        pallet_utils::set_pallet_head(name, &parcel_hash).unwrap();
     }
 }
 
@@ -108,6 +116,13 @@ fn store(mut object: LooseObject) -> String {
 
 fn file(name: &str, blob: &str) -> TreeItem {
     TreeItem::new(name.to_string(), blob.to_string(), DirEntryType::Normal)
+}
+
+/// A symlink entry named `name` pointing at `target`.
+fn symlink(name: &str, target: &str) -> TreeItem {
+    let hash = store(LooseObjectBuilder::build_blob(&Blob { content: target.as_bytes().to_vec() }));
+
+    TreeItem::new(name.to_string(), hash, DirEntryType::SymbolicLink)
 }
 
 /// A subtree named `name` holding one file, `escaped.txt`.
@@ -132,7 +147,7 @@ fn assert_refused(warehouse: &Warehouse, escape: &PathBuf, quoted: &str) {
 #[test]
 fn a_dot_dot_subtree_is_refused_and_writes_nothing_outside() {
     let warehouse = Warehouse::new("dotdot");
-    warehouse.craft_pallet(|blob| subtree("..", blob));
+    warehouse.craft_pallet(|blob| vec![subtree("..", blob)]);
 
     assert_refused(&warehouse, &warehouse.base.join("escaped.txt"), "\"..\"");
 }
@@ -140,7 +155,7 @@ fn a_dot_dot_subtree_is_refused_and_writes_nothing_outside() {
 #[test]
 fn a_name_with_a_separator_is_refused_and_writes_nothing_outside() {
     let warehouse = Warehouse::new("separator");
-    warehouse.craft_pallet(|blob| file("../escaped.txt", blob));
+    warehouse.craft_pallet(|blob| vec![file("../escaped.txt", blob)]);
 
     assert_refused(&warehouse, &warehouse.base.join("escaped.txt"), "\"../escaped.txt\"");
 }
@@ -150,7 +165,7 @@ fn an_absolute_name_is_refused_and_writes_nothing_outside() {
     let warehouse = Warehouse::new("absolute");
     let target = warehouse.base.join("absolute.txt");
     let name = target.to_str().unwrap().to_string();
-    warehouse.craft_pallet(|blob| file(&name, blob));
+    warehouse.craft_pallet(|blob| vec![file(&name, blob)]);
 
     assert_refused(&warehouse, &target, &format!("{:?}", name));
 }
@@ -160,7 +175,7 @@ fn an_ordinary_crafted_name_still_shifts() {
     // The positive twin: the same crafting path with a valid name is accepted and written, so the
     // refusals above come from the name and not from the crafted parcel.
     let warehouse = Warehouse::new("ordinary");
-    warehouse.craft_pallet(|blob| subtree("nested", blob));
+    warehouse.craft_pallet(|blob| vec![subtree("nested", blob)]);
 
     warehouse.run_ok(&["shift", "evil"]);
 
@@ -173,7 +188,7 @@ fn an_ordinary_crafted_name_still_shifts() {
 #[test]
 fn a_root_forklift_entry_is_refused_and_leaves_the_metadata_alone() {
     let warehouse = Warehouse::new("metadata");
-    warehouse.craft_pallet(|blob| subtree(".forklift", blob));
+    warehouse.craft_pallet(|blob| vec![subtree(".forklift", blob)]);
 
     assert_refused(&warehouse, &warehouse.root.join(".forklift").join("escaped.txt"), "\".forklift\"");
 }
@@ -181,7 +196,52 @@ fn a_root_forklift_entry_is_refused_and_leaves_the_metadata_alone() {
 #[test]
 fn a_root_forklift_entry_in_another_case_is_refused() {
     let warehouse = Warehouse::new("metadata-case");
-    warehouse.craft_pallet(|blob| subtree(".ForkLift", blob));
+    warehouse.craft_pallet(|blob| vec![subtree(".ForkLift", blob)]);
 
     assert_refused(&warehouse, &warehouse.root.join(".forklift").join("escaped.txt"), "\".ForkLift\"");
+}
+
+/// Whether the warehouse's file system treats names differently by case.
+fn is_case_insensitive(warehouse: &Warehouse) -> bool {
+    warehouse.root.join("APP.TXT").exists()
+}
+
+#[cfg(unix)]
+#[test]
+fn a_subtree_cased_like_a_symlink_does_not_write_through_it() {
+    let warehouse = Warehouse::new("symlink-case");
+    if !is_case_insensitive(&warehouse) {
+        return;
+    }
+
+    let outside = warehouse.base.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    let target = outside.to_str().unwrap().to_string();
+
+    warehouse.craft_pallet(|blob| vec![symlink("lib", &target), subtree("LIB", blob)]);
+
+    assert_refused(&warehouse, &outside.join("escaped.txt"), "\"LIB");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_replaced_by_a_file_is_not_written_through() {
+    // Legitimate history shape: `link` is a symlink in one parcel and a regular file in the
+    // next. Shifting across that change must replace the link, not write into its target.
+    let warehouse = Warehouse::new("symlink-to-file");
+    let outside = warehouse.base.join("outside.txt");
+    std::fs::write(&outside, "untouched\n").unwrap();
+    let target = outside.to_str().unwrap().to_string();
+
+    warehouse.craft_pallet(|_| vec![symlink("link", &target)]);
+    warehouse.run_ok(&["shift", "evil"]);
+    assert!(std::fs::symlink_metadata(warehouse.root.join("link")).unwrap().file_type().is_symlink());
+
+    warehouse.run_ok(&["shift", "main"]);
+    warehouse.run_ok(&["shift", "evil"]);
+    warehouse.craft_pallet_named("next", "evil", |blob| vec![file("link", blob)]);
+    warehouse.run_ok(&["shift", "next"]);
+
+    assert_eq!(std::fs::read_to_string(&outside).unwrap(), "untouched\n", "the shift wrote through the old symlink");
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("link")).unwrap(), "payload\n");
 }

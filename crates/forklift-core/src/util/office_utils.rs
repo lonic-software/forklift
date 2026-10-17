@@ -439,8 +439,9 @@ pub struct TrustAnchor {
     pub adopts: Option<String>,
 }
 
-/// Ensure a tree is a normal content tree: office parcel trees carry a top-level
-/// `.forklift` entry and must never be materialized into a working directory.
+/// Ensure a tree is a normal content tree: meta pallet trees (the office, manifest, haul) carry a
+/// top-level `.forklift` entry and must never be materialized into a working directory, where
+/// that entry would land in the warehouse's own metadata folder.
 ///
 /// # Arguments
 /// * `root_tree_hash` - The hash of the tree to check.
@@ -449,19 +450,35 @@ pub struct TrustAnchor {
 /// * `Ok(())`      - If the tree carries no tracked-metadata namespace.
 /// * `Err(String)` - If it does (or could not be read).
 pub fn ensure_not_metadata_tree(root_tree_hash: &str) -> Result<(), String> {
-    let root = object_utils::load_tree(root_tree_hash)?;
+    ensure_not_metadata_root(&object_utils::load_tree(root_tree_hash)?)
+}
 
-    let has_namespace = root.get_subtrees().any(|(name, _)| name == TREE_NAME_FORKLIFT)
-        || root.get_files().any(|(name, _)| name == TREE_NAME_FORKLIFT);
+/// [`ensure_not_metadata_tree`] over a root tree already loaded.
+///
+/// The match is wider than the exact name: a file system that ignores case (macOS, Windows) or
+/// drops trailing dots and spaces (Windows) opens `.forklift` for `.ForkLift` or `.forklift.`
+/// too, so any of those is refused as well.
+///
+/// # Arguments
+/// * `root` - The root tree to check.
+///
+/// # Returns
+/// * `Ok(())`      - If no top-level entry names the metadata folder.
+/// * `Err(String)` - The refusal, naming the entry Debug-quoted.
+pub fn ensure_not_metadata_root(root: &TreeItem) -> Result<(), String> {
+    let found = root.get_subtrees().chain(root.get_files())
+        .map(|(name, _)| name)
+        .find(|name| name.trim_end_matches(['.', ' ']).eq_ignore_ascii_case(TREE_NAME_FORKLIFT));
 
-    if has_namespace {
-        return Err(
-            "This parcel carries tracked metadata (an office parcel); it cannot be \
-            materialized into a working directory.".to_string()
-        );
+    match found {
+        Some(name) => Err(format!(
+            "This parcel's tree has a top-level entry {:?}, which is the warehouse's metadata \
+            folder (a meta pallet's tree, or a crafted one); it cannot be materialized into a \
+            working directory.",
+            name
+        )),
+        None => Ok(()),
     }
-
-    Ok(())
 }
 
 /// Read the trust anchor, if signing has been established.

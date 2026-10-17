@@ -54,11 +54,12 @@ impl TreeVersion {
         move |t: &TreeItem| builder_fn(self.code(), t)
     }
 
-    /// Get the object parser function for the version.
+    /// Get the entry parser function for the version. It returns the raw entries; callers go
+    /// through `tree_parser::parse_tree`, which validates them.
     ///
     /// # Returns
-    /// * `impl Fn(usize, &[u8]) -> Result<TreeItem, String>` - The object parser function.
-    pub fn get_parser(&self) -> impl Fn(usize, &[u8]) -> Result<TreeItem, String> + '_ {
+    /// * `impl Fn(usize, &[u8]) -> Result<Vec<TreeItem>, String>` - The entry parser function.
+    pub fn get_parser(&self) -> impl Fn(usize, &[u8]) -> Result<Vec<TreeItem>, String> + '_ {
         let parser_fn = match self {
             TreeVersion::V2024_09_04 =>
                 crate::parser::object::tree::version::v2024_09_04::parse,
