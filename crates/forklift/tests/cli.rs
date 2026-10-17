@@ -949,8 +949,9 @@ fn stocktake_leaves_an_ignored_tracked_directory_alone_instead_of_reporting_it_r
     assert_success(&warehouse.run(&["stack", "initial"]));
 
     // Ignore build/ *after* it was already tracked (a build-output dir added to
-    // .forkliftignore late). It is still on disk, so forklift must leave it alone — not walk
-    // its whole subtree reporting every file as removed (the serial-walk hang this fixes).
+    // .forkliftignore late). It stays tracked, so stocktake walks it like any tracked directory:
+    // its unchanged files are not reported, and nothing under it is reported removed (the
+    // serial walk of a "removed" subtree is what once made stocktake hang here).
     warehouse.write_file(".forkliftignore", "^build\\/?.*$\n");
 
     let unstaged_paths = |warehouse: &TestWarehouse| -> Vec<String> {
@@ -977,6 +978,404 @@ fn stocktake_leaves_an_ignored_tracked_directory_alone_instead_of_reporting_it_r
         "a genuine removal must still be reported, got: {:?}",
         paths,
     );
+}
+
+/// The staged and unstaged changes `stocktake --json` reports, as (kind, path) pairs.
+fn changes(warehouse: &TestWarehouse, section: &str) -> Vec<(String, String)> {
+    // An empty section is left out of the JSON, so a misspelled one would read as empty.
+    assert!(matches!(section, "staged" | "unstaged"), "stocktake has no section {:?}", section);
+    let out = warehouse.run(&["--json", "stocktake"]);
+    assert_success(&out);
+    json(&out)["data"][section].as_array().cloned().unwrap_or_default()
+        .iter()
+        .map(|change| (change["kind"].as_str().unwrap().to_string(), change["path"].as_str().unwrap().to_string()))
+        .collect()
+}
+
+fn read(warehouse: &TestWarehouse, relative_path: &str) -> String {
+    std::fs::read_to_string(warehouse.root.join(relative_path)).unwrap()
+}
+
+/// A warehouse whose main pallet tracks notes.txt and build/out.txt, plus a pallet "feature"
+/// where both differ. Ends on main with a clean working directory.
+fn warehouse_with_a_diverged_pallet(name: &str) -> TestWarehouse {
+    let warehouse = TestWarehouse::new(name);
+    warehouse.write_file("notes.txt", "v1\n");
+    warehouse.write_file("build/out.txt", "b1\n");
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "one"]));
+    assert_success(&warehouse.run(&["palletize", "feature"]));
+    warehouse.write_file("notes.txt", "v2\n");
+    warehouse.write_file("build/out.txt", "b2\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "two"]));
+    assert_success(&warehouse.run(&["shift", "main"]));
+
+    warehouse
+}
+
+#[test]
+fn an_edit_to_a_tracked_file_a_rule_covers_stays_visible_and_blocks_shift() {
+    let warehouse = warehouse_with_a_diverged_pallet("ignore-tracked-edit");
+    warehouse.write_file(".forkliftignore", "^notes\\.txt$\n");
+    warehouse.write_file("notes.txt", "local edit\n");
+
+    assert!(changes(&warehouse, "unstaged").contains(&("modified".to_string(), "notes.txt".to_string())),
+        "an edit to a tracked file must stay visible whatever the rules say");
+
+    let shift = warehouse.run(&["shift", "feature"]);
+    assert!(!shift.status.success(), "shift must refuse over the edit: {}", stdout(&shift));
+    assert_eq!(read(&warehouse, "notes.txt"), "local edit\n", "the edit must survive");
+}
+
+#[test]
+fn loading_the_root_or_a_tracked_folder_a_rule_covers_stages_no_removal() {
+    let warehouse = warehouse_with_a_diverged_pallet("ignore-tracked-load");
+
+    warehouse.write_file(".forkliftignore", "^notes\\.txt$\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert!(!changes(&warehouse, "staged").iter().any(|(_, path)| path == "notes.txt"),
+        "load . must not stage the removal of a tracked file a rule matches");
+
+    warehouse.write_file(".forkliftignore", "^build(/.*)?$\n");
+    warehouse.write_file("build/out.txt", "b3\n");
+    assert_success(&warehouse.run(&["load", "build"]));
+    let staged = changes(&warehouse, "staged");
+    assert!(!staged.iter().any(|(kind, _)| kind == "removed"), "load build must not stage a removal: {:?}", staged);
+    // The folder's tracked content is refreshed, not skipped.
+    assert!(staged.contains(&("modified".to_string(), "build/out.txt".to_string())), "{:?}", staged);
+}
+
+#[test]
+fn removing_a_tracked_file_a_rule_covers_untracks_it_and_the_rule_then_hides_it() {
+    let warehouse = warehouse_with_a_diverged_pallet("ignore-tracked-remove");
+    warehouse.write_file(".forkliftignore", "^notes\\.txt$\n");
+
+    assert_success(&warehouse.run(&["remove", "notes.txt"]));
+    assert_success(&warehouse.run(&["load", ".forkliftignore"]));
+    assert_success(&warehouse.run(&["stack", "untrack notes"]));
+
+    assert_eq!(read(&warehouse, "notes.txt"), "v1\n", "remove never touches the working directory");
+    assert!(!changes(&warehouse, "unstaged").iter().any(|(_, path)| path == "notes.txt"),
+        "once untracked, the rule covers the file");
+}
+
+#[test]
+fn a_rule_on_a_tracked_folder_hides_its_new_files_but_not_edits_to_its_tracked_ones() {
+    let warehouse = warehouse_with_a_diverged_pallet("ignore-tracked-folder");
+    // The rule matches the folder's key only, never the key of a file inside it.
+    warehouse.write_file(".forkliftignore", "^build$\n");
+    warehouse.write_file("build/new.txt", "generated\n");
+    warehouse.write_file("build/out.txt", "edited\n");
+
+    let unstaged = changes(&warehouse, "unstaged");
+    assert!(unstaged.contains(&("modified".to_string(), "build/out.txt".to_string())), "{:?}", unstaged);
+    assert!(!unstaged.iter().any(|(_, path)| path.starts_with("build/new")),
+        "an untracked file inside a covered folder is covered: {:?}", unstaged);
+
+    assert_success(&warehouse.run(&["load", "."]));
+    assert!(!changes(&warehouse, "staged").iter().any(|(_, path)| path.starts_with("build/new")));
+}
+
+#[test]
+fn a_folder_load_of_an_untracked_folder_a_rule_covers_stages_nothing() {
+    let warehouse = TestWarehouse::new("ignore-untracked-folder");
+    warehouse.write_file("keep.txt", "kept\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "initial"]));
+
+    warehouse.write_file(".forkliftignore", "^build(/.*)?$\n");
+    warehouse.write_file("build/out.txt", "generated\n");
+    assert_success(&warehouse.run(&["load", "build"]));
+    assert_eq!(changes(&warehouse, "staged"), Vec::<(String, String)>::new());
+}
+
+#[test]
+fn load_refuses_a_path_inside_the_metadata_folder_in_any_spelling() {
+    let warehouse = TestWarehouse::new("load-metadata-folder");
+    assert_success(&warehouse.run(&["prepare"]));
+    warehouse.write_file(".forklift/x", "x\n");
+    warehouse.write_file(".Forklift/y", "y\n");
+
+    for target in [".forklift/x", ".Forklift/y"] {
+        let load = warehouse.run(&["load", target]);
+        assert!(!load.status.success(), "load {} must be refused", target);
+        assert!(stderr(&load).contains("metadata folder"), "{}", stderr(&load));
+    }
+    assert_eq!(changes(&warehouse, "staged"), Vec::<(String, String)>::new());
+}
+
+/// A warehouse that tracked a/b/c.txt through a single-file load, the only load that registers
+/// just the directory it writes, and stacked it. Ends with a clean working directory.
+fn warehouse_with_a_nested_single_file_load(name: &str) -> TestWarehouse {
+    let warehouse = TestWarehouse::new(name);
+    warehouse.write_file("root.txt", "r\n");
+    warehouse.write_file("a/b/c.txt", "c\n");
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "root.txt"]));
+    assert_success(&warehouse.run(&["load", "a/b/c.txt"]));
+    assert_success(&warehouse.run(&["stack", "nested"]));
+
+    warehouse
+}
+
+#[test]
+fn an_edit_under_a_nested_single_file_load_is_visible_and_blocks_shift() {
+    let warehouse = TestWarehouse::new("nested-load-edit");
+    warehouse.write_file("root.txt", "r\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["palletize", "feature"]));
+    warehouse.write_file("a/b/c.txt", "feature\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "feature"]));
+    assert_success(&warehouse.run(&["shift", "main"]));
+
+    // A shift rebuilds every shard from the tree, so the single-file load and the edit come
+    // after it: the load registers only a/b itself.
+    warehouse.write_file("a/b/c.txt", "c\n");
+    assert_success(&warehouse.run(&["load", "a/b/c.txt"]));
+    assert_success(&warehouse.run(&["stack", "nested"]));
+    warehouse.write_file("a/b/c.txt", "local\n");
+    assert!(changes(&warehouse, "unstaged").contains(&("modified".to_string(), "a/b/c.txt".to_string())));
+
+    let shift = warehouse.run(&["shift", "feature"]);
+    assert!(!shift.status.success(), "shift must refuse over the edit: {}", stdout(&shift));
+    assert_eq!(read(&warehouse, "a/b/c.txt"), "local\n", "the edit must survive");
+}
+
+#[test]
+fn an_edit_under_a_cherry_picked_nested_folder_is_visible_and_blocks_shift() {
+    let warehouse = TestWarehouse::new("cherry-pick-nested-edit");
+    warehouse.write_file("root.txt", "r\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base"]));
+
+    assert_success(&warehouse.run(&["palletize", "feature"]));
+    warehouse.write_file("x/y/z.txt", "z\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "add x/y/z.txt"]));
+    let source = pallet_head_hash(&warehouse, "feature");
+    warehouse.write_file("x/y/z.txt", "feature only\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "change x/y/z.txt"]));
+
+    assert_success(&warehouse.run(&["shift", "main"]));
+    assert_success(&warehouse.run(&["cherry-pick", &source]));
+    assert_eq!(read(&warehouse, "x/y/z.txt"), "z\n");
+
+    warehouse.write_file("x/y/z.txt", "local\n");
+    assert!(changes(&warehouse, "unstaged").contains(&("modified".to_string(), "x/y/z.txt".to_string())));
+
+    let shift = warehouse.run(&["shift", "feature"]);
+    assert!(!shift.status.success(), "shift must refuse over the edit: {}", stdout(&shift));
+    assert_eq!(read(&warehouse, "x/y/z.txt"), "local\n", "the edit must survive");
+}
+
+#[test]
+fn a_directory_only_its_descendant_registered_is_tracked_for_replace_and_remove() {
+    let warehouse = TestWarehouse::new("closure-registered-flip");
+    warehouse.write_file("root.txt", "r\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["palletize", "flat"]));
+    warehouse.write_file("a", "a file\n");
+    assert_success(&warehouse.run(&["load", "a"]));
+    assert_success(&warehouse.run(&["stack", "a is a file"]));
+    assert_success(&warehouse.run(&["shift", "main"]));
+
+    warehouse.write_file("a/b/c.txt", "c\n");
+    assert_success(&warehouse.run(&["load", "a/b/c.txt"]));
+    assert_success(&warehouse.run(&["stack", "nested"]));
+
+    // `a` holds only tracked content, so replacing it with the file is safe.
+    assert_success(&warehouse.run(&["shift", "flat"]));
+    assert_eq!(read(&warehouse, "a"), "a file\n");
+
+    assert_success(&warehouse.run(&["shift", "main"]));
+    assert_success(&warehouse.run(&["remove", "a"]));
+    assert!(changes(&warehouse, "staged").contains(&("removed".to_string(), "a/b/c.txt".to_string())));
+}
+
+#[test]
+fn remove_and_restore_follow_a_directory_replaced_by_a_file() {
+    let warehouse = warehouse_with_a_nested_single_file_load("flip-dir-to-file");
+    std::fs::remove_dir_all(warehouse.root.join("a")).unwrap();
+    warehouse.write_file("a", "now a file\n");
+    assert_success(&warehouse.run(&["load", "."]));
+
+    warehouse.write_file("a", "edited\n");
+    assert_success(&warehouse.run(&["restore", "a"]));
+    assert_eq!(read(&warehouse, "a"), "now a file\n", "restore must restore the file");
+
+    assert_success(&warehouse.run(&["remove", "a"]));
+    let staged = changes(&warehouse, "staged");
+    assert!(!staged.iter().any(|(_, path)| path == "a"), "the file's addition must be unstaged: {:?}", staged);
+}
+
+#[test]
+fn restore_follows_a_file_replaced_by_a_directory() {
+    let warehouse = TestWarehouse::new("flip-file-to-dir");
+    warehouse.write_file("a", "a file\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "a"]));
+    assert_success(&warehouse.run(&["stack", "a is a file"]));
+
+    std::fs::remove_file(warehouse.root.join("a")).unwrap();
+    warehouse.write_file("a/b.txt", "b\n");
+    assert_success(&warehouse.run(&["load", "a/b.txt"]));
+
+    warehouse.write_file("a/b.txt", "edited\n");
+    assert_success(&warehouse.run(&["restore", "a"]));
+    assert_eq!(read(&warehouse, "a/b.txt"), "b\n", "restore must restore the directory's tracked files");
+}
+
+#[test]
+fn a_tracked_file_a_rule_covers_replaced_by_a_folder_still_shows_its_removal() {
+    let warehouse = warehouse_with_a_diverged_pallet("flip-file-to-dir-ignored");
+    warehouse.write_file(".forkliftignore", "^notes\\.txt$\n");
+    std::fs::remove_file(warehouse.root.join("notes.txt")).unwrap();
+    warehouse.write_file("notes.txt/new.txt", "new\n");
+
+    let unstaged = changes(&warehouse, "unstaged");
+    assert!(unstaged.iter().any(|(_, path)| path == "notes.txt"),
+        "the tracked file's removal must stay visible under the rule: {:?}", unstaged);
+    assert!(!unstaged.iter().any(|(_, path)| path.starts_with("notes.txt/")),
+        "the rule still covers the folder that replaced it: {:?}", unstaged);
+
+    // Loading the parent stages the tracked file's removal, and nothing the rule covers; the
+    // folder is not registered, so after the stack the rule covers it whole.
+    assert_success(&warehouse.run(&["load", "."]));
+    let staged = changes(&warehouse, "staged");
+    assert!(staged.contains(&("removed".to_string(), "notes.txt".to_string())), "{:?}", staged);
+    assert!(!staged.iter().any(|(_, path)| path.starts_with("notes.txt/")), "{:?}", staged);
+    assert_success(&warehouse.run(&["stack", "notes.txt is gone"]));
+    let remove = warehouse.run(&["remove", "notes.txt"]);
+    assert!(!remove.status.success(), "notes.txt must be untracked: {}", stdout(&remove));
+}
+
+#[test]
+fn a_tracked_folder_a_rule_covers_replaced_by_a_file_is_removed_and_the_file_stays_ignored() {
+    let warehouse = warehouse_with_a_diverged_pallet("flip-dir-to-file-ignored");
+    warehouse.write_file(".forkliftignore", "^build$\n");
+    std::fs::remove_dir_all(warehouse.root.join("build")).unwrap();
+    warehouse.write_file("build", "now a file\n");
+
+    let unstaged = changes(&warehouse, "unstaged");
+    assert!(unstaged.iter().any(|(_, path)| path.starts_with("build/")),
+        "the tracked folder's removal must stay visible under the rule: {:?}", unstaged);
+    assert!(!unstaged.iter().any(|(_, path)| path == "build"), "the rule covers the untracked file: {:?}", unstaged);
+
+    assert_success(&warehouse.run(&["load", "."]));
+    let staged = changes(&warehouse, "staged");
+    assert!(staged.contains(&("removed".to_string(), "build/out.txt".to_string())), "{:?}", staged);
+    assert!(!staged.iter().any(|(_, path)| path == "build"), "a folder load must not add the covered file: {:?}", staged);
+}
+
+#[test]
+fn a_rule_on_a_tracked_folder_covers_new_files_in_its_tracked_subfolders() {
+    let warehouse = TestWarehouse::new("rule-covers-tracked-subfolder");
+    warehouse.write_file("a/sub/x.txt", "x\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "a"]));
+    assert_success(&warehouse.run(&["stack", "a"]));
+
+    warehouse.write_file(".forkliftignore", "^a$\n");
+    warehouse.write_file("a/sub/new.txt", "new\n");
+    let unstaged = changes(&warehouse, "unstaged");
+    assert!(!unstaged.iter().any(|(_, path)| path == "a/sub/new.txt"), "the rule covers a/ and below: {:?}", unstaged);
+
+    assert_success(&warehouse.run(&["load", "."]));
+    let staged = changes(&warehouse, "staged");
+    assert!(!staged.iter().any(|(_, path)| path == "a/sub/new.txt"), "{:?}", staged);
+}
+
+#[test]
+fn a_folder_load_refuses_an_unreadable_shard_instead_of_dropping_a_tracked_file_a_rule_covers() {
+    let warehouse = TestWarehouse::new("load-unreadable-shard");
+    warehouse.write_file("x.log", "log\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "x.log"]));
+    assert_success(&warehouse.run(&["stack", "x.log"]));
+    warehouse.write_file(".forkliftignore", "\\.log$\n");
+
+    // The root's shard: a rebuild of it without the old entries would not know x.log is
+    // tracked, and the rule would drop it without a staged removal.
+    warehouse.write_file(".forklift/inventory/inv_/data", "not a shard\n");
+    let load = warehouse.run(&["load", "."]);
+    assert!(!load.status.success(), "{}", stdout(&load));
+    assert!(stderr(&load).contains("cannot be read"), "{}", stderr(&load));
+
+    // The way out the message names works, and x.log is still tracked afterwards.
+    let suggested = if cfg!(windows) { "forklift restore --staged \".\"" } else { "forklift restore --staged '.'" };
+    assert!(stderr(&load).contains(suggested), "{}", stderr(&load));
+    assert!(stderr(&load).contains("every folder below it"), "the reset's scope must be named: {}", stderr(&load));
+    assert_success(&warehouse.run(&["restore", "--staged", "."]));
+    assert_success(&warehouse.run(&["load", "."]));
+    warehouse.write_file("x.log", "edited\n");
+    assert!(changes(&warehouse, "unstaged").contains(&("modified".to_string(), "x.log".to_string())));
+}
+
+#[test]
+fn restore_refuses_a_file_replaced_by_a_folder_and_keeps_the_folder() {
+    let warehouse = warehouse_with_a_diverged_pallet("restore-flip-file-to-dir");
+    std::fs::remove_file(warehouse.root.join("notes.txt")).unwrap();
+    warehouse.write_file("notes.txt/new.txt", "new\n");
+
+    let restore = warehouse.run(&["restore", "notes.txt"]);
+    assert!(!restore.status.success(), "{}", stdout(&restore));
+    assert!(stderr(&restore).contains("replaced by a folder"), "{}", stderr(&restore));
+    assert_eq!(read(&warehouse, "notes.txt/new.txt"), "new\n");
+}
+
+#[test]
+fn remove_untracks_a_file_replaced_by_a_folder_on_disk() {
+    let warehouse = warehouse_with_a_diverged_pallet("remove-flip-file-to-dir");
+    std::fs::remove_file(warehouse.root.join("notes.txt")).unwrap();
+    warehouse.write_file("notes.txt/new.txt", "new\n");
+
+    assert_success(&warehouse.run(&["remove", "notes.txt"]));
+    assert!(changes(&warehouse, "staged").contains(&("removed".to_string(), "notes.txt".to_string())));
+}
+
+#[test]
+fn remove_untracks_a_folder_replaced_by_a_file_on_disk() {
+    let warehouse = warehouse_with_a_diverged_pallet("remove-flip-dir-to-file");
+    std::fs::remove_dir_all(warehouse.root.join("build")).unwrap();
+    warehouse.write_file("build", "now a file\n");
+
+    assert_success(&warehouse.run(&["remove", "build"]));
+    assert!(changes(&warehouse, "staged").contains(&("removed".to_string(), "build/out.txt".to_string())));
+}
+
+#[test]
+fn an_ancestor_registered_only_for_removed_content_stops_being_tracked() {
+    let warehouse = warehouse_with_a_nested_single_file_load("prune-ancestor");
+    warehouse.write_file("a/untracked.txt", "u\n");
+    std::fs::remove_dir_all(warehouse.root.join("a/b")).unwrap();
+    assert_success(&warehouse.run(&["remove", "a/b"]));
+    assert_success(&warehouse.run(&["stack", "drop a/b"]));
+
+    // "a" was registered only as the parent of a/b: with a/b gone it holds nothing tracked, so
+    // it must leave the registered keys (no command reports registration as such).
+    let registered = read(&warehouse, ".forklift/inventory/metadata");
+    assert!(!registered.lines().any(|key| key == "a"), "a must no longer be registered: {:?}", registered);
 }
 
 #[test]
