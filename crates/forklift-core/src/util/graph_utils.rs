@@ -1216,6 +1216,12 @@ mod tests {
         let root_path = dir.join("graph");
         std::fs::create_dir_all(&root_path).unwrap();
         std::fs::set_permissions(&root_path, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::File::create(root_path.join("probe")).is_ok() {
+            // Running as root: permissions cannot make the write fail, so there is nothing to test.
+            std::fs::set_permissions(&root_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
         let root = root_path.to_string_lossy().into_owned();
 
         let hash = "cd".repeat(32);
@@ -1250,6 +1256,11 @@ mod tests {
         let shard_file = root_path.join("ef");
         std::fs::write(&shard_file, &original).unwrap();
         std::fs::set_permissions(&shard_file, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&shard_file).is_ok() {
+            // Running as root: permissions cannot make the read fail, so there is nothing to test.
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
 
         let mut new = HashMap::new();
         new.insert(format!("ef{}", "01".repeat(31)),
