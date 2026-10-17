@@ -2404,6 +2404,26 @@ fn symlinks_are_stored_as_symlinks_and_cycles_do_not_hang() {
     }
 }
 
+/// A symlink's identity is its own inode, read from the `lstat` the walk already holds: a dangling
+/// link has no target to `stat`, and it loads and stays clean like any other entry.
+#[cfg(unix)]
+#[test]
+fn a_dangling_symlink_loads_and_reads_clean() {
+    let warehouse = TestWarehouse::new("dangling-symlink");
+    warehouse.write_file("real.txt", "content\n");
+    std::os::unix::fs::symlink("nowhere", warehouse.root.join("dangling")).unwrap();
+    std::os::unix::fs::symlink("real.txt", warehouse.root.join("pointing")).unwrap();
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "links"]));
+
+    let status = json(&warehouse.run(&["--json", "stocktake"]));
+    assert_eq!(status["data"]["staged_count"], 0, "{}", status);
+    assert_eq!(status["data"]["unstaged_count"], 0, "{}", status);
+}
+
 #[test]
 fn diff_reports_unstaged_and_staged_line_changes() {
     let warehouse = TestWarehouse::new("diff");
@@ -2452,6 +2472,151 @@ fn diff_reports_unstaged_and_staged_line_changes() {
     // Verbose mode includes the unchanged lines.
     let verbose = stdout(&warehouse.run(&["--verbose", "diff", "--staged", "a.txt"]));
     assert!(verbose.contains("shared"), "unexpected verbose output: {}", verbose);
+}
+
+/// Past the fan-out threshold, each mode renders its files on several threads; the report must
+/// still read as the serial one did: every file once, in path order, each with its own lines.
+#[test]
+fn diff_renders_many_files_in_path_order_in_every_mode() {
+    let warehouse = TestWarehouse::new("diff-fanout");
+    let names: Vec<String> = (0..12).map(|i| format!("d{}/f{:02}.txt", i % 3, i)).collect();
+    for name in &names {
+        warehouse.write_file(name, &format!("old {}\n", name));
+    }
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "first"]));
+    assert_success(&warehouse.run(&["compact"]));
+
+    for name in &names {
+        warehouse.write_file(name, &format!("new {}\n", name));
+    }
+
+    let mut sorted = names.clone();
+    sorted.sort();
+    let expected: String = sorted.iter()
+        .map(|name| format!("modified: {}|- old {}|+ new {}|", name, name, name))
+        .collect();
+    // One line per header and changed line, stripped of colour and line-number columns.
+    let digest = |output: &Output| -> String {
+        stdout(output).lines()
+            .map(|line| line.replace("\x1b[1m", "").replace("\x1b[0m", "").replace("\x1b[31m", "")
+                .replace("\x1b[32m", ""))
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                let trimmed = line.trim_start_matches(|c: char| c == ' ' || c.is_ascii_digit()).to_string();
+                format!("{}|", trimmed)
+            })
+            .collect()
+    };
+
+    let unstaged = warehouse.run(&["diff"]);
+    assert_success(&unstaged);
+    assert_eq!(digest(&unstaged), expected, "{}", stdout(&unstaged));
+
+    assert_success(&warehouse.run(&["load", "."]));
+    let staged = warehouse.run(&["diff", "--staged"]);
+    assert_success(&staged);
+    assert_eq!(digest(&staged), expected, "{}", stdout(&staged));
+}
+
+/// The `FORKLIFT_DEBUG_PACK_COUNTS` lines of a run: (pack-folder reads, preloads that landed).
+fn pack_counts(output: &Output) -> (u64, u64) {
+    let stderr = stderr(output);
+    let count = |prefix: &str| stderr.lines()
+        .find_map(|line| line.strip_prefix(prefix))
+        .unwrap_or_else(|| panic!("no {} line in stderr: {}", prefix, stderr))
+        .trim().parse::<u64>().unwrap();
+
+    (count("pack-set-reads: "), count("pack-preloads: "))
+}
+
+/// `diff` opens the pack set during the walk, and only when a change needs an old side read:
+/// the render finds it cached (one read, the preload's), and a walk with nothing to render never
+/// pays for it.
+#[test]
+fn diff_preloads_the_pack_set_only_for_a_change_it_renders() {
+    let warehouse = TestWarehouse::new("diff-pack-preload");
+    warehouse.write_file("a.txt", "original\n");
+    warehouse.write_file("dir/b.txt", "b\n");
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "first"]));
+    assert_success(&warehouse.run(&["compact"]));
+    let counts = [("FORKLIFT_DEBUG_PACK_COUNTS", "1")];
+
+    let clean = warehouse.run_with_env(&["diff"], &counts);
+    assert_success(&clean);
+    assert_eq!(pack_counts(&clean), (0, 0), "a clean walk reads no packs");
+
+    warehouse.write_file("untracked.txt", "new\n");
+    let untracked = warehouse.run_with_env(&["diff"], &counts);
+    assert_success(&untracked);
+    assert_eq!(pack_counts(&untracked), (0, 0), "an untracked file is not diffed, so nothing is preloaded");
+
+    warehouse.write_file("dir/b.txt", "changed\n");
+    let modified = warehouse.run_with_env(&["diff"], &counts);
+    assert_success(&modified);
+    assert!(stdout(&modified).contains("+ changed"), "{}", stdout(&modified));
+    assert_eq!(pack_counts(&modified), (1, 1), "the render reads the preloaded set, never a second one");
+
+    let filtered = warehouse.run_with_env(&["diff", "a.txt"], &counts);
+    assert_success(&filtered);
+    assert!(stdout(&filtered).contains("matches the inventory"), "{}", stdout(&filtered));
+    assert_eq!(pack_counts(&filtered), (0, 0), "a change outside the path filter is not rendered, so nothing is preloaded");
+}
+
+/// A file whose stored side cannot be read fails `diff`, but only after every file before it has
+/// printed, as a serial render would: in the fanned-out render (10 files) and in the serial one
+/// (3 files, through a path filter).
+#[test]
+fn diff_prints_the_files_before_an_unreadable_one_then_fails() {
+    let warehouse = TestWarehouse::new("diff-partial");
+    for index in 0..10 {
+        warehouse.write_file(&format!("fan/f{:02}.txt", index), &format!("old {}\n", index));
+    }
+    for index in 0..3 {
+        warehouse.write_file(&format!("ser/s{}.txt", index), &format!("old s{}\n", index));
+    }
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+
+    let stored_hash = |dir: &str, name: &str| -> String {
+        let peek = stdout(&warehouse.run(&["peek", "--inventory", dir]));
+        let line = peek.lines().find(|line| line.ends_with(name)).unwrap_or_else(|| panic!("{} not in: {}", name, peek));
+        line.split_whitespace().nth(1).expect("peek line: <state> <hash> <name>").to_string()
+    };
+    std::fs::remove_file(object_store_path(&warehouse, &stored_hash("fan", "f05.txt"))).unwrap();
+    std::fs::remove_file(object_store_path(&warehouse, &stored_hash("ser", "s1.txt"))).unwrap();
+
+    for index in 0..10 {
+        warehouse.write_file(&format!("fan/f{:02}.txt", index), &format!("new {}\n", index));
+    }
+    for index in 0..3 {
+        warehouse.write_file(&format!("ser/s{}.txt", index), &format!("new s{}\n", index));
+    }
+
+    let fanned = warehouse.run(&["diff", "fan"]);
+    assert!(!fanned.status.success(), "an unreadable stored side must fail the diff");
+    let out = stdout(&fanned);
+    for index in 0..5 {
+        assert!(out.contains(&format!("+ new {}", index)), "file {} precedes the failure and must print: {}", index, out);
+    }
+    for index in 5..10 {
+        assert!(!out.contains(&format!("+ new {}", index)), "file {} is at or after the failure and must not print: {}", index, out);
+    }
+
+    let serial = warehouse.run(&["diff", "ser"]);
+    assert!(!serial.status.success(), "an unreadable stored side must fail the diff");
+    let out = stdout(&serial);
+    assert!(out.contains("+ new s0"), "the file before the failure must print: {}", out);
+    assert!(!out.contains("+ new s2"), "a file after the failure must not print: {}", out);
 }
 
 #[test]

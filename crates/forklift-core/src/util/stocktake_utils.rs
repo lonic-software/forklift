@@ -3,7 +3,6 @@ use std::fmt::Display;
 use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
-use file_id::FileId;
 use crate::enums::inventory_item_state::InventoryItemState;
 use crate::model::inventory::Inventory;
 use crate::model::task::change_walk::change_walk_context::ChangeWalkContext;
@@ -363,26 +362,35 @@ fn walk_directory_staged(context: Arc<ChangeWalkContext>,
 /// * `Ok(Vec<Change>)` - The unstaged changes, sorted by path.
 /// * `Err(String)`     - If the working directory or a shard could not be read.
 pub async fn collect_unstaged_changes() -> Result<Vec<Change>, String> {
-    collect_unstaged_changes_impl(false).await.map(|(changes, _)| changes)
+    collect_unstaged_changes_impl(ChangeWalkContext::new(false)).await.map(|(changes, _)| changes)
 }
 
 /// Like [`collect_unstaged_changes`], but also returns the per-directory inventories the walk
 /// parsed along the way, keyed by warehouse path key — see
 /// [`collect_staged_changes_with_shards`] for why this exists and why it is invocation-scoped.
 ///
+/// The caller is about to render content, so once the walk finds a change `renders` accepts (one
+/// the caller will look up in the object store) it also opens the pack set in the background, and
+/// returns only after that lands: the render's first object lookup then finds it cached.
+///
+/// # Arguments
+/// * `renders` - Whether the caller's render may read a change's stored side. Changes outside the
+///   caller's path filter, or ones it never diffs, should answer `false`, or the walk waits on a
+///   pack read nothing uses. It sees each change before moves are paired, so a `Removed` change
+///   may still become the old side of a `Moved` one.
+///
 /// # Returns
 /// * `Ok((Vec<Change>, HashMap<String, Arc<Inventory>>))` - The unstaged changes (sorted by
 ///   path) and the shards the walk parsed.
 /// * `Err(String)` - If the working directory or a shard could not be read.
-pub async fn collect_unstaged_changes_with_shards()
+pub async fn collect_unstaged_changes_with_shards(renders: impl Fn(&Change) -> bool + Send + Sync + 'static)
     -> Result<(Vec<Change>, HashMap<String, Arc<Inventory>>), String> {
-    collect_unstaged_changes_impl(true).await
+    collect_unstaged_changes_impl(ChangeWalkContext::new(true).with_pack_preload(renders)).await
 }
 
-/// The shared body of [`collect_unstaged_changes`] and [`collect_unstaged_changes_with_shards`].
-/// `collect_shards` gates whether the walk pays for populating the shard memo — see
-/// [`ChangeWalkContext::collect_shards`].
-async fn collect_unstaged_changes_impl(collect_shards: bool)
+/// The shared body of [`collect_unstaged_changes`] and [`collect_unstaged_changes_with_shards`],
+/// over a `context` that says whether the walk fills the shard memo and reads packs ahead.
+async fn collect_unstaged_changes_impl(context: ChangeWalkContext)
     -> Result<(Vec<Change>, HashMap<String, Arc<Inventory>>), String> {
     let ignore_rules = Arc::new(file_utils::get_ignore_rules()?);
 
@@ -393,7 +401,7 @@ async fn collect_unstaged_changes_impl(collect_shards: bool)
         .map(|entry| inventory_utils::metadata_entry_to_key(entry).to_string())
         .collect());
 
-    let context = Arc::new(ChangeWalkContext::new(collect_shards));
+    let context = Arc::new(context);
     let executor = TaskExecutor::new(Arc::clone(&context));
 
     let root_task: Task<(), String> = Box::pin(walk_directory_unstaged(
@@ -411,6 +419,7 @@ async fn collect_unstaged_changes_impl(collect_shards: bool)
     let mut changes = std::mem::take(&mut *context.changes.lock().await);
 
     detect_unstaged_moves(&mut changes)?;
+    context.wait_for_packs().await;
 
     changes.sort_by(|a, b| a.path.cmp(&b.path));
 
@@ -575,6 +584,8 @@ fn walk_directory_unstaged(context: Arc<ChangeWalkContext>,
         if context.collect_shards && !found.is_empty() {
             context.shards.lock().await.insert(key.clone(), inventory);
         }
+
+        context.preload_packs_for(&found);
 
         context.changes.lock().await.extend(found);
 
@@ -770,14 +781,12 @@ fn remove_consumed(changes: &mut Vec<Change>, consumed: &[bool]) {
     });
 }
 
-/// Get the (device, inode) pair of a file in the working directory, if it can be read.
+/// Get the (device, inode) pair of an entry in the working directory, if it can be read. It is
+/// the same symlink-own identity the inventory records, so a moved symlink pairs too.
 fn file_id_for_path(path: &str) -> Option<(u64, u64)> {
-    match file_utils::get_file_id_for_file(Path::new(path)).ok()? {
-        FileId::Inode { device_id, inode_number } => Some((device_id, inode_number)),
-        FileId::LowRes { volume_serial_number, file_index } =>
-            Some((volume_serial_number as u64, file_index)),
-        FileId::HighRes { .. } => None,
-    }
+    let metadata = file_utils::get_symlink_metadata_for_path(Path::new(path)).ok()?;
+
+    file_utils::get_device_and_inode(Path::new(path), &metadata).ok()
 }
 
 /// Hash a file in the working directory (without storing anything), exactly as `load`

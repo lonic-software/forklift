@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
-use file_id::FileId;
 use crate::builder::inventory::InventoryBuilder;
 use crate::enums::inventory_item_state::InventoryItemState;
 use crate::enums::dir_entry_type::DirEntryType;
@@ -1248,13 +1247,7 @@ pub fn build_inventory_item_from_stat(path: &Path,
     let mtime = file_utils::get_content_modification_timestamp_for_file(&metadata)?;
     let ctime = file_utils::get_metadata_modification_timestamp_for_file(&metadata);
 
-    let file_id = file_utils::get_file_id_for_file(path)?;
-
-    let (device_id, inode) = match file_id {
-        FileId::Inode { device_id, inode_number } => Ok((device_id, inode_number)),
-        FileId::LowRes { volume_serial_number, file_index } => Ok((volume_serial_number as u64, file_index)),
-        FileId::HighRes { .. } => Err("High resolution file IDs are not supported.".to_string()),
-    }?;
+    let (device_id, inode) = file_utils::get_device_and_inode(path, &metadata)?;
 
     let (user_id, group_id) = file_utils::get_owners_for_file(&metadata);
 
@@ -2327,13 +2320,8 @@ pub fn is_entry_unchanged(existing: &InventoryItem,
     };
     let ctime = file_utils::get_metadata_modification_timestamp_for_file(metadata);
 
-    let Ok(file_id) = file_utils::get_file_id_for_file(path) else {
+    let Ok((device, inode)) = file_utils::get_device_and_inode(path, metadata) else {
         return false;
-    };
-    let (device, inode) = match file_id {
-        FileId::Inode { device_id, inode_number } => (device_id, inode_number),
-        FileId::LowRes { volume_serial_number, file_index } => (volume_serial_number as u64, file_index),
-        FileId::HighRes { .. } => return false,
     };
 
     // For symlinks the stored size is the length of the target path, which is not comparable
@@ -2435,13 +2423,7 @@ fn build_item_and_object_for_file(path: &Path,
     let mtime = file_utils::get_content_modification_timestamp_for_file(&metadata)?;
     let ctime = file_utils::get_metadata_modification_timestamp_for_file(&metadata);
 
-    let file_id = file_utils::get_file_id_for_file(path)?;
-
-    let (device_id, inode) = match file_id {
-        FileId::Inode { device_id, inode_number } => Ok((device_id, inode_number)),
-        FileId::LowRes { volume_serial_number, file_index } => Ok((volume_serial_number as u64, file_index)),
-        FileId::HighRes { .. } => Err("High resolution file IDs are not supported.".to_string()),
-    }?;
+    let (device_id, inode) = file_utils::get_device_and_inode(path, &metadata)?;
 
     let (user_id, group_id) = file_utils::get_owners_for_file(&metadata);
     let ingested = object_utils::ingest_file(name, path, item_type, mode)?;
@@ -2770,6 +2752,84 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.root);
         }
+    }
+
+    /// The stat cache's writer and reader must agree on a symlink's identity, or every symlink
+    /// misses the cache and rehashes on every walk. Both take it from the link's own `lstat`.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_recorded_from_stat_reads_unchanged_against_its_own_lstat() {
+        let scratch = Scratch::new("symlink-identity");
+        let target = scratch.root.join("target.txt");
+        let link = scratch.root.join("link");
+        std::fs::write(&target, "content\n").unwrap();
+        std::os::unix::fs::symlink("target.txt", &link).unwrap();
+
+        let recorded = build_inventory_item_from_stat(&link, "link", "hash".to_string(),
+                                                      DirEntryType::SymbolicLink).unwrap();
+        let link_metadata = std::fs::symlink_metadata(&link).unwrap();
+        assert_eq!(recorded.inode, std::os::unix::fs::MetadataExt::ino(&link_metadata));
+
+        assert!(is_entry_unchanged(&recorded, &link_metadata, DirEntryType::SymbolicLink, &link, u64::MAX),
+            "a symlink recorded from its own stat must hit the stat cache");
+    }
+
+    /// The Windows identity opens the link itself, not its target, so a dangling link has one and
+    /// a live link's differs from its target's. Creating a symlink needs developer mode or an
+    /// elevated runner; without either the test has nothing to check.
+    #[cfg(windows)]
+    #[test]
+    fn a_symlink_identity_is_its_own_on_windows() {
+        let scratch = Scratch::new("symlink-identity");
+        let target = scratch.root.join("target.txt");
+        let link = scratch.root.join("link");
+
+        if std::os::windows::fs::symlink_file("target.txt", &link).is_err() {
+            eprintln!("skipped: this runner cannot create symlinks");
+            return;
+        }
+
+        let dangling = std::fs::symlink_metadata(&link).unwrap();
+        let identity = file_utils::get_device_and_inode(&link, &dangling)
+            .expect("a dangling symlink must have an identity");
+
+        std::fs::write(&target, "content\n").unwrap();
+        let target_identity = file_utils::get_device_and_inode(&target, &std::fs::metadata(&target).unwrap()).unwrap();
+
+        assert_ne!(identity, target_identity, "a symlink's identity must not be its target's");
+        assert_eq!(file_utils::get_device_and_inode(&link, &dangling).unwrap(), identity,
+            "a symlink's identity must not change when its target appears");
+    }
+
+    /// The alias probe's full id names an entry, not a spelling: two hard links to one file share
+    /// it, two files never do, and a symlink has its own, stable while it dangles.
+    #[cfg(windows)]
+    #[test]
+    fn the_full_file_id_tells_entries_apart_on_windows() {
+        let scratch = Scratch::new("full-file-id");
+        let first = scratch.root.join("first.txt");
+        let second = scratch.root.join("second.txt");
+        let hard_link = scratch.root.join("hard-link.txt");
+        std::fs::write(&first, "one\n").unwrap();
+        std::fs::write(&second, "two\n").unwrap();
+        std::fs::hard_link(&first, &hard_link).unwrap();
+
+        let first_id = file_utils::get_full_file_id(&first).unwrap();
+        assert_eq!(file_utils::get_full_file_id(&hard_link).unwrap(), first_id,
+            "two hard links to one file must share an id");
+        assert_ne!(file_utils::get_full_file_id(&second).unwrap(), first_id,
+            "two files must not share an id");
+
+        let link = scratch.root.join("link");
+        if std::os::windows::fs::symlink_file("missing.txt", &link).is_err() {
+            eprintln!("skipped the symlink half: this runner cannot create symlinks");
+            return;
+        }
+
+        let dangling_id = file_utils::get_full_file_id(&link).expect("a dangling symlink must have an id");
+        assert_ne!(dangling_id, first_id, "a symlink must have its own id");
+        assert_eq!(file_utils::get_full_file_id(&link).unwrap(), dangling_id,
+            "a dangling symlink's id must be stable");
     }
 
     #[test]

@@ -6,7 +6,6 @@ use std::os::unix::fs::MetadataExt;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use file_id::FileId;
 use regex::Regex;
 use crate::enums::dir_entry_type::DirEntryType;
 use crate::globals::{bay_root, forklift_root, FOLDER_NAME_GRAPH_ROOT, FOLDER_NAME_INVENTORY_ROOT, FOLDER_NAME_OBJECTS_ROOT};
@@ -2449,36 +2448,112 @@ pub fn get_content_modification_timestamp_for_file(file_metadata: &Metadata) -> 
         ).map(|time| time.as_secs())
 }
 
-/// Get the file ID for a file.
-/// On windows, we use the low resolution file ID.
+/// Get the (device, inode) identity of a directory entry, without following a symlink.
+///
+/// On unix the pair comes straight from `metadata`, which must be the entry's `symlink_metadata`:
+/// the walk already holds it, and a second, symlink-following `stat` per file was ~19% of the
+/// unstaged walk's CPU on git.git (FORK-183). A symlink therefore carries its own inode, never its
+/// target's, so a dangling link has an identity too.
 ///
 /// # Arguments
-/// * `path` - The path to the file.
+/// * `_path`    - The path of the entry (unused on unix).
+/// * `metadata` - The entry's `symlink_metadata`.
 ///
 /// # Returns
-/// * `Ok(FileId)`  - The file ID for the file.
-/// * `Err(String)` - If an error occurred while getting the file ID.
+/// * `Ok((u64, u64))` - The device and inode numbers.
+/// * `Err(String)`    - Never on unix.
 #[cfg(unix)]
-pub fn get_file_id_for_file(path: &Path) -> Result<FileId, String> {
-    file_id::get_file_id(path).map_err(|e|
-        format!("Error while getting file ID for file: {}", e)
-    )
+pub fn get_device_and_inode(_path: &Path, metadata: &Metadata) -> Result<(u64, u64), String> {
+    Ok((metadata.dev(), metadata.ino()))
 }
 
-/// Get the file ID for a file.
-/// On windows, we use the low resolution file ID.
+/// Get the (volume serial, file index) identity of a directory entry, without following a
+/// symlink.
+///
+/// Stable Rust exposes neither number through `Metadata` on Windows, so this opens the entry with
+/// `FILE_FLAG_OPEN_REPARSE_POINT`, which opens a symlink itself rather than its target, as an
+/// `lstat` would. A dangling link therefore has an identity too, and a link's identity never
+/// changes with its target.
 ///
 /// # Arguments
-/// * `path` - The path to the file.
+/// * `path`      - The path of the entry.
+/// * `_metadata` - The entry's metadata (unused on Windows).
 ///
 /// # Returns
-/// * `Ok(FileId)`  - The file ID for the file.
-/// * `Err(String)` - If an error occurred while getting the file ID.
+/// * `Ok((u64, u64))` - The volume serial number and file index.
+/// * `Err(String)`    - If the entry could not be opened or queried.
 #[cfg(windows)]
-pub fn get_file_id_for_file(path: &Path) -> Result<FileId, String> {
-    file_id::get_low_res_file_id(path).map_err(|e|
-        format!("Error while getting file ID for file: {}", e)
-    )
+pub fn get_device_and_inode(path: &Path, _metadata: &Metadata) -> Result<(u64, u64), String> {
+    get_device_and_inode_of(&open_entry_unfollowed(path)?)
+}
+
+/// The (volume serial, 64-bit file index) identity of an entry opened by `open_entry_unfollowed`.
+#[cfg(windows)]
+fn get_device_and_inode_of(entry: &std::fs::File) -> Result<(u64, u64), String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+
+    // SAFETY: the handle is open for the whole call, and `info` is a plain-data out parameter
+    // the call fills in.
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    let ok = unsafe { GetFileInformationByHandle(entry.as_raw_handle() as _, &mut info) };
+
+    if ok == 0 {
+        return Err(format!("Error while getting file ID for file: {}", std::io::Error::last_os_error()));
+    }
+
+    Ok((info.dwVolumeSerialNumber as u64,
+        ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64))
+}
+
+/// Get the full (volume serial, 128-bit file id) identity of a directory entry, without following
+/// a symlink. ReFS needs all 128 bits for the id to stay unique; NTFS ids fit in the low 64.
+///
+/// # Arguments
+/// * `path` - The path of the entry.
+///
+/// # Returns
+/// * `Ok((u64, u128))` - The volume serial number and file id.
+/// * `Err(String)`     - If the entry could not be opened or queried.
+#[cfg(windows)]
+pub fn get_full_file_id(path: &Path) -> Result<(u64, u128), String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{FileIdInfo, GetFileInformationByHandleEx, FILE_ID_INFO};
+
+    let entry = open_entry_unfollowed(path)?;
+
+    // SAFETY: the handle is open for the whole call, and `info` is a plain-data out parameter of
+    // exactly the size passed.
+    let mut info: FILE_ID_INFO = unsafe { std::mem::zeroed() };
+    let ok = unsafe {
+        GetFileInformationByHandleEx(entry.as_raw_handle() as _, FileIdInfo,
+                                     &mut info as *mut FILE_ID_INFO as *mut _,
+                                     std::mem::size_of::<FILE_ID_INFO>() as u32)
+    };
+
+    // A volume without 128-bit ids (FAT, some network shares) answers the 64-bit query instead.
+    if ok == 0 {
+        let (volume, index) = get_device_and_inode_of(&entry)?;
+
+        return Ok((volume, index as u128));
+    }
+
+    Ok((info.VolumeSerialNumber, u128::from_le_bytes(info.FileId.Identifier)))
+}
+
+/// Open a directory entry for querying its identity: the entry itself, never a symlink's target
+/// (`FILE_FLAG_OPEN_REPARSE_POINT`, as an `lstat` would), with access mode 0, so no read access is
+/// needed, and backup semantics, so a directory opens too.
+#[cfg(windows)]
+fn open_entry_unfollowed(path: &Path) -> Result<std::fs::File, String> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT};
+
+    std::fs::OpenOptions::new()
+        .access_mode(0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|e| format!("Error while getting file ID for file: {}", e))
 }
 
 /// Get the owners of a file (user ID and group ID).

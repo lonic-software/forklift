@@ -44,7 +44,9 @@ flume = "0.11.0"
 libc = "0.2"
 memmap2 = "0.9"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
-file-id = "0.2.3"
+# Windows only: a directory entry's own file id, opened without following a reparse point, for the
+# inventory's device/inode identity and the alias probe.
+windows-sys = { version = "0.60.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 rand = "0.8"
 # No `zstd` feature: reqwest decodes (and so advertises) every codec it is built with, and the
 # zstd decoder's window (up to 128 MiB under a hostile frame) would sit beneath every response

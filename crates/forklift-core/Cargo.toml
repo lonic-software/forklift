@@ -23,7 +23,6 @@ flume = { workspace = true }
 libc = { workspace = true }
 memmap2 = { workspace = true }
 ed25519-dalek = { workspace = true }
-file-id = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true }
 percent-encoding = { workspace = true }
@@ -35,6 +34,9 @@ chacha20poly1305 = { workspace = true }
 # Optional: JSON Schema derivation for the `docgen` feature (see crates/forklift's
 # Cargo.toml and bin/gen-docs). Never enabled in a release build.
 schemars = { workspace = true, optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
 
 [dev-dependencies]
 # The capped-reader tests serve a gzip body; flate2 is already in the tree through reqwest's

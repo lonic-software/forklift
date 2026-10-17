@@ -173,12 +173,72 @@ with a skip-count A/B: 0 shards skipped before the fix, 2 after, on the same
 
 ---
 
+## FORK-183: `diff`, `diff --staged` and `stocktake` on git.git (2026-10-17)
+
+**Baseline** (`bin/benchmark --repo git`, fresh work dir, native arm64 git 2.55.0, before
+any fix below): status 15/21 ms (1.40×), diff unstaged 13/29 ms (2.23×), diff staged
+9/20 ms (2.22×).
+
+**Method.** A release build with debug symbols (`CARGO_PROFILE_RELEASE_DEBUG=true`, separate
+target dir), sampled with `samply` at 4 kHz over 150 back-to-back runs per command. Three
+steady copies of the benchmark's B were used: clean, 20 unstaged, and 20 staged. Each was
+re-`load`ed after copying, because `cp -a` changes every ctime, and stocktake never persists
+the stat refresh (FORK-182), so without it every file rehashes on every run. Off-CPU time
+isn't sampled on macOS, so wall-clock attribution also came from `hyperfine` A/Bs and from
+`--json` variants, which skip the content render. The floor (`forklift version`) is ~3 ms.
+
+### Breakdown and what was done
+
+| Cost | Measured share | Fix | Before → after |
+|------|----------------|-----|----------------|
+| Range sort in `validate_index_records`, on every process's first pack open | 5.1 of its 5.8 ms; ~50–75% of in-process main-thread time in stocktake, diff and diff --staged | **Fixed:** LSD radix sort (11-bit digits; three passes for any pack under 8 GiB). Same checks, same order. | stocktake 20.4 → 17.8 ms |
+| Second, symlink-following `stat` per file (`file_id::get_file_id`) in the unstaged walk | 5.4 of ~28.7 ms walk CPU (~19%) | **Fixed:** device/inode from the `lstat` already in hand. A symlink now carries its own inode. This also fixed `load` aborting on a dangling symlink. | stocktake 17.2 → 16.4, diff 20.4 → 18.6 ms |
+| stocktake ran the staged side (head pack open + staged walk) and then the unstaged walk | the staged side's whole wall time | **Fixed:** `tokio::join!` of the two. The unstaged tasks fan out while the command task opens the pack. | stocktake 16.1 → 12.1 ms clean, 17.2 → 11.8 ms staged |
+| diff's first blob lookup opened the whole pack set (5 packs, ~500k records) after the walk | ~4.4 of the 7 ms render | **Fixed:** the unstaged walk preloads the pack set on a background thread once a directory reports a change the diff will render (inside its path filter, not untracked), and returns when it lands. A clean, untracked-only or out-of-filter walk never starts it. | diff 18.7 → 15.0 ms dirty; 11.3 → 11.1 ms clean |
+| Serial per-file render in the worktree and staged modes | most of the 8.5 ms by which `diff --staged` exceeds its `--json` form (loose head after the benchmark's commit rows) | **Fixed:** both modes render through `fanout_map` past 8 files, like the pallet diff. Output is byte-identical, and a file that fails to render still prints every file before it, then the error. | diff --staged 17.5 → 12.5 ms, diff 14.7 → 13.4 ms |
+| Verification of every intermediate base in a delta chain | ~20% of the staged render's main thread (blake3), plus zstd ~13% and delta apply ~14% | **Filed: FORK-188.** It needs a design note: bases enter the shared cache. | up to ~2 ms on diff --staged |
+| One task per directory in the unstaged walk (t/ has 1129 files, the root 531) | walk ~7 ms wall for ~28 ms CPU over 6 P-cores | **Filed: FORK-189.** Measure the critical path first. | up to ~2 ms on stocktake and diff |
+| Residual pack-set open: index reads (~24 MB `read_to_end`) plus the linear validation pass (~0.7 ms) | ~4.4 ms per process wherever it can't overlap (e.g. `diff --staged`, whose first act is reading the head parcel) | **Commented on FORK-118** (lazy or sealed index). | ~3–4 ms on every command that reads an object first |
+| Line interning hasher (`diff::lines`, SipHash) | ~0.2–0.6 ms per 20 files | Not worth a ticket alone. It now runs fanned out, so the wall-clock share is smaller still. | < 0.3 ms |
+
+**FORK-163.** This PR covers that ticket's `diff` sites. The rest of its sweep (other
+commands' serial loads; reading a stat-clean worktree file instead of decompressing the stored
+object) stays open there.
+
+**Found on the way:**
+- FORK-187: `import-git` records git's LF blob against the stat of a CRLF-converted working
+  file (`eol=crlf`), so the file reads modified once its stat cache misses.
+- FORK-182: the stat refresh stocktake never persists, which made copied warehouses rehash
+  everything.
+
+No durability barrier or verification step was removed. The radix sort keeps every check
+`validate_index_records` made; the preload reads the same packs, and a failed preload is dropped
+so the first real lookup reports it as before.
+
+**After** (`bin/benchmark --repo git`, fresh work dir, 2026-10-18):
+
+| Operation | git | forklift before | forklift after | ratio before → after |
+|-----------|-----|-----------------|----------------|----------------------|
+| status (clean tree) | 16 ms | 21 ms | 14 ms | 1.40x → 0.88x |
+| diff, unstaged (20 files) | 13 ms | 29 ms | 16 ms | 2.23x → 1.23x |
+| diff, staged (20 files) | 9 ms | 20 ms | 12 ms | 2.22x → 1.33x |
+
+The log and commit rows didn't move beyond noise (0.99x, 3.11x). The git-side numbers drift by
+about 1 ms between runs.
+
+---
+
 ## Remaining items
 
 With the rollup hash fixed (above), **(b) pack-index validation tax is now the top
 remaining item** — a store-wide read-floor cost, not specific to one command.
 
 ### b. Pack-index validation tax
+
+**Update (FORK-183, 2026-10-17).** The comparison sort inside `validate_index_records` was most
+of this cost (5.1 of 5.8 ms on git.git) and is now a radix sort. Opening the whole pack set still
+costs ~4.4 ms per process, mostly reading the indexes; `stocktake` and `diff` now overlap it with
+their walks. What remains is FORK-118's design item.
 
 **Symptom.** ~6.4–6.9 ms warm (up to ~19 ms cold) added to **every** command that
 touches a packed object — which, on a densified store, is nearly every command.
@@ -217,6 +277,10 @@ which only touch the frontier). Recorded as a note for whenever an unbounded
 full-history walk at kernel scale is exercised for real, not something to act on now.
 
 ### d. Diff head-blob delta decode
+
+**Update (FORK-183, 2026-10-17).** The decodes now fan out across the cores (see the FORK-183
+section). The per-chain cost that remains is mostly verifying every intermediate base, which is
+FORK-188.
 
 ~5.5–5.9 ms per 20 files reconstructing a blob from its delta record against the
 densified pack's stored base. This is genuine reconstruction cost — the store trades

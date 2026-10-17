@@ -755,6 +755,88 @@ fn loaded_packs() -> Result<Arc<PackSet>, String> {
     reload_packs()
 }
 
+/// How many times this process read a pack folder into a pack set, and how many of those sets a
+/// preload cached. Test-only observability across the subprocess boundary, printed under
+/// `FORKLIFT_DEBUG_PACK_COUNTS`: a preload that raced the render into a second read, or one that
+/// fired for a walk with nothing to render, is invisible in the output alone.
+static PACK_SET_READ_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PACK_PRELOAD_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The process-wide pack-folder read count — see [`PACK_SET_READ_COUNT`].
+pub fn pack_set_read_count() -> u64 {
+    PACK_SET_READ_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The process-wide count of pack sets a preload cached — see [`PACK_SET_READ_COUNT`].
+pub fn pack_preload_count() -> u64 {
+    PACK_PRELOAD_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Where the active warehouse's pack set lives: its registry key and its pack folder, resolved
+/// when this is made. A storage-root scope is thread-local, so a caller that hands the read to
+/// other threads resolves this first, on its own thread.
+#[derive(Clone, Debug)]
+pub struct PackSetLocation {
+    key: String,
+    folder: PathBuf,
+}
+
+impl PackSetLocation {
+    /// The active warehouse's pack set, as the calling thread resolves it.
+    pub fn current() -> Self {
+        Self { key: file_utils::get_path_objects_root(), folder: pack_folder() }
+    }
+
+    /// Start reading this pack set on a background thread. Opening a pack set reads and validates
+    /// every index, ~4.4 ms for git.git's ~500k records (FORK-183), so a command that walks first
+    /// and looks objects up after overlaps the two instead of paying them in turn.
+    ///
+    /// The set is cached only if nothing was cached for the key meanwhile, and a read error is
+    /// dropped: the first real lookup then reads the folder itself and reports the error where it
+    /// always has. Dropping the result without waiting on it detaches the thread, and process
+    /// exit does not wait for it.
+    pub fn preload(&self) -> PackPreload {
+        let PackSetLocation { key, folder } = self.clone();
+
+        let handle = std::thread::Builder::new()
+            .name("forklift-pack-preload".to_string())
+            .spawn(move || {
+                if registry().lock().expect("the pack registry lock is poisoned").contains_key(&key) {
+                    return;
+                }
+
+                if let Ok(packs) = load_packs_from_disk(&folder) {
+                    registry().lock().expect("the pack registry lock is poisoned")
+                        .entry(key)
+                        .or_insert_with(|| {
+                            PACK_PRELOAD_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            Arc::new(packs)
+                        });
+                }
+            })
+            .ok();
+
+        PackPreload { handle }
+    }
+}
+
+/// A pack set being read on a background thread ahead of its first lookup (see
+/// [`PackSetLocation::preload`]).
+pub struct PackPreload {
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PackPreload {
+    /// Wait for the preload to land, so the next lookup finds the set cached rather than racing
+    /// the background read into a second one. The join runs on tokio's blocking pool, so the
+    /// awaiting task's worker stays free meanwhile.
+    pub async fn landed(self) {
+        if let Some(handle) = self.handle {
+            let _ = tokio::task::spawn_blocking(move || handle.join()).await;
+        }
+    }
+}
+
 /// Load the active warehouse's packs from disk and cache them, replacing whatever was cached.
 /// Two threads reloading at once may overwrite each other; an older set that wins carries an
 /// older stamp, so the next miss sees the folder past it and reloads again.
@@ -1060,6 +1142,8 @@ pub fn densify_pending() -> Result<bool, String> {
 /// The returned set carries a [`FolderStamp`] taken before the listing, and each broken entry a
 /// [`PairStamp`] taken before its load, which is what [`reloaded_if_stale`] compares against.
 fn load_packs_from_disk(pack_folder: &Path) -> Result<PackSet, String> {
+    PACK_SET_READ_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
     let mut packs = Vec::new();
     let mut quarantined = Vec::new();
     let mut unenumerable = Vec::new();
@@ -1320,7 +1404,7 @@ fn validate_index_records(index: &[u8], count: usize, data_len: usize, path: &Pa
         ranges.push((offset, end));
     }
 
-    ranges.sort_unstable_by_key(|(start, _)| *start);
+    sort_ranges_by_start(&mut ranges);
     let mut expected = PACK_DATA_HEADER_LEN;
     for (start, end) in ranges {
         if start != expected {
@@ -1334,6 +1418,54 @@ fn validate_index_records(index: &[u8], count: usize, data_len: usize, path: &Pa
     }
 
     Ok(())
+}
+
+/// The bits of a start offset one radix pass of [`sort_ranges_by_start`] consumes.
+const RANGE_RADIX_BITS: u32 = 11;
+
+/// Sort `(start, end)` ranges by `start`, as `sort_unstable_by_key` would, with an LSD radix sort.
+///
+/// Every process pays this once per pack it opens, over every record of a hash-ordered index —
+/// ~400k on git.git, where the comparison sort was 5.1 of the 5.8 ms the whole validation took
+/// (FORK-183). The keys are byte offsets bounded by the pack's size, so a few 11-bit passes cover
+/// them: three for any pack under 8 GiB.
+fn sort_ranges_by_start(ranges: &mut Vec<(u64, u64)>) {
+    // Below this the counting arrays cost more than the comparison sort they replace.
+    if ranges.len() < 1024 {
+        ranges.sort_unstable_by_key(|(start, _)| *start);
+        return;
+    }
+
+    let max_start = ranges.iter().map(|(start, _)| *start).max().unwrap_or(0);
+    let key_bits = u64::BITS - max_start.leading_zeros();
+    let mask = (1u64 << RANGE_RADIX_BITS) - 1;
+    let mut scratch = vec![(0u64, 0u64); ranges.len()];
+    let mut shift = 0;
+
+    while shift < key_bits {
+        let mut counts = [0usize; 1 << RANGE_RADIX_BITS];
+        for (start, _) in ranges.iter() {
+            counts[((start >> shift) & mask) as usize] += 1;
+        }
+
+        let mut position = 0;
+        for count in counts.iter_mut() {
+            let bucket = *count;
+            *count = position;
+            position += bucket;
+        }
+
+        // Each pass is stable, so the order the earlier (lower-digit) passes established survives
+        // every tie on this digit.
+        for range in ranges.iter() {
+            let digit = ((range.0 >> shift) & mask) as usize;
+            scratch[counts[digit]] = *range;
+            counts[digit] += 1;
+        }
+
+        std::mem::swap(ranges, &mut scratch);
+        shift += RANGE_RADIX_BITS;
+    }
 }
 
 /// What installing the native-pack payload of a transport bundle added to this object store.
@@ -4184,6 +4316,109 @@ mod tests {
             PackRetrieval::Verified(bytes) => bytes,
             other => panic!("expected a verified pack record for {}, got {:?}", hash, other),
         }
+    }
+
+    /// A deterministic pseudo-random stream (an LCG), so the shuffles below are reproducible.
+    fn lcg(seed: &mut u64) -> u64 {
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *seed >> 11
+    }
+
+    /// An index (header bytes zeroed: `validate_index_records` reads only the records) over
+    /// `count` objects that tile a data body in a shuffled order, with the records in strictly
+    /// increasing hash order, as the native writer lays them out. Lengths vary so that offsets
+    /// need several radix digits. Returns the index and the data length the records tile.
+    fn tiled_index(count: usize) -> (Vec<u8>, Vec<(u64, u64)>, usize) {
+        let mut seed = 7;
+        let mut order: Vec<usize> = (0..count).collect();
+        for i in (1..count).rev() {
+            order.swap(i, (lcg(&mut seed) % (i as u64 + 1)) as usize);
+        }
+
+        let lengths: Vec<u64> = (0..count).map(|_| 1 + lcg(&mut seed) % 5000).collect();
+        let mut placed = vec![(0u64, 0u64); count];
+        let mut offset = PACK_DATA_HEADER_LEN;
+        for &record in &order {
+            placed[record] = (offset, lengths[record]);
+            offset += lengths[record];
+        }
+
+        let mut index = vec![0u8; INDEX_HEADER_LEN];
+        for (position, (offset, length)) in placed.iter().enumerate() {
+            let mut hash = [0u8; HASH_LEN];
+            hash[..8].copy_from_slice(&(position as u64).to_be_bytes());
+            index.extend_from_slice(&hash);
+            index.extend_from_slice(&offset.to_le_bytes());
+            index.extend_from_slice(&length.to_le_bytes());
+        }
+
+        (index, placed, offset as usize)
+    }
+
+    /// Overwrite record `position`'s offset and length in an index built by [`tiled_index`].
+    fn set_record(index: &mut [u8], position: usize, offset: u64, length: u64) {
+        let record = INDEX_HEADER_LEN + position * INDEX_RECORD_LEN + HASH_LEN;
+        index[record..record + 8].copy_from_slice(&offset.to_le_bytes());
+        index[record + 8..record + 16].copy_from_slice(&length.to_le_bytes());
+    }
+
+    #[test]
+    fn the_radix_range_sort_orders_like_a_comparison_sort() {
+        // Starts spread over 41 bits take four radix passes, and repeated starts check that ties
+        // keep a valid order; small inputs take the comparison-sort branch.
+        for count in [0, 1, 5, 1023, 1024, 5000] {
+            let mut seed = count as u64 + 1;
+            let mut ranges: Vec<(u64, u64)> = (0..count).map(|_| {
+                let start = lcg(&mut seed) % (1 << 41);
+                let start = if start % 7 == 0 { 4096 } else { start };
+                (start, lcg(&mut seed))
+            }).collect();
+
+            let mut expected = ranges.clone();
+            expected.sort_by_key(|(start, _)| *start);
+            sort_ranges_by_start(&mut ranges);
+
+            let first_misplaced = ranges.iter().zip(&expected).position(|(got, want)| got.0 != want.0);
+            assert_eq!(first_misplaced, None, "starts out of order for {} ranges", count);
+
+            let mut got_sorted = ranges.clone();
+            got_sorted.sort();
+            expected.sort();
+            assert!(got_sorted == expected, "the sort lost or duplicated a range for {} ranges", count);
+        }
+    }
+
+    #[test]
+    fn index_validation_accepts_a_shuffled_tiling_and_refuses_a_gap_or_an_overlap() {
+        // 5000 records: the radix branch. The records are in hash order and their offsets are a
+        // shuffle of the body, so only a correct sort by offset sees the exact tiling.
+        let (index, placed, data_len) = tiled_index(5000);
+        let path = Path::new("test.idx");
+        assert!(validate_index_records(&index, placed.len(), data_len, path).is_ok());
+
+        // A record that starts one byte late leaves a gap before it and overlaps its successor.
+        let (record, (offset, length)) = placed.iter().enumerate()
+            .find(|(_, (offset, length))| *length > 1 && offset + length < data_len as u64)
+            .map(|(record, range)| (record, *range)).unwrap();
+        let mut shifted = index.clone();
+        set_record(&mut shifted, record, offset + 1, length);
+        let error = validate_index_records(&shifted, placed.len(), data_len, path).unwrap_err();
+        assert!(error.contains("is corrupt"), "{}", error);
+
+        // A record one byte short leaves a gap after it that no record accounts for.
+        let mut short = index.clone();
+        set_record(&mut short, record, offset, length - 1);
+        let error = validate_index_records(&short, placed.len(), data_len, path).unwrap_err();
+        assert!(error.contains("is corrupt"), "{}", error);
+
+        // Two records swapping their offsets but keeping their lengths no longer tile the body when
+        // the lengths differ, although the lengths still sum to it.
+        let (a, b) = (0..placed.len()).flat_map(|a| (a + 1..placed.len()).map(move |b| (a, b)))
+            .find(|&(a, b)| placed[a].1 != placed[b].1).unwrap();
+        let mut swapped = index.clone();
+        set_record(&mut swapped, a, placed[b].0, placed[a].1);
+        set_record(&mut swapped, b, placed[a].0, placed[b].1);
+        assert!(validate_index_records(&swapped, placed.len(), data_len, path).is_err());
     }
 
     #[test]

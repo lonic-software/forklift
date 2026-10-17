@@ -9,7 +9,7 @@ use forklift_core::model::inventory::Inventory;
 use forklift_core::model::tree_item::TreeItem;
 use forklift_core::util::path_utils::{self, WarehousePath};
 use forklift_core::util::scope_utils::{self, MaterializationScope, ScopeClass};
-use forklift_core::util::stocktake_utils::ChangeKind;
+use forklift_core::util::stocktake_utils::{Change, ChangeKind};
 use forklift_core::util::{
     chunk_utils, diff, fanout_utils, file_utils, merge_utils, object_utils, pallet_utils,
     stocktake_utils,
@@ -141,32 +141,41 @@ async fn diff_worktree(filter: Option<&WarehousePath>, verbose: bool) -> Result<
         return Ok(());
     }
 
-    let (changes, shards) = stocktake_utils::collect_unstaged_changes_with_shards().await?;
-
-    let mut printed_any = false;
-
-    for change in &changes {
-        if !is_within(&change.path, filter) {
-            continue;
+    // The walk reads the pack set ahead only for a change the render below may read from the
+    // store. It sees changes before moves are paired, so a removal anywhere counts: it may be the
+    // old side of a move into the filter. A removal that pairs out of the filter, or a chunked file
+    // (whose stored side is never read), costs at most one unused pack read.
+    let preload_filter = filter.cloned();
+    let (changes, shards) = stocktake_utils::collect_unstaged_changes_with_shards(move |change| {
+        match change.kind {
+            ChangeKind::Untracked => false,
+            ChangeKind::Removed => true,
+            _ => is_within(&change.path, preload_filter.as_ref()),
         }
+    }).await?;
 
+    // Untracked files are not diffed (stocktake reports them).
+    let selected: Vec<&Change> = changes.iter()
+        .filter(|change| change.kind != ChangeKind::Untracked && is_within(&change.path, filter))
+        .collect();
+
+    if selected.is_empty() {
+        println!("The working directory matches the inventory.");
+        return Ok(());
+    }
+
+    let blocks = format_blocks(&selected, |change| {
         let (old_content, new_content) = match (change.kind, &change.moved_from) {
-            (ChangeKind::Untracked, _) => continue,
             (ChangeKind::Removed, _) => (inventory_content(&change.path, &shards)?, DiffSide::empty()),
             (ChangeKind::Moved, Some(from)) =>
                 (inventory_content(from, &shards)?, worktree_content(&change.path)?),
             _ => (inventory_content(&change.path, &shards)?, worktree_content(&change.path)?),
         };
 
-        print_file_diff(change.kind, &change_label(change), &old_content, &new_content,
-                        &mut printed_any, verbose);
-    }
+        Ok(format_file_diff(change.kind, &change_label(change), &old_content, &new_content, verbose))
+    });
 
-    if !printed_any {
-        println!("The working directory matches the inventory.");
-    }
-
-    Ok(())
+    print_blocks(blocks)
 }
 
 /// Diff the inventory against the pallet head. An unborn head reports every inventoried
@@ -207,28 +216,26 @@ async fn diff_staged(filter: Option<&WarehousePath>, verbose: bool) -> Result<()
     let (changes, shards) =
         stocktake_utils::collect_staged_changes_with_shards(head_tree_hash.as_deref()).await?;
 
-    let mut printed_any = false;
+    let selected: Vec<&Change> = changes.iter()
+        .filter(|change| is_within(&change.path, filter))
+        .collect();
 
-    for change in &changes {
-        if !is_within(&change.path, filter) {
-            continue;
-        }
+    if selected.is_empty() {
+        println!("The inventory matches the pallet head; nothing is staged.");
+        return Ok(());
+    }
 
+    let head_tree_hash = head_tree_hash.as_deref();
+    let blocks = format_blocks(&selected, |change| {
         if change.kind == ChangeKind::Conflict {
-            if printed_any {
-                println!();
-            }
-
-            printed_any = true;
-            println!("\x1b[1mconflict: {}\x1b[0m", change.path);
-            println!("  (unresolved — resolve the file and \"load\" it)");
-            continue;
+            return Ok(format!("\x1b[1mconflict: {}\x1b[0m\n  (unresolved — resolve the file and \"load\" it)\n",
+                              change.path));
         }
 
         let old_content = match (change.kind, &change.moved_from) {
             (ChangeKind::Added, _) => DiffSide::empty(),
-            (ChangeKind::Moved, Some(from)) => head_content(head_tree_hash.as_deref(), from)?,
-            _ => head_content(head_tree_hash.as_deref(), &change.path)?,
+            (ChangeKind::Moved, Some(from)) => head_content(head_tree_hash, from)?,
+            _ => head_content(head_tree_hash, &change.path)?,
         };
 
         let new_content = match change.kind {
@@ -236,15 +243,10 @@ async fn diff_staged(filter: Option<&WarehousePath>, verbose: bool) -> Result<()
             _ => inventory_content(&change.path, &shards)?,
         };
 
-        print_file_diff(change.kind, &change_label(change), &old_content, &new_content,
-                        &mut printed_any, verbose);
-    }
+        Ok(format_file_diff(change.kind, &change_label(change), &old_content, &new_content, verbose))
+    });
 
-    if !printed_any {
-        println!("The inventory matches the pallet head; nothing is staged.");
-    }
-
-    Ok(())
+    print_blocks(blocks)
 }
 
 /// Diff the trees of two revisions: `from` is the old side, `to` the new side (the
@@ -326,9 +328,60 @@ fn diff_pallets(from_revision: &str,
     // diff is real CPU, so the files fan out across the cores. The output must stay in path
     // order, so the blocks are computed into strings and printed afterwards rather than
     // inline.
-    let blocks = format_changed_files(&selected, verbose)?;
+    let blocks = format_blocks(&selected, |change| diff_block(change, verbose));
 
-    for (index, block) in blocks.iter().enumerate() {
+    print_blocks(blocks)
+}
+
+/// Format one block per changed file, fanning the work across the cores once there are enough
+/// files to be worth it. Returns the blocks positionally aligned with `changes`, so the caller
+/// prints them in the (path-sorted) order they arrived. Every mode of `diff` renders through
+/// here: loading a file's two sides is most of a block's cost (a packed side is rebuilt from its
+/// delta chain and verified), and it shares only the object caches, so the speed-up is real but
+/// sub-linear; the histogram diff itself is pure CPU and parallelizes freely.
+///
+/// # Arguments
+/// * `changes` - The changed files to diff (already path-sorted and filtered).
+/// * `block`   - Formats one file's block.
+///
+/// # Returns
+/// * `Vec<Result<String, String>>` - One formatted block, or the error reading that file's content,
+///   per change, in order. The serial path stops at the first error, so the list may be shorter.
+fn format_blocks<T: Sync>(changes: &[&T],
+                          block: impl Fn(&T) -> Result<String, String> + Sync)
+                          -> Vec<Result<String, String>> {
+    // Below this many files the threads cost more than the diffs they would share.
+    const PARALLEL_THRESHOLD: usize = 8;
+
+    // Serially, nothing past the first unreadable file is printed, so nothing past it is rendered.
+    if changes.len() < PARALLEL_THRESHOLD {
+        let mut blocks = Vec::with_capacity(changes.len());
+
+        for change in changes {
+            let block = block(change);
+            let failed = block.is_err();
+            blocks.push(block);
+
+            if failed {
+                break;
+            }
+        }
+
+        return blocks;
+    }
+
+    // See `forklift_core::util::fanout_utils::fanout_map` for the fan-out idiom (chunking,
+    // worker count, and the storage-scope re-entry every worker needs).
+    fanout_utils::fanout_map(changes, |change| block(change))
+}
+
+/// Print formatted diff blocks in order, a blank line between consecutive blocks, stopping at the
+/// first file whose content could not be read: the files before it print, as they would from a
+/// serial render, and its error is returned.
+fn print_blocks(blocks: Vec<Result<String, String>>) -> Result<(), String> {
+    for (index, block) in blocks.into_iter().enumerate() {
+        let block = block?;
+
         if index > 0 {
             println!();
         }
@@ -336,37 +389,6 @@ fn diff_pallets(from_revision: &str,
     }
 
     Ok(())
-}
-
-/// Format each changed file's diff block, fanning the work across the cores once there are
-/// enough files to be worth it. Returns the blocks positionally aligned with `changes`, so
-/// the caller prints them in the (path-sorted) order they arrived.
-///
-/// Loading each file's two blobs shares the object caches, so — like `audit` — the speed-up
-/// is real but sub-linear; the histogram diff itself is pure CPU and parallelizes freely.
-///
-/// # Arguments
-/// * `changes` - The changed files to diff (already path-sorted and filtered).
-/// * `verbose` - Whether to include unchanged lines too.
-///
-/// # Returns
-/// * `Ok(Vec<String>)` - One formatted diff block per change, in order.
-/// * `Err(String)`     - The first (lowest-index) file whose blob could not be read.
-fn format_changed_files(changes: &[&TreeChange], verbose: bool) -> Result<Vec<String>, String> {
-    // Below this many files the threads cost more than the diffs they would share.
-    const PARALLEL_THRESHOLD: usize = 8;
-
-    if changes.len() < PARALLEL_THRESHOLD {
-        return changes.iter().map(|change| diff_block(change, verbose)).collect();
-    }
-
-    // See `forklift_core::util::fanout_utils::fanout_map` for the fan-out idiom (chunking,
-    // worker count, and the storage-scope re-entry every worker needs). It never
-    // short-circuits, so the first-path error a serial `.collect()` would report is
-    // recovered by collecting the (order-preserved) results the same way here.
-    fanout_utils::fanout_map(changes, |change| diff_block(change, verbose))
-        .into_iter()
-        .collect()
 }
 
 /// Load one changed file's two sides and format its diff block (the body of the parallel
@@ -730,35 +752,10 @@ fn head_content(head_tree_hash: Option<&str>, path: &str) -> Result<DiffSide, St
     }
 }
 
-/// Print one file's diff: a header with the change kind, then the changed lines (or a
-/// note for binary content). Files are separated by a blank line.
-///
-/// # Arguments
-/// * `kind`        - The kind of the change (the header label).
-/// * `path`        - The warehouse path of the file.
-/// * `old`         - The old content.
-/// * `new`         - The new content.
-/// * `printed_any` - Whether a previous file was already printed (set by this function).
-/// * `verbose`     - Whether to print unchanged lines too.
-fn print_file_diff(kind: ChangeKind,
-                   path: &str,
-                   old: &DiffSide,
-                   new: &DiffSide,
-                   printed_any: &mut bool,
-                   verbose: bool) {
-    if *printed_any {
-        println!();
-    }
-
-    *printed_any = true;
-
-    print!("{}", format_file_diff(kind, path, old, new, verbose));
-}
-
 /// Format one file's diff into a block of text — the header line, then the changed lines
-/// (or a note for binary content), each line terminated with a newline. The pure sibling
-/// of [`print_file_diff`]: it touches no shared state and does not print, so a batch of
-/// them can be computed in parallel and printed in order afterwards.
+/// (or a note for binary content), each line terminated with a newline. It touches no shared
+/// state and does not print, so [`format_blocks`] can compute a batch of them in parallel for
+/// [`print_blocks`] to print in order.
 ///
 /// # Arguments
 /// * `kind`    - The kind of the change (the header label).
