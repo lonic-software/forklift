@@ -6,14 +6,16 @@ below that, the manual steps the harness automates — so you can reproduce ever
 number by hand and add your own.
 
 > **Read this first — the honest framing.** Git is a 20-year-old C codebase tuned
-> against the exact repos below; Forklift is **v0.2.x**. Forklift's `status` and
-> `log` are both *faster* than git today — `status` from the sharded per-directory
-> inventory (no per-file stat pass), `log` from buffered streaming output — though
-> against a native arm64 git the margins are modest (0.64x / 0.84x), not dramatic.
-> On-disk size ends up smaller after the one-shot redelta pass; see §2. `diff` and
-> `commit` are ~3.4–3.6x slower than this faster git baseline (forklift's own times
-> are unchanged; git got faster) and are tracked as open optimization targets in
-> [`PERFORMANCE_BACKLOG.md`](PERFORMANCE_BACKLOG.md). The point of
+> against the exact repos below; Forklift is **v0.3.x**. On git.git against a native
+> arm64 git (2026-10-17, hyperfine), `log` is level with git (1.01x) and `status` is
+> 1.4x slower; `diff` is ~2.2–2.4x slower; `commit` is 3.3x slower than git's
+> defaults but 1.55x against a git that syncs as durably as forklift does (§3).
+> On-disk size ends up smaller after the one-shot redelta pass; see §2. The slower
+> rows are tracked as optimization targets in
+> [`PERFORMANCE_BACKLOG.md`](PERFORMANCE_BACKLOG.md). Earlier versions of this page
+> reported `status` and `log` *faster* than git (0.64x / 0.84x); those came from a
+> harness with no warm-up run and a shell timer, and this re-run does not reproduce
+> them. The point of
 > benchmarking here is not to "beat git" — it
 > is to (a) see where Forklift is already in the same ballpark or ahead, (b) find the
 > operations that are *unexpectedly* slow so they become optimization targets, and
@@ -31,10 +33,12 @@ number by hand and add your own.
 | `forklift` on PATH | the system under test | `forklift version` |
 | A timer: GNU `date`, `python3`, or `perl` | wall-clock measurement | any of `python3 --version` |
 | Disk: ~2× the repo's size | the harness keeps two working copies | `df -h .` |
-| *(optional)* [`hyperfine`](https://github.com/sharkdp/hyperfine) | tighter statistics, warmup, outlier detection | `hyperfine --version` |
+| *(recommended)* [`hyperfine`](https://github.com/sharkdp/hyperfine) | the harness times with it when it is on PATH: more runs, outlier detection | `hyperfine --version` |
 
-Install hyperfine if you want publication-grade numbers: `brew install hyperfine`
-(macOS) or `cargo install hyperfine`. The bundled harness does **not** require it.
+Install hyperfine for publication-grade numbers: `brew install hyperfine` (macOS) or
+`cargo install hyperfine`. The harness picks it up from PATH and names the timer it used
+in its report; without it, or with a hyperfine older than 1.13, it falls back to its
+own shell timer and fewer runs.
 
 Disk budget, concretely:
 - **git.git** — ~230 MB of history, ~4.7k files. Two copies ≈ 0.6 GB. Fast.
@@ -62,7 +66,9 @@ bin/benchmark --repo /path/to/some/local/repo
 bin/benchmark --repo git --out results.md --keep
 ```
 
-Options: `--runs N` (iterations for the fast read-only ops, default 5),
+Options: `--runs N` (iterations for the fast read-only ops; default 20 under hyperfine,
+5 with the shell timer — the commit rows default to 10 and 3, set `COMMIT_RUNS` in the
+environment to change that),
 `--work DIR` (where to build the copies; default a fresh temp dir),
 `--keep` (don't delete the work dir), `--out FILE` (append the results table),
 `--no-redelta` (skip the post-import densify pass and time the as-imported store —
@@ -78,8 +84,10 @@ in copy `B`:
 |-----------|-----|----------|
 | **status** (clean tree) | `git status` | `forklift stocktake --summary` |
 | **log** (whole history) | `git log` | `forklift history` |
-| **diff** (dirty tree) | `git diff` | `forklift diff --staged` |
-| **commit** (1 file) | `git add` + `git commit` | `forklift load` + `forklift stack` |
+| **diff, unstaged** (20 edited files) | `git diff` | `forklift diff` |
+| **diff, staged** (same 20, staged) | `git diff --staged` | `forklift diff --staged` |
+| **commit** (1 file) | `git commit` | `forklift stack` |
+| **commit, git fsync=all** | `git -c core.fsync=all -c core.fsyncMethod=fsync commit` | `forklift stack` |
 | **onboard** *(separate)* | `git clone --local` | `forklift import-git .` |
 
 `import-git` writes straight into native packs as it imports — there is no loose store
@@ -88,46 +96,57 @@ import finishes. The harness then records that as-imported size and runs the one
 **`compact --all --redelta`** densify pass import itself suggests (import's per-path
 delta chains miss cross-path similarity, so the as-imported store is larger than it
 needs to be). Both sizes appear in the report, the redelta time is reported alongside
-the import as onboarding cost, and the four comparison rows run on the *densified*
+the import as onboarding cost, and the comparison rows run on the *densified*
 store — the steady state a user who followed the suggestion operates in, compared
 against the shape git is always measured in (`clone --local` copies packfiles).
 Pass `--no-redelta` to time the as-imported store instead.
+
+Each read-only command gets one untimed warm-up run before its timed runs. The commit
+rows time only the commit: the one-line edit and its `git add` / `forklift load` are
+untimed setup (hyperfine's `--prepare`), so each timed commit records exactly one file.
+The commit rows run before the diff rows, on the clean tree onboarding leaves, so no
+reset step runs between them — a reset is a different operation in each tool and would
+leave forklift's inventory in a different state from a fresh import's. The harness
+checks that both trees are clean around the commit rows and that both tools saw the
+same change set before each diff row, and it stops with an error if any timed or setup
+command fails, rather than publishing the time of a command that failed early.
 
 Output is an **aligned text table** (pass `--markdown` for a pasteable markdown one):
 git time, forklift time, the **forklift/git ratio** (below 1.0 means forklift was
 faster), and a per-row note. Example shape:
 
 ```
-  Repo:      git — 81489 commits, 4775 tracked files
-  On-disk:   git .git = 317M   forklift .forklift = 435M as imported, 235M after redelta  (forklift 1.3x smaller)
-  Tools:     git version 2.55.0 · Forklift version 0.2.1
-  Method:    read-only ops = mean of 5 runs, commit = mean of 3; warm cache.
+  Repo:      git — 82513 commits, 4857 tracked files
+  On-disk:   git .git = 334M   forklift .forklift = 444M as imported, 239M after redelta  (forklift 1.4x smaller)
+  Tools:     git version 2.55.0 · Forklift version 0.3.1
+  Method:    hyperfine 2.0.0; read-only ops = mean of 20 runs after one warm-up run, commit = mean of 10; warm cache.
              A ratio below 1.00 means forklift is faster.
              git ships packed; forklift is packed + densified (one-shot compact --all --redelta after import).
 
-  Operation               git        forklift   forklift/git   Notes
-  ----------------------  ---------  ---------  -------------  ----------------------------------
-  status (clean tree)     66 ms      42 ms      0.64x          git status vs forklift stocktake --summary
-  log (whole history)     545 ms     457 ms     0.84x          81489 commits walked
-  diff (20 files changed)  13 ms      47 ms      3.62x          git diff vs forklift diff --staged
-  commit (1 file)         19 ms      65 ms      3.42x          git add+commit vs forklift load+stack; mean of 3
+  Operation                  git        forklift   forklift/git   Notes
+  -------------------------  ---------  ---------  -------------  ----------------------------------
+  status (clean tree)        15 ms      21 ms      1.40x          git status vs forklift stocktake --summary
+  log (whole history)        558 ms     565 ms     1.01x          82513 commits walked
+  commit (1 file)            18 ms      59 ms      3.28x          git commit vs forklift stack, staging untimed
+  commit, git fsync=all      38 ms      59 ms      1.55x          same, git with core.fsync=all core.fsyncMethod=fsync
+  diff, unstaged (20 files)  12 ms      29 ms      2.42x          git diff vs forklift diff
+  diff, staged (20 files)    9 ms       20 ms      2.22x          git diff --staged vs forklift diff --staged
 
   Onboarding — measured separately; NOT a ratio (different operations):
-    git clone --local     361 ms     (copies an existing packfile)
-    forklift import-git   62.54 s    (re-encodes every commit/tree/blob straight into packs; store lands at 435M)
-    Packed the imported store: 402959 object(s) into 5 pack(s), 310344 delta-compressed.
-    compact --all --redelta  177.02 s (one-shot densify: 435M -> 235M)
+    git clone --local     379 ms     (copies an existing packfile)
+    forklift import-git   60.99 s    (re-encodes every commit/tree/blob straight into packs; store lands at 444M)
+    Packed the imported store: 409297 object(s) into 5 pack(s), 315500 delta-compressed.
+    compact --all --redelta  181.05 s (one-shot densify: 444M -> 239M)
 ```
 
 **Two sizes, one store.** `import-git` writes straight into native packs as it imports
 (delta-compressing successive file/tree versions on the way in), but its per-path delta
 chains don't see the cross-path similarity (renames, moved files) that a global repack
-ordering does — on git.git the as-imported store lands **~1.4x larger** than git's own
-pack (435M vs 317M). The one-shot `compact --all --redelta` densify pass closes that
-and more: **235M, ~1.3x smaller than git**, for ~177 s of one-time CPU on this corpus.
+ordering does — on git.git the as-imported store lands **~1.3x larger** than git's own
+pack (444M vs 334M). The one-shot `compact --all --redelta` densify pass closes that
+and more: **239M, ~1.4x smaller than git**, for ~181 s of one-time CPU on this corpus.
 The harness reports both sizes and times the comparison rows on the densified store;
-redelta itself did not measurably change the timing rows — the `log` speedup seen in
-§2 comes from buffering the history walk's output, not from redelta. On
+redelta itself did not measurably change the timing rows. On
 repos whose `.git` carries unreachable refs or stale
 remote-tracking branches, `.forklift` often lands far smaller still — `import-git` only
 pulls branch-reachable history — but that reflects the source repo's ref clutter, not a
@@ -187,10 +206,23 @@ These matter. A benchmark that hides them is a sales pitch, not a measurement.
   (counts only) against `git status`. That's the closest fair pairing (neither
   formats a long per-file list); use plain `forklift stocktake` if you want the
   full-report cost instead.
-- **One machine, few runs.** The bundled timer reports a mean over a handful of
-  runs, not a distribution. For anything you plan to publish, re-run the same
-  commands under `hyperfine` (see §5) — it does warmup, many runs, and outlier
-  detection.
+- **One machine.** Under hyperfine the harness reports a mean over 20 runs (10 for
+  commit); with the shell-timer fallback it is a mean over a handful of runs, not a
+  distribution. Either way it is one machine on one day — quote the hardware with the
+  number. For a distribution, run the commands under `hyperfine` yourself (see §5).
+- **Forklift's timings depend on inventory state.** `forklift restore` of a directory
+  currently rewrites every tracked file under it, which clears the inventory's cached
+  subtree hashes, and `restore --staged` leaves entries whose stat data is re-read on
+  every later `stocktake`. Either makes later `status`/`diff`/`stack` timings slower
+  than on a fresh import, which is why the harness never resets with them. If you run
+  the steps by hand, time on a freshly imported copy.
+- **Durability differs by default.** Every `forklift stack` is durable when it
+  returns: on macOS it ends with a device-cache flush (`F_FULLFSYNC`). git's defaults
+  are weaker there: git-config(1) documents `core.fsyncMethod`'s macOS default as
+  `writeout-only`, which "may not be durable in the event of a system crash". The
+  harness therefore times git's commit twice, with its defaults and with
+  `core.fsync=all` + `core.fsyncMethod=fsync`; the second row is the like-for-like
+  durability comparison. Quote the one that matches the question you are asking.
 - **Forklift signs; git doesn't (by default).** If you `office enroll` the imported
   warehouse, every `stack` afterwards signs the parcel — real work git isn't doing
   in its `commit`. Benchmark signed vs unsigned deliberately; don't conflate them.
@@ -230,6 +262,10 @@ du -sh .forklift                             # packed, as imported
 time forklift compact --all --redelta
 du -sh .forklift                             # densified — the state the table compares
 
+# 2c. import-git leaves an untracked .forkliftignore (the .git rule) and asks you to
+#     record it; do, so that a later `load .` stages only your edits.
+forklift load .forkliftignore && forklift stack "Keep the .git ignore rule"
+
 # 3. Compare, running each tool in its own copy.
 # status:
 ( cd ~/bench/A && time git status )
@@ -239,14 +275,18 @@ du -sh .forklift                             # densified — the state the table
 ( cd ~/bench/A && time git log            >/dev/null )
 ( cd ~/bench/B && time forklift history   >/dev/null )
 
-# diff (dirty the same files in both, then diff):
-for f in README.md Makefile; do printf '\n// edit\n' >> ~/bench/A/$f ~/bench/B/$f; done
-( cd ~/bench/A && time git diff           >/dev/null )
-( cd ~/bench/B && forklift load . && time forklift diff --staged >/dev/null )
-
-# commit (stage a change, then commit/stack):
+# commit (stage a change, then commit/stack; only the commit is timed). Run this
+# before the diff step, while both trees are still clean:
 ( cd ~/bench/A && echo x >> README.md && git add README.md   && time git commit -q -m bench )
 ( cd ~/bench/B && echo x >> README.md && forklift load README.md && time forklift stack bench )
+
+# diff (dirty the same files in both, then diff unstaged and staged):
+for f in README.md Makefile; do printf '\n// edit\n' >> ~/bench/A/$f; printf '\n// edit\n' >> ~/bench/B/$f; done
+( cd ~/bench/A && time git diff           >/dev/null )
+( cd ~/bench/B && time forklift diff      >/dev/null )
+( cd ~/bench/A && git add -A    && time git diff --staged      >/dev/null )
+( cd ~/bench/B && forklift load . && time forklift diff --staged >/dev/null )
+
 ```
 
 ### Extend it — ops the harness doesn't cover
@@ -294,12 +334,12 @@ Use `--export-markdown out.md` to capture a table, or `--export-json` for plots.
 ## 6. Interpreting results — what "good" looks like
 
 - **Same order of magnitude as git** on status/diff/commit is a genuine win for a
-  v0.1 system. A large multiple on a *fast* op (tens of ms) is often fixed overhead
+  pre-1.0 system. A large multiple on a *fast* op (tens of ms) is often fixed overhead
   (process start, lock acquisition, inventory open) that amortizes away on big
   operations — note the absolute time, not just the ratio.
 - **`log`/`history`** stresses graph-walk and object decode, measured on the **packed,
-  densified** store (where forklift is modestly *faster* than git — 0.84x on the
-  recorded run). A regression here is the real object-store read-path signal.
+  densified** store (where forklift is level with git — 1.01x on the recorded
+  run). A regression here is the real object-store read-path signal.
 - **`onboard`** will always favor git (see §3). Track it over releases to catch
   import regressions, not to compare against clone.
 - **A regression across releases matters more than the absolute gap to git.**

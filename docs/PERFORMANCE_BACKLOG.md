@@ -38,10 +38,14 @@ startup — CLI argument parsing, TOML config load, warehouse-root discovery —
 chunk of every command's time. Measured floor: forklift's own no-op path costs
 **~7–8 ms**; git's is **~11–14 ms**. Forklift is not behind here, it is ahead — and
 that git figure should be read generously in forklift's favor, not the other way:
-the git binary measured is **x86_64 running under Rosetta** on this box, which
+the git binary measured then was **x86_64 running under Rosetta**, which
 inflates every git measurement, most visibly on syscall-heavy operations (many small
 `read`/`stat` calls each pay the translation tax). So the true native-vs-native gap
 on fixed overhead likely favors forklift by even more than 7–8 vs 11–14 ms suggests.
+*(Correction, 2026-10-17: this applies to the figures in this document, which were
+taken against the Rosetta git 2.33.0. Later the same day (2026-07-15) `BENCHMARK.md`
+was re-measured against native arm64 git 2.55.0, and every ratio there since is native
+against native. The fixed-overhead figures above were not re-measured natively.)*
 Whatever is making `diff` and `commit` slower than git is not a fixed floor — it is
 work that scales with the corpus, per command, addressed below.
 
@@ -51,13 +55,14 @@ work that scales with the corpus, per command, addressed below.
 
 Four fixes landed on `perf-quick-wins`, none structural — this section exists so the
 doc reads correctly once that branch merges (numbers below either measured on that
-branch or expected, and `BENCHMARK.md` will get a full re-run once it does).
+branch or expected; `BENCHMARK.md` was re-run in full on 2026-10-17, see below).
 
 1. **`BufWriter` on `history`/`query`'s streaming stdout.** Both commands were
    writing to `stdout` one record at a time, unbuffered — a syscall per printed
    line at git.git's 81k-commit depth. Wrapping the writer in a `BufWriter` took
-   `history` from **962 ms → ~0.42 s**, which is **~2× faster than git**, not merely
-   at parity with it.
+   `history` from **962 ms → ~0.42 s**, which was **~2× faster than the Rosetta git**
+   measured then. Against native arm64 git 2.55.0 the two are level (558 ms vs 565 ms
+   on git.git, 2026-10-17).
 2. **Collapsing `stack`'s three full inventory-shard scans into one.** `stack` was
    walking every shard three separate times (once each for staged detection, tree
    build input, and post-stack cleanup); collapsed into a single pass. Expected
@@ -81,7 +86,9 @@ wins on paths that were already correct.
 
 Landed on `perf-rollup-hash`: the structural fix from the "highest value" item this
 document originally listed as remaining. Numbers below are measured on that branch;
-`BENCHMARK.md` gets its own full re-run once it merges.
+`BENCHMARK.md` was re-run in full on 2026-10-17 (hyperfine, native arm64 git 2.55.0,
+Forklift 0.3.1): status 1.40x, log 1.01x, diff 2.2–2.4x, commit 3.28x against git's
+defaults and 1.55x against `core.fsync=all`.
 
 **Mechanism.** Each inventory shard's header can now carry an optional rollup hash
 (format `v2026_07_15`) — the tree hash `stack` would build for that shard's entire
