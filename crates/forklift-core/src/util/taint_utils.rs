@@ -1093,8 +1093,9 @@ mod tests {
         let taint_dir = forklift.join(TAINT_DIR_NAME);
         std::fs::create_dir_all(&taint_dir).unwrap();
 
-        // An older, unescaped file: torn, and none of its lines read as paths.
-        std::fs::write(taint_dir.join("taint-99999-0"), b"inventory/inv_/inv_a\\b/data\nEND\n").unwrap();
+        // An older, unescaped file: torn, and none of its lines read as paths — this raw path,
+        // holding a literal backslash before "n", would otherwise unescape into a different one.
+        std::fs::write(taint_dir.join("taint-99999-0"), b"inventory/inv_/inv_a\\nb/data\nEND\n").unwrap();
         let state = read_taints(&forklift).unwrap();
         assert!(state.torn, "a headerless taint file must read as torn");
         assert!(state.recorded.is_empty(), "{:?}", state.recorded);
