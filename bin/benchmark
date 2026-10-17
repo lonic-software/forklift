@@ -285,6 +285,13 @@ fi
 FORK_SIZE_K=$(du -sk "$B/.forklift" 2>/dev/null | cut -f1)
 FORK_SIZE=$(du -sh "$B/.forklift" 2>/dev/null | cut -f1 | tr -d ' ')
 
+# import-git adds a `.git` rule to `.forkliftignore` and asks for it to be loaded and
+# stacked. Do that (untimed), like the redelta it suggests: left untracked, the file
+# would join the diff step's `forklift load .` and give forklift one more change than git.
+if [ -f "$B/.forkliftignore" ]; then
+    run_in "$B" 'forklift load .forkliftignore && forklift stack "Keep the .git ignore rule"'
+fi
+
 # From here B is a fully imported, packed warehouse whose current pallet is '$MAIN_REF'.
 
 # ── 2. status on a clean tree ───────────────────────────────────────────────
