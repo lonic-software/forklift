@@ -7,7 +7,7 @@ use forklift_core::model::parcel_action::ParcelAction;
 use forklift_core::util::shift_utils::FileOp;
 use serde::Serialize;
 use forklift_core::util::{
-    config_utils, file_utils, inventory_utils, load_guard_utils, merge_utils, object_utils,
+    alias_utils, config_utils, file_utils, inventory_utils, load_guard_utils, merge_utils, object_utils,
     pallet_utils, park_utils, scope_utils, shift_utils, sign_utils, stack_utils, tree_utils,
 };
 use crate::output::{self, CommandOutput};
@@ -169,6 +169,14 @@ pub async fn park_changes() -> Result<(), String> {
     // kept out of this same batch (see `stack_utils::stack_parcel`'s identical ordering note).
     batch.finish()?;
 
+    // The reset back to the pallet head is checked before anything references the parked
+    // parcel: a staged removal leaves a path the head writes back, and untracked content (or,
+    // on a case-insensitive volume, another spelling) may sit there now. A refusal here leaves
+    // the bay as it was; the parcel object stays unreferenced.
+    let (ops, removed_dirs) = shift_utils::diff_trees(Some(&root_tree.hash), &head_tree_hash)?;
+
+    alias_utils::refuse_collisions("Parking", &shift_utils::collect_collisions(&ops, &removed_dirs)?)?;
+
     if let Some(key_id) = &signing_key_id {
         let signature = sign_utils::sign_parcel_hash(key_id, &object.hash)?;
         sign_utils::store_parcel_signature(&object.hash, &signature)?;
@@ -179,13 +187,7 @@ pub async fn park_changes() -> Result<(), String> {
     park_utils::write_parked(&parked)?;
 
     // Reset the working directory and the inventory to the pallet head.
-    let (ops, removed_dirs) = shift_utils::diff_trees(Some(&root_tree.hash), &head_tree_hash)?;
-
-    for op in &ops {
-        shift_utils::apply_file_op(op)?;
-    }
-
-    shift_utils::remove_empty_directories(&removed_dirs);
+    shift_utils::apply_ops(&ops, &removed_dirs)?;
 
     let shards = shift_utils::build_inventories_for_tree(&head_tree_hash)?;
     inventory_utils::replace_all_inventories(&shards)?;
@@ -248,13 +250,21 @@ pub fn pop_parked() -> Result<(), String> {
 
         if in_base != in_head {
             conflicts.push(path);
-            continue;
         }
+    }
 
-        // Untracked files must not be overwritten either.
-        if in_head.is_none() && std::path::Path::new(path).exists() {
-            conflicts.push(path);
-        }
+    // Untracked files must not be overwritten either, nor another entry through a case alias.
+    // A path new to the parked base is new to the head too (every touched path is the same in
+    // both, checked above), so the diff's own `is_new` marks the writes to judge.
+    let (untracked, aliases) = alias_utils::split_collisions(&shift_utils::collect_collisions(&ops, &removed_dirs)?);
+    conflicts.extend(untracked.iter().map(String::as_str));
+
+    if !aliases.is_empty() {
+        return Err(format!(
+            "Un-parking would write two entries this file system treats as one file:\n  {}\n\
+            Rename one of them on a case-sensitive file system first.",
+            aliases.join("\n  ")
+        ));
     }
 
     if !conflicts.is_empty() {
@@ -266,7 +276,19 @@ pub fn pop_parked() -> Result<(), String> {
         ));
     }
 
-    for op in &ops {
+    // Every removal (and the directories it empties) before every write, as in `apply_ops`:
+    // across a case-only rename the write would otherwise land on the old name through the
+    // alias, and the removal after it would delete it.
+    let removals = ops.iter().filter(|op| matches!(op, FileOp::Remove { .. }));
+    let writes = ops.iter().filter(|op| matches!(op, FileOp::Write { .. }));
+    let mut emptied = false;
+
+    for op in removals.chain(writes) {
+        if !emptied && matches!(op, FileOp::Write { .. }) {
+            shift_utils::remove_empty_directories(&removed_dirs);
+            emptied = true;
+        }
+
         shift_utils::apply_file_op(op)?;
 
         match op {
@@ -287,7 +309,9 @@ pub fn pop_parked() -> Result<(), String> {
         }
     }
 
-    shift_utils::remove_empty_directories(&removed_dirs);
+    if !emptied {
+        shift_utils::remove_empty_directories(&removed_dirs);
+    }
 
     parked.pop();
     park_utils::write_parked(&parked)?;

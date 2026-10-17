@@ -806,6 +806,26 @@ have staged or unstaged changes (they'd be overwritten) — stack, restore, or p
 them first. Untracked files are left alone unless the target needs to write over
 one.
 
+On a case-insensitive file system (the default on macOS and Windows), two names
+that differ only in case, such as `README` and `readme`, are one file. Every
+command that writes the working directory (`shift`, `consolidate`, `cherry-pick`,
+`lower`, `franchise`, `bay add`, `park` and `park pop`) asks the file system what
+a new path lands on before it writes anything:
+
+- A case-only rename (`foo` to `Foo`, or `Docs/` to `docs/`) just works. A
+  directory rename is refused if anything the pallet does not track is left in the
+  old directory, such as an untracked or ignored file or an empty folder, because
+  the new spelling would land inside it.
+- A tree that holds two spellings of one name is refused before anything is
+  written, and the refusal names both entries. Rename one of them on a
+  case-sensitive file system. The pair stays valid in the warehouse and
+  materializes normally wherever the file system tells the names apart.
+- An untracked file reached through another spelling is refused under its own
+  name, like any other untracked collision.
+
+`restore` likewise refuses a path that names the same file as another entry on
+disk, instead of overwriting it.
+
 ### `consolidate` — merge (`con`)
 
 ```sh

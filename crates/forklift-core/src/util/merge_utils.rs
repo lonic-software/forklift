@@ -633,8 +633,9 @@ pub enum MergeAction {
         path: String,
         hash: String,
         item_type: crate::enums::dir_entry_type::DirEntryType,
-        /// Whether the file does not exist in our tree (an untracked file at the path is
-        /// then a collision).
+        /// Whether the file does not exist in our tree (whatever the path resolves to on disk,
+        /// an untracked file or a case alias of another entry, is then a collision, and the
+        /// write creates the file exclusively).
         is_new: bool,
     },
 

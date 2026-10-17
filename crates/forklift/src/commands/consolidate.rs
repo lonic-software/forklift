@@ -6,7 +6,7 @@ use forklift_core::model::inventory::InventoryItem;
 use forklift_core::util::merge_utils::{ConsolidationState, MergeAction};
 use forklift_core::util::stocktake_utils::ChangeKind;
 use forklift_core::util::{
-    inventory_utils, load_guard_utils, merge_utils, object_utils, office_utils, pallet_utils,
+    alias_utils, inventory_utils, load_guard_utils, merge_utils, object_utils, office_utils, pallet_utils,
     scope_utils, shift_utils, stack_utils, stocktake_utils,
 };
 use crate::output::{self, CommandOutput};
@@ -342,16 +342,10 @@ fn fast_forward(current: &str,
                 their_tree_hash: &str) -> Result<String, String> {
     let (ops, removed_dirs) = shift_utils::diff_trees(Some(our_tree_hash), their_tree_hash)?;
 
-    let conflicts = shift_utils::collect_untracked_collisions(&ops)?;
-
-    if !conflicts.is_empty() {
-        return Err(format!(
-            "Consolidating \"{}\" would overwrite these untracked files:\n  {}\n\
-            Move them out of the way (or load and stack them) first.",
-            target,
-            conflicts.join("\n  ")
-        ));
-    }
+    alias_utils::refuse_collisions(
+        &format!("Consolidating \"{}\"", target),
+        &shift_utils::collect_collisions(&ops, &removed_dirs)?,
+    )?;
 
     shift_utils::apply_ops(&ops, &removed_dirs)?;
 
@@ -383,48 +377,82 @@ async fn ensure_warehouse_is_clean(our_tree_hash: &str) -> Result<(), String> {
 
 /// Ensure the merge will not overwrite untracked files: every path the merge writes that
 /// does not exist in our tree (`is_new` takes, delete/modify conflict re-adds) must not
-/// exist in the working directory. Shared with `cherry-pick`, which applies the same
-/// `MergeAction`s.
+/// exist in the working directory — judged by what the file system resolves it to, so a
+/// case-only rename on their side is a rename, and a name that lands on another entry through a
+/// case alias is refused naming both (see [`alias_utils`]). Shared with `cherry-pick`, which
+/// applies the same `MergeAction`s.
 pub(crate) fn ensure_no_untracked_collisions(actions: &[MergeAction], target: &str) -> Result<(), String> {
-    let mut collisions: Vec<&str> = Vec::new();
+    let removals = MergeRemovals(actions.iter()
+        .filter_map(|action| match action {
+            MergeAction::Delete { path } => Some(path.clone()),
+            _ => None,
+        })
+        .collect());
+
+    let mut check = alias_utils::AliasCheck::new();
+    let mut collisions = Vec::new();
+    let mut created = Vec::new();
 
     for action in actions {
         let new_path = match action {
             MergeAction::TakeTheirs { path, is_new: true, .. } => Some(path),
             // A delete/modify conflict re-creates a file we deleted.
-            MergeAction::Conflict { path, content: Some(_), .. }
-                if !std::path::Path::new(path).exists() => None,
-            MergeAction::Conflict { path, content: Some(_), .. } => Some(path),
+            MergeAction::Conflict { path, .. } if conflict_writes(action) => Some(path),
             _ => None,
         };
 
-        if let Some(path) = new_path {
-            // A tracked file cannot collide (tracked paths were verified clean). A tracked
-            // directory with no untracked content beneath it cannot collide either — the merge
-            // legitimately replaces it with the new entry (see `apply_merge_action`'s
-            // deletes-before-writes ordering); a directory is tracked by its own inventory
-            // shard, not as an item in its parent's inventory, so it is checked separately.
-            let is_tracked_file = inventory_lookup(path)?.is_some();
-            let fs_path = std::path::Path::new(path);
-            let is_replaceable_dir = fs_path.is_dir()
-                && inventory_utils::directory_is_safe_to_replace(path)?;
+        let Some(path) = new_path else { continue };
 
-            if !is_tracked_file && !is_replaceable_dir && fs_path.exists() {
-                collisions.push(path);
+        // A tracked file cannot collide (tracked paths were verified clean).
+        if inventory_lookup(path)?.is_some() {
+            continue;
+        }
+
+        created.push(path.as_str());
+
+        match check.judge(path, &removals)? {
+            alias_utils::Verdict::Proceed => {}
+            alias_utils::Verdict::Refuse(collision) => collisions.push(collision),
+            alias_utils::Verdict::Exists => {
+                // A tracked directory with no untracked content beneath it cannot collide
+                // either — the merge legitimately replaces it with the new entry (see
+                // `apply_merge_action`'s deletes-before-writes ordering); a directory is tracked
+                // by its own inventory shard, not as an item in its parent's inventory, so it is
+                // checked separately.
+                let fs_path = std::path::Path::new(path);
+
+                if !(fs_path.is_dir() && inventory_utils::directory_is_safe_to_replace(path)?) {
+                    collisions.push(alias_utils::Collision::Untracked(path.clone()));
+                }
             }
         }
     }
 
-    if collisions.is_empty() {
-        return Ok(());
+    collisions.extend(check.created_pairs(created)?);
+
+    alias_utils::refuse_collisions(&format!("Consolidating \"{}\"", target), &collisions)
+}
+
+/// The files a merge deletes before it writes (its `Delete` actions).
+struct MergeRemovals(std::collections::HashSet<String>);
+
+impl alias_utils::Removals for MergeRemovals {
+    fn removes_file(&self, key: &str) -> bool {
+        self.0.contains(key)
     }
 
-    Err(format!(
-        "Consolidating \"{}\" would overwrite these untracked files:\n  {}\n\
-        Move them out of the way (or load and stack them) first.",
-        target,
-        collisions.join("\n  ")
-    ))
+    /// A Delete removes each directory up its own chain once it is empty (see
+    /// `apply_merge_action`), so a directory is removed when some deleted file lies beneath it.
+    fn removes_directory(&self, key: &str) -> bool {
+        let prefix = format!("{}/", key);
+        self.0.iter().any(|path| path.starts_with(&prefix))
+    }
+}
+
+/// Whether applying a conflict writes its file: inline content, or a chunked file materialized
+/// from its recipe.
+fn conflict_writes(action: &MergeAction) -> bool {
+    matches!(action, MergeAction::Conflict { content, item_type, .. } if content.is_some() || item_type.is_chunked())
 }
 
 /// Look up the inventory entry for a warehouse path (`None` when the file is untracked).
@@ -476,8 +504,8 @@ pub(crate) fn apply_merge_actions(actions: &[MergeAction]) -> Result<Vec<String>
 /// `cherry-pick`, which applies a parcel's diff through the same `MergeAction`s.
 pub(crate) fn apply_merge_action(action: &MergeAction, conflict_paths: &mut Vec<String>) -> Result<(), String> {
     match action {
-        MergeAction::TakeTheirs { path, hash, item_type, .. } => {
-            shift_utils::write_tracked_file(path, hash, *item_type)?;
+        MergeAction::TakeTheirs { path, hash, item_type, is_new } => {
+            shift_utils::write_tracked_file(path, hash, *item_type, *is_new)?;
             inventory_utils::stage_file_entry_from_stat(path, hash.clone(), *item_type)
         }
 
@@ -512,7 +540,7 @@ pub(crate) fn apply_merge_action(action: &MergeAction, conflict_paths: &mut Vec<
         }
 
         MergeAction::Merged { path, content, item_type } => {
-            shift_utils::write_working_file(path, content, *item_type)?;
+            shift_utils::write_working_file(path, content, *item_type, false)?;
 
             // The merged content is new — store its blob so the next stack can point at it. A
             // three-way merge only ever runs on plain text files, so a `Merged` result is always
@@ -524,13 +552,17 @@ pub(crate) fn apply_merge_action(action: &MergeAction, conflict_paths: &mut Vec<
         }
 
         MergeAction::Conflict { path, content, entry_hash, item_type } => {
+            // A conflict on a path the inventory does not hold re-creates a file we deleted, so
+            // it is new to the working directory, like `ensure_no_untracked_collisions` judged it.
+            let create = conflict_writes(action) && inventory_lookup(path)?.is_none();
+
             if let Some(content) = content {
-                shift_utils::write_working_file(path, content, *item_type)?;
+                shift_utils::write_working_file(path, content, *item_type, create)?;
             } else if item_type.is_chunked() {
                 // A chunked (binary) conflict carries no inline content: materialize the
                 // should-be-on-disk version from its recipe (`entry_hash` is ours when we keep
                 // ours, theirs when theirs is put back). Bounded, verified stream-assembly.
-                shift_utils::write_tracked_file(path, entry_hash, *item_type)?;
+                shift_utils::write_tracked_file(path, entry_hash, *item_type, create)?;
             }
 
             let (parent_key, name) = split_path(path);

@@ -7,7 +7,7 @@ use forklift_core::util::path_utils::{self, WarehousePath};
 use forklift_core::util::inventory_utils::TrackedKind;
 use forklift_core::util::scope_utils::{self, MaterializationScope, ScopeClass};
 use forklift_core::util::{
-    file_utils, inventory_utils, load_guard_utils, object_utils, pallet_utils, shift_utils, tree_utils,
+    alias_utils, file_utils, inventory_utils, load_guard_utils, object_utils, pallet_utils, shift_utils, tree_utils,
 };
 use crate::output;
 
@@ -205,7 +205,20 @@ fn restore_file_and_refresh_entry(parent_key: &str,
         format!("{}/{}", parent_key, name)
     };
 
-    shift_utils::write_tracked_file(&file_path, hash, item_type)?;
+    // The inventory can hold two spellings of one file on a case-insensitive volume (a
+    // case-only directory rename staged under the new name while the old one stays): writing
+    // the one that is not on disk would overwrite the other through the alias.
+    if let alias_utils::Occupancy::Alias { occupant, .. } | alias_utils::Occupancy::Unidentified { component: occupant }
+        = alias_utils::AliasCheck::new().occupancy(&file_path)? {
+        return Err(format!(
+            "Cannot restore \"{}\": on this file system it names the same file as \"{}\", which \
+            restoring would overwrite. Stage the one you mean to keep (load or unload the other) \
+            first.",
+            file_path, occupant
+        ));
+    }
+
+    shift_utils::write_tracked_file(&file_path, hash, item_type, false)?;
 
     let refreshed = inventory_utils::build_inventory_item_from_stat(
         std::path::Path::new(&file_path),

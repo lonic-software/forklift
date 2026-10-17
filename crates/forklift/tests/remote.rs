@@ -6036,3 +6036,36 @@ mod progress_events {
         assert_eq!(area.read_file("b/new.txt"), "new\n");
     }
 }
+
+/// A lower across a case-only rename removes the old spelling before it writes the new one. On a
+/// case-insensitive file system the two name one file, so writing `Foo` first and removing `foo`
+/// after would delete the file it just wrote. On a case-sensitive one the rename is ordinary.
+#[test]
+fn a_lower_across_a_case_only_rename_keeps_the_file() {
+    let area = TestArea::new("case-only-rename");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "a", &server.url);
+    area.write_file("a/foo", "lower\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "first"]));
+    assert_success(&area.forklift("a", &["lift"]));
+    assert_success(&area.forklift(".", &["franchise", &server.url, "b"]));
+
+    std::fs::remove_file(area.path("a/foo")).unwrap();
+    area.write_file("a/Foo", "upper\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "rename foo to Foo"]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    assert_success(&area.forklift("b", &["lower"]));
+    let names: Vec<String> = std::fs::read_dir(area.path("b")).unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert!(names.contains(&"Foo".to_string()) && !names.contains(&"foo".to_string()), "b holds {:?}", names);
+    assert_eq!(area.read_file("b/Foo"), "upper\n");
+
+    let status = area.forklift("b", &["stocktake"]);
+    assert_success(&status);
+    assert!(stdout(&status).contains("matches the inventory"), "{}", stdout(&status));
+}
