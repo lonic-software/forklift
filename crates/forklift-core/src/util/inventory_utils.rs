@@ -1053,8 +1053,11 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
         // the tentative "carry forward" value if this directory's content turns out unchanged.
         let existing_inventory = match file_utils::retrieve_inventory_or_none_by_key(path.as_key())? {
             (shard_path, Some(bytes)) => {
+                let folder = if path.is_root() { "." } else { path.as_key() };
                 let unreadable = |e: String| format!(
-                    "The inventory of folder \"{}\" cannot be read: {}", path.as_key(), e
+                    "The inventory of folder \"{}\" cannot be read: {}. \"forklift restore --staged {}\" \
+                    resets it to the pallet head, unstaging what was staged in that folder.",
+                    folder, e, folder
                 );
                 let shard_mtime = file_utils::get_symlink_metadata_for_path(&shard_path)
                     .and_then(|m| file_utils::get_content_modification_timestamp_for_file(&m))

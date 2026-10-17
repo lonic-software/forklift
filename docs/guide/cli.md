@@ -228,6 +228,12 @@ like) clears every recorded marker at once, the same way. A directory that faile
 before anything of its own ever got staged has nothing to reset — `restore --staged`
 over it still succeeds, as a no-op that just clears the marker.
 
+A load refuses outright when a folder's stored inventory cannot be read (a truncated file
+after a crash, say), rather than rebuilding it: the inventory is what says which files are
+tracked, and a rebuild would quietly stop tracking any file an ignore rule covers.
+`restore --staged <folder>` resets that folder's inventory to the pallet head, unstaging
+what was staged in it; the error names the exact command.
+
 ### `unload` — unstage (`ul`)
 
 ```sh
