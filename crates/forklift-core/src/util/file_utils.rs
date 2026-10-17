@@ -2454,7 +2454,34 @@ pub struct IgnoreRules {
     user: Vec<Regex>,
 }
 
+/// Whether a user rule matches a directory's key or the key of one of its ancestors: what that
+/// directory passes down to [`IgnoreRules::excludes`] for its entries. Opaque, so it can only
+/// feed that one method; a walk computes it once per directory instead of once per entry.
+#[derive(Clone, Copy)]
+pub struct Coverage(bool);
+
 impl IgnoreRules {
+    /// The coverage the directory with the given key passes to its entries.
+    ///
+    /// # Arguments
+    /// * `dir_key` - The warehouse path key of the directory (`""` for the root).
+    ///
+    /// # Returns
+    /// * `Coverage` - Whether a user rule matches the key or an ancestor's key.
+    pub fn coverage_of(&self, dir_key: &str) -> Coverage {
+        let mut current = dir_key;
+
+        while !current.is_empty() {
+            if self.user.iter().any(|r| r.is_match(current)) {
+                return Coverage(true);
+            }
+
+            current = current.rsplit_once(PATH_SEPARATOR_CHAR).map(|(parent, _)| parent).unwrap_or("");
+        }
+
+        Coverage(false)
+    }
+
     /// Whether the walks should skip the path with the given key.
     ///
     /// An untracked path is covered by a user rule that matches its own key or the key of any
@@ -2463,33 +2490,20 @@ impl IgnoreRules {
     ///
     /// # Arguments
     /// * `key`     - The warehouse path key (see `WarehousePath::as_key`).
-    /// * `tracked` - Whether the path is tracked: a file with a live entry in its parent's
-    ///               shard, or a directory whose key is registered in the inventory metadata.
+    /// * `tracked` - Whether the path is tracked: its name has a live entry in its parent's shard,
+    ///               or its key is registered in the inventory metadata, whatever its type on
+    ///               disk is now.
+    /// * `parent`  - The coverage of the path's parent directory (see [`IgnoreRules::coverage_of`]).
     ///
     /// # Returns
     /// * `true`  - If the path should be skipped.
     /// * `false` - If the path should be walked.
-    pub fn excludes(&self, key: &str, tracked: bool) -> bool {
+    pub fn excludes(&self, key: &str, tracked: bool, parent: Coverage) -> bool {
         if self.built_in.iter().any(|r| r.is_match(key)) {
             return true;
         }
 
-        if tracked || self.user.is_empty() {
-            return false;
-        }
-
-        let mut current = key;
-
-        loop {
-            if self.user.iter().any(|r| r.is_match(current)) {
-                return true;
-            }
-
-            match current.rsplit_once(PATH_SEPARATOR_CHAR) {
-                Some((parent, _)) => current = parent,
-                None => return false,
-            }
-        }
+        !tracked && (parent.0 || self.user.iter().any(|r| r.is_match(key)))
     }
 }
 
@@ -2674,14 +2688,18 @@ mod tests {
     #[test]
     fn default_ignore_rules_cover_the_warehouse_folder_but_no_sibling() {
         let defaults = IgnoreRules { built_in: get_default_ignored_paths().unwrap(), user: Vec::new() };
+        let excludes = |key: &str, tracked: bool| {
+            let parent = key.rsplit_once('/').map(|(parent, _)| parent).unwrap_or("");
+            defaults.excludes(key, tracked, defaults.coverage_of(parent))
+        };
 
         for ignored in [".forklift", ".forklift/config/warehouse.toml"] {
             // Trackedness never overrides a built-in rule.
-            assert!(defaults.excludes(ignored, true), "{} must be ignored", ignored);
+            assert!(excludes(ignored, true), "{} must be ignored", ignored);
         }
         // The ignore file is a sibling too: it is tracked content, like `.gitignore`.
         for tracked in [".forkliftignore", ".forkliftignore.bak", ".forklift-notes", ".forkliftrc", "a/.forklift", "x.forklift"] {
-            assert!(!defaults.excludes(tracked, false), "{} must not be ignored", tracked);
+            assert!(!excludes(tracked, false), "{} must not be ignored", tracked);
         }
     }
 
@@ -2691,17 +2709,21 @@ mod tests {
             built_in: get_default_ignored_paths().unwrap(),
             user: parse_ignore_rules("^build$\n\\.log$\n").unwrap(),
         };
+        let excludes = |key: &str, tracked: bool| {
+            let parent = key.rsplit_once('/').map(|(parent, _)| parent).unwrap_or("");
+            rules.excludes(key, tracked, rules.coverage_of(parent))
+        };
 
         // A tracked path is never excluded by a user rule, an untracked one is.
-        assert!(!rules.excludes("build", true));
-        assert!(rules.excludes("build", false));
-        assert!(!rules.excludes("a/x.log", true));
-        assert!(rules.excludes("a/x.log", false));
+        assert!(!excludes("build", true));
+        assert!(excludes("build", false));
+        assert!(!excludes("a/x.log", true));
+        assert!(excludes("a/x.log", false));
         // Coverage is inherited: the rule matches only the folder's key, not the file's.
-        assert!(rules.excludes("build/new.txt", false));
-        assert!(rules.excludes("build/sub/new.txt", false));
-        assert!(!rules.excludes("build/new.txt", true));
-        assert!(!rules.excludes("src/main.rs", false));
+        assert!(excludes("build/new.txt", false));
+        assert!(excludes("build/sub/new.txt", false));
+        assert!(!excludes("build/new.txt", true));
+        assert!(!excludes("src/main.rs", false));
     }
 
     #[test]

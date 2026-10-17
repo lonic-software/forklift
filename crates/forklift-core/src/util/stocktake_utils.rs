@@ -468,28 +468,22 @@ fn walk_directory_unstaged(context: Arc<ChangeWalkContext>,
         // matches is walked by its own task, never reported "removed" (which fans out into a
         // single-threaded walk of its whole subtree).
         let mut ignored_names: BTreeSet<String> = BTreeSet::new();
+        let coverage = ignore_rules.coverage_of(&key);
 
         for entry_result in file_utils::read_directory(&fs_path)? {
             let entry = entry_result.map_err(|e| format!("Error while reading directory entry: {}", e))?;
             let name = file_utils::get_name_for_file_or_directory(&entry)?;
             let entry_key = join_key(&key, &name);
 
-            let metadata = file_utils::get_symlink_metadata_for_path(&entry.path())?;
-            let item_type = file_utils::get_type_of_dir_entry(&metadata);
+            let tracked = inventory_utils::entry_is_tracked(Some(&inventory), &name, &entry_key, &keys);
 
-            let tracked = if item_type.is_file() {
-                matches!(
-                    inventory.get_item_by_name(&name),
-                    Some(item) if item.state != InventoryItemState::Deleted
-                )
-            } else {
-                keys.contains(&entry_key)
-            };
-
-            if ignore_rules.excludes(&entry_key, tracked) {
+            if ignore_rules.excludes(&entry_key, tracked, coverage) {
                 ignored_names.insert(name);
                 continue;
             }
+
+            let metadata = file_utils::get_symlink_metadata_for_path(&entry.path())?;
+            let item_type = file_utils::get_type_of_dir_entry(&metadata);
 
             if item_type.is_file() {
                 seen_files.insert(name.clone());

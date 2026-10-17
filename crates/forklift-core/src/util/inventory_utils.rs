@@ -13,7 +13,7 @@ use crate::model::task::inventory_builder::inventory_builder_task::InventoryBuil
 use crate::model::task::TaskExecutor;
 use crate::parser;
 use crate::traits::task_context::TaskContext;
-use crate::util::{fanout_utils, file_utils, load_guard_utils, object_utils, path_utils};
+use crate::util::{fanout_utils, file_utils, load_guard_utils, object_utils, office_utils, path_utils};
 use crate::util::object_utils::IngestMode;
 use crate::util::path_utils::WarehousePath;
 
@@ -319,6 +319,19 @@ fn inventory_content_matches(a: &Inventory, b: &Inventory) -> bool {
 /// * `Ok(())`      - If the operation was successful.
 /// * `Err(String)` - If there was an error.
 pub async fn add_changes_to_inventory(path: &WarehousePath) -> Result<(), String> {
+    // The walk skips the metadata folder by its exact name, but a named path is loaded whatever
+    // the rules say, so refuse it here. The test is the one `stack` uses: a spelling some file
+    // system opens as the metadata folder (`.Forklift`, `.forklift.`) is refused too.
+    let first_component = path.as_key().split('/').next().unwrap_or("");
+
+    if office_utils::is_metadata_folder_name(first_component) {
+        return Err(format!(
+            "Refusing to load \"{}\": {:?} is the warehouse's metadata folder on some file systems, \
+            and it is never tracked.",
+            path.as_key(), first_component
+        ));
+    }
+
     let is_directory = file_utils::is_directory(&path.to_fs_path())?;
 
     if is_directory {
@@ -368,9 +381,12 @@ pub enum TrackedKind {
 /// Decide whether a (non-root) path is a file or a directory for `remove` and `restore`.
 ///
 /// Registration says a directory is tracked, not that the path is a directory now: after a
-/// staged flip, a registered key can name a file on disk, and a live file entry can name a
-/// directory. So the type on disk decides when the path exists, and the inventory only when it
-/// is gone: a live file entry in the parent's shard first, then the key's registration.
+/// flip, a registered key can name a file on disk, and a live file entry can name a directory.
+/// So the inventory entry matching the type on disk wins, then the other one, and a path that is
+/// gone takes the live file entry first:
+/// * a directory on disk: registered, then a live file entry, else untracked;
+/// * a file on disk, or nothing: a live file entry, then registered, else the file branch (which
+///   reports the path as not in the inventory).
 ///
 /// # Arguments
 /// * `path` - The warehouse path.
@@ -379,32 +395,44 @@ pub enum TrackedKind {
 /// * `Ok(TrackedKind)` - What to treat the path as.
 /// * `Err(String)`     - If the path, the parent's shard or the metadata could not be read.
 pub fn tracked_kind(path: &WarehousePath) -> Result<TrackedKind, String> {
-    match std::fs::symlink_metadata(path.to_fs_path()) {
-        Ok(metadata) if metadata.is_dir() => {
-            if is_tracked_directory(path.as_key())? {
-                Ok(TrackedKind::Directory)
-            } else {
-                Ok(TrackedKind::UntrackedDirectory)
-            }
-        }
-        Ok(_) => Ok(TrackedKind::File),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let (parent, file_name) = path.split_parent()?;
-            let (_, parent_inventory) = retrieve_inventory_or_empty(&parent)?;
+    let is_directory_on_disk = match std::fs::symlink_metadata(path.to_fs_path()) {
+        Ok(metadata) => metadata.is_dir(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(format!("Error while getting metadata for path \"{}\": {}", path.as_key(), e)),
+    };
 
-            let has_live_file_entry = matches!(
-                parent_inventory.get_item_by_name(&file_name),
-                Some(item) if item.state != InventoryItemState::Deleted
-            );
+    let (parent, file_name) = path.split_parent()?;
+    let (_, parent_inventory) = retrieve_inventory_or_empty(&parent)?;
+    let has_live_file_entry = has_live_entry(&parent_inventory, &file_name);
+    let registered = is_tracked_directory(path.as_key())?;
 
-            if !has_live_file_entry && is_tracked_directory(path.as_key())? {
-                Ok(TrackedKind::Directory)
-            } else {
-                Ok(TrackedKind::File)
-            }
-        }
-        Err(e) => Err(format!("Error while getting metadata for path \"{}\": {}", path.as_key(), e)),
-    }
+    Ok(match (is_directory_on_disk, registered, has_live_file_entry) {
+        (true, true, _) => TrackedKind::Directory,
+        (true, false, true) => TrackedKind::File,
+        (true, false, false) => TrackedKind::UntrackedDirectory,
+        (false, _, true) => TrackedKind::File,
+        (false, true, false) => TrackedKind::Directory,
+        (false, false, false) => TrackedKind::File,
+    })
+}
+
+/// Whether a shard holds a live (not `Deleted`) entry with the given name.
+fn has_live_entry(inventory: &Inventory, name: &str) -> bool {
+    matches!(inventory.get_item_by_name(name), Some(item) if item.state != InventoryItemState::Deleted)
+}
+
+/// Whether the entry `name` of a directory is tracked, for the ignore rules: its name has a live
+/// entry in the directory's shard, or its key is registered. Deliberately blind to the entry's
+/// type on disk now, so that after a file/directory flip the tracked half is still reported
+/// rather than hidden by a rule.
+///
+/// # Arguments
+/// * `shard`      - The directory's shard (`None` when it has none, or it could not be read).
+/// * `name`       - The entry's name.
+/// * `key`        - The entry's warehouse path key.
+/// * `registered` - The registered directory keys.
+pub fn entry_is_tracked(shard: Option<&Inventory>, name: &str, key: &str, registered: &BTreeSet<String>) -> bool {
+    shard.is_some_and(|inventory| has_live_entry(inventory, name)) || registered.contains(key)
 }
 
 /// Whether the directory with the given key is tracked: registered in the inventory metadata.
@@ -951,9 +979,23 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
         // by its parent's per-entry filter below. A folder load never force-tracks, so an
         // untracked root the rules cover adds nothing. A tracked one is walked: its tracked
         // content is refreshed, and its untracked content stays skipped by the filter below.
-        if !path.is_root() && ignore_rules.excludes(path.as_key(), registered.contains(path.as_key())) {
-            return Ok(());
+        // Trackedness is by name, as in the per-entry filter, so the parent's shard is read, but
+        // only when the rules would exclude the path.
+        if !path.is_root() {
+            let (parent, name) = path.split_parent()?;
+            let parent_coverage = ignore_rules.coverage_of(parent.as_key());
+
+            if ignore_rules.excludes(path.as_key(), registered.contains(path.as_key()), parent_coverage) {
+                let (_, parent_inventory) = retrieve_inventory_or_empty(&parent)?;
+                let tracked = entry_is_tracked(Some(&parent_inventory), &name, path.as_key(), &registered);
+
+                if ignore_rules.excludes(path.as_key(), tracked, parent_coverage) {
+                    return Ok(());
+                }
+            }
         }
+
+        let coverage = ignore_rules.coverage_of(path.as_key());
 
         // The existing inventory of this directory (if any) is the stat cache: entries whose
         // file metadata is unchanged are reused without reading or hashing the file.
@@ -984,22 +1026,18 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
             )?;
 
             let name = file_utils::get_name_for_file_or_directory(&entry)?;
-            let metadata = file_utils::get_symlink_metadata_for_path(&entry.path())?;
-            let item_type = file_utils::get_type_of_dir_entry(&metadata);
             let entry_path = path.child(&name);
 
-            let tracked = if item_type.is_file() {
-                existing_inventory.as_ref().is_some_and(|(inv, _)| matches!(
-                    inv.get_item_by_name(&name),
-                    Some(item) if item.state != InventoryItemState::Deleted
-                ))
-            } else {
-                registered.contains(entry_path.as_key())
-            };
+            let tracked = entry_is_tracked(
+                existing_inventory.as_ref().map(|(inv, _)| inv), &name, entry_path.as_key(), &registered,
+            );
 
-            if ignore_rules.excludes(entry_path.as_key(), tracked) {
+            if ignore_rules.excludes(entry_path.as_key(), tracked, coverage) {
                 continue;
             }
+
+            let metadata = file_utils::get_symlink_metadata_for_path(&entry.path())?;
+            let item_type = file_utils::get_type_of_dir_entry(&metadata);
 
             if item_type.is_file() {
                 let existing_entry = existing_inventory.as_ref()
@@ -1105,7 +1143,8 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
 
         // Registered only once this directory's content is decided: registration is what makes
         // a directory tracked, so a task that failed partway must not leave its key registered
-        // with nothing decided for it.
+        // with nothing decided for it. (A descendant whose task did finish still registers it,
+        // through the ancestor closure: it is then the ancestor of tracked content.)
         context.new_inventory_paths.lock().await.insert(path.as_key().to_string());
 
         Ok(())
@@ -1240,28 +1279,29 @@ fn directory_has_no_untracked_content(key: &str,
         None => Inventory::new(),
     };
 
+    let coverage = ignore_rules.coverage_of(key);
+
     for entry_result in file_utils::read_directory(&fs_path)? {
         let entry = entry_result.map_err(|e| format!("Error while reading directory entry: {}", e))?;
         let name = file_utils::get_name_for_file_or_directory(&entry)?;
         let entry_key = if key.is_empty() { name.clone() } else { format!("{}/{}", key, name) };
 
-        let metadata = file_utils::get_symlink_metadata_for_path(&entry.path())?;
-        let item_type = file_utils::get_type_of_dir_entry(&metadata);
-
-        let tracked = if item_type.is_file() {
-            matches!(
-                inventory.get_item_by_name(&name),
-                Some(item) if item.state != InventoryItemState::Deleted
-            )
-        } else {
-            registered.contains(&entry_key)
-        };
-
-        if ignore_rules.excludes(&entry_key, tracked) {
+        if ignore_rules.excludes(&entry_key, entry_is_tracked(Some(&inventory), &name, &entry_key, registered), coverage) {
             continue;
         }
 
-        if !tracked || (!item_type.is_file() && !directory_has_no_untracked_content(&entry_key, ignore_rules, registered)?) {
+        let metadata = file_utils::get_symlink_metadata_for_path(&entry.path())?;
+        let item_type = file_utils::get_type_of_dir_entry(&metadata);
+
+        // Tracked as what it is on disk now: a file by its live entry, a directory by its
+        // registration and, recursively, its content.
+        let is_tracked = if item_type.is_file() {
+            has_live_entry(&inventory, &name)
+        } else {
+            registered.contains(&entry_key) && directory_has_no_untracked_content(&entry_key, ignore_rules, registered)?
+        };
+
+        if !is_tracked {
             return Ok(false);
         }
     }
@@ -1995,6 +2035,28 @@ pub fn cleanup_after_stack_with(prepared: &PreparedInventory,
     }
 
     batch.finish()?;
+
+    // A key registered only as the ancestor of tracked content has no shard of its own. Once
+    // that content is gone (its own keys removed above, or never more than a single file's
+    // parent), the key would otherwise stay registered, and so tracked, for good: an ignore rule
+    // could never cover the folder again. Deepest first, so a chain of such ancestors goes in
+    // one pass.
+    for key in metadata.iter().rev() {
+        let key = metadata_entry_to_key(key);
+
+        if key.is_empty() || removed_keys.contains(key) || prepared.shards.contains_key(key) {
+            continue;
+        }
+
+        let prefix = format!("{}/", key);
+        let has_registered_descendant = metadata.range(prefix.clone()..)
+            .take_while(|other| other.starts_with(&prefix))
+            .any(|other| !removed_keys.contains(metadata_entry_to_key(other)));
+
+        if !has_registered_descendant {
+            removed_keys.insert(key.to_string());
+        }
+    }
 
     update_inventory_metadata(&BTreeSet::new(), &removed_keys)
 }

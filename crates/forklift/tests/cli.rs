@@ -1243,6 +1243,61 @@ fn restore_follows_a_file_replaced_by_a_directory() {
 }
 
 #[test]
+fn a_tracked_file_a_rule_covers_replaced_by_a_folder_still_shows_its_removal() {
+    let warehouse = warehouse_with_a_diverged_pallet("flip-file-to-dir-ignored");
+    warehouse.write_file(".forkliftignore", "^notes\\.txt$\n");
+    std::fs::remove_file(warehouse.root.join("notes.txt")).unwrap();
+    warehouse.write_file("notes.txt/new.txt", "new\n");
+
+    let unstaged = changes(&warehouse, "unstaged");
+    assert!(unstaged.iter().any(|(_, path)| path == "notes.txt"),
+        "the tracked file's removal must stay visible under the rule: {:?}", unstaged);
+    let untracked = changes(&warehouse, "untracked");
+    assert!(!untracked.iter().any(|(_, path)| path.starts_with("notes.txt/")),
+        "the rule still covers the folder's untracked content: {:?}", untracked);
+
+    // Loading the folder by name stages the tracked file's removal, and nothing the rule covers.
+    assert_success(&warehouse.run(&["load", "notes.txt"]));
+    let staged = changes(&warehouse, "staged");
+    assert!(staged.contains(&("removed".to_string(), "notes.txt".to_string())), "{:?}", staged);
+    assert!(!staged.iter().any(|(_, path)| path.starts_with("notes.txt/")), "{:?}", staged);
+}
+
+#[test]
+fn remove_untracks_a_file_replaced_by_a_folder_on_disk() {
+    let warehouse = warehouse_with_a_diverged_pallet("remove-flip-file-to-dir");
+    std::fs::remove_file(warehouse.root.join("notes.txt")).unwrap();
+    warehouse.write_file("notes.txt/new.txt", "new\n");
+
+    assert_success(&warehouse.run(&["remove", "notes.txt"]));
+    assert!(changes(&warehouse, "staged").contains(&("removed".to_string(), "notes.txt".to_string())));
+}
+
+#[test]
+fn remove_untracks_a_folder_replaced_by_a_file_on_disk() {
+    let warehouse = warehouse_with_a_diverged_pallet("remove-flip-dir-to-file");
+    std::fs::remove_dir_all(warehouse.root.join("build")).unwrap();
+    warehouse.write_file("build", "now a file\n");
+
+    assert_success(&warehouse.run(&["remove", "build"]));
+    assert!(changes(&warehouse, "staged").contains(&("removed".to_string(), "build/out.txt".to_string())));
+}
+
+#[test]
+fn an_ancestor_registered_only_for_removed_content_stops_being_tracked() {
+    let warehouse = warehouse_with_a_nested_single_file_load("prune-ancestor");
+    warehouse.write_file("a/untracked.txt", "u\n");
+    std::fs::remove_dir_all(warehouse.root.join("a/b")).unwrap();
+    assert_success(&warehouse.run(&["remove", "a/b"]));
+    assert_success(&warehouse.run(&["stack", "drop a/b"]));
+
+    // "a" was registered only as the parent of a/b: with a/b gone it holds nothing tracked.
+    let remove = warehouse.run(&["remove", "a"]);
+    assert!(!remove.status.success(), "a must no longer be tracked: {}", stdout(&remove));
+    assert!(stderr(&remove).contains("No inventory found for folder \"a\""), "{}", stderr(&remove));
+}
+
+#[test]
 fn stack_consumes_staged_removals() {
     let warehouse = TestWarehouse::new("stack-removal");
     warehouse.write_file("keep.txt", "keep\n");

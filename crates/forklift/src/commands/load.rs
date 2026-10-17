@@ -1,5 +1,5 @@
 use serde::Serialize;
-use forklift_core::util::{inventory_utils, office_utils};
+use forklift_core::util::inventory_utils;
 use forklift_core::util::path_utils::WarehousePath;
 use crate::output::{self, CommandOutput};
 
@@ -18,19 +18,6 @@ pub async fn handle_command(target: &str) -> Result<(), String> {
     // In a scoped bay an out-of-scope path is not materialized, so staging it would be a
     // confusing "not in the inventory" (or a silent no-op) — refuse it clearly instead (§7.6).
     crate::commands::scope::ensure_path_in_scope(path.as_key())?;
-
-    // The walk skips the metadata folder by its exact name, but a named path is loaded whatever
-    // the rules say, so refuse it here. The test is the one `stack` uses: a spelling some file
-    // system opens as the metadata folder (`.Forklift`, `.forklift.`) is refused too.
-    let first_component = path.as_key().split('/').next().unwrap_or("");
-
-    if office_utils::is_metadata_folder_name(first_component) {
-        return Err(format!(
-            "Refusing to load \"{}\": {:?} is the warehouse's metadata folder on some file systems, \
-            and it is never tracked.",
-            path.as_key(), first_component
-        ));
-    }
 
     inventory_utils::add_changes_to_inventory(&path).await?;
 
