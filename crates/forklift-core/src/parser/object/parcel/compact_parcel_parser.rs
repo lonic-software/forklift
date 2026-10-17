@@ -28,12 +28,13 @@ pub fn parse_compact_parcel(offset: usize, content: &[u8]) -> Result<Parcel, Str
     // Every hash a parcel names is later printed, walked and turned into a store path, and the
     // parcel may have arrived from a remote: one that is not hash-shaped is refused here, once,
     // rather than trusted by every reader.
+    // Debug-quoted, so the refusal shows the bad value with any hidden character escaped.
     if !object_utils::is_object_hash(&parcel.tree_hash) {
-        return Err("The parcel's tree hash is not an object hash.".to_string());
+        return Err(format!("The parcel's tree hash {:?} is not an object hash.", parcel.tree_hash));
     }
 
-    if parcel.parents.iter().any(|parent| !object_utils::is_object_hash(parent)) {
-        return Err("A parent of the parcel is not an object hash.".to_string());
+    if let Some(parent) = parcel.parents.iter().find(|parent| !object_utils::is_object_hash(parent)) {
+        return Err(format!("The parcel's parent {:?} is not an object hash.", parent));
     }
 
     Ok(parcel)
@@ -130,7 +131,8 @@ mod tests {
 
         assert!(parse(good.clone(), vec![good.clone()]).is_ok());
         assert!(parse(bad.clone(), vec![]).err().unwrap().contains("tree hash"));
-        assert!(parse(good.clone(), vec![good.clone(), bad]).err().unwrap().contains("parent"));
+        let refused = parse(good.clone(), vec![good.clone(), bad]).err().unwrap();
+        assert!(refused.contains("parent") && refused.contains("\\u{1b}[2J"), "names the bad value: {}", refused);
         assert!(parse(good.to_uppercase(), vec![]).is_err(), "only the canonical spelling is a hash");
     }
 }

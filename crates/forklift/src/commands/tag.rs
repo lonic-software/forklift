@@ -259,8 +259,9 @@ impl CommandOutput for TagList {
         }
 
         // Sanitized once here (not stored on `TagView`, which `--json` also reads — see
-        // `sanitize`'s doc comment) so the column width matches what actually prints.
-        let names: Vec<String> = self.tags.iter().map(|tag| sanitize(&tag.name)).collect();
+        // `sanitize`'s doc comment) so the column width matches what actually prints; a padded
+        // column also spaces its tabs, since a tab prints wider than the one character it counts.
+        let names: Vec<String> = self.tags.iter().map(|tag| sanitize(&tag.name).replace('\t', " ")).collect();
         let width = names.iter().map(|name| name.chars().count()).max().unwrap_or(0);
 
         for (tag, name) in self.tags.iter().zip(names) {

@@ -180,9 +180,10 @@ impl BlamedParcel {
 impl CommandOutput for Blame {
     fn render_human(&self) {
         // Each parcel's label is built once, not once per line it blames. Column widths: the
-        // author label (in characters, as `{:<w$}` pads) and the line-number gutter.
+        // author label (in characters, as `{:<w$}` pads, so its tabs are spaced) and the
+        // line-number gutter.
         let labels: HashMap<&str, String> = self.parcels.iter()
-            .map(|(hash, parcel)| (hash.as_str(), parcel.author_label()))
+            .map(|(hash, parcel)| (hash.as_str(), parcel.author_label().replace('\t', " ")))
             .collect();
 
         let author_width = self.lines.iter()

@@ -204,8 +204,8 @@ pub enum CoreError {
     Refusal {
         /// The stable classification.
         code: RefusalCode,
-        /// The human explanation. Rendered verbatim by [`fmt::Display`]; control characters are
-        /// stripped at construction so it stays frame-safe.
+        /// The human explanation. Rendered verbatim by [`fmt::Display`]; [sanitized](sanitize) at
+        /// construction so it stays frame-safe (every control character but tab becomes a space).
         message: String,
         /// The machine-actionable recovery step.
         next_step: String,
@@ -219,8 +219,8 @@ pub enum CoreError {
 }
 
 impl CoreError {
-    /// Build a classified refusal. Strips ASCII control characters (including `\u{1f}`, the frame
-    /// separator) out of the message and next step so the value is safe to render *and* safe to
+    /// Build a classified refusal. [Sanitizes](sanitize) every control character but tab (including
+    /// `\u{1f}`, the frame separator) out of the message and next step so the value is safe to render *and* safe to
     /// carry through the bridge shim regardless of where the interpolated text came from — a path
     /// read back off disk (a tree or inventory entry) can carry a control character that
     /// `WarehousePath::from_user_input`'s guard never saw.
