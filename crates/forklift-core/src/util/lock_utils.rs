@@ -274,39 +274,56 @@ pub fn raise_open_file_limit() {
             return;
         }
 
-        let (current, hard) = (limit.rlim_cur, limit.rlim_max);
-        let try_raise = |target: libc::rlim_t| {
+        let hard = limit.rlim_max;
+        #[cfg(target_os = "macos")]
+        let fallback = Some(MACOS_OPEN_MAX);
+        #[cfg(not(target_os = "macos"))]
+        let fallback = None;
+
+        largest_accepted_limit(limit.rlim_cur, hard, fallback, |target| {
             let raised = libc::rlimit { rlim_cur: target, rlim_max: hard };
             // SAFETY: `setrlimit` only reads the `rlimit` it is given.
-            target > current && unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0
-        };
-        if try_raise(hard) {
-            return;
-        }
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) == 0 }
+        });
+    }
+}
 
-        // Search for the largest limit the kernel accepts, between the current one (accepted) and
-        // the first refused one.
-        let (mut accepted, mut refused) = (current, hard);
-        #[cfg(target_os = "macos")]
-        {
-            let start = MACOS_OPEN_MAX.min(hard);
-            if start > current {
-                if try_raise(start) {
-                    accepted = start;
-                } else {
-                    refused = start;
-                }
-            }
-        }
-        while refused > accepted && refused - accepted > 1 {
-            let middle = accepted + (refused - accepted) / 2;
-            if try_raise(middle) {
-                accepted = middle;
-            } else {
-                refused = middle;
-            }
+/// The search behind [`raise_open_file_limit`], apart from the kernel so it can be tested against
+/// any ceiling: `accept` sets a soft limit and says whether the kernel took it. Tries `hard`, then
+/// `fallback` (capped at `hard`), then searches between the largest accepted limit and the
+/// smallest refused one. Only limits above `current` are ever tried, so the limit never drops.
+///
+/// # Returns
+/// The limit in force at the end: the largest one accepted, or `current` if none was.
+#[cfg(unix)]
+fn largest_accepted_limit(current: libc::rlim_t,
+                          hard: libc::rlim_t,
+                          fallback: Option<libc::rlim_t>,
+                          mut accept: impl FnMut(libc::rlim_t) -> bool) -> libc::rlim_t {
+    let mut try_raise = |target: libc::rlim_t| target > current && accept(target);
+    if try_raise(hard) {
+        return hard;
+    }
+
+    // The largest limit known to be accepted, and the smallest known to be refused.
+    let (mut accepted, mut refused) = (current, hard);
+    if let Some(start) = fallback.map(|start| start.min(hard)).filter(|&start| start > current) {
+        if try_raise(start) {
+            accepted = start;
+        } else {
+            refused = start;
         }
     }
+    while refused > accepted && refused - accepted > 1 {
+        let middle = accepted + (refused - accepted) / 2;
+        if try_raise(middle) {
+            accepted = middle;
+        } else {
+            refused = middle;
+        }
+    }
+
+    accepted
 }
 
 /// Open (creating if needed) the store-access sidecar at the current storage root, at an absolute
@@ -533,6 +550,37 @@ mod tests {
             "the sidecar stays: it is never deleted");
 
         std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// The open-file search against a fake kernel: it lands on the largest limit the ceiling
+    /// allows, from below or above the fallback, and never tries a limit at or under the current
+    /// one — including when the current limit is already above the fallback, where a search that
+    /// started from the fallback would run downward.
+    #[cfg(unix)]
+    #[test]
+    fn the_open_file_search_finds_the_largest_accepted_limit_and_never_lowers() {
+        let search = |current, hard, fallback, ceiling| {
+            let mut tried = Vec::new();
+            let mut limit = current;
+            let final_limit = largest_accepted_limit(current, hard, fallback, |target| {
+                tried.push(target);
+                let ok = target <= ceiling;
+                if ok { limit = target; }
+                ok
+            });
+            assert!(tried.iter().all(|&target| target > current), "tried a limit at or under the current one: {:?}", tried);
+            assert_eq!(final_limit, limit, "the result is the limit in force");
+            final_limit
+        };
+        let infinity = libc::RLIM_INFINITY;
+
+        assert_eq!(search(256, 65536, None, 65536), 65536, "the hard limit, when accepted");
+        assert_eq!(search(256, infinity, Some(10240), 8000), 8000, "a ceiling under the fallback");
+        assert_eq!(search(256, infinity, Some(10240), 245760), 245760, "a ceiling over the fallback");
+        assert_eq!(search(1024, 4096, None, 3000), 3000, "a ceiling under a finite hard limit");
+        assert_eq!(search(1_048_576, infinity, Some(10240), 245760), 1_048_576,
+            "a current limit above everything the kernel accepts stays");
+        assert_eq!(search(256, 256, Some(10240), infinity), 256, "nothing to raise");
     }
 
     /// A sidecar another user created can be read-only to this one. Taking either side of the lock
