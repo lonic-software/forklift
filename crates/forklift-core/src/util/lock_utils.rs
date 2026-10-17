@@ -262,9 +262,10 @@ const MACOS_OPEN_MAX: libc::rlim_t = 10240;
 /// store-access hold — one open file — per warehouse it serves, for as long as it serves it, so in
 /// multi-warehouse mode the count grows with the warehouses served, and the default soft limit
 /// (256 on macOS) is far below what the hard limit allows. Tries the hard limit, then searches for
-/// the largest limit below it the kernel accepts (from `OPEN_MAX` up on macOS, whose kernel also
-/// caps the limit at `kern.maxfilesperproc`); never lowers the limit. Best-effort: a limit that cannot be read
-/// or raised is left as it is. A no-op off Unix, which has no such per-process soft limit.
+/// the largest limit below it the kernel accepts (on macOS, whose kernel also caps the limit at
+/// `kern.maxfilesperproc`, trying `OPEN_MAX` first when it is above the current limit); never
+/// lowers the limit. Best-effort: a limit that cannot be read or raised is left as it is. A no-op
+/// off Unix, which has no such per-process soft limit.
 pub fn raise_open_file_limit() {
     #[cfg(unix)]
     {

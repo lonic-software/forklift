@@ -217,12 +217,11 @@ revocation by more than about a day.
   `<root>/.forklift/serve.lock` and retry. It is also refused while a `forklift` command
   that writes objects runs against the root, which could reuse an unreachable object the
   sweep is about to delete; that lock is a kernel lock, so it never outlives its process.
-  A server keeps that lock's file open for every warehouse it serves, so in multi-warehouse
-  mode it raises its own soft limit on open files at startup, as far toward the hard limit as
-  the kernel allows. A served
-  warehouse stays open until the server stops, so that limit also bounds how many distinct
-  warehouses one server process can serve; raise the hard limit (`ulimit -Hn`, systemd
-  `LimitNOFILE`) to match the fleet.
+  A server keeps that lock's file open for every warehouse it serves, so it raises its own soft
+  limit on open files at startup, as far toward the hard limit as the kernel allows. In
+  multi-warehouse mode a served warehouse stays open until the server stops, so that limit also
+  bounds how many distinct warehouses one server process can serve; raise the hard limit
+  (`ulimit -Hn`, systemd `LimitNOFILE`) to match the fleet.
 - **Repack:** `forklift compact --all` against a served root is refused for the same reason
   as `gc` — it drops unreachable packed objects with no grace period at all — so it also
   belongs in the maintenance window. Plain `forklift compact` (incremental) never drops an
