@@ -5,7 +5,7 @@ use std::process::{Command, Output};
 const FORKLIFT: &str = env!("CARGO_BIN_EXE_forklift");
 
 mod common;
-use common::forklift_command;
+use common::{forklift_command, hold_store_access};
 
 /// A temporary warehouse directory that is deleted when the test ends.
 struct TestWarehouse {
@@ -6798,6 +6798,63 @@ fn compact_finds_a_directorys_path_base_across_many_versions() {
 }
 
 #[test]
+fn a_writer_waits_for_object_store_maintenance_and_says_so() {
+    // FORK-150: a writing command holds the object store shared for its whole run, so a full
+    // repack, gc or scope-prune in another process — which takes it exclusively — cannot delete
+    // an object the command has just decided it can reuse. Writers wait rather than fail, and
+    // say what they are waiting for. The test process stands in for the maintenance.
+    //
+    // Revert: the command skips its shared hold → it never waits and finishes while the
+    // maintenance still holds the store → red.
+    use std::io::BufRead;
+
+    let warehouse = TestWarehouse::new("store-access-wait");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    warehouse.write_file("f.txt", "hello\n");
+
+    let maintenance = hold_store_access(&warehouse.root, true);
+    let mut child = forklift_command()
+        .args(["load", "."])
+        .current_dir(&warehouse.root)
+        .env("FORKLIFT_GLOBAL_CONFIG", warehouse.home.join("global-config.toml"))
+        .env("FORKLIFT_KEYS_DIR", warehouse.home.join("test-keys"))
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let (lines, received) = std::sync::mpsc::channel();
+    let stderr = child.stderr.take().unwrap();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stderr).lines() {
+            let Ok(line) = line else { break };
+            if lines.send(line).is_err() { break }
+        }
+    });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match received.recv_timeout(left) {
+            Ok(line) if line.contains("Waiting for object-store maintenance") => break,
+            Ok(_) => continue,
+            Err(_) => {
+                let _ = child.kill();
+                panic!("the load never said it was waiting for the maintenance");
+            }
+        }
+    }
+    assert!(child.try_wait().unwrap().is_none(), "the load must still be waiting while the maintenance runs");
+
+    drop(maintenance);
+    let status = child.wait().unwrap();
+    assert!(status.success(), "once the maintenance is done, the load proceeds");
+    let status = json(&warehouse.run(&["--json", "stocktake"]));
+    assert!(status["data"]["staged"].as_array().unwrap().iter().any(|entry| entry["path"] == "f.txt"),
+        "the waited-for load staged the file: {}", status);
+}
+
+#[test]
 fn a_mutating_command_runs_maintenance_when_due() {
     let warehouse = TestWarehouse::new("auto-maintenance");
     assert_success(&warehouse.run(&["prepare"]));
@@ -6825,6 +6882,9 @@ fn a_mutating_command_runs_maintenance_when_due() {
 
     // Enable it: the next mutating command runs `compact --all` synchronously (under its own
     // lock, before it returns), so by the time it returns the packs are already consolidated.
+    // The command must have released its shared store-access hold first: a full repack takes the
+    // store exclusively, and a process's own shared hold would refuse it — quietly, on the
+    // auto-maintenance path, leaving the packs unconsolidated.
     assert_success(&warehouse.run(&["config", "maintenance.auto", "true"]));
     warehouse.write_file("f.txt", "trigger\n");
     assert_success(&warehouse.run(&["load", "."]));

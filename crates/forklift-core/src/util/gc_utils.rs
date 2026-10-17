@@ -485,6 +485,32 @@ pub(crate) mod tests {
         assert!(!live.contains(&f.web_blob), "nothing beneath a sealed boundary is individually marked");
     }
 
+    /// FORK-150: gc is refused while any writer holds the store, and the unreachable loose object
+    /// past its grace period survives; with no holder the same sweep deletes it. A writer in
+    /// another bay is stood in for by a shared hold on a second open file.
+    ///
+    /// Revert: drop the store-access acquire from `collect_garbage` → the guarded sweep deletes
+    /// the object → red.
+    #[test]
+    fn gc_refuses_while_a_writer_holds_the_store_and_keeps_the_object_it_would_delete() {
+        let _scratch = Scratch::new("gc-store-access");
+        let garbage = store_blob("unreachable, and found present by another bay's dedup\n");
+
+        let writer = lock_utils::StoreAccessLock::shared(|| panic!("nothing holds the store exclusively"))
+            .expect("hold the store shared, as a writer in another bay does");
+        let error = match collect_garbage(0) {
+            Ok(_) => panic!("gc must refuse beside a writer"),
+            Err(error) => error,
+        };
+        assert!(error.contains("using the object store"), "the refusal should say the store is in use: {}", error);
+        assert!(loose_path(&garbage).exists(), "the refused sweep must leave the unreachable object");
+        drop(writer);
+
+        let stats = collect_garbage(0).expect("gc runs once no writer holds the store");
+        assert_eq!(stats.deleted, 1, "with no writer, the sweep deletes the unreachable object");
+        assert!(!loose_path(&garbage).exists(), "the unreachable object is gone");
+    }
+
     #[test]
     fn gc_collects_garbage_and_never_touches_the_sealed_spine() {
         let _scratch = Scratch::new("gc-tolerates-absence");

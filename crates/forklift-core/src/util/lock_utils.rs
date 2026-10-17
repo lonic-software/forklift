@@ -425,6 +425,50 @@ mod tests {
         std::fs::remove_dir_all(&temp).ok();
     }
 
+    /// Writers share the store; a deleter's exclusive try is refused beside any of them; a
+    /// writer's try is refused beside a deleter, and its waiting acquire announces the wait once
+    /// and is granted when the deleter releases. Separate open files stand in for separate
+    /// processes: the kernel lock is per open file.
+    #[test]
+    fn store_access_is_shared_among_writers_and_exclusive_against_deleters() {
+        let temp = std::env::temp_dir().join(format!("forklift-storeaccess-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(temp.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+
+        let first = StoreAccessLock::shared(|| panic!("an uncontended shared hold must not wait"))
+            .expect("the first writer");
+        let second = StoreAccessLock::try_shared().expect("a second writer shares the store");
+        let error = match StoreAccessLock::try_exclusive() {
+            Ok(_) => panic!("a deleter must be refused while a writer holds the store"),
+            Err(error) => error,
+        };
+        assert!(error.contains("using the object store"), "the refusal names the contention: {}", error);
+        drop(first);
+        assert!(StoreAccessLock::try_exclusive().is_err(), "one remaining writer still refuses a deleter");
+        drop(second);
+
+        let deleter = StoreAccessLock::try_exclusive().expect("a deleter runs once no writer holds the store");
+        assert!(StoreAccessLock::try_shared().is_err(), "a server's try is refused while a deleter runs");
+        assert!(StoreAccessLock::try_exclusive().is_err(), "two deleters never run together");
+
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let root = temp.clone();
+        let writer = std::thread::spawn(move || {
+            let _scope = StorageRootScope::enter(&root);
+            StoreAccessLock::shared(move || waiting_tx.send(()).unwrap()).map(|_| ())
+        });
+        waiting_rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("a writer blocked by a deleter announces its wait");
+        drop(deleter);
+        writer.join().unwrap().expect("the waiting writer is granted once the deleter releases");
+
+        assert!(temp.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT).join(FILE_NAME_STORE_ACCESS_LOCK).is_file(),
+            "the sidecar stays: it is never deleted");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
     #[test]
     fn the_serve_lock_is_exclusive_releases_on_drop_and_is_distinct_from_the_store_lock() {
         let temp = std::env::temp_dir().join(format!("forklift-servelock-{}", std::process::id()));

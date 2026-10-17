@@ -6787,6 +6787,39 @@ mod tests {
         std::fs::remove_dir_all(&temp).ok();
     }
 
+    /// FORK-150: a full repack is refused while any writer holds the store, and the packed
+    /// unreachable object it would drop survives; with no holder the same repack drops it. A
+    /// writer in another bay is stood in for by a shared hold on a second open file, which the
+    /// kernel treats exactly like another process's. Incremental compaction drops nothing on a
+    /// liveness decision and still runs beside the writer.
+    ///
+    /// Revert: drop the store-access acquire from `compact` → the guarded repack drops the
+    /// object → red.
+    #[test]
+    fn a_repack_refuses_while_a_writer_holds_the_store_and_keeps_the_object_it_would_drop() {
+        let temp = fresh_root("repack-store-access");
+        let _scope = StorageRootScope::enter(&temp);
+
+        let content = b"unreachable, packed, and found present by another bay's dedup".to_vec();
+        let hash = blake3::hash(&content).to_hex().to_string();
+        store_loose(&hash, &content);
+        compact(false, false, &Progress::NONE).unwrap();
+        assert!(is_in_packs(&hash).unwrap(), "sanity: the object is packed before the repack");
+
+        let writer = lock_utils::StoreAccessLock::shared(|| panic!("nothing holds the store exclusively"))
+            .expect("hold the store shared, as a writer in another bay does");
+        let error = compact(true, false, &Progress::NONE).expect_err("a repack must refuse beside a writer");
+        assert!(error.contains("using the object store"), "the refusal should say the store is in use: {}", error);
+        assert!(is_in_packs(&hash).unwrap(), "the refused repack must leave the unreachable object packed");
+        assert!(compact(false, false, &Progress::NONE).is_ok(), "incremental compaction runs beside a writer");
+        drop(writer);
+
+        compact(true, false, &Progress::NONE).expect("a repack runs once no writer holds the store");
+        assert!(!is_in_packs(&hash).unwrap(), "with no writer, the repack drops the unreachable object");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
     /// FORK-106, the open probe: an unenumerable pair whose index could not be opened is retried
     /// once the *index* opens, even while its data file still cannot be — re-classifying it
     /// quarantined, so a hash its index names reads `Unverifiable`, never `Absent`.
