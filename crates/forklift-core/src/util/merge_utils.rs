@@ -1476,6 +1476,10 @@ mod tests {
             assert_eq!(read_back.their_head, state.their_head);
         }
 
+        std::fs::write(get_consolidation_state_path(), format!("{}\nfeature\n", "ab".repeat(32))).unwrap();
+        let error = read_consolidation_state().err().expect("a headerless state file must be refused");
+        assert!(error.contains("has no format header") && error.contains("Abort the consolidation"), "{}", error);
+
         std::fs::remove_dir_all(&temp).ok();
     }
 }

@@ -462,4 +462,40 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn a_redirect_without_its_format_header_is_refused() {
+        let dir = std::env::temp_dir()
+            .join(format!("forklift-bay-utils-redirect-headerless-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let forklift_path = dir.join(FOLDER_NAME_FORKLIFT_ROOT);
+        std::fs::write(&forklift_path, "/srv/warehouse\nreview\n").unwrap();
+
+        let error = read_bay_redirect(&forklift_path).err().expect("a headerless redirect must be refused");
+        assert!(error.contains("is not a valid forklift bay"), "{}", error);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_bay_path_round_trips_a_directory_holding_a_line_break_and_refuses_a_headerless_file() {
+        let dir = std::env::temp_dir()
+            .join(format!("forklift-bay-utils-bay-path-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        let _scope = StorageRootScope::enter(&dir);
+
+        for bay_dir in ["/srv/bay\nreview", "/srv/bay\r", "/srv/a\\nb"] {
+            write_bay_path("review", Path::new(bay_dir)).unwrap();
+            assert_eq!(read_bay_path("review").unwrap(), PathBuf::from(bay_dir));
+        }
+
+        std::fs::write(bay_state_dir("review").join(FILE_NAME_BAY_PATH), "/srv/bay\n").unwrap();
+        let error = read_bay_path("review").unwrap_err();
+        assert!(error.contains("has no format header"), "{}", error);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
