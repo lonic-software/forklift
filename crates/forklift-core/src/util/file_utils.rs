@@ -2581,26 +2581,45 @@ pub fn ignore_file_path() -> PathBuf {
 /// # Returns
 /// * `Ok(Some(String))` - The file's content.
 /// * `Ok(None)`         - There is no ignore file.
-/// * `Err(String)`      - The file is a symbolic link or not a regular file, or could not be read.
-pub fn read_ignore_file() -> Result<Option<String>, String> {
+/// * `Err(IgnoreFileError)` - The file is refused (a symbolic link or not a regular file), or
+///                            could not be read.
+pub fn read_ignore_file() -> Result<Option<String>, IgnoreFileError> {
     let path = ignore_file_path();
+    let unreadable = |e: std::io::Error| IgnoreFileError::Unreadable(format!("Error while reading \"{}\": {}", FILENAME_IGNORE, e));
 
     let metadata = match std::fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("Error while reading \"{}\": {}", FILENAME_IGNORE, e)),
+        Err(e) => return Err(unreadable(e)),
     };
 
     if !metadata.file_type().is_file() {
-        return Err(format!(
+        return Err(IgnoreFileError::Refused(format!(
             "\"{}\" must be a regular file; a symbolic link or a folder is not read as ignore rules.",
             FILENAME_IGNORE
-        ));
+        )));
     }
 
-    std::fs::read_to_string(&path)
-        .map(Some)
-        .map_err(|e| format!("Error while reading \"{}\": {}", FILENAME_IGNORE, e))
+    std::fs::read_to_string(&path).map(Some).map_err(unreadable)
+}
+
+/// Why [`read_ignore_file`] returned no content. The two differ in what fixes them: a refused
+/// file stays refused whatever it holds, while an unreadable one may only need its permissions.
+#[derive(Debug)]
+pub enum IgnoreFileError {
+    /// The file is a symbolic link or not a regular file. Holds the message.
+    Refused(String),
+
+    /// The file could not be read. Holds the message.
+    Unreadable(String),
+}
+
+impl From<IgnoreFileError> for String {
+    fn from(error: IgnoreFileError) -> String {
+        match error {
+            IgnoreFileError::Refused(message) | IgnoreFileError::Unreadable(message) => message,
+        }
+    }
 }
 
 /// One rule of the ignore file, with the line it was read from.
@@ -2630,19 +2649,26 @@ impl IgnoreFileRule {
 /// * a merge conflict marker, which consolidating two edits of the file writes into it. One of
 ///   them, `||||||| base`, compiles to a pattern that matches every path, so the next `load .`
 ///   would stage the removal of the whole tree;
-/// * a pattern with whitespace, or a byte order mark, at its start or end. It would be part of
-///   the regex, so `^build$ ` never matches `build`. Trimming it instead would guess: a space the
-///   pattern needs is written `\x20`;
-/// * a pattern holding a control character, such as the carriage returns of a file with bare-CR
-///   line endings, which read as one line whose rules never match. A pattern that needs one
-///   writes its escape;
+/// * a pattern holding a control or an invisible format character (Unicode categories Cc and
+///   Cf): a tab, the carriage returns of a file with bare-CR line endings (which reads as one
+///   line whose rules never match), a zero-width space, a bidirectional override that makes the
+///   rule display as another, a byte order mark past the start of the file. A pattern that needs
+///   one writes its escape;
+/// * a pattern with whitespace at its start or end. It would be part of the regex, so `^build$ `
+///   never matches `build`. Trimming it instead would guess: a space the pattern needs is
+///   written `\x20`;
 /// * a pattern that matches the empty string. Matching is a search anywhere in the path, so
 ///   such a pattern (`.*`, `x*`, `a|`) matches every path.
+///
+/// The error names the refused character by code point, so an invisible one can be found.
 ///
 /// # Returns
 /// * `Ok(Vec<IgnoreFileRule>)` - The rules, in file order.
 /// * `Err(String)`             - The first refused line, by number.
 fn parse_ignore_file(content: &str) -> Result<Vec<IgnoreFileRule>, String> {
+    static INVISIBLE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let invisible = INVISIBLE.get_or_init(|| Regex::new(r"[\p{Cc}\p{Cf}]").expect("a valid class"));
+
     let content = content.strip_prefix('\u{FEFF}').unwrap_or(content);
     let mut rules = Vec::new();
 
@@ -2658,23 +2684,25 @@ fn parse_ignore_file(content: &str) -> Result<Vec<IgnoreFileRule>, String> {
             ));
         }
 
-        // A byte order mark past the start of the file (two files joined) is as invisible.
-        let edge = [line.chars().next(), line.chars().next_back()].into_iter().flatten()
-            .find(|&c| c.is_whitespace() || c == '\u{FEFF}');
-        if let Some(c) = edge {
+        if let Some(found) = invisible.find(line) {
+            let c = found.as_str().chars().next().expect("a match is one character");
+            let remedy = match c {
+                '\r' => "Save the file with newline line endings.".to_string(),
+                _ => format!("Remove it, or write it as {} if the pattern needs it.", escape_for(c)),
+            };
             return Err(format!(
-                "\"{}\", line {}: the pattern {:?} starts or ends with {} ({}), which would be part \
-                of the regex. Remove it, or write it as an escape if the pattern needs it (\\x20 for a space).",
-                FILENAME_IGNORE, index + 1, line,
-                if c == '\u{FEFF}' { "a byte order mark" } else { "whitespace" }, code_point(c)
+                "\"{}\", line {}: the pattern {:?} holds an invisible or control character ({}), which \
+                would be part of the regex. {}",
+                FILENAME_IGNORE, index + 1, line, code_point(c), remedy
             ));
         }
 
-        if let Some(c) = line.chars().find(|c| c.is_control()) {
+        let edge = [line.chars().next(), line.chars().next_back()].into_iter().flatten().find(|c| c.is_whitespace());
+        if let Some(c) = edge {
             return Err(format!(
-                "\"{}\", line {}: the pattern {:?} holds a control character ({}). Save the file with \
-                newline line endings, or write the character as an escape if the pattern needs it.",
-                FILENAME_IGNORE, index + 1, line, code_point(c)
+                "\"{}\", line {}: the pattern {:?} starts or ends with whitespace ({}), which would be part \
+                of the regex. Remove it, or write it as {} if the pattern needs it.",
+                FILENAME_IGNORE, index + 1, line, code_point(c), escape_for(c)
             ));
         }
 
@@ -2697,6 +2725,16 @@ fn parse_ignore_file(content: &str) -> Result<Vec<IgnoreFileRule>, String> {
 /// A character as its Unicode code point, such as `U+00A0`: an invisible one stays nameable.
 fn code_point(c: char) -> String {
     format!("U+{:04X}", c as u32)
+}
+
+/// The regex escape that matches the character: `\x20` for a space, `\t` for a tab, else its
+/// code point as `\x{A0}`.
+fn escape_for(c: char) -> String {
+    match c {
+        ' ' => r"\x20".to_string(),
+        '\t' => r"\t".to_string(),
+        _ => format!(r"\x{{{:X}}}", c as u32),
+    }
 }
 
 /// Get the metadata of the file or directory at the given path.
@@ -2850,7 +2888,7 @@ mod tests {
         }
 
         // Whitespace around a pattern is refused, naming the line, rather than trimmed or kept.
-        for (content, line) in [("^a$\n^b$ \n", 2), (" ^a$\n", 1), ("^a$\t\n", 1), ("  # note\n", 1), ("^a$\r", 1)] {
+        for (content, line) in [("^a$\n^b$ \n", 2), (" ^a$\n", 1), ("  # note\n", 1)] {
             let error = parse_ignore_file(content).unwrap_err();
             assert!(error.contains(&format!("line {}: the pattern", line)) && error.contains("starts or ends with whitespace"),
                 "{:?}: {}", content, error);
@@ -2866,18 +2904,28 @@ mod tests {
         // A CRLF file reads as its lines, so its line endings are not whitespace around a pattern.
         assert_eq!(parse_ignore_file("^a$\r\n^b$\r\n").unwrap().len(), 2);
 
-        // The refusal names the character, so an invisible one is nameable.
+        // The refusal names the character, so an invisible one is nameable, and its escape.
         let error = parse_ignore_file("^a$\u{00A0}\n").unwrap_err();
-        assert!(error.contains("whitespace (U+00A0)"), "{}", error);
+        assert!(error.contains("whitespace (U+00A0)") && error.contains(r"write it as \x{A0}"), "{}", error);
+        assert!(parse_ignore_file("^a$ \n").unwrap_err().contains(r"write it as \x20"));
     }
 
     #[test]
     fn a_control_character_in_an_ignore_pattern_is_refused_and_a_leading_bom_is_skipped() {
-        // Bare-CR line endings read as one line, whose rules would never match.
-        for (content, c) in [("^a$\r^b$\n", "U+000D"), ("^a\tb$\n", "U+0009"), ("^a\u{1b}b$\n", "U+001B")] {
+        // Each is refused wherever it stands, by code point, with the remedy that fits it. Bare-CR
+        // line endings read as one line whose rules would never match; a format character makes
+        // a rule silently dead, or display as another.
+        for (content, c, remedy) in [
+            ("^a$\r^b$\n", "U+000D", "newline line endings"), ("^a$\r", "U+000D", "newline line endings"),
+            ("^a\tb$\n", "U+0009", r"write it as \t"), ("^a$\t\n", "U+0009", r"write it as \t"),
+            ("^a\u{1b}b$\n", "U+001B", r"write it as \x{1B}"),
+            ("^build$\u{200B}\n", "U+200B", r"write it as \x{200B}"),
+            ("^src/\u{202E}a$\n", "U+202E", r"write it as \x{202E}"),
+            ("\u{FEFF}\u{FEFF}^a$\n", "U+FEFF", r"write it as \x{FEFF}"),
+        ] {
             let error = parse_ignore_file(content).unwrap_err();
-            assert!(error.contains(&format!("line 1: the pattern")) && error.contains(&format!("control character ({})", c)),
-                "{:?}: {}", content, error);
+            assert!(error.contains("line 1: the pattern") && error.contains(&format!("invisible or control character ({})", c))
+                && error.contains(remedy), "{:?}: {}", content, error);
         }
 
         // A byte order mark is an encoding marker, not part of the first rule or comment.
@@ -2885,9 +2933,9 @@ mod tests {
         assert_eq!(rules[0].pattern, "^build(/.*)?$");
         assert!(rules[0].matches("build"));
         assert!(parse_ignore_file("\u{FEFF}# note\n").unwrap().is_empty());
-        // Past the start of the file it is no encoding marker, and is refused like whitespace.
+        // Past the start of the file it is no encoding marker, and is refused.
         let error = parse_ignore_file("^a$\n\u{FEFF}^b$\n").unwrap_err();
-        assert!(error.contains("line 2: the pattern") && error.contains("a byte order mark (U+FEFF)"), "{}", error);
+        assert!(error.contains("line 2: the pattern") && error.contains("(U+FEFF)"), "{}", error);
     }
 
     #[test]
@@ -2897,6 +2945,13 @@ mod tests {
         assert_eq!(rules.covering_rule("build/sub").map(|rule| (rule.line, rule.pattern.as_str())), Some((3, "^build$")));
         assert!(rules.covering_rule("src").is_none() && !rules.coverage_of("src").0);
         assert!(rules.coverage_of("build/sub").0);
+
+        // The first in file order, of two rules matching one key.
+        let rules = ignore_rules_from(Some("^\\.git$\n^\\.g\n")).unwrap();
+        assert_eq!(rules.covering_rule(".git").map(|rule| rule.line), Some(1));
+        // The nearest key first: the rule matching the key itself, before one matching its parent.
+        let rules = ignore_rules_from(Some("^a$\n^a/b$\n")).unwrap();
+        assert_eq!(rules.covering_rule("a/b").map(|rule| rule.line), Some(2));
     }
 
     #[test]

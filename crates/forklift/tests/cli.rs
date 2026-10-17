@@ -3211,12 +3211,30 @@ fn import_git_reports_a_rule_already_covering_git_and_leaves_a_refused_file_alon
     let indented = colocated("import-git-rule-indented", rules);
     let imported = indented.run(&["import-git", source.root.to_str().unwrap()]);
     assert_success(&imported);
-    assert!(stdout(&imported).contains("left as it is: \".forkliftignore\", line 1: the pattern"), "{}", stdout(&imported));
-    assert!(stdout(&imported).contains("starts or ends with whitespace (U+0020)"), "{}", stdout(&imported));
-    assert!(stdout(&imported).contains(r"Once that is fixed, add the rule ^\.git(/.*)?$ if no rule covers"), "{}", stdout(&imported));
+    assert!(stdout(&imported).contains(r"left as it is, as it is refused. Once that is fixed, add the rule ^\.git(/.*)?$ if no rule covers"),
+        "{}", stdout(&imported));
+    assert!(stdout(&imported).contains("\".forkliftignore\", line 1: the pattern \"  ^\\\\.git(/.*)?$\" starts or ends with whitespace (U+0020)"),
+        "{}", stdout(&imported));
     assert!(!stdout(&imported).contains("by hand"), "{}", stdout(&imported));
     assert!(!stdout(&imported).contains("Added \".git/\""), "{}", stdout(&imported));
     assert_eq!(std::fs::read_to_string(indented.root.join(".forkliftignore")).unwrap(), rules);
+
+    // A symbolic link is refused whatever it holds, so it gets the same remedy, not "by hand".
+    #[cfg(unix)]
+    {
+        let linked = colocated("import-git-rule-linked", "");
+        let ignore_file = linked.root.join(".forkliftignore");
+        std::fs::remove_file(&ignore_file).unwrap();
+        linked.write_file("rules.txt", "^x$\n");
+        std::os::unix::fs::symlink("rules.txt", &ignore_file).unwrap();
+        let imported = linked.run(&["import-git", source.root.to_str().unwrap()]);
+        assert_success(&imported);
+        assert!(stdout(&imported).contains("as it is refused") && stdout(&imported).contains("must be a regular file"),
+            "{}", stdout(&imported));
+        assert!(!stdout(&imported).contains("by hand"), "{}", stdout(&imported));
+        assert!(std::fs::symlink_metadata(&ignore_file).unwrap().file_type().is_symlink());
+        assert_eq!(read(&linked, "rules.txt"), "^x$\n");
+    }
 }
 
 #[test]

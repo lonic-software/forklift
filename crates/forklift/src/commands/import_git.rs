@@ -154,10 +154,11 @@ pub fn handle_command(path: &str, no_compact: bool) -> Result<(), String> {
             Ok(GitRule::Refused(e)) => {
                 // Adding the rule by hand would not help: the file stays refused until that
                 // line is fixed, and fixed, it may already cover `.git`.
+                // The reason goes last: a regex error runs over several lines.
                 warnings.push(format!(
-                    "the \".git\" folder is not ignored, and \".forkliftignore\" was left as it is: {} \
-                    Once that is fixed, add the rule {} if no rule covers \".git\"",
-                    e, GIT_DIRECTORY_PATTERN
+                    "the \".git\" folder is not ignored, and \".forkliftignore\" was left as it is, as it is \
+                    refused. Once that is fixed, add the rule {} if no rule covers \".git\". {}",
+                    GIT_DIRECTORY_PATTERN, e
                 ));
                 None
             }
@@ -205,8 +206,8 @@ enum GitRule {
     /// A rule already in the file covers `.git`, so nothing was written.
     Present { line: usize, pattern: String },
 
-    /// The file's content is refused as rules, so nothing was written: appending a rule would
-    /// leave it refused. Holds the reason.
+    /// The file, or its content, is refused as rules, so nothing was written: appending a rule
+    /// would leave it refused. Holds the reason.
     Refused(String),
 }
 
@@ -222,7 +223,11 @@ fn ignore_git_directory() -> Result<GitRule, String> {
 
     // Only a missing file starts empty: on any other read error, writing would replace the
     // user's rules with this one.
-    let existing = file_utils::read_ignore_file()?.unwrap_or_default();
+    let existing = match file_utils::read_ignore_file() {
+        Ok(existing) => existing.unwrap_or_default(),
+        Err(file_utils::IgnoreFileError::Refused(e)) => return Ok(GitRule::Refused(e)),
+        Err(file_utils::IgnoreFileError::Unreadable(e)) => return Err(e),
+    };
 
     // Judged as the walks judge it, from the content just read: the rule covering `.git`,
     // however it is spelled, is the one that keeps the walks out of it.
