@@ -141,12 +141,17 @@ async fn diff_worktree(filter: Option<&WarehousePath>, verbose: bool) -> Result<
         return Ok(());
     }
 
-    // The changes rendered below are exactly the ones read from the store, so the walk reads the
-    // pack set ahead only for those. A chunked file's stored side is never read, but the walk
-    // cannot tell one apart from here; that rare case costs only an unused pack read.
+    // The walk reads the pack set ahead only for a change the render below may read from the
+    // store. It sees changes before moves are paired, so a removal anywhere counts: it may be the
+    // old side of a move into the filter. A removal that pairs out of the filter, or a chunked file
+    // (whose stored side is never read), costs at most one unused pack read.
     let preload_filter = filter.cloned();
     let (changes, shards) = stocktake_utils::collect_unstaged_changes_with_shards(move |change| {
-        change.kind != ChangeKind::Untracked && is_within(&change.path, preload_filter.as_ref())
+        match change.kind {
+            ChangeKind::Untracked => false,
+            ChangeKind::Removed => true,
+            _ => is_within(&change.path, preload_filter.as_ref()),
+        }
     }).await?;
 
     // Untracked files are not diffed (stocktake reports them).
@@ -341,15 +346,28 @@ fn diff_pallets(from_revision: &str,
 ///
 /// # Returns
 /// * `Vec<Result<String, String>>` - One formatted block, or the error reading that file's content,
-///   per change, in order.
+///   per change, in order. The serial path stops at the first error, so the list may be shorter.
 fn format_blocks<T: Sync>(changes: &[&T],
                           block: impl Fn(&T) -> Result<String, String> + Sync)
                           -> Vec<Result<String, String>> {
     // Below this many files the threads cost more than the diffs they would share.
     const PARALLEL_THRESHOLD: usize = 8;
 
+    // Serially, nothing past the first unreadable file is printed, so nothing past it is rendered.
     if changes.len() < PARALLEL_THRESHOLD {
-        return changes.iter().map(|change| block(change)).collect();
+        let mut blocks = Vec::with_capacity(changes.len());
+
+        for change in changes {
+            let block = block(change);
+            let failed = block.is_err();
+            blocks.push(block);
+
+            if failed {
+                break;
+            }
+        }
+
+        return blocks;
     }
 
     // See `forklift_core::util::fanout_utils::fanout_map` for the fan-out idiom (chunking,

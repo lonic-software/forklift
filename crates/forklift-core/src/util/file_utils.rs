@@ -2484,19 +2484,14 @@ pub fn get_device_and_inode(_path: &Path, metadata: &Metadata) -> Result<(u64, u
 /// * `Err(String)`    - If the entry could not be opened or queried.
 #[cfg(windows)]
 pub fn get_device_and_inode(path: &Path, _metadata: &Metadata) -> Result<(u64, u64), String> {
-    use std::os::windows::fs::OpenOptionsExt;
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{
-        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_FLAG_OPEN_REPARSE_POINT,
-    };
+    get_device_and_inode_of(&open_entry_unfollowed(path)?)
+}
 
-    // Access mode 0 queries attributes without read access; backup semantics lets a directory open.
-    let entry = std::fs::OpenOptions::new()
-        .access_mode(0)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)
-        .map_err(|e| format!("Error while getting file ID for file: {}", e))?;
+/// The (volume serial, 64-bit file index) identity of an entry opened by `open_entry_unfollowed`.
+#[cfg(windows)]
+fn get_device_and_inode_of(entry: &std::fs::File) -> Result<(u64, u64), String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
 
     // SAFETY: the handle is open for the whole call, and `info` is a plain-data out parameter
     // the call fills in.
@@ -2509,6 +2504,56 @@ pub fn get_device_and_inode(path: &Path, _metadata: &Metadata) -> Result<(u64, u
 
     Ok((info.dwVolumeSerialNumber as u64,
         ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64))
+}
+
+/// Get the full (volume serial, 128-bit file id) identity of a directory entry, without following
+/// a symlink. ReFS needs all 128 bits for the id to stay unique; NTFS ids fit in the low 64.
+///
+/// # Arguments
+/// * `path` - The path of the entry.
+///
+/// # Returns
+/// * `Ok((u64, u128))` - The volume serial number and file id.
+/// * `Err(String)`     - If the entry could not be opened or queried.
+#[cfg(windows)]
+pub fn get_full_file_id(path: &Path) -> Result<(u64, u128), String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{FileIdInfo, GetFileInformationByHandleEx, FILE_ID_INFO};
+
+    let entry = open_entry_unfollowed(path)?;
+
+    // SAFETY: the handle is open for the whole call, and `info` is a plain-data out parameter of
+    // exactly the size passed.
+    let mut info: FILE_ID_INFO = unsafe { std::mem::zeroed() };
+    let ok = unsafe {
+        GetFileInformationByHandleEx(entry.as_raw_handle() as _, FileIdInfo,
+                                     &mut info as *mut FILE_ID_INFO as *mut _,
+                                     std::mem::size_of::<FILE_ID_INFO>() as u32)
+    };
+
+    // A volume without 128-bit ids (FAT, some network shares) answers the 64-bit query instead.
+    if ok == 0 {
+        let (volume, index) = get_device_and_inode_of(&entry)?;
+
+        return Ok((volume, index as u128));
+    }
+
+    Ok((info.VolumeSerialNumber, u128::from_le_bytes(info.FileId.Identifier)))
+}
+
+/// Open a directory entry for querying its identity: the entry itself, never a symlink's target
+/// (`FILE_FLAG_OPEN_REPARSE_POINT`, as an `lstat` would), with access mode 0, so no read access is
+/// needed, and backup semantics, so a directory opens too.
+#[cfg(windows)]
+fn open_entry_unfollowed(path: &Path) -> Result<std::fs::File, String> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT};
+
+    std::fs::OpenOptions::new()
+        .access_mode(0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|e| format!("Error while getting file ID for file: {}", e))
 }
 
 /// Get the owners of a file (user ID and group ID).

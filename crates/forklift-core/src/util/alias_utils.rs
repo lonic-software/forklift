@@ -28,12 +28,11 @@ use crate::util::{file_utils, inventory_utils};
 #[cfg(unix)]
 type Identity = (u64, u64);
 
-/// A file's identity as the file system reports it. This keeps the high-resolution id, unlike the
-/// inventory's 64-bit file index, because the volume is the oracle for whether two names are one
-/// entry, and ReFS ids need all 128 bits to stay unique. It follows a symlink, which is safe here:
-/// Windows never materializes one, and every write sink refuses a symlinked ancestor first.
+/// A file's identity as the file system reports it without following a symlink. This keeps the
+/// 128-bit id, unlike the inventory's 64-bit file index, because the volume is the oracle for
+/// whether two names are one entry, and ReFS ids need all 128 bits to stay unique.
 #[cfg(not(unix))]
-type Identity = file_id::FileId;
+type Identity = (u64, u128);
 
 #[cfg(unix)]
 fn identity(path: &Path) -> Option<Identity> {
@@ -44,7 +43,7 @@ fn identity(path: &Path) -> Option<Identity> {
 
 #[cfg(not(unix))]
 fn identity(path: &Path) -> Option<Identity> {
-    file_id::get_file_id(path).ok()
+    file_utils::get_full_file_id(path).ok()
 }
 
 /// The candidate key two names must share before a probe is spent on them: a full case fold

@@ -23,7 +23,6 @@ flume = { workspace = true }
 libc = { workspace = true }
 memmap2 = { workspace = true }
 ed25519-dalek = { workspace = true }
-file-id = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true }
 percent-encoding = { workspace = true }

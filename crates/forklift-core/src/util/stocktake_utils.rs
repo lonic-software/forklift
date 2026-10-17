@@ -374,9 +374,10 @@ pub async fn collect_unstaged_changes() -> Result<Vec<Change>, String> {
 /// returns only after that lands: the render's first object lookup then finds it cached.
 ///
 /// # Arguments
-/// * `renders` - Whether the caller's render reads a change's stored side. Changes outside the
-///   caller's path filter, or ones it never diffs, must answer `false`, or the walk waits on a
-///   pack read nothing uses.
+/// * `renders` - Whether the caller's render may read a change's stored side. Changes outside the
+///   caller's path filter, or ones it never diffs, should answer `false`, or the walk waits on a
+///   pack read nothing uses. It sees each change before moves are paired, so a `Removed` change
+///   may still become the old side of a `Moved` one.
 ///
 /// # Returns
 /// * `Ok((Vec<Change>, HashMap<String, Arc<Inventory>>))` - The unstaged changes (sorted by
