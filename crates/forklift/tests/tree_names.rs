@@ -297,20 +297,17 @@ fn stacking_a_top_level_alias_of_the_metadata_folder_is_refused() {
     assert!(stderr.contains("\".forklift.\""), "the refusal must name the entry; stderr: {}", stderr);
 }
 
-#[test]
-fn a_leftover_assembly_temp_file_neither_wedges_checkout_nor_is_deleted() {
-    // An interrupted assembly can leave a temp file behind. The temp file is always created new
-    // (so a symlink there is never followed), which must not turn a leftover into a permanent
-    // refusal; it is untracked content, so it is left alone, not deleted.
-    let warehouse = Warehouse::new("assemble-leftover");
+/// A warehouse whose `main` holds a chunked `big` beside `app.txt`, shifted to a pallet `before`
+/// that lacks it, so the next `shift main` assembles it. Returns the chunked file's content.
+fn with_chunked_file(warehouse: &Warehouse, big: &str) -> Vec<u8> {
     let first = {
         let _scope = StorageRootScope::enter(&warehouse.root);
         pallet_utils::get_pallet_head("main").unwrap().unwrap()
     };
 
-    let big: Vec<u8> = (0..9 * 1024 * 1024u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
-    std::fs::write(warehouse.root.join("big.bin"), &big).unwrap();
-    warehouse.run_ok(&["load", "big.bin"]);
+    let content: Vec<u8> = (0..9 * 1024 * 1024u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
+    std::fs::write(warehouse.root.join(big), &content).unwrap();
+    warehouse.run_ok(&["load", "."]);
     warehouse.run_ok(&["stack", "big"]);
 
     {
@@ -318,12 +315,41 @@ fn a_leftover_assembly_temp_file_neither_wedges_checkout_nor_is_deleted() {
         pallet_utils::set_pallet_head("before", &first).unwrap();
     }
     warehouse.run_ok(&["shift", "before"]);
-    std::fs::write(warehouse.root.join(".big.bin.forklift-assemble.tmp"), "half an assembly").unwrap();
+    content
+}
+
+#[test]
+fn a_leftover_from_an_interrupted_assembly_is_cleared_and_never_reaches_the_working_directory() {
+    // An interrupted assembly leaves its temp file behind. It lives in the metadata folder, so
+    // it is never stacked, and a later run clears it instead of letting leftovers pile up.
+    let warehouse = Warehouse::new("assemble-leftover");
+    let big = with_chunked_file(&warehouse, "big.bin");
+    let assembly = warehouse.root.join(".forklift").join("assembly");
+    std::fs::create_dir_all(&assembly).unwrap();
+    std::fs::write(assembly.join("1-0.tmp"), "half an assembly").unwrap();
 
     warehouse.run_ok(&["shift", "main"]);
 
     assert!(std::fs::read(warehouse.root.join("big.bin")).unwrap() == big);
-    assert_eq!(std::fs::read_to_string(warehouse.root.join(".big.bin.forklift-assemble.tmp")).unwrap(), "half an assembly");
+    assert!(!assembly.join("1-0.tmp").exists(), "the leftover was not cleared");
+    let strays: Vec<_> = std::fs::read_dir(&warehouse.root).unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains("assemble"))
+        .collect();
+    assert!(strays.is_empty(), "assembly left files in the working directory: {:?}", strays);
+}
+
+#[test]
+fn a_chunked_file_with_a_name_near_the_length_limit_checks_out() {
+    // The temp name must not grow with the file's name, or a name the file system took when the
+    // file was stacked could never be checked out again.
+    let warehouse = Warehouse::new("assemble-long-name");
+    let name = format!("{}.bin", "n".repeat(250));
+    let big = with_chunked_file(&warehouse, &name);
+
+    warehouse.run_ok(&["shift", "main"]);
+
+    assert!(std::fs::read(warehouse.root.join(&name)).unwrap() == big);
 }
 
 #[test]
