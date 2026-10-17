@@ -1,5 +1,6 @@
 use chrono::Utc;
 use serde::Serialize;
+use forklift_core::error::sanitize;
 use forklift_core::model::operator::Operator;
 use forklift_core::util::office_utils::{IdentityClass, OfficeState, RevocationReason, Role, TrustAnchor, UserRecord};
 use forklift_core::util::office_utils::OFFICE_PALLET_NAME;
@@ -685,7 +686,9 @@ impl CommandOutput for OfficeListing {
                 }
             };
 
-            println!("{} — {}{}{}", display, user.role, grants, class);
+            // Every value on these lines is read out of `@office`, which syncs in from a remote,
+            // so each whole line is sanitized for the terminal (never for `--json`).
+            println!("{}", sanitize(&format!("{} — {}{}{}", display, user.role, grants, class)));
 
             for key in &user.keys {
                 let status = if key.retired {
@@ -699,7 +702,7 @@ impl CommandOutput for OfficeListing {
                 let protected = if key.on_this_machine && key.protected { ", protected" } else { "" };
                 let root = if key.identity_root { ", identity root" } else { "" };
 
-                println!("  key {} ({}{}{})", key.key_id, status, protected, root);
+                println!("  key {} ({}{}{})", sanitize(&key.key_id), status, protected, root);
             }
         }
     }

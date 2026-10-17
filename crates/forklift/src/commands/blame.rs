@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use serde::Serialize;
+use forklift_core::error::sanitize;
 use forklift_core::model::parcel::Parcel;
 use forklift_core::enums::parcel_action_type::ParcelActionType;
 use forklift_core::util::office_utils::OfficeState;
@@ -213,6 +214,8 @@ impl CommandOutput for Blame {
 impl BlamedParcel {
     /// The author label shown in the gutter: the display name (or operator id), plus a
     /// class marker for automated authors so a human/agent line is legible at a glance.
+    /// [Sanitized](sanitize): the name, operator id and supervisor all come out of a parcel or
+    /// the office, either of which may have arrived from a remote.
     fn author_label(&self) -> String {
         let who = self.name.clone().unwrap_or_else(|| self.operator.clone());
 
@@ -222,9 +225,9 @@ impl BlamedParcel {
                     .map(|s| format!(", supervised by {}", s))
                     .unwrap_or_default();
 
-                format!("{} [{}{}]", who, class, supervisor)
+                sanitize(&format!("{} [{}{}]", who, class, supervisor))
             }
-            None => who,
+            None => sanitize(&who),
         }
     }
 

@@ -1,5 +1,6 @@
 use chrono::Utc;
 use serde::Serialize;
+use forklift_core::error::sanitize;
 use forklift_core::util::manifest_utils::{self, AttributedEntry, ManifestEntry, ManifestKind, Provenance};
 use forklift_core::util::{config_utils, pallet_utils};
 use crate::cli::ManifestAction;
@@ -209,6 +210,9 @@ impl CommandOutput for ManifestView {
             println!("parcel {}", subject);
         }
 
+        // Every string an entry carries came out of `@manifest` (synced in wholesale, validated by
+        // nothing on the way in) or the office, so each is sanitized for the terminal, never for
+        // `--json`.
         for entry in &self.entries {
             // When scoped to a subject the parcel is already printed; otherwise show it.
             let where_clause = match self.subject {
@@ -219,12 +223,12 @@ impl CommandOutput for ManifestView {
             let body = if entry.body.is_empty() {
                 String::new()
             } else {
-                format!("  \"{}\"", entry.body)
+                format!("  \"{}\"", sanitize(&entry.body))
             };
 
             println!(
                 "  {:<10}{}  {}{}",
-                entry.kind, where_clause, entry.author, body
+                entry.kind, where_clause, sanitize(&entry.author), body
             );
 
             // Provenance carries the how-it-was-made detail on a second, indented line.
@@ -241,7 +245,7 @@ impl CommandOutput for ManifestView {
                     detail.push_str(&format!(", transcript {}", transcript));
                 }
 
-                println!("             {}", detail);
+                println!("             {}", sanitize(&detail));
             }
 
             // Delivery carries the trail reference on a second, indented line.
@@ -249,7 +253,7 @@ impl CommandOutput for ManifestView {
                 println!(
                     "             {} checkpoint(s) from \"{}\", trail tip {}",
                     entry.checkpoints.unwrap_or(0),
-                    source,
+                    sanitize(source),
                     entry.trail_head.as_deref().map(short).unwrap_or_default()
                 );
             }
@@ -257,9 +261,10 @@ impl CommandOutput for ManifestView {
     }
 }
 
-/// A short parcel-hash prefix for display (full hashes stay in `--json`).
+/// A short, [sanitized](sanitize) parcel-hash prefix for display (full hashes stay in `--json`);
+/// an entry's subject and trail head are record strings like any other.
 fn short(hash: &str) -> String {
-    hash.chars().take(12).collect()
+    sanitize(&hash.chars().take(12).collect::<String>())
 }
 
 

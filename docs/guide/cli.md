@@ -530,6 +530,17 @@ instead of scrolling off the top:
 `next` is absent (the history is exhausted). The cursor is opaque — treat it as a
 token to hand back, not something to construct.
 
+### Record text is printed inert
+
+Descriptions, titles, comments, operator names and the other free text in a record were
+written by whoever authored the record — once it syncs, possibly another operator, and
+nothing checks that text on the way in. Human output never lets it drive your terminal:
+control characters (ANSI escapes, carriage returns) and invisible bidirectional overrides
+print as spaces, and a multi-line text is printed line by line rather than as one
+string. `--json` is never touched — it carries the record's text exactly as
+stored. File content (`show`, `peek` of a blob, `blame`'s lines) prints as-is, the way
+`cat` and git do.
+
 ### `blame` — who wrote each line (`bl`, `annotate`)
 
 ```sh

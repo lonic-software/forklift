@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::io::Write;
 use chrono::{DateTime, Utc};
 use serde::{Serialize, Serializer};
+use forklift_core::error::sanitize;
 use forklift_core::model::parcel::Parcel;
 use forklift_core::util::office_utils::{IdentityClass, OfficeState};
 use forklift_core::util::{object_utils, office_utils, pallet_utils, remote_utils};
@@ -206,7 +207,7 @@ fn render_terse(
                 .unwrap_or("");
             let abbrev = &hash[..hash.len().min(ABBREV)];
             // A write error means the reader (a pager, a `| head`) went away: stop cleanly.
-            if writeln!(out, "\x1b[33m{}\x1b[0m {}", abbrev, subject).is_err() {
+            if writeln!(out, "\x1b[33m{}\x1b[0m {}", abbrev, sanitize(subject)).is_err() {
                 return Ok(());
             }
             shown += 1;
@@ -393,20 +394,23 @@ impl HistoryEntry {
         writeln!(out, "\x1b[33mparcel {}\x1b[0m", self.parcel)?;
 
         if !self.consolidates.is_empty() {
-            writeln!(out, "consolidates {}", self.consolidates.join(" + "))?;
+            writeln!(out, "consolidates {}", sanitize(&self.consolidates.join(" + ")))?;
         }
 
+        // Every string below the parcel line is read out of a parcel or the office, either of
+        // which may have arrived from a remote, so each is sanitized for the terminal here and
+        // left raw on the struct for `--json`.
         for action in &self.actions {
             let operator = match &action.name {
-                Some(name) => format!("{} <{}>", name, action.operator),
-                None => action.operator.clone(),
+                Some(name) => format!("{} <{}>", sanitize(name), sanitize(&action.operator)),
+                None => sanitize(&action.operator),
             };
 
             // Automated authorship is called out inline: "[agent, supervised by …]".
             let class = match &action.class {
                 Some(class) => {
                     let supervisor = action.supervisor.as_ref()
-                        .map(|s| format!(", supervised by {}", s))
+                        .map(|s| format!(", supervised by {}", sanitize(s)))
                         .unwrap_or_default();
                     format!(" [{}{}]", class, supervisor)
                 }
@@ -427,7 +431,7 @@ impl HistoryEntry {
             writeln!(out)?;
 
             for line in description.lines() {
-                writeln!(out, "    {}", line)?;
+                writeln!(out, "    {}", sanitize(line))?;
             }
         }
 

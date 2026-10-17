@@ -1,4 +1,5 @@
 use serde::Serialize;
+use forklift_core::error::sanitize;
 use forklift_core::util::haul_utils::{self, Haul, HaulStatus, ReviewVerdict};
 use forklift_core::util::office_utils::{self, OfficeState};
 use forklift_core::util::{config_utils, merge_utils, object_utils, pallet_utils};
@@ -225,8 +226,8 @@ pub(crate) struct Opened {
 
 impl CommandOutput for Opened {
     fn render_human(&self) {
-        println!("Opened haul {} — \"{}\".", short(&self.id), self.title);
-        println!("  {} → {}", self.source, self.target);
+        println!("Opened haul {} — \"{}\".", short(&self.id), sanitize(&self.title));
+        println!("  {} → {}", sanitize(&self.source), sanitize(&self.target));
     }
 }
 
@@ -320,7 +321,8 @@ impl CommandOutput for HaulList {
             let approvals = if haul.approvals > 0 { format!(" · {} approval(s)", haul.approvals) } else { String::new() };
             println!(
                 "{}  [{}]  {}  ({} → {}{})",
-                short(&haul.id), haul.status, haul.title, haul.source, haul.target, approvals
+                short(&haul.id), sanitize(&haul.status), sanitize(&haul.title), sanitize(&haul.source),
+                sanitize(&haul.target), approvals
             );
         }
     }
@@ -396,46 +398,56 @@ impl HaulDetail {
 
 impl CommandOutput for HaulDetail {
     fn render_human(&self) {
-        println!("\x1b[33mhaul {}\x1b[0m — {}", short(&self.id), self.title);
-        println!("{} → {}   [{}]", self.source, self.target, self.status);
-        println!("opened by {}", self.opened_by);
+        // A haul record syncs in from `@haul` wholesale, and nothing validates its strings on
+        // the way in, so every one of them is sanitized for the terminal (never for `--json`).
+        println!("\x1b[33mhaul {}\x1b[0m — {}", short(&self.id), sanitize(&self.title));
+        println!("{} → {}   [{}]", sanitize(&self.source), sanitize(&self.target), sanitize(&self.status));
+        println!("opened by {}", sanitize(&self.opened_by));
         println!("head {}", short(&self.head));
 
         if !self.description.is_empty() {
             println!();
             for line in self.description.lines() {
-                println!("    {}", line);
+                println!("    {}", sanitize(line));
             }
         }
 
         if !self.reviews.is_empty() {
             println!("\nReviews:");
             for review in &self.reviews {
-                let class = review.class.as_ref().map(|c| format!(" [{}]", c)).unwrap_or_default();
+                let class = review.class.as_ref().map(|c| format!(" [{}]", sanitize(c))).unwrap_or_default();
                 let body = first_line(&review.body);
-                println!("  {}{}: {}{}", review.author, class, review.verdict, body);
+                println!("  {}{}: {}{}", sanitize(&review.author), class, sanitize(&review.verdict), body);
             }
         }
 
         let comments: Vec<&ThreadLine> = self.thread.iter().filter(|t| t.kind == "comment").collect();
         if !comments.is_empty() {
             println!("\nComments:");
+            // A comment keeps its line structure: the first line beside the author, the rest
+            // indented under it.
             for comment in comments {
-                println!("  {}: {}", comment.author, comment.body);
+                let mut lines = comment.body.lines();
+                println!("  {}: {}", sanitize(&comment.author), sanitize(lines.next().unwrap_or("")));
+                for line in lines {
+                    println!("      {}", sanitize(line));
+                }
             }
         }
     }
 }
 
-/// A short display form of a haul or parcel id.
+/// A short, [sanitized](sanitize) display form of a haul or parcel id; both come out of a
+/// synced record.
 fn short(id: &str) -> String {
-    id.chars().take(12).collect()
+    sanitize(&id.chars().take(12).collect::<String>())
 }
 
-/// The first line of a body, prefixed with a space (empty when the body is empty).
+/// The first line of a body, [sanitized](sanitize) and prefixed with a dash (empty when the body
+/// is empty).
 fn first_line(body: &str) -> String {
     match body.lines().next() {
-        Some(line) if !line.is_empty() => format!(" — {}", line),
+        Some(line) if !line.is_empty() => format!(" — {}", sanitize(line)),
         _ => String::new(),
     }
 }

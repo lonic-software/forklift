@@ -1,4 +1,5 @@
 use serde::Serialize;
+use forklift_core::error::sanitize;
 use forklift_core::util::journal_utils::{self, JournalEntry};
 use forklift_core::util::{object_utils, pallet_utils};
 use crate::commands::shift;
@@ -166,7 +167,7 @@ impl CommandOutput for Undone {
 
         if let Some(first_line) = self.description.lines().next() {
             if !first_line.is_empty() {
-                println!("  ({})", first_line);
+                println!("  ({})", sanitize(first_line));
             }
         }
 

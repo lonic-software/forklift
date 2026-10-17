@@ -2,6 +2,7 @@ use std::io::{Read, Write};
 use chrono::{DateTime, Utc};
 use serde::{Serialize, Serializer};
 use serde_json::{json, Value};
+use forklift_core::error::sanitize;
 use forklift_core::model::parcel::Parcel;
 use forklift_core::util::office_utils::{OfficeState, RevocationReason};
 use forklift_core::util::query_utils::{
@@ -272,7 +273,7 @@ fn render_oneline(out: &mut impl Write, found: &QueryMatch) -> std::io::Result<(
         .and_then(|description| description.lines().next())
         .unwrap_or("");
     let abbrev = &found.hash[..found.hash.len().min(ABBREV)];
-    writeln!(out, "\x1b[33m{}\x1b[0m {}", abbrev, subject)
+    writeln!(out, "\x1b[33m{}\x1b[0m {}", abbrev, sanitize(subject))
 }
 
 /// The human trust suffix for a match's identity line: a bare word for every trust except
@@ -318,14 +319,16 @@ fn render_match(
 
     writeln!(out, "\x1b[33mparcel {}\x1b[0m", found.hash)?;
 
-    // The identity line: who this parcel resolves to at the query's trust level.
+    // The identity line: who this parcel resolves to at the query's trust level. The operator,
+    // supervisor and description below come out of a parcel or the office, either of which may
+    // have arrived from a remote, so each is sanitized for the terminal (never for `--json`).
     let identity = &found.identity;
-    let operator = identity.operator.as_deref().unwrap_or("(unknown)");
+    let operator = sanitize(identity.operator.as_deref().unwrap_or("(unknown)"));
     let mut qualifiers: Vec<String> = Vec::new();
     if let Some(class) = identity.class.filter(|class| class.is_automated()) {
         match &identity.supervisor {
             Some(supervisor) => {
-                qualifiers.push(format!("{}, supervised by {}", class.as_str(), supervisor))
+                qualifiers.push(format!("{}, supervised by {}", class.as_str(), sanitize(supervisor)))
             }
             None => qualifiers.push(class.as_str().to_string()),
         }
@@ -347,7 +350,7 @@ fn render_match(
             .map(|class| {
                 let supervisor = user
                     .and_then(|user| user.supervisor.as_deref())
-                    .map(|supervisor| format!(", supervised by {}", supervisor))
+                    .map(|supervisor| format!(", supervised by {}", sanitize(supervisor)))
                     .unwrap_or_default();
                 format!(" [{}{}]", class.as_str(), supervisor)
             })
@@ -357,7 +360,7 @@ fn render_match(
             out,
             "{} {}{} at {}",
             action.action.get_name_for_peek(),
-            identifier,
+            sanitize(identifier),
             class,
             action.timestamp.format("%Y-%m-%d %H:%M:%S UTC"),
         )?;
@@ -366,7 +369,7 @@ fn render_match(
     if let Some(description) = &found.parcel.description {
         writeln!(out)?;
         for line in description.lines() {
-            writeln!(out, "    {}", line)?;
+            writeln!(out, "    {}", sanitize(line))?;
         }
     }
 

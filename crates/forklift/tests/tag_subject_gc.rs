@@ -15,7 +15,7 @@
 //! tags whose subject it never fetched. Only a genuinely indeterminate probe (an I/O error, never
 //! a definite answer) is still an ordinary command error — see the third test below.
 //!
-//! Round 2 of review added a third classification: `Tag.subject` is an unvalidated free string
+//! A third classification followed: `Tag.subject` is an unvalidated free string
 //! (`tag_utils.rs:328`, `read_string("subject")`), and `@tags` records sync in wholesale via
 //! `adopt_meta_pallets`, so a foreign or older client can author one that is not even hash-shaped.
 //! Before that fix, `probe_subject`'s presence check (`file_utils::does_object_exist`) reached
@@ -32,13 +32,13 @@
 //! `crate::commands::tag::tests` (`crates/forklift/src/commands/tag.rs`) for the unit-level
 //! coverage of the classification and rendering logic instead.
 //!
-//! Round 3 found round 2's fix incomplete: `parse_tag` validates none of `Tag`'s fields (only
+//! That fix was itself incomplete: `parse_tag` validates none of `Tag`'s fields (only
 //! `tag create` validates the one it creates, `name`), so `name`/`subject`/`message`/`tagger` are
 //! *all* remote-authored and arbitrary, and the render path did not honour that — a subject
 //! sliced by byte range (`&s[..12]`) could panic on multi-byte UTF-8, and `name` renders even
-//! further ahead of the marker than `message` does, so round 2's positional fix did not cover it.
+//! further ahead of the marker than `message` does, so a positional fix did not cover it.
 //! The fix moved from field-by-field patching to a boundary: every tag-record string a human
-//! render prints goes through `crate::commands::tag::render_safe` (neutralizes control
+//! render prints goes through `forklift_core::error::sanitize` (neutralizes control
 //! characters, including ANSI escapes) and, where truncated for display,
 //! `crate::commands::tag::truncate_chars` (character-safe, never a byte range). A name that fails
 //! `tag create`'s own naming rules is surfaced (`TagView::name_invalid`) rather than hidden or
@@ -616,7 +616,7 @@ fn list_row_fields_cannot_forge_hide_or_corrupt_the_absent_marker() {
     );
 
     // THE ANSI ESCAPE: the raw ESC byte must never survive to a printed row — the whole point of
-    // `render_safe`. Checked over the full `stdout`, not just `ansi_line`, so a leaked escape
+    // `forklift_core::error::sanitize`. Checked over the full `stdout`, not just `ansi_line`, so a leaked escape
     // that (mis)styles a *different* row still fails this.
     assert!(
         !stdout.contains('\x1b'),
