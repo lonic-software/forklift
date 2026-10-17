@@ -78,8 +78,10 @@ in copy `B`:
 |-----------|-----|----------|
 | **status** (clean tree) | `git status` | `forklift stocktake --summary` |
 | **log** (whole history) | `git log` | `forklift history` |
-| **diff** (dirty tree) | `git diff` | `forklift diff --staged` |
-| **commit** (1 file) | `git add` + `git commit` | `forklift load` + `forklift stack` |
+| **diff, unstaged** (20 edited files) | `git diff` | `forklift diff` |
+| **diff, staged** (same 20, staged) | `git diff --staged` | `forklift diff --staged` |
+| **commit** (1 file) | `git commit` | `forklift stack` |
+| **commit, git fsync=all** | `git -c core.fsync=all -c core.fsyncMethod=fsync commit` | `forklift stack` |
 | **onboard** *(separate)* | `git clone --local` | `forklift import-git .` |
 
 `import-git` writes straight into native packs as it imports — there is no loose store
@@ -92,6 +94,14 @@ the import as onboarding cost, and the four comparison rows run on the *densifie
 store — the steady state a user who followed the suggestion operates in, compared
 against the shape git is always measured in (`clone --local` copies packfiles).
 Pass `--no-redelta` to time the as-imported store instead.
+
+Each read-only command gets one untimed warm-up run before its timed runs. The commit
+rows time only the commit: the one-line edit and its `git add` / `forklift load` are
+untimed setup, and both copies are reset to a clean tree after the diff rows, so each
+timed commit records exactly one file. The harness checks that both tools saw the same
+change set before each diff row and that both trees are clean before the commit rows,
+and it stops with an error if any timed or setup command fails, rather than publishing
+the time of a command that failed early.
 
 Output is an **aligned text table** (pass `--markdown` for a pasteable markdown one):
 git time, forklift time, the **forklift/git ratio** (below 1.0 means forklift was
@@ -191,6 +201,13 @@ These matter. A benchmark that hides them is a sales pitch, not a measurement.
   runs, not a distribution. For anything you plan to publish, re-run the same
   commands under `hyperfine` (see §5) — it does warmup, many runs, and outlier
   detection.
+- **Durability differs by default.** Every `forklift stack` is durable when it
+  returns: on macOS it ends with a device-cache flush (`F_FULLFSYNC`). git's defaults
+  are weaker there: git-config(1) documents `core.fsyncMethod`'s macOS default as
+  `writeout-only`, which "may not be durable in the event of a system crash". The
+  harness therefore times git's commit twice, with its defaults and with
+  `core.fsync=all` + `core.fsyncMethod=fsync`; the second row is the like-for-like
+  durability comparison. Quote the one that matches the question you are asking.
 - **Forklift signs; git doesn't (by default).** If you `office enroll` the imported
   warehouse, every `stack` afterwards signs the parcel — real work git isn't doing
   in its `commit`. Benchmark signed vs unsigned deliberately; don't conflate them.
@@ -239,12 +256,18 @@ du -sh .forklift                             # densified — the state the table
 ( cd ~/bench/A && time git log            >/dev/null )
 ( cd ~/bench/B && time forklift history   >/dev/null )
 
-# diff (dirty the same files in both, then diff):
-for f in README.md Makefile; do printf '\n// edit\n' >> ~/bench/A/$f ~/bench/B/$f; done
+# diff (dirty the same files in both, then diff unstaged and staged):
+for f in README.md Makefile; do printf '\n// edit\n' >> ~/bench/A/$f; printf '\n// edit\n' >> ~/bench/B/$f; done
 ( cd ~/bench/A && time git diff           >/dev/null )
+( cd ~/bench/B && time forklift diff      >/dev/null )
+( cd ~/bench/A && git add -A    && time git diff --staged      >/dev/null )
 ( cd ~/bench/B && forklift load . && time forklift diff --staged >/dev/null )
 
-# commit (stage a change, then commit/stack):
+# back to a clean tree, so the commit records one file and not the diff step's edits:
+( cd ~/bench/A && git reset -q --hard )
+( cd ~/bench/B && forklift restore --staged . && forklift restore . )
+
+# commit (stage a change, then commit/stack; only the commit is timed):
 ( cd ~/bench/A && echo x >> README.md && git add README.md   && time git commit -q -m bench )
 ( cd ~/bench/B && echo x >> README.md && forklift load README.md && time forklift stack bench )
 ```

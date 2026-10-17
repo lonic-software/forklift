@@ -38,10 +38,14 @@ startup — CLI argument parsing, TOML config load, warehouse-root discovery —
 chunk of every command's time. Measured floor: forklift's own no-op path costs
 **~7–8 ms**; git's is **~11–14 ms**. Forklift is not behind here, it is ahead — and
 that git figure should be read generously in forklift's favor, not the other way:
-the git binary measured is **x86_64 running under Rosetta** on this box, which
+the git binary measured then was **x86_64 running under Rosetta**, which
 inflates every git measurement, most visibly on syscall-heavy operations (many small
 `read`/`stat` calls each pay the translation tax). So the true native-vs-native gap
 on fixed overhead likely favors forklift by even more than 7–8 vs 11–14 ms suggests.
+*(Correction, 2026-10-17: this applies to the 2026-07-15 measurement only. The box
+now runs native arm64 git 2.55.0, and every ratio in `BENCHMARK.md` since its
+2026-07-15 re-measure is native against native. The fixed-overhead figures above were
+not re-measured natively.)*
 Whatever is making `diff` and `commit` slower than git is not a fixed floor — it is
 work that scales with the corpus, per command, addressed below.
 

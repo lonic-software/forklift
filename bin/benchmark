@@ -147,31 +147,40 @@ N_FILES=$(git -C "$A" ls-files | wc -l | tr -d ' ')
 GIT_SIZE=$(du -sh "$A/.git" 2>/dev/null | cut -f1 | tr -d ' ')
 
 # ── the timing core ─────────────────────────────────────────────────────────
-# time_cmd <runs> <dir> <setup> <cmd>  → echoes "mean_ms min_ms"
-#   setup empty  → read-only op: the whole loop is timed once and divided (low
-#                  timer overhead), min == mean.
+# time_cmd <runs> <dir> <setup> <cmd>  → echoes the mean in ms
+#   setup empty  → read-only op: one untimed warm-up run, then the whole loop is
+#                  timed once and divided (low timer overhead).
 #   setup given  → run before each timed iteration and NOT counted; each run is
-#                  timed individually so the mean/min reflect the command alone.
+#                  timed individually so the mean reflects the command alone.
+# A failing setup or command aborts the benchmark: a command that errors out early
+# times as fast, and that number must never reach the table. Callers assign the
+# result directly (`GM=$(time_cmd ...)`) so `set -e` sees the subshell's exit.
+run_in() { # dir cmd  — run quietly; on failure name the command and exit
+    if ! ( cd "$1" && eval "$2" ) >/dev/null 2>&1; then
+        echo "error: benchmark command failed in $1: $2" >&2
+        echo "  Re-run with --keep and reproduce it by hand there." >&2
+        exit 1
+    fi
+}
 time_cmd() {
     local runs="$1" dir="$2" setup="$3" cmd="$4"
-    local i t0 t1 dt sum=0 min=""
+    local i t0 t1 sum=0
     if [ -z "$setup" ]; then
+        run_in "$dir" "$cmd"
         t0=$(_now_ms)
-        for ((i=0; i<runs; i++)); do ( cd "$dir" && eval "$cmd" ) >/dev/null 2>&1 || true; done
+        for ((i=0; i<runs; i++)); do run_in "$dir" "$cmd"; done
         t1=$(_now_ms)
         local per=$(( (t1 - t0) / runs ))
-        echo "$per $per"
+        echo "$per"
     else
         for ((i=0; i<runs; i++)); do
-            ( cd "$dir" && eval "$setup" ) >/dev/null 2>&1 || true
+            run_in "$dir" "$setup"
             t0=$(_now_ms)
-            ( cd "$dir" && eval "$cmd" ) >/dev/null 2>&1 || true
+            run_in "$dir" "$cmd"
             t1=$(_now_ms)
-            dt=$(( t1 - t0 ))
-            sum=$(( sum + dt ))
-            if [ -z "$min" ] || [ "$dt" -lt "$min" ]; then min=$dt; fi
+            sum=$(( sum + t1 - t0 ))
         done
-        echo "$(( sum / runs )) $min"
+        echo "$(( sum / runs ))"
     fi
 }
 
@@ -280,19 +289,23 @@ FORK_SIZE=$(du -sh "$B/.forklift" 2>/dev/null | cut -f1 | tr -d ' ')
 
 # ── 2. status on a clean tree ───────────────────────────────────────────────
 echo "→ [2/5] status…"
-read -r GM _        <<< "$(time_cmd "$RUNS" "$A" "" 'git status')"
-read -r FM _        <<< "$(time_cmd "$RUNS" "$B" "" 'forklift stocktake --summary')"
+GM=$(time_cmd "$RUNS" "$A" "" 'git status')
+FM=$(time_cmd "$RUNS" "$B" "" 'forklift stocktake --summary')
 add_row "status (clean tree)" "$GM" "$FM" "git status vs forklift stocktake --summary"
 
 # ── 3. full-history log walk ────────────────────────────────────────────────
 echo "→ [3/5] log…"
-read -r GM _        <<< "$(time_cmd "$RUNS" "$A" "" 'git log')"
-read -r FM _        <<< "$(time_cmd "$RUNS" "$B" "" 'forklift history')"
+GM=$(time_cmd "$RUNS" "$A" "" 'git log')
+FM=$(time_cmd "$RUNS" "$B" "" 'forklift history')
 add_row "log (whole history)" "$GM" "$FM" "$N_COMMITS commits walked"
 
 # ── 4. diff of a dirty tree ─────────────────────────────────────────────────
 echo "→ [4/5] diff…"
-# Dirty the same handful of tracked files in both copies, then diff read-only.
+# Dirty the same handful of tracked files in both copies, then diff read-only, twice:
+# unstaged (working directory vs index/inventory), then staged (index/inventory vs
+# head) after staging the same files on both sides. Each row pairs the two tools'
+# like-for-like operation; timing `git diff` against `forklift diff --staged` would
+# compare a re-stat against a tree walk.
 # (Portable array read — macOS bash 3.2 has no `mapfile`.)
 DIRTY=()
 while IFS= read -r f; do DIRTY+=("$f"); done \
@@ -304,22 +317,63 @@ for f in "${DIRTY[@]}"; do
     printf '\n// benchmark edit\n' >> "$A/$f"
     printf '\n// benchmark edit\n' >> "$B/$f"
 done
-( cd "$B" && forklift load . ) >/dev/null 2>&1 || true   # so forklift diff --staged has something too
-read -r GM _        <<< "$(time_cmd "$RUNS" "$A" "" 'git diff')"
-read -r FM _        <<< "$(time_cmd "$RUNS" "$B" "" 'forklift diff --staged')"
-add_row "diff (${#DIRTY[@]} files changed)" "$GM" "$FM" "git diff vs forklift diff --staged"
-# restore both trees to clean before the commit benchmark
-git -C "$A" checkout -- . 2>/dev/null || true
-( cd "$B" && forklift restore . ) >/dev/null 2>&1 || true
+
+# fl_count <staged_count|unstaged_count>  → that count from forklift's stocktake
+fl_count() {
+    ( cd "$B" && forklift --json stocktake --summary ) 2>/dev/null \
+        | sed -n "s/.*\"$1\": *\([0-9][0-9]*\).*/\1/p"
+}
+# expect_counts <what> <git_count> <forklift_count>  — both tools must see the same
+# change set, or the row compares different work.
+expect_counts() {
+    if [ "$2" != "${#DIRTY[@]}" ] || [ "$3" != "${#DIRTY[@]}" ]; then
+        echo "error: $1: expected ${#DIRTY[@]} changed file(s) on both sides, git saw '$2'" \
+             "and forklift saw '$3' — the two copies no longer hold the same change." >&2
+        echo "  Re-run with --keep and compare $A and $B by hand." >&2
+        exit 1
+    fi
+}
+
+expect_counts "unstaged diff" "$(git -C "$A" diff --name-only | wc -l | tr -d ' ')" \
+    "$(fl_count unstaged_count)"
+GM=$(time_cmd "$RUNS" "$A" "" 'git diff')
+FM=$(time_cmd "$RUNS" "$B" "" 'forklift diff')
+add_row "diff, unstaged (${#DIRTY[@]} files)" "$GM" "$FM" "git diff vs forklift diff"
+
+run_in "$A" 'git add -A'
+run_in "$B" 'forklift load .'
+expect_counts "staged diff" "$(git -C "$A" diff --cached --name-only | wc -l | tr -d ' ')" \
+    "$(fl_count staged_count)"
+GM=$(time_cmd "$RUNS" "$A" "" 'git diff --staged')
+FM=$(time_cmd "$RUNS" "$B" "" 'forklift diff --staged')
+add_row "diff, staged (${#DIRTY[@]} files)" "$GM" "$FM" "git diff --staged vs forklift diff --staged"
+
+# Return both trees to clean — index/inventory and working files — so the commit
+# below records exactly the one file its setup stages, then check that it did.
+run_in "$A" 'git reset -q --hard'
+run_in "$B" 'forklift restore --staged . && forklift restore .'
+if [ -n "$(git -C "$A" status --porcelain)" ] \
+    || [ "$(fl_count staged_count)" != 0 ] || [ "$(fl_count unstaged_count)" != 0 ]; then
+    echo "error: a working copy is not clean after the diff step, so the commit benchmark" >&2
+    echo "  would record more than one file. Re-run with --keep and inspect $A and $B." >&2
+    exit 1
+fi
 
 # ── 5. commit / stack (per-run setup: make + stage a one-line change) ───────
 echo "→ [5/5] commit…"
+# Only the commit itself is timed; the edit and the staging step are setup. git runs
+# twice: with its defaults, and with every write fsynced. git-config(1) documents
+# core.fsyncMethod's default on macOS as writeout-only, which may not survive a crash;
+# forklift syncs each stack durably (a device-cache flush on macOS), so the second
+# row is the like-for-like durability comparison there.
 BENCH_FILE="${DIRTY[0]:-BENCHMARK_SCRATCH.txt}"
 GIT_SETUP="printf '\n// commit bench %s\n' \"\$RANDOM\" >> '$BENCH_FILE'; git add '$BENCH_FILE'"
 FORK_SETUP="printf '\n// commit bench %s\n' \"\$RANDOM\" >> '$BENCH_FILE'; forklift load '$BENCH_FILE'"
-read -r GM _        <<< "$(time_cmd "$COMMIT_RUNS" "$A" "$GIT_SETUP"  'git commit -q -m bench')"
-read -r FM _        <<< "$(time_cmd "$COMMIT_RUNS" "$B" "$FORK_SETUP" 'forklift stack bench')"
-add_row "commit (1 file)" "$GM" "$FM" "git add+commit vs forklift load+stack; mean of $COMMIT_RUNS"
+GM=$(time_cmd "$COMMIT_RUNS" "$A" "$GIT_SETUP"  'git commit -q -m bench')
+GDM=$(time_cmd "$COMMIT_RUNS" "$A" "$GIT_SETUP" 'git -c core.fsync=all -c core.fsyncMethod=fsync commit -q -m bench')
+FM=$(time_cmd "$COMMIT_RUNS" "$B" "$FORK_SETUP" 'forklift stack bench')
+add_row "commit (1 file)" "$GM" "$FM" "git commit vs forklift stack, staging untimed; mean of $COMMIT_RUNS"
+add_row "commit, git fsync=all" "$GDM" "$FM" "same, git with core.fsync=all core.fsyncMethod=fsync"
 
 # ── report ──────────────────────────────────────────────────────────────────
 # The size ratio compares git against the store the timings ran on (densified when
@@ -346,7 +400,7 @@ build_report() {
         echo "- **Repo:** $REPO_NAME — $N_COMMITS commits, $N_FILES tracked files"
         echo "- **On-disk:** git \`.git\` = ${GIT_SIZE:-?}, forklift \`.forklift\` = ${FORK_SIZE_FIELD}${SIZE_NOTE}"
         echo "- **Tools:** $GIT_VERSION · $FORKLIFT_VERSION"
-        echo "- **Method:** read-only ops = mean of $RUNS runs, commit = mean of $COMMIT_RUNS; warm cache. Ratio < 1 means forklift is faster."
+        echo "- **Method:** read-only ops = mean of $RUNS runs after one warm-up run, commit = mean of $COMMIT_RUNS; warm cache. Ratio < 1 means forklift is faster."
         echo "- **Store:** git ships packed (\`clone --local\` copies packfiles); forklift is ${STORE_STATE} — the timings below ran on that store."
         echo
         render_table_markdown
@@ -370,7 +424,7 @@ build_report() {
         printf '  Repo:      %s — %s commits, %s tracked files\n' "$REPO_NAME" "$N_COMMITS" "$N_FILES"
         printf '  On-disk:   git .git = %s   forklift .forklift = %s%s\n' "${GIT_SIZE:-?}" "$FORK_SIZE_FIELD" "$SIZE_NOTE"
         printf '  Tools:     %s · %s\n' "$GIT_VERSION" "$FORKLIFT_VERSION"
-        printf '  Method:    read-only ops = mean of %s runs, commit = mean of %s; warm cache.\n' "$RUNS" "$COMMIT_RUNS"
+        printf '  Method:    read-only ops = mean of %s runs after one warm-up run, commit = mean of %s; warm cache.\n' "$RUNS" "$COMMIT_RUNS"
         printf '             A ratio below 1.00 means forklift is faster.\n'
         printf '             git ships packed; forklift is %s.\n' "$(printf '%s' "$STORE_STATE" | tr -d '`')"
         echo
