@@ -149,12 +149,20 @@ is a leftover conflict marker (consolidating two edits of the file writes them),
 when a pattern matches the empty string (`.*`, `x*`, `a|`): such a pattern matches
 every path.
 
-Unlike git, a rule also applies to paths that are already tracked: the next `load .`
-stages their removal. Because the rules travel, a rule someone else stacks does the
-same in your warehouse once you `lower` it.
+As in git, a rule covers only **untracked** paths. A path inside a folder a rule
+covers is covered too, even where no rule matches the path itself. A tracked path
+stays tracked whatever the rules say, so its edits keep showing in `stocktake`, and
+`shift` and the other pallet switches refuse to overwrite them. Because the rules
+travel, this matters when someone else stacks a rule over files you track. To stop
+tracking a path a rule now covers, `remove` it and stack: the file stays on disk and
+is ignored from then on.
+
+Naming a file in `load` tracks it despite a rule. Loading a folder (`load .`,
+`load build`) never adds content the rules cover. It still refreshes tracked files
+inside that folder. Nothing under `.forklift/` can be loaded at all.
 
 Anchor a folder rule at both ends. `^target\/?.*$` also matches `targets.txt` and
-`target-notes/`, so an unanchored rule can swallow tracked files you meant to keep.
+`target-notes/`, so an unanchored rule can hide new files you meant to load.
 
 ### `alias` — the `fl` short name
 
@@ -241,7 +249,8 @@ forklift remove old.txt
 Marks the path's inventory entries as deleted so the next parcel won't contain
 them. The working directory is **not** touched (the file stays on disk). To
 un-stage the removal, `load` the file again (if it's still there) or use
-`unload`.
+`unload`. A file that stays on disk after its removal is stacked is untracked, so
+this is how a tracked path starts being covered by a `.forkliftignore` rule.
 
 ### `stocktake` — status (`st`)
 

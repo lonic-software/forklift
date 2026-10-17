@@ -3776,6 +3776,32 @@ fn narrow_refuses_to_delete_dirty_tracked_changes() {
 }
 
 #[test]
+fn narrow_refuses_to_delete_an_edited_tracked_file_a_rule_covers() {
+    // A rule covers only untracked paths, so an edit to a tracked file it matches is still
+    // uncommitted work that narrow's unconditional delete would destroy.
+    let area = TestArea::new("sparse-narrow-ignored-tracked");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/src/api/a.txt", "api v1\n");
+    area.write_file("dev/docs/gen.txt", "gen v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    assert_success(&area.forklift(".",
+        &["franchise", &server.url, "sparse", "--only", "src/api", "--only", "docs"]));
+
+    std::fs::write(area.path("sparse/.forkliftignore"), "^docs/gen\\.txt$\n").unwrap();
+    std::fs::write(area.path("sparse/docs/gen.txt"), "gen v2 (unsaved)\n").unwrap();
+
+    let refused = area.forklift("sparse", &["--json", "narrow", "docs"]);
+    assert_eq!(refused.status.code(), Some(12), "narrow_unclean exits 12: {}", stderr(&refused));
+    assert_eq!(area.read_file("sparse/docs/gen.txt"), "gen v2 (unsaved)\n",
+        "the edit must survive a refused narrow");
+}
+
+#[test]
 fn narrow_refuses_to_delete_untracked_files() {
     // An untracked file under the narrowed prefix — never loaded, never stacked — must also
     // block narrow: it is uncommitted work, even though it was never tracked.

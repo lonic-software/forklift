@@ -547,7 +547,7 @@ pub async fn create_inventory_for_directory(path: &WarehousePath) -> Result<(), 
     let mut outcomes: BTreeMap<String, ShardOutcome> = std::mem::take(&mut *context.outcomes.lock().await);
     let mut stale_keys: BTreeSet<String> = BTreeSet::new();
 
-    // Directories that are gone from the working directory (deleted, or ignored now) keep their
+    // Directories that are gone from the working directory keep their
     // inventory shard, with every entry marked as a staged removal. Folded into the same join
     // point as every other mutation this walk makes, rather than its own separate atomic write
     // per directory. Only ever considered after a fully successful walk — on failure, the walk
@@ -2053,7 +2053,7 @@ pub fn remove_inventories_under(prefix: &str) -> Result<(), String> {
 }
 
 /// Carry over the entries of the previous inventory that were not re-added by the directory
-/// walk (their file was deleted, renamed, newly ignored, or replaced by a directory),
+/// walk (their file was deleted, renamed, or replaced by a directory),
 /// marking them as staged removals.
 ///
 /// # Arguments
@@ -2802,6 +2802,28 @@ mod tests {
         assert_eq!(read_rollup(""), None, "narrow must conservatively clear the root's rollup");
         assert_eq!(read_rollup("a"), None, "narrow must conservatively clear the parent's rollup");
         assert!(!file_utils::get_inventory_data_path_for_key("a/b").exists());
+    }
+
+    #[test]
+    fn the_metadata_is_written_closed_under_ancestors() {
+        let _scratch = Scratch::new("metadata-closure");
+        write_stamped_shard("a/b", None);
+
+        let registered = |expected: &[&str]| {
+            let (_, metadata) = file_utils::retrieve_inventory_metadata_or_none().unwrap();
+            let expected: BTreeSet<String> = expected.iter().map(|key| key_to_metadata_entry(key)).collect();
+            assert_eq!(metadata.unwrap(), expected);
+        };
+
+        // A writer that registers only the directory it wrote still registers every ancestor.
+        update_inventory_metadata(&BTreeSet::from(["a/b".to_string()]), &BTreeSet::new()).unwrap();
+        registered(&["", "a", "a/b"]);
+
+        // A remover that drops an ancestor while a descendant stays registered does not unregister it.
+        update_inventory_metadata(&BTreeSet::new(), &BTreeSet::from(["a".to_string()])).unwrap();
+        registered(&["", "a", "a/b"]);
+        assert!(is_tracked_directory("a").unwrap());
+        assert!(!is_tracked_directory("a/b/c").unwrap());
     }
 
     #[test]
