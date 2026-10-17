@@ -755,6 +755,72 @@ fn loaded_packs() -> Result<Arc<PackSet>, String> {
     reload_packs()
 }
 
+/// How many times this process read a pack folder into a pack set, and how many of those sets a
+/// preload cached. Test-only observability across the subprocess boundary, printed under
+/// `FORKLIFT_DEBUG_PACK_COUNTS`: a preload that raced the render into a second read, or one that
+/// fired for a walk with nothing to render, is invisible in the output alone.
+static PACK_SET_READ_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PACK_PRELOAD_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The process-wide pack-folder read count — see [`PACK_SET_READ_COUNT`].
+pub fn pack_set_read_count() -> u64 {
+    PACK_SET_READ_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The process-wide count of pack sets a preload cached — see [`PACK_SET_READ_COUNT`].
+pub fn pack_preload_count() -> u64 {
+    PACK_PRELOAD_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A pack set being read on a background thread ahead of its first lookup (see [`preload_packs`]).
+pub struct PackPreload {
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PackPreload {
+    /// Wait for the preload to land, so the next lookup finds the set cached rather than racing
+    /// the background read into a second one.
+    pub fn wait(self) {
+        if let Some(handle) = self.handle {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Start reading the active warehouse's packs on a background thread. Opening a pack set reads
+/// and validates every index, ~4.4 ms for git.git's ~500k records (FORK-183), so a command that
+/// walks first and looks objects up after overlaps the two instead of paying them in turn.
+///
+/// The objects root is resolved here, on the calling thread, since a storage-root scope is
+/// thread-local. The set is cached only if nothing was cached for that root meanwhile, and a read
+/// error is dropped: the first real lookup then reads the folder itself and reports the error
+/// where it always has. Dropping the handle without [`PackPreload::wait`] detaches the thread,
+/// and process exit does not wait for it.
+pub fn preload_packs() -> PackPreload {
+    let key = file_utils::get_path_objects_root();
+    let folder = pack_folder();
+
+    let handle = std::thread::Builder::new()
+        .name("forklift-pack-preload".to_string())
+        .spawn(move || {
+            if registry().lock().expect("the pack registry lock is poisoned").contains_key(&key) {
+                return;
+            }
+
+            if let Ok(packs) = load_packs_from_disk(&folder) {
+                registry().lock().expect("the pack registry lock is poisoned")
+                    .entry(key)
+                    .or_insert_with(|| {
+                        PACK_PRELOAD_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        Arc::new(packs)
+                    });
+            }
+        })
+        .ok();
+
+    PackPreload { handle }
+}
+
 /// Load the active warehouse's packs from disk and cache them, replacing whatever was cached.
 /// Two threads reloading at once may overwrite each other; an older set that wins carries an
 /// older stamp, so the next miss sees the folder past it and reloads again.
@@ -1060,6 +1126,8 @@ pub fn densify_pending() -> Result<bool, String> {
 /// The returned set carries a [`FolderStamp`] taken before the listing, and each broken entry a
 /// [`PairStamp`] taken before its load, which is what [`reloaded_if_stale`] compares against.
 fn load_packs_from_disk(pack_folder: &Path) -> Result<PackSet, String> {
+    PACK_SET_READ_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
     let mut packs = Vec::new();
     let mut quarantined = Vec::new();
     let mut unenumerable = Vec::new();

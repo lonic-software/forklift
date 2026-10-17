@@ -106,6 +106,13 @@ async fn async_main() {
         eprintln!("barrier-count: {}", forklift_core::util::file_utils::barrier_count());
     }
 
+    // Undocumented, test-only debug hook, same shape again: lets the pack preload tests prove a
+    // `diff` read the pack folder once, and that the read was the preload's.
+    if std::env::var("FORKLIFT_DEBUG_PACK_COUNTS").is_ok() {
+        eprintln!("pack-set-reads: {}", forklift_core::util::pack_utils::pack_set_read_count());
+        eprintln!("pack-preloads: {}", forklift_core::util::pack_utils::pack_preload_count());
+    }
+
     if let Err(error) = result {
         // A result that failed to serialize already wrote this process's one document.
         if !output::result_unserializable() {

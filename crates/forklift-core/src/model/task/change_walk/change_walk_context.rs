@@ -4,6 +4,7 @@ use tokio::sync::Mutex;
 use crate::model::inventory::Inventory;
 use crate::model::task::base_task_context::BaseTaskContext;
 use crate::traits::task_context::TaskContext;
+use crate::util::pack_utils::{self, PackPreload};
 use crate::util::stocktake_utils::Change;
 
 /// The context for the parallel change-collection walks (the staged and unstaged halves
@@ -29,6 +30,10 @@ pub struct ChangeWalkContext {
     /// only wants the change list — skipping the per-directory `shards` lock keeps their walk as
     /// contention-free as it was before this memo existed.
     pub collect_shards: bool,
+
+    /// The pack set read ahead for a content render, started by the first directory that found a
+    /// change whose old side lives in the object store (see [`preload_packs`](Self::preload_packs)).
+    pack_preload: std::sync::Mutex<Option<PackPreload>>,
 }
 
 impl ChangeWalkContext {
@@ -47,6 +52,27 @@ impl ChangeWalkContext {
             changes: Arc::new(Mutex::new(Vec::new())),
             shards: Arc::new(Mutex::new(HashMap::new())),
             collect_shards,
+            pack_preload: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Start reading the pack set in the background, once per walk. A walk that collects shards
+    /// is feeding a content render, whose first object lookup would otherwise open every pack
+    /// after the walk instead of during it; a walk that finds no such change never pays for it.
+    pub fn preload_packs(&self) {
+        let mut preload = self.pack_preload.lock().expect("the pack preload lock is poisoned");
+
+        if preload.is_none() {
+            *preload = Some(pack_utils::preload_packs());
+        }
+    }
+
+    /// Wait for a preload [`preload_packs`](Self::preload_packs) started, if any.
+    pub fn wait_for_packs(&self) {
+        let preload = self.pack_preload.lock().expect("the pack preload lock is poisoned").take();
+
+        if let Some(preload) = preload {
+            preload.wait();
         }
     }
 }

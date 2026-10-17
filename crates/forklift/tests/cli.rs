@@ -2474,6 +2474,49 @@ fn diff_reports_unstaged_and_staged_line_changes() {
     assert!(verbose.contains("shared"), "unexpected verbose output: {}", verbose);
 }
 
+/// The `FORKLIFT_DEBUG_PACK_COUNTS` lines of a run: (pack-folder reads, preloads that landed).
+fn pack_counts(output: &Output) -> (u64, u64) {
+    let stderr = stderr(output);
+    let count = |prefix: &str| stderr.lines()
+        .find_map(|line| line.strip_prefix(prefix))
+        .unwrap_or_else(|| panic!("no {} line in stderr: {}", prefix, stderr))
+        .trim().parse::<u64>().unwrap();
+
+    (count("pack-set-reads: "), count("pack-preloads: "))
+}
+
+/// `diff` opens the pack set during the walk, and only when a change needs an old side read:
+/// the render finds it cached (one read, the preload's), and a walk with nothing to render never
+/// pays for it.
+#[test]
+fn diff_preloads_the_pack_set_only_for_a_change_it_renders() {
+    let warehouse = TestWarehouse::new("diff-pack-preload");
+    warehouse.write_file("a.txt", "original\n");
+    warehouse.write_file("dir/b.txt", "b\n");
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "first"]));
+    assert_success(&warehouse.run(&["compact"]));
+    let counts = [("FORKLIFT_DEBUG_PACK_COUNTS", "1")];
+
+    let clean = warehouse.run_with_env(&["diff"], &counts);
+    assert_success(&clean);
+    assert_eq!(pack_counts(&clean), (0, 0), "a clean walk reads no packs");
+
+    warehouse.write_file("untracked.txt", "new\n");
+    let untracked = warehouse.run_with_env(&["diff"], &counts);
+    assert_success(&untracked);
+    assert_eq!(pack_counts(&untracked), (0, 0), "an untracked file is not diffed, so nothing is preloaded");
+
+    warehouse.write_file("dir/b.txt", "changed\n");
+    let modified = warehouse.run_with_env(&["diff"], &counts);
+    assert_success(&modified);
+    assert!(stdout(&modified).contains("+ changed"), "{}", stdout(&modified));
+    assert_eq!(pack_counts(&modified), (1, 1), "the render reads the preloaded set, never a second one");
+}
+
 #[test]
 fn diff_reports_removals_added_files_and_binary_content() {
     let warehouse = TestWarehouse::new("diff-kinds");

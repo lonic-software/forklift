@@ -369,6 +369,11 @@ pub async fn collect_unstaged_changes() -> Result<Vec<Change>, String> {
 /// parsed along the way, keyed by warehouse path key — see
 /// [`collect_staged_changes_with_shards`] for why this exists and why it is invocation-scoped.
 ///
+/// The caller is about to render content, so once the walk finds a change with an inventory side
+/// it also opens the pack set in the background, and returns only after that lands: the render's
+/// first object lookup then finds it cached. It blocks the calling task while it waits, which
+/// costs nothing here because the walk is all that runs on it.
+///
 /// # Returns
 /// * `Ok((Vec<Change>, HashMap<String, Arc<Inventory>>))` - The unstaged changes (sorted by
 ///   path) and the shards the walk parsed.
@@ -410,6 +415,7 @@ async fn collect_unstaged_changes_impl(collect_shards: bool)
     let mut changes = std::mem::take(&mut *context.changes.lock().await);
 
     detect_unstaged_moves(&mut changes)?;
+    context.wait_for_packs();
 
     changes.sort_by(|a, b| a.path.cmp(&b.path));
 
@@ -573,6 +579,10 @@ fn walk_directory_unstaged(context: Arc<ChangeWalkContext>,
         // matching comment in `walk_directory_staged`.
         if context.collect_shards && !found.is_empty() {
             context.shards.lock().await.insert(key.clone(), inventory);
+
+            if found.iter().any(|change| change.kind != ChangeKind::Untracked) {
+                context.preload_packs();
+            }
         }
 
         context.changes.lock().await.extend(found);
