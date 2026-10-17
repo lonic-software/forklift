@@ -2453,7 +2453,7 @@ pub fn get_owners_for_file(_metadata: &Metadata) -> (u64, u64) {
 /// tracked name of the other type, from `inventory_utils::rule_verdict`.
 pub struct IgnoreRules {
     built_in: Vec<Regex>,
-    user: Vec<Regex>,
+    user: Vec<IgnoreFileRule>,
 }
 
 /// Whether a user rule matches a directory's key or the key of one of its ancestors: what that
@@ -2471,17 +2471,30 @@ impl IgnoreRules {
     /// # Returns
     /// * `Coverage` - Whether a user rule matches the key or an ancestor's key.
     pub fn coverage_of(&self, dir_key: &str) -> Coverage {
+        Coverage(self.covering_rule(dir_key).is_some())
+    }
+
+    /// The first user rule, in file order, that matches the directory's key or the key of one of
+    /// its ancestors: the rule behind [`IgnoreRules::coverage_of`].
+    ///
+    /// # Arguments
+    /// * `dir_key` - The warehouse path key of the directory (`""` for the root).
+    ///
+    /// # Returns
+    /// * `Some(&IgnoreFileRule)` - The rule, nearest key first.
+    /// * `None`                  - No user rule covers the directory.
+    pub fn covering_rule(&self, dir_key: &str) -> Option<&IgnoreFileRule> {
         let mut current = dir_key;
 
         while !current.is_empty() {
-            if self.user.iter().any(|r| r.is_match(current)) {
-                return Coverage(true);
+            if let Some(rule) = self.user.iter().find(|rule| rule.matches(current)) {
+                return Some(rule);
             }
 
             current = current.rsplit_once(PATH_SEPARATOR_CHAR).map(|(parent, _)| parent).unwrap_or("");
         }
 
-        Coverage(false)
+        None
     }
 
     /// The coverage a directory passes to its entries, given its parent's: what
@@ -2494,7 +2507,7 @@ impl IgnoreRules {
     /// # Returns
     /// * `Coverage` - Whether a user rule matches the key or an ancestor's key.
     pub fn coverage_below(&self, parent: Coverage, dir_key: &str) -> Coverage {
-        Coverage(parent.0 || (!dir_key.is_empty() && self.user.iter().any(|r| r.is_match(dir_key))))
+        Coverage(parent.0 || (!dir_key.is_empty() && self.user.iter().any(|rule| rule.matches(dir_key))))
     }
 
     /// Whether the walks should skip the path with the given key.
@@ -2519,7 +2532,7 @@ impl IgnoreRules {
             return true;
         }
 
-        !tracked && (parent.0 || self.user.iter().any(|r| r.is_match(key)))
+        !tracked && (parent.0 || self.user.iter().any(|rule| rule.matches(key)))
     }
 }
 
@@ -2528,13 +2541,26 @@ impl IgnoreRules {
 /// # Returns
 /// * Ok(IgnoreRules) - The rules.
 /// * Err(String)     - If the ignore file could not be read, or was refused: a symbolic link or
-///                     folder, a conflict marker, whitespace around a pattern, or a pattern
-///                     matching the empty string.
+///                     folder, a conflict marker, whitespace around a pattern, a control
+///                     character in one, or a pattern matching the empty string.
 pub fn get_ignore_rules() -> Result<IgnoreRules, String> {
-    let built_in = get_default_ignored_paths()?;
+    ignore_rules_from(read_ignore_file()?.as_deref())
+}
 
-    let user = match read_ignore_file()? {
-        Some(content) => parse_ignore_file(&content)?.into_iter().map(|rule| rule.regex).collect(),
+/// Get the ignore rules in force for the given ignore file content: the built-in rules and the
+/// rules the content holds. A caller that goes on to rewrite the file reads it once and judges
+/// that same content.
+///
+/// # Arguments
+/// * `content` - The ignore file's content (see [`read_ignore_file`]), or `None` for no file.
+///
+/// # Returns
+/// * Ok(IgnoreRules) - The rules.
+/// * Err(String)     - If the content was refused (see [`get_ignore_rules`]).
+pub fn ignore_rules_from(content: Option<&str>) -> Result<IgnoreRules, String> {
+    let built_in = get_default_ignored_paths()?;
+    let user = match content {
+        Some(content) => parse_ignore_file(content)?,
         None => Vec::new(),
     };
 
@@ -2597,22 +2623,27 @@ impl IgnoreFileRule {
 }
 
 /// Parse the ignore file's content into rules: one regex per line, skipping blank lines (empty,
-/// or whitespace only) and lines that start with `#`.
+/// or whitespace only) and lines that start with `#`. A byte order mark opening the file is an
+/// encoding marker, not part of the first line, and is skipped as git skips it.
 ///
-/// Three kinds of line are refused rather than compiled:
+/// Four kinds of line are refused rather than compiled:
 /// * a merge conflict marker, which consolidating two edits of the file writes into it. One of
 ///   them, `||||||| base`, compiles to a pattern that matches every path, so the next `load .`
 ///   would stage the removal of the whole tree;
-/// * a pattern with whitespace at its start or end. It would be part of the regex, so `^build$ `
-///   never matches `build`. Trimming it instead would guess: a space the pattern needs is
-///   written `\x20`;
+/// * a pattern with whitespace, or a byte order mark, at its start or end. It would be part of
+///   the regex, so `^build$ ` never matches `build`. Trimming it instead would guess: a space the
+///   pattern needs is written `\x20`;
+/// * a pattern holding a control character, such as the carriage returns of a file with bare-CR
+///   line endings, which read as one line whose rules never match. A pattern that needs one
+///   writes its escape;
 /// * a pattern that matches the empty string. Matching is a search anywhere in the path, so
 ///   such a pattern (`.*`, `x*`, `a|`) matches every path.
 ///
 /// # Returns
 /// * `Ok(Vec<IgnoreFileRule>)` - The rules, in file order.
 /// * `Err(String)`             - The first refused line, by number.
-pub fn parse_ignore_file(content: &str) -> Result<Vec<IgnoreFileRule>, String> {
+fn parse_ignore_file(content: &str) -> Result<Vec<IgnoreFileRule>, String> {
+    let content = content.strip_prefix('\u{FEFF}').unwrap_or(content);
     let mut rules = Vec::new();
 
     for (index, line) in content.lines().enumerate() {
@@ -2627,11 +2658,23 @@ pub fn parse_ignore_file(content: &str) -> Result<Vec<IgnoreFileRule>, String> {
             ));
         }
 
-        if line.trim() != line {
+        // A byte order mark past the start of the file (two files joined) is as invisible.
+        let edge = [line.chars().next(), line.chars().next_back()].into_iter().flatten()
+            .find(|&c| c.is_whitespace() || c == '\u{FEFF}');
+        if let Some(c) = edge {
             return Err(format!(
-                "\"{}\", line {}: the pattern {:?} starts or ends with whitespace, which would be part of \
-                the regex. Remove it, or write a space the pattern needs as \\x20.",
-                FILENAME_IGNORE, index + 1, line
+                "\"{}\", line {}: the pattern {:?} starts or ends with {} ({}), which would be part \
+                of the regex. Remove it, or write it as an escape if the pattern needs it (\\x20 for a space).",
+                FILENAME_IGNORE, index + 1, line,
+                if c == '\u{FEFF}' { "a byte order mark" } else { "whitespace" }, code_point(c)
+            ));
+        }
+
+        if let Some(c) = line.chars().find(|c| c.is_control()) {
+            return Err(format!(
+                "\"{}\", line {}: the pattern {:?} holds a control character ({}). Save the file with \
+                newline line endings, or write the character as an escape if the pattern needs it.",
+                FILENAME_IGNORE, index + 1, line, code_point(c)
             ));
         }
 
@@ -2640,7 +2683,7 @@ pub fn parse_ignore_file(content: &str) -> Result<Vec<IgnoreFileRule>, String> {
 
         if regex.is_match("") {
             return Err(format!(
-                "\"{}\", line {}: the pattern \"{}\" matches the empty string, so it would match every path.",
+                "\"{}\", line {}: the pattern {:?} matches the empty string, so it would match every path.",
                 FILENAME_IGNORE, index + 1, line
             ));
         }
@@ -2649,6 +2692,11 @@ pub fn parse_ignore_file(content: &str) -> Result<Vec<IgnoreFileRule>, String> {
     }
 
     Ok(rules)
+}
+
+/// A character as its Unicode code point, such as `U+00A0`: an invisible one stays nameable.
+fn code_point(c: char) -> String {
+    format!("U+{:04X}", c as u32)
 }
 
 /// Get the metadata of the file or directory at the given path.
@@ -2758,7 +2806,7 @@ mod tests {
     fn a_user_rule_covers_only_untracked_paths_and_their_descendants() {
         let rules = IgnoreRules {
             built_in: get_default_ignored_paths().unwrap(),
-            user: parse_ignore_file("^build$\n\\.log$\n").unwrap().into_iter().map(|rule| rule.regex).collect(),
+            user: parse_ignore_file("^build$\n\\.log$\n").unwrap(),
         };
         let excludes = |key: &str, tracked: bool| {
             let parent = key.rsplit_once('/').map(|(parent, _)| parent).unwrap_or("");
@@ -2817,6 +2865,38 @@ mod tests {
 
         // A CRLF file reads as its lines, so its line endings are not whitespace around a pattern.
         assert_eq!(parse_ignore_file("^a$\r\n^b$\r\n").unwrap().len(), 2);
+
+        // The refusal names the character, so an invisible one is nameable.
+        let error = parse_ignore_file("^a$\u{00A0}\n").unwrap_err();
+        assert!(error.contains("whitespace (U+00A0)"), "{}", error);
+    }
+
+    #[test]
+    fn a_control_character_in_an_ignore_pattern_is_refused_and_a_leading_bom_is_skipped() {
+        // Bare-CR line endings read as one line, whose rules would never match.
+        for (content, c) in [("^a$\r^b$\n", "U+000D"), ("^a\tb$\n", "U+0009"), ("^a\u{1b}b$\n", "U+001B")] {
+            let error = parse_ignore_file(content).unwrap_err();
+            assert!(error.contains(&format!("line 1: the pattern")) && error.contains(&format!("control character ({})", c)),
+                "{:?}: {}", content, error);
+        }
+
+        // A byte order mark is an encoding marker, not part of the first rule or comment.
+        let rules = parse_ignore_file("\u{FEFF}^build(/.*)?$\n").unwrap();
+        assert_eq!(rules[0].pattern, "^build(/.*)?$");
+        assert!(rules[0].matches("build"));
+        assert!(parse_ignore_file("\u{FEFF}# note\n").unwrap().is_empty());
+        // Past the start of the file it is no encoding marker, and is refused like whitespace.
+        let error = parse_ignore_file("^a$\n\u{FEFF}^b$\n").unwrap_err();
+        assert!(error.contains("line 2: the pattern") && error.contains("a byte order mark (U+FEFF)"), "{}", error);
+    }
+
+    #[test]
+    fn the_covering_rule_is_the_one_coverage_reports() {
+        let rules = ignore_rules_from(Some("^x$\n^\\.git($|/)\n^build$\n")).unwrap();
+        assert_eq!(rules.covering_rule(".git").map(|rule| rule.line), Some(2));
+        assert_eq!(rules.covering_rule("build/sub").map(|rule| (rule.line, rule.pattern.as_str())), Some((3, "^build$")));
+        assert!(rules.covering_rule("src").is_none() && !rules.coverage_of("src").0);
+        assert!(rules.coverage_of("build/sub").0);
     }
 
     #[test]

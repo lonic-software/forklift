@@ -150,13 +150,26 @@ pub fn handle_command(path: &str, no_compact: bool) -> Result<(), String> {
     // it is reported as a warning naming the rule, not as a failed import.
     let mut warnings = converter.warnings;
     let git_rule = if forklift_core::globals::warehouse_root().join(".git").exists() {
-        ignore_git_directory().map(Some).unwrap_or_else(|e| {
-            warnings.push(format!(
-                "the \".git\" folder is not ignored ({}); add the rule {} to \".forkliftignore\" by hand",
-                e, GIT_DIRECTORY_PATTERN
-            ));
-            None
-        })
+        match ignore_git_directory() {
+            Ok(GitRule::Refused(e)) => {
+                // Adding the rule by hand would not help: the file stays refused until that
+                // line is fixed, and fixed, it may already cover `.git`.
+                warnings.push(format!(
+                    "the \".git\" folder is not ignored, and \".forkliftignore\" was left as it is: {} \
+                    Once that is fixed, add the rule {} if no rule covers \".git\"",
+                    e, GIT_DIRECTORY_PATTERN
+                ));
+                None
+            }
+            Ok(rule) => Some(rule),
+            Err(e) => {
+                warnings.push(format!(
+                    "the \".git\" folder is not ignored ({}); add the rule {} to \".forkliftignore\" by hand",
+                    e, GIT_DIRECTORY_PATTERN
+                ));
+                None
+            }
+        }
     } else {
         None
     };
@@ -191,14 +204,19 @@ enum GitRule {
 
     /// A rule already in the file covers `.git`, so nothing was written.
     Present { line: usize, pattern: String },
+
+    /// The file's content is refused as rules, so nothing was written: appending a rule would
+    /// leave it refused. Holds the reason.
+    Refused(String),
 }
 
 /// Add a `.git` ignore pattern to `.forkliftignore` unless a rule there already covers `.git`,
 /// so a colocated git repository's metadata folder is not treated as untracked content.
 ///
 /// # Returns
-/// * `Ok(GitRule)`  - Whether the rule was added, or which line already covers `.git`.
-/// * `Err(String)`  - The file could not be read, was refused as rules, or could not be written.
+/// * `Ok(GitRule)`  - Whether the rule was added, which line already covers `.git`, or why the
+///                    file's content is refused.
+/// * `Err(String)`  - The file could not be read or written.
 fn ignore_git_directory() -> Result<GitRule, String> {
     let pattern = GIT_DIRECTORY_PATTERN;
 
@@ -206,13 +224,14 @@ fn ignore_git_directory() -> Result<GitRule, String> {
     // user's rules with this one.
     let existing = file_utils::read_ignore_file()?.unwrap_or_default();
 
-    // Parsed as the walks parse it. A refused file is left alone, since appending a rule would
-    // leave it refused. A rule matching the key `.git` covers the folder and all beneath it,
-    // however it is spelled; one that does not (an indented copy is refused above) is no rule
-    // for `.git`.
-    let rules = file_utils::parse_ignore_file(&existing)?;
-    if let Some(rule) = rules.into_iter().find(|rule| rule.matches(".git")) {
-        return Ok(GitRule::Present { line: rule.line, pattern: rule.pattern });
+    // Judged as the walks judge it, from the content just read: the rule covering `.git`,
+    // however it is spelled, is the one that keeps the walks out of it.
+    let rules = match file_utils::ignore_rules_from(Some(&existing)) {
+        Ok(rules) => rules,
+        Err(e) => return Ok(GitRule::Refused(e)),
+    };
+    if let Some(rule) = rules.covering_rule(".git") {
+        return Ok(GitRule::Present { line: rule.line, pattern: rule.pattern.clone() });
     }
 
     let mut content = existing;
