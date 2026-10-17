@@ -245,3 +245,37 @@ fn a_symlink_replaced_by_a_file_is_not_written_through() {
     assert_eq!(std::fs::read_to_string(&outside).unwrap(), "untouched\n", "the shift wrote through the old symlink");
     assert_eq!(std::fs::read_to_string(warehouse.root.join("link")).unwrap(), "payload\n");
 }
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_at_the_chunked_assembly_temp_path_is_not_written_through() {
+    // A chunked file is assembled into `.<name>.forklift-assemble.tmp` and renamed into place. A
+    // tree that plants a symlink under that name, sorted before the chunked entry, must not get
+    // the assembly written into the symlink's target.
+    let warehouse = Warehouse::new("assemble-temp");
+    let first = {
+        let _scope = StorageRootScope::enter(&warehouse.root);
+        pallet_utils::get_pallet_head("main").unwrap().unwrap()
+    };
+
+    let big: Vec<u8> = (0..9 * 1024 * 1024u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
+    std::fs::write(warehouse.root.join("big.bin"), &big).unwrap();
+    warehouse.run_ok(&["load", "big.bin"]);
+    warehouse.run_ok(&["stack", "big"]);
+
+    let outside = warehouse.base.join("outside.txt");
+    std::fs::write(&outside, "untouched\n").unwrap();
+    let target = outside.to_str().unwrap().to_string();
+    warehouse.craft_pallet(|_| vec![symlink(".big.bin.forklift-assemble.tmp", &target)]);
+
+    {
+        let _scope = StorageRootScope::enter(&warehouse.root);
+        pallet_utils::set_pallet_head("before", &first).unwrap();
+    }
+    warehouse.run_ok(&["shift", "before"]);
+    assert!(!warehouse.root.join("big.bin").exists());
+
+    let _ = warehouse.run(&["shift", "evil"]);
+
+    assert!(std::fs::read(&outside).unwrap() == b"untouched\n", "the assembly wrote through the symlink");
+}
