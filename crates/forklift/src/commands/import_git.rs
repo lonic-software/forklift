@@ -429,17 +429,15 @@ impl Converter {
     /// unchanged subtrees, so — like the bundle builder's closure walk — only changed paths
     /// are revisited, and each blob is considered exactly where history changed it.
     fn convert_tree(&mut self, git_hash: &str, path_prefix: &str) -> Result<String, String> {
-        // Before the memo: a tree first converted as a subdirectory, where any name is fine,
-        // can come back as a commit's root.
-        if path_prefix.is_empty() {
-            self.ensure_importable_root(git_hash)?;
-        }
-
-        if let Some(hash) = self.trees.get(git_hash) {
+        if let Some(hash) = self.trees.get(git_hash).cloned() {
+            // A tree first converted as a subdirectory, where any name is fine, can come back as
+            // a commit's root; a fresh conversion checks its root entries in the loop below.
+            if path_prefix.is_empty() {
+                self.ensure_importable_root(git_hash)?;
+            }
             // Already imported (an identical directory elsewhere in history) — nothing to
             // store, but it is now the newest version at *this* path, so a later version
             // here deltas against it.
-            let hash = hash.clone();
             if self.ingest.is_some() {
                 self.latest_tree_at_path.insert(path_prefix.to_string(), git_hash.to_string());
             }
@@ -455,6 +453,10 @@ impl Converter {
             e, if path_prefix.is_empty() { "/" } else { path_prefix }
         ))?;
         for entry in entries {
+            if path_prefix.is_empty() {
+                refuse_metadata_alias(git_hash, &entry.name)?;
+            }
+
             let path = join_path(path_prefix, &entry.name);
             let child = match entry.mode.as_str() {
                 "40000" | "040000" => {
@@ -559,24 +561,14 @@ impl Converter {
         Ok(Some((base_hash, bytes, depth)))
     }
 
-    /// Refuse a root tree with a top-level name some file system opens as `.forklift`, as `stack`
-    /// does: a parcel carrying it could never be checked out there.
+    /// [`refuse_metadata_alias`] over every entry of the root tree `git_hash`, read again: for a
+    /// tree whose conversion is reused, so its entries were never checked as a root.
     fn ensure_importable_root(&mut self, git_hash: &str) -> Result<(), String> {
         let (_, bytes) = self.batch.read(git_hash)?;
 
         let entries = parse_raw_tree(&bytes, self.oid_len)
             .map_err(|e| format!("{} It is in the directory \"/\" of the git history.", e))?;
-        for entry in entries {
-            if office_utils::is_metadata_folder_name(&entry.name) {
-                return Err(format!(
-                    "The git tree {} has the top-level entry {:?}, which some file systems open as \
-                    the warehouse's metadata folder, so it cannot be imported.",
-                    git_hash, entry.name
-                ));
-            }
-        }
-
-        Ok(())
+        entries.iter().try_for_each(|entry| refuse_metadata_alias(git_hash, &entry.name))
     }
 
     /// Rebuild a tree's object bytes from its git hash, for when the cache has evicted them.
@@ -872,6 +864,20 @@ fn parse_identity(text: &str) -> Result<(Operator, i64), String> {
 
     // The email is the stable, pseudonymous id; the name is local display data.
     Ok((Operator { name, identifier: email }, time))
+}
+
+/// Refuse `name` as a top-level entry of the root tree `git_hash` if some file system opens it as
+/// `.forklift`, as `stack` does: a parcel carrying it could never be checked out there.
+fn refuse_metadata_alias(git_hash: &str, name: &str) -> Result<(), String> {
+    if office_utils::is_metadata_folder_name(name) {
+        return Err(format!(
+            "The git tree {} has the top-level entry {:?}, which some file systems open as the \
+            warehouse's metadata folder, so it cannot be imported.",
+            git_hash, name
+        ));
+    }
+
+    Ok(())
 }
 
 /// Parse a raw git tree object. `git cat-file --batch` hands back the object's own bytes

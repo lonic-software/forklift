@@ -514,7 +514,7 @@ fn write_chunked_file(path: &str,
     // atomic rename replaces a regular file or a symlink in one step (it does not follow the
     // symlink); replacing a directory is the shift command's deletes-before-writes concern, not
     // this one.
-    let (temp_path, file) = create_assembly_temp(path, fs_path)?;
+    let (temp_path, file) = create_assembly_temp(path)?;
 
     let assemble = || -> Result<(), String> {
         let mut writer = std::io::BufWriter::new(file);
@@ -526,46 +526,99 @@ fn write_chunked_file(path: &str,
         Ok(())
     };
 
-    if let Err(e) = assemble() {
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(e);
-    }
-
-    let finalize = || -> Result<(), String> {
+    let placed = assemble().and_then(|()| {
         set_file_mode(&temp_path, path, item_type)?;
 
-        std::fs::rename(&temp_path, fs_path)
-            .map_err(|e| format!("Error while finalizing \"{}\": {}", path, e))
-    };
+        match std::fs::rename(&temp_path, fs_path) {
+            Ok(()) => Ok(()),
+            // A bay may live on another file system than the metadata folder.
+            Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+                copy_into_place(&temp_path, fs_path, path, item_type)
+            }
+            Err(e) => Err(format!("Error while finalizing \"{}\": {}", path, e)),
+        }
+    });
 
-    if let Err(e) = finalize() {
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(e);
-    }
-
-    Ok(())
+    let _ = std::fs::remove_file(&temp_path);
+    placed
 }
 
-/// Create a fresh temp file beside `fs_path` to assemble a chunked file into. The temp name sits in
-/// the working directory, the user's namespace, so it is never taken over: it is unique to this
-/// process and attempt, and created new, so an existing entry of that name (a tracked file, a
-/// leftover, or a symlink a tree planted, which opening would follow) is skipped, never
-/// truncated, removed or written through.
-fn create_assembly_temp(path: &str, fs_path: &Path) -> Result<(PathBuf, std::fs::File), String> {
+/// The bay-local folder chunked files are assembled in. It is in the metadata folder, not beside
+/// the file: the working directory is the user's namespace, so a temp file there could collide
+/// with a tracked name, push a long name past the file system's limit, or be left behind for a
+/// later `load` to stack.
+const FOLDER_NAME_ASSEMBLY: &str = "assembly";
+
+/// Create a fresh temp file to assemble a chunked file into, in [`FOLDER_NAME_ASSEMBLY`]. Its name
+/// is unique to this process and attempt and it is created new, so nothing already there is ever
+/// opened (a symlink would be followed). Once per process, leftovers from other processes are
+/// cleared first: the warehouse lock means none of them is still assembling.
+fn create_assembly_temp(path: &str) -> Result<(PathBuf, std::fs::File), String> {
     static ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static CLEARED: std::sync::Once = std::sync::Once::new();
     const MAX_ATTEMPTS: usize = 64;
 
-    let name = fs_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let dir = crate::globals::bay_root().join(FOLDER_NAME_ASSEMBLY);
+    file_utils::create_folder_if_not_exists(&dir)?;
+
+    let pid = std::process::id();
+    CLEARED.call_once(|| clear_other_assemblies(&dir, pid));
+
     let candidates = (0..MAX_ATTEMPTS).map(|_| {
         let attempt = ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        fs_path.with_file_name(format!(".{}.{}-{}.forklift-assemble.tmp", name, std::process::id(), attempt))
+        dir.join(format!("{}-{}.tmp", pid, attempt))
     });
 
     create_first_new(path, candidates)
 }
 
+/// Remove every entry of the assembly folder that this process did not create. Best effort: a
+/// leftover that cannot be removed only costs space.
+fn clear_other_assemblies(dir: &Path, pid: u32) {
+    let ours = format!("{}-", pid);
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+
+    for entry in entries.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with(&ours) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Place an assembled file across file systems: copy it into a fresh temp file beside `fs_path`
+/// and rename that into place, so the swap is still atomic. The beside-the-file name is short
+/// and created new, as in [`create_assembly_temp`].
+fn copy_into_place(assembled: &Path, fs_path: &Path, path: &str, item_type: DirEntryType) -> Result<(), String> {
+    static ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    let pid = std::process::id();
+    let candidates = (0..64).map(|_| {
+        let attempt = ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        fs_path.with_file_name(format!(".forklift-place-{}-{}.tmp", pid, attempt))
+    });
+    let (beside, mut file) = create_first_new(path, candidates)?;
+
+    let placed = (|| -> Result<(), String> {
+        let mut source = std::fs::File::open(assembled)
+            .map_err(|e| format!("Error while reading the assembly of \"{}\": {}", path, e))?;
+        std::io::copy(&mut source, &mut file)
+            .map_err(|e| format!("Error while copying \"{}\" into place: {}", path, e))?;
+        drop(file);
+
+        set_file_mode(&beside, path, item_type)?;
+
+        std::fs::rename(&beside, fs_path)
+            .map_err(|e| format!("Error while finalizing \"{}\": {}", path, e))
+    })();
+
+    if placed.is_err() {
+        let _ = std::fs::remove_file(&beside);
+    }
+    placed
+}
+
 /// Create the first of `candidates` that does not exist yet, skipping (never opening) any that
-/// does. See [`create_assembly_temp`].
+/// does: opening it would follow a symlink, or truncate a file someone else owns.
 fn create_first_new(path: &str, candidates: impl Iterator<Item = PathBuf>) -> Result<(PathBuf, std::fs::File), String> {
     for temp_path in candidates {
         match std::fs::OpenOptions::new().write(true).create_new(true).open(&temp_path) {
@@ -831,6 +884,30 @@ mod tests {
 
         assert_eq!(temp_path, dir.join("fresh"));
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), "untouched\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copying_into_place_replaces_a_symlink_and_leaves_no_temp() {
+        // The cross-device fallback: the rename from the metadata folder failed, so the assembly
+        // is copied beside the file and renamed over it, replacing (not following) a symlink.
+        let dir = std::env::temp_dir().join(format!("forklift-copy-into-place-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("work")).unwrap();
+        let outside = dir.join("outside.txt");
+        std::fs::write(&outside, "untouched\n").unwrap();
+        let assembled = dir.join("assembled.tmp");
+        std::fs::write(&assembled, "assembled\n").unwrap();
+        let target = dir.join("work").join("big.bin");
+        std::os::unix::fs::symlink(&outside, &target).unwrap();
+
+        copy_into_place(&assembled, &target, "big.bin", DirEntryType::NormalChunked).unwrap();
+
+        assert!(!std::fs::symlink_metadata(&target).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "assembled\n");
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "untouched\n");
+        assert_eq!(std::fs::read_dir(dir.join("work")).unwrap().count(), 1, "a temp file was left beside it");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
