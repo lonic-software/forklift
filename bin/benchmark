@@ -49,6 +49,9 @@ fi
 #
 # Usage:  bin/benchmark [--repo git|linux|<url>|<path>] [--runs N] [--work DIR] [--keep] [--out FILE] [--markdown] [--no-redelta]
 #
+# --runs N sets the read-only ops' run count; the environment variable COMMIT_RUNS sets
+# the commit rows' (defaults: 20 and 10 under hyperfine, 5 and 3 with the shell timer).
+#
 # Output is an aligned text table by default; pass --markdown for a table you can paste
 # into a doc. Onboarding (clone vs import-git) is reported separately, never as a ratio.
 set -euo pipefail
@@ -79,8 +82,8 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-case "$RUNS" in ''|*[!0-9]*|0) [ -z "$RUNS" ] || { echo "error: --runs needs a positive integer, got '$RUNS'" >&2; exit 2; };; esac
-case "$COMMIT_RUNS" in ''|*[!0-9]*|0) [ -z "$COMMIT_RUNS" ] || { echo "error: COMMIT_RUNS needs a positive integer, got '$COMMIT_RUNS'" >&2; exit 2; };; esac
+case "$RUNS" in ''|*[!0-9]*|0*) [ -z "$RUNS" ] || { echo "error: --runs needs a positive integer, got '$RUNS'" >&2; exit 2; };; esac
+case "$COMMIT_RUNS" in ''|*[!0-9]*|0*) [ -z "$COMMIT_RUNS" ] || { echo "error: COMMIT_RUNS needs a positive integer, got '$COMMIT_RUNS'" >&2; exit 2; };; esac
 
 # ── resolve tools ───────────────────────────────────────────────────────────
 command -v git      >/dev/null || { echo "error: git not on PATH" >&2; exit 1; }
@@ -224,7 +227,7 @@ time_hyperfine() {
         # through a shell under -N differs between versions, so hand it a script to run.
         prep=$(mktemp "${TMPDIR:-/tmp}/forklift-bench-prep.XXXXXX")
         printf 'set -e\n%s\n' "$setup" > "$prep"
-        args+=(--prepare "bash $prep")
+        args+=(--prepare "bash '$prep'")
     else
         args+=(--warmup 1)
     fi
