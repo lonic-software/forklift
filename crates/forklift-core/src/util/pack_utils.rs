@@ -4294,13 +4294,13 @@ mod tests {
             expected.sort_by_key(|(start, _)| *start);
             sort_ranges_by_start(&mut ranges);
 
-            let starts = |rs: &[(u64, u64)]| rs.iter().map(|(start, _)| *start).collect::<Vec<_>>();
-            assert_eq!(starts(&ranges), starts(&expected), "starts out of order for {} ranges", count);
+            let first_misplaced = ranges.iter().zip(&expected).position(|(got, want)| got.0 != want.0);
+            assert_eq!(first_misplaced, None, "starts out of order for {} ranges", count);
 
             let mut got_sorted = ranges.clone();
             got_sorted.sort();
             expected.sort();
-            assert_eq!(got_sorted, expected, "the sort lost or duplicated a range for {} ranges", count);
+            assert!(got_sorted == expected, "the sort lost or duplicated a range for {} ranges", count);
         }
     }
 
