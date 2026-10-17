@@ -20,13 +20,19 @@ pub async fn handle_command(summary: bool) -> Result<(), String> {
     let consolidation = merge_utils::read_consolidation_state()?
         .map(|state| state.their_pallet);
 
-    let head_tree_hash = match &head {
-        Some(hash) => Some(object_utils::load_parcel(hash)?.tree_hash),
-        None => None,
-    };
+    // The two comparisons read disjoint sources (pallet head vs working directory) against the
+    // same inventory, so they overlap: the unstaged walk's tasks fan out over the runtime's
+    // workers while this task opens the pack for the head parcel and walks the staged side.
+    let staged = async {
+        let head_tree_hash = match &head {
+            Some(hash) => Some(object_utils::load_parcel(hash)?.tree_hash),
+            None => None,
+        };
 
-    let staged = stocktake_utils::collect_staged_changes(head_tree_hash.as_deref()).await?;
-    let unstaged = stocktake_utils::collect_unstaged_changes().await?;
+        stocktake_utils::collect_staged_changes(head_tree_hash.as_deref()).await
+    };
+    let (unstaged, staged) = tokio::join!(stocktake_utils::collect_unstaged_changes(), staged);
+    let (staged, unstaged) = (staged?, unstaged?);
 
     let report = StocktakeReport {
         pallet,
