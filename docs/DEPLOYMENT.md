@@ -764,11 +764,9 @@ at all, and only `forklift-server` ships it.
 * **A residual worth knowing about, even though it is a client/CLI-side concern, not a Lambda
   one:** the whole-object write ceiling (`MAX_OBJECT_BYTES`, 64 MiB) is enforced only on the way
   *in* — a pre-existing, over-ceiling object authored before this policy existed stays fully
-  readable, and an old-version bundle can still carry such a "grandfathered giant" through the
-  streaming import path, which deliberately does not enforce the ceiling (`forklift-core`'s
-  `object_utils.rs`). This head's own promotion path (`verify_and_promote`) is type-blind and
-  enforces only the coarse, size-only `MAX_STAGED_OBJECT_BYTES` (5 GiB) backstop regardless — so
-  it will happily promote a grandfathered giant if one is ever staged. It is mentioned here only
+  readable (a "grandfathered giant"), though no client import admits one any more. This head's
+  own promotion path (`verify_and_promote`) is type-blind and enforces only the coarse, size-only
+  `MAX_STAGED_OBJECT_BYTES` (5 GiB) backstop regardless — so it will happily promote a grandfathered giant if one is ever staged. It is mentioned here only
   so you are not surprised by it; there is no operator action this document can recommend beyond
   awareness.
 

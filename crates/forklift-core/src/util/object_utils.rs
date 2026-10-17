@@ -23,8 +23,8 @@ use crate::util::{byte_utils, chunk_utils, fanout_utils, file_utils};
 /// It gates the way *in* only — [`store_object_bytes`] (import) and `LooseObject::store` (local
 /// authorship) refuse an over-ceiling object, but no read path calls either, so a pre-existing
 /// over-ceiling object authored before this policy stays fully readable and an old store never
-/// bricks. An old-version bundle may still carry such a grandfathered giant; it is imported through
-/// [`store_object_stream`], which deliberately does not enforce this ceiling.
+/// bricks. No import admits one any more: the bundle importer refuses a record declaring more
+/// before reading it.
 pub const MAX_OBJECT_BYTES: usize = 64 * 1024 * 1024;
 
 /// The largest object the bundle importer ([`crate::util::bundle_utils`]) buffers whole before it
@@ -939,8 +939,9 @@ struct StreamOutcome {
 /// (a bomb, a corrupt or a truncated record) discards the temp file — so nothing unverified ever
 /// lands and a failed import cleans up after itself.
 ///
-/// The whole-object ceiling (`MAX_OBJECT_BYTES`) is deliberately *not* enforced here: this path
-/// must still import a grandfathered over-ceiling object from an old-version bundle. The per-type
+/// The whole-object ceiling (`MAX_OBJECT_BYTES`) is *not* enforced here: the bundle importer, its
+/// only caller, refuses a record whose declared length is above it before streaming a byte. The
+/// per-type
 /// chunk ceiling *is* enforced — a `Chunk`-typed object whose payload exceeds `MAX_CHUNK_BYTES` is
 /// refused mid-stream, exactly as [`store_object_bytes`] refuses it whole.
 ///

@@ -7,7 +7,9 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use crate::error::CoreError;
+use crate::enums::object_type::ObjectType;
 use crate::globals::forklift_root;
+use crate::model::remote::MAX_MISSING_BATCH;
 use crate::util::{
     audit_utils, delta_utils, file_utils, object_utils, pack_utils, pallet_utils, scope_utils,
     sign_utils,
@@ -19,26 +21,15 @@ use crate::util::{
 /// into one durably-synced loose file per object.
 pub const BUNDLE_HEADER: &str = "forklift-bundle 2026-07-13";
 
-/// Version 3: the former current format — one outer zstd stream of `O`/`D`/`S` records. Still the
-/// format of partial bundles (`objects/batch`, subtree fetches), which are imported as they stream
-/// in and accept no other version, and still accepted for whole-bundle imports.
+/// Version 3: one outer zstd stream of `O` records. The format of partial bundles
+/// (`objects/batch`, subtree fetches) only, which are imported as they stream in, each record
+/// admitted against what the client asked for (see [`StreamAdmission`]). A whole-warehouse bundle
+/// file in this format is no longer read: nothing writes one.
 const BUNDLE_HEADER_V3: &str = "forklift-bundle 2026-07-11";
-
-/// The version-2 header (2026-07-06, §9.1 #1), which added delta records (`KIND_DELTA`). Still
-/// *read*: a version-2 bundle predates the ceiling, so it may carry a grandfathered giant `'O'`
-/// record and is therefore **not** hard-refused on declared size — its oversized objects stream
-/// bounded (see `import_bundle_reader`).
-const BUNDLE_HEADER_V2: &str = "forklift-bundle 2026-07-06";
-
-/// The version-1 header (2026-07-03), before delta records. Still *read*, so an older
-/// server's bundle imports fine: a v1 bundle has only 'O'/'S' records, which this build
-/// understands. Only the writer moved forward. An unknown header is refused; the caller may then
-/// choose an incremental-object fallback.
-const BUNDLE_HEADER_V1: &str = "forklift-bundle 2026-07-03";
 
 /// The longest a bundle's opening header line may run before a newline, before the import is
 /// refused outright rather than searching further. Every header this build recognizes
-/// (`BUNDLE_HEADER` and all three legacy headers) is under 30 bytes; 128 leaves headroom for a
+/// (`BUNDLE_HEADER` and `BUNDLE_HEADER_V3`) is under 30 bytes; 128 leaves headroom for a
 /// longer future header while staying a small, fixed bound — a hostile bundle with no newline (or
 /// a very long run before one) cannot grow the header buffer past it, regardless of how long the
 /// underlying stream actually is.
@@ -46,16 +37,6 @@ const MAX_HEADER_BYTES: usize = 128;
 
 /// The record kind of a raw (full) object.
 const KIND_OBJECT: u8 = b'O';
-
-/// The record kind of a parcel signature sidecar.
-const KIND_SIGNATURE: u8 = b'S';
-
-/// The record kind of a delta object (§9.1 #1). Its payload is
-/// `base-hash (64 ASCII hex) || decompressed-length (8, big-endian u64) || zstd frame`,
-/// the frame compressed with the base object as a dictionary (`delta_utils`). The importer
-/// loads the base, reconstructs the object, and hash-verifies it like any other — so a bad
-/// delta only ever fails import, never corrupts the store.
-const KIND_DELTA: u8 = b'D';
 
 /// The longest delta chain the builder forms at one path: after this many successive
 /// deltas, the next version is stored in full. This caps both the reconstruction cost of a
@@ -78,7 +59,7 @@ pub struct BuildStats {
     /// Objects stored in full (`'O'` records).
     pub objects: usize,
 
-    /// Blob versions stored as a delta against an earlier version (`'D'` records).
+    /// Blob versions stored as a delta against an earlier version (pack delta entries).
     pub deltas: usize,
 
     pub signatures: usize,
@@ -375,6 +356,9 @@ fn remove_stale_staging(parent: &Path) {
 /// writer-side refusal `build_bundle` gives, rather than silently omitting content the
 /// caller asked for by name.
 ///
+/// A hash repeated in `hashes` is written once, at its first occurrence: the importer admits each
+/// requested hash at most once (see [`StreamAdmission`]), so a repeat would fail the whole import.
+///
 /// # Arguments
 /// * `hashes` - The objects to pack.
 ///
@@ -384,17 +368,18 @@ fn remove_stale_staging(parent: &Path) {
 pub fn build_partial_bundle(hashes: &[String]) -> Result<Vec<u8>, String> {
     let mut bytes: Vec<u8> = Vec::new();
 
-    // Partial responses remain the compact legacy record stream: they are incremental additions
-    // to an existing store, not the whole-clone artifact whose native packs can be installed as a
-    // unit. The importer reads both formats.
+    // Partial responses are the compact record stream: they are incremental additions to an
+    // existing store, not the whole-clone artifact whose native packs can be installed as a unit.
     bytes.extend_from_slice(BUNDLE_HEADER_V3.as_bytes());
     bytes.push(b'\n');
 
     let mut encoder = zstd::stream::Encoder::new(&mut bytes, 0)
         .map_err(|e| format!("Error while starting the bundle stream: {}", e))?;
 
+    let mut written: HashSet<&str> = HashSet::new();
+
     for hash in hashes {
-        if !file_utils::does_object_exist(hash)? {
+        if !written.insert(hash.as_str()) || !file_utils::does_object_exist(hash)? {
             continue;
         }
 
@@ -526,11 +511,10 @@ fn emit_blob(pack: &mut pack_utils::TransportPackBuilder,
 }
 
 /// Refuse to write a record above the whole-object ceiling into a bundle — the writer-side half
-/// of the maintainer's chosen posture for a grandfathered giant (an object authored, or imported
-/// via an old-version bundle, before `MAX_OBJECT_BYTES` existed): it stays readable locally
-/// forever, but a bundle must never carry it, because no reader accepts it (a version-3 reader
-/// refuses its declared length pre-read; an older reader would only rediscover the problem on the
-/// far end after streaming it). Checked here, right after an object's bytes are loaded and before
+/// of the maintainer's chosen posture for a grandfathered giant (an object authored before
+/// `MAX_OBJECT_BYTES` existed): it stays readable locally forever, but a bundle must never carry
+/// it, because no reader accepts it (the record-stream reader refuses its declared length
+/// pre-read, and the native reader refuses it on verification). Checked here, right after an object's bytes are loaded and before
 /// a single byte is written into the bundle stream — so a warehouse holding one anywhere in the
 /// closure fails loudly at the source, before writing anything a consumer could partially import.
 fn refuse_if_transporting_over_ceiling(what: &str, len: usize) -> Result<(), CoreError> {
@@ -612,9 +596,13 @@ fn write_record<W: Write>(encoder: &mut zstd::stream::Encoder<'_, W>,
         .map_err(|e| format!("Error while writing a bundle record: {}", e))
 }
 
-/// Import a bundle file into the object store. Objects already present are skipped;
-/// every stored object is hash-verified; a mismatching record fails the import (the
-/// bundle is corrupt — nothing unverified may land).
+/// Import a whole-warehouse bundle file into the object store. Only the native format is read: it
+/// is the only one any whole-bundle writer produces, and it is copied into the store byte for byte,
+/// so an import never stores more bytes than the file holds. Any other header — including the
+/// record-stream formats a whole bundle once used — is refused with the error
+/// [`is_unsupported_bundle_error`] recognizes, on which a clone falls back to its verified walk.
+/// Objects already present are skipped; every stored object is hash-verified; a mismatching
+/// record fails the import (the bundle is corrupt — nothing unverified may land).
 ///
 /// # Arguments
 /// * `path` - The bundle file.
@@ -629,8 +617,92 @@ pub fn import_bundle(path: &Path) -> Result<ImportStats, String> {
     import_bundle_reader(std::io::BufReader::new(file))
 }
 
-/// Import a bundle streamed from a remote (a batch or subtree response) as it arrives — the same
-/// verification as `import_bundle`, holding at most one record in memory.
+/// What a streamed partial bundle may store. Every record is checked against this before a byte
+/// of its payload is read, so a remote can make the client write only objects it asked for, each
+/// at most once, however long the stream runs.
+pub enum StreamAdmission {
+    /// A batch response: each record must name one of these hashes, and none twice.
+    Requested(HashSet<String>),
+
+    /// A subtree response: the object closure of this tree. The first admissible record is the
+    /// root itself, and each admitted tree makes its files and subtrees admissible — the order the
+    /// server's breadth-first closure walk emits, where every hash follows the tree naming it.
+    /// At most [`MAX_MISSING_BATCH`] records are admitted, the server's own cap on one response.
+    Closure { root: String },
+}
+
+/// The running state of a [`StreamAdmission`] over one stream.
+struct Admitter {
+    /// Every hash a record may still name, mapped to whether it is a tree to expand on admission.
+    expected: HashMap<String, bool>,
+    admitted: HashSet<String>,
+    expand_trees: bool,
+    cap: usize,
+}
+
+impl Admitter {
+    fn new(admission: StreamAdmission) -> Self {
+        match admission {
+            StreamAdmission::Requested(hashes) => Admitter {
+                cap: hashes.len(),
+                expected: hashes.into_iter().map(|hash| (hash, false)).collect(),
+                admitted: HashSet::new(),
+                expand_trees: false,
+            },
+            StreamAdmission::Closure { root } => Admitter {
+                expected: HashMap::from([(root, true)]),
+                admitted: HashSet::new(),
+                expand_trees: true,
+                cap: MAX_MISSING_BATCH,
+            },
+        }
+    }
+
+    /// Admit a record naming `hash`, or refuse it. `Ok(true)` when it is a tree whose children
+    /// [`Self::expand`] must make admissible once it is in the store.
+    fn admit(&mut self, hash: &str) -> Result<bool, String> {
+        if self.admitted.contains(hash) {
+            return Err(format!("The remote sent object {} twice in one response; refusing it.", hash));
+        }
+
+        let is_tree = match self.expected.get(hash) {
+            Some(is_tree) => *is_tree,
+            None => return Err(format!(
+                "The remote sent object {}, which this request did not ask for; refusing it.", hash
+            )),
+        };
+
+        if self.admitted.len() >= self.cap {
+            return Err(format!(
+                "The remote sent more than {} objects in one response; refusing it.", self.cap
+            ));
+        }
+
+        self.admitted.insert(hash.to_string());
+
+        Ok(is_tree && self.expand_trees)
+    }
+
+    /// Make an admitted tree's files and subtrees admissible. The tree is read from the store,
+    /// which holds it whether this record stored it or it was already present (and the record
+    /// skipped): the server sends every closure object it has, including ones the client holds.
+    fn expand(&mut self, tree_hash: &str) -> Result<(), String> {
+        let tree = object_utils::load_tree(tree_hash)?;
+
+        for (_, file) in tree.get_files() {
+            self.expected.entry(file.hash.clone()).or_insert(false);
+        }
+
+        for (_, subtree) in tree.get_subtrees() {
+            self.expected.entry(subtree.hash.clone()).or_insert(true);
+        }
+
+        Ok(())
+    }
+}
+
+/// Import a bundle streamed from a remote (a batch or subtree response) as it arrives, holding at
+/// most one record in memory, and storing only what `admission` allows.
 ///
 /// Only a version-3 bundle is accepted: that is what every batch and subtree producer writes, and
 /// it is the version whose records stream. A whole-warehouse version-4 bundle imports through
@@ -638,13 +710,15 @@ pub fn import_bundle(path: &Path) -> Result<ImportStats, String> {
 /// by a path this one was never meant to take.
 ///
 /// # Arguments
-/// * `reader` - The response body, as it arrives.
+/// * `reader`    - The response body, as it arrives.
+/// * `admission` - What the request asked for.
 ///
 /// # Returns
 /// * `Ok(ImportStats)` - What was stored.
-/// * `Err(String)`     - On any header but version 3, a corrupt or truncated record, or an I/O
-///   error (including the transfer ending before the bundle did).
-pub fn import_streamed_bundle<R: std::io::BufRead>(mut reader: R) -> Result<ImportStats, String> {
+/// * `Err(String)`     - On any header but version 3, a record `admission` refuses, a corrupt or
+///   truncated record, or an I/O error (including the transfer ending before the bundle did).
+pub fn import_streamed_bundle<R: std::io::BufRead>(mut reader: R,
+                                                   admission: StreamAdmission) -> Result<ImportStats, String> {
     let header = read_bundle_header(&mut reader)?;
 
     if header != BUNDLE_HEADER_V3.as_bytes() {
@@ -654,7 +728,7 @@ pub fn import_streamed_bundle<R: std::io::BufRead>(mut reader: R) -> Result<Impo
         ));
     }
 
-    import_record_stream(reader, true)
+    import_record_stream(reader, Admitter::new(admission))
 }
 
 /// Read a bundle's uncompressed header line, without its newline.
@@ -689,34 +763,19 @@ fn read_bundle_header<R: std::io::BufRead>(reader: &mut R) -> Result<Vec<u8>, St
 fn import_bundle_reader<R: std::io::BufRead>(mut reader: R) -> Result<ImportStats, String> {
     let header = read_bundle_header(&mut reader)?;
 
-    if header == BUNDLE_HEADER.as_bytes() {
-        return import_native_bundle_reader(&mut reader);
-    }
-
-    if header != BUNDLE_HEADER_V3.as_bytes()
-        && header != BUNDLE_HEADER_V2.as_bytes()
-        && header != BUNDLE_HEADER_V1.as_bytes() {
+    if header != BUNDLE_HEADER.as_bytes() {
         return Err(format!(
-            "{}\"{}\" (this build reads \"{}\", \"{}\", \"{}\" and \"{}\").",
-            UNKNOWN_BUNDLE_HEADER_PREFIX,
-            String::from_utf8_lossy(&header),
-            BUNDLE_HEADER, BUNDLE_HEADER_V3, BUNDLE_HEADER_V2, BUNDLE_HEADER_V1
+            "{}\"{}\" (this build reads \"{}\").",
+            UNKNOWN_BUNDLE_HEADER_PREFIX, String::from_utf8_lossy(&header), BUNDLE_HEADER
         ));
     }
 
-    // A version-3 bundle is written by a build that never emits an over-ceiling record, so its
-    // `'O'`/`'D'` records may be refused on declared size *before* a byte is read (the ceiling as
-    // policy). Older bundles predate the ceiling and may carry a grandfathered giant, so they are
-    // not hard-refused — their oversized `'O'` records still stream bounded (below), which is the
-    // unconditional memory defense regardless of version.
-    let is_new_version = header == BUNDLE_HEADER_V3.as_bytes();
-
-    import_record_stream(reader, is_new_version)
+    import_native_bundle_reader(&mut reader)
 }
 
-/// Import the zstd record stream that follows a version 1–3 header. `is_new_version` is whether
-/// the header was version 3, whose records are refused on declared size past the object ceiling.
-fn import_record_stream<R: std::io::BufRead>(reader: R, is_new_version: bool) -> Result<ImportStats, String> {
+/// Import the zstd record stream that follows a version-3 header, storing only the records
+/// `admitter` admits.
+fn import_record_stream<R: std::io::BufRead>(reader: R, mut admitter: Admitter) -> Result<ImportStats, String> {
     let mut decoder = object_utils::bounded_zstd_decoder(reader)
         .map_err(|e| format!("Error while opening the bundle stream: {}", e))?;
 
@@ -754,70 +813,35 @@ fn import_record_stream<R: std::io::BufRead>(reader: R, is_new_version: bool) ->
 
         let length = u64::from_be_bytes(length_bytes);
 
-        // The ceiling as *policy*, only on a version-3 bundle (whose writer never emits an
-        // over-ceiling record): refuse before a byte of the payload is read. This is cheap and
-        // sound, but it is not the memory defense — that is the streaming `'O'` path below, which
-        // bounds memory even on an older bundle the ceiling does not gate.
-        if is_new_version && length > object_utils::MAX_OBJECT_BYTES as u64 {
-            return Err(oversized_record_refusal(kind[0], length));
+        // Every check runs before a byte of the payload is read: what is refused here is never
+        // decompressed, buffered or written.
+        if kind[0] != KIND_OBJECT {
+            return Err(format!("Unknown bundle record kind 0x{:02x}.", kind[0]));
         }
 
-        match kind[0] {
-            KIND_OBJECT => {
-                // A small object is buffered whole and stored in one shot; a large one streams
-                // through an incremental Blake3 to a temp file, bounding memory regardless of the
-                // declared length or the bundle version. `store_object_stream` reports truncation,
-                // verifies the hash, and enforces the per-chunk ceiling itself.
-                let stored = if length <= object_utils::STREAM_STORE_THRESHOLD_BYTES as u64 {
-                    let payload = read_exact_payload(&mut decoder, length)?;
-                    object_utils::store_object_bytes(&hash, &payload)?
-                } else {
-                    object_utils::store_object_stream(&hash, decoder.by_ref(), length)?
-                };
+        let is_tree = admitter.admit(&hash)?;
 
-                if stored { stats.stored_objects += 1; } else { stats.skipped_records += 1; }
-            }
-            KIND_DELTA => {
-                // A delta's payload is 72 bytes of framing plus its zstd frame; no writer — of any
-                // version — ever emits a delta near the object ceiling (a delta targets at most
-                // `MAX_DELTA_TARGET_BYTES`, 16 MiB). Cap the *declared* length unconditionally: that
-                // is what keeps a hostile frame from being read whole into memory as a bomb, on any
-                // bundle version, before `reconstruct_delta`'s own bounded decompression even runs.
-                if length > object_utils::MAX_OBJECT_BYTES as u64 {
-                    return Err(oversized_record_refusal(kind[0], length));
-                }
+        // The ceiling as *policy*: no writer emits an over-ceiling record. It is not the memory
+        // defense — that is the streaming path below, which bounds memory whatever the length.
+        if length > object_utils::MAX_OBJECT_BYTES as u64 {
+            return Err(oversized_record_refusal("object", length));
+        }
 
-                let payload = read_exact_payload(&mut decoder, length)?;
+        // A small object is buffered whole and stored in one shot; a large one streams through an
+        // incremental Blake3 to a temp file, bounding memory regardless of the declared length.
+        // `store_object_stream` reports truncation, verifies the hash, and enforces the per-chunk
+        // ceiling itself.
+        let stored = if length <= object_utils::STREAM_STORE_THRESHOLD_BYTES as u64 {
+            let payload = read_exact_payload(&mut decoder, length)?;
+            object_utils::store_object_bytes(&hash, &payload)?
+        } else {
+            object_utils::store_object_stream(&hash, decoder.by_ref(), length)?
+        };
 
-                // Reconstruct against the base (already stored), then store — which
-                // hash-verifies, so a wrong reconstruction is rejected here.
-                let object = reconstruct_delta(&hash, &payload)?;
+        if stored { stats.stored_objects += 1; } else { stats.skipped_records += 1; }
 
-                if object_utils::store_object_bytes(&hash, &object)? {
-                    stats.stored_objects += 1;
-                } else {
-                    stats.skipped_records += 1;
-                }
-            }
-            KIND_SIGNATURE => {
-                // A signature sidecar is small; cap its declared length too so a lie cannot read
-                // unbounded bytes into memory (this record kind is never streamed).
-                if length > object_utils::MAX_OBJECT_BYTES as u64 {
-                    return Err(oversized_record_refusal(kind[0], length));
-                }
-
-                let payload = read_exact_payload(&mut decoder, length)?;
-
-                if sign_utils::load_raw_parcel_signature(&hash)?.is_none() {
-                    sign_utils::store_raw_parcel_signature(&hash, &payload)?;
-                    stats.stored_signatures += 1;
-                } else {
-                    stats.skipped_records += 1;
-                }
-            }
-            other => {
-                return Err(format!("Unknown bundle record kind 0x{:02x}.", other));
-            }
+        if is_tree {
+            admitter.expand(&hash)?;
         }
     }
 
@@ -825,7 +849,8 @@ fn import_record_stream<R: std::io::BufRead>(reader: R, is_new_version: bool) ->
 }
 
 /// Import a version-4 whole-warehouse bundle: quarantine and verify its native pack pairs, publish
-/// those aggregate files, then store the structurally-validated signature sidecars that follow.
+/// those aggregate files, then store the signature sidecars that follow, each admitted only for a
+/// parcel those packs carry.
 fn import_native_bundle_reader(reader: &mut impl Read) -> Result<ImportStats, String> {
     let pack_count = read_u32_be(reader, "native pack count")? as usize;
     if pack_count > pack_utils::MAX_TRANSPORT_PACKS {
@@ -873,6 +898,12 @@ fn import_native_bundle_reader(reader: &mut impl Read) -> Result<ImportStats, St
         installed_packs: imported.stored_objects > 0,
     };
 
+    // Each entry becomes its own sidecar file, so an entry is admitted only for a parcel the packs
+    // just imported, once: a sidecar naming anything else would cost a file for bytes the bundle
+    // never carried. The store is checked rather than the packs' own index because the only
+    // caller imports into a freshly prepared warehouse, where the two are the same set.
+    let mut seen_signatures: HashSet<String> = HashSet::new();
+
     for _ in 0..signature_count {
         let mut hash_bytes = [0u8; 64];
         reader.read_exact(&mut hash_bytes)
@@ -884,11 +915,19 @@ fn import_native_bundle_reader(reader: &mut impl Read) -> Result<ImportStats, St
             .map_err(|_| "A bundle signature hash is not valid ASCII.".to_string())?;
         let length = read_u64_be(reader, "signature length")?;
         if length > object_utils::MAX_OBJECT_BYTES as u64 {
-            return Err(oversized_record_refusal(KIND_SIGNATURE, length));
+            return Err(oversized_record_refusal("signature", length));
+        }
+        if !seen_signatures.insert(hash.clone()) {
+            return Err(format!("The bundle carries two signatures for {}; refusing it.", hash));
+        }
+        if !names_stored_parcel(&hash)? {
+            return Err(format!(
+                "The bundle carries a signature for {}, which is not a parcel it carries; refusing it.",
+                hash
+            ));
         }
         let payload = read_exact_payload(reader, length)?;
-        // Same semantics as the legacy record importer: an already-present sidecar wins and the
-        // bundle's copy is skipped — even a conflicting one, whose refusal would otherwise fail
+        // An already-present sidecar wins and the bundle's copy is skipped — even a conflicting one, whose refusal would otherwise fail
         // the import after its packs were already published.
         if sign_utils::load_raw_parcel_signature(&hash)?.is_some() {
             stats.skipped_records += 1;
@@ -940,58 +979,25 @@ fn read_exact_payload<R: Read>(reader: &mut R, length: u64) -> Result<Vec<u8>, S
     Ok(payload)
 }
 
+/// Whether `hash` names a parcel in the store.
+fn names_stored_parcel(hash: &str) -> Result<bool, String> {
+    if !file_utils::does_object_exist(hash)? {
+        return Ok(false);
+    }
+
+    let bytes = file_utils::retrieve_object_by_hash(hash)?;
+
+    Ok(matches!(object_utils::peek_object_header(&bytes), Ok((ObjectType::Parcel, _))))
+}
+
 /// The refusal for a bundle record whose *declared* length is above the whole-object ceiling —
 /// raised before a byte of the payload is read, so a declared-length lie can neither allocate nor
 /// stream a single byte. Names the record kind and the limit.
-fn oversized_record_refusal(kind: u8, length: u64) -> String {
-    let kind_name = match kind {
-        KIND_OBJECT => "object",
-        KIND_DELTA => "delta",
-        KIND_SIGNATURE => "signature",
-        _ => "record",
-    };
-
+fn oversized_record_refusal(kind_name: &str, length: u64) -> String {
     format!(
         "A bundle {} record declares {} bytes, above the {}-byte object ceiling; refusing the bundle.",
         kind_name, length, object_utils::MAX_OBJECT_BYTES
     )
-}
-
-/// Reconstruct a delta record's object from its payload
-/// (`base-hash (64) || decompressed-length (8, big-endian) || zstd frame`): load the base
-/// from the store and decompress the frame against it. The caller hash-verifies the result
-/// before storing, so this never has to trust the reconstruction.
-///
-/// # Arguments
-/// * `target_hash` - The hash the reconstructed object must have (for error messages).
-/// * `payload`     - The delta record's payload.
-///
-/// # Returns
-/// * `Ok(Vec<u8>)` - The reconstructed object bytes.
-/// * `Err(String)` - If the payload is truncated, the base is absent, or decoding fails.
-fn reconstruct_delta(target_hash: &str, payload: &[u8]) -> Result<Vec<u8>, String> {
-    // 64-byte base hash + 8-byte length prefix.
-    if payload.len() < 72 {
-        return Err(format!("The bundle delta record for {} is truncated.", target_hash));
-    }
-
-    let base_hash = std::str::from_utf8(&payload[0..64])
-        .map_err(|_| format!("The bundle delta for {} has a non-ASCII base hash.", target_hash))?;
-
-    let mut length_bytes = [0u8; 8];
-    length_bytes.copy_from_slice(&payload[64..72]);
-    let decompressed_len = u64::from_be_bytes(length_bytes) as usize;
-
-    let frame = &payload[72..];
-
-    // The base must already be in the store — the builder emits it before the delta, and an
-    // incremental import may already hold it. An absent base is a corrupt/misordered bundle.
-    let base_bytes = file_utils::retrieve_object_by_hash(base_hash).map_err(|_| format!(
-        "The bundle delta for {} references base {}, which is not present; the bundle is corrupt.",
-        target_hash, base_hash
-    ))?;
-
-    delta_utils::decompress_delta(&base_bytes, frame, decompressed_len)
 }
 
 #[cfg(test)]
@@ -1010,6 +1016,20 @@ mod tests {
     /// Import an in-memory bundle, as `import_bundle` imports a file.
     fn import_bundle_bytes(bytes: &[u8]) -> Result<ImportStats, String> {
         import_bundle_reader(std::io::Cursor::new(bytes))
+    }
+
+    /// Import an in-memory batch response to a request for `hashes`, as `fetch_batch` imports one.
+    fn import_batch_bytes(bytes: &[u8], hashes: &[&str]) -> Result<ImportStats, String> {
+        import_streamed_bundle(std::io::Cursor::new(bytes), requested(hashes))
+    }
+
+    fn requested(hashes: &[&str]) -> StreamAdmission {
+        StreamAdmission::Requested(hashes.iter().map(|hash| hash.to_string()).collect())
+    }
+
+    /// Import an in-memory subtree response for the tree `root`, as `fetch_subtree` imports one.
+    fn import_closure_bytes(bytes: &[u8], root: &str) -> Result<ImportStats, String> {
+        import_streamed_bundle(std::io::Cursor::new(bytes), StreamAdmission::Closure { root: root.to_string() })
     }
 
     /// A fresh warehouse root for one test, entered as the active storage-root scope for
@@ -1042,10 +1062,9 @@ mod tests {
         }
     }
 
-    /// Build a minimal legacy (uncompressed-header + one zstd stream) bundle byte string from
-    /// raw records, exactly as the legacy importer expects to read one — the manual
-    /// low-level construction the fuzz suite also uses, but here to hit semantic
-    /// (not just never-panic) branches.
+    /// Build a minimal record-stream bundle (an uncompressed header, then one zstd stream) from raw
+    /// records, exactly as `import_streamed_bundle` reads one — the manual low-level construction
+    /// the fuzz suite also uses, but here to hit semantic (not just never-panic) branches.
     fn raw_bundle(header: &str, records: &[u8]) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend(header.as_bytes());
@@ -1085,7 +1104,7 @@ mod tests {
         let hash = object_utils::hash_object_bytes(content);
         let bytes = raw_bundle(BUNDLE_HEADER_V3, &record(b'O', &hash, content));
 
-        let stats = import_bundle_bytes(&bytes).unwrap();
+        let stats = import_batch_bytes(&bytes, &[&hash]).unwrap();
         assert_eq!(stats.stored_objects, 1);
         assert_eq!(stats.skipped_records, 0);
         assert!(file_utils::does_object_exist(&hash).unwrap());
@@ -1100,7 +1119,7 @@ mod tests {
         let wrong_hash = object_utils::hash_object_bytes(b"not the same content");
         let bytes = raw_bundle(BUNDLE_HEADER_V3, &record(b'O', &wrong_hash, content));
 
-        let error = import_bundle_bytes(&bytes).err().unwrap();
+        let error = import_batch_bytes(&bytes, &[&wrong_hash]).err().unwrap();
         assert!(error.contains("does not match its claimed hash"), "{}", error);
         assert!(!file_utils::does_object_exist(&wrong_hash).unwrap(), "nothing unverified may land");
     }
@@ -1114,89 +1133,40 @@ mod tests {
         object_utils::store_object_bytes(&hash, content).unwrap();
 
         let bytes = raw_bundle(BUNDLE_HEADER_V3, &record(b'O', &hash, content));
-        let stats = import_bundle_bytes(&bytes).unwrap();
+        let stats = import_batch_bytes(&bytes, &[&hash]).unwrap();
 
         assert_eq!(stats.stored_objects, 0);
         assert_eq!(stats.skipped_records, 1);
     }
 
+    /// The record stream carries objects only. A signature or delta record — kinds the
+    /// whole-warehouse stream once carried — is refused before its payload is read, and nothing
+    /// lands.
     #[test]
-    fn import_stores_a_signature_record_and_skips_a_duplicate() {
-        let _scratch = Scratch::new("import-signature");
+    fn a_streamed_signature_or_delta_record_is_refused() {
+        for kind in [b'S', b'D'] {
+            let _scratch = Scratch::new("streamed-retired-kind");
 
-        // The signature path shares the object's hash-sharded folder, so (as in a real
-        // bundle, where the parcel record always precedes its signature) the parcel
-        // object must already be stored.
-        let parcel_content = b"a stand-in parcel object";
-        let parcel_hash = object_utils::hash_object_bytes(parcel_content);
-        object_utils::store_object_bytes(&parcel_hash, parcel_content).unwrap();
+            let parcel_content = b"a stand-in parcel object";
+            let parcel_hash = object_utils::hash_object_bytes(parcel_content);
+            object_utils::store_object_bytes(&parcel_hash, parcel_content).unwrap();
 
-        let sidecar = raw_signature_sidecar("key-1", &[7u8; 64]);
-        let bytes = raw_bundle(BUNDLE_HEADER_V3, &record(b'S', &parcel_hash, &sidecar));
+            let sidecar = raw_signature_sidecar("key-1", &[7u8; 64]);
+            let bytes = raw_bundle(BUNDLE_HEADER_V3, &record(kind, &parcel_hash, &sidecar));
 
-        let stats = import_bundle_bytes(&bytes).unwrap();
-        assert_eq!(stats.stored_signatures, 1);
-        assert_eq!(sign_utils::load_raw_parcel_signature(&parcel_hash).unwrap(), Some(sidecar.clone()));
-
-        // The same sidecar again is a duplicate, not an error.
-        let stats = import_bundle_bytes(&bytes).unwrap();
-        assert_eq!(stats.stored_signatures, 0);
-        assert_eq!(stats.skipped_records, 1);
-    }
-
-    #[test]
-    fn import_reconstructs_a_valid_delta_record() {
-        let _scratch = Scratch::new("import-delta-ok");
-
-        let base = b"the quick brown fox\n".repeat(8);
-        let mut target = base.clone();
-        target.extend_from_slice(b"one more line\n");
-        let target_hash = object_utils::hash_object_bytes(&target);
-        let base_hash = object_utils::hash_object_bytes(&base);
-
-        object_utils::store_object_bytes(&base_hash, &base).unwrap();
-
-        let frame = delta_utils::compress_delta(&base, &target).unwrap();
-        let mut payload = Vec::new();
-        payload.extend(base_hash.as_bytes());
-        payload.extend((target.len() as u64).to_be_bytes());
-        payload.extend(&frame);
-
-        let bytes = raw_bundle(BUNDLE_HEADER_V3, &record(b'D', &target_hash, &payload));
-        let stats = import_bundle_bytes(&bytes).unwrap();
-
-        assert_eq!(stats.stored_objects, 1);
-        assert_eq!(file_utils::retrieve_object_by_hash(&target_hash).unwrap(), target);
-    }
-
-    #[test]
-    fn import_rejects_a_delta_record_whose_base_is_missing() {
-        let _scratch = Scratch::new("import-delta-missing-base");
-
-        let base = b"the quick brown fox\n".repeat(8);
-        let mut target = base.clone();
-        target.extend_from_slice(b"one more line\n");
-        let target_hash = object_utils::hash_object_bytes(&target);
-        let base_hash = object_utils::hash_object_bytes(&base);
-        // Deliberately never stored: the base is absent from this warehouse.
-
-        let frame = delta_utils::compress_delta(&base, &target).unwrap();
-        let mut payload = Vec::new();
-        payload.extend(base_hash.as_bytes());
-        payload.extend((target.len() as u64).to_be_bytes());
-        payload.extend(&frame);
-
-        let bytes = raw_bundle(BUNDLE_HEADER_V3, &record(b'D', &target_hash, &payload));
-        let error = import_bundle_bytes(&bytes).err().unwrap();
-        assert!(error.contains("is not present; the bundle is corrupt"), "{}", error);
+            let error = import_batch_bytes(&bytes, &[&parcel_hash]).err().unwrap();
+            assert!(error.contains("Unknown bundle record kind"), "'{}': {}", kind as char, error);
+            assert_eq!(sign_utils::load_raw_parcel_signature(&parcel_hash).unwrap(), None, "no sidecar may land");
+        }
     }
 
     #[test]
     fn import_rejects_an_unknown_record_kind() {
         let _scratch = Scratch::new("import-unknown-kind");
 
-        let bytes = raw_bundle(BUNDLE_HEADER_V3, &record(b'Z', &"a".repeat(64), b"whatever"));
-        let error = import_bundle_bytes(&bytes).err().unwrap();
+        let hash = "a".repeat(64);
+        let bytes = raw_bundle(BUNDLE_HEADER_V3, &record(b'Z', &hash, b"whatever"));
+        let error = import_batch_bytes(&bytes, &[&hash]).err().unwrap();
         assert!(error.contains("Unknown bundle record kind"), "{}", error);
     }
 
@@ -1227,21 +1197,174 @@ mod tests {
         assert!(error.contains(&MAX_HEADER_BYTES.to_string()), "names the bound: {}", error);
     }
 
+    /// A whole-warehouse bundle file is read only in the native format. Every record-stream header —
+    /// version 3 included, which partial responses still use — is refused as unsupported before a
+    /// record is read, so a clone handed such a file falls back to its verified walk.
     #[test]
-    fn import_still_accepts_the_legacy_v1_header() {
-        let _scratch = Scratch::new("import-v1-header");
+    fn import_bundle_refuses_every_record_stream_header() {
+        let _scratch = Scratch::new("import-record-stream-headers");
 
-        let content = b"legacy content";
+        let content = b"record-stream content";
         let hash = object_utils::hash_object_bytes(content);
-        let bytes = raw_bundle(BUNDLE_HEADER_V1, &record(b'O', &hash, content));
 
-        let stats = import_bundle_bytes(&bytes).unwrap();
+        for header in [BUNDLE_HEADER_V3, "forklift-bundle 2026-07-06", "forklift-bundle 2026-07-03"] {
+            let bytes = raw_bundle(header, &record(b'O', &hash, content));
+            let error = import_bundle_bytes(&bytes).err()
+                .unwrap_or_else(|| panic!("a \"{}\" bundle file must be refused", header));
+            assert!(is_unsupported_bundle_error(&error), "{}", error);
+            assert!(!file_utils::does_object_exist(&hash).unwrap(), "nothing past the header is read");
+        }
+    }
+
+    /// A batch response may store only what the request named. An unrequested record is refused
+    /// on its hash alone — even one declaring `u64::MAX` bytes, which would otherwise be refused on
+    /// its length — and an honestly sized one is never stored.
+    #[test]
+    fn a_batch_refuses_an_object_it_did_not_ask_for() {
+        let _scratch = Scratch::new("batch-unrequested");
+
+        let asked = object_utils::hash_object_bytes(b"asked for");
+        let content = b"never asked for";
+        let other = object_utils::hash_object_bytes(content);
+
+        let bytes = raw_bundle(BUNDLE_HEADER_V3, &record(b'O', &other, content));
+        let error = import_batch_bytes(&bytes, &[&asked]).err().unwrap();
+        assert!(error.contains("did not ask for"), "{}", error);
+        assert!(!file_utils::does_object_exist(&other).unwrap(), "an unrequested object never lands");
+
+        let huge = record_with_declared_len(b'O', &other, u64::MAX, b"a few bytes");
+        let error = import_batch_bytes(&raw_bundle(BUNDLE_HEADER_V3, &huge), &[&asked]).err().unwrap();
+        assert!(error.contains("did not ask for"), "refused on its hash, before its length: {}", error);
+    }
+
+    /// A requested object sent twice is refused on the repeat, so a remote cannot make the client
+    /// read and hash one object's bytes over and over.
+    #[test]
+    fn a_batch_refuses_an_object_sent_twice() {
+        let _scratch = Scratch::new("batch-repeat");
+
+        let content = b"sent twice";
+        let hash = object_utils::hash_object_bytes(content);
+        let mut records = record(b'O', &hash, content);
+        records.extend(record(b'O', &hash, content));
+
+        let error = import_batch_bytes(&raw_bundle(BUNDLE_HEADER_V3, &records), &[&hash]).err().unwrap();
+        assert!(error.contains("twice"), "{}", error);
+    }
+
+    /// The producer writes a repeated hash once, so the honest response to a request carrying
+    /// duplicates (the Lambda head passes a request through as given) imports.
+    #[test]
+    fn build_partial_bundle_writes_a_repeated_hash_once() {
+        let content = b"asked for twice";
+        let hash = object_utils::hash_object_bytes(content);
+
+        let bytes = {
+            let _source = Scratch::new("partial-bundle-dedupe-src");
+            object_utils::store_object_bytes(&hash, content).unwrap();
+            build_partial_bundle(&[hash.clone(), hash.clone()]).unwrap()
+        };
+
+        let _destination = Scratch::new("partial-bundle-dedupe-dst");
+        let stats = import_batch_bytes(&bytes, &[&hash]).unwrap();
         assert_eq!(stats.stored_objects, 1);
+        assert_eq!(stats.skipped_records, 0);
+    }
+
+    /// A subtree response's fixture: a root tree holding a file and a subtree holding another file,
+    /// as the server's breadth-first closure walk emits them — root, its file, its subtree, then
+    /// the subtree's file.
+    struct ClosureFixture {
+        records: Vec<u8>,
+        root: String,
+        subtree: (String, Vec<u8>),
+        hashes: Vec<String>,
+    }
+
+    fn closure_fixture() -> ClosureFixture {
+        let top = LooseObjectBuilder::build_blob(&Blob { content: b"top file".to_vec() });
+        let nested = LooseObjectBuilder::build_blob(&Blob { content: b"nested file".to_vec() });
+
+        let mut subtree_item = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        subtree_item.add_child(TreeItem::new("nested.txt".to_string(), nested.hash.clone(), DirEntryType::Normal));
+        let subtree = LooseObjectBuilder::build_tree(&subtree_item);
+
+        let mut root_item = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        root_item.add_child(TreeItem::new("top.txt".to_string(), top.hash.clone(), DirEntryType::Normal));
+        root_item.add_child(TreeItem::new("sub".to_string(), subtree.hash.clone(), DirEntryType::Tree));
+        let root = LooseObjectBuilder::build_tree(&root_item);
+
+        let mut records = Vec::new();
+        let mut hashes = Vec::new();
+        for object in [&root, &top, &subtree, &nested] {
+            records.extend(record(b'O', &object.hash, &object.content));
+            hashes.push(object.hash.clone());
+        }
+
+        ClosureFixture {
+            records,
+            root: root.hash.clone(),
+            subtree: (subtree.hash.clone(), subtree.content.clone()),
+            hashes,
+        }
+    }
+
+    #[test]
+    fn a_subtree_response_imports_its_closure_in_full() {
+        let fixture = closure_fixture();
+        let _scratch = Scratch::new("closure-ok");
+
+        let stats = import_closure_bytes(&raw_bundle(BUNDLE_HEADER_V3, &fixture.records), &fixture.root).unwrap();
+        assert_eq!(stats.stored_objects, 4);
+        assert!(fixture.hashes.iter().all(|hash| file_utils::does_object_exist(hash).unwrap()));
+    }
+
+    /// The first admissible record is the requested root, so a response rooted anywhere else is
+    /// refused at its first record.
+    #[test]
+    fn a_subtree_response_for_another_root_is_refused() {
+        let fixture = closure_fixture();
+        let _scratch = Scratch::new("closure-wrong-root");
+
+        let error = import_closure_bytes(&raw_bundle(BUNDLE_HEADER_V3, &fixture.records), &fixture.subtree.0)
+            .err().unwrap();
+        assert!(error.contains("did not ask for"), "{}", error);
+        assert!(!file_utils::does_object_exist(&fixture.root).unwrap(), "the foreign root never lands");
+    }
+
+    #[test]
+    fn a_subtree_response_carrying_an_object_outside_the_closure_is_refused() {
+        let fixture = closure_fixture();
+        let _scratch = Scratch::new("closure-stray");
+
+        let stray_content = b"outside the closure";
+        let stray = object_utils::hash_object_bytes(stray_content);
+        let mut records = fixture.records.clone();
+        records.extend(record(b'O', &stray, stray_content));
+
+        let error = import_closure_bytes(&raw_bundle(BUNDLE_HEADER_V3, &records), &fixture.root).err().unwrap();
+        assert!(error.contains("did not ask for"), "{}", error);
+        assert!(!file_utils::does_object_exist(&stray).unwrap(), "the stray object never lands");
+    }
+
+    /// The server sends every closure object it has, including a tree the client already holds.
+    /// That record is skipped, but the tree is still expanded — from the store — so the objects
+    /// below it stay admissible and the response imports in full.
+    #[test]
+    fn a_subtree_response_imports_in_full_when_the_client_already_holds_a_tree_inside_it() {
+        let fixture = closure_fixture();
+        let _scratch = Scratch::new("closure-held-tree");
+        object_utils::store_object_bytes(&fixture.subtree.0, &fixture.subtree.1).unwrap();
+
+        let stats = import_closure_bytes(&raw_bundle(BUNDLE_HEADER_V3, &fixture.records), &fixture.root).unwrap();
+        assert_eq!(stats.stored_objects, 3);
+        assert_eq!(stats.skipped_records, 1, "the held tree is skipped");
+        assert!(fixture.hashes.iter().all(|hash| file_utils::does_object_exist(hash).unwrap()));
     }
 
     /// Build a one-parcel/one-blob warehouse's native bundle in its own scratch, returning the
-    /// bundle bytes and the signed parcel's hash.
-    fn build_tiny_native_bundle(name: &str) -> (Vec<u8>, String) {
+    /// bundle bytes, the signed parcel's hash and the blob's hash.
+    fn build_tiny_native_bundle(name: &str) -> (Vec<u8>, String, String) {
         let _source = Scratch::new(name);
 
         let blob = Blob { content: b"version 1".to_vec() };
@@ -1273,7 +1396,56 @@ mod tests {
         assert_eq!(stats.deltas, 0);
         assert_eq!(stats.signatures, 1);
 
-        (std::fs::read(&stats.path).unwrap(), parcel_object.hash.clone())
+        (std::fs::read(&stats.path).unwrap(), parcel_object.hash.clone(), blob_object.hash.clone())
+    }
+
+    /// `bundle` (from [`build_tiny_native_bundle`]) with its signature section replaced by
+    /// `entries`. That section is the bundle's last bytes: a count, then one hash, length and
+    /// sidecar.
+    fn with_signature_section(bundle: &[u8], entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let sidecar = raw_signature_sidecar("test-key", b"test-signature");
+        let start = bundle.len() - 8 - (64 + 8 + sidecar.len());
+        assert_eq!(u64::from_be_bytes(bundle[start..start + 8].try_into().unwrap()), 1,
+            "the tiny bundle's signature section holds one entry");
+
+        let mut bytes = bundle[..start].to_vec();
+        bytes.extend((entries.len() as u64).to_be_bytes());
+        for (hash, payload) in entries {
+            bytes.extend(hash.as_bytes());
+            bytes.extend((payload.len() as u64).to_be_bytes());
+            bytes.extend(*payload);
+        }
+        bytes
+    }
+
+    /// Each signature entry becomes its own sidecar file, so one is admitted only for a parcel the
+    /// bundle's packs carry, and only once. An entry naming a blob, a hash nowhere in the bundle,
+    /// or a parcel already signed by an earlier entry is refused, and no sidecar is written for it.
+    #[test]
+    fn a_native_signature_entry_must_name_a_parcel_the_bundle_carries_once() {
+        let (bundle, parcel_hash, blob_hash) = build_tiny_native_bundle("bundle-sig-admission-src");
+        let sidecar = raw_signature_sidecar("test-key", b"test-signature");
+        let absent = "f".repeat(64);
+
+        {
+            // The section rewrite itself is faithful: the bundle's own entry imports.
+            let _destination = Scratch::new("bundle-sig-admission-control");
+            let stats = import_bundle_bytes(&with_signature_section(&bundle, &[(&parcel_hash, &sidecar)])).unwrap();
+            assert_eq!(stats.stored_signatures, 1);
+        }
+
+        for (name, signed) in [("blob", &blob_hash), ("absent", &absent)] {
+            let _destination = Scratch::new("bundle-sig-admission-foreign");
+            let error = import_bundle_bytes(&with_signature_section(&bundle, &[(signed, &sidecar)])).err()
+                .unwrap_or_else(|| panic!("a signature for the {} must be refused", name));
+            assert!(error.contains("not a parcel it carries"), "{}: {}", name, error);
+            assert_eq!(sign_utils::load_raw_parcel_signature(signed).unwrap(), None, "{}: no sidecar lands", name);
+        }
+
+        let _destination = Scratch::new("bundle-sig-admission-repeat");
+        let repeated = with_signature_section(&bundle, &[(&parcel_hash, &sidecar), (&parcel_hash, &sidecar)]);
+        let error = import_bundle_bytes(&repeated).err().unwrap();
+        assert!(error.contains("two signatures"), "{}", error);
     }
 
     /// The envelope/native-pack write-then-read semantics, end to end: a real (tiny)
@@ -1282,7 +1454,7 @@ mod tests {
     /// aggregate pack and does not explode its objects into individually-fsynced loose files.
     #[test]
     fn build_bundle_then_import_bundle_round_trips_directly_into_a_native_pack() {
-        let (bundle_bytes, _) = build_tiny_native_bundle("bundle-roundtrip-src");
+        let (bundle_bytes, _, _) = build_tiny_native_bundle("bundle-roundtrip-src");
         assert!(bundle_bytes.starts_with(format!("{}\n", BUNDLE_HEADER).as_bytes()));
 
         let _destination = Scratch::new("bundle-roundtrip-dst");
@@ -1309,7 +1481,7 @@ mod tests {
     /// point may become visible in the destination.
     #[test]
     fn corrupt_native_bundle_is_rejected_before_any_pack_is_published() {
-        let (mut bundle_bytes, _) = build_tiny_native_bundle("bundle-corrupt-src");
+        let (mut bundle_bytes, _, _) = build_tiny_native_bundle("bundle-corrupt-src");
         let table = BUNDLE_HEADER.len() + 1;
         let pack_count = u32::from_be_bytes(bundle_bytes[table..table + 4].try_into().unwrap());
         assert_eq!(pack_count, 1);
@@ -1333,11 +1505,11 @@ mod tests {
     }
 
     /// A destination that already carries a *different* sidecar for a bundled parcel keeps its
-    /// own: the bundle's copy is skipped — the same first-sidecar-wins semantics as the legacy
-    /// record importer, never a failed import after the packs were already published.
+    /// own: the bundle's copy is skipped (first sidecar wins), never a failed import after the
+    /// packs were already published.
     #[test]
     fn import_skips_a_conflicting_local_signature_instead_of_failing() {
-        let (bundle_bytes, parcel_hash) = build_tiny_native_bundle("bundle-sig-conflict-src");
+        let (bundle_bytes, parcel_hash, _) = build_tiny_native_bundle("bundle-sig-conflict-src");
 
         let _destination = Scratch::new("bundle-sig-conflict-dst");
         let local = raw_signature_sidecar("another-key", b"a different signature");
@@ -1401,8 +1573,22 @@ mod tests {
         assert!(!get_latest_bundle_path().exists(), "a refused bundle must not be written");
     }
 
+    /// Store an object over the whole-object ceiling, as a store authored before the ceiling holds
+    /// one. `LooseObject::store` and `store_object_bytes` both refuse a fresh over-ceiling write,
+    /// and no import admits one, so the fixture goes through `store_object_stream`, the one store
+    /// path that does not enforce the ceiling.
+    fn store_grandfathered_giant() -> crate::model::object::loose_object::LooseObject {
+        let giant_object = LooseObjectBuilder::build_blob(&Blob {
+            content: vec![0u8; object_utils::MAX_OBJECT_BYTES + 1],
+        });
+        let bytes = &giant_object.content;
+        object_utils::store_object_stream(&giant_object.hash, &mut std::io::Cursor::new(bytes), bytes.len() as u64)
+            .expect("the giant stores through the unchecked stream path");
+        giant_object
+    }
+
     /// A warehouse with a grandfathered giant blob (an object above the whole-object ceiling,
-    /// authored — here, imported via an old-version bundle — before `MAX_OBJECT_BYTES` existed)
+    /// authored before `MAX_OBJECT_BYTES` existed)
     /// refuses to bundle: no reader accepts a record that large (a version-3 reader refuses its
     /// declared length pre-read), so writing one would only produce a bundle nobody could finish
     /// importing. The refusal carries the stable code, names the path and the object, and nothing
@@ -1412,16 +1598,7 @@ mod tests {
     fn build_bundle_refuses_a_warehouse_with_a_grandfathered_giant_blob() {
         let _scratch = Scratch::new("bundle-giant-refuses");
 
-        // The only way such a blob can exist locally: it predates the ceiling. `LooseObject::
-        // store`/`store_object_bytes` both refuse a fresh over-ceiling write, so importing it via
-        // an old-version bundle (which does not hard-enforce the ceiling) is the honest way to
-        // manufacture the fixture — mirrors `an_old_version_bundle_imports_a_grandfathered_giant`.
-        let giant_object = LooseObjectBuilder::build_blob(&Blob {
-            content: vec![0u8; object_utils::MAX_OBJECT_BYTES + 1],
-        });
-        let giant_bytes = giant_object.content.clone();
-        let v2_bundle = raw_bundle(BUNDLE_HEADER_V2, &record(b'O', &giant_object.hash, &giant_bytes));
-        import_bundle_bytes(&v2_bundle).expect("the grandfathered giant imports via an old-version bundle");
+        let giant_object = store_grandfathered_giant();
 
         let mut root_tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
         root_tree.add_child(TreeItem::new(
@@ -1462,12 +1639,7 @@ mod tests {
     fn build_partial_bundle_refuses_a_grandfathered_giant_blob() {
         let _scratch = Scratch::new("partial-bundle-giant-refuses");
 
-        let giant_object = LooseObjectBuilder::build_blob(&Blob {
-            content: vec![0u8; object_utils::MAX_OBJECT_BYTES + 1],
-        });
-        let giant_bytes = giant_object.content.clone();
-        let v2_bundle = raw_bundle(BUNDLE_HEADER_V2, &record(b'O', &giant_object.hash, &giant_bytes));
-        import_bundle_bytes(&v2_bundle).expect("the grandfathered giant imports via an old-version bundle");
+        let giant_object = store_grandfathered_giant();
 
         let error = build_partial_bundle(&[giant_object.hash.clone()]).err()
             .expect("a grandfathered giant must refuse the partial bundle");
@@ -1489,20 +1661,6 @@ mod tests {
         bytes
     }
 
-    /// A version-2 bundle (the delta-record version) is still accepted on import — an older
-    /// server's bundle reads fine.
-    #[test]
-    fn import_still_accepts_the_v2_header() {
-        let _scratch = Scratch::new("import-v2-header");
-
-        let content = b"a version-2 object";
-        let hash = object_utils::hash_object_bytes(content);
-        let bytes = raw_bundle(BUNDLE_HEADER_V2, &record(b'O', &hash, content));
-
-        let stats = import_bundle_bytes(&bytes).unwrap();
-        assert_eq!(stats.stored_objects, 1);
-    }
-
     /// A large object rides the streaming import path (above the buffered threshold) and lands
     /// byte-identical — the D/7 memory defense in the ordinary, honest case.
     #[test]
@@ -1515,44 +1673,26 @@ mod tests {
         let raw = object.content.clone();
         let bytes = raw_bundle(BUNDLE_HEADER_V3, &record(b'O', &object.hash, &raw));
 
-        let stats = import_bundle_bytes(&bytes).unwrap();
+        let stats = import_batch_bytes(&bytes, &[&object.hash]).unwrap();
         assert_eq!(stats.stored_objects, 1);
         assert_eq!(file_utils::retrieve_object_by_hash(&object.hash).unwrap(), raw);
     }
 
-    /// A new-version (v3) bundle refuses an `'O'` record whose *declared* length is above the
-    /// object ceiling **before reading a byte** of it: the record declares a giant length but
+    /// A streamed bundle refuses an `'O'` record whose *declared* length is above the object
+    /// ceiling **before reading a byte** of it: the record declares a giant length but
     /// carries only a few real bytes, so a read would report truncation — the ceiling error
     /// (not truncation) proves the refusal happened pre-read.
     #[test]
-    fn new_version_bundle_refuses_an_over_ceiling_object_pre_read() {
+    fn a_streamed_object_over_the_ceiling_is_refused_pre_read() {
         let _scratch = Scratch::new("import-ceiling-object");
 
+        let hash = "a".repeat(64);
         let declared = object_utils::MAX_OBJECT_BYTES as u64 + 1;
-        let record = record_with_declared_len(b'O', &"a".repeat(64), declared, b"only a few bytes");
+        let record = record_with_declared_len(b'O', &hash, declared, b"only a few bytes");
         let bytes = raw_bundle(BUNDLE_HEADER_V3, &record);
 
-        let error = import_bundle_bytes(&bytes).err().unwrap();
+        let error = import_batch_bytes(&bytes, &[&hash]).err().unwrap();
         assert!(error.contains("object ceiling"), "the ceiling refusal (not truncation): {}", error);
-        assert!(!error.contains("truncated"), "must be refused before reading: {}", error);
-    }
-
-    /// The same pre-read ceiling refusal for a `'D'` record — and, crucially, it applies on an
-    /// **old-version** bundle too: no writer of any version ever emitted a delta near the ceiling,
-    /// so an over-ceiling declared delta length is a bomb regardless of the header, and is capped
-    /// before the frame is read into memory.
-    #[test]
-    fn a_delta_record_over_the_ceiling_is_refused_on_any_version() {
-        let _scratch = Scratch::new("import-ceiling-delta");
-
-        let declared = object_utils::MAX_OBJECT_BYTES as u64 + 1;
-        let record = record_with_declared_len(b'D', &"b".repeat(64), declared, b"tiny frame");
-        // An *old*-version bundle, to prove the delta cap is unconditional, not gated on v3.
-        let bytes = raw_bundle(BUNDLE_HEADER_V2, &record);
-
-        let error = import_bundle_bytes(&bytes).err().unwrap();
-        assert!(error.contains("delta"), "names the delta record: {}", error);
-        assert!(error.contains("object ceiling"), "the ceiling refusal: {}", error);
         assert!(!error.contains("truncated"), "must be refused before reading: {}", error);
     }
 
@@ -1574,39 +1714,9 @@ mod tests {
         // check, not the length check — the under-ceiling lie the ceiling alone cannot catch.
         let bytes = raw_bundle(BUNDLE_HEADER_V3, &record(b'O', &wrong_hash, &raw));
 
-        let error = import_bundle_bytes(&bytes).err().unwrap();
+        let error = import_batch_bytes(&bytes, &[&wrong_hash]).err().unwrap();
         assert!(error.contains("does not match its claimed hash"), "{}", error);
         assert!(!file_utils::does_object_exist(&wrong_hash).unwrap(), "nothing unverified may land");
-    }
-
-    /// An old-version bundle carrying a **grandfathered giant** — a single `'O'` object above the
-    /// object ceiling, from before the ceiling existed — still imports: the ceiling is not
-    /// hard-enforced on an old-version bundle, and the object streams in with memory bounded. This
-    /// is the "an existing store must not brick" guarantee, over the wire.
-    #[test]
-    fn an_old_version_bundle_imports_a_grandfathered_giant() {
-        let _scratch = Scratch::new("import-grandfathered-giant");
-
-        // A real object over the ceiling: the payload itself exceeds MAX_OBJECT_BYTES, so the
-        // object is over-ceiling regardless of how large the prepended object header is (zeros:
-        // cheap to hash and compress).
-        let object = LooseObjectBuilder::build_blob(&Blob {
-            content: vec![0u8; object_utils::MAX_OBJECT_BYTES + 1],
-        });
-        let raw = object.content.clone();
-        assert!(raw.len() > object_utils::MAX_OBJECT_BYTES, "the object must exceed the ceiling");
-
-        // A version-2 header: predates the ceiling, so it is not hard-refused on declared size.
-        let bytes = raw_bundle(BUNDLE_HEADER_V2, &record(b'O', &object.hash, &raw));
-
-        let stats = import_bundle_bytes(&bytes).unwrap();
-        assert_eq!(stats.stored_objects, 1, "the grandfathered giant imports");
-        assert_eq!(file_utils::retrieve_object_by_hash(&object.hash).unwrap().len(), raw.len());
-
-        // But the same giant in a *new-version* bundle is refused before it is read.
-        let bytes = raw_bundle(BUNDLE_HEADER_V3, &record(b'O', &object.hash, &raw));
-        let error = import_bundle_bytes(&bytes).err().unwrap();
-        assert!(error.contains("object ceiling"), "a v3 bundle refuses the giant: {}", error);
     }
 
     /// [`raw_bundle`], but with the record stream's frame declaring a `window_log` window — a
@@ -1646,17 +1756,18 @@ mod tests {
         // inside a record, or exactly between two — the import must fail: a bundle that loses
         // its tail is corrupt, never a smaller valid one.
         let (records, hashes) = three_objects();
+        let asked: Vec<&str> = hashes.iter().map(String::as_str).collect();
         let bytes = raw_bundle(BUNDLE_HEADER_V3, &records);
         let header_len = BUNDLE_HEADER_V3.len() + 1;
 
         for cut in header_len..bytes.len() {
             let _scratch = Scratch::new("streamed-cut");
-            let outcome = import_streamed_bundle(std::io::Cursor::new(&bytes[..cut]));
+            let outcome = import_streamed_bundle(std::io::Cursor::new(&bytes[..cut]), requested(&asked));
             assert!(outcome.is_err(), "a bundle cut at byte {} of {} must not import", cut, bytes.len());
         }
 
         let _scratch = Scratch::new("streamed-whole");
-        let stats = import_streamed_bundle(std::io::Cursor::new(&bytes)).unwrap();
+        let stats = import_streamed_bundle(std::io::Cursor::new(&bytes), requested(&asked)).unwrap();
         assert_eq!(stats.stored_objects, 3);
         assert!(hashes.iter().all(|hash| file_utils::does_object_exist(hash).unwrap()));
     }
@@ -1664,46 +1775,42 @@ mod tests {
     #[test]
     fn a_streamed_bundle_is_accepted_only_at_version_3() {
         let _scratch = Scratch::new("streamed-versions");
-        let (records, _) = three_objects();
+        let (records, hashes) = three_objects();
+        let asked: Vec<&str> = hashes.iter().map(String::as_str).collect();
 
-        for header in [BUNDLE_HEADER, BUNDLE_HEADER_V2, BUNDLE_HEADER_V1] {
-            let error = import_streamed_bundle(std::io::Cursor::new(raw_bundle(header, &records)))
+        for header in [BUNDLE_HEADER, "forklift-bundle 2026-07-06", "forklift-bundle 2026-07-03"] {
+            let error = import_streamed_bundle(std::io::Cursor::new(raw_bundle(header, &records)), requested(&asked))
                 .err().unwrap_or_else(|| panic!("a \"{}\" bundle must be refused on the streamed path", header));
             assert!(error.contains("refusing to import it"), "{}", error);
         }
 
-        assert!(import_streamed_bundle(std::io::Cursor::new(raw_bundle(BUNDLE_HEADER_V3, &records))).is_ok());
+        assert!(import_streamed_bundle(std::io::Cursor::new(raw_bundle(BUNDLE_HEADER_V3, &records)), requested(&asked)).is_ok());
     }
 
     /// The streamed path is the one a remote's batch and subtree answers reach, so the hostile
-    /// declared length the fuzz suite pins through `import_bundle` is pinned here too: a
-    /// record declaring `u64::MAX` bytes is an error, never an allocation of them.
+    /// declared length the fuzz suite pins is pinned here too: a requested record declaring
+    /// `u64::MAX` bytes is an error, never an allocation of them.
     #[test]
     fn a_streamed_record_declaring_a_huge_length_is_refused_without_allocating_it() {
-        for kind in [b'O', b'D', b'S'] {
-            let _scratch = Scratch::new("streamed-huge-length");
-            let mut hostile = vec![kind];
-            hostile.extend([b'a'; 64]);
-            hostile.extend(u64::MAX.to_be_bytes());
-            hostile.extend(b"only a few real bytes");
+        let _scratch = Scratch::new("streamed-huge-length");
+        let hash = "a".repeat(64);
+        let hostile = record_with_declared_len(b'O', &hash, u64::MAX, b"only a few real bytes");
 
-            let outcome = import_streamed_bundle(std::io::Cursor::new(raw_bundle(BUNDLE_HEADER_V3, &hostile)));
-            let error = outcome.err()
-                .unwrap_or_else(|| panic!("a '{}' record of declared length u64::MAX must be refused", kind as char));
-            assert!(error.contains("declares 18446744073709551615 bytes"),
-                "the '{}' record is refused on its declared length before any of it is read: {}", kind as char, error);
-        }
+        let outcome = import_batch_bytes(&raw_bundle(BUNDLE_HEADER_V3, &hostile), &[&hash]);
+        let error = outcome.err().expect("a record of declared length u64::MAX must be refused");
+        assert!(error.contains("declares 18446744073709551615 bytes"),
+            "the record is refused on its declared length before any of it is read: {}", error);
     }
 
     #[test]
     fn a_bundle_stream_declaring_a_window_past_the_bound_is_refused_and_one_at_it_imports() {
         let (records, hashes) = three_objects();
+        let asked: Vec<&str> = hashes.iter().map(String::as_str).collect();
 
         let over = bundle_with_window(BUNDLE_HEADER_V3, &records, object_utils::MAX_DECODE_WINDOW_LOG + 1);
         {
             let _scratch = Scratch::new("window-over");
-            assert!(import_bundle_bytes(&over).is_err(), "a file bundle over the window bound is refused");
-            assert!(import_streamed_bundle(std::io::Cursor::new(&over)).is_err(),
+            assert!(import_streamed_bundle(std::io::Cursor::new(&over), requested(&asked)).is_err(),
                 "a streamed bundle over the window bound is refused");
             assert!(!hashes.iter().any(|hash| file_utils::does_object_exist(hash).unwrap()),
                 "the refusal comes before the first record");
@@ -1711,6 +1818,6 @@ mod tests {
 
         let at = bundle_with_window(BUNDLE_HEADER_V3, &records, object_utils::MAX_DECODE_WINDOW_LOG);
         let _scratch = Scratch::new("window-at");
-        assert_eq!(import_streamed_bundle(std::io::Cursor::new(&at)).unwrap().stored_objects, 3);
+        assert_eq!(import_streamed_bundle(std::io::Cursor::new(&at), requested(&asked)).unwrap().stored_objects, 3);
     }
 }

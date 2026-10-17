@@ -85,7 +85,11 @@ Import is deliberately two-phase:
 4. Sync the handful of verified aggregate files, then publish data first and index last. The index
    is the reader-visible commit point. Finally sync the pack directory and invalidate the in-process
    pack cache.
-5. Import the signature sidecar section and require EOF.
+5. Import the signature sidecar section and require EOF. Each entry becomes its own sidecar file,
+   so it is admitted only when its hash names a parcel present in the store once the packs have
+   landed, and only once per bundle. An entry naming a blob, a tree, an absent hash, or a parcel an
+   earlier entry already signed rejects the bundle before its bytes are read. (The importer runs
+   only against a freshly prepared warehouse, so "present in the store" is "carried by the packs".)
 
 Any failure before pack publication removes the temporary files. A process crash during
 publication leaves at worst a valid subset of verified packs: an index is never published before
@@ -110,23 +114,33 @@ instead of producing an incomplete artifact. Likewise, a grandfathered object ab
 whole-object ceiling remains readable locally but cannot be put into a new bundle or sent by the
 incremental object path; changing its representation would change signed history.
 
-## Partial bundles and compatibility
+## Partial bundles
 
-The incremental `POST /v1/objects/batch` and subtree responses still use the `2026-07-11` legacy
-record stream. Those small responses add selected objects to an existing store and cannot generally
-be installed as a self-contained pack, because requested deltas may not have their bases. The same
-importer accepts both layouts.
+The incremental `POST /v1/objects/batch` and subtree responses use the `2026-07-11` record stream:
+a header line, then one outer zstd stream of `O` records, each `kind[1] | hash[64 ASCII hex] |
+length u64 | object bytes`. Those small responses add selected objects to an existing store and
+cannot generally be installed as a self-contained pack, because requested deltas may not have their
+bases. They are read only from a remote's response, never from a whole-bundle file.
 
-Whole-bundle readers remain backward compatible with:
+Every record is admitted before a byte of its payload is read, so a remote can make the client
+store only what it asked for:
 
-- `2026-07-11`: one outer zstd stream of `O`/`D`/`S` records with the current object ceiling;
-- `2026-07-06`: the first delta-record stream;
-- `2026-07-03`: full objects and signature records only.
+- **Batch.** A record must name a hash the request asked for, and no hash may appear twice. The
+  client sends each hash once, and the builder writes a repeated hash once.
+- **Subtree.** The client names the subtree's hash from the spine tree it already holds. The first
+  admissible record is that tree; each admitted tree makes its files and subtrees admissible,
+  loaded from the store even when the record was skipped because the client already held it. No
+  hash may appear twice, and at most 10,000 records are admitted, the server's own cap on one
+  response.
 
-A current client that sees an unknown future header deletes the downloaded optimization and falls
-back to incremental verified fetches. A known-format integrity failure remains fatal. Because the
-wire endpoint did not historically negotiate bundle versions, clients older than `2026-07-13` may
-need upgrading before cloning from a server that publishes the current envelope.
+Any other record kind, an unrequested hash, or a repeat rejects the response.
+
+## Version handling
+
+A whole-bundle file is read only in the `2026-07-13` envelope. Any other header — a future version,
+or one of the record-stream versions whole bundles once used (`2026-07-11`, `2026-07-06`,
+`2026-07-03`) — is reported as unsupported: the client deletes the downloaded optimization and falls
+back to incremental verified fetches. A known-format integrity failure remains fatal.
 
 ## Future extensions
 

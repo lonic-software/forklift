@@ -1001,7 +1001,11 @@ answer has a size limit: small for an error or a signature, 64 MiB for one objec
 handshake, and one that scales with the request for negotiation answers. An answer over its limit
 is refused with a message naming what was refused and the limit. Bundles (clone, pull, sparse
 fetches) are written to disk or imported as they arrive rather than held whole, so they have no
-memory limit. The client accepts gzip-compressed answers only, and a zstd frame received from a
+memory limit. What they write is bounded instead: a pull or sparse fetch stores only the objects
+the client asked for, each once and each within the 64 MiB object limit. A clone is different
+in kind, since the remote decides how much history there is: its bundle stores no more than the
+downloaded file holds, and the file is kept afterwards, so a clone can briefly need about twice the
+history's size. The client accepts gzip-compressed answers only, and a zstd frame received from a
 remote may use at most an 8 MiB window; a frame asking for more is refused.
 
 ### `franchise` — clone (`fr`)

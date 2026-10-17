@@ -380,10 +380,10 @@ error_codes! {
     ChunkedTransportUnsupported,
 
     /// A bundle or lift was asked to send an object above the whole-object ceiling: a
-    /// grandfathered giant (authored, or imported via an old-version bundle, before the ceiling
-    /// existed) stays readable and checkout-able locally forever, but no migration preserves its
-    /// signed identity, so nothing accepts it in transport. Refuses client-side (or at the
-    /// bundle-building source) rather than ship something no reader could finish importing.
+    /// grandfathered giant (authored before the ceiling existed) stays readable and checkout-able
+    /// locally forever, but no migration preserves its signed identity, so nothing accepts it in
+    /// transport. Refuses client-side (or at the bundle-building source) rather than ship
+    /// something no reader could finish importing.
     OversizedTransportUnsupported,
 
     /// A lift's commit would need more than one paginated batch (more than `MAX_MISSING_BATCH`
