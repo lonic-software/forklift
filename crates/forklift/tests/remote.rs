@@ -4660,7 +4660,8 @@ fn scope_prune_resumes_after_an_interrupted_free_and_completes() {
     // Simulate an interrupted prune by hand: narrow the shared fetch scope directly (step one of
     // a real prune, already durable) and delete only the blob — the child, freed before its
     // parent tree in a real run's order — leaving the parent tree behind (step two, interrupted).
-    std::fs::write(area.path("sparse/.forklift/config/fetch-scope"), "/forklift-scope 2\nsrc/api\n").unwrap();
+    let narrowed = forklift_core::util::scope_utils::MaterializationScope::from_prefixes(["src/api"]);
+    std::fs::write(area.path("sparse/.forklift/config/fetch-scope"), narrowed.to_bytes()).unwrap();
     std::fs::remove_file(object_store_path(&area, "sparse", &web_blob)).unwrap();
     assert!(object_present(&area, "sparse", &web_tree),
         "the simulated interruption leaves the parent tree behind");

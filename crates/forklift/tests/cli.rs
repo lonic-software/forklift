@@ -5254,13 +5254,23 @@ fn a_hand_written_marker_refuses_stack_even_without_a_reported_load_failure() {
 
     let marker_path = incomplete_load_marker_path(&warehouse);
     std::fs::create_dir_all(marker_path.parent().unwrap()).unwrap();
-    std::fs::write(&marker_path, "./\n").unwrap();
+    forklift_core::util::marker_utils::add(&marker_path, "").unwrap();
 
     let stacked = warehouse.run(&["stack", "second", "--json"]);
     assert_eq!(stacked.status.code(), Some(20));
     let value = json(&stacked);
     assert_eq!(value["error"]["code"], "incomplete_load");
     assert!(value["error"]["message"].as_str().unwrap().contains("./"));
+
+    // A marker in a format this build cannot read refuses too, naming the file, rather than
+    // reading as no incomplete load at all.
+    std::fs::write(&marker_path, "./\n").unwrap();
+
+    let stacked = warehouse.run(&["stack", "second", "--json"]);
+    assert_eq!(stacked.status.code(), Some(20));
+    let value = json(&stacked);
+    assert_eq!(value["error"]["code"], "incomplete_load");
+    assert!(value["error"]["message"].as_str().unwrap().contains("has no format header"), "{}", value);
 }
 
 /// Two independent loads, over disjoint subtrees, each fail. A single-path marker could only

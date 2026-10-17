@@ -21,16 +21,15 @@
 //!
 //! ## On-disk format
 //!
-//! One normalized path key per line, sorted. The warehouse root is a literal blank line (`""`),
-//! never specially spelled or omitted — [`str::lines`] round-trips this correctly (a genuinely
-//! empty file, or a missing one, yields zero lines; a file containing a lone `"\n"` yields exactly
-//! one, the empty string). A missing file reads as the empty set.
+//! A [`record_utils`] file of kind `marker`: one normalized path key per line, sorted, escaped so
+//! that a key holding a line break is still one line. The warehouse root is the empty key, a
+//! blank line, never specially spelled or omitted. A missing file reads as the empty set.
 //!
 //! ## Malformed content
 //!
-//! The only way this module considers a marker file malformed is if its bytes are not valid
-//! UTF-8 ([`read`] returns `Err` in that case) — the line-per-key format has no other structural
-//! requirement to violate. Every consumer built on this module is expected to follow one
+//! A marker file is malformed when [`record_utils`] refuses it: bytes that are not UTF-8, a
+//! missing or unknown format header, a file cut short or a bad escape ([`read`] returns `Err`).
+//! Every consumer built on this module is expected to follow one
 //! convention for handling that:
 //! * **Write side** (recording a new key): treat malformed existing content exactly like a
 //!   missing file — self-heal by overwriting with a fresh set. [`add`] does this unconditionally.
@@ -51,33 +50,35 @@
 
 use std::collections::BTreeSet;
 use std::path::Path;
-use crate::util::{file_utils, path_utils};
+use crate::util::{file_utils, path_utils, record_utils};
 
 /// Read the set of path keys currently recorded at `path`.
 ///
 /// # Returns
 /// * `Ok(set)`     - Possibly empty (a missing file reads as the empty set).
-/// * `Err(String)` - The file exists but its content is not valid UTF-8.
+/// * `Err(String)` - The file exists but is malformed (see the module doc comment).
 pub fn read(path: &Path) -> Result<BTreeSet<String>, String> {
     if !path.exists() {
         return Ok(BTreeSet::new());
     }
 
-    let content = std::fs::read_to_string(path)
+    let bytes = std::fs::read(path)
         .map_err(|e| format!("Error while reading \"{}\": {}", path.to_string_lossy(), e))?;
 
-    Ok(content.lines().map(str::to_string).collect())
+    let keys = record_utils::from_bytes(&bytes, MARKER_RECORD, MARKER_VERSION)
+        .map_err(|e| format!("The marker file \"{}\" {}", path.to_string_lossy(), e.describe()))?;
+
+    Ok(keys.into_iter().collect())
 }
 
 /// Serialize `set` to its on-disk form — see the module doc comment's format section.
 fn serialize(set: &BTreeSet<String>) -> Vec<u8> {
-    let mut content = String::new();
-    for key in set {
-        content.push_str(key);
-        content.push('\n');
-    }
-    content.into_bytes()
+    record_utils::to_bytes(MARKER_RECORD, MARKER_VERSION, set)
 }
+
+/// The [`record_utils`] kind and version of a marker file.
+const MARKER_RECORD: &str = "marker";
+const MARKER_VERSION: u32 = 1;
 
 /// The antichain-maintaining update [`add`], [`pending_add`] and [`add_deferred`] share: absorb
 /// `key` into `existing` (see the module doc comment's antichain-invariant section).

@@ -852,7 +852,10 @@ mod tests {
 
         let dir = crate::util::bay_utils::bay_state_dir("b");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("consolidation"), format!("{}\nfeature\n", theirs)).unwrap();
+        let state = crate::util::merge_utils::ConsolidationState {
+            their_head: theirs.clone(), their_pallet: "feature".to_string(),
+        };
+        std::fs::write(dir.join("consolidation"), crate::util::merge_utils::consolidation_state_bytes(&state)).unwrap();
 
         let post_prune = MaterializationScope::from_prefixes(["src/api"]);
         let plan = plan_prune(&["src/web".to_string()], &post_prune, &store_access()).unwrap();

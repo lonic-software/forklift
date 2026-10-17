@@ -27,6 +27,7 @@
 use std::path::{Path, PathBuf};
 use crate::globals::{self, bay_root};
 use crate::error::{CoreError, RefusalCode};
+use crate::util::record_utils::{self, RecordError};
 
 /// The bay-local file that records a bay's materialization scope (under `<bay_root>/`).
 const FILE_NAME_BAY_SCOPE: &str = "scope";
@@ -36,12 +37,13 @@ const FILE_NAME_BAY_SCOPE: &str = "scope";
 const FOLDER_NAME_CONFIG: &str = "config";
 const FILE_NAME_FETCH_SCOPE: &str = "fetch-scope";
 
-/// The first line of every non-full scope file, naming its format. Format 2 is the one in which
-/// the root ignore file is in every scope; the unversioned files before it are refused on read.
-/// It opens with "/", which no stored prefix can (prefixes are trimmed of it), so an unversioned
-/// file can never be mistaken for a versioned one.
-const SCOPE_FORMAT_TAG: &str = "/forklift-scope ";
-const SCOPE_FORMAT_HEADER: &str = "/forklift-scope 2";
+/// The [`record_utils`] kind and version of every non-full scope file. Format 2 put the root
+/// ignore file in every scope, refusing the unversioned files before it; format 3 escapes each
+/// prefix, so one may hold a line break. A file in either earlier format is refused on read.
+/// The header opens with "/", which no stored prefix can (prefixes are trimmed of it), so an
+/// unversioned file can never be mistaken for a versioned one.
+const SCOPE_RECORD: &str = "scope";
+const SCOPE_VERSION: u32 = 3;
 
 /// The stable machine-branchable refusal codes this feature contributes to the §7.4 error
 /// taxonomy, as their code strings — kept as re-exports of the typed [`RefusalCode`] (the source
@@ -246,66 +248,52 @@ impl MaterializationScope {
         self.prefixes.iter().all(|prefix| other.classify(prefix) == ScopeClass::InScope)
     }
 
-    /// Serialize the scope to its on-disk form: the [`SCOPE_FORMAT_HEADER`] line, then one prefix
-    /// per line, each newline-terminated. A full scope serializes to the empty string.
-    fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
-
+    /// Serialize the scope to its on-disk form, a [`record_utils`] file of kind [`SCOPE_RECORD`]:
+    /// one prefix per line, escaped, so a prefix may hold a line break or edge whitespace. A
+    /// full scope serializes to the empty string.
+    pub fn to_bytes(&self) -> Vec<u8> {
         if self.prefixes.is_empty() {
-            return bytes;
+            return Vec::new();
         }
 
-        bytes.extend_from_slice(SCOPE_FORMAT_HEADER.as_bytes());
-        bytes.push(b'\n');
-
-        for prefix in &self.prefixes {
-            bytes.extend_from_slice(prefix.as_bytes());
-            bytes.push(b'\n');
-        }
-
-        bytes
+        record_utils::to_bytes(SCOPE_RECORD, SCOPE_VERSION, &self.prefixes)
     }
 
-    /// Parse a scope from its on-disk form (blank lines and surrounding whitespace ignored); an
-    /// error is phrased to follow "The scope file \"<path>\"". An empty file is the full scope.
-    /// Anything else must open with [`SCOPE_FORMAT_HEADER`] and name at least one prefix: a file
-    /// without the header was written under the older meaning of a scope, which left the root
-    /// ignore file out, and reading it under today's meaning would report that file as removed
-    /// and commit the removal — so it is refused, as is a header naming a format this build does
-    /// not know, and a header with no prefix after it, which no write produces and which would
-    /// otherwise widen a sparse scope to full.
+    /// Parse a scope from its on-disk form; an error is phrased to follow "The scope file
+    /// \"<path>\"". An empty file is the full scope. Anything else must be a [`record_utils`]
+    /// file at [`SCOPE_VERSION`] naming at least one prefix: a file without the header was written
+    /// under the older meaning of a scope, which left the root ignore file out, and reading it
+    /// under today's meaning would report that file as removed and commit the removal — so it is
+    /// refused, as is a header naming a format this build does not know, and a header with no
+    /// prefix after it, which no write produces and which would otherwise widen a sparse scope to
+    /// full.
     ///
     /// # Arguments
     /// * `bytes`  - The file's contents.
     /// * `remedy` - The way out for a file in the older format, which depends on whose file it is.
     fn from_bytes(bytes: &[u8], remedy: &str) -> Result<MaterializationScope, String> {
-        let text = std::str::from_utf8(bytes)
-            .map_err(|_| "is not valid UTF-8.".to_string())?;
-
-        let mut lines = text.lines()
-            .map(|line| line.trim())
-            .filter(|line| !line.is_empty());
-
-        let header = match lines.next() {
-            Some(header) => header,
-            None => return Ok(MaterializationScope::full()),
-        };
-
-        if header != SCOPE_FORMAT_HEADER {
-            return Err(if header.starts_with(SCOPE_FORMAT_TAG) {
-                format!(
-                    "is in a format this version of Forklift does not know (\"{}\"). Use the \
-                    Forklift that wrote it.",
-                    header
-                )
-            } else {
-                format!(
-                    "was written by an older version of Forklift, whose sparse checkouts left out \
-                    the root ignore file, so it cannot be read safely. {}",
-                    remedy
-                )
-            });
+        if bytes.is_empty() {
+            return Ok(MaterializationScope::full());
         }
+
+        let lines = record_utils::from_bytes(bytes, SCOPE_RECORD, SCOPE_VERSION).map_err(|e| match e {
+            RecordError::Unversioned => format!(
+                "was written by an older version of Forklift, whose sparse checkouts left out \
+                the root ignore file, so it cannot be read safely. {}",
+                remedy
+            ),
+            RecordError::OtherVersion(ref header) => {
+                let older = header.rsplit(' ').next()
+                    .and_then(|version| version.parse::<u32>().ok())
+                    .is_some_and(|version| version < SCOPE_VERSION);
+                if older {
+                    format!("{} An older version of Forklift wrote it. {}", e.describe(), remedy)
+                } else {
+                    format!("{} Use the Forklift that wrote it.", e.describe())
+                }
+            }
+            _ => e.describe(),
+        })?;
 
         let scope = MaterializationScope::from_prefixes(lines);
 
@@ -846,14 +834,16 @@ mod tests {
         // The full scope round-trips as the empty file.
         assert!(MaterializationScope::full().to_bytes().is_empty());
         assert!(MaterializationScope::from_bytes(b"", "").unwrap().is_full());
-        assert!(MaterializationScope::from_bytes(b"\n  \n", "").unwrap().is_full());
+        // Only the empty file is: whitespace is no longer trimmed away, so a file of blank lines
+        // has no header and is refused.
+        assert!(MaterializationScope::from_bytes(b"\n  \n", "").is_err());
     }
 
     #[test]
     fn a_scope_file_without_its_format_header_is_refused() {
         // A non-full scope is written under its format header.
         let bytes = MaterializationScope::from_prefixes(["src"]).to_bytes();
-        assert!(bytes.starts_with(b"/forklift-scope 2\n"), "{:?}", String::from_utf8_lossy(&bytes));
+        assert!(bytes.starts_with(b"/forklift-scope 3\n"), "{:?}", String::from_utf8_lossy(&bytes));
 
         // The unversioned form an older Forklift wrote is refused, naming the way out.
         let legacy = MaterializationScope::from_bytes(b"src\n", "Do the remedy.").unwrap_err();
@@ -861,13 +851,18 @@ mod tests {
         assert!(legacy.ends_with("Do the remedy."), "{}", legacy);
 
         // So is a format this build does not know.
-        let unknown = MaterializationScope::from_bytes(b"/forklift-scope 3\nsrc\n", "").unwrap_err();
-        assert!(unknown.contains("/forklift-scope 3"), "{}", unknown);
+        let unknown = MaterializationScope::from_bytes(b"/forklift-scope 4\nsrc\n", "").unwrap_err();
+        assert!(unknown.contains("/forklift-scope 4"), "{}", unknown);
+
+        // Format 2 wrote prefixes raw, so a prefix holding a line break read back as two.
+        let raw = MaterializationScope::from_bytes(b"/forklift-scope 2\nsrc\n", "Do the remedy.").unwrap_err();
+        assert!(raw.contains("/forklift-scope 2") && raw.contains("Do the remedy."), "{}", raw);
+        assert!(!raw.contains("Use the Forklift that wrote it"), "{}", raw);
 
         // And a header with no prefix after it, which would otherwise read as the full scope.
-        let bare = MaterializationScope::from_bytes(b"/forklift-scope 2\n", "Do the remedy.").unwrap_err();
+        let bare = MaterializationScope::from_bytes(b"/forklift-scope 3\n", "Do the remedy.").unwrap_err();
         assert!(bare.contains("no prefix narrower than the warehouse root"), "{}", bare);
-        let rooted = MaterializationScope::from_bytes(b"/forklift-scope 2\nsrc\n/\n", "").unwrap_err();
+        let rooted = MaterializationScope::from_bytes(b"/forklift-scope 3\nsrc\n/\n", "").unwrap_err();
         assert!(rooted.contains("no prefix narrower than the warehouse root"), "{}", rooted);
         assert!(bare.ends_with("Do the remedy."), "{}", bare);
     }

@@ -3080,7 +3080,10 @@ mod tests {
 
         let bay_b_dir = bay_utils::bay_state_dir("b");
         std::fs::create_dir_all(&bay_b_dir).unwrap();
-        std::fs::write(bay_b_dir.join("consolidation"), format!("{}\ntheir-pallet\n", target_hash)).unwrap();
+        let state = crate::util::merge_utils::ConsolidationState {
+            their_head: target_hash.clone(), their_pallet: "their-pallet".to_string(),
+        };
+        std::fs::write(bay_b_dir.join("consolidation"), crate::util::merge_utils::consolidation_state_bytes(&state)).unwrap();
 
         let targets: BTreeSet<String> = [target_hash.clone()].into_iter().collect();
         let referenced = closure_references_any(&targets).unwrap().hashes;

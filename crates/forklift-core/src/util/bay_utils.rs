@@ -13,15 +13,29 @@
 
 use std::path::{Path, PathBuf};
 use crate::globals::{bay_root, forklift_root, FOLDER_NAME_BAYS_ROOT, FOLDER_NAME_FORKLIFT_ROOT};
-use crate::util::{file_utils, merge_utils, park_utils};
+use crate::util::{file_utils, merge_utils, park_utils, record_utils};
+use crate::util::record_utils::RecordError;
 
-/// The first line of a bay's `.forklift` redirect file — how discovery tells a bay's
-/// redirect from an accidental file named `.forklift`.
-const BAY_REDIRECT_MAGIC: &str = "forklift-bay";
+/// The [`record_utils`] kind and version of a bay's `.forklift` redirect file: the warehouse root,
+/// then the bay's name. Its header is how discovery tells a bay's redirect from an accidental
+/// file named `.forklift`.
+const BAY_REDIRECT_RECORD: &str = "bay";
+const BAY_REDIRECT_VERSION: u32 = 1;
 
 /// The file inside a bay's local state recording its working directory (so the main tree
-/// can list where each bay lives).
+/// can list where each bay lives), a [`record_utils`] file of kind [`BAY_PATH_RECORD`] holding
+/// that one path.
 const FILE_NAME_BAY_PATH: &str = "path";
+const BAY_PATH_RECORD: &str = "bay-path";
+const BAY_PATH_VERSION: u32 = 1;
+
+/// A filesystem path as the text a bay record stores. A path that is not UTF-8 is refused rather
+/// than written lossily, which would record a different path.
+fn path_text<'a>(path: &'a Path, what: &str) -> Result<&'a str, String> {
+    path.to_str().ok_or_else(|| format!(
+        "The {} \"{}\" is not valid UTF-8, so a bay cannot record it.", what, path.to_string_lossy()
+    ))
+}
 
 /// A parsed bay `.forklift` redirect: the warehouse it belongs to, and the bay's name.
 pub struct BayRedirect {
@@ -45,12 +59,10 @@ pub fn is_bay_redirect(forklift_path: &Path) -> bool {
 /// * `warehouse_root` - The warehouse root the bay shares.
 /// * `name`           - The bay's name.
 pub fn write_bay_redirect(bay_dir: &Path, warehouse_root: &Path, name: &str) -> Result<(), String> {
-    let content = format!(
-        "{}\n{}\n{}\n",
-        BAY_REDIRECT_MAGIC, warehouse_root.to_string_lossy(), name
-    );
+    let warehouse_root = path_text(warehouse_root, "warehouse root")?;
+    let content = record_utils::to_bytes(BAY_REDIRECT_RECORD, BAY_REDIRECT_VERSION, [warehouse_root, name]);
 
-    file_utils::write_file_atomically(&bay_dir.join(FOLDER_NAME_FORKLIFT_ROOT), content.as_bytes())
+    file_utils::write_file_atomically(&bay_dir.join(FOLDER_NAME_FORKLIFT_ROOT), &content)
 }
 
 /// Read and validate a bay's `.forklift` redirect file.
@@ -62,28 +74,31 @@ pub fn write_bay_redirect(bay_dir: &Path, warehouse_root: &Path, name: &str) -> 
 /// * `Ok(BayRedirect)` - The warehouse root and bay name.
 /// * `Err(String)`     - If the file is not a valid bay redirect.
 pub fn read_bay_redirect(forklift_path: &Path) -> Result<BayRedirect, String> {
-    let content = std::fs::read_to_string(forklift_path)
+    let bytes = std::fs::read(forklift_path)
         .map_err(|e| format!("Error while reading the bay redirect \"{}\": {}", forklift_path.to_string_lossy(), e))?;
 
-    let mut lines = content.lines();
-
-    if lines.next() != Some(BAY_REDIRECT_MAGIC) {
-        return Err(format!(
-            "\"{}\" is not a valid forklift bay (its \".forklift\" file is not a bay redirect).",
+    let fields = record_utils::from_bytes(&bytes, BAY_REDIRECT_RECORD, BAY_REDIRECT_VERSION).map_err(|e| match e {
+        RecordError::Unversioned => format!(
+            "\"{}\" is not a valid forklift bay (its \".forklift\" file is not a bay redirect, or an \
+            older version of Forklift wrote it).",
             forklift_path.to_string_lossy()
-        ));
-    }
+        ),
+        _ => format!("The bay redirect \"{}\" {}", forklift_path.to_string_lossy(), e.describe()),
+    })?;
 
-    let warehouse_root = lines.next()
-        .filter(|line| !line.is_empty())
-        .ok_or("The bay redirect has no warehouse path.".to_string())?;
-    let name = lines.next()
-        .filter(|line| !line.is_empty())
-        .ok_or("The bay redirect has no bay name.".to_string())?;
+    let [warehouse_root, name] = <[String; 2]>::try_from(fields)
+        .map_err(|_| format!("The bay redirect \"{}\" is malformed.", forklift_path.to_string_lossy()))?;
+
+    if warehouse_root.is_empty() {
+        return Err("The bay redirect has no warehouse path.".to_string());
+    }
+    if name.is_empty() {
+        return Err("The bay redirect has no bay name.".to_string());
+    }
 
     Ok(BayRedirect {
         warehouse_root: PathBuf::from(warehouse_root),
-        name: name.to_string(),
+        name,
     })
 }
 
@@ -101,16 +116,26 @@ pub fn does_bay_exist(name: &str) -> bool {
 pub fn write_bay_path(name: &str, bay_dir: &Path) -> Result<(), String> {
     let state = bay_state_dir(name);
     file_utils::create_folder_if_not_exists(&state)?;
-    file_utils::write_file_atomically(&state.join(FILE_NAME_BAY_PATH), bay_dir.to_string_lossy().as_bytes())
+    let bay_dir = path_text(bay_dir, "bay directory")?;
+
+    file_utils::write_file_atomically(
+        &state.join(FILE_NAME_BAY_PATH), &record_utils::to_bytes(BAY_PATH_RECORD, BAY_PATH_VERSION, [bay_dir])
+    )
 }
 
 /// Read a bay's recorded working directory.
 pub fn read_bay_path(name: &str) -> Result<PathBuf, String> {
     let path = bay_state_dir(name).join(FILE_NAME_BAY_PATH);
-    let content = std::fs::read_to_string(&path)
+    let bytes = std::fs::read(&path)
         .map_err(|e| format!("Error while reading the bay path \"{}\": {}", path.to_string_lossy(), e))?;
 
-    Ok(PathBuf::from(content.trim_end_matches('\n')))
+    let fields = record_utils::from_bytes(&bytes, BAY_PATH_RECORD, BAY_PATH_VERSION)
+        .map_err(|e| format!("The bay path file \"{}\" {}", path.to_string_lossy(), e.describe()))?;
+
+    match <[String; 1]>::try_from(fields) {
+        Ok([bay_dir]) if !bay_dir.is_empty() => Ok(PathBuf::from(bay_dir)),
+        _ => Err(format!("The bay path file \"{}\" is malformed.", path.to_string_lossy())),
+    }
 }
 
 /// List the names of all bays (the subfolders of `.forklift/bays/`), sorted.
@@ -368,7 +393,10 @@ mod tests {
         let bay_b_dir = bay_state_dir("b");
         std::fs::create_dir_all(&bay_b_dir).unwrap();
         std::fs::write(bay_b_dir.join("parked"), format!("{}\n", parked_hash)).unwrap();
-        std::fs::write(bay_b_dir.join("consolidation"), format!("{}\ntheir-pallet\n", consolidation_hash)).unwrap();
+        let state = crate::util::merge_utils::ConsolidationState {
+            their_head: consolidation_hash.clone(), their_pallet: "their-pallet".to_string(),
+        };
+        std::fs::write(bay_b_dir.join("consolidation"), crate::util::merge_utils::consolidation_state_bytes(&state)).unwrap();
 
         let dirs = all_bay_state_dirs().unwrap();
         let roots = collect_bay_scoped_parcel_roots(&dirs, BayReadPolicy::FailClosed).unwrap().roots;
