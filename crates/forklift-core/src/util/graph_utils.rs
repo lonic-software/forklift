@@ -1168,6 +1168,29 @@ mod tests {
     }
 
     #[test]
+    fn a_shard_that_cannot_be_written_is_not_an_error() {
+        // The graph is a cache: a full or read-only disk must not fail the query that computed
+        // the records. A file squatting the graph root makes every shard write fail; the persist
+        // still succeeds and the records stay resident for this process.
+        let dir = std::env::temp_dir()
+            .join(format!("forklift-graph-unwritable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let squat = dir.join("graph");
+        std::fs::write(&squat, "not a directory").unwrap();
+        let root = squat.to_string_lossy().into_owned();
+
+        let hash = "cd".repeat(32);
+        let mut new = HashMap::new();
+        new.insert(hash.clone(), Record { generation: 1, parents: vec![], filter: PathFilter::Unknown });
+        persist_records(&root, &new).expect("a failed shard write must not fail the persist");
+        assert_eq!(stored_record(&root, &hash).unwrap().map(|r| r.generation), Some(1),
+            "the record must stay resident after its write failed");
+        assert!(squat.is_file(), "sanity: the squat blocked the write");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn concurrent_persists_to_one_shard_never_lose_a_record() {
         // P2 stress: many threads persist distinct records that all hash into the *same* shard,
         // so they contend on the out-of-lock shard load, the re-lock insert, and the double-load
