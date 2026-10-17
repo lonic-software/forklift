@@ -50,6 +50,7 @@ use crate::util::{
     audit_utils, bay_utils, file_utils, object_utils, office_utils, pack_utils, pallet_utils, recovery_utils,
     tree_utils,
 };
+use crate::util::lock_utils::StoreAccessExclusive;
 
 /// The reclamation a prune would carry out, computed without mutating anything (safe for a
 /// dry run).
@@ -83,9 +84,13 @@ pub struct PruneStats {
 /// * `pruned_prefixes` - The warehouse path keys being pruned (each a current fetch-scope
 ///   prefix, validated by the caller).
 /// * `post_prune`      - The warehouse fetch scope that will remain after the prune.
+/// * `_store_access`   - Exclusive store access, held from before the caller read the fetch scope
+///   until `free_objects` returns: a writer in another bay must not dedup against a planned
+///   object and publish a reference to it between the plan and the deletion (FORK-150).
 pub fn plan_prune(
     pruned_prefixes: &[String],
     post_prune: &MaterializationScope,
+    _store_access: &StoreAccessExclusive,
 ) -> Result<PrunePlan, String> {
     let (user_parcels, meta_parcels) = reachable_parcels()?;
     let local = local_roots(&user_parcels, &meta_parcels)?;
@@ -132,8 +137,9 @@ pub fn plan_prune(
 /// end state, not an error.
 ///
 /// # Arguments
-/// * `to_free` - The loose object hashes from a [`PrunePlan`].
-pub fn free_objects(to_free: &[String]) -> Result<PruneStats, String> {
+/// * `to_free`       - The loose object hashes from a [`PrunePlan`].
+/// * `_store_access` - The exclusive store access the plan was computed under, still held.
+pub fn free_objects(to_free: &[String], _store_access: &StoreAccessExclusive) -> Result<PruneStats, String> {
     let mut freed = 0usize;
 
     for hash in to_free {
@@ -553,6 +559,11 @@ mod tests {
     use crate::model::tree_item::TreeItem;
     use std::path::PathBuf;
 
+    /// Exclusive store access at the active storage root, as the scope-prune handler holds it.
+    fn store_access() -> StoreAccessExclusive {
+        crate::util::lock_utils::StoreAccessLock::try_exclusive().expect("no other holder in a test root")
+    }
+
     /// A fresh warehouse root for one test, entered as the active storage-root scope for its
     /// lifetime (each test runs on its own thread, so scopes never collide).
     struct Scratch {
@@ -684,7 +695,7 @@ mod tests {
 
         // Prune src/web, keeping src/api in scope.
         let post_prune = MaterializationScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &store_access()).unwrap();
 
         // Exactly the pruned subtree's closure is freed.
         assert_eq!(plan.to_free.len(), 2);
@@ -728,7 +739,7 @@ mod tests {
         pallet_utils::set_pallet_head("main", &parcel).unwrap();
 
         let post_prune = MaterializationScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &store_access()).unwrap();
 
         // The shared blob stays (retained via src/api); only web's unique tree object is freed.
         assert!(!plan.to_free.contains(&shared_blob), "a blob shared with a retained path must not be freed");
@@ -748,7 +759,7 @@ mod tests {
         ]);
 
         let post_prune = MaterializationScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &store_access()).unwrap();
 
         assert!(!plan.to_free.contains(&f.web_blob), "a blob a staged entry shares must not be freed");
         assert!(plan.to_free.contains(&f.web_tree), "the pruned subtree's unique object is still freed");
@@ -779,7 +790,7 @@ mod tests {
         plant_parked("b", &src_tree_with("api", "y.txt", &f.web_blob));
 
         let post_prune = MaterializationScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &store_access()).unwrap();
         assert!(!plan.to_free.contains(&f.web_blob), "a blob parked in scope must not be freed");
         assert!(plan.to_free.contains(&f.web_tree), "the head's own unique tree is still freed");
     }
@@ -797,7 +808,7 @@ mod tests {
         plant_parked("b", &snapshot);
 
         let post_prune = MaterializationScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &store_access()).unwrap();
 
         // The parked work is no history, so never a target: it survives.
         for hash in [&edit, &web] {
@@ -822,7 +833,7 @@ mod tests {
         plant_parked("b", &store_tree(&[("src", &src, DirEntryType::Tree)]));
 
         let post_prune = MaterializationScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &store_access()).unwrap();
         assert!(plan.to_free.contains(&f.web_blob));
     }
 
@@ -844,7 +855,7 @@ mod tests {
         std::fs::write(dir.join("consolidation"), format!("{}\nfeature\n", theirs)).unwrap();
 
         let post_prune = MaterializationScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &store_access()).unwrap();
         assert!(!plan.to_free.contains(&f.web_blob), "a blob the consolidation holds in scope must not be freed");
         assert!(plan.to_free.contains(&f.web_tree), "the head's own unique tree is still freed");
     }
@@ -877,7 +888,7 @@ mod tests {
         pallet_utils::set_pallet_head("main", &p2).unwrap();
 
         let post_prune = MaterializationScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &store_access()).unwrap();
 
         // Both versions of the pruned subtree — and both their blobs — are freed.
         for freed in [&web_v1_tree, &web_v1_blob, &web_v2_tree, &web_v2_blob] {
@@ -895,11 +906,11 @@ mod tests {
         let f = build_fixture();
 
         let post_prune = MaterializationScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &store_access()).unwrap();
 
         assert!(loose_exists(&f.web_tree) && loose_exists(&f.web_blob), "the pruned objects start present");
 
-        let stats = free_objects(&plan.to_free).unwrap();
+        let stats = free_objects(&plan.to_free, &store_access()).unwrap();
         assert_eq!(stats.freed, 2, "both pruned objects are freed");
         assert!(!loose_exists(&f.web_tree), "the pruned subtree object is gone");
         assert!(!loose_exists(&f.web_blob), "the pruned blob is gone");
@@ -910,7 +921,7 @@ mod tests {
         object_utils::load_tree(&f.src_tree).expect("the spine tree still loads: src/web stays sealed by hash");
 
         // A resumed prune (objects already gone) is not an error.
-        let again = free_objects(&plan.to_free).unwrap();
+        let again = free_objects(&plan.to_free, &store_access()).unwrap();
         assert_eq!(again.freed, 0, "a resumed prune deletes nothing more and does not error");
     }
 
@@ -935,7 +946,7 @@ mod tests {
         pallet_utils::set_pallet_head("main", &parcel).unwrap();
 
         let post_prune = MaterializationScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &store_access()).unwrap();
 
         assert_eq!(plan.to_free.len(), 3, "web_tree, inner_tree and deep_blob");
         let pos = |h: &str| plan.to_free.iter().position(|x| x == h).unwrap();
@@ -954,23 +965,23 @@ mod tests {
         let f = build_fixture();
 
         let post_prune = MaterializationScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &store_access()).unwrap();
         assert_eq!(plan.to_free.len(), 2, "src/web's tree and blob are the whole plan");
 
         // Simulate an interruption: free only the first item in plan order (a child, by
         // construction — never a parent, since children always precede parents in the plan).
         let (first, rest) = plan.to_free.split_at(1);
         assert_eq!(first, std::slice::from_ref(&f.web_blob), "the child is freed first, by the plan's own order");
-        free_objects(first).unwrap();
+        free_objects(first, &store_access()).unwrap();
         assert!(loose_exists(&f.web_tree), "the parent tree was NOT freed by the simulated interruption");
 
         // Re-planning over the exact same path must not error on the now-absent blob, and must
         // recompute exactly what the interruption left: just the parent tree.
-        let resumed_plan = plan_prune(&["src/web".to_string()], &post_prune)
+        let resumed_plan = plan_prune(&["src/web".to_string()], &post_prune, &store_access())
             .expect("re-planning after a partial free must tolerate the absent object");
         assert_eq!(resumed_plan.to_free, rest, "the resumed plan is exactly what the interruption left");
 
-        let stats = free_objects(&resumed_plan.to_free).unwrap();
+        let stats = free_objects(&resumed_plan.to_free, &store_access()).unwrap();
         assert_eq!(stats.freed, rest.len());
 
         // Everything is now gone, and the store is still coherent: the spine still loads and the
@@ -1005,7 +1016,7 @@ mod tests {
         pallet_utils::set_pallet_head("main", &parcel).unwrap();
 
         let post_prune = MaterializationScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &store_access()).unwrap();
 
         // The recipe and both chunks and the web tree are freed — nothing else.
         for freed in [&recipe, &c1, &c2, &web_tree] {
@@ -1027,7 +1038,7 @@ mod tests {
         }
 
         // And a real free deletes exactly them.
-        let stats = free_objects(&plan.to_free).unwrap();
+        let stats = free_objects(&plan.to_free, &store_access()).unwrap();
         assert_eq!(stats.freed, 4);
         assert!(!loose_exists(&c1) && !loose_exists(&c2) && !loose_exists(&recipe),
             "the recipe and its chunks are gone");
@@ -1061,7 +1072,7 @@ mod tests {
         pallet_utils::set_pallet_head("main", &parcel).unwrap();
 
         let post_prune = MaterializationScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &store_access()).unwrap();
 
         // The shared chunk (and the api-only chunk and recipe) survive; web's unique chunk, its
         // recipe and its tree are freed.
@@ -1074,7 +1085,7 @@ mod tests {
         assert!(plan.retained_shared >= 1, "the shared chunk is counted as retained, not silently dropped");
 
         // Freeing must leave the kept file fully materializable.
-        free_objects(&plan.to_free).unwrap();
+        free_objects(&plan.to_free, &store_access()).unwrap();
         assert!(loose_exists(&shared) && loose_exists(&api_only) && loose_exists(&api_recipe),
             "the kept chunked file and its shared chunk survive the prune");
     }
@@ -1119,7 +1130,7 @@ mod tests {
         pallet_utils::set_pallet_head("main", &parcel).unwrap();
 
         let post_prune = MaterializationScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &store_access()).unwrap();
 
         // Nothing of the giant file is freed: the recipe and both its chunks are still needed by
         // src/api/giant.bin. Only web's own (unshared) tree and note blob are freed.
@@ -1135,7 +1146,7 @@ mod tests {
             "the shared recipe and both its chunks are counted as retained, not silently dropped");
 
         // Freeing must leave the kept (identical) file fully materializable.
-        free_objects(&plan.to_free).unwrap();
+        free_objects(&plan.to_free, &store_access()).unwrap();
         assert!(loose_exists(&giant_recipe) && loose_exists(&c1) && loose_exists(&c2),
             "the recipe shared with the kept path, and its chunks, survive the prune");
         object_utils::load_recipe(&giant_recipe).expect("the shared recipe still loads");
@@ -1163,23 +1174,23 @@ mod tests {
         pallet_utils::set_pallet_head("main", &parcel).unwrap();
 
         let post_prune = MaterializationScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &store_access()).unwrap();
         assert_eq!(plan.to_free.len(), 4, "2 chunks + recipe + web tree");
 
         // Simulate an interruption after freeing just the first chunk (the plan's own leading
         // element, a child by construction — the recipe and web tree are NOT yet freed).
-        free_objects(&plan.to_free[..1]).unwrap();
+        free_objects(&plan.to_free[..1], &store_access()).unwrap();
         assert!(!loose_exists(&plan.to_free[0]), "the first chunk was freed");
         assert!(loose_exists(&recipe), "the recipe was NOT freed by the interruption");
 
         // Re-planning must not error on the absent chunk, and must recompute exactly what is left:
         // the surviving chunk, the recipe (still present, still names its chunks) and the tree.
-        let resumed = plan_prune(&["src/web".to_string()], &post_prune)
+        let resumed = plan_prune(&["src/web".to_string()], &post_prune, &store_access())
             .expect("re-planning after a partial chunk free must tolerate the absent chunk");
         assert_eq!(resumed.to_free, plan.to_free[1..].to_vec(),
             "the resumed plan is exactly the interruption's remainder");
 
-        free_objects(&resumed.to_free).unwrap();
+        free_objects(&resumed.to_free, &store_access()).unwrap();
         assert!(!loose_exists(&c1) && !loose_exists(&c2) && !loose_exists(&recipe) && !loose_exists(&web_tree),
             "the resumed prune finished freeing the chunked file");
         object_utils::load_tree(&src_tree).expect("the spine still loads: src/web is sealed by hash");

@@ -2241,6 +2241,19 @@ pub fn compact(all: bool, redelta: bool, progress: &Progress) -> Result<CompactS
         None
     };
 
+    // A repack drops every packed object outside the live set it is about to compute, so no
+    // writer may be between a dedup decision and the root that publishes it while that set is
+    // computed and the old packs are dropped (FORK-150): a load in another bay that found a
+    // packed-but-unreachable object present would otherwise publish a reference to it and lose it
+    // here. Never waits; refused while any writer holds the store, which auto-maintenance treats
+    // as any other compaction error and retries on a later command. Incremental compaction drops
+    // only loose objects it has just packed, which is no liveness decision, so it takes nothing.
+    let _store_access = if all {
+        Some(lock_utils::StoreAccessLock::try_exclusive()?)
+    } else {
+        None
+    };
+
     remove_stale_temp_files(&pack_folder);
 
     progress.status("Collecting objects");

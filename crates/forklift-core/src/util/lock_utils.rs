@@ -11,6 +11,9 @@ const FILE_NAME_STORE_LOCK: &str = "store.lock";
 /// The name of the serve lock file (inside the forklift root folder).
 const FILE_NAME_SERVE_LOCK: &str = "serve.lock";
 
+/// The name of the store-access lock sidecar (inside the forklift root folder). Never deleted.
+const FILE_NAME_STORE_ACCESS_LOCK: &str = "store-access.lock";
+
 /// An exclusive lock on the warehouse, held for the duration of a mutating command.
 ///
 /// This is the staging-area atomicity story (see the design document): commands that
@@ -61,8 +64,9 @@ impl Drop for WarehouseLock {
 /// `compact` (and, later, `gc`/repack) take it so two bays — or two processes — cannot run
 /// destructive store maintenance against the same loose/pack set at once and race each other's
 /// deletions. It is deliberately a *distinct* lock from the bay lock: an ordinary mutating command
-/// holds only its bay lock and never contends with a compaction running elsewhere on the store,
-/// while two compactions serialize even across bays that each hold their own bay lock.
+/// never takes it, while two compactions serialize even across bays that each hold their own bay
+/// lock. It orders compaction against compaction only; ordering a full repack against the store's
+/// writers is [`StoreAccessLock`]'s job.
 ///
 /// Like the bay lock it is a lock *file* created with `create_new` (atomic on every platform) and
 /// removed on drop; a hard-killed process leaves it behind for the next command to report by PID.
@@ -105,7 +109,9 @@ impl Drop for StoreLock {
 ///
 /// Distinct from [`StoreLock`], which serializes destructive store *maintenance* against itself
 /// (compaction vs compaction) — a server never compacts, so it never takes that lock; this one is
-/// the serve-vs-maintenance gate. Like the other locks it is a lock *file* created with
+/// the serve-vs-maintenance gate. It is not what orders a deleter against the objects a server
+/// writes: a served warehouse also holds [`StoreAccessLock`] shared, which every deleter's
+/// exclusive try refuses beside, scope-prune included. Like the other locks it is a lock *file* created with
 /// `create_new` (atomic on every platform) and removed on drop; a hard-killed holder leaves it
 /// behind for the next command to report by PID (a crashed server thus blocks `gc` and a repack until
 /// the operator removes it, which is the safe default — better than sweeping a root that might
@@ -132,6 +138,137 @@ impl Drop for ServeLock {
     fn drop(&mut self) {
         release_lock_file(&self.path);
     }
+}
+
+/// A store-wide **reader/writer** lock ordering every writer of the shared object store against
+/// every operation that deletes objects on a liveness or scope decision. This is the shared hold:
+/// writers hold it together; [`StoreAccessExclusive`] is the deleters' side.
+///
+/// A writer's dedup ("this object is present, skip the write") says nothing about whether the
+/// object is *live*: unreachable garbage stays present until a deleter removes it. A deleter
+/// computes its keep-set once and then deletes everything outside it — a full repack
+/// (`pack_utils::compact` with `all`), the loose sweep (`gc_utils::collect_garbage`) and
+/// scope-prune. Without an order between the two, a writer in another bay can dedup against an
+/// object the deleter has already excluded, publish a root that references it, and be left with
+/// a dangling reference when the deletion lands. Holding this lock shared across the writer's
+/// whole decide-then-publish window, and exclusive from before the keep-set is computed until the
+/// deletions end, orders the two.
+///
+/// Who holds which side:
+/// * **shared, waiting** — every CLI command that takes the warehouse lock, except `compact` and
+///   `scope-prune`, which host deleters (a process's own shared hold refuses its own exclusive
+///   try). Taken right after the bay lock, so the order is always bay lock first and no cycle is
+///   possible; released before auto-maintenance, which may repack.
+/// * **shared, try** — a server, for every warehouse it serves, for the handle's lifetime.
+/// * **exclusive, try** — the deleters, at the deleter itself so no caller can forget it.
+///
+/// Unlike [`StoreLock`] and [`ServeLock`], this is a *kernel* lock (`File::lock_shared` /
+/// `File::try_lock`: `flock` on Unix, `LockFileEx` on Windows) on a sidecar that is never
+/// deleted, as [`ConfigFileLock`] is. A hard-killed holder leaves nothing stale, because the
+/// kernel drops the lock with the process. That is what makes it safe for a writer to *wait*:
+/// a wait can only end, never hang on a dead holder. Deleters never wait on anything a writer
+/// holds, so the waits cannot deadlock. The sidecar is never read or written, so Windows'
+/// mandatory locking blocks nothing else.
+pub struct StoreAccessLock {
+    // Held only to keep the lock: closing the handle releases it.
+    _file: std::fs::File,
+}
+
+impl StoreAccessLock {
+    /// Take the shared hold at the current storage root, waiting while a deleter holds it
+    /// exclusively. Tries first; only when that would block is `on_wait` called — once, before
+    /// the wait — so the caller can say why it is waiting (core never prints).
+    ///
+    /// # Returns
+    /// * `Ok(StoreAccessLock)` - The shared hold (released when dropped).
+    /// * `Err(String)`         - The sidecar could not be opened or locked.
+    pub fn shared(on_wait: impl FnOnce()) -> Result<StoreAccessLock, String> {
+        let (file, path) = open_store_access_sidecar()?;
+
+        match file.try_lock_shared() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                on_wait();
+                file.lock_shared().map_err(|e| lock_error(&path, &e))?;
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(lock_error(&path, &e)),
+        }
+
+        Ok(StoreAccessLock { _file: file })
+    }
+
+    /// Take the shared hold at the current storage root without waiting: refused while a deleter
+    /// holds it exclusively. For the server, which must not block a runtime thread.
+    ///
+    /// # Returns
+    /// * `Ok(StoreAccessLock)` - The shared hold (released when dropped).
+    /// * `Err(String)`         - A deleter is running on this store, or the sidecar could not be
+    ///                           opened or locked.
+    pub fn try_shared() -> Result<StoreAccessLock, String> {
+        let (file, path) = open_store_access_sidecar()?;
+
+        match file.try_lock_shared() {
+            Ok(()) => Ok(StoreAccessLock { _file: file }),
+            Err(std::fs::TryLockError::WouldBlock) => Err(format!(
+                "Object-store maintenance (a full repack, gc or scope-prune) is running on the \
+                warehouse at \"{}\". Try again once it finishes.",
+                warehouse_root_of(&path)
+            )),
+            Err(std::fs::TryLockError::Error(e)) => Err(lock_error(&path, &e)),
+        }
+    }
+
+    /// Take the exclusive hold at the current storage root, for an operation that deletes objects
+    /// on a liveness or scope decision. Never waits: refused while any other holder exists, shared
+    /// or exclusive — including a shared hold this same process took on another open file.
+    ///
+    /// # Returns
+    /// * `Ok(StoreAccessExclusive)` - The exclusive hold (released when dropped).
+    /// * `Err(String)`              - Another forklift process is using the store, or the sidecar
+    ///                                could not be opened or locked.
+    pub fn try_exclusive() -> Result<StoreAccessExclusive, String> {
+        let (file, path) = open_store_access_sidecar()?;
+
+        match file.try_lock() {
+            Ok(()) => Ok(StoreAccessExclusive { _file: file }),
+            Err(std::fs::TryLockError::WouldBlock) => Err(format!(
+                "Another forklift process is using the object store of the warehouse at \"{}\" \
+                (a command in another bay, a server serving it, or other maintenance). Try again \
+                once it finishes.",
+                warehouse_root_of(&path)
+            )),
+            Err(std::fs::TryLockError::Error(e)) => Err(lock_error(&path, &e)),
+        }
+    }
+}
+
+/// The exclusive side of [`StoreAccessLock`], held by a deleter from before its keep-set is
+/// computed until its deletions end. Functions that delete on a keep-set take a reference to it,
+/// so the type proves the caller holds the guard.
+pub struct StoreAccessExclusive {
+    // Held only to keep the lock: closing the handle releases it.
+    _file: std::fs::File,
+}
+
+/// Open (creating if needed) the store-access sidecar at the current storage root, at an absolute
+/// path. The forklift root folder must exist.
+fn open_store_access_sidecar() -> Result<(std::fs::File, PathBuf), String> {
+    let path = absolute(forklift_root().join(FILE_NAME_STORE_ACCESS_LOCK));
+
+    let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
+        .open(&path)
+        .map_err(|e| format!("Error while opening the lock file \"{}\": {}", path.to_string_lossy(), e))?;
+
+    Ok((file, path))
+}
+
+fn lock_error(path: &Path, error: &std::io::Error) -> String {
+    format!("Error while locking \"{}\": {}", path.to_string_lossy(), error)
+}
+
+/// The warehouse root a sidecar in the forklift root folder belongs to, for messages.
+fn warehouse_root_of(sidecar: &Path) -> String {
+    sidecar.parent().and_then(Path::parent).unwrap_or(sidecar).to_string_lossy().into_owned()
 }
 
 /// An exclusive lock serializing every edit of one **configuration file**, held for one

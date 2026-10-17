@@ -18,7 +18,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::time::SystemTime;
-use crate::util::{audit_utils, bay_utils, file_utils, object_utils};
+use crate::util::{audit_utils, bay_utils, file_utils, lock_utils, object_utils};
 // Test-only: `collect_live_set`'s own pallet-head root gathering moved into the shared
 // `recovery_utils::gc_root_sources`, so this module's non-test code no
 // longer calls `pallet_utils` directly — only its own test fixtures still build pallet refs by
@@ -47,9 +47,16 @@ pub struct GcStats {
 ///
 /// # Returns
 /// * `Ok(GcStats)` - What happened.
-/// * `Err(String)` - If the live set could not be computed (nothing is deleted then)
-///                   or a deletion failed.
+/// * `Err(String)` - If another forklift process is using the store, the live set could
+///                   not be computed (nothing is deleted then), or a deletion failed.
 pub fn collect_garbage(grace_seconds: u64) -> Result<GcStats, String> {
+    // Exclusive store access from before the live set is computed until the sweep ends
+    // (FORK-150): the grace period protects only objects *written* recently, and a writer that
+    // deduplicates against an old unreachable loose object writes nothing, so without this a
+    // concurrent writer could publish a reference to an object the sweep then deletes. Never
+    // waits; refused while any writer or server holds the store.
+    let _store_access = lock_utils::StoreAccessLock::try_exclusive()?;
+
     let live = collect_live_set()?;
 
     let objects_root = std::path::PathBuf::from(file_utils::get_path_objects_root());
