@@ -17,8 +17,9 @@ Because it is namespaced, the office does not reserve any user pallet name — `
 a legal working pallet, distinct from it. The office is addressed with the `@` qualifier:
 `history @office` and `audit @office` read it, `palletize --all` lists it. Working-pallet
 operations (`palletize`, `shift`, `consolidate`, `stack`) only ever see the user
-namespace, so they never touch it; the content guard (a tree carrying the
-`.forklift/tracked/…` namespace is never materialized) stays as defense-in-depth.
+namespace, so they never touch it; the content guard (a tree with a top-level
+`.forklift` entry, in any case, is never materialized, and no working-directory
+write lands inside `.forklift`) stays as defense-in-depth.
 
 ## The manifest pallet (FORK-9 post-metadata)
 The **manifest** is a second tracked-metadata meta pallet (`@manifest`, at

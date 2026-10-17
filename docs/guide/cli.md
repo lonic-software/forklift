@@ -60,7 +60,9 @@ there is none) so a colocated repo reads clean. That edit is left in the working
 not stacked: `load .forkliftignore` and stack it with your next parcel. Requires `git` on your PATH. The imported history is **unsigned** (it
 predates trust) — import into a fresh warehouse, then `office enroll` to anchor it as the
 legacy boundary (a later `audit` then tolerates the imported parcels as legacy). Submodules
-(gitlinks) are skipped with a warning. For agents, this means a project can be moved onto
+(gitlinks) are skipped with a warning. A file or directory name that is not valid UTF-8, or that
+is not one path component (`..`, a name containing `/`), stops the import with an error naming it,
+rather than being imported under a different path. For agents, this means a project can be moved onto
 forklift with one command.
 
 A large history lands hundreds of thousands of objects at once — the case the loose store
