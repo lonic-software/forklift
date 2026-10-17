@@ -750,7 +750,8 @@ fn publish_replacement(temporary_file_path: &Path, file_path: &Path, content: &[
     Ok(())
 }
 
-/// Write [`replace_file_atomically`]'s temporary file: created fresh, given `replaced`'s
+/// Write the temporary file for [`replace_file_atomically`] (`sync` set) or
+/// [`replace_file_unsynced`] (`sync` clear): created fresh, given `replaced`'s
 /// permission bits on Unix (when `replaced` exists) while still empty, then filled and — when
 /// `sync` is set — fsynced through its own write handle.
 ///

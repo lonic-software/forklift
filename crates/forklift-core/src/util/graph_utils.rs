@@ -342,12 +342,11 @@ fn with_shard<R>(root: &str, prefix: &str, f: impl FnOnce(&mut Shard) -> R) -> R
         }
     }
 
-    // Miss: read and parse the shard file with the lock released.
-    let records = match std::fs::read(shard_path(root, prefix)) {
-        Ok(bytes) => parse_shard(&bytes),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
-        Err(e) => return Err(format!("Error while reading commit-graph shard \"{}\": {}", prefix, e)),
-    };
+    // Miss: read and parse the shard file with the lock released. A shard that cannot be read,
+    // for whatever reason, is absent: its records are recomputed from the object store.
+    let records = std::fs::read(shard_path(root, prefix))
+        .map(|bytes| parse_shard(&bytes))
+        .unwrap_or_default();
 
     // Re-take the lock to install the shard and run `f`. Any dirty eviction victims are removed
     // here but flushed to disk *after* the lock is released, below.
@@ -378,9 +377,10 @@ fn with_shard<R>(root: &str, prefix: &str, f: impl FnOnce(&mut Shard) -> R) -> R
     };
 
     // Flush the evicted dirty victims with the lock released. They are already out of the cache,
-    // so their bytes are final; a write error is surfaced (a saved write is a saved rebuild).
+    // so their bytes are final. A failed write only costs a later rebuild, so it never fails the
+    // query that happened to evict them.
     for (root, prefix, bytes) in victim_writes {
-        write_shard_bytes(&root, &prefix, &bytes)?;
+        let _ = write_shard_bytes(&root, &prefix, &bytes);
     }
 
     Ok(result)
@@ -427,7 +427,10 @@ fn evict_collect(cache: &mut Cache, incoming: &str) -> Vec<(String, String, Vec<
 
 /// Write pre-serialized shard bytes to the shard file — atomically, but with no durability
 /// barrier (see the module docs for why that is safe). Callers serialize under the cache lock
-/// and call this with the lock released, so the file write never blocks the cache.
+/// and call this with the lock released, so the file write never blocks the cache. Both callers
+/// treat a failure as best-effort. Because no directory sync runs, this never consults or
+/// records a durability taint either: on a store with a standing taint, a graph query still
+/// writes its checksummed shards, and a shard the failing device mangles simply reads as absent.
 fn write_shard_bytes(root: &str, prefix: &str, bytes: &[u8]) -> Result<(), String> {
     file_utils::create_folder_if_not_exists(std::path::Path::new(root))?;
     file_utils::replace_file_unsynced(&shard_path(root, prefix), bytes)
@@ -462,9 +465,13 @@ fn persist_records(root: &str, new: &HashMap<String, Record>) -> Result<(), Stri
             (serialize_shard(&shard.records), shard.version)
         })?;
 
-        // Write eagerly so the memoization outlives this process (a lost write is only a
-        // rebuild) — off the lock, so a concurrent graph access never waits on the file write.
-        write_shard_bytes(root, &prefix, &bytes)?;
+        // Write eagerly so the memoization outlives this process — off the lock, so a concurrent
+        // graph access never waits on the file write. A failed write (a full or read-only disk)
+        // is not an error: the shard stays dirty, so a later persist or eviction retries it, and
+        // the records are already resident for this process.
+        if write_shard_bytes(root, &prefix, &bytes).is_err() {
+            continue;
+        }
 
         // Mark clean only if nothing changed the shard since the snapshot: a record another
         // thread inserted meanwhile (a higher `version`) is newer than what we just wrote and
@@ -603,8 +610,9 @@ pub fn parents(hash: &str) -> Result<Vec<String>, String> {
 }
 
 /// Populate the graph for everything reachable from `heads`, computing only the records that
-/// are still missing (an already-recorded parcel prunes the walk, since its ancestors were
-/// recorded with it). Cheap to call repeatedly; meant to run inside `compact`, which already
+/// are still missing. An already-recorded parcel is walked through by its stored parents rather
+/// than treated as proof its ancestors are recorded, so a lost or damaged ancestor shard is
+/// found and rebuilt. Cheap to call repeatedly; meant to run inside `compact`, which already
 /// holds the warehouse lock and has warm object caches, so a warehouse is graph-ready right
 /// after an import or a repack. Returns the number of new records written.
 ///
@@ -613,9 +621,11 @@ pub fn parents(hash: &str) -> Result<Vec<String>, String> {
 pub fn build_from_heads(heads: &[String]) -> Result<usize, String> {
     let root = file_utils::get_path_graph_root();
 
-    // Collect the parcels still missing a record, and their parents, in one BFS. Pruning at an
-    // already-recorded parcel assumes its ancestors are recorded too; if a partial write ever
-    // broke that, `node`'s self-heal fills the gap on demand — this is only an optimization.
+    // Collect the parcels still missing a record, and their parents, in one BFS. An
+    // already-recorded parcel does not prune the walk: shards are written without a durability
+    // barrier, so after a power loss a descendant's shard can survive while an ancestor's is
+    // lost or reads as empty. Walking a recorded parcel costs only a record lookup (its parents
+    // come from the record, not the object store).
     let mut parents_of: HashMap<String, Vec<String>> = HashMap::new();
     let mut visited: HashSet<String> = HashSet::new();
     let mut queue: VecDeque<String> = heads.iter().cloned().collect();
@@ -624,7 +634,8 @@ pub fn build_from_heads(heads: &[String]) -> Result<usize, String> {
         if !visited.insert(hash.clone()) {
             continue;
         }
-        if stored_record(&root, &hash)?.is_some() {
+        if let Some(record) = stored_record(&root, &hash)? {
+            queue.extend(record.parents);
             continue;
         }
         let parcel = object_utils::load_parcel(&hash)?;

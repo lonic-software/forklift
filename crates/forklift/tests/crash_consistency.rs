@@ -1,10 +1,12 @@
 //! The crash / interrupted-write harness, part of the hardening test spine.
 //!
-//! "Durable before destructive" holds across power loss: every object, ref, inventory
-//! shard and graph file is written to a temp file, fsynced, renamed, and the directory fsynced,
-//! and a pallet's ref advances only *after* all the objects it names are durable. The claim is
+//! "Durable before destructive" holds across power loss: every object, ref and inventory
+//! shard is written to a temp file, fsynced, renamed, and the directory fsynced, and a pallet's
+//! ref advances only *after* all the objects it names are durable. The claim is
 //! that a crash at any instant leaves the store either at its old state or fully at the new one —
-//! never a torn object at a real address, never a half-written ref.
+//! never a torn object at a real address, never a half-written ref. Commit-graph shards are the
+//! exception by design: a rebuildable, checksummed cache, renamed into place with no barrier
+//! (`building_the_commit_graph_pays_no_durability_barrier` pins that).
 //!
 //! A unit test can assert the atomic-write contract (see `file_utils`), but only a real,
 //! externally killed process exercises the whole `stack` pipeline under interruption. This test

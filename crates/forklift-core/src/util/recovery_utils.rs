@@ -2491,9 +2491,10 @@ mod tests {
         // Thread-local sync recorders, NOT the process-wide `barrier_count()`/`dir_sync_count()`:
         // those are global atomics a test on another thread bumps mid-walk, which made this test
         // flaky under parallel `cargo test`. A durability barrier always ends by fsyncing its
-        // touched directories, and an immediate / graph-self-heal write fsyncs via `sync_dir`, so
-        // "no directory sync attempted on THIS thread during the walk" is equivalent to "no barrier
-        // ran" — with zero cross-test pollution. Armed here, after the setup writes above, so only
+        // touched directories, and an immediate write fsyncs via `sync_dir`, so "no directory sync
+        // attempted on THIS thread during the walk" is equivalent to "no barrier ran" — with zero
+        // cross-test pollution. (A commit-graph self-heal syncs nothing; the graph-root assertions
+        // cover it.) Armed here, after the setup writes above, so only
         // the walk's own (non-)syncs are recorded; both guards RAII-reset on drop.
         let _sync_dir_guard = file_utils::SyncDirFaultGuard::recording();
         let _barrier_dir_guard = file_utils::DirSyncFaultGuard::recording();
@@ -2508,7 +2509,7 @@ mod tests {
         assert!(referenced.is_empty(), "neither target hash is actually referenced");
 
         assert!(file_utils::sync_dir_attempts().is_empty(),
-            "the closure walk must never fsync a directory (immediate / graph-self-heal path): {:?}",
+            "the closure walk must never fsync a directory (immediate write path): {:?}",
             file_utils::sync_dir_attempts());
         assert!(file_utils::dir_sync_attempts().is_empty(),
             "the closure walk must never run a durability barrier (caught via its trailing dir sync): {:?}",

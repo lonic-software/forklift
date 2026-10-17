@@ -2051,6 +2051,90 @@ fn a_corrupted_commit_graph_shard_is_ignored_and_rewritten() {
         .filter(|(shard, damaged)| std::fs::read(shard).unwrap() != **damaged)
         .count();
     assert!(rewritten > 0, "the merge must have rewritten at least one damaged shard");
+
+    // A rebuild from every head heals the rest: each shard is sealed again and holds records.
+    assert_success(&warehouse.run(&["compact"]));
+    for shard in &shards {
+        assert!(graph_shard_is_sealed_with_records(shard),
+            "every damaged shard must be rewritten whole: {}", shard.display());
+    }
+}
+
+/// Whether a commit-graph shard file holds at least one record and its trailing blake3 matches
+/// the bytes before it (the v2 seal), checked from the outside.
+fn graph_shard_is_sealed_with_records(shard: &std::path::Path) -> bool {
+    let bytes = std::fs::read(shard).unwrap();
+    if bytes.len() <= 12 + 32 {
+        return false;
+    }
+    let (body, checksum) = bytes.split_at(bytes.len() - 32);
+    blake3::hash(body).as_bytes() == checksum
+}
+
+/// A shard is written with no durability barrier, so a power loss can keep a descendant's shard
+/// while losing an ancestor's. `compact` must not take the surviving head record as proof that
+/// its history is recorded: it walks through it and rebuilds every lost shard.
+#[test]
+fn compact_rebuilds_lost_ancestor_shards_behind_a_recorded_head() {
+    let warehouse = TestWarehouse::new("commit-graph-lost-ancestor");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    for i in 0..12 {
+        warehouse.write_file("file.txt", &format!("{}\n", i));
+        assert_success(&warehouse.run(&["load", "."]));
+        assert_success(&warehouse.run(&["stack", &format!("c{}", i)]));
+    }
+    assert_success(&warehouse.run(&["compact"]));
+
+    let graph_root = warehouse.root.join(".forklift/graph");
+    let head = pallet_head_hash(&warehouse, "main");
+    let head_shard = graph_root.join(&head[..2]);
+    let shards: Vec<_> = std::fs::read_dir(&graph_root).unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert!(shards.len() > 1 && shards.contains(&head_shard),
+        "sanity: the history spans several shards, one of them the head's: {:?}", shards);
+    for shard in shards.iter().filter(|shard| **shard != head_shard) {
+        std::fs::remove_file(shard).unwrap();
+    }
+
+    assert_success(&warehouse.run(&["compact"]));
+    for shard in &shards {
+        assert!(shard.exists() && graph_shard_is_sealed_with_records(shard),
+            "compact must rebuild the lost ancestor shard {}", shard.display());
+    }
+}
+
+/// The commit-graph is a cache: when it cannot be read or written at all, a query still answers
+/// from the object store rather than failing. A file squatting the graph directory blocks both.
+#[test]
+fn an_unwritable_commit_graph_never_fails_a_query() {
+    let warehouse = TestWarehouse::new("commit-graph-unwritable");
+    warehouse.write_file("file.txt", "one\ntwo\nthree\nfour\nfive\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["palletize", "feature"]));
+    warehouse.write_file("file.txt", "one\ntwo\nthree\nfour\nFIVE\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "feature work"]));
+    assert_success(&warehouse.run(&["shift", "main"]));
+    warehouse.write_file("file.txt", "ONE\ntwo\nthree\nfour\nfive\n");
+    assert_success(&warehouse.run(&["load", "file.txt"]));
+    assert_success(&warehouse.run(&["stack", "main work"]));
+
+    let graph_root = warehouse.root.join(".forklift/graph");
+    let _ = std::fs::remove_dir_all(&graph_root);
+    std::fs::write(&graph_root, "not a directory").unwrap();
+
+    assert_success(&warehouse.run(&["consolidate", "feature"]));
+    assert_eq!(
+        std::fs::read_to_string(warehouse.root.join("file.txt")).unwrap(),
+        "ONE\ntwo\nthree\nfour\nFIVE\n",
+        "the merge must still find the true base with no usable commit-graph"
+    );
+    assert!(graph_root.is_file(), "sanity: the squatting file is still in place");
 }
 
 #[test]

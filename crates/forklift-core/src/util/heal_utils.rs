@@ -32,7 +32,7 @@
 //! claims, so a lock-free rewrite is race-benign — worst case a duplicate loose copy, ordinary gc
 //! food); for anything else this taint schema can record — a pack data/index file, an inventory
 //! shard `data` file, or any other non-object final path a fire site can taint (a pallet ref
-//! pointer, a bay/park/journal/commit-graph/sign/office file, …) — it cannot verify anything and
+//! pointer, a bay/park/journal/sign/office file, …) — it cannot verify anything and
 //! just rewrites the bytes it found, verbatim. That verbatim rewrite is exactly the unsound shape:
 //! it can resurrect bytes a concurrent lock-holder legitimately deleted moments earlier.
 //!
@@ -389,7 +389,8 @@ pub fn heal_if_tainted() -> Result<(), CoreError> {
 ///
 /// `false` covers everything this taint schema can otherwise record: a pack data/index file, an
 /// inventory shard `data` file, or any other non-object final path a `write_file_atomically`-backed
-/// fire site can taint (a pallet ref pointer, a bay/park/journal/commit-graph/sign/office file, …).
+/// fire site can taint (a pallet ref pointer, a bay/park/journal/sign/office file, …). Commit-graph
+/// shards are written with no directory sync, so they never taint.
 /// [`attempt_restage_all`]/[`restage_object`] themselves are unaffected by this predicate — the
 /// `forklift heal` verb calls them directly, under the warehouse lock, for every shape — it is
 /// consulted only in [`heal_if_tainted`], which is the one caller that ever runs lock-free.
@@ -500,8 +501,7 @@ fn categorize_restage_outcome(attempt: &mut RestageAttempt, relative: PathBuf, o
 /// re-record), never re-derived by scanning the taint directory here. That snapshot is what makes
 /// the removal safe under concurrency: it names precisely the files this heal is entitled to
 /// delete, so a taint a sibling process records after the read (taint files are born concurrently,
-/// from any process, at any time — even a read-only command can self-heal a commit-graph shard and
-/// trip one) is never swept just because it happened to land in the directory before this cleanup
+/// from any process, at any time) is never swept just because it happened to land in the directory before this cleanup
 /// ran. The same call also brings the in-memory gate into agreement with whatever `resolve_taints`
 /// finds actually standing once that removal lands — see its own doc comment.
 ///
