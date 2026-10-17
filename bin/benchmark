@@ -43,8 +43,9 @@ fi
 #   3. Times the operations people actually run — onboard, status, log, diff,
 #      commit — for both tools and prints a markdown table with the ratio.
 #
-# It is dependency-free (no hyperfine required) and honest about its limits; see
-# docs/BENCHMARK.md for the fairness caveats and how to go deeper.
+# It times with hyperfine when hyperfine is on PATH (warm-up, many runs) and falls
+# back to a built-in shell timer otherwise, so nothing beyond git and forklift is
+# required. See docs/BENCHMARK.md for the fairness caveats and how to go deeper.
 #
 # Usage:  bin/benchmark [--repo git|linux|<url>|<path>] [--runs N] [--work DIR] [--keep] [--out FILE] [--markdown] [--no-redelta]
 #
@@ -54,8 +55,8 @@ set -euo pipefail
 
 # ── defaults ────────────────────────────────────────────────────────────────
 REPO="git"                         # git | linux | any git URL or local path
-RUNS=5                             # iterations for the fast, read-only ops
-COMMIT_RUNS=3                      # iterations for the commit/stack op
+RUNS=""                            # iterations for the fast, read-only ops (default below)
+COMMIT_RUNS=""                     # iterations for the commit/stack op (default below)
 WORK=""                            # working dir (default: a fresh temp dir)
 KEEP=0                             # keep the work dir on exit
 OUT=""                            # also append the results table here
@@ -83,6 +84,16 @@ command -v git      >/dev/null || { echo "error: git not on PATH" >&2; exit 1; }
 command -v forklift >/dev/null || { echo "error: forklift not on PATH — install it first" >&2; exit 1; }
 
 FORKLIFT_VERSION=$(forklift version 2>/dev/null || echo "forklift ?")
+
+# hyperfine, when present, does the timing; the shell timer below is the fallback.
+# Defaults scale with the timer: hyperfine's per-run cost is low enough for many runs.
+if command -v hyperfine >/dev/null 2>&1; then
+    HYPERFINE=1; TIMER="$(hyperfine --version)"
+    RUNS="${RUNS:-20}"; COMMIT_RUNS="${COMMIT_RUNS:-10}"
+else
+    HYPERFINE=0; TIMER="shell timer"
+    RUNS="${RUNS:-5}"; COMMIT_RUNS="${COMMIT_RUNS:-3}"
+fi
 GIT_VERSION=$(git --version)
 
 # ── portable millisecond clock ──────────────────────────────────────────────
@@ -148,10 +159,12 @@ GIT_SIZE=$(du -sh "$A/.git" 2>/dev/null | cut -f1 | tr -d ' ')
 
 # ── the timing core ─────────────────────────────────────────────────────────
 # time_cmd <runs> <dir> <setup> <cmd>  → echoes the mean in ms
-#   setup empty  → read-only op: one untimed warm-up run, then the whole loop is
-#                  timed once and divided (low timer overhead).
-#   setup given  → run before each timed iteration and NOT counted; each run is
-#                  timed individually so the mean reflects the command alone.
+#   setup empty  → read-only op: one untimed warm-up run, then <runs> timed runs.
+#   setup given  → run before each timed iteration and NOT counted, so the mean
+#                  reflects the command alone.
+# With hyperfine, <cmd> runs without a shell (-N, so it must be a plain command line)
+# and <setup> is hyperfine's --prepare. With the shell timer, a read-only loop is
+# timed once and divided (low timer overhead); a setup loop times each run alone.
 # A failing setup or command aborts the benchmark: a command that errors out early
 # times as fast, and that number must never reach the table. Callers assign the
 # result directly (`GM=$(time_cmd ...)`) so `set -e` sees the subshell's exit.
@@ -165,7 +178,9 @@ run_in() { # dir cmd  — run quietly; on failure name the command and exit
 time_cmd() {
     local runs="$1" dir="$2" setup="$3" cmd="$4"
     local i t0 t1 sum=0
-    if [ -z "$setup" ]; then
+    if [ "$HYPERFINE" -eq 1 ]; then
+        time_hyperfine "$@"
+    elif [ -z "$setup" ]; then
         run_in "$dir" "$cmd"
         t0=$(_now_ms)
         for ((i=0; i<runs; i++)); do run_in "$dir" "$cmd"; done
@@ -182,6 +197,32 @@ time_cmd() {
         done
         echo "$(( sum / runs ))"
     fi
+}
+
+# time_hyperfine <runs> <dir> <setup> <cmd>  → echoes hyperfine's mean wall time in ms.
+# A failing command fails hyperfine, which aborts the benchmark the same way run_in does.
+time_hyperfine() {
+    local runs="$1" dir="$2" setup="$3" cmd="$4" csv log
+    csv=$(mktemp "${TMPDIR:-/tmp}/forklift-bench-csv.XXXXXX")
+    log=$(mktemp "${TMPDIR:-/tmp}/forklift-bench-log.XXXXXX")
+    local args=(-N --style basic --runs "$runs" --export-csv "$csv")
+    if [ -n "$setup" ]; then args+=(--prepare "$setup"); else args+=(--warmup 1); fi
+    if ! ( cd "$dir" && hyperfine "${args[@]}" "$cmd" ) >"$log" 2>&1; then
+        echo "error: benchmark command failed in $dir: $cmd" >&2
+        tail -15 "$log" >&2
+        echo "  Re-run with --keep and reproduce it by hand there." >&2
+        rm -f "$csv" "$log"; exit 1
+    fi
+    # hyperfine 1.x names the column "mean" (seconds); 2.x "time_wall_clock_mean" with
+    # its unit in "time_wall_clock_unit". Find them by header name, never by position.
+    awk -F, 'NR==1 { for (i=1; i<=NF; i++) { if ($i=="mean" || $i=="time_wall_clock_mean") m=i;
+                                             if ($i=="time_wall_clock_unit") u=i } next }
+             NR==2 { if (!m) exit 1; unit = u ? $u : "s"
+                     f = (unit=="s") ? 1000 : (unit=="ms") ? 1 : (unit=="us"||unit=="µs") ? 0.001 : -1
+                     if (f < 0) exit 1; printf "%d\n", $m * f + 0.5; ok=1 }
+             END   { if (!ok) exit 1 }' "$csv" \
+        || { echo "error: could not read hyperfine's mean from $csv (format changed?)" >&2; exit 1; }
+    rm -f "$csv" "$log"
 }
 
 fmt_ms()  { awk -v ms="$1" 'BEGIN{ if (ms>=1000) printf "%.2f s", ms/1000; else printf "%d ms", ms }'; }
@@ -306,13 +347,8 @@ GM=$(time_cmd "$RUNS" "$A" "" 'git log')
 FM=$(time_cmd "$RUNS" "$B" "" 'forklift history')
 add_row "log (whole history)" "$GM" "$FM" "$N_COMMITS commits walked"
 
-# ── 4. diff of a dirty tree ─────────────────────────────────────────────────
-echo "→ [4/5] diff…"
-# Dirty the same handful of tracked files in both copies, then diff read-only, twice:
-# unstaged (working directory vs index/inventory), then staged (index/inventory vs
-# head) after staging the same files on both sides. Each row pairs the two tools'
-# like-for-like operation; timing `git diff` against `forklift diff --staged` would
-# compare a re-stat against a tree walk.
+# ── shared by the commit and diff steps ───────────────────────────────────
+# The edit set: the same handful of tracked files in both copies.
 # (Portable array read — macOS bash 3.2 has no `mapfile`.)
 DIRTY=()
 while IFS= read -r f; do DIRTY+=("$f"); done \
@@ -338,13 +374,48 @@ expect_counts() {
         exit 1
     fi
 }
-
 # Forklift's unstaged count includes untracked entries, which `git diff` never shows
 # (git.git's sha1collisiondetection/ submodule checks out as an empty, untracked
-# directory). Take the clean tree's count as the baseline and expect the edits to add
-# exactly one entry per edited file on top of it.
+# directory). The clean tree's count is the baseline the later checks compare against.
 FL_UNSTAGED_BASE=$(fl_count unstaged_count)
+# expect_clean <when>  — both copies hold nothing staged and nothing modified.
+expect_clean() {
+    if [ -n "$(git -C "$A" status --porcelain)" ] \
+        || [ "$(fl_count staged_count)" != 0 ] \
+        || [ "$(fl_count unstaged_count)" != "$FL_UNSTAGED_BASE" ]; then
+        echo "error: a working copy is not clean $1. Re-run with --keep and inspect $A and $B." >&2
+        exit 1
+    fi
+}
 
+# ── 4. commit / stack (per-run setup: make + stage a one-line change) ───────
+echo "→ [4/5] commit…"
+# Runs before the diff step, on the clean tree onboarding left, so nothing has to be
+# reset first: a reset would be a different operation per tool, and forklift's state
+# after it (inventory stat data, subtree rollups) differs from a fresh import's.
+# Only the commit itself is timed; the edit and the staging step are setup. git runs
+# twice: with its defaults, and with every write fsynced. git-config(1) documents
+# core.fsyncMethod's default on macOS as writeout-only, which may not survive a crash;
+# forklift syncs each stack durably (a device-cache flush on macOS), so the second
+# row is the like-for-like durability comparison there.
+expect_clean "before the commit step"
+BENCH_FILE="${DIRTY[0]:-BENCHMARK_SCRATCH.txt}"
+GIT_SETUP="printf '\n// commit bench %s\n' \"\$RANDOM\" >> '$BENCH_FILE' && git add '$BENCH_FILE'"
+FORK_SETUP="printf '\n// commit bench %s\n' \"\$RANDOM\" >> '$BENCH_FILE' && forklift load '$BENCH_FILE'"
+GM=$(time_cmd "$COMMIT_RUNS" "$A" "$GIT_SETUP"  'git commit -q -m bench')
+GDM=$(time_cmd "$COMMIT_RUNS" "$A" "$GIT_SETUP" 'git -c core.fsync=all -c core.fsyncMethod=fsync commit -q -m bench')
+FM=$(time_cmd "$COMMIT_RUNS" "$B" "$FORK_SETUP" 'forklift stack bench')
+expect_clean "after the commit step (a timed commit left something behind)"
+add_row "commit (1 file)" "$GM" "$FM" "git commit vs forklift stack, staging untimed"
+add_row "commit, git fsync=all" "$GDM" "$FM" "same, git with core.fsync=all core.fsyncMethod=fsync"
+
+# ── 5. diff of a dirty tree ─────────────────────────────────────────────────
+echo "→ [5/5] diff…"
+# Dirty the edit set in both copies, then diff read-only, twice: unstaged (working
+# directory vs index/inventory), then staged (index/inventory vs head) after staging
+# the same files on both sides. Each row pairs the two tools' like-for-like operation;
+# timing `git diff` against `forklift diff --staged` would compare a re-stat against a
+# tree walk. The copies are left dirty: nothing is timed after this step.
 for f in "${DIRTY[@]}"; do
     printf '\n// benchmark edit\n' >> "$A/$f"
     printf '\n// benchmark edit\n' >> "$B/$f"
@@ -363,34 +434,6 @@ expect_counts "staged diff" "$(git -C "$A" diff --cached --name-only | wc -l | t
 GM=$(time_cmd "$RUNS" "$A" "" 'git diff --staged')
 FM=$(time_cmd "$RUNS" "$B" "" 'forklift diff --staged')
 add_row "diff, staged (${#DIRTY[@]} files)" "$GM" "$FM" "git diff --staged vs forklift diff --staged"
-
-# Return both trees to clean — index/inventory and working files — so the commit
-# below records exactly the one file its setup stages, then check that it did.
-run_in "$A" 'git reset -q --hard'
-run_in "$B" 'forklift restore --staged . && forklift restore .'
-if [ -n "$(git -C "$A" status --porcelain)" ] \
-    || [ "$(fl_count staged_count)" != 0 ] \
-    || [ "$(fl_count unstaged_count)" != "$FL_UNSTAGED_BASE" ]; then
-    echo "error: a working copy is not clean after the diff step, so the commit benchmark" >&2
-    echo "  would record more than one file. Re-run with --keep and inspect $A and $B." >&2
-    exit 1
-fi
-
-# ── 5. commit / stack (per-run setup: make + stage a one-line change) ───────
-echo "→ [5/5] commit…"
-# Only the commit itself is timed; the edit and the staging step are setup. git runs
-# twice: with its defaults, and with every write fsynced. git-config(1) documents
-# core.fsyncMethod's default on macOS as writeout-only, which may not survive a crash;
-# forklift syncs each stack durably (a device-cache flush on macOS), so the second
-# row is the like-for-like durability comparison there.
-BENCH_FILE="${DIRTY[0]:-BENCHMARK_SCRATCH.txt}"
-GIT_SETUP="printf '\n// commit bench %s\n' \"\$RANDOM\" >> '$BENCH_FILE'; git add '$BENCH_FILE'"
-FORK_SETUP="printf '\n// commit bench %s\n' \"\$RANDOM\" >> '$BENCH_FILE'; forklift load '$BENCH_FILE'"
-GM=$(time_cmd "$COMMIT_RUNS" "$A" "$GIT_SETUP"  'git commit -q -m bench')
-GDM=$(time_cmd "$COMMIT_RUNS" "$A" "$GIT_SETUP" 'git -c core.fsync=all -c core.fsyncMethod=fsync commit -q -m bench')
-FM=$(time_cmd "$COMMIT_RUNS" "$B" "$FORK_SETUP" 'forklift stack bench')
-add_row "commit (1 file)" "$GM" "$FM" "git commit vs forklift stack, staging untimed; mean of $COMMIT_RUNS"
-add_row "commit, git fsync=all" "$GDM" "$FM" "same, git with core.fsync=all core.fsyncMethod=fsync"
 
 # ── report ──────────────────────────────────────────────────────────────────
 # The size ratio compares git against the store the timings ran on (densified when
@@ -417,7 +460,7 @@ build_report() {
         echo "- **Repo:** $REPO_NAME — $N_COMMITS commits, $N_FILES tracked files"
         echo "- **On-disk:** git \`.git\` = ${GIT_SIZE:-?}, forklift \`.forklift\` = ${FORK_SIZE_FIELD}${SIZE_NOTE}"
         echo "- **Tools:** $GIT_VERSION · $FORKLIFT_VERSION"
-        echo "- **Method:** read-only ops = mean of $RUNS runs after one warm-up run, commit = mean of $COMMIT_RUNS; warm cache. Ratio < 1 means forklift is faster."
+        echo "- **Method:** $TIMER; read-only ops = mean of $RUNS runs after one warm-up run, commit = mean of $COMMIT_RUNS; warm cache. Ratio < 1 means forklift is faster."
         echo "- **Store:** git ships packed (\`clone --local\` copies packfiles); forklift is ${STORE_STATE} — the timings below ran on that store."
         echo
         render_table_markdown
@@ -433,7 +476,7 @@ build_report() {
         fi
         echo
         echo "> Quick comparison on one machine, not a published benchmark. For tighter"
-        echo "> statistics wrap the same commands in \`hyperfine\`. See docs/BENCHMARK.md."
+        echo "> statistics install \`hyperfine\`; the harness then times with it. See docs/BENCHMARK.md."
     else
         echo
         echo "Benchmark: forklift vs git — $REPO_NAME"
@@ -441,7 +484,7 @@ build_report() {
         printf '  Repo:      %s — %s commits, %s tracked files\n' "$REPO_NAME" "$N_COMMITS" "$N_FILES"
         printf '  On-disk:   git .git = %s   forklift .forklift = %s%s\n' "${GIT_SIZE:-?}" "$FORK_SIZE_FIELD" "$SIZE_NOTE"
         printf '  Tools:     %s · %s\n' "$GIT_VERSION" "$FORKLIFT_VERSION"
-        printf '  Method:    read-only ops = mean of %s runs after one warm-up run, commit = mean of %s; warm cache.\n' "$RUNS" "$COMMIT_RUNS"
+        printf '  Method:    %s; read-only ops = mean of %s runs after one warm-up run, commit = mean of %s; warm cache.\n' "$TIMER" "$RUNS" "$COMMIT_RUNS"
         printf '             A ratio below 1.00 means forklift is faster.\n'
         printf '             git ships packed; forklift is %s.\n' "$(printf '%s' "$STORE_STATE" | tr -d '`')"
         echo
@@ -457,7 +500,7 @@ build_report() {
             printf '    compact --all --redelta  %-7s (one-shot densify: %s -> %s)\n' "$(fmt_ms "$FORK_REDELTA_MS")" "${FORK_SIZE_IMPORT:-?}" "${FORK_SIZE:-?}"
         fi
         echo
-        echo "  Quick comparison on one machine — for tighter stats use hyperfine."
+        echo "  Quick comparison on one machine — install hyperfine and the harness times with it."
         echo "  See docs/BENCHMARK.md for the fairness caveats."
     fi
 }
