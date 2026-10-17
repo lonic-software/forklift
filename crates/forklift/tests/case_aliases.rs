@@ -539,3 +539,28 @@ fn restore_refuses_a_path_beneath_a_file() {
         assert_eq!(warehouse.read("foo"), "mine\n");
     }
 }
+
+/// A removed tracked symlink to a directory is a file the shift clears, so two new directory
+/// spellings that resolve to it are probed as a pair rather than merged into one directory.
+#[cfg(unix)]
+#[test]
+fn a_new_directory_pair_replacing_a_removed_symlink_is_refused_or_materialized_whole() {
+    let warehouse = Warehouse::new("pair-replacing-link", &[("app.txt", "app\n"), ("real/x", "x\n")]);
+    std::os::unix::fs::symlink("real", warehouse.root.join("lib")).unwrap();
+    warehouse.run_ok(&["load", "."]);
+    warehouse.run_ok(&["stack", "link"]);
+    warehouse.craft("pair", "main", &[("app.txt", "app\n"), ("real/x", "x\n"), ("LIB/a", "a\n"), ("lib/b", "b\n")]);
+
+    let shifted = warehouse.run(&["shift", "pair"]);
+
+    if warehouse.folds_case() {
+        assert_refused_with(&shifted, ALIAS_REFUSAL, &["LIB and lib"]);
+        assert!(std::fs::symlink_metadata(warehouse.root.join("lib")).unwrap().file_type().is_symlink(),
+                "a refused shift removes nothing");
+        assert_eq!(listed(&warehouse.root.join("real")), BTreeSet::from(["x".to_string()]), "nothing written through the link");
+    } else {
+        assert!(shifted.status.success(), "{}", stderr(&shifted));
+        assert_eq!(warehouse.read("LIB/a"), "a\n");
+        assert_eq!(warehouse.read("lib/b"), "b\n");
+    }
+}

@@ -307,7 +307,10 @@ impl AliasCheck {
         Ok(match self.judge(key, removals)? {
             Verdict::Proceed => false,
             Verdict::Refuse(_) => true,
-            Verdict::Exists if Path::new(key).is_dir() => !self.directory(key, removals)?.1,
+            // Never following a symlink: a link to a directory is a file the operation may remove.
+            Verdict::Exists if std::fs::symlink_metadata(key).is_ok_and(|metadata| metadata.is_dir()) => {
+                !self.directory(key, removals)?.1
+            }
             Verdict::Exists => !removals.removes_file(key),
         })
     }
