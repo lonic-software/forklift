@@ -3188,4 +3188,19 @@ mod tests {
         let error = file_utils::retrieve_inventory_metadata_or_none().unwrap_err();
         assert!(error.contains("has no format header"), "{}", error);
     }
+
+    #[test]
+    fn replacing_every_inventory_overwrites_a_damaged_metadata_file_without_reading_it() {
+        let _scratch = Scratch::new("metadata-damaged-reset");
+
+        let path = file_utils::get_inventory_metadata_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"not a metadata record").unwrap();
+
+        replace_all_inventories(&std::collections::BTreeMap::new())
+            .expect("a wholesale reset must not depend on the metadata it replaces");
+
+        let (_, read) = file_utils::retrieve_inventory_metadata_or_none().unwrap();
+        assert_eq!(read.unwrap(), BTreeSet::new());
+    }
 }
