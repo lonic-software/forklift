@@ -37,7 +37,8 @@ number by hand and add your own.
 
 Install hyperfine for publication-grade numbers: `brew install hyperfine` (macOS) or
 `cargo install hyperfine`. The harness picks it up from PATH and names the timer it used
-in its report; without it, it falls back to its own shell timer and fewer runs.
+in its report; without it, or with a hyperfine older than 1.13, it falls back to its
+own shell timer and fewer runs.
 
 Disk budget, concretely:
 - **git.git** — ~230 MB of history, ~4.7k files. Two copies ≈ 0.6 GB. Fast.
@@ -66,7 +67,8 @@ bin/benchmark --repo git --out results.md --keep
 ```
 
 Options: `--runs N` (iterations for the fast read-only ops; default 20 under hyperfine,
-5 with the shell timer — the commit rows use half as many),
+5 with the shell timer — the commit rows default to 10 and 3, set `COMMIT_RUNS` in the
+environment to change that),
 `--work DIR` (where to build the copies; default a fresh temp dir),
 `--keep` (don't delete the work dir), `--out FILE` (append the results table),
 `--no-redelta` (skip the post-import densify pass and time the as-imported store —

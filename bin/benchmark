@@ -56,7 +56,7 @@ set -euo pipefail
 # ── defaults ────────────────────────────────────────────────────────────────
 REPO="git"                         # git | linux | any git URL or local path
 RUNS=""                            # iterations for the fast, read-only ops (default below)
-COMMIT_RUNS=""                     # iterations for the commit/stack op (default below)
+COMMIT_RUNS="${COMMIT_RUNS:-}"     # iterations for the commit/stack op (env; default below)
 WORK=""                            # working dir (default: a fresh temp dir)
 KEEP=0                             # keep the work dir on exit
 OUT=""                            # also append the results table here
@@ -79,6 +79,9 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+case "$RUNS" in ''|*[!0-9]*|0) [ -z "$RUNS" ] || { echo "error: --runs needs a positive integer, got '$RUNS'" >&2; exit 2; };; esac
+case "$COMMIT_RUNS" in ''|*[!0-9]*|0) [ -z "$COMMIT_RUNS" ] || { echo "error: COMMIT_RUNS needs a positive integer, got '$COMMIT_RUNS'" >&2; exit 2; };; esac
+
 # ── resolve tools ───────────────────────────────────────────────────────────
 command -v git      >/dev/null || { echo "error: git not on PATH" >&2; exit 1; }
 command -v forklift >/dev/null || { echo "error: forklift not on PATH — install it first" >&2; exit 1; }
@@ -87,7 +90,17 @@ FORKLIFT_VERSION=$(forklift version 2>/dev/null || echo "forklift ?")
 
 # hyperfine, when present, does the timing; the shell timer below is the fallback.
 # Defaults scale with the timer: hyperfine's per-run cost is low enough for many runs.
-if command -v hyperfine >/dev/null 2>&1; then
+# It needs -N (--shell=none, hyperfine 1.13+); an older one is ignored, with a note.
+hyperfine_usable() {
+    local v major minor
+    v=$(hyperfine --version 2>/dev/null | sed -n 's/^hyperfine \([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\1 \2/p')
+    read -r major minor <<< "$v"
+    [ -n "$major" ] && { [ "$major" -gt 1 ] || { [ "$major" -eq 1 ] && [ "$minor" -ge 13 ]; }; }
+}
+if command -v hyperfine >/dev/null 2>&1 && ! hyperfine_usable; then
+    echo "note: $(hyperfine --version 2>/dev/null) is older than 1.13; timing with the shell timer instead." >&2
+fi
+if command -v hyperfine >/dev/null 2>&1 && hyperfine_usable; then
     HYPERFINE=1; TIMER="$(hyperfine --version)"
     RUNS="${RUNS:-20}"; COMMIT_RUNS="${COMMIT_RUNS:-10}"
 else
@@ -202,17 +215,26 @@ time_cmd() {
 # time_hyperfine <runs> <dir> <setup> <cmd>  → echoes hyperfine's mean wall time in ms.
 # A failing command fails hyperfine, which aborts the benchmark the same way run_in does.
 time_hyperfine() {
-    local runs="$1" dir="$2" setup="$3" cmd="$4" csv log
+    local runs="$1" dir="$2" setup="$3" cmd="$4" csv log prep=""
     csv=$(mktemp "${TMPDIR:-/tmp}/forklift-bench-csv.XXXXXX")
     log=$(mktemp "${TMPDIR:-/tmp}/forklift-bench-log.XXXXXX")
     local args=(-N --style basic --runs "$runs" --export-csv "$csv")
-    if [ -n "$setup" ]; then args+=(--prepare "$setup"); else args+=(--warmup 1); fi
+    if [ -n "$setup" ]; then
+        # The setup is shell (redirects, &&, $RANDOM). Whether hyperfine runs --prepare
+        # through a shell under -N differs between versions, so hand it a script to run.
+        prep=$(mktemp "${TMPDIR:-/tmp}/forklift-bench-prep.XXXXXX")
+        printf 'set -e\n%s\n' "$setup" > "$prep"
+        args+=(--prepare "bash $prep")
+    else
+        args+=(--warmup 1)
+    fi
     if ! ( cd "$dir" && hyperfine "${args[@]}" "$cmd" ) >"$log" 2>&1; then
         echo "error: benchmark command failed in $dir: $cmd" >&2
         tail -15 "$log" >&2
         echo "  Re-run with --keep and reproduce it by hand there." >&2
-        rm -f "$csv" "$log"; exit 1
+        rm -f "$csv" "$log" ${prep:+"$prep"}; exit 1
     fi
+    [ -z "$prep" ] || rm -f "$prep"
     # hyperfine 1.x names the column "mean" (seconds); 2.x "time_wall_clock_mean" with
     # its unit in "time_wall_clock_unit". Find them by header name, never by position.
     awk -F, 'NR==1 { for (i=1; i<=NF; i++) { if ($i=="mean" || $i=="time_wall_clock_mean") m=i;
@@ -241,11 +263,11 @@ add_row() { # name  git_mean  fork_mean  note
 rule() { printf '%*s' "$1" '' | tr ' ' '-'; }   # N dashes
 
 render_table_aligned() {
-    printf '  %-22s  %-9s  %-9s  %-13s  %s\n' "Operation" "git" "forklift" "forklift/git" "Notes"
-    printf '  %-22s  %-9s  %-9s  %-13s  %s\n' "$(rule 22)" "$(rule 9)" "$(rule 9)" "$(rule 13)" "$(rule 34)"
+    printf '  %-25s  %-9s  %-9s  %-13s  %s\n' "Operation" "git" "forklift" "forklift/git" "Notes"
+    printf '  %-25s  %-9s  %-9s  %-13s  %s\n' "$(rule 25)" "$(rule 9)" "$(rule 9)" "$(rule 13)" "$(rule 34)"
     printf '%s' "$ROWS" | while IFS="$US" read -r name g f r note; do
         [ -z "$name" ] && continue
-        printf '  %-22s  %-9s  %-9s  %-13s  %s\n' "$name" "$g" "$f" "$r" "$note"
+        printf '  %-25s  %-9s  %-9s  %-13s  %s\n' "$name" "$g" "$f" "$r" "$note"
     done
 }
 
@@ -263,7 +285,10 @@ echo "→ [1/5] onboard cost…"
 # git: a fresh local clone from the mirror. forklift: import-git on an existing
 # checkout. Different work, same question — "time to bring this history under the
 # VCS" — so the note flags that they are not byte-identical operations.
-t0=$(_now_ms); git clone --quiet --local "$MIRROR" "$WORK/_gc" >/dev/null 2>&1; t1=$(_now_ms)
+t0=$(_now_ms)
+git clone --quiet --local "$MIRROR" "$WORK/_gc" >/dev/null 2>&1 \
+    || { echo "error: git clone --local of $MIRROR into $WORK/_gc failed" >&2; exit 1; }
+t1=$(_now_ms)
 GIT_ONBOARD=$(( t1 - t0 )); rm -rf "$WORK/_gc"
 # import-git can legitimately fail (e.g. a git object git itself accepts but the importer
 # rejects). Capture its output and surface it — a swallowed error here reads as a silent
@@ -330,8 +355,14 @@ FORK_SIZE=$(du -sh "$B/.forklift" 2>/dev/null | cut -f1 | tr -d ' ')
 # import-git adds a `.git` rule to `.forkliftignore` and asks for it to be loaded and
 # stacked. Do that (untimed), like the redelta it suggests: left untracked, the file
 # would join the diff step's `forklift load .` and give forklift one more change than git.
+# A repo that already tracks a .forkliftignore with that rule gets nothing added, and
+# stacking nothing fails — so only stack when the load staged something.
 if [ -f "$B/.forkliftignore" ]; then
-    run_in "$B" 'forklift load .forkliftignore && forklift stack "Keep the .git ignore rule"'
+    run_in "$B" 'forklift load .forkliftignore'
+    if ( cd "$B" && forklift --json stocktake --summary ) 2>/dev/null \
+        | grep -q '"staged_count": *[1-9]'; then
+        run_in "$B" 'forklift stack "Keep the .git ignore rule"'
+    fi
 fi
 
 # From here B is a fully imported, packed warehouse whose current pallet is '$MAIN_REF'.
@@ -357,11 +388,22 @@ while IFS= read -r f; do DIRTY+=("$f"); done \
 if [ "${#DIRTY[@]}" -eq 0 ]; then
     while IFS= read -r f; do DIRTY+=("$f"); done < <(git -C "$A" ls-files | head -20)
 fi
+if [ "${#DIRTY[@]}" -eq 0 ]; then
+    echo "error: $REPO_NAME has no tracked files to edit; the commit and diff steps need some." >&2
+    exit 1
+fi
 
-# fl_count <staged_count|unstaged_count>  → that count from forklift's stocktake
-fl_count() {
-    ( cd "$B" && forklift --json stocktake --summary ) 2>/dev/null \
-        | sed -n "s/.*\"$1\": *\([0-9][0-9]*\).*/\1/p"
+# fl_counts  → sets FL_STAGED and FL_UNSTAGED from one forklift stocktake, and stops if
+# either count can't be read (an empty count would compare equal to another empty one).
+fl_counts() {
+    local json
+    json=$( cd "$B" && forklift --json stocktake --summary 2>/dev/null ) || json=""
+    FL_STAGED=$(printf '%s' "$json" | sed -n 's/.*"staged_count": *\([0-9][0-9]*\).*/\1/p')
+    FL_UNSTAGED=$(printf '%s' "$json" | sed -n 's/.*"unstaged_count": *\([0-9][0-9]*\).*/\1/p')
+    if [ -z "$FL_STAGED" ] || [ -z "$FL_UNSTAGED" ]; then
+        echo "error: could not read staged/unstaged counts from forklift --json stocktake --summary in $B" >&2
+        exit 1
+    fi
 }
 # expect_counts <what> <git_count> <forklift_count>  — both tools must see the same
 # change set, or the row compares different work. On a mismatch, show what each saw.
@@ -378,12 +420,14 @@ expect_counts() {
 # Forklift's unstaged count includes untracked entries, which `git diff` never shows
 # (git.git's sha1collisiondetection/ submodule checks out as an empty, untracked
 # directory). The clean tree's count is the baseline the later checks compare against.
-FL_UNSTAGED_BASE=$(fl_count unstaged_count)
+# (A count, not a list: a stray edit that also removed an untracked entry would pass,
+# which is not a failure this harness can cause.)
+fl_counts; FL_UNSTAGED_BASE=$FL_UNSTAGED
 # expect_clean <when>  — both copies hold nothing staged and nothing modified.
 expect_clean() {
+    fl_counts
     if [ -n "$(git -C "$A" status --porcelain)" ] \
-        || [ "$(fl_count staged_count)" != 0 ] \
-        || [ "$(fl_count unstaged_count)" != "$FL_UNSTAGED_BASE" ]; then
+        || [ "$FL_STAGED" != 0 ] || [ "$FL_UNSTAGED" != "$FL_UNSTAGED_BASE" ]; then
         echo "error: a working copy is not clean $1. Re-run with --keep and inspect $A and $B." >&2
         exit 1
     fi
@@ -422,16 +466,18 @@ for f in "${DIRTY[@]}"; do
     printf '\n// benchmark edit\n' >> "$B/$f"
 done
 
+fl_counts
 expect_counts "unstaged diff" "$(git -C "$A" diff --name-only | wc -l | tr -d ' ')" \
-    "$(( $(fl_count unstaged_count) - FL_UNSTAGED_BASE ))"
+    "$(( FL_UNSTAGED - FL_UNSTAGED_BASE ))"
 GM=$(time_cmd "$RUNS" "$A" "" 'git diff')
 FM=$(time_cmd "$RUNS" "$B" "" 'forklift diff')
 add_row "diff, unstaged (${#DIRTY[@]} files)" "$GM" "$FM" "git diff vs forklift diff"
 
 run_in "$A" 'git add -A'
 run_in "$B" 'forklift load .'
+fl_counts
 expect_counts "staged diff" "$(git -C "$A" diff --cached --name-only | wc -l | tr -d ' ')" \
-    "$(fl_count staged_count)"
+    "$FL_STAGED"
 GM=$(time_cmd "$RUNS" "$A" "" 'git diff --staged')
 FM=$(time_cmd "$RUNS" "$B" "" 'forklift diff --staged')
 add_row "diff, staged (${#DIRTY[@]} files)" "$GM" "$FM" "git diff --staged vs forklift diff --staged"
