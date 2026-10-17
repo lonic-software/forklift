@@ -1045,18 +1045,25 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
 
         // The existing inventory of this directory (if any) is the stat cache: entries whose
         // file metadata is unchanged are reused without reading or hashing the file.
-        // An unreadable or unparsable shard simply means a full rebuild of this directory.
+        // It is also what says which files are tracked, which the ignore rules depend on, so an
+        // unreadable or unparsable shard fails the load instead of being rebuilt from scratch:
+        // a rebuild would silently drop every tracked file a rule covers.
         // The shard's own modification time is needed to reject "racily clean" entries
         // (see `is_entry_unchanged`). Its rollup (if any) is captured here too, at task start —
         // the tentative "carry forward" value if this directory's content turns out unchanged.
-        let existing_inventory = match file_utils::retrieve_inventory_or_none_by_key(path.as_key()) {
-            Ok((shard_path, Some(bytes))) => {
-                let shard_mtime = file_utils::get_symlink_metadata_for_path(&shard_path).ok()
-                    .and_then(|m| file_utils::get_content_modification_timestamp_for_file(&m).ok());
+        let existing_inventory = match file_utils::retrieve_inventory_or_none_by_key(path.as_key())? {
+            (shard_path, Some(bytes)) => {
+                let unreadable = |e: String| format!(
+                    "The inventory of folder \"{}\" cannot be read: {}", path.as_key(), e
+                );
+                let shard_mtime = file_utils::get_symlink_metadata_for_path(&shard_path)
+                    .and_then(|m| file_utils::get_content_modification_timestamp_for_file(&m))
+                    .map_err(unreadable)?;
+                let inventory = parser::inventory::inventory_parser::parse_inventory(&bytes).map_err(unreadable)?;
 
-                parser::inventory::inventory_parser::parse_inventory(&bytes).ok().zip(shard_mtime)
+                Some((inventory, shard_mtime))
             }
-            _ => None,
+            (_, None) => None,
         };
 
         let mut inventory = Inventory::new();

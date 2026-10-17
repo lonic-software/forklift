@@ -1306,6 +1306,24 @@ fn a_rule_on_a_tracked_folder_covers_new_files_in_its_tracked_subfolders() {
 }
 
 #[test]
+fn a_folder_load_refuses_an_unreadable_shard_instead_of_dropping_a_tracked_file_a_rule_covers() {
+    let warehouse = TestWarehouse::new("load-unreadable-shard");
+    warehouse.write_file("x.log", "log\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "x.log"]));
+    assert_success(&warehouse.run(&["stack", "x.log"]));
+    warehouse.write_file(".forkliftignore", "\\.log$\n");
+
+    // The root's shard: a rebuild of it without the old entries would not know x.log is
+    // tracked, and the rule would drop it without a staged removal.
+    warehouse.write_file(".forklift/inventory/inv_/data", "not a shard\n");
+    let load = warehouse.run(&["load", "."]);
+    assert!(!load.status.success(), "{}", stdout(&load));
+    assert!(stderr(&load).contains("cannot be read"), "{}", stderr(&load));
+}
+
+#[test]
 fn restore_refuses_a_file_replaced_by_a_folder_and_keeps_the_folder() {
     let warehouse = warehouse_with_a_diverged_pallet("restore-flip-file-to-dir");
     std::fs::remove_file(warehouse.root.join("notes.txt")).unwrap();

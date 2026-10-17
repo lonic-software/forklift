@@ -2447,8 +2447,9 @@ pub fn get_owners_for_file(_metadata: &Metadata) -> (u64, u64) {
 /// shard, or a directory registered in the inventory metadata, is tracked whatever the rules say,
 /// so its edits stay visible and are never silently overwritten. `remove` is how a path stops
 /// being tracked and so becomes ignored. The built-in rules apply whether or not a path is
-/// tracked. The only way to ask is [`IgnoreRules::excludes`], which takes the path's trackedness,
-/// so no caller can exclude a tracked path by forgetting to ask.
+/// tracked. [`IgnoreRules::excludes`] takes the path's trackedness as an argument, so no caller
+/// can exclude a tracked path by forgetting to ask; the walks get that answer, and the one for a
+/// tracked name of the other type, from `inventory_utils::rule_verdict`.
 pub struct IgnoreRules {
     built_in: Vec<Regex>,
     user: Vec<Regex>,
@@ -2503,9 +2504,10 @@ impl IgnoreRules {
     ///
     /// # Arguments
     /// * `key`     - The warehouse path key (see `WarehousePath::as_key`).
-    /// * `tracked` - Whether the path is tracked: its name has a live entry in its parent's shard,
-    ///               or its key is registered in the inventory metadata, whatever its type on
-    ///               disk is now.
+    /// * `tracked` - Whether the path is tracked as what it is on disk now: a file with a live
+    ///               entry in its parent's shard, a directory whose key is registered. The walks
+    ///               ask through `inventory_utils::rule_verdict`, which also tells a tracked name
+    ///               of the other type apart; call this directly only with that answer.
     /// * `parent`  - The coverage of the path's parent directory (see [`IgnoreRules::coverage_of`]).
     ///
     /// # Returns
