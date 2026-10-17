@@ -1287,6 +1287,25 @@ fn a_tracked_folder_a_rule_covers_replaced_by_a_file_is_removed_and_the_file_sta
 }
 
 #[test]
+fn a_rule_on_a_tracked_folder_covers_new_files_in_its_tracked_subfolders() {
+    let warehouse = TestWarehouse::new("rule-covers-tracked-subfolder");
+    warehouse.write_file("a/sub/x.txt", "x\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "a"]));
+    assert_success(&warehouse.run(&["stack", "a"]));
+
+    warehouse.write_file(".forkliftignore", "^a$\n");
+    warehouse.write_file("a/sub/new.txt", "new\n");
+    let unstaged = changes(&warehouse, "unstaged");
+    assert!(!unstaged.iter().any(|(_, path)| path == "a/sub/new.txt"), "the rule covers a/ and below: {:?}", unstaged);
+
+    assert_success(&warehouse.run(&["load", "."]));
+    let staged = changes(&warehouse, "staged");
+    assert!(!staged.iter().any(|(_, path)| path == "a/sub/new.txt"), "{:?}", staged);
+}
+
+#[test]
 fn restore_refuses_a_file_replaced_by_a_folder_and_keeps_the_folder() {
     let warehouse = warehouse_with_a_diverged_pallet("restore-flip-file-to-dir");
     std::fs::remove_file(warehouse.root.join("notes.txt")).unwrap();
