@@ -556,13 +556,18 @@ fn create_assembly_temp(path: &str, fs_path: &Path) -> Result<(PathBuf, std::fs:
     const MAX_ATTEMPTS: usize = 64;
 
     let name = fs_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-
-    for _ in 0..MAX_ATTEMPTS {
+    let candidates = (0..MAX_ATTEMPTS).map(|_| {
         let attempt = ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let temp_path = fs_path.with_file_name(format!(
-            ".{}.{}-{}.forklift-assemble.tmp", name, std::process::id(), attempt
-        ));
+        fs_path.with_file_name(format!(".{}.{}-{}.forklift-assemble.tmp", name, std::process::id(), attempt))
+    });
 
+    create_first_new(path, candidates)
+}
+
+/// Create the first of `candidates` that does not exist yet, skipping (never opening) any that
+/// does. See [`create_assembly_temp`].
+fn create_first_new(path: &str, candidates: impl Iterator<Item = PathBuf>) -> Result<(PathBuf, std::fs::File), String> {
+    for temp_path in candidates {
         match std::fs::OpenOptions::new().write(true).create_new(true).open(&temp_path) {
             Ok(file) => return Ok((temp_path, file)),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -809,5 +814,23 @@ mod tests {
         for path in ["docs/.forklift/x", "no-such-dir/.ForkLift", "x.forklift"] {
             assert_eq!(check_working_path(path), Ok(()), "{:?} must be accepted", path);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_temp_candidate_that_exists_is_skipped_not_opened() {
+        let dir = std::env::temp_dir().join(format!("forklift-assembly-temp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let outside = dir.join("outside.txt");
+        std::fs::write(&outside, "untouched\n").unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("taken")).unwrap();
+
+        let (temp_path, file) = create_first_new("big.bin", [dir.join("taken"), dir.join("fresh")].into_iter()).unwrap();
+        std::io::Write::write_all(&mut &file, b"assembled").unwrap();
+
+        assert_eq!(temp_path, dir.join("fresh"));
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "untouched\n");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
