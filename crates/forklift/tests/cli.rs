@@ -2198,6 +2198,39 @@ fn an_unwritable_commit_graph_never_fails_a_query() {
     assert!(graph_root.is_file(), "sanity: the squatting file is still in place");
 }
 
+/// The CLI defers commit-graph writes to the end of the command, so the end must write them: a
+/// blame over a graph that is gone leaves behind every shard it computed, sealed and whole.
+#[test]
+fn a_cold_blame_writes_the_commit_graph_when_it_ends() {
+    let warehouse = TestWarehouse::new("commit-graph-cold-blame");
+    warehouse.write_file("file.txt", "one\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base"]));
+    for line in ["two", "three", "four"] {
+        let content = std::fs::read_to_string(warehouse.root.join("file.txt")).unwrap();
+        warehouse.write_file("file.txt", &format!("{content}{line}\n"));
+        assert_success(&warehouse.run(&["load", "file.txt"]));
+        assert_success(&warehouse.run(&["stack", line]));
+    }
+
+    let graph_root = warehouse.root.join(".forklift/graph");
+    let _ = std::fs::remove_dir_all(&graph_root);
+
+    let blame = warehouse.run(&["blame", "file.txt"]);
+    assert_success(&blame);
+    assert!(stdout(&blame).contains("four"), "sanity: blame answered: {}", stdout(&blame));
+
+    let shards: Vec<_> = std::fs::read_dir(&graph_root)
+        .map(|entries| entries.map(|entry| entry.unwrap().path()).collect())
+        .unwrap_or_default();
+    assert!(!shards.is_empty(), "the blame must have written the graph it computed");
+    for shard in &shards {
+        assert!(graph_shard_is_sealed_with_records(shard), "a shard was left torn or empty: {}", shard.display());
+    }
+}
+
 #[test]
 fn consolidate_conflicts_are_marked_and_resolved_by_stacking() {
     let warehouse = TestWarehouse::new("consolidate-conflict");
