@@ -3361,6 +3361,13 @@ A command not listed here either reports only the generic human-message shape `{
       },
       "type": "array"
     },
+    "implicit_fetch_scope": {
+      "description": "The paths a sparse fetch scope holds without listing them as prefixes: the root ignore\nfile, which the store fetches along with the prefixes. Empty when fully fetched.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
     "implicit_scope": {
       "description": "The paths a scoped bay holds in scope without listing them as prefixes: the root ignore\nfile, so its rules apply to the checkout. Empty when the bay is not scoped.",
       "items": {
@@ -3384,7 +3391,8 @@ A command not listed here either reports only the generic human-message shape `{
     "scoped",
     "materialization_scope",
     "implicit_scope",
-    "fetch_scope"
+    "fetch_scope",
+    "implicit_fetch_scope"
   ],
   "title": "ScopeStatus",
   "type": "object"

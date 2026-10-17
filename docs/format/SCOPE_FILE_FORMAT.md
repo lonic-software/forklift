@@ -31,17 +31,21 @@ Where:
   (including the last).
 
 ## Semantics
-- An **absent file, or a file with no prefixes**, means **full scope** — no restriction, the
-  whole tree is in scope. This is what makes a scoped bay opt-in: without a scope file, every
-  scope-aware operation behaves exactly as an unscoped workspace.
-- A prefix of the empty string (the warehouse root) is equivalent to full scope.
+- An **absent or empty file** means **full scope** — no restriction, the whole tree is in
+  scope. This is what makes a scoped bay opt-in: without a scope file, every scope-aware
+  operation behaves exactly as an unscoped workspace.
+- A header followed by no prefix is **refused**, and so is one whose only prefix is the empty
+  string (the warehouse root) or `/`, which reads as no prefix. Forklift never writes either:
+  the full scope is the empty file.
 - On read, blank lines and surrounding whitespace are ignored; prefixes are trimmed of
   surrounding `/`, de-duplicated and sorted, giving a canonical on-disk form.
 - A non-empty file whose first line is not the header is the unversioned format 1, written
   before the root ignore file joined every scope, and is **refused** — read under format 2's
   meaning, the never-inventoried ignore file would show as removed and the next stack would
-  commit the removal. A header naming any other version is refused too. Neither is migrated:
-  franchise the remote again.
+  commit the removal. A header naming any other version is refused too. Nothing is migrated.
+  The way out depends on the file: for the fetch scope or the main tree's scope, franchise
+  the remote again, into a new directory; for a bay's scope, remove the bay and add it again
+  with `bay add --scope`.
 
 Against a scope, every user-pallet content path is classified three ways (the classifier the
 sparse walks branch on):

@@ -310,8 +310,11 @@ impl MaterializationScope {
         let scope = MaterializationScope::from_prefixes(lines);
 
         if scope.is_full() {
-            return Err("has a format header but names no prefix, so it is not a scope this \
-                version of Forklift writes. Restore it, or remove it for the full tree.".to_string());
+            return Err(format!(
+                "has a format header but names no prefix, so it is not a scope this version of \
+                Forklift writes. {}",
+                remedy
+            ));
         }
 
         Ok(scope)
@@ -797,6 +800,15 @@ mod tests {
         assert_eq!(scope.classify("src/.forkliftignore"), ScopeClass::OutOfScope);
 
         // A path test that does not go through the scope sees only the prefix.
+        // Every implicit member, not just today's one, is a root-level file the spine walkers
+        // keep as in scope, and never a place the scope expects a directory.
+        for member in scope.implicit_members() {
+            assert!(!member.contains('/'), "{} must sit at the root, a spine level", member);
+            assert_eq!(scope.classify(member), ScopeClass::InScope, "{}", member);
+            assert!(!scope.requires_directory(member), "{}", member);
+            assert!(!scope.spine_file_is_sealed(member).unwrap(), "{}", member);
+        }
+
         assert!(is_at_or_under("src/api/x.rs", "src/api"));
         assert!(is_at_or_under("src/api", "src/api"));
         assert!(!is_at_or_under(".forkliftignore", "src/api"));
@@ -855,8 +867,9 @@ mod tests {
         assert!(unknown.contains("/forklift-scope 3"), "{}", unknown);
 
         // And a header with no prefix after it, which would otherwise read as the full scope.
-        let bare = MaterializationScope::from_bytes(b"/forklift-scope 2\n", "").unwrap_err();
+        let bare = MaterializationScope::from_bytes(b"/forklift-scope 2\n", "Do the remedy.").unwrap_err();
         assert!(bare.contains("names no prefix"), "{}", bare);
+        assert!(bare.ends_with("Do the remedy."), "{}", bare);
     }
 
     #[test]

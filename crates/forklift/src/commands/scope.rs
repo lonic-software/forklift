@@ -59,6 +59,7 @@ fn status() -> Result<(), String> {
         materialization_scope: bay_scope.prefixes().to_vec(),
         implicit_scope: bay_scope.implicit_members().iter().map(|path| path.to_string()).collect(),
         fetch_scope: fetch_scope.prefixes().to_vec(),
+        implicit_fetch_scope: fetch_scope.implicit_members().iter().map(|path| path.to_string()).collect(),
     });
 
     Ok(())
@@ -86,6 +87,10 @@ pub(crate) struct ScopeStatus {
     /// The warehouse's fetch-scope prefixes (empty = fully fetched; a sparse franchise records
     /// its fetched prefixes here).
     fetch_scope: Vec<String>,
+
+    /// The paths a sparse fetch scope holds without listing them as prefixes: the root ignore
+    /// file, which the store fetches along with the prefixes. Empty when fully fetched.
+    implicit_fetch_scope: Vec<String>,
 }
 
 impl CommandOutput for ScopeStatus {
@@ -113,6 +118,9 @@ impl CommandOutput for ScopeStatus {
             println!("Warehouse fetch scope:");
             for prefix in &self.fetch_scope {
                 println!("  {}", prefix);
+            }
+            for path in &self.implicit_fetch_scope {
+                println!("  {} (always in scope)", path);
             }
         }
     }

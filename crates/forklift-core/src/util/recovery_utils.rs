@@ -703,10 +703,10 @@ async fn resolve_the_rest(
                 // Present, but an ordinary read fails on it — quote the mechanical failure, never
                 // the "vanished" wording (see the module doc comment's message-honesty rule).
                 Some(reason) => format!(
-                    "cannot be read back verified: \"{}\" ({}; {})", hash, reason, remedy_text(consultation)
+                    "cannot be read back verified: \"{}\" ({}; {})", hash, reason, remedy_text(&consultation)
                 ),
                 None => format!(
-                    "vanished and still referenced: \"{}\" ({})", hash, remedy_text(consultation)
+                    "vanished and still referenced: \"{}\" ({})", hash, remedy_text(&consultation)
                 ),
             });
         } else if roots_incomplete {
@@ -750,7 +750,7 @@ async fn resolve_the_rest(
         // `corrupt_failures` names, per hash, why *this run's own* dedicated refetch
         // (`remote_utils::fetch_corrupt_replacements`, threaded up through
         // `attempt_heal_driven_refetch`) did not land a copy for it — additive detail folded into
-        // the dangling line below, never a substitute for `remedy_text(consultation)`'s own
+        // the dangling line below, never a substitute for `remedy_text(&consultation)`'s own
         // general guidance. Absent whenever pass 3 never ran for this hash, recovered it, or lost
         // its own attribution to a task panic (see `fetch_corrupt_replacements`'s own doc).
         let refetch_failure = corrupt_failures.get(hash);
@@ -768,11 +768,11 @@ async fn resolve_the_rest(
                     Some(fetch_error) => format!(
                         "cannot be read back verified: \"{}\" ({}; {}; the automatic refetch of \
                         this object failed: {})",
-                        relative.to_string_lossy(), reason, remedy_text(consultation), fetch_error
+                        relative.to_string_lossy(), reason, remedy_text(&consultation), fetch_error
                     ),
                     None => format!(
                         "cannot be read back verified: \"{}\" ({}; {})",
-                        relative.to_string_lossy(), reason, remedy_text(consultation)
+                        relative.to_string_lossy(), reason, remedy_text(&consultation)
                     ),
                 });
             }
@@ -786,12 +786,12 @@ async fn resolve_the_rest(
                         "no longer present at its recorded address, and this run's refetch did not \
                         land a verified copy: \"{}\" ({}; the automatic refetch of this object \
                         failed: {})",
-                        relative.to_string_lossy(), remedy_text(consultation), fetch_error
+                        relative.to_string_lossy(), remedy_text(&consultation), fetch_error
                     ),
                     None => format!(
                         "no longer present at its recorded address, and this run's refetch did not \
                         land a verified copy: \"{}\" ({})",
-                        relative.to_string_lossy(), remedy_text(consultation)
+                        relative.to_string_lossy(), remedy_text(&consultation)
                     ),
                 });
             }
@@ -2084,7 +2084,7 @@ fn check_leaf(
 /// specific attempt established (the no-false-prose rule). Never gates *whether* a hash is
 /// treated as recovered — see the module doc comment's D3 note — only the wording of what to do
 /// about one that stayed missing.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum RemoteConsultation {
     /// No remote is configured for this warehouse at all.
     NotConfigured,
@@ -2096,6 +2096,10 @@ enum RemoteConsultation {
     /// a hash still missing below was not necessarily *confirmed* absent upstream, only not yet
     /// recovered; retrying once connectivity is restored may still help.
     ConsultedWithErrors,
+    /// The fetch scope could not be read, so the user pallets' history fetches were skipped —
+    /// retrying cannot help until the scope file itself is dealt with. Carries the reason, which
+    /// names the file and the way out.
+    ScopeUnreadable(String),
 }
 
 /// The remedies that actually exist for a vanished-and-referenced (or still-corrupt) object —
@@ -2104,7 +2108,7 @@ enum RemoteConsultation {
 /// drop it. Unlike before §3.2, this never tells the operator to run a fetch by hand — `heal`
 /// already tried one itself (see [`attempt_heal_driven_refetch`]) before this text is ever
 /// reached; `consultation` says only how much weight that attempt's silence carries.
-fn remedy_text(consultation: RemoteConsultation) -> &'static str {
+fn remedy_text(consultation: &RemoteConsultation) -> String {
     match consultation {
         RemoteConsultation::NotConfigured =>
             "no remote is configured for this warehouse; reproduce it by re-running the \
@@ -2122,7 +2126,10 @@ fn remedy_text(consultation: RemoteConsultation) -> &'static str {
             reproduce it by re-running the operation that created it if its content still exists \
             in your working tree (\"forklift load\" then \"forklift stack\") — there is no \
             in-tool way to abandon a single dangling reference yet",
-    }
+        RemoteConsultation::ScopeUnreadable(reason) => return format!(
+            "this heal could not check the configured remote for it: {}", reason
+        ),
+    }.to_string()
 }
 
 /// §3.2 D1/D3/D4: the heal-driven refetch. Three passes, all best-effort — see the "empirically
@@ -2203,20 +2210,24 @@ async fn attempt_heal_driven_refetch(
     let _self_trip_exemption = file_utils::SelfTripExemptionGuard::new();
 
     let mut clean = true;
+    let mut scope_failure: Option<String> = None;
 
     match client.fetch_info().await {
         Ok(info) => {
             // A user pallet's history fetch needs the fetch scope; one this build cannot read
             // skips those fetches, never widens them to the whole remote. The meta pallets and
             // the hash-addressed passes below need no scope and still run, and whatever stays
-            // missing is reported by the caller's recheck as usual.
+            // missing is reported by the caller's recheck, whose remedy names the scope file.
             let fetch_scope = scope_utils::read_fetch_scope();
 
             for (wire, remote_head) in &info.pallets {
                 let fetched = match (wire.strip_prefix(pallet_utils::META_QUALIFIER), &fetch_scope) {
                     (Some(_), _) => remote_utils::fetch_history(&client, remote_head, &Progress::NONE).await,
                     (None, Ok(scope)) => remote_utils::fetch_history_scoped(&client, remote_head, scope, &Progress::NONE).await,
-                    (None, Err(reason)) => Err(reason.clone()),
+                    (None, Err(reason)) => {
+                        scope_failure = Some(reason.clone());
+                        Err(reason.clone())
+                    }
                 };
 
                 if fetched.is_err() {
@@ -2246,7 +2257,13 @@ async fn attempt_heal_driven_refetch(
         corrupt_failures = failures;
     }
 
-    let consultation = if clean { RemoteConsultation::ConsultedCleanly } else { RemoteConsultation::ConsultedWithErrors };
+    // An unreadable scope outranks a transient failure: re-running cannot fix it, so its reason
+    // (the file and the way out) is what the remedy names.
+    let consultation = match (scope_failure, clean) {
+        (Some(reason), _) => RemoteConsultation::ScopeUnreadable(reason),
+        (None, true) => RemoteConsultation::ConsultedCleanly,
+        (None, false) => RemoteConsultation::ConsultedWithErrors,
+    };
     (consultation, corrupt_failures)
 }
 

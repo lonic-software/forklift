@@ -556,6 +556,8 @@ fn a_sparse_franchise_keeps_the_root_ignore_file_in_scope() {
     let scope_json: serde_json::Value = serde_json::from_str(&stdout(&scope)).unwrap();
     assert_eq!(scope_json["data"]["materialization_scope"], serde_json::json!(["src"]), "{}", stdout(&scope));
     assert_eq!(scope_json["data"]["implicit_scope"], serde_json::json!([".forkliftignore"]), "{}", stdout(&scope));
+    assert_eq!(scope_json["data"]["fetch_scope"], serde_json::json!(["src"]), "{}", stdout(&scope));
+    assert_eq!(scope_json["data"]["implicit_fetch_scope"], serde_json::json!([".forkliftignore"]), "{}", stdout(&scope));
 
     // The rules are in force: an ignored build folder inside the scope reads clean.
     area.write_file("sparse/src/build/out.txt", "generated\n");
@@ -5334,6 +5336,48 @@ fn heal_driven_refetch_leaves_the_taint_intact_on_a_failed_fetch() {
         "the remainder must be exactly unchanged — nothing was actually recovered");
     assert!(!object_store_path(&area, "dev", &blob).exists(),
         "nothing was actually fetched by the failed attempt");
+}
+
+#[test]
+fn heal_names_an_unreadable_fetch_scope_instead_of_blaming_connectivity() {
+    // A fetch scope this build refuses skips the user pallets' history fetches. Re-running heal
+    // can never fix that, so the remedy must name the scope file and its way out, never the
+    // "once connectivity is restored" wording a transient failure gets.
+    //
+    // Mutation: map the skipped fetch to `ConsultedWithErrors` as before → the remedy says
+    // "connectivity" and never names the scope file → red.
+    let area = TestArea::new("heal-refetch-unreadable-scope");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/a.txt", "content the remote has\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base parcel"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    // A second parcel the remote never saw, so no pass can bring its blob back.
+    area.write_file("dev/b.txt", "content only this warehouse ever had\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "local parcel"]));
+
+    let head = pallet_head(&area, "dev", "main");
+    let blob = path_object_hash(&area, "dev", &head, "b.txt");
+    let relative = loose_object_relative_path(&blob);
+
+    std::fs::remove_file(object_store_path(&area, "dev", &blob)).unwrap();
+    area.write_file("dev/.forklift/config/fetch-scope", "src\n");
+    plant_taint(&area, "dev", &[&relative]);
+
+    let status = area.forklift("dev", &["heal"]);
+    assert_eq!(status.status.code(), Some(21));
+
+    let output = format!("{}{}", stdout(&status), stderr(&status));
+    assert!(output.contains("fetch-scope") && output.contains("older version of Forklift"),
+        "the remedy must name the unreadable scope file: {}", output);
+    assert!(output.contains("Franchise the remote again"),
+        "the remedy must name the way out: {}", output);
+    assert!(!output.contains("connectivity"),
+        "an unreadable scope is not a connectivity problem: {}", output);
 }
 
 #[test]
