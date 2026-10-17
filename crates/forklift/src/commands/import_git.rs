@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::Arc;
@@ -287,6 +287,9 @@ struct Converter {
     oid_len: usize,
     blobs: HashMap<String, String>,
     trees: HashMap<String, String>,
+    /// Git trees already checked as a commit's root (`ensure_importable_root`), so a reused
+    /// root is read again at most once.
+    checked_roots: HashSet<String>,
     commits: HashMap<String, String>,
     warnings: Vec<String>,
 
@@ -348,6 +351,7 @@ impl Converter {
             oid_len,
             blobs: HashMap::new(),
             trees: HashMap::new(),
+            checked_roots: HashSet::new(),
             commits: HashMap::new(),
             warnings: Vec::new(),
             ingest: pack_direct.then(StoreIngest::new).transpose()?,
@@ -432,8 +436,9 @@ impl Converter {
         if let Some(hash) = self.trees.get(git_hash).cloned() {
             // A tree first converted as a subdirectory, where any name is fine, can come back as
             // a commit's root; a fresh conversion checks its root entries in the loop below.
-            if path_prefix.is_empty() {
+            if path_prefix.is_empty() && !self.checked_roots.contains(git_hash) {
                 self.ensure_importable_root(git_hash)?;
+                self.checked_roots.insert(git_hash.to_string());
             }
             // Already imported (an identical directory elsewhere in history) — nothing to
             // store, but it is now the newest version at *this* path, so a later version
@@ -485,6 +490,9 @@ impl Converter {
         let mut object = LooseObjectBuilder::build_tree(&tree);
         self.store_tree(&mut object, path_prefix, git_hash)?;
 
+        if path_prefix.is_empty() {
+            self.checked_roots.insert(git_hash.to_string());
+        }
         self.trees.insert(git_hash.to_string(), object.hash.clone());
 
         Ok(object.hash)

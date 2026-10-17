@@ -551,18 +551,24 @@ const FOLDER_NAME_ASSEMBLY: &str = "assembly";
 
 /// Create a fresh temp file to assemble a chunked file into, in [`FOLDER_NAME_ASSEMBLY`]. Its name
 /// is unique to this process and attempt and it is created new, so nothing already there is ever
-/// opened (a symlink would be followed). Once per process, leftovers from other processes are
-/// cleared first: the warehouse lock means none of them is still assembling.
+/// opened (a symlink would be followed). Once per process and folder, leftovers from other
+/// processes are cleared first: every command that materializes holds the warehouse lock, so none
+/// of them is still assembling.
 fn create_assembly_temp(path: &str) -> Result<(PathBuf, std::fs::File), String> {
     static ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    static CLEARED: std::sync::Once = std::sync::Once::new();
+    static CLEARED: std::sync::Mutex<Option<std::collections::HashSet<PathBuf>>> = std::sync::Mutex::new(None);
     const MAX_ATTEMPTS: usize = 64;
 
     let dir = crate::globals::bay_root().join(FOLDER_NAME_ASSEMBLY);
     file_utils::create_folder_if_not_exists(&dir)?;
 
     let pid = std::process::id();
-    CLEARED.call_once(|| clear_other_assemblies(&dir, pid));
+    {
+        let mut cleared = CLEARED.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if cleared.get_or_insert_with(Default::default).insert(dir.clone()) {
+            clear_other_assemblies(&dir, pid);
+        }
+    }
 
     let candidates = (0..MAX_ATTEMPTS).map(|_| {
         let attempt = ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

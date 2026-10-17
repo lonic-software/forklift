@@ -1612,6 +1612,7 @@ impl Command {
                 | Command::Expand { .. }
                 | Command::Heal
                 | Command::ImportGit { .. }
+                | Command::Lift
                 | Command::Load { .. }
                 | Command::Lower { .. }
                 | Command::Haul { .. }
